@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
 import mic_control
 from qt_image import pil_to_qicon
+from toast import show_toast
 
 # eConsole/eMultimedia/eCommunications の全ロールに反映しないと、
 # アプリによっては切替後も旧デバイスに音が出続けることがあるため全て設定する。
@@ -22,8 +23,6 @@ _ROLES = [ERole.eConsole, ERole.eMultimedia, ERole.eCommunications]
 _TOGGLE_COOLDOWN = 0.6
 
 _DEFAULT_ICON_COLOR = "#6b7280"
-
-_NOTIFY_MS = 3000
 
 # mic_control._AUDIO_ERRORS と同じ理由。pycaw/comtypes が投げる COMError は Exception 直下で
 # OSError のサブクラスではないため、OSError だけを捕まえても素通りしてしまう。
@@ -172,9 +171,7 @@ class AudioFeature:
         return [d for d in self.devices if _device_exists(d.get("id"))]
 
     def _notify_unset(self):
-        self.tray_icon.showMessage(
-            "音声出力", f"{_UNSET_MENU_TEXT}。\n{_SETUP_HINT}", QSystemTrayIcon.Information, _NOTIFY_MS
-        )
+        show_toast(f"音声出力\n{_UNSET_MENU_TEXT}。{_SETUP_HINT}")
 
     def _refresh(self):
         # マイクが無い環境では get_mute() が None を返す。その場合はミュート表示をしない。
@@ -234,23 +231,17 @@ class AudioFeature:
         """既定の録音デバイスのミュートを反転する。アイコンにも状態を反映する。"""
         muted = mic_control.toggle_mute()
         if muted is None:
-            self.tray_icon.showMessage(
-                "マイク", "既定の録音デバイスが見つかりません", QSystemTrayIcon.Information, _NOTIFY_MS
-            )
+            show_toast("マイク\n既定の録音デバイスが見つかりません")
             self._refresh()
             return
-        # 成功時は通知を出さない。Windowsのトースト通知は通知システムを経由するため
-        # 数秒遅れて出ることがあり、切り替えた後になって鳴るだけで邪魔になる。
-        # ミュート状態はトレイアイコンの斜線が即座に変わるので、それが十分な合図。
+        # 成功時は通知を出さない。ミュート状態はトレイアイコンの斜線が即座に変わるので、
+        # それが十分な合図であり、いちいち通知が出る方が冗長になる。
         self._refresh()
 
     def _switch_to(self, device: dict):
         if not _set_default_device(device.get("id")):
             label = device.get("label", "(名称未設定)")
-            self.tray_icon.showMessage(
-                "音声出力", f"{label} に切り替えられませんでした。\n{_SETUP_HINT}",
-                QSystemTrayIcon.Information, _NOTIFY_MS,
-            )
+            show_toast(f"音声出力\n{label} に切り替えられませんでした。{_SETUP_HINT}")
         self._refresh()
 
     def _on_activated(self, reason):

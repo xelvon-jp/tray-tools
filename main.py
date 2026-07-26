@@ -16,12 +16,13 @@ from pathlib import Path
 
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication
 
 import settings as settings_module
 from feature_audio import AudioFeature
 from feature_screen import ScreenFeature
 from hotkeys import setup_hotkeys
+from toast import show_toast
 
 # トレイアイコンは音声用と画面用の2つだけ。増やさない方針(上のFeatureの定義を参照)。
 FEATURE_CLASSES = [AudioFeature, ScreenFeature]
@@ -30,7 +31,6 @@ FEATURE_CLASSES = [AudioFeature, ScreenFeature]
 # ショートカットを手動で叩くと二重に立ち上がり、トレイアイコンが2組並ぶうえ
 # グローバルホットキーが二重登録されて競合するため防ぐ。
 SINGLE_INSTANCE_KEY = "yotan.traytools.single-instance"
-NOTIFY_MS = 3000
 
 
 def _is_already_running() -> bool:
@@ -54,12 +54,9 @@ def _hold_single_instance_lock():
     return server
 
 
-def _notify_already_running(server, features):
+def _notify_already_running(server):
     server.nextPendingConnection()  # 接続を回収するだけ。中身は使わない
-    if features:
-        features[0].tray_icon.showMessage(
-            "tray-tools", "すでに起動しています", QSystemTrayIcon.Information, NOTIFY_MS
-        )
+    show_toast("tray-tools\nすでに起動しています")
 
 
 def main():
@@ -90,9 +87,7 @@ def main():
 
     # 2つ目の起動が黙って終わるだけだと「クリックしたのに何も起きない」と見えるので、
     # 常駐中のこちら側から知らせる。
-    instance_lock.newConnection.connect(
-        lambda: _notify_already_running(instance_lock, features)
-    )
+    instance_lock.newConnection.connect(lambda: _notify_already_running(instance_lock))
 
     handlers = {}
     for feature in features:

@@ -1,0 +1,15 @@
+# PC固有のもの。複数PCで同じリポジトリを共有するため、コミットしないこと。
+
+# 音声デバイスIDはPCごとに異なるGUID。他PCへ持ち込むと存在しないIDになり、
+# 保存先パスもユーザー名を含むため、設定ファイルは各PCのローカルに置く。
+settings.json
+
+# ショートカットは絶対パスを埋め込むので他PCでは壊れる(setup.py が作り直す)
+*.lnk
+
+__pycache__/
+*.pyc
+
+# venv は %USERPROFILE%\.venvs\tray-tools に作る。中に作られた場合の保険。
+venv/
+.venv/

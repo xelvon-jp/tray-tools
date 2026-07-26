@@ -239,11 +239,10 @@ class AudioFeature:
             )
             self._refresh()
             return
+        # 成功時は通知を出さない。Windowsのトースト通知は通知システムを経由するため
+        # 数秒遅れて出ることがあり、切り替えた後になって鳴るだけで邪魔になる。
+        # ミュート状態はトレイアイコンの斜線が即座に変わるので、それが十分な合図。
         self._refresh()
-        self.tray_icon.showMessage(
-            "マイク", "ミュートしました" if muted else "ミュートを解除しました",
-            QSystemTrayIcon.Information, _NOTIFY_MS,
-        )
 
     def _switch_to(self, device: dict):
         if not _set_default_device(device.get("id")):

@@ -66,6 +66,8 @@ class ScreenFeature:
         self.overlay = None
         self.picker = None
         self.ruler = None
+        # 範囲選択が終わってから待つ秒数。選択完了まで持ち越す。
+        self._pending_delay = 0
         # 開いている付箋ウインドウの参照をリストで保持する(GC回収防止)。
         # ウインドウが閉じられたらリストから取り除く(残し続けるとメモリリークになる)。
         self.capture_windows = []
@@ -162,18 +164,14 @@ class ScreenFeature:
         # 全画面に貼り付いたまま残る(マウス操作を奪う)。色/定規と同じ作法で弾く。
         if self.overlay is not None or self.countdown is not None:
             return
-        if delay_seconds and delay_seconds > 0:
-            self.countdown = CountdownOverlay(delay_seconds)
-            self.countdown.finished.connect(self._show_overlay)
-            self.countdown.show()
-        else:
-            self._show_overlay()
+        # 遅延キャプチャは「範囲を先に選んでから待つ」。待ってから範囲選択させると、
+        # 選択操作をしている時点の画面が撮られるだけで待った意味がない。
+        # メニューやツールチップなど、操作すると消えるものを撮るのが本来の目的なので、
+        # 範囲を確定させたあとの待ち時間にそれらを開いてもらう。
+        self._pending_delay = max(int(delay_seconds or 0), 0)
+        self._show_overlay()
 
     def _show_overlay(self):
-        if self.countdown is not None:
-            self.countdown.close()
-            self.countdown = None
-
         self.overlay = SelectionOverlay()
         self.overlay.selection_made.connect(self._on_selection_made)
         self.overlay.canceled.connect(self._on_canceled)
@@ -187,12 +185,33 @@ class ScreenFeature:
         self.overlay.close()
         self.overlay.deleteLater()
         self.overlay = None
+        self._pending_delay = 0
 
     def _on_selection_made(self, rect_global: QRect):
         self.overlay.close()
         self.overlay.deleteLater()
         self.overlay = None
 
+        delay = self._pending_delay
+        self._pending_delay = 0
+        if delay > 0:
+            self.countdown = CountdownOverlay(delay)
+            self.countdown.finished.connect(lambda: self._capture_after_countdown(rect_global))
+            self.countdown.show()
+            return
+
+        self._grab_and_show(rect_global)
+
+    def _capture_after_countdown(self, rect_global: QRect):
+        if self.countdown is not None:
+            self.countdown.close()
+            self.countdown.deleteLater()
+            self.countdown = None
+        # カウントダウン表示が選択範囲に重なっていると写り込む。閉じた直後はOSがまだ
+        # 再描画し切っていないことがあるので、少し待ってから撮る(再キャプと同じ理由)。
+        QTimer.singleShot(150, lambda: self._grab_and_show(rect_global))
+
+    def _grab_and_show(self, rect_global: QRect):
         capture_settings = self.app_settings.get("capture", {})
         image = grab_region(rect_global)
         save_image(image, capture_settings)  # キャプチャ直後の素の画像を自動保存

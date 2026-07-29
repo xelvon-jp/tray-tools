@@ -30,7 +30,7 @@ FEATURE_CLASSES = [AudioFeature, ScreenFeature]
 # 多重起動の検出に使うローカルソケット名。スタートアップからの自動起動に加えて
 # ショートカットを手動で叩くと二重に立ち上がり、トレイアイコンが2組並ぶうえ
 # グローバルホットキーが二重登録されて競合するため防ぐ。
-SINGLE_INSTANCE_KEY = "yotan.traytools.single-instance"
+SINGLE_INSTANCE_KEY = "traytools.single-instance"
 
 
 def _is_already_running() -> bool:
@@ -63,7 +63,7 @@ def main():
     # このIDを設定しないと、他のPythonツールとタスクバー/通知領域で同一アプリ扱いされ
     # アイコンが混線することがある。QApplication生成前に呼ぶ必要がある。
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yotan.traytools.1")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("traytools.app.1")
     except (AttributeError, OSError):
         pass
 

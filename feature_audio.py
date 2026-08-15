@@ -2,11 +2,12 @@
 # 音声まわりのFeature。QSystemTrayIconを1つ持ち、出力デバイスのトグル切替(メニュー/
 # ホットキー)と、マイクのミュート切替(mic_control.py に委譲)を提供する。
 # (audio-switcher/main.py, audio_device.py を統合・一般化して移植)
+import json
 import os
 import time
 
 import comtypes
-from pycaw.constants import ERole
+from pycaw.constants import AudioDeviceState, ERole
 from pycaw.utils import AudioUtilities
 from PIL import Image, ImageDraw
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
@@ -73,6 +74,34 @@ def _device_exists(device_id: str) -> bool:
         return AudioUtilities.GetDeviceEnumerator().GetDevice(device_id) is not None
     except _AUDIO_ERRORS:
         return False
+
+
+def _friendly_name(device_id: str):
+    """IDに対応するデバイスのFriendlyName。取れなければ None。
+    プロパティを読む分 _device_exists より重いが、読むのは指定した1台分だけなので
+    全デバイス列挙(GetAllDevices)とは桁が違う。"""
+    try:
+        _ensure_com_initialized()
+        device = AudioUtilities.GetDeviceEnumerator().GetDevice(device_id)
+        return AudioUtilities.CreateDevice(device).FriendlyName
+    except _AUDIO_ERRORS:
+        return None
+
+
+def _find_active_device_id(name: str):
+    """FriendlyNameが完全一致する有効なデバイスがちょうど1台のときだけ、そのIDを返す。
+    このPCには "Digital Output" や "3 - EX-LDGCQ321HD" のような同名デバイスが複数あり、
+    曖昧なまま推測すると意図しない出力先へ切り替わって原因の分かりにくい事故になる。
+    0台でも2台以上でも推測せず None を返す(前方一致・部分一致も使わない)。"""
+    if not name:
+        return None
+    try:
+        _ensure_com_initialized()
+        matched = [d for d in AudioUtilities.GetAllDevices()
+                   if d.state == AudioDeviceState.Active and d.FriendlyName == name]
+    except _AUDIO_ERRORS:
+        return None
+    return matched[0].id if len(matched) == 1 else None
 
 
 def _draw_headphone(draw: ImageDraw.ImageDraw, color: str) -> None:
@@ -168,7 +197,52 @@ class AudioFeature:
     def _usable_devices(self) -> list:
         """settings.json のデバイスのうち、このPCに実在するものだけ。
         デバイスIDはPC固有のGUIDなので、設定を他PCへ持ち込むと全部ここで落ちる。"""
-        return [d for d in self.devices if _device_exists(d.get("id"))]
+        return [d for i, d in enumerate(self.devices) if self._resolve_device(i, d)]
+
+    def _resolve_device(self, index: int, device: dict) -> bool:
+        """設定のデバイスを、このPCの実デバイスへ結び付ける。使えるなら True。
+
+        IDが実在する間はそのまま使い、ついでに現在のFriendlyNameを match_name に控える。
+        label はユーザーがメニュー用に付けた名前でWindowsの名前とは一致しない(実例:
+        "ヘッドホン (Loop120)" と "ヘッドホン (Loop120 by Shokz)")ため照合には使えず、
+        IDが変わってから名前を調べる術は無いので、使えているうちに控えておく。"""
+        if _device_exists(device.get("id")):
+            name = _friendly_name(device.get("id"))
+            if name and name != device.get("match_name"):
+                device["match_name"] = name
+                self._save_device_identity(index, device)
+            return True
+
+        # ここへ来るのはIDが実在しないときだけ。全デバイス列挙は重いので、
+        # メニューを開くたびに通る通常経路には入れない。
+        new_id = _find_active_device_id(device.get("match_name"))
+        if not new_id:
+            return False
+        device["id"] = new_id
+        self._save_device_identity(index, device)
+        label = device.get("label", "(名称未設定)")
+        # IDが黙って書き換わると挙動が読めなくなるので、追従したことは必ず見せる。
+        show_toast(f"音声出力\n{label} のIDが変わっていたため追従しました")
+        return True
+
+    def _save_device_identity(self, index: int, device: dict) -> None:
+        """settings.json を読み直し、該当デバイスの id と match_name だけを書き戻す。
+        メモリ上の設定はデフォルト値をマージ済みで、丸ごと書き出すと未設定の既定値まで
+        明示的に書かれてファイルの姿が変わってしまう。label は重複しうるので、対象は
+        配列のインデックスで特定する。書けなくても動作は続ける(次回また解決すればよい)。"""
+        if not self.settings_path:
+            return
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+            entry = stored["audio"]["devices"][index]
+            entry["id"] = device.get("id")
+            if device.get("match_name"):
+                entry["match_name"] = device["match_name"]
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump(stored, f, ensure_ascii=False, indent=2)
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            pass
 
     def _notify_unset(self):
         show_toast(f"音声出力\n{_UNSET_MENU_TEXT}。{_SETUP_HINT}")
@@ -221,8 +295,10 @@ class AudioFeature:
         if len(devices) < 2:
             # 候補が1台だと「次のデバイス」が自分自身になり、押しても何も起きない。
             # 黙って無反応だと故障と区別がつかないので、消えている登録を名指しで知らせる。
-            # BluetoothデバイスはWindows側で再ペアリングするとIDが振り直されるため、
-            # 設定に書いたIDが実在しなくなるのが主な原因。
+            # 主な原因は、USBドングルを挿すポートが変わる・ドライバが更新される等で
+            # エンドポイントIDが振り直され、設定に書いたIDが実在しなくなること
+            # (Bluetoothの再ペアリングでも同様に起きる)。match_name があれば
+            # _resolve_device が名前で追従するので、ここまで来るのは追従できない場合。
             missing = [d.get("label", "(名称未設定)") for d in self.devices
                        if not _device_exists(d.get("id"))]
             detail = "、".join(missing) if missing else "他のデバイス"

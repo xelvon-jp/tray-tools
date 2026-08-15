@@ -218,6 +218,20 @@ class AudioFeature:
             self._notify_unset()
             self._refresh()
             return
+        if len(devices) < 2:
+            # 候補が1台だと「次のデバイス」が自分自身になり、押しても何も起きない。
+            # 黙って無反応だと故障と区別がつかないので、消えている登録を名指しで知らせる。
+            # BluetoothデバイスはWindows側で再ペアリングするとIDが振り直されるため、
+            # 設定に書いたIDが実在しなくなるのが主な原因。
+            missing = [d.get("label", "(名称未設定)") for d in self.devices
+                       if not _device_exists(d.get("id"))]
+            detail = "、".join(missing) if missing else "他のデバイス"
+            show_toast(
+                f"音声出力\n切り替え先がありません（{detail} が見つかりません）。\n"
+                "接続を確認するか、list_devices.py でIDを取り直してください"
+            )
+            self._refresh()
+            return
 
         current_id = _get_current_device_id()
         ids = [d["id"] for d in devices]

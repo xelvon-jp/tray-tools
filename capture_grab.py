@@ -98,7 +98,8 @@ def render_annotated(base_image: QImage, actions_history: list) -> QImage:
 def _unique_path(save_folder: Path, stem: str, suffix: str) -> Path:
     """save_folder/stem+suffix が既に存在する場合、_2, _3... と連番を付けて衝突を避ける。
     ファイル名は秒単位のため、自動保存直後のCtrl+Sなど同じ秒に2回保存すると
-    連番が無ければ片方が黙って上書きされてしまう。"""
+    連番が無ければ片方が黙って上書きされてしまう。
+    連番セッション(-001形式)でも、同じ秒に別の付箋を開いてしまった場合の保険として残す。"""
     path = save_folder / f"{stem}{suffix}"
     n = 2
     while path.exists():
@@ -107,15 +108,27 @@ def _unique_path(save_folder: Path, stem: str, suffix: str) -> Path:
     return path
 
 
-def save_image(image: QImage, capture_settings: dict):
-    """imageを設定フォルダへ日時ベースのファイル名で保存する。戻り値は保存先Pathか、失敗時はNone。
+def new_session_stem() -> str:
+    """連番セッション(1枚の付箋 = 1セッション)のファイル名の頭を作る。
+    付箋を作った時刻で固定し、以降は連番だけを増やして
+    rapture_20260823_140919-001.png のように一連の作業を名前でまとめる。"""
+    return datetime.datetime.now().strftime("rapture_%Y%m%d_%H%M%S")
+
+
+def save_image(image: QImage, capture_settings: dict, stem: str = None, index: int = None):
+    """imageを設定フォルダへ保存する。戻り値は保存先Pathか、失敗時はNone。
+
+    stem/index を渡すと連番セッションのファイル名(stem-001)になる。省略した場合は
+    従来どおり「今の時刻」から単発のファイル名を作る(引数2つの既存呼び出し互換)。
     JPEGはアルファチャンネルを持てないため保存前にRGBへ変換する。"""
     save_folder = Path(capture_settings.get("save_folder", r"C:\bak\rapture"))
     save_folder.mkdir(parents=True, exist_ok=True)
 
     fmt = capture_settings.get("save_format", "png").lower()
-    stem = datetime.datetime.now().strftime("rapture_%Y%m%d_%H%M%S")
-    path = _unique_path(save_folder, stem, f".{fmt}")
+    name = stem or new_session_stem()
+    if index is not None:
+        name = f"{name}-{int(index):03d}"
+    path = _unique_path(save_folder, name, f".{fmt}")
 
     if fmt in ("jpg", "jpeg"):
         out_image = image.convertToFormat(QImage.Format_RGB32)

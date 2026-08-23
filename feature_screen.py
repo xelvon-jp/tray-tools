@@ -21,7 +21,7 @@ import explorer_nav
 import launcher
 import screen_ruler
 import snippets
-from capture_grab import save_image
+from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from capture_window import CaptureWindow
 from keep_awake import set_keep_awake
@@ -74,6 +74,10 @@ class ScreenFeature:
         # 開いている付箋ウインドウの参照をリストで保持する(GC回収防止)。
         # ウインドウが閉じられたらリストから取り除く(残し続けるとメモリリークになる)。
         self.capture_windows = []
+        # グローバルホットキー(capture_sequence)で撮る対象の付箋。同時に何枚でも開けるので、
+        # 最後に作ったものを対象にする。閉じられたら必ずNoneに戻すこと(WA_DeleteOnClose で
+        # 実体が消えるため、掴んだまま触るとRuntimeErrorになる)。
+        self.active_capture_window = None
 
         self.topmost = TopmostTracker()
 
@@ -156,6 +160,7 @@ class ScreenFeature:
     def hotkeys(self) -> dict:
         return {
             "capture_now": lambda: self.start_capture(0),
+            "capture_sequence": self.capture_sequence,
             "color_picker": self.start_color_picker,
             "always_on_top": self.toggle_always_on_top,
             "snippet_picker": self.start_snippet_picker,
@@ -226,27 +231,68 @@ class ScreenFeature:
         self.overlay.deleteLater()
         self.overlay = None
 
-        save_image(image, self.app_settings.get("capture", {}))  # 素の画像を自動保存
-        self._open_capture_window(image, rect_global.topLeft())
+        # 付箋1枚が1つの連番セッション。撮影直後の自動保存がそのセッションの1枚目になるよう、
+        # 先にファイル名の頭を決めてから付箋へ引き継ぐ(rapture_20260823_140919-001.png)。
+        # 保存に失敗したときは連番0のまま(バッジも出さない)で付箋だけ開く。
+        session_stem = new_session_stem()
+        saved = save_image(  # 素の画像を自動保存
+            image, self.app_settings.get("capture", {}), stem=session_stem, index=1
+        )
+        self._open_capture_window(
+            image,
+            rect_global.topLeft(),
+            session_stem=session_stem,
+            session_index=1 if saved else 0,
+        )
 
-    def _open_capture_window(self, image, global_pos, close_on_escape=False):
+    def _open_capture_window(self, image, global_pos, close_on_escape=False,
+                             session_stem=None, session_index=0):
         window = CaptureWindow(
             image,
             global_pos,
             self.app_settings.get("capture", {}),
             settings_path=self.settings_path,
             close_on_escape=close_on_escape,
+            session_stem=session_stem,
+            session_index=session_index,
+            # 連番キャプチャのキーをタイトルバーに出させる。設定で変えられる値なので
+            # 付箋側にハードコードさせず、ここで実値を渡す。
+            capture_hotkey=self.app_settings.get("hotkeys", {}).get("capture_sequence"),
         )
         window.destroyed.connect(lambda: self._on_window_closed(window))
         self.capture_windows.append(window)
+        # 直前に作った付箋をホットキーの対象にする。撮りたいのは今出したものなので、
+        # 複数枚並んでいても最後の1枚に向ければ迷わない。
+        self.active_capture_window = window
         window.show()
 
     def _on_window_closed(self, window):
         if window in self.capture_windows:
             self.capture_windows.remove(window)
+        # 閉じられた付箋を対象に残すと、次のホットキーで削除済みのC++オブジェクトを
+        # 触ってしまう。ここで必ず手放す(is で比べる。実体が消えた後なので中身は見ない)。
+        if self.active_capture_window is window:
+            self.active_capture_window = None
 
-    # ---------------------------------------------------------------
-    # カラーピッカー
+    def capture_sequence(self):
+        """ホットキー(既定 Ctrl+Alt+S): 対象の付箋の連番キャプチャを1枚進める。
+
+        付箋の Space と同じ処理だが、こちらは付箋がアクティブでなくても効く。
+        ブラウザ等を操作しながら「操作する → 撮る」を繰り返す使い方が本命で、そのとき
+        前面にいるのは操作中のアプリなので、付箋にフォーカスを戻さず撮れる必要がある。
+        付箋は常に最前面で位置を保っているため、非アクティブでも狙った範囲が撮れる。"""
+        window = self.active_capture_window
+        if window is None:
+            # 黙って無反応だとホットキーが効いていないのか壊れたのか区別が付かない。
+            self._notify("Rapture", "付箋がありません")
+            return
+        try:
+            window.capture_and_save()
+        except RuntimeError:
+            # 閉じられた付箋を触ると「削除済みのC++オブジェクト」でRuntimeErrorになる。
+            # destroyed で手放しているので通常は起きないが、ここで投げ切ると常駐ごと落ちる。
+            self.active_capture_window = None
+            self._notify("Rapture", "付箋がありません")
     # ---------------------------------------------------------------
     def start_color_picker(self):
         if self.picker is not None:

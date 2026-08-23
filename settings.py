@@ -47,6 +47,7 @@ DEFAULT_SETTINGS = {
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",
         "capture_now": "ctrl+alt+r",
+        "capture_sequence": "ctrl+alt+s",
         "mic_mute": "ctrl+alt+m",
         "color_picker": "ctrl+alt+c",
         "always_on_top": "ctrl+alt+t",

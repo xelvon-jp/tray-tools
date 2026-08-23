@@ -13,3 +13,10 @@ __pycache__/
 # venv は %USERPROFILE%\.venvs\tray-tools に作る。中に作られた場合の保険。
 venv/
 .venv/
+
+# 例外の記録。PC固有の事象なので共有しない。
+error.log
+
+# 設定ファイルの手動バックアップ。settings.json 自体と同じ理由で共有しない。
+# 日時つきの settings.json.bak_20260823_111251 も拾えるよう末尾を * にする。
+settings.json.bak*

@@ -1,7 +1,8 @@
 # feature_screen.py
 # 画面まわり全般のFeature(旧 feature_capture.py)。トレイアイコンを1つ所有し、
-# 範囲キャプチャ付箋「Rapture」に加えて、色の吸い取り・画面の測定・全画面への書き込み・
-# 任意ウィンドウの最前面固定・スリープ抑止をこのアイコンのメニューから提供する。
+# 範囲キャプチャ付箋「Rapture」に加えて、カラーピッカー・画面定規・定型文・
+# フォルダブックマーク・任意ウィンドウの最前面固定・スリープ抑止を
+# このアイコンのメニューから提供する。
 #
 # アイコンを増やさないのは意図的。状態を持つ機能(スリープ抑止)だけがアイコンの見た目を
 # 占有し、単発の動作はメニュー項目で足りるという方針。
@@ -16,8 +17,11 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 import color_picker
+import explorer_nav
+import launcher
 import screen_ruler
-from capture_grab import grab_region, save_image, virtual_geometry
+import snippets
+from capture_grab import save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from capture_window import CaptureWindow
 from keep_awake import set_keep_awake
@@ -65,6 +69,8 @@ class ScreenFeature:
         self.overlay = None
         self.picker = None
         self.ruler = None
+        self.snippet_picker = None
+        self.launcher_picker = None
         # 開いている付箋ウインドウの参照をリストで保持する(GC回収防止)。
         # ウインドウが閉じられたらリストから取り除く(残し続けるとメモリリークになる)。
         self.capture_windows = []
@@ -86,24 +92,38 @@ class ScreenFeature:
         self._normal_icon = QIcon(str(ICON_PATH)) if ICON_PATH.exists() else QIcon()
         self.tray_icon = QSystemTrayIcon(self._normal_icon)
 
+        # 項目名の先頭に絵文字を1つ置く。通知領域のメニューは項目が縦に並ぶだけで
+        # 手掛かりが少ないため、目的の行を色と形で拾えるようにしている。
+        # ホットキー表記は _with_hotkey が末尾に足すので、絵文字込みのラベルを渡す。
         self.menu = QMenu()
-        self.menu.addAction("キャプチャ（今すぐ）", lambda: self.start_capture(0))
-        self.menu.addAction("5秒後にキャプチャ", lambda: self.start_capture(5))
-        self.menu.addAction("10秒後にキャプチャ", lambda: self.start_capture(10))
+        self.menu.addAction("📷 キャプチャ（今すぐ）", lambda: self.start_capture(0))
+        self.menu.addAction("⏱ 5秒後にキャプチャ", lambda: self.start_capture(5))
+        self.menu.addAction("⏱ 10秒後にキャプチャ", lambda: self.start_capture(10))
         self.menu.addSeparator()
         self.menu.addAction(
-            self._with_hotkey("色を吸い取る", hotkey_config.get("color_picker")),
+            self._with_hotkey("💧 カラーピッカー", hotkey_config.get("color_picker")),
             self.start_color_picker,
         )
-        self.menu.addAction("画面を測る", self.start_ruler)
-        self.menu.addAction("画面全体に書き込む", self.annotate_screen)
+        self.menu.addAction("📏 画面定規", self.start_ruler)
         self.menu.addSeparator()
         self.menu.addAction(
-            self._with_hotkey("このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
+            self._with_hotkey("📋 定型文", hotkey_config.get("snippet_picker")),
+            self.start_snippet_picker,
+        )
+        # QAction.triggered は checked(bool) を渡してくる。引数を取れる関数を直接繋ぐと
+        # current_path に False が入るので、ここは引数なしのラムダで包む。
+        self.menu.addAction("📂 定型文フォルダを開く", lambda: snippets.open_folder())
+        self.menu.addAction(
+            self._with_hotkey("📁 フォルダブックマーク", hotkey_config.get("launcher")),
+            lambda: self.start_launcher(),
+        )
+        self.menu.addSeparator()
+        self.menu.addAction(
+            self._with_hotkey("📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
             self.toggle_always_on_top,
         )
 
-        self._awake_menu = self.menu.addMenu("スリープ抑止")
+        self._awake_menu = self.menu.addMenu("☕ スリープ抑止")
         self._awake_actions = {}
         for minutes in self._awake_choices:
             action = self._awake_menu.addAction(
@@ -118,9 +138,9 @@ class ScreenFeature:
         self._awake_menu.addAction("解除", self._disable_keep_awake)
 
         self.menu.addSeparator()
-        self.menu.addAction("設定", self._open_settings_file)
+        self.menu.addAction("⚙ 設定", self._open_settings_file)
         self.menu.addSeparator()
-        self.menu.addAction("終了", QApplication.instance().quit)
+        self.menu.addAction("✖ 終了", QApplication.instance().quit)
 
         # 残り時間は開くたびに変わるので、表示直前に作り直す
         self.menu.aboutToShow.connect(self._refresh_awake_menu)
@@ -138,6 +158,8 @@ class ScreenFeature:
             "capture_now": lambda: self.start_capture(0),
             "color_picker": self.start_color_picker,
             "always_on_top": self.toggle_always_on_top,
+            "snippet_picker": self.start_snippet_picker,
+            "launcher": lambda: self.start_launcher(),
         }
 
     @staticmethod
@@ -148,15 +170,16 @@ class ScreenFeature:
         show_toast(f"{title}\n{message}")
 
     def _on_activated(self, reason):
-        # 左クリック(Trigger)で即キャプチャ
-        if reason == QSystemTrayIcon.Trigger:
+        # 中クリック(MiddleClick)で即キャプチャ。左クリックだと通知領域を触ったときに
+        # 意図せず撮ってしまうので、押し間違えの少ない中ボタンに寄せている。
+        if reason == QSystemTrayIcon.MiddleClick:
             self.start_capture(0)
 
     # ---------------------------------------------------------------
     # 範囲キャプチャ
     # ---------------------------------------------------------------
     def start_capture(self, delay_seconds: int):
-        # ホットキー・トレイの左クリック・メニューと入口が3つあるため二重起動しやすい。
+        # ホットキー・トレイの中クリック・メニューと入口が3つあるため二重起動しやすい。
         # ガードが無いと self.overlay が上書きされ、前のオーバーレイが参照を失って
         # 全画面に貼り付いたまま残る(マウス操作を奪う)。色/定規と同じ作法で弾く。
         if self.overlay is not None or self.countdown is not None:
@@ -223,7 +246,7 @@ class ScreenFeature:
             self.capture_windows.remove(window)
 
     # ---------------------------------------------------------------
-    # 色を吸い取る
+    # カラーピッカー
     # ---------------------------------------------------------------
     def start_color_picker(self):
         if self.picker is not None:
@@ -246,7 +269,7 @@ class ScreenFeature:
         self._notify("カラーピッカー", f"{hex_color} をコピーしました")
 
     # ---------------------------------------------------------------
-    # 画面を測る
+    # 画面定規
     # ---------------------------------------------------------------
     def start_ruler(self):
         if self.ruler is not None:
@@ -272,14 +295,66 @@ class ScreenFeature:
             self._notify("画面定規", f"{summary} をコピーしました")
 
     # ---------------------------------------------------------------
-    # 画面全体に書き込む
+    # 定型文
     # ---------------------------------------------------------------
-    def annotate_screen(self):
-        """画面全体を静止画として固定し、その上に書き込めるようにする(ZoomIt相当)。
-        描画・ズーム・保存・コピーは付箋ウインドウが既に持っているのでそのまま使う。"""
-        geometry = virtual_geometry()
-        image = grab_region(geometry)
-        self._open_capture_window(image, geometry.topLeft(), close_on_escape=True)
+    def start_snippet_picker(self):
+        # 開いたウインドウはここで参照を持ち続ける(ローカル変数だけだとGCで消える)。
+        if self.snippet_picker is not None:
+            # 開いたまま同じホットキーを叩いたときは、開き直さず前面に呼び戻す
+            self.snippet_picker.raise_()
+            self.snippet_picker.activateWindow()
+            return
+        picker = snippets.create_picker(self.app_settings, self.settings_path)
+        if picker is None:
+            return  # テンプレートが1件も無い(通知は snippets 側が出している)
+        picker.closed.connect(self._close_snippet_picker)
+        self.snippet_picker = picker
+        picker.show()
+
+    def _close_snippet_picker(self):
+        if self.snippet_picker is None:
+            return
+        picker = self.snippet_picker
+        self.snippet_picker = None
+        picker.close()
+        picker.deleteLater()
+
+    # ---------------------------------------------------------------
+    # フォルダブックマーク
+    # ---------------------------------------------------------------
+    def start_launcher(self, current_path: str = None):
+        """フォルダブックマークを開く。current_path はあふｗ側の現在のパスで、
+        IPC(main.py)から呼ばれたときだけ渡る。メニューやホットキーからは渡らないが、
+        前面がエクスプローラならそちらからパスを読めるので「ここを登録」は出せる。"""
+        # 何よりも先に前面ウィンドウを掴む。ピッカーを出した時点で前面はこちらに移り、
+        # メニュー経由ではその前にメニュー側へ移っているので、後からでは手遅れになる。
+        # ホットキー経由は keyboard の別スレッドからシグナルでここへ渡って来るだけなので、
+        # この時点ではまだ元のウィンドウが前面のまま。
+        # 取れない・エクスプローラでない場合は 0 のまま渡り、従来どおりあふｗへ落ちる。
+        hwnd = explorer_nav.foreground_hwnd()
+
+        # 開いたウインドウはここで参照を持ち続ける(ローカル変数だけだとGCで消える)。
+        if self.launcher_picker is not None:
+            # 開いたまま同じホットキーを叩いたときは、開き直さず前面に呼び戻す
+            self.launcher_picker.raise_()
+            self.launcher_picker.activateWindow()
+            return
+        picker = launcher.create_picker(
+            self.app_settings, self.settings_path, current_path=current_path, hwnd=hwnd
+        )
+        if picker is None:
+            return  # ブックマークが1件も無い(通知は launcher 側が出している)
+        picker.closed.connect(self._close_launcher)
+        self.launcher_picker = picker
+        picker.show()
+
+    def _close_launcher(self):
+        if self.launcher_picker is None:
+            return
+        picker = self.launcher_picker
+        self.launcher_picker = None
+        picker.close()
+        picker.deleteLater()
 
     # ---------------------------------------------------------------
     # 最前面固定
@@ -342,11 +417,11 @@ class ScreenFeature:
             action.setChecked(self._awake_active and key == self._awake_minutes)
 
         if not self._awake_active:
-            self._awake_menu.setTitle("スリープ抑止")
+            self._awake_menu.setTitle("☕ スリープ抑止")
         elif self._awake_minutes:
-            self._awake_menu.setTitle(f"スリープ抑止（残り{self._remaining_minutes()}分）")
+            self._awake_menu.setTitle(f"☕ スリープ抑止（残り{self._remaining_minutes()}分）")
         else:
-            self._awake_menu.setTitle("スリープ抑止（無期限）")
+            self._awake_menu.setTitle("☕ スリープ抑止（無期限）")
 
     def _refresh_state(self):
         """スリープ抑止の状態をトレイアイコンとメニューに反映する。"""
@@ -366,6 +441,13 @@ class ScreenFeature:
         self.topmost.release_all()
 
     def _open_settings_file(self):
-        """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。"""
-        if self.settings_path and os.path.exists(self.settings_path):
+        """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。
+
+        os.startfile は .json に関連付けが無いと例外を投げる。Qtのスロット内で投げ切ると
+        常駐アプリごと落ちるので、ここで受けて通知に回す(snippets._open_path と同じ理由)。"""
+        if not (self.settings_path and os.path.exists(self.settings_path)):
+            return
+        try:
             os.startfile(self.settings_path)
+        except OSError as e:
+            self._notify("設定", f"開けませんでした\n{e}")

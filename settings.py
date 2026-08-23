@@ -29,6 +29,20 @@ DEFAULT_SETTINGS = {
     "audio": {
         "devices": [],
     },
+    # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、
+    # アプリからの登録で増える(削除・並べ替えは settings.json を直接編集する想定)。
+    # target は移動先の決め方: auto(呼んだ時の前面がエクスプローラならそこ、でなければ
+    # あふｗ) / afxw(常にあふｗ) / explorer(常にエクスプローラ)。
+    "launcher": {
+        "target": "auto",
+        "afxw_path": r"C:\soft\afxw\AFXW.EXE",
+        "bookmarks": [],
+    },
+    # 定型文。recent は最近コピーしたテンプレート名(新しいものが先頭・上限20件)で、
+    # ピッカーの並び順に使う。アプリが自分で書き足す値なので手で編集する必要はない。
+    "snippets": {
+        "recent": [],
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",
@@ -36,6 +50,8 @@ DEFAULT_SETTINGS = {
         "mic_mute": "ctrl+alt+m",
         "color_picker": "ctrl+alt+c",
         "always_on_top": "ctrl+alt+t",
+        "snippet_picker": "ctrl+alt+v",
+        "launcher": "ctrl+alt+b",
     },
 }
 

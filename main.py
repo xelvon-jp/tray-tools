@@ -11,7 +11,11 @@
 # 単発の動作はアイコンを増やさず、既存Featureのメニュー項目にする。アイコンを持たない能力は
 # 普通のモジュール(color_picker.py / keep_awake.py など)として書き、Featureがそれを呼ぶ。
 import ctypes
+import json
 import sys
+import threading
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtGui import QIcon
@@ -30,7 +34,36 @@ FEATURE_CLASSES = [AudioFeature, ScreenFeature]
 # 多重起動の検出に使うローカルソケット名。スタートアップからの自動起動に加えて
 # ショートカットを手動で叩くと二重に立ち上がり、トレイアイコンが2組並ぶうえ
 # グローバルホットキーが二重登録されて競合するため防ぐ。
+#
+# この待ち受けは外部からのコマンド受付も兼ねる(Windowsでは \\.\pipe\<この名前> という
+# 名前付きパイプになる)。接続してきた側が {"command": ..., "args": [...]} のUTF-8 JSONを
+# 1行書けば、常駐中のこちらがその機能を開く。あふｗから呼ぶ traytools_send.py がその客。
+# 何も書かずに切れた場合は従来どおり「二重起動しようとした」とみなす。
 SINGLE_INSTANCE_KEY = "traytools.single-instance"
+
+# コマンドの読み取り待ち時間(ms)。相手は接続直後に1行書いて終わる作りなので短くてよい。
+# ここで待ちすぎると、ただの二重起動のときにトーストが遅れる。
+COMMAND_READ_TIMEOUT_MS = 300
+
+# 通常起動(TrayTools.lnk)は pythonw.exe なので、コンソールに出した例外は誰も見られない。
+# 落ちた理由を後から追えるようにファイルへ残す。
+ERROR_LOG_PATH = Path(__file__).resolve().parent / "error.log"
+
+
+def log_exception(where: str) -> str:
+    """直前の例外をログに追記し、トースト用の短い1行を返す。
+
+    ログを書けない状況(ディスク不調など)でも、ここで新たな例外を投げないこと。
+    そもそも例外処理の途中で呼ばれる関数なので、ここで落ちると元の原因が消える。"""
+    text = traceback.format_exc()
+    try:
+        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {where} =====\n{text}")
+    except OSError:
+        pass
+    print(text, file=sys.stderr)
+    exc_type, exc_value = sys.exc_info()[:2]
+    return f"{exc_type.__name__}: {exc_value}" if exc_type else "unknown error"
 
 
 def _is_already_running() -> bool:
@@ -54,12 +87,106 @@ def _hold_single_instance_lock():
     return server
 
 
-def _notify_already_running(server):
-    server.nextPendingConnection()  # 接続を回収するだけ。中身は使わない
-    show_toast("tray-tools\nすでに起動しています")
+def _read_command(socket):
+    """接続してきた相手が書いた1行のJSONを (command, args) で返す。読めなければ (None, [])。
+
+    素の名前付きパイプから書かれるため、行の途中で届くことも複数行来ることもありうる。
+    最初の1行だけを見て、残りは捨てる(コマンドは1接続1つと決めている)。"""
+    if not socket.waitForReadyRead(COMMAND_READ_TIMEOUT_MS):
+        return None, []
+    raw = bytes(socket.readAll().data())
+    try:
+        payload = json.loads(raw.decode("utf-8").splitlines()[0])
+        command = payload["command"]
+    except (UnicodeDecodeError, ValueError, IndexError, TypeError, KeyError) as e:
+        print(f"[tray-tools] コマンドを解釈できません: {e}", file=sys.stderr)
+        return None, []
+    args = payload.get("args") or []
+    return command, args if isinstance(args, list) else []
+
+
+def _handle_connection(server, command_handlers):
+    socket = server.nextPendingConnection()
+    if socket is None:
+        return
+    try:
+        command, args = _read_command(socket)
+    finally:
+        socket.close()
+
+    if command is None:
+        # 何も書かずに切れた＝コマンドではなく二重起動。2つ目の起動は黙って終わるだけ
+        # なので、「クリックしたのに何も起きない」と見えないようこちらから知らせる。
+        show_toast("tray-tools\nすでに起動しています")
+        return
+
+    handler = command_handlers.get(command)
+    if handler is None:
+        show_toast(f"tray-tools\n知らないコマンドです\n{command}")
+        return
+
+    # ここは外部(あふｗ等)から叩かれる入口。Qtのスロット内で例外を投げ切ると
+    # 常駐アプリごと落ちるため、必ず受け止める。pythonw起動では標準エラーが
+    # どこにも出ないので、内容はトーストと error.log の両方に残す。
+    try:
+        handler(args)
+    except Exception:
+        summary = log_exception(f"command={command} args={args}")
+        show_toast(f"tray-tools\nコマンドの実行に失敗しました\n{summary}")
+
+
+def _build_command_handlers(features) -> dict:
+    """外部から叩けるコマンドの表を作る。値は args(リスト)を受け取る関数。
+
+    ウインドウの参照は main() ではなく ScreenFeature に持たせている。同じピッカーを
+    トレイメニューとホットキーからも開けるので、「開いていたら前面に呼び戻す」判定も
+    含めて開閉の管理は1か所(ScreenFeature)に置きたい。main() 側にリストを持つと
+    同じ窓を二重に開けてしまう。"""
+    screen = next((f for f in features if isinstance(f, ScreenFeature)), None)
+    if screen is None:
+        return {}
+    return {
+        # あふｗから $P(カレントパス)を渡して呼ぶ。パスが無ければ登録なしで一覧だけ出す。
+        "bookmark": lambda args: screen.start_launcher(args[0] if args else None),
+    }
+
+
+def _install_excepthook():
+    """どこにも捕まらなかった例外を error.log に残す。
+
+    PySide6 はスロットから例外が抜けるとプロセスを終わらせるので、これで落ちるのを
+    防げるわけではない。落ちた「理由」を後から読めるようにするための保険。
+    防ぎたい箇所は個別に try で受け止めること(_handle_connection がその例)。
+
+    sys.excepthook はメインスレッドしか見ない。keyboard のフックは専用スレッドで
+    動くので、threading.excepthook も同じ宛先に向けておく(そうしないと、ホットキー
+    まわりで落ちたときに何も残らない)。"""
+    original = sys.excepthook
+
+    def write(kind: str, text: str) -> None:
+        try:
+            with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {kind} =====\n{text}")
+        except OSError:
+            pass
+
+    def hook(exc_type, exc_value, exc_tb):
+        write("uncaught", "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        original(exc_type, exc_value, exc_tb)
+
+    def thread_hook(args):
+        write(
+            f"uncaught in thread {args.thread.name if args.thread else '?'}",
+            "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+        )
+
+    sys.excepthook = hook
+    threading.excepthook = thread_hook
 
 
 def main():
+    _install_excepthook()
+
     # このIDを設定しないと、他のPythonツールとタスクバー/通知領域で同一アプリ扱いされ
     # アイコンが混線することがある。QApplication生成前に呼ぶ必要がある。
     try:
@@ -85,16 +212,22 @@ def main():
 
     features = [cls(app_settings, settings_module.SETTINGS_PATH) for cls in FEATURE_CLASSES]
 
-    # 2つ目の起動が黙って終わるだけだと「クリックしたのに何も起きない」と見えるので、
-    # 常駐中のこちら側から知らせる。
-    instance_lock.newConnection.connect(lambda: _notify_already_running(instance_lock))
+    # 二重起動の通知と、外部からのコマンド受付を兼ねる入口。
+    command_handlers = _build_command_handlers(features)
+    instance_lock.newConnection.connect(
+        lambda: _handle_connection(instance_lock, command_handlers)
+    )
 
     handlers = {}
     for feature in features:
         handlers.update(feature.hotkeys())
     # 戻り値のHotkeyBridgeはローカル変数として保持し続ける必要がある
     # (参照が無くなるとQObjectがGCされ、シグナル接続ごと消えてしまう)。
-    hotkey_bridge = setup_hotkeys(app_settings, handlers)  # noqa: F841
+    def on_hotkey_error(where):
+        summary = log_exception(where)
+        show_toast(f"tray-tools\nホットキーの処理に失敗しました\n{summary}")
+
+    hotkey_bridge = setup_hotkeys(app_settings, handlers, on_error=on_hotkey_error)  # noqa: F841
 
     sys.exit(app.exec())
 

@@ -5,7 +5,7 @@
 #
 # あふｗ(AFXW.EXE)から呼ぶのが主な用途。AFXW.key には次のように書く($P はカレントパス):
 #
-#   K00xx="4074C:\Users\yotan\.venvs\tray-tools\Scripts\pythonw.exe R:\claude\tray-tools\traytools_send.py bookmark "$P""
+#   K00xx="4074<venvのpythonw.exe> <このスクリプトのフルパス> bookmark "$P""
 #
 # PySide6 を import しないのは意図的。Qt の import だけで1秒近くかかり、キーを押してから
 # ピッカーが出るまでの体感がそのぶん遅くなる。標準ライブラリだけで書く。

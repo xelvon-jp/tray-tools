@@ -10,8 +10,10 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -170,7 +172,109 @@ def _build_devices(detected: list) -> list:
     return devices
 
 
-def setup_settings() -> None:
+def _fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:
+    """defaults にあって current に無いキーだけを current へ足す。既存の値は触らない。
+
+    バージョンが上がって設定項目が増えても、既存の settings.json には入らないままになる。
+    load_settings 側の deep merge で既定値は効くので動作はするが、ファイルを開いても
+    「今どんな設定があるのか」が分からない。ここで実体を書き足して見えるようにする。
+
+    足したキーのパス一覧を返す(何が増えたのかを画面に出すため)。"""
+    added = []
+    for key, value in defaults.items():
+        path = f"{prefix}{key}"
+        if key not in current:
+            current[key] = json.loads(json.dumps(value))  # 既定値を汚さないよう複製して渡す
+            added.append((path, current[key]))
+        elif isinstance(value, dict) and isinstance(current[key], dict):
+            added.extend(_fill_missing(value, current[key], f"{path}."))
+    return added
+
+
+def _backup_settings() -> Path:
+    """書き換える前に控えを取る。settings.json.bak* は .gitignore 済み。"""
+    backup = SETTINGS_PATH.with_name(
+        f"{SETTINGS_PATH.name}.bak_{datetime.now():%Y%m%d_%H%M%S}"
+    )
+    shutil.copy2(SETTINGS_PATH, backup)
+    return backup
+
+
+def _save_settings(data: dict) -> None:
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def _print_devices(title: str, devices: list) -> None:
+    print(f"  {title}")
+    if not devices:
+        print("    (なし)")
+        return
+    for index, item in enumerate(devices, start=1):
+        print(f"    {index}. {item.get('label', '(名称未設定)')}")
+
+
+def _update_existing_settings(detected: list, redetect) -> None:
+    """既存の settings.json を、値を壊さない範囲で今の版に追いつかせる。"""
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            current = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"  {SETTINGS_PATH.name} を読めませんでした({e})。触らずに残します。")
+        return
+    if not isinstance(current, dict):
+        print(f"  {SETTINGS_PATH.name} の中身が想定と違います。触らずに残します。")
+        return
+
+    sys.path.insert(0, str(PROJECT_DIR))
+    import settings as settings_module
+
+    before = json.dumps(current, ensure_ascii=False, sort_keys=True)
+
+    # 1. 不足している設定項目を足す(既存の値には触らない)
+    added = _fill_missing(settings_module.DEFAULT_SETTINGS, current)
+    if added:
+        print("  不足していた設定項目を足します:")
+        for path, value in added:
+            shown = json.dumps(value, ensure_ascii=False)
+            if len(shown) > 50:
+                shown = shown[:47] + "..."
+            print(f"    {path} = {shown}")
+    else:
+        print("  設定項目は最新の状態です")
+
+    # 2. 音声デバイスの入れ替え(必ず確認してから)
+    registered = current.get("audio", {}).get("devices") or []
+    if detected:
+        registered_ids = {d.get("id") for d in registered if isinstance(d, dict)}
+        detected_ids = {d["id"] for d in detected}
+        if registered_ids != detected_ids:
+            print()
+            _print_devices("今の登録:", registered)
+            _print_devices("検出した出力デバイス:", detected)
+            if redetect is None:
+                # 既定は「入れ替えない」。使う機器だけ絞って登録している場合に、
+                # 検出した全部で上書きされると設定し直しになるため。
+                redetect = _ask_yes_no("  検出した内容で入れ替えますか?", default=False)
+            if redetect:
+                current.setdefault("audio", {})["devices"] = _build_devices(detected)
+                print(f"  音声デバイスを入れ替えました({len(detected)} 件)")
+            else:
+                print("  音声デバイスはそのままにします")
+        else:
+            print("  音声デバイスの構成は今の登録と同じです")
+
+    if json.dumps(current, ensure_ascii=False, sort_keys=True) == before:
+        print("  変更はありませんでした")
+        return
+
+    backup = _backup_settings()
+    _save_settings(current)
+    print(f"  {SETTINGS_PATH.name} を更新しました(控え: {backup.name})")
+
+
+def setup_settings(redetect=None) -> None:
     _step(4, "音声デバイスを検出して settings.json を用意します")
     detected = detect_devices()
     if detected:
@@ -182,9 +286,8 @@ def setup_settings() -> None:
         print("  出力デバイスを検出できませんでした(後から手で設定できます)")
 
     if SETTINGS_PATH.exists():
-        # 既存の設定は絶対に壊さない。デバイス構成を変えたい場合だけ手で編集してもらう。
-        print(f"  {SETTINGS_PATH.name} が既にあるので、既存の設定をそのまま使います")
-        print("  デバイスを入れ替えたい場合は、上の一覧の id を settings.json の audio.devices に書いてください")
+        print(f"  {SETTINGS_PATH.name} が既にあります")
+        _update_existing_settings(detected, redetect)
         return
 
     sys.path.insert(0, str(PROJECT_DIR))
@@ -192,8 +295,7 @@ def setup_settings() -> None:
 
     new_settings = json.loads(json.dumps(settings_module.DEFAULT_SETTINGS))
     new_settings["audio"]["devices"] = _build_devices(detected)
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(new_settings, f, ensure_ascii=False, indent=2)
+    _save_settings(new_settings)
     print(f"  {SETTINGS_PATH} を作成しました(デバイス {len(new_settings['audio']['devices'])} 件)")
     print(f"  キャプチャの保存先: {new_settings['capture']['save_folder']}")
 
@@ -303,7 +405,12 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--startup", dest="startup", action="store_true", help="自動起動を登録する(確認を省略)")
     group.add_argument("--no-startup", dest="startup", action="store_false", help="自動起動を登録しない(確認を省略)")
-    parser.set_defaults(startup=None)
+    audio = parser.add_mutually_exclusive_group()
+    audio.add_argument("--redetect-audio", dest="redetect", action="store_true",
+                       help="音声デバイスを検出した内容で入れ替える(確認を省略)")
+    audio.add_argument("--keep-audio", dest="redetect", action="store_false",
+                       help="音声デバイスの登録をそのままにする(確認を省略)")
+    parser.set_defaults(startup=None, redetect=None)
     args = parser.parse_args()
 
     print("tray-tools セットアップ")
@@ -312,7 +419,7 @@ def main() -> None:
     check_python()
     ensure_venv()
     install_requirements()
-    setup_settings()
+    setup_settings(args.redetect)
     setup_shortcut()
     setup_startup(args.startup)
     print_next_steps()

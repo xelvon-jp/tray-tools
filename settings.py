@@ -52,7 +52,8 @@ DEFAULT_SETTINGS = {
         "color_picker": "ctrl+alt+c",
         "always_on_top": "ctrl+alt+t",
         "snippet_picker": "ctrl+alt+v",
-        "launcher": "ctrl+alt+b",
+        # あふｗ側でも同じ機能を J に割り当てているので、単独で呼ぶときも同じ指に置く。
+        "launcher": "win+j",
     },
 }
 

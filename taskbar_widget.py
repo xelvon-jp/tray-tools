@@ -7,9 +7,15 @@
 # トレイの代わりを自分で置く。
 #
 # 既定では「すべてのディスプレイ」に1つずつ出す(all_displays)。プライマリには本物の
-# 通知領域があるので重複ではあるが、どの画面でも同じ場所に同じUIがあるほうが操作を
-# 覚え直さずに済む。位置は「そのタスクバーの右端からのオフセット」として全画面で
-# 共通に持つので、1つをドラッグすれば全部が同じ位置へそろって動く。
+# 通知領域があるので重複ではあるが、狙いは「座標をそろえること」ではなく「どの画面でも
+# 使えること」なので、全部に出す。置き先は画面の数で決める(タスクバーの数ではない)。
+# Windows の「タスクバーをすべてのディスプレイに表示する」がオフの環境ではセカンダリに
+# タスクバーが存在せず、タスクバーを数えると2番目以降が1つも出なくなるため。
+#
+# 位置は「基準の矩形の右端・上端からのオフセット」で持つが、値は画面ごとに独立している
+# (settings.json の positions を画面ごとのキーで引く)。1組を全画面で共有していた頃は、
+# 1つをドラッグすると他の画面のものまで動き、しかもドラッグ中にタスクバーをまたぐと
+# 基準が乗り換わって別の画面へワープしていた。
 #
 # 見た目はタスクバーの時計そのもの(既存の時計に重ねて隠す)で、マウスを乗せた間だけ
 # Rapture と音声のアイコンに入れ替わる。隣に生やさないのは、タスクバーの上に自前の
@@ -25,8 +31,16 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPixmap
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import QWidget
 
 import window_tools
@@ -35,14 +49,28 @@ from toast import show_toast
 
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 
-# 位置は「そのタスクバーの端からの距離(論理px)」で持つ。ディスプレイごとの絶対座標に
-# しないのは、どの画面でも同じ場所に同じものがあってほしいから(操作性の統一が目的で、
-# 画面ごとに置き場所が違うと結局どこにあるか探すことになる)。
-# 実測値: 2560x48 のタスクバーで、Windows 11 の時計の描画範囲は x 2481〜2540 /
-# y はタスクバー上端から6px下。この2つを margin の既定にすると、実測位置がそのまま
-# 再現できる(2560 - 20 - 59 = 2481、-48 + 6 = -42)。
-DEFAULT_RIGHT_MARGIN = 20
-DEFAULT_TOP_MARGIN = 6
+# 位置は「基準の矩形の端からの距離(論理px)」で持つ。絶対座標にしないのは、解像度や
+# 拡大率が変わっても右下との位置関係が保たれるため。ただし値は画面ごとに別々に持つ
+# (config["positions"][_screen_key(screen)])。設定にその画面のキーが無ければ下の既定値で
+# 自動配置するので、別のPCへ settings.json を持って行っても壊れない(画面名が違えば
+# 「知らない画面」として既定に落ちるだけ)。
+# 値の出どころ: 画面のピクセルから Windows 11 の時計の描画範囲を割り出すと
+# 「右端から20px・上端から6px」だったが、実際に2枚のモニタで目視で合わせたら
+# 19/10 と 18/9 に落ち着いた。文字のアンチエイリアスで端が薄くなる分、濃淡から
+# 測る方法では描画枠より内側に見積もっていたらしい。目で合わせたほうを採る。
+DEFAULT_RIGHT_MARGIN = 19
+DEFAULT_TOP_MARGIN = 10
+
+# タスクバーが見つからない画面で、代わりに基準にする帯の高さ(論理px)。
+# Windows の「タスクバーをすべてのディスプレイに表示する」がオフだと、セカンダリには
+# Shell_SecondaryTrayWnd が存在しない。それでも全画面に出すのが狙いなので、画面の
+# 下端から逆算した帯を代わりの基準にする。縦位置の基準になるものが他に無く、かつ
+# タスクバーがあるとすれば画面の下端に接しているので、そこを上端とみなせば既定の
+# 余白(上端からの距離)がそのまま通用する。
+# 高さは、実在するタスクバー(たいていはプライマリ)のものを借りるのがいちばんずれない
+# (Windows は全ディスプレイで同じ高さのタスクバーを出す)。1つも見つからないときだけ、
+# この既定値(Windows 11 の既定のタスクバー高さ)を使う。
+FALLBACK_TASKBAR_HEIGHT = 48
 
 # ディスプレイ構成が変わってから作り直すまでの待ち(ms)。screenAdded/screenRemoved が
 # 飛んだ時点ではWindowsがまだタスクバーを並べ直しておらず、すぐ測ると古い位置を拾う。
@@ -165,32 +193,172 @@ def taskbar_rects(include_primary: bool = True) -> list:
     return rects
 
 
-def _taskbar_at(point: QPoint):
-    """その点を含むタスクバーの矩形(Qt論理座標)。無ければ None。
+def _screens() -> list:
+    """いまの画面(QScreen)の一覧。QApplication が無ければ空リスト。
 
-    ドラッグで動かしたあと「どのタスクバーからのオフセットか」を決めるのに使う。
-    all_displays の設定に関わらずプライマリも含めて探す。設定でプライマリに出していなくても、
-    ドラッグしてそちらへ持っていくことはできるため。"""
-    for rect in taskbar_rects(include_primary=True):
-        if rect.contains(point):
-            return rect
+    QGuiApplication.screens() を直に呼ばずここへ通しているのは、画面構成に依存する
+    挙動(タスクバーが無い画面へのフォールバックなど)を、実機のモニタを抜き差しせずに
+    差し替えて確かめられるようにするため。"""
+    if QGuiApplication.instance() is None:
+        return []
+    return list(QGuiApplication.screens())
+
+
+def _screen_base_key(screen) -> str:
+    """位置を覚えるときの画面の識別子。
+
+    Windows の QScreen.name() はモニタの型番(EX-LDGCQ321HD 等)を返す。ケーブルを
+    挿し替えても切替器で他のPCへ渡して戻しても同じ名前が付くので、DISPLAY1/2 のような
+    接続順に左右される名前より、位置を覚えておく先として安定している。
+
+    ただし同じ型のモニタを2台並べると型番だけでは区別できない(外付けを2枚使う構成が
+    まさにそれ)。EDIDのシリアルを混ぜて別物として扱う。"""
+    name = screen.name() or ""
+    serial = screen.serialNumber() or ""
+    return "%s#%s" % (name, serial) if serial else name
+
+
+def _screen_key(screen, screens=None) -> str:
+    """位置を覚えるときの画面の識別子。同じ名札の画面が複数あるときだけ座標で分ける。
+
+    シリアルを返さないモニタや、同じ値を返してしまうモニタがある。同型を2台並べて
+    それに当たると名札が衝突し、2枚とも同じ位置設定と同じタスクバーを見て、片方の
+    画面には何も出ないまま同じ場所に重なる。その場合だけ画面の左上座標を混ぜる。
+
+    座標を混ぜるのは衝突したときに限る。モニタを並べ替えると座標は変わるので、
+    常用すると「配置を変えたら位置を忘れる」ことになるため。シリアルが読める限りは
+    座標に依存しない名札のままにしておく。"""
+    base = _screen_base_key(screen)
+    if screens and sum(1 for other in screens if _screen_base_key(other) == base) > 1:
+        geometry = screen.geometry()
+        return "%s@%d,%d" % (base, geometry.x(), geometry.y())
+    return base
+
+
+def _primary_screen_name(screens: list):
+    """プライマリの画面名。判別できなければ None。
+
+    QGuiApplication.primaryScreen() を優先し、それが渡された一覧に居ないときは
+    「仮想デスクトップの原点(0,0)にある画面」を採る。Windows はプライマリモニタの
+    左上を必ず (0,0) に置くので、これで一致する。"""
+    primary = QGuiApplication.primaryScreen() if QGuiApplication.instance() else None
+    names = [_screen_key(screen, screens) for screen in screens]
+    if primary is not None and _screen_key(primary, screens) in names:
+        return _screen_key(primary, screens)
+    for screen in screens:
+        if screen.geometry().topLeft() == QPoint(0, 0):
+            return _screen_key(screen, screens)
     return None
 
 
-def _auto_top_left(taskbar: QRect, width: int, height: int,
-                   right_margin: int, top_margin: int) -> QPoint:
-    """タスクバーの矩形と余白から、時計に重なる位置を割り出す。
+def _screen_for(rect: QRect, screens: list):
+    """その矩形がいちばん広く重なっている画面。どれとも重ならなければ None。
+
+    中心点で screenAt() を引くのではなく重なりの面積で選ぶ。タスクバーの矩形は画面の
+    端いっぱいに置かれ、環境によっては数px はみ出して隣の画面まで届くため。"""
+    best = None
+    best_area = 0
+    for screen in screens:
+        overlap = screen.geometry().intersected(rect)
+        area = overlap.width() * overlap.height()
+        if area > best_area:
+            best_area = area
+            best = screen
+    return best
+
+
+def _fallback_taskbar(screen_geometry: QRect, height: int) -> QRect:
+    """タスクバーが見つからない画面で代わりに基準にする、画面下端の帯。
+
+    「タスクバーがあるとすればここ」という位置。横は画面いっぱい、縦は画面の下端から
+    height ぶん上。高さの根拠は FALLBACK_TASKBAR_HEIGHT のコメントを参照。"""
+    height = max(min(height, screen_geometry.height()), MIN_SIZE)
+    return QRect(
+        screen_geometry.x(),
+        screen_geometry.y() + screen_geometry.height() - height,
+        screen_geometry.width(),
+        height,
+    )
+
+
+def widget_slots(include_primary: bool = True) -> list:
+    """ウィジェットの置き先を (画面名, 基準にする矩形) の並びで返す。画面1つにつき1つ。
+
+    タスクバーの数ではなく画面の数で決める。Windows の「タスクバーをすべての
+    ディスプレイに表示する」がオフの環境ではセカンダリに Shell_SecondaryTrayWnd が
+    存在せず、タスクバーを数えると2番目以降が1つも出ないため(実際にそう報告された)。
+    タスクバーが見つからない画面には、その画面の下端の帯を基準として渡す。
+
+    include_primary=False ならプライマリの画面を外す(そちらには本物の通知領域がある)。"""
+    screens = _screens()
+    if not screens:
+        return []
+
+    rects = taskbar_rects(include_primary=True)
+    # 代用の帯の高さは、実在するタスクバーから借りる(いちばん厚いものを採る。自動的に
+    # 隠れる設定などで潰れかけた矩形を掴んでも薄くならないように)。
+    fallback_height = max(
+        (rect.height() for rect in rects), default=FALLBACK_TASKBAR_HEIGHT
+    )
+
+    taskbar_by_screen = {}
+    for rect in rects:
+        screen = _screen_for(rect, screens)
+        if screen is None:
+            continue
+        name = _screen_key(screen, screens)
+        current = taskbar_by_screen.get(name)
+        # 1画面に複数見つかったら面積の大きいほうを採る。
+        if current is None or rect.width() * rect.height() > current.width() * current.height():
+            taskbar_by_screen[name] = rect
+
+    primary_name = _primary_screen_name(screens)
+
+    slots = []
+    for screen in screens:
+        name = _screen_key(screen, screens)
+        if not include_primary and name == primary_name:
+            continue
+        rect = taskbar_by_screen.get(name)
+        if rect is None:
+            rect = _fallback_taskbar(screen.geometry(), fallback_height)
+        slots.append((name, rect))
+    return slots
+
+
+def _default_top_left(taskbar: QRect, width: int, height: int) -> QPoint:
+    """設定にその画面の位置が無いときの置き場所(タスクバーの時計に重なる位置)。
 
     QRect.right() は「最後のピクセル」を指す(幅は right - left + 1)。タスクバーの
     排他的な右端は right() + 1 なので、そこから余白と自分の幅を引く。
-    縦は上端から top_margin。ただしタスクバーが実測より薄い環境でははみ出すので、
-    その場合だけ中央寄せに落とす。"""
-    x = taskbar.right() + 1 - right_margin - width
-    if taskbar.height() >= top_margin + height:
-        y = taskbar.top() + top_margin
+    縦は上端から DEFAULT_TOP_MARGIN。ただしタスクバーが実測より薄い環境でははみ出すので、
+    そのときだけ中央寄せに落とす。
+
+    この中央寄せは「既定の自動配置」にだけかかる調整で、ユーザーがドラッグして決めた
+    位置には一切かけない(かけると置ける場所が制限され、ある高さより下に置けなくなる)。"""
+    x = taskbar.right() + 1 - DEFAULT_RIGHT_MARGIN - width
+    if taskbar.height() >= DEFAULT_TOP_MARGIN + height:
+        y = taskbar.top() + DEFAULT_TOP_MARGIN
     else:
         y = taskbar.top() + max((taskbar.height() - height) // 2, 0)
     return QPoint(x, y)
+
+
+def _is_reachable(rect: QRect) -> bool:
+    """その矩形が仮想デスクトップと少しでも重なっているか。
+
+    掴めない場所に窓を出さないための、最小限の歯止め。完全に画面外へ出てしまった窓は
+    ドラッグで戻せず、settings.json を手で直すしかなくなる。逆に言えば少しでも重なって
+    いれば掴めるので、そのときは何もしない(タスクバーの外や画面の隅に置く使い方を
+    妨げないため。置ける場所を狭める用途にこの判定を使ってはいけない)。
+
+    仮想デスクトップは capture_grab.virtual_geometry ではなく _screens() から組み立てる。
+    画面の一覧をこのモジュール内の1か所(_screens)に統一しておかないと、置き先を決めた
+    画面構成と、掴めるかを判定する画面構成が食い違いうるため。"""
+    virtual = QRect()
+    for screen in _screens():
+        virtual = virtual.united(screen.geometry())
+    return virtual.isEmpty() or virtual.intersects(rect)
 
 
 def _as_int(value, default: int) -> int:
@@ -241,25 +409,33 @@ def _dominant_color(rect: QRect) -> str:
 
 
 class TaskbarWidget(QWidget):
-    """タスクバーの時計に重ねる、枠なし・不透明の小さな窓。1つのタスクバーにつき1つ。
+    """タスクバーの時計に重ねる、枠なし・不透明の小さな窓。ディスプレイ1枚につき1つ。
 
     普段は時計を描き、マウスを乗せている間だけ Rapture と音声のアイコンに入れ替わる。
     クリックの割り当ては通知領域のアイコンに合わせてある(Rapture=中クリックで即キャプチャ・
     右クリックでメニュー / 音声=左クリックで切替・右クリックでメニュー)。
 
-    自分が乗るタスクバーの矩形は生成時に受け取る。矩形はディスプレイ構成が変われば
-    変わるが、追従は作り直し(ScreenFeature)に任せる。動いたタスクバーを掴み直す仕組みを
-    ここに持たせても、画面が増減したときには結局作り直しが要るため。
+    位置の基準にする矩形(その画面のタスクバー、無ければ画面下端の帯)と、その画面の名前は
+    生成時に受け取る。矩形はディスプレイ構成が変われば変わるが、追従は作り直し
+    (ScreenFeature)に任せる。動いたタスクバーを掴み直す仕組みをここに持たせても、画面が
+    増減したときには結局作り直しが要るため。
+
+    基準の矩形は生成時のものを最後まで使い、途中で乗り換えない。ドラッグ中に「いま乗って
+    いるタスクバー」へ基準を切り替えると、画面をまたいだ瞬間に基準が1画面ぶんずれて、
+    保存した位置が別の画面へワープする。
 
     WA_TranslucentBackground は使わない。下にある本物の時計を隠すのが仕事なので、
     背景は必ず不透明に塗る。"""
 
     def __init__(self, app_settings: dict, settings_path, screen_feature, audio_feature,
-                 taskbar: QRect):
+                 taskbar: QRect, screen_name: str):
         super().__init__()
         self.app_settings = app_settings
         self.settings_path = settings_path
         self._taskbar = QRect(taskbar)
+        # 設定から自分の位置を引くキー。Windows では "\\.\DISPLAY1" のような名前になる。
+        # ScreenFeature が作り直すときの同一性判定にも使うので公開しておく。
+        self.screen_name = screen_name
         # ScreenFeature / AudioFeature の参照をそのまま持つ。アイコンの絵だけでなく
         # start_capture・do_toggle・既存の self.menu も呼ぶ必要があり、絵を返す口だけ
         # 足しても足りないため(メニューは別に作らず、通知領域と同じものを出す)。
@@ -322,17 +498,6 @@ class TaskbarWidget(QWidget):
     def stop(self) -> None:
         self.hide()
 
-    def reposition(self) -> None:
-        """設定の余白から位置を計算し直す。
-
-        どれか1つをドラッグすると全ウィジェットに対して呼ばれる(位置は画面ごとではなく
-        「タスクバーの右端からのオフセット」1組で持つため)。背景色は測り直さない。
-        ここで毎回測ると、動かすたびに全画面のキャプチャが走る。壁紙に合わせたいときは
-        メニューの「背景色を取り直す」で明示的にやる、という既存の切り分けに合わせる。"""
-        rect = self._resolve_geometry()
-        if rect is not None:
-            self.setGeometry(rect)
-
     def refresh_background(self) -> None:
         """背景色をいま画面にある色で測り直す(壁紙を変えたとき用)。
 
@@ -372,22 +537,39 @@ class TaskbarWidget(QWidget):
         self._text_color = color if color.isValid() else QColor(_auto_text_color(background))
         self.update()
 
-    def _margins(self):
-        """(右端からの余白, 上端からの余白)。全ウィジェットで共通の1組。"""
+    def _saved_offset(self):
+        """設定に入っているこの画面ぶんの (右端からの余白, 上端からの余白)。無ければ None。
+
+        位置は画面ごとに独立して持つ(キーは _screen_key)。知らない画面名しか入って
+        いない settings.json(別のPCから持ってきたもの)は「この画面の分は無い」となって
+        既定位置に落ちるだけで、壊れない。
+
+        設定は手で書き換えられるので、形が違えば黙って既定へ落とす(書き損じでウィジェットが
+        1つも出ないほうが困る)。"""
+        positions = self._config.get("positions")
+        if not isinstance(positions, dict):
+            return None
+        entry = positions.get(self.screen_name)
+        if not isinstance(entry, dict) or "right" not in entry or "top" not in entry:
+            return None
         return (
-            _as_int(self._config.get("right_margin"), DEFAULT_RIGHT_MARGIN),
-            _as_int(self._config.get("top_margin"), DEFAULT_TOP_MARGIN),
+            _as_int(entry.get("right"), DEFAULT_RIGHT_MARGIN),
+            _as_int(entry.get("top"), DEFAULT_TOP_MARGIN),
         )
 
     def _resolve_geometry(self):
         """表示すべき矩形(Qt論理座標)。出せる場所が無ければ None。
 
-        自分が乗るタスクバーの矩形と、設定の余白(右端・上端からの距離)だけで決まる。
-        ディスプレイごとの絶対座標は持たない(どの画面でも右端から同じ距離に置きたい)。
+        生成時に渡された基準の矩形と、この画面ぶんの余白だけで決まる。基準を後から
+        乗り換えないので、画面をまたいでドラッグしても位置が飛ばない。
 
-        作業領域(availableGeometry)へクランプしないのは、この窓の居場所であるタスクバーの
-        上がそもそも作業領域から除外されているためで、クランプすると必ずタスクバーの外へ
-        弾き出されてしまう。"""
+        保存済みの余白はそのまま使う。作業領域(availableGeometry)へのクランプも、
+        タスクバーの中へ引き戻す補正もしない。この窓の居場所であるタスクバーの上は
+        そもそも作業領域から除外されているうえ、補正を入れると「ある高さより下には
+        置けない」ことになる(実際そうなっていた)。
+
+        唯一の例外は、保存した位置がどの画面にも掛からなくなったとき(モニタを外した等)。
+        そのまま出すと二度と掴めないので、そのときだけ既定位置へ戻す。"""
         if self._taskbar.isEmpty():
             return None
 
@@ -397,9 +579,20 @@ class TaskbarWidget(QWidget):
         configured = self._config.get("width")
         width = max(int(configured), MIN_SIZE) if configured else self._measure_width(height)
 
-        right_margin, top_margin = self._margins()
-        top_left = _auto_top_left(self._taskbar, width, height, right_margin, top_margin)
-        return QRect(top_left.x(), top_left.y(), width, height)
+        offset = self._saved_offset()
+        if offset is None:
+            return QRect(_default_top_left(self._taskbar, width, height), QSize(width, height))
+
+        right_margin, top_margin = offset
+        rect = QRect(
+            self._taskbar.right() + 1 - right_margin - width,
+            self._taskbar.top() + top_margin,
+            width,
+            height,
+        )
+        if not _is_reachable(rect):
+            return QRect(_default_top_left(self._taskbar, width, height), QSize(width, height))
+        return rect
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -616,26 +809,34 @@ class TaskbarWidget(QWidget):
             if self._drag_offset is None or event.button() != Qt.LeftButton:
                 return
             self._drag_offset = None
-            self._save_offset()
+            self._save_position()
         except Exception:
             _guard("位置の保存")
 
-    def _save_offset(self) -> None:
-        """いまの位置を「タスクバーの端からの距離」に直して保存し、全ウィジェットへ配る。
+    def _save_position(self) -> None:
+        """いまの位置を「基準の矩形の端からの距離」に直し、この画面ぶんだけ保存する。
 
-        絶対座標ではなく余白で持つので、1つ動かすと全画面のウィジェットが同じ場所へ
-        そろって動く(どの画面でも同じ位置にある、が狙い)。
+        保存するのは自分の分だけで、他のウィジェットには一切触らない。画面ごとに独立した
+        位置を持つのが狙いなので、1つ動かしたら全部動く、では画面ごとの調整ができない。
 
-        基準は「いま自分が乗っているタスクバー」。画面をまたいでドラッグされたときに
-        生成時のタスクバーを基準にすると、画面1つ分ずれた余白が保存されてしまう。
-        どのタスクバーにも乗っていない位置(タスクバーの外)へ置かれたときは、生成時の
-        ものを基準にする(その位置なりの余白として素直に保存される)。"""
+        基準は常に生成時の矩形(self._taskbar)。「いま乗っているタスクバー」を探し直すと、
+        画面をまたいだ瞬間に基準が乗り換わって1画面ぶんずれ、次の再配置でワープする。
+
+        タスクバーから離れた位置でも、そのぶん大きい(あるいは負の)余白として素直に
+        保存される。クランプも丸めもしない。"""
         rect = self.geometry()
-        taskbar = _taskbar_at(rect.center()) or self._taskbar
-        self._screen.apply_taskbar_widget_offset(
-            taskbar.right() + 1 - (rect.x() + rect.width()),
-            rect.y() - taskbar.top(),
-        )
+        positions = self._config.get("positions")
+        positions = dict(positions) if isinstance(positions, dict) else {}
+        positions[self.screen_name] = {
+            # 右端どうし・上端どうしの距離。QRect.right() は最後のピクセルを指すので、
+            # 排他的な右端(right() + 1 / x + width)どうしで引く。
+            "right": self._taskbar.right() + 1 - (rect.x() + rect.width()),
+            "top": rect.y() - self._taskbar.top(),
+        }
+        # save_config は settings.json を読み直して taskbar_widget の指定キーだけを
+        # 書き戻す。positions は丸ごと1つのキーなので、他のPCの画面名が入っていても
+        # このプロセスが読み込んだ内容ごと保たれる(_config には読み込み済みの値がある)。
+        save_config(self.app_settings, self.settings_path, positions=positions)
 
     def _popup(self, menu) -> None:
         """通知領域と同じメニューをカーソル位置に出す。

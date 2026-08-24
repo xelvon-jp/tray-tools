@@ -12,6 +12,7 @@
 # 普通のモジュール(color_picker.py / keep_awake.py など)として書き、Featureがそれを呼ぶ。
 import ctypes
 import json
+import subprocess
 import sys
 import threading
 import traceback
@@ -27,6 +28,12 @@ from feature_audio import AudioFeature
 from feature_screen import ScreenFeature
 from hotkeys import setup_hotkeys
 from toast import show_toast
+# 窓の出ない実行ファイルの割り出しと、親から切り離して起動するフラグを再起動でも使う。
+from traytools_send import (
+    CREATE_NEW_PROCESS_GROUP,
+    DETACHED_PROCESS,
+    pythonw_executable,
+)
 
 # トレイアイコンは音声用と画面用の2つだけ。増やさない方針(上のFeatureの定義を参照)。
 FEATURE_CLASSES = [AudioFeature, ScreenFeature]
@@ -151,6 +158,38 @@ def _build_command_handlers(features) -> dict:
     }
 
 
+def _restart(instance_lock) -> bool:
+    """自分を起動し直す。新しい方を起こせたら True(呼んだ側がこのプロセスを終わらせる)。
+
+    先に待ち受けを手放すのは、新しい方が起動直後に「すでに起動しています」と判断して
+    引き返してしまうため。逆に、起こすのに失敗したときは待ち受けを張り直して生き残る。
+    再起動できないうえ常駐まで消えると、手で起動し直すしかなくなるため。"""
+    instance_lock.close()
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    try:
+        subprocess.Popen(
+            [pythonw_executable(), str(Path(__file__).resolve())],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    except OSError as e:
+        print(f"[tray-tools] 再起動できません: {e}", file=sys.stderr)
+        instance_lock.listen(SINGLE_INSTANCE_KEY)
+        return False
+    return True
+
+
+def _wire_restart(features, instance_lock) -> None:
+    """再起動をトレイメニューから呼べるようにする。
+
+    待ち受け(instance_lock)を握っているのは main() なので、Featureのコンストラクタでは
+    渡せない。Featureが揃ってからここで渡す(_wire_taskbar_widget と同じ形)。"""
+    screen = next((f for f in features if isinstance(f, ScreenFeature)), None)
+    if screen is None:
+        return
+    screen.attach_restart(lambda: _restart(instance_lock))
+
+
 def _wire_taskbar_widget(features) -> None:
     """各ディスプレイのタスクバーに置くウィジェットを ScreenFeature に組み立てさせる。
 
@@ -228,6 +267,7 @@ def main():
     settings_module.cleanup_old_captures(app_settings.get("capture", {}))
 
     features = [cls(app_settings, settings_module.SETTINGS_PATH) for cls in FEATURE_CLASSES]
+    _wire_restart(features, instance_lock)
     _wire_taskbar_widget(features)
 
     # 二重起動の通知と、外部からのコマンド受付を兼ねる入口。

@@ -39,7 +39,7 @@ def _write(command: str, args: list) -> None:
         pipe.write((payload + "\n").encode("utf-8"))
 
 
-def _pythonw() -> str:
+def pythonw_executable() -> str:
     """このスクリプトを動かしている実行ファイルから、窓の出ない pythonw.exe を割り出す。
 
     python.exe から呼ばれた場合にそのまま使うと、tray-tools にコンソール窓が付いてくる。
@@ -55,7 +55,7 @@ def _start_traytools() -> bool:
         return False
     try:
         subprocess.Popen(
-            [_pythonw(), str(MAIN_SCRIPT)],
+            [pythonw_executable(), str(MAIN_SCRIPT)],
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )

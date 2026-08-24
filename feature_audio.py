@@ -10,10 +10,11 @@ import comtypes
 from pycaw.constants import AudioDeviceState, ERole
 from pycaw.utils import AudioUtilities
 from PIL import Image, ImageDraw
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
 import mic_control
-from qt_image import pil_to_qicon
+from qt_image import pil_to_qpixmap
 from toast import show_toast
 
 # eConsole/eMultimedia/eCommunications の全ロールに反映しないと、
@@ -147,6 +148,9 @@ class AudioFeature:
         self.settings_path = settings_path
         self.devices = app_settings.get("audio", {}).get("devices", [])
         self._last_toggle_time = 0.0
+        # 直近に作ったアイコン図柄。タスクバーウィジェットが同じ絵を描くために読む
+        # (current_icon_pixmap を参照)。_refresh が必ず入れ替える。
+        self._icon_pixmap = None
 
         self.tray_icon = QSystemTrayIcon()
         self.menu = QMenu()
@@ -271,12 +275,29 @@ class AudioFeature:
             else:
                 label = device.get("label", "(名称未設定)")
 
-        self.tray_icon.setIcon(pil_to_qicon(_make_icon_image(device, bool(mic_muted))))
+        # QPixmapを経由するのは、同じ図柄をタスクバーウィジェットにも描かせるため。
+        # QIconからは元の絵を取り戻せない(pixmap(size)で作り直すと縮尺が変わる)。
+        self._icon_pixmap = pil_to_qpixmap(_make_icon_image(device, bool(mic_muted)))
+        self.tray_icon.setIcon(QIcon(self._icon_pixmap))
         tooltip = f"音声出力: {label}"
         if mic_muted:
             tooltip += "\nマイク: ミュート中"
         self.tray_icon.setToolTip(tooltip)
         self._current_action.setText(f"現在: {label}")
+
+    def current_icon_pixmap(self, refresh: bool = False):
+        """いまトレイに出しているのと同じ図柄を QPixmap で返す。まだ無ければ None。
+
+        セカンダリのタスクバーウィジェット(taskbar_widget.py)が、通知領域の代わりに
+        このアイコンを自前で描くために使う。「トレイの代わり」である以上、色も形も
+        本物と食い違ってはいけないので、あちらで描き直さずここで作ったものを渡す。
+
+        refresh=True で状態を読み直してから返す。デバイスは他アプリ(Teams等)からも
+        変えられるので、ウィジェットにマウスを乗せた瞬間だけ読み直させる用。COM越しの
+        問い合わせが入るため、描画のたびに呼ばないこと(メニューを開くのと同じ重さ)。"""
+        if refresh:
+            self._refresh()
+        return self._icon_pixmap
 
     def do_toggle(self):
         """現在のデバイスの次の要素へ切り替える(末尾なら先頭へ循環)。3台以上でも動く。"""

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import mss
-from PySide6.QtCore import Qt, QRect
+from PySide6.QtCore import Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
 
 
@@ -42,6 +42,35 @@ def virtual_geometry() -> QRect:
     for screen in QGuiApplication.screens():
         geometry = geometry.united(screen.geometry())
     return geometry
+
+
+def dpr_at_device_point(x: int, y: int) -> float:
+    """物理ピクセルのその位置にある画面の devicePixelRatio。
+
+    Win32が返すのは物理ピクセル、Qtが使うのは論理座標。どの画面の比率で割るかは、
+    grab_region が「選択範囲の中心にある画面で判定する」のと同じ考え方で決める。
+    ただし screenAt() は論理座標を要求するので、まずプライマリの比率で仮に割って
+    当たりを付ける。全画面が同じ倍率(通常の環境)ならこれで正しい画面に行き着き、
+    倍率が混在していても grab_region と同じ精度に収まる。"""
+    primary = QGuiApplication.primaryScreen()
+    base = (primary.devicePixelRatio() if primary else 1.0) or 1.0
+    screen = QGuiApplication.screenAt(QPoint(int(x / base), int(y / base))) or primary
+    return (screen.devicePixelRatio() if screen else 1.0) or 1.0
+
+
+def device_bounds_to_logical(bounds) -> QRect:
+    """Win32の (left, top, right, bottom)(物理ピクセル)をQtの論理座標のQRectへ直す。
+
+    Win32のRECTは right/bottom が排他なので、幅は right - left。
+    QRect(QPoint(left, top), QPoint(right, bottom)) で作ると縦横が1pxずつ大きくなる。"""
+    left, top, right, bottom = bounds
+    dpr = dpr_at_device_point((left + right) // 2, (top + bottom) // 2)
+    return QRect(
+        int(left / dpr),
+        int(top / dpr),
+        int((right - left) / dpr),
+        int((bottom - top) / dpr),
+    )
 
 
 def draw_stroke(painter: QPainter, stroke: dict) -> None:

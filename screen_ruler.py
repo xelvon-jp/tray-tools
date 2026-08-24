@@ -22,6 +22,11 @@ class RulerOverlay(SelectionOverlay):
     selection_made が渡すQRectは正規化済みでドラッグの向きが失われるため、押した点と離した点を
     グローバル座標のまま別に保持する(定規はAからBを測る道具で、右から左へ引いたなら始点は右)。"""
 
+    # キャプチャ側の「クリックでカーソル下のウィンドウ全体を選ぶ」は使わない。定規はAからBへ
+    # ドラッグした距離を測る道具で、クリックで矩形だけ渡されても始点・終点が無く測定値を
+    # 作れない(何もコピーされないまま定規が閉じることになる)。
+    window_pick_enabled = False
+
     def __init__(self):
         super().__init__()
         self._start_global = None

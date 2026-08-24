@@ -6,15 +6,38 @@ from PySide6.QtCore import Qt, QRect, QPoint, Signal, QTimer
 from PySide6.QtGui import QPainter, QColor, QImage, QPen, QFont, QGuiApplication
 from PySide6.QtWidgets import QWidget
 
-from capture_grab import grab_region, virtual_geometry
+import window_tools
+from capture_grab import device_bounds_to_logical, grab_region, virtual_geometry
+
+# ウィンドウ単位キャプチャ(クリックでカーソル下のウィンドウ全体を選ぶ)の枠。
+# ドラッグ中の選択枠 QPen(QColor(0, 200, 255), 2) と一目で区別が付くよう、
+# 色も太さも変えている。
+WINDOW_FRAME_COLOR = QColor(255, 176, 0)
+WINDOW_FRAME_WIDTH = 4
+# 枠に添えるラベルの最大文字数。長いタイトル(ブラウザのタブ名など)をそのまま出すと
+# 画面を横断してしまうため、これを超えたら省略記号にまとめる。
+WINDOW_LABEL_MAX_CHARS = 48
+
+
+# 物理ピクセル→Qt論理座標の変換(_dpr_at_device_point / _device_bounds_to_logical)は
+# capture_grab へ移した。同じ換算をタスクバーウィジェット(taskbar_widget.py)も使うため、
+# 座標変換を持っている側(grab_region / virtual_geometry のある capture_grab)へ寄せた。
 
 
 class SelectionOverlay(QWidget):
-    """全モニタを覆う半透明ウインドウ。ドラッグで矩形を選択し、離した位置で選択確定を通知する。"""
+    """全モニタを覆う半透明ウインドウ。ドラッグで矩形を選択し、離した位置で選択確定を通知する。
+    ドラッグせずにクリックした場合は、その位置にあるウィンドウ全体を選択する。"""
 
     # rect_global はQtの論理座標系(スクリーン全体, マルチモニタ考慮済み)でのQRect
     selection_made = Signal(QRect)
     canceled = Signal()
+
+    # ウィンドウ単位の選択を使うかどうか。凍結する側(FrozenSelectionOverlay)だけの機能に
+    # せず基底に置いているのは、素のオーバーレイでも同じ操作感にしたいのと、列挙を
+    # 「オーバーレイを表示する前」に済ませる必要があり、それが基底の __init__ だから。
+    # 継承先で切れるようにしてあるのは画面定規(screen_ruler.RulerOverlay)のため
+    # (あちらはA→Bのドラッグを測る道具で、クリックでウィンドウを選ばれても測る物が無い)。
+    window_pick_enabled = True
 
     def __init__(self):
         super().__init__()
@@ -37,11 +60,55 @@ class SelectionOverlay(QWidget):
         # ドラッグ前でもカーソル座標を出すため、ドラッグ中かどうかに関わらず追う
         self._hover = None
 
+        # 開いているウィンドウの一覧。ここで1回だけ作る。
+        # このオーバーレイは全モニタを覆うので、表示してしまうと WindowFromPoint は
+        # 自分自身しか返さない。表示する前(=まだ show() していないこの時点)に列挙して
+        # 矩形を控えておき、以降はカーソル位置から引く。hoverのたびに列挙し直すと重い。
+        self._windows = self._collect_windows() if self.window_pick_enabled else []
+        # カーソルの下にあるウィンドウ。枠の描画にだけ使う(選択確定時は引き直す)。
+        self._hover_window = None
+
     def showEvent(self, event):
         super().showEvent(event)
         self.activateWindow()
         self.raise_()
         self.setFocus()
+
+    # ---------------------------------------------------------------
+    # ウィンドウ単位の選択
+    # ---------------------------------------------------------------
+    def _collect_windows(self) -> list:
+        """今開いているウィンドウを (QRect(Qt論理座標のグローバル座標), タイトル) の一覧にする。
+        前面から順に並ぶので、ある座標を含む最初の1件がその位置の最前面のウィンドウ。
+
+        自分自身のHWNDを除外して渡す。まだ表示していないので列挙されないはずだが、
+        自分を撮ってしまうと何も分からない絵になるため念のため。"""
+        windows = []
+        for _hwnd, title, bounds in window_tools.list_windows(exclude_hwnd=int(self.winId())):
+            rect_global = device_bounds_to_logical(bounds)
+            if rect_global.isEmpty():
+                continue
+            windows.append((rect_global, title))
+        return windows
+
+    def _window_at(self, point_local):
+        """ローカル座標の位置にあるウィンドウ (QRect, タイトル)。無ければ None。"""
+        if point_local is None:
+            return None
+        point_global = self._to_global(point_local)
+        for rect_global, title in self._windows:
+            if rect_global.contains(point_global):
+                return rect_global, title
+        return None
+
+    def _window_rect_at(self, point_local):
+        """ローカル座標の位置にあるウィンドウの矩形(グローバル座標)。無ければ None。
+        画面の外にはみ出している部分は撮れないので、オーバーレイの範囲で切っておく。"""
+        window = self._window_at(point_local)
+        if window is None:
+            return None
+        rect_global = window[0].intersected(QRect(self._origin, self.size()))
+        return rect_global if not rect_global.isEmpty() else None
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -54,6 +121,10 @@ class SelectionOverlay(QWidget):
         self._hover = event.position().toPoint()
         if self._dragging:
             self._current = self._hover
+        else:
+            # 範囲を決める前は「クリックすればこのウィンドウが撮れる」を枠で示す。
+            # ドラッグ中は引き直さない(枠を描くのはドラッグ前だけなので不要)。
+            self._hover_window = self._window_at(self._hover)
         self.update()
 
     def mouseReleaseEvent(self, event):
@@ -61,8 +132,13 @@ class SelectionOverlay(QWidget):
             self._dragging = False
             rect_local = QRect(self._start, self._current).normalized()
 
-            # 小さすぎる選択(クリックだけ等)は無視して選択継続する
+            # 小さすぎる選択(クリックだけ等)は、その位置にあるウィンドウ全体の選択として扱う。
+            # ウィンドウが見つからない位置(壁紙の上など)では従来どおり無視して選択を続ける。
             if rect_local.width() < 4 or rect_local.height() < 4:
+                window_rect = self._window_rect_at(self._current)
+                if window_rect is not None:
+                    self.selection_made.emit(window_rect)
+                    return
                 self._start = None
                 self._current = None
                 self.update()
@@ -93,6 +169,7 @@ class SelectionOverlay(QWidget):
 
             self._draw_info(painter, rect_local)
         else:
+            self._draw_window_frame(painter)
             self._draw_hover_info(painter)
 
     def _draw_background(self, painter):
@@ -106,6 +183,42 @@ class SelectionOverlay(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode_Clear)
         painter.fillRect(rect_local, Qt.transparent)
         painter.restore()
+
+    def _draw_window_frame(self, painter):
+        """カーソルの下にあるウィンドウを枠で囲む。クリックすればどこが撮れるのかを、
+        ドラッグを始める前に見せるためのもの。"""
+        if self._hover_window is None:
+            return
+        rect_global, title = self._hover_window
+        # 画面からはみ出した部分は撮れないので、確定時(_window_rect_at)と同じくここでも切る。
+        # 見えている枠と実際に撮れる範囲を一致させるため。凍結画像を描き直す側(Frozen)が
+        # 画像の外を参照しないようにする意味もある。
+        rect_local = rect_global.translated(-self._origin).intersected(self.rect())
+        if rect_local.isEmpty():
+            return
+
+        # 枠の中だけ減光を解除する。選択範囲のときと同じ見え方にしたいので、
+        # 背景の作り方はサブクラスごとの _draw_selection_background に任せる。
+        self._draw_selection_background(painter, rect_local)
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(WINDOW_FRAME_COLOR, WINDOW_FRAME_WIDTH))
+        # 線は矩形の上に中央揃えで乗るため、そのまま描くと半分が外へはみ出す。
+        # 最大化ウインドウでは画面外に切られて枠が細く見えるので、内側へ寄せる。
+        painter.drawRect(rect_local.adjusted(
+            WINDOW_FRAME_WIDTH // 2, WINDOW_FRAME_WIDTH // 2,
+            -WINDOW_FRAME_WIDTH // 2, -WINDOW_FRAME_WIDTH // 2,
+        ))
+
+        label = title.strip() if title else ""
+        if len(label) > WINDOW_LABEL_MAX_CHARS:
+            label = label[:WINDOW_LABEL_MAX_CHARS - 1] + "…"
+        # 名前の無いウインドウもあるので、その場合は大きさで代用する。
+        if not label:
+            label = f"{rect_local.width()} x {rect_local.height()}"
+        painter.setPen(WINDOW_FRAME_COLOR)
+        painter.setFont(QFont("Meiryo", 10))
+        painter.drawText(QPoint(rect_local.x() + 4, max(rect_local.y() - 6, 12)), label)
 
     def _to_global(self, point: QPoint) -> QPoint:
         """オーバーレイ内のローカル座標を実際の画面座標へ直す。

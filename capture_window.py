@@ -93,8 +93,6 @@ class CaptureWindow(QWidget):
         self.pen_width = capture_settings.get("pen_width", 3)
         self.highlighter_enabled = bool(capture_settings.get("highlighter_enabled", False))
 
-        self._dragging_window = False
-        self._drag_offset = QPoint()
         self._drawing = False
         self._current_stroke = None
         # キャプチャ＆保存の実行中フラグ。hide() → 待つ → 撮る、の非同期処理なので、
@@ -189,34 +187,32 @@ class CaptureWindow(QWidget):
         return QPointF(pos.x() / self.zoom_factor, pos.y() / self.zoom_factor)
 
     # ---------------------------------------------------------------
-    # マウス操作: Ctrl+左ドラッグ=ペン描画 / 通常左ドラッグ=ウインドウ移動
+    # マウス操作: Ctrl+左ドラッグ=ペン描画 / 移動はタイトルバーのドラッグ(OS任せ)
     # ---------------------------------------------------------------
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if event.modifiers() & Qt.ControlModifier:
-                self._drawing = True
-                width = self.pen_width * (
-                    HIGHLIGHTER_WIDTH_MULTIPLIER if self.highlighter_enabled else 1
-                )
-                color = QColor(self.pen_color)
-                if self.highlighter_enabled:
-                    color.setAlpha(HIGHLIGHTER_ALPHA)
-                self._current_stroke = {
-                    "type": "stroke",
-                    "color": color,
-                    "width": width,
-                    "points": [self._to_image_coords(event.position())],
-                }
-            else:
-                self._dragging_window = True
-                self._drag_offset = event.globalPosition().toPoint() - self.pos()
+        # 画像部分の左ドラッグでウインドウを動かす機能は廃止した。描き込もうとして
+        # (Ctrlを押し損ねて)付箋ごと動かしてしまう事故が多かったため。この付箋は
+        # FramelessWindowHint を使っておらずOS標準のタイトルバーがあるので、移動手段は
+        # そちらのドラッグとして残っている。
+        if event.button() == Qt.LeftButton and event.modifiers() & Qt.ControlModifier:
+            self._drawing = True
+            width = self.pen_width * (
+                HIGHLIGHTER_WIDTH_MULTIPLIER if self.highlighter_enabled else 1
+            )
+            color = QColor(self.pen_color)
+            if self.highlighter_enabled:
+                color.setAlpha(HIGHLIGHTER_ALPHA)
+            self._current_stroke = {
+                "type": "stroke",
+                "color": color,
+                "width": width,
+                "points": [self._to_image_coords(event.position())],
+            }
 
     def mouseMoveEvent(self, event):
         if self._drawing and self._current_stroke is not None:
             self._current_stroke["points"].append(self._to_image_coords(event.position()))
             self.update()
-        elif self._dragging_window:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -226,7 +222,6 @@ class CaptureWindow(QWidget):
                 self._current_stroke = None
                 self._drawing = False
                 self.update()
-            self._dragging_window = False
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -375,6 +370,11 @@ class CaptureWindow(QWidget):
         context_pos_image = self._to_image_coords(event.pos())
         menu = QMenu(self)
 
+        # 「コピー」はこのメニューで最も使う操作なので、カーソルの真下に来る先頭に置く。
+        # 直後にセパレータを入れて、描画設定(色・線幅…)の並びとは別物だと分かるようにする。
+        act_copy = menu.addAction("コピー (Ctrl+C)")
+        menu.addSeparator()
+
         act_color = menu.addAction("色...")
 
         width_menu = menu.addMenu("線幅")
@@ -394,7 +394,6 @@ class CaptureWindow(QWidget):
         act_recapture = menu.addAction("再キャプ")
         act_capture_save = menu.addAction("キャプチャ＆保存")
         act_save = menu.addAction("保存 (Ctrl+S)")
-        act_copy = menu.addAction("コピー (Ctrl+C)")
         act_open_folder = menu.addAction("保存フォルダを開く")
         act_ontop = menu.addAction("常に手前に表示")
         act_ontop.setCheckable(True)

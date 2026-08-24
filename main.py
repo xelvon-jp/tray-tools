@@ -151,6 +151,23 @@ def _build_command_handlers(features) -> dict:
     }
 
 
+def _wire_taskbar_widget(features) -> None:
+    """各ディスプレイのタスクバーに置くウィジェットを ScreenFeature に組み立てさせる。
+
+    あれは通知領域そのものの代わりなので、画面側と音声側の両方(アイコンの絵・デバイス
+    切替・それぞれのメニュー)を呼ぶ。Featureは1つずつ構築されるため、コンストラクタの
+    中では相手がまだ居ない。全部そろったここで渡す(_build_command_handlers が features を
+    受け取って引き当てているのと同じ形)。
+
+    ウィジェットの参照は main() ではなく ScreenFeature が持つ。表示のON/OFFはトレイ
+    メニューからも切り替えるので、開閉の管理は1か所に置きたい。"""
+    screen = next((f for f in features if isinstance(f, ScreenFeature)), None)
+    audio = next((f for f in features if isinstance(f, AudioFeature)), None)
+    if screen is None or audio is None:
+        return
+    screen.attach_audio_feature(audio)
+
+
 def _install_excepthook():
     """どこにも捕まらなかった例外を error.log に残す。
 
@@ -211,6 +228,7 @@ def main():
     settings_module.cleanup_old_captures(app_settings.get("capture", {}))
 
     features = [cls(app_settings, settings_module.SETTINGS_PATH) for cls in FEATURE_CLASSES]
+    _wire_taskbar_widget(features)
 
     # 二重起動の通知と、外部からのコマンド受付を兼ねる入口。
     command_handlers = _build_command_handlers(features)

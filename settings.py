@@ -43,6 +43,27 @@ DEFAULT_SETTINGS = {
     "snippets": {
         "recent": [],
     },
+    # セカンダリディスプレイのタスクバーに置く、通知領域の代わりの小さなウィジェット。
+    # Windowsは通知領域をプライマリのタスクバーにしか出さないため、正面のモニタを
+    # セカンダリにしている構成では、トレイを触るたびに視線と手が別の画面へ行ってしまう。
+    # 既定は無効。セカンダリの無いPC(そのまま設定を持ち回るノート等)で勝手に出さない。
+    #
+    # x/y が None なら Shell_SecondaryTrayWnd の矩形から自動算出する。ドラッグで動かすと
+    # 実値が書き込まれ、以後はそちらが優先される。
+    # background_color が None なら、表示する直前にその位置の画面を撮って最頻色を使う
+    # (タスクバーの透明効果で壁紙が透けるため、決め打ちの色では浮く)。
+    # clock_format_* は strftime の書式。先頭ゼロを落とすのは Windows では %#H(%-H はLinux系)。
+    "taskbar_widget": {
+        "enabled": False,
+        "x": None,
+        "y": None,
+        "width": None,
+        "height": 31,
+        "background_color": None,
+        "text_color": None,
+        "clock_format_top": "%m/%d(%a)",
+        "clock_format_bottom": "%H:%M:%S",
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",

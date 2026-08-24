@@ -8,7 +8,9 @@
 # 占有し、単発の動作はメニュー項目で足りるという方針。
 import math
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -21,6 +23,7 @@ import explorer_nav
 import launcher
 import screen_ruler
 import snippets
+import taskbar_widget
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from capture_window import CaptureWindow
@@ -80,6 +83,20 @@ class ScreenFeature:
         self.active_capture_window = None
 
         self.topmost = TopmostTracker()
+
+        # 各ディスプレイのタスクバーに置く時計擬態ウィジェット。Featureにはしない
+        # (トレイアイコンを増やさない方針)ので、ここが生成と参照の持ち主になる。
+        # ローカル変数だけで持つとGCで即消えるため、必ずこの属性で掴んでおくこと。
+        # タスクバー1つにつき1つ作るのでリストで持つ(何画面あるかは起動後まで決まらない)。
+        # 実体は音声側の参照が要るので、Featureが揃ってから attach_audio_feature で作る。
+        self.taskbar_widgets = []
+        self._audio_feature = None
+        # ディスプレイ構成が変わったら作り直す。変化の通知が連続で飛ぶ(1台の抜き差しでも
+        # screenRemoved と primaryScreenChanged が続けて来る)ので、シングルショットで
+        # 受けて最後の1回にまとめる。
+        self._taskbar_rebuild_timer = QTimer()
+        self._taskbar_rebuild_timer.setSingleShot(True)
+        self._taskbar_rebuild_timer.timeout.connect(self._rebuild_taskbar_widgets)
 
         self._awake_active = False
         self._awake_minutes = None  # None = 無期限
@@ -142,12 +159,25 @@ class ScreenFeature:
         self._awake_menu.addAction("解除", self._disable_keep_awake)
 
         self.menu.addSeparator()
+        # 通知領域はプライマリのタスクバーにしか出ないので、各ディスプレイのタスクバーへ
+        # 自前で置く出張所の表示切替。詳細は taskbar_widget.py 冒頭を参照。
+        self._taskbar_action = self.menu.addAction("🖥 タスクバーウィジェット")
+        self._taskbar_action.setCheckable(True)
+        # addAction(テキスト, 関数) は関数を引数なしで呼ぶので、チェック状態を受け取る
+        # 項目をその形で繋いではいけない(クリックのたびにTypeErrorで落ちる)。
+        self._taskbar_action.triggered.connect(self._toggle_taskbar_widget)
+        self._taskbar_bg_action = self.menu.addAction(
+            "🎨 背景色を取り直す", self._recapture_taskbar_background
+        )
+
+        self.menu.addSeparator()
         self.menu.addAction("⚙ 設定", self._open_settings_file)
         self.menu.addSeparator()
         self.menu.addAction("✖ 終了", QApplication.instance().quit)
 
         # 残り時間は開くたびに変わるので、表示直前に作り直す
         self.menu.aboutToShow.connect(self._refresh_awake_menu)
+        self.menu.aboutToShow.connect(self._refresh_taskbar_menu)
 
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self._on_activated)
@@ -414,6 +444,143 @@ class ScreenFeature:
         self._notify("最前面固定", f"{'固定' if pinned else '解除'}: {title}")
 
     # ---------------------------------------------------------------
+    # タスクバーウィジェット(各ディスプレイのタスクバーに置くトレイの代わり)
+    # ---------------------------------------------------------------
+    def attach_audio_feature(self, audio_feature) -> None:
+        """音声側のFeatureを受け取り、設定が有効ならウィジェットを出す。
+
+        ウィジェットは画面側と音声側の両方(アイコンの絵・デバイス切替・それぞれのメニュー)を
+        呼ぶため、Featureが全部そろってからでないと作れない。コンストラクタは1つずつ
+        呼ばれるので、組み立ては main.py が済んだところでここに渡してもらう。
+
+        ディスプレイ構成の変化を拾う接続もここで行う。ウィジェットを作れるようになった
+        あとでないと、通知が来ても作り直しようがない。"""
+        self._audio_feature = audio_feature
+
+        app = QApplication.instance()
+        if app is not None:
+            # モニタを抜き差しすればタスクバーの数も位置も変わる。掴んでいる矩形は
+            # 生成時のもので追従しないので、通知を受けて丸ごと作り直す。
+            app.screenAdded.connect(self._on_screens_changed)
+            app.screenRemoved.connect(self._on_screens_changed)
+            app.primaryScreenChanged.connect(self._on_screens_changed)
+
+        if self.app_settings.get("taskbar_widget", {}).get("enabled"):
+            self._show_taskbar_widgets(notify=False)
+        self._refresh_taskbar_menu()
+
+    def _show_taskbar_widgets(self, notify: bool = True) -> bool:
+        """タスクバー1つにつき1つ、ウィジェットを出す。1つも出せなければ False。
+
+        既に出ているものがあれば作り直さない(トグルで消してから出し直したときに、
+        タスクバーの数が変わっていなければ同じ窓を再利用する)。"""
+        if self._audio_feature is None:
+            return False
+
+        config = self.app_settings.get("taskbar_widget", {})
+        # all_displays が False ならセカンダリだけ(プライマリには本物の通知領域がある)。
+        include_primary = config.get("all_displays", True)
+        rects = taskbar_widget.taskbar_rects(include_primary=include_primary)
+        if not rects:
+            # 位置が決められない＝置けるタスクバーが1つも無い。起動時に黙って出ないと
+            # 故障と区別がつかないが、通知は出しっぱなしにしない。
+            if notify:
+                self._notify("タスクバーウィジェット", "タスクバーが見つかりません")
+            return False
+
+        if len(self.taskbar_widgets) != len(rects):
+            self._close_taskbar_widgets()
+            self.taskbar_widgets = [
+                taskbar_widget.TaskbarWidget(
+                    self.app_settings, self.settings_path, self, self._audio_feature, rect
+                )
+                for rect in rects
+            ]
+
+        # 1つでも出せたなら有効として扱う。画面が3枚あって1枚だけ失敗した場合に、
+        # 全部消してしまうほうが困る。
+        return any(widget.start() for widget in self.taskbar_widgets)
+
+    def _hide_taskbar_widgets(self) -> None:
+        for widget in self.taskbar_widgets:
+            widget.stop()
+
+    def _close_taskbar_widgets(self) -> None:
+        """作り直しと終了のときに、いまの窓を確実に片付ける。
+
+        TaskbarWidget に WA_DeleteOnClose は付けていないので、close() だけでは
+        C++側の実体は残る。参照を手放してPython側の寿命に任せる(deleteLater を使うと、
+        メニューを開いたまま画面構成が変わったときに、イベント処理中のウィジェットの
+        実体だけ先に消えて落ちる)。"""
+        for widget in self.taskbar_widgets:
+            widget.close()
+        self.taskbar_widgets = []
+
+    def _on_screens_changed(self, _screen=None):
+        """screenAdded/screenRemoved/primaryScreenChanged の受け口。
+
+        通知の時点ではWindowsがまだタスクバーを並べ直しておらず、すぐ測ると古い位置を
+        拾う。少し待ってから作り直す(連続で飛んでくる通知をまとめる役目も兼ねる)。"""
+        try:
+            if not self.taskbar_widgets:
+                return
+            self._taskbar_rebuild_timer.start(taskbar_widget.REBUILD_DELAY_MS)
+        except Exception:
+            self._log_taskbar_failure("ディスプレイ構成の変化の受け取り")
+
+    def _rebuild_taskbar_widgets(self):
+        """いまのタスクバーに合わせてウィジェットを作り直す。
+
+        矩形を差し替えるのではなく作り直すのは、画面が増減すると窓の数そのものが
+        変わるため。数が同じでも位置は変わりうるので、区別せず一律に作り直す。"""
+        try:
+            self._close_taskbar_widgets()
+            self._show_taskbar_widgets(notify=False)
+            self._refresh_taskbar_menu()
+        except Exception:
+            self._log_taskbar_failure("ディスプレイ構成の変化への追従")
+
+    def apply_taskbar_widget_offset(self, right_margin: int, top_margin: int) -> None:
+        """ドラッグで決まった「タスクバーの端からの距離」を保存し、全ウィジェットへ配る。
+
+        位置は画面ごとの絶対座標ではなく、この余白1組で全画面共通に持つ。どの画面でも
+        同じ場所に同じものがある状態にするのが目的なので、1つ動かせば全部そろって動く。"""
+        taskbar_widget.save_config(
+            self.app_settings,
+            self.settings_path,
+            right_margin=int(right_margin),
+            top_margin=int(top_margin),
+        )
+        for widget in self.taskbar_widgets:
+            widget.reposition()
+
+    def _toggle_taskbar_widget(self, checked: bool):
+        """QAction.triggered は checked(bool) を渡してくる。チェック可能な項目なので
+        その値をそのまま表示状態として扱う。"""
+        shown = self._show_taskbar_widgets() if checked else False
+        if not checked:
+            self._hide_taskbar_widgets()
+        # 出せなかったときは設定まで有効にしない(次の起動でまた失敗するだけ)。
+        taskbar_widget.save_config(self.app_settings, self.settings_path, enabled=shown)
+        self._refresh_taskbar_menu()
+
+    def _recapture_taskbar_background(self):
+        for widget in self.taskbar_widgets:
+            widget.refresh_background()
+
+    def _refresh_taskbar_menu(self):
+        visible = any(widget.isVisible() for widget in self.taskbar_widgets)
+        self._taskbar_action.setChecked(visible)
+        # 背景は「自分が乗っている場所」を測るので、出ていないと測りようがない。
+        self._taskbar_bg_action.setEnabled(visible)
+
+    def _log_taskbar_failure(self, where: str) -> None:
+        """スクリーン変更のスロットで例外を投げ切らせない(PySide6はプロセスごと終わる)。
+        ウィジェットが出ないだけの話なので、標準エラーに残して常駐は続ける。"""
+        traceback.print_exc()
+        print(f"[tray-tools] タスクバーウィジェット: {where}に失敗しました", file=sys.stderr)
+
+    # ---------------------------------------------------------------
     # スリープ抑止
     # ---------------------------------------------------------------
     def _enable_keep_awake(self, minutes):
@@ -485,6 +652,10 @@ class ScreenFeature:
         self._awake_timer.stop()
         set_keep_awake(False)
         self.topmost.release_all()
+        # 枠なし・最前面の窓を残したままイベントループを畳むと、画面に貼り付いたまま
+        # 消えないことがある。タイマーもここで止まる(hideEvent 参照)。
+        self._taskbar_rebuild_timer.stop()
+        self._close_taskbar_widgets()
 
     def _open_settings_file(self):
         """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。

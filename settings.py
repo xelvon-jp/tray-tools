@@ -69,6 +69,18 @@ DEFAULT_SETTINGS = {
     # background_color が None なら、表示する直前にその位置の画面を撮って最頻色を使う
     # (タスクバーの透明効果で壁紙が透けるため、決め打ちの色では浮く)。
     # clock_format_* は strftime の書式。先頭ゼロを落とすのは Windows では %#H(%-H はLinux系)。
+    #
+    # launcher_* は、ウィジェットにマウスを乗せている間だけ真上に出る縦一列のランチャ
+    # (taskbar_launcher.py)。本体は時計に化ける都合で幅が59px前後しかなく、Rapture と
+    # 音声の2つで埋まる。それ以外の機能へ通知領域まで戻らずに届くようにするためのもの。
+    # launcher_items は上から下へ並ぶ順で、書ける名前は
+    # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
+    # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク)。
+    # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
+    # すると、マウスを乗せても従来どおり本体だけになる。
+    # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
+    # 移る途中には必ず「どちらにも乗っていない」瞬間があるので、0にすると項目へ届く前に
+    # 閉じる。
     "taskbar_widget": {
         "enabled": False,
         "all_displays": True,
@@ -79,6 +91,17 @@ DEFAULT_SETTINGS = {
         "text_color": None,
         "clock_format_top": "%m/%d(%a)",
         "clock_format_bottom": "%H:%M:%S",
+        "launcher_enabled": True,
+        "launcher_items": [
+            "capture",
+            "audio",
+            "ruler",
+            "color_picker",
+            "snippets",
+            "bookmarks",
+        ],
+        "launcher_item_size": 36,
+        "launcher_close_delay_ms": 300,
     },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {

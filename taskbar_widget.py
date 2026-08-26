@@ -21,6 +21,11 @@
 # Rapture と音声のアイコンに入れ替わる。隣に生やさないのは、タスクバーの上に自前の
 # ものが常時2つ増えて見えるのが邪魔だからで、「時計の場所に用がある」わけではない。
 #
+# その幅(実測59px前後)に置けるアイコンは2つが限界なので、残りの機能(画面定規・カラー
+# ピッカー・定型文・フォルダブックマーク)へは、マウスを乗せている間だけ真上へ縦一列で
+# 出るパネルから届かせる(taskbar_launcher.LauncherPanel)。本体の見た目は従来どおり
+# 時計⇄2アイコンのままで、パネルはタスクバーの外へはみ出す別の窓として上に出る。
+#
 # Featureではない(トレイアイコンを持たない)。main.py 冒頭の方針どおり、アイコンを
 # 増やさずに ScreenFeature が生成・保持する(複数出すのでリストで持つ)。
 import json
@@ -43,6 +48,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+import taskbar_launcher
 import window_tools
 from capture_grab import device_bounds_to_logical, grab_region
 from toast import show_toast
@@ -465,6 +471,14 @@ class TaskbarWidget(QWidget):
 
         self._rapture_pixmap = QPixmap(str(ICON_PATH)) if ICON_PATH.exists() else QPixmap()
 
+        # マウスを乗せている間だけ真上に出る縦一列のランチャ。参照はここで持ち続ける
+        # (ローカル変数だけだとGCで即消える)。窓を作るだけで表示はしないので、
+        # ランチャを使わない設定でも作っておいて構わない(出すかどうかは
+        # taskbar_launcher.resolve_items が設定を見て決める)。
+        self._launcher = taskbar_launcher.LauncherPanel(
+            self, screen_feature, audio_feature, self._config
+        )
+
         self._background = QColor(FALLBACK_BACKGROUND)
         self._text_color = QColor(LIGHT_TEXT)
 
@@ -535,7 +549,17 @@ class TaskbarWidget(QWidget):
         text = self._config.get("text_color")
         color = QColor(text) if text else QColor(_auto_text_color(background))
         self._text_color = color if color.isValid() else QColor(_auto_text_color(background))
+        # ランチャのパネルは自分の位置を実測できない(下にあるのは他のアプリの窓)ので、
+        # ここで決めた色を借りる。1つの部品に見せるため、色は必ず本体と同じにする。
+        self._launcher.refresh_colors()
         self.update()
+
+    def current_colors(self):
+        """いま使っている (背景色, 文字色)。ランチャのパネルが自分と同じ色で描くために使う。
+
+        コピーを返す。パネル側で調整(強調色や枠の色を作る)ときに、渡した QColor を
+        書き換えられても本体の色が変わらないようにしておく。"""
+        return QColor(self._background), QColor(self._text_color)
 
     def _saved_offset(self):
         """設定に入っているこの画面ぶんの (右端からの余白, 上端からの余白)。無ければ None。
@@ -601,6 +625,10 @@ class TaskbarWidget(QWidget):
         self._on_topmost_tick()  # 出した直後にタスクバーの上へ回す(500ms待たせない)
 
     def hideEvent(self, event):
+        # 本体が消えるならパネルも道連れ。別の窓なので放っておくと、本体だけ消えて
+        # アイコンの列がタスクバーの上に取り残される(表示のトグルや、ディスプレイ構成が
+        # 変わったときの作り直しでここを通る)。
+        self._launcher.close_panel()
         # 見えていない間はどのタイマーも無駄でしかない。特に最前面への押し上げは
         # 他のウィンドウのZオーダーを触る操作なので、止めておく。
         self._clock_timer.stop()
@@ -645,6 +673,9 @@ class TaskbarWidget(QWidget):
         if pixmap is self._audio_pixmap:
             return
         self._audio_pixmap = pixmap
+        # パネルにも同じ絵が並んでいる。あちらは描くたびに AudioFeature から貰うので、
+        # 描き直しの合図だけ送れば足りる。
+        self._launcher.notify_audio_changed()
         self.update()
 
     # ---------------------------------------------------------------
@@ -750,6 +781,9 @@ class TaskbarWidget(QWidget):
             # 乗せている間はホットキーや通知領域からの切り替えにも追従させる。
             self._audio_timer.start()
             self.update()
+            # 本体に入りきらない機能(画面定規・カラーピッカー・定型文・ブックマーク)へ
+            # 届くように、真上へアイコンの列を出す。
+            self._launcher.notify_widget_enter()
         except Exception:
             _guard("アイコン表示への切り替え")
 
@@ -760,17 +794,44 @@ class TaskbarWidget(QWidget):
             # 閉じたあとの戻し判定は _popup がまとめて行う。
             if self._menu_open:
                 return
+            # ランチャのパネルへカーソルが移る途中かもしれない。本体とパネルは接して
+            # いても別の窓なので、境目をまたぐ一瞬は必ずここへ来る。閉じる判断
+            # (どちらにも乗っていないか)は猶予を置いてパネル側がまとめて行う。
+            self._launcher.notify_widget_leave()
+            if self._launcher.is_open():
+                # パネルが開いている間はアイコンのままにする。メニューを出したときと
+                # 同じ扱いで(_menu_open のコメント参照)、ここで時計へ戻すと、項目を
+                # 選びに行く途中で本体だけ表示が変わって落ち着かない。戻す判断は
+                # パネルが閉じたときに on_launcher_closed がまとめて行う。
+                return
             self._hover = False
             self._audio_timer.stop()
             self.update()
         except Exception:
             _guard("時計表示への切り替え")
 
+    def on_launcher_closed(self) -> None:
+        """ランチャのパネルが閉じたときに、本体の見た目を現実に合わせ直す。
+
+        パネルを開いている間は leaveEvent が来てもアイコン表示のままにしているので、
+        閉じた時点で改めてカーソルの位置を見て、離れていれば時計へ戻す
+        (メニューを閉じたあとに _popup がしているのと同じ後始末)。"""
+        try:
+            self._hover = self._cursor_inside()
+            if not self._hover:
+                self._audio_timer.stop()
+            self.update()
+        except Exception:
+            _guard("ランチャを閉じたあとの表示の戻し", notify=False)
+
     def mousePressEvent(self, event):
         try:
             # Ctrl+左ドラッグだけを移動にする。素の左ドラッグは音声の切替(クリック)判定に
             # 使うため、そちらと取り合いにならないようにしている(付箋のペンと同じ作法)。
             if event.button() == Qt.LeftButton and event.modifiers() & Qt.ControlModifier:
+                # パネルの位置は出したときの本体の位置から決まる。動かしている間ずっと
+                # 置いてきぼりの列が残るのは邪魔なだけなので、掴んだ時点で畳む。
+                self._launcher.close_panel()
                 # トップレベルの pos() は枠込みの左上を返す。中身の位置は geometry() 側。
                 self._drag_offset = (
                     event.globalPosition().toPoint() - self.geometry().topLeft()
@@ -856,6 +917,11 @@ class TaskbarWidget(QWidget):
         (立ったままだと leaveEvent が効かなくなり、以後ずっとアイコンのままになる)。"""
         if menu is None:
             return
+        # メニューはカーソルの上へ開く(タスクバーが画面の下端にあるため下には出せない)。
+        # つまりパネルとちょうど同じ場所を取り合う。しかもパネルは最前面に居続けるので、
+        # 開いたままにすると項目の上に乗り上げて隠してしまう。右クリックはメニュー、と
+        # 割り切って畳む。
+        self._launcher.close_panel()
         self._topmost_timer.stop()
         self._menu_open = True
         try:

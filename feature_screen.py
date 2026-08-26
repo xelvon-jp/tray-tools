@@ -1,11 +1,13 @@
 # feature_screen.py
 # 画面まわり全般のFeature(旧 feature_capture.py)。トレイアイコンを1つ所有し、
 # 範囲キャプチャ付箋「Rapture」に加えて、カラーピッカー・画面定規・定型文・
-# フォルダブックマーク・任意ウィンドウの最前面固定・スリープ抑止を
+# フォルダブックマーク・任意ウィンドウの最前面固定・スリープ抑止・マウスジグラーを
 # このアイコンのメニューから提供する。
 #
 # アイコンを増やさないのは意図的。状態を持つ機能(スリープ抑止)だけがアイコンの見た目を
-# 占有し、単発の動作はメニュー項目で足りるという方針。
+# 占有し、単発の動作はメニュー項目で足りるという方針。マウスジグラーも状態を持つが、
+# 16px相当のアイコンに2つ目の目印は入らないので、こちらはツールチップとメニューの
+# 見出し(残り時間)だけで示す。
 import math
 import os
 import sys
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 import color_picker
 import explorer_nav
 import launcher
+import mouse_jiggler
 import screen_ruler
 import snippets
 import taskbar_widget
@@ -44,6 +47,25 @@ def _format_minutes(minutes: int) -> str:
     if minutes >= 60 and minutes % 60 == 0:
         return f"{minutes // 60}時間"
     return f"{minutes}分"
+
+
+def _remaining_minutes(deadline):
+    """締切(time.monotonic基準)までの残り分数。deadlineがNone(無期限)ならNone。"""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    # 端数は切り上げる(残り30秒を「0分」と出さない)。ちょうど60分なら60分と出す。
+    return max(math.ceil(remaining / 60), 1) if remaining > 0 else 0
+
+
+def _positive_number(value, default):
+    """settings.jsonは手で編集する前提なので、数字でない値や0・負数が入りうる。
+    そのままQTimerの間隔に渡すと延々と発火し続けるため、おかしければ既定へ落とす。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
 
 
 def _make_awake_icon_image() -> Image.Image:
@@ -108,9 +130,33 @@ class ScreenFeature:
         self._awake_timer.timeout.connect(self._on_awake_expired)
         self._awake_icon = None
 
+        # マウスジグラー。「時限で有効化 → 残り時間を出す → 時間が来たら自動解除」は
+        # スリープ抑止とまったく同じ形なので、メニューの組み立ても状態の持ち方も揃えてある。
+        # ただしタイマーは2本要る(締切用と、入力を送る周期用)。抑止側はOSに状態を1回
+        # 申告するだけで周期の概念が無いため、1本にまとめると片方にしか無い都合を
+        # 両方へ持ち込むことになる。無理に共通化せず、素直に並べて置く。
+        self._jiggle_active = False
+        self._jiggle_minutes = None  # None = 無期限
+        self._jiggle_deadline = None
+        self._jiggle_expire_timer = QTimer()
+        self._jiggle_expire_timer.setSingleShot(True)
+        self._jiggle_expire_timer.timeout.connect(self._on_jiggle_expired)
+        # 送信用は繰り返し。QTimerは作ったスレッドのイベントループで動くので、
+        # メインスレッドで作る=メインスレッドで回る(SendInput自体に縛りは無いが、
+        # 一時スレッドから始めても回らないのでここで持つ)。
+        self._jiggle_timer = QTimer()
+        self._jiggle_timer.timeout.connect(self._on_jiggle_tick)
+
         hotkey_config = app_settings.get("hotkeys", {})
         screen_settings = app_settings.get("screen", {})
         self._awake_choices = screen_settings.get("keep_awake_minutes", [30, 120])
+        self._jiggle_choices = screen_settings.get("jiggler_minutes", [30, 120])
+        self._jiggle_interval_ms = int(
+            _positive_number(screen_settings.get("jiggler_interval_seconds"), 60) * 1000
+        )
+        self._jiggle_idle_seconds = _positive_number(
+            screen_settings.get("jiggler_idle_seconds"), 30
+        )
 
         self._normal_icon = QIcon(str(ICON_PATH)) if ICON_PATH.exists() else QIcon()
         self.tray_icon = QSystemTrayIcon(self._normal_icon)
@@ -160,6 +206,22 @@ class ScreenFeature:
         self._awake_menu.addSeparator()
         self._awake_menu.addAction("解除", self._disable_keep_awake)
 
+        # スリープ抑止のすぐ下に置く。狙いが近い(席を外しても切れないようにする)ので、
+        # 探すときに同じ場所を見れば済むようにしている。
+        self._jiggle_menu = self.menu.addMenu("🖱 マウスジグラー")
+        self._jiggle_actions = {}
+        for minutes in self._jiggle_choices:
+            action = self._jiggle_menu.addAction(
+                _format_minutes(minutes), lambda m=minutes: self._enable_jiggler(m)
+            )
+            action.setCheckable(True)
+            self._jiggle_actions[minutes] = action
+        action = self._jiggle_menu.addAction("無期限", lambda: self._enable_jiggler(None))
+        action.setCheckable(True)
+        self._jiggle_actions[None] = action
+        self._jiggle_menu.addSeparator()
+        self._jiggle_menu.addAction("解除", self._disable_jiggler)
+
         self.menu.addSeparator()
         # 通知領域はプライマリのタスクバーにしか出ないので、各ディスプレイのタスクバーへ
         # 自前で置く出張所の表示切替。詳細は taskbar_widget.py 冒頭を参照。
@@ -180,6 +242,7 @@ class ScreenFeature:
 
         # 残り時間は開くたびに変わるので、表示直前に作り直す
         self.menu.aboutToShow.connect(self._refresh_awake_menu)
+        self.menu.aboutToShow.connect(self._refresh_jiggle_menu)
         self.menu.aboutToShow.connect(self._refresh_taskbar_menu)
 
         self.tray_icon.setContextMenu(self.menu)
@@ -626,13 +689,6 @@ class ScreenFeature:
         self._disable_keep_awake(notify=False)
         self._notify("スリープ抑止", "時間切れで自動解除しました")
 
-    def _remaining_minutes(self):
-        if self._awake_deadline is None:
-            return None
-        remaining = self._awake_deadline - time.monotonic()
-        # 端数は切り上げる(残り30秒を「0分」と出さない)。ちょうど60分なら60分と出す。
-        return max(math.ceil(remaining / 60), 1) if remaining > 0 else 0
-
     def _refresh_awake_menu(self):
         for key, action in self._awake_actions.items():
             action.setChecked(self._awake_active and key == self._awake_minutes)
@@ -640,25 +696,105 @@ class ScreenFeature:
         if not self._awake_active:
             self._awake_menu.setTitle("☕ スリープ抑止")
         elif self._awake_minutes:
-            self._awake_menu.setTitle(f"☕ スリープ抑止（残り{self._remaining_minutes()}分）")
+            self._awake_menu.setTitle(
+                f"☕ スリープ抑止（残り{_remaining_minutes(self._awake_deadline)}分）"
+            )
         else:
             self._awake_menu.setTitle("☕ スリープ抑止（無期限）")
 
+    # ---------------------------------------------------------------
+    # マウスジグラー
+    # ---------------------------------------------------------------
+    def _enable_jiggler(self, minutes):
+        # ここで1回送って確かめる、はしない。メニューを操作した直後は当然「操作中」で、
+        # 無操作の判定に引っかかって送らないため、成否を確かめようがない。
+        # SendInput が弾かれている場合は最初の周期で分かる(_on_jiggle_tick を参照)。
+        self._jiggle_expire_timer.stop()
+        self._jiggle_active = True
+        self._jiggle_minutes = minutes
+        self._jiggle_timer.start(self._jiggle_interval_ms)
+        if minutes:
+            self._jiggle_deadline = time.monotonic() + minutes * 60
+            self._jiggle_expire_timer.start(minutes * 60 * 1000)
+            label = _format_minutes(minutes)
+        else:
+            self._jiggle_deadline = None
+            label = "無期限"
+        self._refresh_state()
+        self._notify("マウスジグラー", f"有効: {label}")
+
+    def _disable_jiggler(self, notify: bool = True):
+        was_active = self._jiggle_active
+        self._jiggle_timer.stop()
+        self._jiggle_expire_timer.stop()
+        self._jiggle_active = False
+        self._jiggle_minutes = None
+        self._jiggle_deadline = None
+        self._refresh_state()
+        if notify and was_active:
+            self._notify("マウスジグラー", "解除しました")
+
+    def _on_jiggle_expired(self):
+        self._disable_jiggler(notify=False)
+        self._notify("マウスジグラー", "時間切れで自動解除しました")
+
+    def _on_jiggle_tick(self):
+        """周期実行の受け口。無操作のときだけカーソルを+1px動かして戻す。
+
+        PySide6はスロット内で例外を投げ切るとプロセスごと終わる。ここは席を外している
+        間ずっと回り続ける場所なので、投げれば確実に踏む。必ず受けて常駐を続ける。"""
+        try:
+            result = mouse_jiggler.jiggle_if_idle(self._jiggle_idle_seconds)
+            if result is None:
+                return  # 操作中(または経過を取れなかった)。跳ねさせず次の周回へ
+            if not result:
+                # SendInput が弾かれている(管理者権限のウィンドウが前面など)。
+                # このまま回しても毎周期失敗するだけなので、止めて1回だけ知らせる。
+                self._disable_jiggler(notify=False)
+                self._notify("マウスジグラー", "入力を送れないため停止しました")
+        except Exception:
+            self._disable_jiggler(notify=False)
+            traceback.print_exc()
+            print("[tray-tools] マウスジグラー: 実行に失敗したため停止しました", file=sys.stderr)
+
+    def _refresh_jiggle_menu(self):
+        for key, action in self._jiggle_actions.items():
+            action.setChecked(self._jiggle_active and key == self._jiggle_minutes)
+
+        if not self._jiggle_active:
+            self._jiggle_menu.setTitle("🖱 マウスジグラー")
+        elif self._jiggle_minutes:
+            self._jiggle_menu.setTitle(
+                f"🖱 マウスジグラー（残り{_remaining_minutes(self._jiggle_deadline)}分）"
+            )
+        else:
+            self._jiggle_menu.setTitle("🖱 マウスジグラー（無期限）")
+
     def _refresh_state(self):
-        """スリープ抑止の状態をトレイアイコンとメニューに反映する。"""
+        """スリープ抑止とマウスジグラーの状態をトレイアイコンとメニューに反映する。"""
         if self._awake_active:
             if self._awake_icon is None and ICON_PATH.exists():
                 self._awake_icon = pil_to_qicon(_make_awake_icon_image())
             self.tray_icon.setIcon(self._awake_icon or self._normal_icon)
-            self.tray_icon.setToolTip("Rapture（スリープ抑止中）")
         else:
             self.tray_icon.setIcon(self._normal_icon)
-            self.tray_icon.setToolTip("Rapture")
+        # アイコンの見た目(リング)はスリープ抑止が占有しているので、ジグラーの状態は
+        # ツールチップで示す。実質16pxのアイコンに2つ目の目印を入れても潰れて読めない。
+        states = []
+        if self._awake_active:
+            states.append("スリープ抑止中")
+        if self._jiggle_active:
+            states.append("マウスジグラー動作中")
+        self.tray_icon.setToolTip(f"Rapture（{'・'.join(states)}）" if states else "Rapture")
         self._refresh_awake_menu()
+        self._refresh_jiggle_menu()
 
     def _on_quit(self):
         self._awake_timer.stop()
         set_keep_awake(False)
+        # 止め忘れると、終了処理の途中でタイマーが回って入力を送りに行く。
+        self._jiggle_timer.stop()
+        self._jiggle_expire_timer.stop()
         self.topmost.release_all()
         # 枠なし・最前面の窓を残したままイベントループを畳むと、画面に貼り付いたまま
         # 消えないことがある。タイマーもここで止まる(hideEvent 参照)。
@@ -680,7 +816,11 @@ class ScreenFeature:
                 self._notify("再起動", "この起動のしかたでは再起動できません")
                 return
             if self._restart_app():
-                QApplication.instance().quit()
+                # メニューの exec() が回しているイベントループの中から quit() を呼ぶと、
+                # そのループを抜けるだけでアプリ本体が終わらないことがある。実際、
+                # 再起動すると古い方がスレッド1つの抜け殻のまま居座っていた。
+                # メニューが閉じてイベントループが戻ってから終わらせる。
+                QTimer.singleShot(0, QApplication.instance().quit)
             else:
                 self._notify("再起動", "起動し直せませんでした")
         except Exception:

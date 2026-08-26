@@ -20,3 +20,4 @@ error.log
 # 設定ファイルの手動バックアップ。settings.json 自体と同じ理由で共有しない。
 # 日時つきの settings.json.bak_20260823_111251 も拾えるよう末尾を * にする。
 settings.json.bak*
+crash.log

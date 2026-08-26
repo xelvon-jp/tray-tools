@@ -11,7 +11,9 @@
 # 単発の動作はアイコンを増やさず、既存Featureのメニュー項目にする。アイコンを持たない能力は
 # 普通のモジュール(color_picker.py / keep_awake.py など)として書き、Featureがそれを呼ぶ。
 import ctypes
+import faulthandler
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -26,7 +28,7 @@ from PySide6.QtWidgets import QApplication
 import settings as settings_module
 from feature_audio import AudioFeature
 from feature_screen import ScreenFeature
-from hotkeys import setup_hotkeys
+from hotkeys import init_keyboard, setup_hotkeys
 from toast import show_toast
 # 窓の出ない実行ファイルの割り出しと、親から切り離して起動するフラグを再起動でも使う。
 from traytools_send import (
@@ -55,6 +57,10 @@ COMMAND_READ_TIMEOUT_MS = 300
 # 通常起動(TrayTools.lnk)は pythonw.exe なので、コンソールに出した例外は誰も見られない。
 # 落ちた理由を後から追えるようにファイルへ残す。
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "error.log"
+# ctypes/COM の先で落ちた瞬間のスタック。error.log と分けるのは、こちらが
+# シグナルハンドラから書かれるため(通常のログと混ざると読みにくい)。
+CRASH_LOG_PATH = Path(__file__).resolve().parent / "crash.log"
+_crash_log_file = None
 
 
 def log_exception(where: str) -> str:
@@ -207,6 +213,28 @@ def _wire_taskbar_widget(features) -> None:
     screen.attach_audio_feature(audio)
 
 
+def _install_crash_log():
+    """ctypes/COM の先で落ちたときに、その瞬間のPythonスタックを残す。
+
+    _install_excepthook が拾えるのは Python の例外だけで、ctypes を経由した先の
+    アクセス違反(0xC0000005)やコールバック内の致命的例外(0xC000041D)は例外にならず
+    プロセスが即死する。実際、Windowsのイベントログには _ctypes.pyd での 0xC0000005 が
+    何度も記録されているのに error.log には何も残っていなかった。
+
+    faulthandler はシグナルハンドラの中から直接書き出すので、この状況でもスタックが
+    残る。ファイルは開いたまま保持する必要があるので、モジュールに掴んでおく
+    (閉じるとハンドラの書き込み先が無くなる)。all_threads=True にするのは、
+    keyboard のフックが専用スレッドで動くため。"""
+    global _crash_log_file
+    try:
+        _crash_log_file = open(CRASH_LOG_PATH, "a", encoding="utf-8", buffering=1)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _crash_log_file.write(os.linesep.join(["", "===== " + stamp + " 起動 =====", ""]))
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except OSError as e:
+        print(f"[tray-tools] クラッシュログを開けません: {e}", file=sys.stderr)
+
+
 def _install_excepthook():
     """どこにも捕まらなかった例外を error.log に残す。
 
@@ -241,7 +269,10 @@ def _install_excepthook():
 
 
 def main():
+    _install_crash_log()
     _install_excepthook()
+    # COMを使う機能(音声デバイス)を組み立てる前に済ませる。理由は init_keyboard を参照。
+    init_keyboard()
 
     # このIDを設定しないと、他のPythonツールとタスクバー/通知領域で同一アプリ扱いされ
     # アイコンが混線することがある。QApplication生成前に呼ぶ必要がある。

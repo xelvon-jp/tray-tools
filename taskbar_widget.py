@@ -450,6 +450,8 @@ class TaskbarWidget(QWidget):
 
         self._config = app_settings.setdefault("taskbar_widget", {})
         self._hover = False
+        # 全画面のアプリに譲ってZオーダーの後ろへ回っている最中か。
+        self._behind = False
         # メニューを出している間だけ True。カーソルがメニューへ移ると leaveEvent が
         # 飛んでくるが、その間もアイコンを出したままにするために使う。
         self._menu_open = False
@@ -653,12 +655,17 @@ class TaskbarWidget(QWidget):
             hwnd = int(self.winId())
             if self._hidden_by_fullscreen():
                 # 動画の全画面表示などの上に出続けると邪魔でしかない。hide() ではなく
-                # 最前面から降ろす。隠すと hideEvent でこのタイマーごと止まり、全画面が
-                # 終わったことに気づけなくなる(降ろすだけならタスクバーの裏に回って
-                # 見えなくなり、タイマーは回り続ける)。
-                window_tools.drop_topmost(hwnd)
-                self._launcher.close_panel()
+                # Zオーダーを下げる。隠すと hideEvent でこのタイマーごと止まり、全画面が
+                # 終わったことに気づけなくなる(下げるだけならタイマーは回り続ける)。
+                #
+                # 下げるのは後ろへ回る1回だけ。毎周期やると、全画面の間ずっと他の窓の
+                # Zオーダーを触り続けることになる。
+                if not self._behind:
+                    self._behind = True
+                    window_tools.send_to_back(hwnd)
+                    self._launcher.close_panel()
                 return
+            self._behind = False
             window_tools.push_topmost(hwnd)
         except Exception:
             _guard("最前面への押し上げ", notify=False)

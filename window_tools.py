@@ -6,6 +6,8 @@ import ctypes
 
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
+# Zオーダーの最後尾。最前面属性も外れる(send_to_back を参照)。
+HWND_BOTTOM = 1
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 # 「Zオーダーだけ動かして、フォーカスは一切触るな」の指定。これを付け忘れると
@@ -128,19 +130,21 @@ def set_topmost(hwnd: int, topmost: bool) -> bool:
     )
 
 
-def drop_topmost(hwnd) -> bool:
-    """最前面グループから降ろす。押し上げの逆。
+def send_to_back(hwnd) -> bool:
+    """Zオーダーのいちばん後ろへ送る(最前面属性も外れる)。
 
     フルスクリーンのアプリ(動画の全画面表示など)が前面に来たとき、その上に自前の
     ウィジェットが出続けると邪魔でしかない。かといって hide() すると hideEvent で
-    押し上げのタイマーごと止まり、全画面が終わったことに気づけなくなる。最前面属性を
-    外すだけならタイマーは回り続けるので、戻ってきたら押し上げを再開できる。
+    押し上げのタイマーごと止まり、全画面が終わったことに気づけなくなる。Zオーダーを
+    下げるだけならタイマーは回り続けるので、戻ってきたら押し上げを再開できる。
 
-    タスクバー自身が最前面なので、降ろせばその裏に回って見えなくなる。"""
+    HWND_NOTOPMOST ではなく HWND_BOTTOM を使う。前者は「最前面ではないウィンドウ全部の
+    上」に置く指定で、最前面属性は外れるものの全画面アプリより手前に居座ってしまう
+    (実際それで隠れなかった)。HWND_BOTTOM なら確実に後ろへ回る。"""
     return bool(
         _user32.SetWindowPos(
             hwnd,
-            HWND_NOTOPMOST,
+            HWND_BOTTOM,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )

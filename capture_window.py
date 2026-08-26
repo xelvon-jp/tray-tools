@@ -256,11 +256,16 @@ class CaptureWindow(QWidget):
     # キーボード: Ctrl+Z でアンドゥ / Ctrl+S で保存 / Ctrl+C でコピー
     # ---------------------------------------------------------------
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+        # 修飾キーは & ではなく == で見る。& だと「Ctrlが含まれていれば真」なので、
+        # 連番キャプチャのホットキー(既定 Ctrl+Alt+S)を付箋にフォーカスがある状態で
+        # 押したときに Ctrl+S とも解釈され、同じ絵が単発の名前と連番の名前の両方で
+        # 保存されていた。
+        ctrl_only = event.modifiers() == Qt.ControlModifier
+        if event.key() == Qt.Key_Z and ctrl_only:
             self.undo()
-        elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
+        elif event.key() == Qt.Key_S and ctrl_only:
             self._save()
-        elif event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+        elif event.key() == Qt.Key_C and ctrl_only:
             self._copy()
         elif event.key() == Qt.Key_Escape and self.close_on_escape:
             self.close()

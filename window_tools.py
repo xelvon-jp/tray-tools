@@ -128,6 +128,41 @@ def set_topmost(hwnd: int, topmost: bool) -> bool:
     )
 
 
+def drop_topmost(hwnd) -> bool:
+    """最前面グループから降ろす。押し上げの逆。
+
+    フルスクリーンのアプリ(動画の全画面表示など)が前面に来たとき、その上に自前の
+    ウィジェットが出続けると邪魔でしかない。かといって hide() すると hideEvent で
+    押し上げのタイマーごと止まり、全画面が終わったことに気づけなくなる。最前面属性を
+    外すだけならタイマーは回り続けるので、戻ってきたら押し上げを再開できる。
+
+    タスクバー自身が最前面なので、降ろせばその裏に回って見えなくなる。"""
+    return bool(
+        _user32.SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    )
+
+
+def foreground_bounds():
+    """前面のウィンドウの矩形(物理px)。前面が無い/デスクトップのときは None。
+
+    デスクトップを除くのは、何も前面に無いときにあれが前面扱いになるため。覆われて
+    いても普通にウィジェットを出したい相手なので、判定から外す。
+
+    覆っているかどうかの判断は呼ぶ側でする。ここが返すのは物理ピクセルで、比べたい
+    相手(画面の矩形)はQtの論理座標なので、換算を持っている側で揃えるほうが確実。"""
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    if get_window_class(hwnd) in DESKTOP_CLASSES:
+        return None
+    return get_window_bounds(hwnd)
+
+
 def push_topmost(hwnd) -> bool:
     """最前面グループの中で、もう一度いちばん手前へ押し上げる。
 

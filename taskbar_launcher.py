@@ -23,9 +23,9 @@ import traceback
 from pathlib import Path
 
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QGuiApplication, QPainter, QPixmap
-from PySide6.QtWidgets import QToolTip, QWidget
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QGuiApplication, QPainter, QPixmap
+from PySide6.QtWidgets import QWidget
 
 import window_tools
 from qt_image import pil_to_qpixmap
@@ -37,6 +37,14 @@ RAPTURE_ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 # 本体はタスクバーの時計に重ねる都合で高さを選べないが、こちらは何にも縛られないので、
 # 狙って押せる大きさを優先する。
 DEFAULT_ITEM_SIZE = 36
+
+# ツールチップをパネルの横に出すときの、文字幅への足し分と隙間(論理px)。
+# 内側の余白は環境で変わるので実測せず、少し多めに見ておく。
+# 名前を出す小窓の内側の余白と、パネルとの隙間(論理px)。
+LABEL_PADDING_X = 8
+LABEL_PADDING_Y = 3
+LABEL_GAP = 6
+LABEL_FLIP_GAP = 6
 ITEM_SIZE_MIN = 16
 
 # アイコンの絵の周囲に空ける余白(px)。当たり判定は項目の正方形いっぱいで、絵だけを
@@ -334,6 +342,61 @@ def _blend(color: QColor, other: QColor, ratio: float) -> QColor:
     )
 
 
+class ItemLabel(QWidget):
+    """項目の名前を出す小窓。
+
+    QToolTip を使わないのは、showText に渡した座標がそのまま使われないため。Qtは
+    カーソルで文字が隠れないよう内部で下へずらすが、縦に並ぶこのパネルではその「下」が
+    次の項目にあたり、どれの説明なのか分からなくなる(実際そう見えていた)。ずらす量は
+    Qt側の都合で決まり、こちらからは指定できないので、自前の窓にして位置を握る。
+
+    配色はパネルから貰う。タスクバーの色を実測して決めているので、ここだけ既定の
+    ツールチップ色にすると浮く。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.ToolTip  # タスクバーに出さず、フォーカスも奪わない
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._text = ""
+        self._background = QColor("#202020")
+        self._foreground = QColor("#ffffff")
+        self._border = QColor("#606060")
+
+    def apply_colors(self, background: QColor, foreground: QColor, border: QColor) -> None:
+        self._background = QColor(background)
+        self._foreground = QColor(foreground)
+        self._border = QColor(border)
+        self.update()
+
+    def show_for(self, text: str, right: int, center_y: int, screen: QRect) -> None:
+        """text を、右端が right・縦の中心が center_y になる位置に出す。
+
+        右端で揃えるのは、パネルの左隣に並べたいため。文字数が違っても
+        パネル側の辺がそろう。左が画面からはみ出すときは右隣へ回す。"""
+        metrics = QFontMetrics(self.font())
+        width = metrics.horizontalAdvance(text) + LABEL_PADDING_X * 2
+        height = metrics.height() + LABEL_PADDING_Y * 2
+        x = right - width
+        if not screen.isEmpty() and x < screen.left():
+            x = right + LABEL_FLIP_GAP
+        self._text = text
+        self.setGeometry(x, center_y - height // 2, width, height)
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self._background)
+        painter.setPen(self._border)
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(self._foreground)
+        painter.drawText(self.rect(), Qt.AlignCenter, self._text)
+
+
 class LauncherPanel(QWidget):
     """タスクバーウィジェットの真上に出る、アイコンを縦一列に並べた枠なしの窓。
 
@@ -367,6 +430,8 @@ class LauncherPanel(QWidget):
         self._keys = []
         self._item_size = DEFAULT_ITEM_SIZE
         self._hover_index = -1
+        # 名前を出す小窓。参照を持たないとGCで消えるのでここで掴んでおく。
+        self._label = ItemLabel()
         self._background = QColor("#202020")
         self._highlight = QColor("#3a3a3a")
         self._border = QColor("#606060")
@@ -440,6 +505,7 @@ class LauncherPanel(QWidget):
         """畳む。カーソルがどこにあっても閉じる(判断は呼ぶ側が済ませている)。"""
         self._close_timer.stop()
         self._hover_index = -1
+        self._label.hide()
         if self.isVisible():
             self.hide()
         # 本体は「パネルが開いている間はアイコンのまま」にしているので、閉じたことを
@@ -534,6 +600,7 @@ class LauncherPanel(QWidget):
         other = QColor("#000000") if ratio == HIGHLIGHT_RATIO_ON_LIGHT else QColor("#ffffff")
         self._highlight = _blend(self._background, other, ratio)
         self._border = _blend(self._background, QColor(text), BORDER_RATIO)
+        self._label.apply_colors(self._background, QColor(text), self._border)
         self.update()
 
     def notify_audio_changed(self) -> None:
@@ -642,15 +709,19 @@ class LauncherPanel(QWidget):
         100px超)まで広げると、タスクバーの上に常時それだけの面積が居座ることになり、
         「アイコンを縦に並べる」という形が崩れる。ツールチップなら幅を取らない。
 
-        setToolTip と showText の両方を使う。showText はその場で出せる(標準の待ち時間が
-        入らない)が、カーソルを動かさずに待った場合など出ない経路があるため、
-        setToolTip も入れて取りこぼしを防ぐ。"""
+        出す位置はパネルの左隣、項目と同じ高さ。詳しくは ItemLabel を参照。"""
         label = "" if index < 0 else (ITEMS.get(self._keys[index], {}).get("label") or "")
-        self.setToolTip(label)
         if not label:
-            QToolTip.hideText()
+            self._label.hide()
             return
-        QToolTip.showText(global_pos, label, self)
+        cell = self._item_rect(index)
+        center_y = self.mapToGlobal(QPoint(0, cell.center().y())).y()
+        self._label.show_for(
+            label,
+            self.geometry().left() - LABEL_GAP,
+            center_y,
+            _screen_bounds(self.geometry()),
+        )
 
     def mousePressEvent(self, event):
         try:

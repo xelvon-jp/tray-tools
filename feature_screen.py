@@ -20,6 +20,7 @@ from PySide6.QtCore import QRect, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+import capture_process
 import color_picker
 import explorer_nav
 import launcher
@@ -29,7 +30,6 @@ import snippets
 import taskbar_widget
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
-from capture_window import CaptureWindow
 from keep_awake import set_keep_awake
 from qt_image import pil_to_qicon
 from toast import show_toast
@@ -96,13 +96,13 @@ class ScreenFeature:
         self.ruler = None
         self.snippet_picker = None
         self.launcher_picker = None
-        # 開いている付箋ウインドウの参照をリストで保持する(GC回収防止)。
-        # ウインドウが閉じられたらリストから取り除く(残し続けるとメモリリークになる)。
-        self.capture_windows = []
-        # グローバルホットキー(capture_sequence)で撮る対象の付箋。同時に何枚でも開けるので、
-        # 最後に作ったものを対象にする。閉じられたら必ずNoneに戻すこと(WA_DeleteOnClose で
-        # 実体が消えるため、掴んだまま触るとRuntimeErrorになる)。
-        self.active_capture_window = None
+        # 付箋(Rapture)のウインドウはここでは持たない。別プロセス(capture_process.py)に
+        # 出したので、参照どころか同じアドレス空間にすら居ない。以前は開いている付箋を
+        # self.capture_windows に、ホットキーで撮る対象を self.active_capture_window に
+        # 持っていたが、両方とも名前付きパイプの一覧から引き当てる形へ移した
+        # (capture_process.list_sticky_pipes / send_to_latest)。
+        # そうしたのは、本体が落ちたときと再起動したときの道連れを防ぐため。開いている
+        # 付箋を掴んでいる限り、本体の寿命が付箋の寿命になってしまう。
 
         self.topmost = TopmostTracker()
 
@@ -343,52 +343,63 @@ class ScreenFeature:
 
     def _open_capture_window(self, image, global_pos, close_on_escape=False,
                              session_stem=None, session_index=0):
-        window = CaptureWindow(
-            image,
-            global_pos,
-            self.app_settings.get("capture", {}),
-            settings_path=self.settings_path,
-            close_on_escape=close_on_escape,
-            session_stem=session_stem,
-            session_index=session_index,
-            # 連番キャプチャのキーをタイトルバーに出させる。設定で変えられる値なので
-            # 付箋側にハードコードさせず、ここで実値を渡す。
-            capture_hotkey=self.app_settings.get("hotkeys", {}).get("capture_sequence"),
-        )
-        window.destroyed.connect(lambda: self._on_window_closed(window))
-        self.capture_windows.append(window)
-        # 直前に作った付箋をホットキーの対象にする。撮りたいのは今出したものなので、
-        # 複数枚並んでいても最後の1枚に向ければ迷わない。
-        self.active_capture_window = window
-        window.show()
+        """付箋を1枚開く。実体はこのプロセスではなく別プロセス(capture_process.py)。
 
-    def _on_window_closed(self, window):
-        if window in self.capture_windows:
-            self.capture_windows.remove(window)
-        # 閉じられた付箋を対象に残すと、次のホットキーで削除済みのC++オブジェクトを
-        # 触ってしまう。ここで必ず手放す(is で比べる。実体が消えた後なので中身は見ない)。
-        if self.active_capture_window is window:
-            self.active_capture_window = None
+        本体と同じプロセスに置くと、本体が落ちたときはもちろん、機能追加のたびの
+        再起動でも開いている付箋が全部消える。手順書を作るために連番キャプチャで
+        何枚も並べている最中にそれをやられると撮り直しになるため、付箋の寿命を
+        本体から切り離してある。付箋側は capture_grab と toast にしか依存しておらず、
+        元から本体の状態を何も見ていないので、そのまま持ち出せた。
+
+        起動には0.37秒ほどかかる(PythonとQtの立ち上がりぶん。実測値と代案は
+        capture_process.spawn のコメント参照)。同じプロセスで開いていた頃の
+        「押した瞬間に出る」よりは遅いが、ここで止まるのは10ms程度でこちらは
+        固まらないため、範囲選択の操作感は変わらない。"""
+        try:
+            capture_process.spawn(
+                image,
+                global_pos,
+                settings_path=self.settings_path,
+                close_on_escape=close_on_escape,
+                session_stem=session_stem,
+                session_index=session_index,
+                # 連番キャプチャのキーをタイトルバーに出させる。設定で変えられる値なので
+                # 付箋側にハードコードさせず、ここで実値を渡す。
+                capture_hotkey=self.app_settings.get("hotkeys", {}).get("capture_sequence"),
+            )
+        except OSError as e:
+            # 撮ったのに何も出ないと、キャプチャ自体が失敗したように見える。
+            # 自動保存だけは済んでいるので、そのことが分かる言い方で知らせる。
+            self._notify("Rapture", f"付箋を開けませんでした(保存は済んでいます)\n{e}")
 
     def capture_sequence(self):
         """ホットキー(既定 Ctrl+Alt+S): 対象の付箋の連番キャプチャを1枚進める。
 
-        付箋の Space と同じ処理だが、こちらは付箋がアクティブでなくても効く。
-        ブラウザ等を操作しながら「操作する → 撮る」を繰り返す使い方が本命で、そのとき
-        前面にいるのは操作中のアプリなので、付箋にフォーカスを戻さず撮れる必要がある。
-        付箋は常に最前面で位置を保っているため、非アクティブでも狙った範囲が撮れる。"""
-        window = self.active_capture_window
-        if window is None:
-            # 黙って無反応だとホットキーが効いていないのか壊れたのか区別が付かない。
-            self._notify("Rapture", "付箋がありません")
-            return
+        付箋の右クリックメニュー「キャプチャ＆保存」と同じ処理だが、こちらは付箋が
+        アクティブでなくても効く。ブラウザ等を操作しながら「操作する → 撮る」を
+        繰り返す使い方が本命で、そのとき前面にいるのは操作中のアプリなので、付箋に
+        フォーカスを戻さず撮れる必要がある。付箋は常に最前面で位置を保っているため、
+        非アクティブでも狙った範囲が撮れる。
+
+        対象は別プロセス化の前と同じく「最後に作られた付箋」。違うのは覚え方で、
+        以前は生成時に掴んだオブジェクトを持ち続けていたのに対し、今は毎回パイプの
+        一覧から選び直す(capture_process.send_to_latest)。本体を再起動しても
+        生きている付箋を見つけ直せる。
+
+        この選び直しで挙動が1つ変わっている。以前は対象の付箋を閉じると、他の付箋が
+        残っていても対象は無し(「付箋がありません」)になった。今は「生きている中で
+        いちばん新しい付箋」なので、閉じると次に新しい付箋へ引き継がれる。掴んだ
+        オブジェクトを覚える方式に戻さない限りこうなるし、再起動をまたいで対象を
+        保てるほうが今回の目的に適うので、こちらを採った。"""
         try:
-            window.capture_and_save()
-        except RuntimeError:
-            # 閉じられた付箋を触ると「削除済みのC++オブジェクト」でRuntimeErrorになる。
-            # destroyed で手放しているので通常は起きないが、ここで投げ切ると常駐ごと落ちる。
-            self.active_capture_window = None
-            self._notify("Rapture", "付箋がありません")
+            if capture_process.send_to_latest("capture_sequence") is None:
+                # 黙って無反応だとホットキーが効いていないのか壊れたのか区別が付かない。
+                self._notify("Rapture", "付箋がありません")
+        except OSError as e:
+            # 付箋は居るのに届かなかった場合。「付箋がありません」と出すと、目の前に
+            # 付箋があるユーザーに嘘をつくことになるので分けて知らせる。
+            self._notify("Rapture", f"付箋へ送れませんでした\n{e}")
+
     # ---------------------------------------------------------------
     def start_color_picker(self):
         if self.picker is not None:
@@ -790,6 +801,8 @@ class ScreenFeature:
         self._refresh_jiggle_menu()
 
     def _on_quit(self):
+        # 付箋(Rapture)はここで閉じない。別プロセスで動いており、本体を終了・再起動
+        # しても生き残るのが狙いだから。見つけて閉じて回る処理を足さないこと。
         self._awake_timer.stop()
         set_keep_awake(False)
         # 止め忘れると、終了処理の途中でタイマーが回って入力を送りに行く。

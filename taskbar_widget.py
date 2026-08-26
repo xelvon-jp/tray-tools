@@ -650,9 +650,32 @@ class TaskbarWidget(QWidget):
         try:
             # winId() はネイティブハンドルを必要なら作ってから返す。
             # ctypes へ渡すので int にしておく(HWNDは c_void_p で受ける側の約束)。
-            window_tools.push_topmost(int(self.winId()))
+            hwnd = int(self.winId())
+            if self._hidden_by_fullscreen():
+                # 動画の全画面表示などの上に出続けると邪魔でしかない。hide() ではなく
+                # 最前面から降ろす。隠すと hideEvent でこのタイマーごと止まり、全画面が
+                # 終わったことに気づけなくなる(降ろすだけならタスクバーの裏に回って
+                # 見えなくなり、タイマーは回り続ける)。
+                window_tools.drop_topmost(hwnd)
+                self._launcher.close_panel()
+                return
+            window_tools.push_topmost(hwnd)
         except Exception:
             _guard("最前面への押し上げ", notify=False)
+
+    def _hidden_by_fullscreen(self) -> bool:
+        """自分が乗っている画面を、前面のウィンドウが丸ごと覆っているか。
+
+        判定に使うのは自分の画面だけ。2枚目で動画を全画面にしているときに、1枚目の
+        ウィジェットまで引っ込む必要はない。"""
+        screen = _screen_for(self.geometry(), _screens())
+        if screen is None:
+            return False
+        bounds = window_tools.foreground_bounds()
+        if bounds is None:
+            return False
+        # Win32が返すのは物理px。画面の矩形はQtの論理座標なので、換算してから比べる。
+        return device_bounds_to_logical(bounds).contains(screen.geometry())
 
     def _on_audio_tick(self):
         try:

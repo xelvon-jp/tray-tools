@@ -42,6 +42,12 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 AWAKE_RING_COLOR = (245, 158, 11, 255)
 AWAKE_RING_WIDTH = 4
 
+# 付箋の待機役(capture_process.py --prewarm)を最初に起こすまでの待ち。
+# 起動直後はトレイアイコンの構築とホットキーの登録で忙しく、ここで0.4秒ぶんの
+# プロセス起動を重ねると常駐が立ち上がるまでの体感が延びる。最初のキャプチャまでには
+# 十分間に合うので、少しずらして出す。
+PREWARM_STARTUP_DELAY_MS = 3000
+
 
 def _format_minutes(minutes: int) -> str:
     if minutes >= 60 and minutes % 60 == 0:
@@ -103,6 +109,13 @@ class ScreenFeature:
         # (capture_process.list_sticky_pipes / send_to_latest)。
         # そうしたのは、本体が落ちたときと再起動したときの道連れを防ぐため。開いている
         # 付箋を掴んでいる限り、本体の寿命が付箋の寿命になってしまう。
+        #
+        # 付箋を出すまでの待ちを消すため、画像を渡されるまでウインドウを出さない
+        # 「待機役」を1つ飼っておく(capture_process の冒頭を参照)。これも別プロセスなので
+        # ここで持つのは参照ではなくタイマーだけ。居場所はやはりパイプの一覧から引く。
+        self._prewarm_timer = QTimer()
+        self._prewarm_timer.setSingleShot(True)
+        self._prewarm_timer.timeout.connect(self._ensure_prewarmed)
 
         self.topmost = TopmostTracker()
 
@@ -253,6 +266,11 @@ class ScreenFeature:
         # 抑止したまま/固定したままアプリを終わらせると、解除する手段が無くなる
         QApplication.instance().aboutToQuit.connect(self._on_quit)
 
+        # 待機役は起動時にも起こしておく。「付箋を使った直後」だけにすると、その日の
+        # 1枚目——いちばん待たされたと感じる1枚——が必ず従来どおりの355msになる。
+        if self._prewarm_enabled():
+            self._prewarm_timer.start(PREWARM_STARTUP_DELAY_MS)
+
     def hotkeys(self) -> dict:
         return {
             "capture_now": lambda: self.start_capture(0),
@@ -341,6 +359,26 @@ class ScreenFeature:
             session_index=1 if saved else 0,
         )
 
+    def _prewarm_enabled(self) -> bool:
+        """待機役を飼うかどうか。既定は有効。
+
+        false にすると1枚ごとにプロセスを起こす従来の形へ戻る。常時1プロセスぶん
+        (専有27MB程度)のメモリを使うのが唯一の代償なので、そこを惜しむPC用の逃げ道。"""
+        return bool(self.app_settings.get("capture", {}).get("prewarm", True))
+
+    def _ensure_prewarmed(self):
+        """待機役が居なければ1人起こす。
+
+        失敗しても黙って諦めてよい。居なければ従来どおり spawn() で出すだけで、
+        キャプチャができなくなることは無い(ここで通知を出すと、原因が別にある不調の
+        たびにトーストが増えて邪魔になる)。"""
+        if not self._prewarm_enabled():
+            return
+        try:
+            capture_process.ensure_prewarmed(self.settings_path)
+        except OSError as e:
+            print(f"[rapture] 待機役を起こせません: {e}", file=sys.stderr)
+
     def _open_capture_window(self, image, global_pos, close_on_escape=False,
                              session_stem=None, session_index=0):
         """付箋を1枚開く。実体はこのプロセスではなく別プロセス(capture_process.py)。
@@ -351,10 +389,36 @@ class ScreenFeature:
         本体から切り離してある。付箋側は capture_grab と toast にしか依存しておらず、
         元から本体の状態を何も見ていないので、そのまま持ち出せた。
 
-        起動には0.37秒ほどかかる(PythonとQtの立ち上がりぶん。実測値と代案は
-        capture_process.spawn のコメント参照)。同じプロセスで開いていた頃の
-        「押した瞬間に出る」よりは遅いが、ここで止まるのは10ms程度でこちらは
-        固まらないため、範囲選択の操作感は変わらない。"""
+        道は2本ある。既定は待機役へ画像を送るだけの道(show_via_warm)で、範囲を選んでから
+        付箋が出るまで実測10ms前後。待機役が居ない・死んでいる・設定で切ってあるときは
+        毎回プロセスを起こす道(spawn)へ落ちる。こちらは355msかかるが確実に出る。
+        速いほうが使えないせいでキャプチャが失敗する、という形には絶対にしないこと。"""
+        capture_hotkey = self.app_settings.get("hotkeys", {}).get("capture_sequence")
+
+        if self._prewarm_enabled():
+            used = None
+            try:
+                used = capture_process.show_via_warm(
+                    image,
+                    global_pos,
+                    settings_path=self.settings_path,
+                    close_on_escape=close_on_escape,
+                    session_stem=session_stem,
+                    session_index=session_index,
+                    capture_hotkey=capture_hotkey,
+                )
+            except OSError as e:
+                # 受け渡し用PNGを書けなかった場合。spawn も同じ書き出しをするので
+                # まず助からないが、道が2本ある意味が無くなるので下へ落とす。
+                print(f"[rapture] 待機役へ渡せません: {e}", file=sys.stderr)
+
+            # 次の1枚のために待機役を補充する。使った待機役はもう付箋なので、
+            # 補充しないと次が355msに戻る。付箋を出す合図は送り終えているので、
+            # ここでプロセスを起こすぶん(10〜15ms)は表示を遅らせない。
+            QTimer.singleShot(0, self._ensure_prewarmed)
+            if used is not None:
+                return
+
         try:
             capture_process.spawn(
                 image,
@@ -365,7 +429,7 @@ class ScreenFeature:
                 session_index=session_index,
                 # 連番キャプチャのキーをタイトルバーに出させる。設定で変えられる値なので
                 # 付箋側にハードコードさせず、ここで実値を渡す。
-                capture_hotkey=self.app_settings.get("hotkeys", {}).get("capture_sequence"),
+                capture_hotkey=capture_hotkey,
             )
         except OSError as e:
             # 撮ったのに何も出ないと、キャプチャ自体が失敗したように見える。
@@ -803,6 +867,15 @@ class ScreenFeature:
     def _on_quit(self):
         # 付箋(Rapture)はここで閉じない。別プロセスで動いており、本体を終了・再起動
         # しても生き残るのが狙いだから。見つけて閉じて回る処理を足さないこと。
+        #
+        # 待機役は別。まだ何も表示していないので残す理由が無く、置いていくと使われない
+        # プロセスが1つ居座る。ここで店じまいを頼む(呼べずに落ちた場合の受け皿は
+        # 待機役側にもある。capture_process._WarmHost._check_parent 参照)。
+        self._prewarm_timer.stop()
+        try:
+            capture_process.shutdown_warm()
+        except OSError as e:
+            print(f"[rapture] 待機役を終われませんでした: {e}", file=sys.stderr)
         self._awake_timer.stop()
         set_keep_awake(False)
         # 止め忘れると、終了処理の途中でタイマーが回って入力を送りに行く。

@@ -115,6 +115,62 @@ class CaptureWindow(QWidget):
         self.setFixedSize(logical_size)
         self.move(global_pos)
 
+    def prepare_for_capture(self, image: QImage, global_pos: QPoint,
+                            capture_settings: dict = None, settings_path=None,
+                            close_on_escape: bool = False, session_stem: str = None,
+                            session_index: int = 0, capture_hotkey: str = None):
+        """作り置きしてあった付箋を、まっさらな1枚として使い回せる状態に戻す。
+
+        待機プロセス(capture_process.py --prewarm)専用の入口。__init__ が組み立てるのと
+        同じ状態へ、既にあるインスタンスを戻す。新しく作らずに使い回すのは、「このプロセスで
+        最初のウインドウを画面に出す」費用(native window の生成と初回描画。実測80〜148ms)を
+        待機中に前払いしてしまうため。一度出して隠したウインドウを持っておくと、次に出すのは
+        実測6〜8msで済む。生成そのものは元から0.5msなので、削れるのは描画のほうだけ。
+
+        __init__ に状態を1つ足したら、ここにも足すこと。片方だけ直すと、待機役から出た
+        付箋にだけ前の1枚の状態(描き込み・ズーム・連番・不透明度)が残る、という
+        再現しにくい形で出る。"""
+        if capture_settings is not None:
+            self.capture_settings = capture_settings
+        if settings_path is not None:
+            self.settings_path = settings_path
+        self.close_on_escape = close_on_escape
+
+        self.setWindowTitle(
+            f"Rapture － {capture_hotkey} で次の1枚" if capture_hotkey else "Rapture"
+        )
+
+        self.session_stem = session_stem or new_session_stem()
+        self.session_index = session_index
+        # __init__ と同じ約束: 自動保存済み(index>0)で開くときだけ「保存済みの絵」を持つ。
+        # QImage は暗黙的共有なので必ず copy() する(参照のままだと後で中身が変わる)。
+        self._last_saved_image = image.copy() if session_index > 0 else None
+
+        self.always_on_top = True
+        self.actions_history = []
+        self._drawing = False
+        self._current_stroke = None
+        self._capturing = False
+
+        self.pen_color = QColor(self.capture_settings.get("pen_color", "#ff0000"))
+        self.pen_width = self.capture_settings.get("pen_width", 3)
+        self.highlighter_enabled = bool(
+            self.capture_settings.get("highlighter_enabled", False)
+        )
+
+        # 下ごしらえのときに 0 にしてある(見えない状態で描かせるため)。戻し忘れると
+        # 透明なままの付箋が出る。
+        self.setWindowOpacity(1.0)
+
+        # 画像と大きさ。zoom_factor は _apply_zoom が setFixedSize までやってくれる。
+        self._set_base_image(image)
+        self._apply_zoom(1.0)
+
+        # showEvent のタイトルバー補正を、この1枚ぶんもう一度効かせる。
+        self._aligned_once = False
+        self._target_global_pos = QPoint(global_pos)
+        self.move(global_pos)
+
     def _set_base_image(self, image: QImage):
         """元画像(QImage, 保存/焼き込み用の正)と、表示用QPixmapを両方更新する。"""
         self.base_image = image

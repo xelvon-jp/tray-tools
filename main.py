@@ -12,6 +12,7 @@
 # 普通のモジュール(color_picker.py / keep_awake.py など)として書き、Featureがそれを呼ぶ。
 import ctypes
 import faulthandler
+import gc
 import json
 import os
 import subprocess
@@ -254,14 +255,31 @@ def _install_excepthook():
         except OSError:
             pass
 
+    def formatted(exc_type, exc_value, exc_tb) -> str:
+        """例外を文字列にする。整形している間はGCを止める。
+
+        comtypes のCOMオブジェクトは CoInitialize(STA)で作られており、作った
+        スレッド以外から解放すると落ちる。PythonのGCは任意のスレッドで走るので、
+        たまたま整形の最中に走ると、記録しようとしたこちらがプロセスごと死ぬ。
+
+        実際 crash.log に、traceback.format_exception の途中でGCが動き
+        comtypes の __del__ → Release で access violation になった記録が残っている。
+        そのとき元の例外が何だったのかは、記録し終える前に死んだので永久に分からない。
+        例外は滅多に起きないので、その間だけ止めても実害は無い。"""
+        gc.disable()
+        try:
+            return "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        finally:
+            gc.enable()
+
     def hook(exc_type, exc_value, exc_tb):
-        write("uncaught", "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        write("uncaught", formatted(exc_type, exc_value, exc_tb))
         original(exc_type, exc_value, exc_tb)
 
     def thread_hook(args):
         write(
             f"uncaught in thread {args.thread.name if args.thread else '?'}",
-            "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+            formatted(args.exc_type, args.exc_value, args.exc_traceback),
         )
 
     sys.excepthook = hook

@@ -1,8 +1,8 @@
 # feature_screen.py
 # 画面まわり全般のFeature(旧 feature_capture.py)。トレイアイコンを1つ所有し、
 # 範囲キャプチャ付箋「Rapture」に加えて、カラーピッカー・画面定規・定型文・
-# フォルダブックマーク・任意ウィンドウの最前面固定・スリープ抑止・マウスジグラーを
-# このアイコンのメニューから提供する。
+# フォルダブックマーク・任意ウィンドウの最前面固定・スリープ抑止・マウスジグラー・
+# 画面に重ねるプレゼン支援をこのアイコンのメニューから提供する。
 #
 # アイコンを増やさないのは意図的。状態を持つ機能(スリープ抑止)だけがアイコンの見た目を
 # 占有し、単発の動作はメニュー項目で足りるという方針。マウスジグラーも状態を持つが、
@@ -25,6 +25,7 @@ import color_picker
 import explorer_nav
 import launcher
 import mouse_jiggler
+import presenter_overlay
 import screen_ruler
 import snippets
 import taskbar_widget
@@ -39,6 +40,11 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 
 # 同梱の発表者ツール。HTMLのプレゼン資料にカンペ・次スライド・タイマー・レーザーを
 # 付ける単一ファイルのビューアで、サーバー不要でブラウザに投げるだけで動く。
+#
+# こちらはブラウザの中だけの道具で、資料を about:blank へ書き出して同一オリジンに
+# しているからスライドを検出できる。任意のウェブサイトを相手にするとクロスオリジンで
+# 前提が崩れるため、その用途は画面へ重ねる側(presenter_overlay.py)が受け持つ。
+# どちらも残す(ローカル資料には向こうのカンペ・次スライドが要る)。
 BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
 
 # スリープ抑止中の目印。通知領域のアイコンは実質16px相当で、隅の小さなバッジは潰れて
@@ -106,6 +112,10 @@ class ScreenFeature:
         self.ruler = None
         self.snippet_picker = None
         self.launcher_picker = None
+        # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
+        # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
+        # OverlayController にまとめてある(ここが1つだけ持つ。持たないとGCで即消える)。
+        self.presenter_overlays = presenter_overlay.OverlayController(app_settings)
         # 付箋(Rapture)のウインドウはここでは持たない。別プロセス(capture_process.py)に
         # 出したので、参照どころか同じアドレス空間にすら居ない。以前は開いている付箋を
         # self.capture_windows に、ホットキーで撮る対象を self.active_capture_window に
@@ -205,6 +215,26 @@ class ScreenFeature:
         )
         self.menu.addAction("📽 発表者ツール", self.start_presenter)
 
+        # 画面に重ねるプレゼン支援。発表者ツールの真下に置く(狙いが同じで、探すときに
+        # 同じ場所を見れば済む)。4項目あるのでサブメニューにまとめ、親メニューが
+        # 縦に伸び続けるのを避ける。
+        self._presenter_menu = self.menu.addMenu("🔦 プレゼン支援（画面に重ねる）")
+        self._presenter_actions = {}
+        for kind, label, hotkey_name in (
+            ("laser", "🔴 レーザーポインタ", "presenter_laser"),
+            ("spotlight", "💡 スポットライト", "presenter_spotlight"),
+            ("black", "⬛ 黒画面", "presenter_blackout"),
+            ("white", "⬜ 白画面", "presenter_whiteout"),
+        ):
+            action = self._presenter_menu.addAction(
+                self._with_hotkey(label, hotkey_config.get(hotkey_name))
+            )
+            action.setCheckable(True)
+            # addAction(テキスト, 関数) で登録すると関数は引数なしで呼ばれる。チェック
+            # 状態を受け取る項目はこの形で繋ぐこと(タスクバーウィジェットと同じ理由)。
+            action.triggered.connect(lambda checked, k=kind: self._set_presenter_overlay(k, checked))
+            self._presenter_actions[kind] = action
+
         self.menu.addSeparator()
         self.menu.addAction(
             self._with_hotkey("📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
@@ -263,6 +293,9 @@ class ScreenFeature:
         self.menu.aboutToShow.connect(self._refresh_awake_menu)
         self.menu.aboutToShow.connect(self._refresh_jiggle_menu)
         self.menu.aboutToShow.connect(self._refresh_taskbar_menu)
+        # プレゼン支援はホットキーやクリック(黒画面)でも切り替わるので、メニューの
+        # チェックは開く直前に実物へ合わせる。
+        self.menu.aboutToShow.connect(self._refresh_presenter_menu)
 
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self._on_activated)
@@ -285,6 +318,12 @@ class ScreenFeature:
             "always_on_top": self.toggle_always_on_top,
             "snippet_picker": self.start_snippet_picker,
             "launcher": lambda: self.start_launcher(),
+            # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
+            # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
+            "presenter_laser": lambda: self.toggle_presenter_overlay("laser"),
+            "presenter_spotlight": lambda: self.toggle_presenter_overlay("spotlight"),
+            "presenter_blackout": lambda: self.toggle_presenter_overlay("black"),
+            "presenter_whiteout": lambda: self.toggle_presenter_overlay("white"),
         }
 
     @staticmethod
@@ -892,6 +931,9 @@ class ScreenFeature:
         # 消えないことがある。タイマーもここで止まる(hideEvent 参照)。
         self._taskbar_rebuild_timer.stop()
         self._close_taskbar_widgets()
+        # プレゼン支援も同じ。黒画面を出したまま終わらせると画面が真っ黒のまま残り、
+        # しかも畳む手段(このアプリ)がもう居ない。
+        self.presenter_overlays.close_all()
 
     def attach_restart(self, restart) -> None:
         """自分を起動し直す手段を受け取る。組み立ては main.py が行う。"""
@@ -939,6 +981,34 @@ class ScreenFeature:
             # os.startfile は関連付けが無いと投げる。Qtのスロット内で投げ切ると
             # 常駐ごと落ちるので、ここで受けて通知に回す。
             self._notify("発表者ツール", f"開けませんでした\n{e}")
+
+    # ---------------------------------------------------------------
+    # プレゼン支援（画面に重ねる）
+    #
+    # 実物は presenter_overlay.py。ここは入口(メニュー・ホットキー・ランチャ)と
+    # 通知だけを持つ。開閉と排他はあちらの OverlayController が面倒を見る。
+    # ---------------------------------------------------------------
+    def toggle_presenter_overlay(self, kind: str) -> bool:
+        """レーザー/スポットライト/黒画面/白画面を切り替える。戻り値は切り替え後の状態。
+
+        通知を出すのは「出した」ときだけ。消したときにトーストを出すと、発表を隠すために
+        黒画面を畳んだ瞬間に画面の隅で通知が光ることになる。"""
+        active = self.presenter_overlays.toggle(kind)
+        label = presenter_overlay.KIND_LABELS.get(kind, kind)
+        if active:
+            self._notify("プレゼン支援", f"{label}: ON")
+        return active
+
+    def _set_presenter_overlay(self, kind: str, checked: bool):
+        """メニューのチェック項目から。QAction.triggered が渡す checked をそのまま
+        出す/畳むの指示として扱う(タスクバーウィジェットの項目と同じ作法)。"""
+        if checked == self.presenter_overlays.is_active(kind):
+            return
+        self.toggle_presenter_overlay(kind)
+
+    def _refresh_presenter_menu(self):
+        for kind, action in self._presenter_actions.items():
+            action.setChecked(self.presenter_overlays.is_active(kind))
 
     def _open_settings_file(self):
         """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。

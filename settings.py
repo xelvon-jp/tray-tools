@@ -49,6 +49,41 @@ DEFAULT_SETTINGS = {
     "tools": {
         "presenter": "",
     },
+    # 画面に重ねて使うプレゼン支援(presenter_overlay.py)。レーザーポインタ・
+    # スポットライト・黒画面/白画面。presenter.html がブラウザの中だけの道具なのに対し、
+    # こちらは画面の上に重ねるので対象を選ばない(ウェブでも PowerPoint でも PDF でも効く)。
+    #
+    # poll_interval_ms は、透過した窓では受け取れないカーソル位置を QCursor.pos() で
+    # 読みに行く周期。16で60fps相当。滑らかさと負荷の兼ね合いは presenter_overlay.py の
+    # DEFAULT_POLL_INTERVAL_MS に実測値付きで書いてある(33にすると負荷は半分)。
+    # partial_repaint は「動いた周りだけ描き直す」。万一描き残し(尾を引く)が出たら
+    # false にすると毎回全面を描き直す。
+    #
+    # target_screen は出す先。"cursor"(既定)ならカーソルのある画面1枚、"all" なら全画面。
+    # 既定を1枚にしてあるのは、マルチディスプレイで全画面を覆うと手元の資料や発表者
+    # ツールまで見えなくなるため。レーザーとスポットライトは、カーソルが別の画面へ
+    # 移れば窓ごと追いかける(黒画面/白画面は出した画面に留まる)。
+    #
+    # laser_radius は光点の芯の半径、laser_glow_radius はその外に広がる淡い光の半径(px)。
+    # spotlight_radius は素通しの半径、spotlight_feather はその外側で減光へ戻すまでの幅、
+    # spotlight_dim は周囲の暗さ(0〜1、1で真っ黒)。
+    # blank_click_to_close を false にすると、黒画面/白画面はクリックでは消えなくなる
+    # (ホットキーとトレイメニューだけで解除する)。
+    "presenter_overlay": {
+        "poll_interval_ms": 16,
+        "partial_repaint": True,
+        "target_screen": "cursor",
+        "laser_radius": 9,
+        "laser_glow_radius": 26,
+        "laser_color": "#ff2d2d",
+        "laser_opacity": 0.9,
+        "spotlight_radius": 140,
+        "spotlight_feather": 60,
+        "spotlight_dim": 0.72,
+        "blank_black_color": "#000000",
+        "blank_white_color": "#ffffff",
+        "blank_click_to_close": True,
+    },
     # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、
     # アプリからの登録で増える(削除・並べ替えは settings.json を直接編集する想定)。
     # target は移動先の決め方: auto(呼んだ時の前面がエクスプローラならそこ、でなければ
@@ -89,7 +124,8 @@ DEFAULT_SETTINGS = {
     # launcher_items は上から下へ並ぶ順で、書ける名前は
     # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
     # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
-    # presenter(発表者ツール)。
+    # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
+    # blackout(黒画面) / whiteout(白画面)。
     # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
@@ -129,6 +165,17 @@ DEFAULT_SETTINGS = {
         "snippet_picker": "ctrl+alt+v",
         # あふｗ側でも同じ機能を J に割り当てているので、単独で呼ぶときも同じ指に置く。
         "launcher": "win+j",
+        # 画面に重ねるプレゼン支援(presenter_overlay.py)。レーザーとスポットライトは
+        # マウスを透過する＝自分ではキーもマウスも受け取れないので、ここが唯一の
+        # 「畳む手段」になる(トレイメニューからも切れるが、発表中に通知領域まで
+        # 手を伸ばすことは考えにくい)。空文字にするとその機能が閉じられなくなるため、
+        # 消すならメニューだけで足りるか考えてから。
+        # 文字は l=laser / o=spOtlight / b=black / w=white。既に使っている
+        # h,r,s,m,c,t,v と win+j のどれとも重ならない組み合わせを選んである。
+        "presenter_laser": "ctrl+alt+l",
+        "presenter_spotlight": "ctrl+alt+o",
+        "presenter_blackout": "ctrl+alt+b",
+        "presenter_whiteout": "ctrl+alt+w",
     },
 }
 

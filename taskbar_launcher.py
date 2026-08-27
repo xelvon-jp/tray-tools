@@ -145,12 +145,37 @@ def _draw_presenter(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.rectangle((21, 50, 43, 53), fill="white")
 
 
+def _draw_laser(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """レーザーポインタ。光点と、そこから四方へ伸びる光。芯だけだと24px相当で
+    ただの点になり、下のスポットライトと見分けが付かないので線を足す。"""
+    for x0, y0, x1, y1 in ((32, 8, 32, 20), (32, 44, 32, 56), (8, 32, 20, 32), (44, 32, 56, 32)):
+        draw.line((x0, y0, x1, y1), fill="white", width=5)
+    draw.ellipse((23, 23, 41, 41), fill="white")
+
+
+def _draw_spotlight(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """スポットライト。暗い面に丸く明るい部分を1つ。丸を白で塗り、周りを色のままに
+    することで「周りが暗い」ほうを見せる。"""
+    draw.rounded_rectangle((8, 12, 56, 52), radius=5, fill=color, outline="white", width=3)
+    draw.ellipse((22, 20, 46, 44), fill="white")
+
+
+def _draw_blank(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """黒画面/白画面。覆われた画面そのもの。黒と白は丸の色で描き分けるので、
+    絵は共通のものを1つだけ持つ。"""
+    draw.rounded_rectangle((10, 14, 54, 46), radius=4, fill="white")
+    draw.rectangle((30, 46, 34, 52), fill="white")
+
+
 _GLYPHS = {
     "ruler": _draw_ruler,
     "dropper": _draw_dropper,
     "snippet": _draw_snippet,
     "folder": _draw_folder,
     "presenter": _draw_presenter,
+    "laser": _draw_laser,
+    "spotlight": _draw_spotlight,
+    "blank": _draw_blank,
 }
 
 
@@ -264,6 +289,41 @@ ITEMS = {
         "icon": "presenter",
         "color": "#7c3aed",
     },
+    # 画面に重ねるプレゼン支援(presenter_overlay.py)。押すたびに出す/畳むが入れ替わる。
+    # 出ているかどうかはここでは示せない(パネルはマウスを乗せている間だけの表示で、
+    # 状態を出し続ける場所が無い)ので、状態を見たいときは通知領域のメニューを開く。
+    "laser": {
+        "label": "レーザーポインタ",
+        "feature": "screen",
+        "method": "toggle_presenter_overlay",
+        "args": ("laser",),
+        "icon": "laser",
+        "color": "#dc2626",
+    },
+    "spotlight": {
+        "label": "スポットライト",
+        "feature": "screen",
+        "method": "toggle_presenter_overlay",
+        "args": ("spotlight",),
+        "icon": "spotlight",
+        "color": "#ca8a04",
+    },
+    "blackout": {
+        "label": "黒画面",
+        "feature": "screen",
+        "method": "toggle_presenter_overlay",
+        "args": ("black",),
+        "icon": "blank",
+        "color": "#1f2937",
+    },
+    "whiteout": {
+        "label": "白画面",
+        "feature": "screen",
+        "method": "toggle_presenter_overlay",
+        "args": ("white",),
+        "icon": "blank",
+        "color": "#94a3b8",
+    },
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
@@ -285,6 +345,13 @@ ITEM_ALIASES = {
     "launcher": "bookmarks",
     "folder": "bookmarks",
     "presenter": "presenter",
+    # プレゼン支援は hotkeys セクションでの名前(presenter_laser 等)でも受ける。
+    "presenter_laser": "laser",
+    "presenter_spotlight": "spotlight",
+    "presenter_blackout": "blackout",
+    "presenter_whiteout": "whiteout",
+    "black": "blackout",
+    "white": "whiteout",
 }
 
 # 同じ書き損じで毎回警告を出さないための記録(設定を読むたびに呼ばれるため)。

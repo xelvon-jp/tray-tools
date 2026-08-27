@@ -1461,6 +1461,12 @@ async function openShow() {
   if (App.child && !App.child.closed) { App.child.focus(); return; }
   const w = window.open('', 'pvShow', 'width=1280,height=720,menubar=no,toolbar=no,location=no,status=no');
   if (!w) { toast('ポップアップがブロックされました。このページのポップアップを許可してください', true); return; }
+  // 新しいウィンドウを開けない設定のブラウザでは、window.open が自分自身を返すことがある。
+  // 気づかずに資料を document.write するとこのツール自身のページが消えるので、必ず弾く。
+  if (w === window || w === window.self) {
+    toast('別ウィンドウを開けませんでした。ブラウザが新しいウィンドウを開けない設定になっています（Firefox なら browser.link.open_newwindow を確認、または Chrome で開いてください）', true);
+    return;
+  }
   App.child = w;
   if (App.html) {
     App.baseW = w.innerWidth || App.baseW;

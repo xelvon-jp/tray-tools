@@ -136,11 +136,21 @@ def _draw_folder(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.rounded_rectangle((10, 22, 54, 48), radius=4, fill="white")
 
 
+def _draw_presenter(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """発表者ツール。スクリーンと脚。24px相当まで縮めても「画面」に見えるよう、
+    枠は塗りつぶしにして中の余白で見せる(細い線だと潰れる)。"""
+    draw.rounded_rectangle((10, 14, 54, 42), radius=3, fill="white")
+    draw.rectangle((15, 19, 49, 37), fill=color)
+    draw.rectangle((30, 42, 34, 50), fill="white")
+    draw.rectangle((21, 50, 43, 53), fill="white")
+
+
 _GLYPHS = {
     "ruler": _draw_ruler,
     "dropper": _draw_dropper,
     "snippet": _draw_snippet,
     "folder": _draw_folder,
+    "presenter": _draw_presenter,
 }
 
 
@@ -245,6 +255,16 @@ ITEMS = {
         "icon": "folder",
         "color": "#f59e0b",
     },
+    # 設定 tools.presenter にパスを書いたときだけ意味がある(未設定なら押しても
+    # その旨を通知するだけ)。既定の launcher_items には入れていない。
+    "presenter": {
+        "label": "発表者ツール",
+        "feature": "screen",
+        "method": "start_presenter",
+        "args": (),
+        "icon": "presenter",
+        "color": "#7c3aed",
+    },
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
@@ -265,6 +285,7 @@ ITEM_ALIASES = {
     "snippet_picker": "snippets",
     "launcher": "bookmarks",
     "folder": "bookmarks",
+    "presenter": "presenter",
 }
 
 # 同じ書き損じで毎回警告を出さないための記録(設定を読むたびに呼ばれるため)。

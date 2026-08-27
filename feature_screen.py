@@ -199,6 +199,8 @@ class ScreenFeature:
             self._with_hotkey("📁 フォルダブックマーク", hotkey_config.get("launcher")),
             lambda: self.start_launcher(),
         )
+        self.menu.addAction("📽 発表者ツール", self.start_presenter)
+
         self.menu.addSeparator()
         self.menu.addAction(
             self._with_hotkey("📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
@@ -911,6 +913,29 @@ class ScreenFeature:
                 self._notify("再起動", "起動し直せませんでした")
         except Exception:
             self._log_taskbar_failure("再起動")
+
+    def start_presenter(self):
+        """HTMLプレゼン資料の発表者ツールを開く(設定 tools.presenter にパスがあるとき)。
+
+        あちらは単一ファイルの file:// で動くビューアなので、既定のブラウザに投げる
+        だけでよい。tray-tools 側に資料を渡す仕組みは持たせていない(資料は向こうへ
+        ドラッグ＆ドロップする)。"""
+        path = (self.app_settings.get("tools", {}) or {}).get("presenter") or ""
+        if not path:
+            self._notify(
+                "発表者ツール",
+                "settings.json の tools.presenter にパスを書いてください",
+            )
+            return
+        if not os.path.exists(path):
+            self._notify("発表者ツール", f"見つかりません\n{path}")
+            return
+        try:
+            os.startfile(path)
+        except OSError as e:
+            # os.startfile は関連付けが無いと投げる。Qtのスロット内で投げ切ると
+            # 常駐ごと落ちるので、ここで受けて通知に回す。
+            self._notify("発表者ツール", f"開けませんでした\n{e}")
 
     def _open_settings_file(self):
         """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。

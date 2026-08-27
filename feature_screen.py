@@ -29,6 +29,7 @@ import presenter_overlay
 import screen_ruler
 import snippets
 import taskbar_widget
+import web_presenter
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from keep_awake import set_keep_awake
@@ -42,9 +43,10 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 # 付ける単一ファイルのビューアで、サーバー不要でブラウザに投げるだけで動く。
 #
 # こちらはブラウザの中だけの道具で、資料を about:blank へ書き出して同一オリジンに
-# しているからスライドを検出できる。任意のウェブサイトを相手にするとクロスオリジンで
-# 前提が崩れるため、その用途は画面へ重ねる側(presenter_overlay.py)が受け持つ。
-# どちらも残す(ローカル資料には向こうのカンペ・次スライドが要る)。
+# しているからスライドを検出できる。他所のサイトを iframe で直接開くとクロスオリジンで
+# その前提が崩れるが、こちら側がブラウザ(QtWebEngine)を持って DOM を取り出してしまえば
+# 壁は消える。それが web_presenter.py で、あちらは presenter.html を無改造のまま使う。
+# 画面へ重ねる側(presenter_overlay.py)も残す(対象を選ばないのはあちらの取り柄)。
 BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
 
 # スリープ抑止中の目印。通知領域のアイコンは実質16px相当で、隅の小さなバッジは潰れて
@@ -214,6 +216,9 @@ class ScreenFeature:
             lambda: self.start_launcher(),
         )
         self.menu.addAction("📽 発表者ツール", self.start_presenter)
+        # 同じ発表者ツールを、ローカル資料ではなく任意のサイトに対して使う入口。
+        # 真下に置くのは、探すときに同じ場所を見れば済むようにするため。
+        self.menu.addAction("🌐 サイトを取り込んで開く", self.start_web_presenter)
 
         # 画面に重ねるプレゼン支援。発表者ツールの真下に置く(狙いが同じで、探すときに
         # 同じ場所を見れば済む)。4項目あるのでサブメニューにまとめ、親メニューが
@@ -981,6 +986,23 @@ class ScreenFeature:
             # os.startfile は関連付けが無いと投げる。Qtのスロット内で投げ切ると
             # 常駐ごと落ちるので、ここで受けて通知に回す。
             self._notify("発表者ツール", f"開けませんでした\n{e}")
+
+    def start_web_presenter(self, url: str = None):
+        """任意のウェブサイトを取り込んで、発表者ツールとして開く(web_presenter.py)。
+
+        URL を尋ねる → 非表示の QtWebEngine で開く → レンダリング後の DOM を取り出す →
+        <base> を挿して presenter.html と一緒に %TEMP% へ書き出す → 既定のブラウザへ、
+        という流れ。読み込みは非同期なので、この関数は待たずにすぐ戻る(結果は通知)。
+
+        中身の始末はすべてあちらが持つ。ここは入口と通知だけ(プレゼン支援と同じ形)。
+        url を渡せば尋ねずに取り込む。"""
+        web_presenter.open_site(
+            self.app_settings,
+            self.settings_path,
+            BUNDLED_PRESENTER,
+            self._notify,
+            url=url,
+        )
 
     # ---------------------------------------------------------------
     # プレゼン支援（画面に重ねる）

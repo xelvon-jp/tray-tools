@@ -167,12 +167,23 @@ def _draw_blank(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.rectangle((30, 46, 34, 52), fill="white")
 
 
+def _draw_globe(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """サイトを取り込んで開く。地球儀(丸＋赤道＋経線)。
+
+    線は白い丸を先に塗ってから色で抜く。細い白線を色の上に描くと24px相当で消えるが、
+    白い面の中に色の筋を入れる形なら面積が残るので潰れにくい(定型文の絵と同じ手)。"""
+    draw.ellipse((10, 10, 54, 54), fill="white")
+    draw.line((12, 32, 52, 32), fill=color, width=4)
+    draw.ellipse((23, 10, 41, 54), outline=color, width=4)
+
+
 _GLYPHS = {
     "ruler": _draw_ruler,
     "dropper": _draw_dropper,
     "snippet": _draw_snippet,
     "folder": _draw_folder,
     "presenter": _draw_presenter,
+    "globe": _draw_globe,
     "laser": _draw_laser,
     "spotlight": _draw_spotlight,
     "blank": _draw_blank,
@@ -289,6 +300,18 @@ ITEMS = {
         "icon": "presenter",
         "color": "#7c3aed",
     },
+    # 任意のサイトを取り込んで発表者ツールとして開く(web_presenter.py)。URL を尋ねる
+    # ダイアログが出るので、押してすぐ何かが起きる他の項目とは毛色が違う。既定の並び
+    # (DEFAULT_ITEMS)には入れていない: パネルは縦に伸びる一方なので、使う人だけが
+    # settings.json の launcher_items に足す。
+    "web_presenter": {
+        "label": "サイトを取り込んで開く",
+        "feature": "screen",
+        "method": "start_web_presenter",
+        "args": (),
+        "icon": "globe",
+        "color": "#0d9488",
+    },
     # 画面に重ねるプレゼン支援(presenter_overlay.py)。押すたびに出す/畳むが入れ替わる。
     # 出ているかどうかはここでは示せない(パネルはマウスを乗せている間だけの表示で、
     # 状態を出し続ける場所が無い)ので、状態を見たいときは通知領域のメニューを開く。
@@ -345,6 +368,9 @@ ITEM_ALIASES = {
     "launcher": "bookmarks",
     "folder": "bookmarks",
     "presenter": "presenter",
+    "web": "web_presenter",
+    "site": "web_presenter",
+    "presenter_web": "web_presenter",
     # プレゼン支援は hotkeys セクションでの名前(presenter_laser 等)でも受ける。
     "presenter_laser": "laser",
     "presenter_spotlight": "spotlight",

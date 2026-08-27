@@ -46,8 +46,22 @@ DEFAULT_SETTINGS = {
     },
     # 外から呼ぶツール。空なら同梱のものを使う(presenter.html はこのフォルダにある)。
     # 別の場所に置いたものを使いたいときだけパスを書く。
+    #
+    # web_presenter_* は「🌐 サイトを取り込んで開く」(web_presenter.py)の調整用。
+    #   timeout_seconds … 読み込みの打ち切り。loadFinished が永遠に来ないサイトがある
+    #     ので必ず切る。重いページを相手にして毎回間に合わないなら伸ばす。
+    #   settle_ms … 読み込み完了から DOM を取り出すまでの追加の待ち。load 直後に中身を
+    #     書き足すページ向け。骨組みだけしか取り込めないときは伸ばす。
+    #   strip_scripts … 取り込んだ HTML から <script> を落とす。取り込んだ JS が
+    #     発表者ツールの iframe の中で暴れて表示が崩れるサイト向けの逃げ道。
+    #     既定は false(スライド送りを JS が担う資料もあるため)。
+    #   web_presenter_recent … 入力欄に出す履歴。取り込みに成功したときだけ増える。
     "tools": {
         "presenter": "",
+        "web_presenter_timeout_seconds": 30,
+        "web_presenter_settle_ms": 800,
+        "web_presenter_strip_scripts": False,
+        "web_presenter_recent": [],
     },
     # 画面に重ねて使うプレゼン支援(presenter_overlay.py)。レーザーポインタ・
     # スポットライト・黒画面/白画面。presenter.html がブラウザの中だけの道具なのに対し、

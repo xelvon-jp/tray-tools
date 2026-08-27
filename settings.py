@@ -98,6 +98,46 @@ DEFAULT_SETTINGS = {
         "blank_white_color": "#ffffff",
         "blank_click_to_close": True,
     },
+    # 手元の画面の一部を別のモニタへ全画面でミラーする「画面ミラー」(screen_mirror.py)。
+    # 範囲を選んだあともその中は普通に操作でき、操作した結果がそのまま向こうに映る。
+    # 画面共有(Teams等)に出しているモニタへ向けて使う。
+    #
+    # 選ぶ範囲の大きさは自由で、固定されるのは縦横比だけ。そのぶん大きく選ぶほど重い。
+    # このPCでの実測は 1280x720 で 29.6fps(1コアの71%)、1920x1080 で 25.8fps(108%、
+    # コマ落ちする)。重いと感じたら範囲を小さくするか、fps を落とす。範囲選択中は
+    # その大きさで出せそうなfpsが出るし、ミラー中は実測値が手元の枠に出る。
+    #
+    # fps は1秒あたりに送る枚数(1〜60)。既定30。
+    # target_screen_name は出す先のモニタ名(QScreen.name())。トレイメニューの
+    #   「ミラー先」から選ぶとここへ書かれる。空なら「選択範囲が乗っていないモニタ」の
+    #   先頭を自動で使う(モニタが3枚以上ある構成では明示的に選ぶこと)。
+    # aspect は範囲選択の既定の縦横比("16:9" / "4:3" / "free")。選択中も 1/2/3 キーと
+    #   ホイールで切り替えられる(切り替えた結果はその起動の間だけ覚える)。
+    # cursor_* はミラー先に描く矢印。実カーソルは映らないので自前で描いている。
+    #   拡大率によらず一定の大きさにしてあり、cursor_size はその一辺(論理px)。
+    # click_ripple はクリックした瞬間にミラー先へ波紋を出す。画面共有では「今押した」が
+    #   伝わりにくいため。_ms は消えるまでの時間、_radius は広がりきったときの半径。
+    # source_frame は手元に「いまミラーしている範囲」の枠を出す。枠は範囲の外側に描くので
+    #   ミラーには映り込まない。枠の外の帯に実測fpsも出る。
+    #
+    # レーザーとスポットライトの色や大きさはここには無い。ミラー先へ描くときも
+    # presenter_overlay セクションの値をそのまま使う(同じ道具の同じ光点なので)。
+    "screen_mirror": {
+        "fps": 30,
+        "target_screen_name": "",
+        "aspect": "16:9",
+        "cursor_size": 34,
+        "cursor_color": "#ffffff",
+        "cursor_outline": "#101010",
+        "click_ripple": True,
+        "click_ripple_ms": 420,
+        "click_ripple_radius": 62,
+        "click_ripple_color": "#ffd400",
+        "source_frame": True,
+        "source_frame_color": "#00c8ff",
+        "source_frame_width": 3,
+        "source_frame_opacity": 0.55,
+    },
     # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、
     # アプリからの登録で増える(削除・並べ替えは settings.json を直接編集する想定)。
     # target は移動先の決め方: auto(呼んだ時の前面がエクスプローラならそこ、でなければ
@@ -139,7 +179,7 @@ DEFAULT_SETTINGS = {
     # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
     # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
     # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
-    # blackout(黒画面) / whiteout(白画面)。
+    # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー)。
     # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
@@ -190,6 +230,14 @@ DEFAULT_SETTINGS = {
         "presenter_spotlight": "ctrl+alt+o",
         "presenter_blackout": "ctrl+alt+b",
         "presenter_whiteout": "ctrl+alt+w",
+        # 画面ミラー(screen_mirror.py)の開始/終了。押すと範囲選択が出て、選ぶと
+        # ミラーが始まる。もう一度押すと畳む。p は presentation の p で、
+        # 既に使っている h,r,s,m,c,t,v,l,o,b,w と win+j のどれとも重ならない。
+        #
+        # ミラー中のレーザーとスポットライトに別のキーは要らない。上の
+        # presenter_laser / presenter_spotlight がそのままミラー先の光点になる
+        # (手元に重ねてしまうと、それが撮られて向こうへ二重に映る)。
+        "screen_mirror": "ctrl+alt+p",
     },
 }
 

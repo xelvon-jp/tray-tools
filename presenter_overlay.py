@@ -26,8 +26,15 @@
 import sys
 import traceback
 
-from PySide6.QtCore import QPoint, QPointF, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QGuiApplication, QPainter, QRadialGradient
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QGuiApplication,
+    QPainter,
+    QPainterPath,
+    QRadialGradient,
+)
 from PySide6.QtWidgets import QWidget
 
 from toast import show_toast
@@ -159,6 +166,102 @@ def _as_color(value, default: str) -> QColor:
 def overlay_config(app_settings: dict) -> dict:
     """settings.json の presenter_overlay セクション。無ければ空辞書。"""
     return (app_settings or {}).get("presenter_overlay", {}) or {}
+
+
+# ---------------------------------------------------------------
+# レーザーとスポットライトの描画
+#
+# 窓のクラスから切り出して関数にしてある。画面ミラー(screen_mirror.py)が同じ光点と
+# 同じ穴を「ミラー先の窓」に描くため。あちらは対象が違う(こちらは手元の画面に重ね、
+# あちらは別モニタへ映した映像の上に描く)が、絵と設定はまったく同じでよい。
+# 2箇所に同じ絵を書くと、片方だけ直したときに見た目が食い違う。
+#
+# 設定の読み取りも *_params として一緒に出してある。色や半径を2つのセクションで
+# 設定させる意味は無いので、画面ミラー側もこの presenter_overlay セクションを読む。
+# ---------------------------------------------------------------
+def laser_params(app_settings: dict) -> dict:
+    """draw_laser にそのまま渡せる形で設定を読む。"""
+    cfg = overlay_config(app_settings)
+    radius = max(_as_int(cfg.get("laser_radius"), DEFAULT_LASER_RADIUS), 1)
+    return {
+        "color": _as_color(cfg.get("laser_color"), DEFAULT_LASER_COLOR),
+        "radius": radius,
+        "glow": max(_as_int(cfg.get("laser_glow_radius"), DEFAULT_LASER_GLOW_RADIUS), radius),
+        "opacity": _as_float(cfg.get("laser_opacity"), DEFAULT_LASER_OPACITY, 0.0, 1.0),
+    }
+
+
+def spotlight_params(app_settings: dict) -> dict:
+    """draw_spotlight にそのまま渡せる形で設定を読む。"""
+    cfg = overlay_config(app_settings)
+    dim = _as_float(cfg.get("spotlight_dim"), DEFAULT_SPOTLIGHT_DIM, 0.0, 1.0)
+    return {
+        "radius": max(_as_int(cfg.get("spotlight_radius"), DEFAULT_SPOTLIGHT_RADIUS), 1),
+        "feather": max(_as_int(cfg.get("spotlight_feather"), DEFAULT_SPOTLIGHT_FEATHER), 0),
+        "dim_alpha": int(round(dim * 255)),
+    }
+
+
+def draw_laser(painter: QPainter, center: QPointF, color: QColor, radius: int,
+               glow: int, opacity: float) -> None:
+    """光点を1つ描く。芯(はっきりした円)と暈(そのまわりの淡いにじみ)の2枚重ね。
+
+    暈を付けるのは、投影した画面では芯だけだと小さくて見失うため。実物のレーザー
+    ポインタも同じ見え方をするので、見る側にとっても素直。
+
+    呼ぶ側で Antialiasing を立てておくこと(ペンとブラシはここで設定する)。"""
+    def alpha_color(ratio: float) -> QColor:
+        shade = QColor(color)
+        shade.setAlphaF(opacity * ratio)
+        return shade
+
+    painter.save()
+    painter.setPen(Qt.NoPen)
+    if glow > radius:
+        core_stop = radius / glow
+        gradient = QRadialGradient(center, float(glow))
+        gradient.setColorAt(0.0, alpha_color(0.45))
+        gradient.setColorAt(core_stop, alpha_color(0.30))
+        gradient.setColorAt(1.0, alpha_color(0.0))
+        painter.setBrush(gradient)
+        painter.drawEllipse(center, float(glow), float(glow))
+
+    painter.setBrush(alpha_color(1.0))
+    painter.drawEllipse(center, float(radius), float(radius))
+    painter.restore()
+
+
+def draw_spotlight(painter: QPainter, area, center: QPointF, radius: int,
+                   feather: int, dim_alpha: int) -> None:
+    """area を減光しつつ、center のまわりだけ抜く。
+
+    以前は「全面を減光してから CompositionMode_DestinationOut で穴を開ける」形だった。
+    やめたのは、あれが透過窓(下が透けるので、アルファを削れば素通しになる)でしか
+    成立しないため。画面ミラーは不透明な窓に映像を描いた上へ重ねるので、アルファを
+    削ると窓そのものに穴が開いてしまう。
+
+    今の形は素の重ね塗り(SourceOver)だけで、どちらの窓でも同じ絵になる。中心が透明・
+    外周が減光色の放射グラデーションを1本作り、それで area を塗りつぶす。QGradient は
+    最後の止めより外を最後の色で埋める(PadSpread)ので、円の外は自動的に減光色になる。
+    塗りが1回なので、減光した部分と抜いた部分の境目に継ぎ目も出ない。"""
+    painter.save()
+    outer = float(radius + feather)
+    if feather > 0:
+        gradient = QRadialGradient(center, outer)
+        gradient.setColorAt(0.0, QColor(0, 0, 0, 0))
+        gradient.setColorAt(radius / outer, QColor(0, 0, 0, 0))
+        gradient.setColorAt(1.0, QColor(0, 0, 0, dim_alpha))
+        painter.fillRect(area, gradient)
+    else:
+        # feather=0 をグラデーションで表すと、内側の止め位置(radius/outer)が 1.0 に
+        # なって最後の止めと同じ位置で重なり、中心から外へだらだら薄くなる帯に化ける
+        # (実測: 中心のアルファが0にならず、半径の半分の位置で既に4割方戻る)。
+        # 縁をぼかさないなら、矩形と円の2つを持つパスを偶奇規則で塗れば穴が開く。
+        path = QPainterPath()
+        path.addRect(QRectF(area))
+        path.addEllipse(center, outer, outer)
+        painter.fillPath(path, QColor(0, 0, 0, dim_alpha))
+    painter.restore()
 
 
 def cursor_screen():
@@ -379,44 +482,16 @@ class LaserOverlay(_CursorOverlay):
 
     def __init__(self, app_settings: dict):
         super().__init__(app_settings)
-        self._color = _as_color(self.cfg.get("laser_color"), DEFAULT_LASER_COLOR)
-        self._radius = max(_as_int(self.cfg.get("laser_radius"), DEFAULT_LASER_RADIUS), 1)
-        self._glow = max(
-            _as_int(self.cfg.get("laser_glow_radius"), DEFAULT_LASER_GLOW_RADIUS),
-            self._radius,
-        )
-        self._opacity = _as_float(self.cfg.get("laser_opacity"), DEFAULT_LASER_OPACITY, 0.0, 1.0)
+        # 絵と設定は draw_laser / laser_params に置いてある(画面ミラーと共有するため)。
+        self._laser = laser_params(app_settings)
 
     def dirty_radius(self) -> int:
-        return self._glow
+        return self._laser["glow"]
 
     def paintEvent(self, event):
-        """光点を1つ描く。芯(はっきりした円)と暈(そのまわりの淡いにじみ)の2枚重ね。
-
-        暈を付けるのは、投影した画面では芯だけだと小さくて見失うため。実物のレーザー
-        ポインタも同じ見え方をするので、見る側にとっても素直。"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-        center = QPointF(self.cursor_local())
-
-        if self._glow > self._radius:
-            core_stop = self._radius / self._glow
-            gradient = QRadialGradient(center, float(self._glow))
-            gradient.setColorAt(0.0, self._alpha_color(0.45))
-            gradient.setColorAt(core_stop, self._alpha_color(0.30))
-            gradient.setColorAt(1.0, self._alpha_color(0.0))
-            painter.setBrush(gradient)
-            painter.drawEllipse(center, float(self._glow), float(self._glow))
-
-        painter.setBrush(self._alpha_color(1.0))
-        painter.drawEllipse(center, float(self._radius), float(self._radius))
-
-    def _alpha_color(self, ratio: float) -> QColor:
-        """芯の色を、設定の不透明度に ratio を掛けた濃さで返す。"""
-        color = QColor(self._color)
-        color.setAlphaF(self._opacity * ratio)
-        return color
+        draw_laser(painter, QPointF(self.cursor_local()), **self._laser)
 
 
 class SpotlightOverlay(_CursorOverlay):
@@ -424,52 +499,18 @@ class SpotlightOverlay(_CursorOverlay):
 
     def __init__(self, app_settings: dict):
         super().__init__(app_settings)
-        self._radius = max(
-            _as_int(self.cfg.get("spotlight_radius"), DEFAULT_SPOTLIGHT_RADIUS), 1
-        )
-        self._feather = max(
-            _as_int(self.cfg.get("spotlight_feather"), DEFAULT_SPOTLIGHT_FEATHER), 0
-        )
-        dim = _as_float(self.cfg.get("spotlight_dim"), DEFAULT_SPOTLIGHT_DIM, 0.0, 1.0)
-        self._dim_alpha = int(round(dim * 255))
+        # 絵と設定は draw_spotlight / spotlight_params に置いてある(画面ミラーと共有)。
+        self._spot = spotlight_params(app_settings)
 
     def dirty_radius(self) -> int:
-        return self._radius + self._feather
+        return self._spot["radius"] + self._spot["feather"]
 
     def paintEvent(self, event):
-        """減光を全面に敷いてから、カーソルの周りだけ抜く。
-
-        抜くのに CompositionMode_Clear(capture_overlay の選択範囲と同じ手)は使えない。
-        あれは元の色に関係なく透明にするので、縁をぼかすための濃淡が乗らず、丸い切り口が
-        そのまま見えてしまう。DestinationOut なら「描いた分だけ不透明度を削る」ので、
-        中心を不透明・外周を透明にした放射グラデーションを1回描けば縁がぼける。
-
-        塗るのは self.rect() ではなく event.rect()。部分描画で呼ばれたときに全面を
+        """塗るのは self.rect() ではなく event.rect()。部分描画で呼ばれたときに全面を
         塗り直さないため(触っていない場所は前回描いたものがそのまま残る)。"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(event.rect(), QColor(0, 0, 0, self._dim_alpha))
-
-        center = QPointF(self.cursor_local())
-        outer = float(self._radius + self._feather)
-        if self._feather > 0:
-            # 色は何でもよい(DestinationOut が見るのはアルファだけ)。中心は完全に抜き、
-            # feather のぶんで減光へ戻す。
-            brush = QRadialGradient(center, outer)
-            brush.setColorAt(0.0, QColor(0, 0, 0, 255))
-            brush.setColorAt(self._radius / outer, QColor(0, 0, 0, 255))
-            brush.setColorAt(1.0, QColor(0, 0, 0, 0))
-        else:
-            # feather=0 をグラデーションで表すと、内側の止め位置(radius/outer)が 1.0 に
-            # なって最後の止め(透明)と同じ位置で重なり、中心から外へだらだら薄くなる帯に
-            # 化ける(実測: 中心のアルファが0にならず、半径の半分の位置で既に4割方戻る)。
-            # 縁をぼかさないなら単色で抜けばよい。
-            brush = QColor(0, 0, 0, 255)
-
-        painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(brush)
-        painter.drawEllipse(center, outer, outer)
+        draw_spotlight(painter, event.rect(), QPointF(self.cursor_local()), **self._spot)
 
 
 class BlankOverlay(_Overlay):

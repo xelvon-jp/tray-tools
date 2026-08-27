@@ -177,8 +177,18 @@ def _draw_globe(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.ellipse((23, 10, 41, 54), outline=color, width=4)
 
 
+def _draw_mirror(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """画面ミラー。小さい画面から大きい画面へ映している形。左に小さな枠、右に大きな枠、
+    間に矢印。「発表者ツール」の1枚の画面と見分けが付くよう、必ず2枚描く。"""
+    draw.rectangle((6, 20, 24, 44), fill="white")
+    draw.rectangle((9, 23, 21, 41), fill=color)
+    draw.rounded_rectangle((34, 12, 58, 52), radius=3, fill="white")
+    draw.line((26, 32, 33, 32), fill="white", width=5)
+
+
 _GLYPHS = {
     "ruler": _draw_ruler,
+    "mirror": _draw_mirror,
     "dropper": _draw_dropper,
     "snippet": _draw_snippet,
     "folder": _draw_folder,
@@ -346,6 +356,18 @@ ITEMS = {
         "args": ("white",),
         "icon": "blank",
         "color": "#94a3b8",
+    },
+    # 手元の画面の一部を別のモニタへ全画面でミラーする(screen_mirror.py)。押すと範囲
+    # 選択が出て、選ぶと始まる。もう一度押すと畳む。既定の並び(DEFAULT_ITEMS)には
+    # 入れていない: パネルは縦に伸びる一方なので、使う人だけが settings.json の
+    # launcher_items に足す(web_presenter と同じ扱い)。
+    "screen_mirror": {
+        "label": "画面ミラー",
+        "feature": "screen",
+        "method": "toggle_screen_mirror",
+        "args": (),
+        "icon": "mirror",
+        "color": "#2563eb",
     },
 }
 

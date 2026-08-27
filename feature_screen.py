@@ -26,6 +26,7 @@ import explorer_nav
 import launcher
 import mouse_jiggler
 import presenter_overlay
+import screen_mirror
 import screen_ruler
 import snippets
 import taskbar_widget
@@ -118,6 +119,12 @@ class ScreenFeature:
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
         # OverlayController にまとめてある(ここが1つだけ持つ。持たないとGCで即消える)。
         self.presenter_overlays = presenter_overlay.OverlayController(app_settings)
+        # 手元の画面の一部を別のモニタへ全画面でミラーする「画面ミラー」。範囲選択・
+        # ミラー窓・手元の枠の3枚を抱えるので、参照と開閉は screen_mirror 側の
+        # MirrorController にまとめてある(ここが1つだけ持つ。持たないとGCで即消える)。
+        self.screen_mirror = screen_mirror.MirrorController(
+            app_settings, settings_path, self._notify
+        )
         # 付箋(Rapture)のウインドウはここでは持たない。別プロセス(capture_process.py)に
         # 出したので、参照どころか同じアドレス空間にすら居ない。以前は開いている付箋を
         # self.capture_windows に、ホットキーで撮る対象を self.active_capture_window に
@@ -240,6 +247,21 @@ class ScreenFeature:
             action.triggered.connect(lambda checked, k=kind: self._set_presenter_overlay(k, checked))
             self._presenter_actions[kind] = action
 
+        # 画面ミラー。プレゼン支援の真下に置く(発表中に使う道具でひとかたまり)。
+        # 「開始」とミラー先のモニタ選択でサブメニューにする。
+        self._mirror_menu = self.menu.addMenu("🖥 画面ミラー（別モニタへ）")
+        self._mirror_action = self._mirror_menu.addAction(
+            self._with_hotkey("▶ 範囲を選んで開始", hotkey_config.get("screen_mirror"))
+        )
+        self._mirror_action.setCheckable(True)
+        # addAction(テキスト, 関数) で登録すると関数は引数なしで呼ばれる。チェック状態を
+        # 受け取る項目はこの形で繋ぐこと(プレゼン支援・タスクバーと同じ理由)。
+        self._mirror_action.triggered.connect(self._set_screen_mirror)
+        self._mirror_screen_menu = self._mirror_menu.addMenu("🖵 ミラー先")
+        # 中身は開く直前に作り直す(モニタは抜き差しされる)。項目はメニューが持つので
+        # GCの心配は無いが、作り直しの前後で状態を見るためにここでも並びを持っておく。
+        self._mirror_screen_actions = []
+
         self.menu.addSeparator()
         self.menu.addAction(
             self._with_hotkey("📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
@@ -301,6 +323,7 @@ class ScreenFeature:
         # プレゼン支援はホットキーやクリック(黒画面)でも切り替わるので、メニューの
         # チェックは開く直前に実物へ合わせる。
         self.menu.aboutToShow.connect(self._refresh_presenter_menu)
+        self.menu.aboutToShow.connect(self._refresh_mirror_menu)
 
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self._on_activated)
@@ -329,6 +352,9 @@ class ScreenFeature:
             "presenter_spotlight": lambda: self.toggle_presenter_overlay("spotlight"),
             "presenter_blackout": lambda: self.toggle_presenter_overlay("black"),
             "presenter_whiteout": lambda: self.toggle_presenter_overlay("white"),
+            # 画面ミラー。ミラー窓はキーを受け取らない(前面を奪わない作りなので)ため、
+            # こことトレイメニューが畳む手段になる。
+            "screen_mirror": self.toggle_screen_mirror,
         }
 
     @staticmethod
@@ -776,6 +802,12 @@ class ScreenFeature:
         traceback.print_exc()
         print(f"[tray-tools] タスクバーウィジェット: {where}に失敗しました", file=sys.stderr)
 
+    def _log_failure(self, where: str) -> None:
+        """上と同じ役目の、ウィジェット以外から呼ぶほう。メニューを組み立てるスロットで
+        投げ切ると常駐ごと終わるので、どの入口にも受け皿が要る。"""
+        traceback.print_exc()
+        print(f"[tray-tools] {where}に失敗しました", file=sys.stderr)
+
     # ---------------------------------------------------------------
     # スリープ抑止
     # ---------------------------------------------------------------
@@ -939,6 +971,9 @@ class ScreenFeature:
         # プレゼン支援も同じ。黒画面を出したまま終わらせると画面が真っ黒のまま残り、
         # しかも畳む手段(このアプリ)がもう居ない。
         self.presenter_overlays.close_all()
+        # 画面ミラーも同じ。全画面の窓と手元の枠を残したまま終わると、映しっぱなしの
+        # まま畳む手段(このアプリ)が居なくなる。
+        self.screen_mirror.close_all()
 
     def attach_restart(self, restart) -> None:
         """自分を起動し直す手段を受け取る。組み立ては main.py が行う。"""
@@ -1014,7 +1049,21 @@ class ScreenFeature:
         """レーザー/スポットライト/黒画面/白画面を切り替える。戻り値は切り替え後の状態。
 
         通知を出すのは「出した」ときだけ。消したときにトーストを出すと、発表を隠すために
-        黒画面を畳んだ瞬間に画面の隅で通知が光ることになる。"""
+        黒画面を畳んだ瞬間に画面の隅で通知が光ることになる。
+
+        画面ミラー中は、レーザーとスポットライトの行き先をミラー先へ振り替える。手元の
+        画面に重ねると、それがそのまま撮られて向こうにも映る——光点は二重に見えるし、
+        スポットライトに至っては減光ごと焼き込まれて戻せない。同じキーで同じことが
+        起きるようにしたいので、ホットキーを増やさずここで振り分ける。
+        黒画面/白画面は振り替えない。あちらは手元を覆う道具で、撮る範囲ごと覆われれば
+        ミラーにもそのまま黒が映る(それが期待どおり)。"""
+        if kind in ("laser", "spotlight") and self.screen_mirror.is_active():
+            active = self.screen_mirror.toggle_light(kind)
+            label = presenter_overlay.KIND_LABELS.get(kind, kind)
+            if active:
+                self._notify("画面ミラー", f"{label}: ON")
+            return active
+
         active = self.presenter_overlays.toggle(kind)
         label = presenter_overlay.KIND_LABELS.get(kind, kind)
         if active:
@@ -1024,13 +1073,74 @@ class ScreenFeature:
     def _set_presenter_overlay(self, kind: str, checked: bool):
         """メニューのチェック項目から。QAction.triggered が渡す checked をそのまま
         出す/畳むの指示として扱う(タスクバーウィジェットの項目と同じ作法)。"""
-        if checked == self.presenter_overlays.is_active(kind):
+        if checked == self._presenter_overlay_active(kind):
             return
         self.toggle_presenter_overlay(kind)
 
+    def _presenter_overlay_active(self, kind: str) -> bool:
+        """その機能が今出ているか。ミラー中のレーザー/スポットはミラー先に居る。"""
+        if kind in ("laser", "spotlight") and self.screen_mirror.is_active():
+            return self.screen_mirror.is_light_on(kind)
+        return self.presenter_overlays.is_active(kind)
+
     def _refresh_presenter_menu(self):
         for kind, action in self._presenter_actions.items():
-            action.setChecked(self.presenter_overlays.is_active(kind))
+            action.setChecked(self._presenter_overlay_active(kind))
+
+    # ---------------------------------------------------------------
+    # 画面ミラー（別モニタへ）
+    #
+    # 実物は screen_mirror.py。ここは入口(メニュー・ホットキー・ランチャ)だけを持つ。
+    # 範囲選択からミラー窓・手元の枠までは MirrorController が面倒を見る。
+    # ---------------------------------------------------------------
+    def toggle_screen_mirror(self) -> bool:
+        """画面ミラーを開始(範囲選択から)または終了する。戻り値は「これから出す」か。
+
+        通知は screen_mirror 側が出す(どのモニタへ何fpsで出したかを知っているのは
+        あちらなので、ここで持ち直しても同じことを2回書くだけになる)。"""
+        return self.screen_mirror.toggle()
+
+    def _set_screen_mirror(self, checked: bool):
+        """メニューのチェック項目から。範囲選択の最中も「動作中」として扱う
+        (選んでいる途中にもう一度押したら、選択ごと畳むのが素直)。"""
+        active = self.screen_mirror.is_active() or self.screen_mirror.is_selecting()
+        if checked == active:
+            return
+        self.toggle_screen_mirror()
+
+    def _refresh_mirror_menu(self):
+        """開く直前に、状態のチェックとミラー先の一覧を作り直す。
+
+        モニタは抜き差しされるし、ミラーはホットキーからも切り替わる。一覧を作りっぱなしに
+        すると、繋ぎ直したモニタが選べないまま残る。"""
+        try:
+            self._mirror_action.setChecked(
+                self.screen_mirror.is_active() or self.screen_mirror.is_selecting()
+            )
+
+            self._mirror_screen_menu.clear()
+            self._mirror_screen_actions = []
+            current = str(
+                (self.app_settings.get("screen_mirror", {}) or {}).get("target_screen_name") or ""
+            )
+            auto = self._mirror_screen_menu.addAction("自動（範囲の無いモニタ）")
+            auto.setCheckable(True)
+            auto.setChecked(not current)
+            auto.triggered.connect(lambda _checked: self.screen_mirror.set_target_screen(""))
+            self._mirror_screen_actions.append(auto)
+            self._mirror_screen_menu.addSeparator()
+            for screen in screen_mirror.available_screens():
+                name = screen.name()
+                action = self._mirror_screen_menu.addAction(screen_mirror.screen_label(screen))
+                action.setCheckable(True)
+                action.setChecked(name == current)
+                # addAction(テキスト, 関数) は引数なしで呼ぶので、ここも triggered で繋ぐ。
+                action.triggered.connect(
+                    lambda _checked, n=name: self.screen_mirror.set_target_screen(n)
+                )
+                self._mirror_screen_actions.append(action)
+        except Exception:
+            self._log_failure("画面ミラーのメニューの組み立て")
 
     def _open_settings_file(self):
         """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。

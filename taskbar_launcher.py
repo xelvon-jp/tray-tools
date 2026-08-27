@@ -255,8 +255,7 @@ ITEMS = {
         "icon": "folder",
         "color": "#f59e0b",
     },
-    # 設定 tools.presenter にパスを書いたときだけ意味がある(未設定なら押しても
-    # その旨を通知するだけ)。既定の launcher_items には入れていない。
+    # 同梱の presenter.html を既定のブラウザで開く(設定 tools.presenter で差し替え可)。
     "presenter": {
         "label": "発表者ツール",
         "feature": "screen",

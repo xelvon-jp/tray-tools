@@ -44,10 +44,8 @@ DEFAULT_SETTINGS = {
     "audio": {
         "devices": [],
     },
-    # 外から呼ぶツール。パスを書いた項目だけがメニューとランチャに出る。
-    # presenter は HTML のプレゼン資料に発表者ツール(カンペ・次スライド・タイマー・
-    # レーザー)を付ける単一ファイルのビューアで、ダブルクリック(file://)で動く。
-    # 置き場所は環境ごとに違うので既定は空。
+    # 外から呼ぶツール。空なら同梱のものを使う(presenter.html はこのフォルダにある)。
+    # 別の場所に置いたものを使いたいときだけパスを書く。
     "tools": {
         "presenter": "",
     },
@@ -90,7 +88,8 @@ DEFAULT_SETTINGS = {
     # 音声の2つで埋まる。それ以外の機能へ通知領域まで戻らずに届くようにするためのもの。
     # launcher_items は上から下へ並ぶ順で、書ける名前は
     # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
-    # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク)。
+    # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
+    # presenter(発表者ツール)。
     # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
@@ -114,6 +113,7 @@ DEFAULT_SETTINGS = {
             "color_picker",
             "snippets",
             "bookmarks",
+            "presenter",
         ],
         "launcher_item_size": 36,
         "launcher_close_delay_ms": 300,

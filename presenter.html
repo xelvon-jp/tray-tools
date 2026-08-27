@@ -1,0 +1,1875 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HTML Presenter — 発表者ツール</title>
+<style>
+:root{
+  --bg:#141922; --bg2:#1c232f; --bg3:#252e3d;
+  --line:#334054; --ink:#e8eef7; --muted:#8fa0b8;
+  --accent:#4d9bff; --accent2:#2563eb;
+  --warn:#f59e0b; --danger:#ef4444; --ok:#10b981;
+  --note-size:19px;
+  --font:"Yu Gothic UI","Meiryo","Hiragino Kaku Gothic ProN",-apple-system,sans-serif;
+  --mono:"Cascadia Mono","Consolas",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--ink);font-family:var(--font);
+  overflow:hidden;-webkit-font-smoothing:antialiased;
+  display:grid;
+  grid-template-columns:1fr minmax(300px,30vw);
+  grid-template-rows:auto 1fr auto;
+  grid-template-areas:"top top" "main side" "bot bot";
+  gap:8px;padding:8px;
+}
+
+/* ---------- 共通パーツ ---------- */
+button{
+  font-family:var(--font);font-size:13px;color:var(--ink);
+  background:var(--bg3);border:1px solid var(--line);border-radius:7px;
+  padding:7px 11px;cursor:pointer;line-height:1;white-space:nowrap;
+  transition:background .12s,border-color .12s;
+}
+button:hover{background:#313d51;border-color:#48597a}
+button:active{transform:translateY(1px)}
+button.on{background:var(--accent2);border-color:var(--accent);color:#fff}
+button.primary{background:var(--accent2);border-color:var(--accent)}
+button.primary:hover{background:#1d4ed8}
+button:disabled{opacity:.35;cursor:default}
+select,input[type=text],input[type=number]{
+  font-family:var(--font);font-size:13px;color:var(--ink);
+  background:var(--bg3);border:1px solid var(--line);border-radius:7px;
+  padding:6px 8px;
+}
+.kbd{
+  font-family:var(--mono);font-size:11px;color:var(--muted);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+  background:#0f141c;
+}
+.sep{width:1px;height:22px;background:var(--line);margin:0 3px}
+.spacer{flex:1}
+
+/* ---------- トップバー ---------- */
+#top{
+  grid-area:top;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  padding:8px 10px;min-height:48px;
+}
+#fileName{
+  font-size:13px;font-weight:700;max-width:24vw;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#modeTag{
+  font-size:11px;color:var(--muted);border:1px solid var(--line);
+  border-radius:20px;padding:3px 9px;white-space:nowrap;
+}
+#timer{
+  font-family:var(--mono);font-size:26px;font-weight:700;
+  letter-spacing:.02em;font-variant-numeric:tabular-nums;
+}
+#timer.over{color:var(--danger)}
+#timer.run{color:var(--ok)}
+#limitWrap{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted)}
+#limit{width:56px;text-align:right}
+
+/* ---------- メインプレビュー ---------- */
+#main{
+  grid-area:main;background:var(--bg2);border:1px solid var(--line);
+  border-radius:10px;position:relative;overflow:hidden;
+  display:flex;align-items:center;justify-content:center;
+}
+.stageBox{position:relative;overflow:hidden;background:#000;box-shadow:0 6px 30px rgba(0,0,0,.5)}
+.stageBox iframe{border:0;display:block;transform-origin:top left;background:#fff}
+#catch{position:absolute;inset:0;cursor:crosshair;z-index:5}
+#mainBadge{
+  position:absolute;left:10px;top:10px;z-index:6;
+  background:rgba(10,14,20,.72);border:1px solid var(--line);
+  border-radius:7px;padding:4px 9px;font-size:12px;color:var(--muted);
+  pointer-events:none;
+}
+#liveDot{
+  position:absolute;right:10px;top:10px;z-index:6;
+  background:rgba(10,14,20,.72);border:1px solid var(--line);
+  border-radius:7px;padding:4px 9px;font-size:11px;
+  pointer-events:none;display:flex;align-items:center;gap:6px;
+}
+#liveDot i{width:8px;height:8px;border-radius:50%;background:var(--muted);display:block}
+#liveDot.live i{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+
+/* ---------- サイド（次スライド＋カンペ） ---------- */
+#side{grid-area:side;display:flex;flex-direction:column;gap:8px;min-height:0}
+.panel{
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  display:flex;flex-direction:column;min-height:0;
+}
+.panelHead{
+  display:flex;align-items:center;gap:8px;
+  padding:7px 10px;border-bottom:1px solid var(--line);
+  font-size:12px;font-weight:700;color:var(--muted);
+}
+#nextPanel{flex:0 0 auto}
+#nextBox{
+  padding:8px;display:flex;align-items:center;justify-content:center;
+  background:#0e131b;border-radius:0 0 9px 9px;
+}
+#notePanel{flex:1 1 auto}
+#note{
+  flex:1;width:100%;resize:none;border:0;outline:0;background:transparent;
+  color:var(--ink);font-family:var(--font);font-size:var(--note-size);
+  line-height:1.72;padding:12px 14px;
+}
+#note::placeholder{color:#5a6a80}
+#noteMeta{font-size:11px;color:var(--muted);padding:0 10px 8px;display:flex;gap:10px}
+
+/* ---------- ボトムバー ---------- */
+#bot{
+  grid-area:bot;display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  padding:8px 10px;
+}
+#pos{
+  font-family:var(--mono);font-size:15px;font-weight:700;
+  min-width:78px;text-align:center;font-variant-numeric:tabular-nums;
+}
+#navSlider{width:min(240px,18vw);accent-color:var(--accent)}
+
+/* ---------- サムネ一覧 ---------- */
+#grid{
+  position:fixed;inset:0;z-index:50;background:rgba(10,13,18,.96);
+  display:none;flex-direction:column;padding:14px;
+}
+#grid.open{display:flex}
+#gridHead{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+#gridHead h2{font-size:15px;font-weight:700}
+#gridBody{
+  flex:1;overflow:auto;display:grid;gap:14px;
+  grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  align-content:start;padding-bottom:10px;
+}
+.thumb{
+  border:2px solid var(--line);border-radius:8px;overflow:hidden;
+  cursor:pointer;background:#000;position:relative;transition:border-color .12s;
+}
+.thumb:hover{border-color:var(--accent)}
+.thumb.cur{border-color:var(--accent);box-shadow:0 0 0 3px rgba(77,155,255,.28)}
+.thumb .tbox{position:relative;overflow:hidden;background:#fff}
+.thumb iframe{border:0;display:block;transform-origin:top left;pointer-events:none}
+.thumb .tno{
+  position:absolute;left:0;bottom:0;z-index:2;
+  background:rgba(10,13,18,.82);color:#fff;font-size:11px;
+  padding:3px 8px;border-radius:0 7px 0 0;font-family:var(--mono);
+  display:flex;gap:7px;align-items:baseline;max-width:100%;
+}
+.thumb .tno em{font-style:normal;color:var(--muted);font-family:var(--font);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thumb .thasnote{
+  position:absolute;right:5px;top:5px;z-index:2;width:8px;height:8px;
+  border-radius:50%;background:var(--warn);box-shadow:0 0 0 2px rgba(10,13,18,.6);
+}
+
+/* ---------- ドロップゾーン ---------- */
+#drop{
+  position:fixed;inset:0;z-index:60;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+#drop.hide{display:none}
+#dropInner{
+  border:2px dashed var(--line);border-radius:16px;
+  padding:44px 52px;text-align:center;max-width:700px;
+  transition:border-color .15s,background .15s;
+}
+#drop.over #dropInner{border-color:var(--accent);background:rgba(77,155,255,.07)}
+#dropInner h1{font-size:22px;margin-bottom:8px}
+#dropInner p{color:var(--muted);font-size:13px;line-height:1.9;margin-bottom:16px}
+#dropInner .hint{
+  margin-top:20px;font-size:12px;color:var(--muted);text-align:left;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;
+}
+#dropInner .hint b{color:var(--ink)}
+#dropInner .hint div{margin:3px 0}
+
+/* ---------- トースト ---------- */
+#toast{
+  position:fixed;left:50%;bottom:76px;transform:translateX(-50%);
+  z-index:70;background:rgba(20,26,36,.96);border:1px solid var(--line);
+  border-radius:9px;padding:9px 16px;font-size:13px;
+  opacity:0;pointer-events:none;transition:opacity .2s;max-width:70vw;
+}
+#toast.show{opacity:1}
+#toast.warn{border-color:var(--warn);color:var(--warn)}
+
+/* ---------- ヘルプ ---------- */
+#help{
+  position:fixed;inset:0;z-index:65;background:rgba(10,13,18,.93);
+  display:none;align-items:center;justify-content:center;padding:24px;
+}
+#help.open{display:flex}
+#helpCard{
+  background:var(--bg2);border:1px solid var(--line);border-radius:14px;
+  padding:24px 28px;max-width:640px;width:100%;max-height:86vh;overflow:auto;
+}
+#helpCard h2{font-size:17px;margin-bottom:14px}
+#helpCard table{width:100%;border-collapse:collapse;font-size:13px}
+#helpCard td{padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+#helpCard td:first-child{width:170px;white-space:nowrap}
+#helpCard h3{font-size:13px;color:var(--muted);margin:18px 0 6px}
+</style>
+</head>
+<body>
+<!-- ===================== トップバー ===================== -->
+<div id="top">
+  <div id="fileName">— 資料未読込 —</div>
+  <div id="modeTag">—</div>
+  <div class="sep"></div>
+  <label style="font-size:12px;color:var(--muted)">区切り</label>
+  <select id="selSelector" title="スライドの区切りに使う要素"></select>
+  <div class="spacer"></div>
+  <div id="timer">00:00</div>
+  <div id="limitWrap">
+    <span>目標</span><input id="limit" type="number" min="0" max="300" step="1" value="0"><span>分</span>
+  </div>
+  <button id="btnTimer" title="タイマー開始/停止 (T)">▶ 開始</button>
+  <button id="btnTimerReset" title="タイマーリセット (Shift+T)">⟲</button>
+  <div class="sep"></div>
+  <label style="font-size:12px;color:var(--muted)" title="スライドショー側の表示倍率">本番</label>
+  <select id="zoomShow" title="スライドショー側の表示倍率（ブラウザのズームに相当）"></select>
+  <label style="font-size:12px;color:var(--muted)" title="この発表者ツールの表示倍率">手元</label>
+  <select id="zoomUI" title="この発表者ツールの表示倍率"></select>
+  <div class="sep"></div>
+  <button id="btnOpenShow" class="primary" title="スライドショーを別ウィンドウで開く">🖥 別モニタで開く</button>
+  <button id="btnHelp" title="ヘルプ (?)">?</button>
+</div>
+
+<!-- ===================== メインプレビュー ===================== -->
+<div id="main">
+  <div class="stageBox" id="mainStage">
+    <iframe id="pvMain" title="現在のスライド"></iframe>
+    <div id="catch"></div>
+  </div>
+  <div id="mainBadge">現在</div>
+  <div id="liveDot"><i></i><span>未接続</span></div>
+</div>
+
+<!-- ===================== サイド ===================== -->
+<div id="side">
+  <div class="panel" id="nextPanel">
+    <div class="panelHead">次のスライド <span class="spacer"></span><span id="nextLabel" style="font-weight:400"></span></div>
+    <div id="nextBox">
+      <div class="stageBox" id="nextStage"><iframe id="pvNext" title="次のスライド"></iframe></div>
+    </div>
+  </div>
+  <div class="panel" id="notePanel">
+    <div class="panelHead">
+      カンペ
+      <span class="spacer"></span>
+      <button id="btnNoteMinus" title="文字を小さく">A-</button>
+      <button id="btnNotePlus" title="文字を大きく">A+</button>
+      <button id="btnNoteExport" title="全カンペをJSONで保存">保存</button>
+      <button id="btnNoteImport" title="カンペJSONを読み込み">読込</button>
+    </div>
+    <textarea id="note" placeholder="ここに話す内容を書きます。&#10;自動保存されます（このブラウザに保存）。&#10;&#10;Ctrl+Enter で次のスライドへ。"></textarea>
+    <div id="noteMeta"><span id="noteSaved">—</span><span class="spacer"></span><span id="noteCount"></span></div>
+  </div>
+</div>
+
+<!-- ===================== ボトムバー ===================== -->
+<div id="bot">
+  <button id="btnPrev" title="前へ (← ↑ PageUp)">◀ 前</button>
+  <div id="pos">— / —</div>
+  <button id="btnNext" title="次へ (→ ↓ Space PageDown)">次 ▶</button>
+  <input id="navSlider" type="range" min="0" max="0" value="0">
+  <div class="sep"></div>
+  <button id="btnLaser" title="レーザーポインタ：L を押している間だけ表示 / Shift+L またはこのボタンで固定">🔴 レーザー</button>
+  <button id="btnSpot" title="スポットライト：S を押している間だけ表示 / Shift+S またはこのボタンで固定">🔦 スポット</button>
+  <span style="font-size:11px;color:var(--muted)">半径</span>
+  <input id="spotR" type="range" min="60" max="520" value="180" style="width:80px;accent-color:var(--accent)" title="スポットライトの明るい部分の広さ">
+  <span style="font-size:11px;color:var(--muted)">暗さ</span>
+  <input id="spotDim" type="range" min="10" max="95" value="60" style="width:80px;accent-color:var(--accent)" title="周囲をどれだけ暗くするか">
+  <div class="sep"></div>
+  <button id="btnBlack" title="黒画面 (B)">■ 黒</button>
+  <button id="btnWhite" title="白画面 (W)">□ 白</button>
+  <div class="sep"></div>
+  <button id="btnGrid" title="サムネ一覧 (G)">▦ 一覧</button>
+  <button id="btnFull" title="スライドショーを全画面 (F)">⛶ 全画面</button>
+  <div class="spacer"></div>
+  <button id="btnReload" title="資料を読み直す (R)">⟳ 再読込</button>
+  <button id="btnLoadOther" title="別の資料を開く">📂 開く</button>
+</div>
+
+<!-- ===================== サムネ一覧 ===================== -->
+<div id="grid">
+  <div id="gridHead">
+    <h2>スライド一覧</h2>
+    <span id="gridInfo" style="font-size:12px;color:var(--muted)"></span>
+    <div class="spacer"></div>
+    <span style="font-size:12px;color:var(--muted)">クリックでジャンプ</span>
+    <button id="btnGridClose">閉じる (G / Esc)</button>
+  </div>
+  <div id="gridBody"></div>
+</div>
+
+<!-- ===================== ドロップゾーン ===================== -->
+<div id="drop">
+  <div id="dropInner">
+    <h1>HTML Presenter</h1>
+    <p>
+      HTML のプレゼン資料をここに<b style="color:var(--ink)">ドラッグ＆ドロップ</b>してください。<br>
+      クリックしてファイルを選ぶこともできます。
+    </p>
+    <button id="btnPick" class="primary" style="font-size:14px;padding:11px 22px">📂 HTMLファイルを選ぶ</button>
+    <input id="filePick" type="file" accept=".html,.htm" style="display:none">
+    <input id="notePick" type="file" accept=".json" style="display:none">
+    <div class="hint">
+      <div><b>スライド型</b>（<code>section.slide</code> などで区切られた資料）→ ページ送りで進みます</div>
+      <div><b>ドキュメント型</b>（普通の縦長ページ）→ 見出し単位のジャンプ＋スクロール同期で進みます</div>
+      <div style="margin-top:8px">カンペ（.notes.json）を一緒にドロップすると読み込まれます</div>
+      <div style="margin-top:8px"><b>画像を外部参照している資料</b>は、<b>フォルダごと</b>ドロップしてください（画像も一緒に読み込みます）</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== ヘルプ ===================== -->
+<div id="help">
+  <div id="helpCard">
+    <h2>キーボード操作</h2>
+    <table>
+      <tr><td><span class="kbd">→</span> <span class="kbd">↓</span> <span class="kbd">Space</span> <span class="kbd">PageDown</span></td><td>次へ</td></tr>
+      <tr><td><span class="kbd">←</span> <span class="kbd">↑</span> <span class="kbd">PageUp</span></td><td>前へ</td></tr>
+      <tr><td><span class="kbd">Home</span> / <span class="kbd">End</span></td><td>最初 / 最後へ</td></tr>
+      <tr><td><span class="kbd">G</span></td><td>サムネ一覧の開閉</td></tr>
+      <tr><td><span class="kbd">L</span> を押している間</td><td>レーザーポインタ（離すと消える）</td></tr>
+      <tr><td><span class="kbd">Shift</span>+<span class="kbd">L</span></td><td>レーザーポインタを出しっぱなしにする／戻す</td></tr>
+      <tr><td><span class="kbd">S</span> を押している間</td><td>スポットライト（離すと消える）</td></tr>
+      <tr><td><span class="kbd">Shift</span>+<span class="kbd">S</span></td><td>スポットライトを出しっぱなしにする／戻す</td></tr>
+      <tr><td><span class="kbd">B</span> / <span class="kbd">W</span></td><td>黒画面 / 白画面</td></tr>
+      <tr><td><span class="kbd">F</span></td><td>スライドショーを全画面</td></tr>
+      <tr><td><span class="kbd">T</span> / <span class="kbd">Shift+T</span></td><td>タイマー開始停止 / リセット</td></tr>
+      <tr><td><span class="kbd">R</span></td><td>資料を読み直す</td></tr>
+      <tr><td><span class="kbd">+</span> / <span class="kbd">-</span></td><td>本番の表示倍率を上げる／下げる</td></tr>
+      <tr><td><span class="kbd">数字</span> → <span class="kbd">Enter</span></td><td>その番号へジャンプ</td></tr>
+      <tr><td><span class="kbd">Ctrl+Enter</span></td><td>カンペ入力中に次へ</td></tr>
+    </table>
+    <h3>マウス（左のプレビュー上）</h3>
+    <table>
+      <tr><td>左クリック</td><td>次へ</td></tr>
+      <tr><td>右クリック</td><td>前へ</td></tr>
+      <tr><td>ホイール</td><td>ページ送り（ドキュメント型ならスクロール同期）</td></tr>
+      <tr><td>マウス移動</td><td>レーザー / スポットライトが別モニタに同期</td></tr>
+    </table>
+    <h3>2画面の使い方</h3>
+    <table>
+      <tr><td>手順</td><td>「🖥 別モニタで開く」→ 開いたウィンドウを発表用モニタへドラッグ →
+        このツールに戻って <span class="kbd">F</span> で全画面。<br>
+        操作はすべてこのウィンドウ側で行います。</td></tr>
+    </table>
+    <div style="text-align:right;margin-top:18px"><button id="btnHelpClose" class="primary">閉じる</button></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ============================================================
+   HTML Presenter — 発表者ツール
+   任意の HTML プレゼン資料に PowerPoint 相当の発表者ビューを付ける
+
+   構成：
+     ・メインプレビュー / 次スライド / 別ウィンドウ（スライドショー）
+       の3つに同じ HTML を document.write して注入し、
+       ひとつのコントローラが全部を同じ状態に保つ
+     ・about:blank は親と同一オリジンなので file:// でも DOM を直接操作できる
+     ・プレビューの iframe は「本番と同じ論理サイズ」で描画して
+       CSS transform で縮小 → レイアウトが完全一致し座標が 1:1 で同期する
+   ============================================================ */
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 状態 ---------- */
+const App = {
+  html: '',           // 資料の HTML 文字列
+  fileName: '',       // 表示用ファイル名
+  mode: 'slide',      // 'slide' | 'doc'
+  sel: '',            // スライド区切りのセレクタ
+  candidates: [],     // 検出した区切り候補
+  ctrl: null,         // 表示切替の方式 {kind:'class'|'display'|'scroll', cls, disp}
+  count: 0,
+  index: 0,
+  sections: [],       // doc モードのジャンプ先 [{top,label}]
+  labels: [],         // 一覧表示用の見出しテキスト
+  notes: {},          // index -> カンペ本文
+  child: null,        // スライドショーの別ウィンドウ
+  baseW: 1600, baseH: 900,
+  // laser / spot は「押している間だけ（held）」と「固定（latched）」の論理和で決まる
+  laser: false, spot: false, black: false, white: false,
+  laserHeld: false, laserLatched: false,
+  spotHeld: false, spotLatched: false,
+  spotR: 180,
+  spotDim: 0.6,       // 周囲の暗さ 0〜1
+  // 表示倍率。Chrome のズームはオリジン単位で親子ウィンドウに同じ値が掛かってしまうため、
+  // ブラウザのズームに相当するものを資料側（本番）とツール側（手元）で別々に持つ
+  zoomShow: 1,
+  zoomUI: 1,
+  ptr: { x: 0.5, y: 0.5 },
+  timer: { acc: 0, t0: 0, running: false, limit: 0 },
+  thumbsBuilt: false,
+  assets: {},         // 資料が参照する画像などの 相対パス -> blob URL
+  assetUrls: [],      // 後片付け用
+};
+
+/* 区切り候補として試すセレクタ（上ほど優先） */
+const CANDS = [
+  'section.slide', '.slide', 'section.page', '.page', 'div.slide',
+  '.reveal .slides > section', 'section[data-slide]', '[data-slide]',
+  'article.slide', '.step', 'body > section', 'main > section',
+  'body > article', 'section',
+];
+
+/* ---------- 小物 ---------- */
+let toastTimer = null;
+function toast(msg, warn) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'show' + (warn ? ' warn' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, warn ? 4200 : 1900);
+}
+
+function waitReady(doc, ms) {
+  const limit = ms || 5000;
+  return new Promise((res) => {
+    const t0 = Date.now();
+    (function chk() {
+      let st = 'complete';
+      try { st = doc.readyState; } catch (e) { /* 破棄済み */ }
+      if (st === 'complete' || Date.now() - t0 > limit) return res();
+      setTimeout(chk, 25);
+    })();
+  });
+}
+
+/* ============================================================
+   外部ファイル（画像など）の解決
+   資料と一緒にフォルダをドロップしてもらい、相対パスを blob URL に置き換える。
+   about:blank に流し込む都合で相対パスがそのままでは解決できないため。
+   ============================================================ */
+const REL_RE = /(\s(?:src|href)\s*=\s*)(["'])(?!\s*(?:https?:|data:|blob:|javascript:|mailto:|#))([^"']+)\2/gi;
+const URL_RE = /url\(\s*(['"]?)(?!\s*(?:https?:|data:|blob:|#))([^'")]+)\1\s*\)/gi;
+
+function clearAssets() {
+  App.assetUrls.forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) { /* noop */ } });
+  App.assetUrls = [];
+  App.assets = {};
+}
+
+function addAsset(path, file) {
+  const url = URL.createObjectURL(file);
+  App.assetUrls.push(url);
+  const clean = path.replace(/^\.\//, '');
+  App.assets[clean] = url;
+  // フォルダごと入れられた場合に備えて、先頭フォルダを外した形でも引けるようにする
+  const parts = clean.split('/');
+  if (parts.length > 1) App.assets[parts.slice(1).join('/')] = url;
+  App.assets['#name#' + parts[parts.length - 1]] = url;
+}
+
+function lookupAsset(p) {
+  const key = p.replace(/^\.\//, '').split(/[?#]/)[0];
+  if (App.assets[key]) return App.assets[key];
+  const base = key.split('/').pop();
+  return App.assets['#name#' + base] || null;
+}
+
+function resolveAssets(html) {
+  if (!Object.keys(App.assets).length) return html;
+  html = html.replace(REL_RE, (m, a, q, p) => {
+    const u = lookupAsset(p);
+    return u ? a + q + u + q : m;
+  });
+  html = html.replace(URL_RE, (m, q, p) => {
+    const u = lookupAsset(p);
+    return u ? 'url(' + q + u + q + ')' : m;
+  });
+  return html;
+}
+
+/* ドロップされたフォルダを再帰的に読む */
+function walkEntry(entry, prefix, out) {
+  return new Promise((res) => {
+    if (!entry) return res();
+    if (entry.isFile) {
+      entry.file((f) => { out.push({ path: prefix + entry.name, file: f }); res(); }, () => res());
+      return;
+    }
+    if (!entry.isDirectory) return res();
+    const reader = entry.createReader();
+    const all = [];
+    const readMore = () => {
+      reader.readEntries(async (ents) => {
+        if (!ents.length) {
+          for (const e of all) await walkEntry(e, prefix + entry.name + '/', out);
+          return res();
+        }
+        all.push.apply(all, ents);
+        readMore();
+      }, () => res());
+    };
+    readMore();
+  });
+}
+
+async function collectDrop(dt) {
+  const out = [];
+  const items = dt && dt.items ? Array.from(dt.items) : [];
+  const entries = items
+    .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  if (entries.length) {
+    for (const e of entries) await walkEntry(e, '', out);
+  } else {
+    Array.from((dt && dt.files) || []).forEach((f) => out.push({ path: f.name, file: f }));
+  }
+  return out;
+}
+
+/* 資料 HTML を任意のドキュメントへ流し込む */
+function injectDoc(doc, html) {
+  try {
+    doc.open();
+    doc.write(html);
+    doc.close();
+  } catch (e) {
+    console.error('injectDoc', e);
+  }
+}
+
+/* ============================================================
+   区切りの検出
+   ============================================================ */
+/* こちらが差し込んだオーバーレイは資料の一部ではないので検出から除く */
+function notOurs(el) {
+  if (!el || el.id === '__pvOv') return false;
+  try { return !el.closest('#__pvOv'); } catch (e) { return true; }
+}
+
+function findCandidates(doc) {
+  const list = [];
+  const seen = new Set();
+  const setKey = (els) =>
+    els.length + '|' + els.map((e) => e.tagName + '.' + (e.className || '')).join('~').slice(0, 400);
+
+  for (const sel of CANDS) {
+    let els;
+    try { els = Array.from(doc.querySelectorAll(sel)).filter(notOurs); } catch (e) { continue; }
+    if (els.length < 2) continue;
+    // 同じ要素集合になる候補は 1 つに絞る
+    const key = setKey(els);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const sameParent = els.every((e) => e.parentElement === els[0].parentElement);
+    list.push({ sel: sel, count: els.length, sameParent: sameParent });
+  }
+  list.sort((a, b) => {
+    if (a.sameParent !== b.sameParent) return a.sameParent ? -1 : 1;
+    return CANDS.indexOf(a.sel) - CANDS.indexOf(b.sel);
+  });
+
+  // 既知の名前で見つからないときは、構造から探す（class="pg" のような独自の名前に対応）
+  for (const c of structuralCandidates(doc)) {
+    let els;
+    try { els = Array.from(doc.querySelectorAll(c.sel)); } catch (e) { continue; }
+    const key = setKey(els);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push(c);
+  }
+  return list;
+}
+
+/* 要素を一意に指すセレクタを組み立てる */
+function nodeSelector(el) {
+  if (!el || el.nodeType !== 1) return null;
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'body' || tag === 'html') return tag;
+  if (el.id) { try { return '#' + CSS.escape(el.id); } catch (e) { /* noop */ } }
+  const cls = Array.from(el.classList)[0];
+  if (cls) { try { return tag + '.' + CSS.escape(cls); } catch (e) { /* noop */ } }
+  const par = nodeSelector(el.parentElement);
+  return par ? par + ' > ' + tag : null;
+}
+
+function selectorForGroup(doc, parent, kids) {
+  const tag = kids[0].tagName.toLowerCase();
+  // ① 全員が持つ共通クラスで一意に取れるか
+  const common = Array.from(kids[0].classList)
+    .filter((c) => kids.every((k) => k.classList.contains(c)));
+  for (const c of common) {
+    let s;
+    try { s = tag + '.' + CSS.escape(c); } catch (e) { continue; }
+    try { if (doc.querySelectorAll(s).length === kids.length) return s; } catch (e) { /* noop */ }
+  }
+  // ② 親の目印から
+  const ps = nodeSelector(parent);
+  if (ps) {
+    const s = ps + ' > ' + tag;
+    try { if (doc.querySelectorAll(s).length === kids.length) return s; } catch (e) { /* noop */ }
+  }
+  return null;
+}
+
+/* 「同じタグの子が並んでいて、1 枚だけ見えている or 全部が画面 1 枚分の高さ」
+   という並びをスライド群とみなす */
+const SKIP_TAGS = ['BR', 'SCRIPT', 'STYLE', 'LINK', 'META', 'OPTION', 'TR', 'TD', 'TH', 'LI', 'SPAN', 'A', 'IMG'];
+
+function structuralCandidates(doc) {
+  const win = doc.defaultView;
+  const out = [];
+  let scanned = 0;
+  let nodes = [];
+  try { nodes = Array.from(doc.querySelectorAll('body, body *')); } catch (e) { return out; }
+
+  for (const p of nodes) {
+    if (scanned++ > 600) break;
+    if (!notOurs(p)) continue;
+    const kids = Array.from(p.children).filter(notOurs);
+    if (kids.length < 2 || kids.length > 300) continue;
+    const tag = kids[0].tagName;
+    if (SKIP_TAGS.indexOf(tag) >= 0) continue;
+    if (!kids.every((k) => k.tagName === tag)) continue;
+
+    const H = win.innerHeight || App.baseH;
+    const W = win.innerWidth || App.baseW;
+
+    const visKids = [];
+    for (const k of kids) {
+      let d = 'block';
+      try { d = win.getComputedStyle(k).display; } catch (e) { /* noop */ }
+      if (d !== 'none') visKids.push(k);
+    }
+    const vis = visKids.length;
+
+    // 小さすぎる部品の並びは対象外（非表示要素はサイズが 0 なので見えている分だけ見る）
+    if (vis && !visKids.every((k) => (k.offsetWidth || 0) > W * 0.3)) continue;
+
+    const fullish = vis === kids.length &&
+      kids.filter((k) => (k.offsetHeight || 0) >= H * 0.75 && (k.offsetHeight || 0) <= H * 1.35).length
+      >= kids.length * 0.7;
+
+    if (!(vis <= 1 || fullish)) continue;
+
+    const sel = selectorForGroup(doc, p, kids);
+    if (sel) out.push({ sel: sel, count: kids.length, sameParent: true });
+  }
+  out.sort((a, b) => b.count - a.count);
+  return out;
+}
+
+/* 資料の CSS ルールを走査して「付けると表示になるクラス」を全部集める。
+   例：.slide{display:none} .slide.active{display:flex}  →  [{cls:'active', disp:'flex'}] */
+function scanActiveClasses(doc, sample) {
+  const found = [];
+  const walk = (rules) => {
+    for (const r of rules) {
+      if (!r.selectorText && r.cssRules) {           // @media / @supports など
+        try { walk(r.cssRules); } catch (e) { /* noop */ }
+        continue;
+      }
+      if (!r.selectorText || !r.style) continue;
+      const d = r.style.display;
+      if (!d || d === 'none') continue;
+      for (let sel of r.selectorText.split(',')) {
+        sel = sel.trim();
+        const m = sel.match(/\.([A-Za-z0-9_\-]+)$/);   // 末尾がクラスのものだけ見る
+        if (!m) continue;
+        const cls = m[1];
+        if (sample.classList.contains(cls)) continue;
+        // 仮にそのクラスを付けたらマッチするか＝そのクラスが「表示中」の印
+        sample.classList.add(cls);
+        let ok = false;
+        try { ok = sample.matches(sel); } catch (e) { /* noop */ }
+        sample.classList.remove(cls);
+        if (ok) found.push({ cls: cls, disp: d });
+      }
+    }
+  };
+  let sheets = [];
+  try { sheets = Array.from(doc.styleSheets); } catch (e) { /* noop */ }
+  for (const sh of sheets) {
+    let rs = null;
+    try { rs = sh.cssRules; } catch (e) { continue; }   // 外部 CSS は読めないことがある
+    if (rs) walk(rs);
+  }
+  // よくある名前を優先
+  const pri = ['active', 'current', 'show', 'shown', 'visible', 'selected', 'on', 'present'];
+  found.sort((a, b) => ((pri.indexOf(a.cls) + 1) || 99) - ((pri.indexOf(b.cls) + 1) || 99));
+  // 同じクラス名の重複を除く
+  const seen = new Set();
+  return found.filter((f) => (seen.has(f.cls) ? false : (seen.add(f.cls), true)));
+}
+
+/* スライドの見せ方を決める */
+function detectControl(doc, slides) {
+  const win = doc.defaultView;
+  const disp = (el) => { try { return win.getComputedStyle(el).display; } catch (e) { return 'block'; } };
+  const vis = slides.filter((s) => disp(s) !== 'none');
+
+  // 全部見えている＝縦積み型 → スクロールで送る
+  if (vis.length === slides.length && slides.length > 1) return { kind: 'scroll' };
+
+  // 隠れているスライドを見本に、CSS から「表示にするクラス」を集める
+  const hidden = slides.find((s) => disp(s) === 'none') || slides[slides.length - 1];
+  const cssCands = scanActiveClasses(doc, hidden);
+  const pri = ['active', 'current', 'show', 'shown', 'visible', 'selected', 'on', 'present'];
+
+  if (vis.length >= 1) {
+    const cur = vis[0];
+    const d = disp(cur);
+    // ① CSS が「表示にする」と言っていて、かつ今の 1 枚が実際に持っているクラス
+    //    （.title-slide のような見た目だけのクラスを誤検出しないための決め手）
+    const hit = cssCands.find((c) => cur.classList.contains(c.cls));
+    if (hit) return { kind: 'class', cls: hit.cls, disp: d };
+
+    // ② 1 枚だけが持っているクラスのうち、よくある名前
+    const uniq = Array.from(cur.classList).filter(
+      (c) => slides.every((s) => s === cur || !s.classList.contains(c))
+    );
+    const byName = uniq.find((c) => pri.indexOf(c) >= 0);
+    if (byName) return { kind: 'class', cls: byName, disp: d };
+
+    // ③ CSS 由来の候補 → ④ display を直接指定
+    if (cssCands.length) return { kind: 'class', cls: cssCands[0].cls, disp: cssCands[0].disp };
+    return { kind: 'display', disp: d === 'none' ? 'block' : d };
+  }
+
+  // 全部隠れている
+  if (cssCands.length) return { kind: 'class', cls: cssCands[0].cls, disp: cssCands[0].disp };
+  return { kind: 'display', disp: 'block' };
+}
+
+/* 候補要素が「1 枚ずつのスライド」らしいか。
+   全部が同時に見えている資料は、各要素がほぼ画面 1 枚分の高さのときだけスライド扱いにする
+   （そうしないと、ただの縦長ページの <section> をスライドと誤認する） */
+function looksFullScreen(win, els) {
+  const H = win.innerHeight || App.baseH;
+  let ok = 0;
+  for (const e of els) {
+    const h = e.offsetHeight || 0;
+    if (h >= H * 0.75 && h <= H * 1.35) ok++;
+  }
+  return ok >= els.length * 0.7;
+}
+
+/* ドキュメント型：見出しからジャンプ先を作る */
+function absTop(el) {
+  let y = 0, n = el;
+  while (n) { y += n.offsetTop || 0; n = n.offsetParent; }
+  return y;
+}
+
+function buildSections(doc) {
+  const win = doc.defaultView;
+  const H = win.innerHeight || 900;
+  const total = Math.max(
+    doc.documentElement.scrollHeight || 0,
+    doc.body ? doc.body.scrollHeight : 0
+  );
+
+  let hs = [];
+  try {
+    hs = Array.from(doc.querySelectorAll('h1,h2,h3'))
+      .filter((el) => el.getClientRects().length > 0);
+  } catch (e) { /* noop */ }
+
+  const secs = [];
+  for (const el of hs) {
+    const top = Math.max(0, absTop(el) - 24);
+    // 近すぎる見出しはまとめる
+    if (secs.length && top - secs[secs.length - 1].top < 80) continue;
+    secs.push({ top: top, label: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60) });
+  }
+
+  if (secs.length < 2) {
+    // 見出しが無い資料は 1 画面ずつ送る
+    const n = Math.max(1, Math.ceil(total / H));
+    const out = [];
+    for (let i = 0; i < n; i++) out.push({ top: i * H, label: '画面 ' + (i + 1) });
+    return out;
+  }
+  if (secs[0].top > H * 0.4) secs.unshift({ top: 0, label: '先頭' });
+  return secs;
+}
+
+/* スライドの見出しテキスト（一覧のキャプション用） */
+function slideLabel(el) {
+  let t = '';
+  try {
+    const h = el.querySelector('h1,h2,h3,.title,.eyebrow');
+    t = ((h && h.textContent) || el.textContent || '').trim();
+  } catch (e) { /* noop */ }
+  return t.replace(/\s+/g, ' ').slice(0, 48);
+}
+
+/* ============================================================
+   ビュー（メイン / 次 / 本番ウィンドウ）
+   ============================================================ */
+const viewMain = { win: null, doc: null, slides: [] };
+const viewNext = { win: null, doc: null, slides: [] };
+const viewShow = { win: null, doc: null, slides: [] };
+
+function sizeIframe(ifr, w, h) {
+  ifr.style.width = w + 'px';
+  ifr.style.height = h + 'px';
+}
+
+function bindSlides(v) {
+  v.slides = [];
+  if (!v.doc) return;
+  if (App.mode === 'slide' && App.sel) {
+    try { v.slides = Array.from(v.doc.querySelectorAll(App.sel)).filter(notOurs); } catch (e) { /* noop */ }
+  }
+}
+
+/* 資料側のキー操作・クリック操作を止め、こちらの操作に一本化する */
+function guardEvents(v) {
+  const w = v.win;
+  if (!w || w.__pvGuarded) return;
+  w.__pvGuarded = true;
+  const kill = (e) => { e.stopImmediatePropagation(); };
+  ['keydown', 'keyup', 'keypress'].forEach((t) => {
+    w.addEventListener(t, (e) => {
+      kill(e);
+      if (t === 'keydown') onKey(e);
+      else if (t === 'keyup') onKeyUp(e);
+    }, true);
+  });
+  ['click', 'dblclick', 'contextmenu', 'mousedown', 'mouseup'].forEach((t) => {
+    w.addEventListener(t, kill, true);
+  });
+}
+
+/* オーバーレイ（レーザー / スポットライト / 黒白画面） */
+function ensureOverlay(v) {
+  if (!v.doc) return null;
+  const d = v.doc;
+  let ov = d.getElementById('__pvOv');
+  if (ov) return ov;
+  const host = d.body || d.documentElement;
+  if (!host) return null;
+
+  ov = d.createElement('div');
+  ov.id = '__pvOv';
+  ov.style.cssText =
+    // 幅と高さは paintOverlay で指定する（資料側に zoom を掛けると
+    // fixed の座標系も倍率ぶん伸び縮みするため、inset:0 では合わなくなる）
+    'position:fixed;left:0;top:0;z-index:2147483000;pointer-events:none;';
+
+  const spot = d.createElement('div');
+  spot.id = '__pvSpot';
+  spot.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;display:none;';
+
+  const laser = d.createElement('div');
+  laser.id = '__pvLaser';
+  laser.style.cssText =
+    'position:absolute;left:0;top:0;width:20px;height:20px;margin:-10px 0 0 -10px;' +
+    'border-radius:50%;display:none;' +
+    'background:radial-gradient(circle,#ff2d20 0%,#ff2d20 38%,rgba(255,45,32,.45) 58%,rgba(255,45,32,0) 72%);' +
+    'box-shadow:0 0 16px 6px rgba(255,45,32,.5);';
+
+  const cover = d.createElement('div');
+  cover.id = '__pvCover';
+  cover.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;display:none;background:#000;';
+
+  ov.appendChild(spot);
+  ov.appendChild(laser);
+  ov.appendChild(cover);
+  host.appendChild(ov);
+  return ov;
+}
+
+function paintOverlay(v) {
+  if (!v || !v.doc || !v.win) return;
+  const ov = ensureOverlay(v);
+  if (!ov) return;
+  const d = v.doc;
+  // 資料に zoom を掛けている場合、その中の座標系は倍率ぶん縮む
+  const z = App.zoomShow || 1;
+  const W = (v.win.innerWidth || App.baseW) / z;
+  const H = (v.win.innerHeight || App.baseH) / z;
+  ov.style.width = W + 'px';
+  ov.style.height = H + 'px';
+  const x = App.ptr.x * W;
+  const y = App.ptr.y * H;
+
+  const laser = d.getElementById('__pvLaser');
+  const spot = d.getElementById('__pvSpot');
+  const cover = d.getElementById('__pvCover');
+  if (!laser || !spot || !cover) return;
+
+  laser.style.display = App.laser ? 'block' : 'none';
+  laser.style.left = x + 'px';
+  laser.style.top = y + 'px';
+
+  if (App.spot) {
+    const R = App.spotR / z;   // 画面上の見た目の大きさを倍率によらず一定に保つ
+    spot.style.display = 'block';
+    spot.style.background =
+      'radial-gradient(circle at ' + x + 'px ' + y + 'px,' +
+      ' rgba(0,0,0,0) 0, rgba(0,0,0,0) ' + R + 'px,' +
+      ' rgba(0,0,0,' + App.spotDim + ') ' + (R + 44 / z) + 'px)';
+  } else {
+    spot.style.display = 'none';
+  }
+
+  if (App.black || App.white) {
+    cover.style.display = 'block';
+    cover.style.background = App.black ? '#000' : '#fff';
+  } else {
+    cover.style.display = 'none';
+  }
+}
+
+/* ============================================================
+   表示倍率
+   資料側は body に zoom を掛ける（documentElement ではなくオーバーレイの
+   親である body に掛けることで、資料と重ね物の座標系を揃えて扱える）
+   ============================================================ */
+function zoomDoc(doc) {
+  if (!doc || !doc.body) return;
+  doc.body.style.zoom = App.zoomShow === 1 ? '' : String(App.zoomShow);
+}
+
+function applyShowZoom() {
+  [viewMain, viewNext, viewShow].forEach((v) => { if (v && v.doc) zoomDoc(v.doc); });
+  Array.from($('gridBody').children).forEach((c) => {
+    const ifr = c.querySelector('iframe');
+    try { zoomDoc(ifr.contentDocument); } catch (e) { /* noop */ }
+  });
+  // ドキュメント型は倍率で本文の高さが変わるので、ジャンプ先を作り直す
+  if (App.mode === 'doc' && viewMain.doc) {
+    App.sections = buildSections(viewMain.doc);
+    App.count = App.sections.length;
+    App.labels = App.sections.map((s) => s.label);
+    $('navSlider').max = String(Math.max(0, App.count - 1));
+    updateModeTag();
+  }
+  goto(Math.min(App.index, Math.max(0, App.count - 1)), true);
+  $('zoomShow').value = String(App.zoomShow);
+}
+
+function stepShowZoom(dir) {
+  const i = ZOOM_STEPS.indexOf(App.zoomShow);
+  const cur = i >= 0 ? i : ZOOM_STEPS.indexOf(1);
+  const n = Math.max(0, Math.min(ZOOM_STEPS.length - 1, cur + dir));
+  if (ZOOM_STEPS[n] === App.zoomShow) return;
+  App.zoomShow = ZOOM_STEPS[n];
+  savePrefs();
+  applyShowZoom();
+  toast('本番の表示倍率 ' + Math.round(App.zoomShow * 100) + '%');
+}
+
+function applyUIZoom() {
+  document.documentElement.style.zoom = App.zoomUI === 1 ? '' : String(App.zoomUI);
+  $('zoomUI').value = String(App.zoomUI);
+  // 倍率が変わるとプレビュー枠の実寸も変わるので測り直す
+  setTimeout(fitAll, 0);
+}
+
+function paintAllOverlays() {
+  paintOverlay(viewMain);
+  if (App.child && !App.child.closed) paintOverlay(viewShow);
+}
+
+/* ---------- ビューへ資料を流し込む ---------- */
+async function mountIframe(v, ifr) {
+  sizeIframe(ifr, App.baseW, App.baseH);
+  injectDoc(ifr.contentDocument, App.html);
+  await waitReady(ifr.contentDocument);
+  v.win = ifr.contentWindow;
+  v.doc = ifr.contentDocument;
+  bindSlides(v);
+  guardEvents(v);
+  ensureOverlay(v);
+  zoomDoc(v.doc);
+}
+
+async function mountChild() {
+  if (!App.child || App.child.closed) return;
+  injectDoc(App.child.document, App.html);
+  await waitReady(App.child.document);
+  viewShow.win = App.child;
+  viewShow.doc = App.child.document;
+  bindSlides(viewShow);
+  guardEvents(viewShow);
+  ensureOverlay(viewShow);
+  zoomDoc(viewShow.doc);
+  // 本番ウィンドウのサイズ変更に追従
+  if (!App.child.__pvResize) {
+    App.child.__pvResize = true;
+    App.child.addEventListener('resize', () => {
+      App.baseW = App.child.innerWidth;
+      App.baseH = App.child.innerHeight;
+      resizeIframesToBase();
+      fitAll();
+    });
+  }
+}
+
+function resizeIframesToBase() {
+  sizeIframe($('pvMain'), App.baseW, App.baseH);
+  sizeIframe($('pvNext'), App.baseW, App.baseH);
+}
+
+/* ============================================================
+   表示位置の適用
+   ============================================================ */
+function applyIndex(v, i) {
+  if (!v || !v.doc || !v.win) return;
+
+  if (App.mode === 'doc') {
+    const s = App.sections[i];
+    try { v.win.scrollTo(0, s ? s.top : 0); } catch (e) { /* noop */ }
+    return;
+  }
+
+  const c = App.ctrl;
+  if (!c || !v.slides.length) return;
+
+  if (c.kind === 'class') {
+    v.slides.forEach((s, k) => {
+      if (k === i) s.classList.add(c.cls);
+      else s.classList.remove(c.cls);
+    });
+  } else if (c.kind === 'display') {
+    v.slides.forEach((s, k) => {
+      s.style.setProperty('display', k === i ? c.disp : 'none', 'important');
+    });
+  } else if (c.kind === 'scroll') {
+    const el = v.slides[i];
+    if (el) {
+      try { v.win.scrollTo(0, absTop(el)); } catch (e) { /* noop */ }
+    }
+  }
+}
+
+function goto(i, force) {
+  if (!App.count) return;
+  const n = Math.max(0, Math.min(App.count - 1, i));
+  if (!force && n === App.index) return;
+  App.index = n;
+  applyIndex(viewMain, n);
+  if (App.child && !App.child.closed) applyIndex(viewShow, n);
+  applyIndex(viewNext, Math.min(n + 1, App.count - 1));
+  paintAllOverlays();
+  syncUI();
+  showNote();
+  markThumb();
+}
+
+const next = () => goto(App.index + 1);
+const prev = () => goto(App.index - 1);
+
+/* ドキュメント型：自由スクロールを全ビューに同期する */
+function scrollAllBy(dy) {
+  if (!viewMain.win) return;
+  const y = Math.max(0, (viewMain.win.scrollY || 0) + dy);
+  try { viewMain.win.scrollTo(0, y); } catch (e) { /* noop */ }
+  if (App.child && !App.child.closed && viewShow.win) {
+    try { viewShow.win.scrollTo(0, y); } catch (e) { /* noop */ }
+  }
+  if (viewNext.win) {
+    try { viewNext.win.scrollTo(0, y + (App.baseH || 900)); } catch (e) { /* noop */ }
+  }
+  // 現在位置に一番近いセクションへインデックスを寄せる
+  let k = 0;
+  for (let i = 0; i < App.sections.length; i++) {
+    if (App.sections[i].top <= y + 12) k = i;
+  }
+  if (k !== App.index) {
+    App.index = k;
+    syncUI();
+    showNote();
+    markThumb();
+  }
+}
+
+/* ============================================================
+   サイズ合わせ（本番と同じ論理サイズで描いて縮小表示）
+   ============================================================ */
+function fitStage(box, ifr, availW, availH) {
+  const w = App.baseW, h = App.baseH;
+  const s = Math.max(0.02, Math.min(availW / w, availH / h));
+  ifr.style.transform = 'scale(' + s + ')';
+  box.style.width = Math.round(w * s) + 'px';
+  box.style.height = Math.round(h * s) + 'px';
+  return s;
+}
+
+function fitAll() {
+  const mainEl = $('main');
+  fitStage($('mainStage'), $('pvMain'), mainEl.clientWidth - 26, mainEl.clientHeight - 26);
+  const nb = $('nextBox');
+  const availW = nb.clientWidth - 16;
+  fitStage($('nextStage'), $('pvNext'), availW, availW * (App.baseH / App.baseW));
+}
+
+/* ============================================================
+   資料の読み込みと構造解析
+   ============================================================ */
+function fillSelectorUI() {
+  const sel = $('selSelector');
+  sel.innerHTML = '';
+  App.candidates.forEach((c) => {
+    const o = document.createElement('option');
+    o.value = c.sel;
+    o.textContent = c.sel + '（' + c.count + '枚）';
+    sel.appendChild(o);
+  });
+  const o = document.createElement('option');
+  o.value = '__doc__';
+  o.textContent = 'ドキュメント（スクロール）';
+  sel.appendChild(o);
+  sel.value = App.mode === 'doc' ? '__doc__' : App.sel;
+}
+
+function updateModeTag() {
+  const t = $('modeTag');
+  if (App.mode === 'doc') {
+    t.textContent = 'ドキュメント型 · ' + App.count + ' セクション';
+  } else {
+    const k = App.ctrl ? App.ctrl.kind : '?';
+    const how = k === 'class' ? ('.' + App.ctrl.cls + ' で切替')
+      : k === 'display' ? ('display:' + App.ctrl.disp + ' で切替')
+        : 'スクロールで送る';
+    t.textContent = 'スライド型 · ' + App.count + '枚 · ' + how;
+  }
+}
+
+function applyStructure() {
+  const doc = viewMain.doc;
+  if (!doc) return;
+  if (App.mode === 'slide') {
+    bindSlides(viewMain);
+    if (!viewMain.slides.length) { App.mode = 'doc'; return applyStructure(); }
+    App.ctrl = detectControl(doc, viewMain.slides);
+    App.count = viewMain.slides.length;
+    App.labels = viewMain.slides.map(slideLabel);
+    App.sections = [];
+  } else {
+    App.ctrl = null;
+    App.sections = buildSections(doc);
+    App.count = App.sections.length;
+    App.labels = App.sections.map((s) => s.label);
+    viewMain.slides = [];
+  }
+  bindSlides(viewNext);
+  bindSlides(viewShow);
+  fillSelectorUI();
+  updateModeTag();
+  $('navSlider').max = String(Math.max(0, App.count - 1));
+}
+
+async function loadHtml(html, name) {
+  App.html = resolveAssets(html);
+  App.fileName = name || 'presentation.html';
+  App.thumbsBuilt = false;
+  App.index = 0;
+  $('gridBody').innerHTML = '';
+  $('drop').classList.add('hide');
+  $('fileName').textContent = App.fileName;
+  $('fileName').title = App.fileName;
+
+  await mountIframe(viewMain, $('pvMain'));
+
+  // 候補を上から試し、「本当にスライド型か」を確かめてから採用する
+  App.candidates = findCandidates(viewMain.doc);
+  App.mode = 'doc';
+  App.sel = '';
+  for (const c of App.candidates) {
+    let els = [];
+    try { els = Array.from(viewMain.doc.querySelectorAll(c.sel)); } catch (e) { continue; }
+    if (els.length < 2) continue;
+    const ctrl = detectControl(viewMain.doc, els);
+    // 1 枚ずつ切り替わる資料＝確実にスライド型。
+    // 全部見えている資料は、各要素が画面 1 枚分の高さのときだけスライド型とみなす。
+    if (ctrl.kind !== 'scroll' || looksFullScreen(viewMain.win, els)) {
+      App.mode = 'slide';
+      App.sel = c.sel;
+      break;
+    }
+  }
+  applyStructure();
+
+  await mountIframe(viewNext, $('pvNext'));
+  if (App.child && !App.child.closed) await mountChild();
+
+  loadNotes();
+  fitAll();
+  goto(0, true);
+
+  // まだ解決できていない外部参照があれば知らせる
+  const left = (App.html.match(REL_RE) || []).length + (App.html.match(URL_RE) || []).length;
+  const what = App.mode === 'doc'
+    ? App.count + ' セクションのドキュメントとして読み込みました'
+    : App.count + ' 枚のスライドを読み込みました';
+  if (left) {
+    toast(what + '（画像など ' + left + ' 件が未解決です。資料の入ったフォルダごとドロップすると表示されます）', true);
+  } else {
+    toast(what);
+  }
+}
+
+async function remount() {
+  const keep = App.index;
+  await mountIframe(viewMain, $('pvMain'));
+  applyStructure();
+  await mountIframe(viewNext, $('pvNext'));
+  if (App.child && !App.child.closed) await mountChild();
+  App.thumbsBuilt = false;
+  $('gridBody').innerHTML = '';
+  fitAll();
+  goto(Math.min(keep, App.count - 1), true);
+}
+
+/* ============================================================
+   カンペ（ノート）
+   ============================================================ */
+function noteKey() {
+  return 'pvNotes:' + App.fileName + ':' + App.count;
+}
+
+function loadNotes() {
+  App.notes = {};
+  try {
+    const raw = localStorage.getItem(noteKey());
+    if (raw) App.notes = JSON.parse(raw) || {};
+  } catch (e) { /* noop */ }
+}
+
+let noteSaveTimer = null;
+function saveNotes(quiet) {
+  try {
+    localStorage.setItem(noteKey(), JSON.stringify(App.notes));
+    if (!quiet) {
+      const d = new Date();
+      $('noteSaved').textContent = '保存済み ' +
+        String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+  } catch (e) {
+    $('noteSaved').textContent = '保存できません';
+  }
+}
+
+function showNote() {
+  $('note').value = App.notes[App.index] || '';
+  const n = Object.keys(App.notes).filter((k) => (App.notes[k] || '').trim()).length;
+  $('noteCount').textContent = n ? ('カンペ ' + n + ' / ' + App.count) : '';
+}
+
+function exportNotes() {
+  const data = {
+    file: App.fileName,
+    count: App.count,
+    mode: App.mode,
+    selector: App.sel,
+    savedAt: new Date().toISOString(),
+    notes: App.notes,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = App.fileName.replace(/\.html?$/i, '') + '.notes.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast('カンペを書き出しました');
+}
+
+function importNotesText(text) {
+  try {
+    const d = JSON.parse(text);
+    const src = d && d.notes ? d.notes : d;
+    if (!src || typeof src !== 'object') throw new Error('形式が違います');
+    App.notes = {};
+    Object.keys(src).forEach((k) => { App.notes[k] = String(src[k] || ''); });
+    saveNotes(true);
+    showNote();
+    markThumb();
+    toast('カンペを読み込みました');
+  } catch (e) {
+    toast('カンペの読み込みに失敗しました：' + e.message, true);
+  }
+}
+
+/* ============================================================
+   サムネ一覧
+   ============================================================ */
+function markThumb() {
+  const body = $('gridBody');
+  Array.from(body.children).forEach((el, i) => {
+    el.classList.toggle('cur', i === App.index);
+    const dot = el.querySelector('.thasnote');
+    const has = (App.notes[i] || '').trim().length > 0;
+    if (dot) dot.style.display = has ? 'block' : 'none';
+  });
+}
+
+function buildThumbs() {
+  const body = $('gridBody');
+  body.innerHTML = '';
+  App.thumbsBuilt = true;
+
+  const colW = 220;
+  const scale = colW / App.baseW;
+  const boxH = Math.round(App.baseH * scale);
+
+  const queue = [];
+  for (let i = 0; i < App.count; i++) {
+    const card = document.createElement('div');
+    card.className = 'thumb' + (i === App.index ? ' cur' : '');
+
+    const box = document.createElement('div');
+    box.className = 'tbox';
+    box.style.height = boxH + 'px';
+
+    const ifr = document.createElement('iframe');
+    ifr.style.width = App.baseW + 'px';
+    ifr.style.height = App.baseH + 'px';
+    ifr.style.transform = 'scale(' + scale + ')';
+
+    const tag = document.createElement('div');
+    tag.className = 'tno';
+    const lab = App.labels[i] || '';
+    tag.innerHTML = '<span>' + (i + 1) + '</span><em></em>';
+    tag.querySelector('em').textContent = lab;
+
+    const dot = document.createElement('div');
+    dot.className = 'thasnote';
+    dot.style.display = (App.notes[i] || '').trim() ? 'block' : 'none';
+
+    box.appendChild(ifr);
+    card.appendChild(box);
+    card.appendChild(tag);
+    card.appendChild(dot);
+    card.addEventListener('click', () => { closeGrid(); goto(i, true); });
+    body.appendChild(card);
+    queue.push({ ifr: ifr, i: i });
+  }
+
+  $('gridInfo').textContent = App.count + ' 枚';
+
+  // 一気に作ると重いので少しずつ流し込む
+  let p = 0;
+  const step = () => {
+    if (p >= queue.length) return;
+    if (!$('grid').classList.contains('open')) { App.thumbsBuilt = false; return; }
+    const q = queue[p++];
+    const v = { win: null, doc: null, slides: [] };
+    injectDoc(q.ifr.contentDocument, App.html);
+    waitReady(q.ifr.contentDocument, 3000).then(() => {
+      v.win = q.ifr.contentWindow;
+      v.doc = q.ifr.contentDocument;
+      bindSlides(v);
+      zoomDoc(v.doc);
+      applyIndex(v, q.i);
+      setTimeout(step, 0);
+    });
+  };
+  step();
+}
+
+function openGrid() {
+  $('grid').classList.add('open');
+  if (!App.thumbsBuilt) buildThumbs();
+  else markThumb();
+  const cur = $('gridBody').children[App.index];
+  if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+function closeGrid() { $('grid').classList.remove('open'); }
+function toggleGrid() {
+  if ($('grid').classList.contains('open')) closeGrid();
+  else openGrid();
+}
+
+/* ============================================================
+   タイマー
+   ============================================================ */
+function timerElapsed() {
+  const t = App.timer;
+  return t.acc + (t.running ? Date.now() - t.t0 : 0);
+}
+function fmt(ms) {
+  const neg = ms < 0;
+  let s = Math.floor(Math.abs(ms) / 1000);
+  const h = Math.floor(s / 3600);
+  s -= h * 3600;
+  const m = Math.floor(s / 60);
+  s -= m * 60;
+  const body = (h ? h + ':' + String(m).padStart(2, '0') : String(m).padStart(2, '0')) +
+    ':' + String(s).padStart(2, '0');
+  return (neg ? '-' : '') + body;
+}
+function tickTimer() {
+  const el = $('timer');
+  const ms = timerElapsed();
+  const lim = App.timer.limit * 60000;
+  if (lim > 0) {
+    const left = lim - ms;
+    el.textContent = fmt(left);
+    el.className = left < 0 ? 'over' : (App.timer.running ? 'run' : '');
+  } else {
+    el.textContent = fmt(ms);
+    el.className = App.timer.running ? 'run' : '';
+  }
+}
+function toggleTimer() {
+  const t = App.timer;
+  if (t.running) { t.acc += Date.now() - t.t0; t.running = false; }
+  else { t.t0 = Date.now(); t.running = true; }
+  $('btnTimer').textContent = t.running ? '⏸ 停止' : '▶ 開始';
+  $('btnTimer').classList.toggle('on', t.running);
+  tickTimer();
+}
+function resetTimer() {
+  App.timer.acc = 0;
+  App.timer.t0 = Date.now();
+  tickTimer();
+  toast('タイマーをリセットしました');
+}
+
+/* ============================================================
+   本番ウィンドウ
+   ============================================================ */
+function childHint() {
+  if (!App.child || App.child.closed) return;
+  const d = App.child.document;
+  const h = d.createElement('div');
+  h.style.cssText =
+    'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483600;' +
+    'background:rgba(12,16,22,.9);color:#e8eef7;border:1px solid #334054;border-radius:9px;' +
+    'padding:9px 16px;font:14px/1.5 "Yu Gothic UI",Meiryo,sans-serif;pointer-events:none;' +
+    'transition:opacity .4s';
+  h.textContent = 'このウィンドウを発表用モニタへ移動し、F11 で全画面にしてください';
+  (d.body || d.documentElement).appendChild(h);
+  setTimeout(() => { h.style.opacity = '0'; }, 5000);
+  setTimeout(() => { try { h.remove(); } catch (e) { /* noop */ } }, 5600);
+}
+
+async function openShow() {
+  if (App.child && !App.child.closed) { App.child.focus(); return; }
+  const w = window.open('', 'pvShow', 'width=1280,height=720,menubar=no,toolbar=no,location=no,status=no');
+  if (!w) { toast('ポップアップがブロックされました。このページのポップアップを許可してください', true); return; }
+  App.child = w;
+  if (App.html) {
+    App.baseW = w.innerWidth || App.baseW;
+    App.baseH = w.innerHeight || App.baseH;
+    resizeIframesToBase();
+    await mountChild();
+    // 別ウィンドウの中身を触れているか確認（触れないと同期できない）
+    let ok = false;
+    try { ok = !!(viewShow.doc && viewShow.doc.body); } catch (e) { ok = false; }
+    if (!ok) {
+      toast('スライドショーの中身を操作できませんでした。presenter.html をローカルサーバー経由で開くか、資料と同じフォルダに置いて開き直してください', true);
+      return;
+    }
+    applyIndex(viewShow, App.index);
+    paintOverlay(viewShow);
+    fitAll();
+  }
+  childHint();
+  updateLive();
+}
+
+function fullShow() {
+  if (!App.child || App.child.closed) { toast('先に「別モニタで開く」を押してください', true); return; }
+  App.child.focus();
+  try {
+    const el = App.child.document.documentElement;
+    const p = el.requestFullscreen ? el.requestFullscreen() : null;
+    if (p && p.catch) {
+      p.catch(() => toast('スライドショー側のウィンドウで F11 を押してください', true));
+    }
+  } catch (e) {
+    toast('スライドショー側のウィンドウで F11 を押してください', true);
+  }
+  setTimeout(() => window.focus(), 400);
+}
+
+function updateLive() {
+  const live = !!(App.child && !App.child.closed);
+  const el = $('liveDot');
+  el.classList.toggle('live', live);
+  el.querySelector('span').textContent = live ? 'スライドショー表示中' : '未接続';
+}
+
+/* ============================================================
+   UI 反映
+   ============================================================ */
+function syncUI() {
+  $('pos').textContent = App.count ? (App.index + 1) + ' / ' + App.count : '— / —';
+  $('navSlider').value = String(App.index);
+  $('btnPrev').disabled = App.index <= 0;
+  $('btnNext').disabled = App.index >= App.count - 1;
+  const nl = App.index >= App.count - 1 ? '（最後のスライド）' : (App.labels[App.index + 1] || '');
+  $('nextLabel').textContent = nl;
+  $('btnLaser').classList.toggle('on', App.laser);
+  $('btnSpot').classList.toggle('on', App.spot);
+  $('btnBlack').classList.toggle('on', App.black);
+  $('btnWhite').classList.toggle('on', App.white);
+}
+
+/* ============================================================
+   入力
+   ============================================================ */
+let numBuf = '';
+let numTimer = null;
+
+function onKey(e) {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  const typing = tag === 'TEXTAREA' || tag === 'INPUT';
+
+  if (typing) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); next(); }
+    if (e.key === 'Escape') document.activeElement.blur();
+    return;
+  }
+
+  if ($('help').classList.contains('open') && (e.key === 'Escape' || e.key === '?')) {
+    e.preventDefault(); $('help').classList.remove('open'); return;
+  }
+
+  const k = e.key;
+
+  if (k >= '0' && k <= '9') {
+    numBuf += k;
+    clearTimeout(numTimer);
+    numTimer = setTimeout(() => { numBuf = ''; }, 1600);
+    toast('ジャンプ: ' + numBuf + ' → Enter');
+    return;
+  }
+  if (k === 'Enter' && numBuf) {
+    e.preventDefault();
+    const n = parseInt(numBuf, 10);
+    numBuf = '';
+    if (n >= 1 && n <= App.count) { closeGrid(); goto(n - 1, true); }
+    return;
+  }
+
+  switch (k) {
+    case 'ArrowRight': case 'ArrowDown': case 'PageDown': case ' ': case 'Spacebar':
+      e.preventDefault(); next(); break;
+    case 'ArrowLeft': case 'ArrowUp': case 'PageUp':
+      e.preventDefault(); prev(); break;
+    case 'Home': e.preventDefault(); goto(0, true); break;
+    case 'End': e.preventDefault(); goto(App.count - 1, true); break;
+    case 'Escape': e.preventDefault(); closeGrid(); break;
+    default: break;
+  }
+
+  const lk = k.length === 1 ? k.toLowerCase() : k;
+  switch (lk) {
+    case 'g': e.preventDefault(); toggleGrid(); break;
+    // 単押し＝押している間だけ / Shift 併用＝固定のオンオフ
+    case 'l':
+      e.preventDefault();
+      if (e.repeat) break;
+      if (e.shiftKey) setLaserLatched(!App.laserLatched); else setLaserHeld(true);
+      break;
+    case 's':
+      e.preventDefault();
+      if (e.repeat) break;
+      if (e.shiftKey) setSpotLatched(!App.spotLatched); else setSpotHeld(true);
+      break;
+    case 'b': e.preventDefault(); setCover('black'); break;
+    case 'w': e.preventDefault(); setCover('white'); break;
+    case 'f': e.preventDefault(); fullShow(); break;
+    case 'r': e.preventDefault(); if (App.html) remount(); break;
+    case '+': case '=': e.preventDefault(); stepShowZoom(1); break;
+    case '-': case '_': e.preventDefault(); stepShowZoom(-1); break;
+    case 't': e.preventDefault(); if (e.shiftKey) resetTimer(); else toggleTimer(); break;
+    case '?': e.preventDefault(); $('help').classList.toggle('open'); break;
+    default: break;
+  }
+}
+
+function onKeyUp(e) {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+  const k = e.key && e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k === 'l') setLaserHeld(false);
+  if (k === 's') setSpotHeld(false);
+}
+
+/* 押している間（held）と固定（latched）の論理和を実際の表示に反映する */
+function refreshFx() {
+  App.laser = App.laserHeld || App.laserLatched;
+  App.spot = App.spotHeld || App.spotLatched;
+  paintAllOverlays();
+  syncUI();
+}
+function setLaserHeld(on) { if (App.laserHeld !== on) { App.laserHeld = on; refreshFx(); } }
+function setSpotHeld(on) { if (App.spotHeld !== on) { App.spotHeld = on; refreshFx(); } }
+function setLaserLatched(on) { App.laserLatched = on; refreshFx(); }
+function setSpotLatched(on) { App.spotLatched = on; refreshFx(); }
+/* キーを押したままウィンドウを離れたときに押しっぱなし状態が残らないようにする */
+function releaseHeld() {
+  if (App.laserHeld || App.spotHeld) { App.laserHeld = false; App.spotHeld = false; refreshFx(); }
+}
+function setCover(which) {
+  if (which === 'black') { App.black = !App.black; if (App.black) App.white = false; }
+  else { App.white = !App.white; if (App.white) App.black = false; }
+  paintAllOverlays();
+  syncUI();
+}
+
+/* ---------- プレビュー上のマウス ---------- */
+function bindCatch() {
+  const c = $('catch');
+  let wheelLock = 0;
+
+  c.addEventListener('mousemove', (e) => {
+    const r = c.getBoundingClientRect();
+    App.ptr.x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    App.ptr.y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    if (App.laser || App.spot) paintAllOverlays();
+  });
+
+  c.addEventListener('click', (e) => { e.preventDefault(); next(); });
+  c.addEventListener('contextmenu', (e) => { e.preventDefault(); prev(); });
+
+  c.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (App.mode === 'doc') {
+      scrollAllBy(e.deltaY);
+      return;
+    }
+    const now = Date.now();
+    if (now - wheelLock < 260) return;
+    wheelLock = now;
+    if (e.deltaY > 0) next(); else prev();
+  }, { passive: false });
+}
+
+/* ---------- ファイル読み込み ---------- */
+function readFile(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result || ''));
+    r.onerror = () => rej(new Error('読み込み失敗'));
+    r.readAsText(file, 'UTF-8');
+  });
+}
+
+/* entries: [{path, file}] — フォルダごとドロップされた場合も同じ形で受ける */
+async function handleEntries(entries) {
+  const arr = entries || [];
+  const htmls = arr.filter((e) => /\.html?$/i.test(e.path));
+  const json = arr.find((e) => /\.notes\.json$/i.test(e.path)) || arr.find((e) => /\.json$/i.test(e.path));
+  if (!htmls.length) {
+    if (json) { importNotesText(await readFile(json.file)); return; }
+    toast('HTML ファイルを入れてください', true);
+    return;
+  }
+  // 複数あるときは一番浅い場所にある大きいものを資料とみなす
+  htmls.sort((a, b) => {
+    const d = a.path.split('/').length - b.path.split('/').length;
+    return d !== 0 ? d : b.file.size - a.file.size;
+  });
+  const deck = htmls[0];
+
+  clearAssets();
+  for (const e of arr) {
+    if (e === deck) continue;
+    if (/\.(html?|json)$/i.test(e.path)) continue;
+    addAsset(e.path, e.file);
+  }
+
+  await loadHtml(await readFile(deck.file), deck.path.split('/').pop());
+  if (json) importNotesText(await readFile(json.file));
+}
+
+function handleFiles(files) {
+  return handleEntries(Array.from(files || []).map((f) => ({ path: f.name, file: f })));
+}
+
+function bindDnD() {
+  const dz = $('drop');
+  ['dragenter', 'dragover'].forEach((t) => {
+    window.addEventListener(t, (e) => {
+      e.preventDefault();
+      if (!$('drop').classList.contains('hide')) dz.classList.add('over');
+    });
+  });
+  ['dragleave', 'dragend'].forEach((t) => {
+    window.addEventListener(t, () => dz.classList.remove('over'));
+  });
+  window.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    dz.classList.remove('over');
+    const entries = await collectDrop(e.dataTransfer);
+    await handleEntries(entries);
+  });
+}
+
+/* ============================================================
+   起動
+   ============================================================ */
+function bindUI() {
+  $('btnPrev').addEventListener('click', prev);
+  $('btnNext').addEventListener('click', next);
+  $('navSlider').addEventListener('input', (e) => goto(parseInt(e.target.value, 10), true));
+
+  // ボタンは固定のオンオフ（キーは押している間だけ）
+  $('btnLaser').addEventListener('click', () => setLaserLatched(!App.laserLatched));
+  $('btnSpot').addEventListener('click', () => setSpotLatched(!App.spotLatched));
+  $('spotR').addEventListener('input', (e) => {
+    App.spotR = parseInt(e.target.value, 10);
+    savePrefs();
+    if (App.spot) paintAllOverlays();
+  });
+  $('spotDim').addEventListener('input', (e) => {
+    App.spotDim = parseInt(e.target.value, 10) / 100;
+    savePrefs();
+    if (App.spot) paintAllOverlays();
+  });
+  $('btnBlack').addEventListener('click', () => setCover('black'));
+  $('btnWhite').addEventListener('click', () => setCover('white'));
+
+  $('zoomShow').addEventListener('change', (e) => {
+    App.zoomShow = parseFloat(e.target.value);
+    savePrefs();
+    applyShowZoom();
+    toast('本番の表示倍率を ' + Math.round(App.zoomShow * 100) + '% にしました');
+  });
+  $('zoomUI').addEventListener('change', (e) => {
+    App.zoomUI = parseFloat(e.target.value);
+    savePrefs();
+    applyUIZoom();
+  });
+
+  $('btnGrid').addEventListener('click', toggleGrid);
+  $('btnGridClose').addEventListener('click', closeGrid);
+  $('btnFull').addEventListener('click', fullShow);
+  $('btnOpenShow').addEventListener('click', openShow);
+  $('btnReload').addEventListener('click', () => { if (App.html) remount(); });
+  $('btnLoadOther').addEventListener('click', () => $('filePick').click());
+
+  $('btnHelp').addEventListener('click', () => $('help').classList.toggle('open'));
+  $('btnHelpClose').addEventListener('click', () => $('help').classList.remove('open'));
+
+  $('btnTimer').addEventListener('click', toggleTimer);
+  $('btnTimerReset').addEventListener('click', resetTimer);
+  $('limit').addEventListener('input', (e) => {
+    App.timer.limit = Math.max(0, parseInt(e.target.value, 10) || 0);
+    tickTimer();
+  });
+
+  $('note').addEventListener('input', (e) => {
+    App.notes[App.index] = e.target.value;
+    $('noteSaved').textContent = '入力中…';
+    clearTimeout(noteSaveTimer);
+    noteSaveTimer = setTimeout(() => { saveNotes(); markThumb(); }, 500);
+  });
+  $('btnNotePlus').addEventListener('click', () => setNoteSize(2));
+  $('btnNoteMinus').addEventListener('click', () => setNoteSize(-2));
+  $('btnNoteExport').addEventListener('click', exportNotes);
+  $('btnNoteImport').addEventListener('click', () => $('notePick').click());
+
+  $('btnPick').addEventListener('click', () => $('filePick').click());
+  $('drop').addEventListener('click', (e) => {
+    if (e.target === $('drop') || e.target === $('dropInner')) $('filePick').click();
+  });
+  $('filePick').addEventListener('change', (e) => handleFiles(e.target.files));
+  $('notePick').addEventListener('change', async (e) => {
+    if (e.target.files[0]) importNotesText(await readFile(e.target.files[0]));
+  });
+
+  $('selSelector').addEventListener('change', async (e) => {
+    const v = e.target.value;
+    if (v === '__doc__') { App.mode = 'doc'; App.sel = ''; }
+    else { App.mode = 'slide'; App.sel = v; }
+    await remount();
+    toast('区切りを変更しました');
+  });
+
+  window.addEventListener('keydown', onKey);
+  window.addEventListener('keyup', onKeyUp);
+  // フォーカスが外れたときにキーの押しっぱなしが残らないようにする
+  window.addEventListener('blur', releaseHeld);
+  window.addEventListener('resize', fitAll);
+  window.addEventListener('beforeunload', () => {
+    if (App.child && !App.child.closed) App.child.close();
+  });
+}
+
+function setNoteSize(d) {
+  const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--note-size'), 10) || 19;
+  const n = Math.min(42, Math.max(12, cur + d));
+  document.documentElement.style.setProperty('--note-size', n + 'px');
+  try { localStorage.setItem('pvNoteSize', String(n)); } catch (e) { /* noop */ }
+}
+
+const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5];
+
+function fillZoomSelect(el) {
+  el.innerHTML = '';
+  ZOOM_STEPS.forEach((z) => {
+    const o = document.createElement('option');
+    o.value = String(z);
+    o.textContent = Math.round(z * 100) + '%';
+    el.appendChild(o);
+  });
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem('pvPrefs', JSON.stringify({
+      spotR: App.spotR, spotDim: App.spotDim,
+      zoomShow: App.zoomShow, zoomUI: App.zoomUI,
+    }));
+  } catch (e) { /* noop */ }
+}
+
+function loadPrefs() {
+  let p = null;
+  try { p = JSON.parse(localStorage.getItem('pvPrefs') || 'null'); } catch (e) { /* noop */ }
+  if (p) {
+    if (typeof p.spotR === 'number') App.spotR = p.spotR;
+    if (typeof p.spotDim === 'number') App.spotDim = p.spotDim;
+    if (typeof p.zoomShow === 'number') App.zoomShow = p.zoomShow;
+    if (typeof p.zoomUI === 'number') App.zoomUI = p.zoomUI;
+  }
+  $('spotR').value = String(App.spotR);
+  $('spotDim').value = String(Math.round(App.spotDim * 100));
+  fillZoomSelect($('zoomShow'));
+  fillZoomSelect($('zoomUI'));
+  $('zoomShow').value = String(App.zoomShow);
+  $('zoomUI').value = String(App.zoomUI);
+}
+
+function init() {
+  const saved = (() => { try { return localStorage.getItem('pvNoteSize'); } catch (e) { return null; } })();
+  if (saved) document.documentElement.style.setProperty('--note-size', saved + 'px');
+  loadPrefs();
+
+  bindUI();
+  bindCatch();
+  bindDnD();
+  applyUIZoom();
+  syncUI();
+  tickTimer();
+  fitAll();
+
+  setInterval(tickTimer, 250);
+  setInterval(() => {
+    updateLive();
+    if (App.child && App.child.closed) { App.child = null; viewShow.win = null; viewShow.doc = null; }
+  }, 800);
+}
+
+init();
+</script>
+</body>
+</html>

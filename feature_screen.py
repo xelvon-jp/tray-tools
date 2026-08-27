@@ -37,6 +37,10 @@ from window_tools import TopmostTracker
 
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 
+# 同梱の発表者ツール。HTMLのプレゼン資料にカンペ・次スライド・タイマー・レーザーを
+# 付ける単一ファイルのビューアで、サーバー不要でブラウザに投げるだけで動く。
+BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
+
 # スリープ抑止中の目印。通知領域のアイコンは実質16px相当で、隅の小さなバッジは潰れて
 # 見えない。アイコン全周に太いリングを描き、縮小しても輪郭の変化で判別できるようにする。
 AWAKE_RING_COLOR = (245, 158, 11, 255)
@@ -919,14 +923,13 @@ class ScreenFeature:
 
         あちらは単一ファイルの file:// で動くビューアなので、既定のブラウザに投げる
         だけでよい。tray-tools 側に資料を渡す仕組みは持たせていない(資料は向こうへ
-        ドラッグ＆ドロップする)。"""
+        ドラッグ＆ドロップする)。
+
+        既定では同梱のものを開く。設定 tools.presenter にパスを書けば差し替えられる。"""
         path = (self.app_settings.get("tools", {}) or {}).get("presenter") or ""
         if not path:
-            self._notify(
-                "発表者ツール",
-                "settings.json の tools.presenter にパスを書いてください",
-            )
-            return
+            # 同梱してあるものを使う。設定に書くのは別の場所のものを使いたいときだけ。
+            path = str(BUNDLED_PRESENTER)
         if not os.path.exists(path):
             self._notify("発表者ツール", f"見つかりません\n{path}")
             return

@@ -30,6 +30,7 @@ import screen_mirror
 import screen_ruler
 import snippets
 import browser_open
+import capture_grab
 import taskbar_widget
 import web_presenter
 from capture_grab import new_session_stem, save_image
@@ -779,6 +780,9 @@ class ScreenFeature:
         通知の時点ではWindowsがまだタスクバーを並べ直しておらず、すぐ測ると古い位置を
         拾う。少し待ってから作り直す(連続で飛んでくる通知をまとめる役目も兼ねる)。"""
         try:
+            # mss はモニタの一覧を生成時に読むので、構成が変わったら作り直させる
+            # (使い回しの詳細は capture_grab._sct を参照)。
+            capture_grab.release_sct()
             if not self.taskbar_widgets:
                 return
             self._taskbar_rebuild_timer.start(taskbar_widget.REBUILD_DELAY_MS)

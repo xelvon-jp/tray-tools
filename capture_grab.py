@@ -11,6 +11,42 @@ from PySide6.QtCore import Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
 
 
+# mss のインスタンスは使い回す。生成のたびに ctypes で GDI の関数を引き直すため
+# 安くはなく、それ以上に「生成中にGCが走ると落ちる」問題がある。
+#
+# comtypes のCOMオブジェクトは CoInitialize(STA)で作られており、作ったスレッド以外から
+# 解放するとプロセスごと落ちる。PythonのGCは任意のスレッドで走るので、mss の初期化中に
+# たまたま動くとそこで死ぬ。画面ミラーが30fpsで呼ぶようになって発火が現実的になり、
+# crash.log に mss/base.py __init__ → comtypes __del__ → Release という同じスタックが
+# 何度も残った(2026-08-28に8回)。作らなければ、その窓は開かない。
+#
+# mss はスレッドセーフではない。ここを呼ぶのはQtのメインスレッドだけという前提で
+# 使い回している(キャプチャもミラーもメインスレッドのタイマーから走る)。
+_MSS = None
+
+
+def _sct():
+    """使い回す mss のインスタンス。無ければ作る。"""
+    global _MSS
+    if _MSS is None:
+        _MSS = mss.MSS()
+    return _MSS
+
+
+def release_sct() -> None:
+    """使い回している mss を手放す。画面構成が変わったときに呼ぶ。
+
+    mss は生成時にモニタの一覧を読むので、モニタを抜き差ししたあとも古いまま持って
+    いると、そのぶんズレたところを撮る。次に必要になった時点で作り直させる。"""
+    global _MSS
+    sct, _MSS = _MSS, None
+    if sct is not None:
+        try:
+            sct.close()
+        except Exception:
+            pass
+
+
 def grab_region(rect_global: QRect) -> QImage:
     """rect_global: Qt論理座標系(スクリーン全体)でのQRect。
     選択範囲の中心にある画面の devicePixelRatio を使って物理ピクセル座標に変換し、mssでキャプチャする。
@@ -27,11 +63,10 @@ def grab_region(rect_global: QRect) -> QImage:
         "height": int(rect_global.height() * dpr),
     }
 
-    with mss.MSS() as sct:
-        shot = sct.grab(region)
+    shot = _sct().grab(region)
 
     qimage = QImage(shot.bgra, shot.width, shot.height, shot.width * 4, QImage.Format_ARGB32)
-    qimage = qimage.copy()  # shot.bgraのバッファはwithブロックを抜けると無効になるためコピーする
+    qimage = qimage.copy()  # shot.bgraのバッファは次のgrabで上書きされるためコピーする
     qimage.setDevicePixelRatio(dpr)
     return qimage
 

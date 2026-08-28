@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw
 from PySide6.QtCore import QRect, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QInputDialog, QMenu, QSystemTrayIcon,
+    QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
 )
 
 import capture_process
@@ -28,6 +28,7 @@ import explorer_nav
 import launcher
 import mouse_jiggler
 import presenter_overlay
+import pushover
 import screen_mirror
 import screen_ruler
 import snippets
@@ -396,6 +397,19 @@ class ScreenFeature:
         self._taskbar_bg_action = self.menu.addAction(
             "🎨 背景色を取り直す", self._recapture_taskbar_background
         )
+
+        self.menu.addSeparator()
+        # スマホへのプッシュ通知(Pushover)。送るのは外からの IPC コマンドだけで、
+        # ここに置くのは登録・削除の口だけ。トークンは settings.json には書かず
+        # Windows の資格情報マネージャへ預ける(pushover.py 冒頭を参照)。
+        self._pushover_menu = self.menu.addMenu("📱 スマホ通知（Pushover）")
+        self._pushover_register_action = self._pushover_menu.addAction(
+            "🔑 トークンを登録…", self._register_pushover
+        )
+        self._pushover_delete_action = self._pushover_menu.addAction(
+            "🗑 登録を削除", self._delete_pushover
+        )
+        self._pushover_menu.aboutToShow.connect(self._refresh_pushover_menu)
 
         self.menu.addSeparator()
         self.menu.addAction("⚙ 設定", self._open_settings_file)
@@ -928,6 +942,61 @@ class ScreenFeature:
         print(f"[tray-tools] {where}に失敗しました", file=sys.stderr)
 
     # ---------------------------------------------------------------
+    # スマホ通知(Pushover)のトークン登録
+    # ---------------------------------------------------------------
+    def _refresh_pushover_menu(self):
+        """開く直前に「登録済みかどうか」だけ反映する。値は絶対に出さない。"""
+        try:
+            registered = pushover.is_registered()
+        except Exception:
+            registered = False
+        self._pushover_register_action.setText(
+            "🔑 トークンを登録し直す…" if registered else "🔑 トークンを登録…"
+        )
+        self._pushover_delete_action.setEnabled(registered)
+        self._pushover_menu.setTitle(
+            "📱 スマホ通知（Pushover：登録済み）" if registered
+            else "📱 スマホ通知（Pushover：未登録）"
+        )
+
+    def _register_pushover(self):
+        """ユーザーキーとアプリのトークンを尋ねて資格情報マネージャへ預ける。
+
+        入力欄は両方ともマスク表示にする。肩越しに見られる場所で打つことがあるうえ、
+        入力欄に平文で残ったまま画面キャプチャを撮る事故もありうる。
+        受け取った値はここから先へ持ち出さない(ログにも通知にも出さない)。"""
+        try:
+            user_key, ok = QInputDialog.getText(
+                None, "Pushover",
+                "ユーザーキー（Pushover の User Key）",
+                QLineEdit.Password,
+            )
+            if not ok or not user_key.strip():
+                return
+            app_token, ok = QInputDialog.getText(
+                None, "Pushover",
+                "アプリのトークン（API Token）",
+                QLineEdit.Password,
+            )
+            if not ok or not app_token.strip():
+                return
+            if pushover.store(user_key, app_token):
+                self._notify("Pushover", "資格情報マネージャに登録しました")
+            else:
+                self._notify("Pushover", "登録できませんでした")
+        except Exception:
+            self._log_failure("Pushover トークンの登録")
+
+    def _delete_pushover(self):
+        try:
+            if pushover.clear():
+                self._notify("Pushover", "登録を削除しました")
+            else:
+                self._notify("Pushover", "登録がありません")
+        except Exception:
+            self._log_failure("Pushover トークンの削除")
+
+    # ---------------------------------------------------------------
     # スリープ抑止
     # ---------------------------------------------------------------
     def _ask_keep_awake_minutes(self):
@@ -1057,6 +1126,61 @@ class ScreenFeature:
         if self._sleep_deadline is None:
             return None
         return max(0, int(self._sleep_deadline - time.monotonic()))
+
+    # ---------------------------------------------------------------
+    # いまの状態を1行ずつ言う(外からの status コマンド用)
+    # ---------------------------------------------------------------
+    # 外(名前付きパイプ)から叩く側は、この常駐が何を抱えているかを見る手段が無かった。
+    # 掛けたはずの抑止が本当に効いているのか、予約が入ったのかを確かめられるようにする。
+    # 状態を数えているのは各機能の側なので、ここは読んで文字にするだけにとどめる
+    # (2か所で数えると必ずズレる。_on_sleep_tick と同じ考え方)。
+    def keep_awake_status(self) -> str:
+        if not self._awake_active:
+            return "スリープ抑止: なし"
+        left = _remaining_minutes(self._awake_deadline)
+        if left is None:
+            return "スリープ抑止: 有効（無期限）"
+        return f"スリープ抑止: 有効（残り{_format_minutes(left)}）"
+
+    def sleep_status(self) -> str:
+        left = self.sleep_seconds_left()
+        if left is None:
+            return "スリープ予約: なし"
+        name = "休止状態" if self._sleep_hibernate else "スリープ"
+        return f"スリープ予約: {name}（残り{_format_seconds(left)}）"
+
+    def mirror_status(self) -> str:
+        try:
+            return "画面ミラー: 動作中" if self.screen_mirror.is_active() else "画面ミラー: 停止中"
+        except Exception:
+            # 状態を1つ読めないだけで status 全体を落とさない。
+            return "画面ミラー: 不明"
+
+    def sticky_status(self) -> str:
+        """開いている付箋の枚数。付箋は別プロセスなので、名前付きパイプの一覧から数える
+        (capture_process.py 冒頭を参照)。"""
+        try:
+            return f"付箋: {len(capture_process.list_sticky_pipes())}枚"
+        except Exception:
+            return "付箋: 不明"
+
+    def status_text(self) -> str:
+        """status コマンドの本文。1状態1行。"""
+        return "\n".join([
+            self.keep_awake_status(),
+            self.sleep_status(),
+            self.mirror_status(),
+            self.sticky_status(),
+            self.jiggler_status(),
+        ])
+
+    def jiggler_status(self) -> str:
+        if not self._jiggle_active:
+            return "マウスジグラー: なし"
+        left = _remaining_minutes(self._jiggle_deadline)
+        if left is None:
+            return "マウスジグラー: 有効（無期限）"
+        return f"マウスジグラー: 有効（残り{_format_minutes(left)}）"
 
     def _ask_sleep_minutes(self, hibernate: bool = False):
         """何分後に寝るかを尋ねて予約する。"""

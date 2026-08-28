@@ -22,10 +22,14 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
+import action_log
+import beep
+import pushover
 import settings as settings_module
 from feature_audio import AudioFeature
 from feature_screen import ScreenFeature
@@ -54,6 +58,41 @@ SINGLE_INSTANCE_KEY = "traytools.single-instance"
 # コマンドの読み取り待ち時間(ms)。相手は接続直後に1行書いて終わる作りなので短くてよい。
 # ここで待ちすぎると、ただの二重起動のときにトーストが遅れる。
 COMMAND_READ_TIMEOUT_MS = 300
+
+# ---------------------------------------------------------------
+# 応答(この口は双方向)
+# ---------------------------------------------------------------
+# 以前この口は一方向で、送った側は結果を受け取れなかった。予約が入ったのか引数を
+# 間違えて無視されたのかが分からず、「エラーが出ていないから多分成功」という確かめ方しか
+# できなかった(action_log.py 冒頭を参照)。いまは1接続につき1つ応答を返す。
+#
+# 【応答の形式】UTF-8 のテキスト。
+#   1行目 : "OK" で始まれば成功、"ERR" で始まれば失敗。後ろに1行の要約が付くことがある
+#   2行目〜: 本文(status / log のように中身を返すコマンドだけ)
+#   最後まで書いたら切断するので、受け取る側はEOFまで読めばよい
+#
+# 応答を読まずに切る客(この機能を足す前の traytools_send.py、あふｗからの呼び出し)が
+# 居ても壊れないこと。QLocalSocket への書き込みは相手が居なくても例外にならず -1 を
+# 返すだけなので、こちらは何事もなく次へ進む。
+REPLY_ENCODING = "utf-8"
+# 応答を書き切るまで待つ上限(ms)。名前付きパイプ相手なので普通は一瞬で終わる。
+REPLY_WRITE_TIMEOUT_MS = 1000
+# ハンドラが応答を返さないまま放置した接続を回収するまでの時間(ms)。
+# Pushover の送信(最長10秒)より長くしておくこと。
+REPLY_DEADLINE_MS = 20000
+# 応答を書いたあと、切断が完了しなかった場合に後片付けするまでの猶予(ms)。
+REPLY_CLOSE_GRACE_MS = 2000
+
+# 応答待ちの接続。ローカル変数だけで持つとGCで消え、応答が返らなくなる。
+_pending_replies = set()
+
+# log コマンドが一度に返す行数の上限。ここを無制限にすると、うっかり大きな数を
+# 渡したときに応答が数百KBになる(パイプの向こうで詰まる)。
+MAX_LOG_LINES = 500
+DEFAULT_LOG_LINES = 20
+
+# notify で出すトーストの上限。長い文字列がそのまま来ると画面いっぱいの板になる。
+MAX_NOTIFY_CHARS = 300
 
 # 通常起動(TrayTools.lnk)は pythonw.exe なので、コンソールに出した例外は誰も見られない。
 # 落ちた理由を後から追えるようにファイルへ残す。
@@ -119,38 +158,122 @@ def _read_command(socket):
     return command, args if isinstance(args, list) else []
 
 
+class _Reply(QObject):
+    """1接続ぶんの応答を書いて切る係。1回だけ書けて、2回目以降は黙って捨てる。
+
+    呼び出しはシグナルを経由する。Pushover の送信のようにネットワークを待つ処理は
+    別スレッドで走らせる(Qtのメインスレッドを塞ぐと常駐全体が固まる)ので、応答を
+    出すのが別スレッドになりうる。ソケットに触ってよいのは作ったスレッドだけなので、
+    ここで必ずメインスレッドへ渡し直す(この QObject はメインスレッドで作られるため、
+    別スレッドからの emit はキュー接続になる)。"""
+
+    ready = Signal(str)
+
+    def __init__(self, socket):
+        super().__init__()
+        self._socket = socket
+        self._finished = False
+        self._sent = False
+        self.ready.connect(self._write)
+        # ハンドラが応答を返さないまま忘れても、接続を開いたままにしない。
+        self._deadline = QTimer(self)
+        self._deadline.setSingleShot(True)
+        self._deadline.timeout.connect(self._on_deadline)
+        self._deadline.start(REPLY_DEADLINE_MS)
+        _pending_replies.add(self)
+
+    def __call__(self, text: str) -> None:
+        """応答を出す。別スレッドから呼んでよい唯一の入口。"""
+        self.ready.emit(text)
+
+    def _on_deadline(self) -> None:
+        self._write("ERR 応答が返りませんでした（タイムアウト）")
+
+    def _write(self, text: str) -> None:
+        if self._sent:
+            return  # 1接続1応答。重ねて呼ばれても最初の1つだけ
+        self._sent = True
+        self._deadline.stop()
+        try:
+            data = ((text or "OK").rstrip("\r\n") + "\n").encode(REPLY_ENCODING, "replace")
+            # 応答を読まずに切る客が居る。相手が既に居なくても write は例外を投げず
+            # -1 を返すだけなので、戻り値は見ずにそのまま切断へ進む。
+            self._socket.write(data)
+            self._socket.flush()
+            self._socket.waitForBytesWritten(REPLY_WRITE_TIMEOUT_MS)
+            self._socket.disconnectFromServer()
+        except Exception:
+            log_exception("応答の書き込み")
+        if self._socket.state() == QLocalSocket.UnconnectedState:
+            self._finish()
+        else:
+            # 書き終わるまで待ってから切れる(disconnectFromServer の作法)。
+            # それでも切れないときのために猶予付きで後片付けする。
+            self._socket.disconnected.connect(self._finish)
+            QTimer.singleShot(REPLY_CLOSE_GRACE_MS, self._finish)
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            self._socket.close()
+        except Exception:
+            pass
+        _pending_replies.discard(self)
+        self.deleteLater()
+
+
 def _handle_connection(server, command_handlers):
     socket = server.nextPendingConnection()
     if socket is None:
         return
+    # ソケットはここでは閉じない。応答を書いてから切るのは _Reply の仕事で、
+    # ハンドラが別スレッドを使う場合はこの関数を抜けたあとに書かれる。
+    reply = _Reply(socket)
     try:
         command, args = _read_command(socket)
-    finally:
-        socket.close()
+    except Exception:
+        summary = log_exception("コマンドの読み取り")
+        reply(f"ERR {summary}")
+        return
 
     if command is None:
         # 何も書かずに切れた＝コマンドではなく二重起動。2つ目の起動は黙って終わるだけ
         # なので、「クリックしたのに何も起きない」と見えないようこちらから知らせる。
         show_toast("tray-tools\nすでに起動しています")
+        reply("ERR コマンドが書かれませんでした（二重起動として扱いました）")
         return
 
     handler = command_handlers.get(command)
     if handler is None:
         show_toast(f"tray-tools\n知らないコマンドです\n{command}")
+        reply(f"ERR 知らないコマンドです: {command}\n使えるのは: "
+              + " / ".join(sorted(command_handlers)))
         return
 
     # ここは外部(あふｗ等)から叩かれる入口。Qtのスロット内で例外を投げ切ると
     # 常駐アプリごと落ちるため、必ず受け止める。pythonw起動では標準エラーが
     # どこにも出ないので、内容はトーストと error.log の両方に残す。
     try:
-        handler(args)
+        handler(args, reply)
     except Exception:
         summary = log_exception(f"command={command} args={args}")
         show_toast(f"tray-tools\nコマンドの実行に失敗しました\n{summary}")
+        reply(f"ERR {summary}")
 
 
 def _build_command_handlers(features) -> dict:
-    """外部から叩けるコマンドの表を作る。値は args(リスト)を受け取る関数。
+    """外部から叩けるコマンドの表を作る。値は (args, reply) を受け取る関数。
+
+    reply は1接続につき1回だけ呼べる応答の口(_Reply)。同期で済むコマンドはその場で
+    呼び、Pushover のように待ちの入るものは別スレッドの終わりに呼ぶ。
+
+    【この表を増やすときの線引き】
+    ここは外から叩ける口で、増やすほど誤操作の被害が広がる。足してよいのは
+    「常駐しているこのプロセスでなければできないこと」だけ。アプリの起動・ファイル操作の
+    たぐいは足さない——呼ぶ側が直接できるので、わざわざ常駐を経由させる利点が無く、
+    口を通る危険だけが増える。
 
     ウインドウの参照は main() ではなく ScreenFeature に持たせている。同じピッカーを
     トレイメニューとホットキーからも開けるので、「開いていたら前面に呼び戻す」判定も
@@ -161,14 +284,14 @@ def _build_command_handlers(features) -> dict:
         return {}
     return {
         # あふｗから $P(カレントパス)を渡して呼ぶ。パスが無ければ登録なしで一覧だけ出す。
-        "bookmark": lambda args: screen.start_launcher(args[0] if args else None),
+        "bookmark": lambda args, reply: _bookmark_command(screen, args, reply),
         # スリープ抑止の入切。長い処理を外から回すとき、始める前に掛けて終わったら
         # 外す、という使い方ができる(席を外している間に寝られると処理が止まるため)。
         #
         #   traytools_send.py keep-awake on        無期限
         #   traytools_send.py keep-awake on 90     90分だけ
         #   traytools_send.py keep-awake off       解除
-        "keep-awake": lambda args: _keep_awake_command(screen, args),
+        "keep-awake": lambda args, reply: reply(_keep_awake_command(screen, args)),
         # PCをスリープさせる。長い処理を回し終えたあとに寝かせる用。
         #
         #   traytools_send.py sleep                    すぐ(猶予のあと)
@@ -178,16 +301,44 @@ def _build_command_handlers(features) -> dict:
         #
         # 予約の時刻になってもすぐには寝ず、声を掛けてから少し待つ。予約を忘れて
         # 作業している最中に落ちると、開いているものが道連れになるため。
-        "sleep": lambda args: _sleep_command(screen, args),
+        "sleep": lambda args, reply: reply(_sleep_command(screen, args)),
+        # いま何が起きているかを返す。抑止・予約・ミラー・付箋の枚数。
+        #
+        #   traytools_send.py status
+        "status": lambda args, reply: reply("OK\n" + screen.status_text()),
+        # 操作ログの末尾を読む。既定20行、引数で行数を指定できる。
+        #
+        #   traytools_send.py log 50
+        "log": lambda args, reply: reply(_log_command(args)),
+        # トーストを1枚出す。長い処理の節目を知らせる用。
+        #
+        #   traytools_send.py notify "変換が終わりました"
+        "notify": lambda args, reply: reply(_notify_command(args)),
+        # 音を1つ鳴らす。トーストより強い合図(画面を見ていなくても気づける)。
+        #
+        #   traytools_send.py beep done
+        "beep": lambda args, reply: reply(_beep_command(args)),
+        # スマホへプッシュ通知。席を外していても届く。
+        #
+        #   traytools_send.py pushover "変換が終わりました" --title 変換 --priority 1
+        "pushover": lambda args, reply: _pushover_command(args, reply),
     }
 
 
-def _sleep_command(screen, args) -> None:
-    """外から来た sleep の引数を解いて呼び分ける。想定外は「何もしない」に倒す。"""
+def _bookmark_command(screen, args, reply) -> None:
+    screen.start_launcher(args[0] if args else None)
+    reply("OK フォルダブックマークを開きました")
+
+
+def _sleep_command(screen, args) -> str:
+    """外から来た sleep の引数を解いて呼び分ける。想定外は「何もしない」に倒す。
+
+    戻り値は応答の1行。「無視された」のか「効いた」のかを送った側が区別できるよう、
+    何もしなかったときは ERR で返す(動作は従来どおり何もしない)。"""
     first = (args[0] if args else "").strip().lower()
     if first in ("cancel", "off", "stop", "abort"):
         screen.cancel_sleep(source="external")
-        return
+        return "OK " + screen.sleep_status()
     # 2つめに hibernate と書けば休止状態。書かなければスリープ。
     hibernate = any(str(a).strip().lower() in ("hibernate", "hiber") for a in args[1:])
     seconds = 0
@@ -195,21 +346,23 @@ def _sleep_command(screen, args) -> None:
         try:
             seconds = max(0, int(first))
         except (TypeError, ValueError):
-            return
+            return f"ERR 秒数を解釈できません: {first}（何もしませんでした）"
     elif first in ("hibernate", "hiber"):
         hibernate = True
     screen.schedule_sleep(seconds, hibernate, source="external")
+    return "OK " + screen.sleep_status()
 
 
-def _keep_awake_command(screen, args) -> None:
+def _keep_awake_command(screen, args) -> str:
     """外から来た keep-awake の引数を解いて呼び分ける。
 
     引数を間違えても落とさない。外から叩かれる口なので、想定外が来ても
-    「何もしない」に倒すほうがよい。"""
+    「何もしない」に倒すほうがよい。戻り値は応答の1行で、掛け終わった実際の状態を返す
+    (頼んだとおりになったかは、送った側がこれで確かめられる)。"""
     mode = (args[0] if args else "on").strip().lower()
     if mode in ("off", "0", "false", "stop", "disable"):
         screen.disable_keep_awake(source="external")
-        return
+        return "OK " + screen.keep_awake_status()
     minutes = None
     if len(args) > 1:
         try:
@@ -217,6 +370,100 @@ def _keep_awake_command(screen, args) -> None:
         except (TypeError, ValueError):
             minutes = None
     screen.enable_keep_awake(minutes, source="external")
+    return "OK " + screen.keep_awake_status()
+
+
+def _log_command(args) -> str:
+    """操作ログの末尾を返す。行数は args[0](省略時20行)。"""
+    lines = DEFAULT_LOG_LINES
+    if args:
+        try:
+            lines = int(str(args[0]).strip())
+        except (TypeError, ValueError):
+            return f"ERR 行数を解釈できません: {args[0]}"
+        if lines <= 0:
+            return f"ERR 行数は1以上にしてください: {lines}"
+        lines = min(lines, MAX_LOG_LINES)
+    body = action_log.tail(lines)
+    if not body.strip():
+        return "OK 操作ログはまだ空です"
+    return f"OK 直近{lines}行\n" + body.rstrip("\n")
+
+
+def _notify_command(args) -> str:
+    """トーストを1枚出す。引数は繋いで1つの本文にする。
+
+    引数の中の \\n(円記号とn の2文字)は改行に直す。あふｗやバッチから渡すときに
+    本物の改行を通すのは面倒なため。"""
+    text = " ".join(str(a) for a in args).strip()
+    if not text:
+        return "ERR 本文がありません（何も出しませんでした）"
+    text = text.replace("\\n", "\n")[:MAX_NOTIFY_CHARS]
+    show_toast(text)
+    action_log.record("通知", text.splitlines()[0][:40], "external")
+    return "OK 通知を出しました"
+
+
+def _beep_command(args) -> str:
+    """音を1つ鳴らす。知らない名前なら鳴らさずに ERR。"""
+    kind = (str(args[0]).strip() if args else beep.DEFAULT_KIND)
+    if not beep.play(kind):
+        return f"ERR 知らない音です: {kind}（{beep.kind_names()} のどれか）"
+    return f"OK 鳴らしました: {kind}"
+
+
+def _parse_pushover_args(args):
+    """pushover の引数を (本文, オプション辞書) に解く。解けなければ (None, 理由)。
+
+    --title / --priority / --sound を抜いた残りを繋いで本文にする。位置引数で
+    タイトルを受けると「本文の続き」と見分けが付かないため、明示の旗にしている。"""
+    options = {"title": None, "priority": None, "sound": None}
+    words = []
+    rest = list(args)
+    while rest:
+        word = str(rest.pop(0))
+        key = word[2:].lower() if word.startswith("--") else None
+        if key in options:
+            if not rest:
+                return None, f"{word} の値がありません"
+            options[key] = str(rest.pop(0))
+        elif word.startswith("--"):
+            return None, f"知らないオプションです: {word}"
+        else:
+            words.append(word)
+    message = " ".join(words).strip().replace("\\n", "\n")
+    if not message:
+        return None, "本文がありません"
+    return message, options
+
+
+def _pushover_command(args, reply) -> None:
+    """スマホへプッシュ通知を送る。送信は別スレッドで行う。
+
+    ネットワークは数秒かかりうる。Qtのメインスレッドで待つと、その間トレイも付箋も
+    ホットキーも全部固まる。応答は送信が終わってから reply() で返す(_Reply が
+    メインスレッドへ渡し直してくれるので、ワーカーから呼んで安全)。"""
+    message, options = _parse_pushover_args(args)
+    if message is None:
+        reply(f"ERR {options}（送信しませんでした）")
+        return
+    if not pushover.is_registered():
+        # 未登録のまま送りにいっても弾かれるだけ。通信する前に断る。
+        reply("ERR Pushover のトークンが登録されていません"
+              "（トレイメニューの「スマホ通知（Pushover）」から登録してください）")
+        return
+
+    def work():
+        # ここはワーカースレッド。Qtのウィジェットには絶対に触らないこと。
+        ok, detail = pushover.send(
+            message,
+            title=options["title"],
+            priority=options["priority"],
+            sound=options["sound"],
+        )
+        reply(("OK " if ok else "ERR ") + detail)
+
+    threading.Thread(target=work, name="pushover-send", daemon=True).start()
 
 
 def _restart(instance_lock) -> bool:

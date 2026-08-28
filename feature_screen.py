@@ -29,6 +29,7 @@ import presenter_overlay
 import screen_mirror
 import screen_ruler
 import snippets
+import browser_open
 import taskbar_widget
 import web_presenter
 from capture_grab import new_session_stem, save_image
@@ -1003,9 +1004,13 @@ class ScreenFeature:
     def start_presenter(self):
         """HTMLプレゼン資料の発表者ツールを開く(設定 tools.presenter にパスがあるとき)。
 
-        あちらは単一ファイルの file:// で動くビューアなので、既定のブラウザに投げる
-        だけでよい。tray-tools 側に資料を渡す仕組みは持たせていない(資料は向こうへ
-        ドラッグ＆ドロップする)。
+        あちらは単一ファイルの file:// で動くビューアなので、ブラウザに投げるだけでよい。
+        tray-tools 側に資料を渡す仕組みは持たせていない(資料は向こうへドラッグ＆
+        ドロップする)。
+
+        開くのは Edge(設定 tools.browser で変えられる)。既定のブラウザに任せないのは、
+        Firefox だと真っ白になるため。あれは about:blank へ document.write して親と
+        同一オリジンにする作りで、Firefox の file:// の扱いと噛み合わない。
 
         既定では同梱のものを開く。設定 tools.presenter にパスを書けば差し替えられる。"""
         path = (self.app_settings.get("tools", {}) or {}).get("presenter") or ""
@@ -1016,11 +1021,17 @@ class ScreenFeature:
             self._notify("発表者ツール", f"見つかりません\n{path}")
             return
         try:
-            os.startfile(path)
+            browser_open.open_html(path, self._browser_name())
         except OSError as e:
-            # os.startfile は関連付けが無いと投げる。Qtのスロット内で投げ切ると
-            # 常駐ごと落ちるので、ここで受けて通知に回す。
+            # 名指ししたブラウザが無いと既定へ落ちるが、そちらも .html に関連付けが
+            # 無ければ投げる。Qtのスロット内で投げ切ると常駐ごと落ちるので受ける。
             self._notify("発表者ツール", f"開けませんでした\n{e}")
+
+    def _browser_name(self) -> str:
+        """HTMLを開くのに使うブラウザ。設定 tools.browser、無ければ Edge。"""
+        return (self.app_settings.get("tools", {}) or {}).get(
+            "browser"
+        ) or browser_open.DEFAULT_BROWSER
 
     def start_web_presenter(self, url: str = None):
         """任意のウェブサイトを取り込んで、発表者ツールとして開く(web_presenter.py)。

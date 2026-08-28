@@ -304,6 +304,12 @@ class AspectSelectionOverlay(SelectionOverlay):
     直せば見えている枠と確定する矩形が必ず一致する(両方に同じ計算を書くと、片方だけ
     直したときにズレる)。"""
 
+    # ウィンドウ単位の選択は使わない。あれはキャプチャのために「クリックした窓を丸ごと
+    # 撮る」機能で、非ドラッグ中は対象の窓を黄色い枠で予告する。こちらが選ぶのは
+    # 「画面のこの範囲」であって窓ではないうえ、比率を保った矩形を作りたいので、
+    # 窓の形に引っぱられては困る(画面定規が同じ理由で切っている)。
+    window_pick_enabled = False
+
     def __init__(self, aspect: str = DEFAULT_ASPECT, fps_limit: int = DEFAULT_FPS):
         super().__init__()
         self.aspect = aspect if aspect_ratio(aspect) is not None or aspect == "free" else DEFAULT_ASPECT

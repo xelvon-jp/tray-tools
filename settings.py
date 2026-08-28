@@ -57,6 +57,11 @@ DEFAULT_SETTINGS = {
     #     既定は false(スライド送りを JS が担う資料もあるため)。
     #   web_presenter_recent … 入力欄に出す履歴。取り込みに成功したときだけ増える。
     "tools": {
+        # HTMLを開くのに使うブラウザ。edge / chrome / firefox、または実行ファイルの
+        # フルパス。既定のブラウザに任せないのは、Firefox だと presenter.html が
+        # 真っ白になるため(about:blank へ document.write する作りと、Firefox の
+        # file:// の扱いが噛み合わない。Chrome と Edge では動く)。
+        "browser": "edge",
         "presenter": "",
         "web_presenter_timeout_seconds": 30,
         "web_presenter_settle_ms": 800,

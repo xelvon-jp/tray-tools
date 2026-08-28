@@ -514,6 +514,8 @@ HTML のプレゼン資料に、PowerPoint の発表者ツール相当を付け�
 
 使い方とキー操作は [presenter_README.md](presenter_README.md) を参照してください。
 
+**開くブラウザは Edge です**（`settings.json` の `tools.browser` で `chrome` / `firefox` / 実行ファイルのフルパスに変えられます）。既定のブラウザに任せないのは、**Firefox では真っ白になる**ためです。`presenter.html` は `about:blank` へ `document.write` して親と同一オリジンにする作りで、Firefox の `file://` の扱いと噛み合いません。Chrome と Edge では動きます。
+
 別の場所に置いたものを使いたいときは、`settings.json` の `tools.presenter` にパスを書けば差し替えられます。空なら同梱のものを開きます。
 
 ### 任意のサイトを取り込んで開く（`web_presenter.py`）

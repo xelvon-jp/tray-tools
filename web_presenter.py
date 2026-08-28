@@ -26,6 +26,7 @@
 # 窓は出さない。QWebEngineView は show() せずに使う(Chromium は非表示でも読み込みと
 # スクリプト実行を行う)。そのぶん「WebEngine の中で対話的にログインする」ことは
 # できないので、認証の要るサイトは取り込めない(README の制約を参照)。
+import browser_open
 import json
 import os
 import re
@@ -515,7 +516,13 @@ def open_site(app_settings: dict, settings_path, presenter_path, notify,
             try:
                 page = build_page(presenter_path, html, base_url, title or target, strip_js)
                 path = write_temp_page(page)
-                os.startfile(str(path))
+                # 既定のブラウザではなく名指しで開く。理由は browser_open を参照
+                # (Firefox では presenter.html が真っ白になる)。
+                browser_open.open_html(
+                    path,
+                    (app_settings.get("tools", {}) or {}).get("browser")
+                    or browser_open.DEFAULT_BROWSER,
+                )
             except OSError as e:
                 # os.startfile は .html に関連付けが無いと投げる。書き出しの失敗もここ。
                 notify(DIALOG_TITLE, f"開けませんでした\n{e}")

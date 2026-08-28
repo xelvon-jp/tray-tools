@@ -452,6 +452,9 @@ class TaskbarWidget(QWidget):
         self._hover = False
         # 全画面のアプリに譲ってZオーダーの後ろへ回っている最中か。
         self._behind = False
+        # この画面を自前の全画面窓(画面ミラー)が覆っているか。set_app_covered で立てる。
+        # _hidden_by_fullscreen とは別に持つ理由は、あちらのコメントを参照。
+        self._app_covered = False
         # メニューを出している間だけ True。カーソルがメニューへ移ると leaveEvent が
         # 飛んでくるが、その間もアイコンを出したままにするために使う。
         self._menu_open = False
@@ -653,7 +656,7 @@ class TaskbarWidget(QWidget):
             # winId() はネイティブハンドルを必要なら作ってから返す。
             # ctypes へ渡すので int にしておく(HWNDは c_void_p で受ける側の約束)。
             hwnd = int(self.winId())
-            if self._hidden_by_fullscreen():
+            if self._app_covered or self._hidden_by_fullscreen():
                 # 動画の全画面表示などの上に出続けると邪魔でしかない。hide() ではなく
                 # Zオーダーを下げる。隠すと hideEvent でこのタイマーごと止まり、全画面が
                 # 終わったことに気づけなくなる(下げるだけならタイマーは回り続ける)。
@@ -670,11 +673,41 @@ class TaskbarWidget(QWidget):
         except Exception:
             _guard("最前面への押し上げ", notify=False)
 
+    def set_app_covered(self, covered: bool) -> None:
+        """自分の画面を、このアプリ自身の全画面窓(画面ミラー)が覆っているかを受け取る。
+
+        _hidden_by_fullscreen では検出できないので外から教えてもらう。あちらは
+        GetForegroundWindow を見るが、ミラー窓は WS_EX_NOACTIVATE(WindowDoesNotAcceptFocus)
+        ＋WA_ShowWithoutActivating で作ってあり、発表の邪魔をしないために「決して前面に
+        ならない」窓だからである。前面になるのは発表者が操作している手元のアプリのままで、
+        その矩形はミラー先の画面を覆わない。結果ここが常に False を返し、ウィジェットは
+        500msごとに push_topmost を続け、同じく500msごとに raise_ するミラー窓と最前面を
+        奪い合って、共有側のモニタでチカチカしていた。
+
+        引っ込め方は全画面アプリのときと同じ(hide せずZオーダーだけ下げる)。hide すると
+        hideEvent でこのタイマーごと止まり、ミラーが終わったことに気付けなくなる。"""
+        try:
+            covered = bool(covered)
+            if covered == self._app_covered:
+                return
+            self._app_covered = covered
+            if not covered:
+                # 戻すときは次の周期を待たずに押し上げ直す。ミラーを終えた瞬間に
+                # ウィジェットが消えたままだと、壊れたようにしか見えない。
+                self._behind = False
+            if self.isVisible():
+                self._on_topmost_tick()
+        except Exception:
+            _guard("全画面窓への譲り合いの切り替え", notify=False)
+
     def _hidden_by_fullscreen(self) -> bool:
         """自分が乗っている画面を、前面のウィンドウが丸ごと覆っているか。
 
         判定に使うのは自分の画面だけ。2枚目で動画を全画面にしているときに、1枚目の
-        ウィジェットまで引っ込む必要はない。"""
+        ウィジェットまで引っ込む必要はない。
+
+        ここで拾えるのは「前面(GetForegroundWindow)になる」窓だけ。前面にならない窓に
+        覆われる場合は set_app_covered で外から教えてもらう。"""
         screen = _screen_for(self.geometry(), _screens())
         if screen is None:
             return False

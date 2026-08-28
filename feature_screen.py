@@ -17,7 +17,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QRect, QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 import capture_process
@@ -134,6 +134,13 @@ class ScreenFeature:
         self.screen_mirror.attach_presenter(
             self.toggle_presenter_overlay, self._presenter_overlay_active
         )
+        # ミラーが覆っている画面の名前(覆っていなければ None)。ディスプレイ構成が
+        # 変わってウィジェットを作り直したときに、もう一度同じ指示を出すために覚える。
+        # 先に用意してから繋ぐ(attach_screen_cover はその場で1回呼び返してくる)。
+        self._mirror_covered_screen = None
+        # ミラー窓が覆っている画面のタスクバーウィジェットを引っ込めるための連絡口。
+        # ウィジェットを持っているのはこちらなので、あちらからは名前だけ受け取る。
+        self.screen_mirror.attach_screen_cover(self._set_mirror_covered_screen)
         # 付箋(Rapture)のウインドウはここでは持たない。別プロセス(capture_process.py)に
         # 出したので、参照どころか同じアドレス空間にすら居ない。以前は開いている付箋を
         # self.capture_windows に、ホットキーで撮る対象を self.active_capture_window に
@@ -236,10 +243,15 @@ class ScreenFeature:
         # 真下に置くのは、探すときに同じ場所を見れば済むようにするため。
         self.menu.addAction("🌐 サイトを取り込んで開く", self.start_web_presenter)
 
-        # 画面に重ねるプレゼン支援。発表者ツールの真下に置く(狙いが同じで、探すときに
-        # 同じ場所を見れば済む)。4項目あるのでサブメニューにまとめ、親メニューが
-        # 縦に伸び続けるのを避ける。
-        self._presenter_menu = self.menu.addMenu("🔦 プレゼン支援（画面に重ねる）")
+        # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
+        # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
+        # トレイまで戻る場面が無くなったため。機能自体は残してあり、ホットキー
+        # (ctrl+alt+l/o/b/w)とミラー中のツールバーから使える。
+        #
+        # 項目(QAction)は作る。チェック状態を持たせておかないと、ホットキーで
+        # 切り替えたときの「いま点いているか」を他から引けなくなるため。メニューへ
+        # 追加していないので画面には出ない。
+        self._presenter_menu = None
         self._presenter_actions = {}
         for kind, label, hotkey_name in (
             ("laser", "🔴 レーザーポインタ", "presenter_laser"),
@@ -247,9 +259,7 @@ class ScreenFeature:
             ("black", "⬛ 黒画面", "presenter_blackout"),
             ("white", "⬜ 白画面", "presenter_whiteout"),
         ):
-            action = self._presenter_menu.addAction(
-                self._with_hotkey(label, hotkey_config.get(hotkey_name))
-            )
+            action = QAction(self._with_hotkey(label, hotkey_config.get(hotkey_name)), self.menu)
             action.setCheckable(True)
             # addAction(テキスト, 関数) で登録すると関数は引数なしで呼ばれる。チェック
             # 状態を受け取る項目はこの形で繋ぐこと(タスクバーウィジェットと同じ理由)。
@@ -755,9 +765,30 @@ class ScreenFeature:
         # 返した時点で打ち切られ、2つめ以降の start() が呼ばれない(＝1番目のディスプレイ
         # にしか出ない)。実際にそれで「2番目以降に表示されない」が起きていた。
         started = [widget.start() for widget in self.taskbar_widgets]
+        # 出し直した窓は「ミラーが覆っている画面」を知らない状態で出てくるので配り直す。
+        self._apply_mirror_cover()
         # 1つでも出せたなら有効として扱う。画面が3枚あって1枚だけ失敗した場合に、
         # 全部消してしまうほうが困る。
         return any(started)
+
+    def _set_mirror_covered_screen(self, screen_name) -> None:
+        """画面ミラーが覆っている画面の名前を受け取り、そのウィジェットを引っ込める。
+
+        ウィジェット側の全画面判定(GetForegroundWindow)ではミラー窓を検出できない。
+        あれは前面にならない作りだから(taskbar_widget.set_app_covered のコメント参照)。
+        押し上げ合いになると、共有側のモニタでウィジェットとミラー窓がチカチカする。"""
+        try:
+            self._mirror_covered_screen = screen_name or None
+            self._apply_mirror_cover()
+        except Exception:
+            self._log_taskbar_failure("画面ミラーに合わせた引っ込め")
+
+    def _apply_mirror_cover(self) -> None:
+        """覚えている「覆われている画面」を、いまあるウィジェット全部へ配り直す。
+        作り直した直後にも通すこと(新しい窓は何も知らない状態で出てくる)。"""
+        covered = getattr(self, "_mirror_covered_screen", None)
+        for widget in getattr(self, "taskbar_widgets", []):
+            widget.set_app_covered(widget.screen_name == covered)
 
     def _hide_taskbar_widgets(self) -> None:
         for widget in self.taskbar_widgets:
@@ -1089,17 +1120,25 @@ class ScreenFeature:
         通知を出すのは「出した」ときだけ。消したときにトーストを出すと、発表を隠すために
         黒画面を畳んだ瞬間に画面の隅で通知が光ることになる。
 
-        画面ミラー中は、レーザーとスポットライトの行き先をミラー先へ振り替える。手元の
-        画面に重ねると、それがそのまま撮られて向こうにも映る——光点は二重に見えるし、
-        スポットライトに至っては減光ごと焼き込まれて戻せない。同じキーで同じことが
+        画面ミラー中は、4つとも行き先をミラー先へ振り替える。同じキーで同じことが
         起きるようにしたいので、ホットキーを増やさずここで振り分ける。
-        黒画面/白画面は振り替えない。あちらは手元を覆う道具で、撮る範囲ごと覆われれば
-        ミラーにもそのまま黒が映る(それが期待どおり)。"""
-        if kind in ("laser", "spotlight") and self.screen_mirror.is_active():
-            active = self.screen_mirror.toggle_light(kind)
+
+        レーザーとスポットライトを振り替えるのは、手元の画面に重ねるとそれがそのまま
+        撮られて向こうにも映るため——光点は二重に見えるし、スポットライトに至っては
+        減光ごと焼き込まれて戻せない。
+
+        黒画面/白画面も振り替える。以前はここだけ振り替えず「撮る範囲ごと覆われれば
+        ミラーにも黒が映る」で済ませていたが、それでは手元まで真っ黒になり、次に何を
+        見せるか準備できない。覆うのは向こうだけにして、手元には枠とツールバーで
+        「いま共有側は黒画面」と出す(静止のときと同じ流儀)。"""
+        if self.screen_mirror.is_active() and kind in ("laser", "spotlight", "black", "white"):
+            if kind in ("black", "white"):
+                active = self.screen_mirror.toggle_blank(kind)
+            else:
+                active = self.screen_mirror.toggle_light(kind)
             label = presenter_overlay.KIND_LABELS.get(kind, kind)
             if active:
-                self._notify("画面ミラー", f"{label}: ON")
+                self._notify("画面ミラー", f"{label}: ON（共有側だけ）")
             return active
 
         active = self.presenter_overlays.toggle(kind)
@@ -1116,9 +1155,12 @@ class ScreenFeature:
         self.toggle_presenter_overlay(kind)
 
     def _presenter_overlay_active(self, kind: str) -> bool:
-        """その機能が今出ているか。ミラー中のレーザー/スポットはミラー先に居る。"""
-        if kind in ("laser", "spotlight") and self.screen_mirror.is_active():
-            return self.screen_mirror.is_light_on(kind)
+        """その機能が今出ているか。ミラー中は4つともミラー先に居る。"""
+        if self.screen_mirror.is_active():
+            if kind in ("black", "white"):
+                return self.screen_mirror.is_blank_on(kind)
+            if kind in ("laser", "spotlight"):
+                return self.screen_mirror.is_light_on(kind)
         return self.presenter_overlays.is_active(kind)
 
     def _refresh_presenter_menu(self):

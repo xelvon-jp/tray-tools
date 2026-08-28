@@ -86,6 +86,9 @@ DEFAULT_SETTINGS = {
     # laser_radius は光点の芯の半径、laser_glow_radius はその外に広がる淡い光の半径(px)。
     # spotlight_radius は素通しの半径、spotlight_feather はその外側で減光へ戻すまでの幅、
     # spotlight_dim は周囲の暗さ(0〜1、1で真っ黒)。
+    # spotlight_radius と spotlight_dim は、画面ミラー中なら手元のツールバーの上で
+    # ホイール(暗さは Shift+ホイール)を回して発表の最中に変えられる。変えた値はここへ
+    # 書き戻されるので、次に始めるときも同じ設定で始まる。
     # blank_click_to_close を false にすると、黒画面/白画面はクリックでは消えなくなる
     # (ホットキーとトレイメニューだけで解除する)。
     "presenter_overlay": {
@@ -126,9 +129,19 @@ DEFAULT_SETTINGS = {
     #   ミラーには映り込まない。枠の外の帯に実測fpsも出る。
     # toolbar は手元の枠の下に出す操作パネル(レーザー・スポットライト・黒画面・白画面・
     #   静止・範囲の選び直し・終了)。これも範囲の外に置くのでミラーには映り込まない
-    #   (置ける場所が無いときは出ない)。
+    #   (置ける場所が無いときは出ない)。右側の説明欄はタイトルバーを兼ねていて、そこを
+    #   ドラッグするとミラー範囲ごと動く(大きさは変わらない)。アイコンの上のドラッグでは
+    #   動かない——押すつもりで滑っただけで範囲が動いては困るため。
+    #   ツールバーの上でホイールを回すとスポットライトの半径、Shift(かCtrl)+ホイールで
+    #   暗さが変わる(スポットライトのアイコンの上なら消えていても効く)。変えた値は
+    #   presenter_overlay の spotlight_radius / spotlight_dim へ書き戻される。
     # freeze_frame_* は静止(一時停止)しているときの枠の色。通常の枠より目立たせてある。
     #   静止したまま話し続けるのが最悪なので、ここは主張してよい。
+    # blank_frame_* はミラー先だけを黒画面/白画面で覆っているときの枠の色。ミラー中の
+    #   黒画面/白画面は向こうだけを覆い、手元は普通に見えたままにする(次に何を見せるか
+    #   準備できるように)。そのぶん手元の見た目でしか気付けないので、静止とは別の色で
+    #   主張する。ミラーしていないときの黒画面/白画面は従来どおりカーソルのある画面を
+    #   覆う(presenter_overlay の blank_* を使う)。
     #
     # scaling は拡大方法。"auto"(既定) / "smooth" / "fast"。拡大する以上、補間による
     #   滲みは避けられない(Qt の選択肢は双線形と最近傍の2つだけで、間は無い)。本当の解は
@@ -154,11 +167,13 @@ DEFAULT_SETTINGS = {
         "target_screen_name": "",
         "aspect": "16:9",
         "scaling": "auto",
+        # 先頭が「範囲を選ばずに開始したとき」の既定になる。画面の左上に寄せ、縦だけ
+        # タイトルバーのぶん下げてある。ブラウザやアプリの枠を外して中身から映すため。
         "presets": [
+            {"label": "FHD（左上）", "x": 0, "y": "titlebar", "width": 1920, "height": 1080},
             {"label": "等倍（ミラー先と同じ）", "size": "target"},
             {"label": "上を100空ける", "x": 0, "y": 100, "width": 1600, "height": 900},
             {"label": "HD", "width": 1280, "height": 720},
-            {"label": "FHD", "width": 1920, "height": 1080},
         ],
         "cursor_size": 34,
         "cursor_color": "#ffffff",
@@ -173,6 +188,8 @@ DEFAULT_SETTINGS = {
         "source_frame_opacity": 0.55,
         "freeze_frame_color": "#ff8c00",
         "freeze_frame_opacity": 0.9,
+        "blank_frame_color": "#a855f7",
+        "blank_frame_opacity": 0.9,
         "toolbar": True,
     },
     # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、

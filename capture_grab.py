@@ -47,11 +47,63 @@ def release_sct() -> None:
             pass
 
 
-def grab_region(rect_global: QRect) -> QImage:
+# mss の Windows バックエンド(mss.windows.gdi)。CAPTUREBLT を一時的に外すために掴む。
+# import 自体は安いが、毎フレーム走る経路なので1回だけ解決して持っておく
+# (_sct を使い回すのと同じ理由)。取れなければ None のままで、その場合は素のまま撮る。
+_GDI = None
+_GDI_RESOLVED = False
+
+
+def _gdi_module():
+    global _GDI, _GDI_RESOLVED
+    if not _GDI_RESOLVED:
+        _GDI_RESOLVED = True
+        try:
+            import mss.windows.gdi as gdi
+
+            # 期待する名前が無いバージョンなら触らない(下の差し替えが意味を成さない)。
+            _GDI = gdi if hasattr(gdi, "CAPTUREBLT") else None
+        except ImportError:
+            _GDI = None
+    return _GDI
+
+
+def _grab(region: dict, include_layered: bool):
+    """mss で1枚撮る。include_layered=False のときだけ CAPTUREBLT を外す。
+
+    mss は BitBlt を SRCCOPY | CAPTUREBLT で呼ぶ。CAPTUREBLT は「自分より上に重なって
+    いるレイヤードウィンドウも結果に含める」フラグで、そのために Windows は撮る直前に
+    画面からマウスカーソルをいったん取り除く。1枚撮るだけなら誰も気付かないが、画面
+    ミラーのように毎秒30回撮り続けると、その取り除きが目に見えてカーソルのちらつきに
+    なる(gdigrab 等の画面録画でも同じ症状が知られている)。
+
+    ミラーはそもそもレイヤードウィンドウを撮りたくない(自前の枠やツールバーが写ると
+    入れ子になる)ので、外して困るものが無い。このPCで実測しても、可視のレイヤード
+    ウィンドウ6枚の矩形を CAPTUREBLT あり/なしで撮り比べて1バイトも違わなかった
+    (DWM合成の画面からBitBltする以上、フラグの有無で中身が変わらない)。
+
+    差し替えはモジュール変数の一時変更で行う。mss 側は呼び出しのたびにこの名前を
+    グローバルとして引くので、これで効く。Qtのメインスレッドからしか呼ばない前提
+    (_sct と同じ)なので、戻し忘れが無ければ他へ漏れない。"""
+    sct = _sct()
+    gdi = None if include_layered else _gdi_module()
+    if gdi is None:
+        return sct.grab(region)
+    saved = gdi.CAPTUREBLT
+    gdi.CAPTUREBLT = 0
+    try:
+        return sct.grab(region)
+    finally:
+        gdi.CAPTUREBLT = saved
+
+
+def grab_region(rect_global: QRect, include_layered: bool = True) -> QImage:
     """rect_global: Qt論理座標系(スクリーン全体)でのQRect。
     選択範囲の中心にある画面の devicePixelRatio を使って物理ピクセル座標に変換し、mssでキャプチャする。
     (マルチモニタでスケーリング率が異なる場合のズレを抑えるため、primaryScreen()固定ではなく
     screenAt()でそのつど対象画面を判定する。screenAtがNoneを返す場合はprimaryScreenにフォールバックする)
+
+    include_layered=False は「毎フレーム撮り続ける」呼び出し(画面ミラー)用。理由は _grab を参照。
     """
     screen = QGuiApplication.screenAt(rect_global.center()) or QGuiApplication.primaryScreen()
     dpr = screen.devicePixelRatio() or 1.0
@@ -63,7 +115,7 @@ def grab_region(rect_global: QRect) -> QImage:
         "height": int(rect_global.height() * dpr),
     }
 
-    shot = _sct().grab(region)
+    shot = _grab(region, include_layered)
 
     qimage = QImage(shot.bgra, shot.width, shot.height, shot.width * 4, QImage.Format_ARGB32)
     qimage = qimage.copy()  # shot.bgraのバッファは次のgrabで上書きされるためコピーする

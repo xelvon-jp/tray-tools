@@ -89,7 +89,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QRegion,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QStyle, QWidget
 
 import presenter_overlay
 from capture_grab import grab_region
@@ -144,6 +144,12 @@ DEFAULT_SOURCE_FRAME_OPACITY = 0.55
 DEFAULT_FREEZE_FRAME_COLOR = "#ff8c00"
 DEFAULT_FREEZE_FRAME_OPACITY = 0.9
 
+# 黒画面/白画面をミラー先だけに出している間の枠の色。静止とは別の色にする——手元は
+# 普通に見えているので、見た目だけでは「向こうに何が出ているか」がまったく分からない。
+# 気付かずに黒画面のまま話し続けるのは静止と同じかそれ以上に最悪なので、ここも主張する。
+DEFAULT_BLANK_FRAME_COLOR = "#a855f7"
+DEFAULT_BLANK_FRAME_OPACITY = 0.9
+
 # 手元の枠に添える帯の高さ(論理px)。実測フレームレートと範囲の大きさをここへ出す。
 # 帯は選択範囲の外側(枠のさらに外)にあるのでミラーには映り込まない。
 SOURCE_FRAME_BAND_HEIGHT = 18
@@ -164,6 +170,32 @@ TOOLBAR_REFRESH_INTERVAL_MS = 400
 # 消えているアイコンの丸の色。点いているときは項目ごとの色になる(_TOOLBAR_ITEMS)。
 TOOLBAR_OFF_COLOR = "#475569"
 TOOLBAR_BACKGROUND = QColor(20, 20, 20, 225)
+# ツールバー右側の説明欄は、そのままミラー範囲を動かすための「タイトルバー」も兼ねる。
+# 別に帯を1本足すより、既にある窓の使っていない場所を使うほうが窓が増えない
+# (窓が増えると最前面の押し合いが増え、撮影範囲の外に置き場所をもう1つ探すことになる)。
+# アイコンの上をドラッグしても動かないのは意図的。押すつもりで少し滑っただけで範囲ごと
+# 動いては困る(付箋で「画像部分のドラッグで動く」をやめたのと同じ理由)。
+TOOLBAR_GRIP_WIDTH = 12
+# ドラッグ後に出す一言(半径や暗さの値など)を消すまでの時間(ms)。
+TOOLBAR_HINT_MS = 2500
+
+# スポットライトをその場で調整する幅。ホイール1目盛りぶん。
+SPOTLIGHT_RADIUS_STEP = 10
+SPOTLIGHT_RADIUS_MIN = 20
+SPOTLIGHT_RADIUS_MAX = 1200
+SPOTLIGHT_DIM_STEP = 0.05
+SPOTLIGHT_DIM_MIN = 0.0
+# 1.0(真っ黒)まで許すと、周りが完全に潰れて「どこを指しているか」以外は何も見えなくなる。
+# スポットライトは資料の一部に注目させる道具で、資料を消す道具ではない。
+SPOTLIGHT_DIM_MAX = 0.95
+# 調整した値を settings.json へ書き戻すまでの待ち(ms)。ホイールは1回転で何目盛りも
+# 飛んでくるので、そのたびに書くとファイルを何十回も開き直すことになる。
+SPOTLIGHT_SAVE_DELAY_MS = 800
+
+# ミラー範囲をドラッグで動かすときの歯止め。画面(全モニタの合算)の中へこれだけは
+# 残す(論理px)。範囲まるごと画面外へ送れてしまうと、手元から掴む手段が無くなる。
+# 大きい範囲では、これより先に「中心が画面の中に残ること」のほうが効く(move_source_by)。
+MOVE_MIN_VISIBLE = 120
 
 # 拡大方法。"smooth"(双線形) / "fast"(最近傍) / "auto"(倍率が整数なら fast)。
 # 詳しくは冒頭の実測コメント。
@@ -183,11 +215,15 @@ SCALE_INTEGER_TOLERANCE = 0.002
 #                  「作業しているモニタのタスクバー/アドレスバーを外した位置」の意味で
 #                  書かれるため。絶対座標にすると、プライマリでないモニタで作業して
 #                  いる人の手元では別のモニタを指してしまう。
+# 先頭が「範囲を選ばずに開始したとき」の既定になる。画面の左上へ寄せ、縦だけ
+# タイトルバーのぶん下げてある("titlebar"。ブラウザやアプリの枠を外して中身から
+# 映したいため)。settings.py の DEFAULT_SETTINGS と同じ内容を持つ規約なので、
+# 片方を変えたらもう片方も直すこと。
 DEFAULT_PRESETS = (
+    {"label": "FHD（左上）", "x": 0, "y": "titlebar", "width": 1920, "height": 1080},
     {"label": "等倍（ミラー先と同じ）", "size": "target"},
     {"label": "上を100空ける", "x": 0, "y": 100, "width": 1600, "height": 900},
     {"label": "HD", "width": 1280, "height": 720},
-    {"label": "FHD", "width": 1920, "height": 1080},
 )
 # プリセットの一覧を範囲選択の画面に出す枠。Ctrl+数字でも選べる。
 PRESET_PANEL_MARGIN = 28
@@ -227,9 +263,79 @@ _CURSOR_POLYGON = (
 VK_LBUTTON = 0x01
 VK_RBUTTON = 0x02
 
+# Zオーダーで「自分のひとつ手前(上)」を引く。GetWindow の第2引数。
+GW_HWNDPREV = 3
+# 手前を何枚まで遡って調べるか。最前面グループの上に何十枚も居ることは無いので、
+# ここに当たったら「調べきれなかった」とみなして押し上げる側に倒す。
+Z_ORDER_SCAN_LIMIT = 64
+
 _user32 = ctypes.windll.user32
 _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 _user32.GetAsyncKeyState.restype = ctypes.c_short
+_user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+_user32.GetWindow.restype = ctypes.c_void_p
+_user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+_user32.IsWindowVisible.restype = ctypes.c_int
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+_user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+_user32.GetWindowRect.restype = ctypes.c_int
+
+
+def _window_bounds(hwnd):
+    """ウィンドウの矩形(物理px, 排他的な right/bottom)。取れなければ None。"""
+    rect = _RECT()
+    if not _user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+        return None
+    if rect.right <= rect.left or rect.bottom <= rect.top:
+        return None
+    return rect
+
+
+def _overlapped_from_above(hwnd: int) -> bool:
+    """自分より手前に、自分の矩形へ重なっている可視ウィンドウが居るか。
+
+    最前面を保つために raise_() を撒くのをやめるための判定。押し上げは「Zオーダーを
+    触る」操作で、そのたびにWindowsは並びを組み替え、カーソルの下にあるウィンドウへ
+    当たり判定とカーソル形状の問い合わせを出し直す。ミラー中は枠・ツールバー・ミラー窓の
+    3枚が500msごとにこれをやり、さらにタスクバーウィジェットも同じ周期で押し上げていた。
+    誰にも覆われていないなら押し上げる必要は無い。
+
+    判断が付かないときは True(＝押し上げる)に倒す。ここが誤って False を返すと、
+    ミラー窓が会議アプリの裏へ回って共有先に何も映らなくなる——ちらつきより遥かに重い。"""
+    try:
+        mine = _window_bounds(hwnd)
+        if mine is None:
+            return True
+        current = hwnd
+        for _ in range(Z_ORDER_SCAN_LIMIT):
+            current = _user32.GetWindow(ctypes.c_void_p(current), GW_HWNDPREV)
+            if not current:
+                return False  # 手前に誰も居ない＝いちばん上に居る
+            if not _user32.IsWindowVisible(ctypes.c_void_p(current)):
+                continue
+            other = _window_bounds(current)
+            if other is None:
+                continue
+            if (
+                other.left < mine.right
+                and other.right > mine.left
+                and other.top < mine.bottom
+                and other.bottom > mine.top
+            ):
+                return True
+        return True
+    except Exception:
+        return True
 
 
 def _guard(where: str, notify: bool = True) -> None:
@@ -381,6 +487,35 @@ def preset_entries(app_settings: dict) -> list:
     return [dict(entry) for entry in entries if isinstance(entry, dict)]
 
 
+# プリセットの x/y に書ける別名と、その画素数。数字の代わりに置ける。
+# "titlebar" は、ウィンドウの枠を外して中身から映したいときのため。ブラウザや
+# アプリのタイトルバーのぶんだけ下げる。実際の高さはテーマで変わるので、Windows の
+# メトリクスから引く(取れなければ Windows 11 の既定値で妥協する)。
+_TITLEBAR_FALLBACK = 32
+
+
+def _titlebar_height() -> int:
+    """タイトルバーの高さ(論理px)。取れなければ既定値。"""
+    try:
+        style = QApplication.style()
+        if style is not None:
+            value = style.pixelMetric(QStyle.PM_TitleBarHeight)
+            if value and value > 0:
+                return int(value)
+    except Exception:
+        pass
+    return _TITLEBAR_FALLBACK
+
+
+def _preset_offset(value) -> int:
+    """プリセットの x/y を画素数にする。別名(titlebar)も受ける。"""
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key == "titlebar":
+            return _titlebar_height()
+    return _as_int(value, 0)
+
+
 def preset_rects(app_settings: dict, anchor_screen=None, target_screen=None) -> list:
     """プリセットを [(見出し, QRect(グローバル論理座標)), ...] にする。
 
@@ -423,8 +558,8 @@ def preset_rects(app_settings: dict, anchor_screen=None, target_screen=None) -> 
                 left = area.x() + (area.width() - width) // 2
                 top = area.y() + (area.height() - height) // 2
             else:
-                left = area.x() + _as_int(entry.get("x"), 0)
-                top = area.y() + _as_int(entry.get("y"), 0)
+                left = area.x() + _preset_offset(entry.get("x"))
+                top = area.y() + _preset_offset(entry.get("y"))
 
             # 始点だけモニタの中へ寄せる(大きさは変えない)。
             left = min(max(left, area.left()), max(area.right() - width + 1, area.left()))
@@ -829,8 +964,15 @@ class _TopmostWindow(QWidget):
         super().hideEvent(event)
 
     def _on_topmost(self):
+        """最前面を保つ。ただし、実際に誰かに覆われているときだけ押し上げる。
+
+        以前は周期のたびに無条件で raise_() していた。やめたのは、Zオーダーを触る操作が
+        毎回カーソルの当たり判定と形状の問い合わせを引き起こすため(_overlapped_from_above
+        のコメント参照)。覆われていなければ並びは既に正しいので、触る理由が無い。"""
         try:
-            if self.isVisible():
+            if not self.isVisible():
+                return
+            if _overlapped_from_above(int(self.winId())):
                 self.raise_()
         except Exception:
             _guard("最前面の維持", notify=False)
@@ -880,7 +1022,14 @@ class SourceFrameWindow(_TopmostWindow):
                 cfg.get("freeze_frame_opacity"), DEFAULT_FREEZE_FRAME_OPACITY, 0.0, 1.0
             )
         )
+        # ミラー先だけを黒画面/白画面にしている間の色。手元は普通に見えているので、
+        # 枠の色以外に「向こうが覆われている」と分かる手がかりが無い。
+        self._blank_color = _as_color(cfg.get("blank_frame_color"), DEFAULT_BLANK_FRAME_COLOR)
+        self._blank_color.setAlphaF(
+            _as_float(cfg.get("blank_frame_opacity"), DEFAULT_BLANK_FRAME_OPACITY, 0.0, 1.0)
+        )
         self.frozen = False
+        self.blank_kind = None
 
         # 呼ぶと1行の文字列を返すもの(実測fps)。無ければ帯そのものを作らない。
         self._status = status
@@ -918,20 +1067,43 @@ class SourceFrameWindow(_TopmostWindow):
         return source_rect.top() - band >= top
 
     def set_frozen(self, frozen: bool) -> None:
-        """静止中かどうかを受け取り、枠の色と帯の文字を切り替える。
-
-        帯は1秒ごとにしか更新しないので、ここでは待たずに引き直す。静止を切り替えた
-        瞬間に手元の見た目が変わらないと、切り替わったのかどうかが分からない。"""
+        """静止中かどうかを受け取り、枠の色と帯の文字を切り替える。"""
         try:
             frozen = bool(frozen)
             if frozen == self.frozen:
                 return
             self.frozen = frozen
-            self._color = self._frozen_color if frozen else self._normal_color
-            self._status_text = self._status() if self._status is not None else ""
-            self.update()
+            self._apply_style()
         except Exception:
             _guard("枠の色の切り替え", notify=False)
+
+    def set_blank(self, kind) -> None:
+        """ミラー先が黒画面/白画面で覆われているかを受け取る("black"/"white"/None)。"""
+        try:
+            kind = kind if kind in ("black", "white") else None
+            if kind == self.blank_kind:
+                return
+            self.blank_kind = kind
+            self._apply_style()
+        except Exception:
+            _guard("枠の色の切り替え", notify=False)
+
+    def _apply_style(self) -> None:
+        """いまの状態(黒/白画面・静止)に合わせて枠の色と帯の文字を引き直す。
+
+        帯は1秒ごとにしか更新しないので、ここでは待たずに引き直す。状態を切り替えた
+        瞬間に手元の見た目が変わらないと、切り替わったのかどうかが分からない。
+
+        黒/白画面を静止より優先するのは、見ている側に届いている絵がそれだから。
+        静止していようがいまいが、覆っている間は覆った色しか向こうには出ていない。"""
+        if self.blank_kind is not None:
+            self._color = self._blank_color
+        elif self.frozen:
+            self._color = self._frozen_color
+        else:
+            self._color = self._normal_color
+        self._status_text = self._status() if self._status is not None else ""
+        self.update()
 
     def _on_status(self):
         try:
@@ -1099,19 +1271,34 @@ class MirrorToolbarWindow(_TopmostWindow):
 
     押されたときの処理は呼ぶ側から辞書で受け取る。中身が「終了」だとこの窓自身が
     片付けられるので、押した場所から直接は呼ばず QTimer で次の回へ回す
-    (自分のイベントハンドラの中で自分を delete すると落ちる)。"""
+    (自分のイベントハンドラの中で自分を delete すると落ちる)。
+
+    右側の説明欄はタイトルバーも兼ねていて、そこをドラッグするとミラー範囲ごと動く
+    (TOOLBAR_GRIP_WIDTH のコメント参照)。ホイールはスポットライトの調整に使う。"""
 
     click_through = False
 
-    def __init__(self, geometry: QRect, actions: dict, state=None):
+    def __init__(self, geometry: QRect, actions: dict, state=None,
+                 adjust=None, move=None, move_end=None):
         super().__init__(geometry)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self._actions = dict(actions or {})
         # 呼ぶと「そのキーが今点いているか」を返すもの。無ければ全部消灯で描く。
         self._state = state
+        # スポットライトの調整。adjust(半径の増減, 暗さの増減) を呼ぶと、変えた後の値を
+        # 1行の文字列で返してくる(説明欄に出す)。無ければホイールは何もしない。
+        self._adjust = adjust
+        # 範囲の移動。move(dx, dy) を動かしている間に呼び、離したら move_end()。
+        self._move = move
+        self._move_end = move_end
         self._on = {key: False for key, _label, _color, _glyph in _TOOLBAR_ITEMS}
         self._hover = -1
+        # ドラッグ中に掴んでいる位置(グローバル)。掴んでいなければ None。
+        self._drag_from = None
+        # 調整した値などを一時的に説明欄へ出すための一言と、その期限(perf_counter)。
+        self._hint = ""
+        self._hint_until = 0.0
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_state)
@@ -1130,6 +1317,22 @@ class MirrorToolbarWindow(_TopmostWindow):
     def _index_at(self, point) -> int:
         for index in range(len(_TOOLBAR_ITEMS)):
             if self._button_rect(index).contains(point):
+                return index
+        return -1
+
+    def _title_rect(self) -> QRect:
+        """右側の説明欄。そのままミラー範囲を動かすタイトルバーでもある。"""
+        return QRect(
+            self.width() - TOOLBAR_LABEL_WIDTH - TOOLBAR_PADDING,
+            TOOLBAR_PADDING,
+            TOOLBAR_LABEL_WIDTH,
+            TOOLBAR_BUTTON_SIZE,
+        )
+
+    @staticmethod
+    def _spotlight_index() -> int:
+        for index, (key, _label, _color, _glyph) in enumerate(_TOOLBAR_ITEMS):
+            if key == "spotlight":
                 return index
         return -1
 
@@ -1157,16 +1360,37 @@ class MirrorToolbarWindow(_TopmostWindow):
                 if value != self._on.get(key):
                     self._on[key] = value
                     changed = True
+            if self._hint and time.perf_counter() >= self._hint_until:
+                self._hint = ""
+                changed = True
             if changed:
                 self.update()
         except Exception:
             _guard("ツールバーの状態の更新", notify=False)
+
+    def show_hint(self, text: str) -> None:
+        """説明欄へ一言を出す。TOOLBAR_HINT_MS 後に refresh_state が消す。"""
+        self._hint = str(text or "")
+        self._hint_until = time.perf_counter() + TOOLBAR_HINT_MS / 1000.0
+        self.update(self._title_rect())
 
     # ---------------------------------------------------------------
     # 入力
     # ---------------------------------------------------------------
     def mouseMoveEvent(self, event):
         try:
+            if self._drag_from is not None:
+                position = event.globalPosition().toPoint()
+                delta = position - self._drag_from
+                if delta.isNull():
+                    return
+                # 掴んだ点は「動かせた分」だけ進める。歯止めに当たって動けなかった分を
+                # ここで足してしまうと、戻すときにその分だけ空振りする。
+                moved = self._move(delta.x(), delta.y()) if self._move is not None else (0, 0)
+                self._drag_from = position - QPoint(delta.x() - moved[0], delta.y() - moved[1])
+                if moved[0] or moved[1]:
+                    self.move(self.x() + moved[0], self.y() + moved[1])
+                return
             index = self._index_at(event.position().toPoint())
             if index != self._hover:
                 self._hover = index
@@ -1179,11 +1403,46 @@ class MirrorToolbarWindow(_TopmostWindow):
         self.update()
         super().leaveEvent(event)
 
+    def wheelEvent(self, event):
+        """スポットライトの大きさと暗さをその場で変える。
+
+        素のホイールで半径、Shift(またはCtrl)を押しながらで暗さ。効くのはスポットライトの
+        アイコンの上と、スポットライトが点いている間のツールバー全体
+        (点けたあとは、どこで回しても効いたほうが手数が少ない)。"""
+        try:
+            if self._adjust is None:
+                event.ignore()
+                return
+            index = self._index_at(event.position().toPoint())
+            if index != self._spotlight_index() and not self._on.get("spotlight"):
+                event.ignore()
+                return
+            steps = event.angleDelta().y() / 120.0
+            if not steps:
+                event.ignore()
+                return
+            fine = bool(event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier))
+            if fine:
+                text = self._adjust(0, SPOTLIGHT_DIM_STEP * steps)
+            else:
+                text = self._adjust(SPOTLIGHT_RADIUS_STEP * steps, 0.0)
+            if text:
+                self.show_hint(text)
+            event.accept()
+        except Exception:
+            _guard("スポットライトの調整", notify=False)
+
     def mousePressEvent(self, event):
         try:
             if event.button() != Qt.LeftButton:
                 return
-            index = self._index_at(event.position().toPoint())
+            local = event.position().toPoint()
+            if self._move is not None and self._title_rect().contains(local):
+                # タイトルバーを掴んだ。アイコンの上では始めない(押すつもりで滑った
+                # だけで範囲ごと動くのを防ぐ。TOOLBAR_GRIP_WIDTH のコメント参照)。
+                self._drag_from = event.globalPosition().toPoint()
+                return
+            index = self._index_at(local)
             if index < 0:
                 return
             key = _TOOLBAR_ITEMS[index][0]
@@ -1195,6 +1454,20 @@ class MirrorToolbarWindow(_TopmostWindow):
             QTimer.singleShot(0, action)
         except Exception:
             _guard("ツールバーの操作", notify=False)
+
+    def mouseReleaseEvent(self, event):
+        try:
+            if self._drag_from is None or event.button() != Qt.LeftButton:
+                return
+            self._drag_from = None
+            if self._move_end is None:
+                return
+            # 離したところで枠とツールバーを作り直す(帯を上下どちらに置くか、ツールバーが
+            # 収まるかは範囲ごとに決まるため)。この窓自身が作り直されるので、押した場所
+            # からは直接呼ばず次の回へ回す(mousePressEvent と同じ理由)。
+            QTimer.singleShot(0, self._move_end)
+        except Exception:
+            _guard("範囲の移動の後始末", notify=False)
 
     # ---------------------------------------------------------------
     # 描画
@@ -1234,24 +1507,50 @@ class MirrorToolbarWindow(_TopmostWindow):
 
     def _draw_label(self, painter: QPainter) -> None:
         """右側の説明。乗せているボタンの名前を出す場所で、何も乗せていないときは
-        静止中かどうかを出す(静止に気付かないまま話し続けるのが最悪なので、
-        既定の表示をここに割り当てている)。"""
-        area = QRect(
-            self.width() - TOOLBAR_LABEL_WIDTH - TOOLBAR_PADDING,
-            TOOLBAR_PADDING,
-            TOOLBAR_LABEL_WIDTH,
-            TOOLBAR_BUTTON_SIZE,
-        )
-        if 0 <= self._hover < len(_TOOLBAR_ITEMS):
+        いま向こうに何が出ているか(黒/白画面・静止)を出す。気付かないまま話し続けるのが
+        最悪なので、既定の表示をここに割り当てている。
+
+        ここはタイトルバーでもあるので、左端に掴みしろの点々を描く。"""
+        area = self._title_rect()
+
+        # 掴みしろ。点を2列。ここを引いた残りが文字の場所になる。
+        grip = QRect(area.x(), area.y(), TOOLBAR_GRIP_WIDTH, area.height())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 90 if self._drag_from is None else 190))
+        for row in range(4):
+            for column in range(2):
+                painter.drawEllipse(
+                    QRectF(
+                        grip.x() + 2 + column * 5,
+                        grip.center().y() - 7 + row * 5,
+                        2.4,
+                        2.4,
+                    )
+                )
+        area = area.adjusted(TOOLBAR_GRIP_WIDTH + 2, 0, 0, 0)
+
+        blank = "black" if self._on.get("black") else ("white" if self._on.get("white") else None)
+        bold = False
+        if self._hint:
+            text = self._hint
+            painter.setPen(QColor(250, 220, 120))
+        elif 0 <= self._hover < len(_TOOLBAR_ITEMS):
             text = _TOOLBAR_ITEMS[self._hover][1]
             painter.setPen(QColor(235, 235, 235))
+        elif blank is not None:
+            # 手元は普通に見えたままなので、ここに出さないと気付きようが無い。
+            text = "⬛ 共有側は黒画面" if blank == "black" else "⬜ 共有側は白画面"
+            painter.setPen(QColor(DEFAULT_BLANK_FRAME_COLOR))
+            bold = True
         elif self._on.get("freeze"):
             text = "⏸ 静止中"
             painter.setPen(QColor(DEFAULT_FREEZE_FRAME_COLOR))
+            bold = True
         else:
-            text = "画面ミラー"
+            text = "ドラッグで範囲を移動"
             painter.setPen(QColor(150, 150, 150))
-        painter.setFont(QFont("Meiryo", 9, QFont.Bold if self._on.get("freeze") else QFont.Normal))
+        painter.setBrush(Qt.NoBrush)
+        painter.setFont(QFont("Meiryo", 9, QFont.Bold if bold else QFont.Normal))
         metrics = QFontMetrics(painter.font())
         painter.drawText(
             area,
@@ -1300,6 +1599,24 @@ class MirrorWindow(_TopmostWindow):
         self._spot = presenter_overlay.spotlight_params(app_settings)
         self.laser_on = False
         self.spotlight_on = False
+
+        # 黒画面/白画面。ミラー中は「ミラー先だけ」を覆う("black"/"white"/None)。
+        # 手元の画面へ重ねる presenter_overlay.BlankOverlay は使わない——あれはカーソルの
+        # ある画面を覆うので、手元まで真っ黒になって次に何を見せるか準備できなくなる
+        # (撮る範囲ごと覆われた結果がミラーにも映る、という以前の作りを改めたもの)。
+        blank_cfg = presenter_overlay.overlay_config(app_settings)
+        self.blank_kind = None
+        self._blank_colors = {
+            "black": _as_color(
+                blank_cfg.get("blank_black_color"), presenter_overlay.DEFAULT_BLANK_BLACK
+            ),
+            "white": _as_color(
+                blank_cfg.get("blank_white_color"), presenter_overlay.DEFAULT_BLANK_WHITE
+            ),
+        }
+        for color in self._blank_colors.values():
+            # 透けると意味が無い(BlankOverlay と同じ判断)。
+            color.setAlpha(255)
 
         # 拡大方法(smooth / fast / auto)。冒頭の実測コメントを参照。
         self._scaling = scaling_mode(app_settings)
@@ -1383,12 +1700,52 @@ class MirrorWindow(_TopmostWindow):
         self._frame = None
         self._ripples = []
         self._buttons = (False, False)
-        if not self.frozen:
+        if not self.frozen and self.blank_kind is None:
             try:
                 self.grab_frame()
             except Exception:
                 _guard("フレームの更新", notify=False)
         self.update()
+
+    def move_source_rect(self, source_rect: QRect) -> None:
+        """大きさを変えずに位置だけ差し替える。ドラッグで範囲を動かしている間の入口。
+
+        set_source_rect と違って撮り直さないし、前のフレームも捨てない。ドラッグ中は
+        マウスが動くたびにここへ来るので(毎秒100回以上ありうる)、1枚17msの取得を
+        呼んでいたら追いつかない。大きさは変わらないので前の絵をそのまま出しておけば
+        歪まず、次のフレーム(最大33ms後)には新しい位置の絵に入れ替わる。
+
+        波紋だけは捨てる。押した位置は前の範囲の座標なので、動かした先では別の場所を指す。"""
+        self.source_rect = QRect(source_rect)
+        self._ripples = []
+        self._buttons = (False, False)
+
+    def set_blank(self, kind) -> None:
+        """ミラー先だけを黒(または白)で覆う。kind は "black"/"white"/None。
+
+        覆っている間は撮りに行かない。向こうには単色しか出ていないので、撮る意味が
+        無いうえ、手元で資料を切り替える(まさにこの機能を使う場面)ときにCPUを空けられる。"""
+        kind = kind if kind in ("black", "white") else None
+        if kind == self.blank_kind:
+            return
+        self.blank_kind = kind
+        if kind is not None:
+            self.current_fps = 0.0
+        else:
+            # 覆っていた間は数えていないので、区間の起点を取り直す(set_frozen と同じ)。
+            self._fps_mark_time = None
+            self._fps_mark_count = self.frame_count
+        self.update()
+
+    def set_spotlight(self, radius: int, dim: float) -> None:
+        """スポットライトの半径と暗さを差し替える。発表中にその場で変えるための入口。
+
+        窓もタイマーも作り直さない。draw_spotlight へ渡す値を持ち替えるだけで、
+        次に描くときから新しい大きさになる。"""
+        self._spot["radius"] = max(int(radius), 1)
+        self._spot["dim_alpha"] = int(round(max(min(float(dim), 1.0), 0.0) * 255))
+        if self.spotlight_on:
+            self.update()
 
     def set_frozen(self, frozen: bool) -> None:
         """静止を切り替える。立てた瞬間に1回描き直すのは、最後のフレームに描いてある
@@ -1422,9 +1779,10 @@ class MirrorWindow(_TopmostWindow):
         """周期の本体。ここは必ず try で受けること(PySide6はスロットから例外が
         投げ切られるとプロセスごと終わる)。1枚撮って、入力を読んで、描き直す。"""
         try:
-            if self.frozen:
+            if self.frozen or self.blank_kind is not None:
                 # 静止中は撮りに行かないし描き直しもしない。カーソルも読まない——
                 # 止まった絵の上でカーソルだけが動いたら、指している場所が嘘になる。
+                # 黒/白画面で覆っている間も同じ(向こうには単色しか出ていない)。
                 return
             self.grab_frame()
             self._update_fps()
@@ -1453,8 +1811,11 @@ class MirrorWindow(_TopmostWindow):
         持っているが論理サイズはこれ」という印を付けて返すが、こちらは映像を枠へ
         引き伸ばして描くだけで、論理サイズを使う場面が無い。印が付いたままだと
         drawImage の転送元がどちらの単位なのか曖昧になるので、生のピクセルとして扱う。
-        grab_region が返すのは copy() 済みの独立した画像なので、書き換えてよい。"""
-        frame = grab_region(self.source_rect)
+        grab_region が返すのは copy() 済みの独立した画像なので、書き換えてよい。
+
+        include_layered=False にしてあるのは、毎フレーム撮り続ける経路だから。詳しくは
+        capture_grab._grab のコメント(CAPTUREBLT を外す理由=カーソルのちらつき)。"""
+        frame = grab_region(self.source_rect, include_layered=False)
         frame.setDevicePixelRatio(1.0)
         self._frame = frame
         self.frame_count += 1
@@ -1488,6 +1849,11 @@ class MirrorWindow(_TopmostWindow):
 
         設定値も併記するのは、数字が低いときに「設定で落としてある」のか
         「重くて出ていない」のかが区別できないと、手の打ちようが無いため。"""
+        if self.blank_kind is not None:
+            # 手元は普通に見えたままなので、ここに出さないと「向こうは真っ黒」だと
+            # 気付きようが無い(静止より優先して出す。覆っている間は静止も見えない)。
+            kind = "黒画面" if self.blank_kind == "black" else "白画面"
+            return f"⬛ 共有側だけ{kind}（手元は見えています） {self.source_rect.width()}x{self.source_rect.height()}"
         if self.frozen:
             # 静止していることは、数字より先に読めるところへ置く。
             return (
@@ -1511,6 +1877,15 @@ class MirrorWindow(_TopmostWindow):
         painter = QPainter(self)
         # 余白は黒。映像より先に全面を塗る(前のフレームの端が残らないように)。
         painter.fillRect(event.rect(), QColor(0, 0, 0))
+
+        if self.blank_kind is not None:
+            # 黒画面/白画面。ミラー先だけを覆い、手元には何もしない。映像もカーソルも
+            # レーザーも描かない——覆う目的は「いま見せない」ことなので、上に何か出たら
+            # 台無しになる。静止中の印と同じで、ミラー先には状態も出さない
+            # (知る必要があるのは発表者だけ。手元の枠とツールバーに出している)。
+            painter.fillRect(event.rect(), self._blank_colors.get(self.blank_kind, QColor(0, 0, 0)))
+            return
+
         if self._frame is None:
             return
 
@@ -1627,9 +2002,47 @@ class MirrorController:
         # attach_presenter で渡す。ツールバーの黒画面/白画面はこちらにしか無い。
         self._presenter_toggle = None
         self._presenter_state = None
+        # 「この画面はミラー窓が覆っている」を知らせる先。ScreenFeature が
+        # attach_screen_cover で渡す(タスクバーウィジェットを引っ込めさせるため)。
+        self._screen_cover = None
+        self._covered_screen = None
         # 前回選んだ比率。次に始めるときの初期値にする(設定ファイルには書かない。
         # 発表ごとに選び直す性質の値で、残すほどのものではない)。
         self.aspect = str(mirror_config(app_settings).get("aspect") or DEFAULT_ASPECT)
+
+        # スポットライトの調整を settings.json へ書き戻すのを遅らせるためのタイマー。
+        # ホイールは1回転で何目盛りも飛んでくるので、そのたびに書くとファイルを何十回も
+        # 開き直すことになる(SPOTLIGHT_SAVE_DELAY_MS)。
+        self._spot_save_timer = QTimer()
+        self._spot_save_timer.setSingleShot(True)
+        self._spot_save_timer.timeout.connect(self._flush_spotlight)
+
+    def attach_screen_cover(self, callback) -> None:
+        """「いまミラー窓が覆っている画面の名前」を知らせる先を受け取る。
+
+        タスクバーウィジェットに引っ込んでもらうために要る。あちらは
+        GetForegroundWindow で全画面アプリを見分けるが、ミラー窓は前面にならない作りなので
+        永久に気付けない(taskbar_widget.set_app_covered のコメントに詳しく書いた)。
+        こちらは自分がどの画面を覆っているかを知っているので、こちらから教える。"""
+        self._screen_cover = callback
+        if callback is not None:
+            try:
+                callback(self._covered_screen)
+            except Exception:
+                _guard("画面を覆っていることの通知", notify=False)
+
+    def _set_covered_screen(self, name) -> None:
+        """覆っている画面の名前を控え、知らせる先があれば知らせる。"""
+        name = name or None
+        if name == self._covered_screen:
+            return
+        self._covered_screen = name
+        if self._screen_cover is None:
+            return
+        try:
+            self._screen_cover(name)
+        except Exception:
+            _guard("画面を覆っていることの通知", notify=False)
 
     def attach_presenter(self, toggle, is_on) -> None:
         """手元のツールバーから呼ぶ、プレゼン支援の切り替えと状態取得を受け取る。
@@ -1688,12 +2101,16 @@ class MirrorController:
         except Exception:
             _guard("ミラー先の変更")
 
-    def _save_keys(self, values: dict) -> None:
-        """settings.json の screen_mirror セクションへ、指定したキーだけを書き戻す。
+    def _save_keys(self, values: dict, section_name: str = "screen_mirror") -> None:
+        """settings.json の指定セクションへ、指定したキーだけを書き戻す。
 
         メモリ上の app_settings は既定値をマージ済みなので、それを丸ごと書き出すと
         未設定の既定値まで明示的に書かれてファイルの姿が変わってしまう
-        (launcher.save_bookmark と同じ作法)。"""
+        (launcher.save_bookmark と同じ作法)。
+
+        セクション名を引数にしてあるのは、スポットライトの半径と暗さが
+        presenter_overlay セクションの値だから(画面へ重ねる側と共有している。
+        同じ道具の同じ穴を2箇所で設定させる意味が無い)。"""
         if not self.settings_path:
             return
         try:
@@ -1708,10 +2125,10 @@ class MirrorController:
                     stored = json.load(f)
             if not isinstance(stored, dict):
                 stored = {}
-            section = stored.setdefault("screen_mirror", {})
+            section = stored.setdefault(section_name, {})
             if not isinstance(section, dict):
                 section = {}
-                stored["screen_mirror"] = section
+                stored[section_name] = section
             section.update(values)
             settings_module.save_settings(stored, self.settings_path)
         except (OSError, ValueError, TypeError, AttributeError) as e:
@@ -1911,6 +2328,9 @@ class MirrorController:
             _guard("ミラー窓の表示")
             return False
 
+        # このモニタのタスクバーウィジェットに引っ込んでもらう。押し上げ合いになると
+        # 共有側でチカチカする(attach_screen_cover のコメント参照)。
+        self._set_covered_screen(screen.name())
         self._show_frame(source_rect)
 
         self.notify(
@@ -1940,6 +2360,7 @@ class MirrorController:
                     source_rect, self.app_settings, status=self._mirror.status_text
                 )
                 self._frame.set_frozen(self._mirror.frozen)
+                self._frame.set_blank(self._mirror.blank_kind)
                 self._frame.show()
                 # ツールバーは枠のさらに外に置く(枠の帯と重ならないように)。
                 anchor = QRect(self._frame.geometry())
@@ -1957,7 +2378,12 @@ class MirrorController:
                     self.notify("ツールバーを置く場所がありません\n範囲の外に余白がある位置を選んでください")
                 else:
                     self._toolbar = MirrorToolbarWindow(
-                        geometry, self._toolbar_actions(), self._toolbar_state
+                        geometry,
+                        self._toolbar_actions(),
+                        self._toolbar_state,
+                        adjust=self.adjust_spotlight,
+                        move=self.move_source_by,
+                        move_end=self.end_move,
                     )
                     self._toolbar.show()
             except Exception:
@@ -2003,6 +2429,9 @@ class MirrorController:
         """ミラーも枠もツールバーも選択も畳む。終了時の後始末からも呼ぶ。"""
         self._reselecting = False
         self._close_selection()
+        # 先に知らせる。ミラー窓を畳んでからだと、タスクバーウィジェットが戻るまでの
+        # 間に「誰も居ない画面」ができる。
+        self._set_covered_screen(None)
         for name in ("_toolbar", "_frame", "_mirror"):
             window = getattr(self, name, None)
             setattr(self, name, None)
@@ -2065,6 +2494,8 @@ class MirrorController:
                 return bool(self._presenter_toggle(kind))
             if kind in ("laser", "spotlight"):
                 return self.toggle_light(kind)
+            if kind in ("black", "white"):
+                return self.toggle_blank(kind)
         except Exception:
             _guard("プレゼン支援の切り替え", notify=False)
         return False
@@ -2073,6 +2504,8 @@ class MirrorController:
         try:
             if self._presenter_state is not None:
                 return bool(self._presenter_state(kind))
+            if kind in ("black", "white"):
+                return self.is_blank_on(kind)
             return self.is_light_on(kind)
         except Exception:
             _guard("プレゼン支援の状態", notify=False)
@@ -2109,3 +2542,167 @@ class MirrorController:
 
     def toggle_freeze(self) -> bool:
         return self.set_freeze(not self.is_frozen())
+
+    # ---------------------------------------------------------------
+    # スポットライトの調整(発表中にその場で変える)
+    #
+    # 値の置き場は presenter_overlay セクション。画面へ重ねる側と同じ穴・同じ設定キーで、
+    # ここで変えた大きさは次に手元へ重ねたときにもそのまま効く。
+    # ---------------------------------------------------------------
+    def spotlight_values(self) -> tuple:
+        """いまの (半径, 暗さ)。設定に書かれていなければ既定。"""
+        cfg = presenter_overlay.overlay_config(self.app_settings)
+        radius = _as_int(
+            cfg.get("spotlight_radius"), presenter_overlay.DEFAULT_SPOTLIGHT_RADIUS
+        )
+        dim = _as_float(
+            cfg.get("spotlight_dim"), presenter_overlay.DEFAULT_SPOTLIGHT_DIM, 0.0, 1.0
+        )
+        return (
+            min(max(radius, SPOTLIGHT_RADIUS_MIN), SPOTLIGHT_RADIUS_MAX),
+            min(max(dim, SPOTLIGHT_DIM_MIN), SPOTLIGHT_DIM_MAX),
+        )
+
+    def adjust_spotlight(self, radius_delta: float, dim_delta: float) -> str:
+        """スポットライトの半径と暗さを増減する。戻り値は手元に出す1行。
+
+        すぐ効かせて、書き戻しは遅らせる(ホイールは目盛りが連続で飛んでくるので、
+        1目盛りごとに settings.json を開き直すことになる)。効かせる先は「今出ている
+        ミラー窓」と「メモリ上の設定」の両方——後者を更新しないと、次に手元へ重ねる
+        スポットライトが古い値のままになる。"""
+        try:
+            radius, dim = self.spotlight_values()
+            radius = int(
+                min(
+                    max(round(radius + radius_delta), SPOTLIGHT_RADIUS_MIN),
+                    SPOTLIGHT_RADIUS_MAX,
+                )
+            )
+            dim = min(max(dim + dim_delta, SPOTLIGHT_DIM_MIN), SPOTLIGHT_DIM_MAX)
+            # 0.05刻みで足し引きすると 0.7200000000000001 のような値が溜まる。
+            dim = round(dim, 3)
+
+            section = self.app_settings.setdefault("presenter_overlay", {})
+            section["spotlight_radius"] = radius
+            section["spotlight_dim"] = dim
+            if self._mirror is not None:
+                self._mirror.set_spotlight(radius, dim)
+            self._spot_save_timer.start(SPOTLIGHT_SAVE_DELAY_MS)
+            return f"スポット 半径 {radius} / 暗さ {int(round(dim * 100))}%"
+        except Exception:
+            _guard("スポットライトの調整", notify=False)
+            return ""
+
+    def _flush_spotlight(self) -> None:
+        """遅らせておいた書き戻し。タイマーのスロットなので必ず try で受ける。"""
+        try:
+            radius, dim = self.spotlight_values()
+            self._save_keys(
+                {"spotlight_radius": radius, "spotlight_dim": dim},
+                section_name="presenter_overlay",
+            )
+        except Exception:
+            _guard("スポットライトの設定の保存", notify=False)
+
+    # ---------------------------------------------------------------
+    # 黒画面・白画面(ミラー先だけ)
+    # ---------------------------------------------------------------
+    def toggle_blank(self, kind: str) -> bool:
+        """ミラー先だけを黒(または白)で覆う。戻り値は切り替え後の状態。
+
+        以前は presenter_overlay の黒画面をそのまま出していた。あれは「カーソルのある
+        画面」を覆うので、撮る範囲ごと覆われた結果がミラーにも映る——向こうは黒くなるが、
+        手元まで真っ黒になる。次に何を見せるか準備するために手元は見えていなければ
+        ならないので、ミラー中は覆う先を向こうだけにする。
+
+        手元には枠の色・帯の文字・ツールバーの点灯と文字で出す(静止のときと同じ流儀)。
+        ミラー先には何も足さない。覆う目的は「いま見せない」ことなので、上に印が乗ったら
+        台無しになる。"""
+        if self._mirror is None:
+            return False
+        try:
+            if kind not in ("black", "white"):
+                return False
+            new_kind = None if self._mirror.blank_kind == kind else kind
+            self._mirror.set_blank(new_kind)
+            if self._frame is not None:
+                self._frame.set_blank(new_kind)
+            if self._toolbar is not None:
+                self._toolbar.refresh_state()
+            return new_kind == kind
+        except Exception:
+            _guard("黒画面の切り替え", notify=False)
+        return False
+
+    def is_blank_on(self, kind: str) -> bool:
+        return self._mirror is not None and self._mirror.blank_kind == kind
+
+    # ---------------------------------------------------------------
+    # ミラー範囲の移動(ツールバーのタイトルバーをドラッグ)
+    # ---------------------------------------------------------------
+    def move_source_by(self, dx: int, dy: int) -> tuple:
+        """ミラー範囲を (dx, dy) 動かす。戻り値は「実際に動かせた量」。
+
+        歯止めは2つ。ミラー先のモニタに重ねないこと(自分を撮ると無限に入れ子になる)と、
+        画面の外へ丸ごと出さないこと(手元から掴めなくなる)。当たったら、当たった向きの
+        成分だけ捨てて残りは動かす——縦に突き当たったからと横まで止まると、縁に沿って
+        滑らせられずに使い勝手が悪い。
+
+        大きさは変えない(今回は移動だけ)。枠とツールバーはドラッグ中は動かすだけで、
+        作り直すのは離したとき(end_move)。"""
+        if self._mirror is None:
+            return (0, 0)
+        try:
+            base = QRect(self._mirror.source_rect)
+            forbidden = QRect(self._mirror.geometry())
+            allowed = QRect()
+            for screen in available_screens():
+                allowed = allowed.united(screen.geometry())
+
+            def fits(rect: QRect) -> bool:
+                if rect.intersects(forbidden):
+                    return False
+                # 中心は画面の中に残す。掴めなくなるのを防ぐのが第一だが、ツールバーの
+                # 置き場所も範囲の中心にあるモニタを基準に探している(toolbar_geometry)。
+                # 中心が画面の外へ出ると基準のモニタが見つからず、離した瞬間に作り直した
+                # ツールバーが画面の外へ行って二度と掴めなくなる(実際そうなっていた)。
+                if not allowed.contains(rect.center()):
+                    return False
+                # 範囲が画面より大きいことは(等倍プリセットで端数のある構成だと)ありうる
+                # ので、「丸ごと収まること」は求めない。最低限だけ残す。
+                visible = rect.intersected(allowed)
+                if visible.isEmpty():
+                    return False
+                return (
+                    visible.width() >= min(MOVE_MIN_VISIBLE, rect.width())
+                    and visible.height() >= min(MOVE_MIN_VISIBLE, rect.height())
+                )
+
+            for candidate in ((dx, dy), (dx, 0), (0, dy)):
+                if not candidate[0] and not candidate[1]:
+                    continue
+                moved = base.translated(candidate[0], candidate[1])
+                if fits(moved):
+                    self._mirror.move_source_rect(moved)
+                    if self._frame is not None:
+                        self._frame.move(
+                            self._frame.x() + candidate[0], self._frame.y() + candidate[1]
+                        )
+                    return candidate
+            return (0, 0)
+        except Exception:
+            _guard("ミラー範囲の移動", notify=False)
+            return (0, 0)
+
+    def end_move(self) -> None:
+        """ドラッグを離したところで、枠とツールバーを新しい範囲へ作り直す。
+
+        動かしている間は平行移動で済ませているが、帯を範囲の上に置けるか・ツールバーが
+        下に収まるかは位置ごとに決まる。答えが変わっているかもしれないので、最後に一度
+        本来の手順(_show_frame)を通す。"""
+        try:
+            if self._mirror is None:
+                return
+            self._show_frame(self._mirror.source_rect)
+        except Exception:
+            _guard("ミラー範囲の移動の後始末", notify=False)

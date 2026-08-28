@@ -986,7 +986,7 @@ rapture_20260823_140919-003.png   ← Ctrl+Alt+S
 | `taskbar_widget.all_displays` | 全ディスプレイに出すか（既定 `true`）。`false` にするとプライマリの画面だけ外す（そちらには本物の通知領域があるため） |
 | `taskbar_widget.positions` | 表示位置を**ディスプレイごと**に持つ辞書。キーはモニタの型番とシリアル（`EX-LDGCQ321HD#951` 等）、値は `{"right": タスクバー右端からの距離, "top": タスクバー上端からの距離}`。**Ctrl+左ドラッグで動かしたウィジェットの分だけが書き込まれます**（他の画面は動きません）。書かれていない画面は既定の余白（右 19px・上 10px）で自動配置。**知らないモニタは無視されるので、別のPCへこのファイルを持って行っても壊れません** |
 | `taskbar_widget.width` / `.height` | 大きさ（既定 `59` x `31`＝Windows 11 の時計の描画範囲の実測値）。下の本物の時計を隠しきれない場合は少し大きくしてください |
-| `taskbar_widget.background_color` | 背景色（`#rrggbb`）。`null` なら表示直前にその位置の画面を撮って最頻色を使う（タスクバーの透明効果で壁紙が透けるため、決め打ちでは浮きます） |
+| `taskbar_widget.background_color` | 背景色。**空なら初回に実測して、その値をここへ書き込みます**。以後は測らずにこれを使うので、画面を切り替えた直後の真っ黒を拾って背景が黒くなることがありません。壁紙を変えたときはメニューの「🎨 背景色を取り直す」で更新します |
 | `taskbar_widget.text_color` | 時計の文字色（`#rrggbb`）。`null` なら背景の明るさから自動で黒／白を選ぶ |
 | `taskbar_widget.clock_format_top` | 上段（時刻）の `strftime` 書式。既定 `%#H:%M`。**先頭ゼロを落とすのは Windows では `%#H` です**（`%-H` は Linux 系） |
 | `taskbar_widget.clock_format_bottom` | 下段（日付）の `strftime` 書式。既定 `%Y/%m/%d` |

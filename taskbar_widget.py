@@ -102,6 +102,13 @@ REDRAW_WAIT_MS = 150
 # 背景を測れなかったときの色。Windows 11 のダークなタスクバーに一番近い無難な値。
 FALLBACK_BACKGROUND = "#202020"
 
+# 測った色を「タスクバーの地の色として妥当か」で振るう閾値。
+# 画面を切り替えた直後の一瞬は、その画面にまだ何も描かれておらず真っ黒を拾う。
+# そのまま採用すると背景が黒・文字が白のウィジェットが残る(実際そう報告された)。
+# タスクバーが完全な黒や完全な白であることは通常ないので、測り損ねとみなす。
+IMPLAUSIBLE_DARK = 8
+IMPLAUSIBLE_LIGHT = 248
+
 # 文字色を自動で決めるときの明るさのしきい値(0〜255)。タスクバーの透明効果で壁紙が
 # 透けるため、背景は明るくも暗くもなりうる。白固定だと明るい壁紙で読めなくなる。
 BRIGHTNESS_THRESHOLD = 140
@@ -376,6 +383,18 @@ def _as_int(value, default: int) -> int:
         return default
 
 
+def _is_plausible_background(color: QColor) -> bool:
+    """測った色が地の色として妥当か。真っ黒・真っ白は測り損ねとみなす。"""
+    if not color.isValid():
+        return False
+    channels = (color.red(), color.green(), color.blue())
+    if all(value <= IMPLAUSIBLE_DARK for value in channels):
+        return False
+    if all(value >= IMPLAUSIBLE_LIGHT for value in channels):
+        return False
+    return True
+
+
 def _auto_text_color(background: QColor) -> str:
     """背景の明るさから文字色を決める。ITU-R BT.601 の輝度で見る。
 
@@ -528,11 +547,11 @@ class TaskbarWidget(QWidget):
         QTimer.singleShot(REDRAW_WAIT_MS, self._finish_refresh_background)
 
     def _finish_refresh_background(self):
-        """測り直した色は settings.json に書かない。
+        """測り直して settings.json に控える。
 
-        background_color を空のままにしておけば起動のたびに実測されるので、壁紙が
-        変わっても放っておいて合う。ここで書き込むと以後その色に固定され、次に壁紙を
-        変えたときにまた手で取り直す羽目になる(色を固定したい人は自分で書く)。"""
+        起動のたびに測る形はやめた。画面を切り替えた直後は、その画面にまだ何も
+        描かれておらず真っ黒を拾うため(_apply_colors のコメント参照)。壁紙を変えた
+        ときはこのメニュー項目で更新する。"""
         try:
             self._apply_colors(measure=True)
             self.show()
@@ -541,13 +560,27 @@ class TaskbarWidget(QWidget):
             self.show()  # 測り直しに失敗しても消えたままにはしない
 
     def _apply_colors(self, measure: bool) -> None:
-        """背景色と文字色を決めて保持する。measure=True のときだけ画面を実測する。"""
+        """背景色と文字色を決めて保持する。measure=True のときだけ画面を実測する。
+
+        実測するのは、設定に色が無いとき(初回)と、メニューから取り直したときだけ。
+        測れたら settings.json に書いて、以後はそれを使う。
+
+        毎回測る形にしていたのをやめたのは、画面を切り替えた直後にウィジェットが
+        作り直され、まだ何も描かれていない画面から真っ黒を拾っていたため。壁紙を
+        変えたときは「背景色を取り直す」で更新する。"""
         configured = self._config.get("background_color")
+        background = None
         if measure or not configured:
-            background = QColor(_dominant_color(self.geometry()))
-        else:
+            measured = QColor(_dominant_color(self.geometry()))
+            if _is_plausible_background(measured):
+                background = measured
+                self._remember_background(measured)
+            elif configured:
+                # 測り損ねたときは、覚えている色があればそれを守る。
+                background = QColor(configured)
+        elif configured:
             background = QColor(configured)
-        if not background.isValid():
+        if background is None or not background.isValid():
             background = QColor(FALLBACK_BACKGROUND)
         self._background = background
 
@@ -558,6 +591,13 @@ class TaskbarWidget(QWidget):
         # ここで決めた色を借りる。1つの部品に見せるため、色は必ず本体と同じにする。
         self._launcher.refresh_colors()
         self.update()
+
+    def _remember_background(self, color: QColor) -> None:
+        """測れた背景色を settings.json に控える。次からは測らずにこれを使う。"""
+        name = color.name()
+        if self._config.get("background_color") == name:
+            return
+        save_config(self.app_settings, self.settings_path, background_color=name)
 
     def current_colors(self):
         """いま使っている (背景色, 文字色)。ランチャのパネルが自分と同じ色で描くために使う。

@@ -38,6 +38,7 @@ import web_presenter
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from keep_awake import hibernate_available, set_keep_awake, suspend
+from sleep_countdown import SleepCountdown
 from qt_image import pil_to_qicon
 from toast import show_toast
 from window_tools import TopmostTracker
@@ -70,6 +71,10 @@ PREWARM_STARTUP_DELAY_MS = 3000
 # 忘れて作業している最中に落ちると、開いているものが道連れになるため。この間に
 # 「予約を取り消す」を押せば止まる。
 SLEEP_WARN_SECONDS = 20
+
+# 予約の何秒前からカウントダウンの窓を出すか。3分あれば、区切りのいいところまで
+# 手を動かしてから止めるか寝るかを決められる。
+SLEEP_COUNTDOWN_SECONDS = 180
 
 
 def _format_seconds(seconds: int) -> str:
@@ -204,6 +209,10 @@ class ScreenFeature:
         self._sleep_warn_timer.timeout.connect(self._do_sleep)
         self._sleep_deadline = None
         self._sleep_hibernate = False
+        # 予約が近づいたら出すカウントダウンの窓。参照を持たないとGCで消える。
+        self._sleep_countdown = None
+        self._sleep_tick = QTimer()
+        self._sleep_tick.timeout.connect(self._on_sleep_tick)
         self._awake_timer = QTimer()
         self._awake_timer.setSingleShot(True)
         self._awake_timer.timeout.connect(self._on_awake_expired)
@@ -1004,6 +1013,9 @@ class ScreenFeature:
             self._sleep_hibernate = bool(hibernate)
             self._sleep_deadline = time.monotonic() + seconds + SLEEP_WARN_SECONDS
             name = "休止状態" if hibernate else "スリープ"
+            # 予告の窓は1秒ごとに残りを見て出す。予約の時点で「何秒後に出すか」を
+            # 決め打ちにすると、途中で予約を差し替えたときに古い予定が残る。
+            self._sleep_tick.start(1000)
             if seconds:
                 self._sleep_timer.start(seconds * 1000)
                 self._notify(name, f"{_format_seconds(seconds)}後に{name}にします")
@@ -1017,12 +1029,16 @@ class ScreenFeature:
         """予約を取り消す。掛かっていなければ何もしない。"""
         try:
             had = self._sleep_deadline is not None
+            # 種類は控えを消す前に読む。休止の予約を取り消したのに「スリープ」と
+            # 出ては、何を取り消したのか分からない。
+            name = "休止状態" if getattr(self, "_sleep_hibernate", False) else "スリープ"
             self._sleep_timer.stop()
             self._sleep_warn_timer.stop()
             self._sleep_deadline = None
+            self._close_sleep_countdown()
             self._refresh_state()
             if notify and had:
-                self._notify("スリープ", "予約を取り消しました")
+                self._notify(name, "予約を取り消しました")
         except Exception:
             self._log_failure("スリープ予約の取り消し")
 
@@ -1044,6 +1060,38 @@ class ScreenFeature:
         except Exception:
             self._log_failure("スリープ時刻の入力")
 
+    def _on_sleep_tick(self):
+        """1秒ごとに残りを見て、近づいていれば予告の窓を出す・数字を更新する。
+
+        残りを数えているのはこちら(_sleep_deadline)だけで、窓は見せるだけ。
+        2か所で数えると必ずズレる。"""
+        try:
+            left = self.sleep_seconds_left()
+            if left is None:
+                self._close_sleep_countdown()
+                self._sleep_tick.stop()
+                return
+            if left > SLEEP_COUNTDOWN_SECONDS:
+                return
+            name = "休止状態" if self._sleep_hibernate else "スリープ"
+            if self._sleep_countdown is None:
+                self._sleep_countdown = SleepCountdown(self.cancel_sleep, name)
+                self._sleep_countdown.show_for(left, name)
+            else:
+                self._sleep_countdown.set_seconds(left)
+        except Exception:
+            self._log_failure("スリープ予告の更新")
+
+    def _close_sleep_countdown(self) -> None:
+        """予告の窓を片付ける。出ていなければ何もしない。"""
+        try:
+            self._sleep_tick.stop()
+            if self._sleep_countdown is not None:
+                self._sleep_countdown.close()
+                self._sleep_countdown = None
+        except Exception:
+            self._log_failure("スリープ予告の片付け")
+
     def _on_sleep_due(self):
         """予約の時刻になった。すぐには寝ず、猶予を置いて声を掛ける。"""
         try:
@@ -1061,6 +1109,7 @@ class ScreenFeature:
         try:
             hibernate = bool(getattr(self, "_sleep_hibernate", False))
             self._sleep_deadline = None
+            self._close_sleep_countdown()
             self._refresh_state()
             if not suspend(hibernate):
                 name = "休止状態" if hibernate else "スリープ"

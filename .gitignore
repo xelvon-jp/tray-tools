@@ -21,3 +21,7 @@ error.log
 # 日時つきの settings.json.bak_20260823_111251 も拾えるよう末尾を * にする。
 settings.json.bak*
 crash.log
+
+# カンペ(画面ミラー)。中身は個人のものなので追跡しない。
+# フォルダは mirror_notes が必要になった時点で作る(雛形もコード側が持っている)。
+notes/

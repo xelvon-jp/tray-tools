@@ -38,6 +38,7 @@ import web_presenter
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from keep_awake import hibernate_available, set_keep_awake, suspend
+import action_log
 from sleep_countdown import SleepCountdown
 from qt_image import pil_to_qicon
 from toast import show_toast
@@ -945,18 +946,18 @@ class ScreenFeature:
         except Exception:
             self._log_failure("スリープ抑止の時間の入力")
 
-    def enable_keep_awake(self, minutes=None):
+    def enable_keep_awake(self, minutes=None, source: str = "external"):
         """外(名前付きパイプ)から呼ばれる入口。minutes が None なら無期限。
 
         長い処理を外から回すとき、始める前に掛けて終わったら外す、という使い方を
         想定している。中身はメニューから呼ぶものと同じ。"""
-        self._enable_keep_awake(minutes)
+        self._enable_keep_awake(minutes, source)
 
-    def disable_keep_awake(self):
+    def disable_keep_awake(self, source: str = "external"):
         """外から呼ばれる入口。掛かっていなければ何もしない。"""
-        self._disable_keep_awake()
+        self._disable_keep_awake(source=source)
 
-    def _enable_keep_awake(self, minutes):
+    def _enable_keep_awake(self, minutes, source: str = "menu"):
         # SetThreadExecutionStateは呼び出したスレッドに紐づく。ここはメニュー操作か、
         # シグナル経由でメインスレッドに渡されたホットキーからしか呼ばれない。
         if not set_keep_awake(True):
@@ -974,9 +975,10 @@ class ScreenFeature:
             self._awake_deadline = None
             label = "無期限"
         self._refresh_state()
+        action_log.record("スリープ抑止 有効", label, source)
         self._notify("スリープ抑止", f"有効: {label}")
 
-    def _disable_keep_awake(self, notify: bool = True):
+    def _disable_keep_awake(self, notify: bool = True, source: str = "menu"):
         was_active = self._awake_active
         self._awake_timer.stop()
         set_keep_awake(False)
@@ -984,13 +986,16 @@ class ScreenFeature:
         self._awake_minutes = None
         self._awake_deadline = None
         self._refresh_state()
+        if was_active:
+            action_log.record("スリープ抑止 解除", "", source)
         if notify and was_active:
             self._notify("スリープ抑止", "解除しました")
 
     # ---------------------------------------------------------------
     # スリープさせる
     # ---------------------------------------------------------------
-    def schedule_sleep(self, seconds: int, hibernate: bool = False) -> None:
+    def schedule_sleep(self, seconds: int, hibernate: bool = False,
+                       source: str = "menu") -> None:
         """指定した秒数のあとにPCをスリープさせる。0なら猶予だけ置いてすぐ。
 
         外(名前付きパイプ)からも呼ばれる。長い処理を回している間だけ起こしておいて、
@@ -1016,6 +1021,9 @@ class ScreenFeature:
             # 予告の窓は1秒ごとに残りを見て出す。予約の時点で「何秒後に出すか」を
             # 決め打ちにすると、途中で予約を差し替えたときに古い予定が残る。
             self._sleep_tick.start(1000)
+            action_log.record(
+                f"{name} 予約", f"{_format_seconds(seconds)}後", source
+            )
             if seconds:
                 self._sleep_timer.start(seconds * 1000)
                 self._notify(name, f"{_format_seconds(seconds)}後に{name}にします")
@@ -1025,7 +1033,7 @@ class ScreenFeature:
         except Exception:
             self._log_failure("スリープの予約")
 
-    def cancel_sleep(self, notify: bool = True) -> None:
+    def cancel_sleep(self, notify: bool = True, source: str = "menu") -> None:
         """予約を取り消す。掛かっていなければ何もしない。"""
         try:
             had = self._sleep_deadline is not None
@@ -1037,6 +1045,8 @@ class ScreenFeature:
             self._sleep_deadline = None
             self._close_sleep_countdown()
             self._refresh_state()
+            if had:
+                action_log.record(f"{name} 予約を取り消し", "", source)
             if notify and had:
                 self._notify(name, "予約を取り消しました")
         except Exception:
@@ -1111,8 +1121,10 @@ class ScreenFeature:
             self._sleep_deadline = None
             self._close_sleep_countdown()
             self._refresh_state()
+            name = "休止状態" if hibernate else "スリープ"
+            action_log.record(f"{name} 実行", "", "timer")
             if not suspend(hibernate):
-                name = "休止状態" if hibernate else "スリープ"
+                action_log.record(f"{name} 失敗", "OSが受け付けなかった", "timer")
                 self._notify(name, f"{name}にできませんでした")
         except Exception:
             self._log_failure("スリープの実行")

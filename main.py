@@ -186,7 +186,7 @@ def _sleep_command(screen, args) -> None:
     """外から来た sleep の引数を解いて呼び分ける。想定外は「何もしない」に倒す。"""
     first = (args[0] if args else "").strip().lower()
     if first in ("cancel", "off", "stop", "abort"):
-        screen.cancel_sleep()
+        screen.cancel_sleep(source="external")
         return
     # 2つめに hibernate と書けば休止状態。書かなければスリープ。
     hibernate = any(str(a).strip().lower() in ("hibernate", "hiber") for a in args[1:])
@@ -198,7 +198,7 @@ def _sleep_command(screen, args) -> None:
             return
     elif first in ("hibernate", "hiber"):
         hibernate = True
-    screen.schedule_sleep(seconds, hibernate)
+    screen.schedule_sleep(seconds, hibernate, source="external")
 
 
 def _keep_awake_command(screen, args) -> None:
@@ -208,7 +208,7 @@ def _keep_awake_command(screen, args) -> None:
     「何もしない」に倒すほうがよい。"""
     mode = (args[0] if args else "on").strip().lower()
     if mode in ("off", "0", "false", "stop", "disable"):
-        screen.disable_keep_awake()
+        screen.disable_keep_awake(source="external")
         return
     minutes = None
     if len(args) > 1:
@@ -216,7 +216,7 @@ def _keep_awake_command(screen, args) -> None:
             minutes = max(1, int(args[1]))
         except (TypeError, ValueError):
             minutes = None
-    screen.enable_keep_awake(minutes)
+    screen.enable_keep_awake(minutes, source="external")
 
 
 def _restart(instance_lock) -> bool:

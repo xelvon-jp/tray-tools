@@ -28,16 +28,28 @@ ICON_PATH = PROJECT_DIR / "icons" / "rapture.ico"
 MIN_PYTHON = (3, 10)
 
 # デバイスに順番に振る色。足りなくなったら先頭へ戻る。
+# feature_audio._ICON_COLORS と同じ並び。両方を触るときは揃えること。
 _ICON_COLORS = ["#2563eb", "#ea580c", "#16a34a", "#9333ea", "#0891b2"]
 _HEADPHONE_HINTS = ["ヘッドホン", "ヘッドセット", "イヤホン", "headphone", "headset", "earphone"]
 
+# EndpointFormFactor → アイコンの図柄。feature_audio._FORM_FACTOR_SHAPES と同じ対応。
+# ここに写しがあるのは、setup.py がシステムの python で動いて feature_audio を
+# import できない(PySide6 も pycaw も venv 側にしかない)ため。片方を変えたら
+# 両方を揃えること。
+_FORM_FACTOR_ICONS = {0: "speaker", 1: "speaker", 2: "speaker", 3: "headphone",
+                      5: "headphone", 8: "speaker", 9: "monitor"}
+
 # venv 側の python で走らせて、有効な出力デバイスを JSON で返させる。
 # setup.py 自体はシステムの python で動くので pycaw を import できない。
+# form_factor は Windows がエンドポイントに持たせている機器の種類
+# (PKEY_AudioEndpoint_FormFactor)。名前から推測するより確実なので、アイコンの
+# 図柄はこれで決める。プロパティは列挙の時点で読み終わっているので追加のコストは無い。
 _DETECT_CODE = """
 import json
 from pycaw.constants import AudioDeviceState, EDataFlow
 from pycaw.utils import AudioUtilities
 
+FORM_FACTOR_KEY = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E} 0"
 found = []
 for device in AudioUtilities.GetAllDevices():
     if device.state != AudioDeviceState.Active:
@@ -47,7 +59,8 @@ for device in AudioUtilities.GetAllDevices():
             continue
     except Exception:
         continue
-    found.append({"label": str(device.FriendlyName), "id": device.id})
+    found.append({"label": str(device.FriendlyName), "id": device.id,
+                  "form_factor": device.properties.get(FORM_FACTOR_KEY)})
 print(json.dumps(found, ensure_ascii=False))
 """
 
@@ -155,9 +168,14 @@ def detect_devices() -> list:
         return []
 
 
-def _guess_icon(label: str) -> str:
+def _guess_icon(label: str, form_factor=None) -> str:
+    """アイコンの図柄。FormFactor が取れればそれを信じ、取れないときだけ名前で拾う。
+    どちらも駄目なら speaker(少なくとも「何かから鳴る」絵にはなる)。"""
+    icon = _FORM_FACTOR_ICONS.get(form_factor)
+    if icon:
+        return icon
     lowered = label.lower()
-    return "headphone" if any(h in lowered for h in _HEADPHONE_HINTS) else "monitor"
+    return "headphone" if any(h in lowered for h in _HEADPHONE_HINTS) else "speaker"
 
 
 def _build_devices(detected: list) -> list:
@@ -166,7 +184,7 @@ def _build_devices(detected: list) -> list:
         devices.append({
             "label": item["label"],
             "id": item["id"],
-            "icon": _guess_icon(item["label"]),
+            "icon": _guess_icon(item["label"], item.get("form_factor")),
             "color": _ICON_COLORS[index % len(_ICON_COLORS)],
         })
     return devices

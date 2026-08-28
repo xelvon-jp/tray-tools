@@ -31,6 +31,9 @@
 # 手元の枠(SourceFrameWindow)の下にはツールバー(MirrorToolbarWindow)を出す。
 # レーザー・スポットライト・黒画面・白画面・カンペ・静止・選び直し・終了をアイコンで
 # 並べたもの。枠と同じで撮影範囲の外に置く(自分を撮ると無限に入れ子になる)。
+# 右側の説明欄は掴みしろも兼ねていて、掴んでドラッグすると範囲ごと動き(move_source_by)、
+# その右端の ◢ を掴むと範囲の大きさが変わる(begin_resize / resize_source_to)。どちらも
+# 映したまま効くので、少し動かしたい・少し広げたいだけのときに選び直さずに済む。
 #
 # 範囲の右隣にはカンペ(MirrorNotesWindow)を出す。notes/ フォルダに置いた Markdown を
 # 読むだけのパネルで、# の見出しを ◀ ▶ でワンクリックで行き来できる。中身のファイルは
@@ -196,6 +199,9 @@ TOOLBAR_BACKGROUND = QColor(20, 20, 20, 225)
 # アイコンの上をドラッグしても動かないのは意図的。押すつもりで少し滑っただけで範囲ごと
 # 動いては困る(付箋で「画像部分のドラッグで動く」をやめたのと同じ理由)。
 TOOLBAR_GRIP_WIDTH = 12
+# 説明欄の右端から分ける、大きさを変える掴みしろの幅(論理px)。移動(欄のどこでも掴める)
+# と取り違えないよう、拡縮はこの帯の中だけにする。窓の右下の ◢ と同じ役どころ。
+TOOLBAR_RESIZE_WIDTH = 18
 # ドラッグ後に出す一言(半径や暗さの値など)を消すまでの時間(ms)。
 TOOLBAR_HINT_MS = 2500
 
@@ -247,6 +253,47 @@ SPOTLIGHT_SAVE_DELAY_MS = 800
 # 残す(論理px)。範囲まるごと画面外へ送れてしまうと、手元から掴む手段が無くなる。
 # 大きい範囲では、これより先に「中心が画面の中に残ること」のほうが効く(move_source_by)。
 MOVE_MIN_VISIBLE = 120
+
+# ---------------------------------------------------------------
+# ミラー範囲の拡縮(ツールバー右端の ◢ をドラッグ / ホイール)
+#
+# 移動だけあって大きさが変えられなかったので、少し広げたいだけでも Ctrl+Alt+P で
+# 選び直すしかなかった。選び直すとオーバーレイが全モニタを覆うぶん共有側が一瞬止まる
+# ので、微調整には大げさすぎる。
+#
+# 掴みしろをツールバーの右端に置いたのは、他の置き場所がどれも高くつくため。
+#   ・枠(SourceFrameWindow)の角や辺 … あの窓は WindowTransparentForInput で、自分では
+#     マウスを受け取れない。透過をやめると、穴(＝撮影範囲)の外周でクリックを吸い始める
+#     ので、映しながら操作するというこの機能の前提が崩れる。
+#   ・四隅に小さい窓を置く … 最前面の窓が4枚増える。このアプリでは窓が増えるたびに
+#     最前面の押し合いが増え、撮影範囲に掛からない置き場所を探す仕事も増えている
+#     (TOOLBAR_GRIP_WIDTH のコメントと同じ話)。掴みしろ4つのために払う額ではない。
+# ツールバーは既に「撮影範囲の外に置けた矩形」で、右端の説明欄は移動用の掴みしろも
+# 兼ねている。そこへ幅 TOOLBAR_RESIZE_WIDTH ぶんを分けるのがいちばん安い。
+# ---------------------------------------------------------------
+
+# 下限(論理px)。240x135 は 16:9 の最小で、ミラー先2560x1440へ出すと10.6倍——ここまで
+# 拡大すると何を映しても滲んで読めない。これ以下を選べても得が無い。
+SIZE_MIN_WIDTH = 240
+SIZE_MIN_HEIGHT = 135
+# 上限(論理px)。GRAB_MS_PER_PIXEL の実測から 3840x2160 は1枚122ms(=8fps)で、ここが
+# 「映せるが使い物にならない」の入口になる。実際にはデスクトップ全体の大きさとも
+# 突き合わせる(存在しない広さは撮れない)。
+SIZE_MAX_WIDTH = 3840
+SIZE_MAX_HEIGHT = 2160
+# 掴んで動かしている間、実際に窓へ反映する間隔(ms)。マウスは毎秒100回以上動くが、
+# 1回あたり枠の setMask を張り直し、ツールバーとカンペの置き場所を計算し直して動かす
+# ことになる。そのたびに全部やるほどの価値は無い(このプロジェクトは「よく走る経路で
+# 重い処理をしない」で何度も痛い目を見ている)。間引いても取りこぼさないのは、大きさを
+# 「掴んだ点からの絶対量」で決めているから——飛ばした回の結果は次の1回に含まれる。
+SIZE_APPLY_INTERVAL_MS = 16
+# ホイール1目盛りで変える幅(論理px)。Shift/Ctrl を押している間は細かく。
+# ドラッグでは狙いにくい「あと少しだけ」を、数字を見ながら詰めるための道。
+SIZE_WHEEL_STEP = 64
+SIZE_WHEEL_FINE_STEP = 16
+# ホイールで変えたあと、枠とツールバーを作り直すまでの待ち(ms)。1目盛りごとに作り直すと
+# 掴んでいる窓が消えるうえ、続けて回している間ずっと窓を捨てては作ることになる。
+SIZE_SETTLE_DELAY_MS = 450
 
 # 拡大方法。"smooth"(双線形) / "fast"(最近傍) / "auto"(倍率が整数なら fast)。
 # 詳しくは冒頭の実測コメント。
@@ -453,6 +500,16 @@ def available_screens() -> list:
     挙動を、実機を繋がずに確かめられるようにしてある(名前と矩形だけを持つ偽物を
     並べて差し替える)。呼ぶ側は毎回この名前をモジュールから引くこと。"""
     return QGuiApplication.screens()
+
+
+def desktop_bounds() -> QRect:
+    """全モニタを合わせた矩形。範囲を動かす/大きさを変えるときの「画面の中」の定義。
+
+    available_screens() を通すので、検証でモニタ構成を差し替えればここも一緒に変わる。"""
+    bounds = QRect()
+    for screen in available_screens():
+        bounds = bounds.united(screen.geometry())
+    return bounds
 
 
 def mouse_buttons_down() -> tuple:
@@ -1091,6 +1148,14 @@ class SourceFrameWindow(_TopmostWindow):
         # 上を既定にするのは、下端はタスクバーと重なりやすいため。
         above = band if band and self._fits_above(source_rect, band) else 0
         below = band - above
+        # 帯を上下どちらに置いたかは、あとで大きさを変えるとき(resize_to)にも要る。
+        # 作り直さずに形だけ合わせ直すので、置いた側を覚えておかないと再現できない。
+        self._band_height = band
+        self._above = above
+        self._below = below
+        # outer_rect と同じ式。ここで呼ばないのは、まだ QWidget.__init__ を通していない
+        # 自分のメソッドを呼びに行かないため(PySide6 は C++ 側が未初期化の間に触ると
+        # 何が起きるか保証が無い)。式を変えるときは両方。
         outer = source_rect.adjusted(
             -self._width, -self._width - above, self._width, self._width + below
         )
@@ -1109,6 +1174,53 @@ class SourceFrameWindow(_TopmostWindow):
             self._status_timer = QTimer(self)
             self._status_timer.timeout.connect(self._on_status)
             self._status_timer.start(SOURCE_FRAME_BAND_INTERVAL_MS)
+
+    def outer_rect(self, source_rect: QRect) -> QRect:
+        """その範囲を囲むときの窓の外形。枠の太さと帯のぶんだけ外へ広げたもの。
+
+        ツールバーとカンペの置き場所はこの矩形を基準に決まる(toolbar_geometry /
+        notes_geometry の anchor_rect)。大きさを変えている最中は窓を作り直さないので、
+        「作ったらこうなる外形」を先に引けるよう関数にしてある。"""
+        return source_rect.adjusted(
+            -self._width,
+            -self._width - self._above,
+            self._width,
+            self._width + self._below,
+        )
+
+    def resize_to(self, source_rect: QRect) -> None:
+        """映す範囲の大きさが変わったので、窓の形だけ合わせ直す。
+
+        作り直さないのは、掴んでいる間に窓を作り直すとドラッグが切れるため
+        (MirrorController.end_move と同じ理由)。帯は作ったときと同じ側に置く——
+        大きさを変えるときは左上を固定するので範囲の上端は動かず、「上に帯を置けるか」
+        の答えも変わらない(_fits_above は上端と帯の高さだけで決まる)。
+
+        setMask を張り直すのはここ。毎フレームの経路では触らない(張り直しはカーソルの
+        ちらつきの元になるので、生成時と、人が掴んで動かしている間だけに留める)。
+        穴を追わせないと、広げた範囲の中に枠の実体が入って自分が映り込む。"""
+        try:
+            self.setGeometry(self.outer_rect(source_rect))
+            self._hole = QRect(
+                self._width,
+                self._width + self._above,
+                source_rect.width(),
+                source_rect.height(),
+            )
+            self.setMask(QRegion(self.rect()).subtracted(QRegion(self._hole)))
+            if self._band_height:
+                self._band = QRect(
+                    0,
+                    0 if self._above else self.height() - self._band_height,
+                    self.width(),
+                    self._band_height,
+                )
+            # 帯は1秒ごとにしか引き直さない。掴んでいる間ずっと古い大きさとfpsが出て
+            # いては何を選んでいるか分からないので、ここでは待たずに引き直す。
+            self._status_text = self._status() if self._status is not None else ""
+            self.update()
+        except Exception:
+            _guard("枠の大きさの変更", notify=False)
 
     @staticmethod
     def _fits_above(source_rect: QRect, band: int) -> bool:
@@ -1336,12 +1448,15 @@ class MirrorToolbarWindow(_TopmostWindow):
     (自分のイベントハンドラの中で自分を delete すると落ちる)。
 
     右側の説明欄はタイトルバーも兼ねていて、そこをドラッグするとミラー範囲ごと動く
-    (TOOLBAR_GRIP_WIDTH のコメント参照)。ホイールはスポットライトの調整に使う。"""
+    (TOOLBAR_GRIP_WIDTH のコメント参照)。さらにその右端 TOOLBAR_RESIZE_WIDTH ぶんが
+    大きさを変える掴みしろ(◢)で、ドラッグでもホイールでも変えられる
+    (SIZE_MIN_WIDTH 前後のコメント参照)。ホイールはスポットライトの調整にも使う。"""
 
     click_through = False
 
     def __init__(self, geometry: QRect, actions: dict, state=None,
-                 adjust=None, move=None, move_end=None):
+                 adjust=None, move=None, move_end=None,
+                 resize_begin=None, resize_to=None, resize_end=None, resize_steps=None):
         super().__init__(geometry)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
@@ -1354,10 +1469,23 @@ class MirrorToolbarWindow(_TopmostWindow):
         # 範囲の移動。move(dx, dy) を動かしている間に呼び、離したら move_end()。
         self._move = move
         self._move_end = move_end
+        # 範囲の拡縮。掴んだ時点で resize_begin() を呼び、動かしている間は
+        # resize_to(掴んだ点からのdx, dy, 比率を捨てるか) を呼び、離したら resize_end()。
+        # 移動(差分の積み上げ)と違って「掴んだ点からの絶対量」を渡すのは、反映を間引いて
+        # いるため——飛ばした回のぶんは次の1回に含まれるので、取りこぼしが残らない。
+        self._resize_begin = resize_begin
+        self._resize_to = resize_to
+        self._resize_end = resize_end
+        # ホイールでの拡縮。resize_steps(目盛り数, 細かくするか) を呼ぶ。
+        self._resize_steps = resize_steps
         self._on = {key: False for key, _label, _color, _glyph in _TOOLBAR_ITEMS}
         self._hover = -1
         # ドラッグ中に掴んでいる位置(グローバル)。掴んでいなければ None。
         self._drag_from = None
+        # 大きさを変えるドラッグで掴んだ位置(グローバル)。掴んでいなければ None。
+        self._size_from = None
+        # 今カーソルの形を何にしてあるか。動かすたびに setCursor しないための控え。
+        self._cursor_zone = ""
         # 調整した値などを一時的に説明欄へ出すための一言と、その期限(perf_counter)。
         self._hint = ""
         self._hint_until = 0.0
@@ -1390,6 +1518,42 @@ class MirrorToolbarWindow(_TopmostWindow):
             TOOLBAR_LABEL_WIDTH,
             TOOLBAR_BUTTON_SIZE,
         )
+
+    def _resize_rect(self) -> QRect:
+        """説明欄の右端。ここを掴むと範囲の大きさが変わる(◢)。"""
+        area = self._title_rect()
+        return QRect(
+            area.right() - TOOLBAR_RESIZE_WIDTH + 1,
+            area.y(),
+            TOOLBAR_RESIZE_WIDTH,
+            area.height(),
+        )
+
+    def _move_rect(self) -> QRect:
+        """説明欄のうち、掴むと範囲が動くほう(◢ を除いた残り)。"""
+        return self._title_rect().adjusted(0, 0, -TOOLBAR_RESIZE_WIDTH, 0)
+
+    def _update_cursor(self, local) -> None:
+        """カーソルの形を、その場所で何が起きるかに合わせる。
+
+        掴みしろが見た目だけだと、点々や ◢ が飾りにしか見えない。形が変われば掴めると
+        分かる。変わったときだけ setCursor するのは、動かすたびに呼ぶと形の問い合わせが
+        毎回走るため(カーソルまわりは _on_topmost で一度痛い目を見ている)。"""
+        if self._resize_steps is not None and self._resize_rect().contains(local):
+            zone = "size"
+        elif self._move is not None and self._move_rect().contains(local):
+            zone = "move"
+        else:
+            zone = ""
+        if zone == self._cursor_zone:
+            return
+        self._cursor_zone = zone
+        if zone == "size":
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif zone == "move":
+            self.setCursor(Qt.SizeAllCursor)
+        else:
+            self.unsetCursor()
 
     @staticmethod
     def _spotlight_index() -> int:
@@ -1441,6 +1605,19 @@ class MirrorToolbarWindow(_TopmostWindow):
     # ---------------------------------------------------------------
     def mouseMoveEvent(self, event):
         try:
+            if self._size_from is not None:
+                # 大きさを変えている最中。渡すのは掴んだ点からの絶対量で、掴んだ側の
+                # 窓(このツールバー)が動いてもずれない。Shift を押している間だけ比率を
+                # 捨てる(既定は掴んだときの比率を保つ。MirrorController._resized_rect)。
+                if self._resize_to is None:
+                    return
+                delta = event.globalPosition().toPoint() - self._size_from
+                text = self._resize_to(
+                    delta.x(), delta.y(), bool(event.modifiers() & Qt.ShiftModifier)
+                )
+                if text:
+                    self.show_hint(text)
+                return
             if self._drag_from is not None:
                 position = event.globalPosition().toPoint()
                 delta = position - self._drag_from
@@ -1453,7 +1630,9 @@ class MirrorToolbarWindow(_TopmostWindow):
                 if moved[0] or moved[1]:
                     self.move(self.x() + moved[0], self.y() + moved[1])
                 return
-            index = self._index_at(event.position().toPoint())
+            local = event.position().toPoint()
+            self._update_cursor(local)
+            index = self._index_at(local)
             if index != self._hover:
                 self._hover = index
                 self.update()
@@ -1462,6 +1641,9 @@ class MirrorToolbarWindow(_TopmostWindow):
 
     def leaveEvent(self, event):
         self._hover = -1
+        if self._cursor_zone:
+            self._cursor_zone = ""
+            self.unsetCursor()
         self.update()
         super().leaveEvent(event)
 
@@ -1470,12 +1652,30 @@ class MirrorToolbarWindow(_TopmostWindow):
 
         素のホイールで半径、Shift(またはCtrl)を押しながらで暗さ。効くのはスポットライトの
         アイコンの上と、スポットライトが点いている間のツールバー全体
-        (点けたあとは、どこで回しても効いたほうが手数が少ない)。"""
+        (点けたあとは、どこで回しても効いたほうが手数が少ない)。
+
+        ただし ◢ の上だけは範囲の大きさに割り当てる。先に見るのは、スポットライトが
+        点いている間はツールバー全体が調整の場所になるため——◢ を後回しにすると、
+        点けた瞬間に大きさが変えられなくなる。ドラッグは狙った大きさへ一息に持っていく
+        道、ホイールは「あと少しだけ」を数字を見ながら詰める道で、用途が違う。"""
         try:
+            local = event.position().toPoint()
+            if self._resize_steps is not None and self._resize_rect().contains(local):
+                steps = event.angleDelta().y() / 120.0
+                if not steps:
+                    event.ignore()
+                    return
+                text = self._resize_steps(
+                    steps, bool(event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier))
+                )
+                if text:
+                    self.show_hint(text)
+                event.accept()
+                return
             if self._adjust is None:
                 event.ignore()
                 return
-            index = self._index_at(event.position().toPoint())
+            index = self._index_at(local)
             if index != self._spotlight_index() and not self._on.get("spotlight"):
                 event.ignore()
                 return
@@ -1499,7 +1699,13 @@ class MirrorToolbarWindow(_TopmostWindow):
             if event.button() != Qt.LeftButton:
                 return
             local = event.position().toPoint()
-            if self._move is not None and self._title_rect().contains(local):
+            if self._resize_to is not None and self._resize_rect().contains(local):
+                # 右端の ◢ を掴んだ。大きさを変える側。begin が False を返したら
+                # (ミラーが畳まれた直後など)何も始めない。
+                if self._resize_begin is None or self._resize_begin():
+                    self._size_from = event.globalPosition().toPoint()
+                return
+            if self._move is not None and self._move_rect().contains(local):
                 # タイトルバーを掴んだ。アイコンの上では始めない(押すつもりで滑った
                 # だけで範囲ごと動くのを防ぐ。TOOLBAR_GRIP_WIDTH のコメント参照)。
                 self._drag_from = event.globalPosition().toPoint()
@@ -1519,7 +1725,16 @@ class MirrorToolbarWindow(_TopmostWindow):
 
     def mouseReleaseEvent(self, event):
         try:
-            if self._drag_from is None or event.button() != Qt.LeftButton:
+            if event.button() != Qt.LeftButton:
+                return
+            if self._size_from is not None:
+                self._size_from = None
+                if self._resize_end is None:
+                    return
+                # 移動と同じ理由で次の回へ回す。end はこの窓を作り直す。
+                QTimer.singleShot(0, self._resize_end)
+                return
+            if self._drag_from is None:
                 return
             self._drag_from = None
             if self._move_end is None:
@@ -1572,8 +1787,22 @@ class MirrorToolbarWindow(_TopmostWindow):
         いま向こうに何が出ているか(黒/白画面・静止)を出す。気付かないまま話し続けるのが
         最悪なので、既定の表示をここに割り当てている。
 
-        ここはタイトルバーでもあるので、左端に掴みしろの点々を描く。"""
+        ここはタイトルバーでもあるので、左端に掴みしろの点々を描き、右端には大きさを
+        変える ◢ を描く。文字が入るのはその間。"""
         area = self._title_rect()
+
+        # 右端の ◢。窓の右下と同じ「斜めの線3本」にする。掴んでいる間は明るくして、
+        # 今どちらを掴んでいるのかが分かるようにする(点々の濃さと同じ作法)。
+        size_grip = self._resize_rect()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 200 if self._size_from is not None else 110), 2))
+        for offset in (0, 5, 10):
+            painter.drawLine(
+                size_grip.right() - 2 - offset,
+                size_grip.bottom() - 4,
+                size_grip.right() - 2,
+                size_grip.bottom() - 4 - offset,
+            )
 
         # 掴みしろ。点を2列。ここを引いた残りが文字の場所になる。
         grip = QRect(area.x(), area.y(), TOOLBAR_GRIP_WIDTH, area.height())
@@ -1589,7 +1818,8 @@ class MirrorToolbarWindow(_TopmostWindow):
                         2.4,
                     )
                 )
-        area = area.adjusted(TOOLBAR_GRIP_WIDTH + 2, 0, 0, 0)
+        # 文字は点々と ◢ の間。◢ に文字が重なると、どちらも読めなくなる。
+        area = area.adjusted(TOOLBAR_GRIP_WIDTH + 2, 0, -TOOLBAR_RESIZE_WIDTH, 0)
 
         blank = "black" if self._on.get("black") else ("white" if self._on.get("white") else None)
         bold = False
@@ -1609,7 +1839,7 @@ class MirrorToolbarWindow(_TopmostWindow):
             painter.setPen(QColor(DEFAULT_FREEZE_FRAME_COLOR))
             bold = True
         else:
-            text = "ドラッグで範囲を移動"
+            text = "ドラッグで移動／◢で大きさ"
             painter.setPen(QColor(150, 150, 150))
         painter.setBrush(Qt.NoBrush)
         painter.setFont(QFont("Meiryo", 9, QFont.Bold if bold else QFont.Normal))
@@ -2354,6 +2584,23 @@ class MirrorWindow(_TopmostWindow):
         self._ripples = []
         self._buttons = (False, False)
 
+    def resize_source_rect(self, source_rect: QRect) -> None:
+        """位置(左上)はそのままに、大きさを差し替える。範囲を掴んで拡げ縮めする入口。
+
+        move_source_rect と同じで撮り直さない。掴んで動かしている間はマウスが動くたびに
+        ここへ来るので、1枚17msの取得を呼んでいたら追いつかない。前の絵はそのまま出して
+        おく——比率を保って変えている限り拡大率が変わるだけで歪まず、次のフレーム
+        (最大33ms後)には新しい範囲の絵に入れ替わる。Shift で比率を捨てたときだけ、
+        その1フレームぶんは縦横の伸びが違う絵になる。
+
+        move_source_rect と違って描き直しを頼むのは、静止中と黒/白画面の間はタイマーが
+        止まっていて誰も描き直さないため。映像の出る矩形(video_rect)は範囲の比率から
+        決まるので、頼まないと帯の位置が古いまま残る。"""
+        self.source_rect = QRect(source_rect)
+        self._ripples = []
+        self._buttons = (False, False)
+        self.update()
+
     def set_blank(self, kind) -> None:
         """ミラー先だけを黒(または白)で覆う。kind は "black"/"white"/None。
 
@@ -2667,6 +2914,19 @@ class MirrorController:
         self._notes_save_timer = QTimer()
         self._notes_save_timer.setSingleShot(True)
         self._notes_save_timer.timeout.connect(self._flush_notes)
+
+        # 大きさを変えている間の控え。掴んだ瞬間の範囲と比率を持ち、以降の大きさは
+        # そこからの絶対量で決める(SIZE_APPLY_INTERVAL_MS のコメント参照)。
+        self._size_base = None
+        self._size_ratio = 16.0 / 9.0
+        # 間引いて反映しなかった最後の (dx, dy, 比率を捨てるか)。離すときに当てる。
+        self._size_pending = None
+        self._size_applied = 0.0
+        # ホイールで変えたあと、枠とツールバーを作り直すまでの待ち。回している間は
+        # 押し直され続けるので、手が止まってから一度だけ走る。
+        self._size_settle_timer = QTimer()
+        self._size_settle_timer.setSingleShot(True)
+        self._size_settle_timer.timeout.connect(self.end_resize)
 
     def attach_screen_cover(self, callback) -> None:
         """「いまミラー窓が覆っている画面の名前」を知らせる先を受け取る。
@@ -3040,6 +3300,10 @@ class MirrorController:
                         adjust=self.adjust_spotlight,
                         move=self.move_source_by,
                         move_end=self.end_move,
+                        resize_begin=self.begin_resize,
+                        resize_to=self.resize_source_to,
+                        resize_end=self.end_resize,
+                        resize_steps=self.resize_source_by_steps,
                     )
                     self._toolbar.show()
                     toolbar_rect = QRect(geometry)
@@ -3117,6 +3381,11 @@ class MirrorController:
         """ミラーも枠もツールバーもカンペも選択も畳む。終了時の後始末からも呼ぶ。"""
         self._reselecting = False
         self._close_selection()
+        # 大きさを変えている途中で終了されることがある(ツールバーの ✕ は掴みしろの
+        # 隣にある)。畳んだ後に作り直しが走らないよう、控えも止める。
+        self._size_settle_timer.stop()
+        self._size_base = None
+        self._size_pending = None
         # 先に知らせる。ミラー窓を畳んでからだと、タスクバーウィジェットが戻るまでの
         # 間に「誰も居ない画面」ができる。
         self._set_covered_screen(None)
@@ -3380,43 +3649,54 @@ class MirrorController:
     # ---------------------------------------------------------------
     # ミラー範囲の移動(ツールバーのタイトルバーをドラッグ)
     # ---------------------------------------------------------------
+    def _source_rect_allowed(self, rect: QRect) -> bool:
+        """その矩形を「映す範囲」にしてよいか。移動でも拡縮でも同じ条件を通す。
+
+        歯止めは2つ。ミラー先のモニタに重ねないこと(自分を撮ると無限に入れ子になる)と、
+        画面の外へ丸ごと出さないこと(手元から掴む手段が無くなる)。
+
+        大きさの上下限はここでは見ない。移動では変わらないし、拡縮では新しい大きさを
+        作る側(_resized_rect)で丸めてから来る——ここで弾くと、上限に当たった瞬間に
+        「動かない」だけになって理由が分からない。"""
+        if self._mirror is None:
+            return False
+        if rect.width() <= 0 or rect.height() <= 0:
+            return False
+        # ミラー窓はミラー先のモニタ全面に出しているので、その矩形がそのまま
+        # 「映してはいけない範囲」になる。
+        if rect.intersects(self._mirror.geometry()):
+            return False
+        allowed = desktop_bounds()
+        # 中心は画面の中に残す。掴めなくなるのを防ぐのが第一だが、ツールバーの
+        # 置き場所も範囲の中心にあるモニタを基準に探している(toolbar_geometry)。
+        # 中心が画面の外へ出ると基準のモニタが見つからず、離した瞬間に作り直した
+        # ツールバーが画面の外へ行って二度と掴めなくなる(実際そうなっていた)。
+        if not allowed.contains(rect.center()):
+            return False
+        # 範囲が画面より大きいことは(等倍プリセットで端数のある構成だと)ありうるので、
+        # 「丸ごと収まること」は求めない。最低限だけ残す。
+        visible = rect.intersected(allowed)
+        if visible.isEmpty():
+            return False
+        return (
+            visible.width() >= min(MOVE_MIN_VISIBLE, rect.width())
+            and visible.height() >= min(MOVE_MIN_VISIBLE, rect.height())
+        )
+
     def move_source_by(self, dx: int, dy: int) -> tuple:
         """ミラー範囲を (dx, dy) 動かす。戻り値は「実際に動かせた量」。
 
-        歯止めは2つ。ミラー先のモニタに重ねないこと(自分を撮ると無限に入れ子になる)と、
-        画面の外へ丸ごと出さないこと(手元から掴めなくなる)。当たったら、当たった向きの
-        成分だけ捨てて残りは動かす——縦に突き当たったからと横まで止まると、縁に沿って
+        歯止めは _source_rect_allowed(拡縮と共通)。当たったら、当たった向きの成分だけ
+        捨てて残りは動かす——縦に突き当たったからと横まで止まると、縁に沿って
         滑らせられずに使い勝手が悪い。
 
-        大きさは変えない(今回は移動だけ)。枠とツールバーはドラッグ中は動かすだけで、
-        作り直すのは離したとき(end_move)。"""
+        大きさは変えない(変えるのは resize_source_to のほう)。枠とツールバーはドラッグ中は
+        動かすだけで、作り直すのは離したとき(end_move)。"""
         if self._mirror is None:
             return (0, 0)
         try:
             base = QRect(self._mirror.source_rect)
-            forbidden = QRect(self._mirror.geometry())
-            allowed = QRect()
-            for screen in available_screens():
-                allowed = allowed.united(screen.geometry())
-
-            def fits(rect: QRect) -> bool:
-                if rect.intersects(forbidden):
-                    return False
-                # 中心は画面の中に残す。掴めなくなるのを防ぐのが第一だが、ツールバーの
-                # 置き場所も範囲の中心にあるモニタを基準に探している(toolbar_geometry)。
-                # 中心が画面の外へ出ると基準のモニタが見つからず、離した瞬間に作り直した
-                # ツールバーが画面の外へ行って二度と掴めなくなる(実際そうなっていた)。
-                if not allowed.contains(rect.center()):
-                    return False
-                # 範囲が画面より大きいことは(等倍プリセットで端数のある構成だと)ありうる
-                # ので、「丸ごと収まること」は求めない。最低限だけ残す。
-                visible = rect.intersected(allowed)
-                if visible.isEmpty():
-                    return False
-                return (
-                    visible.width() >= min(MOVE_MIN_VISIBLE, rect.width())
-                    and visible.height() >= min(MOVE_MIN_VISIBLE, rect.height())
-                )
+            fits = self._source_rect_allowed
 
             for candidate in ((dx, dy), (dx, 0), (0, dy)):
                 if not candidate[0] and not candidate[1]:
@@ -3450,3 +3730,237 @@ class MirrorController:
             self._show_frame(self._mirror.source_rect)
         except Exception:
             _guard("ミラー範囲の移動の後始末", notify=False)
+
+    # ---------------------------------------------------------------
+    # ミラー範囲の拡縮(ツールバー右端の ◢ をドラッグ / ホイール)
+    #
+    # 決めたこと(理由は各所のコメントに分けて書いた):
+    #   掴む場所 … ツールバー右端の ◢ (SIZE_MIN_WIDTH の上のコメント)
+    #   比率    … 掴んだときの比率を保つ。Shift の間だけ自由 (_resized_rect)
+    #   固定辺  … 左上。右下だけが動く (_resized_rect)
+    # ---------------------------------------------------------------
+    def begin_resize(self) -> bool:
+        """掴んだ瞬間の範囲と比率を控える。以降の大きさはここからの絶対量で決める。
+
+        差分の積み上げにしないのは、反映を間引く(SIZE_APPLY_INTERVAL_MS)ため。掴んだ
+        点からの距離で決めていれば、何回か飛ばしても次の1回で正しい大きさに追いつく。
+        移動のほうが差分を積んでいるのは、あちらが歯止めに当たった分を掴んだ点の側で
+        差し引く作りだから(mouseMoveEvent)。こちらは歯止めに当たったら「その大きさに
+        しない」だけで、掴んだ点は動かさない。"""
+        try:
+            if self._mirror is None:
+                return False
+            base = QRect(self._mirror.source_rect)
+            if base.width() <= 0 or base.height() <= 0:
+                return False
+            self._size_settle_timer.stop()
+            self._size_base = base
+            self._size_ratio = base.width() / float(base.height())
+            self._size_pending = None
+            self._size_applied = 0.0
+            return True
+        except Exception:
+            _guard("ミラー範囲の拡縮の開始", notify=False)
+            return False
+
+    def _resized_rect(self, dx: int, dy: int, free: bool) -> QRect:
+        """掴んだ点から (dx, dy) 動いたときの、新しい範囲。
+
+        左上を固定して右下だけを動かす。窓の大きさを変えるときの当たり前の作法である
+        うえに、上端を動かさないことに実利がある——手元の枠は「範囲の上に帯を置けるか」
+        で外形が決まっていて(SourceFrameWindow._fits_above)、上端が動かなければその答えは
+        変わらない。掴んでいる間に帯が上下へ飛ぶと、枠もツールバーもまとめて跳ねる。
+
+        比率は掴んだときのものを保つ。ミラー先のモニタは決まった比率なので、崩すと上下か
+        左右に黒帯が増える(MirrorWindow.video_rect は引き伸ばさず余りを黒で残す)。
+        「今出ている絵のまま大きさだけ変えたい」がこの機能の用なので、既定は保つ側へ
+        倒す。おまけに、保っている限り拡大率が変わるだけなので、次のフレームが来るまでの
+        間に前の絵を引き伸ばしても歪まない(resize_source_rect)。Shift の間だけ自由。
+
+        保つときは、掴んだ点からの移動量を対角線((比率,1)の向き)へ落として1つの伸び量に
+        する。「右へ引けば横に、下へ引けば縦に」が素直に混ざり、縮めるときも同じ式で効く
+        (縦横の変化率の max を取る作りだと、斜めに引いたときに縮められなくなる)。"""
+        base = self._size_base if self._size_base is not None else QRect(0, 0, 16, 9)
+        ratio = self._size_ratio if self._size_ratio > 0 else 16.0 / 9.0
+        if free:
+            width = float(base.width() + dx)
+            height = float(base.height() + dy)
+        else:
+            step = (dx * ratio + dy) / (ratio * ratio + 1.0)
+            width = base.width() + step * ratio
+            height = base.height() + step
+        # 歯止め。小さすぎ(拡大しすぎて読めない)と大きすぎ(1枚の取得が間に合わない)を
+        # 止め、デスクトップ全体より広い範囲も選ばせない(存在しない広さは撮れない)。
+        bounds = desktop_bounds()
+        max_width = min(SIZE_MAX_WIDTH, max(bounds.width(), SIZE_MIN_WIDTH))
+        max_height = min(SIZE_MAX_HEIGHT, max(bounds.height(), SIZE_MIN_HEIGHT))
+        if free:
+            width = min(max(width, SIZE_MIN_WIDTH), max_width)
+            height = min(max(height, SIZE_MIN_HEIGHT), max_height)
+        else:
+            if width < 1.0 or height < 1.0:
+                # 掴んだ点より左上へ大きく戻された。0や負のままでは倍率が出せないが、
+                # 縦横を別々に1へ丸めると比率が壊れる(そこを丸めた結果、下限が
+                # 240x135 ではなく 240x240 の正方形になっていた)。比率だけ残した
+                # 最小の形に置き換えてから、下の _fit_ratio で下限まで広げる。
+                width, height = ratio, 1.0
+            # 比率を保ったまま収める。片方だけ丸めると比率が崩れるので、倍率で寄せる。
+            width, height = self._fit_ratio(width, height, max_width, max_height)
+        return QRect(base.x(), base.y(), int(round(width)), int(round(height)))
+
+    @staticmethod
+    def _fit_ratio(width: float, height: float, max_width: float, max_height: float) -> tuple:
+        """縦横の比を変えずに、上下限の中へ収めた (幅, 高さ)。
+
+        先に上限へ縮め、次に下限へ広げる。逆にすると、下限へ広げた結果が上限を超える
+        構成(モニタが極端に細長いとき)で上限を破る。"""
+        shrink = min(max_width / width, max_height / height, 1.0)
+        width *= shrink
+        height *= shrink
+        grow = max(SIZE_MIN_WIDTH / width, SIZE_MIN_HEIGHT / height, 1.0)
+        return width * grow, height * grow
+
+    def _size_hint(self, rect: QRect) -> str:
+        """ツールバーの説明欄へ出す一言。今の大きさと、その大きさで出せそうなfps。
+
+        推定fpsを添えるのは、大きくするほど重くなるのが選んでいる最中に分からないため。
+        範囲選択の画面には既に同じ数字を出しているので(estimated_fps)、ここでも同じ
+        ものを出す。手元の枠の帯には実測が出るが、あちらは1秒ごとの更新なので、
+        掴んでいる間の手応えにはならない。"""
+        limit = self._mirror.fps if self._mirror is not None else DEFAULT_FPS
+        return (
+            f"{rect.width()}x{rect.height()}　目安 "
+            f"{estimated_fps(rect.width(), rect.height(), limit):.0f}fps"
+        )
+
+    def _apply_resize(self, rect: QRect) -> bool:
+        """新しい範囲をミラーと手元の窓へ反映する。置けない大きさなら False。
+
+        掴んでいる間は窓を作り直さない——作り直すと、掴んでいるツールバーごと消えて
+        ドラッグが切れる(end_move と同じ話)。枠は形だけ合わせ直し(SourceFrameWindow.
+        resize_to)、ツールバーとカンペは置き場所を計算し直して動かす。本来の手順を
+        通すのは離したとき(end_resize)。
+
+        ツールバーの置き場所が無くなる大きさは、そもそもその大きさにしない。掴んでいる
+        間にツールバーを引っ込めると、掴んでいたものが消えてドラッグが切れる。カンペは
+        引っ込めてよい(掴んでいない)が、窓は残す——閉じると読んでいた場所を失う。"""
+        if self._mirror is None:
+            return False
+        if not self._source_rect_allowed(rect):
+            return False
+
+        # 枠があるときは、その外形がツールバーとカンペの置き場所の基準になる
+        # (_show_frame と同じ順序)。まだ動かす前に、置けるかどうかだけ先に確かめる。
+        anchor = QRect(rect)
+        if self._frame is not None:
+            anchor = self._frame.outer_rect(rect)
+
+        toolbar_rect = QRect()
+        if self._toolbar is not None:
+            geometry = toolbar_geometry(anchor, rect)
+            if geometry is None:
+                return False
+            toolbar_rect = QRect(geometry)
+
+        notes_rect = None
+        if self._notes is not None:
+            cfg = mirror_config(self.app_settings)
+            notes_rect = notes_geometry(
+                anchor,
+                rect,
+                _as_int(cfg.get("notes_width"), DEFAULT_NOTES_WIDTH),
+                avoid=(toolbar_rect, QRect(self._mirror.geometry())),
+            )
+
+        # ここから先は失敗しない。映す範囲を先に差し替えてから手元の窓を追わせる。
+        self._mirror.resize_source_rect(rect)
+        if self._frame is not None:
+            self._frame.resize_to(rect)
+        if self._toolbar is not None and toolbar_rect.topLeft() != self._toolbar.pos():
+            self._toolbar.move(toolbar_rect.topLeft())
+        if self._notes is not None:
+            if notes_rect is None:
+                # 置ける場所が無い大きさになった。カンペは発表者だけが見るものなので、
+                # 撮影範囲に掛けるくらいなら引っ込める(notes_geometry と同じ判断)。
+                if self._notes.isVisible():
+                    self._notes.hide()
+            else:
+                if notes_rect != self._notes.geometry():
+                    self._notes.setGeometry(notes_rect)
+                if not self._notes.isVisible():
+                    self._notes.show()
+        return True
+
+    def resize_source_to(self, dx: int, dy: int, free: bool = False) -> str:
+        """掴んだ点から (dx, dy) 動いたときの大きさへ変える。戻り値は説明欄へ出す一言。"""
+        if self._mirror is None or self._size_base is None:
+            return ""
+        try:
+            now = time.perf_counter()
+            if (now - self._size_applied) * 1000.0 < SIZE_APPLY_INTERVAL_MS:
+                # 間引く。掴んだ点からの絶対量なので、取っておけば離すときに追いつく。
+                self._size_pending = (dx, dy, free)
+                return ""
+            self._size_pending = None
+            self._size_applied = now
+            rect = self._resized_rect(dx, dy, free)
+            if rect == self._mirror.source_rect:
+                # 歯止めに当たっているか、まだ1px も動いていない。数字だけは出す。
+                return self._size_hint(rect)
+            if not self._apply_resize(rect):
+                return ""
+            return self._size_hint(rect)
+        except Exception:
+            _guard("ミラー範囲の拡縮", notify=False)
+            return ""
+
+    def resize_source_by_steps(self, steps: float, fine: bool = False) -> str:
+        """ホイールで大きさを変える。1目盛りで幅を SIZE_WHEEL_STEP(細かくは
+        SIZE_WHEEL_FINE_STEP)だけ動かし、比率は今の範囲のものを保つ。
+
+        掴んでいる状態が無いので、そのつど今の範囲を基準にし直す。渡す (dx, dy) を
+        (幅の伸び, 幅の伸び÷比率) にしてあるのは、_resized_rect が対角線へ落とす式を
+        通しても幅がちょうど狙いどおりになるため(この向きに落とすと元に戻る)。"""
+        try:
+            if self._mirror is None or not steps:
+                return ""
+            base = QRect(self._mirror.source_rect)
+            if base.width() <= 0 or base.height() <= 0:
+                return ""
+            self._size_base = base
+            self._size_ratio = base.width() / float(base.height())
+            self._size_pending = None
+            step = (SIZE_WHEEL_FINE_STEP if fine else SIZE_WHEEL_STEP) * steps
+            rect = self._resized_rect(
+                int(round(step)), int(round(step / self._size_ratio)), False
+            )
+            if rect != self._mirror.source_rect and not self._apply_resize(rect):
+                return ""
+            # 手が止まったら本来の手順で作り直す。回している間は押し直され続ける。
+            self._size_settle_timer.start(SIZE_SETTLE_DELAY_MS)
+            return self._size_hint(rect)
+        except Exception:
+            _guard("ミラー範囲の拡縮", notify=False)
+            return ""
+
+    def end_resize(self) -> None:
+        """離した(または手が止まった)ところで、枠・ツールバー・カンペを作り直す。
+
+        先に、間引いて反映しそこねた最後の1回を当てる。掴んだ点からの絶対量なので、
+        ここで一度当てれば離した瞬間の大きさになる。
+
+        作り直すのは end_move と同じ理由。動かしている間は形を合わせ直すだけで済ませて
+        いるが、ツールバーを上下どちらに置くか・カンペを左右どちらに置くかは大きさごとに
+        決まるし、引っ込めたカンペを出し直すのもここ。"""
+        try:
+            self._size_settle_timer.stop()
+            pending = self._size_pending
+            self._size_pending = None
+            if pending is not None and self._size_base is not None and self._mirror is not None:
+                self._apply_resize(self._resized_rect(pending[0], pending[1], pending[2]))
+            self._size_base = None
+            if self._mirror is None:
+                return
+            self._show_frame(self._mirror.source_rect)
+        except Exception:
+            _guard("ミラー範囲の拡縮の後始末", notify=False)

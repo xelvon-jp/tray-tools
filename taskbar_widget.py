@@ -125,6 +125,12 @@ FONT_PIXEL_SIZE_MIN = 7
 TEXT_PADDING = 4
 
 # アイコンの周囲に空ける余白(px)。
+# 音声アイコンの上でホイールを回したときの、音量の反映を待つ間隔(ms)。
+# 音量の上下は1回20msほどかかる(COM越しにエンドポイントを引くため)。ホイールは
+# 一度に何目盛りも飛んでくるので、そのつど呼ぶと回している間ずっと引っかかる。
+# 目盛りを溜めて、止まった時点でまとめて反映する。
+VOLUME_APPLY_DELAY_MS = 60
+
 ICON_MARGIN = 3
 ICON_SIZE_MIN = 8
 
@@ -479,6 +485,11 @@ class TaskbarWidget(QWidget):
         self._menu_open = False
         self._drag_offset = None
         self._audio_pixmap = None
+        # ホイールで溜めた音量の目盛り。止まったところでまとめて反映する。
+        self._volume_steps = 0
+        self._volume_timer = QTimer(self)
+        self._volume_timer.setSingleShot(True)
+        self._volume_timer.timeout.connect(self._apply_volume)
         self._format_warned = False
 
         self.setWindowFlags(
@@ -784,6 +795,39 @@ class TaskbarWidget(QWidget):
     # ---------------------------------------------------------------
     # 描画
     # ---------------------------------------------------------------
+    def wheelEvent(self, event):
+        """音声アイコンの上で回したら音量を上下させる。
+
+        トレイアイコン側では受けられない。QSystemTrayIcon は QWidget ではないので
+        wheelEvent を持たず、Windows もトレイアイコンへホイールを転送しないため。
+        こちらは自前の窓なので普通に届く。"""
+        try:
+            _rapture_zone, audio_zone = self._zones()
+            if not audio_zone.contains(event.position().toPoint()):
+                event.ignore()
+                return
+            notches = event.angleDelta().y()
+            if not notches:
+                return
+            self._volume_steps += 1 if notches > 0 else -1
+            self._volume_timer.start(VOLUME_APPLY_DELAY_MS)
+            event.accept()
+        except Exception:
+            _guard("音量の変更", notify=False)
+
+    def _apply_volume(self):
+        """溜めた目盛りをまとめて反映し、結果を知らせる。"""
+        try:
+            steps, self._volume_steps = self._volume_steps, 0
+            if not steps or self._audio is None:
+                return
+            level = self._audio.step_volume(steps > 0, abs(steps))
+            if level is None:
+                return
+            show_toast("音量 %d%%" % round(level * 100))
+        except Exception:
+            _guard("音量の変更", notify=False)
+
     def _zones(self):
         """(Raptureの当たり判定, 音声の当たり判定)。左右half分けにする。
 

@@ -10,7 +10,8 @@ from pathlib import Path
 DEFAULT_SAVE_FOLDER = str(Path.home() / "Pictures" / "rapture")
 
 # 音声デバイスIDはPCごとに異なるGUIDなので、既定値としては持てない(他PCで使うと
-# 存在しないIDになる)。setup.py での検出か list_devices.py の出力から設定する。
+# 存在しないIDになる)。音声アイコンのメニュー「デバイスを登録/解除…」で選ぶか、
+# setup.py の検出で埋める(どちらもIDと match_name を自動で書き込む)。
 DEFAULT_SETTINGS = {
     "capture": {
         "hide_duration_ms": 2000,
@@ -41,6 +42,10 @@ DEFAULT_SETTINGS = {
         "jiggler_interval_seconds": 60,
         "jiggler_idle_seconds": 30,
     },
+    # 出力デバイスの登録。並び順がそのまま切り替え(audio_toggle)の巡回順になる。
+    # 各要素は {label, id, icon, color, match_name}。icon は headphone / speaker /
+    # monitor のいずれか(それ以外は色だけの丸)。id と match_name はアプリが自動で
+    # 埋めるので手で書かなくてよい。
     "audio": {
         "devices": [],
     },

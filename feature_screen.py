@@ -787,8 +787,13 @@ class ScreenFeature:
         """覚えている「覆われている画面」を、いまあるウィジェット全部へ配り直す。
         作り直した直後にも通すこと(新しい窓は何も知らない状態で出てくる)。"""
         covered = getattr(self, "_mirror_covered_screen", None)
+        # 名前をそのまま比べてはいけない。ミラーが知らせてくるのは QScreen.name()
+        # (モニタの型番)だが、ウィジェット側の screen_name は位置を覚える都合で
+        # 型番にシリアルを繋いだ別物(taskbar_widget._screen_key)。同じ画面でも
+        # 'DST' と 'DST#sn-DST' で永久に一致せず、引っ込まないままだった。
+        # ウィジェットが乗っている画面の名前を引き直して比べる。
         for widget in getattr(self, "taskbar_widgets", []):
-            widget.set_app_covered(widget.screen_name == covered)
+            widget.set_app_covered(_widget_screen_name(widget) == covered)
 
     def _hide_taskbar_widgets(self) -> None:
         for widget in self.taskbar_widgets:
@@ -1262,3 +1267,15 @@ class ScreenFeature:
             os.startfile(self.settings_path)
         except OSError as e:
             self._notify("設定", f"開けませんでした\n{e}")
+
+
+def _widget_screen_name(widget):
+    """そのウィジェットが乗っている画面の QScreen.name()。分からなければ None。
+
+    screen_name(型番＋シリアル)ではなく素の名前を返す。画面ミラーが「この画面を
+    覆っている」と知らせてくるのが QScreen.name() なので、比べる側を揃える。"""
+    try:
+        screen = taskbar_widget._screen_for(widget.geometry(), taskbar_widget._screens())
+    except Exception:
+        return None
+    return screen.name() if screen is not None else None

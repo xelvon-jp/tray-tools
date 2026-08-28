@@ -18,7 +18,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QRect, QTimer
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import (
+    QApplication, QInputDialog, QMenu, QSystemTrayIcon,
+)
 
 import capture_process
 import color_picker
@@ -35,7 +37,7 @@ import taskbar_widget
 import web_presenter
 from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
-from keep_awake import set_keep_awake
+from keep_awake import hibernate_available, set_keep_awake, suspend
 from qt_image import pil_to_qicon
 from toast import show_toast
 from window_tools import TopmostTracker
@@ -62,6 +64,20 @@ AWAKE_RING_WIDTH = 4
 # プロセス起動を重ねると常駐が立ち上がるまでの体感が延びる。最初のキャプチャまでには
 # 十分間に合うので、少しずらして出す。
 PREWARM_STARTUP_DELAY_MS = 3000
+
+
+# 予約の時刻になってから実際に寝るまでの猶予(秒)。すぐ寝ないのは、予約したことを
+# 忘れて作業している最中に落ちると、開いているものが道連れになるため。この間に
+# 「予約を取り消す」を押せば止まる。
+SLEEP_WARN_SECONDS = 20
+
+
+def _format_seconds(seconds: int) -> str:
+    """秒を「30秒」「5分」「1時間30分」のように読める形にする。"""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}秒"
+    return _format_minutes(seconds // 60)
 
 
 def _format_minutes(minutes: int) -> str:
@@ -177,6 +193,17 @@ class ScreenFeature:
         self._awake_active = False
         self._awake_minutes = None  # None = 無期限
         self._awake_deadline = None
+        # スリープの予約。寝る時刻まで数えるタイマーと、寝る直前の猶予。
+        # 猶予を挟むのは、予約したことを忘れて作業している最中に落ちるのを防ぐため。
+        # 声を掛けてから寝るまでの間に取り消せる。
+        self._sleep_timer = QTimer()
+        self._sleep_timer.setSingleShot(True)
+        self._sleep_timer.timeout.connect(self._on_sleep_due)
+        self._sleep_warn_timer = QTimer()
+        self._sleep_warn_timer.setSingleShot(True)
+        self._sleep_warn_timer.timeout.connect(self._do_sleep)
+        self._sleep_deadline = None
+        self._sleep_hibernate = False
         self._awake_timer = QTimer()
         self._awake_timer.setSingleShot(True)
         self._awake_timer.timeout.connect(self._on_awake_expired)
@@ -312,7 +339,25 @@ class ScreenFeature:
         action.setCheckable(True)
         self._awake_actions[None] = action
         self._awake_menu.addSeparator()
+        # 並んでいる長さで足りないとき用。有効中に選び直せば、そこから数え直す。
+        self._awake_menu.addAction("時間を指定…", self._ask_keep_awake_minutes)
         self._awake_menu.addAction("解除", self._disable_keep_awake)
+
+        # スリープ抑止の下に、逆向きの操作(寝かせる)を置く。電源まわりでひとかたまり。
+        self._sleep_menu = self.menu.addMenu("😴 スリープ・休止")
+        for hibernate, head in ((False, "😴 スリープ"), (True, "💤 休止状態")):
+            sub = self._sleep_menu.addMenu(head)
+            for minutes in (0, 5, 30, 60):
+                label = "今すぐ" if minutes == 0 else _format_minutes(minutes) + "後"
+                sub.addAction(
+                    label,
+                    lambda m=minutes, h=hibernate: self.schedule_sleep(m * 60, h),
+                )
+            sub.addAction(
+                "時間を指定…", lambda h=hibernate: self._ask_sleep_minutes(h)
+            )
+        self._sleep_menu.addSeparator()
+        self._sleep_cancel_action = self._sleep_menu.addAction("予約を取り消す", self.cancel_sleep)
 
         # スリープ抑止のすぐ下に置く。狙いが近い(席を外しても切れないようにする)ので、
         # 探すときに同じ場所を見れば済むようにしている。
@@ -875,6 +920,33 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # スリープ抑止
     # ---------------------------------------------------------------
+    def _ask_keep_awake_minutes(self):
+        """何分抑止するかを尋ねて有効にする。
+
+        メニューに並べる長さを増やしても、欲しい長さがそこに無いことはある
+        (「あと40分だけ」など)。入力を1つ用意しておけば、設定を書き換えずに済む。"""
+        try:
+            current = self._awake_minutes if self._awake_active else 60
+            minutes, ok = QInputDialog.getInt(
+                None, "スリープ抑止", "何分間、抑止しますか",
+                int(current or 60), 1, 24 * 60, 15,
+            )
+            if ok:
+                self._enable_keep_awake(int(minutes))
+        except Exception:
+            self._log_failure("スリープ抑止の時間の入力")
+
+    def enable_keep_awake(self, minutes=None):
+        """外(名前付きパイプ)から呼ばれる入口。minutes が None なら無期限。
+
+        長い処理を外から回すとき、始める前に掛けて終わったら外す、という使い方を
+        想定している。中身はメニューから呼ぶものと同じ。"""
+        self._enable_keep_awake(minutes)
+
+    def disable_keep_awake(self):
+        """外から呼ばれる入口。掛かっていなければ何もしない。"""
+        self._disable_keep_awake()
+
     def _enable_keep_awake(self, minutes):
         # SetThreadExecutionStateは呼び出したスレッドに紐づく。ここはメニュー操作か、
         # シグナル経由でメインスレッドに渡されたホットキーからしか呼ばれない。
@@ -905,6 +977,96 @@ class ScreenFeature:
         self._refresh_state()
         if notify and was_active:
             self._notify("スリープ抑止", "解除しました")
+
+    # ---------------------------------------------------------------
+    # スリープさせる
+    # ---------------------------------------------------------------
+    def schedule_sleep(self, seconds: int, hibernate: bool = False) -> None:
+        """指定した秒数のあとにPCをスリープさせる。0なら猶予だけ置いてすぐ。
+
+        外(名前付きパイプ)からも呼ばれる。長い処理を回している間だけ起こしておいて、
+        終わったら寝かせる、という使い方を想定している。
+
+        寝る直前に SLEEP_WARN_SECONDS の猶予を置いて声を掛ける。予約したことを忘れて
+        作業している最中に落ちると、開いているものが道連れになるため。その間に
+        「予約を取り消す」を押せば止まる。"""
+        try:
+            seconds = max(0, int(seconds))
+            if hibernate and not hibernate_available():
+                # 無効なまま呼んでも何も起きないかスリープに落ちる。押して反応が
+                # 無いと故障に見えるので、理由を言って何もしない。
+                self._notify(
+                    "休止状態",
+                    "この環境では使えません（powercfg /hibernate on で有効化できます）",
+                )
+                return
+            self.cancel_sleep(notify=False)
+            self._sleep_hibernate = bool(hibernate)
+            self._sleep_deadline = time.monotonic() + seconds + SLEEP_WARN_SECONDS
+            name = "休止状態" if hibernate else "スリープ"
+            if seconds:
+                self._sleep_timer.start(seconds * 1000)
+                self._notify(name, f"{_format_seconds(seconds)}後に{name}にします")
+            else:
+                self._on_sleep_due()
+            self._refresh_state()
+        except Exception:
+            self._log_failure("スリープの予約")
+
+    def cancel_sleep(self, notify: bool = True) -> None:
+        """予約を取り消す。掛かっていなければ何もしない。"""
+        try:
+            had = self._sleep_deadline is not None
+            self._sleep_timer.stop()
+            self._sleep_warn_timer.stop()
+            self._sleep_deadline = None
+            self._refresh_state()
+            if notify and had:
+                self._notify("スリープ", "予約を取り消しました")
+        except Exception:
+            self._log_failure("スリープ予約の取り消し")
+
+    def sleep_seconds_left(self):
+        """寝るまでの残り秒。予約していなければ None。"""
+        if self._sleep_deadline is None:
+            return None
+        return max(0, int(self._sleep_deadline - time.monotonic()))
+
+    def _ask_sleep_minutes(self, hibernate: bool = False):
+        """何分後に寝るかを尋ねて予約する。"""
+        try:
+            name = "休止状態" if hibernate else "スリープ"
+            minutes, ok = QInputDialog.getInt(
+                None, name, f"何分後に{name}にしますか", 30, 0, 24 * 60, 5
+            )
+            if ok:
+                self.schedule_sleep(int(minutes) * 60, hibernate)
+        except Exception:
+            self._log_failure("スリープ時刻の入力")
+
+    def _on_sleep_due(self):
+        """予約の時刻になった。すぐには寝ず、猶予を置いて声を掛ける。"""
+        try:
+            name = "休止状態" if getattr(self, "_sleep_hibernate", False) else "スリープ"
+            self._notify(
+                name,
+                f"{SLEEP_WARN_SECONDS}秒後に{name}にします（取り消すなら今）",
+            )
+            self._sleep_warn_timer.start(SLEEP_WARN_SECONDS * 1000)
+        except Exception:
+            self._log_failure("スリープ前の通知")
+
+    def _do_sleep(self):
+        """実際に寝かせる。掛けてある抑止は keep_awake.suspend が外す。"""
+        try:
+            hibernate = bool(getattr(self, "_sleep_hibernate", False))
+            self._sleep_deadline = None
+            self._refresh_state()
+            if not suspend(hibernate):
+                name = "休止状態" if hibernate else "スリープ"
+                self._notify(name, f"{name}にできませんでした")
+        except Exception:
+            self._log_failure("スリープの実行")
 
     def _on_awake_expired(self):
         self._disable_keep_awake(notify=False)

@@ -162,7 +162,61 @@ def _build_command_handlers(features) -> dict:
     return {
         # あふｗから $P(カレントパス)を渡して呼ぶ。パスが無ければ登録なしで一覧だけ出す。
         "bookmark": lambda args: screen.start_launcher(args[0] if args else None),
+        # スリープ抑止の入切。長い処理を外から回すとき、始める前に掛けて終わったら
+        # 外す、という使い方ができる(席を外している間に寝られると処理が止まるため)。
+        #
+        #   traytools_send.py keep-awake on        無期限
+        #   traytools_send.py keep-awake on 90     90分だけ
+        #   traytools_send.py keep-awake off       解除
+        "keep-awake": lambda args: _keep_awake_command(screen, args),
+        # PCをスリープさせる。長い処理を回し終えたあとに寝かせる用。
+        #
+        #   traytools_send.py sleep                    すぐ(猶予のあと)
+        #   traytools_send.py sleep 1800               30分後
+        #   traytools_send.py sleep 1800 hibernate     30分後に休止状態
+        #   traytools_send.py sleep cancel             予約を取り消す
+        #
+        # 予約の時刻になってもすぐには寝ず、声を掛けてから少し待つ。予約を忘れて
+        # 作業している最中に落ちると、開いているものが道連れになるため。
+        "sleep": lambda args: _sleep_command(screen, args),
     }
+
+
+def _sleep_command(screen, args) -> None:
+    """外から来た sleep の引数を解いて呼び分ける。想定外は「何もしない」に倒す。"""
+    first = (args[0] if args else "").strip().lower()
+    if first in ("cancel", "off", "stop", "abort"):
+        screen.cancel_sleep()
+        return
+    # 2つめに hibernate と書けば休止状態。書かなければスリープ。
+    hibernate = any(str(a).strip().lower() in ("hibernate", "hiber") for a in args[1:])
+    seconds = 0
+    if first and first not in ("hibernate", "hiber"):
+        try:
+            seconds = max(0, int(first))
+        except (TypeError, ValueError):
+            return
+    elif first in ("hibernate", "hiber"):
+        hibernate = True
+    screen.schedule_sleep(seconds, hibernate)
+
+
+def _keep_awake_command(screen, args) -> None:
+    """外から来た keep-awake の引数を解いて呼び分ける。
+
+    引数を間違えても落とさない。外から叩かれる口なので、想定外が来ても
+    「何もしない」に倒すほうがよい。"""
+    mode = (args[0] if args else "on").strip().lower()
+    if mode in ("off", "0", "false", "stop", "disable"):
+        screen.disable_keep_awake()
+        return
+    minutes = None
+    if len(args) > 1:
+        try:
+            minutes = max(1, int(args[1]))
+        except (TypeError, ValueError):
+            minutes = None
+    screen.enable_keep_awake(minutes)
 
 
 def _restart(instance_lock) -> bool:

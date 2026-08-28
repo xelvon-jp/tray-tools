@@ -24,3 +24,45 @@ def set_keep_awake(enabled: bool) -> bool:
     if enabled:
         flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
     return _SetThreadExecutionState(flags) != 0
+
+
+# ---------------------------------------------------------------
+# スリープさせる
+# ---------------------------------------------------------------
+# SetSuspendState(Hibernate, ForceCritical, DisableWakeEvent)。
+# Hibernate=False でスリープ(休止ではない)、ForceCritical=False にするのは、
+# 各アプリに「これから寝る」を知らせて保存の機会を与えるため。True にすると
+# 問答無用で落とすので、編集中のものが失われうる。
+_SetSuspendState = ctypes.windll.powrprof.SetSuspendState
+_SetSuspendState.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+_SetSuspendState.restype = ctypes.c_bool
+
+
+def hibernate_available() -> bool:
+    """休止状態が使えるか。
+
+    休止は環境によって無効にされている(powercfg /hibernate off)。無効なまま
+    SetSuspendState(True, ...) を呼ぶと、何も起きないかスリープに落ちる。押しても
+    反応がないと故障に見えるので、呼ぶ前に確かめて理由を伝えられるようにする。
+
+    判定は powercfg の予約領域(hiberfil.sys)の有無ではなく、電源APIに聞く。
+    IsPwrHibernateAllowed は「いま休止できるか」を返す。"""
+    try:
+        return bool(ctypes.windll.powrprof.IsPwrHibernateAllowed())
+    except Exception:
+        return False
+
+
+def suspend(hibernate: bool = False) -> bool:
+    """PCをスリープさせる。hibernate=True なら休止状態。掛けてある抑止は先に外す。
+
+    抑止したまま呼ぶと、OSに「起きていろ」と言いながら「寝ろ」と言うことになり、
+    寝ないか、寝てもすぐ起きる。呼ぶ側が忘れても事故らないよう、ここで外す。
+
+    ForceCritical=False にするのは、各アプリに「これから寝る」を知らせて保存の機会を
+    与えるため。True にすると問答無用で落とすので、編集中のものが失われうる。
+
+    戻り値はAPIが受け付けたかどうか。実際に寝るかはOSとドライバ次第で、
+    ここが True でも寝ないことはある。"""
+    set_keep_awake(False)
+    return bool(_SetSuspendState(bool(hibernate), False, False))

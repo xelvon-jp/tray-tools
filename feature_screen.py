@@ -16,7 +16,7 @@ import traceback
 from pathlib import Path
 
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QRect, QTimer
+from PySide6.QtCore import QObject, QRect, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
@@ -28,6 +28,9 @@ import explorer_nav
 import launcher
 import mouse_jiggler
 import presenter_overlay
+import threading
+from datetime import datetime
+
 import pushover
 import screen_mirror
 import screen_ruler
@@ -125,6 +128,16 @@ def _make_awake_icon_image() -> Image.Image:
         width=AWAKE_RING_WIDTH,
     )
     return img
+
+
+class _PushoverBridge(QObject):
+    """送信スレッドからメインスレッドへ結果を渡すための器。
+
+    ScreenFeature 自身は QObject ではないのでシグナルを持てない。トーストはQtの窓で、
+    ワーカーから直に作ると壊れるため、シグナル経由で必ずメインスレッドへ戻す
+    (hotkeys.HotkeyBridge と同じ流儀)。"""
+
+    finished = Signal(bool, str)
 
 
 class ScreenFeature:
@@ -402,9 +415,16 @@ class ScreenFeature:
         # スマホへのプッシュ通知(Pushover)。送るのは外からの IPC コマンドだけで、
         # ここに置くのは登録・削除の口だけ。トークンは settings.json には書かず
         # Windows の資格情報マネージャへ預ける(pushover.py 冒頭を参照)。
+        # 送信スレッドからの結果を受ける橋。参照を持たないとGCで消え、シグナルの
+        # 接続ごと失われる。
+        self._pushover_bridge = _PushoverBridge()
+        self._pushover_bridge.finished.connect(self._on_pushover_tested)
         self._pushover_menu = self.menu.addMenu("📱 スマホ通知（Pushover）")
         self._pushover_register_action = self._pushover_menu.addAction(
             "🔑 トークンを登録…", self._register_pushover
+        )
+        self._pushover_test_action = self._pushover_menu.addAction(
+            "📤 テスト送信", self._test_pushover
         )
         self._pushover_delete_action = self._pushover_menu.addAction(
             "🗑 登録を削除", self._delete_pushover
@@ -958,6 +978,49 @@ class ScreenFeature:
             "📱 スマホ通知（Pushover：登録済み）" if registered
             else "📱 スマホ通知（Pushover：未登録）"
         )
+
+    def _test_pushover(self):
+        """試しに1通送る。届くかどうかをここで確かめられるようにする。
+
+        送信は別スレッドで行う。ネットワークは数秒かかりうるので、メニューから
+        呼んだからといってメインスレッドで待つと、その間トレイも付箋もホットキーも
+        全部固まる(pushover.send は Qt に触らないので、ワーカーから呼んで安全)。
+
+        結果の通知だけはメインスレッドへ戻す。トーストはQtの窓なので、ワーカーから
+        直に作ると壊れる。"""
+        try:
+            if not pushover.is_registered():
+                self._notify(
+                    "Pushover",
+                    "トークンが登録されていません（先に「トークンを登録…」から）",
+                )
+                return
+            self._notify("Pushover", "テスト送信しています…")
+            stamp = datetime.now().strftime("%H:%M:%S")
+            message = f"tray-tools からのテスト送信です（{stamp}）"
+
+            def work():
+                ok, detail = pushover.send(
+                    message, title="tray-tools", sound="magic"
+                )
+                # ワーカーから直接トーストを出さない。シグナル経由でメインスレッドへ。
+                self._pushover_bridge.finished.emit(bool(ok), str(detail or ""))
+
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:
+            self._log_failure("Pushover のテスト送信")
+
+    def _on_pushover_tested(self, ok: bool, detail: str):
+        """テスト送信の結果を知らせる。detail に本文やトークンは入らない。"""
+        try:
+            if ok:
+                action_log.record("Pushover テスト送信", "成功", "menu")
+                self._notify("Pushover", "送信しました（スマホをご確認ください）")
+            else:
+                action_log.record("Pushover テスト送信", "失敗", "menu")
+                self._notify("Pushover", f"送れませんでした\n{detail}")
+        except Exception:
+            self._log_failure("Pushover の結果通知")
 
     def _register_pushover(self):
         """ユーザーキーとアプリのトークンを尋ねて資格情報マネージャへ預ける。

@@ -358,13 +358,14 @@ ITEMS = {
         "color": "#94a3b8",
     },
     # 手元の画面の一部を別のモニタへ全画面でミラーする(screen_mirror.py)。押すと範囲
-    # 選択が出て、選ぶと始まる。もう一度押すと畳む。既定の並び(DEFAULT_ITEMS)には
-    # 入れていない: パネルは縦に伸びる一方なので、使う人だけが settings.json の
-    # launcher_items に足す(web_presenter と同じ扱い)。
+    # 選択が出て、選ぶと始まる。ミラー中に押すと、映したまま範囲だけを選び直す
+    # (終わらせるのはトレイメニューの「⏹ 終了」・手元のツールバーの ✕・Ctrl+Alt+Q)。
+    # 既定の並び(DEFAULT_ITEMS)には入れていない: パネルは縦に伸びる一方なので、
+    # 使う人だけが settings.json の launcher_items に足す(web_presenter と同じ扱い)。
     "screen_mirror": {
         "label": "画面ミラー",
         "feature": "screen",
-        "method": "toggle_screen_mirror",
+        "method": "start_screen_mirror",
         "args": (),
         "icon": "mirror",
         "color": "#2563eb",

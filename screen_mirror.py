@@ -20,12 +20,47 @@
 # 選ぶ範囲の大きさは自由で、固定されるのは縦横比だけ(既定 16:9)。800x450 でも
 # 1600x900 でも 1920x1080 でも選べる。そのぶん、大きく選ぶほど重くなる。
 #
+# ホットキー(Ctrl+Alt+P)は「開始」と「範囲の選び直し」。以前は押すたびに開始/終了の
+# トグルだったが、発表の途中で映す場所を変えたいときに、いったん共有が途切れて
+# しまうのが困る。今は、ミラー中に押すと映したまま範囲選択だけをやり直す
+# (選び直しの最中はミラーを静止させる。範囲選択の減光オーバーレイが全モニタを覆うので、
+# そのまま撮ると向こうには減光した画面が映ってしまう)。
+# 終わらせる手段は別に3つある——トレイメニューの「⏹ 終了」、手元のツールバーの ✕、
+# 専用ホットキー(既定 Ctrl+Alt+Q)。押しても終われない状態を作らないこと。
+#
+# 手元の枠(SourceFrameWindow)の下にはツールバー(MirrorToolbarWindow)を出す。
+# レーザー・スポットライト・黒画面・白画面・静止・選び直し・終了をアイコンで並べたもの。
+# 枠と同じで撮影範囲の外に置く(自分を撮ると無限に入れ子になる)。
+#
+# 静止(フリーズ)は、手元で資料を切り替える間その様子を見せないための機能。止めている
+# 間は撮らないので、向こうには最後の1枚が出たままになる。気付かずに静止したまま話し
+# 続けるのが最悪なので、手元の枠を橙に変え、帯に「静止中」と出し、ツールバーのアイコン
+# も点灯させる(ミラー先には何も出さない。見ている側に知らせる情報ではない)。
+#
 # 実測(このPC。設計の根拠)。capture_grab.grab_region() 1枚あたり:
 #   1280x720   16.9ms  → 30fpsで回して 29.6fps / CPU 71%(1コア換算)
 #   1920x1080  33.5ms  → 30fpsで回して 25.8fps / CPU 108%(コマ落ちする)
-# 拡大は QPixmap.scaled() の 2560x1440 で 7.2ms(SmoothTransformation。Fast のほうが
-# 遅いので使わない)。既定を30fpsにし、負荷が問題になる環境では設定 fps で落とせる。
-# 1920x1080 を映したいなら fps を 20 程度にするのが現実的。
+# 拡大は QPixmap.scaled() の 2560x1440 で 7.2ms(SmoothTransformation)。既定を30fpsにし、
+# 負荷が問題になる環境では設定 fps で落とせる。1920x1080 を映したいなら fps を 20 程度に
+# するのが現実的。
+#
+# 拡大すれば必ず滲む。Qt の選択肢は SmoothTransformation(双線形。滑らかだが滲む)と
+# FastTransformation(最近傍。鮮明だがブロック状)の2つしかなく、間は無い。本当の解は
+# 「等倍で映すこと」で、そのために範囲選択のプリセットに「ミラー先と同じ解像度」を
+# 入れてある。等倍なら補間そのものが起きないので、両方式の出力が1画素も違わない(実測で
+# 完全一致)。
+#
+# 等倍にできないときのために scaling 設定を持たせた(smooth / fast / auto、既定 auto)。
+# auto は倍率が整数のときだけ Fast、それ以外は Smooth。根拠は実測(640x360 の文字と細線を
+# drawImage で拡大し、画素を数えたもの):
+#
+#   2倍    Smooth: 元に無い中間色が 16.8% / 隣接画素の差の平均  9.42 / 1.63ms
+#          Fast  : 中間色 0%             / 隣接画素の差の平均 12.15 / 1.30ms ← 鮮明
+#   1.33倍 1px幅の縦線が Fast では 1px(58本)と 2px(28本)に割れる(2倍なら全部2px)
+#
+# 整数倍では Fast が明確に鮮明で(輪郭のコントラストが約1.3倍残り、滲みの正体である
+# 中間色が1つも生えない)、半端な倍率では線の太さが場所によって変わって汚くなる。
+# だから整数倍だけ Fast にする。速さの差はどちらの向きにも小さく、選ぶ理由にしていない。
 #
 # 大きい範囲も選べてしまうので、目安を2か所に出す。範囲選択中はその大きさで出せる
 # おおよそのフレームレート(estimated_fps)、ミラー中は実測値を手元の枠の帯に出す
@@ -40,14 +75,17 @@ import sys
 import time
 import traceback
 
+from PIL import Image, ImageDraw
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QFontMetrics,
     QGuiApplication,
     QPainter,
     QPen,
+    QPixmap,
     QPolygonF,
     QRegion,
 )
@@ -56,6 +94,7 @@ from PySide6.QtWidgets import QWidget
 import presenter_overlay
 from capture_grab import grab_region
 from capture_overlay import SelectionOverlay
+from qt_image import pil_to_qpixmap
 from toast import show_toast
 
 # ---------------------------------------------------------------
@@ -100,10 +139,63 @@ DEFAULT_SOURCE_FRAME_COLOR = "#00c8ff"
 DEFAULT_SOURCE_FRAME_WIDTH = 3
 DEFAULT_SOURCE_FRAME_OPACITY = 0.55
 
+# 静止(フリーズ)中の枠の色。手元だけで分かればよいので、通常の枠より目立たせる
+# (気付かずに静止したまま話し続けるのが最悪。ここは主張してよい)。
+DEFAULT_FREEZE_FRAME_COLOR = "#ff8c00"
+DEFAULT_FREEZE_FRAME_OPACITY = 0.9
+
 # 手元の枠に添える帯の高さ(論理px)。実測フレームレートと範囲の大きさをここへ出す。
 # 帯は選択範囲の外側(枠のさらに外)にあるのでミラーには映り込まない。
 SOURCE_FRAME_BAND_HEIGHT = 18
 SOURCE_FRAME_BAND_INTERVAL_MS = 1000
+
+# 手元の枠の下に出すツールバー。ボタン1つぶんの正方形の1辺と、右に添える説明の幅
+# (どちらも論理px)。説明は「乗せているボタンの名前」を出す場所で、別窓のツールチップを
+# 出さずに済ませるためにツールバーの中に持っている(窓が1枚増えると最前面の押し合いが
+# 増えるうえ、撮影範囲に入らない置き場所をもう1つ探すことになる)。
+DEFAULT_TOOLBAR = True
+TOOLBAR_BUTTON_SIZE = 30
+TOOLBAR_PADDING = 3
+TOOLBAR_LABEL_WIDTH = 190
+TOOLBAR_GAP = 2
+# アイコンの点灯/消灯を実物へ合わせ直す間隔(ms)。レーザー等はホットキーやトレイメニュー
+# からも切り替わるので、押されたときだけ描き直すと嘘の状態が残る。
+TOOLBAR_REFRESH_INTERVAL_MS = 400
+# 消えているアイコンの丸の色。点いているときは項目ごとの色になる(_TOOLBAR_ITEMS)。
+TOOLBAR_OFF_COLOR = "#475569"
+TOOLBAR_BACKGROUND = QColor(20, 20, 20, 225)
+
+# 拡大方法。"smooth"(双線形) / "fast"(最近傍) / "auto"(倍率が整数なら fast)。
+# 詳しくは冒頭の実測コメント。
+SCALING_MODES = ("auto", "smooth", "fast")
+DEFAULT_SCALING = "auto"
+# 「整数倍」と見なす許容差。ミラー先2560x1440へ1280x720を映すとちょうど2.0になるが、
+# 端数のある構成では 1.9999… になりうる。
+SCALE_INTEGER_TOLERANCE = 0.002
+
+# 範囲選択中に一発で選べる矩形。settings.json の screen_mirror.presets で置き換えられる。
+#
+#   width/height … 大きさ(論理px)。"size": "target" と書くとミラー先のモニタと同じ
+#                  解像度になる(＝等倍。拡大しないので1画素も滲まない)。
+#   x/y          … 始点。省略するとその画面の中央に置く。既定では「今カーソルのある
+#                  モニタの左上」からの相対で、"screen" に QScreen.name() を書けば
+#                  そのモニタに固定できる。相対にしてあるのは、(0,100) のような値が
+#                  「作業しているモニタのタスクバー/アドレスバーを外した位置」の意味で
+#                  書かれるため。絶対座標にすると、プライマリでないモニタで作業して
+#                  いる人の手元では別のモニタを指してしまう。
+DEFAULT_PRESETS = (
+    {"label": "等倍（ミラー先と同じ）", "size": "target"},
+    {"label": "上を100空ける", "x": 0, "y": 100, "width": 1600, "height": 900},
+    {"label": "HD", "width": 1280, "height": 720},
+    {"label": "FHD", "width": 1920, "height": 1080},
+)
+# プリセットの一覧を範囲選択の画面に出す枠。Ctrl+数字でも選べる。
+PRESET_PANEL_MARGIN = 28
+PRESET_PANEL_WIDTH = 380
+PRESET_ROW_HEIGHT = 26
+PRESET_PANEL_PADDING = 10
+# Ctrl+1〜9 まで。10個目からはクリックでだけ選べる(数字が2桁になると押しにくい)。
+PRESET_MAX_KEYS = 9
 
 # 範囲の大きさから所要時間を見積もるための係数。上の実測2点を直線で結んだもの。
 #   1280x720  (921,600px) → 921600*GRAB_MS_PER_PIXEL + GRAB_MS_BASE = 16.9ms
@@ -254,6 +346,98 @@ def estimated_fps(width: int, height: int, limit: int = DEFAULT_FPS) -> float:
     return min(float(limit), 1000.0 / frame_ms)
 
 
+def scaling_mode(app_settings: dict) -> str:
+    """設定の拡大方法。読めない値なら既定("auto")。"""
+    value = str(mirror_config(app_settings).get("scaling") or DEFAULT_SCALING).lower()
+    return value if value in SCALING_MODES else DEFAULT_SCALING
+
+
+def use_smooth(scale: float, mode: str) -> bool:
+    """その拡大率で滑らかな補間(SmoothTransformation)を使うか。
+
+    "auto" は倍率が整数のときだけ Fast にする。整数倍なら元の1画素が正方形へそのまま
+    分かれるので、中間色が生えない=輪郭が鈍らない。等倍(1.0)もここに含まれる
+    (等倍ならどちらの方式でも結果は同じだが、無駄な補間を通さない)。
+    半端な倍率で Fast にすると、行によって太さの違う文字になって読めたものではないので
+    Smooth に落とす。縮小(1.0未満)も Smooth——最近傍の縮小は画素を間引くだけで、
+    細い線が丸ごと消える。"""
+    if mode == "smooth":
+        return True
+    if mode == "fast":
+        return False
+    if scale < 1.0:
+        return True
+    return abs(scale - round(scale)) > SCALE_INTEGER_TOLERANCE
+
+
+def preset_entries(app_settings: dict) -> list:
+    """設定に書かれたプリセットの定義(辞書の並び)。書かれていなければ既定。
+
+    中身の妥当性はここでは見ない(解像度を引くのに画面が要るため)。実際の矩形にするのは
+    preset_rects。"""
+    entries = mirror_config(app_settings).get("presets")
+    if not isinstance(entries, (list, tuple)) or not entries:
+        return [dict(entry) for entry in DEFAULT_PRESETS]
+    return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+
+def preset_rects(app_settings: dict, anchor_screen=None, target_screen=None) -> list:
+    """プリセットを [(見出し, QRect(グローバル論理座標)), ...] にする。
+
+    anchor_screen は x/y を測る基準のモニタ(既定では今カーソルのあるモニタ)、
+    target_screen は "size": "target" が指すミラー先のモニタ。どちらも QScreen だが、
+    検証のために「geometry() と name() を持つだけの偽物」を渡せるようにしてある
+    (available_screens を差し替えるのと同じ流儀)。
+
+    大きさは書かれたとおりに作る。基準のモニタに収まらなくても縮めない——等倍のために
+    ミラー先と同じ大きさを指定しているのに、収まらないからと縮められては意味が無い。
+    はみ出すときは始点だけモニタの中へ寄せる(掴めない位置に置かない)。"""
+    rects = []
+    screens = available_screens()
+    for entry in preset_entries(app_settings):
+        try:
+            screen = anchor_screen
+            wanted = str(entry.get("screen") or "")
+            if wanted:
+                for candidate in screens:
+                    if candidate.name() == wanted:
+                        screen = candidate
+                        break
+            if screen is None:
+                continue
+            area = screen.geometry()
+
+            if str(entry.get("size") or "").lower() == "target":
+                if target_screen is None:
+                    continue
+                size = target_screen.geometry()
+                width, height = size.width(), size.height()
+            else:
+                width = _as_int(entry.get("width"), 0)
+                height = _as_int(entry.get("height"), 0)
+            if width <= 0 or height <= 0:
+                continue
+
+            if entry.get("x") is None or entry.get("y") is None:
+                # 始点の指定が無いものは、そのモニタの中央に置く。
+                left = area.x() + (area.width() - width) // 2
+                top = area.y() + (area.height() - height) // 2
+            else:
+                left = area.x() + _as_int(entry.get("x"), 0)
+                top = area.y() + _as_int(entry.get("y"), 0)
+
+            # 始点だけモニタの中へ寄せる(大きさは変えない)。
+            left = min(max(left, area.left()), max(area.right() - width + 1, area.left()))
+            top = min(max(top, area.top()), max(area.bottom() - height + 1, area.top()))
+
+            label = str(entry.get("label") or "") or f"{width}x{height}"
+            rects.append((label, QRect(left, top, width, height)))
+        except Exception:
+            # 1つ書き損じただけで一覧ごと出ないのは困る。その行だけ落とす。
+            _guard("プリセットの解釈", notify=False)
+    return rects
+
+
 def pick_target_screen(screens, wanted_name: str, source_rect: QRect = None):
     """ミラーを出すモニタを選ぶ。決められなければ None。
 
@@ -310,11 +494,83 @@ class AspectSelectionOverlay(SelectionOverlay):
     # 窓の形に引っぱられては困る(画面定規が同じ理由で切っている)。
     window_pick_enabled = False
 
-    def __init__(self, aspect: str = DEFAULT_ASPECT, fps_limit: int = DEFAULT_FPS):
+    def __init__(
+        self,
+        aspect: str = DEFAULT_ASPECT,
+        fps_limit: int = DEFAULT_FPS,
+        presets=None,
+        reselecting: bool = False,
+    ):
         super().__init__()
         self.aspect = aspect if aspect_ratio(aspect) is not None or aspect == "free" else DEFAULT_ASPECT
         # 選んでいる大きさで出せそうなフレームレートを添えるために持つ(estimated_fps)。
         self.fps_limit = fps_limit
+        # [(見出し, QRect(グローバル)), ...]。解決済みのものを受け取るだけにしてある
+        # (どのモニタを基準にするか・ミラー先はどれか、を知っているのは呼ぶ側なので)。
+        self.presets = list(presets or [])
+        # ミラー中の「選び直し」で開いたか。Esc の意味が変わる(やめてもミラーは続く)ので、
+        # 出す文言だけを変える。
+        self.reselecting = bool(reselecting)
+        # プリセット一覧の枠(ローカル座標)。中身が無ければ空のまま=描かない。
+        self._preset_panel = QRect()
+        self._preset_rows = []
+        self._preset_hover = -1
+        self._layout_presets()
+
+    # ---------------------------------------------------------------
+    # プリセット
+    #
+    # 呼び出し方は2つ。一覧をクリックするのと Ctrl+数字。数字だけにしなかったのは、
+    # 1/2/3 が既に比率の切り替えで埋まっているため。一覧を画面に出しておくのは、
+    # 覚えていなくても使えるようにするため(設定で増やせる以上、中身は人によって違う)。
+    # ---------------------------------------------------------------
+    def _layout_presets(self) -> None:
+        """一覧を出す場所を決める。カーソルのあるモニタの左上へ寄せる。
+
+        置き先を1度だけ決めて動かさないのは、ドラッグ中に一覧が付いてくると、選んでいる
+        枠と重なって邪魔になるため。"""
+        if not self.presets:
+            return
+        try:
+            screen = QGuiApplication.screenAt(cursor_pos())
+            area = screen.geometry() if screen is not None else QRect(self._origin, self.size())
+            height = PRESET_PANEL_PADDING * 2 + PRESET_ROW_HEIGHT * (len(self.presets) + 1)
+            panel = QRect(
+                area.x() + PRESET_PANEL_MARGIN,
+                area.y() + PRESET_PANEL_MARGIN,
+                PRESET_PANEL_WIDTH,
+                height,
+            )
+            self._preset_panel = panel.translated(-self._origin)
+            self._preset_rows = [
+                QRect(
+                    self._preset_panel.x() + PRESET_PANEL_PADDING,
+                    self._preset_panel.y() + PRESET_PANEL_PADDING + PRESET_ROW_HEIGHT * (index + 1),
+                    self._preset_panel.width() - PRESET_PANEL_PADDING * 2,
+                    PRESET_ROW_HEIGHT,
+                )
+                for index in range(len(self.presets))
+            ]
+        except Exception:
+            self._preset_panel = QRect()
+            self._preset_rows = []
+            _guard("プリセット一覧の配置", notify=False)
+
+    def _preset_index_at(self, point_local) -> int:
+        if point_local is None:
+            return -1
+        for index, row in enumerate(self._preset_rows):
+            if row.contains(point_local):
+                return index
+        return -1
+
+    def _apply_preset(self, index: int) -> bool:
+        """プリセットを選んで確定する。比率には合わせない——プリセットは大きさまで
+        決めたものなので、比率で丸めたら指定した意味が無くなる。"""
+        if not 0 <= index < len(self.presets):
+            return False
+        self.selection_made.emit(QRect(self.presets[index][1]))
+        return True
 
     # ---------------------------------------------------------------
     # 比率
@@ -388,6 +644,16 @@ class AspectSelectionOverlay(SelectionOverlay):
     # 入力
     # ---------------------------------------------------------------
     def mousePressEvent(self, event):
+        # 一覧の上で押したときはドラッグを始めない(基底へ渡さない)。渡すと、離した
+        # 位置でウィンドウ単位の選択が走って、押した項目と関係ない範囲が確定する。
+        if event.button() == Qt.LeftButton:
+            index = self._preset_index_at(event.position().toPoint())
+            if index >= 0:
+                try:
+                    self._apply_preset(index)
+                except Exception:
+                    _guard("プリセットの選択", notify=False)
+                return
         super().mousePressEvent(event)
         if self._dragging and self._start is not None:
             self._current = self._constrained_corner(self._start, self._current)
@@ -398,6 +664,11 @@ class AspectSelectionOverlay(SelectionOverlay):
         if self._dragging and self._start is not None and self._current is not None:
             self._current = self._constrained_corner(self._start, self._current)
             self.update()
+        else:
+            hover = self._preset_index_at(event.position().toPoint())
+            if hover != self._preset_hover:
+                self._preset_hover = hover
+                self.update(self._preset_panel)
 
     def wheelEvent(self, event):
         """ホイールで比率を回す。ドラッグしながら左手を使わずに切り替えられる。"""
@@ -407,12 +678,22 @@ class AspectSelectionOverlay(SelectionOverlay):
             _guard("比率の切り替え", notify=False)
 
     def keyPressEvent(self, event):
-        # 1/2/3 で直接、Space/Tab で順送り。Esc は基底(キャンセル)へ渡す。
+        # Ctrl+1〜9 でプリセット、1/2/3 で比率、Space/Tab で順送り。
+        # Esc は基底(キャンセル)へ渡す。
         key = event.key()
-        if key in (Qt.Key_1, Qt.Key_2, Qt.Key_3):
-            self.aspect = ASPECTS[key - Qt.Key_1][0]
-            self._reconstrain()
-            return
+        if Qt.Key_1 <= key <= Qt.Key_9:
+            index = key - Qt.Key_1
+            if event.modifiers() & Qt.ControlModifier:
+                if index < PRESET_MAX_KEYS:
+                    try:
+                        self._apply_preset(index)
+                    except Exception:
+                        _guard("プリセットの選択", notify=False)
+                return
+            if key in (Qt.Key_1, Qt.Key_2, Qt.Key_3):
+                self.aspect = ASPECTS[index][0]
+                self._reconstrain()
+                return
         if key in (Qt.Key_Space, Qt.Key_Tab):
             self._cycle_aspect(1)
             return
@@ -446,6 +727,55 @@ class AspectSelectionOverlay(SelectionOverlay):
             QPoint(self._hover.x() + 14, self._hover.y() + 16),
             f"比率: {aspect_label(self.aspect)}  （1=自由 2=4:3 3=16:9 / ホイールで切替）",
         )
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # 基底の QPainter は super() を抜けた時点で畳まれているので、ここで1本作り直す。
+        # 一覧は最後に描く(選択枠の減光を後から重ねられて薄くならないように)。
+        try:
+            self._draw_presets()
+        except Exception:
+            _guard("プリセット一覧の描画", notify=False)
+
+    def _draw_presets(self) -> None:
+        if self._preset_panel.isEmpty() or not self._preset_rows:
+            return
+        painter = QPainter(self)
+        painter.fillRect(self._preset_panel, QColor(16, 16, 16, 225))
+        painter.setPen(QPen(QColor(0, 200, 255, 160), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self._preset_panel.adjusted(0, 0, -1, -1))
+
+        header = self._preset_panel.adjusted(
+            PRESET_PANEL_PADDING, PRESET_PANEL_PADDING, -PRESET_PANEL_PADDING, 0
+        )
+        header.setHeight(PRESET_ROW_HEIGHT)
+        painter.setFont(QFont("Meiryo", 9, QFont.Bold))
+        painter.setPen(QColor(0, 200, 255))
+        painter.drawText(header, Qt.AlignVCenter | Qt.AlignLeft, "プリセット（クリック / Ctrl+数字）")
+        painter.setPen(QColor(190, 190, 190))
+        painter.drawText(
+            header,
+            Qt.AlignVCenter | Qt.AlignRight,
+            "Esc: 選び直しをやめる" if self.reselecting else "Esc: やめる",
+        )
+
+        painter.setFont(QFont("Meiryo", 9))
+        for index, row in enumerate(self._preset_rows):
+            label, rect = self.presets[index]
+            if index == self._preset_hover:
+                painter.fillRect(row, QColor(0, 200, 255, 60))
+            key = f"Ctrl+{index + 1}" if index < PRESET_MAX_KEYS else "　　　"
+            painter.setPen(QColor(0, 200, 255))
+            painter.drawText(row, Qt.AlignVCenter | Qt.AlignLeft, key)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(row.adjusted(58, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+            painter.setPen(QColor(170, 170, 170))
+            painter.drawText(
+                row,
+                Qt.AlignVCenter | Qt.AlignRight,
+                f"{rect.width()}x{rect.height()} ({rect.x()},{rect.y()})",
+            )
 
 
 # ---------------------------------------------------------------
@@ -540,6 +870,17 @@ class SourceFrameWindow(_TopmostWindow):
             cfg.get("source_frame_opacity"), DEFAULT_SOURCE_FRAME_OPACITY, 0.0, 1.0
         )
         self._color.setAlphaF(opacity)
+        # 静止中の色。枠ごと色を変えるのは、帯の文字より先に目に入るのが枠だから。
+        self._normal_color = QColor(self._color)
+        self._frozen_color = _as_color(
+            cfg.get("freeze_frame_color"), DEFAULT_FREEZE_FRAME_COLOR
+        )
+        self._frozen_color.setAlphaF(
+            _as_float(
+                cfg.get("freeze_frame_opacity"), DEFAULT_FREEZE_FRAME_OPACITY, 0.0, 1.0
+            )
+        )
+        self.frozen = False
 
         # 呼ぶと1行の文字列を返すもの(実測fps)。無ければ帯そのものを作らない。
         self._status = status
@@ -576,6 +917,22 @@ class SourceFrameWindow(_TopmostWindow):
         top = screen.geometry().top() if screen is not None else 0
         return source_rect.top() - band >= top
 
+    def set_frozen(self, frozen: bool) -> None:
+        """静止中かどうかを受け取り、枠の色と帯の文字を切り替える。
+
+        帯は1秒ごとにしか更新しないので、ここでは待たずに引き直す。静止を切り替えた
+        瞬間に手元の見た目が変わらないと、切り替わったのかどうかが分からない。"""
+        try:
+            frozen = bool(frozen)
+            if frozen == self.frozen:
+                return
+            self.frozen = frozen
+            self._color = self._frozen_color if frozen else self._normal_color
+            self._status_text = self._status() if self._status is not None else ""
+            self.update()
+        except Exception:
+            _guard("枠の色の切り替え", notify=False)
+
     def _on_status(self):
         try:
             text = self._status() if self._status is not None else ""
@@ -599,6 +956,307 @@ class SourceFrameWindow(_TopmostWindow):
             self._band.adjusted(6, 0, -6, 0),
             Qt.AlignVCenter | Qt.AlignLeft,
             self._status_text,
+        )
+
+
+# ---------------------------------------------------------------
+# 手元のツールバー
+#
+# アイコンは taskbar_launcher と同じ流儀で Pillow に描かせる(色の付いた丸に白い図形)。
+# あちらから import せず持ち直しているのは、静止・選び直し・終了の3つがここにしか無く、
+# 向こうへ足すと「ランチャに並べられる項目」だと誤解されるため(あの一覧は settings.json
+# の launcher_items に書ける名前そのもの)。丸と白図形という作りだけを揃えてある。
+# ---------------------------------------------------------------
+def _icon_laser(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """レーザーポインタ。光点と四方へ伸びる光(taskbar_launcher._draw_laser と同じ絵)。"""
+    for x0, y0, x1, y1 in ((32, 8, 32, 20), (32, 44, 32, 56), (8, 32, 20, 32), (44, 32, 56, 32)):
+        draw.line((x0, y0, x1, y1), fill="white", width=5)
+    draw.ellipse((23, 23, 41, 41), fill="white")
+
+
+def _icon_spotlight(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """スポットライト。暗い面に丸く明るい部分を1つ。"""
+    draw.rounded_rectangle((8, 12, 56, 52), radius=5, fill=color, outline="white", width=3)
+    draw.ellipse((22, 20, 46, 44), fill="white")
+
+
+def _icon_black(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """黒画面。中身を黒く塗った画面。白画面と並ぶので、中の色で描き分ける
+    (丸の色だけで分けると、小さくしたときに見分けが付かない)。"""
+    draw.rounded_rectangle((10, 14, 54, 46), radius=4, fill="#101010", outline="white", width=3)
+    draw.rectangle((30, 46, 34, 52), fill="white")
+
+
+def _icon_white(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """白画面。中身を白く塗った画面。"""
+    draw.rounded_rectangle((10, 14, 54, 46), radius=4, fill="white")
+    draw.rectangle((30, 46, 34, 52), fill="white")
+
+
+def _icon_freeze(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """静止。一時停止の2本線。動画の停止と同じ記号にする(説明が要らない)。"""
+    draw.rectangle((20, 14, 29, 50), fill="white")
+    draw.rectangle((35, 14, 44, 50), fill="white")
+
+
+def _icon_reselect(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """範囲を選び直す。選択範囲の四隅の鉤。"""
+    for x, y, dx, dy in ((12, 12, 1, 1), (52, 12, -1, 1), (12, 52, 1, -1), (52, 52, -1, -1)):
+        draw.line((x, y, x + 16 * dx, y), fill="white", width=5)
+        draw.line((x, y, x, y + 16 * dy), fill="white", width=5)
+
+
+def _icon_stop(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """ミラーを終了。×印。"""
+    draw.line((18, 18, 46, 46), fill="white", width=7)
+    draw.line((46, 18, 18, 46), fill="white", width=7)
+
+
+# 並ぶ順に (キー, 説明, 丸の色, 絵)。キーは押されたときに呼ぶ処理の名前でもある。
+_TOOLBAR_ITEMS = (
+    ("laser", "レーザーポインタ", "#dc2626", _icon_laser),
+    ("spotlight", "スポットライト", "#ca8a04", _icon_spotlight),
+    ("black", "黒画面", "#334155", _icon_black),
+    ("white", "白画面", "#94a3b8", _icon_white),
+    ("freeze", "静止（もう一度で解除）", "#ff8c00", _icon_freeze),
+    ("reselect", "範囲を選び直す", "#2563eb", _icon_reselect),
+    ("stop", "ミラーを終了", "#b91c1c", _icon_stop),
+)
+
+# 描いた絵はプロセスに1組あれば足りる(taskbar_launcher._pixmap_cache と同じ理由)。
+_toolbar_pixmaps = {}
+
+
+def _toolbar_pixmap(key: str) -> QPixmap:
+    """ツールバーのアイコン。作れなければ空の QPixmap(描く側で捨てる)。"""
+    cached = _toolbar_pixmaps.get(key)
+    if cached is not None:
+        return cached
+    pixmap = QPixmap()
+    try:
+        for name, _label, color, glyph in _TOOLBAR_ITEMS:
+            if name != key:
+                continue
+            image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((2, 2, 62, 62), fill=color)
+            glyph(draw, color)
+            pixmap = pil_to_qpixmap(image)
+            break
+    except Exception:
+        # 絵が1つ出ないだけの話。ツールバーごと出ないほうが困るので握りつぶす。
+        _guard("ツールバーのアイコンの生成", notify=False)
+        pixmap = QPixmap()
+    _toolbar_pixmaps[key] = pixmap
+    return pixmap
+
+
+def toolbar_size() -> tuple:
+    """ツールバーの (幅, 高さ)。論理px。"""
+    count = len(_TOOLBAR_ITEMS)
+    width = (
+        TOOLBAR_PADDING * 2
+        + TOOLBAR_BUTTON_SIZE * count
+        + TOOLBAR_GAP * max(count - 1, 0)
+        + TOOLBAR_LABEL_WIDTH
+    )
+    return width, TOOLBAR_PADDING * 2 + TOOLBAR_BUTTON_SIZE
+
+
+def toolbar_geometry(anchor_rect: QRect, source_rect: QRect):
+    """ツールバーを置く矩形。置き場所が無ければ None。
+
+    anchor_rect は手元の枠(枠が無ければ選択範囲そのもの)。その真下に、収まらなければ
+    真上に置く。左端は枠に揃える。
+
+    撮影範囲(source_rect)に少しでも掛かるなら None を返す。掛かったままでは自分が
+    ミラーに映り込み、映った自分をまた撮る入れ子になる。ツールバーが出ないより、
+    映り込むほうが害が大きい(枠と同じ判断)。"""
+    width, height = toolbar_size()
+    screen = QGuiApplication.screenAt(anchor_rect.center())
+    area = screen.geometry() if screen is not None else QRect(anchor_rect)
+
+    left = min(max(anchor_rect.left(), area.left()), max(area.right() - width + 1, area.left()))
+    top = anchor_rect.bottom() + 1
+    if top + height - 1 > area.bottom():
+        top = anchor_rect.top() - height
+    rect = QRect(left, top, width, height)
+    if rect.intersects(source_rect):
+        return None
+    return rect
+
+
+class MirrorToolbarWindow(_TopmostWindow):
+    """手元の枠の下に出す、プレゼン支援の操作パネル。
+
+    枠(SourceFrameWindow)へ生やさずに別の窓にしてあるのは、あちらがマウスを透過する
+    (WindowTransparentForInput)ため。透過した窓は自分ではクリックを受け取れないので、
+    同じ窓に押せるものを置くことはできない。透過をやめると、今度は穴の部分(＝撮影範囲)の
+    クリックまで枠が吸ってしまい、映しながら操作するというこの機能の前提が壊れる。
+
+    置き場所は撮影範囲の外。枠と同じ理由で、ミラーに映り込んではいけない
+    (映り込むなら出さない。toolbar_geometry が None を返す)。
+
+    押されたときの処理は呼ぶ側から辞書で受け取る。中身が「終了」だとこの窓自身が
+    片付けられるので、押した場所から直接は呼ばず QTimer で次の回へ回す
+    (自分のイベントハンドラの中で自分を delete すると落ちる)。"""
+
+    click_through = False
+
+    def __init__(self, geometry: QRect, actions: dict, state=None):
+        super().__init__(geometry)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self._actions = dict(actions or {})
+        # 呼ぶと「そのキーが今点いているか」を返すもの。無ければ全部消灯で描く。
+        self._state = state
+        self._on = {key: False for key, _label, _color, _glyph in _TOOLBAR_ITEMS}
+        self._hover = -1
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self.refresh_state)
+
+    # ---------------------------------------------------------------
+    # 位置
+    # ---------------------------------------------------------------
+    def _button_rect(self, index: int) -> QRect:
+        return QRect(
+            TOOLBAR_PADDING + (TOOLBAR_BUTTON_SIZE + TOOLBAR_GAP) * index,
+            TOOLBAR_PADDING,
+            TOOLBAR_BUTTON_SIZE,
+            TOOLBAR_BUTTON_SIZE,
+        )
+
+    def _index_at(self, point) -> int:
+        for index in range(len(_TOOLBAR_ITEMS)):
+            if self._button_rect(index).contains(point):
+                return index
+        return -1
+
+    # ---------------------------------------------------------------
+    # 状態
+    # ---------------------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_state()
+        self._refresh_timer.start(TOOLBAR_REFRESH_INTERVAL_MS)
+
+    def hideEvent(self, event):
+        self._refresh_timer.stop()
+        super().hideEvent(event)
+
+    def refresh_state(self):
+        """実物の状態へ合わせ直す。レーザー等はホットキーやトレイメニューからも
+        切り替わるので、押されたときだけ描き直すと嘘の状態が残る。"""
+        try:
+            if self._state is None:
+                return
+            changed = False
+            for key, _label, _color, _glyph in _TOOLBAR_ITEMS:
+                value = bool(self._state(key))
+                if value != self._on.get(key):
+                    self._on[key] = value
+                    changed = True
+            if changed:
+                self.update()
+        except Exception:
+            _guard("ツールバーの状態の更新", notify=False)
+
+    # ---------------------------------------------------------------
+    # 入力
+    # ---------------------------------------------------------------
+    def mouseMoveEvent(self, event):
+        try:
+            index = self._index_at(event.position().toPoint())
+            if index != self._hover:
+                self._hover = index
+                self.update()
+        except Exception:
+            _guard("ツールバーの反応", notify=False)
+
+    def leaveEvent(self, event):
+        self._hover = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        try:
+            if event.button() != Qt.LeftButton:
+                return
+            index = self._index_at(event.position().toPoint())
+            if index < 0:
+                return
+            key = _TOOLBAR_ITEMS[index][0]
+            action = self._actions.get(key)
+            if action is None:
+                return
+            # 押した場所から直接呼ばない。「終了」や「選び直し」はこの窓を片付けるので、
+            # 自分のイベントハンドラの中で自分が消えることになる。
+            QTimer.singleShot(0, action)
+        except Exception:
+            _guard("ツールバーの操作", notify=False)
+
+    # ---------------------------------------------------------------
+    # 描画
+    # ---------------------------------------------------------------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setBrush(TOOLBAR_BACKGROUND)
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 6, 6)
+
+        for index, (key, _label, color, _glyph) in enumerate(_TOOLBAR_ITEMS):
+            cell = self._button_rect(index)
+            on = bool(self._on.get(key))
+            if on:
+                # 点いているものは下地を敷いて縁取る。消えているものは半分の濃さで描く。
+                # 同じ絵の濃淡だけで分けると、離れた席から手元を見たときに分からない。
+                accent = QColor(color)
+                accent.setAlpha(150)
+                painter.setBrush(accent)
+                painter.setPen(QPen(QColor(255, 255, 255, 210), 2))
+                painter.drawRoundedRect(cell.adjusted(1, 1, -1, -1), 5, 5)
+            elif index == self._hover:
+                painter.setBrush(QColor(255, 255, 255, 40))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(cell.adjusted(1, 1, -1, -1), 5, 5)
+
+            pixmap = _toolbar_pixmap(key)
+            if pixmap.isNull():
+                continue
+            painter.setOpacity(1.0 if on else 0.62)
+            painter.drawPixmap(cell.adjusted(3, 3, -3, -3), pixmap)
+            painter.setOpacity(1.0)
+
+        self._draw_label(painter)
+
+    def _draw_label(self, painter: QPainter) -> None:
+        """右側の説明。乗せているボタンの名前を出す場所で、何も乗せていないときは
+        静止中かどうかを出す(静止に気付かないまま話し続けるのが最悪なので、
+        既定の表示をここに割り当てている)。"""
+        area = QRect(
+            self.width() - TOOLBAR_LABEL_WIDTH - TOOLBAR_PADDING,
+            TOOLBAR_PADDING,
+            TOOLBAR_LABEL_WIDTH,
+            TOOLBAR_BUTTON_SIZE,
+        )
+        if 0 <= self._hover < len(_TOOLBAR_ITEMS):
+            text = _TOOLBAR_ITEMS[self._hover][1]
+            painter.setPen(QColor(235, 235, 235))
+        elif self._on.get("freeze"):
+            text = "⏸ 静止中"
+            painter.setPen(QColor(DEFAULT_FREEZE_FRAME_COLOR))
+        else:
+            text = "画面ミラー"
+            painter.setPen(QColor(150, 150, 150))
+        painter.setFont(QFont("Meiryo", 9, QFont.Bold if self._on.get("freeze") else QFont.Normal))
+        metrics = QFontMetrics(painter.font())
+        painter.drawText(
+            area,
+            Qt.AlignVCenter | Qt.AlignLeft,
+            metrics.elidedText(text, Qt.ElideRight, area.width()),
         )
 
 
@@ -642,6 +1300,13 @@ class MirrorWindow(_TopmostWindow):
         self._spot = presenter_overlay.spotlight_params(app_settings)
         self.laser_on = False
         self.spotlight_on = False
+
+        # 拡大方法(smooth / fast / auto)。冒頭の実測コメントを参照。
+        self._scaling = scaling_mode(app_settings)
+
+        # 静止(フリーズ)。手元で資料を切り替える間、その様子を見せないための状態。
+        # 立っている間は撮りに行かないので、向こうには最後の1枚が出たままになる。
+        self.frozen = False
 
         # 直近のフレーム。QImage は暗黙的共有なので、grab_region が返す copy() 済みの
         # ものをそのまま持つ(こちらでさらに触らない)。
@@ -707,6 +1372,40 @@ class MirrorWindow(_TopmostWindow):
     def contains_source(self, point_global: QPoint) -> bool:
         return self.source_rect.contains(point_global)
 
+    def set_source_rect(self, source_rect: QRect) -> None:
+        """映す範囲を差し替える。ミラーを畳まずに範囲だけ選び直すための入口。
+
+        窓もタイマーもそのままなので、向こうの画面は消えない(畳んで作り直すと、
+        画面共有に出しているモニタが一瞬黒くなる)。前のフレームは大きさが違うから
+        捨てる——引き伸ばして1枚だけ歪んだ絵を出すことになる。波紋も捨てる
+        (前の範囲で押した位置なので、新しい範囲では別の場所を指す)。"""
+        self.source_rect = QRect(source_rect)
+        self._frame = None
+        self._ripples = []
+        self._buttons = (False, False)
+        if not self.frozen:
+            try:
+                self.grab_frame()
+            except Exception:
+                _guard("フレームの更新", notify=False)
+        self.update()
+
+    def set_frozen(self, frozen: bool) -> None:
+        """静止を切り替える。立てた瞬間に1回描き直すのは、最後のフレームに描いてある
+        カーソルやレーザーを消すため(止まった絵の上でカーソルだけが古い位置に残ると、
+        見ている側には「発表者がそこを指したまま黙っている」ように見える)。"""
+        frozen = bool(frozen)
+        if frozen == self.frozen:
+            return
+        self.frozen = frozen
+        if frozen:
+            self.current_fps = 0.0
+        else:
+            # 止めていた間は数えていないので、区間の起点を取り直す。
+            self._fps_mark_time = None
+            self._fps_mark_count = self.frame_count
+        self.update()
+
     # ---------------------------------------------------------------
     # 表示・周期
     # ---------------------------------------------------------------
@@ -723,6 +1422,10 @@ class MirrorWindow(_TopmostWindow):
         """周期の本体。ここは必ず try で受けること(PySide6はスロットから例外が
         投げ切られるとプロセスごと終わる)。1枚撮って、入力を読んで、描き直す。"""
         try:
+            if self.frozen:
+                # 静止中は撮りに行かないし描き直しもしない。カーソルも読まない——
+                # 止まった絵の上でカーソルだけが動いたら、指している場所が嘘になる。
+                return
             self.grab_frame()
             self._update_fps()
             self._poll_input()
@@ -785,10 +1488,21 @@ class MirrorWindow(_TopmostWindow):
 
         設定値も併記するのは、数字が低いときに「設定で落としてある」のか
         「重くて出ていない」のかが区別できないと、手の打ちようが無いため。"""
+        if self.frozen:
+            # 静止していることは、数字より先に読めるところへ置く。
+            return (
+                f"⏸ 静止中（動いていません） {self.source_rect.width()}x"
+                f"{self.source_rect.height()}"
+            )
         return (
             f"ミラー中 {self.source_rect.width()}x{self.source_rect.height()}"
             f"　{self.current_fps:.0f}fps / 設定 {self.fps}fps"
+            f"　拡大 {self.scale():.2f}倍 {'滑らか' if self.smooth_scaling() else '鮮明'}"
         )
+
+    def smooth_scaling(self) -> bool:
+        """今の拡大率で滑らかな補間を使うか(設定 scaling と拡大率で決まる)。"""
+        return use_smooth(self.scale(), self._scaling)
 
     # ---------------------------------------------------------------
     # 描画
@@ -801,10 +1515,17 @@ class MirrorWindow(_TopmostWindow):
             return
 
         video = self.video_rect()
-        # 拡大は滑らかに。実測で SmoothTransformation のほうが FastTransformation より
-        # 速く、しかも綺麗(2560x1440への拡大で7.2ms)。
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        # 拡大方法。既定(auto)は倍率が整数のときだけ最近傍にする。等倍で映していれば
+        # どちらでも同じ絵になる(そもそも補間が起きない)。理由は冒頭の実測コメント。
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, self.smooth_scaling())
         painter.drawImage(video, self._frame, QRectF(self._frame.rect()))
+
+        if self.frozen:
+            # 静止中はカーソルもレーザーも波紋も描かない。絵が止まっているのに指先だけ
+            # 動くと、見ている側には嘘になる。ミラー先には静止中の印も出さない——
+            # 静止していることを知る必要があるのは発表者だけで、そのための表示は
+            # 手元の枠とツールバーに出している。
+            return
 
         painter.setRenderHint(QPainter.Antialiasing)
         inside = self.contains_source(self._cursor_global)
@@ -895,9 +1616,31 @@ class MirrorController:
         self._overlay = None       # 範囲選択中のオーバーレイ
         self._mirror = None        # ミラー先の窓
         self._frame = None         # 手元の枠
+        self._toolbar = None       # 手元のツールバー
+        # 「ミラーを続けたまま範囲だけ選び直している」最中か。選び終えたときの行き先
+        # (新規に始めるのか、今の窓の範囲を差し替えるのか)がこれで決まる。
+        self._reselecting = False
+        # 選び直しに入る前の静止の状態。選び直しの間は必ず静止させるので、終わったら
+        # ここへ戻す(自分で静止させていた人の状態を勝手に解除しない)。
+        self._frozen_before = False
+        # プレゼン支援(レーザー等)の切り替えと状態を借りる先。ScreenFeature が
+        # attach_presenter で渡す。ツールバーの黒画面/白画面はこちらにしか無い。
+        self._presenter_toggle = None
+        self._presenter_state = None
         # 前回選んだ比率。次に始めるときの初期値にする(設定ファイルには書かない。
         # 発表ごとに選び直す性質の値で、残すほどのものではない)。
         self.aspect = str(mirror_config(app_settings).get("aspect") or DEFAULT_ASPECT)
+
+    def attach_presenter(self, toggle, is_on) -> None:
+        """手元のツールバーから呼ぶ、プレゼン支援の切り替えと状態取得を受け取る。
+
+        ここで受け取るのは ScreenFeature.toggle_presenter_overlay と
+        _presenter_overlay_active。黒画面/白画面の窓を持っているのはあちら
+        (presenter_overlay.OverlayController)で、こちらからは触れない。レーザーと
+        スポットライトも、行き先の振り替え・通知・トレイメニューのチェックが
+        あちらに揃っているので、同じ入口へ回すほうが状態が食い違わない。"""
+        self._presenter_toggle = toggle
+        self._presenter_state = is_on
 
     # ---------------------------------------------------------------
     # 状態
@@ -908,6 +1651,13 @@ class MirrorController:
 
     def is_selecting(self) -> bool:
         return self._overlay is not None
+
+    def is_reselecting(self) -> bool:
+        """ミラーを続けたまま範囲を選び直している最中か。"""
+        return self._reselecting
+
+    def is_frozen(self) -> bool:
+        return self._mirror is not None and bool(self._mirror.frozen)
 
     def notify(self, message: str) -> None:
         if self._notify is not None:
@@ -970,15 +1720,29 @@ class MirrorController:
     # ---------------------------------------------------------------
     # 開始・終了
     # ---------------------------------------------------------------
-    def toggle(self) -> bool:
-        """出ていれば畳み、出ていなければ範囲選択から始める。戻り値は「これから出す」か。"""
+    def activate(self) -> bool:
+        """ホットキー(Ctrl+Alt+P)とメニューの入口。「開始」または「範囲の選び直し」。
+
+        以前はここが開始/終了のトグルだった。やめたのは、発表の途中で映す場所を変えたく
+        なったときに、いったんミラーを畳むことになるため——画面共有に出しているモニタが
+        一瞬黒くなり、見ている側からは事故に見える。今は映したまま範囲だけを選び直す。
+
+        そのぶん、このキーでは終われない。終わらせる手段はトレイメニューの「⏹ 終了」、
+        手元のツールバーの ✕、専用ホットキー(既定 Ctrl+Alt+Q)の3つ。押しても終われない
+        状態を作らないよう、必ずどれかは残しておくこと。
+
+        戻り値は「範囲選択が出たか」。"""
         try:
-            if self.is_active() or self.is_selecting():
-                self.stop()
+            if self.is_selecting():
+                # 選択中にもう一度押されたら、その選択をやめる(ミラー中なら映したまま)。
+                # 押すたびに選択オーバーレイが増えるのを防ぐ意味もある。
+                self._on_canceled()
                 return False
+            if self.is_active():
+                return self.start_reselect()
             return self.start_selection()
         except Exception:
-            _guard("画面ミラーの切り替え")
+            _guard("画面ミラーの操作")
             return False
 
     def start_selection(self) -> bool:
@@ -989,11 +1753,38 @@ class MirrorController:
             # 1枚しか無いPCでは、映した先が撮る対象そのものになって入れ子になる。
             self.notify("モニタが1台しかありません")
             return False
+        self._reselecting = False
+        return self._open_overlay(False)
+
+    def start_reselect(self) -> bool:
+        """ミラーを続けたまま、範囲だけ選び直す。
+
+        選び直しの間はミラーを静止させる。範囲選択オーバーレイは全モニタを覆う減光窓
+        なので、撮り続けたままだと向こうには「減光した自分の画面」が映る。静止させれば
+        最後の1枚が出たままになり、見ている側からは何も起きていないように見える。
+        手元の枠とツールバーも畳む(新しい範囲の外側へ作り直すので、動かすより単純)。"""
+        if self._mirror is None:
+            return self.start_selection()
+        if self._overlay is not None:
+            return False
+        self._frozen_before = bool(self._mirror.frozen)
+        self._mirror.set_frozen(True)
+        self._hide_frame()
+        self._reselecting = True
+        if not self._open_overlay(True):
+            self._reselecting = False
+            self._restore_after_reselect()
+            return False
+        return True
+
+    def _open_overlay(self, reselecting: bool) -> bool:
         try:
             fps_limit = min(
                 max(_as_int(mirror_config(self.app_settings).get("fps"), DEFAULT_FPS), 1), MAX_FPS
             )
-            self._overlay = AspectSelectionOverlay(self.aspect, fps_limit)
+            self._overlay = AspectSelectionOverlay(
+                self.aspect, fps_limit, self.presets(), reselecting
+            )
             self._overlay.selection_made.connect(self._on_selection_made)
             self._overlay.canceled.connect(self._on_canceled)
             self._overlay.show()
@@ -1002,6 +1793,33 @@ class MirrorController:
             _guard("範囲選択の表示")
             return False
         return True
+
+    # ---------------------------------------------------------------
+    # プリセット
+    # ---------------------------------------------------------------
+    def anchor_screen(self, target_screen=None):
+        """プリセットの x/y を測る基準のモニタ。今カーソルのあるモニタ。
+
+        ただしミラー先だけは選ばない。そこを基準にすると、プリセットで作った範囲が
+        ミラー先に乗って始められない(自分を撮ることになる)。"""
+        target_name = target_screen.name() if target_screen is not None else ""
+        screens = available_screens()
+        current = QGuiApplication.screenAt(cursor_pos())
+        if current is not None and current.name() != target_name:
+            return current
+        for screen in screens:
+            if screen.name() != target_name:
+                return screen
+        return current
+
+    def presets(self) -> list:
+        """範囲選択に出すプリセット [(見出し, QRect), ...]。"""
+        try:
+            target = self.target_screen()
+            return preset_rects(self.app_settings, self.anchor_screen(target), target)
+        except Exception:
+            _guard("プリセットの用意", notify=False)
+            return []
 
     def _close_selection(self) -> None:
         """オーバーレイは canceled をemitするだけで自分では閉じない。参照を捨てるだけだと
@@ -1022,18 +1840,55 @@ class MirrorController:
             if self._overlay is not None:
                 self.aspect = self._overlay.aspect
             self._close_selection()
+            if self._reselecting:
+                # 選び直しをやめただけ。ミラーは畳まない(Esc に「終了」の意味を
+                # 持たせると、範囲を選び直そうとして思い直しただけで共有が切れる)。
+                self._reselecting = False
+                self._restore_after_reselect()
         except Exception:
             _guard("範囲選択の後始末", notify=False)
+
+    def _restore_after_reselect(self) -> None:
+        """選び直しに入る前の状態へ戻す。静止も枠もツールバーも、入る前と同じにする。"""
+        if self._mirror is None:
+            return
+        self._mirror.set_frozen(self._frozen_before)
+        self._show_frame(self._mirror.source_rect)
 
     def _on_selection_made(self, rect_global: QRect) -> None:
         try:
             if self._overlay is not None:
                 self.aspect = self._overlay.aspect
             source_rect = QRect(rect_global)
+            reselecting = self._reselecting
+            self._reselecting = False
             self._close_selection()
-            self._start_mirror(source_rect)
+            if reselecting and self._mirror is not None:
+                self._apply_source_rect(source_rect)
+            else:
+                self._start_mirror(source_rect)
         except Exception:
             _guard("画面ミラーの開始")
+
+    def _apply_source_rect(self, source_rect: QRect) -> bool:
+        """選び直した範囲へ切り替える。ミラー窓はそのまま使い回す。"""
+        if self._mirror is None:
+            return False
+        # ミラー窓はミラー先のモニタ全面に出しているので、その矩形がそのまま
+        # 「映してはいけない範囲」になる。
+        if self._mirror.geometry().intersects(source_rect):
+            self.notify(
+                "選んだ範囲がミラー先に重なっています\n"
+                "範囲はそのままにしました（もう一度選び直してください）"
+            )
+            self._restore_after_reselect()
+            return False
+
+        self._mirror.set_source_rect(source_rect)
+        self._mirror.set_frozen(self._frozen_before)
+        self._show_frame(source_rect)
+        self.notify(f"映す範囲を {source_rect.width()}x{source_rect.height()} に変えました")
+        return True
 
     def _start_mirror(self, source_rect: QRect) -> bool:
         screen = self.target_screen(source_rect)
@@ -1056,16 +1911,7 @@ class MirrorController:
             _guard("ミラー窓の表示")
             return False
 
-        if bool(mirror_config(self.app_settings).get("source_frame", DEFAULT_SOURCE_FRAME)):
-            try:
-                self._frame = SourceFrameWindow(
-                    source_rect, self.app_settings, status=self._mirror.status_text
-                )
-                self._frame.show()
-            except Exception:
-                # 枠が出ないだけならミラーは続けられる。ここで畳むほうが損。
-                self._frame = None
-                _guard("手元の枠の表示", notify=False)
+        self._show_frame(source_rect)
 
         self.notify(
             f"{screen.name()} へ {source_rect.width()}x{source_rect.height()} を"
@@ -1073,10 +1919,91 @@ class MirrorController:
         )
         return True
 
+    # ---------------------------------------------------------------
+    # 手元の枠とツールバー
+    # ---------------------------------------------------------------
+    def _show_frame(self, source_rect: QRect) -> None:
+        """手元の枠とツールバーを、この範囲に合わせて出し直す。
+
+        動かさずに作り直すのは、どちらも「範囲の外側のどこに置けるか」を作るときに
+        決めているため(枠は帯を上に置けるか、ツールバーは下に収まるか)。範囲が変われば
+        その答えも変わるので、位置だけ動かしても正しくならない。"""
+        self._hide_frame()
+        if self._mirror is None:
+            return
+        cfg = mirror_config(self.app_settings)
+
+        anchor = QRect(source_rect)
+        if bool(cfg.get("source_frame", DEFAULT_SOURCE_FRAME)):
+            try:
+                self._frame = SourceFrameWindow(
+                    source_rect, self.app_settings, status=self._mirror.status_text
+                )
+                self._frame.set_frozen(self._mirror.frozen)
+                self._frame.show()
+                # ツールバーは枠のさらに外に置く(枠の帯と重ならないように)。
+                anchor = QRect(self._frame.geometry())
+            except Exception:
+                # 枠が出ないだけならミラーは続けられる。ここで畳むほうが損。
+                self._frame = None
+                _guard("手元の枠の表示", notify=False)
+
+        if bool(cfg.get("toolbar", DEFAULT_TOOLBAR)):
+            try:
+                geometry = toolbar_geometry(anchor, source_rect)
+                if geometry is None:
+                    # 撮影範囲に掛からずに置ける場所が無かった。出さないほうがまし
+                    # (映り込むと、映った自分をまた撮る入れ子になる)。
+                    self.notify("ツールバーを置く場所がありません\n範囲の外に余白がある位置を選んでください")
+                else:
+                    self._toolbar = MirrorToolbarWindow(
+                        geometry, self._toolbar_actions(), self._toolbar_state
+                    )
+                    self._toolbar.show()
+            except Exception:
+                self._toolbar = None
+                _guard("ツールバーの表示", notify=False)
+
+    def _hide_frame(self) -> None:
+        """枠とツールバーを畳む。ミラーはそのまま。"""
+        for name in ("_toolbar", "_frame"):
+            window = getattr(self, name, None)
+            setattr(self, name, None)
+            if window is None:
+                continue
+            try:
+                window.close()
+                window.deleteLater()
+            except RuntimeError:
+                pass
+            except Exception:
+                _guard("手元の枠の後始末", notify=False)
+
+    def _toolbar_actions(self) -> dict:
+        """ツールバーの各アイコンを押したときに呼ぶもの。キーは _TOOLBAR_ITEMS と揃える。"""
+        return {
+            "laser": lambda: self.toggle_presenter("laser"),
+            "spotlight": lambda: self.toggle_presenter("spotlight"),
+            "black": lambda: self.toggle_presenter("black"),
+            "white": lambda: self.toggle_presenter("white"),
+            "freeze": self.toggle_freeze,
+            "reselect": self.start_reselect,
+            "stop": self.stop,
+        }
+
+    def _toolbar_state(self, key: str) -> bool:
+        """そのアイコンが今点いているか。"""
+        if key == "freeze":
+            return self.is_frozen()
+        if key in ("laser", "spotlight", "black", "white"):
+            return self.is_presenter_on(key)
+        return False
+
     def stop(self) -> None:
-        """ミラーも枠も選択も畳む。終了時の後始末からも呼ぶ。"""
+        """ミラーも枠もツールバーも選択も畳む。終了時の後始末からも呼ぶ。"""
+        self._reselecting = False
         self._close_selection()
-        for name in ("_frame", "_mirror"):
+        for name in ("_toolbar", "_frame", "_mirror"):
             window = getattr(self, name, None)
             setattr(self, name, None)
             if window is None:
@@ -1125,3 +2052,60 @@ class MirrorController:
         if kind == "spotlight":
             return bool(self._mirror.spotlight_on)
         return False
+
+    def toggle_presenter(self, kind: str) -> bool:
+        """ツールバーからプレゼン支援(レーザー/スポット/黒画面/白画面)を切り替える。
+
+        attach_presenter で本体へ繋がっていればそちらへ回す。行き先の振り替え・通知・
+        トレイメニューのチェックがあちらに揃っているので、同じ入口を通したほうが
+        状態が食い違わない。繋がっていないとき(この module だけを動かしたとき)は、
+        ここで扱えるレーザーとスポットライトだけを直接切り替える。"""
+        try:
+            if self._presenter_toggle is not None:
+                return bool(self._presenter_toggle(kind))
+            if kind in ("laser", "spotlight"):
+                return self.toggle_light(kind)
+        except Exception:
+            _guard("プレゼン支援の切り替え", notify=False)
+        return False
+
+    def is_presenter_on(self, kind: str) -> bool:
+        try:
+            if self._presenter_state is not None:
+                return bool(self._presenter_state(kind))
+            return self.is_light_on(kind)
+        except Exception:
+            _guard("プレゼン支援の状態", notify=False)
+            return False
+
+    # ---------------------------------------------------------------
+    # 静止(フリーズ)
+    # ---------------------------------------------------------------
+    def set_freeze(self, frozen: bool) -> bool:
+        """ミラーを静止させる/戻す。戻り値は切り替え後の状態。
+
+        止めている間は撮らないので、向こうには最後の1枚が出たままになる。手元で資料を
+        切り替えたり、見せたくないものを開いたりする間に使う。
+
+        手元には3か所で出す(枠の色・帯の文字・ツールバーのアイコンと文字)。ミラー先には
+        何も出さない——静止していることを知る必要があるのは発表者だけで、向こうに印を
+        出したら「今は見せていない」と宣言することになる。"""
+        try:
+            if self._mirror is None:
+                return False
+            if self._reselecting:
+                # 選び直しの最中は静止を借りている。ここで解除されると、範囲選択の
+                # 減光オーバーレイがそのまま向こうへ映る。
+                return bool(self._mirror.frozen)
+            self._mirror.set_frozen(frozen)
+            if self._frame is not None:
+                self._frame.set_frozen(self._mirror.frozen)
+            if self._toolbar is not None:
+                self._toolbar.refresh_state()
+            return bool(self._mirror.frozen)
+        except Exception:
+            _guard("静止の切り替え")
+            return self.is_frozen()
+
+    def toggle_freeze(self) -> bool:
+        return self.set_freeze(not self.is_frozen())

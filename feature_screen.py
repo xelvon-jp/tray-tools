@@ -126,6 +126,13 @@ class ScreenFeature:
         self.screen_mirror = screen_mirror.MirrorController(
             app_settings, settings_path, self._notify
         )
+        # 手元のツールバーからプレゼン支援を押せるようにする。黒画面/白画面の窓を
+        # 持っているのはこちら(presenter_overlays)なので、あちらからは触れない。
+        # レーザーとスポットライトも、行き先の振り替え・通知・メニューのチェックが
+        # toggle_presenter_overlay に揃っているので同じ入口へ回す。
+        self.screen_mirror.attach_presenter(
+            self.toggle_presenter_overlay, self._presenter_overlay_active
+        )
         # 付箋(Rapture)のウインドウはここでは持たない。別プロセス(capture_process.py)に
         # 出したので、参照どころか同じアドレス空間にすら居ない。以前は開いている付箋を
         # self.capture_windows に、ホットキーで撮る対象を self.active_capture_window に
@@ -251,13 +258,26 @@ class ScreenFeature:
         # 画面ミラー。プレゼン支援の真下に置く(発表中に使う道具でひとかたまり)。
         # 「開始」とミラー先のモニタ選択でサブメニューにする。
         self._mirror_menu = self.menu.addMenu("🖥 画面ミラー（別モニタへ）")
+        # 「開始」はチェック項目にしない。Ctrl+Alt+P は開始と範囲の選び直しで、押しても
+        # 終わらないため——チェックを外す操作＝終了に見えてしまう。動作中かどうかは
+        # 下の「終了」「静止」が押せるかどうかと、見出しの文言で示す(_refresh_mirror_menu)。
         self._mirror_action = self._mirror_menu.addAction(
             self._with_hotkey("▶ 範囲を選んで開始", hotkey_config.get("screen_mirror"))
         )
-        self._mirror_action.setCheckable(True)
+        self._mirror_action.triggered.connect(lambda _checked=False: self.start_screen_mirror())
+        self._mirror_freeze_action = self._mirror_menu.addAction(
+            self._with_hotkey("⏸ 静止（一時停止）", hotkey_config.get("screen_mirror_freeze"))
+        )
+        self._mirror_freeze_action.setCheckable(True)
         # addAction(テキスト, 関数) で登録すると関数は引数なしで呼ばれる。チェック状態を
         # 受け取る項目はこの形で繋ぐこと(プレゼン支援・タスクバーと同じ理由)。
-        self._mirror_action.triggered.connect(self._set_screen_mirror)
+        self._mirror_freeze_action.triggered.connect(self._set_screen_mirror_freeze)
+        # ホットキーが「選び直し」になったぶん、終わらせる手段をここに必ず置く
+        # (手元のツールバーの ✕ と Ctrl+Alt+Q でも終われる)。
+        self._mirror_stop_action = self._mirror_menu.addAction(
+            self._with_hotkey("⏹ 終了", hotkey_config.get("screen_mirror_stop"))
+        )
+        self._mirror_stop_action.triggered.connect(lambda _checked=False: self.stop_screen_mirror())
         self._mirror_screen_menu = self._mirror_menu.addMenu("🖵 ミラー先")
         # 中身は開く直前に作り直す(モニタは抜き差しされる)。項目はメニューが持つので
         # GCの心配は無いが、作り直しの前後で状態を見るためにここでも並びを持っておく。
@@ -353,9 +373,12 @@ class ScreenFeature:
             "presenter_spotlight": lambda: self.toggle_presenter_overlay("spotlight"),
             "presenter_blackout": lambda: self.toggle_presenter_overlay("black"),
             "presenter_whiteout": lambda: self.toggle_presenter_overlay("white"),
-            # 画面ミラー。ミラー窓はキーを受け取らない(前面を奪わない作りなので)ため、
-            # こことトレイメニューが畳む手段になる。
-            "screen_mirror": self.toggle_screen_mirror,
+            # 画面ミラー。開始と「範囲の選び直し」。ミラー窓はキーを受け取らない
+            # (前面を奪わない作りなので)ため、終わらせるのは screen_mirror_stop と
+            # トレイメニューと手元のツールバー。
+            "screen_mirror": self.start_screen_mirror,
+            "screen_mirror_stop": self.stop_screen_mirror,
+            "screen_mirror_freeze": self.toggle_screen_mirror_freeze,
         }
 
     @staticmethod
@@ -1104,20 +1127,40 @@ class ScreenFeature:
     # 実物は screen_mirror.py。ここは入口(メニュー・ホットキー・ランチャ)だけを持つ。
     # 範囲選択からミラー窓・手元の枠までは MirrorController が面倒を見る。
     # ---------------------------------------------------------------
-    def toggle_screen_mirror(self) -> bool:
-        """画面ミラーを開始(範囲選択から)または終了する。戻り値は「これから出す」か。
+    def start_screen_mirror(self) -> bool:
+        """画面ミラーを開始する。ミラー中に呼ぶと、映したまま範囲だけを選び直す。
+
+        以前は押すたびに開始/終了のトグルだった。やめたのは、発表の途中で映す場所を
+        変えたいときに、いったんミラーを畳むことになるため——画面共有に出しているモニタが
+        一瞬黒くなり、見ている側からは事故に見える。終わらせるのは stop_screen_mirror。
 
         通知は screen_mirror 側が出す(どのモニタへ何fpsで出したかを知っているのは
         あちらなので、ここで持ち直しても同じことを2回書くだけになる)。"""
-        return self.screen_mirror.toggle()
+        return self.screen_mirror.activate()
 
-    def _set_screen_mirror(self, checked: bool):
-        """メニューのチェック項目から。範囲選択の最中も「動作中」として扱う
-        (選んでいる途中にもう一度押したら、選択ごと畳むのが素直)。"""
-        active = self.screen_mirror.is_active() or self.screen_mirror.is_selecting()
-        if checked == active:
+    # ランチャ(taskbar_launcher.ITEMS)から名前で呼ばれていた旧名。設定を書き換えずに
+    # 済むよう残してある(呼び先が消えると「機能が無い」という通知だけが出る)。
+    toggle_screen_mirror = start_screen_mirror
+
+    def stop_screen_mirror(self) -> None:
+        """画面ミラーを終了する。ホットキー(既定 Ctrl+Alt+Q)・トレイメニュー・
+        手元のツールバーの ✕ から。開始のキーが終了を兼ねなくなったので、ここが
+        「必ず終われる」担保になる。"""
+        self.screen_mirror.stop()
+
+    def toggle_screen_mirror_freeze(self) -> bool:
+        """ミラーを静止させる/戻す。戻り値は切り替え後の状態。
+
+        止めている間は撮らないので、向こうには最後の1枚が出たままになる。静止したことは
+        手元(枠の色・帯・ツールバー)にだけ出す。"""
+        return self.screen_mirror.toggle_freeze()
+
+    def _set_screen_mirror_freeze(self, checked: bool):
+        """メニューのチェック項目から。QAction.triggered が渡す checked をそのまま
+        指示として扱う(プレゼン支援の項目と同じ作法)。"""
+        if checked == self.screen_mirror.is_frozen():
             return
-        self.toggle_screen_mirror()
+        self.screen_mirror.set_freeze(checked)
 
     def _refresh_mirror_menu(self):
         """開く直前に、状態のチェックとミラー先の一覧を作り直す。
@@ -1125,9 +1168,18 @@ class ScreenFeature:
         モニタは抜き差しされるし、ミラーはホットキーからも切り替わる。一覧を作りっぱなしに
         すると、繋ぎ直したモニタが選べないまま残る。"""
         try:
-            self._mirror_action.setChecked(
-                self.screen_mirror.is_active() or self.screen_mirror.is_selecting()
+            active = self.screen_mirror.is_active()
+            hotkey_config = self.app_settings.get("hotkeys", {})
+            # 見出しで「今押すと何が起きるか」を示す。ミラー中は選び直しになる。
+            self._mirror_action.setText(
+                self._with_hotkey(
+                    "🔁 範囲を選び直す（映したまま）" if active else "▶ 範囲を選んで開始",
+                    hotkey_config.get("screen_mirror"),
+                )
             )
+            self._mirror_freeze_action.setEnabled(active)
+            self._mirror_freeze_action.setChecked(self.screen_mirror.is_frozen())
+            self._mirror_stop_action.setEnabled(active or self.screen_mirror.is_selecting())
 
             self._mirror_screen_menu.clear()
             self._mirror_screen_actions = []

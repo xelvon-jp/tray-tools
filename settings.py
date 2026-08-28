@@ -124,6 +124,28 @@ DEFAULT_SETTINGS = {
     #   伝わりにくいため。_ms は消えるまでの時間、_radius は広がりきったときの半径。
     # source_frame は手元に「いまミラーしている範囲」の枠を出す。枠は範囲の外側に描くので
     #   ミラーには映り込まない。枠の外の帯に実測fpsも出る。
+    # toolbar は手元の枠の下に出す操作パネル(レーザー・スポットライト・黒画面・白画面・
+    #   静止・範囲の選び直し・終了)。これも範囲の外に置くのでミラーには映り込まない
+    #   (置ける場所が無いときは出ない)。
+    # freeze_frame_* は静止(一時停止)しているときの枠の色。通常の枠より目立たせてある。
+    #   静止したまま話し続けるのが最悪なので、ここは主張してよい。
+    #
+    # scaling は拡大方法。"auto"(既定) / "smooth" / "fast"。拡大する以上、補間による
+    #   滲みは避けられない(Qt の選択肢は双線形と最近傍の2つだけで、間は無い)。本当の解は
+    #   「等倍で映すこと」で、そのために presets に「ミラー先と同じ解像度」を入れてある。
+    #   auto は倍率が整数のときだけ fast(最近傍)にする。整数倍なら元の1画素が正方形へ
+    #   そのまま分かれるので中間色が生えず、輪郭が鈍らない。半端な倍率で fast にすると
+    #   行ごとに太さの違う文字になるので smooth へ落とす。
+    #
+    # presets は範囲選択中に一発で選べる矩形。一覧が画面に出て、クリックか Ctrl+数字で
+    #   選べる。書ける値は
+    #     label  … 一覧に出す見出し
+    #     width / height … 大きさ(論理px)
+    #     size: "target"  … 大きさをミラー先のモニタと同じにする(＝等倍。滲まない)
+    #     x / y  … 始点。省略するとその画面の中央。既定では「今カーソルのあるモニタの
+    #              左上」からの相対で、screen に QScreen.name() を書けばそのモニタに固定
+    #              できる。相対なのは、(0,100) のような値が「作業しているモニタの
+    #              タスクバーやアドレスバーを外した位置」の意味で書かれるため。
     #
     # レーザーとスポットライトの色や大きさはここには無い。ミラー先へ描くときも
     # presenter_overlay セクションの値をそのまま使う(同じ道具の同じ光点なので)。
@@ -131,6 +153,13 @@ DEFAULT_SETTINGS = {
         "fps": 30,
         "target_screen_name": "",
         "aspect": "16:9",
+        "scaling": "auto",
+        "presets": [
+            {"label": "等倍（ミラー先と同じ）", "size": "target"},
+            {"label": "上を100空ける", "x": 0, "y": 100, "width": 1600, "height": 900},
+            {"label": "HD", "width": 1280, "height": 720},
+            {"label": "FHD", "width": 1920, "height": 1080},
+        ],
         "cursor_size": 34,
         "cursor_color": "#ffffff",
         "cursor_outline": "#101010",
@@ -142,6 +171,9 @@ DEFAULT_SETTINGS = {
         "source_frame_color": "#00c8ff",
         "source_frame_width": 3,
         "source_frame_opacity": 0.55,
+        "freeze_frame_color": "#ff8c00",
+        "freeze_frame_opacity": 0.9,
+        "toolbar": True,
     },
     # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、
     # アプリからの登録で増える(削除・並べ替えは settings.json を直接編集する想定)。
@@ -235,14 +267,24 @@ DEFAULT_SETTINGS = {
         "presenter_spotlight": "ctrl+alt+o",
         "presenter_blackout": "ctrl+alt+b",
         "presenter_whiteout": "ctrl+alt+w",
-        # 画面ミラー(screen_mirror.py)の開始/終了。押すと範囲選択が出て、選ぶと
-        # ミラーが始まる。もう一度押すと畳む。p は presentation の p で、
-        # 既に使っている h,r,s,m,c,t,v,l,o,b,w と win+j のどれとも重ならない。
+        # 画面ミラー(screen_mirror.py)の開始と「範囲の選び直し」。押すと範囲選択が
+        # 出て、選ぶとミラーが始まる。ミラー中に押すと、映したまま範囲だけを選び直す
+        # (発表の途中で映す場所を変えたいときに、いったん共有が途切れないように)。
+        # p は presentation の p。
+        #
+        # このキーでは終われないので、終了は screen_mirror_stop に持たせてある
+        # (トレイメニューの「⏹ 終了」と手元のツールバーの ✕ でも終われる)。
+        # q は quit の q、f は freeze の f。どちらも既に使っている
+        # h,r,s,m,c,t,v,l,o,b,w,p と win+j のどれとも重ならない。
         #
         # ミラー中のレーザーとスポットライトに別のキーは要らない。上の
         # presenter_laser / presenter_spotlight がそのままミラー先の光点になる
         # (手元に重ねてしまうと、それが撮られて向こうへ二重に映る)。
         "screen_mirror": "ctrl+alt+p",
+        "screen_mirror_stop": "ctrl+alt+q",
+        # 静止(一時停止)。押すと今の1枚で止まり、もう一度押すと現在の画面へ戻る。
+        # 手元で資料を切り替える間、その様子を見せないためのもの。
+        "screen_mirror_freeze": "ctrl+alt+f",
     },
 }
 

@@ -29,8 +29,15 @@
 # 専用ホットキー(既定 Ctrl+Alt+Q)。押しても終われない状態を作らないこと。
 #
 # 手元の枠(SourceFrameWindow)の下にはツールバー(MirrorToolbarWindow)を出す。
-# レーザー・スポットライト・黒画面・白画面・静止・選び直し・終了をアイコンで並べたもの。
-# 枠と同じで撮影範囲の外に置く(自分を撮ると無限に入れ子になる)。
+# レーザー・スポットライト・黒画面・白画面・カンペ・静止・選び直し・終了をアイコンで
+# 並べたもの。枠と同じで撮影範囲の外に置く(自分を撮ると無限に入れ子になる)。
+#
+# 範囲の右隣にはカンペ(MirrorNotesWindow)を出す。notes/ フォルダに置いた Markdown を
+# 読むだけのパネルで、# の見出しを ◀ ▶ でワンクリックで行き来できる。中身のファイルは
+# mirror_notes.py が受け持つ。ここも撮影範囲の外に置くが、理由は枠やツールバーとは
+# 違う——入れ子になるからではなく、カンペは発表者だけが見るものだから。掛かった時点で
+# 手元のメモが共有側に丸見えになるので、置けないなら出さない(右が無理なら左、それも
+# 無理なら出さない)。共有側には何も足さない。
 #
 # 静止(フリーズ)は、手元で資料を切り替える間その様子を見せないための機能。止めている
 # 間は撮らないので、向こうには最後の1枚が出たままになる。気付かずに静止したまま話し
@@ -76,7 +83,7 @@ import time
 import traceback
 
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -88,9 +95,22 @@ from PySide6.QtGui import (
     QPixmap,
     QPolygonF,
     QRegion,
+    QTextCursor,
 )
-from PySide6.QtWidgets import QApplication, QStyle, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QStyle,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
+import mirror_notes
 import presenter_overlay
 from capture_grab import grab_region
 from capture_overlay import SelectionOverlay
@@ -178,6 +198,37 @@ TOOLBAR_BACKGROUND = QColor(20, 20, 20, 225)
 TOOLBAR_GRIP_WIDTH = 12
 # ドラッグ後に出す一言(半径や暗さの値など)を消すまでの時間(ms)。
 TOOLBAR_HINT_MS = 2500
+
+# ---------------------------------------------------------------
+# 手元のカンペ(発表者だけが見るメモ)
+#
+# 撮影範囲の右隣に置くパネル。中身は notes/ フォルダの Markdown で、ファイルの面倒は
+# mirror_notes.py が見る。枠・ツールバーと同じで、撮影範囲に1画素も掛けてはいけない
+# (掛かれば共有側に丸見えになる。カンペは「手元だけに見えるもの」なので、これは
+# 入れ子になるより悪い——見せてはいけないものが見えるということ)。
+# ---------------------------------------------------------------
+DEFAULT_NOTES = True
+# パネルの幅(論理px)。設定 notes_width で変えられる。
+DEFAULT_NOTES_WIDTH = 380
+# これより狭くするくらいなら出さない。折り返しだらけで読めないものを置いても、
+# 撮影範囲の外の場所を1つ潰すだけで得が無い。
+NOTES_MIN_WIDTH = 240
+# 撮影範囲が小さいときでも、これだけの高さは確保する(範囲と同じ高さでは数行しか
+# 読めない)。伸ばす向きは上——下へ伸ばすとツールバーに掛かる。
+NOTES_MIN_HEIGHT = 320
+# 枠との隙間(論理px)。0にすると枠と地続きに見えて、どこまでが撮影範囲か分かりにくい。
+NOTES_GAP = 6
+# 本文の文字。発表中に手元で読むものなので、その場で変えられる(A-/A+ と Ctrl+ホイール)。
+DEFAULT_NOTES_FONT_SIZE = 11
+NOTES_FONT_MIN = 7
+NOTES_FONT_MAX = 32
+NOTES_FONT_FAMILY = "Meiryo"
+# 文字の大きさとカンペの選択を settings.json へ書き戻すまでの待ち(ms)。Ctrl+ホイールは
+# 1回転で何目盛りも飛んでくるので、そのたびに書くとファイルを何十回も開き直すことになる
+# (SPOTLIGHT_SAVE_DELAY_MS と同じ理由・同じ値)。
+NOTES_SAVE_DELAY_MS = 800
+# 目次/一覧の高さの上限(論理px)。本文が見えなくなるほど広げない。
+NOTES_SIDE_HEIGHT = 150
 
 # スポットライトをその場で調整する幅。ホイール1目盛りぶん。
 SPOTLIGHT_RADIUS_STEP = 10
@@ -1165,6 +1216,14 @@ def _icon_white(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.rectangle((30, 46, 34, 52), fill="white")
 
 
+def _icon_notes(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """カンペ。紙に横線を数本。黒画面/白画面と同じ「四角い面」だが、あちらは画面の形
+    (横長・脚つき)、こちらは紙の形(縦長)にして小さくしても見分けが付くようにする。"""
+    draw.rounded_rectangle((16, 8, 48, 56), radius=4, fill="white")
+    for y in (18, 27, 36, 45):
+        draw.line((22, y, 42 if y != 45 else 34, y), fill=color, width=4)
+
+
 def _icon_freeze(draw: ImageDraw.ImageDraw, color: str) -> None:
     """静止。一時停止の2本線。動画の停止と同じ記号にする(説明が要らない)。"""
     draw.rectangle((20, 14, 29, 50), fill="white")
@@ -1190,6 +1249,9 @@ _TOOLBAR_ITEMS = (
     ("spotlight", "スポットライト", "#ca8a04", _icon_spotlight),
     ("black", "黒画面", "#334155", _icon_black),
     ("white", "白画面", "#94a3b8", _icon_white),
+    # カンペは「向こうに何が出ているか」を切り替えるものではないので、黒画面/白画面と
+    # 静止の間に置く。押しても共有側は何も変わらない、手元だけの項目。
+    ("notes", "カンペ（手元だけに出る）", "#0d9488", _icon_notes),
     ("freeze", "静止（もう一度で解除）", "#ff8c00", _icon_freeze),
     ("reselect", "範囲を選び直す", "#2563eb", _icon_reselect),
     ("stop", "ミラーを終了", "#b91c1c", _icon_stop),
@@ -1557,6 +1619,578 @@ class MirrorToolbarWindow(_TopmostWindow):
             Qt.AlignVCenter | Qt.AlignLeft,
             metrics.elidedText(text, Qt.ElideRight, area.width()),
         )
+
+
+# ---------------------------------------------------------------
+# 手元のカンペ(発表者だけが見るメモ)
+# ---------------------------------------------------------------
+def notes_geometry(anchor_rect: QRect, source_rect: QRect, width: int = DEFAULT_NOTES_WIDTH,
+                   avoid=()):
+    """カンペのパネルを置く矩形。置き場所が無ければ None。
+
+    anchor_rect は手元の枠(枠が無ければ選択範囲そのもの)。その右隣に置く。右に入らない
+    ときは左へ回し、それも無理なら None を返す。None のときは出さない——カンペは
+    発表者だけが見るものなので、撮影範囲に1画素でも掛かった時点で手元のメモが共有側へ
+    丸見えになる。出ないほうがはるかにましで、これはツールバー(映り込むと入れ子になる)
+    より強い理由になる。
+
+    高さは範囲の高さに合わせ、足りなければ NOTES_MIN_HEIGHT まで「上へ」伸ばす。下へ
+    伸ばさないのは、範囲の真下がツールバーの場所だから(ボタンを覆ってしまう)。伸ばした
+    結果ツールバーや撮影範囲に掛かる構成では、avoid に渡された矩形との交差で弾かれる。
+
+    avoid には撮影範囲以外の「掛かってはいけない矩形」を入れる(ミラー先のモニタ全体と
+    ツールバー)。ミラー先を入れるのは、そこへ置くと共有側に映るうえ、最前面の押し合いに
+    なって共有側でチカチカするため。"""
+    width = int(max(width, NOTES_MIN_WIDTH))
+    screen = QGuiApplication.screenAt(anchor_rect.center())
+    area = screen.geometry() if screen is not None else QRect(anchor_rect)
+
+    height = min(max(anchor_rect.height(), NOTES_MIN_HEIGHT), area.height())
+    top = anchor_rect.bottom() - height + 1
+    top = min(max(top, area.top()), max(area.bottom() - height + 1, area.top()))
+
+    blocked = [QRect(source_rect)] + [QRect(rect) for rect in avoid if rect is not None]
+
+    def usable(rect: QRect):
+        if rect.left() < area.left() or rect.right() > area.right():
+            return None
+        for other in blocked:
+            if not other.isNull() and rect.intersects(other):
+                return None
+        return rect
+
+    # 右が既定。左に回すのは右に入らないときだけ——資料(撮影範囲)を左、手元のメモを右に
+    # 置くのが読む向きに合う。
+    right_space = area.right() - (anchor_rect.right() + NOTES_GAP)
+    left_space = (anchor_rect.left() - NOTES_GAP) - area.left()
+    for left in (anchor_rect.right() + 1 + NOTES_GAP, anchor_rect.left() - NOTES_GAP - width):
+        found = usable(QRect(left, top, width, height))
+        if found is not None:
+            return found
+
+    # 既定の幅では入らなかった。広いほうの空きに合わせて詰めてみる。狭くても読めれば
+    # 出したほうがよいが、NOTES_MIN_WIDTH を割るなら折り返しだらけで読めないので諦める。
+    if right_space >= left_space:
+        narrowed = min(width, right_space)
+        left = anchor_rect.right() + 1 + NOTES_GAP
+    else:
+        narrowed = min(width, left_space)
+        left = anchor_rect.left() - NOTES_GAP - narrowed
+    if narrowed >= NOTES_MIN_WIDTH:
+        found = usable(QRect(left, top, narrowed, height))
+        if found is not None:
+            return found
+    return None
+
+
+def _clamp_notes_font(size) -> int:
+    """本文の文字の大きさを扱える範囲へ丸める。設定ファイルからも来るので必ず通す。"""
+    return min(max(_as_int(size, DEFAULT_NOTES_FONT_SIZE), NOTES_FONT_MIN), NOTES_FONT_MAX)
+
+
+# パネルの見た目。半透明にせず不透明で塗るのは、これが「読むための窓」だから——下の
+# アプリが透けると本文が読みにくい(ツールバーはアイコンを並べるだけなので半透明でよい)。
+# 角も丸めない。丸めるには WA_TranslucentBackground が要り、そのぶん合成が増える。
+NOTES_STYLE = """
+QWidget { background: transparent; color: #e8e8e8; }
+QWidget#mirrorNotes { background: #141414; border: 1px solid #3f3f46; }
+QPushButton {
+    background: rgba(255, 255, 255, 26); border: none; border-radius: 4px; padding: 2px 4px;
+}
+QPushButton:hover { background: rgba(255, 255, 255, 64); }
+QPushButton:checked { background: rgba(13, 148, 136, 200); }
+QTextEdit, QListWidget {
+    background: #0b0b0b; border: 1px solid #3f3f46; border-radius: 4px;
+    selection-background-color: rgba(13, 148, 136, 160);
+}
+QListWidget::item { padding: 1px 2px; }
+QListWidget::item:selected { background: rgba(13, 148, 136, 160); }
+"""
+
+
+class MirrorNotesWindow(_TopmostWindow):
+    """撮影範囲の右隣に出す、発表者だけが見るカンペ(メモ)のパネル。
+
+    中身は notes/ フォルダの Markdown(mirror_notes.py が読む)。ここは読むだけで、
+    その場での編集はしない——発表中に文章を書き換えることはまず無いし、編集できる窓を
+    最前面に置くと、話しながら誤って打ち込む事故のほうが起こりやすい。書き足すのは
+    「編集」ボタンから外部エディタで、直したら「再読込」で読み直す。
+
+    見出しの拾い方は、生のテキストを正規表現で舐めるのではなく、setMarkdown した後の
+    QTextDocument から blockFormat().headingLevel() で拾う。こうすると、表示されている
+    ものと目次が必ず一致する——コードブロック(```)の中の # を見出しと数えてしまう、
+    といった食い違いが原理的に起きない。ジャンプ先の文書内位置もそのまま取れる。
+
+    ## を目次に入れるかは迷うところだが、入れることにした(字下げして並べる)。カンペの
+    中身は「# 章」ではなく「## 話すこと」の側に書かれるので、## を落とすと目次から
+    行きたい場所へ辿り着けない。ただし ◀ ▶ の前後ボタンが辿るのは # だけにしてある
+    ——発表中にワンクリックで動かしたいのは章単位で、小見出しまで刻むと押す回数が
+    増えて目的の場所を通り過ぎる。「2/3」の表示も # の数で数える。
+
+    ツールチップは付けない。ツールチップは別の窓として出るので、パネルの左端で出ると
+    撮影範囲に掛かりうる(それが共有側に映る)。ボタンは日本語の短い語にして、見れば
+    分かる状態にしてある(ツールバーが説明欄を窓の中に持っているのと同じ判断)。
+
+    フォーカスは奪わない。窓自体が WindowDoesNotAcceptFocus で、中の部品もすべて
+    Qt.NoFocus にしてある。発表中に操作しているのは手元のアプリで、そこからキーボードの
+    相手を取り上げたら発表が止まる。"""
+
+    click_through = False
+
+    def __init__(self, geometry: QRect, note_name: str = "",
+                 font_size: int = DEFAULT_NOTES_FONT_SIZE, on_state=None):
+        super().__init__(geometry)
+        self.setObjectName("mirrorNotes")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(NOTES_STYLE)
+
+        # 状態が変わったことを知らせる先。on_state(カンペ名, 文字の大きさ) を呼ぶ。
+        # 設定への書き戻しは呼び元(MirrorController)がまとめて遅延させる。
+        self._on_state = on_state
+        self._name = ""
+        self._font_size = _clamp_notes_font(font_size)
+        # (見出しの深さ, 文字, 文書内の位置) を上から順に。目次も前後ボタンもこれを見る。
+        self._headings = []
+        # そのうち深さ1(＝「#」)のものの添字。前後ボタンと「2/3」はこれだけを辿る。
+        self._tops = []
+        # いま見ている見出し(_headings の添字)。-1 は「最初の見出しより上」。
+        self._current = -1
+        # 見出しの画面上の高さ。毎回 blockBoundingRect を引くとスクロールのたびに
+        # 見出しの数だけ問い合わせることになるので、レイアウトが変わるまで使い回す。
+        self._top_cache = None
+        self._side_mode = ""
+        self._position_text = ""
+
+        self._build_ui()
+        self._apply_font()
+        self.load(note_name)
+
+    # ---------------------------------------------------------------
+    # 組み立て
+    # ---------------------------------------------------------------
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        chrome = QFont(NOTES_FONT_FAMILY, 9)
+
+        # 1行目: カンペの名前と、ファイルを触るボタン。
+        head = QHBoxLayout()
+        head.setSpacing(3)
+        self.title = QLabel("")
+        self.title.setFont(QFont(NOTES_FONT_FAMILY, 9, QFont.Bold))
+        head.addWidget(self.title, 1)
+        self.list_button = self._button("一覧", chrome, self._toggle_files, checkable=True)
+        self.edit_button = self._button("編集", chrome, self._on_edit)
+        self.folder_button = self._button("フォルダ", chrome, self._on_folder, width=56)
+        for button in (self.list_button, self.edit_button, self.folder_button):
+            head.addWidget(button)
+        layout.addLayout(head)
+
+        # 2行目: 見出しの移動と、読むための道具。
+        bar = QHBoxLayout()
+        bar.setSpacing(3)
+        self.prev_button = self._button("◀", chrome, lambda: self.step_section(-1), width=26)
+        self.next_button = self._button("▶", chrome, lambda: self.step_section(1), width=26)
+        bar.addWidget(self.prev_button)
+        bar.addWidget(self.next_button)
+        self.position = QLabel("")
+        self.position.setFont(chrome)
+        self.position.setMinimumWidth(1)
+        bar.addWidget(self.position, 1)
+        self.toc_button = self._button("目次", chrome, self._toggle_toc, checkable=True)
+        self.smaller_button = self._button("A-", chrome, lambda: self.zoom(-1), width=26)
+        self.bigger_button = self._button("A+", chrome, lambda: self.zoom(1), width=26)
+        self.reload_button = self._button("再読込", chrome, self.reload, width=48)
+        for button in (self.toc_button, self.smaller_button, self.bigger_button,
+                       self.reload_button):
+            bar.addWidget(button)
+        layout.addLayout(bar)
+
+        # 目次とカンペ一覧は同じ場所に出す(窓の中で切り替える)。別窓にすると、撮影範囲に
+        # 掛からない置き場所をもう1つ探すことになる。
+        self.side = QListWidget()
+        self.side.setFont(chrome)
+        self.side.setFocusPolicy(Qt.NoFocus)
+        self.side.setUniformItemSizes(True)
+        self.side.setMaximumHeight(NOTES_SIDE_HEIGHT)
+        self.side.itemClicked.connect(self._on_side_clicked)
+        self.side.hide()
+        layout.addWidget(self.side)
+
+        self.view = QTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setFocusPolicy(Qt.NoFocus)
+        self.view.setLineWrapMode(QTextEdit.WidgetWidth)
+        # Ctrl+ホイールで文字の大きさを変える。QTextEdit が先にホイールを食べるので、
+        # ビューポートに入れたフィルタで横取りする(picker の QLineEdit と同じ手)。
+        self.view.viewport().installEventFilter(self)
+        self.view.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+        layout.addWidget(self.view, 1)
+
+        # レイアウトが変われば見出しの高さも変わる。文字の大きさを変えたときも、
+        # 窓を作った直後(まだ組版されていない)にも来る。
+        self.view.document().documentLayout().documentSizeChanged.connect(
+            self._invalidate_tops
+        )
+
+        self.status = QLabel("")
+        self.status.setFont(chrome)
+        self.status.setWordWrap(True)
+        self.status.hide()
+        layout.addWidget(self.status)
+
+    def _button(self, text: str, font: QFont, slot, width: int = 34,
+                checkable: bool = False) -> QPushButton:
+        button = QPushButton(text)
+        button.setFont(font)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setFixedSize(width, 22)
+        button.setCheckable(checkable)
+        # 押した処理の中で例外を投げ切るとプロセスごと終わる。各スロットが自分で try して
+        # いるが、ここでも一枚受けておく(ラムダの中で落ちる余地を残さない)。
+        button.clicked.connect(lambda _checked=False, f=slot: self._run(f))
+        return button
+
+    @staticmethod
+    def _run(func) -> None:
+        try:
+            func()
+        except Exception:
+            _guard("カンペの操作", notify=False)
+
+    # ---------------------------------------------------------------
+    # 読み込み
+    # ---------------------------------------------------------------
+    def note_name(self) -> str:
+        return self._name
+
+    def load(self, name: str = "") -> None:
+        """カンペを1つ読んで表示する。名前が無効なら実在するものへ寄せる。"""
+        try:
+            resolved = mirror_notes.resolve_name(name or "")
+            if not resolved:
+                self._name = ""
+                self.title.setText("カンペ（notes フォルダ）")
+                self._render(mirror_notes.EMPTY_GUIDE)
+                self._set_status("")
+                return
+            text = mirror_notes.read_note(resolved)
+            self._name = resolved
+            self.title.setText(resolved)
+            if text is None:
+                # 読めない理由(文字コード違い・消された)は手元にだけ出す。共有側には
+                # 何も出ないので、ここに出さないと気付きようが無い。
+                self._render("")
+                self._set_status("このファイルを読めません（UTF-8 で保存してください）")
+                return
+            self._render(text)
+            self._set_status("")
+        except Exception:
+            _guard("カンペの読み込み", notify=False)
+
+    def reload(self) -> None:
+        """外部エディタで直した内容を読み直す。見ていた章はできるだけ保つ。"""
+        try:
+            order = self._current_top_order()
+            self.load(self._name)
+            if 0 <= order < len(self._tops):
+                self.jump_to_heading(self._tops[order])
+        except Exception:
+            _guard("カンペの再読み込み", notify=False)
+
+    def _render(self, text: str) -> None:
+        """本文を描き直し、見出しと目次を作り直す。
+
+        .txt でも setMarkdown を通す。カンペの見出しは # で書く約束なので、拡張子で
+        描き方を変えると「.txt にしたらジャンプできない」という分かりにくい差になる。"""
+        self.view.setMarkdown(text or "")
+        # 見出しを拾い直してからスクロールを戻す。逆にすると、位置を戻したことで走る
+        # _on_scrolled が「新しい文書」を「古い見出しの位置」で見ることになる。
+        self._collect_headings()
+        self._invalidate_tops()
+        self._current = -1
+        self.view.verticalScrollBar().setValue(0)
+        self._rebuild_side()
+        self._update_position()
+
+    def _collect_headings(self) -> None:
+        """組版済みの文書から見出しを拾う。見た目と目次を必ず一致させるため、生の
+        テキストではなく QTextDocument の blockFormat().headingLevel() を見る。"""
+        self._headings = []
+        self._tops = []
+        document = self.view.document()
+        block = document.begin()
+        while block.isValid():
+            level = block.blockFormat().headingLevel()
+            if level in (1, 2):
+                text = block.text().strip()
+                if text:
+                    if level == 1:
+                        self._tops.append(len(self._headings))
+                    self._headings.append((level, text, block.position()))
+            block = block.next()
+
+    # ---------------------------------------------------------------
+    # 目次 / カンペ一覧(同じ場所に切り替えて出す)
+    # ---------------------------------------------------------------
+    def _rebuild_side(self) -> None:
+        try:
+            self.side.clear()
+            if self._side_mode == "toc":
+                for index, (level, text, _position) in enumerate(self._headings):
+                    # ## は字下げして並べる。見出しの深さは目次の並びでしか分からない。
+                    item = QListWidgetItem(("　" if level == 2 else "") + text)
+                    item.setData(Qt.UserRole, index)
+                    self.side.addItem(item)
+            elif self._side_mode == "files":
+                for name in mirror_notes.list_notes():
+                    item = QListWidgetItem(name)
+                    item.setData(Qt.UserRole, name)
+                    self.side.addItem(item)
+                    if name == self._name:
+                        self.side.setCurrentItem(item)
+            self.side.setVisible(bool(self._side_mode) and self.side.count() > 0)
+            if self._side_mode and self.side.count() == 0:
+                self._set_status(
+                    "見出し（#）がありません" if self._side_mode == "toc"
+                    else "notes フォルダにカンペがありません"
+                )
+        except Exception:
+            _guard("カンペの目次の更新", notify=False)
+
+    def _set_side_mode(self, mode: str) -> None:
+        self._side_mode = "" if self._side_mode == mode else mode
+        self.toc_button.setChecked(self._side_mode == "toc")
+        self.list_button.setChecked(self._side_mode == "files")
+        self._rebuild_side()
+
+    def _toggle_toc(self) -> None:
+        self._set_side_mode("toc")
+
+    def _toggle_files(self) -> None:
+        self._set_side_mode("files")
+
+    def _on_side_clicked(self, item) -> None:
+        try:
+            if item is None:
+                return
+            data = item.data(Qt.UserRole)
+            if self._side_mode == "toc":
+                self.jump_to_heading(int(data))
+                return
+            if self._side_mode == "files" and isinstance(data, str):
+                self.load(data)
+                # 選んだら一覧は畳む。読むために開いたパネルなので、本文の場所を
+                # 一覧に占領されたままにしない。
+                self._side_mode = ""
+                self.list_button.setChecked(False)
+                self.toc_button.setChecked(False)
+                self._rebuild_side()
+                self._notify_state()
+        except Exception:
+            _guard("カンペの選択", notify=False)
+
+    # ---------------------------------------------------------------
+    # 見出しの移動
+    # ---------------------------------------------------------------
+    def _invalidate_tops(self, *args) -> None:
+        self._top_cache = None
+
+    def _heading_tops(self) -> list:
+        """見出しの画面上の高さ(文書座標)。レイアウトが変わるまで使い回す。"""
+        if self._top_cache is None:
+            document = self.view.document()
+            layout = document.documentLayout()
+            cache = []
+            for _level, _text, position in self._headings:
+                block = document.findBlock(position)
+                cache.append(
+                    float(layout.blockBoundingRect(block).top()) if block.isValid() else 0.0
+                )
+            self._top_cache = cache
+        return self._top_cache
+
+    def jump_to_heading(self, index: int) -> None:
+        """見出しを本文の一番上に持ってくる。"""
+        try:
+            if not (0 <= index < len(self._headings)):
+                return
+            position = self._headings[index][2]
+            cursor = QTextCursor(self.view.document())
+            cursor.setPosition(position)
+            # 先にカーソルを置く(ensureCursorVisible が走る)。その後で改めてスクロール
+            # 位置を決めるので、見出しは必ず一番上に来る。
+            self.view.setTextCursor(cursor)
+            tops = self._heading_tops()
+            if index < len(tops):
+                self.view.verticalScrollBar().setValue(int(round(tops[index])))
+            self._current = index
+            self._update_position()
+        except Exception:
+            _guard("カンペのジャンプ", notify=False)
+
+    def section_order(self) -> int:
+        """いま見ている「#」の章の並び順(0起点)。最初の章より上なら -1。
+
+        範囲を動かすとこのパネルは作り直される(置ける場所が位置ごとに変わるため)。
+        作り直したあとに読んでいた場所へ戻すために、呼び元がこれを控えておく。"""
+        return self._current_top_order()
+
+    def restore_section(self, order: int) -> None:
+        """section_order() で控えた章へ戻す。
+
+        黙って先頭へ戻ると、範囲をちょっと動かしただけでどこを話していたか見失う。"""
+        try:
+            if 0 <= order < len(self._tops):
+                self.jump_to_heading(self._tops[order])
+        except Exception:
+            _guard("カンペの位置の復元", notify=False)
+
+    def _current_top_order(self) -> int:
+        """いま見ている場所が「#」の何番目の章か(0起点)。最初の章より上なら -1。"""
+        order = -1
+        for position, index in enumerate(self._tops):
+            if index <= self._current:
+                order = position
+            else:
+                break
+        return order
+
+    def step_section(self, delta: int) -> None:
+        """前後の「#」へ移る。端では止まる(丸めて先頭へ戻ったりはしない——発表中に
+        意図せず最初へ飛ぶと、どこを話していたか見失う)。"""
+        try:
+            if not self._tops:
+                return
+            order = min(max(self._current_top_order() + delta, 0), len(self._tops) - 1)
+            self.jump_to_heading(self._tops[order])
+        except Exception:
+            _guard("カンペの章の移動", notify=False)
+
+    def _on_scrolled(self, value) -> None:
+        """手でスクロールされたときも「いま何番目か」を合わせる。"""
+        try:
+            tops = self._heading_tops()
+            current = -1
+            for index, top in enumerate(tops):
+                # 1画素の丸めで1つ手前に居ることになるのを防ぐ余裕。
+                if top <= value + 2:
+                    current = index
+                else:
+                    break
+            if current != self._current:
+                self._current = current
+                self._update_position()
+        except Exception:
+            _guard("カンペの現在位置の更新", notify=False)
+
+    def _update_position(self) -> None:
+        """「2/3 見出し」を出す。いま何番目のセクションを見ているかが分かるように。"""
+        if not self._tops:
+            self._position_text = "見出し（#）なし" if self._headings else ""
+        else:
+            order = self._current_top_order()
+            number = order + 1 if order >= 0 else 0
+            label = ""
+            if 0 <= self._current < len(self._headings):
+                level, text, _position = self._headings[self._current]
+                label = ("## " if level == 2 else "# ") + text
+            self._position_text = f"{number}/{len(self._tops)}　{label}".rstrip()
+        self._draw_position()
+
+    def _draw_position(self) -> None:
+        metrics = QFontMetrics(self.position.font())
+        width = max(self.position.width(), 40)
+        self.position.setText(metrics.elidedText(self._position_text, Qt.ElideRight, width))
+
+    def _set_status(self, text: str) -> None:
+        self.status.setText(text or "")
+        self.status.setVisible(bool(text))
+
+    # ---------------------------------------------------------------
+    # 文字の大きさ
+    # ---------------------------------------------------------------
+    def font_size(self) -> int:
+        return self._font_size
+
+    def zoom(self, steps: int) -> None:
+        self.set_font_size(self._font_size + int(steps))
+
+    def set_font_size(self, size: int, notify: bool = True) -> None:
+        """本文の文字の大きさを変える。見出しは Markdown の比率のまま一緒に伸び縮みする
+        (既定フォントを差し替えるだけで、文字ごとの指定は書き換えない)。"""
+        try:
+            size = _clamp_notes_font(size)
+            if size == self._font_size:
+                return
+            self._font_size = size
+            self._apply_font()
+            if notify:
+                self._notify_state()
+        except Exception:
+            _guard("カンペの文字の大きさ", notify=False)
+
+    def _apply_font(self) -> None:
+        self.view.document().setDefaultFont(QFont(NOTES_FONT_FAMILY, self._font_size))
+        self._invalidate_tops()
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Wheel and obj is self.view.viewport():
+                if event.modifiers() & Qt.ControlModifier:
+                    steps = event.angleDelta().y() / 120.0
+                    if steps:
+                        self.zoom(1 if steps > 0 else -1)
+                    return True
+        except Exception:
+            _guard("カンペのホイール操作", notify=False)
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self._invalidate_tops()
+            self._draw_position()
+        except Exception:
+            _guard("カンペの再配置", notify=False)
+
+    # ---------------------------------------------------------------
+    # ファイルを触る
+    # ---------------------------------------------------------------
+    def _on_edit(self) -> None:
+        """既定のエディタで開く。カンペが1つも無ければ作ってから開く。
+
+        外部プログラムを起こす経路なので必ず受ける(関連付けが無ければ例外が飛ぶ。
+        mirror_notes 側でメモ帳へ落とすところまで面倒を見ている)。"""
+        try:
+            path = mirror_notes.open_in_editor(self._name)
+            if path is None:
+                self._set_status("エディタで開けませんでした")
+                return
+            self._set_status(f"編集中: {path.name}（直したら「再読込」）")
+            if not self._name:
+                # 作られたばかり。名前を引き直して、そのまま読めるようにする。
+                self.load(path.stem)
+                self._notify_state()
+        except Exception:
+            _guard("カンペの編集", notify=False)
+
+    def _on_folder(self) -> None:
+        try:
+            if mirror_notes.open_folder() is None:
+                self._set_status("notes フォルダを開けませんでした")
+        except Exception:
+            _guard("カンペのフォルダを開く", notify=False)
+
+    def _notify_state(self) -> None:
+        if self._on_state is None:
+            return
+        try:
+            self._on_state(self._name, self._font_size)
+        except Exception:
+            _guard("カンペの状態の通知", notify=False)
 
 
 # ---------------------------------------------------------------
@@ -1992,6 +2626,7 @@ class MirrorController:
         self._mirror = None        # ミラー先の窓
         self._frame = None         # 手元の枠
         self._toolbar = None       # 手元のツールバー
+        self._notes = None         # 手元のカンペ(発表者だけが見るメモ)
         # 「ミラーを続けたまま範囲だけ選び直している」最中か。選び終えたときの行き先
         # (新規に始めるのか、今の窓の範囲を差し替えるのか)がこれで決まる。
         self._reselecting = False
@@ -2010,12 +2645,28 @@ class MirrorController:
         # 発表ごとに選び直す性質の値で、残すほどのものではない)。
         self.aspect = str(mirror_config(app_settings).get("aspect") or DEFAULT_ASPECT)
 
+        # カンペを出すかどうか。既定は設定 notes(既定 True)。ツールバーの「カンペ」で
+        # 切り替えたぶんは、その起動の間だけ覚える(比率と同じ扱い。発表ごとに要否が
+        # 変わる性質の値で、押すたびに settings.json を書きに行くほどのものではない)。
+        cfg = mirror_config(app_settings)
+        self._notes_wanted = bool(cfg.get("notes", DEFAULT_NOTES))
+        # どのカンペを開いていたか / 何ポイントで読んでいたか。こちらは設定に残す
+        # (次の発表でも同じものを同じ大きさで開きたい。毎回選び直す性質の値ではない)。
+        self._notes_name = str(cfg.get("notes_file") or "")
+        self._notes_font_size = _clamp_notes_font(cfg.get("notes_font_size"))
+
         # スポットライトの調整を settings.json へ書き戻すのを遅らせるためのタイマー。
         # ホイールは1回転で何目盛りも飛んでくるので、そのたびに書くとファイルを何十回も
         # 開き直すことになる(SPOTLIGHT_SAVE_DELAY_MS)。
         self._spot_save_timer = QTimer()
         self._spot_save_timer.setSingleShot(True)
         self._spot_save_timer.timeout.connect(self._flush_spotlight)
+
+        # カンペの状態(開いていたファイル・文字の大きさ)の書き戻しも同じ理由で遅らせる。
+        # Ctrl+ホイールは1回転で何目盛りも飛んでくる。
+        self._notes_save_timer = QTimer()
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.timeout.connect(self._flush_notes)
 
     def attach_screen_cover(self, callback) -> None:
         """「いまミラー窓が覆っている画面の名前」を知らせる先を受け取る。
@@ -2340,14 +2991,18 @@ class MirrorController:
         return True
 
     # ---------------------------------------------------------------
-    # 手元の枠とツールバー
+    # 手元の枠とツールバーとカンペ
     # ---------------------------------------------------------------
     def _show_frame(self, source_rect: QRect) -> None:
-        """手元の枠とツールバーを、この範囲に合わせて出し直す。
+        """手元の枠・ツールバー・カンペを、この範囲に合わせて出し直す。
 
-        動かさずに作り直すのは、どちらも「範囲の外側のどこに置けるか」を作るときに
-        決めているため(枠は帯を上に置けるか、ツールバーは下に収まるか)。範囲が変われば
-        その答えも変わるので、位置だけ動かしても正しくならない。"""
+        動かさずに作り直すのは、どれも「範囲の外側のどこに置けるか」を作るときに
+        決めているため(枠は帯を上に置けるか、ツールバーは下に収まるか、カンペは右に
+        入るか)。範囲が変わればその答えも変わるので、位置だけ動かしても正しくならない。
+
+        作り直すぶん、カンペの「どこまで読んでいたか」だけは持ち越す。範囲をドラッグで
+        少し動かしただけで先頭へ戻ると、発表中にどこを話していたか見失う。"""
+        notes_section = self._notes.section_order() if self._notes is not None else -1
         self._hide_frame()
         if self._mirror is None:
             return
@@ -2369,6 +3024,7 @@ class MirrorController:
                 self._frame = None
                 _guard("手元の枠の表示", notify=False)
 
+        toolbar_rect = QRect()
         if bool(cfg.get("toolbar", DEFAULT_TOOLBAR)):
             try:
                 geometry = toolbar_geometry(anchor, source_rect)
@@ -2386,13 +3042,42 @@ class MirrorController:
                         move_end=self.end_move,
                     )
                     self._toolbar.show()
+                    toolbar_rect = QRect(geometry)
             except Exception:
                 self._toolbar = None
                 _guard("ツールバーの表示", notify=False)
 
+        # カンペは最後。ツールバーの場所が決まってからでないと、そこを避けられない。
+        if self._notes_wanted and bool(cfg.get("notes", DEFAULT_NOTES)):
+            try:
+                geometry = notes_geometry(
+                    anchor,
+                    source_rect,
+                    _as_int(cfg.get("notes_width"), DEFAULT_NOTES_WIDTH),
+                    avoid=(toolbar_rect, QRect(self._mirror.geometry())),
+                )
+                if geometry is None:
+                    # 撮影範囲(かツールバー、かミラー先)に掛からずに置ける場所が無かった。
+                    # カンペは発表者だけが見るものなので、掛けるくらいなら出さない。
+                    self.notify(
+                        "カンペを置く場所がありません\n範囲の左右に余白がある位置を選んでください"
+                    )
+                else:
+                    self._notes = MirrorNotesWindow(
+                        geometry,
+                        self._notes_name,
+                        self._notes_font_size,
+                        on_state=self._on_notes_state,
+                    )
+                    self._notes.show()
+                    self._notes.restore_section(notes_section)
+            except Exception:
+                self._notes = None
+                _guard("カンペの表示", notify=False)
+
     def _hide_frame(self) -> None:
-        """枠とツールバーを畳む。ミラーはそのまま。"""
-        for name in ("_toolbar", "_frame"):
+        """枠・ツールバー・カンペを畳む。ミラーはそのまま。"""
+        for name in ("_notes", "_toolbar", "_frame"):
             window = getattr(self, name, None)
             setattr(self, name, None)
             if window is None:
@@ -2412,6 +3097,7 @@ class MirrorController:
             "spotlight": lambda: self.toggle_presenter("spotlight"),
             "black": lambda: self.toggle_presenter("black"),
             "white": lambda: self.toggle_presenter("white"),
+            "notes": self.toggle_notes,
             "freeze": self.toggle_freeze,
             "reselect": self.start_reselect,
             "stop": self.stop,
@@ -2421,18 +3107,20 @@ class MirrorController:
         """そのアイコンが今点いているか。"""
         if key == "freeze":
             return self.is_frozen()
+        if key == "notes":
+            return self.is_notes_open()
         if key in ("laser", "spotlight", "black", "white"):
             return self.is_presenter_on(key)
         return False
 
     def stop(self) -> None:
-        """ミラーも枠もツールバーも選択も畳む。終了時の後始末からも呼ぶ。"""
+        """ミラーも枠もツールバーもカンペも選択も畳む。終了時の後始末からも呼ぶ。"""
         self._reselecting = False
         self._close_selection()
         # 先に知らせる。ミラー窓を畳んでからだと、タスクバーウィジェットが戻るまでの
         # 間に「誰も居ない画面」ができる。
         self._set_covered_screen(None)
-        for name in ("_toolbar", "_frame", "_mirror"):
+        for name in ("_notes", "_toolbar", "_frame", "_mirror"):
             window = getattr(self, name, None)
             setattr(self, name, None)
             if window is None:
@@ -2542,6 +3230,58 @@ class MirrorController:
 
     def toggle_freeze(self) -> bool:
         return self.set_freeze(not self.is_frozen())
+
+    # ---------------------------------------------------------------
+    # カンペ(発表者だけが見るメモ)
+    #
+    # 共有側には何も出ない・何も変わらない。ここで作る窓は撮影範囲の外にしか置かない
+    # (notes_geometry。置けなければ出さない)ので、押しても向こうの絵は1画素も動かない。
+    # ---------------------------------------------------------------
+    def is_notes_open(self) -> bool:
+        return self._notes is not None
+
+    def toggle_notes(self) -> bool:
+        """カンペのパネルを出す/畳む。戻り値は切り替え後の状態。
+
+        枠とツールバーごと作り直すのは _show_frame の作法に従うため(置ける場所は
+        範囲ごとに決まるので、位置だけ動かしても正しくならない)。ツールバーの押した
+        場所からは QTimer 越しに呼ばれるので、ここで自分を作り直しても問題ない。"""
+        try:
+            if self._mirror is None:
+                return False
+            self._notes_wanted = not self.is_notes_open()
+            self._show_frame(self._mirror.source_rect)
+            return self.is_notes_open()
+        except Exception:
+            _guard("カンペの切り替え", notify=False)
+            return self.is_notes_open()
+
+    def _on_notes_state(self, name: str, font_size: int) -> None:
+        """カンペ側で「別のファイルを選んだ」「文字の大きさを変えた」ときに呼ばれる。
+
+        すぐ効かせて、書き戻しは遅らせる(Ctrl+ホイールは目盛りが連続で飛んでくる。
+        adjust_spotlight と同じ作法)。"""
+        try:
+            self._notes_name = str(name or "")
+            self._notes_font_size = _clamp_notes_font(font_size)
+            section = self.app_settings.setdefault("screen_mirror", {})
+            section["notes_file"] = self._notes_name
+            section["notes_font_size"] = self._notes_font_size
+            self._notes_save_timer.start(NOTES_SAVE_DELAY_MS)
+        except Exception:
+            _guard("カンペの状態の記録", notify=False)
+
+    def _flush_notes(self) -> None:
+        """遅らせておいた書き戻し。タイマーのスロットなので必ず try で受ける。"""
+        try:
+            self._save_keys(
+                {
+                    "notes_file": self._notes_name,
+                    "notes_font_size": self._notes_font_size,
+                }
+            )
+        except Exception:
+            _guard("カンペの設定の保存", notify=False)
 
     # ---------------------------------------------------------------
     # スポットライトの調整(発表中にその場で変える)
@@ -2684,10 +3424,14 @@ class MirrorController:
                 moved = base.translated(candidate[0], candidate[1])
                 if fits(moved):
                     self._mirror.move_source_rect(moved)
-                    if self._frame is not None:
-                        self._frame.move(
-                            self._frame.x() + candidate[0], self._frame.y() + candidate[1]
-                        )
+                    # 枠とカンペは平行移動で追わせる。作り直すのは離したとき(end_move)
+                    # ——置ける場所の答えは位置ごとに変わるが、掴んでいる間に窓を作り
+                    # 直すとドラッグが切れる。
+                    for window in (self._frame, self._notes):
+                        if window is not None:
+                            window.move(
+                                window.x() + candidate[0], window.y() + candidate[1]
+                            )
                     return candidate
             return (0, 0)
         except Exception:

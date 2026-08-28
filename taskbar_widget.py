@@ -809,6 +809,13 @@ class TaskbarWidget(QWidget):
             notches = event.angleDelta().y()
             if not notches:
                 return
+            # ランチャのパネルが出ているなら、その隣の音量バーへ回す。あちらは
+            # 目盛りを持っていて見た目も動くので、二重に音量を触らないこと。
+            bar = getattr(self._launcher, "_volume", None)
+            if bar is not None and bar.isVisible():
+                bar.nudge(1 if notches > 0 else -1)
+                event.accept()
+                return
             self._volume_steps += 1 if notches > 0 else -1
             self._volume_timer.start(VOLUME_APPLY_DELAY_MS)
             event.accept()
@@ -821,6 +828,8 @@ class TaskbarWidget(QWidget):
             steps, self._volume_steps = self._volume_steps, 0
             if not steps or self._audio is None:
                 return
+            # バーが出ていないとき(パネルを開かずにホイールした)だけここへ来る。
+            # 見た目の手がかりが無いので、そのときはトーストで知らせる。
             level = self._audio.step_volume(steps > 0, abs(steps))
             if level is None:
                 return

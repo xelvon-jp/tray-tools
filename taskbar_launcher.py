@@ -24,7 +24,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QFontMetrics, QGuiApplication, QPainter, QPixmap
+from PySide6.QtGui import (
+    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPixmap,
+)
 from PySide6.QtWidgets import QWidget
 
 import window_tools
@@ -41,6 +43,19 @@ DEFAULT_ITEM_SIZE = 36
 # ツールチップをパネルの横に出すときの、文字幅への足し分と隙間(論理px)。
 # 内側の余白は環境で変わるので実測せず、少し多めに見ておく。
 # 名前を出す小窓の内側の余白と、パネルとの隙間(論理px)。
+# 音量バー(パネルの右隣)。数値の高さ・溝の太さ・つまみの大きさ・全体の幅(論理px)。
+VOLUME_WIDTH = 34
+VOLUME_LABEL_HEIGHT = 22
+VOLUME_LABEL_SIZE = 12
+VOLUME_TRACK_WIDTH = 6
+VOLUME_KNOB_SIZE = 14
+VOLUME_PADDING = 8
+VOLUME_GAP = 4
+VOLUME_ACCENT = "#2f6fed"
+# 値を触ってから実際に音量を送るまでの待ち(ms)。COM越しで1回20msかかるので、
+# ドラッグやホイールのたびに送ると引っかかる。
+VOLUME_APPLY_DELAY_MS = 80
+
 LABEL_PADDING_X = 8
 LABEL_PADDING_Y = 3
 LABEL_GAP = 6
@@ -478,6 +493,187 @@ def _blend(color: QColor, other: QColor, ratio: float) -> QColor:
     )
 
 
+class VolumeBar(QWidget):
+    """パネルの右隣に出る縦の音量バー。
+
+    ホイールで音量を変えたとき、いくつになったかが目で分かるようにするためのもの。
+    以前はトーストで「音量 47%」と出していたが、パネルが手前に居るので隠れて読めなかった。
+
+    つまみは上下にドラッグできる。設定は SetMasterVolumeLevelScalar で直に行う
+    (VolumeStepUp だと Windows 標準の音量OSDが出て、このバーと二重になる)。
+
+    音量の読み取りはCOM越しで1回20msかかるので、描くたびには読まない。開いたときに
+    1回読み、あとは自分で持っている値を動かして、実際の反映だけを向こうへ送る。"""
+
+    def __init__(self, audio_feature):
+        super().__init__()
+        self._audio = audio_feature
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._level = 0.0
+        self._muted = False
+        self._dragging = False
+        self._background = QColor("#202020")
+        self._foreground = QColor("#ffffff")
+        self._border = QColor("#606060")
+        self._accent = QColor(VOLUME_ACCENT)
+        # 実際に音量を送るのは少し待ってから。ドラッグもホイールも値が連続で飛んでくる
+        # ので、そのつどCOMを叩くと引っかかる(1回20ms)。
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.timeout.connect(self._apply)
+
+    def apply_colors(self, background: QColor, foreground: QColor, border: QColor) -> None:
+        self._background = QColor(background)
+        self._foreground = QColor(foreground)
+        self._border = QColor(border)
+        self.update()
+
+    def refresh_from_device(self) -> bool:
+        """いまの音量を読み直す。読めなければ False(呼ぶ側は出すのをやめる)。"""
+        if self._audio is None:
+            return False
+        try:
+            level, muted = self._audio.volume_state()
+        except Exception:
+            _guard("音量の取得", notify=False)
+            return False
+        if level is None:
+            return False
+        self._level, self._muted = float(level), bool(muted)
+        return True
+
+    def show_at(self, rect: QRect) -> None:
+        self.setGeometry(rect)
+        self.show()
+        self.raise_()
+
+    # ---------------------------------------------------------------
+    # 値の操作
+    # ---------------------------------------------------------------
+    def nudge(self, steps: int) -> None:
+        """ホイール1目盛りぶん動かす。Windowsの段階数に合わせる。"""
+        try:
+            step = self._audio.volume_step() if self._audio else 0.02
+        except Exception:
+            step = 0.02
+        self._set_level(self._level + step * steps)
+
+    def _set_level(self, level: float) -> None:
+        self._level = max(0.0, min(1.0, float(level)))
+        self.update()                      # 先に見た目を動かす(手応えを遅らせない)
+        self._apply_timer.start(VOLUME_APPLY_DELAY_MS)
+
+    def _apply(self) -> None:
+        try:
+            if self._audio is not None:
+                self._audio.set_volume(self._level)
+        except Exception:
+            _guard("音量の変更", notify=False)
+
+    def _level_at(self, y: int) -> float:
+        """バーの中の縦位置を音量に直す。上が最大。"""
+        track = self._track_rect()
+        if track.height() <= 1:
+            return self._level
+        ratio = (track.bottom() - y) / float(track.height() - 1)
+        return max(0.0, min(1.0, ratio))
+
+    # ---------------------------------------------------------------
+    # マウス
+    # ---------------------------------------------------------------
+    def mousePressEvent(self, event):
+        try:
+            if event.button() != Qt.LeftButton:
+                return
+            self._dragging = True
+            self._set_level(self._level_at(event.position().toPoint().y()))
+        except Exception:
+            _guard("音量バーの操作", notify=False)
+
+    def mouseMoveEvent(self, event):
+        try:
+            if self._dragging:
+                self._set_level(self._level_at(event.position().toPoint().y()))
+        except Exception:
+            _guard("音量バーの操作", notify=False)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+
+    def wheelEvent(self, event):
+        try:
+            notches = event.angleDelta().y()
+            if notches:
+                self.nudge(1 if notches > 0 else -1)
+                event.accept()
+        except Exception:
+            _guard("音量バーの操作", notify=False)
+
+    # ---------------------------------------------------------------
+    # 描画
+    # ---------------------------------------------------------------
+    def _track_rect(self) -> QRect:
+        """バーの溝。上に数値を出すぶんだけ空ける。"""
+        return QRect(
+            (self.width() - VOLUME_TRACK_WIDTH) // 2,
+            VOLUME_LABEL_HEIGHT,
+            VOLUME_TRACK_WIDTH,
+            max(self.height() - VOLUME_LABEL_HEIGHT - VOLUME_PADDING, 1),
+        )
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.fillRect(self.rect(), self._background)
+            painter.setPen(self._border)
+            painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+            # 数値。ミュート中はそれと分かるようにする。
+            font = QFont(self.font())
+            font.setPixelSize(VOLUME_LABEL_SIZE)
+            painter.setFont(font)
+            painter.setPen(self._foreground)
+            text = "×" if self._muted else str(round(self._level * 100))
+            painter.drawText(
+                QRect(0, 0, self.width(), VOLUME_LABEL_HEIGHT), Qt.AlignCenter, text
+            )
+
+            track = self._track_rect()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(_blend(self._background, self._foreground, 0.25))
+            painter.drawRoundedRect(track, VOLUME_TRACK_WIDTH / 2, VOLUME_TRACK_WIDTH / 2)
+
+            # 溜まっているぶん。ミュート中は色を落として「効いていない」を見せる。
+            filled_height = int(track.height() * self._level)
+            if filled_height > 0:
+                filled = QRect(
+                    track.x(), track.bottom() - filled_height + 1,
+                    track.width(), filled_height,
+                )
+                painter.setBrush(
+                    _blend(self._background, self._foreground, 0.35)
+                    if self._muted else self._accent
+                )
+                painter.drawRoundedRect(filled, VOLUME_TRACK_WIDTH / 2, VOLUME_TRACK_WIDTH / 2)
+
+            # つまみ。掴む場所が分かるよう溝より太くする。
+            center_y = track.bottom() - int((track.height() - 1) * self._level)
+            knob = QRect(0, 0, VOLUME_KNOB_SIZE, VOLUME_KNOB_SIZE)
+            knob.moveCenter(QPoint(track.center().x(), center_y))
+            painter.setBrush(_blend(self._background, self._foreground, 0.5) if self._muted else self._accent)
+            painter.setPen(self._border)
+            painter.drawEllipse(knob)
+        except Exception:
+            _guard("音量バーの描画", notify=False)
+
+
 class ItemLabel(QWidget):
     """項目の名前を出す小窓。
 
@@ -568,6 +764,8 @@ class LauncherPanel(QWidget):
         self._hover_index = -1
         # 名前を出す小窓。参照を持たないとGCで消えるのでここで掴んでおく。
         self._label = ItemLabel()
+        # 音量バー。パネルの右隣に並べる。参照を持たないとGCで消える。
+        self._volume = VolumeBar(audio_feature)
         self._background = QColor("#202020")
         self._highlight = QColor("#3a3a3a")
         self._border = QColor("#606060")
@@ -634,14 +832,17 @@ class LauncherPanel(QWidget):
 
         width = self._item_size + PANEL_PADDING * 2
         height = self._item_size * len(keys) + PANEL_PADDING * 2
-        self.setGeometry(self._place(width, height))
+        panel_rect = self._place(width, height)
+        self.setGeometry(panel_rect)
         self.show()
+        self._show_volume(panel_rect)
 
     def close_panel(self) -> None:
         """畳む。カーソルがどこにあっても閉じる(判断は呼ぶ側が済ませている)。"""
         self._close_timer.stop()
         self._hover_index = -1
         self._label.hide()
+        self._volume.hide()
         if self.isVisible():
             self.hide()
         # 本体は「パネルが開いている間はアイコンのまま」にしているので、閉じたことを
@@ -671,6 +872,10 @@ class LauncherPanel(QWidget):
         pos = QCursor.pos()
         if self.isVisible() and self.geometry().contains(pos):
             return True
+        # 音量バーも「乗っている窓」に数える。数え忘れると、バーを掴もうとした瞬間に
+        # パネルごと畳まれて操作できない。
+        if self._volume.isVisible() and self._volume.geometry().contains(pos):
+            return True
         return bool(self._widget.isVisible() and self._widget.geometry().contains(pos))
 
     # ---------------------------------------------------------------
@@ -685,7 +890,9 @@ class LauncherPanel(QWidget):
         少なくとも全部の項目が見えて押せる。押し戻した結果まれに本体と重なることはあるが、
         そのときも「見えていて押せる」ほうを採る。"""
         anchor = self._widget.geometry()
-        x = anchor.center().x() - width // 2
+        # 本体の左半分(Raptureのアイコン側)の真上にそろえる。右隣に音量バーを並べる
+        # ぶん、中央そろえのままだとバーが本体からはみ出して見え方が釣り合わない。
+        x = anchor.left() + anchor.width() // 4 - width // 2
         y = anchor.top() - height
 
         bounds = _screen_bounds(anchor)
@@ -716,6 +923,32 @@ class LauncherPanel(QWidget):
         except Exception:
             _guard("最前面への押し上げ", notify=False)
 
+    def _show_volume(self, panel_rect: QRect) -> None:
+        """パネルの右隣に音量バーを出す。音量が読めなければ出さない。
+
+        読めない環境(出力デバイスが無い等)でバーだけ出しても操作できないので、
+        その場合はパネルだけにする。"""
+        try:
+            if not self._volume.refresh_from_device():
+                self._volume.hide()
+                return
+            rect = QRect(
+                panel_rect.right() + 1 + VOLUME_GAP,
+                panel_rect.top(),
+                VOLUME_WIDTH,
+                panel_rect.height(),
+            )
+            bounds = _screen_bounds(panel_rect)
+            if not bounds.isEmpty() and rect.right() >= bounds.right():
+                # 右に入らないときは左隣へ回す。それも無理なら出さない。
+                rect.moveLeft(panel_rect.left() - VOLUME_GAP - VOLUME_WIDTH)
+                if rect.left() < bounds.left():
+                    self._volume.hide()
+                    return
+            self._volume.show_at(rect)
+        except Exception:
+            _guard("音量バーの表示", notify=False)
+
     def refresh_colors(self) -> None:
         """本体が使っている色に合わせる。
 
@@ -737,6 +970,7 @@ class LauncherPanel(QWidget):
         self._highlight = _blend(self._background, other, ratio)
         self._border = _blend(self._background, QColor(text), BORDER_RATIO)
         self._label.apply_colors(self._background, QColor(text), self._border)
+        self._volume.apply_colors(self._background, QColor(text), self._border)
         self.update()
 
     def notify_audio_changed(self) -> None:

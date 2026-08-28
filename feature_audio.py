@@ -112,6 +112,40 @@ def _step_volume(up: bool, steps: int = 1) -> bool:
         return False
 
 
+def _set_volume(level: float) -> bool:
+    """音量を 0.0〜1.0 で直に設定する。
+
+    VolumeStepUp/Down ではなくこちらを使うのは、あちらが Windows 標準の音量OSD
+    (画面の中央あたりに出るバー)を表示させるため。自前のバーを出す以上、同じものが
+    二重に出ては鬱陶しい。直に設定する経路ならOSDは出ない。
+
+    刻み幅は呼ぶ側が決める(_volume_step を参照)。COMオブジェクトはこの関数の外へ
+    出さない。持ち出すと親が先に解放され、解放済みのメモリを触って落ちる。"""
+    try:
+        _ensure_com_initialized()
+        endpoint = AudioUtilities.GetSpeakers().EndpointVolume
+        endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, float(level))), None)
+        return True
+    except _AUDIO_ERRORS:
+        return False
+
+
+def _volume_step() -> float:
+    """音量1目盛りぶんの大きさ(0.0〜1.0)。取れなければ 1/50。
+
+    Windows が持っている段階数から割り出す。こうしておくと、音量キーを押したときや
+    メディアキーと同じ刻みで動く(この環境では51段階)。"""
+    try:
+        _ensure_com_initialized()
+        endpoint = AudioUtilities.GetSpeakers().EndpointVolume
+        _current, total = endpoint.GetVolumeStepInfo()
+        if total and total > 1:
+            return 1.0 / (total - 1)
+    except _AUDIO_ERRORS:
+        pass
+    return 1.0 / 50
+
+
 def _current_volume():
     """(音量0.0〜1.0, ミュートか)。取れなければ (None, None)。
 
@@ -749,16 +783,36 @@ class AudioFeature:
             self._refresh()
         return self._icon_pixmap
 
+    def volume_state(self):
+        """(音量0.0〜1.0, ミュートか)。取れなければ (None, None)。
+
+        COM越しで1回20msほどかかるので、毎フレーム呼ばないこと。"""
+        return _current_volume()
+
+    def volume_step(self) -> float:
+        """音量1目盛りぶん(0.0〜1.0)。Windowsの段階数に合わせる。"""
+        return _volume_step()
+
+    def set_volume(self, level: float):
+        """音量を直に設定して、設定後の値を返す(失敗したら None)。
+
+        タスクバーウィジェットの音量バーから呼ばれる。VolumeStepUp を使わないのは
+        Windows標準の音量OSDが出てしまうため(_set_volume のコメント参照)。"""
+        if not _set_volume(level):
+            return None
+        return max(0.0, min(1.0, float(level)))
+
     def step_volume(self, up: bool, steps: int = 1):
         """音量を上下させて、いまの音量を返す(取れなければ None)。
 
         タスクバーウィジェットの音声アイコンでホイールを回したときに呼ばれる。
         トレイアイコン側では受けられない(QSystemTrayIcon は QWidget ではないので
         wheelEvent を持たず、Windowsもトレイへホイールを転送しない)。"""
-        if not _step_volume(up, steps):
-            return None
         level, _muted = _current_volume()
-        return level
+        if level is None:
+            return None
+        target = level + _volume_step() * (steps if up else -steps)
+        return self.set_volume(target)
 
     def do_toggle(self):
         """現在のデバイスの次の要素へ切り替える(末尾なら先頭へ循環)。3台以上でも動く。"""

@@ -8,6 +8,12 @@
 # 選択ウインドウ自体は picker.PickerWindow に切り出してある(フォルダブックマークと共用)。
 # ここに残っているのは「テンプレートの読み込み」「変数の展開」「テンプレートファイルの
 # 新規作成・編集を外部エディタに投げる部分」だけ。
+#
+# この窓にはもう1種類の項目が乗る。クリップボードに HTML Format が載っているときだけ
+# 現れる「書式を落とす」で、中身は clipboard_format.py が持つ。窓を増やさずに済ませたい
+# (Ctrl+Alt+V で開くこの一覧が、クリップボードを触りに来る唯一の入口であってほしい)ため
+# ここへ相乗りさせている。項目のデータは (種類, 中身) のタプルで、種類は "snippet" か
+# "format"。
 import json
 import locale
 import os
@@ -19,6 +25,7 @@ from pathlib import Path
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QInputDialog
 
+import clipboard_format
 import settings as settings_module
 from picker import PickerWindow
 from toast import show_toast
@@ -54,6 +61,17 @@ HINT = (
     "{clipboard} クリップボード　{date} 日付　{time} 時刻　{datetime} 日時\n"
     "{date:%Y-%m-%d} 書式指定　{input:ラベル} 実行時に入力"
 )
+
+# クリップボードに HTML Format が載っているときだけ足す行。
+FORMAT_HINT = "📋 の項目はクリップボードの書式を落とします（貼り付けはしません。自分で Ctrl+V）"
+
+# 書式を落とす項目の表示名の頭。絞り込みは前方一致なので、この頭文字を打たない限り
+# 何か文字を入れた時点で一覧から消える(定型文を探しているときに邪魔をしない)。
+FORMAT_PREFIX = "📋 書式を落とす"
+
+# 項目データの種類
+KIND_SNIPPET = "snippet"
+KIND_FORMAT = "format"
 
 # ロケール設定は1回で足りる。プロセス全体に効く操作なので、日時を実際に使うまで遅らせる。
 _locale_ready = False
@@ -294,15 +312,43 @@ def expand_variables(text: str, parent=None, preview: bool = False):
     return "".join(result)
 
 
+def format_items() -> list:
+    """「書式を落とす」の項目を [(表示名, (種類, 段階)), ...] で返す。
+
+    クリップボードに HTML Format が載っていないときは空リスト。関係ないときに
+    一覧を占領させないため、出す・出さないはここで決める(読むだけでクリップボードの
+    中身は変えない)。"""
+    try:
+        if not clipboard_format.clipboard_has_html():
+            return []
+        return [
+            (f"{FORMAT_PREFIX}（{label}）", (KIND_FORMAT, key))
+            for key, label, _description in clipboard_format.LEVELS
+        ]
+    except Exception as e:
+        # 整形の項目が出ないだけで定型文まで開けなくなるのは行き過ぎ。
+        print(f"[tray-tools] クリップボードの書式を調べられません: {e}", file=sys.stderr)
+        return []
+
+
 def create_picker(app_settings: dict, settings_path=None):
-    """選択ウインドウを作って返す。テンプレートが1件も無ければ通知だけ出して None を返す
+    """選択ウインドウを作って返す。出すものが1つも無ければ通知だけ出して None を返す
     (空のウインドウを出しても操作できることが無く、置き場所も伝わらないため。この場合は
     トレイメニューの「定型文フォルダを開く」から辿る)。
 
-    並びは settings.json の snippets.recent(最近使った順)。コピーしたら履歴を更新するので、
-    保存先として app_settings と settings_path を受け取る。"""
+    一覧の中身は2種類:
+      - 「書式を落とす」… クリップボードに HTML Format が載っているときだけ、先頭に出る
+      - 定型文 … settings.json の snippets.recent(最近使った順)で並ぶ
+
+    書式を落とす項目を先頭に置くのは、リッチテキストをコピーした直後に Ctrl+Alt+V を
+    叩いたなら、やりたいのはたいてい整形の方だから(Enter で既定の「構造だけ残す」に
+    当たる)。定型文だけを探しているときは1文字打てば前方一致から外れて消える。
+
+    コピーしたら履歴を更新するので、保存先として app_settings と settings_path を受け取る。"""
     templates = load_templates(load_recent(app_settings))
-    if not templates:
+    formats = format_items()
+    items = formats + [(name, (KIND_SNIPPET, body)) for name, body in templates]
+    if not items:
         show_toast(f"定型文\nsnippets フォルダにテンプレートがありません\n{SNIPPETS_DIR}")
         return None
 
@@ -311,8 +357,15 @@ def create_picker(app_settings: dict, settings_path=None):
     # まだそのオブジェクトが無い)。
     picker = None
 
-    def _accept(name: str, body: str) -> None:
-        expanded = expand_variables(body, picker)
+    def _accept(name: str, data) -> None:
+        kind, payload = data
+        if kind == KIND_FORMAT:
+            _ok, message = clipboard_format.apply_level(payload)
+            # 貼り付けはしない。整形した結果をクリップボードへ載せるところまでで、
+            # Ctrl+V は本人が押す(キー送信は誤爆したときの被害が読めない)。
+            show_toast(f"クリップボードの書式\n{message}")
+            return
+        expanded = expand_variables(payload, picker)
         if expanded is None:
             # 入力ダイアログでキャンセルされた。中途半端な文字列は載せずに引き下がる。
             return
@@ -320,20 +373,30 @@ def create_picker(app_settings: dict, settings_path=None):
         push_recent(app_settings, settings_path, name)
         show_toast(f"定型文をコピーしました\n{name}")
 
-    def _preview(body: str) -> str:
+    def _preview(data) -> str:
+        kind, payload = data
+        if kind == KIND_FORMAT:
+            # 整形後にどうなるかを、選ぶ前に見せる。
+            return clipboard_format.preview_text(payload)
         # 「何がコピーされるか」を見せるのが狙いなので、変数を展開した後の姿を返す。
         # {input} だけは preview=True で尋ねずに 【ラベル】 のまま置く。
-        return expand_variables(body, preview=True)
+        return expand_variables(payload, preview=True)
+
+    def _edit(name: str, data) -> None:
+        if data[0] != KIND_SNIPPET:
+            show_toast("定型文\nこの項目はテンプレートではありません")
+            return
+        edit_template(name)
 
     picker = PickerWindow(
         "定型文",
-        templates,
+        items,
         _accept,
         placeholder=PLACEHOLDER,
         preview_provider=_preview,
-        hint=HINT,
+        hint=f"{HINT}\n{FORMAT_HINT}" if formats else HINT,
         on_new=lambda: create_template(picker),
-        on_edit=lambda name, _body: edit_template(name),
+        on_edit=_edit,
         on_open_folder=open_folder,
     )
     return picker

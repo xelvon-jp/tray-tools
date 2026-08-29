@@ -267,32 +267,42 @@ class ScreenFeature:
         # 項目名の先頭に絵文字を1つ置く。通知領域のメニューは項目が縦に並ぶだけで
         # 手掛かりが少ないため、目的の行を色と形で拾えるようにしている。
         # ホットキー表記は _with_hotkey が末尾に足すので、絵文字込みのラベルを渡す。
+        # 束ね方の考え: よく使うもの(定型文・ブックマーク・画面ミラー)はトップに残し、
+        # それ以外は性質ごとにサブメニューへ畳む。全部畳むと頻度の高い操作が一段深く
+        # なって遅くなるし、全部並べるとトップが20項目を超えて目的の行を探せなくなる。
+        # ホットキーのある項目は畳んでも実害が小さい(そちらから呼べるため)。
         self.menu = QMenu()
-        self.menu.addAction("📷 キャプチャ（今すぐ）", lambda: self.start_capture(0))
-        self.menu.addAction("⏱ 5秒後にキャプチャ", lambda: self.start_capture(5))
-        self.menu.addAction("⏱ 10秒後にキャプチャ", lambda: self.start_capture(10))
-        self.menu.addSeparator()
-        self.menu.addAction(
+
+        capture_menu = self.menu.addMenu("📷 キャプチャ")
+        capture_menu.addAction("今すぐ", lambda: self.start_capture(0))
+        capture_menu.addAction("5秒後", lambda: self.start_capture(5))
+        capture_menu.addAction("10秒後", lambda: self.start_capture(10))
+
+        tools_menu = self.menu.addMenu("🔧 画面の道具")
+        tools_menu.addAction(
             self._with_hotkey("💧 カラーピッカー", hotkey_config.get("color_picker")),
             self.start_color_picker,
         )
-        self.menu.addAction("📏 画面定規", self.start_ruler)
+        tools_menu.addAction("📏 画面定規", self.start_ruler)
+        tools_menu.addAction(
+            self._with_hotkey(
+                "📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")
+            ),
+            self.toggle_always_on_top,
+        )
+
         self.menu.addSeparator()
+        # ここから3つはトップに残す。押す頻度が高く、階層を挟むと明らかに遅くなる。
         self.menu.addAction(
             self._with_hotkey("📋 定型文", hotkey_config.get("snippet_picker")),
             self.start_snippet_picker,
         )
         # QAction.triggered は checked(bool) を渡してくる。引数を取れる関数を直接繋ぐと
         # current_path に False が入るので、ここは引数なしのラムダで包む。
-        self.menu.addAction("📂 定型文フォルダを開く", lambda: snippets.open_folder())
         self.menu.addAction(
             self._with_hotkey("📁 フォルダブックマーク", hotkey_config.get("launcher")),
             lambda: self.start_launcher(),
         )
-        self.menu.addAction("📽 発表者ツール", self.start_presenter)
-        # 同じ発表者ツールを、ローカル資料ではなく任意のサイトに対して使う入口。
-        # 真下に置くのは、探すときに同じ場所を見れば済むようにするため。
-        self.menu.addAction("🌐 サイトを取り込んで開く", self.start_web_presenter)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -317,7 +327,12 @@ class ScreenFeature:
             action.triggered.connect(lambda checked, k=kind: self._set_presenter_overlay(k, checked))
             self._presenter_actions[kind] = action
 
-        # 画面ミラー。プレゼン支援の真下に置く(発表中に使う道具でひとかたまり)。
+        # 発表者ツール系はサブメニューへ。画面ミラーだけはトップに残す(いちばん使う)。
+        presenter_menu = self.menu.addMenu("📽 発表者ツール")
+        presenter_menu.addAction("📽 ローカルの資料を開く", self.start_presenter)
+        presenter_menu.addAction("🌐 サイトを取り込んで開く", self.start_web_presenter)
+
+        # 画面ミラー。トップに置く(発表中いちばん使う入口なので畳まない)。
         # 「開始」とミラー先のモニタ選択でサブメニューにする。
         self._mirror_menu = self.menu.addMenu("🖥 画面ミラー（別モニタへ）")
         # 「開始」はチェック項目にしない。Ctrl+Alt+P は開始と範囲の選び直しで、押しても
@@ -346,12 +361,11 @@ class ScreenFeature:
         self._mirror_screen_actions = []
 
         self.menu.addSeparator()
-        self.menu.addAction(
-            self._with_hotkey("📌 このウィンドウを最前面に固定", hotkey_config.get("always_on_top")),
-            self.toggle_always_on_top,
-        )
+        # 電源まわりをひとつの傘に。狙いが近い(席を外す・寝かせる・寝させない)ので、
+        # 探すときに同じ場所を見れば済む。
+        power_menu = self.menu.addMenu("⚡ 電源")
 
-        self._awake_menu = self.menu.addMenu("☕ スリープ抑止")
+        self._awake_menu = power_menu.addMenu("☕ スリープ抑止")
         self._awake_actions = {}
         for minutes in self._awake_choices:
             action = self._awake_menu.addAction(
@@ -368,7 +382,7 @@ class ScreenFeature:
         self._awake_menu.addAction("解除", self._disable_keep_awake)
 
         # スリープ抑止の下に、逆向きの操作(寝かせる)を置く。電源まわりでひとかたまり。
-        self._sleep_menu = self.menu.addMenu("😴 スリープ・休止")
+        self._sleep_menu = power_menu.addMenu("😴 スリープ・休止")
         for hibernate, head in ((False, "😴 スリープ"), (True, "💤 休止状態")):
             sub = self._sleep_menu.addMenu(head)
             for minutes in (0, 5, 30, 60):
@@ -385,7 +399,7 @@ class ScreenFeature:
 
         # スリープ抑止のすぐ下に置く。狙いが近い(席を外しても切れないようにする)ので、
         # 探すときに同じ場所を見れば済むようにしている。
-        self._jiggle_menu = self.menu.addMenu("🖱 マウスジグラー")
+        self._jiggle_menu = power_menu.addMenu("🖱 マウスジグラー")
         self._jiggle_actions = {}
         for minutes in self._jiggle_choices:
             action = self._jiggle_menu.addAction(
@@ -400,18 +414,20 @@ class ScreenFeature:
         self._jiggle_menu.addAction("解除", self._disable_jiggler)
 
         self.menu.addSeparator()
+        # 設定まわりをひとつの傘に。日々押すものではないので、トップから畳んでよい。
+        config_menu = self.menu.addMenu("⚙ 設定")
+
         # 通知領域はプライマリのタスクバーにしか出ないので、各ディスプレイのタスクバーへ
         # 自前で置く出張所の表示切替。詳細は taskbar_widget.py 冒頭を参照。
-        self._taskbar_action = self.menu.addAction("🖥 タスクバーウィジェット")
+        self._taskbar_action = config_menu.addAction("🖥 タスクバーウィジェット")
         self._taskbar_action.setCheckable(True)
         # addAction(テキスト, 関数) は関数を引数なしで呼ぶので、チェック状態を受け取る
         # 項目をその形で繋いではいけない(クリックのたびにTypeErrorで落ちる)。
         self._taskbar_action.triggered.connect(self._toggle_taskbar_widget)
-        self._taskbar_bg_action = self.menu.addAction(
+        self._taskbar_bg_action = config_menu.addAction(
             "🎨 背景色を取り直す", self._recapture_taskbar_background
         )
 
-        self.menu.addSeparator()
         # スマホへのプッシュ通知(Pushover)。送るのは外からの IPC コマンドだけで、
         # ここに置くのは登録・削除の口だけ。トークンは settings.json には書かず
         # Windows の資格情報マネージャへ預ける(pushover.py 冒頭を参照)。
@@ -430,7 +446,7 @@ class ScreenFeature:
         self._pushover_test_action = None
         self._pushover_delete_action = None
         if self._pushover_wanted():
-            self._pushover_menu = self.menu.addMenu("📱 スマホ通知（Pushover）")
+            self._pushover_menu = config_menu.addMenu("📱 スマホ通知（Pushover）")
             self._pushover_register_action = self._pushover_menu.addAction(
                 "🔑 トークンを登録…", self._register_pushover
             )
@@ -442,8 +458,12 @@ class ScreenFeature:
             )
             self._pushover_menu.aboutToShow.connect(self._refresh_pushover_menu)
 
-        self.menu.addSeparator()
-        self.menu.addAction("⚙ 設定", self._open_settings_file)
+        config_menu.addSeparator()
+        # 定型文のフォルダを開く口はここ。定型文そのものはトップに置いてあるが、
+        # フォルダを開くのは「中身を書き換えるとき」だけなので設定側が似合う。
+        config_menu.addAction("📂 定型文フォルダを開く", lambda: snippets.open_folder())
+        config_menu.addAction("📝 settings.json を開く", self._open_settings_file)
+
         self.menu.addSeparator()
         self.menu.addAction("🔄 再起動", self._restart)
         self.menu.addAction("✖ 終了", QApplication.instance().quit)

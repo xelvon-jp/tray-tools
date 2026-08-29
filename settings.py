@@ -69,6 +69,11 @@ DEFAULT_SETTINGS = {
         # 真っ白になるため(about:blank へ document.write する作りと、Firefox の
         # file:// の扱いが噛み合わない。Chrome と Edge では動く)。
         "browser": "edge",
+        # スマホ通知(Pushover)のメニューを出すか。既定は「トークンを登録済みなら
+        # 出す」で、この値は「まだ登録していないPCでも出したい」ときに書く。
+        # 複数のPCで同じコードを動かしており、業務用の端末に個人の通知先の入口が
+        # 並んでいても使い道がないため。
+        "pushover": False,
         "presenter": "",
         "web_presenter_timeout_seconds": 30,
         "web_presenter_settle_ms": 800,

@@ -419,17 +419,28 @@ class ScreenFeature:
         # 接続ごと失われる。
         self._pushover_bridge = _PushoverBridge()
         self._pushover_bridge.finished.connect(self._on_pushover_tested)
-        self._pushover_menu = self.menu.addMenu("📱 スマホ通知（Pushover）")
-        self._pushover_register_action = self._pushover_menu.addAction(
-            "🔑 トークンを登録…", self._register_pushover
-        )
-        self._pushover_test_action = self._pushover_menu.addAction(
-            "📤 テスト送信", self._test_pushover
-        )
-        self._pushover_delete_action = self._pushover_menu.addAction(
-            "🗑 登録を削除", self._delete_pushover
-        )
-        self._pushover_menu.aboutToShow.connect(self._refresh_pushover_menu)
+        # このPCで使う気があるときだけメニューに出す。複数のPCで同じコードを動かして
+        # おり、業務用の端末に個人の通知先の入口が並んでいても使い道がない。
+        #
+        # 判定は「トークンを登録済み」か「設定 tools.pushover が true」。前者だけだと
+        # 未登録のPCで登録する手段が無くなるので、設定で明示する道を残してある
+        # (書いて再起動すれば出る)。
+        self._pushover_menu = None
+        self._pushover_register_action = None
+        self._pushover_test_action = None
+        self._pushover_delete_action = None
+        if self._pushover_wanted():
+            self._pushover_menu = self.menu.addMenu("📱 スマホ通知（Pushover）")
+            self._pushover_register_action = self._pushover_menu.addAction(
+                "🔑 トークンを登録…", self._register_pushover
+            )
+            self._pushover_test_action = self._pushover_menu.addAction(
+                "📤 テスト送信", self._test_pushover
+            )
+            self._pushover_delete_action = self._pushover_menu.addAction(
+                "🗑 登録を削除", self._delete_pushover
+            )
+            self._pushover_menu.aboutToShow.connect(self._refresh_pushover_menu)
 
         self.menu.addSeparator()
         self.menu.addAction("⚙ 設定", self._open_settings_file)
@@ -966,6 +977,8 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     def _refresh_pushover_menu(self):
         """開く直前に「登録済みかどうか」だけ反映する。値は絶対に出さない。"""
+        if self._pushover_menu is None:
+            return
         try:
             registered = pushover.is_registered()
         except Exception:
@@ -978,6 +991,19 @@ class ScreenFeature:
             "📱 スマホ通知（Pushover：登録済み）" if registered
             else "📱 スマホ通知（Pushover：未登録）"
         )
+
+    def _pushover_wanted(self) -> bool:
+        """このPCでスマホ通知のメニューを出すか。
+
+        登録済みなら出す(使っているPCということなので)。まだ登録していないPCでも、
+        設定に書けば出せる。どちらでもなければ出さない。判定に失敗したときは
+        出さない側へ倒す(出ないことより、業務用の端末に個人の通知先が並ぶほうが困る)。"""
+        try:
+            if (self.app_settings.get("tools", {}) or {}).get("pushover"):
+                return True
+            return bool(pushover.is_registered())
+        except Exception:
+            return False
 
     def _test_pushover(self):
         """試しに1通送る。届くかどうかをここで確かめられるようにする。

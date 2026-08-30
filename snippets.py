@@ -9,11 +9,15 @@
 # ここに残っているのは「テンプレートの読み込み」「変数の展開」「テンプレートファイルの
 # 新規作成・編集を外部エディタに投げる部分」だけ。
 #
-# この窓にはもう1種類の項目が乗る。クリップボードに HTML Format が載っているときだけ
-# 現れる「書式を落とす」で、中身は clipboard_format.py が持つ。窓を増やさずに済ませたい
-# (Ctrl+Alt+V で開くこの一覧が、クリップボードを触りに来る唯一の入口であってほしい)ため
-# ここへ相乗りさせている。項目のデータは (種類, 中身) のタプルで、種類は "snippet" か
-# "format"。
+# この窓にはもう2種類の項目が乗る。クリップボードに HTML Format が載っているときに
+# 現れる「書式を落とす」と、一度整形した後だけ現れる「元に戻す」で、中身は
+# clipboard_format.py が持つ。窓を増やさずに済ませたい(Ctrl+Alt+V で開くこの一覧が、
+# クリップボードを触りに来る唯一の入口であってほしい)ためここへ相乗りさせている。
+# 項目のデータは (種類, 中身) のタプルで、種類は "snippet" / "format" / "restore"。
+#
+# 「書式を落とす」は段階ごとに3項目を並べていたが、選ぶ前に結果を確かめられないと
+# 使えない(下段のプレビューでは生の HTML しか出せず、しかも下が切れた)ので、
+# 1項目にまとめて clipboard_preview.py の窓へ渡す形に変えた。段階はその窓で選ぶ。
 import json
 import locale
 import os
@@ -26,6 +30,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QInputDialog
 
 import clipboard_format
+import clipboard_preview
 import settings as settings_module
 from picker import PickerWindow
 from toast import show_toast
@@ -62,16 +67,18 @@ HINT = (
     "{date:%Y-%m-%d} 書式指定　{input:ラベル} 実行時に入力"
 )
 
-# クリップボードに HTML Format が載っているときだけ足す行。
-FORMAT_HINT = "📋 の項目はクリップボードの書式を落とします（貼り付けはしません。自分で Ctrl+V）"
+# クリップボードに関わる項目が出ているときだけ足す行。
+FORMAT_HINT = "📋 の項目はクリップボードを扱います（貼り付けはしません。自分で Ctrl+V）"
 
-# 書式を落とす項目の表示名の頭。絞り込みは前方一致なので、この頭文字を打たない限り
-# 何か文字を入れた時点で一覧から消える(定型文を探しているときに邪魔をしない)。
-FORMAT_PREFIX = "📋 書式を落とす"
+# クリップボード側の項目の表示名の頭。絞り込みは前方一致なので、この頭文字を打たない
+# 限り、何か文字を入れた時点で一覧から消える(定型文を探しているときに邪魔をしない)。
+FORMAT_PREFIX = "📋 書式を落とす…（プレビューを見て選ぶ）"
+RESTORE_PREFIX = "📋 クリップボードを元に戻す"
 
 # 項目データの種類
 KIND_SNIPPET = "snippet"
 KIND_FORMAT = "format"
+KIND_RESTORE = "restore"
 
 # ロケール設定は1回で足りる。プロセス全体に効く操作なので、日時を実際に使うまで遅らせる。
 _locale_ready = False
@@ -313,22 +320,28 @@ def expand_variables(text: str, parent=None, preview: bool = False):
 
 
 def format_items() -> list:
-    """「書式を落とす」の項目を [(表示名, (種類, 段階)), ...] で返す。
+    """クリップボード側の項目を [(表示名, (種類, 中身)), ...] で返す。
 
-    クリップボードに HTML Format が載っていないときは空リスト。関係ないときに
-    一覧を占領させないため、出す・出さないはここで決める(読むだけでクリップボードの
-    中身は変えない)。"""
+    出るのは次の2つで、どちらも当てはまらなければ空リスト。関係ないときに一覧を
+    占領させないため、出す・出さないはここで決める(読むだけで中身は変えない)。
+
+      - 書式を落とす … HTML Format が載っているとき。選ぶとプレビュー窓が開く
+      - 元に戻す     … 一度整形して、戻す先が残っているとき
+
+    「元に戻す」を HTML の有無で絞らないのは、テキストのみに落とした直後こそ
+    戻したくなるから(そのときクリップボードに HTML は載っていない)。"""
+    items = []
     try:
-        if not clipboard_format.clipboard_has_html():
-            return []
-        return [
-            (f"{FORMAT_PREFIX}（{label}）", (KIND_FORMAT, key))
-            for key, label, _description in clipboard_format.LEVELS
-        ]
+        if clipboard_format.clipboard_has_html():
+            items.append((FORMAT_PREFIX, (KIND_FORMAT, None)))
+        if clipboard_format.has_snapshot():
+            summary = clipboard_format.snapshot_summary()
+            label = f"{RESTORE_PREFIX}（{summary}）" if summary else RESTORE_PREFIX
+            items.append((label, (KIND_RESTORE, None)))
     except Exception as e:
         # 整形の項目が出ないだけで定型文まで開けなくなるのは行き過ぎ。
         print(f"[tray-tools] クリップボードの書式を調べられません: {e}", file=sys.stderr)
-        return []
+    return items
 
 
 def create_picker(app_settings: dict, settings_path=None):
@@ -336,13 +349,14 @@ def create_picker(app_settings: dict, settings_path=None):
     (空のウインドウを出しても操作できることが無く、置き場所も伝わらないため。この場合は
     トレイメニューの「定型文フォルダを開く」から辿る)。
 
-    一覧の中身は2種類:
+    一覧の中身は3種類:
       - 「書式を落とす」… クリップボードに HTML Format が載っているときだけ、先頭に出る
+      - 「元に戻す」  … 一度整形して、戻す先が残っているときだけ出る
       - 定型文 … settings.json の snippets.recent(最近使った順)で並ぶ
 
-    書式を落とす項目を先頭に置くのは、リッチテキストをコピーした直後に Ctrl+Alt+V を
-    叩いたなら、やりたいのはたいてい整形の方だから(Enter で既定の「構造だけ残す」に
-    当たる)。定型文だけを探しているときは1文字打てば前方一致から外れて消える。
+    クリップボード側の項目を先頭に置くのは、リッチテキストをコピーした直後に
+    Ctrl+Alt+V を叩いたなら、やりたいのはたいてい整形の方だから(Enter でプレビュー窓が
+    開く)。定型文だけを探しているときは1文字打てば前方一致から外れて消える。
 
     コピーしたら履歴を更新するので、保存先として app_settings と settings_path を受け取る。"""
     templates = load_templates(load_recent(app_settings))
@@ -358,11 +372,14 @@ def create_picker(app_settings: dict, settings_path=None):
     picker = None
 
     def _accept(name: str, data) -> None:
-        kind, payload = data
+        kind, _payload = data
         if kind == KIND_FORMAT:
-            _ok, message = clipboard_format.apply_level(payload)
-            # 貼り付けはしない。整形した結果をクリップボードへ載せるところまでで、
-            # Ctrl+V は本人が押す(キー送信は誤爆したときの被害が読めない)。
+            # ここでは整形しない。段階を選ぶのも実際に載せるのもプレビュー窓の側で、
+            # この一覧は入口を出すだけ(見ないまま書き換えてしまうのを避けたい)。
+            clipboard_preview.open_preview(app_settings, settings_path)
+            return
+        if kind == KIND_RESTORE:
+            _ok, message = clipboard_format.restore_snapshot()
             show_toast(f"クリップボードの書式\n{message}")
             return
         expanded = expand_variables(payload, picker)
@@ -376,8 +393,24 @@ def create_picker(app_settings: dict, settings_path=None):
     def _preview(data) -> str:
         kind, payload = data
         if kind == KIND_FORMAT:
-            # 整形後にどうなるかを、選ぶ前に見せる。
-            return clipboard_format.preview_text(payload)
+            # 中身の下見はプレビュー窓の仕事。ここは「選ぶと何が起きるか」だけ書く。
+            return (
+                "選ぶとプレビュー窓が開きます。\n"
+                "\n"
+                "左に元のまま・右に落とした結果を並べて描画するので、\n"
+                "改行が潰れるかどうかを貼る前に確かめられます。\n"
+                "段階は窓の中で 1/2/3 で切り替え、Enter でクリップボードへ載せます。\n"
+                "\n"
+                "この一覧を出した時点ではクリップボードは書き換わりません。"
+            )
+        if kind == KIND_RESTORE:
+            return (
+                "整形する前の中身をクリップボードへ書き戻します。\n"
+                "\n"
+                f"戻る中身： {clipboard_format.snapshot_summary() or '(不明)'}\n"
+                "\n"
+                "戻した後も退避は残るので、もう一度整形し直せます。"
+            )
         # 「何がコピーされるか」を見せるのが狙いなので、変数を展開した後の姿を返す。
         # {input} だけは preview=True で尋ねずに 【ラベル】 のまま置く。
         return expand_variables(payload, preview=True)

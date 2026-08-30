@@ -712,6 +712,116 @@ def transform(fragment: str, text: str, level: str):
     return document, plain
 
 
+# ---------------------------------------------------------------------------
+# 元に戻す(スナップショット)
+# ---------------------------------------------------------------------------
+# 整形するとコピー元のリッチテキストは失われる。クリップボードに履歴は無く Ctrl+Z も
+# 効かないので、整形の直前に中身を丸ごと退避しておき、後から書き戻せるようにする。
+#
+# 退避は「1つだけ・そのプロセスが生きている間だけ」。何段も持つと、どれに戻るのか
+# 分からなくなる。ファイルには残さない(クリップボードには資格情報が載ることがあり、
+# ディスクへこぼしたくない)。
+#
+# 退避に使ってよい合計バイト数。画像を貼った直後などは巨大な DIB が載っていることが
+# あり、無条件に抱えるとメモリを食い続ける。超える場合は退避せず、整形もしない
+# (戻せないまま壊すよりは、何もしない方がまし)。
+SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+
+# 退避しても書き戻しに使わない形式。Qt が画像から内部で起こすもので、
+# 元になった CF_DIB / CF_BITMAP を持っていれば復元できる。
+_SNAPSHOT_SKIP_PREFIXES = ("application/x-qt-image",)
+
+_snapshot = None
+
+
+def _copy_mime(source):
+    """QMimeData の中身を写し取って新しい QMimeData を返す。
+
+    クリップボードが返す QMimeData は「いまの中身」への窓でしかなく、他アプリが
+    コピーした瞬間に中身が変わる。参照を持っても退避にならないので値を写す。
+    大きすぎる場合は None。"""
+    if source is None:
+        return None
+    copy = QMimeData()
+    total = 0
+    for fmt in source.formats():
+        if fmt.startswith(_SNAPSHOT_SKIP_PREFIXES):
+            continue
+        try:
+            payload = source.data(fmt)
+        except Exception:
+            continue
+        total += payload.size() if hasattr(payload, "size") else len(payload)
+        if total > SNAPSHOT_MAX_BYTES:
+            return None
+        copy.setData(fmt, payload)
+    return copy
+
+
+def take_snapshot(clipboard=None) -> bool:
+    """いまのクリップボードを退避する。退避できたら True。"""
+    global _snapshot
+    try:
+        board = _clipboard(clipboard)
+        if board is None:
+            return False
+        copy = _copy_mime(board.mimeData())
+        if copy is None:
+            return False
+        _snapshot = copy
+        return True
+    except Exception as e:
+        print(f"[tray-tools] クリップボードを退避できません: {e}", file=sys.stderr)
+        return False
+
+
+def has_snapshot() -> bool:
+    """戻せる退避を持っているか。ピッカーへ「元に戻す」を出す条件。"""
+    return _snapshot is not None
+
+
+def snapshot_summary() -> str:
+    """退避の中身を一言で。「何に戻るのか」が分からないまま押させないための表示用。"""
+    if _snapshot is None:
+        return ""
+    text = (_snapshot.text() or "").strip().replace("\r", " ").replace("\n", " ")
+    if len(text) > 40:
+        text = text[:40] + "…"
+    kinds = []
+    if _snapshot.hasHtml() or _snapshot.hasFormat(RAW_CF_HTML_MIME):
+        kinds.append("HTML")
+    if _snapshot.hasText():
+        kinds.append("テキスト")
+    head = "＋".join(kinds) if kinds else "不明"
+    return f"{head}: {text}" if text else head
+
+
+def clear_snapshot() -> None:
+    global _snapshot
+    _snapshot = None
+
+
+def restore_snapshot(clipboard=None):
+    """退避した中身をクリップボードへ書き戻す。(成否, 通知文) を返す。
+
+    戻した後も退避は残す。戻す→やっぱり整形する、を往復できるようにするため。"""
+    try:
+        if _snapshot is None:
+            return False, "戻せる中身がありません"
+        board = _clipboard(clipboard)
+        if board is None:
+            return False, "クリップボードを扱えません"
+        # 退避そのものを渡すと Qt に所有権を持っていかれ、2度目に戻せなくなる。
+        copy = _copy_mime(_snapshot)
+        if copy is None:
+            return False, "戻す中身が大きすぎます"
+        board.setMimeData(copy)
+        return True, "整形する前の中身に戻しました"
+    except Exception as e:
+        print(f"[tray-tools] クリップボードを戻せません: {e}", file=sys.stderr)
+        return False, f"戻せませんでした\n{e}"
+
+
 def apply_level(level: str, clipboard=None):
     """クリップボードの中身をその段階で整形して置き換える。(成否, 通知文) を返す。
 
@@ -723,6 +833,11 @@ def apply_level(level: str, clipboard=None):
         document, fragment, text = read_clipboard(board)
         if fragment is None:
             return False, "HTMLが載っていません"
+
+        # 上書きする前に退避する。取れないなら整形もしない(戻せないまま
+        # コピー元のリッチテキストを失う方が困る)。
+        if not take_snapshot(board):
+            return False, "退避できないので整形しません\n（中身が大きすぎます）"
 
         new_document, new_text = transform(fragment, text, level)
 
@@ -736,48 +851,9 @@ def apply_level(level: str, clipboard=None):
 
         label = LEVEL_LABELS.get(level, level)
         if new_document is None:
-            return True, f"{label}\nHTMLを捨てました"
+            return True, f"{label}\nHTMLを捨てました（元に戻せます）"
         size = len(build_cf_html(new_document))
-        return True, f"{label}\nHTMLを整形しました（{size} バイト）"
+        return True, f"{label}\nHTMLを整形しました（{size} バイト / 元に戻せます）"
     except Exception as e:
         print(f"[tray-tools] クリップボードを整形できません: {e}", file=sys.stderr)
         return False, f"整形できませんでした\n{e}"
-
-
-# プレビューで長い1行を読ませないための改行位置。表示専用で、クリップボードへ
-# 載せるHTMLには手を入れない(ピッカーのプレビューは折り返さない作りのため)。
-_PREVIEW_BREAK_RE = re.compile(r"(?=<(?:/?(?:p|div|li|ul|ol|tr|table|h[1-6]|blockquote|br)\b))", re.IGNORECASE)
-
-
-def _pretty_for_preview(html_text: str) -> str:
-    return _PREVIEW_BREAK_RE.sub("\n", html_text or "").strip("\n")
-
-
-def preview_text(level: str, clipboard=None) -> str:
-    """ピッカーのプレビューに出す文字列。選ぶ前に「何に置き換わるか」を見せる。"""
-    try:
-        _document, fragment, text = read_clipboard(clipboard)
-        if fragment is None:
-            return "クリップボードにHTMLがありません。"
-
-        label = LEVEL_LABELS.get(level, level)
-        description = next((desc for key, _l, desc in LEVELS if key == level), "")
-        new_document, new_text = transform(fragment, text, level)
-
-        lines = [f"■ {label} … {description}", "", "■ 貼り付く文字", new_text or "(空)"]
-        if new_document is None:
-            lines += ["", "■ HTML", "載せません（テキストだけになります）"]
-        else:
-            payload = build_cf_html(new_document)
-            _doc, _frag, offsets = parse_cf_html(payload)
-            lines += [
-                "",
-                f"■ 残るHTML（CF_HTML {len(payload)} バイト / "
-                f"StartFragment:{offsets.get('StartFragment')} "
-                f"EndFragment:{offsets.get('EndFragment')}）",
-                _pretty_for_preview(new_document),
-            ]
-        return "\n".join(lines)
-    except Exception as e:
-        print(f"[tray-tools] 整形のプレビューを作れません: {e}", file=sys.stderr)
-        return f"(プレビューを作れませんでした: {e})"

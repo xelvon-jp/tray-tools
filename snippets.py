@@ -319,6 +319,21 @@ def expand_variables(text: str, parent=None, preview: bool = False):
     return "".join(result)
 
 
+def load_preview_height(app_settings: dict):
+    """settings.json の snippets.preview_height を返す。未設定なら None(既定を使う)。
+
+    範囲の検査は PickerWindow 側が持つ。ここは「読めた数値かどうか」だけを見る。"""
+    try:
+        section = (app_settings or {}).get("snippets")
+        if not isinstance(section, dict):
+            return None
+        value = section.get("preview_height")
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        print("[tray-tools] snippets.preview_height を読めません（既定を使います）", file=sys.stderr)
+        return None
+
+
 def format_items() -> list:
     """クリップボード側の項目を [(表示名, (種類, 中身)), ...] で返す。
 
@@ -427,6 +442,7 @@ def create_picker(app_settings: dict, settings_path=None):
         _accept,
         placeholder=PLACEHOLDER,
         preview_provider=_preview,
+        preview_height=load_preview_height(app_settings),
         hint=f"{HINT}\n{FORMAT_HINT}" if formats else HINT,
         on_new=lambda: create_template(picker),
         on_edit=_edit,

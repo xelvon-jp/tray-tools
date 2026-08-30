@@ -35,8 +35,20 @@ PREVIEW_MAX_VISIBLE_ROWS = 12
 # プレビュー領域とキーヒント1行の高さ(px)。行数×フォント高さで求めない。
 # QT_QPA_PLATFORM=offscreen ではフォントメトリクスが当てにならず、測った値だけを
 # 根拠にすると環境によって潰れたり伸びたりするため、ここは固定値で持つ。
-PREVIEW_HEIGHT = 150
+#
+# 150px だと 8行ほどしか映らず、13行のテンプレートで下が切れていた(実測で
+# 縦に6行ぶん、横に 325px はみ出していた)。280px で手元の最長テンプレートが
+# 収まったので、少し余裕を見て 300px にしてある。選んだものが
+# 何なのかを確かめる欄なので、まず「収まること」を優先して広げる。中身に合わせて
+# 伸縮させないのは、↑↓ を動かすたびに窓の高さと位置が変わって目が落ち着かないため
+# (項目数で高さを決めないのと同じ理由)。呼び出し側から preview_height で変えられる。
+PREVIEW_HEIGHT = 300
 HINT_LINE_HEIGHT = 15
+
+# プレビューの高さとして受け付ける範囲(px)。設定ファイルに極端な値が入っても、
+# 窓が潰れたり画面を覆ったりしないように挟む。
+PREVIEW_HEIGHT_MIN = 80
+PREVIEW_HEIGHT_MAX = 600
 
 # 画面の作業領域に対して、ウインドウが占めてよい高さの上限。
 MAX_SCREEN_RATIO = 0.8
@@ -64,6 +76,7 @@ class PickerWindow(QWidget):
     ここで吸収する(共用の窓なので、既定では今までどおり「絞り込んで選ぶだけ」)。
 
     - preview_provider(データ) -> str … 選択中の項目の中身を下のプレビューに出す
+    - preview_height … プレビュー欄の高さ(px)。既定は PREVIEW_HEIGHT
     - hint … ウインドウ下部に出す小さな説明(改行可)
     - on_new() / on_edit(表示名, データ) / on_open_folder() … Ctrl+N / Ctrl+E / Ctrl+O。
       いずれも実行後はこのウインドウを閉じる(外部エディタで直した結果を出すには
@@ -82,6 +95,7 @@ class PickerWindow(QWidget):
         on_new=None,
         on_edit=None,
         on_open_folder=None,
+        preview_height: int = None,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -90,6 +104,10 @@ class PickerWindow(QWidget):
         self._items = list(items)
         self._on_accept = on_accept
         self._preview_provider = preview_provider
+        self._preview_height = max(
+            PREVIEW_HEIGHT_MIN,
+            min(int(preview_height or PREVIEW_HEIGHT), PREVIEW_HEIGHT_MAX),
+        )
         self._on_new = on_new
         self._on_edit = on_edit
         self._on_open_folder = on_open_folder
@@ -131,10 +149,13 @@ class PickerWindow(QWidget):
             self.preview.setObjectName("pickerPreview")
             self.preview.setFont(QFont("Meiryo", 9))
             self.preview.setReadOnly(True)
-            # 折り返さない。テンプレートは行単位で書かれているので、折り返すと
-            # 「実際にコピーされる形」と見た目がずれる。
-            self.preview.setLineWrapMode(QPlainTextEdit.NoWrap)
-            self.preview.setFixedHeight(PREVIEW_HEIGHT)
+            # 折り返す。もとは「テンプレートは行単位で書かれているので、折り返すと
+            # 実際にコピーされる形と見た目がずれる」として折り返さずにいたが、
+            # 実測すると長い行は右へ 325px はみ出して**そもそも見えていなかった**。
+            # 見えない正確さより、見える近似を採る(1行がどこで終わるかを字面で
+            # 確かめたいときは Ctrl+E でファイルを開く)。
+            self.preview.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+            self.preview.setFixedHeight(self._preview_height)
             layout.addWidget(self.preview)
             # currentItemChanged はクリック・↑↓・絞り込みのどれで動いても飛ぶ。
             # itemSelectionChanged と両方繋ぐと二度走るので、こちらだけにする。
@@ -206,7 +227,7 @@ class PickerWindow(QWidget):
         # 追加分は測らずに固定値で足す。offscreen では sizeHint が当てにならず、
         # 測った値を信じるとプレビューが潰れた高さでウインドウが決まってしまう。
         if self.preview is not None:
-            height += spacing + PREVIEW_HEIGHT
+            height += spacing + self._preview_height
         if self.hint is not None:
             height += spacing + self._hint_height
 

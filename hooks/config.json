@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "min_seconds": 60,
+  "away_seconds": 180,
+  "pushover_when_away": true,
+  "pushover_min_seconds": 300,
+  "pushover_include_excerpt": false,
+  "excerpt_chars": 120,
+  "beep_on_done": true,
+  "beep_on_error": true,
+  "beep_on_ask": true
+}

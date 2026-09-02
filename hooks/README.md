@@ -41,6 +41,23 @@ Claude Code のフックから tray-tools を鳴らし、**画面を見ていな
 | `pushover_include_excerpt` | `false` | スマホの本文に応答の書き出しを載せるか |
 | `excerpt_chars` | `120` | 載せる場合の長さ |
 | `beep_on_done` / `beep_on_error` / `beep_on_ask` | `true` | 種類ごとの入切 |
+| `sound_done` / `sound_error` / `sound_ask` | `done` / `error` / `warn` | 鳴らす音（`beep.py` の名前: `ok` `done` `warn` `error` `ask`） |
+| `ask_repeat` | `2` | 確認待ちを何回鳴らすか |
+| `ask_repeat_interval` | `0.35` | 繰り返すときの間隔（秒） |
+
+### 確認待ちに `ask` を使っていない理由
+
+**Windows の既定のサウンド設定では「質問（`SystemQuestion`）」に音が割り当てられていません。** そのまま `beep ask` を使うと、いちばん気づきたい「止まっている」が**無音**になります（このPCでも実際に空でした）。
+
+さらに既定では「情報（`SystemAsterisk`）」と「警告（`SystemExclamation`）」が**同じ wav** を指しているので、音色では完了と区別が付きません。そこで**回数**で分けています（完了は1回、確認待ちは2回）。
+
+コントロールパネルのサウンドで「質問」に音を割り当てたなら、`sound_ask` を `ask` に、`ask_repeat` を `1` に戻してかまいません。
+
+割り当てを確かめるには:
+
+```powershell
+(Get-ItemProperty 'HKCU:\AppEvents\Schemes\Apps\.Default\SystemQuestion\.Current').'(default)'
+```
 
 ## 設計上、外せない点
 

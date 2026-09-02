@@ -82,6 +82,21 @@ DEFAULTS = {
     "beep_on_done": True,
     "beep_on_error": True,
     "beep_on_ask": True,
+    # どの音を鳴らすか(beep.py の名前: ok / done / warn / error / ask)。
+    #
+    # 確認待ちに "ask" を使わないのは、Windows の既定のサウンド設定では
+    # 「質問(SystemQuestion)」に音が割り当てられておらず、いちばん気づきたい
+    # 「止まっている」が**無音になる**ため。実際このPCでも空だった。
+    # コントロールパネルのサウンドで「質問」に音を割り当てたなら "ask" に戻してよい。
+    "sound_done": "done",
+    "sound_error": "error",
+    "sound_ask": "warn",
+    # 確認待ちだけ複数回鳴らす。既定のサウンド設定では「情報」と「警告」が同じ
+    # wav を指しているので、音色では done と区別が付かない。回数で分ける。
+    "ask_repeat": 2,
+    # 繰り返すときの間隔(秒)。MessageBeep は鳴り終わるのを待たずに戻るので、
+    # 間を空けないと2回目が重なって1回に聞こえる。
+    "ask_repeat_interval": 0.35,
 }
 
 # ファイル名に使ってよい文字。session_id は UUID のはずだが、外から来る値なので
@@ -209,6 +224,15 @@ def send(command: str, args: list) -> bool:
         return False
 
 
+def beep(config: dict, sound_key: str, times: int = 1, interval: float = 0.0) -> None:
+    """設定で指定された音を鳴らす。回数と間隔を指定できる。"""
+    kind = config.get(sound_key) or "done"
+    for index in range(max(1, int(times))):
+        if index:
+            time.sleep(max(0.0, float(interval)))
+        send("beep", [str(kind)])
+
+
 def is_away(config: dict) -> bool:
     """最後の操作から離れているか。取得できなければ「居る」に倒す。"""
     idle = mouse_jiggler.idle_seconds()
@@ -254,7 +278,7 @@ def on_stop(config: dict, event: dict) -> None:
     if elapsed is None or elapsed < config["min_seconds"]:
         return  # 短い応答では鳴らさない
     if config["beep_on_done"]:
-        send("beep", ["done"])
+        beep(config, "sound_done")
     maybe_pushover(
         config,
         event,
@@ -268,7 +292,7 @@ def on_fail(config: dict, event: dict) -> None:
     # 失敗は時間で絞らない。短く終わったということは、たいてい早々に落ちたということ。
     elapsed = take_elapsed(event)
     if config["beep_on_error"]:
-        send("beep", ["error"])
+        beep(config, "sound_error")
     reason = (event.get("error_type") or event.get("error_message") or "").strip()
     body = f"止まりました（{_format_minutes(elapsed)}）"
     if reason:
@@ -279,7 +303,7 @@ def on_fail(config: dict, event: dict) -> None:
 def on_ask(config: dict, event: dict) -> None:
     # 確認待ちは、放っておくといつまでも進まない。経過時間では絞らない。
     if config["beep_on_ask"]:
-        send("beep", ["ask"])
+        beep(config, "sound_ask", config["ask_repeat"], config["ask_repeat_interval"])
     maybe_pushover(config, event, _project_name(event), "確認待ちで止まっています")
 
 

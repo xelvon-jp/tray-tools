@@ -8,5 +8,10 @@
   "excerpt_chars": 120,
   "beep_on_done": true,
   "beep_on_error": true,
-  "beep_on_ask": true
+  "beep_on_ask": true,
+  "sound_done": "done",
+  "sound_error": "error",
+  "sound_ask": "warn",
+  "ask_repeat": 2,
+  "ask_repeat_interval": 0.35
 }

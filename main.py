@@ -120,21 +120,72 @@ def log_exception(where: str) -> str:
     return f"{exc_type.__name__}: {exc_value}" if exc_type else "unknown error"
 
 
-def _is_already_running() -> bool:
-    socket = QLocalSocket()
-    socket.connectToServer(SINGLE_INSTANCE_KEY)
-    connected = socket.waitForConnected(300)
-    if connected:
-        socket.disconnectFromServer()
-    return connected
+# 先着を決める名前付きミューテックス。Local\\ 配下はログオンセッションごとに分かれるので、
+# 別ユーザーが同時に使っても互いを弾かない。
+SINGLE_INSTANCE_MUTEX = r"Local\traytools.single-instance"
+ERROR_ALREADY_EXISTS = 183
+
+# 握っているハンドル。プロセスが終わればOSが必ず手放すので、後始末を書き忘れても
+# ロックが残り続けることはない(前回クラッシュ後に起動できなくなる、が起きない)。
+_instance_mutex = None
 
 
-def _hold_single_instance_lock():
-    """先着プロセスの目印となるサーバを立てる。戻り値は呼び出し側で参照を保持すること。
-    listenに失敗しても起動は止めない(誰も待ち受けていないことは確認済みで、
-    ロック機構の不調でアプリ自体が使えなくなる方が困る)。"""
-    # 前回クラッシュで終わるとソケットが残り、以後ずっと起動できなくなる。
-    # 接続できなかった＝誰も待ち受けていないので、残骸を消してからlistenする。
+def _acquire_single_instance() -> bool:
+    """先着なら True。すでに誰か居るなら False。
+
+    【なぜ QLocalServer で判定しないのか】
+    元は「待ち受けに接続できるか調べる → 誰も居なければ自分が listen する」だった。
+    これには2つ穴がある。
+
+    1. **検査と確保の間に隙間がある。** 同時に起動した2つが両方「誰も居ない」と
+       判断して、両方とも起動してしまう。実際 17ms 差で2つ立ち上がっていた
+       (トレイの再起動と、待ち受けが消えている隙に traytools_send が本体を
+        起こす経路が重なると起きる)。
+    2. **Windows では listen が排他にならない。** 名前付きパイプは同じ名前で
+       複数のサーバインスタンスを作れる。実測でも、別プロセスが待ち受けている
+       名前に対して listen() が True を返した。つまり「立てられたから自分が
+       先着」という判定自体が成り立たない。
+
+    CreateMutexW は作成と「既にあったか」の判定が1回のシステムコールで済むので、
+    隙間が無い。判定に使えるのはこちら。"""
+    global _instance_mutex
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+        already = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+    except OSError:
+        # 判定できないなら起動を通す。ロック機構の不調でアプリが使えなくなる方が困る。
+        return True
+    if not handle:
+        return True
+    if already:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return False
+    _instance_mutex = handle
+    return True
+
+
+def _release_single_instance() -> None:
+    """先着の権利を手放す。再起動で自分の後継を起こす直前に呼ぶ。"""
+    global _instance_mutex
+    if _instance_mutex:
+        try:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(_instance_mutex))
+        except OSError:
+            pass
+        _instance_mutex = None
+
+
+def _start_command_listener():
+    """外部コマンドを受ける待ち受けを立てる。戻り値は呼び出し側で参照を保持すること。
+
+    **これは単一起動の判定には使わない**(上の理由で判定にならない)。あふｗ・フック・
+    MCP から来るコマンドを受けるためだけの口。listen に失敗しても起動は止めない
+    (外部コマンドが使えなくなるだけで、常駐そのものは使えるため)。"""
+    # 前回クラッシュで終わるとソケットが残ることがある(Unix系)。先着なのは
+    # ミューテックスで確認済みなので、残骸は消してから立ててよい。
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
     server = QLocalServer()
     server.listen(SINGLE_INSTANCE_KEY)
@@ -520,11 +571,12 @@ def _pushover_command(args, reply) -> None:
 def _restart(instance_lock) -> bool:
     """自分を起動し直す。新しい方を起こせたら True(呼んだ側がこのプロセスを終わらせる)。
 
-    先に待ち受けを手放すのは、新しい方が起動直後に「すでに起動しています」と判断して
-    引き返してしまうため。逆に、起こすのに失敗したときは待ち受けを張り直して生き残る。
+    先に待ち受けと先着の権利を手放すのは、新しい方が起動直後に「すでに起動しています」と
+    判断して引き返してしまうため。逆に、起こすのに失敗したときは張り直して生き残る。
     再起動できないうえ常駐まで消えると、手で起動し直すしかなくなるため。"""
     instance_lock.close()
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    _release_single_instance()
     try:
         subprocess.Popen(
             [pythonw_executable(), str(Path(__file__).resolve())],
@@ -533,6 +585,7 @@ def _restart(instance_lock) -> bool:
         )
     except OSError as e:
         print(f"[tray-tools] 再起動できません: {e}", file=sys.stderr)
+        _acquire_single_instance()
         instance_lock.listen(SINGLE_INSTANCE_KEY)
         return False
     return True
@@ -655,10 +708,10 @@ def main():
     # 付箋ウインドウを全部閉じても常駐アプリごと終了しないようにする(必須)。
     app.setQuitOnLastWindowClosed(False)
 
-    if _is_already_running():
+    if not _acquire_single_instance():
         # 常駐中の側が「すでに起動しています」と知らせるので、こちらは黙って終わる。
         return
-    instance_lock = _hold_single_instance_lock()
+    instance_lock = _start_command_listener()
 
     icon_path = Path(__file__).resolve().parent / "icons" / "rapture.ico"
     if icon_path.exists():

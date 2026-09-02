@@ -55,6 +55,14 @@ import traytools_send  # noqa: E402  (標準ライブラリだけ)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
+# 呼ばれるたびに1行残す。フックは目に見えないところで走るので、記録が無いと
+# 「鳴らなかった」のが「呼ばれていない」のか「短くて見送った」のか「送ったが
+# 聞こえなかった」のか切り分けられない。実際その3つで詰まった。
+LOG_PATH = Path(__file__).resolve().parent / "hook.log"
+
+# 記録の上限行数。超えたら古い方から捨てる(放っておくと際限なく伸びる)。
+LOG_MAX_LINES = 500
+
 # 状態の置き場所。セッションごとに1ファイル。複数セッションを並行させても混ざらない
 # ように、フックの JSON にある session_id をファイル名に使う。
 STATE_DIR = Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".") / "tray-tools-hooks"
@@ -107,6 +115,30 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 def _log(message: str) -> None:
     """理由を標準エラーへ。フックの stdout は Claude 側に解釈されうるので使わない。"""
     print(f"[tray-tools hook] {message}", file=sys.stderr)
+
+
+def _record(action: str, message: str) -> None:
+    """hook.log に1行残す。書けなくても黙って諦める(記録のために本体を止めない)。"""
+    try:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {action:5}  {message}"
+        with open(LOG_PATH, "a", encoding="utf-8", newline="") as f:
+            # print で改行を付ける。newline="" なので LF のまま入る。
+            print(line, file=f)
+        _trim_log()
+    except OSError:
+        pass
+
+
+def _trim_log() -> None:
+    """行数が増えすぎたら古い方から捨てる。"""
+    try:
+        if not LOG_PATH.exists() or LOG_PATH.stat().st_size < 200 * LOG_MAX_LINES:
+            return
+        lines = LOG_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+        if len(lines) > LOG_MAX_LINES:
+            LOG_PATH.write_text("".join(lines[-LOG_MAX_LINES:]), encoding="utf-8", newline="")
+    except OSError:
+        pass
 
 
 def load_config() -> dict:
@@ -171,7 +203,9 @@ def mark_start(event: dict) -> None:
     """このターンの開始時刻を控える。ここでは音を鳴らさない(毎プロンプト走るため)。"""
     path = _state_path(event.get("session_id"))
     if path is None:
+        _record("start", "session_id が無いので控えられません")
         return
+    _record("start", f"開始を控えました（{path.name}）")
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -218,9 +252,13 @@ def send(command: str, args: list) -> bool:
         traytools_send._exchange(command, args, RESPONSE_TIMEOUT)
         return True
     except FileNotFoundError:
-        return False  # 待ち受けが無い＝tray-tools は起きていない
+        # 待ち受けが無い＝tray-tools は起きていない。黙って諦めるが、記録は残す
+        # (「鳴らなかった」の理由でいちばん多いのがこれ)。
+        _record("send", f"{command} {args} → tray-tools が起きていません")
+        return False
     except OSError as e:
         _log(f"送れませんでした（{command}）: {e}")
+        _record("send", f"{command} {args} → 送れません: {e}")
         return False
 
 
@@ -275,8 +313,13 @@ def maybe_pushover(config: dict, event: dict, title: str, body: str, elapsed=Non
 # ---------------------------------------------------------------------------
 def on_stop(config: dict, event: dict) -> None:
     elapsed = take_elapsed(event)
-    if elapsed is None or elapsed < config["min_seconds"]:
-        return  # 短い応答では鳴らさない
+    if elapsed is None:
+        _record("stop", "開始の控えが無いので見送り（フック導入直後 / 再開したセッション）")
+        return
+    if elapsed < config["min_seconds"]:
+        _record("stop", f"経過 {elapsed:.1f}秒 < {config['min_seconds']}秒 なので見送り")
+        return
+    _record("stop", f"経過 {elapsed:.1f}秒 → {config['sound_done']} を鳴らす")
     if config["beep_on_done"]:
         beep(config, "sound_done")
     maybe_pushover(
@@ -293,6 +336,7 @@ def on_fail(config: dict, event: dict) -> None:
     elapsed = take_elapsed(event)
     if config["beep_on_error"]:
         beep(config, "sound_error")
+    _record("fail", f"経過 {_format_minutes(elapsed)} → {config['sound_error']} を鳴らす")
     reason = (event.get("error_type") or event.get("error_message") or "").strip()
     body = f"止まりました（{_format_minutes(elapsed)}）"
     if reason:
@@ -302,6 +346,7 @@ def on_fail(config: dict, event: dict) -> None:
 
 def on_ask(config: dict, event: dict) -> None:
     # 確認待ちは、放っておくといつまでも進まない。経過時間では絞らない。
+    _record("ask", f"{config['sound_ask']} を {config['ask_repeat']} 回鳴らす")
     if config["beep_on_ask"]:
         beep(config, "sound_ask", config["ask_repeat"], config["ask_repeat_interval"])
     maybe_pushover(config, event, _project_name(event), "確認待ちで止まっています")

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import QApplication
 
 import action_log
 import beep
+import capture_grab
 import pushover
 import settings as settings_module
 from feature_audio import AudioFeature
@@ -322,6 +323,19 @@ def _build_command_handlers(features) -> dict:
         #
         #   traytools_send.py pushover "変換が終わりました" --title 変換 --priority 1
         "pushover": lambda args, reply: _pushover_command(args, reply),
+        # 画面を1枚撮ってファイルに保存し、そのパスを返す。
+        #
+        #   traytools_send.py capture        画面全体(仮想デスクトップ)
+        #   traytools_send.py capture 2      2番目の画面だけ
+        #
+        # 「常駐でなければできないこと」に当たるので載せている。mss のインスタンスを
+        # 都度作ると COM/GC 衝突で落ちるため(2026-08-28 に8回)、必ず常駐が抱えている
+        # capture_grab._sct() を通す必要がある。呼ぶ側が自前で撮る道は無い。
+        #
+        # 画像そのものは返さない。この口の応答は1行のテキストで、画像を載せるなら
+        # base64 で数MBを流すことになる。保存してパスを返せば、読む側は普通に
+        # ファイルを開けばよい(保存先は capture.save_folder と同じ)。
+        "capture": lambda args, reply: reply(_capture_command(screen, args)),
     }
 
 
@@ -371,6 +385,43 @@ def _keep_awake_command(screen, args) -> str:
             minutes = None
     screen.enable_keep_awake(minutes, source="external")
     return "OK " + screen.keep_awake_status()
+
+
+def _capture_command(screen, args) -> str:
+    """画面を1枚撮って保存し、そのパスを返す。args[0] があれば画面番号(1始まり)。"""
+    screens = QApplication.screens()
+    if not screens:
+        return "ERR 画面が見つかりません"
+
+    if args:
+        try:
+            index = int(str(args[0]).strip())
+        except (TypeError, ValueError):
+            return f"ERR 画面番号を解釈できません: {args[0]}"
+        if not 1 <= index <= len(screens):
+            return f"ERR 画面番号は 1〜{len(screens)} です（指定: {index}）"
+        rect = screens[index - 1].geometry()
+        label = f"画面{index}"
+    else:
+        rect = capture_grab.virtual_geometry()
+        label = f"画面全体({len(screens)}面)"
+
+    try:
+        # include_layered=True で半透明のウィンドウも写す(通知やメニューを撮りたい)。
+        image = capture_grab.grab_region(rect, include_layered=True)
+    except Exception as e:  # noqa: BLE001  外部から叩かれる口。落とさない
+        return f"ERR 撮影できません: {e}"
+    if image.isNull():
+        return "ERR 撮影できませんでした（空の画像）"
+
+    path = capture_grab.save_image(
+        image, screen.app_settings.get("capture", {}), stem=capture_grab.new_session_stem()
+    )
+    if not path:
+        return "ERR 保存できませんでした（保存先を確認してください）"
+
+    action_log.record("画面キャプチャ", f"{label} {image.width()}x{image.height()}", "external")
+    return f"OK {label} {image.width()}x{image.height()}\n{path}"
 
 
 def _log_command(args) -> str:

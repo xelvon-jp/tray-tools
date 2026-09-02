@@ -305,7 +305,66 @@ traytools_send.py sleep 1800 hibernate   30分後に休止状態
 traytools_send.py sleep cancel           予約を取り消す
 ```
 
+**Claude Code からは MCP サーバー経由でも呼べます**（下の「Claude Code から道具として呼ぶ」）。
+
 想定外の引数が来ても落ちません。外から叩かれる口なので「何もしない」側に倒してあります。
+
+## Claude Code から道具として呼ぶ（`mcp_server.py`）
+
+常駐している tray-tools を、Claude Code の **MCP サーバー**として差し出します。Claude が「そういう道具がある」と知った状態になり、自分で判断して呼べるようになります。
+
+**できることは増えていません。** 名前付きパイプは今でもこのマシン上の何からでも書けます。MCP 化は**既存の口に説明書を付けるだけ**です。増えるのは次の2つ。
+
+- Claude が道具の存在と使い方を知っている（言われなくても適切な場面で使える）
+- **道具ごとに承認の粒度を分けられる**（`status` は読むだけ、`sleep_pc` は要確認）
+
+### 登録
+
+`~/.claude/settings.json` の `mcpServers` に足します。**PySide6 を読まないので、起動は実測 0.085 秒**です（Claude Code の起動ごとにこのサーバーが立つため、ここが重いと毎回の待ちになります）。
+
+### 道具の一覧
+
+| 道具 | 引数 | 印 |
+|---|---|---|
+| `status` | なし | `readOnlyHint` |
+| `read_log` | `lines` | `readOnlyHint` |
+| `keep_awake` | `state`（必須）, `minutes` | `idempotentHint` |
+| `sleep_pc` | `action`（必須）, `seconds` | **`destructiveHint`** |
+| `notify` | `message`（必須） | |
+| `beep` | `kind` | |
+| `pushover` | `message`（必須）, `title`, `priority`, `sound` | `openWorldHint` |
+| `capture` | `screen` | |
+| `bookmark` | `path` | |
+
+`annotations` はクライアントが承認の重さを決める材料です。読むだけのものに `readOnlyHint` を付けてあるので、都度確認せずに使う設定にしやすくなっています。逆に `sleep_pc` には `destructiveHint` を付けてあります —— **作業中に寝られるのがいちばん困る**ためです。
+
+### 何を載せて、何を載せないか
+
+`main.py` の `_build_command_handlers` と**同じ線引き**です。載せてよいのは「**常駐しているこのプロセスでなければできないこと**」だけ。ファイル操作もアプリ起動も呼ぶ側が直接できるので載せません。口を通る危険だけが増えます。
+
+`capture` がこの線引きの分かりやすい例です。`mss` のインスタンスを都度作ると COM/GC 衝突で落ちるため（2026-08-28 に8回）、**常駐が抱えているものを通すしか安全な手がありません。**
+
+逆に**画像そのものは返しません。** 撮ったファイルのパスを返せば、読む側は普通にファイルを開けばよく、数MBを base64 で流す必要がないためです。
+
+### 実装上の約束
+
+- **MCP の SDK を使いません。** stdio 上の JSON-RPC は数十行で足りるうえ、venv に依存を増やさずに済みます
+- **`stdout` には MCP のメッセージ以外を一切書きません。** 診断は `stderr` へ。メッセージは1行1件で、**中に改行を含めません**（`separators=(",", ":")` で潰しています）
+- **常駐が起きていなければ、起こしに行かず「起きていない」と返します。** `traytools_send.send()` は未起動なら本体を起動して6秒待ちますが、それはあふｗから呼ぶときの作法です
+- **引数の不正はプロトコルのエラーにせず、`isError` を立てた結果として返します。** そのほうが Claude 側が読んで対処できます（プロトコルのエラーは会話に載りません）
+
+## 画面を撮る（外部コマンド）
+
+```
+traytools_send.py capture        画面全体（仮想デスクトップ）を1枚
+traytools_send.py capture 2      2番目の画面だけ
+```
+
+保存先は Rapture と同じ `capture.save_folder` で、応答の2行目に保存したパスが返ります。
+
+**必ず常駐の `capture_grab._sct()` を通します。** `mss.MSS()` を都度作ると COM/GC 衝突でプロセスごと落ちるためで、単発の呼び出しでも同じ経路に乗せています。
+
+半透明のウィンドウも写します（`include_layered=True`）。通知やメニューが出ている状態を撮りたいためです。
 
 ### メニューに出る条件
 

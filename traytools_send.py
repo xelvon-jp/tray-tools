@@ -247,7 +247,8 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   notify <本文>                トーストを1枚出す
   beep [ok|done|warn|error|ask] 音を1つ鳴らす
   pushover <本文> [--title T] [--priority N] [--sound S]
-                               スマホへプッシュ通知（要トークン登録）"""
+                               スマホへプッシュ通知（要トークン登録）
+  capture [画面番号]           画面を1枚撮って保存し、パスを返す"""
 
 
 def main() -> int:

@@ -84,6 +84,36 @@ python -c "import main; print(main._acquire_single_instance())"
 - **offscreen で `setMimeData()` を使うと終了時にセグメンテーション違反（139）が出る。** 実機とは無関係（`README.md` に理由あり）。
 - offscreen では日本語フォントが解決されず豆腐になることがある。レイアウトの確認には使えるが、字が出ないことを不具合と読み違えないこと。
 
+## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py`）
+
+Copilot アプリを相手に「プロンプト送信 → 応答受信 → コード実行 → 結果貼り戻し」を自動で回す仕組み。
+
+- **UIA だけを使う。キー送信もマウス操作もしない。** フォーカスを奪わないので、他の作業と並行しても事故が起きない
+- **既定は dry-run。** `--auto` を明示しない限り PowerShell を実行せず、コードをログに残して止まる。初めての題材はまずここで安全に確かめる
+- **危険パターン検知**（`copilot_loop.risky_lines`）でヒットしたら自動実行しない。人の判断を待って止まる。Copilot に理由を返して終わる
+- **3層のタイムアウト**（PowerShell 単発 / 応答待ち / ループ全体）で無限ループを防ぐ
+- **キャンセルはファイル方式**（`.copilot_loop_cancel`）。実行スレッドが詰まっていても次の周の頭で拾って止まる
+
+### 応答テキストの取り方に決着済みの罠
+
+`copilot_loop.Copilot.document_text` の docstring に詳しいが要点を再掲。3案を実測して「**`FindAll` の並びのまま `Text` 要素の名前を繋ぐ**」だけが正解だった。
+
+- Text を座標順に並べる → 構文強調でトークンが割れ、コードが原形を失う
+- `TextPattern.DocumentRange` → 一部のトークン境界で改行が入る（`@{` が `@` と `{` に割れる、`-Encoding UTF8` が2行になる）
+- `FindAll` の返り順（DOM 順）は保たれるので、**並べ替えないこと**が肝
+
+### wait_until_idle は「busy を見てから idle 復帰」に依存しない
+
+前実装は「busy を見た後に idle に戻ったら完了」で作っていたが、生成が短すぎたり poll の隙間で busy を見逃すと**永久に idle 待ちになった**（301秒タイムアウトの実例あり）。いまは「送信後 grace → idle が settle_seconds 連続で完了 / busy を見たらタイマーをリセット」。busy を見逃しても止まる。
+
+### new_response は送信直前の全文長から切り出す
+
+`rsplit("Copilot の発言", 1)[1]` は会話が長くなると誤爆する。応答内に見出しとして同じマーカーが混ざったり、古いターンの断片が最後尾になったりして、27文字などの短片が返る。**送信直前の `snapshot_length()` を渡して、それより後ろだけを扱う**。
+
+### 業務PC（M365 Copilot）への移植
+
+`copilot_loop.SELECTORS` を書き換えるだけで対応できる作り（窓の class / title、入力欄の AutomationId、送信/停止ボタンの日本語名など）。**書き換える候補は `tools/uia_probe.py` が出してくれる**。`--watch 20` で `メッセージの送信 → メッセージの割り込み → Copilot と会話する` の遷移を眺めて、正しいボタン名を突き止める。
+
 ## 設定ファイル
 
 `settings.json` を丸ごと書き戻さない。**ファイルを読み直して該当キーだけ差し替える**（丸ごと書くと未設定の既定値まで焼き込まれ、ファイルの姿が変わる）。`snippets.push_recent` / `launcher.save_bookmark` / `clipboard_preview._save_size` が同じ作法。

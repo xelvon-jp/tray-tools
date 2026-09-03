@@ -248,7 +248,12 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   beep [ok|done|warn|error|ask] 音を1つ鳴らす
   pushover <本文> [--title T] [--priority N] [--sound S]
                                スマホへプッシュ通知（要トークン登録）
-  capture [画面番号]           画面を1枚撮って保存し、パスを返す"""
+  capture [画面番号]           画面を1枚撮って保存し、パスを返す
+  agent-loop status            疑似エージェントループの状態
+  agent-loop cancel            走っているループに停止要求（次の周の頭で止まる）
+  agent-loop start <お題ファイル> [--auto] [--max=N] [--ps-timeout=N]
+                               [--response-timeout=N] [--paste-limit=N] [--finish-word=W]
+                               既定は dry-run（コードを実行せずログに残して止まる）"""
 
 
 def main() -> int:

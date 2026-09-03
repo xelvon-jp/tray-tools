@@ -387,6 +387,21 @@ def _build_command_handlers(features) -> dict:
         # base64 で数MBを流すことになる。保存してパスを返せば、読む側は普通に
         # ファイルを開けばよい(保存先は capture.save_folder と同じ)。
         "capture": lambda args, reply: reply(_capture_command(screen, args)),
+        # Copilot アプリを相手にした疑似エージェントループ。
+        #
+        #   traytools_send.py agent-loop start <お題ファイル> [--auto] [--max N]
+        #   traytools_send.py agent-loop status
+        #   traytools_send.py agent-loop cancel
+        #   traytools_send.py agent-loop stop-if-cancelled  （内部用）
+        #
+        # 【なぜ常駐に載せるのか】
+        # - 1周ぶん十数秒 × 数周 = 数分の非同期処理を持ち回るのに、外の呼び出し側で
+        #   待つ形にすると使い勝手が悪い。常駐に投げっぱなしにできると便利。
+        # - status で「回っているか」を人にもエージェントにも見せられる。
+        # - cancel は「置きっぱなしのフラグ」だけで済むので、実行スレッドの応答性に
+        #   関係なく効く(実行スレッドが PowerShell の完了待ちで詰まっていても、
+        #   次の周の頭で拾って止まる)。
+        "agent-loop": lambda args, reply: _agent_loop_command(args, reply),
     }
 
 
@@ -566,6 +581,139 @@ def _pushover_command(args, reply) -> None:
         reply(("OK " if ok else "ERR ") + detail)
 
     threading.Thread(target=work, name="pushover-send", daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 疑似エージェントループ(Copilot アプリを相手に回す)
+# ---------------------------------------------------------------------------
+# 走っているスレッドを1本だけ持つ。2本同時に走らせない(Copilot は1つしか無い)。
+# 完了・失敗時のサマリはここに載せて status で読める状態にする。
+_agent_loop_state = {"thread": None, "started": None, "prompt": None,
+                     "auto": False, "summary": None}
+
+
+def _agent_loop_running() -> bool:
+    thread = _agent_loop_state.get("thread")
+    return thread is not None and thread.is_alive()
+
+
+def _agent_loop_status_text() -> str:
+    if _agent_loop_running():
+        started = _agent_loop_state["started"] or ""
+        return (f"agent-loop 実行中 (開始 {started}, "
+                f"auto={_agent_loop_state['auto']}, "
+                f"prompt={_agent_loop_state['prompt']})")
+    summary = _agent_loop_state.get("summary")
+    if summary:
+        return (f"直近: 停止理由={summary.get('stopped_by')} "
+                f"周回={summary.get('rounds')} "
+                f"経過={summary.get('elapsed')}秒 "
+                f"詳細={summary.get('detail', '')}")
+    return "agent-loop 未実行"
+
+
+def _agent_loop_command(args, reply) -> None:
+    """外部から agent-loop を操作する。start/status/cancel。
+
+    実処理は別スレッドで走らせる。Qtメインスレッドを塞ぐと常駐全体が固まるうえ、
+    ループ本体は Copilot への送信・PowerShell 実行で数分ブロックしうる。"""
+    action = (args[0].strip().lower() if args else "status")
+
+    if action == "status":
+        reply("OK " + _agent_loop_status_text())
+        return
+
+    if action == "cancel":
+        # ファイルを置くだけ。実行スレッドが次の周の頭で拾って止まる。
+        # 実行スレッドが PowerShell で詰まっていても、これは即座に効く。
+        try:
+            import agent_loop as al
+            al.request_cancel()
+            reply("OK agent-loop にキャンセルを要求しました（次の周の頭で止まります）")
+        except Exception as e:  # noqa: BLE001
+            reply(f"ERR キャンセル要求できませんでした: {e}")
+        return
+
+    if action != "start":
+        reply(f"ERR 不明な agent-loop 指示: {action}（start / status / cancel）")
+        return
+
+    if _agent_loop_running():
+        reply("ERR agent-loop は既に走っています（先に cancel してください）")
+        return
+
+    # --- start の引数解析 ---
+    # traytools_send.py agent-loop start <お題ファイル> [--auto] [--max N]
+    #                                                  [--ps-timeout N] [--response-timeout N]
+    #                                                  [--paste-limit N] [--finish-word W]
+    if len(args) < 2:
+        reply("ERR お題ファイルのパスを指定してください")
+        return
+    prompt_path = args[1]
+    if not os.path.exists(prompt_path):
+        reply(f"ERR お題ファイルが見つかりません: {prompt_path}")
+        return
+
+    opts = {"auto": False, "max_rounds": None, "ps_timeout": None,
+            "response_timeout": None, "paste_limit": None,
+            "finish_word": "", "loop_timeout": None}
+    i = 2
+    tail = args[2:]
+    for i, tok in enumerate(tail):
+        if tok == "--auto":
+            opts["auto"] = True
+        elif tok.startswith("--max=") or tok.startswith("--max-rounds="):
+            opts["max_rounds"] = int(tok.split("=", 1)[1])
+        elif tok.startswith("--ps-timeout="):
+            opts["ps_timeout"] = int(tok.split("=", 1)[1])
+        elif tok.startswith("--response-timeout="):
+            opts["response_timeout"] = int(tok.split("=", 1)[1])
+        elif tok.startswith("--paste-limit="):
+            opts["paste_limit"] = int(tok.split("=", 1)[1])
+        elif tok.startswith("--finish-word="):
+            opts["finish_word"] = tok.split("=", 1)[1]
+        elif tok.startswith("--loop-timeout="):
+            opts["loop_timeout"] = int(tok.split("=", 1)[1])
+        # 未知のオプションは黙って飛ばす(古い呼び出しが将来の版で落ちないため)
+
+    def work():
+        # ここはワーカースレッド。Qtのウィジェットには絶対に触らないこと。
+        try:
+            import agent_loop as al  # 遅延 import。常駐の起動時間を伸ばさないため
+            prompt = open(prompt_path, encoding="utf-8-sig").read().strip()
+            kwargs = {"initial_prompt": prompt, "auto_run": opts["auto"]}
+            for key in ("max_rounds", "ps_timeout", "response_timeout",
+                        "paste_limit", "loop_timeout"):
+                if opts[key] is not None:
+                    kwargs[key] = opts[key]
+            if opts["finish_word"]:
+                kwargs["finish_word"] = opts["finish_word"]
+            _agent_loop_state["summary"] = None
+            summary = al.run_loop(**kwargs)
+            _agent_loop_state["summary"] = summary
+            action_log.record("agent-loop 終了",
+                              f"{summary.get('stopped_by')} 周回{summary.get('rounds')} "
+                              f"経過{summary.get('elapsed')}秒",
+                              "external")
+        except Exception as e:  # noqa: BLE001
+            _agent_loop_state["summary"] = {
+                "stopped_by": "error", "detail": str(e),
+                "rounds": 0, "elapsed": 0,
+            }
+            action_log.record("agent-loop 失敗", str(e)[:80], "external")
+
+    _agent_loop_state["thread"] = threading.Thread(
+        target=work, name="agent-loop", daemon=True)
+    _agent_loop_state["started"] = datetime.now().strftime("%H:%M:%S")
+    _agent_loop_state["prompt"] = os.path.basename(prompt_path)
+    _agent_loop_state["auto"] = opts["auto"]
+    _agent_loop_state["thread"].start()
+
+    action_log.record("agent-loop 開始",
+                      f"{os.path.basename(prompt_path)} auto={opts['auto']}",
+                      "external")
+    reply(f"OK agent-loop を開始しました "
+          f"(auto={opts['auto']}, prompt={os.path.basename(prompt_path)})")
 
 
 def _restart(instance_lock) -> bool:

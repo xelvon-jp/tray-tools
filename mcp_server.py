@@ -210,6 +210,42 @@ TOOLS = [
         "**画面に窓が出るので、頼まれていないのに呼ばないこと。**",
         {"path": {"type": "string", "description": "登録したいフォルダのパス"}},
     ),
+    _tool(
+        "agent_loop",
+        "疑似エージェントループを操作する",
+        "Copilot アプリを相手にした疑似エージェントループの起動・状態・停止。"
+        "action=start は非同期で常駐スレッドに投げる(すぐに戻る)。既定は dry-run で、"
+        "Copilot が返したコードを実行せずログに残して止まる。--auto を付けたときだけ"
+        "PowerShell に流す。危険パターン(Remove-Item / 外部通信など)を検出したら"
+        "実行せずに停止する。"
+        "**Copilot に投稿する副作用がある。頼まれていないのに呼ばないこと。**",
+        {
+            "action": {
+                "type": "string",
+                "enum": ["status", "start", "cancel"],
+                "description": "status=状態確認 / start=開始 / cancel=停止要求",
+            },
+            "prompt_file": {
+                "type": "string",
+                "description": "action=start のときの1周目プロンプトのファイルパス",
+            },
+            "auto": {
+                "type": "boolean",
+                "description": "true で PowerShell を自動実行。既定は false(dry-run)",
+            },
+            "max_rounds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "上限周回。既定10",
+            },
+            "finish_word": {
+                "type": "string",
+                "description": "応答に含まれたら完了とみなす語(例: <DONE>)",
+            },
+        },
+        ["action"],
+        destructiveHint=True,
+    ),
 ]
 
 TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
@@ -280,6 +316,26 @@ def _to_command(name: str, params: dict):
     if name == "bookmark":
         path = (params.get("path") or "").strip()
         return "bookmark", ([path] if path else [])
+
+    if name == "agent_loop":
+        action = params.get("action")
+        if action not in ("status", "start", "cancel"):
+            raise ValueError("action は status / start / cancel です")
+        if action != "start":
+            return "agent-loop", [action]
+        prompt_file = (params.get("prompt_file") or "").strip()
+        if not prompt_file:
+            raise ValueError("start には prompt_file が必要です")
+        args = ["start", prompt_file]
+        if params.get("auto") is True:
+            args.append("--auto")
+        max_rounds = params.get("max_rounds")
+        if max_rounds is not None:
+            args.append(f"--max={int(max_rounds)}")
+        finish_word = (params.get("finish_word") or "").strip()
+        if finish_word:
+            args.append(f"--finish-word={finish_word}")
+        return "agent-loop", args
 
     raise ValueError(f"知らない道具です: {name}")
 

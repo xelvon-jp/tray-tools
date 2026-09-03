@@ -366,6 +366,52 @@ traytools_send.py capture 2      2番目の画面だけ
 
 半透明のウィンドウも写します（`include_layered=True`）。通知やメニューが出ている状態を撮りたいためです。
 
+## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py`）
+
+Copilot アプリを相手に「プロンプト送信 → 応答受信 → コード実行 → 結果貼り戻し」を自動で回す仕組み。**Ctrl+V や Enter を送らない**（UIA の `ValuePattern.SetValue` と `InvokePattern.Invoke` だけを使う）ので、フォーカスを奪わず、裏で作業しても事故が起きません。
+
+### 使い方
+
+```
+traytools_send.py agent-loop start C:\path\to\お題.txt        # 既定は dry-run
+traytools_send.py agent-loop start C:\path\to\お題.txt --auto  # PowerShell を実行
+traytools_send.py agent-loop status                            # いま回っているか
+traytools_send.py agent-loop cancel                            # 次の周の頭で止まる
+```
+
+Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`action=start|status|cancel`）。
+
+### 安全機構
+
+- **既定は dry-run**（`--auto` を明示するまで実行しない）。Copilot が返したコードは `copilot_loop.log` に残るので、目視で確かめてから `--auto` を付ける
+- **危険パターン検知**（`Remove-Item` / `Stop-Process` / `Invoke-WebRequest` / `git push` / `-Force` など）にヒットしたら実行せず停止。Copilot に理由を返して人の判断を待つ
+- **3層のタイムアウト**: PowerShell 1回（既定60秒）／応答待ち（180秒）／ループ全体（30分）
+- **キャンセルはファイル方式**（`.copilot_loop_cancel`）。実行スレッドが PowerShell で詰まっていても、次の周の頭で拾って止まる
+
+### プロンプトの作り方
+
+1周目のプロンプトには次を入れます（`snippets/エージェントループ開始.txt` を参考に）。
+
+- **スニペットを `#start <数字ID>` 〜 `#end <同じID>` で囲ませる。** 言語フェンス検出より確実で、実行漏れ・重複実行の検知にもなる
+- **「エラーを貼ったら、原因の一言 + 修正後のスニペット全体だけ返して」** と縛る。回答が長引くと1周が10分単位で伸びる
+- **完了語**（例 `<DONE>`）を仕込むと `--finish-word=<DONE>` で正常終了できる
+
+### 実測
+
+3案を比べた結果はコードのコメントに残していますが、実運用で効いた設計判断だけ抜粋:
+
+- **応答テキストは `FindAll` の並びのまま `Text` 要素を連結する**（座標順に並べる／`TextPattern.DocumentRange` はどちらも壊れる）
+- **`wait_until_idle` は「busy を見てから idle」ではなく「idle が settle_seconds 連続」で判定**（busy を見逃す事故を避ける）
+- **応答は送信直前の全文長を控えて、そこより後ろだけ扱う**（会話が長くなると `rsplit` は27文字などの短片を返す）
+
+### 業務PC（M365 Copilot）への移植
+
+`copilot_loop.SELECTORS` を書き換えれば済む作りです。書き換える候補は同梱の `tools/uia_probe.py` が出してくれます。詳しくは [`tools/README.md`](tools/README.md)。
+
+### ログ
+
+`copilot_loop.log`（JSON Lines）に、1周ごとの送信・応答・スニペット・実行結果・停止理由を全部残します。個人の使用履歴なので `.gitignore` に入れて追跡対象外にしています。
+
 ### メニューに出る条件
 
 **このメニューは、トークンを登録済みのPCにだけ出ます。** 複数のPCで同じコードを動かしていると、業務用の端末に個人の通知先の入口が並ぶことになり、使い道がないためです。

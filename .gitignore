@@ -31,3 +31,9 @@ action.log
 
 # フックの実行記録。個人の使用履歴なので追跡しない。
 hooks/hook.log
+
+# 疑似エージェントループ(agent_loop.py)の実行ログ・キャンセルフラグ・
+# 実行用の一時 .ps1。個人の使用履歴なので追跡しない(action.log と同じ扱い)。
+copilot_loop.log
+copilot_loop_scratch/
+.copilot_loop_cancel

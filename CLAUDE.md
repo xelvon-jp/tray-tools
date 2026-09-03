@@ -92,4 +92,28 @@ python -c "import main; print(main._acquire_single_instance())"
 
 - コミットメッセージは**日本語**。1行目に要約、本文に「なぜそうしたか」。
 - **このリポジトリは public。** 個人的な除外は `.gitignore` ではなく `.git/info/exclude` へ（`.gitignore` は共有されるので「何を隠したか」が公開される）。
-- **push はユーザーが行う。**
+
+### push
+
+**通常の push は確認なしでよい。** 単一PC・単独操作で、GitHub Actions も他の書き手もいないため競合しない（`threads-auto-post` で git を禁止しているのは Actions と `index.lock` が競合するからで、ここにその事情は無い）。
+
+**ただし public なので、push の直前に必ずこれを通すこと。** 一度出せば取り消しは事実上効かない（キャッシュ・フォーク・検索）。危ないのは push ではなく**コミットの時点**なので、push を止めても守りにはならない。だから止める代わりに、毎回見る。
+
+```bash
+git diff --stat origin/main..HEAD
+git ls-files --error-unmatch settings.json hooks/hook.log action.log crash.log error.log
+git diff origin/main..HEAD | grep -inE "token|api[_-]?key|password|secret|bearer|[a-f0-9]{32,}"
+git log origin/main..HEAD --format="%an <%ae>" | sort -u
+```
+
+- `settings.json` と各種 `*.log` が**追跡対象になっていないこと**（`--error-unmatch` が全部失敗すれば正しい）
+- 追加行に秘密情報らしき文字列が無いこと
+- 著者が noreply で統一されていること
+
+**引っかかったら push せずに報告する。**
+
+### 確認が要るもの（自動でやらない）
+
+- **履歴を書き換える操作** … `push --force` / `rebase` / `reset --hard`
+- **public ↔ private の切り替え**
+- **新しいリポジトリを公開すること**

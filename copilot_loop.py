@@ -208,18 +208,26 @@ class Copilot:
             return None
         return pattern.QueryInterface(UIA.IUIAutomationValuePattern).CurrentValue
 
-    def click_send(self):
-        """送信ボタンを押す。フォーカスは奪わない。"""
-        root, desc = self._descendants()
-        for name, el in self._bottom_buttons(root, desc):
-            if name != SELECTORS["send_button"]:
-                continue
-            pattern = el.GetCurrentPattern(INVOKE_PATTERN)
-            if not pattern:
-                raise RuntimeError("送信ボタンを押せません（InvokePattern が無い）")
-            pattern.QueryInterface(UIA.IUIAutomationInvokePattern).Invoke()
-            return True
-        return False
+    def click_send(self, wait=3.0, poll=0.2):
+        """送信ボタンを押す。フォーカスは奪わない。
+
+        set_input の直後は Chromium がまだ送信ボタンを出していないことがある
+        (前実装では 2.6 秒で「送信ボタンが見つかりません」で停止した実例あり)。
+        wait 秒までポーリングして、ready 状態になったら即押す。"""
+        end = time.time() + max(0.0, wait)
+        while True:
+            root, desc = self._descendants()
+            for name, el in self._bottom_buttons(root, desc):
+                if name != SELECTORS["send_button"]:
+                    continue
+                pattern = el.GetCurrentPattern(INVOKE_PATTERN)
+                if not pattern:
+                    raise RuntimeError("送信ボタンを押せません（InvokePattern が無い）")
+                pattern.QueryInterface(UIA.IUIAutomationInvokePattern).Invoke()
+                return True
+            if time.time() >= end:
+                return False
+            time.sleep(poll)
 
     # -- 読む --------------------------------------------------------------
     def document_text(self):

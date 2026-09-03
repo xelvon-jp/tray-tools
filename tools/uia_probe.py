@@ -133,7 +133,11 @@ def find_render_child(hwnd):
 
 
 def wake_accessibility(hwnd):
-    """WM_GETOBJECT を投げて Chromium にツリーを作らせる。"""
+    """WM_GETOBJECT を投げて Chromium にツリーを作らせる。
+
+    レンダラ HWND に投げるのが本筋だが、実測ではメイン窓に投げても起きることが
+    ある(Chromium のフレーム側が支援技術の要求として受け取り、レンダラへ回す)。
+    レンダラが取れなくても諦めずにメイン窓に投げるとよい。"""
     out = ctypes.c_size_t()
     user32.SendMessageTimeoutW(
         ctypes.c_void_p(hwnd), WM_GETOBJECT, 0, ctypes.c_ssize_t(OBJID_CLIENT),
@@ -141,12 +145,26 @@ def wake_accessibility(hwnd):
     )
 
 
-def probe(hwnd_main, hwnd_render, top_px=170):
-    """1回覗いて (下段ボタン, 入力欄候補, 全子孫数) を返す。"""
-    wake_accessibility(hwnd_render or hwnd_main)
+def probe(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
+    """1回覗いて (下段ボタン, 入力欄候補, 全子孫数) を返す。
+
+    Chromium は WM_GETOBJECT を受け取ってからツリーを作るまでに数百ミリ秒〜数秒
+    かかることがある(バックグラウンドだったタブなら特に)。子孫が 30 個未満なら
+    まだ立ち上がりきっていない可能性が高いので、wake_wait 秒までリトライする。
+    ツリーが起きていないままだと下段ボタンも入力欄候補も空で返り、原因不明の
+    「見つかりません」に見えてしまう。"""
     uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+    true_cond = uia.CreateTrueCondition()
     root = uia.ElementFromHandle(ctypes.c_void_p(hwnd_main))
-    desc = root.FindAll(UIA.TreeScope_Descendants, uia.CreateTrueCondition())
+
+    wake_accessibility(hwnd_render or hwnd_main)
+    deadline = time.time() + wake_wait
+    desc = root.FindAll(UIA.TreeScope_Descendants, true_cond)
+    while desc.Length < 30 and time.time() < deadline:
+        time.sleep(0.4)
+        # 2回目以降も投げる(1回目を落とすアプリがある。害はない)
+        wake_accessibility(hwnd_render or hwnd_main)
+        desc = root.FindAll(UIA.TreeScope_Descendants, true_cond)
 
     win_bottom = root.CurrentBoundingRectangle.bottom
     limit = win_bottom - top_px

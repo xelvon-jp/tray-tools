@@ -454,7 +454,11 @@ Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`a
 
 ### 業務PC（M365 Copilot）への移植
 
-`copilot_loop.SELECTORS` を書き換えれば済む作りです。書き換える候補は同梱の `tools/uia_probe.py` が出してくれます。詳しくは [`tools/README.md`](tools/README.md)。
+`copilot_loop.BUILTIN_PROFILES` にアプリごとのプロファイルが並んでいて、実行時に「動いている窓に合うもの」が選ばれます。手元PCの Copilot（`mscopilot.exe`）と業務PCの M365 Copilot（`M365Copilot.exe`）の両方が入っているので、同じコードがどちらでも動きます。
+
+PCごとに値が違うときは、コードを触らず `settings.json` の `copilot_profiles` で上書きできます（同じ `name` なら設定側が勝ちます）。
+
+調べる候補は同梱の `tools/uia_probe.py` が出してくれます。詳しくは [`tools/README.md`](tools/README.md)。
 
 **Claude Code の無い業務PCでは、監視モード（`--watch` またはトレイメニュー）が本命の使い方**です。人が M365 Copilot にお題を貼って Enter → トレイの「監視モード開始」を押す → 以降は自動、という流れになります。
 

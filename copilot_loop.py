@@ -38,18 +38,83 @@ comtypes.CoInitialize()
 comtypes.client.GetModule("UIAutomationCore.dll")
 import comtypes.gen.UIAutomationClient as UIA  # noqa: E402
 
-# --- 差し替え箇所（別アプリへ移すときはここだけ） ---------------------------
-SELECTORS = {
-    "window_class": "Chrome_WidgetWin_1",
-    "window_title": "Copilot",
-    "render_class": "Chrome_RenderWidgetHostHWND",
-    "input_automation_id": "userInput",
-    "send_button": "メッセージの送信",
-    "busy_button": "メッセージの割り込み",   # 回答中だけ出る
-    "idle_marker": "Copilot と会話する",     # 入力待ちのときに出ている
-    "assistant_marker": "Copilot の発言",
-    "user_marker": "あなたの発言",
-}
+# --- プロファイル（別アプリへ移すときはここに1つ足す） -----------------------
+# 窓の探し方とボタン名を1アプリぶんまとめたもの。
+#
+# 【なぜ1組の定数をやめたのか】
+# 手元PCの Copilot と業務PCの M365 Copilot は、実測で全部違った:
+#   mscopilot.exe    class='Chrome_WidgetWin_1'           aid='userInput'
+#   M365Copilot.exe  class='Microsoft 365 Copilot Host'   aid='m365chat-editor-target-element'
+# 1組を書き換えて回す作りだと、PCを移るたびに書き換えが要る。両方を持っておいて、
+# 実際に動いている窓に合うものを選ぶ。
+#
+# 【なぜ exe 名で照合するのか】
+# タイトルは表示言語・開いている会話で変わる。クラスも当てにならない
+# (Chrome_WidgetWin_1 には Claude も Chrome も居る)。exe 名はそのどちらの影響も
+# 受けないので、これを第一の手掛かりにする。
+#
+# 【なぜボタン名がリストなのか】
+# 文言はアプリ・バージョン・表示言語で変わる。1つの完全一致に賭けると、少し違う
+# だけで「ずっと idle」に見えてしまい、しかも理由が画面に出ない。候補を並べて
+# 「どれかに当てはまれば」で判定する。
+BUILTIN_PROFILES = [
+    {
+        "name": "mscopilot",
+        "process_name": "mscopilot.exe",
+        "window_class": "Chrome_WidgetWin_1",
+        "window_title_contains": "Copilot",
+        "render_class": "Chrome_RenderWidgetHostHWND",
+        "input_automation_id": "userInput",
+        "send_button": ["メッセージの送信", "送信"],
+        "busy_button": ["メッセージの割り込み", "生成を停止する", "停止"],
+        "assistant_marker": "Copilot の発言",
+        "user_marker": "あなたの発言",
+        "input_band_px": 170,
+    },
+    {
+        # 業務PCの M365 Copilot。値は uia_probe の実測(子孫335個)による。
+        "name": "m365",
+        "process_name": "M365Copilot.exe",
+        "window_class": "Microsoft 365 Copilot Host",
+        # タイトルは実測していないので条件にしない(exe とクラスで十分に絞れる)。
+        "window_title_contains": "",
+        # Chromium の窓クラスではないが、中身は WebView2 なのでレンダラの窓は居る
+        # 見込み。見つからなければメイン窓へ WM_GETOBJECT を投げる道に落ちる。
+        "render_class": "Chrome_RenderWidgetHostHWND",
+        "input_automation_id": "m365chat-editor-target-element",
+        "send_button": ["送信", "メッセージの送信"],
+        "busy_button": ["生成を停止する", "メッセージの割り込み", "停止"],
+        # 発言マーカーは未特定。M365 は 'あなたの発言' に相当する Text を出して
+        # おらず、プローブの上位に出たのは会話本文だった。空のままにしてあるのは、
+        # 当てずっぽうで埋めると agent_loop が誤った位置で応答を切り出すため。
+        # 状態表示(copilot_watchdog)はマーカーを使わないので、空でも動く。
+        "assistant_marker": "",
+        "user_marker": "",
+        "input_band_px": 170,
+    },
+]
+
+# 既定のプロファイル。SELECTORS という名前は、これ1つで回していた頃からの呼び名。
+# Copilot インスタンスは self.profile を見るので、実際に効くのはそちら。
+SELECTORS = BUILTIN_PROFILES[0]
+
+SETTINGS_PROFILES_KEY = "copilot_profiles"
+
+
+def profiles(app_settings=None):
+    """使うプロファイルを、優先順に並べて返す。
+
+    settings.json の copilot_profiles を先に置く。業務PCでコードを書き換えずに
+    直せるようにするため(あちらへは git で配るしかなく、settings.json は git
+    管理外なので、PCごとに違う値を持たせても衝突しない)。
+    同じ name のものは settings.json 側が勝つ。"""
+    extra = []
+    if isinstance(app_settings, dict):
+        found = app_settings.get(SETTINGS_PROFILES_KEY)
+        if isinstance(found, list):
+            extra = [p for p in found if isinstance(p, dict) and p.get("name")]
+    overridden = {p.get("name") for p in extra}
+    return extra + [p for p in BUILTIN_PROFILES if p["name"] not in overridden]
 
 CONTROL_BUTTON, CONTROL_TEXT, CONTROL_DOCUMENT = 50000, 50020, 50030
 VALUE_PATTERN, INVOKE_PATTERN, TEXT_PATTERN = 10002, 10000, 10014
@@ -67,6 +132,36 @@ user32.SendMessageTimeoutW.argtypes = [
 # (CLAUDE.md「argtypes/restype は必須」)。
 user32.IsWindow.argtypes = [ctypes.c_void_p]
 user32.IsWindow.restype = ctypes.c_bool
+user32.IsIconic.argtypes = [ctypes.c_void_p]
+user32.IsIconic.restype = ctypes.c_bool
+user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+user32.IsWindowVisible.restype = ctypes.c_bool
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+user32.GetWindowRect.restype = ctypes.c_bool
+
+
+def window_bounds(hwnd):
+    """窓の外接矩形 (left, top, right, bottom)(物理px)。最小化・非表示なら None。
+
+    UIA を経由しないので桁違いに軽い。窓をドラッグに追従させるような短い周期の
+    呼び出しはこちらを使うこと(UIA の走査を150msごとに回すと重すぎる)。"""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return None
+    if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+        return None
+    r = _RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    if r.right <= r.left or r.bottom <= r.top:
+        return None
+    return (r.left, r.top, r.right, r.bottom)
 
 
 def _bounding_rect(element):
@@ -83,45 +178,122 @@ def _bounding_rect(element):
     return (r.left, r.top, r.right, r.bottom)
 
 
+def _class_of(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def _title_of(hwnd):
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def _exe_of(hwnd):
+    """窓を持っているプロセスの実行ファイル名。取れなければ ''。
+
+    psutil が無い環境でも動くようにしておく(その場合は exe 名での照合を諦め、
+    クラスとタイトルだけで絞る)。"""
+    try:
+        import psutil
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return psutil.Process(pid.value).name()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _find_render_child(hwnd, render_class):
+    """レンダラの窓を再帰的に探す。見つからなければ None。
+
+    EnumChildWindows は直接の子しか返さない環境がある(実測)。M365 Copilot のように
+    Chromium 由来でない窓クラスを被せているアプリでは、レンダラが孫以下に居ることが
+    あるので、コールバックの中で潜り直す。"""
+    found = {"h": None}
+    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def walk(parent):
+        def on_child(child, _l):
+            if found["h"] is not None:
+                return False
+            if _class_of(child) == render_class:
+                found["h"] = child
+                return False
+            walk(child)
+            return found["h"] is None
+        user32.EnumChildWindows(parent, EnumProc(on_child), None)
+
+    walk(hwnd)
+    return found["h"]
+
+
+def find_window(profile):
+    """プロファイルに合う可視の窓を探す。(hwnd_main, hwnd_render) を返す。
+
+    照合は exe 名 → クラス → タイトル(部分一致)の順。指定が空の項目は見ない。
+    exe 名が取れない環境では、その条件だけ飛ばして残りで絞る。"""
+    want_exe = (profile.get("process_name") or "").lower()
+    want_class = profile.get("window_class") or ""
+    want_title = profile.get("window_title_contains") or ""
+    found = {}
+    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def on_window(hwnd, _l):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if want_class and _class_of(hwnd) != want_class:
+            return True
+        if want_title and want_title.lower() not in _title_of(hwnd).lower():
+            return True
+        if want_exe:
+            exe = _exe_of(hwnd)
+            if exe and exe.lower() != want_exe:
+                return True
+        found["main"] = hwnd
+        return False
+
+    user32.EnumWindows(EnumProc(on_window), None)
+    main = found.get("main")
+    if not main:
+        return None, None
+    return main, _find_render_child(main, profile.get("render_class") or "")
+
+
 class Copilot:
     """Copilot アプリの窓を1つ掴んで、読み書きする。
 
     COM オブジェクトは属性として持ち続ける。関数の外に出すと即座に解放されて
     0xC0000005 で落ちる(tray-tools で何度も踏んだ罠)。"""
 
-    def __init__(self):
-        self.hwnd_main, self.hwnd_render = self._find_window()
-        if not self.hwnd_main:
-            raise RuntimeError("Copilot の窓が見つかりません")
+    def __init__(self, profile=None, app_settings=None):
+        """profile を渡さなければ、動いている窓に合うものを自動で選ぶ。
+
+        自動選択にしてあるのは、同じコードを手元PCと業務PCの両方で動かすため。
+        どちらのアプリが起きているかは実行時にしか分からない。"""
+        candidates = [profile] if profile else profiles(app_settings)
+        for candidate in candidates:
+            main, render = find_window(candidate)
+            if main:
+                self.profile = candidate
+                self.hwnd_main, self.hwnd_render = main, render
+                break
+        else:
+            names = "/".join(c.get("name", "?") for c in candidates)
+            raise RuntimeError(f"Copilot の窓が見つかりません (試した設定: {names})")
         self._wake()
         self.uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
         self.true_cond = self.uia.CreateTrueCondition()
 
-    # -- 窓を探す ----------------------------------------------------------
-    def _find_window(self):
-        found = {}
-        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    # -- プロファイルの参照 ------------------------------------------------
+    def _names(self, key):
+        """プロファイルの項目を必ずリストで返す(文字列1つでも書けるように)。"""
+        value = self.profile.get(key) or []
+        return [value] if isinstance(value, str) else list(value)
 
-        def on_window(hwnd, _l):
-            cls = ctypes.create_unicode_buffer(256)
-            user32.GetClassNameW(hwnd, cls, 256)
-            title = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(hwnd, title, 256)
-            if cls.value == SELECTORS["window_class"] and title.value == SELECTORS["window_title"]:
-                found["main"] = hwnd
-
-                def on_child(child, _l2):
-                    cbuf = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(child, cbuf, 256)
-                    if cbuf.value == SELECTORS["render_class"]:
-                        found["render"] = child
-                    return True
-
-                user32.EnumChildWindows(hwnd, EnumProc(on_child), None)
-            return True
-
-        user32.EnumWindows(EnumProc(on_window), None)
-        return found.get("main"), found.get("render")
+    def _has(self, names, key):
+        """下段のボタン名の集合に、その役目のボタンが1つでも居るか。"""
+        return any(w in names for w in self._names(key))
 
     def _wake(self):
         """Chromium のアクセシビリティツリーを起こす。既に起きていれば無害。"""
@@ -141,15 +313,20 @@ class Copilot:
         for i in range(desc.Length):
             el = desc.GetElement(i)
             try:
-                if (el.CurrentAutomationId or "") == SELECTORS["input_automation_id"]:
+                if (el.CurrentAutomationId or "") == self.profile["input_automation_id"]:
                     return el
             except Exception:
                 continue
         return None
 
     def _bottom_buttons(self, root, desc):
-        """入力欄まわり(窓の下端から170px)のボタン名。状態はここに出る。"""
-        limit = root.CurrentBoundingRectangle.bottom - 170
+        """入力欄まわり(窓の下端から一定の帯)のボタン名。状態はここに出る。
+
+        帯の高さをプロファイルで変えられるようにしてあるのは、アプリごとに入力欄の
+        まわりの作りが違うため。M365 Copilot も 170px で送信・停止の両方が入ることを
+        実測で確かめてあるが、レイアウトが変わったときにコードを触らず直せる。"""
+        limit = root.CurrentBoundingRectangle.bottom - int(
+            self.profile.get("input_band_px") or 170)
         names = []
         for i in range(desc.Length):
             el = desc.GetElement(i)
@@ -170,9 +347,9 @@ class Copilot:
         """'busy'(回答中) / 'ready'(送信できる) / 'idle'(入力待ち・空) を返す。"""
         root, desc = self._descendants()
         names = [n for n, _ in self._bottom_buttons(root, desc)]
-        if SELECTORS["busy_button"] in names:
+        if self._has(names, "busy_button"):
             return "busy"
-        if SELECTORS["send_button"] in names:
+        if self._has(names, "send_button"):
             return "ready"
         return "idle"
 
@@ -189,9 +366,9 @@ class Copilot:
         """
         root, desc = self._descendants()
         names = [n for n, _ in self._bottom_buttons(root, desc)]
-        if SELECTORS["busy_button"] in names:
+        if self._has(names, "busy_button"):
             state = "busy"
-        elif SELECTORS["send_button"] in names:
+        elif self._has(names, "send_button"):
             state = "ready"
         else:
             state = "idle"
@@ -276,7 +453,7 @@ class Copilot:
         while True:
             root, desc = self._descendants()
             for name, el in self._bottom_buttons(root, desc):
-                if name != SELECTORS["send_button"]:
+                if name not in self._names("send_button"):
                     continue
                 pattern = el.GetCurrentPattern(INVOKE_PATTERN)
                 if not pattern:
@@ -351,11 +528,11 @@ class Copilot:
         text = self.document_text()
         new_part = text[previous_length:]
         # こちらの発言(user_marker)以降を捨てる
-        marker_user = SELECTORS["user_marker"]
+        marker_user = self.profile["user_marker"]
         if marker_user in new_part:
             new_part = new_part.split(marker_user)[0]
         # 先頭に assistant_marker があれば剥がす
-        marker_ai = SELECTORS["assistant_marker"]
+        marker_ai = self.profile["assistant_marker"]
         if marker_ai in new_part:
             new_part = new_part.rsplit(marker_ai, 1)[1]
         return new_part.strip()
@@ -366,11 +543,11 @@ class Copilot:
         新しい呼び出しからは snapshot_length + new_response を使うこと。
         """
         text = self.document_text()
-        marker = SELECTORS["assistant_marker"]
+        marker = self.profile["assistant_marker"]
         if marker not in text:
             return text
         tail = text.rsplit(marker, 1)[1]
-        return tail.split(SELECTORS["user_marker"])[0].strip()
+        return tail.split(self.profile["user_marker"])[0].strip()
 
 
 # --- スニペットの切り出し ---------------------------------------------------

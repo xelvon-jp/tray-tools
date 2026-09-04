@@ -303,8 +303,11 @@ def run_loop(
             # する。応答が完了していても書きかけでも、正しく「人の最後の発言以降」を
             # 拾える。user_marker が無い(会話履歴がまっさら)なら 0 から取る。
             text = cp.document_text()
-            user_marker = copilot_loop.SELECTORS["user_marker"]
-            idx = text.rfind(user_marker)
+            # マーカーが空のプロファイル(M365 Copilot は 'あなたの発言' 相当の
+            # Text を出していない)では位置を決めようがないので全文を対象にする。
+            # rfind("") は len(text) を返すため、空を弾かないと常に空応答になる。
+            user_marker = cp.profile.get("user_marker") or ""
+            idx = text.rfind(user_marker) if user_marker else -1
             previous_length = 0 if idx == -1 else idx + len(user_marker)
         else:
             # 1) 送信直前の全文長を控える(new_response が使う)

@@ -277,9 +277,13 @@ def print_report(name, hwnd_main, hwnd_render, bottom, inputs, total, markers):
 
 def watch(hwnd_main, hwnd_render, seconds):
     """指定秒数、下段のボタン集合を眺める。変化したときだけ表示。
-    「入力待ち → 送信ボタン → 回答中 → 停止ボタン → 入力待ち」を捉えるため。"""
+    「入力待ち → 送信ボタン → 回答中 → 停止ボタン → 入力待ち」を捉えるため。
+
+    各時点の集合を全部返す。あとで volatile_buttons に渡して、状態で出入りする
+    ボタンだけに絞り込む。"""
     print(f"[watch] {seconds}秒、下段のボタン集合を見ます。")
     print("  対象アプリで実際にメッセージを送信して、遷移を捉えてください。")
+    snapshots = []
     last = None
     end = time.time() + seconds
     while time.time() < end:
@@ -289,11 +293,32 @@ def watch(hwnd_main, hwnd_render, seconds):
             print(f"  読み取り失敗: {e}")
             time.sleep(1)
             continue
-        key = tuple(sorted(set(bottom)))
+        names = set(bottom)
+        snapshots.append(names)
+        key = tuple(sorted(names))
         if key != last:
             print(f"  [{time.strftime('%H:%M:%S')}] {list(key)}")
             last = key
         time.sleep(0.5)
+    return snapshots
+
+
+def volatile_buttons(snapshots):
+    """出たり消えたりしたボタンだけを (名前, 出現回数) で返す。
+
+    【なぜ絞るのか】
+    下段のボタンは十数個あるが、状態によって出入りするのは送信ボタンと回答中の
+    ボタンだけ。「オプションを表示する」「ファイルの添付」などは常に見えている。
+    全時点に出ていたものを捨てると、候補が2〜3個まで落ちる。業務PCのように
+    画面を目で読んで書き写すしかない環境では、この差が効く。"""
+    if not snapshots:
+        return [], 0
+    always = set.intersection(*snapshots)
+    counts = collections.Counter()
+    for names in snapshots:
+        for n in names - always:
+            counts[n] += 1
+    return counts.most_common(), len(snapshots)
 
 
 def build_profile(cls, title, exe, inputs, bottom, markers):
@@ -348,6 +373,39 @@ def print_profile(profile, bottom, markers):
         print(f"  x{count:<3} {text!r}")
     print("  ※ AI 側の発言の頭に出るもの → assistant_marker")
     print("     自分の発言の頭に出るもの → user_marker")
+
+
+def print_readout(cls, exe, inputs, markers, volatile, sample_count, total):
+    """業務PCのように、画面を見て口で伝えるしかない環境のための最終まとめ。
+
+    出力の一番最後に置くこと。スクロールで戻らずに済むうえ、ここだけ読み上げれば
+    プロファイルが組める、という状態にしてある。長い一覧はこの上に残してあるので、
+    判断に迷ったときだけ戻ればよい。"""
+    aid = next((e["automation_id"] for e in inputs if e["automation_id"]), "")
+    print()
+    print("#" * 68)
+    print("#  ここから下だけ読み上げれば足ります")
+    print("#" * 68)
+    print(f"  1. exe            : {exe or '(不明)'}")
+    print(f"  2. window_class   : {cls or '(不明)'}")
+    print(f"  3. 入力欄の aid   : {aid or '(見つかりません)'}")
+    print(f"  4. 子孫の個数     : {total}")
+    print()
+    print("  5. 状態で出入りしたボタン（送信/回答中の候補）")
+    if not volatile:
+        if sample_count:
+            print("     (変化なし。--watch 中に送信されなかった可能性があります)")
+        else:
+            print("     (--watch を付けて、送信を1往復すると出ます)")
+    for name, count in volatile[:6]:
+        print(f"     {name!r}   … {sample_count}回中 {count}回")
+    print()
+    print("  6. 発言マーカーの候補（対になっている2つを探す）")
+    if not markers:
+        print("     (会話を1往復してから実行すると出ます)")
+    for text, count in markers[:6]:
+        print(f"     {text!r}   x{count}")
+    print("#" * 68)
 
 
 def main() -> int:
@@ -439,18 +497,25 @@ def _run(args) -> int:
             continue
         label = f"class={cls!r} exe={exe!r} title={tt!r} pid={_pid_of(hwnd)}"
         print_report(label, hwnd, render, bottom, inputs, total, markers)
+        volatile, sample_count = [], 0
         if args.watch:
             print()
-            watch(hwnd, render, args.watch)
+            snapshots = watch(hwnd, render, args.watch)
+            volatile, sample_count = volatile_buttons(snapshots)
             # watch のあとにもう一度見る。1往復してもらった後なら、
             # 発言マーカーが出そろっている。
             try:
-                bottom2, inputs2, _t2, markers2 = probe(hwnd, render, top_px=args.top_px)
-                bottom, inputs, markers = bottom or bottom2, inputs or inputs2, markers2 or markers
+                bottom2, inputs2, t2, markers2 = probe(hwnd, render, top_px=args.top_px)
+                bottom = bottom or bottom2
+                inputs = inputs or inputs2
+                markers = markers2 or markers
+                total = max(total, t2)
             except Exception:  # noqa: BLE001
                 pass
         print_profile(build_profile(cls, tt, exe, inputs, bottom, markers),
                       bottom, markers)
+        # 読み上げ用のまとめは必ず最後。画面の下端に残るようにする。
+        print_readout(cls, exe, inputs, markers, volatile, sample_count, total)
         print()
     return 0
 

@@ -540,7 +540,8 @@ class Copilot:
         return len(self.document_text())
 
     def new_response(self, previous_length, min_delta=10,
-                     stable_seconds=1.5, timeout=15.0, poll=0.3):
+                     stable_seconds=1.5, timeout=15.0, poll=0.3,
+                     sent_prompt=None):
         """previous_length より後ろの新しい部分から、最後の Copilot 応答を取り出す。
 
         【なぜ前実装が壊れたか】
@@ -572,14 +573,22 @@ class Copilot:
             time.sleep(poll)
         text = self.document_text()
         new_part = text[previous_length:]
-        # こちらの発言(user_marker)以降を捨てる
-        marker_user = self.profile["user_marker"]
-        if marker_user in new_part:
+        # こちらの発言(user_marker)以降を捨てる。
+        # 空判定を先に置くこと。空文字はどんな文字列にも「含まれる」ので、
+        # マーカー未設定のプロファイル(M365 Copilot)では split("") が
+        # ValueError: empty separator で落ちる。
+        marker_user = self.profile.get("user_marker") or ""
+        if marker_user and marker_user in new_part:
             new_part = new_part.split(marker_user)[0]
         # 先頭に assistant_marker があれば剥がす
-        marker_ai = self.profile["assistant_marker"]
-        if marker_ai in new_part:
+        marker_ai = self.profile.get("assistant_marker") or ""
+        if marker_ai and marker_ai in new_part:
             new_part = new_part.rsplit(marker_ai, 1)[1]
+        elif not marker_ai and sent_prompt:
+            # マーカーを持たないアプリ用の代替。送った本文は会話に echo される
+            # ので、その終わりまでを捨てれば残りが応答になる。マーカーを
+            # 突き止められなくても、こちらの道で応答を取り出せる。
+            new_part = strip_echoed_prompt(new_part, sent_prompt)
         return new_part.strip()
 
     def last_response(self):
@@ -593,6 +602,45 @@ class Copilot:
             return text
         tail = text.rsplit(marker, 1)[1]
         return tail.split(self.profile["user_marker"])[0].strip()
+
+
+def strip_echoed_prompt(text, prompt):
+    """会話に echo された自分の発言を捨てて、その後ろ(＝応答)を返す。
+
+    【何のためか】
+    発言マーカー(「あなたの発言」など)を持たないアプリでも応答を取り出せるように
+    するため。M365 Copilot はそういう Text を出しておらず、マーカー方式が使えない。
+    だが「送った本文」はこちらが知っているので、それを目印にすればよい。
+
+    【素の find では当たらない】
+    UIA が返す文字列は、入力した本文と空白・改行が一致しない。要素の切れ目に
+    空白が入ったり、折り返しが改行になったりする。そこで空白を全部落とした形で
+    突き合わせ、見つけた位置を元の文字列の位置へ翻訳して返す。
+
+    突き合わせは全文一致だけにしてある。「一部だけ当てて切る」も考えたが、外すと
+    応答の頭が欠けたものが「正しく取れた」顔で下流へ流れる。見つからなければ
+    text をそのまま返し、echo が残っていると分かる形で呼び側へ渡すほうがよい。
+    (その場合、送った本文が応答の頭に付いたまま返る。)"""
+    if not text or not prompt:
+        return text
+    # 空白を落とした文字列と、その各文字が元の何文字目だったかの対応表を作る。
+    dense, index_map = [], []
+    for i, ch in enumerate(text):
+        if not ch.isspace():
+            dense.append(ch)
+            index_map.append(i)
+    dense = "".join(dense)
+    needle = "".join(ch for ch in prompt if not ch.isspace())
+    if not needle:
+        return text
+
+    hit = dense.find(needle)
+    if hit == -1:
+        return text
+    end_dense = hit + len(needle) - 1
+    if end_dense >= len(index_map):
+        return text
+    return text[index_map[end_dense] + 1:].lstrip()
 
 
 # --- スニペットの切り出し ---------------------------------------------------

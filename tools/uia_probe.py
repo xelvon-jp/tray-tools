@@ -408,6 +408,79 @@ def print_readout(cls, exe, inputs, markers, volatile, sample_count, total):
     print("#" * 68)
 
 
+def hunt_markers(timeout=180.0):
+    """1往復の前後で会話の全文を比べ、差分の頭だけを見せる。
+
+    【なぜツリーを全部出さないか】
+    発言マーカーを探すのにツリーをダンプすると数百行になる。業務PCからは
+    データを持ち出せず画面を読み上げるしかないので、それでは使えない。
+    増えた部分の頭だけ見れば「自分の発言」と「応答」の境目に何が挟まっているかが
+    分かる。挟まっていなければマーカー方式は使えない、と結論できる。
+
+    【読み方】
+    増えた部分は [自分の発言][区切り?][Copilot の応答] の順に並ぶ。手元PCなら
+    'あなたの発言' と 'Copilot の発言' がここに見える。M365 で何も挟まって
+    いなければ、マーカー方式は諦めて送信本文の照合(strip_echoed_prompt)で切る。"""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import copilot_loop
+
+    try:
+        cp = copilot_loop.Copilot()
+    except RuntimeError as e:
+        print(f"Copilot が見つかりません: {e}")
+        return 1
+    cp.wait_awake(timeout=6.0)
+    print(f"[マーカー探索] プロファイル: {cp.profile['name']}")
+    before = cp.document_text()
+    print(f"  いまの会話: {len(before)} 文字")
+    print()
+    print("  >>> Copilot に何か一言送って、返事が出そろうまで待ってください <<<")
+    print(f"      ({int(timeout)}秒まで待ちます。Ctrl+C で中断)")
+
+    deadline = time.time() + timeout
+    last_len, stable_since = len(before), None
+    while time.time() < deadline:
+        time.sleep(1.0)
+        now = cp.document_text()
+        if len(now) == last_len:
+            # 増えたあと、しばらく動かなくなったら出そろったとみなす
+            if len(now) > len(before) and stable_since is None:
+                stable_since = time.time()
+            elif stable_since and time.time() - stable_since >= 3.0:
+                break
+        else:
+            stable_since = None
+            last_len = len(now)
+
+    after = cp.document_text()
+    added = after[len(before):]
+    print()
+    if not added:
+        print("  会話が増えませんでした。送信されなかったか、待ち時間が足りません。")
+        return 1
+
+    print("#" * 68)
+    print("#  ここから下だけ読み上げれば足ります")
+    print("#" * 68)
+    print(f"  増えた文字数: {len(added)}")
+    print()
+    print("  増えた部分の先頭200文字（[自分の発言][区切り?][応答] の順に並ぶ）:")
+    print("  " + "-" * 62)
+    for line in _wrap(repr(added[:200]), 60):
+        print(f"    {line}")
+    print("  " + "-" * 62)
+    print()
+    print("  ※ 自分が送った文章の直後に、毎回同じ短い語が挟まっていれば、")
+    print("     それが assistant_marker です。何も挟まっていなければ、")
+    print("     マーカー方式は使えません（送信本文の照合で切る道に倒します）。")
+    print("#" * 68)
+    return 0
+
+
+def _wrap(text, width):
+    return [text[i:i + width] for i in range(0, len(text), width)] or [""]
+
+
 def self_check():
     """copilot_loop のプロファイルで実際に掴めるかを、順に確かめて短く報告する。
 
@@ -505,6 +578,8 @@ def main() -> int:
                         help="可視の窓を全部並べるだけ。まずこれで対象を見つける")
     parser.add_argument("--check", action="store_true",
                         help="仕込んだプロファイルで実際に掴めるかを診断する")
+    parser.add_argument("--markers", action="store_true",
+                        help="1往復の前後を比べて発言マーカーの有無を突き止める")
     parser.add_argument("--watch", type=int, default=0,
                         help="この秒数だけ下段のボタン変化を眺める")
     parser.add_argument("--top-px", type=int, default=170,
@@ -547,6 +622,8 @@ def main() -> int:
 def _run(args) -> int:
     if args.check:
         return self_check()
+    if args.markers:
+        return hunt_markers()
     if args.survey:
         print("[可視の窓 一覧] 対象アプリを前面に出した状態で見てください")
         print(f"{'class':<28} {'exe':<24} title")

@@ -336,7 +336,11 @@ def run_loop(
             break
 
         # 3) 新規応答を取得
-        response = cp.new_response(previous_length)
+        # 送った本文を渡す。発言マーカーを持たないアプリ(M365 Copilot)では、
+        # これが「どこまでが自分の発言か」を知る唯一の手掛かりになる。
+        # 監視モードの1周目は人が手で投稿しているので、こちらは本文を知らない。
+        response = cp.new_response(previous_length,
+                                   sent_prompt=None if skip_send else prompt)
         emit("response", round=rounds, chars=len(response),
              wait_seconds=round(wait_elapsed, 1),
              response_head=response[:800])

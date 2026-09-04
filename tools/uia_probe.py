@@ -38,6 +38,8 @@
 import argparse
 import collections
 import ctypes
+import json
+import os
 import sys
 import time
 
@@ -48,7 +50,7 @@ comtypes.CoInitialize()
 comtypes.client.GetModule("UIAutomationCore.dll")
 import comtypes.gen.UIAutomationClient as UIA  # noqa: E402
 
-CONTROL_BUTTON, CONTROL_EDIT, CONTROL_COMBO = 50000, 50003, 50004
+CONTROL_BUTTON, CONTROL_EDIT, CONTROL_COMBO, CONTROL_TEXT = 50000, 50003, 50004, 50020
 VALUE_PATTERN, TEXT_PATTERN = 10002, 10014
 WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 
@@ -84,10 +86,29 @@ def _pid_of(hwnd):
     return pid.value
 
 
-def find_windows(title=None, cls=None):
-    """条件に合うトップレベル窓を返す。空条件だと Chromium 系すべて。"""
+def _exe_of(hwnd):
+    """窓を持っているプロセスの実行ファイル名(例 'Copilot.exe')。取れなければ ''。
+
+    【なぜ exe 名を見るのか】
+    窓のタイトルは表示言語・開いている会話・アプリの更新で変わるが、実行ファイル名は
+    まず変わらない。別PC・別バージョンの Copilot を狙うときの手掛かりとして、
+    タイトルより桁違いに当てになる。"""
+    try:
+        import psutil
+        return psutil.Process(_pid_of(hwnd)).name()
+    except Exception:  # noqa: BLE001  psutil が無い・アクセス拒否・既に終了
+        return ""
+
+
+def find_windows(title=None, cls=None, title_contains=None, exe=None):
+    """条件に合う可視のトップレベル窓を [(hwnd, class, title, exe), ...] で返す。
+
+    条件を1つも渡さないと Chromium 系(Chrome_WidgetWin*)だけに絞る。M365 Copilot の
+    ように正式なタイトルが分からないときは title_contains か exe で当たりを付ける
+    (完全一致だけだと、タイトルに会話名が付くアプリで永久に見つからない)。"""
     hits = []
     EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    filtered = any(v is not None for v in (title, cls, title_contains, exe))
 
     def on(hwnd, _l):
         if not user32.IsWindowVisible(hwnd):
@@ -96,15 +117,41 @@ def find_windows(title=None, cls=None):
         c = _class_of(hwnd)
         if title is not None and t != title:
             return True
+        if title_contains is not None and title_contains.lower() not in t.lower():
+            return True
         if cls is not None and c != cls:
             return True
-        if not title and not cls and "Chrome_WidgetWin" not in c:
+        e = _exe_of(hwnd) if (exe is not None or filtered) else ""
+        if exe is not None and e.lower() != exe.lower():
             return True
-        hits.append((hwnd, c, t))
+        if not filtered and "Chrome_WidgetWin" not in c:
+            return True
+        hits.append((hwnd, c, t, e or _exe_of(hwnd)))
         return True
 
     user32.EnumWindows(EnumProc(on), None)
     return hits
+
+
+def survey():
+    """可視のトップレベル窓を、タイトルのあるものだけ全部並べる。
+
+    業務PCで最初に走らせる用。M365 Copilot がどのクラス・どの exe なのかを、
+    当てずっぽうのタイトル一致に頼らず目で確かめるための一覧。"""
+    rows = []
+    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def on(hwnd, _l):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        t = _title_of(hwnd)
+        if not t.strip():
+            return True
+        rows.append((hwnd, _class_of(hwnd), t, _exe_of(hwnd)))
+        return True
+
+    user32.EnumWindows(EnumProc(on), None)
+    return rows
 
 
 def find_render_child(hwnd):
@@ -146,7 +193,7 @@ def wake_accessibility(hwnd):
 
 
 def probe(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
-    """1回覗いて (下段ボタン, 入力欄候補, 全子孫数) を返す。
+    """1回覗いて (下段ボタン, 入力欄候補, 全子孫数, 発言マーカー候補) を返す。
 
     Chromium は WM_GETOBJECT を受け取ってからツリーを作るまでに数百ミリ秒〜数秒
     かかることがある(バックグラウンドだったタブなら特に)。子孫が 30 個未満なら
@@ -171,6 +218,7 @@ def probe(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
 
     bottom_buttons = []
     input_candidates = []
+    text_names = collections.Counter()
     for i in range(desc.Length):
         el = desc.GetElement(i)
         try:
@@ -189,15 +237,23 @@ def probe(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
                         "name": name[:60],
                         "y": rect.top,
                     })
+            # 発言マーカーの候補集め。会話の1往復ごとに同じ短い文字列が現れるので、
+            # 「2回以上出てくる短い Text」に絞ると、本文に埋もれず浮かび上がる。
+            if t == CONTROL_TEXT and 2 <= len(name) <= 30:
+                text_names[name] += 1
         except Exception:
             continue
-    return bottom_buttons, input_candidates, desc.Length
+    markers = [(n, c) for n, c in text_names.most_common(25) if c >= 2]
+    return bottom_buttons, input_candidates, desc.Length, markers
 
 
-def print_report(name, hwnd_main, hwnd_render, bottom, inputs, total):
+def print_report(name, hwnd_main, hwnd_render, bottom, inputs, total, markers):
     print(f"[窓] {name}")
     print(f"  HWND: {hwnd_main}  レンダラ: {hwnd_render}")
     print(f"  子孫: {total} 個")
+    if total < 30:
+        print("  ⚠ 子孫が少なすぎます。アクセシビリティツリーが起きていません。")
+        print("     アプリを一度前面に出してから、もう一度実行してください。")
     print()
     print("[下段のボタン] (窓の下から170px以内)")
     if not bottom:
@@ -211,6 +267,12 @@ def print_report(name, hwnd_main, hwnd_render, bottom, inputs, total):
     for entry in inputs:
         print(f"  - {entry['type']:8}  aid={entry['automation_id']!r:22}  "
               f"y={entry['y']:>6}  name={entry['name']!r}")
+    print()
+    print("[発言マーカー候補] 2回以上出てくる短い Text（会話の往復ごとに現れるもの）")
+    if not markers:
+        print("  (見つかりません — 会話を1往復してから実行すると出ます)")
+    for text, count in markers:
+        print(f"  x{count:<3} {text!r}")
 
 
 def watch(hwnd_main, hwnd_render, seconds):
@@ -222,7 +284,7 @@ def watch(hwnd_main, hwnd_render, seconds):
     end = time.time() + seconds
     while time.time() < end:
         try:
-            bottom, _inputs, _total = probe(hwnd_main, hwnd_render)
+            bottom, _inputs, _total, _markers = probe(hwnd_main, hwnd_render)
         except Exception as e:
             print(f"  読み取り失敗: {e}")
             time.sleep(1)
@@ -234,31 +296,58 @@ def watch(hwnd_main, hwnd_render, seconds):
         time.sleep(0.5)
 
 
-def suggest_selectors(cls, title, inputs, bottom):
-    """観察結果から SELECTORS の候補を組み立てて出す。"""
+def build_profile(cls, title, exe, inputs, bottom, markers):
+    """観察結果から、settings.json に貼れるプロファイルの下書きを組み立てる。
+
+    埋まらない項目は空のまま残す。ここを機械が勝手に埋めると、間違った値のまま
+    「設定はできている」ように見えてしまい、原因の切り分けが遅くなる。
+    人が見て決めるべきところは、空にして候補を隣に並べるだけにしてある。"""
+    aid = next((e["automation_id"] for e in inputs if e["automation_id"]), "")
+    return {
+        "name": (exe or title or "copilot").replace(".exe", "").lower(),
+        # 窓の探し方。exe 名がいちばん当てになるので先に置く。
+        # title は完全一致ではなく「含む」で見る(会話名が付くアプリがあるため)。
+        "process_name": exe,
+        "window_class": cls,
+        "window_title_contains": title,
+        "render_class": "Chrome_RenderWidgetHostHWND",
+        "input_automation_id": aid,
+        # 状態を読むボタン名。候補を並べておいて「どれかに当てはまれば」で判定する。
+        # 1つの文字列の完全一致だと、文言が少し違うだけで全部 idle に見えてしまう。
+        "send_button": [],
+        "busy_button": [],
+        "assistant_marker": "",
+        "user_marker": "",
+        "input_band_px": 170,
+    }
+
+
+def print_profile(profile, bottom, markers):
     print()
-    print("[SELECTORS の候補] — copilot_loop.py にコピーする用")
-    aid = ""
-    for entry in inputs:
-        if entry["automation_id"]:
-            aid = entry["automation_id"]
-            break
-    print("SELECTORS = {")
-    print(f"    \"window_class\":         {cls!r},")
-    print(f"    \"window_title\":         {title!r},")
-    print(f"    \"render_class\":         \"Chrome_RenderWidgetHostHWND\",")
-    print(f"    \"input_automation_id\":  {aid!r},   # ← 入力欄候補から選ぶ")
-    print(f"    \"send_button\":          \"\",   # ← 送信ボタンの日本語名 (watch で確認)")
-    print(f"    \"busy_button\":          \"\",   # ← 回答中に出るボタン (停止/割り込み等)")
-    print(f"    \"idle_marker\":          \"\",   # ← 入力待ちのときに常に見えるボタン")
-    print(f"    \"assistant_marker\":     \"\",   # ← AI 側の発言の頭に出る文字列")
-    print(f"    \"user_marker\":          \"\",   # ← 自分側の発言の頭に出る文字列")
-    print("}")
+    print("=" * 70)
+    print("[プロファイルの下書き] settings.json の \"copilot_profiles\" に貼る用")
+    print("=" * 70)
+    print(json.dumps({"copilot_profiles": [profile]}, ensure_ascii=False, indent=2))
     print()
-    print("いま見えている下段のボタン(送信・停止の候補):")
-    counts = collections.Counter(bottom)
-    for n, c in counts.most_common():
-        print(f"  x{c}  {n}")
+    print("--- 空欄を埋めるための手掛かり ---")
+    print()
+    print("send_button / busy_button に入れる候補（下段のボタン）:")
+    if not bottom:
+        print("  (いま見えているボタンはありません)")
+    for n, c in collections.Counter(bottom).most_common():
+        print(f"  x{c}  {n!r}")
+    print("  ※ --watch 30 を付けて実際に1往復送信すると、")
+    print("     「入力待ち → 送信 → 回答中(停止/割り込み) → 入力待ち」の変化が見えます。")
+    print("     送信できるときだけ出る名前 → send_button")
+    print("     回答中だけ出る名前         → busy_button")
+    print()
+    print("assistant_marker / user_marker に入れる候補（発言マーカー）:")
+    if not markers:
+        print("  (会話を1往復してから実行すると出ます)")
+    for text, count in markers[:12]:
+        print(f"  x{count:<3} {text!r}")
+    print("  ※ AI 側の発言の頭に出るもの → assistant_marker")
+    print("     自分の発言の頭に出るもの → user_marker")
 
 
 def main() -> int:
@@ -266,14 +355,20 @@ def main() -> int:
         description="Copilot 系アプリの UIA ツリーを覗いて SELECTORS 候補を出す。")
     parser.add_argument("--title", help="窓のタイトル完全一致(既定: Copilot)",
                         default="Copilot")
+    parser.add_argument("--title-contains", dest="title_contains",
+                        help="窓のタイトル部分一致。M365 のように正式名が不明なとき用")
+    parser.add_argument("--exe", help="実行ファイル名で絞る(例: Copilot.exe)")
     parser.add_argument("--class", dest="cls",
                         help="窓の ClassName で絞る(例: Chrome_WidgetWin_1)")
     parser.add_argument("--any", action="store_true",
                         help="タイトル絞りを外して Chromium 系すべてを列挙する")
+    parser.add_argument("--survey", action="store_true",
+                        help="可視の窓を全部並べるだけ。まずこれで対象を見つける")
     parser.add_argument("--watch", type=int, default=0,
                         help="この秒数だけ下段のボタン変化を眺める")
     parser.add_argument("--top-px", type=int, default=170,
                         help="下端から何px以内を「下段」とみなすか")
+    parser.add_argument("--out", help="表示内容をこのファイルにも書き出す")
     args = parser.parse_args()
 
     try:
@@ -281,26 +376,81 @@ def main() -> int:
     except AttributeError:
         pass
 
-    title = None if args.any else args.title
-    windows = find_windows(title=title, cls=args.cls)
+    # --out が指定されたら、画面と同じものをファイルへも流す。業務PCで採った結果を
+    # そのまま持ち帰れるようにするため(コンソールからの手選択コピーは取りこぼす)。
+    sink = None
+    if args.out:
+        sink = open(args.out, "w", encoding="utf-8")
+        real_stdout = sys.stdout
+
+        class _Tee:
+            def write(self, s):
+                real_stdout.write(s)
+                sink.write(s)
+
+            def flush(self):
+                real_stdout.flush()
+                sink.flush()
+
+        sys.stdout = _Tee()
+
+    try:
+        return _run(args)
+    finally:
+        if sink is not None:
+            sys.stdout = sys.__stdout__
+            sink.close()
+            print(f"\n書き出しました: {os.path.abspath(args.out)}")
+
+
+def _run(args) -> int:
+    if args.survey:
+        print("[可視の窓 一覧] 対象アプリを前面に出した状態で見てください")
+        print(f"{'class':<28} {'exe':<24} title")
+        print("-" * 100)
+        for _hwnd, cls, tt, exe in survey():
+            print(f"{cls:<28} {exe:<24} {tt}")
+        print()
+        print("Copilot らしい行を見つけたら、その exe で絞って調べます:")
+        print('  python tools\\uia_probe.py --exe "Copilot.exe" --watch 30')
+        return 0
+
+    # 明示的な絞り込みが1つでもあれば、既定のタイトル完全一致は外す
+    # (--exe だけ渡したのに title="Copilot" が効いて0件、という事故を防ぐ)。
+    explicit = args.title_contains or args.exe or args.cls or args.any
+    title = None if explicit else args.title
+    windows = find_windows(title=title, cls=args.cls,
+                           title_contains=args.title_contains, exe=args.exe)
     if not windows:
-        print(f"該当する窓が見つかりません (title={title!r} class={args.cls!r})")
-        print("--any で Chromium 系すべてを列挙できます。")
+        print("該当する窓が見つかりません "
+              f"(title={title!r} contains={args.title_contains!r} "
+              f"exe={args.exe!r} class={args.cls!r})")
+        print()
+        print("まず --survey で、可視の窓を全部並べて対象を探してください:")
+        print("  python tools\\uia_probe.py --survey")
         return 1
 
-    for hwnd, cls, tt in windows:
+    for hwnd, cls, tt, exe in windows:
         render = find_render_child(hwnd)
         try:
-            bottom, inputs, total = probe(hwnd, render, top_px=args.top_px)
+            bottom, inputs, total, markers = probe(hwnd, render, top_px=args.top_px)
         except Exception as e:
             print(f"[{tt}] プローブ失敗: {e}")
             continue
-        label = f"class={cls!r} title={tt!r} pid={_pid_of(hwnd)}"
-        print_report(label, hwnd, render, bottom, inputs, total)
-        suggest_selectors(cls, tt, inputs, bottom)
+        label = f"class={cls!r} exe={exe!r} title={tt!r} pid={_pid_of(hwnd)}"
+        print_report(label, hwnd, render, bottom, inputs, total, markers)
         if args.watch:
             print()
             watch(hwnd, render, args.watch)
+            # watch のあとにもう一度見る。1往復してもらった後なら、
+            # 発言マーカーが出そろっている。
+            try:
+                bottom2, inputs2, _t2, markers2 = probe(hwnd, render, top_px=args.top_px)
+                bottom, inputs, markers = bottom or bottom2, inputs or inputs2, markers2 or markers
+            except Exception:  # noqa: BLE001
+                pass
+        print_profile(build_profile(cls, tt, exe, inputs, bottom, markers),
+                      bottom, markers)
         print()
     return 0
 

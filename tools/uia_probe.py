@@ -1,30 +1,33 @@
 # tools/uia_probe.py
-# Copilot 系アプリ(Chromium ベース)の UI Automation ツリーを覗いて、
-# copilot_loop.SELECTORS の候補を提案する調査ツール。
+# Copilot 系アプリの UI Automation ツリーを覗いて、
+# copilot_loop のプロファイル候補を提案する調査ツール。
 #
 # 【何のためのファイルか】
-# 業務PCの M365 Copilot 版など、別のアプリで agent_loop を動かすときは、
-# copilot_loop.py の SELECTORS を書き換える必要がある(窓のクラス名、入力欄の
-# AutomationId、送信ボタンの日本語名、回答中に出るボタンの日本語名、など)。
-# 目視で調べると時間がかかるし、UIA ツリーを起こす手順(WM_GETOBJECT を投げる)
-# を知らないと何も見えない。これを対話的にやってくれる。
+# 業務PCの M365 Copilot など、別のアプリで動かすにはプロファイル(窓のクラス、
+# exe 名、入力欄の AutomationId、送信/停止ボタンの名前)が要る。目視で調べると
+# 時間がかかるし、UIA ツリーを起こす手順(WM_GETOBJECT を投げる)を知らないと
+# そもそも何も見えない。これを対話的にやってくれる。
 #
-# 【使い方】
-# 1. 対象アプリを開いておく(Copilot、M365 Copilot、Copilot Studio など)
-# 2. python tools/uia_probe.py --title "Copilot"
-#    タイトル完全一致で窓を探す。--class で ClassName でも絞れる。
-# 3. 出力を見て copilot_loop.py の SELECTORS を書き換える
+# 【この道具の形を決めている制約】
+# 業務PCからはデータを持ち出せない。画面に見えているものを読み上げて伝えるしか
+# ないので、「全部出して人に選ばせる」ができない。だから:
+#   - 常に出ているボタンは自動で捨てて、候補を2〜3個に絞る(volatile_buttons)
+#   - 出力の最後に「ここから下だけ読み上げれば足ります」のまとめを置く
+#   - マーカー探索はツリーを吐かず、差分の頭200文字だけを見せる(hunt_markers)
+#
+# 【使い方】この順に叩く
+#   --survey                     可視の窓を全部並べて対象を見つける
+#   --exe "M365Copilot.exe" --watch 30   1往復させながら調べる
+#   --check                      仕込んだプロファイルで掴めるかを診断する
+#   --markers                    発言マーカーの有無を突き止める
 #
 # 【読み方】
-# 出力は3つのブロックに分かれる:
-#   [窓]         見つけた窓の情報(class / title / process 名)
-#   [下段のボタン] 入力欄まわり(下端から170px以内)のボタン名。ここに
-#                「送信」「停止」「会話する」相当のボタンが並ぶ。
-#                回答中に切り替わる名前を突き止めるため、--watch を付けて
-#                何秒か眺めるとよい。
-#   [入力欄候補]  ValuePattern を持ち、AutomationId が付いている要素。
-#                Chromium アプリは Edit ではなく ComboBox で作られていることも
-#                多いので、type にはこだわらない。
+#   [窓]           見つけた窓の情報(class / exe / レンダラ / 子孫数)
+#   [下段のボタン]  入力欄まわりのボタン名。送信・停止はここに出る
+#   [入力欄候補]    ValuePattern を持ち AutomationId が付いている要素。
+#                 Chromium アプリは Edit ではなく ComboBox のことも多いので、
+#                 type にはこだわらない。
+#   [発言マーカー候補] 2回以上出てくる短い Text。往復ごとに現れるものが手掛かり
 #
 # 【なぜ WM_GETOBJECT を投げるのか】
 # Chromium は支援技術を検出するまでアクセシビリティツリーを作らない。素で覗くと

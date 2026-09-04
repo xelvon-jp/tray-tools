@@ -408,6 +408,55 @@ def print_readout(cls, exe, inputs, markers, volatile, sample_count, total):
     print("#" * 68)
 
 
+def self_check():
+    """copilot_loop のプロファイルで実際に掴めるかを、順に確かめて短く報告する。
+
+    調査(何が居るか調べる)ではなく動作確認(仕込んだ設定で動くか)のためのもの。
+    業務PCからはデータを持ち出せないので、出力は読み上げられる長さに抑えてある。
+    どこで転んだかが1行で分かるように、工程ごとに OK / NG を出す。"""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import copilot_loop
+
+    print("[自己診断] copilot_loop のプロファイルで掴めるか")
+    print()
+    for profile in copilot_loop.profiles():
+        name = profile.get("name")
+        exe = profile.get("process_name")
+        main_hwnd, render = copilot_loop.find_window(profile)
+        if not main_hwnd:
+            print(f"  {name:<10} ({exe}) … 窓なし")
+            continue
+        print(f"  {name:<10} ({exe}) … 窓 OK")
+        print(f"     レンダラ窓     : "
+              f"{'OK' if render else '無し（メイン窓へ投げる道に落ちる）'}")
+        try:
+            cp = copilot_loop.Copilot(profile=profile)
+        except Exception as e:  # noqa: BLE001
+            print(f"     UIA 接続       : NG ({e})")
+            continue
+        try:
+            snap = cp.status_snapshot()
+        except Exception as e:  # noqa: BLE001
+            print(f"     状態の取得     : NG ({e})")
+            continue
+        win = snap.get("window_rect")
+        inp = snap.get("input_rect")
+        print(f"     入力欄         : {'OK' if inp else 'NG（aid が違う可能性）'}")
+        print(f"     状態           : {snap.get('state')}")
+        if win and inp:
+            print(f"     札を出す位置   : 窓の下端から12px / "
+                  f"右端から{win[2] - inp[2]}px内側")
+        marker = profile.get("user_marker") or ""
+        print(f"     発言マーカー   : "
+              f"{marker!r} " if marker else "     発言マーカー   : 未設定")
+        if not marker:
+            print("                      （状態表示は動きます。"
+                  "agent-loop の応答切り出しだけ使えません）")
+    print()
+    print("窓なしばかりのときは --survey で対象を探し直してください。")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Copilot 系アプリの UIA ツリーを覗いて SELECTORS 候補を出す。")
@@ -422,6 +471,8 @@ def main() -> int:
                         help="タイトル絞りを外して Chromium 系すべてを列挙する")
     parser.add_argument("--survey", action="store_true",
                         help="可視の窓を全部並べるだけ。まずこれで対象を見つける")
+    parser.add_argument("--check", action="store_true",
+                        help="仕込んだプロファイルで実際に掴めるかを診断する")
     parser.add_argument("--watch", type=int, default=0,
                         help="この秒数だけ下段のボタン変化を眺める")
     parser.add_argument("--top-px", type=int, default=170,
@@ -462,6 +513,8 @@ def main() -> int:
 
 
 def _run(args) -> int:
+    if args.check:
+        return self_check()
     if args.survey:
         print("[可視の窓 一覧] 対象アプリを前面に出した状態で見てください")
         print(f"{'class':<28} {'exe':<24} title")

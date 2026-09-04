@@ -434,6 +434,16 @@ def self_check():
         except Exception as e:  # noqa: BLE001
             print(f"     UIA 接続       : NG ({e})")
             continue
+        # 木が組み上がるまで待つ。ここを待たずに読むと、入力欄もボタンも全部
+        # 「見つかりません」になり、綴り違いと区別がつかない。
+        awake = cp.wait_awake(timeout=6.0)
+        try:
+            _root, desc = cp._descendants()
+            total = desc.Length
+        except Exception:  # noqa: BLE001
+            desc, total = None, 0
+        print(f"     子孫の個数     : {total}"
+              f"{'' if awake else '  ← 少なすぎ。ツリーが起きていません'}")
         try:
             snap = cp.status_snapshot()
         except Exception as e:  # noqa: BLE001
@@ -441,11 +451,33 @@ def self_check():
             continue
         win = snap.get("window_rect")
         inp = snap.get("input_rect")
-        print(f"     入力欄         : {'OK' if inp else 'NG（aid が違う可能性）'}")
+        want_aid = profile.get("input_automation_id")
+        print(f"     入力欄         : {'OK' if inp else 'NG'}  (探した aid: {want_aid!r})")
         print(f"     状態           : {snap.get('state')}")
         if win and inp:
             print(f"     札を出す位置   : 窓の下端から12px / "
                   f"右端から{win[2] - inp[2]}px内側")
+        if not inp and desc is not None and total >= copilot_loop.MIN_AWAKE_DESCENDANTS:
+            # ツリーは起きているのに見つからない＝aid が違う。実物を並べて見せる。
+            # ここを出しておかないと「綴りが違う」のか「そもそも無い」のかが
+            # 業務PC 側で判断できず、往復が増える。
+            print("     → ツリーは起きているので aid 違いです。実物の候補:")
+            found = []
+            for i in range(total):
+                el = desc.GetElement(i)
+                try:
+                    aid = (el.CurrentAutomationId or "").strip()
+                    if not aid:
+                        continue
+                    if el.CurrentControlType in (CONTROL_EDIT, CONTROL_COMBO) or \
+                            el.GetCurrentPattern(VALUE_PATTERN):
+                        found.append(aid)
+                except Exception:  # noqa: BLE001
+                    continue
+            for aid in list(dict.fromkeys(found))[:8]:
+                print(f"        {aid!r}")
+            if not found:
+                print("        (書き込める要素が1つも見つかりません)")
         marker = profile.get("user_marker") or ""
         print(f"     発言マーカー   : "
               f"{marker!r} " if marker else "     発言マーカー   : 未設定")

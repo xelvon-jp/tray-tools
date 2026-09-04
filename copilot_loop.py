@@ -100,6 +100,10 @@ SELECTORS = BUILTIN_PROFILES[0]
 
 SETTINGS_PROFILES_KEY = "copilot_profiles"
 
+# 子孫がこれ未満なら、アクセシビリティツリーがまだ組み上がっていないとみなす。
+# 実測: 起きる前は窓枠だけの11個、起きると300〜371個。境目は広く空いている。
+MIN_AWAKE_DESCENDANTS = 30
+
 
 def profiles(app_settings=None):
     """使うプロファイルを、優先順に並べて返す。
@@ -296,18 +300,48 @@ class Copilot:
         return any(w in names for w in self._names(key))
 
     def _wake(self):
-        """Chromium のアクセシビリティツリーを起こす。既に起きていれば無害。"""
+        """Chromium のアクセシビリティツリーを起こす合図を送る。既に起きていれば無害。
+
+        投げるだけで、組み上がるのを待たない。待つのは _descendants と wait_awake。"""
         out = ctypes.c_size_t()
         user32.SendMessageTimeoutW(
             ctypes.c_void_p(self.hwnd_render or self.hwnd_main), WM_GETOBJECT, 0,
             ctypes.c_ssize_t(OBJID_CLIENT), SMTO_ABORTIFHUNG, 1000, ctypes.byref(out),
         )
 
+    def wait_awake(self, timeout=6.0, poll=0.3):
+        """木が組み上がるまで待つ。組み上がったか(bool)を返す。
+
+        起動直後や、ずっと裏に居たアプリを相手にするときはこれを通すこと。
+        待たずに読むと窓枠だけの十数個しか見えず、入力欄もボタンも全部
+        「見つかりません」になる(実測: 起きる前11個 / 起きた後371個)。
+        UI スレッドから呼ぶと止まるので、そこでは短い timeout にするか、
+        _descendants の自己修復に任せる。"""
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            _root, desc = self._descendants(heal=False)
+            if desc.Length >= MIN_AWAKE_DESCENDANTS:
+                return True
+            if time.time() >= deadline:
+                return False
+            self._wake()  # 1回目を取りこぼすアプリがある。投げ直しても害はない
+            time.sleep(poll)
+
     # -- 木を歩く ----------------------------------------------------------
-    def _descendants(self):
-        """毎回取り直す。中身が変わると前に取った要素は無効になるため。"""
+    def _descendants(self, heal=True):
+        """毎回取り直す。中身が変わると前に取った要素は無効になるため。
+
+        子孫が異様に少ないときは、木がまだ組み上がっていない。1回だけ起こし直して
+        取り直す(heal)。ここで面倒を見ておかないと、呼び側それぞれが「入力欄が
+        見つかりません」を別々に処理する羽目になり、しかも本当の原因が見えない。
+        1回に限っているのは、UI スレッドから呼ばれても止まる時間を抑えるため。"""
         root = self.uia.ElementFromHandle(ctypes.c_void_p(self.hwnd_main))
-        return root, root.FindAll(UIA.TreeScope_Descendants, self.true_cond)
+        desc = root.FindAll(UIA.TreeScope_Descendants, self.true_cond)
+        if heal and desc.Length < MIN_AWAKE_DESCENDANTS:
+            self._wake()
+            time.sleep(0.3)
+            desc = root.FindAll(UIA.TreeScope_Descendants, self.true_cond)
+        return root, desc
 
     def _input_box(self, desc):
         for i in range(desc.Length):

@@ -1,133 +1,258 @@
 # copilot_watchdog.py
-# Copilot が「応答済みで、こちらの入力を待っている」状態が閾値秒(既定30秒)を超えたら
-# 画面に大きな通知を出す。業務PC で Copilot に聞いた後、返事を返し忘れて放置している
-# のを、遠目でも気づけるようにするための機能。
+# Copilot の「いま誰の手番か」を、Copilot の入力欄のすぐ上に常時オーバーレイで出す。
+# 応答待ちが閾値秒(既定30秒)を超えたら、Copilot の窓全体を点滅させて遠目でも気づかせる。
+#
+# なぜ「1回だけ出す通知」から「常時表示」に変えたか
+# --------------------------------------------------
+# 前の版は「idle が30秒続いたら画面中央に大きな窓を1回出す」だった。実機で使うと
+# 二つ困った。(1) 出ていない間は何も分からないので、いま応答中なのか止まっているのか
+# 見て判断できない。(2) 画面中央に出るので Copilot と視線が離れ、しかも本文を隠す。
+# ステータスを常に入力欄の脇に置いておけば、視線をその場から動かさずに手番が分かる。
+#
+# 4つの状態
+# ---------
+#   ✏ ユーザ入力中        入力欄に文字がある(送信前)
+#   ⏳ 応答待ち            送信済みで、Copilot がまだ喋り始めていない ← ここが閾値超えで点滅
+#   💬 応答中              Copilot が生成中(割り込みボタンが出ている)
+#   🙂 応答済（入力待ち）  Copilot が喋り終わって、こちらの番
+#
+# copilot_loop.state() が返すのは busy/ready/idle の3つで、「送信直後の idle」と
+# 「応答が終わった後の idle」が区別できない。直前に見た状態を覚えておいて、
+# 入力中→idle なら応答待ち、応答中→idle なら入力待ち、と手番を決めている。
 #
 # なぜ Pushover ではなく画面通知か
 # --------------------------------
-# 業務PC ではスマホ通知を使えない場面が多い(Pushover が入れられない、Wi-Fi 分離、
-# セキュリティ規約など)。手元でPCの画面を見れば分かる形が必要。トレイ通知の「トースト」
-# は小さくて隅に出るだけなので、遠目でも見える大きな窓を画面中央に半透明で被せる。
-#
-# 判定ロジック
-# ------------
-# - Copilot が idle(state == "idle") かつ入力欄が空、その状態が threshold_seconds
-#   連続で続いたら通知
-# - busy になったら、その回のカウントは捨てる(応答生成中の 30 秒は普通のこと)
-# - 陽太さんが入力欄に何か書き始めたら、その回のカウントは捨てる(入力中は「待ち」ではない)
-# - 通知は 1 回だけ。次の busy を経由するまで再通知しない(鳴らしすぎで無視される)
-# - **agent-loop が動いている間は完全に休む。** ループのなかの idle は「次周を送る直前」で、
-#   人の入力を待っているわけではない。ここに通知を出したら agent-loop の妨害になる。
+# 業務PC ではスマホ通知を使えない場面が多い(Pushover を入れられない、Wi-Fi 分離、
+# セキュリティ規約など)。手元でPCの画面を見れば分かる形が必要。
 #
 # 実装のかたち
 # ------------
-# QTimer で数秒おきに poll するだけ。Copilot が起動していないときは state() を呼ぶ前に
-# 「窓が無い = idle 判定できない」と分かるので、フォルスポジ通知にはならない
-# (copilot_loop.Copilot() は窓が無ければ RuntimeError を投げるので try で受ける)。
-#
+# QTimer で数秒おきに poll するだけ。Copilot が起動していないときは
+# copilot_loop.Copilot() が RuntimeError を投げるので、そこで畳む。
 # CLAUDE.md にある「スロット内で例外が投げ切られると常駐ごと終了する」対策として、
 # QTimer のスロットで呼ぶ tick は必ず try で受ける。
 import time
-from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCursor, QFont, QGuiApplication
-from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
+import capture_grab
 import copilot_loop
 import settings as settings_module
 
-# poll する間隔(秒)。閾値の 1/6 くらいを目安に。5秒だと 30秒閾値で最大10秒の遅延がある
-# (state を取った瞬間から数え始めるため)。3秒にする。
-POLL_INTERVAL_SECONDS = 3.0
+# poll する間隔(秒)。常時表示なので、状態が変わってから札に反映されるまでの遅れが
+# そのまま「反応が鈍い」という印象になる。1.5秒だと体感で追随して見える。
+POLL_INTERVAL_SECONDS = 1.5
 
 # 既定の閾値。陽太さんの要件「30秒以上」。
 DEFAULT_THRESHOLD_SECONDS = 30
 
-# 通知窓の大きさ。「遠目でも見える」ために大きく取る。
-NOTIFY_WIDTH = 720
-NOTIFY_HEIGHT = 220
+# ステータス札の大きさ。入力欄の上に載せるので、本文を隠さない範囲で。
+STATUS_WIDTH = 290
+STATUS_HEIGHT = 40
+
+# 札を入力欄の上端からどれだけ浮かせるか(論理px)。
+STATUS_GAP = 6
+
+# 入力欄の矩形が取れなかったときの逃げ道。窓の下端からこれだけ上に置く
+# (copilot_loop._bottom_buttons が入力欄まわりとみなしている 170px に合わせてある)。
+INPUT_BAND_HEIGHT = 170
+
+# 点滅の周期(ms)。速すぎると視界の端で不快、遅いと点滅と気づかない。
+FLASH_INTERVAL_MS = 550
+
+# 点滅の枠の太さ(論理px)。遠目で気づかせるのが目的なので太くする。
+FLASH_BORDER_PX = 16
 
 SETTINGS_SECTION = "copilot_watchdog"
 SETTINGS_ENABLED = "enabled"
 SETTINGS_THRESHOLD = "threshold_seconds"
 
+# 状態キー → (札の文言, 背景色)。色は状態を色だけで見分けられるように離してある。
+STATE_STYLES = {
+    "typing": ("✏ ユーザ入力中", "rgba(230, 145, 20, 235)"),
+    "waiting_ai": ("⏳ 応答待ち", "rgba(190, 45, 45, 235)"),
+    "responding": ("💬 応答中", "rgba(40, 115, 190, 235)"),
+    "waiting_user": ("🙂 応答済（入力待ち）", "rgba(35, 145, 80, 235)"),
+}
 
-class IdleNotifyWindow(QWidget):
-    """画面中央に半透明で被せる大きな通知窓。
+# 経過秒を出す状態。入力中と応答中は「何秒経ったか」に意味が薄く、
+# 数字が動き続けると視界の端でちらついて邪魔になる。
+ELAPSED_STATES = ("waiting_ai", "waiting_user")
 
-    半透明にするのは、後ろのアプリを完全に隠さないため(通知に気づいた瞬間、視線を
-    その下の Copilot 画面に戻せる)。閉じる操作は明示的な×ボタンだけにして、
-    誤クリックで消えないようにする(全画面ならクリックスルーにすべきだが、この窓は
-    「私はここ」を強く主張するのが目的なのでクリックスルーにはしない)。"""
+
+def _to_logical(bounds):
+    """Win32/UIA の (left, top, right, bottom)(物理px)を Qt の論理 QRect へ。
+
+    最小化された窓は -32000 付近を返すので、そこは呼び側で弾く。"""
+    if bounds is None:
+        return None
+    return capture_grab.device_bounds_to_logical(bounds)
+
+
+def _looks_offscreen(rect) -> bool:
+    """最小化された窓かどうか。Windows は最小化中の窓に -32000 付近の座標を返す。"""
+    return rect is None or rect.left() < -20000 or rect.top() < -20000
+
+
+class CopilotStatusOverlay(QWidget):
+    """入力欄のすぐ上に貼り付ける、常時表示のステータス札。
+
+    フォーカスを奪わない(WindowDoesNotAcceptFocus)うえ、マウスも透過する
+    (WA_TransparentForMouseEvents)。Copilot の入力欄の直上に置くので、透過しないと
+    札を掴んでしまって入力欄が押せなくなる。"""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Copilot 入力待ち")
-        self.setObjectName("copilotIdleNotify")
-        # 最前面固定。フォーカスを奪わない(WindowDoesNotAcceptFocus)ので、
-        # 陽太さんが Copilot にすぐ入力を戻せる。
+        self.setWindowTitle("Copilot ステータス")
+        self.setObjectName("copilotStatus")
         self.setWindowFlags(
             Qt.Tool
             | Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
             | Qt.WindowDoesNotAcceptFocus
+            | Qt.WindowTransparentForInput
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.resize(NOTIFY_WIDTH, NOTIFY_HEIGHT)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # QWidget を継承した窓は、これが無いとスタイルシートの背景と枠が描かれない
+        # (Qt の仕様。中の QLabel には効くので「文字だけ宙に浮く」という出方になる)。
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.resize(STATUS_WIDTH, STATUS_HEIGHT)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(8)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 4, 14, 4)
+        layout.setSpacing(10)
 
-        # 上段: 大きな見出し
-        self.head = QLabel("🤖 Copilot が応答を返しています")
-        self.head.setFont(QFont("Meiryo", 22, QFont.Bold))
-        self.head.setStyleSheet("color: #fff;")
-        layout.addWidget(self.head)
-
-        # 中段: 経過秒数
-        self.body = QLabel("入力待ちのまま 30 秒経過")
-        self.body.setFont(QFont("Meiryo", 14))
-        self.body.setStyleSheet("color: #eee;")
-        layout.addWidget(self.body)
+        self.label = QLabel("")
+        self.label.setFont(QFont("Meiryo", 11, QFont.Bold))
+        self.label.setStyleSheet("color: #fff; background: transparent;")
+        layout.addWidget(self.label)
 
         layout.addStretch(1)
 
-        # 右下: 閉じるボタン
-        self.close_btn = QPushButton("閉じる")
-        self.close_btn.setFont(QFont("Meiryo", 10))
-        self.close_btn.setStyleSheet(
-            "QPushButton { background-color: #333; color: #fff;"
-            " border: 1px solid #666; border-radius: 4px; padding: 6px 18px; }"
-            "QPushButton:hover { background-color: #444; }"
-        )
-        self.close_btn.clicked.connect(self.hide)
-        layout.addWidget(self.close_btn, 0, Qt.AlignRight)
+        self.elapsed = QLabel("")
+        self.elapsed.setFont(QFont("Meiryo", 10))
+        self.elapsed.setStyleSheet("color: rgba(255,255,255,200); background: transparent;")
+        layout.addWidget(self.elapsed)
 
+        self._background = None
+        self._apply_background("rgba(90, 90, 90, 235)")
+
+    def _apply_background(self, color: str) -> None:
+        # setStyleSheet は毎回スタイルを作り直すので、変わっていないなら触らない
+        # (1.5秒ごとに再適用すると札が微妙にちらつく)。
+        if color == self._background:
+            return
+        self._background = color
         self.setStyleSheet(
-            "#copilotIdleNotify { background-color: rgba(180, 40, 40, 220);"
-            " border-radius: 12px; border: 2px solid #f0a0a0; }"
+            f"#copilotStatus {{ background-color: {color};"
+            " border-radius: 8px; border: 1px solid rgba(255,255,255,90); }}"
         )
 
-    def _center_on_screen(self):
-        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
-        area = screen.availableGeometry()
-        x = area.center().x() - self.width() // 2
-        y = area.top() + area.height() // 3
-        self.move(max(area.left(), x), max(area.top(), y))
+    def apply_state(self, state_key: str, elapsed_seconds) -> None:
+        text, color = STATE_STYLES[state_key]
+        self.label.setText(text)
+        self.elapsed.setText(
+            f"{int(elapsed_seconds)}秒" if elapsed_seconds is not None else ""
+        )
+        self._apply_background(color)
 
-    def show_with_elapsed(self, elapsed_seconds: int) -> None:
-        self.body.setText(f"入力待ちのまま {elapsed_seconds} 秒経過")
-        self._center_on_screen()
+    def place_above(self, anchor_rect, window_rect) -> bool:
+        """入力欄(anchor_rect)の直上に置く。取れないときは窓の下端から逆算する。
+
+        置けたら True。窓が最小化されていて置き場所が決まらないなら False。"""
+        rect = anchor_rect
+        if _looks_offscreen(rect):
+            if _looks_offscreen(window_rect):
+                return False
+            # 入力欄の矩形だけ取れなかった場合。窓の下端の帯を入力欄とみなす。
+            rect = window_rect.adjusted(0, window_rect.height() - INPUT_BAND_HEIGHT, 0, 0)
+
+        # 入力欄の右端に寄せる。左寄せだと本文の書き出しに重なりやすいのと、
+        # Copilot の送信ボタンが右下にあるので視線の動線とも合う。
+        x = rect.right() - self.width()
+        y = rect.top() - self.height() - STATUS_GAP
+
+        # 画面の外へ出すと Windows は表示するが見えない。乗っている画面へ押し戻す。
+        screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            area = screen.geometry()
+            x = max(area.left(), min(x, area.right() - self.width()))
+            y = max(area.top(), min(y, area.bottom() - self.height()))
+        self.move(int(x), int(y))
+        return True
+
+
+class CopilotFlashOverlay(QWidget):
+    """Copilot の窓全体に重ねて点滅させる枠。応答待ちが閾値を超えたときだけ出る。
+
+    塗り潰さず「太い枠 + ごく薄い塗り」で点滅させる。全面を濃く塗ると本文が読めず、
+    気づいた瞬間に中身を確認できない。マウスもキーも透過するので、点滅したまま
+    Copilot をそのまま操作できる。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Copilot 応答待ち")
+        self.setObjectName("copilotFlash")
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # 枠だけの窓なので、これが無いと本当に何も描かれない(上と同じ理由)。
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        self._bright = False
+        self._timer = QTimer()
+        self._timer.setInterval(FLASH_INTERVAL_MS)
+        self._timer.timeout.connect(self._on_flash_tick)
+        self._paint(False)
+
+    def _on_flash_tick(self) -> None:
+        try:
+            self._paint(not self._bright)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
+            print(f"[copilot_watchdog] 点滅の描き替えに失敗: {e}")
+
+    def _paint(self, bright: bool) -> None:
+        self._bright = bright
+        if bright:
+            border, fill = "rgba(255, 45, 45, 240)", "rgba(255, 45, 45, 45)"
+        else:
+            border, fill = "rgba(255, 45, 45, 40)", "rgba(255, 45, 45, 0)"
+        self.setStyleSheet(
+            f"#copilotFlash {{ background-color: {fill};"
+            f" border: {FLASH_BORDER_PX}px solid {border}; }}"
+        )
+
+    def start(self, window_rect) -> None:
+        """window_rect(論理 QRect)に重ねて点滅を始める。既に出ていれば位置だけ追う。"""
+        if _looks_offscreen(window_rect):
+            self.stop()
+            return
+        self.setGeometry(window_rect)
+        if not self._timer.isActive():
+            self._paint(True)
+            self._timer.start()
         # WA_ShowWithoutActivating が効くので show でよい(activateWindow は呼ばない)。
         self.show()
         self.raise_()
 
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
 
 class CopilotWatchdog:
-    """Copilot が idle のまま閾値を超えたら通知窓を出す監視係。
+    """Copilot の手番を常時オーバーレイで出す監視係。
 
     トレイメニューから ON/OFF できる。ON の間だけ QTimer が回る。"""
 
@@ -135,25 +260,26 @@ class CopilotWatchdog:
                  is_agent_loop_running=lambda: False):
         self._app_settings = app_settings
         self._settings_path = settings_path
-        # agent-loop が回っている間は通知を出したくない。判定を外から差し込めるように
-        # コールバックで受ける(feature_screen.ScreenFeature が持っている状態を渡す)。
+        # agent-loop が回っている間は札も点滅も出さない。あれが回っているときの
+        # 手番は「tray-tools の番」であって、この4状態のどれでもない。
         self._is_agent_loop_running = is_agent_loop_running
 
         self._enabled = self._load_bool(SETTINGS_ENABLED, False)
         self._threshold = self._load_int(SETTINGS_THRESHOLD, DEFAULT_THRESHOLD_SECONDS)
 
-        # 状態: idle が続き始めた時刻。None なら「連続していない」。
-        self._idle_since = None
-        # 直近の通知時刻(1回鳴らしたら次の busy を経由するまで再通知しない)。
-        self._notified_since = None
-        # 直近に見た state(遷移検知用)。
-        self._last_state = None
+        self._state = None        # 4状態のキー。None は未判定
+        self._state_since = None  # その状態になった時刻
+        # 直近に見た「手番がはっきりしている状態」。idle の意味を決めるのに使う。
+        self._last_decisive = None
 
         self._timer = QTimer()
         self._timer.setInterval(int(POLL_INTERVAL_SECONDS * 1000))
         self._timer.timeout.connect(self._on_tick)
 
-        self._notify = None  # IdleNotifyWindow(遅延生成)
+        self._status = None  # CopilotStatusOverlay(遅延生成)
+        self._flash = None   # CopilotFlashOverlay(遅延生成)
+        # 掴んだ Copilot(使い回す。_read_snapshot を参照)。
+        self._copilot = None
 
         if self._enabled:
             self._timer.start()
@@ -163,14 +289,14 @@ class CopilotWatchdog:
         self._enabled = bool(enabled)
         self._save_bool(SETTINGS_ENABLED, self._enabled)
         if self._enabled:
-            # 立ち上げ直後は state 未知。次の tick から普通に数え始める。
-            self._idle_since = None
-            self._notified_since = None
-            self._last_state = None
+            self._reset()
             self._timer.start()
+            # 最初の tick を待つと、押してから札が出るまで1.5秒黙る。すぐ1回叩く。
+            QTimer.singleShot(0, self._on_tick)
         else:
             self._timer.stop()
-            self._hide_notify()
+            self._hide_all()
+            self._copilot = None
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -184,12 +310,14 @@ class CopilotWatchdog:
         self._save_int(SETTINGS_THRESHOLD, seconds)
 
     def close(self) -> None:
-        """常駐終了時に呼ぶ。タイマー停止 + 窓破棄。"""
+        """常駐終了時に呼ぶ。タイマー停止 + 窓を畳む。"""
         try:
             self._timer.stop()
         except Exception:  # noqa: BLE001
             pass
-        self._hide_notify()
+        self._hide_all()
+        # UIA クライアントを握ったままにしない。
+        self._copilot = None
 
     # -- タイマー本体 ---------------------------------------------------
     def _on_tick(self) -> None:
@@ -200,63 +328,109 @@ class CopilotWatchdog:
             print(f"[copilot_watchdog] tick 失敗: {e}")
 
     def _tick(self) -> None:
-        # agent-loop が走っているときは休む(応答→次周送信の間の idle を拾わない)。
         if self._is_agent_loop_running():
-            self._idle_since = None
-            self._notified_since = None
+            self._hide_all()
+            self._reset()
             return
 
-        state, input_value = self._read_copilot_state()
-        if state is None:
-            # Copilot 窓が無い or 一時的に取れなかった。無音で終わる(false positive しない)。
-            self._idle_since = None
+        snapshot = self._read_snapshot()
+        if snapshot is None:
+            # Copilot が居ない or 一時的に読めなかった。畳むが、手番の記憶は残す
+            # (Copilot が一瞬読めなかっただけで応答待ちが入力待ちに化けると困る)。
+            self._hide_all()
             return
 
-        # 「入力待ち」= idle かつ入力欄が空。入力中は待ちではないので数え直す。
-        is_idle = state == "idle" and not (input_value or "").strip()
+        state = self._classify(snapshot)
+        if state != self._state:
+            self._state = state
+            self._state_since = time.time()
+        elapsed = time.time() - (self._state_since or time.time())
 
-        # busy → idle の遷移で「通知済みフラグ」を外す(次の応答に対しては再通知したい)。
-        if self._last_state == "busy" and state != "busy":
-            self._notified_since = None
-        self._last_state = state
+        window_rect = _to_logical(snapshot.get("window_rect"))
+        input_rect = _to_logical(snapshot.get("input_rect"))
 
-        if not is_idle:
-            self._idle_since = None
+        if self._status is None:
+            self._status = CopilotStatusOverlay()
+        if not self._status.place_above(input_rect, window_rect):
+            # 最小化されている。札の置き場所が無いので何も出さない。
+            self._hide_all()
             return
+        self._status.apply_state(
+            state, elapsed if state in ELAPSED_STATES else None
+        )
+        self._status.show()
+        self._status.raise_()
 
-        now = time.time()
-        if self._idle_since is None:
-            self._idle_since = now
-            return
+        # 応答待ちが続きすぎたら窓全体を点滅させる。他の状態に移れば即やめる。
+        if state == "waiting_ai" and elapsed >= self._threshold:
+            if self._flash is None:
+                self._flash = CopilotFlashOverlay()
+            self._flash.start(window_rect)
+        elif self._flash is not None:
+            self._flash.stop()
 
-        elapsed = int(now - self._idle_since)
-        if elapsed < self._threshold:
-            return
-        if self._notified_since is not None:
-            # 既に通知済み。busy を挟むまで再通知しない。
-            return
+    def _classify(self, snapshot: dict) -> str:
+        """busy/ready/idle の3値と入力欄の中身から、4つの手番のどれかを決める。
 
-        # 通知を出す。窓は遅延生成(常駐起動を軽く保つ)。
-        if self._notify is None:
-            self._notify = IdleNotifyWindow()
-        self._notify.show_with_elapsed(elapsed)
-        self._notified_since = now
+        入力欄に文字があれば、送信ボタンが出ていようがいまいが「入力中」。
+        state が 'ready'(送信ボタンあり)でも入力欄が空のことがあるので、
+        文字の有無を先に見る。
 
-    def _read_copilot_state(self):
-        """Copilot の状態と入力欄の中身を取る。Copilot が居ないなら (None, None)。"""
-        try:
-            cp = copilot_loop.Copilot()
-        except RuntimeError:
-            return None, None
-        try:
-            return cp.state(), cp.read_input()
-        except Exception:  # noqa: BLE001
-            return None, None
+        空の idle は、直前に何を見たかで意味が変わる:
+          入力中 → 空idle : 送信した直後 → 応答待ち
+          応答中 → 空idle : 喋り終わった → 入力待ち
+        判断がつかない(常駐を起動した直後など)ときは入力待ち扱いにする。
+        こちらに寄せるのは、点滅するのが応答待ちのほうだけだから
+        (分からないときに点滅を始めるより、黙っているほうが害が小さい)。"""
+        if snapshot.get("state") == "busy":
+            self._last_decisive = "responding"
+            return "responding"
+        if (snapshot.get("input_text") or "").strip():
+            self._last_decisive = "typing"
+            return "typing"
+        return "waiting_ai" if self._last_decisive == "typing" else "waiting_user"
 
-    def _hide_notify(self) -> None:
-        if self._notify is not None:
+    def _read_snapshot(self):
+        """Copilot の状態一式を取る。Copilot が居ない・読めないなら None。
+
+        掴んだ Copilot は使い回す。Copilot() の生成は窓の全列挙 + アクセシビリティ
+        ツリーの起こし(最大1秒待つ) + UIA クライアントの生成で、常時ポーリングの
+        たびにやるには重い。窓が閉じた・Copilot を起動し直したときは hwnd が
+        無効になるので、そこで捨てて作り直す。
+
+        COM オブジェクトは Copilot インスタンスの属性として生き続けるので、
+        こちらがインスタンスを持ち続けている限り「関数の外に出して即解放」の罠
+        (CLAUDE.md)は踏まない。"""
+        cp = self._copilot
+        if cp is not None and not copilot_loop.user32.IsWindow(cp.hwnd_main):
+            cp = self._copilot = None
+        if cp is None:
             try:
-                self._notify.hide()
+                cp = self._copilot = copilot_loop.Copilot()
+            except RuntimeError:
+                return None
+        try:
+            return cp.status_snapshot()
+        except Exception:  # noqa: BLE001
+            # 窓を掴み直せば直ることが多い(Copilot の再起動・タブの入れ替えなど)。
+            # 次の tick で作り直す。
+            self._copilot = None
+            return None
+
+    def _reset(self) -> None:
+        self._state = None
+        self._state_since = None
+        self._last_decisive = None
+
+    def _hide_all(self) -> None:
+        if self._flash is not None:
+            try:
+                self._flash.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._status is not None:
+            try:
+                self._status.hide()
             except Exception:  # noqa: BLE001
                 pass
 

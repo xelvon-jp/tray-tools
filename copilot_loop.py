@@ -63,6 +63,24 @@ user32.SendMessageTimeoutW.argtypes = [
     ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
     ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
 ]
+# HWND は 64bit。argtypes を省くと ctypes が C int(32bit)に落として上位が消える
+# (CLAUDE.md「argtypes/restype は必須」)。
+user32.IsWindow.argtypes = [ctypes.c_void_p]
+user32.IsWindow.restype = ctypes.c_bool
+
+
+def _bounding_rect(element):
+    """UIA 要素の外接矩形を (left, top, right, bottom) で返す。取れなければ None。
+
+    最小化された窓は left が -32000 付近の座標を返す。そのまま窓の位置として使うと
+    画面外にオーバーレイを置くことになるので、呼び側で弾けるよう素の値を渡す。"""
+    try:
+        r = element.CurrentBoundingRectangle
+    except Exception:
+        return None
+    if r.right <= r.left or r.bottom <= r.top:
+        return None
+    return (r.left, r.top, r.right, r.bottom)
 
 
 class Copilot:
@@ -157,6 +175,46 @@ class Copilot:
         if SELECTORS["send_button"] in names:
             return "ready"
         return "idle"
+
+    def status_snapshot(self):
+        """状態・入力欄の中身・入力欄の矩形・窓の矩形を、木の走査1回でまとめて取る。
+
+        ステータスの常時表示(copilot_watchdog)は1〜2秒ごとに全部を欲しがる。
+        state() と read_input() を別々に呼ぶと FindAll(実測371要素)を二度歩くので、
+        ここで1回に畳んでいる。単発で状態だけ欲しいときは従来どおり state() でよい。
+
+        戻り値の矩形は Win32 と同じ (left, top, right, bottom) の物理ピクセル。
+        Qt に渡す前に capture_grab.device_bounds_to_logical を通すこと。
+        取れなかった項目は None。
+        """
+        root, desc = self._descendants()
+        names = [n for n, _ in self._bottom_buttons(root, desc)]
+        if SELECTORS["busy_button"] in names:
+            state = "busy"
+        elif SELECTORS["send_button"] in names:
+            state = "ready"
+        else:
+            state = "idle"
+
+        input_text = None
+        input_rect = None
+        box = self._input_box(desc)
+        if box is not None:
+            try:
+                pattern = box.GetCurrentPattern(VALUE_PATTERN)
+                if pattern:
+                    value = pattern.QueryInterface(UIA.IUIAutomationValuePattern)
+                    input_text = value.CurrentValue
+            except Exception:
+                pass
+            input_rect = _bounding_rect(box)
+
+        return {
+            "state": state,
+            "input_text": input_text,
+            "input_rect": input_rect,
+            "window_rect": _bounding_rect(root),
+        }
 
     def wait_until_idle(self, timeout=300, poll=0.4,
                         settle_seconds=2.5, grace_seconds=1.5):

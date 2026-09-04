@@ -266,8 +266,8 @@ class ScreenFeature:
         self._agent_loop_busy_icon = None   # 応答/実行中のリング(色違い)
         self._agent_loop_err_icon = None    # 危険停止・エラーのリング(色違い)
 
-        # Copilot 入力待ち検知(業務PC用: Pushover を使えない環境で、Copilot の
-        # 応答が返ったのに気づかず放置しているのを画面通知で気づかせる)。
+        # Copilot の手番の常時表示(業務PC用: Pushover を使えない環境で、Copilot が
+        # いま誰の番なのかを画面だけで分かるようにする)。
         # 監視モード実行中は完全に休むように、agent-loop の状態を伝えるコールバックを
         # 渡す(_agent_loop_state != "idle" のとき動いているとみなす)。
         import copilot_watchdog as _cw
@@ -422,10 +422,11 @@ class ScreenFeature:
             lambda _checked=False: self._show_agent_loop_log(),
         )
         self._agent_loop_menu.addSeparator()
-        # Copilot 入力待ちの通知(独立機能。エージェントループが動いていないときだけ働く)。
+        # Copilot の手番の常時表示(独立機能。エージェントループが動いていないときだけ働く)。
+        # 入力欄の上に小さな札を出し、応答待ちが閾値を超えたら窓全体を点滅させる。
         # チェック項目にして、いま ON/OFF どちらかがひと目で分かるようにする。
         self._copilot_watchdog_action = self._agent_loop_menu.addAction(
-            "🔔 Copilot 入力待ちを画面通知（30秒〜）"
+            "🔔 Copilot の状態を画面に常時表示"
         )
         self._copilot_watchdog_action.setCheckable(True)
         self._copilot_watchdog_action.setChecked(self._copilot_watchdog.is_enabled())
@@ -1689,7 +1690,7 @@ class ScreenFeature:
             print(f"[agent-loop] キャンセル要求失敗: {e}", file=sys.stderr)
 
     def _toggle_copilot_watchdog(self, checked: bool) -> None:
-        """Copilot 入力待ち通知の入切をメニューから切り替える。設定は自動保存。"""
+        """Copilot の状態表示の入切をメニューから切り替える。設定は自動保存。"""
         try:
             self._copilot_watchdog.set_enabled(bool(checked))
         except Exception as e:  # noqa: BLE001

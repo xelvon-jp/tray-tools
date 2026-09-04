@@ -366,20 +366,57 @@ traytools_send.py capture 2      2番目の画面だけ
 
 半透明のウィンドウも写します（`include_layered=True`）。通知やメニューが出ている状態を撮りたいためです。
 
-## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py`）
+## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py` / `agent_loop_viewer.py`）
 
 Copilot アプリを相手に「プロンプト送信 → 応答受信 → コード実行 → 結果貼り戻し」を自動で回す仕組み。**Ctrl+V や Enter を送らない**（UIA の `ValuePattern.SetValue` と `InvokePattern.Invoke` だけを使う）ので、フォーカスを奪わず、裏で作業しても事故が起きません。
 
-### 使い方
+### 3つのモード
+
+| モード | 送信 | 実行 | いつ使うか |
+|---|---|---|---|
+| **通常 dry-run** | tray-tools がお題を送信 | 実行しない | 初めての題材で、Copilot がどんなコードを書くか目視 |
+| **通常 auto**（`--auto`） | tray-tools がお題を送信 | 実行して結果を貼り戻す | 慣れた題材、Claude Code や PowerShell から起動 |
+| **監視モード**（`--watch`） | **人が Copilot に手で投稿** | 実行して結果を貼り戻す | 業務PC など Claude Code の無い環境。トレイメニューから開始できる |
+
+### 使い方（コマンド）
 
 ```
-traytools_send.py agent-loop start C:\path\to\お題.txt        # 既定は dry-run
-traytools_send.py agent-loop start C:\path\to\お題.txt --auto  # PowerShell を実行
-traytools_send.py agent-loop status                            # いま回っているか
-traytools_send.py agent-loop cancel                            # 次の周の頭で止まる
+traytools_send.py agent-loop start C:\path\to\お題.txt         # 通常 dry-run
+traytools_send.py agent-loop start C:\path\to\お題.txt --auto   # 通常 auto
+traytools_send.py agent-loop start --watch --auto               # 監視モード
+traytools_send.py agent-loop status                             # いま回っているか
+traytools_send.py agent-loop cancel                             # 次の周の頭で止まる
 ```
 
-Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`action=start|status|cancel`）。
+Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`action=start|status|cancel`、`watch=true` オプション）。
+
+### 使い方（トレイメニュー・業務PC向け）
+
+トレイの **🤖 エージェントループ ▸ 監視モード開始** を押します。ログ窓が開き、その後 Copilot アプリの入力欄に人が手でお題を貼って Enter するだけ。応答が始まると tray-tools が引き取ってループを回します。
+
+**トレイアイコンの色で状態が見えます**（既存の Rapture アイコンにリングを重ねる形。「アイコン2つ固定」の方針を維持）：
+
+| 色 | 状態 |
+|---|---|
+| なし（通常） | エージェントループ停止中 |
+| 🟠 オレンジ | スリープ抑止中 |
+| 🟢 緑 | 監視モード待機中（Copilot の応答を待っている） |
+| 🔵 青 | 応答受信中・PowerShell 実行中 |
+| 🔴 赤 | 危険パターン検出などで停止（要確認） |
+
+### ログ窓（`agent_loop_viewer.py`）
+
+監視モード開始と同時に開く常時表示の窓です。周ごとに次を色分けで流します：
+
+- 送信するプロンプトの先頭（監視モードなら「送信スキップ」と表示）
+- 応答受信の経過秒と先頭 800 文字
+- 抽出されたコード全文
+- 実行結果（exit code、stdout、stderr）
+- 停止理由
+
+**PowerShell 窓ではなく tray-tools 自身の窓なので**、監視モード終了で自動的に閉じられ、周が増えても窓は1枚に集約され、スクロールと文字選択もそのまま使えます。トレイの **🤖 ▸ 📜 ログ窓を前面に** で後から呼び戻せます。
+
+### 安全機構
 
 ### 安全機構
 
@@ -407,6 +444,8 @@ Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`a
 ### 業務PC（M365 Copilot）への移植
 
 `copilot_loop.SELECTORS` を書き換えれば済む作りです。書き換える候補は同梱の `tools/uia_probe.py` が出してくれます。詳しくは [`tools/README.md`](tools/README.md)。
+
+**Claude Code の無い業務PCでは、監視モード（`--watch` またはトレイメニュー）が本命の使い方**です。人が M365 Copilot にお題を貼って Enter → トレイの「監視モード開始」を押す → 以降は自動、という流れになります。
 
 ### ログ
 

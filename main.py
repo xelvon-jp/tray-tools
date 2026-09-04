@@ -589,7 +589,7 @@ def _pushover_command(args, reply) -> None:
 # 走っているスレッドを1本だけ持つ。2本同時に走らせない(Copilot は1つしか無い)。
 # 完了・失敗時のサマリはここに載せて status で読める状態にする。
 _agent_loop_state = {"thread": None, "started": None, "prompt": None,
-                     "auto": False, "summary": None}
+                     "auto": False, "watch": False, "summary": None}
 
 
 def _agent_loop_running() -> bool:
@@ -602,6 +602,7 @@ def _agent_loop_status_text() -> str:
         started = _agent_loop_state["started"] or ""
         return (f"agent-loop 実行中 (開始 {started}, "
                 f"auto={_agent_loop_state['auto']}, "
+                f"watch={_agent_loop_state.get('watch', False)}, "
                 f"prompt={_agent_loop_state['prompt']})")
     summary = _agent_loop_state.get("summary")
     if summary:
@@ -643,24 +644,21 @@ def _agent_loop_command(args, reply) -> None:
         return
 
     # --- start の引数解析 ---
-    # traytools_send.py agent-loop start <お題ファイル> [--auto] [--max N]
-    #                                                  [--ps-timeout N] [--response-timeout N]
-    #                                                  [--paste-limit N] [--finish-word W]
-    if len(args) < 2:
-        reply("ERR お題ファイルのパスを指定してください")
-        return
-    prompt_path = args[1]
-    if not os.path.exists(prompt_path):
-        reply(f"ERR お題ファイルが見つかりません: {prompt_path}")
-        return
+    # 通常モード:
+    #   traytools_send.py agent-loop start <お題ファイル> [--auto] [--max=N] ...
+    # 監視モード(Claude Code が無くても使える):
+    #   traytools_send.py agent-loop start --watch [--auto] [--max=N] ...
+    #   お題は人が Copilot に直接投稿する。tray-tools はその応答から引き取る。
+    opts = {"auto": False, "watch": False, "max_rounds": None,
+            "ps_timeout": None, "response_timeout": None,
+            "paste_limit": None, "finish_word": "", "loop_timeout": None}
 
-    opts = {"auto": False, "max_rounds": None, "ps_timeout": None,
-            "response_timeout": None, "paste_limit": None,
-            "finish_word": "", "loop_timeout": None}
-    i = 2
-    tail = args[2:]
-    for i, tok in enumerate(tail):
-        if tok == "--auto":
+    # 位置引数の1つ目は「--」で始まらなければ prompt_path、始まれば watch 前提
+    positional = [t for t in args[1:] if not t.startswith("--")]
+    for tok in args[1:]:
+        if tok == "--watch":
+            opts["watch"] = True
+        elif tok == "--auto":
             opts["auto"] = True
         elif tok.startswith("--max=") or tok.startswith("--max-rounds="):
             opts["max_rounds"] = int(tok.split("=", 1)[1])
@@ -676,18 +674,42 @@ def _agent_loop_command(args, reply) -> None:
             opts["loop_timeout"] = int(tok.split("=", 1)[1])
         # 未知のオプションは黙って飛ばす(古い呼び出しが将来の版で落ちないため)
 
+    prompt_path = positional[0] if positional else None
+    if not opts["watch"]:
+        if not prompt_path:
+            reply("ERR お題ファイルのパスを指定してください（--watch なら不要）")
+            return
+        if not os.path.exists(prompt_path):
+            reply(f"ERR お題ファイルが見つかりません: {prompt_path}")
+            return
+
+    prompt_label = ("<watch モード>" if opts["watch"]
+                    else os.path.basename(prompt_path))
+
     def work():
         # ここはワーカースレッド。Qtのウィジェットには絶対に触らないこと。
+        # イベントは screen.agent_loop_event シグナル(あれば)にメインスレッド経由で流す。
         try:
             import agent_loop as al  # 遅延 import。常駐の起動時間を伸ばさないため
-            prompt = open(prompt_path, encoding="utf-8-sig").read().strip()
-            kwargs = {"initial_prompt": prompt, "auto_run": opts["auto"]}
+            if opts["watch"]:
+                prompt = None
+            else:
+                prompt = open(prompt_path, encoding="utf-8-sig").read().strip()
+            kwargs = {"initial_prompt": prompt, "auto_run": opts["auto"],
+                      "watch": opts["watch"]}
             for key in ("max_rounds", "ps_timeout", "response_timeout",
                         "paste_limit", "loop_timeout"):
                 if opts[key] is not None:
                     kwargs[key] = opts[key]
             if opts["finish_word"]:
                 kwargs["finish_word"] = opts["finish_word"]
+
+            # ScreenFeature がログ窓を持っていれば on_event を繋ぐ。
+            # ここは遅延参照(常駐が Feature を持たない構成でも動くように)。
+            on_event = getattr(screen, "on_agent_loop_event", None)
+            if on_event is not None:
+                kwargs["on_event"] = on_event
+
             _agent_loop_state["summary"] = None
             summary = al.run_loop(**kwargs)
             _agent_loop_state["summary"] = summary
@@ -705,15 +727,16 @@ def _agent_loop_command(args, reply) -> None:
     _agent_loop_state["thread"] = threading.Thread(
         target=work, name="agent-loop", daemon=True)
     _agent_loop_state["started"] = datetime.now().strftime("%H:%M:%S")
-    _agent_loop_state["prompt"] = os.path.basename(prompt_path)
+    _agent_loop_state["prompt"] = prompt_label
     _agent_loop_state["auto"] = opts["auto"]
+    _agent_loop_state["watch"] = opts["watch"]
     _agent_loop_state["thread"].start()
 
     action_log.record("agent-loop 開始",
-                      f"{os.path.basename(prompt_path)} auto={opts['auto']}",
+                      f"{prompt_label} auto={opts['auto']} watch={opts['watch']}",
                       "external")
     reply(f"OK agent-loop を開始しました "
-          f"(auto={opts['auto']}, prompt={os.path.basename(prompt_path)})")
+          f"(auto={opts['auto']}, watch={opts['watch']}, prompt={prompt_label})")
 
 
 def _restart(instance_lock) -> bool:

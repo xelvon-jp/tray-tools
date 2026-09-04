@@ -217,7 +217,7 @@ def _matches_finish_word(text: str, finish_word: str) -> bool:
 # ループ本体
 # ---------------------------------------------------------------------------
 def run_loop(
-    initial_prompt: str,
+    initial_prompt=None,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     ps_timeout: int = DEFAULT_PS_TIMEOUT,
     response_timeout: int = DEFAULT_RESPONSE_TIMEOUT,
@@ -225,26 +225,50 @@ def run_loop(
     finish_word: str = "",
     auto_run: bool = False,
     loop_timeout: int = 30 * 60,
+    watch: bool = False,
+    on_event=None,
 ) -> dict:
     """疑似エージェントループを1回まわす。結果のサマリを辞書で返す。
 
-    auto_run=False(既定) は「実行係」を人がやるモード。Copilot が返したコードを
-    ログに残して停止する。初めての題材はまずこれで安全に確かめる。
-    auto_run=True で初めて PowerShell に流す。危険パターンが1件でも見つかったら
-    そのまま止まる(復帰は人の判断で)。"""
+    【モード】
+    - initial_prompt を渡すと従来モード: 1周目に tray-tools が送信する。
+    - watch=True にすると監視モード: 1周目の送信をスキップし、いきなり
+      応答受信から始める。**人が Copilot に直接お題を打った後**に開始する用。
+      業務PCで Claude Code が無い環境向け。
+
+    【実行の切り替え】
+    - auto_run=False(既定) は dry-run。Copilot が返したコードを実行せずログに
+      残して停止する。新しい題材はまずここで安全に確かめる。
+    - auto_run=True で初めて PowerShell に流す。危険パターン検出でそのまま止まる。
+
+    【イベント配信】
+    - on_event を渡すと、進捗イベント(response / snippet / run / stop など)が
+      その呼び出し可能に流れる。Qt のログ窓に反映するために使う。呼び出しは
+      ワーカースレッド。受け側で Qt をキュー接続などで受け直すこと。
+    """
     started = time.time()
     _cancel_clear()
-    _log({"event": "loop_start",
-          "prompt_chars": len(initial_prompt or ""),
-          "max_rounds": max_rounds, "auto_run": auto_run,
-          "ps_timeout": ps_timeout, "response_timeout": response_timeout,
-          "loop_timeout": loop_timeout, "finish_word": finish_word})
+
+    def emit(kind, **extra):
+        payload = {"event": kind, **extra}
+        _log(payload)
+        if on_event is not None:
+            try:
+                on_event(payload)
+            except Exception as e:  # noqa: BLE001  受け側で失敗してもループを止めない
+                print(f"[agent_loop] on_event 失敗: {e}", file=sys.stderr)
+
+    emit("loop_start",
+         prompt_chars=len(initial_prompt or ""),
+         max_rounds=max_rounds, auto_run=auto_run, watch=watch,
+         ps_timeout=ps_timeout, response_timeout=response_timeout,
+         loop_timeout=loop_timeout, finish_word=finish_word)
 
     cp = copilot_loop.Copilot()
     initial_state = cp.state()
-    if initial_state == "busy":
-        _log({"event": "loop_end", "reason": STOP_ERROR,
-              "detail": "起動時点で Copilot が回答中"})
+    if initial_state == "busy" and not watch:
+        emit("loop_end", reason=STOP_ERROR,
+             detail="起動時点で Copilot が回答中")
         return {"stopped_by": STOP_ERROR, "rounds": 0,
                 "detail": "Copilot が回答中でした。終わってから始めてください。"}
 
@@ -263,46 +287,54 @@ def run_loop(
 
         rounds += 1
         round_started = time.time()
-        _log({"event": "round_start", "round": rounds,
-              "prompt_preview": (prompt or "")[:120]})
+        # 監視モードの1周目は送信をスキップ(人が Copilot に既に送っている想定)。
+        # 2周目以降は普通の送信になる。
+        skip_send = watch and rounds == 1
+        emit("round_start", round=rounds, skip_send=skip_send,
+             prompt_preview=(prompt or "")[:120])
 
-        # 1) 送信直前の全文長を控える(new_response が使う)
-        previous_length = cp.snapshot_length()
-        try:
-            cp.set_input(prompt)
-        except Exception as e:  # noqa: BLE001  UIA は多様に落ちうる
-            stopped_by, stop_detail = STOP_ERROR, f"入力欄に書けませんでした: {e}"
-            break
-        try:
-            sent = cp.click_send()
-        except Exception as e:  # noqa: BLE001
-            stopped_by, stop_detail = STOP_ERROR, f"送信ボタンを押せませんでした: {e}"
-            break
-        if not sent:
-            stopped_by, stop_detail = STOP_ERROR, "送信ボタンが見つかりません"
-            break
+        if skip_send:
+            # 監視モード開始時点の全文長。ここから増えた分が「人が投げたお題への応答」。
+            previous_length = cp.snapshot_length()
+        else:
+            # 1) 送信直前の全文長を控える(new_response が使う)
+            previous_length = cp.snapshot_length()
+            try:
+                cp.set_input(prompt)
+            except Exception as e:  # noqa: BLE001  UIA は多様に落ちうる
+                stopped_by, stop_detail = STOP_ERROR, f"入力欄に書けませんでした: {e}"
+                break
+            try:
+                sent = cp.click_send()
+            except Exception as e:  # noqa: BLE001
+                stopped_by, stop_detail = STOP_ERROR, f"送信ボタンを押せませんでした: {e}"
+                break
+            if not sent:
+                stopped_by, stop_detail = STOP_ERROR, "送信ボタンが見つかりません"
+                break
 
         # 2) 完了待ち
         done, wait_elapsed = cp.wait_until_idle(timeout=response_timeout)
         if not done:
             stopped_by = STOP_TIMEOUT_RESPONSE
             stop_detail = f"応答待ちで {response_timeout} 秒を超えました"
-            _log({"event": "round_end", "round": rounds,
-                  "reason": stopped_by, "elapsed": time.time() - round_started})
+            emit("round_end", round=rounds,
+                 reason=stopped_by, elapsed=time.time() - round_started)
             break
 
         # 3) 新規応答を取得
         response = cp.new_response(previous_length)
-        _log({"event": "response", "round": rounds, "chars": len(response),
-              "wait_seconds": round(wait_elapsed, 1)})
+        emit("response", round=rounds, chars=len(response),
+             wait_seconds=round(wait_elapsed, 1),
+             response_head=response[:800])
 
         # 4) 完了語チェック(コードより先に見る。コード内の変数名にヒットしても
         #    「完了語で止まる」方が事故が少ない)
         if _matches_finish_word(response, finish_word):
             stopped_by = STOP_FINISH_WORD
             stop_detail = f"応答に完了語 {finish_word!r} が現れました"
-            _log({"event": "round_end", "round": rounds,
-                  "reason": stopped_by, "elapsed": time.time() - round_started})
+            emit("round_end", round=rounds,
+                 reason=stopped_by, elapsed=time.time() - round_started)
             break
 
         # 5) スニペット抽出
@@ -310,16 +342,16 @@ def run_loop(
         if not snippets:
             stopped_by = STOP_NO_SNIPPET
             stop_detail = "応答に #start/#end のスニペットがありません"
-            _log({"event": "round_end", "round": rounds,
-                  "reason": stopped_by, "elapsed": time.time() - round_started,
-                  "response_tail": response[-500:]})
+            emit("round_end", round=rounds,
+                 reason=stopped_by, elapsed=time.time() - round_started,
+                 response_tail=response[-500:])
             break
 
         # 最後の1つだけを扱う(複数出されたら仕様確認のため止める方が安全)
         sid, code = snippets[-1]
         risks = copilot_loop.risky_lines(code)
-        _log({"event": "snippet", "round": rounds, "id": sid,
-              "chars": len(code), "risks": len(risks)})
+        emit("snippet", round=rounds, id=sid,
+             chars=len(code), risks=len(risks), code=code)
 
         if risks:
             stopped_by = STOP_RISKY
@@ -329,33 +361,35 @@ def run_loop(
                 cp.set_input(format_risky_report(sid, risks))
             except Exception:  # noqa: BLE001  ここは best-effort
                 pass
-            _log({"event": "round_end", "round": rounds,
-                  "reason": stopped_by, "elapsed": time.time() - round_started})
+            emit("round_end", round=rounds,
+                 reason=stopped_by, elapsed=time.time() - round_started,
+                 risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
             break
 
         # 6) 実行(auto_run のときだけ)
         if not auto_run:
             stopped_by = STOP_DRY_RUN
             stop_detail = f"dry-run。#{sid}({len(code)}文字) は実行せず、ログに残しました"
-            _log({"event": "dry_run", "round": rounds, "id": sid,
-                  "code_head": code[:400]})
+            emit("dry_run", round=rounds, id=sid, code=code)
             break
 
         result = _run_powershell(code, sid, ps_timeout)
-        _log({"event": "run", "round": rounds, "id": sid,
-              "exit_code": result.get("exit_code"),
-              "timed_out": result.get("timed_out"),
-              "stdout_chars": len(result.get("stdout") or ""),
-              "stderr_chars": len(result.get("stderr") or "")})
+        emit("run", round=rounds, id=sid,
+             exit_code=result.get("exit_code"),
+             timed_out=result.get("timed_out"),
+             stdout_chars=len(result.get("stdout") or ""),
+             stderr_chars=len(result.get("stderr") or ""),
+             stdout=result.get("stdout") or "",
+             stderr=result.get("stderr") or "")
 
         # 7) 次のプロンプトを組み立てて次周へ
         prompt = format_paste(sid, result, paste_limit)
-        _log({"event": "round_end", "round": rounds,
-              "elapsed": time.time() - round_started})
+        emit("round_end", round=rounds,
+             elapsed=time.time() - round_started)
 
     total = time.time() - started
-    _log({"event": "loop_end", "reason": stopped_by, "detail": stop_detail,
-          "rounds": rounds, "elapsed": round(total, 1)})
+    emit("loop_end", reason=stopped_by, detail=stop_detail,
+         rounds=rounds, elapsed=round(total, 1))
     return {
         "stopped_by": stopped_by, "detail": stop_detail,
         "rounds": rounds, "elapsed": round(total, 1),
@@ -396,7 +430,10 @@ def _load_prompt(path: str) -> str:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Copilot アプリで疑似エージェントループを回す。")
-    parser.add_argument("prompt_file", help="1周目のプロンプトを書いたテキストファイル")
+    parser.add_argument("prompt_file", nargs="?", default=None,
+                        help="1周目のプロンプトを書いたテキストファイル(--watch では不要)")
+    parser.add_argument("--watch", action="store_true",
+                        help="監視モード: 人が Copilot に投稿した直後から引き取って回す")
     parser.add_argument("--auto", action="store_true",
                         help="実行係も自動化(危険パターン検出時は止まる)")
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
@@ -413,9 +450,15 @@ def main(argv=None) -> int:
     except AttributeError:
         pass
 
-    prompt = _load_prompt(args.prompt_file)
+    if args.watch:
+        prompt = None
+    else:
+        if not args.prompt_file:
+            print("prompt_file を指定するか --watch を付けてください", file=sys.stderr)
+            return 2
+        prompt = _load_prompt(args.prompt_file)
     summary = run_loop(
-        initial_prompt=prompt,
+        initial_prompt=prompt, watch=args.watch,
         max_rounds=args.max_rounds, ps_timeout=args.ps_timeout,
         response_timeout=args.response_timeout, paste_limit=args.paste_limit,
         finish_word=args.finish_word, auto_run=args.auto,

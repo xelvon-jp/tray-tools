@@ -227,7 +227,11 @@ TOOLS = [
             },
             "prompt_file": {
                 "type": "string",
-                "description": "action=start のときの1周目プロンプトのファイルパス",
+                "description": "action=start のときの1周目プロンプトのファイルパス(watch のときは不要)",
+            },
+            "watch": {
+                "type": "boolean",
+                "description": "監視モード。人が Copilot に投稿した直後から引き取って回す。prompt_file は不要",
             },
             "auto": {
                 "type": "boolean",
@@ -323,10 +327,15 @@ def _to_command(name: str, params: dict):
             raise ValueError("action は status / start / cancel です")
         if action != "start":
             return "agent-loop", [action]
+        watch = params.get("watch") is True
         prompt_file = (params.get("prompt_file") or "").strip()
-        if not prompt_file:
-            raise ValueError("start には prompt_file が必要です")
-        args = ["start", prompt_file]
+        if not watch and not prompt_file:
+            raise ValueError("start には prompt_file または watch=true が必要です")
+        args = ["start"]
+        if prompt_file:
+            args.append(prompt_file)
+        if watch:
+            args.append("--watch")
         if params.get("auto") is True:
             args.append("--auto")
         max_rounds = params.get("max_rounds")

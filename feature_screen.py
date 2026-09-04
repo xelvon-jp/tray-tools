@@ -65,6 +65,14 @@ BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
 AWAKE_RING_COLOR = (245, 158, 11, 255)
 AWAKE_RING_WIDTH = 4
 
+# 監視モード(agent-loop watch)中の目印。スリープ抑止と別の色にする。
+# 通常監視: 緑のリング / 応答受信・実行中は同じ緑を太く塗る(状態の変化として感じられる)。
+# CLAUDE.md「通知領域のアイコン2つ固定」の方針は既存を差し替えるだけなので守れている。
+AGENT_LOOP_RING_COLOR = (46, 204, 113, 255)   # 緑
+AGENT_LOOP_BUSY_COLOR = (52, 152, 219, 255)   # 青(応答受信・実行中)
+AGENT_LOOP_ERR_COLOR = (231, 76, 60, 255)     # 赤(危険停止など)
+AGENT_LOOP_RING_WIDTH = 4
+
 # 付箋の待機役(capture_process.py --prewarm)を最初に起こすまでの待ち。
 # 起動直後はトレイアイコンの構築とホットキーの登録で忙しく、ここで0.4秒ぶんの
 # プロセス起動を重ねると常駐が立ち上がるまでの体感が延びる。最初のキャプチャまでには
@@ -118,14 +126,20 @@ def _positive_number(value, default):
 def _make_awake_icon_image() -> Image.Image:
     """rapture.png(ユーザーの手描きドット絵)にリングを重ねた画像をメモリ上で作る。
     元ファイルは書き換えない。"""
+    return _make_ring_icon_image(AWAKE_RING_COLOR, AWAKE_RING_WIDTH)
+
+
+def _make_ring_icon_image(color, width) -> Image.Image:
+    """rapture.png を土台にして、任意の色・太さのリングを重ねる。
+    _make_awake_icon_image を一般化したもの(agent-loop でも同じ形を使う)。"""
     base = Image.open(ICON_PATH).convert("RGBA")
     img = base.copy()
     draw = ImageDraw.Draw(img)
-    inset = AWAKE_RING_WIDTH / 2
+    inset = width / 2
     draw.ellipse(
         (inset, inset, img.width - 1 - inset, img.height - 1 - inset),
-        outline=AWAKE_RING_COLOR,
-        width=AWAKE_RING_WIDTH,
+        outline=color,
+        width=width,
     )
     return img
 
@@ -138,6 +152,16 @@ class _PushoverBridge(QObject):
     (hotkeys.HotkeyBridge と同じ流儀)。"""
 
     finished = Signal(bool, str)
+
+
+class _AgentLoopBridge(QObject):
+    """エージェントループのワーカースレッドからメインスレッドへ状態変化を届ける器。
+
+    _PushoverBridge と同じ理由(ScreenFeature は QObject ではない)で、
+    別スレッドで走る run_loop() のイベントを、まずシグナル経由でメインへ渡し直してから
+    トレイアイコンを触る。ログ窓側はさらに独自の pyqtSignal で受けている。"""
+
+    state_changed = Signal(dict)
 
 
 class ScreenFeature:
@@ -232,6 +256,15 @@ class ScreenFeature:
         self._awake_timer.setSingleShot(True)
         self._awake_timer.timeout.connect(self._on_awake_expired)
         self._awake_icon = None
+
+        # エージェントループ(監視モード)の状態と、そのログ窓の参照。
+        # 状態は "idle"(オフ) / "watching"(待機中) / "busy"(応答受信中や実行中) / "err"。
+        # ログ窓は監視モードを開始したときだけ開く(参照はここで持たないと GC で消える)。
+        self._agent_loop_state = "idle"
+        self._agent_loop_viewer = None
+        self._agent_loop_ring_icon = None   # 通常監視のリング
+        self._agent_loop_busy_icon = None   # 応答/実行中のリング(色違い)
+        self._agent_loop_err_icon = None    # 危険停止・エラーのリング(色違い)
 
         # マウスジグラー。「時限で有効化 → 残り時間を出す → 時間が来たら自動解除」は
         # スリープ抑止とまったく同じ形なので、メニューの組み立ても状態の持ち方も揃えてある。
@@ -360,6 +393,25 @@ class ScreenFeature:
         # GCの心配は無いが、作り直しの前後で状態を見るためにここでも並びを持っておく。
         self._mirror_screen_actions = []
 
+        # エージェントループ(監視モード)のメニュー。Claude Code が無い環境でも
+        # Copilot ↔ tray-tools ↔ PowerShell のピンポンを回せるようにするための入口。
+        # 状態はトレイアイコンの色でも分かる(緑=待機/青=応答受信・実行中/赤=停止)。
+        self._agent_loop_menu = self.menu.addMenu("🤖 エージェントループ")
+        self._agent_loop_start_action = self._agent_loop_menu.addAction(
+            "▶ 監視モード開始 (Copilotの応答から引き取り)",
+            lambda _checked=False: self.start_agent_loop_watch(),
+        )
+        self._agent_loop_stop_action = self._agent_loop_menu.addAction(
+            "⏹ 停止",
+            lambda _checked=False: self.stop_agent_loop(),
+        )
+        self._agent_loop_show_log_action = self._agent_loop_menu.addAction(
+            "📜 ログ窓を前面に",
+            lambda _checked=False: self._show_agent_loop_log(),
+        )
+        # 初期状態を反映
+        self._refresh_agent_loop_menu()
+
         self.menu.addSeparator()
         # 電源まわりをひとつの傘に。狙いが近い(席を外す・寝かせる・寝させない)ので、
         # 探すときに同じ場所を見れば済む。
@@ -435,6 +487,17 @@ class ScreenFeature:
         # 接続ごと失われる。
         self._pushover_bridge = _PushoverBridge()
         self._pushover_bridge.finished.connect(self._on_pushover_tested)
+
+        # エージェントループの状態変化(agent_loop.run_loop ワーカースレッドから)を
+        # メインスレッドで受ける橋。参照を持たないとGCで消え、シグナル接続ごと失われる。
+        self._agent_loop_bridge = _AgentLoopBridge()
+        self._agent_loop_bridge.state_changed.connect(self._on_agent_loop_state_event)
+
+        # メニュー項目(トレイメニューの組み立て時に設定される)
+        self._agent_loop_menu = None
+        self._agent_loop_start_action = None
+        self._agent_loop_stop_action = None
+        self._agent_loop_show_log_action = None
         # このPCで使う気があるときだけメニューに出す。複数のPCで同じコードを動かして
         # おり、業務用の端末に個人の通知先の入口が並んでいても使い道がない。
         #
@@ -1448,16 +1511,43 @@ class ScreenFeature:
             self._jiggle_menu.setTitle("🖱 マウスジグラー（無期限）")
 
     def _refresh_state(self):
-        """スリープ抑止とマウスジグラーの状態をトレイアイコンとメニューに反映する。"""
-        if self._awake_active:
+        """スリープ抑止・監視モード・マウスジグラーの状態をトレイアイコンと
+        メニューに反映する。
+
+        アイコンの優先順位: 監視モード(色でさらに細分) > スリープ抑止 > 通常。
+        監視モードを最優先にするのは、これがいちばん見落としたときの被害が
+        大きいから(裏で Copilot とやり取りしていて実行までしている状態)。"""
+        icon = self._normal_icon
+        state = self._agent_loop_state
+        if state == "busy":
+            if self._agent_loop_busy_icon is None and ICON_PATH.exists():
+                self._agent_loop_busy_icon = pil_to_qicon(_make_ring_icon_image(
+                    AGENT_LOOP_BUSY_COLOR, AGENT_LOOP_RING_WIDTH))
+            icon = self._agent_loop_busy_icon or icon
+        elif state == "err":
+            if self._agent_loop_err_icon is None and ICON_PATH.exists():
+                self._agent_loop_err_icon = pil_to_qicon(_make_ring_icon_image(
+                    AGENT_LOOP_ERR_COLOR, AGENT_LOOP_RING_WIDTH))
+            icon = self._agent_loop_err_icon or icon
+        elif state == "watching":
+            if self._agent_loop_ring_icon is None and ICON_PATH.exists():
+                self._agent_loop_ring_icon = pil_to_qicon(_make_ring_icon_image(
+                    AGENT_LOOP_RING_COLOR, AGENT_LOOP_RING_WIDTH))
+            icon = self._agent_loop_ring_icon or icon
+        elif self._awake_active:
             if self._awake_icon is None and ICON_PATH.exists():
                 self._awake_icon = pil_to_qicon(_make_awake_icon_image())
-            self.tray_icon.setIcon(self._awake_icon or self._normal_icon)
-        else:
-            self.tray_icon.setIcon(self._normal_icon)
-        # アイコンの見た目(リング)はスリープ抑止が占有しているので、ジグラーの状態は
-        # ツールチップで示す。実質16pxのアイコンに2つ目の目印を入れても潰れて読めない。
+            icon = self._awake_icon or icon
+        self.tray_icon.setIcon(icon)
+        # アイコンの見た目(リング)は上の優先順位で埋まる。他の状態はツールチップで示す。
+        # 実質16pxのアイコンに2つ目の目印を入れても潰れて読めない。
         states = []
+        if state == "busy":
+            states.append("エージェントループ(応答/実行中)")
+        elif state == "watching":
+            states.append("エージェントループ 監視中")
+        elif state == "err":
+            states.append("エージェントループ エラー")
         if self._awake_active:
             states.append("スリープ抑止中")
         if self._jiggle_active:
@@ -1465,6 +1555,144 @@ class ScreenFeature:
         self.tray_icon.setToolTip(f"Rapture（{'・'.join(states)}）" if states else "Rapture")
         self._refresh_awake_menu()
         self._refresh_jiggle_menu()
+        self._refresh_agent_loop_menu()
+
+    # -- エージェントループ(監視モード)の統合 -----------------------
+    # main.py の _agent_loop_command から on_agent_loop_event を getattr で拾って
+    # 渡している。ここでは agent_loop のワーカースレッドから直接呼ばれても
+    # 安全に受けるため、Qt のシグナル/スロット(LogViewer 内)へ渡すだけにする。
+    def on_agent_loop_event(self, payload: dict) -> None:
+        """agent_loop.run_loop() の on_event として渡す入口。ワーカースレッド。
+
+        - ログ窓は QueuedConnection で受けるのでスレッド跨ぎ OK
+        - 状態(トレイアイコン)の更新は Qt を触るのでシグナル経由でメインへ
+        """
+        try:
+            viewer = self._agent_loop_viewer
+            if viewer is not None:
+                viewer.on_agent_loop_event(payload)
+            # 状態遷移は QMetaObject.invokeMethod でメインスレッドに投げるのが本筋だが、
+            # ここでは単純に _agent_loop_bridge.state_changed シグナルを使う。
+            self._agent_loop_bridge.state_changed.emit(payload)
+        except Exception as e:  # noqa: BLE001  ここで落とすとループ全体が止まる
+            print(f"[agent-loop] on_event 失敗: {e}", file=sys.stderr)
+
+    def _on_agent_loop_state_event(self, payload: dict) -> None:
+        """メインスレッドで受ける。イベントを見てトレイアイコンの状態を切り替える。"""
+        try:
+            event = payload.get("event", "")
+            new_state = None
+            if event == "loop_start":
+                new_state = "watching"
+                # ログ窓が閉じられていたら再表示(手で×を押した場合)
+                if self._agent_loop_viewer is not None:
+                    self._agent_loop_viewer.show()
+                    self._agent_loop_viewer.raise_()
+            elif event in ("response", "snippet", "run"):
+                new_state = "busy"
+            elif event == "round_end":
+                # 実行 → 次周に入るまでの間だけ watching(rest 状態)
+                reason = payload.get("reason")
+                if not reason:
+                    new_state = "watching"
+            elif event == "loop_end":
+                reason = payload.get("reason") or ""
+                if reason in ("risky-code", "error", "response-timeout", "loop-timeout"):
+                    new_state = "err"
+                else:
+                    new_state = "idle"
+            if new_state is not None:
+                self._agent_loop_state = new_state
+                self._refresh_state()
+        except Exception as e:  # noqa: BLE001
+            print(f"[agent-loop] 状態反映に失敗: {e}", file=sys.stderr)
+
+    def start_agent_loop_watch(self) -> None:
+        """トレイメニューから呼ぶ「監視モード開始」。
+
+        非同期で常駐スレッドを起こす。ここは Qt メインスレッド。実処理は
+        main._agent_loop_command と同じ経路を通したいので、traytools_send 経由で
+        自プロセスの名前付きパイプに投げるのではなく、直接 run_loop を回すスレッドを
+        立てる。ログ窓は先に開いておく(loop_start が届く頃には見える)。"""
+        # 実行中なら二重起動しない
+        import agent_loop as al
+        import agent_loop_viewer as av
+        # 既に走っていれば窓を前面に戻して終わり
+        # main._agent_loop_state の thread を見に行くのが正式だが、Feature からは
+        # 参照が見えないので、こちらの状態フラグで代替する(_agent_loop_state != "idle")。
+        if self._agent_loop_state != "idle":
+            if self._agent_loop_viewer is not None:
+                self._agent_loop_viewer.show()
+                self._agent_loop_viewer.raise_()
+            return
+        # ログ窓を先に用意
+        if self._agent_loop_viewer is None:
+            self._agent_loop_viewer = av.LogViewer()
+        self._agent_loop_viewer.show()
+        self._agent_loop_viewer.raise_()
+        self._agent_loop_viewer.append_note(
+            "監視モード開始。Copilot に手動でお題を投稿してください。"
+            "応答が始まると tray-tools が引き取ります。"
+        )
+
+        # 実処理はワーカースレッドで
+        import threading
+
+        def worker():
+            try:
+                al.run_loop(
+                    initial_prompt=None,
+                    watch=True,
+                    auto_run=True,
+                    max_rounds=10,
+                    on_event=self.on_agent_loop_event,
+                )
+            except Exception as e:  # noqa: BLE001
+                # loop_end が出ないので、ここで状態だけ戻す
+                self._agent_loop_bridge.state_changed.emit(
+                    {"event": "loop_end", "reason": "error", "detail": str(e),
+                     "rounds": 0, "elapsed": 0})
+
+        threading.Thread(target=worker, name="agent-loop-menu", daemon=True).start()
+        self._agent_loop_state = "watching"
+        self._refresh_state()
+        self._refresh_agent_loop_menu()
+
+    def stop_agent_loop(self) -> None:
+        """トレイメニューから呼ぶ「監視モード停止」。次の周の頭で止まる。"""
+        try:
+            import agent_loop as al
+            al.request_cancel()
+        except Exception as e:  # noqa: BLE001
+            print(f"[agent-loop] キャンセル要求失敗: {e}", file=sys.stderr)
+
+    def _show_agent_loop_log(self) -> None:
+        """トレイメニューから呼ぶ「ログ窓を前面に」。実行中でなくても、
+        直近の実行結果を振り返るために窓は残しておく。"""
+        if self._agent_loop_viewer is None:
+            import agent_loop_viewer as av
+            self._agent_loop_viewer = av.LogViewer()
+        self._agent_loop_viewer.show()
+        self._agent_loop_viewer.raise_()
+
+    def _refresh_agent_loop_menu(self) -> None:
+        """監視モードのメニューの見出しと開始/停止項目の見せ方を更新する。"""
+        if not hasattr(self, "_agent_loop_menu") or self._agent_loop_menu is None:
+            return
+        if self._agent_loop_state == "idle":
+            self._agent_loop_menu.setTitle("🤖 エージェントループ")
+        elif self._agent_loop_state == "watching":
+            self._agent_loop_menu.setTitle("🤖 エージェントループ（監視中）")
+        elif self._agent_loop_state == "busy":
+            self._agent_loop_menu.setTitle("🤖 エージェントループ（実行中）")
+        elif self._agent_loop_state == "err":
+            self._agent_loop_menu.setTitle("🤖 エージェントループ（停止：要確認）")
+        if self._agent_loop_start_action:
+            self._agent_loop_start_action.setEnabled(self._agent_loop_state == "idle")
+        if self._agent_loop_stop_action:
+            self._agent_loop_stop_action.setEnabled(self._agent_loop_state != "idle")
+        if self._agent_loop_show_log_action:
+            self._agent_loop_show_log_action.setEnabled(self._agent_loop_viewer is not None)
 
     def _on_quit(self):
         # 付箋(Rapture)はここで閉じない。別プロセスで動いており、本体を終了・再起動

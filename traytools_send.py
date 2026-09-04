@@ -253,7 +253,11 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   agent-loop cancel            走っているループに停止要求（次の周の頭で止まる）
   agent-loop start <お題ファイル> [--auto] [--max=N] [--ps-timeout=N]
                                [--response-timeout=N] [--paste-limit=N] [--finish-word=W]
-                               既定は dry-run（コードを実行せずログに残して止まる）"""
+                               既定は dry-run（コードを実行せずログに残して止まる）
+  agent-loop start --watch [--auto] [--max=N] [--finish-word=W]
+                               監視モード。お題ファイル不要。人が Copilot に投稿した後、
+                               tray-tools が応答を受け取って以降を回す。Claude Code の無い
+                               業務PCで使う想定"""
 
 
 def main() -> int:

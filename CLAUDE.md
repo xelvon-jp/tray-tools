@@ -84,7 +84,7 @@ python -c "import main; print(main._acquire_single_instance())"
 - **offscreen で `setMimeData()` を使うと終了時にセグメンテーション違反（139）が出る。** 実機とは無関係（`README.md` に理由あり）。
 - offscreen では日本語フォントが解決されず豆腐になることがある。レイアウトの確認には使えるが、字が出ないことを不具合と読み違えないこと。
 
-## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py`）
+## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py` / `agent_loop_viewer.py`）
 
 Copilot アプリを相手に「プロンプト送信 → 応答受信 → コード実行 → 結果貼り戻し」を自動で回す仕組み。
 
@@ -93,6 +93,30 @@ Copilot アプリを相手に「プロンプト送信 → 応答受信 → コ�
 - **危険パターン検知**（`copilot_loop.risky_lines`）でヒットしたら自動実行しない。人の判断を待って止まる。Copilot に理由を返して終わる
 - **3層のタイムアウト**（PowerShell 単発 / 応答待ち / ループ全体）で無限ループを防ぐ
 - **キャンセルはファイル方式**（`.copilot_loop_cancel`）。実行スレッドが詰まっていても次の周の頭で拾って止まる
+
+### 3つのモード
+
+| モード | 送信 | 実行 | 用途 |
+|---|---|---|---|
+| 通常 dry-run | tray-tools が送信 | 実行しない | 目視確認 |
+| 通常 auto（`--auto`） | tray-tools が送信 | 実行 | Claude Code / CLI から起動 |
+| 監視モード（`--watch`） | **人が Copilot に手で投稿** | 実行 | 業務PC など Claude Code の無い環境 |
+
+**監視モードは1周目の送信をスキップする**。それだけの違い。`run_loop(watch=True, initial_prompt=None)`。busy 判定も skip する（人が送った直後で busy なのが普通）。2周目以降は通常モードと同じ。
+
+### イベント配信で「PowerShell の窓」を作らない
+
+トレイメニューの「監視モード開始」から起動すると、`agent_loop_viewer.LogViewer`（Qt の QPlainTextEdit）が開いて、応答受信・スニペット抽出・PowerShell 実行の内容を色分けで流す。Start-Process で新しい PowerShell 窓を開かない理由:
+
+- 周ごとに窓が増える／監視モード終了で自動的に閉じられない
+- 1つに集約したいが、cmd/pwsh 窓を1つに集約するのは面倒（stdin にコマンドを流し込む必要があり、標準出力を吸うのも面倒）
+- Qt 窓なら開閉を tray-tools が管理でき、周が増えても1枚に集約、ログもスクロール・選択がそのまま使える
+
+`agent_loop.run_loop(on_event=...)` にコールバックを渡すことで、ワーカースレッド → メインスレッド（Qt シグナル `QueuedConnection`）→ LogViewer の順に流す。**ワーカースレッドから Qt を直接触ると壊れる**ので `_AgentLoopBridge`（`Signal(dict)`）を必ず経由する（`_PushoverBridge` と同じ流儀）。
+
+### アイコン状態表示
+
+`_refresh_state` で優先順位 監視モード > スリープ抑止 > 通常。監視モードはさらに待機（緑）／実行中（青）／エラー（赤）で色を変える。**新しいトレイアイコンは追加しない**（`_normal_icon` を差し替える）ので、「アイコン2つ固定」の方針は維持。既存の `_make_awake_icon_image` を一般化した `_make_ring_icon_image(color, width)` を使う。
 
 ### 応答テキストの取り方に決着済みの罠
 

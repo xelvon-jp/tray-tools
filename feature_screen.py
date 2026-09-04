@@ -266,6 +266,18 @@ class ScreenFeature:
         self._agent_loop_busy_icon = None   # 応答/実行中のリング(色違い)
         self._agent_loop_err_icon = None    # 危険停止・エラーのリング(色違い)
 
+        # Copilot 入力待ち検知(業務PC用: Pushover を使えない環境で、Copilot の
+        # 応答が返ったのに気づかず放置しているのを画面通知で気づかせる)。
+        # 監視モード実行中は完全に休むように、agent-loop の状態を伝えるコールバックを
+        # 渡す(_agent_loop_state != "idle" のとき動いているとみなす)。
+        import copilot_watchdog as _cw
+        self._copilot_watchdog = _cw.CopilotWatchdog(
+            app_settings=app_settings,
+            settings_path=settings_path,
+            is_agent_loop_running=lambda: self._agent_loop_state != "idle",
+        )
+        self._copilot_watchdog_action = None  # メニュー項目(後で作る)
+
         # マウスジグラー。「時限で有効化 → 残り時間を出す → 時間が来たら自動解除」は
         # スリープ抑止とまったく同じ形なので、メニューの組み立ても状態の持ち方も揃えてある。
         # ただしタイマーは2本要る(締切用と、入力を送る周期用)。抑止側はOSに状態を1回
@@ -409,6 +421,16 @@ class ScreenFeature:
             "📜 ログ窓を前面に",
             lambda _checked=False: self._show_agent_loop_log(),
         )
+        self._agent_loop_menu.addSeparator()
+        # Copilot 入力待ちの通知(独立機能。エージェントループが動いていないときだけ働く)。
+        # チェック項目にして、いま ON/OFF どちらかがひと目で分かるようにする。
+        self._copilot_watchdog_action = self._agent_loop_menu.addAction(
+            "🔔 Copilot 入力待ちを画面通知（30秒〜）"
+        )
+        self._copilot_watchdog_action.setCheckable(True)
+        self._copilot_watchdog_action.setChecked(self._copilot_watchdog.is_enabled())
+        # addAction(テキスト, 関数) だと checked が渡らないので triggered.connect で受ける。
+        self._copilot_watchdog_action.triggered.connect(self._toggle_copilot_watchdog)
         # 初期状態を反映
         self._refresh_agent_loop_menu()
 
@@ -1627,7 +1649,7 @@ class ScreenFeature:
             return
         # ログ窓を先に用意
         if self._agent_loop_viewer is None:
-            self._agent_loop_viewer = av.LogViewer()
+            self._agent_loop_viewer = av.LogViewer(self.app_settings, self.settings_path)
         self._agent_loop_viewer.show()
         self._agent_loop_viewer.raise_()
         self._agent_loop_viewer.append_note(
@@ -1666,12 +1688,19 @@ class ScreenFeature:
         except Exception as e:  # noqa: BLE001
             print(f"[agent-loop] キャンセル要求失敗: {e}", file=sys.stderr)
 
+    def _toggle_copilot_watchdog(self, checked: bool) -> None:
+        """Copilot 入力待ち通知の入切をメニューから切り替える。設定は自動保存。"""
+        try:
+            self._copilot_watchdog.set_enabled(bool(checked))
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-watchdog] 切替失敗: {e}", file=sys.stderr)
+
     def _show_agent_loop_log(self) -> None:
         """トレイメニューから呼ぶ「ログ窓を前面に」。実行中でなくても、
         直近の実行結果を振り返るために窓は残しておく。"""
         if self._agent_loop_viewer is None:
             import agent_loop_viewer as av
-            self._agent_loop_viewer = av.LogViewer()
+            self._agent_loop_viewer = av.LogViewer(self.app_settings, self.settings_path)
         self._agent_loop_viewer.show()
         self._agent_loop_viewer.raise_()
 
@@ -1722,6 +1751,12 @@ class ScreenFeature:
         # 画面ミラーも同じ。全画面の窓と手元の枠を残したまま終わると、映しっぱなしの
         # まま畳む手段(このアプリ)が居なくなる。
         self.screen_mirror.close_all()
+        # Copilot 入力待ち通知のタイマー・窓も後始末する。生きたままだと再起動で
+        # タイマーが2重に走る恐れがある。
+        try:
+            self._copilot_watchdog.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-watchdog] 終了処理に失敗: {e}", file=sys.stderr)
 
     def attach_restart(self, restart) -> None:
         """自分を起動し直す手段を受け取る。組み立ては main.py が行う。"""

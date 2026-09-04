@@ -26,9 +26,15 @@ import html
 import time
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QObject, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication
-from PySide6.QtWidgets import QLabel, QPlainTextEdit, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QObject, QRectF, Signal
+from PySide6.QtGui import (
+    QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPixmap,
+)
+from PySide6.QtWidgets import (
+    QCheckBox, QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
+)
+
+import settings as settings_module
 
 # 既定の窓の大きさ。1周ぶんの実行結果(stdout+stderr)が読める程度。
 DEFAULT_WIDTH = 900
@@ -73,6 +79,34 @@ def _clip_head_tail(text, head=1200, tail=800):
             + text[-tail:])
 
 
+# settings.json に覚える。窓を開くたびに使う人が「最前面固定」を設定し直さないで
+# 済むようにするため。位置は毎回中央に置き直すので保存しない(モニタ構成が変わっても
+# 迷子にならない)。
+SETTINGS_SECTION = "agent_loop_viewer"
+SETTINGS_ALWAYS_ON_TOP = "always_on_top"
+
+
+def _make_emoji_icon(emoji: str, size: int = 64) -> QIcon:
+    """絵文字1文字を大きめに描いた QIcon を作る。
+
+    タスクバー/タイトルバーに tray-tools 本体のドット絵(天むす)ではなく、
+    この窓が何者かを一目で示すロボット等を出したいときに使う。フォントは
+    Segoe UI Emoji(Windows 標準)で描くと絵文字が出る(Meiryo だと豆腐になる)。"""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        font = QFont("Segoe UI Emoji", int(size * 0.7))
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(QRectF(0, 0, size, size), Qt.AlignCenter, emoji)
+    finally:
+        painter.end()
+    return QIcon(pixmap)
+
+
 class LogViewer(QWidget):
     """エージェントループの実行状況を常時表示する窓。
 
@@ -81,22 +115,43 @@ class LogViewer(QWidget):
 
     _event_signal = Signal(dict)
 
-    def __init__(self):
+    def __init__(self, app_settings=None, settings_path=None):
         super().__init__()
+        # 陽太さんの要望: タスクバー/タイトルバーには天むす(Rapture)ではなく🤖を出す。
+        # 「これはエージェントループの窓」と一目で分かるように、tray アイコンとは
+        # 別のアイコンにする。絵文字から作れば追加ファイルが要らない。
+        self.setWindowIcon(_make_emoji_icon("🤖"))
         self.setWindowTitle("エージェントループ")
         self.setObjectName("agentLoopViewer")
-        # 常時最前面にはしない(陽太さんは他アプリを見ながら回すので前面固定は迷惑)。
-        # 単なる普通の窓として振る舞う。
+        # 既定は「最前面固定なし」。上のチェックボックスで陽太さんが決められる。
         self.resize(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+
+        self._app_settings = app_settings
+        self._settings_path = settings_path
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
 
+        # 状態バーと最前面固定のチェックを1行に並べる。チェックは右寄せ。
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
         self.status = QLabel("待機中")
         self.status.setFont(QFont("Meiryo", 10))
         self.status.setObjectName("agentLoopStatus")
-        layout.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+
+        self.top_check = QCheckBox("📌 最前面固定")
+        self.top_check.setFont(QFont("Meiryo", 9))
+        self.top_check.setObjectName("agentLoopTopCheck")
+        self.top_check.setChecked(self._load_always_on_top())
+        # setChecked(True) では setWindowFlags を効かせられる前に窓が構築される。
+        # 描画順が固まる setSingleShot(0) 相当を、show の後にする(closeEvent 側で
+        # 保存も同じ)。ここでは接続だけしておく。
+        self.top_check.toggled.connect(self._on_top_toggled)
+        status_row.addWidget(self.top_check, 0)
+        layout.addLayout(status_row)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -110,11 +165,14 @@ class LogViewer(QWidget):
             "#agentLoopViewer { background-color: #1a1a1a; color: #ddd; }"
             "#agentLoopStatus { color: #eee; padding: 4px 8px; "
             "background-color: #262626; border-radius: 4px; }"
+            "#agentLoopTopCheck { color: #ccc; padding: 4px 8px; }"
             "QPlainTextEdit { background-color: #111; color: #ddd; "
             "border: 1px solid #333; border-radius: 4px; padding: 6px; }"
         )
 
         self._center_on_cursor_screen()
+        # 保存されていた「最前面固定」を今の窓フラグに反映する。
+        self._apply_always_on_top(self.top_check.isChecked())
 
         # スレッドをまたぐシグナル。Qt.QueuedConnection が自動で選ばれる。
         self._event_signal.connect(self._handle_event)
@@ -125,6 +183,64 @@ class LogViewer(QWidget):
         x = area.center().x() - self.width() // 2
         y = area.center().y() - self.height() // 2
         self.move(max(area.left(), x), max(area.top(), y))
+
+    # ------- 「最前面固定」チェックの挙動と永続化 --------------------
+    def _load_always_on_top(self) -> bool:
+        section = (self._app_settings or {}).get(SETTINGS_SECTION)
+        if not isinstance(section, dict):
+            return False
+        return bool(section.get(SETTINGS_ALWAYS_ON_TOP, False))
+
+    def _save_always_on_top(self, checked: bool) -> None:
+        """settings.json を丸ごと書き戻さず、該当キーだけ差し替える。
+        (snippets.push_recent と同じ流儀。既定値まで焼き込まれてファイルの姿が
+        変わるのを避けるため。)"""
+        if isinstance(self._app_settings, dict):
+            section = self._app_settings.get(SETTINGS_SECTION)
+            if not isinstance(section, dict):
+                section = self._app_settings[SETTINGS_SECTION] = {}
+            section[SETTINGS_ALWAYS_ON_TOP] = bool(checked)
+        if not self._settings_path:
+            return
+        import json
+        import os
+        try:
+            stored = {}
+            if os.path.exists(self._settings_path):
+                with open(self._settings_path, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            if not isinstance(stored, dict):
+                stored = {}
+            section = stored.get(SETTINGS_SECTION)
+            if not isinstance(section, dict):
+                section = stored[SETTINGS_SECTION] = {}
+            section[SETTINGS_ALWAYS_ON_TOP] = bool(checked)
+            settings_module.save_settings(stored, self._settings_path)
+        except OSError as e:
+            print(f"[agent_loop_viewer] 最前面固定の保存に失敗: {e}")
+
+    def _apply_always_on_top(self, checked: bool) -> None:
+        """WindowStaysOnTopHint フラグを付け外しする。setWindowFlags は
+        いったん hide → show が必要になる場合があるが、visible な間は Qt が
+        面倒を見てくれるので、show を呼び直すだけで済む。"""
+        flags = self.windowFlags()
+        if checked:
+            flags |= Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowStaysOnTopHint
+        # まだ show されていないタイミングで呼ばれても壊れないよう、
+        # setWindowFlags の後で isVisible なら再度 show する。
+        was_visible = self.isVisible()
+        self.setWindowFlags(flags)
+        if was_visible:
+            self.show()
+
+    def _on_top_toggled(self, checked: bool) -> None:
+        try:
+            self._apply_always_on_top(checked)
+            self._save_always_on_top(checked)
+        except Exception as e:  # noqa: BLE001  設定保存失敗で窓を落とさない
+            print(f"[agent_loop_viewer] 最前面固定の切替に失敗: {e}")
 
     # ------- 外から呼ぶ入口 --------------------------------------------
     def on_agent_loop_event(self, payload: dict) -> None:

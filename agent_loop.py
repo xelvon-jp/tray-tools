@@ -294,8 +294,18 @@ def run_loop(
              prompt_preview=(prompt or "")[:120])
 
         if skip_send:
-            # 監視モード開始時点の全文長。ここから増えた分が「人が投げたお題への応答」。
-            previous_length = cp.snapshot_length()
+            # 監視モードの1周目。「人が Copilot に投稿したお題への応答」を取りたいが、
+            # snapshot_length を使うと、開始ボタンを押すまでに Copilot が既に応答を
+            # 書き終わっていた場合に「全文長より後ろ = 空」となってしまう
+            # (実測: 5.9秒で 0 文字が返り、no-snippet で終わった)。
+            #
+            # 代わりに「最後の user_marker(あなたの発言)」の位置を previous_length に
+            # する。応答が完了していても書きかけでも、正しく「人の最後の発言以降」を
+            # 拾える。user_marker が無い(会話履歴がまっさら)なら 0 から取る。
+            text = cp.document_text()
+            user_marker = copilot_loop.SELECTORS["user_marker"]
+            idx = text.rfind(user_marker)
+            previous_length = 0 if idx == -1 else idx + len(user_marker)
         else:
             # 1) 送信直前の全文長を控える(new_response が使う)
             previous_length = cp.snapshot_length()

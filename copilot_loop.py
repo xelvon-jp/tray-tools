@@ -81,7 +81,12 @@ BUILTIN_PROFILES = [
         # Chromium の窓クラスではないが、中身は WebView2 なのでレンダラの窓は居る
         # 見込み。見つからなければメイン窓へ WM_GETOBJECT を投げる道に落ちる。
         "render_class": "Chrome_RenderWidgetHostHWND",
-        "input_automation_id": "m365chat-editor-target-element",
+        # ハイフンの位置は読み上げで拾ったので、聞き取り違いの余地がある綴りを
+        # 両方入れてある(どちらかが当たれば動く)。
+        "input_automation_id": [
+            "m365-chat-editor-target-element",
+            "m365chat-editor-target-element",
+        ],
         "send_button": ["送信", "メッセージの送信"],
         "busy_button": ["生成を停止する", "メッセージの割り込み", "停止"],
         # 発言マーカーは未特定。M365 は 'あなたの発言' に相当する Text を出して
@@ -344,10 +349,16 @@ class Copilot:
         return root, desc
 
     def _input_box(self, desc):
+        """入力欄の要素。プロファイルの aid のどれかに一致するものを返す。
+
+        aid をリストで受けるのはボタン名と同じ理由。加えて、業務PC の値は画面を
+        読み上げてもらって書き取ったもので、聞き取り違いの余地がある。候補を
+        並べておけば、一発勝負にならずに済む。"""
+        wanted = self._names("input_automation_id")
         for i in range(desc.Length):
             el = desc.GetElement(i)
             try:
-                if (el.CurrentAutomationId or "") == self.profile["input_automation_id"]:
+                if (el.CurrentAutomationId or "") in wanted:
                     return el
             except Exception:
                 continue

@@ -66,7 +66,7 @@ from PySide6.QtCore import Qt, QPointF, QRect, QRectF, QTimer  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
     QColor, QFont, QGuiApplication, QPainter, QPen, QPolygonF,
 )
-from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 
 import capture_grab  # noqa: E402
 import copilot_loop  # noqa: E402
@@ -111,6 +111,11 @@ BUTTON_MARGIN = 8
 # 親(常駐)がまだ居るかを見る間隔(ms)。落ちたときに札が貼り付いたままになるのを防ぐ。
 PARENT_CHECK_MS = 3000
 
+# 点滅を何往復させたら止めるか。ずっと点滅していると視界の端でうるさく、
+# しばらくすると脳が慣れて逆に気づかなくなる。数回で気を引いたら、あとは
+# 赤いままで「まだ待っている」ことだけを示し続ける。
+FLASH_MAX_CYCLES = 5
+
 ALERTABLE_STATES = ("waiting_ai", "waiting_user")
 
 
@@ -135,7 +140,7 @@ class StatusPill(QWidget):
     入力位置(キャレット)が飛ばないので、書きかけの文章を触っても続きから打てる。
     tray-tools が SetForegroundWindow を禁じているのと同じ考え方。"""
 
-    def __init__(self, on_toggle_pause=None):
+    def __init__(self, on_toggle_pause=None, on_quit=None):
         super().__init__()
         self.setWindowTitle("Copilot ステータス")
         self.setWindowFlags(
@@ -152,6 +157,7 @@ class StatusPill(QWidget):
         self.setCursor(Qt.PointingHandCursor)
 
         self._on_toggle_pause = on_toggle_pause
+        self._on_quit = on_quit
         self._emoji = ""
         self._label = ""
         self._elapsed = ""
@@ -209,6 +215,21 @@ class StatusPill(QWidget):
                 and self._button_rect().contains(event.position().toPoint())
                 and self._on_toggle_pause is not None):
             self._on_toggle_pause()
+
+    def contextMenuEvent(self, event):
+        """右クリックで、一時停止と終了を選ばせる。
+
+        右クリックで即終了にしなかったのは、消してしまうとトレイのメニューまで
+        戻らないと出し直せないため。誤クリック1回で消えるのは代償が大きい。"""
+        menu = QMenu(self)
+        pause = menu.addAction("▶ 監視を再開" if self._paused else "⏸ 監視を一時停止")
+        menu.addSeparator()
+        quit_action = menu.addAction("⏹ 状態監視バーを終了")
+        chosen = menu.exec(event.globalPos())
+        if chosen is pause and self._on_toggle_pause is not None:
+            self._on_toggle_pause()
+        elif chosen is quit_action and self._on_quit is not None:
+            self._on_quit()
 
     def paintEvent(self, _event):
         p = QPainter(self)
@@ -290,13 +311,26 @@ class FlashFrame(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         self._bright = True
+        self._cycles = 0
         self._timer = QTimer()
         self._timer.setInterval(FLASH_INTERVAL_MS)
         self._timer.timeout.connect(self._on_blink)
 
     def _on_blink(self):
         try:
+            if self._cycles >= FLASH_MAX_CYCLES:
+                # 規定回数を過ぎたら明るいまま固定。タイマーは止めてあるが、
+                # 呼ばれても状態を変えないようにしておく(止め忘れの保険)。
+                self._timer.stop()
+                self._bright = True
+                return
             self._bright = not self._bright
+            if self._bright:
+                # 暗→明で1往復ぶん数える。規定回数を過ぎたら点滅をやめ、
+                # 明るい赤のまま置いておく(消してしまうと待ちに気づけない)。
+                self._cycles += 1
+                if self._cycles >= FLASH_MAX_CYCLES:
+                    self._timer.stop()
             self.update()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
             print(f"[copilot-status] 点滅の描き替えに失敗: {e}")
@@ -314,8 +348,11 @@ class FlashFrame(QWidget):
 
     def start(self, window_rect):
         self.setGeometry(window_rect)
-        if not self._timer.isActive():
+        # 既に出ているなら点滅の続き(または点滅し終わった赤)をそのまま保つ。
+        # ここで数え直すと、窓を動かすたびに点滅が復活してしまう。
+        if not self.isVisible() and not self._timer.isActive():
             self._bright = True
+            self._cycles = 0
             self._timer.start()
         # show / raise_ は出ていないときだけ。毎回叩くと他の最前面の窓と
         # 押し上げ合いになってちらつく。
@@ -325,6 +362,7 @@ class FlashFrame(QWidget):
 
     def stop(self):
         self._timer.stop()
+        self._cycles = 0
         self.hide()
 
 
@@ -346,7 +384,8 @@ class StatusWatcher:
         # のが当たり前で、黙って止まったままのほうが事故になる)。
         self._paused = False
 
-        self._pill = StatusPill(on_toggle_pause=self.toggle_pause)
+        self._pill = StatusPill(on_toggle_pause=self.toggle_pause,
+                                on_quit=self.quit_by_user)
         self._flash = FlashFrame()
 
         self._poll_timer = QTimer()
@@ -374,6 +413,22 @@ class StatusWatcher:
                 self._on_poll()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
             print(f"[copilot-status] 一時停止の切り替えに失敗: {e}")
+
+    def quit_by_user(self):
+        """札の右クリックから「終了」を選ばれたときの出口。
+
+        終了コード0で終わる。常駐はこれを見て「事故で落ちたのではなく、人が
+        消した」と判断し、起こし直さずにメニューのチェックを外す
+        (copilot_watchdog._on_watch)。区別が無いと、消した札が数秒後に
+        勝手に戻ってきてしまう。"""
+        try:
+            self._poll_timer.stop()
+            self._follow_timer.stop()
+            self._hide_all()
+            self._release()
+        except Exception:  # noqa: BLE001
+            pass
+        QApplication.instance().exit(0)
 
     def start(self):
         self._poll_timer.start()
@@ -514,6 +569,63 @@ class StatusWatcher:
             pass
 
 
+def sweep_other_instances():
+    """自分以外の状態監視バーを片付ける。片付けた数を返す。
+
+    【なぜ子側でやるのか】
+    最初は常駐側で掃除していたが、psutil の process_iter(['cmdline']) は内部で
+    COM を使う。常駐は pycaw を持っているので、そこへ COM を持ち込むと GC のたびに
+    即死する——**避けようとしていた当のものを、避けるためのコードで持ち込んでいた**
+    (2026-09-05 13:17 に実際に落ちた)。こちらのプロセスには pycaw が居ないので、
+    psutil を使っても安全。
+
+    【判定を引数ごとに見る理由】
+    コマンドラインを連結した文字列で判定すると、判定コード自身がスクリプト名の
+    文字列を含むため自分を殺す。これも実際にやらかした。"""
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    # 自分と、自分の先祖は除く。venv の Scripts\pythonw.exe は本体のインタプリタを
+    # 子として起こす中継役で、**その中継役のコマンドラインもこのスクリプトを指す**。
+    # 自分だけ除いて掃除すると、自分を起こしてくれた中継役を殺すことになり、
+    # 常駐から見ると「子が死んだ」ことになってしまう(実際そうなった)。
+    keep = {os.getpid()}
+    try:
+        proc = psutil.Process(os.getpid())
+        for _ in range(4):   # 中継役は1段だが、余裕を見て数段たどる
+            proc = proc.parent()
+            if proc is None:
+                break
+            keep.add(proc.pid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    victims = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid in keep:
+                continue
+            argv = proc.info["cmdline"] or []
+            if any(a.replace("\\", "/").endswith("/copilot_status_process.py")
+                   for a in argv):
+                proc.terminate()
+                victims.append(proc)
+        except Exception:  # noqa: BLE001  消えた・権限が無いだけなら気にしない
+            continue
+    if victims:
+        try:
+            _gone, alive = psutil.wait_procs(victims, timeout=3)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+    return len(victims)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Copilot の手番を常時表示する（常駐とは別プロセス）")
@@ -527,6 +639,9 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass  # pythonw.exe では stdout が無い
+
+    # 二重に出さない。前の常駐が落ちて取り残された札が居ることがある。
+    sweep_other_instances()
 
     app = QApplication(sys.argv)
     # 札は show/hide を繰り返すので、最後の窓が閉じても終わらせない。

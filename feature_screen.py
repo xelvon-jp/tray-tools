@@ -290,6 +290,8 @@ class ScreenFeature:
             app_settings=app_settings,
             settings_path=settings_path,
             is_agent_loop_running=lambda: self._agent_loop_state != "idle",
+            # 札の右クリックで終了されたら、メニューのチェックも外す。
+            on_child_exit=self._on_copilot_watchdog_exited,
         )
         self._copilot_watchdog_action = None  # メニュー項目(後で作る)
 
@@ -1774,6 +1776,17 @@ class ScreenFeature:
                 proc.kill()
             except OSError:
                 pass
+
+    def _on_copilot_watchdog_exited(self) -> None:
+        """状態監視バーが自分から終わったときに呼ばれる。メニューの表示を合わせる。
+
+        チェックが入ったままだと、次に押したときに「切る」操作になってしまい、
+        出したいのに出せない(もう一度押す羽目になる)。"""
+        try:
+            if self._copilot_watchdog_action is not None:
+                self._copilot_watchdog_action.setChecked(False)
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-status] メニューの更新に失敗: {e}", file=sys.stderr)
 
     def _toggle_copilot_watchdog(self, checked: bool) -> None:
         """状態監視バーの入切をメニューから切り替える。設定は自動保存。"""

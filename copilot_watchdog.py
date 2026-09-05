@@ -1,5 +1,5 @@
 # copilot_watchdog.py
-# Copilot の手番の常時表示を「起こす・止める」だけの監督役。
+# 状態監視バーを「起こす・止める」だけの監督役。
 # **表示と UIA の実処理は別プロセス(copilot_status_process.py)にある。**
 #
 # なぜ別プロセスに追い出したのか
@@ -24,12 +24,18 @@
 # 【この経緯を知らずに「1プロセスに戻せば単純になる」と考えないこと。】
 # 2026-09-04〜05 に15回、常駐が理由不明で即死した原因がこれ。
 #
+# 【このファイルで COM に触れるものを使わないこと。psutil も含む。】
+# 取り残しを掃除するために psutil.process_iter(['cmdline']) を呼んだら、それ自体が
+# 内部で COM を使っていて常駐が即死した(2026-09-05 13:17)。避けようとしていた当の
+# ものを、避けるためのコードで持ち込んでいた。**掃除は子プロセス側の仕事**にしてある
+# (copilot_status_process の sweep_other_instances)。
+#
 # 常駐に残す仕事
 # --------------
-#   - トレイメニューのチェック状態と、その設定の保存
+#   - トレイメニューのチェック状態
 #   - 子プロセスの起動と停止(常駐が終わるときは道連れにする)
 #   - agent-loop が動いている間は止めておく
-# UIA には一切触らない。このファイルは comtypes を import すらしない。
+#   - 子が自分から終わったら(札の右クリック)、メニューのチェックを外す
 import os
 import subprocess
 import sys
@@ -39,7 +45,6 @@ from PySide6.QtCore import QTimer
 import settings as settings_module
 
 SETTINGS_SECTION = "copilot_watchdog"
-SETTINGS_ENABLED = "enabled"
 SETTINGS_THRESHOLD = "threshold_seconds"
 
 DEFAULT_THRESHOLD_SECONDS = 30
@@ -47,9 +52,13 @@ DEFAULT_THRESHOLD_SECONDS = 30
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "copilot_status_process.py")
 
-# 子が落ちていないかを見る間隔(ms)。すぐ起こし直すと、起動直後に落ち続ける状況で
-# 無限に再起動を繰り返す。少し置いてから見る。
+# 子の生死を見る間隔(ms)。すぐ起こし直すと、起動直後に落ち続ける状況で無限に
+# 再起動を繰り返す。少し置いてから見る。
 RESPAWN_CHECK_MS = 5000
+
+# 子が「自分の意思で終わった」ときの終了コード。札の右クリックで終了したとき、
+# 常駐が親切に起こし直してしまわないよう、事故で落ちた場合と区別する。
+EXIT_BY_USER = 0
 
 
 def _pythonw():
@@ -58,63 +67,27 @@ def _pythonw():
     return pythonw_executable()
 
 
-def sweep_orphans(exclude_pid=None) -> int:
-    """取り残された表示プロセスを片付ける。片付けた数を返す。
-
-    【なぜ要るか】
-    常駐が落ちたり強制終了されたりすると、subprocess の子は Windows では生き残る。
-    札だけが画面に貼り付き、消す手段(トレイのメニュー)も無くなる。実際これで
-    25個溜まった。子側も親の生死を見張るようにしたが、古い版から乗り換えた直後は
-    その見張りを持たない子が残っているので、こちら側でも掃除する。
-
-    【判定を引数ごとに見る理由】
-    コマンドラインを連結した文字列で判定すると、この判定コード自身('...py' という
-    文字列を含む)が引っかかって自分を殺す。実際にやらかした。"""
-    killed = []
-    try:
-        import psutil
-    except ImportError:
-        return 0
-    me = os.getpid()
-    for proc in psutil.process_iter(["pid", "cmdline"]):
-        try:
-            if proc.pid in (me, exclude_pid):
-                continue
-            argv = proc.info["cmdline"] or []
-            if any(a.replace("\\", "/").endswith("/copilot_status_process.py")
-                   for a in argv):
-                proc.terminate()
-                killed.append(proc)
-        except Exception:  # noqa: BLE001  消えた・権限が無いだけなら気にしない
-            continue
-    if killed:
-        try:
-            _gone, alive = psutil.wait_procs(killed, timeout=3)
-            for proc in alive:
-                try:
-                    proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception:  # noqa: BLE001
-            pass
-    return len(killed)
-
-
 class CopilotWatchdog:
-    """Copilot 状態表示の入切。実処理は子プロセス。
+    """状態監視バーの入切。実処理は子プロセス。
 
     公開している名前(set_enabled / is_enabled / close など)は、1プロセスで
     動かしていた頃と同じにしてある。feature_screen 側を書き換えずに済ませるため。"""
 
     def __init__(self, app_settings=None, settings_path=None,
-                 is_agent_loop_running=lambda: False):
+                 is_agent_loop_running=lambda: False, on_child_exit=None):
         self._app_settings = app_settings
         self._settings_path = settings_path
         # agent-loop が回っている間は止めておく。あれが回っているときの手番は
         # 「tray-tools の番」であって、表示している4状態のどれでもない。
         self._is_agent_loop_running = is_agent_loop_running
+        # 子が自分から終わったときに、メニューのチェックを外してもらう連絡口。
+        self._on_child_exit = on_child_exit
 
-        self._enabled = self._load_bool(SETTINGS_ENABLED, False)
+        # **起動時は必ず OFF。** 前回 ON のまま終わっても、次に立ち上げたときに
+        # 勝手に札が出ないようにする。常駐の起動は「PC を使い始めるとき」なので、
+        # そこで前回の続きを再開されても困ることのほうが多い。
+        # 閾値だけは設定から読む(こちらは好みの値で、毎回入れ直したくない)。
+        self._enabled = False
         self._threshold = self._load_int(SETTINGS_THRESHOLD, DEFAULT_THRESHOLD_SECONDS)
         self._proc = None
 
@@ -124,14 +97,9 @@ class CopilotWatchdog:
         self._watch_timer.setInterval(RESPAWN_CHECK_MS)
         self._watch_timer.timeout.connect(self._on_watch)
 
-        if self._enabled:
-            self._start_child()
-            self._watch_timer.start()
-
     # -- 外部から呼ばれる操作 --------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
-        self._save_bool(SETTINGS_ENABLED, self._enabled)
         if self._enabled:
             self._start_child()
             self._watch_timer.start()
@@ -159,12 +127,12 @@ class CopilotWatchdog:
 
         付箋(capture_process)は本体が落ちても残ってほしいので DETACHED_PROCESS に
         してあるが、こちらは逆。常駐が終われば札を出し続ける理由が無いし、消す手段も
-        無くなる(トレイのメニューが消えるため)。"""
+        無くなる(トレイのメニューが消えるため)。
+
+        常駐が「終了」を通らずに落ちた場合の取り残しは、子が自分で親を見張って
+        始末する(--parent-pid)。ここで psutil を使って掃除してはいけない。"""
         self._watch_timer.stop()
         self._stop_child()
-        # 掴んでいる子だけでなく、取り残しも消す。前の常駐の子が生きていると、
-        # 常駐を落としたのに札が残る。
-        sweep_orphans()
 
     # -- 子プロセスの世話 ------------------------------------------------
     def _child_alive(self) -> bool:
@@ -175,8 +143,6 @@ class CopilotWatchdog:
             return
         if self._is_agent_loop_running():
             return
-        # 起こす前に取り残しを掃除する。前回の常駐が落ちていると札が二重に出る。
-        sweep_orphans()
         argv = [_pythonw(), SCRIPT_PATH,
                 "--threshold", str(self._threshold),
                 # 常駐が落ちても札が残らないよう、子に見張らせる。
@@ -193,39 +159,60 @@ class CopilotWatchdog:
             print(f"[copilot-status] 起こせませんでした: {e}", file=sys.stderr)
 
     def _stop_child(self) -> None:
+        """子を木ごと終わらせる。
+
+        【木ごとにする理由】
+        venv の Scripts/pythonw.exe は本体のインタプリタを子として起こす中継役で、
+        Popen が返すのは中継役の pid。terminate() は中継役しか殺さないので、
+        札を出している実体はそのまま残る(消したはずの札が消えない)。
+
+        taskkill を使うのは、木をたどるのに psutil を使いたくないため。あれは
+        内部で COM を使っていて、常駐に持ち込むと即死する(このファイル冒頭)。
+        taskkill は外部コマンドなので、この常駐に COM を持ち込まない。"""
         proc, self._proc = self._proc, None
         if proc is None or proc.poll() is not None:
             return
         try:
-            proc.terminate()
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"[copilot-status] 止められませんでした: {e}", file=sys.stderr)
+        try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-        except OSError as e:
-            print(f"[copilot-status] 止められませんでした: {e}", file=sys.stderr)
+            pass
 
     def _on_watch(self) -> None:
-        """agent-loop の出入りに追従し、子が落ちていたら起こし直す。"""
+        """agent-loop の出入りに追従し、子が落ちていたら起こし直す。
+
+        ただし子が終了コード0で終わったときは起こし直さない。それは札の右クリックで
+        「終了」を選んだ場合で、起こし直すと消したものが即座に戻ってきてしまう。"""
         try:
             if not self._enabled:
                 return
             if self._is_agent_loop_running():
                 self._stop_child()
-            elif not self._child_alive():
-                self._start_child()
+                return
+            if self._child_alive():
+                return
+            code = self._proc.poll() if self._proc is not None else None
+            if code == EXIT_BY_USER:
+                # 札の上で終了された。機能ごと OFF にして、メニューのチェックも外す。
+                self._proc = None
+                self._enabled = False
+                self._watch_timer.stop()
+                if self._on_child_exit is not None:
+                    self._on_child_exit()
+                return
+            self._start_child()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
             print(f"[copilot-status] 面倒見に失敗: {e}", file=sys.stderr)
 
     # -- 設定の永続化(snippets.push_recent と同じ流儀) ------------------
-    def _load_bool(self, key: str, default: bool) -> bool:
-        section = (self._app_settings or {}).get(SETTINGS_SECTION)
-        if not isinstance(section, dict):
-            return default
-        return bool(section.get(key, default))
-
+    # 保存するのは閾値だけ。入切は保存しない(起動時は必ず OFF)。
     def _load_int(self, key: str, default: int) -> int:
         section = (self._app_settings or {}).get(SETTINGS_SECTION)
         if not isinstance(section, dict):
@@ -235,13 +222,8 @@ class CopilotWatchdog:
         except (TypeError, ValueError):
             return default
 
-    def _save_bool(self, key: str, value: bool) -> None:
-        self._save_scalar(key, bool(value))
-
     def _save_int(self, key: str, value: int) -> None:
-        self._save_scalar(key, int(value))
-
-    def _save_scalar(self, key: str, value) -> None:
+        value = int(value)
         if isinstance(self._app_settings, dict):
             section = self._app_settings.get(SETTINGS_SECTION)
             if not isinstance(section, dict):

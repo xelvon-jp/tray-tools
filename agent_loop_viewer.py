@@ -31,7 +31,8 @@ from PySide6.QtGui import (
     QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget,
+    QCheckBox, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout,
+    QWidget,
 )
 
 import settings as settings_module
@@ -115,8 +116,14 @@ class LogViewer(QWidget):
 
     _event_signal = Signal(dict)
 
-    def __init__(self, app_settings=None, settings_path=None):
+    def __init__(self, app_settings=None, settings_path=None,
+                 on_start=None, on_stop=None):
         super().__init__()
+        # ループの開始・停止をここからも押せるようにする連絡口。トレイのメニューまで
+        # 戻らずに止められると、様子がおかしいと思った瞬間に手を出せる
+        # (この窓は実況を見ている場所なので、気づくのはたいていここ)。
+        self._on_start = on_start
+        self._on_stop = on_stop
         # 陽太さんの要望: タスクバー/タイトルバーには天むす(Rapture)ではなく🤖を出す。
         # 「これはエージェントループの窓」と一目で分かるように、tray アイコンとは
         # 別のアイコンにする。絵文字から作れば追加ファイルが要らない。
@@ -153,6 +160,26 @@ class LogViewer(QWidget):
         status_row.addWidget(self.top_check, 0)
         layout.addLayout(status_row)
 
+        # 開始・停止。状態に合わせて押せる押せないを切り替える(_set_running)。
+        # 停止はファイルのフラグで伝わるので、実体が別プロセスでもここから効く。
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        self.start_button = QPushButton("▶ 開始")
+        self.start_button.setFont(QFont("Meiryo", 9))
+        self.start_button.setObjectName("agentLoopStart")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        button_row.addWidget(self.start_button, 0)
+
+        self.stop_button = QPushButton("⏹ 停止")
+        self.stop_button.setFont(QFont("Meiryo", 9))
+        self.stop_button.setObjectName("agentLoopStop")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        button_row.addWidget(self.stop_button, 0)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        self._set_running(False)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -166,6 +193,10 @@ class LogViewer(QWidget):
             "#agentLoopStatus { color: #eee; padding: 4px 8px; "
             "background-color: #262626; border-radius: 4px; }"
             "#agentLoopTopCheck { color: #ccc; padding: 4px 8px; }"
+            "QPushButton { background-color: #333; color: #eee;"
+            " border: 1px solid #555; border-radius: 4px; padding: 5px 16px; }"
+            "QPushButton:hover:enabled { background-color: #444; }"
+            "QPushButton:disabled { color: #666; border-color: #333; }"
             "QPlainTextEdit { background-color: #111; color: #ddd; "
             "border: 1px solid #333; border-radius: 4px; padding: 6px; }"
         )
@@ -256,6 +287,34 @@ class LogViewer(QWidget):
         """外部から任意の一行を追記する(監視モード開始のあいさつなど)。"""
         self._append(text, COLOR_INFO)
 
+    # ------- 開始・停止ボタン -------------------------------------------
+    def _set_running(self, running: bool) -> None:
+        """走っているかどうかで、押せるボタンを入れ替える。
+
+        両方いつでも押せるようにはしない。走っていないのに停止を押せると、
+        効かないボタンを押したのか止まったのか分からなくなる。"""
+        self.start_button.setEnabled(not running and self._on_start is not None)
+        self.stop_button.setEnabled(running and self._on_stop is not None)
+
+    def _on_start_clicked(self) -> None:
+        try:
+            if self._on_start is not None:
+                self._on_start()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
+            self._append(f"[viewer] 開始できませんでした: {e}", COLOR_STOP_ERR)
+
+    def _on_stop_clicked(self) -> None:
+        try:
+            if self._on_stop is not None:
+                self._on_stop()
+                # 実際に止まるのは次の周の頭。押しても何も起きないように
+                # 見えるので、受け付けたことをここで知らせる。
+                self._append("■ 停止を要求しました（次の周の頭で止まります）",
+                             COLOR_META)
+                self.stop_button.setEnabled(False)
+        except Exception as e:  # noqa: BLE001
+            self._append(f"[viewer] 停止できませんでした: {e}", COLOR_STOP_ERR)
+
     # ------- 内部 -----------------------------------------------------
     def _append(self, text: str, color: str = COLOR_INFO) -> None:
         """1行を色付きで追記して末尾へスクロール。"""
@@ -294,6 +353,7 @@ class LogViewer(QWidget):
     def _render(self, payload: dict) -> None:
         event = payload.get("event", "")
         if event == "loop_start":
+            self._set_running(True)
             mode = "監視" if payload.get("watch") else "通常"
             auto = "auto" if payload.get("auto_run") else "dry-run"
             self.status.setText(f"エージェントループ 開始 ({mode} / {auto})")
@@ -362,6 +422,7 @@ class LogViewer(QWidget):
                              COLOR_STOP_WARN)
             # 普通の完了(reason なし)はうるさいので何も出さない
         elif event == "loop_end":
+            self._set_running(False)
             reason = payload.get("reason") or ""
             color, label = STOP_STYLES.get(reason, (COLOR_INFO, f"停止: {reason}"))
             detail = payload.get("detail") or ""

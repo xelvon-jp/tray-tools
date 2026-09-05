@@ -1675,7 +1675,14 @@ class ScreenFeature:
             return
         # ログ窓を先に用意
         if self._agent_loop_viewer is None:
-            self._agent_loop_viewer = av.LogViewer(self.app_settings, self.settings_path)
+            self._agent_loop_viewer = av.LogViewer(
+                self.app_settings, self.settings_path,
+                # 実況を見ている場所から直接止められるようにする。
+                # 様子がおかしいと気づくのはたいていこの窓の前なので、
+                # そこからトレイまで戻らせない。
+                on_start=self.start_agent_loop_watch,
+                on_stop=self.stop_agent_loop,
+            )
         self._agent_loop_viewer.show()
         self._agent_loop_viewer.raise_()
         self._agent_loop_viewer.append_note(
@@ -1756,7 +1763,14 @@ class ScreenFeature:
         直近の実行結果を振り返るために窓は残しておく。"""
         if self._agent_loop_viewer is None:
             import agent_loop_viewer as av
-            self._agent_loop_viewer = av.LogViewer(self.app_settings, self.settings_path)
+            self._agent_loop_viewer = av.LogViewer(
+                self.app_settings, self.settings_path,
+                # 実況を見ている場所から直接止められるようにする。
+                # 様子がおかしいと気づくのはたいていこの窓の前なので、
+                # そこからトレイまで戻らせない。
+                on_start=self.start_agent_loop_watch,
+                on_stop=self.stop_agent_loop,
+            )
         self._agent_loop_viewer.show()
         self._agent_loop_viewer.raise_()
 

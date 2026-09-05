@@ -160,6 +160,20 @@ def _run_powershell(code: str, snippet_id: str, timeout: int) -> dict:
 # ---------------------------------------------------------------------------
 # 貼り戻し用の整形
 # ---------------------------------------------------------------------------
+def failed(result: dict) -> bool:
+    """実行が失敗したか。**終了コードだけでは判定できない。**
+
+    PowerShell は中で例外が出ても終了コード0を返すことがある。実測で
+    「'-fixed' は認識されません」「パラメーターが見つかりません」が出ているのに
+    0 だった。終了コードしか見ていなかったせいで、失敗が1回も数えられず、
+    10周まわりきるまで止まらなかった。標準エラーに何か出ていたら失敗とみなす。"""
+    if result.get("timed_out"):
+        return True
+    if result.get("exit_code") not in (0, None):
+        return True
+    return bool((result.get("stderr") or "").strip())
+
+
 def _clip(text: str, limit: int) -> str:
     """頭と末尾を残して真ん中を省略。エラーは末尾に、成功サマリは頭に出やすい。"""
     text = text or ""
@@ -176,10 +190,19 @@ def format_paste(snippet_id: str, result: dict, paste_limit: int) -> str:
     「原因の一言 + 修正後のスニペット全体」だけ返してもらう)に合わせる。"""
     if result.get("timed_out"):
         head = f"#{snippet_id} を実行しましたが、{DEFAULT_PS_TIMEOUT} 秒でタイムアウトしました。"
-    elif result.get("exit_code") == 0:
+    elif not failed(result):
         head = f"#{snippet_id} を実行しました。終了コード 0、エラーなしです。"
     else:
-        head = f"#{snippet_id} を実行しました。終了コード {result.get('exit_code')}、エラーがあります。"
+        # **終了コードだけを見て「エラーなし」と言わないこと。**
+        # PowerShell は中で例外が出ても終了コード0を返すことがある。実測で
+        # 「-fixed は認識されません」「パラメーターが見つかりません」が出ているのに
+        # 0 だった。それを「エラーなしです」と伝えたうえでエラー本文を貼っていたので、
+        # Copilot は矛盾した材料を渡されて堂々巡りに入った。
+        head = (f"#{snippet_id} を実行しました。終了コード {result.get('exit_code')} "
+                "ですが、標準エラーに出力があります。失敗として扱ってください。"
+                if result.get("exit_code") == 0 else
+                f"#{snippet_id} を実行しました。終了コード {result.get('exit_code')}、"
+                "エラーがあります。")
 
     parts = [head, ""]
     stdout = _clip(result.get("stdout") or "", paste_limit)
@@ -327,6 +350,9 @@ def run_loop(
         stop_detail = ""
 
         consecutive_failures = 0
+        # 直前の周の標準出力。同じ結果が続く＝進んでいない、の判定に使う。
+        last_output = None
+        repeated_outputs = 0
         while rounds < max_rounds:
             if _cancel_requested():
                 stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
@@ -473,18 +499,37 @@ def run_loop(
             # 書き間違いだと誤診し、「直したつもりの同じコード」を出し続けた。
             # 上限まで回ればいずれ止まるが、その間ずっと実行を繰り返してしまう。
             # 進んでいないと分かった時点で人に返すほうがよい。
-            if result.get("exit_code") == 0 and not result.get("timed_out"):
-                consecutive_failures = 0
-            else:
+            if failed(result):
                 consecutive_failures += 1
-                if consecutive_failures >= max_consecutive_failures:
-                    stopped_by = STOP_STUCK
-                    stop_detail = (
-                        f"{consecutive_failures} 周続けて失敗しました。"
-                        "同じところで止まっている可能性が高いので中断します。")
-                    emit("round_end", round=rounds, reason=stopped_by,
-                         elapsed=time.time() - round_started)
-                    break
+                stuck_reason = f"{consecutive_failures} 周続けて失敗しました。"
+            else:
+                consecutive_failures = 0
+                stuck_reason = ""
+
+            # 失敗していなくても、同じ結果が続くなら進んでいない。
+            #
+            # 実測で6〜10周目がこれだった。集計の抽出が空振りして毎回
+            # 「Count: 0, Sum: 0」が返るのに、終了コード0・標準エラーも空。
+            # 失敗の signal がどこにも立たないので、上限まで回り切ってしまった。
+            # 出力が丸ごと同じなら、書き換えても結果が変わっていないということ。
+            output = (result.get("stdout") or "").strip()
+            if output and output == last_output:
+                repeated_outputs += 1
+                if not stuck_reason:
+                    stuck_reason = (
+                        f"{repeated_outputs + 1} 周続けて同じ結果です。")
+            else:
+                repeated_outputs = 0
+            last_output = output
+
+            if (consecutive_failures >= max_consecutive_failures
+                    or repeated_outputs + 1 >= max_consecutive_failures):
+                stopped_by = STOP_STUCK
+                stop_detail = (stuck_reason
+                               + "同じところで足踏みしている可能性が高いので中断します。")
+                emit("round_end", round=rounds, reason=stopped_by,
+                     elapsed=time.time() - round_started)
+                break
 
             # 7) 次のプロンプトを組み立てて次周へ
             prompt = format_paste(sid, result, paste_limit)

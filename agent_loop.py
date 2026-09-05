@@ -469,6 +469,8 @@ def main(argv=None) -> int:
     parser.add_argument("--finish-word", default="",
                         help="応答に含まれたら完了とみなす語。例: DONE")
     parser.add_argument("--loop-timeout", type=int, default=30 * 60)
+    parser.add_argument("--emit-events", action="store_true",
+                        help="進捗イベントを1行1件のJSONで標準出力へ流す（常駐が読む）")
     args = parser.parse_args(argv)
 
     try:
@@ -483,14 +485,31 @@ def main(argv=None) -> int:
             print("prompt_file を指定するか --watch を付けてください", file=sys.stderr)
             return 2
         prompt = _load_prompt(args.prompt_file)
+    # 常駐から別プロセスで起こされたときは、進捗をここから流し返す。
+    #
+    # 【なぜ常駐の中で回さないのか】
+    # run_loop は UI Automation を使う。常駐は音声切替(pycaw)を持っていて、
+    # UIA と pycaw を同じプロセスに置くと GC のたびに 0xC0000005 で即死する
+    # (copilot_watchdog.py 冒頭に実測値)。実際 2026-09-05 に、常駐のワーカー
+    # スレッドで run_loop を起こした瞬間に落ちた。だから別プロセスにして、
+    # 進捗だけを標準出力で返す。
+    def emit_line(payload):
+        try:
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            sys.stdout.flush()   # 常駐が待っているので溜めない
+        except (OSError, ValueError):
+            pass
+
     summary = run_loop(
+        on_event=emit_line if args.emit_events else None,
         initial_prompt=prompt, watch=args.watch,
         max_rounds=args.max_rounds, ps_timeout=args.ps_timeout,
         response_timeout=args.response_timeout, paste_limit=args.paste_limit,
         finish_word=args.finish_word, auto_run=args.auto,
         loop_timeout=args.loop_timeout,
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not args.emit_events:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["stopped_by"] in (STOP_FINISH_WORD, STOP_DRY_RUN,
                                           STOP_NO_SNIPPET) else 1
 

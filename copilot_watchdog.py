@@ -296,7 +296,7 @@ class CopilotWatchdog:
             self._poll_timer.stop()
             self._follow_timer.stop()
             self._hide_all()
-            self._copilot = None
+            self._release_copilot()
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -318,7 +318,7 @@ class CopilotWatchdog:
                 pass
         self._hide_all()
         # UIA クライアントを握ったままにしない。
-        self._copilot = None
+        self._release_copilot()
 
     def _start_timers(self) -> None:
         self._poll_timer.start()
@@ -430,7 +430,8 @@ class CopilotWatchdog:
         (CLAUDE.md)は踏まない。"""
         cp = self._copilot
         if cp is not None and not copilot_loop.user32.IsWindow(cp.hwnd_main):
-            cp = self._copilot = None
+            self._release_copilot()
+            cp = None
         if cp is None:
             try:
                 cp = self._copilot = copilot_loop.Copilot(
@@ -441,8 +442,22 @@ class CopilotWatchdog:
             return cp.status_snapshot()
         except Exception:  # noqa: BLE001
             # 窓を掴み直せば直ることが多い(アプリの再起動など)。次の poll で作り直す。
-            self._copilot = None
+            self._release_copilot()
             return None
+
+    def _release_copilot(self) -> None:
+        """掴んでいる Copilot を、このスレッドで明示的に手放す。
+
+        参照を None にするだけだと、COM の解放が「次に GC が走ったところ」まで
+        先送りされる。そこが別のスレッドだとアパートメントを跨いだ解放になり、
+        0xC0000005 で常駐ごと落ちる(2026-09-04〜05 に15回起きた)。
+        タイマーはメインスレッドで回るので、ここで捨てれば必ず同じスレッドで解放される。"""
+        cp, self._copilot = self._copilot, None
+        if cp is not None:
+            try:
+                cp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _reset(self) -> None:
         self._state = None

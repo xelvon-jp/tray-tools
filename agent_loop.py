@@ -265,152 +265,161 @@ def run_loop(
          loop_timeout=loop_timeout, finish_word=finish_word)
 
     cp = copilot_loop.Copilot()
-    initial_state = cp.state()
-    if initial_state == "busy" and not watch:
-        emit("loop_end", reason=STOP_ERROR,
-             detail="起動時点で Copilot が回答中")
-        return {"stopped_by": STOP_ERROR, "rounds": 0,
-                "detail": "Copilot が回答中でした。終わってから始めてください。"}
+    try:
+        initial_state = cp.state()
+        if initial_state == "busy" and not watch:
+            emit("loop_end", reason=STOP_ERROR,
+                 detail="起動時点で Copilot が回答中")
+            return {"stopped_by": STOP_ERROR, "rounds": 0,
+                    "detail": "Copilot が回答中でした。終わってから始めてください。"}
 
-    prompt = initial_prompt or ""
-    rounds = 0
-    stopped_by = STOP_MAX_ROUNDS
-    stop_detail = ""
+        prompt = initial_prompt or ""
+        rounds = 0
+        stopped_by = STOP_MAX_ROUNDS
+        stop_detail = ""
 
-    while rounds < max_rounds:
-        if _cancel_requested():
-            stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
-            break
-        if time.time() - started > loop_timeout:
-            stopped_by, stop_detail = STOP_TIMEOUT_LOOP, f"ループ全体で {loop_timeout} 秒を超過"
-            break
-
-        rounds += 1
-        round_started = time.time()
-        # 監視モードの1周目は送信をスキップ(人が Copilot に既に送っている想定)。
-        # 2周目以降は普通の送信になる。
-        skip_send = watch and rounds == 1
-        emit("round_start", round=rounds, skip_send=skip_send,
-             prompt_preview=(prompt or "")[:120])
-
-        if skip_send:
-            # 監視モードの1周目。「人が Copilot に投稿したお題への応答」を取りたいが、
-            # snapshot_length を使うと、開始ボタンを押すまでに Copilot が既に応答を
-            # 書き終わっていた場合に「全文長より後ろ = 空」となってしまう
-            # (実測: 5.9秒で 0 文字が返り、no-snippet で終わった)。
-            #
-            # 代わりに「最後の user_marker(あなたの発言)」の位置を previous_length に
-            # する。応答が完了していても書きかけでも、正しく「人の最後の発言以降」を
-            # 拾える。user_marker が無い(会話履歴がまっさら)なら 0 から取る。
-            text = cp.document_text()
-            # マーカーが空のプロファイル(M365 Copilot は 'あなたの発言' 相当の
-            # Text を出していない)では位置を決めようがないので全文を対象にする。
-            # rfind("") は len(text) を返すため、空を弾かないと常に空応答になる。
-            user_marker = cp.profile.get("user_marker") or ""
-            idx = text.rfind(user_marker) if user_marker else -1
-            previous_length = 0 if idx == -1 else idx + len(user_marker)
-        else:
-            # 1) 送信直前の全文長を控える(new_response が使う)
-            previous_length = cp.snapshot_length()
-            try:
-                cp.set_input(prompt)
-            except Exception as e:  # noqa: BLE001  UIA は多様に落ちうる
-                stopped_by, stop_detail = STOP_ERROR, f"入力欄に書けませんでした: {e}"
+        while rounds < max_rounds:
+            if _cancel_requested():
+                stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
                 break
-            try:
-                sent = cp.click_send()
-            except Exception as e:  # noqa: BLE001
-                stopped_by, stop_detail = STOP_ERROR, f"送信ボタンを押せませんでした: {e}"
-                break
-            if not sent:
-                stopped_by, stop_detail = STOP_ERROR, "送信ボタンが見つかりません"
+            if time.time() - started > loop_timeout:
+                stopped_by, stop_detail = STOP_TIMEOUT_LOOP, f"ループ全体で {loop_timeout} 秒を超過"
                 break
 
-        # 2) 完了待ち
-        done, wait_elapsed = cp.wait_until_idle(timeout=response_timeout)
-        if not done:
-            stopped_by = STOP_TIMEOUT_RESPONSE
-            stop_detail = f"応答待ちで {response_timeout} 秒を超えました"
+            rounds += 1
+            round_started = time.time()
+            # 監視モードの1周目は送信をスキップ(人が Copilot に既に送っている想定)。
+            # 2周目以降は普通の送信になる。
+            skip_send = watch and rounds == 1
+            emit("round_start", round=rounds, skip_send=skip_send,
+                 prompt_preview=(prompt or "")[:120])
+
+            if skip_send:
+                # 監視モードの1周目。「人が Copilot に投稿したお題への応答」を取りたいが、
+                # snapshot_length を使うと、開始ボタンを押すまでに Copilot が既に応答を
+                # 書き終わっていた場合に「全文長より後ろ = 空」となってしまう
+                # (実測: 5.9秒で 0 文字が返り、no-snippet で終わった)。
+                #
+                # 代わりに「最後の user_marker(あなたの発言)」の位置を previous_length に
+                # する。応答が完了していても書きかけでも、正しく「人の最後の発言以降」を
+                # 拾える。user_marker が無い(会話履歴がまっさら)なら 0 から取る。
+                text = cp.document_text()
+                # マーカーが空のプロファイル(M365 Copilot は 'あなたの発言' 相当の
+                # Text を出していない)では位置を決めようがないので全文を対象にする。
+                # rfind("") は len(text) を返すため、空を弾かないと常に空応答になる。
+                user_marker = cp.profile.get("user_marker") or ""
+                idx = text.rfind(user_marker) if user_marker else -1
+                previous_length = 0 if idx == -1 else idx + len(user_marker)
+            else:
+                # 1) 送信直前の全文長を控える(new_response が使う)
+                previous_length = cp.snapshot_length()
+                try:
+                    cp.set_input(prompt)
+                except Exception as e:  # noqa: BLE001  UIA は多様に落ちうる
+                    stopped_by, stop_detail = STOP_ERROR, f"入力欄に書けませんでした: {e}"
+                    break
+                try:
+                    sent = cp.click_send()
+                except Exception as e:  # noqa: BLE001
+                    stopped_by, stop_detail = STOP_ERROR, f"送信ボタンを押せませんでした: {e}"
+                    break
+                if not sent:
+                    stopped_by, stop_detail = STOP_ERROR, "送信ボタンが見つかりません"
+                    break
+
+            # 2) 完了待ち
+            done, wait_elapsed = cp.wait_until_idle(timeout=response_timeout)
+            if not done:
+                stopped_by = STOP_TIMEOUT_RESPONSE
+                stop_detail = f"応答待ちで {response_timeout} 秒を超えました"
+                emit("round_end", round=rounds,
+                     reason=stopped_by, elapsed=time.time() - round_started)
+                break
+
+            # 3) 新規応答を取得
+            # 送った本文を渡す。発言マーカーを持たないアプリ(M365 Copilot)では、
+            # これが「どこまでが自分の発言か」を知る唯一の手掛かりになる。
+            # 監視モードの1周目は人が手で投稿しているので、こちらは本文を知らない。
+            response = cp.new_response(previous_length,
+                                       sent_prompt=None if skip_send else prompt)
+            emit("response", round=rounds, chars=len(response),
+                 wait_seconds=round(wait_elapsed, 1),
+                 response_head=response[:800])
+
+            # 4) 完了語チェック(コードより先に見る。コード内の変数名にヒットしても
+            #    「完了語で止まる」方が事故が少ない)
+            if _matches_finish_word(response, finish_word):
+                stopped_by = STOP_FINISH_WORD
+                stop_detail = f"応答に完了語 {finish_word!r} が現れました"
+                emit("round_end", round=rounds,
+                     reason=stopped_by, elapsed=time.time() - round_started)
+                break
+
+            # 5) スニペット抽出
+            snippets = copilot_loop.extract_snippets(response)
+            if not snippets:
+                stopped_by = STOP_NO_SNIPPET
+                stop_detail = "応答に #start/#end のスニペットがありません"
+                emit("round_end", round=rounds,
+                     reason=stopped_by, elapsed=time.time() - round_started,
+                     response_tail=response[-500:])
+                break
+
+            # 最後の1つだけを扱う(複数出されたら仕様確認のため止める方が安全)
+            sid, code = snippets[-1]
+            risks = copilot_loop.risky_lines(code)
+            emit("snippet", round=rounds, id=sid,
+                 chars=len(code), risks=len(risks), code=code)
+
+            if risks:
+                stopped_by = STOP_RISKY
+                stop_detail = f"#{sid} に危険パターン {len(risks)} 件"
+                # Copilot に理由だけ伝える(応答は取らずに終わる。人が判断する場面)
+                try:
+                    cp.set_input(format_risky_report(sid, risks))
+                except Exception:  # noqa: BLE001  ここは best-effort
+                    pass
+                emit("round_end", round=rounds,
+                     reason=stopped_by, elapsed=time.time() - round_started,
+                     risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
+                break
+
+            # 6) 実行(auto_run のときだけ)
+            if not auto_run:
+                stopped_by = STOP_DRY_RUN
+                stop_detail = f"dry-run。#{sid}({len(code)}文字) は実行せず、ログに残しました"
+                emit("dry_run", round=rounds, id=sid, code=code)
+                break
+
+            result = _run_powershell(code, sid, ps_timeout)
+            emit("run", round=rounds, id=sid,
+                 exit_code=result.get("exit_code"),
+                 timed_out=result.get("timed_out"),
+                 stdout_chars=len(result.get("stdout") or ""),
+                 stderr_chars=len(result.get("stderr") or ""),
+                 stdout=result.get("stdout") or "",
+                 stderr=result.get("stderr") or "")
+
+            # 7) 次のプロンプトを組み立てて次周へ
+            prompt = format_paste(sid, result, paste_limit)
             emit("round_end", round=rounds,
-                 reason=stopped_by, elapsed=time.time() - round_started)
-            break
+                 elapsed=time.time() - round_started)
 
-        # 3) 新規応答を取得
-        # 送った本文を渡す。発言マーカーを持たないアプリ(M365 Copilot)では、
-        # これが「どこまでが自分の発言か」を知る唯一の手掛かりになる。
-        # 監視モードの1周目は人が手で投稿しているので、こちらは本文を知らない。
-        response = cp.new_response(previous_length,
-                                   sent_prompt=None if skip_send else prompt)
-        emit("response", round=rounds, chars=len(response),
-             wait_seconds=round(wait_elapsed, 1),
-             response_head=response[:800])
-
-        # 4) 完了語チェック(コードより先に見る。コード内の変数名にヒットしても
-        #    「完了語で止まる」方が事故が少ない)
-        if _matches_finish_word(response, finish_word):
-            stopped_by = STOP_FINISH_WORD
-            stop_detail = f"応答に完了語 {finish_word!r} が現れました"
-            emit("round_end", round=rounds,
-                 reason=stopped_by, elapsed=time.time() - round_started)
-            break
-
-        # 5) スニペット抽出
-        snippets = copilot_loop.extract_snippets(response)
-        if not snippets:
-            stopped_by = STOP_NO_SNIPPET
-            stop_detail = "応答に #start/#end のスニペットがありません"
-            emit("round_end", round=rounds,
-                 reason=stopped_by, elapsed=time.time() - round_started,
-                 response_tail=response[-500:])
-            break
-
-        # 最後の1つだけを扱う(複数出されたら仕様確認のため止める方が安全)
-        sid, code = snippets[-1]
-        risks = copilot_loop.risky_lines(code)
-        emit("snippet", round=rounds, id=sid,
-             chars=len(code), risks=len(risks), code=code)
-
-        if risks:
-            stopped_by = STOP_RISKY
-            stop_detail = f"#{sid} に危険パターン {len(risks)} 件"
-            # Copilot に理由だけ伝える(応答は取らずに終わる。人が判断する場面)
-            try:
-                cp.set_input(format_risky_report(sid, risks))
-            except Exception:  # noqa: BLE001  ここは best-effort
-                pass
-            emit("round_end", round=rounds,
-                 reason=stopped_by, elapsed=time.time() - round_started,
-                 risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
-            break
-
-        # 6) 実行(auto_run のときだけ)
-        if not auto_run:
-            stopped_by = STOP_DRY_RUN
-            stop_detail = f"dry-run。#{sid}({len(code)}文字) は実行せず、ログに残しました"
-            emit("dry_run", round=rounds, id=sid, code=code)
-            break
-
-        result = _run_powershell(code, sid, ps_timeout)
-        emit("run", round=rounds, id=sid,
-             exit_code=result.get("exit_code"),
-             timed_out=result.get("timed_out"),
-             stdout_chars=len(result.get("stdout") or ""),
-             stderr_chars=len(result.get("stderr") or ""),
-             stdout=result.get("stdout") or "",
-             stderr=result.get("stderr") or "")
-
-        # 7) 次のプロンプトを組み立てて次周へ
-        prompt = format_paste(sid, result, paste_limit)
-        emit("round_end", round=rounds,
-             elapsed=time.time() - round_started)
-
-    total = time.time() - started
-    emit("loop_end", reason=stopped_by, detail=stop_detail,
-         rounds=rounds, elapsed=round(total, 1))
-    return {
-        "stopped_by": stopped_by, "detail": stop_detail,
-        "rounds": rounds, "elapsed": round(total, 1),
-    }
+        total = time.time() - started
+        emit("loop_end", reason=stopped_by, detail=stop_detail,
+             rounds=rounds, elapsed=round(total, 1))
+        return {
+            "stopped_by": stopped_by, "detail": stop_detail,
+            "rounds": rounds, "elapsed": round(total, 1),
+        }
+    finally:
+        # 掴んだのと同じスレッドで COM を手放す。GC 任せにすると解放が
+        # 別スレッドまで先送りされ、アパートメントを跨いで 0xC0000005 で落ちる。
+        # run_loop はワーカースレッドで回るので、ここが要になる。
+        try:
+            cp.close()
+        except Exception:  # noqa: BLE001  finally の例外はどこにも捕まらない
+            pass
 
 
 # ---------------------------------------------------------------------------

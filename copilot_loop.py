@@ -34,9 +34,37 @@ import time
 import comtypes
 import comtypes.client
 
-comtypes.CoInitialize()
-comtypes.client.GetModule("UIAutomationCore.dll")
-import comtypes.gen.UIAutomationClient as UIA  # noqa: E402
+# UIAutomationCore の型ライブラリ。最初に本当に使うときまで読まない(_ensure_uia)。
+UIA = None
+
+
+def _ensure_uia():
+    """UIA の型ライブラリを読み、このスレッドで COM を使えるようにする。
+
+    【なぜ import 時にやらないか】
+    常駐(tray-tools)は起動時にこのモジュールを読み込む。import しただけで
+    CoInitialize と型ライブラリの読み込み(どちらも COM)が走ると、Copilot の機能を
+    一度も使っていない常駐プロセスが COM を抱え込むことになる。
+
+    実際それで事故った。2026-09-04 にこの機能が常駐へ入ってから、GC 中の
+    comtypes 解放でプロセスごと即死する事故が15回起きている。落ちる場所は
+    アイコン描画・ピッカーの採寸・設定保存とばらばらで、どれも Copilot とは
+    関係ない。「たまたま GC が走ったところ」でしかないからで、犯人は
+    「解放してはいけない状態の COM オブジェクトが常駐の中に居続けたこと」。
+    Python の例外ではないので error.log には何も残らない(0xC0000005)。
+
+    【なぜスレッドごとに呼ぶのか】
+    COM のアパートメントはスレッドに紐づく。agent_loop はワーカースレッドで
+    Copilot を作るので、そのスレッドでも CoInitialize が要る。ここを通れば
+    どのスレッドから使っても初期化済みになる。2回目以降の CoInitialize は
+    参照カウントが増えるだけで害はない。"""
+    global UIA
+    comtypes.CoInitialize()
+    if UIA is None:
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        import comtypes.gen.UIAutomationClient as _UIA
+        UIA = _UIA
+    return UIA
 
 # --- プロファイル（別アプリへ移すときはここに1つ足す） -----------------------
 # 窓の探し方とボタン名を1アプリぶんまとめたもの。
@@ -291,8 +319,21 @@ class Copilot:
             names = "/".join(c.get("name", "?") for c in candidates)
             raise RuntimeError(f"Copilot の窓が見つかりません (試した設定: {names})")
         self._wake()
-        self.uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+        # ここで初めて COM を触る。窓が見つからなかった場合は上で抜けているので、
+        # Copilot が起動していない環境では COM をまったく初期化しない。
+        uia_mod = _ensure_uia()
+        self.uia = comtypes.client.CreateObject(
+            uia_mod.CUIAutomation, interface=uia_mod.IUIAutomation)
         self.true_cond = self.uia.CreateTrueCondition()
+
+    def close(self):
+        """COM への参照を、掴んだのと同じスレッドで明示的に手放す。
+
+        GC 任せにすると、解放が「たまたま次に GC が走った場所」まで先送りされる。
+        そこが別のスレッドだと、アパートメントを跨いだ解放になってプロセスごと
+        落ちる。使い終わりが分かっているなら、その場で捨てる。"""
+        self.true_cond = None
+        self.uia = None
 
     # -- プロファイルの参照 ------------------------------------------------
     def _names(self, key):

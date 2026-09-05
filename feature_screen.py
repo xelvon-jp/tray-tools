@@ -1689,6 +1689,10 @@ class ScreenFeature:
         try:
             proc, _reader = al.spawn(
                 watch=True, auto=True, max_rounds=10,
+                # 定型文が「終わったら <DONE> と書いて」で締めているので、それを
+                # 完了の合図として拾う。渡さないと上限まで回るか no-snippet で
+                # 止まり、やり切ったのか途中で力尽きたのか区別がつかない。
+                finish_word="DONE",
                 on_event=self.on_agent_loop_event,
                 parent_pid=os.getpid(),
             )

@@ -36,6 +36,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -427,6 +428,74 @@ def run_loop(
 # ---------------------------------------------------------------------------
 # 常駐から起こされたときの親 pid。0 なら見張らない(手で叩いたとき)。
 PARENT_PID = 0
+
+
+def spawn(prompt_path=None, watch=False, auto=False, max_rounds=None,
+          ps_timeout=None, response_timeout=None, paste_limit=None,
+          finish_word="", loop_timeout=None, on_event=None, parent_pid=None):
+    """このループを別プロセスで起こし、進捗を on_event に流す。(proc, thread) を返す。
+
+    【常駐の中で run_loop を直接呼んではいけない】
+    run_loop は UI Automation を使う。常駐は音声切替(pycaw)を持っていて、UIA と
+    pycaw を同じプロセスに置くと GC のたびに 0xC0000005 で即死する(実測値は
+    copilot_watchdog.py 冒頭)。**スレッドを分けても同じプロセスなら助からない。**
+    2026-09-05 に、常駐のワーカースレッドで run_loop を起こした瞬間に落ちた。
+
+    進捗は子の標準出力から1行1件の JSON で受け取る。読み役はテキストを読むだけで
+    COM に触らないので、常駐に UIA が入り込む余地が無い。
+
+    on_event はワーカースレッドから呼ばれる。Qt のウィジェットを直接触らないこと
+    (シグナル経由でメインスレッドへ渡す)。"""
+    exe = sys.executable
+    # pythonw.exe には標準出力が無い。進捗を受け取りたいので python.exe を使い、
+    # コンソール窓は CREATE_NO_WINDOW で出さないようにする。
+    if exe.lower().endswith("pythonw.exe"):
+        exe = exe[: -len("pythonw.exe")] + "python.exe"
+
+    argv = [exe, str(_HERE / "agent_loop.py")]
+    if prompt_path:
+        argv.append(str(prompt_path))
+    if watch:
+        argv.append("--watch")
+    if auto:
+        argv.append("--auto")
+    argv.append("--emit-events")
+    for flag, value in (("--max-rounds", max_rounds), ("--ps-timeout", ps_timeout),
+                        ("--response-timeout", response_timeout),
+                        ("--paste-limit", paste_limit),
+                        ("--loop-timeout", loop_timeout)):
+        if value is not None:
+            argv += [flag, str(value)]
+    if finish_word:
+        argv += ["--finish-word", finish_word]
+    if parent_pid:
+        argv += ["--parent-pid", str(parent_pid)]
+
+    proc = subprocess.Popen(
+        argv, cwd=str(_HERE),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue  # JSON でない行(警告など)は捨てる
+                if on_event is not None:
+                    on_event(payload)
+        except Exception as e:  # noqa: BLE001
+            print(f"[agent_loop] 出力の読み取りに失敗: {e}", file=sys.stderr)
+
+    thread = threading.Thread(target=reader, name="agent-loop-reader", daemon=True)
+    thread.start()
+    return proc, thread
 
 
 def _cancel_requested() -> bool:

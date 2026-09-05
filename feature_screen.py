@@ -1683,67 +1683,19 @@ class ScreenFeature:
             "応答が始まると tray-tools が引き取ります。"
         )
 
-        # 実処理は別プロセスで回す。
-        #
-        # 【常駐の中で回してはいけない】
-        # run_loop は UI Automation を使う。常駐は音声切替(pycaw)を持っていて、
-        # UIA と pycaw を同じプロセスに置くと GC のたびに 0xC0000005 で即死する
-        # (実測値は copilot_watchdog.py 冒頭)。2026-09-05 に、ここでワーカー
-        # スレッドを立てた瞬間に常駐ごと落ちた。**スレッドを分けても同じプロセス
-        # である限り助からない。プロセスを分けること。**
-        #
-        # 進捗は子の標準出力から1行1件の JSON で受け取る。読み役はテキストを
-        # 読むだけで COM に触らないので、常駐に UIA が入り込む余地が無い。
-        import json
-        import subprocess
-        import threading
-
-        # pythonw.exe には標準出力が無い。進捗を受け取りたいので python.exe を
-        # 使い、コンソール窓は CREATE_NO_WINDOW で出さないようにする。
-        exe = capture_process.pythonw_executable()
-        exe = exe.replace("pythonw.exe", "python.exe")
-        here = Path(__file__).resolve().parent
-        argv = [exe, str(here / "agent_loop.py"),
-                "--watch", "--auto", "--emit-events", "--max-rounds", "10",
-                # 常駐が落ちても Copilot に書き込み続けないよう、子に見張らせる。
-                "--parent-pid", str(os.getpid())]
+        # 実処理は別プロセスで回す。常駐の中で UIA を使うと pycaw と衝突して
+        # 即死するため(copilot_watchdog.py 冒頭)。起こし方は agent_loop.spawn に
+        # まとめてあり、IPC 経由(main._agent_loop_command)と同じ道を通る。
         try:
-            proc = subprocess.Popen(
-                argv, cwd=str(here),
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            proc, _reader = al.spawn(
+                watch=True, auto=True, max_rounds=10,
+                on_event=self.on_agent_loop_event,
+                parent_pid=os.getpid(),
             )
         except OSError as e:
             self._agent_loop_viewer.append_note(f"起こせませんでした: {e}")
             return
         self._agent_loop_proc = proc
-
-        def reader():
-            """子の標準出力を1行ずつ読んで、既存のイベント経路へ流す。"""
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except ValueError:
-                        continue  # JSON でない行(警告など)は捨てる
-                    self.on_agent_loop_event(payload)
-            except Exception as e:  # noqa: BLE001
-                print(f"[agent-loop] 出力の読み取りに失敗: {e}", file=sys.stderr)
-            finally:
-                # loop_end を受け取らずに終わった場合(強制終了・異常終了)の後始末。
-                # 二重に出しても _on_agent_loop_state_event は状態を戻すだけ。
-                code = proc.poll()
-                if code not in (0, None):
-                    self._agent_loop_bridge.state_changed.emit(
-                        {"event": "loop_end", "reason": "error",
-                         "detail": f"子プロセスが異常終了しました (code={code})",
-                         "rounds": 0, "elapsed": 0})
-
-        threading.Thread(target=reader, name="agent-loop-reader", daemon=True).start()
         self._agent_loop_state = "watching"
         self._refresh_state()
         self._refresh_agent_loop_menu()

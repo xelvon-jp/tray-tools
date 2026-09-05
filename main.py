@@ -586,15 +586,16 @@ def _pushover_command(args, reply) -> None:
 # ---------------------------------------------------------------------------
 # 疑似エージェントループ(Copilot アプリを相手に回す)
 # ---------------------------------------------------------------------------
-# 走っているスレッドを1本だけ持つ。2本同時に走らせない(Copilot は1つしか無い)。
+# 走っている子プロセスを1つだけ持つ。2つ同時に走らせない(Copilot は1つしか無い)。
 # 完了・失敗時のサマリはここに載せて status で読める状態にする。
-_agent_loop_state = {"thread": None, "started": None, "prompt": None,
+_agent_loop_state = {"proc": None, "started": None, "prompt": None,
                      "auto": False, "watch": False, "summary": None}
 
 
 def _agent_loop_running() -> bool:
-    thread = _agent_loop_state.get("thread")
-    return thread is not None and thread.is_alive()
+    """走っているか。実体は別プロセスなので、スレッドではなく Popen を見る。"""
+    proc = _agent_loop_state.get("proc")
+    return proc is not None and proc.poll() is None
 
 
 def _agent_loop_status_text() -> str:
@@ -616,8 +617,9 @@ def _agent_loop_status_text() -> str:
 def _agent_loop_command(args, reply) -> None:
     """外部から agent-loop を操作する。start/status/cancel。
 
-    実処理は別スレッドで走らせる。Qtメインスレッドを塞ぐと常駐全体が固まるうえ、
-    ループ本体は Copilot への送信・PowerShell 実行で数分ブロックしうる。"""
+    実処理は別プロセスで走らせる。Qtメインスレッドを塞がないためでもあるが、
+    それ以上に、常駐の中で UIA を使うと pycaw と衝突して即死するため
+    (copilot_watchdog.py 冒頭)。スレッドでは足りない。"""
     action = (args[0].strip().lower() if args else "status")
 
     if action == "status":
@@ -686,51 +688,54 @@ def _agent_loop_command(args, reply) -> None:
     prompt_label = ("<watch モード>" if opts["watch"]
                     else os.path.basename(prompt_path))
 
-    def work():
-        # ここはワーカースレッド。Qtのウィジェットには絶対に触らないこと。
-        # イベントは screen.agent_loop_event シグナル(あれば)にメインスレッド経由で流す。
-        try:
-            import agent_loop as al  # 遅延 import。常駐の起動時間を伸ばさないため
-            if opts["watch"]:
-                prompt = None
-            else:
-                prompt = open(prompt_path, encoding="utf-8-sig").read().strip()
-            kwargs = {"initial_prompt": prompt, "auto_run": opts["auto"],
-                      "watch": opts["watch"]}
-            for key in ("max_rounds", "ps_timeout", "response_timeout",
-                        "paste_limit", "loop_timeout"):
-                if opts[key] is not None:
-                    kwargs[key] = opts[key]
-            if opts["finish_word"]:
-                kwargs["finish_word"] = opts["finish_word"]
+    # **常駐の中で run_loop を呼んではいけない。** run_loop は UI Automation を使い、
+    # 常駐は音声切替(pycaw)を持っている。UIA と pycaw を同じプロセスに置くと GC の
+    # たびに 0xC0000005 で即死する(実測値は copilot_watchdog.py 冒頭)。
+    # **スレッドを分けても同じプロセスなら助からない。** 2026-09-05 に、常駐の
+    # ワーカースレッドで run_loop を起こした瞬間に落ちた。別プロセスで起こす。
+    import agent_loop as al  # 遅延 import。常駐の起動時間を伸ばさないため
 
-            # ScreenFeature がログ窓を持っていれば on_event を繋ぐ。
-            # ここは遅延参照(常駐が Feature を持たない構成でも動くように)。
-            on_event = getattr(screen, "on_agent_loop_event", None)
-            if on_event is not None:
-                kwargs["on_event"] = on_event
+    # ScreenFeature がログ窓を持っていれば on_event を繋ぐ。
+    # ここは遅延参照(常駐が Feature を持たない構成でも動くように)。
+    on_event = getattr(screen, "on_agent_loop_event", None)
 
-            _agent_loop_state["summary"] = None
-            summary = al.run_loop(**kwargs)
-            _agent_loop_state["summary"] = summary
-            action_log.record("agent-loop 終了",
-                              f"{summary.get('stopped_by')} 周回{summary.get('rounds')} "
-                              f"経過{summary.get('elapsed')}秒",
-                              "external")
-        except Exception as e:  # noqa: BLE001
+    def on_loop_event(payload):
+        """子から流れてくる進捗。ログ窓へ渡しつつ、終了だけこちらでも覚える。"""
+        if payload.get("event") == "loop_end":
             _agent_loop_state["summary"] = {
-                "stopped_by": "error", "detail": str(e),
-                "rounds": 0, "elapsed": 0,
+                "stopped_by": payload.get("reason"),
+                "detail": payload.get("detail", ""),
+                "rounds": payload.get("rounds", 0),
+                "elapsed": payload.get("elapsed", 0),
             }
-            action_log.record("agent-loop 失敗", str(e)[:80], "external")
+            action_log.record(
+                "agent-loop 終了",
+                f"{payload.get('reason')} 周回{payload.get('rounds')} "
+                f"経過{payload.get('elapsed')}秒", "external")
+        if on_event is not None:
+            on_event(payload)
 
-    _agent_loop_state["thread"] = threading.Thread(
-        target=work, name="agent-loop", daemon=True)
+    _agent_loop_state["summary"] = None
+    try:
+        proc, _reader = al.spawn(
+            prompt_path=None if opts["watch"] else prompt_path,
+            watch=opts["watch"], auto=opts["auto"],
+            max_rounds=opts["max_rounds"], ps_timeout=opts["ps_timeout"],
+            response_timeout=opts["response_timeout"],
+            paste_limit=opts["paste_limit"], finish_word=opts["finish_word"],
+            loop_timeout=opts["loop_timeout"], on_event=on_loop_event,
+            parent_pid=os.getpid(),
+        )
+    except OSError as e:
+        action_log.record("agent-loop 失敗", str(e)[:80], "external")
+        reply(f"ERR agent-loop を起こせませんでした: {e}")
+        return
+
+    _agent_loop_state["proc"] = proc
     _agent_loop_state["started"] = datetime.now().strftime("%H:%M:%S")
     _agent_loop_state["prompt"] = prompt_label
     _agent_loop_state["auto"] = opts["auto"]
     _agent_loop_state["watch"] = opts["watch"]
-    _agent_loop_state["thread"].start()
 
     action_log.record("agent-loop 開始",
                       f"{prompt_label} auto={opts['auto']} watch={opts['watch']}",

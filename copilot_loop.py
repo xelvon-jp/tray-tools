@@ -97,6 +97,8 @@ BUILTIN_PROFILES = [
         "busy_button": ["メッセージの割り込み", "生成を停止する", "停止"],
         "assistant_marker": "Copilot の発言",
         "user_marker": "あなたの発言",
+        # 会話の末尾にくっついてくる入力欄のプレースホルダ。本文ではないので落とす。
+        "idle_marker": ["Copilot へメッセージを送る", "Copilot と会話する"],
         "input_band_px": 170,
     },
     {
@@ -123,6 +125,8 @@ BUILTIN_PROFILES = [
         # 状態表示(copilot_watchdog)はマーカーを使わないので、空でも動く。
         "assistant_marker": "",
         "user_marker": "",
+        # M365 側の文言は未実測。分かったらここに足す。
+        "idle_marker": [],
         "input_band_px": 170,
     },
 ]
@@ -614,15 +618,23 @@ class Copilot:
             time.sleep(poll)
         text = self.document_text()
         new_part = text[previous_length:]
-        # こちらの発言(user_marker)以降を捨てる。
         # 空判定を先に置くこと。空文字はどんな文字列にも「含まれる」ので、
         # マーカー未設定のプロファイル(M365 Copilot)では split("") が
         # ValueError: empty separator で落ちる。
         marker_user = self.profile.get("user_marker") or ""
-        if marker_user and marker_user in new_part:
-            new_part = new_part.split(marker_user)[0]
-        # 先頭に assistant_marker があれば剥がす
         marker_ai = self.profile.get("assistant_marker") or ""
+
+        # 【順序が肝】「最後の AI 発言以降を取る」→「次の人の発言の手前で切る」。
+        #
+        # 逆順(先に最初の user_marker で切る)にしていたら、実機で会話と無関係な
+        # ニュース本文が「応答」として返った。previous_length は送信直前の全文長だが、
+        # Copilot がそのときニュース面を出していると本文が短く、送信後に会話へ
+        # 切り替わって全文がまるごと入れ替わる。すると new_part に過去のターンまで
+        # 入り、「最初の"あなたの発言"の手前」＝ニュース本文になってしまう。
+        #
+        # 先に最後の AI 発言を捕まえておけば、previous_length がずれていても
+        # 直近の応答に着地する。previous_length は「どこから見るか」の目安であって、
+        # そこに寄りかからない作りにしておくこと。
         if marker_ai and marker_ai in new_part:
             new_part = new_part.rsplit(marker_ai, 1)[1]
         elif not marker_ai and sent_prompt:
@@ -630,6 +642,15 @@ class Copilot:
             # ので、その終わりまでを捨てれば残りが応答になる。マーカーを
             # 突き止められなくても、こちらの道で応答を取り出せる。
             new_part = strip_echoed_prompt(new_part, sent_prompt)
+        if marker_user and marker_user in new_part:
+            new_part = new_part.split(marker_user)[0]
+
+        # 入力欄のプレースホルダ(「Copilot と会話する」等)が末尾に混ざる。
+        # 本文ではないので落とす。
+        for idle_marker in self._names("idle_marker"):
+            if idle_marker and new_part.rstrip().endswith(idle_marker):
+                new_part = new_part.rstrip()[: -len(idle_marker)]
+                break
         return new_part.strip()
 
     def last_response(self):

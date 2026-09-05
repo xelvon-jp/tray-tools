@@ -68,6 +68,18 @@ AWAKE_RING_WIDTH = 4
 # 監視モード(agent-loop watch)中の目印。スリープ抑止と別の色にする。
 # 通常監視: 緑のリング / 応答受信・実行中は同じ緑を太く塗る(状態の変化として感じられる)。
 # CLAUDE.md「通知領域のアイコン2つ固定」の方針は既存を差し替えるだけなので守れている。
+# Copilot まわりのメニューの見出し。状態は括弧で足す。
+# 親を「Copilot」にしてあるのは、この下に性質の違う2つ(見るだけの状態監視バーと、
+# コードまで実行するエージェントループ)が並ぶため。片方の名前を親にすると、
+# もう片方がその下位機能に見えてしまう。
+AGENT_LOOP_MENU_TITLE = "🤖 Copilot"
+AGENT_LOOP_MENU_SUFFIX = {
+    "idle": "",
+    "watching": "（ループ待機中）",
+    "busy": "（ループ実行中）",
+    "err": "（ループ停止：要確認）",
+}
+
 AGENT_LOOP_RING_COLOR = (46, 204, 113, 255)   # 緑
 AGENT_LOOP_BUSY_COLOR = (52, 152, 219, 255)   # 青(応答受信・実行中)
 AGENT_LOOP_ERR_COLOR = (231, 76, 60, 255)     # 赤(危険停止など)
@@ -408,33 +420,41 @@ class ScreenFeature:
         # GCの心配は無いが、作り直しの前後で状態を見るためにここでも並びを持っておく。
         self._mirror_screen_actions = []
 
-        # エージェントループ(監視モード)のメニュー。Claude Code が無い環境でも
-        # Copilot ↔ tray-tools ↔ PowerShell のピンポンを回せるようにするための入口。
-        # 状態はトレイアイコンの色でも分かる(緑=待機/青=応答受信・実行中/赤=停止)。
-        self._agent_loop_menu = self.menu.addMenu("🤖 エージェントループ")
-        self._agent_loop_start_action = self._agent_loop_menu.addAction(
-            "▶ 監視モード開始 (Copilotの応答から引き取り)",
-            lambda _checked=False: self.start_agent_loop_watch(),
-        )
-        self._agent_loop_stop_action = self._agent_loop_menu.addAction(
-            "⏹ 停止",
-            lambda _checked=False: self.stop_agent_loop(),
-        )
-        self._agent_loop_show_log_action = self._agent_loop_menu.addAction(
-            "📜 ログ窓を前面に",
-            lambda _checked=False: self._show_agent_loop_log(),
-        )
-        self._agent_loop_menu.addSeparator()
-        # Copilot の手番の常時表示(独立機能。エージェントループが動いていないときだけ働く)。
-        # 入力欄の上に小さな札を出し、応答待ちが閾値を超えたら窓全体を点滅させる。
+        # Copilot まわりのメニュー。中身は性質の違う2つで、区切り線で分けてある。
+        #   上: 状態監視バー   … 見るだけ。Copilot の手番を画面に出す
+        #   下: エージェントループ … tray-tools が応答を引き取ってコードまで実行する
+        #
+        # 【親を「エージェントループ」にしない理由】
+        # 状態監視バーはループと関係なく単体で使える機能なのに、親がループだと
+        # 下位機能に見えてしまう。加えて、以前は「監視モード開始」という項目が
+        # 並んでいて「監視」が2つの別物を指していた。親を Copilot にして、
+        # ループ側は「エージェントループ」と名乗らせることで重複を解いた。
+        self._agent_loop_menu = self.menu.addMenu(AGENT_LOOP_MENU_TITLE)
+        # 状態監視バー(独立機能。エージェントループが動いている間は休む)。
         # チェック項目にして、いま ON/OFF どちらかがひと目で分かるようにする。
         self._copilot_watchdog_action = self._agent_loop_menu.addAction(
-            "🔔 Copilot の状態を画面に常時表示"
+            "🏷 状態監視バーを表示"
         )
         self._copilot_watchdog_action.setCheckable(True)
         self._copilot_watchdog_action.setChecked(self._copilot_watchdog.is_enabled())
         # addAction(テキスト, 関数) だと checked が渡らないので triggered.connect で受ける。
         self._copilot_watchdog_action.triggered.connect(self._toggle_copilot_watchdog)
+
+        self._agent_loop_menu.addSeparator()
+        # ここから下は「tray-tools が自分でコードを実行する」側。押すと何が起きるかを
+        # 項目名に入れておく(危険パターンで止まる作りとはいえ、実行はする)。
+        self._agent_loop_start_action = self._agent_loop_menu.addAction(
+            "▶ エージェントループを始める（応答を引き取って自動実行）",
+            lambda _checked=False: self.start_agent_loop_watch(),
+        )
+        self._agent_loop_stop_action = self._agent_loop_menu.addAction(
+            "⏹ エージェントループを止める",
+            lambda _checked=False: self.stop_agent_loop(),
+        )
+        self._agent_loop_show_log_action = self._agent_loop_menu.addAction(
+            "📜 実行ログを開く",
+            lambda _checked=False: self._show_agent_loop_log(),
+        )
         # 初期状態を反映
         self._refresh_agent_loop_menu()
 
@@ -519,11 +539,11 @@ class ScreenFeature:
         self._agent_loop_bridge = _AgentLoopBridge()
         self._agent_loop_bridge.state_changed.connect(self._on_agent_loop_state_event)
 
-        # メニュー項目(トレイメニューの組み立て時に設定される)
-        self._agent_loop_menu = None
-        self._agent_loop_start_action = None
-        self._agent_loop_stop_action = None
-        self._agent_loop_show_log_action = None
+        # ここに以前 _agent_loop_menu などを None で初期化する行があったが、消した。
+        # メニューを組み立てるのはこれより前(上の addMenu)なので、あとから None を
+        # 入れると作ったばかりの参照を捨てることになる。_refresh_agent_loop_menu は
+        # None なら黙って何もしない作りなので、見出しの状態表示も開始/停止の
+        # 有効切り替えも、ずっと効いていなかった。
         # このPCで使う気があるときだけメニューに出す。複数のPCで同じコードを動かして
         # おり、業務用の端末に個人の通知先の入口が並んでいても使い道がない。
         #
@@ -1569,11 +1589,11 @@ class ScreenFeature:
         # 実質16pxのアイコンに2つ目の目印を入れても潰れて読めない。
         states = []
         if state == "busy":
-            states.append("エージェントループ(応答/実行中)")
+            states.append("エージェントループ 実行中")
         elif state == "watching":
-            states.append("エージェントループ 監視中")
+            states.append("エージェントループ 待機中")
         elif state == "err":
-            states.append("エージェントループ エラー")
+            states.append("エージェントループ 停止：要確認")
         if self._awake_active:
             states.append("スリープ抑止中")
         if self._jiggle_active:
@@ -1756,7 +1776,7 @@ class ScreenFeature:
                 pass
 
     def _toggle_copilot_watchdog(self, checked: bool) -> None:
-        """Copilot の状態表示の入切をメニューから切り替える。設定は自動保存。"""
+        """状態監視バーの入切をメニューから切り替える。設定は自動保存。"""
         try:
             self._copilot_watchdog.set_enabled(bool(checked))
         except Exception as e:  # noqa: BLE001
@@ -1772,17 +1792,14 @@ class ScreenFeature:
         self._agent_loop_viewer.raise_()
 
     def _refresh_agent_loop_menu(self) -> None:
-        """監視モードのメニューの見出しと開始/停止項目の見せ方を更新する。"""
+        """メニューの見出しと、開始/停止項目の押せる押せないを更新する。
+
+        見出しに出すのはエージェントループの状態だけ。状態監視バーの入切は
+        チェックマークで分かるので、見出しに混ぜると何の状態か読み取れなくなる。"""
         if not hasattr(self, "_agent_loop_menu") or self._agent_loop_menu is None:
             return
-        if self._agent_loop_state == "idle":
-            self._agent_loop_menu.setTitle("🤖 エージェントループ")
-        elif self._agent_loop_state == "watching":
-            self._agent_loop_menu.setTitle("🤖 エージェントループ（監視中）")
-        elif self._agent_loop_state == "busy":
-            self._agent_loop_menu.setTitle("🤖 エージェントループ（実行中）")
-        elif self._agent_loop_state == "err":
-            self._agent_loop_menu.setTitle("🤖 エージェントループ（停止：要確認）")
+        suffix = AGENT_LOOP_MENU_SUFFIX.get(self._agent_loop_state, "")
+        self._agent_loop_menu.setTitle(AGENT_LOOP_MENU_TITLE + suffix)
         if self._agent_loop_start_action:
             self._agent_loop_start_action.setEnabled(self._agent_loop_state == "idle")
         if self._agent_loop_stop_action:

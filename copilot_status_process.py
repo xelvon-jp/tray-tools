@@ -108,6 +108,9 @@ PAUSED_COLOR = QColor(88, 94, 104)
 BUTTON_SIZE = 26
 BUTTON_MARGIN = 8
 
+# 親(常駐)がまだ居るかを見る間隔(ms)。落ちたときに札が貼り付いたままになるのを防ぐ。
+PARENT_CHECK_MS = 3000
+
 ALERTABLE_STATES = ("waiting_ai", "waiting_user")
 
 
@@ -516,6 +519,8 @@ def main(argv=None):
         description="Copilot の手番を常時表示する（常駐とは別プロセス）")
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD_SECONDS,
                         help="この秒数を超えて待ちが続いたら窓を点滅させる")
+    parser.add_argument("--parent-pid", type=int, default=0,
+                        help="この pid が消えたら自分も終わる（常駐が指定する）")
     args = parser.parse_args(argv)
 
     try:
@@ -538,6 +543,30 @@ def main(argv=None):
 
     watcher = StatusWatcher(max(5, args.threshold), app_settings)
     watcher.start()
+
+    # 常駐が消えたら自分も終わる。
+    #
+    # 【なぜ要るか】
+    # 常駐が「終了」で綺麗に終わるとは限らない。落ちることもあるし、タスク
+    # マネージャで殺されることもある。そのとき subprocess の子は Windows では
+    # 生き残るので、札だけが画面に貼り付いたまま消せなくなる(実際そうなった。
+    # 取り残しが25個溜まっていた)。親の生死を自分で見張るのが確実。
+    if args.parent_pid:
+        def check_parent():
+            try:
+                import psutil
+                if not psutil.pid_exists(args.parent_pid):
+                    app.quit()
+            except Exception:  # noqa: BLE001  見張りのために落ちない
+                pass
+
+        parent_timer = QTimer()
+        parent_timer.setInterval(PARENT_CHECK_MS)
+        parent_timer.timeout.connect(check_parent)
+        parent_timer.start()
+        # 参照を持ち続けないと GC で消える(タイマーの持ち主が居なくなる)。
+        app._parent_timer = parent_timer
+
     return app.exec()
 
 

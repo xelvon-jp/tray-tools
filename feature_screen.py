@@ -1682,7 +1682,9 @@ class ScreenFeature:
         exe = exe.replace("pythonw.exe", "python.exe")
         here = Path(__file__).resolve().parent
         argv = [exe, str(here / "agent_loop.py"),
-                "--watch", "--auto", "--emit-events", "--max-rounds", "10"]
+                "--watch", "--auto", "--emit-events", "--max-rounds", "10",
+                # 常駐が落ちても Copilot に書き込み続けないよう、子に見張らせる。
+                "--parent-pid", str(os.getpid())]
         try:
             proc = subprocess.Popen(
                 argv, cwd=str(here),

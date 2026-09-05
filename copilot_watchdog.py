@@ -58,6 +58,48 @@ def _pythonw():
     return pythonw_executable()
 
 
+def sweep_orphans(exclude_pid=None) -> int:
+    """取り残された表示プロセスを片付ける。片付けた数を返す。
+
+    【なぜ要るか】
+    常駐が落ちたり強制終了されたりすると、subprocess の子は Windows では生き残る。
+    札だけが画面に貼り付き、消す手段(トレイのメニュー)も無くなる。実際これで
+    25個溜まった。子側も親の生死を見張るようにしたが、古い版から乗り換えた直後は
+    その見張りを持たない子が残っているので、こちら側でも掃除する。
+
+    【判定を引数ごとに見る理由】
+    コマンドラインを連結した文字列で判定すると、この判定コード自身('...py' という
+    文字列を含む)が引っかかって自分を殺す。実際にやらかした。"""
+    killed = []
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    me = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid in (me, exclude_pid):
+                continue
+            argv = proc.info["cmdline"] or []
+            if any(a.replace("\\", "/").endswith("/copilot_status_process.py")
+                   for a in argv):
+                proc.terminate()
+                killed.append(proc)
+        except Exception:  # noqa: BLE001  消えた・権限が無いだけなら気にしない
+            continue
+    if killed:
+        try:
+            _gone, alive = psutil.wait_procs(killed, timeout=3)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+    return len(killed)
+
+
 class CopilotWatchdog:
     """Copilot 状態表示の入切。実処理は子プロセス。
 
@@ -120,6 +162,9 @@ class CopilotWatchdog:
         無くなる(トレイのメニューが消えるため)。"""
         self._watch_timer.stop()
         self._stop_child()
+        # 掴んでいる子だけでなく、取り残しも消す。前の常駐の子が生きていると、
+        # 常駐を落としたのに札が残る。
+        sweep_orphans()
 
     # -- 子プロセスの世話 ------------------------------------------------
     def _child_alive(self) -> bool:
@@ -130,7 +175,12 @@ class CopilotWatchdog:
             return
         if self._is_agent_loop_running():
             return
-        argv = [_pythonw(), SCRIPT_PATH, "--threshold", str(self._threshold)]
+        # 起こす前に取り残しを掃除する。前回の常駐が落ちていると札が二重に出る。
+        sweep_orphans()
+        argv = [_pythonw(), SCRIPT_PATH,
+                "--threshold", str(self._threshold),
+                # 常駐が落ちても札が残らないよう、子に見張らせる。
+                "--parent-pid", str(os.getpid())]
         try:
             self._proc = subprocess.Popen(
                 argv,

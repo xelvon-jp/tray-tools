@@ -425,8 +425,26 @@ def run_loop(
 # ---------------------------------------------------------------------------
 # キャンセル
 # ---------------------------------------------------------------------------
+# 常駐から起こされたときの親 pid。0 なら見張らない(手で叩いたとき)。
+PARENT_PID = 0
+
+
 def _cancel_requested() -> bool:
-    return CANCEL_FLAG.exists()
+    """次の周に進んでよいか。止める理由があれば True。
+
+    キャンセルのフラグに加えて、親(常駐)が消えていないかも見る。常駐が落ちても
+    subprocess の子は Windows では生き残るので、見張らないと Copilot に書き込み
+    続けることになる。止める手段(トレイのメニュー)は常駐と一緒に消えている。"""
+    if CANCEL_FLAG.exists():
+        return True
+    if PARENT_PID:
+        try:
+            import psutil
+            if not psutil.pid_exists(PARENT_PID):
+                return True
+        except Exception:  # noqa: BLE001  見張りのために落ちない
+            pass
+    return False
 
 
 def _cancel_clear() -> None:
@@ -471,7 +489,12 @@ def main(argv=None) -> int:
     parser.add_argument("--loop-timeout", type=int, default=30 * 60)
     parser.add_argument("--emit-events", action="store_true",
                         help="進捗イベントを1行1件のJSONで標準出力へ流す（常駐が読む）")
+    parser.add_argument("--parent-pid", type=int, default=0,
+                        help="この pid が消えたら次の周の頭で止まる（常駐が指定する）")
     args = parser.parse_args(argv)
+
+    global PARENT_PID
+    PARENT_PID = args.parent_pid
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

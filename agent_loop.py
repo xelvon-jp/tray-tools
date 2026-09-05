@@ -59,6 +59,14 @@ DEFAULT_PS_TIMEOUT = 60
 # 1周ぶんの応答待ち上限(秒)。Copilot の応答は普通10〜30秒。長すぎたら異常。
 DEFAULT_RESPONSE_TIMEOUT = 180
 
+# 実行が何周続けて失敗したら諦めるか。実測で、壊れたコードを渡してしまったときに
+# Copilot が誤診して同じ失敗を8周繰り返した。3周も同じなら人が見たほうが早い。
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
+
+# 監視モードで「新しい応答」を待つ上限(秒)。押してから Copilot に投稿する使い方を
+# 想定して、少し長めに取る。ここを過ぎたら何もせず終わる(勝手に走り出さない)。
+DEFAULT_WATCH_TIMEOUT = 180
+
 # 貼り戻す出力の最大文字数。長すぎる出力は Copilot の解釈も雑になるので切る。
 # 頭と末尾の両方を残す(エラーは末尾に、成功サマリは先頭に出やすい)。
 DEFAULT_PASTE_LIMIT = 3000
@@ -78,6 +86,8 @@ STOP_TIMEOUT_LOOP = "loop-timeout"
 STOP_CANCEL = "cancelled"
 STOP_DRY_RUN = "dry-run"
 STOP_FINISH_WORD = "finish-word"
+STOP_STUCK = "stuck"
+STOP_NO_NEW_RESPONSE = "no-new-response"
 STOP_ERROR = "error"
 
 
@@ -214,6 +224,40 @@ def _matches_finish_word(text: str, finish_word: str) -> bool:
     return re.search(FINISH_WORD_RE_TEMPLATE.format(re.escape(finish_word)), text or "") is not None
 
 
+def _wait_for_new_response(cp, timeout, emit, poll=1.0, settle=2.0):
+    """監視モードの入口で、新しい応答が来るまで待つ。来たら True。
+
+    「新しい」の判定は、開始時点の全文長より伸びて、かつしばらく伸び止まったこと。
+    生成中に開始を押した場合(busy)は、そのまま書き終わるのを待つ。
+
+    ここで待たずに最後の応答を拾うと、前のやり取りが画面に残っているときに
+    押した瞬間から走り出す。実測でそれが起きて、意図せず10周回った。
+    「押してから投稿する」使い方もあるので、待つほうを既定にする。"""
+    start_len = cp.snapshot_length()
+    deadline = time.time() + max(0.0, timeout)
+    emit("watch_waiting", chars=start_len, timeout=timeout)
+    grew_at = None
+    while time.time() < deadline:
+        time.sleep(poll)
+        try:
+            now = cp.snapshot_length()
+            busy = cp.state() == "busy"
+        except Exception:  # noqa: BLE001  一時的に読めないだけなら次の周期で
+            continue
+        if busy:
+            # 生成中。伸び止まりの判定はやり直す。
+            grew_at = None
+            continue
+        if now > start_len:
+            if grew_at is None:
+                grew_at = time.time()
+            elif time.time() - grew_at >= settle:
+                return True
+        else:
+            grew_at = None
+    return False
+
+
 # ---------------------------------------------------------------------------
 # ループ本体
 # ---------------------------------------------------------------------------
@@ -227,6 +271,9 @@ def run_loop(
     auto_run: bool = False,
     loop_timeout: int = 30 * 60,
     watch: bool = False,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    wait_for_new: bool = True,
+    watch_timeout: int = DEFAULT_WATCH_TIMEOUT,
     on_event=None,
 ) -> dict:
     """疑似エージェントループを1回まわす。結果のサマリを辞書で返す。
@@ -279,6 +326,7 @@ def run_loop(
         stopped_by = STOP_MAX_ROUNDS
         stop_detail = ""
 
+        consecutive_failures = 0
         while rounds < max_rounds:
             if _cancel_requested():
                 stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
@@ -296,11 +344,27 @@ def run_loop(
                  prompt_preview=(prompt or "")[:120])
 
             if skip_send:
-                # 監視モードの1周目。「人が Copilot に投稿したお題への応答」を取りたいが、
-                # snapshot_length を使うと、開始ボタンを押すまでに Copilot が既に応答を
-                # 書き終わっていた場合に「全文長より後ろ = 空」となってしまう
-                # (実測: 5.9秒で 0 文字が返り、no-snippet で終わった)。
+                # 監視モードの1周目。「人が Copilot に投稿したお題への応答」を取る。
                 #
+                # 【まず新しい応答を待つ】
+                # 以前はここで無条件に「最後の応答」を拾っていた。そのため、前回の
+                # やり取りが画面に残っている状態で開始を押すと、**押した瞬間に古い
+                # 応答を引き取って走り出した**(実測: 意図せず10周回った)。
+                # 人が投稿するより先に押すこともあるので、まず新しい応答の到着を待つ。
+                # 既に生成が終わっていれば待たずに進む。
+                if wait_for_new:
+                    fresh = _wait_for_new_response(cp, watch_timeout, emit)
+                    if not fresh:
+                        stopped_by = STOP_NO_NEW_RESPONSE
+                        stop_detail = (
+                            f"{watch_timeout} 秒待ちましたが、新しい応答が来ませんでした。"
+                            "Copilot にお題を投稿してから始めてください。")
+                        emit("round_end", round=rounds, reason=stopped_by,
+                             elapsed=time.time() - round_started)
+                        break
+
+                # snapshot_length を使うと、Copilot が既に応答を書き終わっていた場合に
+                # 「全文長より後ろ = 空」となってしまう(実測: 5.9秒で 0 文字)。
                 # 代わりに「最後の user_marker(あなたの発言)」の位置を previous_length に
                 # する。応答が完了していても書きかけでも、正しく「人の最後の発言以降」を
                 # 拾える。user_marker が無い(会話履歴がまっさら)なら 0 から取る。
@@ -400,6 +464,27 @@ def run_loop(
                  stderr_chars=len(result.get("stderr") or ""),
                  stdout=result.get("stdout") or "",
                  stderr=result.get("stderr") or "")
+
+            # 失敗が続いたら諦める。
+            #
+            # 【なぜ要るか】
+            # 実測で、10周のうち8周が同じエラーの堂々巡りになった。こちらが渡した
+            # コードは画面から読んだ時点で壊れていたのに、Copilot はそれを自分の
+            # 書き間違いだと誤診し、「直したつもりの同じコード」を出し続けた。
+            # 上限まで回ればいずれ止まるが、その間ずっと実行を繰り返してしまう。
+            # 進んでいないと分かった時点で人に返すほうがよい。
+            if result.get("exit_code") == 0 and not result.get("timed_out"):
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    stopped_by = STOP_STUCK
+                    stop_detail = (
+                        f"{consecutive_failures} 周続けて失敗しました。"
+                        "同じところで止まっている可能性が高いので中断します。")
+                    emit("round_end", round=rounds, reason=stopped_by,
+                         elapsed=time.time() - round_started)
+                    break
 
             # 7) 次のプロンプトを組み立てて次周へ
             prompt = format_paste(sid, result, paste_limit)
@@ -560,6 +645,13 @@ def main(argv=None) -> int:
                         help="進捗イベントを1行1件のJSONで標準出力へ流す（常駐が読む）")
     parser.add_argument("--parent-pid", type=int, default=0,
                         help="この pid が消えたら次の周の頭で止まる（常駐が指定する）")
+    parser.add_argument("--max-consecutive-failures", type=int,
+                        default=DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                        help="実行がこの回数続けて失敗したら中断する")
+    parser.add_argument("--take-last", action="store_true",
+                        help="監視モードで、新しい応答を待たず画面の最後の応答を引き取る")
+    parser.add_argument("--watch-timeout", type=int, default=DEFAULT_WATCH_TIMEOUT,
+                        help="監視モードで新しい応答を待つ上限(秒)")
     args = parser.parse_args(argv)
 
     global PARENT_PID
@@ -599,6 +691,8 @@ def main(argv=None) -> int:
         response_timeout=args.response_timeout, paste_limit=args.paste_limit,
         finish_word=args.finish_word, auto_run=args.auto,
         loop_timeout=args.loop_timeout,
+        max_consecutive_failures=args.max_consecutive_failures,
+        wait_for_new=not args.take_last, watch_timeout=args.watch_timeout,
     )
     if not args.emit_events:
         print(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -718,12 +718,38 @@ LANG_LABEL_RE = re.compile(r"^(?:powershell|pwsh|python|bash|cmd|batch|json|yaml
                            re.IGNORECASE)
 
 
+# 画面から読んだコードで、アンダースコアが落ちた跡。
+#
+# 【なぜ起きるか】
+# Copilot がコードを ``` で囲まずに返すと、描画側が Markdown として解釈する。
+# `__text__` は太字、`_text_` は斜体なので、**下線そのものが消えて描画される**。
+# 実測: `__dunder__` が `dunder` になり、`$_.Name` が `$.Name` になった。
+# 画面にもそう出ているので、UIA の読み取りを工夫しても取り返せない。
+#
+# 【なぜ機械的に直してよいか】
+# `$.` は PowerShell の構文として成立しない。出てきた時点で「本来 `$_.` だった」と
+# 断定できる。当てずっぽうではない。
+UNDERSCORE_LOST_RE = re.compile(r"\$(?=\.)")
+
+
+def repair_lost_underscores(code):
+    """落ちたアンダースコアを戻す。(直したコード, 直した数) を返す。
+
+    直せるのは `$.` → `$_.` だけ。識別子の中で消えた下線(`my_var` → `myvar`)は
+    元の綴りを知りようがないので触らない。**直しきれないことがある**前提で、
+    呼び側は「直した数」を見て人に知らせること。黙って直すと、直せなかった箇所が
+    あったときに原因が見えなくなる。"""
+    repaired, count = UNDERSCORE_LOST_RE.subn("$_", code or "")
+    return repaired, count
+
+
 def extract_snippets(text):
-    """[(ID, コード), ...] を返す。"""
+    """[(ID, コード), ...] を返す。落ちたアンダースコアはここで戻す。"""
     result = []
     for hit in SNIPPET_RE.finditer(text or ""):
         code = LANG_LABEL_RE.sub("", hit.group(2).strip("\n"), count=1)
-        result.append((hit.group(1), code.strip("\n")))
+        code, _fixed = repair_lost_underscores(code.strip("\n"))
+        result.append((hit.group(1), code))
     return result
 
 

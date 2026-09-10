@@ -637,8 +637,23 @@ def _agent_loop_command(args, reply) -> None:
             reply(f"ERR キャンセル要求できませんでした: {e}")
         return
 
+    if action == "log":
+        # ログ窓を前面に出すだけ。状態監視バーの右クリックから叩く口。
+        # 札は別プロセスなので、窓を持っている常駐に頼むしかない。
+        show = getattr(screen, "_show_agent_loop_log", None)
+        if show is None:
+            reply("ERR この構成にはログ窓がありません")
+            return
+        try:
+            show()
+            reply("OK ログ窓を出しました")
+        except Exception as e:  # noqa: BLE001
+            reply(f"ERR ログ窓を出せませんでした: {e}")
+        return
+
     if action != "start":
-        reply(f"ERR 不明な agent-loop 指示: {action}（start / status / cancel）")
+        reply(f"ERR 不明な agent-loop 指示: {action}"
+              "（start / status / cancel / log）")
         return
 
     if _agent_loop_running():

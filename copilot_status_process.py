@@ -300,6 +300,36 @@ def format_loop_badge(status):
     return f"{rounds}/{maximum}" if maximum > 0 else f"{rounds}周目"
 
 
+# 常駐の待ち受け(QLocalServer)。Windows では名前付きパイプなので素の open() で書ける。
+# traytools_send.py と同じ口を叩く。
+TRAY_PIPE_PATH = r"\\.\pipe\traytools.single-instance"
+
+
+def send_to_tray(command, args=None):
+    """常駐に指示を1つ投げる。届いたら True。
+
+    【なぜ札から直接やらないか】
+    エージェントループを起こすのも、ログ窓を出すのも、この子プロセスの仕事ではない。
+    ループをここで起こすと、この窓が応答待ち(最大180秒)や PowerShell 実行(最大60秒)で
+    固まる。窓は常駐が持っている。だから札は「頼む」だけにする。
+
+    【返事は読まない】
+    読むには相手が書くまで待つことになり、その間 Qt の描画が止まる。押した結果は
+    画面に出る(ループが始まればログ窓が開き、札に周回数が出る)ので、ここで確かめる
+    必要が無い。traytools_send.py と違って、常駐が居なければ起動し直す処理も要らない
+    —— 常駐が居なければ、この札は親を見張って既に終わっている。"""
+    import json
+    payload = json.dumps({"command": command, "args": list(args or [])},
+                         ensure_ascii=False)
+    try:
+        with open(TRAY_PIPE_PATH, "wb", buffering=0) as pipe:
+            pipe.write((payload + "\n").encode("utf-8"))
+        return True
+    except OSError as e:
+        print(f"[copilot-status] 常駐へ届きませんでした: {e}")
+        return False
+
+
 def _on_screen(point):
     """その位置に札を置いても画面内に見えるか。
 
@@ -388,6 +418,9 @@ class StatusPill(QWidget):
         self._fill = QColor(90, 90, 90)
         self._paused = False
         self._pinned = False
+        # エージェントループの周回数。右クリックの献立(開始/停止)もこれで決める。
+        # 札に出ているものと同じ根拠にしておけば、見えているとおりに操作できる。
+        self._loop_badge = ""
         # ホバー中のボタン名('pause' / 'pin' / None)。
         self._hover_button = None
         # Ctrl+ドラッグ中に、掴んだ点と窓の左上との差を覚えておく。
@@ -434,6 +467,9 @@ class StatusPill(QWidget):
 
     def apply_state(self, state_key, elapsed_seconds=None, alert=False,
                     paused=False, loop_badge=""):
+        # 見た目が変わらないときは下で早々に抜けるので、その前に控えておく。
+        # 右クリックの献立がこれを見る(点滅中は見た目に出ないが、回ってはいる)。
+        self._loop_badge = loop_badge or ""
         if paused:
             emoji, label, color = PAUSED_EMOJI, PAUSED_LABEL, PAUSED_COLOR
             wants_elapsed = False
@@ -509,23 +545,60 @@ class StatusPill(QWidget):
             self._on_moved(self.pos())
 
     def contextMenuEvent(self, event):
-        """右クリックで、一時停止と終了を選ばせる。
+        """右クリックの献立。
 
         右クリックで即終了にしなかったのは、消してしまうとトレイのメニューまで
-        戻らないと出し直せないため。誤クリック1回で消えるのは代償が大きい。"""
+        戻らないと出し直せないため。誤クリック1回で消えるのは代償が大きい。
+
+        【エージェントループの操作もここに置く理由】
+        使う側から見れば、札もループも「Copilot を見張る」ひとつの話。いまは
+        Copilot の状態が札に、実況がログ窓に、開始停止がトレイメニューにと三箇所に
+        散っている。目の前にある札から手が届くほうが素直。
+        **実処理は常駐に頼む**(send_to_tray の説明を参照)。"""
+        menu = self.build_context_menu()
+        chosen = menu.exec(event.globalPos())
+        self.apply_menu_choice(chosen.data() if chosen is not None else None)
+
+    def build_context_menu(self):
+        """右クリックの献立を組む。各項目には合言葉(data)を持たせる。
+
+        どれが選ばれたかを QAction の同一性で見比べるのをやめて、合言葉で分岐する。
+        並び順を変えたときに分岐側を直し忘れる事故が無くなるのと、組み立てと
+        選択後の処理を別々に確かめられるため。"""
         menu = QMenu(self)
-        pause = menu.addAction("▶ 監視を再開" if self._paused else "⏸ 監視を一時停止")
+        menu.addAction("▶ 監視を再開" if self._paused
+                       else "⏸ 監視を一時停止").setData("pause")
         # 覚えた位置が邪魔になったときの逃げ道。これが無いと、一度動かした札を
         # 自動配置へ戻す手段が無くなる(位置を覚えるようにしたので、なおさら要る)。
-        reset = menu.addAction("↺ 位置を自動に戻す")
+        menu.addAction("↺ 位置を自動に戻す").setData("reset")
+
         menu.addSeparator()
-        quit_action = menu.addAction("⏹ 状態監視バーを終了")
-        chosen = menu.exec(event.globalPos())
-        if chosen is pause and self._on_toggle_pause is not None:
+        # 開始と停止は入れ替える。両方出して片方を空振りさせると、押したのに何も
+        # 起きない状態になり、効かないのか届いていないのかが分からない。どちらを
+        # 出すかは札に出ている周回数と同じ根拠にする(＝見えているとおりに操作できる)。
+        running = bool(self._loop_badge)
+        menu.addAction("⏹ エージェントループを停止" if running
+                       else "▶ エージェントループを開始（監視）"
+                       ).setData("loop_stop" if running else "loop_start")
+        menu.addAction("🤖 ループのログ窓を開く").setData("loop_log")
+
+        menu.addSeparator()
+        menu.addAction("⏹ 状態監視バーを終了").setData("quit")
+        return menu
+
+    def apply_menu_choice(self, key):
+        """右クリックで選ばれた項目を実行する。知らない合言葉なら何もしない。"""
+        if key == "pause" and self._on_toggle_pause is not None:
             self._on_toggle_pause()
-        elif chosen is reset and self._on_reset_position is not None:
+        elif key == "reset" and self._on_reset_position is not None:
             self._on_reset_position()
-        elif chosen is quit_action and self._on_quit is not None:
+        elif key == "loop_start":
+            send_to_tray("agent-loop", ["start", "--watch", "--auto"])
+        elif key == "loop_stop":
+            send_to_tray("agent-loop", ["cancel"])
+        elif key == "loop_log":
+            send_to_tray("agent-loop", ["log"])
+        elif key == "quit" and self._on_quit is not None:
             self._on_quit()
 
     def paintEvent(self, _event):

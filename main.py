@@ -409,6 +409,11 @@ def _build_command_handlers(features) -> dict:
         #   traytools_send.py restart          安全なときだけ再起動
         #   traytools_send.py restart --check  落としてよいかだけ答える
         "restart": lambda args, reply: reply(_restart_command(screen, args)),
+        # 状態監視バーの入切。入切がトレイのメニューにしか無く、再起動のたびに人が
+        # 押す必要があった。起動時は必ず OFF の決まりは変えず、押す手段だけ増やす。
+        #
+        #   traytools_send.py copilot-bar on / off / status
+        "copilot-bar": lambda args, reply: reply(screen.copilot_bar_command(args)),
         # screen を渡すのを忘れていて、この口からの start は **一度も動いていなかった**
         # (NameError で落ちる)。トレイメニューからの開始は別経路(ScreenFeature)を
         # 通るので、そちらでは表に出ていなかった。状態監視バーの右クリックが初めて

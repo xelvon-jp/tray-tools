@@ -1826,6 +1826,33 @@ class ScreenFeature:
         except Exception as e:  # noqa: BLE001
             print(f"[copilot-status] メニューの更新に失敗: {e}", file=sys.stderr)
 
+    def copilot_bar_command(self, args) -> str:
+        """外から状態監視バーを入切する。on / off / status。
+
+        【なぜ口を足したか】
+        入切がトレイのメニューにしか無かったので、再起動するたびに人に押してもらう
+        必要があった。**起動時は必ず OFF** という決まり(copilot_watchdog 冒頭)は
+        そのままにしたいので、代わりにメニュー以外からも入れられるようにする。
+        メニューのチェックも合わせて動かす。片方だけ変わると、次に押したときに
+        逆の操作になってしまう。"""
+        mode = (str(args[0]).strip().lower() if args else "status")
+        if mode == "status":
+            return ("OK 状態監視バー: "
+                    + ("表示中" if self._copilot_watchdog.is_enabled() else "停止中"))
+        if mode in ("on", "1", "true", "start", "show"):
+            want = True
+        elif mode in ("off", "0", "false", "stop", "hide"):
+            want = False
+        else:
+            return f"ERR 不明な指示: {mode}（on / off / status）"
+        try:
+            self._copilot_watchdog.set_enabled(want)
+            if self._copilot_watchdog_action is not None:
+                self._copilot_watchdog_action.setChecked(want)
+        except Exception as e:  # noqa: BLE001
+            return f"ERR 切り替えられませんでした: {e}"
+        return "OK 状態監視バー: " + ("表示中" if want else "停止中")
+
     def _toggle_copilot_watchdog(self, checked: bool) -> None:
         """状態監視バーの入切をメニューから切り替える。設定は自動保存。"""
         try:

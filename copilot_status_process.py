@@ -65,7 +65,7 @@ if _HERE not in sys.path:
 
 from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QTimer  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
-    QColor, QFont, QGuiApplication, QPainter, QPen, QPolygonF,
+    QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPolygonF,
 )
 from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 
@@ -623,15 +623,32 @@ class StatusPill(QWidget):
         p.setPen(QColor(255, 255, 255))
         p.setFont(self._emoji_font)
         p.drawText(box.adjusted(13, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self._emoji)
+        # 経過秒はボタンの左に寄せる。右端まで書くとボタンと重なる。
+        # ボタンが2つ並ぶので、そのぶん左へ寄せる。寄せ足りないと数字が
+        # ボタンの下に潜って読めなくなる。
+        right_pad = BUTTON_MARGIN + BUTTON_SIZE * 2 + 4 + 8
+
+        # 文言は入る幅に収まらなければ末尾を「…」で切る。
+        #
+        # 【切らずに描いていて重なった】
+        # 札の幅は 290px 固定。ふだんの「応答済（入力待ち）」はぎりぎり収まるが、
+        # 周回数(🤖 1/8)が頭に付くと溢れて、右側の経過秒に重なって両方読めなく
+        # なった(実測: 「応答済（入力待ち）3秒」が団子になった)。溢れたぶんを
+        # 黙って捨てるのではなく、切ったことが分かる形にする。
+        label_left = 40
+        avail = box.width() - label_left - right_pad
+        if self._elapsed:
+            # 経過秒のぶんは空けておく。数字は消えると意味が変わるので切らない。
+            avail -= QFontMetrics(self._elapsed_font).horizontalAdvance(
+                self._elapsed) + 6
         p.setFont(self._label_font)
-        p.drawText(box.adjusted(40, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self._label)
+        label = QFontMetrics(self._label_font).elidedText(
+            self._label, Qt.ElideRight, max(0, int(avail)))
+        p.drawText(box.adjusted(label_left, 0, 0, 0),
+                   Qt.AlignVCenter | Qt.AlignLeft, label)
         if self._elapsed:
             p.setPen(QColor(255, 255, 255, 210))
             p.setFont(self._elapsed_font)
-            # 経過秒はボタンの左に寄せる。右端まで書くとボタンと重なる。
-            # ボタンが2つ並ぶので、そのぶん左へ寄せる。寄せ足りないと数字が
-            # ボタンの下に潜って読めなくなる。
-            right_pad = BUTTON_MARGIN + BUTTON_SIZE * 2 + 4 + 8
             p.drawText(box.adjusted(0, 0, -right_pad, 0),
                        Qt.AlignVCenter | Qt.AlignRight, self._elapsed)
 

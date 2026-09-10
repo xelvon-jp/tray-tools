@@ -481,18 +481,21 @@ def run_loop(
             else:
                 # 1) 送信直前の全文長を控える(new_response が使う)
                 previous_length = cp.snapshot_length()
+                # 書いて送る。空振りしたら一度だけ書き直して試す
+                # (理由は copilot_loop.send_prompt を参照)。
                 try:
-                    cp.set_input(prompt)
+                    sent = cp.send_prompt(prompt)
                 except Exception as e:  # noqa: BLE001  UIA は多様に落ちうる
-                    stopped_by, stop_detail = STOP_ERROR, f"入力欄に書けませんでした: {e}"
-                    break
-                try:
-                    sent = cp.click_send()
-                except Exception as e:  # noqa: BLE001
-                    stopped_by, stop_detail = STOP_ERROR, f"送信ボタンを押せませんでした: {e}"
+                    stopped_by, stop_detail = STOP_ERROR, f"送信できませんでした: {e}"
                     break
                 if not sent:
-                    stopped_by, stop_detail = STOP_ERROR, "送信ボタンが見つかりません"
+                    # 見えていたボタン名を残す。「見つかりません」だけだと、次に
+                    # 起きたときにまた推測から始めることになる(実際そうなった)。
+                    seen = getattr(cp, "last_bottom_buttons", None) or []
+                    stopped_by = STOP_ERROR
+                    stop_detail = ("送信ボタンが見つかりません（書き直して2回試しました。"
+                                   "そのとき見えていたボタン: "
+                                   + ("・".join(seen) if seen else "読めず") + "）")
                     break
 
             # 2) 完了待ち

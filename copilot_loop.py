@@ -533,6 +533,34 @@ class Copilot:
             return None
         return pattern.QueryInterface(UIA.IUIAutomationValuePattern).CurrentValue
 
+    def send_prompt(self, text, attempts=2, wait=3.0):
+        """入力欄に書いて送信する。送れたら True。
+
+        【なぜ一度書き直すか】
+        SetValue で値を入れても、アプリ側がそれに気づかず送信ボタンを出さないことが
+        まれにある。実測(2026-09-11)では、同じお題で3回続けて「送信ボタンが
+        見つかりません」で1周目に落ちたのに、直後に同じ手順を手でなぞったら
+        0.18秒で通った。**値は入っているので read_input では気づけない**
+        (中身も文字数も一致していた)。書き直すと再描画が走って直る。
+
+        当たりどころが分からないまま、1回の空振りでループ全体を諦めるのは代償が
+        大きすぎる。原因を突き止めるのは、まず落ちなくしてからでよい。
+
+        押せなかったときは、そのとき下段に見えていたボタン名を last_bottom_buttons に
+        残す。次に起きたときに、また推測から始めないで済むように。"""
+        self.last_bottom_buttons = []
+        for _attempt in range(max(1, attempts)):
+            self.set_input(text)
+            if self.click_send(wait=wait):
+                return True
+            try:
+                root, desc = self._descendants()
+                self.last_bottom_buttons = [
+                    n for n, _el in self._bottom_buttons(root, desc)]
+            except Exception:  # noqa: BLE001  記録のために落ちない
+                pass
+        return False
+
     def click_send(self, wait=3.0, poll=0.2):
         """送信ボタンを押す。フォーカスは奪わない。
 

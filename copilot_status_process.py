@@ -54,6 +54,7 @@
 # 基準に「すぐ上」へ置くと入力ボックスに重なる。窓の下端から一定量だけ浮かせれば、
 # 入力ボックスがどれだけ大きくても必ずその下に出る。横位置だけ入力欄の右端に合わせる。
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -112,9 +113,24 @@ BUTTON_MARGIN = 8
 PARENT_CHECK_MS = 3000
 
 # 点滅を何往復させたら止めるか。ずっと点滅していると視界の端でうるさく、
-# しばらくすると脳が慣れて逆に気づかなくなる。数回で気を引いたら、あとは
-# 赤いままで「まだ待っている」ことだけを示し続ける。
+# しばらくすると脳が慣れて逆に気づかなくなる。数回で気を引いたら枠は消して、
+# あとは札の色(警告色)だけで「まだ待っている」ことを示す。
 FLASH_MAX_CYCLES = 5
+
+# 最後に人がキーやマウスを触ってから、この秒数以内なら「操作中」とみなす。
+# 操作中は入力待ちの経過を数えない(目の前で作業している人を急かさない)。
+# 短すぎるとタイプの合間で解除され、長すぎると席を立ってもしばらく数え始めない。
+INPUT_ACTIVE_SECONDS = 3.0
+
+# 「監視を再開しますか？」の小窓。札のすぐ上に出す。
+PROMPT_WIDTH = 250
+PROMPT_HEIGHT = 92
+PROMPT_BUTTON_W = 62
+PROMPT_BUTTON_H = 26
+
+# Ctrl+ドラッグで札を動かせる。Ctrl を要ることにしたのは、掴むつもりが無いのに
+# 動かしてしまう事故を避けるため(札は入力欄のすぐ近くに置いてある)。
+DRAG_MODIFIER = Qt.ControlModifier
 
 ALERTABLE_STATES = ("waiting_ai", "waiting_user")
 
@@ -124,6 +140,38 @@ def _to_logical(bounds):
     if bounds is None:
         return None
     return capture_grab.device_bounds_to_logical(bounds)
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+_user32 = ctypes.windll.user32
+_user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+_user32.GetLastInputInfo.restype = ctypes.c_bool
+_kernel32 = ctypes.windll.kernel32
+_kernel32.GetTickCount.restype = ctypes.c_uint
+
+
+def seconds_since_input():
+    """最後にキーかマウスが操作されてからの秒数。取れなければ None。
+
+    【なぜフックを張らないか】
+    tray-tools の作法として、キー/マウスをグローバルに捕捉する仕組みは事故の
+    もとなので入れない(CLAUDE.md)。GetLastInputInfo は**捕捉ではなく照会**で、
+    何が押されたかは一切分からず、最後に入力があった時刻だけが返る。見張りたい
+    のは「人が operating しているか」だけなので、これで足りる。
+
+    GetTickCount は約49日でひと回りする。回った直後は負になりうるので、
+    負なら「たった今」として扱う(0を返す)。"""
+    info = _LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+    if not _user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+    delta_ms = _kernel32.GetTickCount() - info.dwTime
+    if delta_ms < 0:
+        return 0.0
+    return delta_ms / 1000.0
 
 
 class StatusPill(QWidget):
@@ -140,7 +188,8 @@ class StatusPill(QWidget):
     入力位置(キャレット)が飛ばないので、書きかけの文章を触っても続きから打てる。
     tray-tools が SetForegroundWindow を禁じているのと同じ考え方。"""
 
-    def __init__(self, on_toggle_pause=None, on_quit=None):
+    def __init__(self, on_toggle_pause=None, on_quit=None,
+                 on_toggle_pin=None, on_moved=None):
         super().__init__()
         self.setWindowTitle("Copilot ステータス")
         self.setWindowFlags(
@@ -158,22 +207,50 @@ class StatusPill(QWidget):
 
         self._on_toggle_pause = on_toggle_pause
         self._on_quit = on_quit
+        self._on_toggle_pin = on_toggle_pin
+        self._on_moved = on_moved
         self._emoji = ""
         self._label = ""
         self._elapsed = ""
         self._fill = QColor(90, 90, 90)
         self._paused = False
-        self._hover_button = False
+        self._pinned = False
+        # ホバー中のボタン名('pause' / 'pin' / None)。
+        self._hover_button = None
+        # Ctrl+ドラッグ中に、掴んだ点と窓の左上との差を覚えておく。
+        self._drag_origin = None
 
         self._emoji_font = QFont("Segoe UI Emoji", 11)
+        # ボタンの中に収める都合で、状態の絵文字より小さくする。
+        self._pin_font = QFont("Segoe UI Emoji", 9)
         self._label_font = QFont("Meiryo", 11, QFont.Bold)
         self._elapsed_font = QFont("Meiryo", 9)
 
     # -- ボタンの当たり判定 ----------------------------------------------
-    def _button_rect(self):
+    # 右端から「一時停止」「ピン留め」の順に並べる。よく押すほうを端に置く。
+    def _button_rect(self, index=0):
         size = BUTTON_SIZE
-        return QRect(PILL_WIDTH - BUTTON_MARGIN - size,
-                     (PILL_HEIGHT - size) // 2, size, size)
+        right = PILL_WIDTH - BUTTON_MARGIN - index * (size + 4)
+        return QRect(right - size, (PILL_HEIGHT - size) // 2, size, size)
+
+    def _pause_button_rect(self):
+        return self._button_rect(0)
+
+    def _pin_button_rect(self):
+        return self._button_rect(1)
+
+    def _hit_button(self, pos):
+        """押された場所がどのボタンか。'pause' / 'pin' / None。"""
+        if self._pause_button_rect().contains(pos):
+            return "pause"
+        if self._pin_button_rect().contains(pos):
+            return "pin"
+        return None
+
+    def set_pinned(self, pinned: bool) -> None:
+        if bool(pinned) != self._pinned:
+            self._pinned = bool(pinned)
+            self.update()
 
     def apply_state(self, state_key, elapsed_seconds=None, alert=False,
                     paused=False):
@@ -199,22 +276,46 @@ class StatusPill(QWidget):
 
     # -- マウス ------------------------------------------------------------
     def mouseMoveEvent(self, event):
-        hovering = self._button_rect().contains(event.position().toPoint())
+        if self._drag_origin is not None:
+            # Ctrl+ドラッグ中。掴んだ点との差だけ動かす。
+            self.move(event.globalPosition().toPoint() - self._drag_origin)
+            return
+        hovering = self._hit_button(event.position().toPoint())
         if hovering != self._hover_button:
             self._hover_button = hovering
             self.update()
 
     def leaveEvent(self, _event):
         if self._hover_button:
-            self._hover_button = False
+            self._hover_button = None
             self.update()
 
     def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.position().toPoint()
+        # Ctrl を押しながらなら、どこを掴んでも移動。ボタンより先に見るので、
+        # Ctrl+ボタンの位置で掴んでも一時停止が誤爆しない。
+        if event.modifiers() & DRAG_MODIFIER:
+            self._drag_origin = (event.globalPosition().toPoint()
+                                 - self.frameGeometry().topLeft())
+            self.setCursor(Qt.SizeAllCursor)
+            return
+        hit = self._hit_button(pos)
         # ボタン以外を押したときは何もしない(閉じたり動かしたりできると事故る)。
-        if (event.button() == Qt.LeftButton
-                and self._button_rect().contains(event.position().toPoint())
-                and self._on_toggle_pause is not None):
+        if hit == "pause" and self._on_toggle_pause is not None:
             self._on_toggle_pause()
+        elif hit == "pin" and self._on_toggle_pin is not None:
+            self._on_toggle_pin()
+
+    def mouseReleaseEvent(self, _event):
+        if self._drag_origin is None:
+            return
+        self._drag_origin = None
+        self.setCursor(Qt.PointingHandCursor)
+        # 自動配置に戻されないよう、置かれた場所を覚えてもらう。
+        if self._on_moved is not None:
+            self._on_moved(self.pos())
 
     def contextMenuEvent(self, event):
         """右クリックで、一時停止と終了を選ばせる。
@@ -248,34 +349,64 @@ class StatusPill(QWidget):
             p.setPen(QColor(255, 255, 255, 210))
             p.setFont(self._elapsed_font)
             # 経過秒はボタンの左に寄せる。右端まで書くとボタンと重なる。
-            right_pad = BUTTON_MARGIN + BUTTON_SIZE + 8
+            # ボタンが2つ並ぶので、そのぶん左へ寄せる。寄せ足りないと数字が
+            # ボタンの下に潜って読めなくなる。
+            right_pad = BUTTON_MARGIN + BUTTON_SIZE * 2 + 4 + 8
             p.drawText(box.adjusted(0, 0, -right_pad, 0),
                        Qt.AlignVCenter | Qt.AlignRight, self._elapsed)
 
         self._paint_button(p)
 
     def _paint_button(self, p):
-        rect = QRectF(self._button_rect())
+        self._paint_pause_button(p)
+        self._paint_pin_button(p)
+
+    def _button_face(self, p, rect, name, active=False):
+        """ボタンの土台。押せることが分かる程度に明るくする。
+
+        ピン留めのように「入っている/入っていない」があるものは、入っているときを
+        さらに明るくして、ホバーと区別がつくようにする。"""
         p.setPen(Qt.NoPen)
-        # 札の色に対して少し明るい面を置く。ホバーでさらに明るくして、押せることを示す。
-        p.setBrush(QColor(255, 255, 255, 70 if self._hover_button else 38))
+        if active:
+            alpha = 120 if self._hover_button == name else 95
+        else:
+            alpha = 70 if self._hover_button == name else 38
+        p.setBrush(QColor(255, 255, 255, alpha))
         p.drawRoundedRect(rect, 6, 6)
-        p.setPen(QPen(QColor(255, 255, 255, 235), 2.0))
+
+    def _paint_pause_button(self, p):
+        rect = QRectF(self._pause_button_rect())
+        self._button_face(p, rect, "pause")
         cx, cy = rect.center().x(), rect.center().y()
         if self._paused:
             # ▶（再開）。線ではなく塗りの三角にする(細い線だと小さくて潰れる)。
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(255, 255, 255, 235))
-            tri = QPolygonF([
+            p.drawPolygon(QPolygonF([
                 QPointF(cx - 3.5, cy - 5.5),
                 QPointF(cx - 3.5, cy + 5.5),
                 QPointF(cx + 5.5, cy),
-            ])
-            p.drawPolygon(tri)
+            ]))
         else:
             # ⏸（一時停止）。縦棒2本。
+            p.setPen(QPen(QColor(255, 255, 255, 235), 2.0))
             p.drawLine(QPointF(cx - 3.0, cy - 5.0), QPointF(cx - 3.0, cy + 5.0))
             p.drawLine(QPointF(cx + 3.0, cy - 5.0), QPointF(cx + 3.0, cy + 5.0))
+
+    def _paint_pin_button(self, p):
+        """📌 ピン留め。入っていると、Copilot が引っ込んでも札を出したままにする。
+
+        図形で画鋲を描いてみたが、26px では漏斗にしか見えなかった。札の他の記号
+        (✏⏳💬🙂)と同じく絵文字に揃える。入/切は下地の明るさと、絵文字自体の
+        濃さで示す。"""
+        rect = QRectF(self._pin_button_rect())
+        self._button_face(p, rect, "pin", active=self._pinned)
+        p.save()
+        p.setOpacity(1.0 if self._pinned else 0.5)
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(self._pin_font)
+        p.drawText(rect, Qt.AlignCenter, "📌")
+        p.restore()
 
     def place(self, window_rect, right_inset):
         """窓の下端に沿って置く。入力ボックスの大きさに関係なく必ずその下に来る。"""
@@ -312,25 +443,27 @@ class FlashFrame(QWidget):
 
         self._bright = True
         self._cycles = 0
+        # この待ちについて光り終えたか。待ちが解けるまで立てたままにする。
+        self._done = False
         self._timer = QTimer()
         self._timer.setInterval(FLASH_INTERVAL_MS)
         self._timer.timeout.connect(self._on_blink)
 
     def _on_blink(self):
         try:
-            if self._cycles >= FLASH_MAX_CYCLES:
-                # 規定回数を過ぎたら明るいまま固定。タイマーは止めてあるが、
-                # 呼ばれても状態を変えないようにしておく(止め忘れの保険)。
-                self._timer.stop()
-                self._bright = True
-                return
             self._bright = not self._bright
             if self._bright:
-                # 暗→明で1往復ぶん数える。規定回数を過ぎたら点滅をやめ、
-                # 明るい赤のまま置いておく(消してしまうと待ちに気づけない)。
+                # 暗→明で1往復ぶん数える。規定回数まで来たら枠ごと引っ込める。
+                #
+                # 【薄い赤を残さない理由】
+                # 以前は明るい赤のまま置いていたが、画面の縁がずっと赤いのは
+                # 単純に邪魔で、しかも見慣れると意味を持たなくなる。数回光って
+                # 気を引くところまでが枠の仕事で、「まだ待っている」ことは札の
+                # 色と経過秒が示し続ける。
                 self._cycles += 1
                 if self._cycles >= FLASH_MAX_CYCLES:
-                    self._timer.stop()
+                    self.stop()
+                    return
             self.update()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
             print(f"[copilot-status] 点滅の描き替えに失敗: {e}")
@@ -347,9 +480,16 @@ class FlashFrame(QWidget):
         p.drawRect(QRectF(self.rect()).adjusted(half, half, -half, -half))
 
     def start(self, window_rect):
+        # この待ちについては光り終えた。もう出さない。
+        #
+        # この印が無いと、消えた直後の tick で「出ていない」と判断して光り直し、
+        # 永久に点滅し続けることになる(消す変更を入れた時点で必ず踏む)。
+        # 印が消えるのは、待ちが解けて reset() が呼ばれたとき。
+        if self._done:
+            return
         self.setGeometry(window_rect)
-        # 既に出ているなら点滅の続き(または点滅し終わった赤)をそのまま保つ。
-        # ここで数え直すと、窓を動かすたびに点滅が復活してしまう。
+        # 既に光っている最中なら、そのまま続ける。ここで数え直すと、窓を動かす
+        # たびに点滅が最初からになってしまう。
         if not self.isVisible() and not self._timer.isActive():
             self._bright = True
             self._cycles = 0
@@ -361,9 +501,124 @@ class FlashFrame(QWidget):
             self.raise_()
 
     def stop(self):
+        """光るのをやめて引っ込める。光り終えた印は残す。"""
+        self._timer.stop()
+        self._done = True
+        self.hide()
+
+    def reset(self):
+        """待ちが解けたときに呼ぶ。次の待ちでまた光れるように印を消す。"""
         self._timer.stop()
         self._cycles = 0
+        self._done = False
         self.hide()
+
+
+class ResumePrompt(QWidget):
+    """「監視を再開しますか？」を尋ねる小さな窓。札のすぐ上に出す。
+
+    【なぜ QMessageBox を使わないか】
+    あれは前面に出てフォーカスを取る。Copilot に何か打っている最中に出たら、
+    続きの文字が吸われる。この道具の全体方針(フォーカスを奪わない)に反するので、
+    札と同じ作りの、フォーカスを取らない窓を自前で出す。"""
+
+    def __init__(self, on_yes=None, on_no=None):
+        super().__init__()
+        self.setWindowTitle("Copilot 監視の再開")
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.resize(PROMPT_WIDTH, PROMPT_HEIGHT)
+
+        self._on_yes = on_yes
+        self._on_no = on_no
+        self._hover = None
+        self._label_font = QFont("Meiryo", 10, QFont.Bold)
+        self._button_font = QFont("Meiryo", 9, QFont.Bold)
+
+    def _yes_rect(self):
+        return QRect(PROMPT_WIDTH - 8 - PROMPT_BUTTON_W * 2 - 6,
+                     PROMPT_HEIGHT - 8 - PROMPT_BUTTON_H,
+                     PROMPT_BUTTON_W, PROMPT_BUTTON_H)
+
+    def _no_rect(self):
+        return QRect(PROMPT_WIDTH - 8 - PROMPT_BUTTON_W,
+                     PROMPT_HEIGHT - 8 - PROMPT_BUTTON_H,
+                     PROMPT_BUTTON_W, PROMPT_BUTTON_H)
+
+    def _hit(self, pos):
+        if self._yes_rect().contains(pos):
+            return "yes"
+        if self._no_rect().contains(pos):
+            return "no"
+        return None
+
+    def mouseMoveEvent(self, event):
+        hit = self._hit(event.position().toPoint())
+        if hit != self._hover:
+            self._hover = hit
+            self.update()
+
+    def leaveEvent(self, _event):
+        if self._hover:
+            self._hover = None
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        hit = self._hit(event.position().toPoint())
+        if hit == "yes" and self._on_yes is not None:
+            self._on_yes()
+        elif hit == "no" and self._on_no is not None:
+            self._on_no()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QColor(31, 107, 176))
+        p.setPen(QPen(QColor(255, 255, 255, 130), 1.0))
+        p.drawRoundedRect(box, 9, 9)
+
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(self._label_font)
+        p.drawText(box.adjusted(13, 8, -13, 0),
+                   Qt.AlignTop | Qt.AlignLeft,
+                   "Copilot が応答中です。\n監視を再開しますか？")
+        self._paint_button(p, self._yes_rect(), "yes", "はい")
+        self._paint_button(p, self._no_rect(), "no", "いいえ")
+
+    def _paint_button(self, p, rect, name, text):
+        r = QRectF(rect)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 95 if self._hover == name else 55))
+        p.drawRoundedRect(r, 5, 5)
+        p.setPen(QColor(255, 255, 255, 245))
+        p.setFont(self._button_font)
+        p.drawText(r, Qt.AlignCenter, text)
+
+    def show_above(self, pill_rect):
+        """札のすぐ上に出す。画面から食み出さないよう寄せる。"""
+        x = pill_rect.right() - self.width()
+        y = pill_rect.top() - self.height() - 8
+        screen = (QGuiApplication.screenAt(pill_rect.center())
+                  or QGuiApplication.primaryScreen())
+        if screen is not None:
+            area = screen.geometry()
+            x = max(area.left(), min(x, area.right() - self.width()))
+            y = max(area.top(), min(y, area.bottom() - self.height()))
+        self.move(int(x), int(y))
+        if not self.isVisible():
+            self.show()
+            self.raise_()
 
 
 class StatusWatcher:
@@ -383,9 +638,23 @@ class StatusWatcher:
         # 一時停止は、そのとき限りの操作。設定に保存しない(次に開いたら見張っている
         # のが当たり前で、黙って止まったままのほうが事故になる)。
         self._paused = False
+        # ピン留め。Copilot が引っ込んでも札を出したままにする。
+        self._pinned = False
+        # Ctrl+ドラッグで置かれた場所。None なら自動配置。
+        self._manual_pos = None
+        # 最後に札が居た場所。Copilot が最小化されたときの置き場所に使う。
+        self._last_pos = None
+        # 待ちの経過秒。操作していない時間だけを積み上げる(_advance_elapsed)。
+        self._elapsed_accum = 0.0
+        self._elapsed_ticked_at = None
+        # 一時停止中に Copilot が動き出したとき、再開するか尋ねる窓。
+        self._resume_prompt = None
+        self._resume_declined = False
 
         self._pill = StatusPill(on_toggle_pause=self.toggle_pause,
-                                on_quit=self.quit_by_user)
+                                on_quit=self.quit_by_user,
+                                on_toggle_pin=self.toggle_pin,
+                                on_moved=self._on_pill_moved)
         self._flash = FlashFrame()
 
         self._poll_timer = QTimer()
@@ -404,8 +673,11 @@ class StatusWatcher:
         進んでいることがあり、古い記憶から続けると経過秒が嘘になるため。"""
         try:
             self._paused = not self._paused
+            self._close_prompt()
             if self._paused:
-                self._flash.stop()
+                # 止めている間は光らせない。再開したときにまだ待っていれば、
+                # そのとき改めて光ってよいので reset で印も消す。
+                self._flash.reset()
             else:
                 self._state = None
                 self._state_since = None
@@ -413,6 +685,80 @@ class StatusWatcher:
                 self._on_poll()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
             print(f"[copilot-status] 一時停止の切り替えに失敗: {e}")
+
+    def _check_resume_while_paused(self):
+        """一時停止中に Copilot が応答中になったら、再開するか一度だけ尋ねる。
+
+        止めている間も UIA を1回だけ触ることになるが、状態を見るだけで
+        (status_snapshot ではなく state)、走査は軽い。ここを見ないと、
+        止めたまま忘れて放置する事故が起きる——それを防ぐのが元々この機能の目的。
+
+        断られたら二度と聞かない(_resume_declined)。しつこいと邪魔なだけで、
+        手番が変わればフラグは消える。"""
+        if self._resume_declined or self._resume_prompt is not None:
+            return
+        cp = self._copilot
+        if cp is None:
+            return
+        try:
+            if cp.state() != "busy":
+                return
+        except Exception:  # noqa: BLE001  読めないだけなら次の周期で
+            return
+        self._resume_prompt = ResumePrompt(on_yes=self._resume_yes,
+                                           on_no=self._resume_no)
+        self._resume_prompt.show_above(self._pill.geometry())
+
+    def _close_prompt(self):
+        prompt, self._resume_prompt = self._resume_prompt, None
+        if prompt is not None:
+            try:
+                prompt.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _resume_yes(self):
+        try:
+            self._close_prompt()
+            if self._paused:
+                self.toggle_pause()
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-status] 再開に失敗: {e}")
+
+    def _resume_no(self):
+        try:
+            self._close_prompt()
+            # 同じ待ちについては、もう聞かない。手番が変われば聞き直す。
+            self._resume_declined = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-status] 応答の処理に失敗: {e}")
+
+    def toggle_pin(self):
+        """札のピン留めを入切する。
+
+        留めるのは**この札だけ**で、Copilot の窓には一切手を出さない。前面化や
+        最小化の復元はフォーカスを奪う恐れがあり、tray-tools では禁じている
+        (打ちかけの文章が別の窓へ飛ぶ事故を過去に踏んだ)。相手を引き出す代わりに、
+        こちらが残る。"""
+        try:
+            self._pinned = not self._pinned
+            self._pill.set_pinned(self._pinned)
+            if not self._pinned:
+                # 留めるのをやめた。Copilot が見えないなら素直に引っ込む。
+                self._on_follow()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
+            print(f"[copilot-status] ピン留めの切り替えに失敗: {e}")
+
+    def _on_pill_moved(self, pos):
+        """Ctrl+ドラッグで置かれた場所を覚える。以後そこに置き続ける。
+
+        覚えないと、次の追従(150ms後)で自動配置に引き戻されて動かせない。"""
+        self._manual_pos = pos
+        self._last_pos = pos
+
+    def reset_position(self):
+        """手で動かした位置を忘れて、自動配置に戻す。"""
+        self._manual_pos = None
 
     def quit_by_user(self):
         """札の右クリックから「終了」を選ばれたときの出口。
@@ -445,6 +791,10 @@ class StatusWatcher:
 
     def _poll(self):
         if self._paused:
+            # 止めている間も、Copilot が動き出したかどうかだけは見る。
+            # 一時停止は「いまは邪魔しないで」であって「もう知らない」ではない。
+            # 相手が喋り始めたなら、見張りに戻すか一度だけ尋ねる。
+            self._check_resume_while_paused()
             # 掴んだ窓が無効になっていたら捨てるだけ。ここで掴み直すと UIA を
             # 触ることになるので、再開するまで何もしない。
             cp = self._copilot
@@ -462,6 +812,12 @@ class StatusWatcher:
         if state != self._state:
             self._state = state
             self._state_since = time.time()
+            # 手番が変わったら経過秒は数え直す。積み上げ方式なので、
+            # ここで戻さないと前の待ちの秒数を引き継いでしまう。
+            self._elapsed_accum = 0.0
+            self._elapsed_ticked_at = None
+            # 前の待ちで断った「再開しますか」も、状況が変わったので忘れる。
+            self._resume_declined = False
 
         window = _to_logical(snapshot.get("window_rect"))
         inp = _to_logical(snapshot.get("input_rect"))
@@ -479,18 +835,23 @@ class StatusWatcher:
             print(f"[copilot-status] 追従に失敗: {e}")
 
     def _follow(self):
-        if self._state is None and not self._paused:
+        if self._state is None and not self._paused and not self._pinned:
             self._hide_all()
             return
         cp = self._copilot
         rect = _to_logical(
             copilot_loop.window_bounds(cp.hwnd_main) if cp else None)
         if rect is None:
-            # 最小化・窓が消えた。次の poll で掴み直す。
-            self._hide_all()
+            # 最小化・窓が消えた。ピン留めしてあるなら、最後に居た場所へ札だけ
+            # 残す(Copilot を前面に引き出したりはしない。触るのは自分の窓だけ)。
+            if not self._pinned or self._last_pos is None:
+                self._hide_all()
+                return
+            self._flash.reset()   # 相手が見えないのに窓を光らせても意味が無い
+            self._show_pill_at(self._last_pos)
             return
 
-        elapsed = time.time() - (self._state_since or time.time())
+        elapsed = self._advance_elapsed()
         alert = (not self._paused
                  and self._state in ALERTABLE_STATES
                  and elapsed >= self._threshold)
@@ -499,15 +860,50 @@ class StatusWatcher:
         # 「一時停止中」になるので、状態のキーは何でもよい。
         self._pill.apply_state(self._state or "waiting_user", elapsed,
                                alert=alert, paused=self._paused)
-        self._pill.place(rect, self._right_inset)
-        if not self._pill.isVisible():
-            self._pill.show()
-            self._pill.raise_()
+        # 手で動かされていたら、その場所を尊重する。自動配置に戻すと、直した
+        # そばから元へ引き戻されて動かせなくなる。
+        if self._manual_pos is not None:
+            self._show_pill_at(self._manual_pos)
+        else:
+            self._pill.place(rect, self._right_inset)
+            self._show_pill_at(None)
+        self._last_pos = self._pill.pos()
 
         if alert:
             self._flash.start(rect)
         else:
-            self._flash.stop()
+            # 待ちが解けた。次の待ちでまた光れるように印を消す。
+            self._flash.reset()
+
+    def _show_pill_at(self, pos):
+        """札を出す。pos を渡せばそこへ置く。既に出ていれば raise しない。"""
+        if pos is not None:
+            self._pill.move(pos)
+        if not self._pill.isVisible():
+            self._pill.show()
+            self._pill.raise_()
+
+    def _advance_elapsed(self):
+        """待ちの経過秒を進めて返す。**操作中は進めない。**
+
+        壁時計の差(now - 開始時刻)をやめたのは、陽太さんが目の前で作業している
+        間まで数えてしまうため。キーやマウスを触っている人は画面を見ているので、
+        点滅で急かす相手ではない。数えるのは「触っていない時間」だけにする。
+
+        追従のタイマー(150ms)ごとに呼ばれるので、その刻みで積み上げる。"""
+        now = time.time()
+        last = self._elapsed_ticked_at
+        self._elapsed_ticked_at = now
+        if self._state_since is None:
+            return self._elapsed_accum
+        if last is None:
+            return self._elapsed_accum
+        idle = seconds_since_input()
+        if idle is not None and idle < INPUT_ACTIVE_SECONDS:
+            # 操作中。時間は進めるが、待ちとしては数えない。
+            return self._elapsed_accum
+        self._elapsed_accum += now - last
+        return self._elapsed_accum
 
     # -- 判定 ------------------------------------------------------------
     def _classify(self, snapshot):
@@ -563,7 +959,8 @@ class StatusWatcher:
 
     def _hide_all(self):
         try:
-            self._flash.stop()
+            self._close_prompt()
+            self._flash.reset()
             self._pill.hide()
         except Exception:  # noqa: BLE001
             pass

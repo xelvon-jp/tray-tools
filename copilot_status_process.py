@@ -63,7 +63,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from PySide6.QtCore import Qt, QPointF, QRect, QRectF, QTimer  # noqa: E402
+from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QTimer  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
     QColor, QFont, QGuiApplication, QPainter, QPen, QPolygonF,
 )
@@ -76,8 +76,6 @@ import copilot_loop  # noqa: E402
 POLL_INTERVAL_SECONDS = 1.5
 # 窓を追う間隔(ms)。GetWindowRect だけなので短くてよい。
 FOLLOW_INTERVAL_MS = 150
-
-DEFAULT_THRESHOLD_SECONDS = 30
 
 PILL_WIDTH = 290
 PILL_HEIGHT = 40
@@ -98,6 +96,37 @@ STATE_STYLES = {
 }
 ALERT_EMOJI = "🔔"
 ALERT_COLOR = QColor(211, 32, 32)
+
+# 閾値を超えたときだけ差し替える文言。
+#
+# 【なぜ入力中だけ差し替えるか】
+# 他の状態は「応答待ち」「応答済」のまま赤くなれば意味が通る。だが入力中は
+# 「ユーザ入力中」と出したまま赤くしても、打っていない人に「入力中」と言うことに
+# なって噛み合わない。伝えたいのは「書いたまま送っていない」なので、そう書く。
+ALERT_LABELS = {"typing": "送信していません"}
+
+# 状態ごとの閾値(秒)。ここを超えて待ちが続いたら点滅させる。
+#
+# 【なぜ状態ごとに分けるか】
+# 同じ30秒でも意味が違う。応答待ちの30秒は「Copilot が遅い/詰まった」(普段は
+# 5〜30秒で返る)。応答済の30秒は「こちらが余所見している」で、こちらはもう少し
+# 待ってよい。打ちかけの放置はその中間。1つの数字を共有すると、片方に合わせた
+# 途端にもう片方がうるさくなるか鈍くなる。
+#
+# 応答中(responding)は入れない。Copilot が喋っている間は誰も待たされていない。
+DEFAULT_THRESHOLDS = {
+    "typing": 60,        # 書いたまま送っていない
+    "waiting_ai": 30,    # Copilot が返してこない
+    "waiting_user": 120,  # 返ってきたのに読んでいない
+}
+
+# 手で動かした位置とピン留めを覚えておくファイル。
+#
+# 【なぜ settings.json に書かないか】
+# この子プロセスは「設定は読むだけ、書くのは常駐側」という約束で動いている
+# (両方から書くと取り合いになる)。位置とピン留めはこの窓だけの都合なので、
+# 自分の持ち物として別ファイルに持つ。
+STATE_FILE = os.path.join(_HERE, "copilot_status_state.json")
 
 # 一時停止中の見た目。状態の色(橙/赤/青/緑)のどれとも違う灰色にして、
 # 「いま見張っていない」ことが色だけで分かるようにする。
@@ -132,7 +161,6 @@ PROMPT_BUTTON_H = 26
 # 動かしてしまう事故を避けるため(札は入力欄のすぐ近くに置いてある)。
 DRAG_MODIFIER = Qt.ControlModifier
 
-ALERTABLE_STATES = ("waiting_ai", "waiting_user")
 
 
 def _to_logical(bounds):
@@ -140,6 +168,86 @@ def _to_logical(bounds):
     if bounds is None:
         return None
     return capture_grab.device_bounds_to_logical(bounds)
+
+
+def load_thresholds(app_settings):
+    """状態ごとの閾値を決める。
+
+    優先順:
+      1. settings.json の copilot_watchdog.thresholds（状態名 → 秒）
+      2. 旧 copilot_watchdog.threshold_seconds（1つしか無かった頃の設定）
+      3. 組み込みの既定値
+
+    2 を残してあるのは、状態ごとに分ける前の設定を書いていた場合に、黙って
+    挙動が変わらないようにするため。その値は「待たされている側」の2つに当てる
+    (打ちかけの放置は当時そもそも見ていなかったので、既定値のままにする)。"""
+    values = dict(DEFAULT_THRESHOLDS)
+    section = (app_settings or {}).get("copilot_watchdog")
+    if not isinstance(section, dict):
+        return values
+
+    per_state = section.get("thresholds")
+    if isinstance(per_state, dict):
+        for state in values:
+            try:
+                if per_state.get(state) is not None:
+                    values[state] = max(5, int(per_state[state]))
+            except (TypeError, ValueError):
+                continue
+        return values
+
+    legacy = section.get("threshold_seconds")
+    if legacy is not None:
+        try:
+            seconds = max(5, int(legacy))
+            values["waiting_ai"] = seconds
+            values["waiting_user"] = seconds
+        except (TypeError, ValueError):
+            pass
+    return values
+
+
+def load_state():
+    """覚えておいた位置とピン留めを読む。読めなければ空の辞書。
+
+    壊れていても落ちないこと。ここで転ぶと札が一切出なくなる。"""
+    try:
+        import json
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(manual_pos, pinned):
+    """位置とピン留めを覚える。書けなくても黙って諦める。
+
+    覚えられないのは不便なだけで、動作は続けられる。ここで例外を投げると、
+    札を動かした瞬間にプロセスが落ちることになる。"""
+    try:
+        import json
+        data = {"pinned": bool(pinned)}
+        if manual_pos is not None:
+            data["manual_pos"] = [int(manual_pos.x()), int(manual_pos.y())]
+        with open(STATE_FILE, "w", encoding="utf-8", newline="") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _on_screen(point):
+    """その位置に札を置いても画面内に見えるか。
+
+    モニタ構成が変わると、覚えた位置が画面外になることがある。そのまま置くと
+    札が見えないまま「出ているつもり」になるので、外れていたら忘れる。"""
+    if point is None:
+        return False
+    for screen in QGuiApplication.screens():
+        if screen.geometry().intersects(
+                QRect(point.x(), point.y(), PILL_WIDTH, PILL_HEIGHT)):
+            return True
+    return False
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -189,7 +297,7 @@ class StatusPill(QWidget):
     tray-tools が SetForegroundWindow を禁じているのと同じ考え方。"""
 
     def __init__(self, on_toggle_pause=None, on_quit=None,
-                 on_toggle_pin=None, on_moved=None):
+                 on_toggle_pin=None, on_moved=None, on_reset_position=None):
         super().__init__()
         self.setWindowTitle("Copilot ステータス")
         self.setWindowFlags(
@@ -209,6 +317,7 @@ class StatusPill(QWidget):
         self._on_quit = on_quit
         self._on_toggle_pin = on_toggle_pin
         self._on_moved = on_moved
+        self._on_reset_position = on_reset_position
         self._emoji = ""
         self._label = ""
         self._elapsed = ""
@@ -267,8 +376,10 @@ class StatusPill(QWidget):
         else:
             emoji, label, color, wants_elapsed = STATE_STYLES[state_key]
             if alert:
-                # 文言は状態のものを残す。何を待っているのか分からなくなるため。
+                # 文言は基本そのまま残す。何を待っているのか分からなくなるため。
+                # ただし入力中だけは差し替える(ALERT_LABELS の理由を参照)。
                 emoji, color, wants_elapsed = ALERT_EMOJI, ALERT_COLOR, True
+                label = ALERT_LABELS.get(state_key, label)
         elapsed_text = (
             f"{int(elapsed_seconds)}秒"
             if wants_elapsed and elapsed_seconds is not None else ""
@@ -331,11 +442,16 @@ class StatusPill(QWidget):
         戻らないと出し直せないため。誤クリック1回で消えるのは代償が大きい。"""
         menu = QMenu(self)
         pause = menu.addAction("▶ 監視を再開" if self._paused else "⏸ 監視を一時停止")
+        # 覚えた位置が邪魔になったときの逃げ道。これが無いと、一度動かした札を
+        # 自動配置へ戻す手段が無くなる(位置を覚えるようにしたので、なおさら要る)。
+        reset = menu.addAction("↺ 位置を自動に戻す")
         menu.addSeparator()
         quit_action = menu.addAction("⏹ 状態監視バーを終了")
         chosen = menu.exec(event.globalPos())
         if chosen is pause and self._on_toggle_pause is not None:
             self._on_toggle_pause()
+        elif chosen is reset and self._on_reset_position is not None:
+            self._on_reset_position()
         elif chosen is quit_action and self._on_quit is not None:
             self._on_quit()
 
@@ -631,9 +747,10 @@ class ResumePrompt(QWidget):
 class StatusWatcher:
     """Copilot を見張って、札と点滅を出し入れする本体。"""
 
-    def __init__(self, threshold_seconds, app_settings=None):
-        self._threshold = threshold_seconds
+    def __init__(self, app_settings=None):
         self._app_settings = app_settings
+        # 状態ごとの閾値。ここに無い状態(応答中)はそもそも点滅させない。
+        self._thresholds = load_thresholds(app_settings)
 
         self._state = None
         self._state_since = None
@@ -645,10 +762,21 @@ class StatusWatcher:
         # 一時停止は、そのとき限りの操作。設定に保存しない(次に開いたら見張っている
         # のが当たり前で、黙って止まったままのほうが事故になる)。
         self._paused = False
-        # ピン留め。Copilot が引っ込んでも札を出したままにする。
-        self._pinned = False
-        # Ctrl+ドラッグで置かれた場所。None なら自動配置。
+        # 前回の位置とピン留めを引き継ぐ。せっかく動かしたのに、切って入れ直す
+        # たびに自動配置へ戻るのでは、動かせる意味が薄い。
+        saved = load_state()
+        self._pinned = bool(saved.get("pinned"))
         self._manual_pos = None
+        pos = saved.get("manual_pos")
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            try:
+                candidate = QPoint(int(pos[0]), int(pos[1]))
+            except (TypeError, ValueError):
+                candidate = None
+            # モニタ構成が変わって画面外になっていたら忘れる。そのまま置くと
+            # 「出ているのに見えない」状態になり、原因が分からなくなる。
+            if _on_screen(candidate):
+                self._manual_pos = candidate
         # 最後に札が居た場所。Copilot が最小化されたときの置き場所に使う。
         self._last_pos = None
         # 待ちの経過秒。操作していない時間だけを積み上げる(_advance_elapsed)。
@@ -661,8 +789,10 @@ class StatusWatcher:
         self._pill = StatusPill(on_toggle_pause=self.toggle_pause,
                                 on_quit=self.quit_by_user,
                                 on_toggle_pin=self.toggle_pin,
-                                on_moved=self._on_pill_moved)
+                                on_moved=self._on_pill_moved,
+                                on_reset_position=self.reset_position)
         self._flash = FlashFrame()
+        self._pill.set_pinned(self._pinned)
 
         self._poll_timer = QTimer()
         self._poll_timer.setInterval(int(POLL_INTERVAL_SECONDS * 1000))
@@ -750,6 +880,7 @@ class StatusWatcher:
         try:
             self._pinned = not self._pinned
             self._pill.set_pinned(self._pinned)
+            save_state(self._manual_pos, self._pinned)
             if not self._pinned:
                 # 留めるのをやめた。Copilot が見えないなら素直に引っ込む。
                 self._on_follow()
@@ -759,13 +890,18 @@ class StatusWatcher:
     def _on_pill_moved(self, pos):
         """Ctrl+ドラッグで置かれた場所を覚える。以後そこに置き続ける。
 
-        覚えないと、次の追従(150ms後)で自動配置に引き戻されて動かせない。"""
+        覚えないと、次の追従(150ms後)で自動配置に引き戻されて動かせない。
+        ファイルにも残すので、切って入れ直しても同じ場所に出る。"""
         self._manual_pos = pos
         self._last_pos = pos
+        save_state(self._manual_pos, self._pinned)
 
     def reset_position(self):
-        """手で動かした位置を忘れて、自動配置に戻す。"""
+        """手で動かした位置を忘れて、自動配置に戻す。
+
+        覚えた位置が邪魔になったときの逃げ道。右クリックから呼べる。"""
         self._manual_pos = None
+        save_state(None, self._pinned)
 
     def quit_by_user(self):
         """札の右クリックから「終了」を選ばれたときの出口。
@@ -860,9 +996,7 @@ class StatusWatcher:
             return
 
         elapsed = self._advance_elapsed()
-        alert = (not self._paused
-                 and self._state in ALERTABLE_STATES
-                 and elapsed >= self._threshold)
+        alert = not self._paused and elapsed >= self._alert_after()
 
         # 停止中は state が None のこともある(掴み直す前など)。札は灰色の
         # 「一時停止中」になるので、状態のキーは何でもよい。
@@ -891,6 +1025,13 @@ class StatusWatcher:
         else:
             # 待ちが解けた。次の待ちでまた光れるように印を消す。
             self._flash.reset()
+
+    def _alert_after(self):
+        """いまの状態で、何秒待ったら点滅させるか。点滅させない状態なら無限大。
+
+        応答中(responding)と、まだ手番が決まっていないときは対象外。
+        誰も待たされていない場面で光らせても、意味が無いどころか慣れて効かなくなる。"""
+        return self._thresholds.get(self._state, float("inf"))
 
     def _show_pill_at(self, pos):
         """札を出す。pos を渡せばそこへ置く。既に出ていれば raise しない。"""
@@ -1043,8 +1184,9 @@ def sweep_other_instances():
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Copilot の手番を常時表示する（常駐とは別プロセス）")
-    parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD_SECONDS,
-                        help="この秒数を超えて待ちが続いたら窓を点滅させる")
+    # 閾値は状態ごとに分かれたので、コマンドラインでは受けない。settings.json の
+    # copilot_watchdog.thresholds を唯一の出どころにする(渡し口が2つあると、
+    # どちらが効いているのか追えなくなる)。
     parser.add_argument("--parent-pid", type=int, default=0,
                         help="この pid が消えたら自分も終わる（常駐が指定する）")
     args = parser.parse_args(argv)
@@ -1070,7 +1212,7 @@ def main(argv=None):
     except Exception:  # noqa: BLE001
         pass
 
-    watcher = StatusWatcher(max(5, args.threshold), app_settings)
+    watcher = StatusWatcher(app_settings)
     watcher.start()
 
     # 常駐が消えたら自分も終わる。

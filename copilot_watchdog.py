@@ -34,6 +34,8 @@
 # --------------
 #   - トレイメニューのチェック状態
 #   - 子プロセスの起動と停止(常駐が終わるときは道連れにする)
+#   ※ 閾値も位置もこちらは持たない。子が settings.json と自分の状態ファイルから
+#     直接読む(渡し口を2つ持つと、どちらが効いているのか追えなくなる)。
 #   - agent-loop が動いている間は止めておく
 #   - 子が自分から終わったら(札の右クリック)、メニューのチェックを外す
 import os
@@ -41,13 +43,6 @@ import subprocess
 import sys
 
 from PySide6.QtCore import QTimer
-
-import settings as settings_module
-
-SETTINGS_SECTION = "copilot_watchdog"
-SETTINGS_THRESHOLD = "threshold_seconds"
-
-DEFAULT_THRESHOLD_SECONDS = 30
 
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "copilot_status_process.py")
@@ -86,9 +81,7 @@ class CopilotWatchdog:
         # **起動時は必ず OFF。** 前回 ON のまま終わっても、次に立ち上げたときに
         # 勝手に札が出ないようにする。常駐の起動は「PC を使い始めるとき」なので、
         # そこで前回の続きを再開されても困ることのほうが多い。
-        # 閾値だけは設定から読む(こちらは好みの値で、毎回入れ直したくない)。
         self._enabled = False
-        self._threshold = self._load_int(SETTINGS_THRESHOLD, DEFAULT_THRESHOLD_SECONDS)
         self._proc = None
 
         # agent-loop の出入りに合わせて子を止める/起こす。ついでに、子が落ちて
@@ -109,18 +102,6 @@ class CopilotWatchdog:
 
     def is_enabled(self) -> bool:
         return self._enabled
-
-    def threshold_seconds(self) -> int:
-        return self._threshold
-
-    def set_threshold(self, seconds: int) -> None:
-        seconds = max(5, int(seconds))
-        self._threshold = seconds
-        self._save_int(SETTINGS_THRESHOLD, seconds)
-        if self._enabled:
-            # 子は起動時に閾値を受け取るので、入れ替えるには起こし直す。
-            self._stop_child()
-            self._start_child()
 
     def close(self) -> None:
         """常駐終了時に呼ぶ。子を道連れにする。
@@ -143,8 +124,9 @@ class CopilotWatchdog:
             return
         if self._is_agent_loop_running():
             return
+        # 閾値は子が settings.json から直接読む。渡し口を2つ持つと、どちらが
+        # 効いているのか追えなくなる。
         argv = [_pythonw(), SCRIPT_PATH,
-                "--threshold", str(self._threshold),
                 # 常駐が落ちても札が残らないよう、子に見張らせる。
                 "--parent-pid", str(os.getpid())]
         try:
@@ -210,39 +192,3 @@ class CopilotWatchdog:
             self._start_child()
         except Exception as e:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
             print(f"[copilot-status] 面倒見に失敗: {e}", file=sys.stderr)
-
-    # -- 設定の永続化(snippets.push_recent と同じ流儀) ------------------
-    # 保存するのは閾値だけ。入切は保存しない(起動時は必ず OFF)。
-    def _load_int(self, key: str, default: int) -> int:
-        section = (self._app_settings or {}).get(SETTINGS_SECTION)
-        if not isinstance(section, dict):
-            return default
-        try:
-            return int(section.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    def _save_int(self, key: str, value: int) -> None:
-        value = int(value)
-        if isinstance(self._app_settings, dict):
-            section = self._app_settings.get(SETTINGS_SECTION)
-            if not isinstance(section, dict):
-                section = self._app_settings[SETTINGS_SECTION] = {}
-            section[key] = value
-        if not self._settings_path:
-            return
-        import json
-        try:
-            stored = {}
-            if os.path.exists(self._settings_path):
-                with open(self._settings_path, "r", encoding="utf-8") as f:
-                    stored = json.load(f)
-            if not isinstance(stored, dict):
-                stored = {}
-            section = stored.get(SETTINGS_SECTION)
-            if not isinstance(section, dict):
-                section = stored[SETTINGS_SECTION] = {}
-            section[key] = value
-            settings_module.save_settings(stored, self._settings_path)
-        except OSError as e:
-            print(f"[copilot-status] 設定保存に失敗: {e}", file=sys.stderr)

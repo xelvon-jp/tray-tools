@@ -38,3 +38,6 @@ notes/
 # ログ本体は上の *.log で拾える。
 copilot_loop_scratch/
 .copilot_loop_cancel
+
+# 状態監視バーが覚えている位置とピン留め。PC・モニタ構成ごとの値なので共有しない。
+copilot_status_state.json

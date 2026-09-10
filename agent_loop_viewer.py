@@ -66,8 +66,25 @@ STOP_STYLES = {
     "response-timeout": (COLOR_STOP_WARN, "⚠️ 応答待ちタイムアウト"),
     "loop-timeout": (COLOR_STOP_WARN, "⚠️ ループ全体タイムアウト"),
     "risky-code": (COLOR_STOP_ERR, "🛑 危険パターン検出で停止"),
+    "multi-snippet": (COLOR_STOP_WARN, "⚠️ スニペットが複数あり停止"),
+    "stuck": (COLOR_STOP_WARN, "⚠️ 足踏みを検知して停止"),
+    "no-new-response": (COLOR_STOP_WARN, "⚪ 新しい応答が来なかった"),
     "error": (COLOR_STOP_ERR, "❌ エラーで停止"),
 }
+
+# 「続けてよいか」を聞かれたときの見出しとボタンの文言。場面ごとに言い分ける
+# (どれも同じ文面だと、危険パターンの承認まで惰性で押してしまう)。
+APPROVAL_TITLES = {
+    "risky-code": "🛑 危険パターンを検出しました",
+    "dry-run": "🟢 dry-run で止まりました",
+    "multi-snippet": "⚠️ スニペットが複数あります",
+}
+APPROVAL_RUN_LABELS = {
+    "risky-code": "⚠ 承知のうえで実行して続行",
+    "dry-run": "▶ 実行して続行",
+    "multi-snippet": "▶ 最後の1つを実行して続行",
+}
+COLOR_ASK = "#f0d078"
 
 
 def _clip_head_tail(text, head=1200, tail=800):
@@ -117,8 +134,12 @@ class LogViewer(QWidget):
     _event_signal = Signal(dict)
 
     def __init__(self, app_settings=None, settings_path=None,
-                 on_start=None, on_stop=None):
+                 on_start=None, on_stop=None, on_answer=None):
         super().__init__()
+        # 「続けてよいか」への返事を書き戻す口。押されたら (token, 'run'/'stop') を渡す。
+        # 実体は別プロセスなので、返事はファイル経由で届く(agent_loop.answer_approval)。
+        self._on_answer = on_answer
+        self._pending_token = None
         # ループの開始・停止をここからも押せるようにする連絡口。トレイのメニューまで
         # 戻らずに止められると、様子がおかしいと思った瞬間に手を出せる
         # (この窓は実況を見ている場所なので、気づくのはたいていここ)。
@@ -180,6 +201,32 @@ class LogViewer(QWidget):
         layout.addLayout(button_row)
         self._set_running(False)
 
+        # 「続けてよいか」を聞かれたときだけ出る一行。ふだんは隠しておく。
+        #
+        # 【なぜ常設しないか】
+        # 出しっぱなしにすると、危険パターンの承認ボタンがいつもそこにある状態になる。
+        # 聞かれた瞬間にだけ現れるほうが、押すときに何を許しているのかを意識できる。
+        self.ask_row = QWidget()
+        ask_layout = QHBoxLayout(self.ask_row)
+        ask_layout.setContentsMargins(0, 0, 0, 0)
+        ask_layout.setSpacing(8)
+        self.ask_label = QLabel("")
+        self.ask_label.setFont(QFont("Meiryo", 9))
+        self.ask_label.setObjectName("agentLoopAsk")
+        self.ask_label.setWordWrap(True)
+        ask_layout.addWidget(self.ask_label, 1)
+        self.ask_run_button = QPushButton("▶ 実行して続行")
+        self.ask_run_button.setFont(QFont("Meiryo", 9))
+        self.ask_run_button.setObjectName("agentLoopAskRun")
+        self.ask_run_button.clicked.connect(lambda: self._answer("run"))
+        ask_layout.addWidget(self.ask_run_button, 0)
+        self.ask_stop_button = QPushButton("■ ここで止める")
+        self.ask_stop_button.setFont(QFont("Meiryo", 9))
+        self.ask_stop_button.clicked.connect(lambda: self._answer("stop"))
+        ask_layout.addWidget(self.ask_stop_button, 0)
+        self.ask_row.hide()
+        layout.addWidget(self.ask_row)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -193,6 +240,10 @@ class LogViewer(QWidget):
             "#agentLoopStatus { color: #eee; padding: 4px 8px; "
             "background-color: #262626; border-radius: 4px; }"
             "#agentLoopTopCheck { color: #ccc; padding: 4px 8px; }"
+            # 聞かれている一行は、ログの黒地から浮かせて見落とさないようにする。
+            "#agentLoopAsk { color: #f0d078; padding: 4px 8px; "
+            "background-color: #3a3320; border-radius: 4px; }"
+            "#agentLoopAskRun { border-color: #8a7a3a; }"
             "QPushButton { background-color: #333; color: #eee;"
             " border: 1px solid #555; border-radius: 4px; padding: 5px 16px; }"
             "QPushButton:hover:enabled { background-color: #444; }"
@@ -315,6 +366,38 @@ class LogViewer(QWidget):
         except Exception as e:  # noqa: BLE001
             self._append(f"[viewer] 停止できませんでした: {e}", COLOR_STOP_ERR)
 
+    # ------- 「続けてよいか」への返事 -------------------------------------
+    def _answer(self, answer: str) -> None:
+        """承認の行のボタン。押されたら返事を書いて、行を引っ込める。
+
+        押した直後に隠すのは、二度押しで別の場面に返事が飛ばないようにするため
+        (合言葉でも弾けるが、押せてしまう見た目のほうが紛らわしい)。"""
+        token, self._pending_token = self._pending_token, None
+        self.ask_row.hide()
+        if token is None:
+            return
+        try:
+            if self._on_answer is not None:
+                self._on_answer(token, answer)
+            self._append("→ " + ("実行して続行を選びました" if answer == "run"
+                                 else "ここで止めるを選びました"), COLOR_ASK)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
+            self._append(f"[viewer] 返事を送れませんでした: {e}", COLOR_STOP_ERR)
+
+    def _show_approval(self, payload: dict) -> None:
+        kind = payload.get("kind") or ""
+        self._pending_token = payload.get("token")
+        title = APPROVAL_TITLES.get(kind, "続けてよいか確認しています")
+        summary = payload.get("summary") or ""
+        timeout = payload.get("timeout") or 0
+        self.ask_label.setText(
+            f"{title}  {summary}（{int(timeout)} 秒返事が無ければ止まります）")
+        self.ask_run_button.setText(APPROVAL_RUN_LABELS.get(kind, "▶ 実行して続行"))
+        self.ask_row.show()
+        self.status.setText(f"{title}  返事待ち")
+        self._append_block(f"？ {title} — {summary}", COLOR_ASK,
+                           payload.get("detail") or "", COLOR_INFO)
+
     # ------- 内部 -----------------------------------------------------
     def _append(self, text: str, color: str = COLOR_INFO) -> None:
         """1行を色付きで追記して末尾へスクロール。"""
@@ -389,7 +472,10 @@ class LogViewer(QWidget):
             self.status.setText(f"round {r} スニペット抽出 #{sid}")
             code = payload.get("code") or ""
             risks = payload.get("risks", 0)
+            siblings = payload.get("siblings") or 1
             header = f"抽出 #{sid} ({payload.get('chars')} 文字、危険 {risks} 件)"
+            if siblings > 1:
+                header += f" ※この応答にスニペットが {siblings} 個あります"
             self._append_block(header, COLOR_CODE, code, COLOR_CODE)
         elif event == "run":
             r = payload.get("round")
@@ -410,10 +496,25 @@ class LogViewer(QWidget):
             if stderr.strip():
                 self._append_block("=== STDERR ===", COLOR_STDERR, stderr, COLOR_STDERR)
         elif event == "dry_run":
-            self.status.setText("dry-run で停止（コードは実行しませんでした）")
-            self._append(f"dry-run 停止: #{payload.get('id')} は実行せず、"
-                         "コードをログに残しました",
+            self.status.setText("dry-run（実行前）")
+            self._append(f"dry-run: #{payload.get('id')} は自動では実行しません",
                          COLOR_STOP_OK)
+        elif event == "approval_request":
+            self._show_approval(payload)
+        elif event == "approval_result":
+            # 押されたときは _answer で既に消してある。時間切れや停止要求で
+            # 向こうから終わった場合に、聞かれっぱなしの行を残さないための後始末。
+            self._pending_token = None
+            self.ask_row.hide()
+            if payload.get("reason"):
+                self._append(f"（{payload.get('reason')}）", COLOR_ASK)
+        elif event == "approval_override":
+            kind = payload.get("kind")
+            if kind == "risky-code":
+                self._append(f"⚠ 承認により #{payload.get('id')} を実行します"
+                             f"（危険 {payload.get('risks')} 件）", COLOR_STOP_ERR)
+            else:
+                self._append(f"承認により #{payload.get('id')} を実行します", COLOR_ASK)
         elif event == "round_end":
             reason = payload.get("reason")
             if reason:
@@ -423,6 +524,9 @@ class LogViewer(QWidget):
             # 普通の完了(reason なし)はうるさいので何も出さない
         elif event == "loop_end":
             self._set_running(False)
+            # 聞かれたまま終わった場合に、押せないボタンを残さない。
+            self._pending_token = None
+            self.ask_row.hide()
             reason = payload.get("reason") or ""
             color, label = STOP_STYLES.get(reason, (COLOR_INFO, f"停止: {reason}"))
             detail = payload.get("detail") or ""

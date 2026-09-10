@@ -55,6 +55,20 @@ RESPAWN_CHECK_MS = 5000
 # 常駐が親切に起こし直してしまわないよう、事故で落ちた場合と区別する。
 EXIT_BY_USER = 0
 
+# エージェントループの周回数を状態監視バーに知らせるファイル。
+#
+# 【なぜここに置くか】
+# 書くのは常駐(feature_screen)、読むのは札の子プロセス(copilot_status_process)。
+# 常駐から copilot_status_process を import すると UIA(comtypes)が常駐に入り込み、
+# pycaw と衝突して 0xC0000005 で即死する(このファイルの冒頭の実測値)。だから
+# 双方が安全に import できるこの監督役に、場所の取り決めだけを置く。
+#
+# 【なぜファイルか】
+# 札とループはどちらも常駐の子で、互いに直接の連絡口を持たない。札は150msごとに
+# 追従処理を回しているので、そこで1つファイルを見るのがいちばん安い。
+LOOP_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "copilot_loop_status.json")
+
 
 def _pythonw():
     """コンソール窓を出さないインタプリタ。capture_process と同じ流儀。"""

@@ -41,3 +41,9 @@ copilot_loop_scratch/
 
 # 状態監視バーが覚えている位置とピン留め。PC・モニタ構成ごとの値なので共有しない。
 copilot_status_state.json
+
+# エージェントループの周回数を状態監視バーへ知らせるファイル。実行中だけ存在する。
+copilot_loop_status.json
+
+# 「続けてよいか」への返事を子プロセスへ渡すファイル。聞いている間だけ存在する。
+.copilot_loop_decision

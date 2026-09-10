@@ -8,6 +8,7 @@
 # 占有し、単発の動作はメニュー項目で足りるという方針。マウスジグラーも状態を持つが、
 # 16px相当のアイコンに2つ目の目印は入らないので、こちらはツールチップとメニューの
 # 見出し(残り時間)だけで示す。
+import json
 import math
 import os
 import sys
@@ -277,6 +278,10 @@ class ScreenFeature:
         # 監視モードの子プロセス。常駐の中で回すと UIA と pycaw の同居で落ちるので
         # 別プロセスにしてある(start_agent_loop_watch のコメント参照)。
         self._agent_loop_proc = None
+        # いま何周目か。状態監視バーへ知らせるために覚えておく(周回数はイベントの
+        # round_start にしか載っていないので、実行中のイベントからは拾えない)。
+        self._agent_loop_round = 0
+        self._agent_loop_max_rounds = 0
         self._agent_loop_ring_icon = None   # 通常監視のリング
         self._agent_loop_busy_icon = None   # 応答/実行中のリング(色違い)
         self._agent_loop_err_icon = None    # 危険停止・エラーのリング(色違い)
@@ -1652,8 +1657,72 @@ class ScreenFeature:
             if new_state is not None:
                 self._agent_loop_state = new_state
                 self._refresh_state()
+            self._publish_agent_loop_status(payload)
+            self._announce_agent_loop(payload)
         except Exception as e:  # noqa: BLE001
             print(f"[agent-loop] 状態反映に失敗: {e}", file=sys.stderr)
+
+    # -- ループの様子を「離れていても分かる」ようにする ----------------
+    def _publish_agent_loop_status(self, payload: dict) -> None:
+        """いま何周目かを、状態監視バーが読めるファイルに書き出す。
+
+        バーは Copilot の状態しか知らないので、ループが回している間も
+        「応答待ち」としか出ない。生きているのか固まったのかが遠目に分からない。
+        周回数が出ていれば、進んでいることが一目で分かる。
+
+        書けなくても作業には影響しないので、失敗は黙って諦める(バーの表示が
+        今までどおりになるだけ)。"""
+        import copilot_watchdog as cw
+        event = payload.get("event", "")
+        try:
+            if event == "loop_end":
+                # 終わったら消す。残すと、次に札が出たときに古い周回数が出る。
+                try:
+                    os.remove(cw.LOOP_STATUS_FILE)
+                except FileNotFoundError:
+                    pass
+                return
+            if event == "round_start":
+                self._agent_loop_round = payload.get("round")
+            elif event == "loop_start":
+                self._agent_loop_round = 0
+                self._agent_loop_max_rounds = payload.get("max_rounds") or 0
+            elif event not in ("response", "snippet", "run", "approval_request"):
+                return
+            labels = {"response": "応答受信", "snippet": "コード抽出",
+                      "run": "実行中", "approval_request": "返事待ち"}
+            with open(cw.LOOP_STATUS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"round": self._agent_loop_round or 0,
+                           "max_rounds": self._agent_loop_max_rounds or 0,
+                           "label": labels.get(event, ""),
+                           "at": time.time()}, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _announce_agent_loop(self, payload: dict) -> None:
+        """人を呼ぶ場面だけ、音と通知を出す。
+
+        出すのは2つだけ。**返事待ち**(誰かが答えないと止まる)と**終了**
+        (席を外している間に終わっていることが多い)。周ごとに鳴らすと、
+        長い題材では鳴りっぱなしになって意味を失う。"""
+        event = payload.get("event", "")
+        try:
+            import beep
+            if event == "approval_request":
+                beep.play("ask")
+                self._notify("エージェントループ",
+                             f"返事待ち: {payload.get('summary') or ''}")
+            elif event == "loop_end":
+                reason = payload.get("reason") or ""
+                bad = reason in ("risky-code", "error", "response-timeout",
+                                 "loop-timeout", "stuck")
+                beep.play("warn" if bad else "done")
+                self._notify(
+                    "エージェントループ 終了",
+                    f"{reason} — {payload.get('rounds')}周 / "
+                    f"{payload.get('elapsed')}秒")
+        except Exception as e:  # noqa: BLE001  知らせられなくても作業は続く
+            print(f"[agent-loop] 通知に失敗: {e}", file=sys.stderr)
 
     def start_agent_loop_watch(self) -> None:
         """トレイメニューから呼ぶ「監視モード開始」。
@@ -1664,7 +1733,6 @@ class ScreenFeature:
         立てる。ログ窓は先に開いておく(loop_start が届く頃には見える)。"""
         # 実行中なら二重起動しない
         import agent_loop as al
-        import agent_loop_viewer as av
         # 既に走っていれば窓を前面に戻して終わり
         # main._agent_loop_state の thread を見に行くのが正式だが、Feature からは
         # 参照が見えないので、こちらの状態フラグで代替する(_agent_loop_state != "idle")。
@@ -1674,15 +1742,7 @@ class ScreenFeature:
                 self._agent_loop_viewer.raise_()
             return
         # ログ窓を先に用意
-        if self._agent_loop_viewer is None:
-            self._agent_loop_viewer = av.LogViewer(
-                self.app_settings, self.settings_path,
-                # 実況を見ている場所から直接止められるようにする。
-                # 様子がおかしいと気づくのはたいていこの窓の前なので、
-                # そこからトレイまで戻らせない。
-                on_start=self.start_agent_loop_watch,
-                on_stop=self.stop_agent_loop,
-            )
+        self._ensure_agent_loop_viewer()
         self._agent_loop_viewer.show()
         self._agent_loop_viewer.raise_()
         self._agent_loop_viewer.append_note(
@@ -1729,6 +1789,13 @@ class ScreenFeature:
         残しても止める手段(トレイのメニュー)が無くなるうえ、Copilot に勝手に
         書き込み続けることになる。付箋と違って生き残らせる理由が無い。"""
         proc, self._agent_loop_proc = self._agent_loop_proc, None
+        # 周回数の置き手紙も消す。残すと、次に札が出たときに終わったループの
+        # 周回数が出る(古すぎれば札の側でも無視するが、待たせる理由が無い)。
+        try:
+            import copilot_watchdog as cw
+            os.remove(cw.LOOP_STATUS_FILE)
+        except OSError:
+            pass
         if proc is None or proc.poll() is not None:
             return
         try:
@@ -1758,9 +1825,11 @@ class ScreenFeature:
         except Exception as e:  # noqa: BLE001
             print(f"[copilot-watchdog] 切替失敗: {e}", file=sys.stderr)
 
-    def _show_agent_loop_log(self) -> None:
-        """トレイメニューから呼ぶ「ログ窓を前面に」。実行中でなくても、
-        直近の実行結果を振り返るために窓は残しておく。"""
+    def _ensure_agent_loop_viewer(self):
+        """ログ窓を1つだけ作って使い回す。
+
+        開始時と「ログ窓を前面に」の2か所から要る。同じ引数を2か所に書いていて、
+        片方だけ直す事故が起きやすかったのでここにまとめた。"""
         if self._agent_loop_viewer is None:
             import agent_loop_viewer as av
             self._agent_loop_viewer = av.LogViewer(
@@ -1770,9 +1839,26 @@ class ScreenFeature:
                 # そこからトレイまで戻らせない。
                 on_start=self.start_agent_loop_watch,
                 on_stop=self.stop_agent_loop,
+                # 「続けてよいか」への返事。実体は別プロセスなので、返事も
+                # ファイル経由で届ける(停止フラグと同じ流儀)。
+                on_answer=self._answer_agent_loop,
             )
-        self._agent_loop_viewer.show()
-        self._agent_loop_viewer.raise_()
+        return self._agent_loop_viewer
+
+    def _answer_agent_loop(self, token: str, answer: str) -> None:
+        """ログ窓の承認ボタンから呼ばれる。子プロセスへ返事を書く。"""
+        try:
+            import agent_loop as al
+            al.answer_approval(token, answer)
+        except Exception as e:  # noqa: BLE001  返事を送れなくてもループは時間切れで止まる
+            print(f"[agent-loop] 返事の送信に失敗: {e}", file=sys.stderr)
+
+    def _show_agent_loop_log(self) -> None:
+        """トレイメニューから呼ぶ「ログ窓を前面に」。実行中でなくても、
+        直近の実行結果を振り返るために窓は残しておく。"""
+        viewer = self._ensure_agent_loop_viewer()
+        viewer.show()
+        viewer.raise_()
 
     def _refresh_agent_loop_menu(self) -> None:
         """メニューの見出しと、開始/停止項目の押せる押せないを更新する。

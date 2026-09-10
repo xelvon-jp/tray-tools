@@ -128,6 +128,31 @@ DEFAULT_THRESHOLDS = {
 # 自分の持ち物として別ファイルに持つ。
 STATE_FILE = os.path.join(_HERE, "copilot_status_state.json")
 
+# エージェントループがいま何周目かを常駐が書き出すファイル。場所の取り決めそのものは
+# copilot_watchdog に置いてある(あちらは常駐からも安全に import できる)。
+#
+# 【なぜ読むか】
+# ループが回している間、この札は Copilot の状態しか知らないので「応答待ち」としか
+# 出ない。ループが進んでいるのか固まったのかが遠目に分からなかった。
+LOOP_STATUS_FILE = os.path.join(_HERE, "copilot_loop_status.json")
+
+# 周回数を読み直す間隔(秒)。追従は150msごとに走るが、そのたびにファイルを開く必要は
+# 無い。1秒に1回で十分間に合う。
+LOOP_STATUS_POLL_SECONDS = 1.0
+
+# 周回数が更新されないまま この秒数 を過ぎたら、ループはもう居ないとみなす。
+# 常駐が落ちるなどしてファイルが消し忘れられたとき、札に古い周回数が残り続けるのを
+# 防ぐ(消し忘れは起きる前提で作る)。
+#
+# **応答待ちの上限(agent_loop の 180 秒)より長くしておくこと。** 短くすると、
+# Copilot がなかなか返してこないだけの周で印が一度消えて、返ってきたらまた出る、
+# というちらつきになる。回っているのに消えるのが、いちばん困る誤りかた。
+LOOP_STATUS_STALE_SECONDS = 300
+
+# ループが回っている間の絵文字。状態の絵文字と置き換える(札の幅に両方は入らない)。
+# 色は状態のまま残るので、何を待っているのかは色と文言で分かる。
+LOOP_EMOJI = "🤖"
+
 # 一時停止中の見た目。状態の色(橙/赤/青/緑)のどれとも違う灰色にして、
 # 「いま見張っていない」ことが色だけで分かるようにする。
 PAUSED_EMOJI = "⏸"
@@ -234,6 +259,45 @@ def save_state(manual_pos, pinned):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+def load_loop_status():
+    """エージェントループの周回数を読む。回っていなければ None。
+
+    ファイルが無い・壊れている・古すぎる、はどれも「回っていない」として扱う。
+    ここで転ぶと札が一切出なくなるので、絶対に例外を出さないこと。"""
+    try:
+        import json
+        with open(LOOP_STATUS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        at = data.get("at")
+        if not isinstance(at, (int, float)):
+            return None
+        # 消し忘れ対策。書かれた時刻が古ければ、もう回っていないとみなす。
+        if time.time() - at > LOOP_STATUS_STALE_SECONDS:
+            return None
+        return data
+    except (OSError, ValueError):
+        return None
+
+
+def format_loop_badge(status):
+    """周回数を札に出す短い文字列にする。出すものが無ければ空。
+
+    幅が 290px しかないので、「3/10」まで。上限が分からないときは「3周目」。"""
+    if not status:
+        return ""
+    try:
+        rounds = int(status.get("round") or 0)
+        maximum = int(status.get("max_rounds") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if rounds <= 0:
+        # まだ1周目に入っていない(開始した直後)。周回数より「始まった」ことを出す。
+        return "開始"
+    return f"{rounds}/{maximum}" if maximum > 0 else f"{rounds}周目"
 
 
 def _on_screen(point):
@@ -369,7 +433,7 @@ class StatusPill(QWidget):
             self.update()
 
     def apply_state(self, state_key, elapsed_seconds=None, alert=False,
-                    paused=False):
+                    paused=False, loop_badge=""):
         if paused:
             emoji, label, color = PAUSED_EMOJI, PAUSED_LABEL, PAUSED_COLOR
             wants_elapsed = False
@@ -380,6 +444,15 @@ class StatusPill(QWidget):
                 # ただし入力中だけは差し替える(ALERT_LABELS の理由を参照)。
                 emoji, color, wants_elapsed = ALERT_EMOJI, ALERT_COLOR, True
                 label = ALERT_LABELS.get(state_key, label)
+        # エージェントループが回している間は、それが分かる姿にする。
+        #
+        # 絵文字を差し替えるのは、幅 290px に状態の絵文字とループの印を両方は
+        # 入れられないため。色と文言はそのまま残るので、何を待っているのかは
+        # 引き続き読み取れる。ただし点滅中(alert)は差し替えない — そこで伝えたい
+        # のは「待たされすぎている」ことのほうなので、印を上書きさせない。
+        if loop_badge and not paused and not alert:
+            emoji = LOOP_EMOJI
+            label = f"{loop_badge} {label}"
         elapsed_text = (
             f"{int(elapsed_seconds)}秒"
             if wants_elapsed and elapsed_seconds is not None else ""
@@ -782,6 +855,9 @@ class StatusWatcher:
         # 待ちの経過秒。操作していない時間だけを積み上げる(_advance_elapsed)。
         self._elapsed_accum = 0.0
         self._elapsed_ticked_at = None
+        # エージェントループの周回数。毎回ファイルを開かないよう覚えておく。
+        self._loop_badge_text = ""
+        self._loop_badge_at = None
         # 一時停止中に Copilot が動き出したとき、再開するか尋ねる窓。
         self._resume_prompt = None
         self._resume_declined = False
@@ -1001,7 +1077,8 @@ class StatusWatcher:
         # 停止中は state が None のこともある(掴み直す前など)。札は灰色の
         # 「一時停止中」になるので、状態のキーは何でもよい。
         self._pill.apply_state(self._state or "waiting_user", elapsed,
-                               alert=alert, paused=self._paused)
+                               alert=alert, paused=self._paused,
+                               loop_badge=self._loop_badge())
         # 掴まれている間は位置に触らない。
         #
         # 【ここを見落として引き戻していた】
@@ -1025,6 +1102,18 @@ class StatusWatcher:
         else:
             # 待ちが解けた。次の待ちでまた光れるように印を消す。
             self._flash.reset()
+
+    def _loop_badge(self):
+        """エージェントループの周回数。回っていなければ空。
+
+        追従は150msごとに走るので、そのたびにファイルを開かないよう間隔を空けて
+        読み、間は前回の値を使い回す。"""
+        now = time.time()
+        if (self._loop_badge_at is None
+                or now - self._loop_badge_at >= LOOP_STATUS_POLL_SECONDS):
+            self._loop_badge_at = now
+            self._loop_badge_text = format_loop_badge(load_loop_status())
+        return self._loop_badge_text
 
     def _alert_after(self):
         """いまの状態で、何秒待ったら点滅させるか。点滅させない状態なら無限大。

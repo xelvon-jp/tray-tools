@@ -12,9 +12,11 @@
 #   ボタンの InvokePattern。フォーカスを奪わないので、陽太さんが裏で作業していても
 #   誤入力事故が起きない(tray-tools の CLAUDE.md の SetForegroundWindow 禁止と
 #   同じ思想)。
-# - **危険パターン(risky_lines)にヒットしたら実行せずに止める。** その旨を
-#   Copilot に返して人の判断を待つ。自動で「別の書き方でお願いします」と繰り返す
-#   ような挙動はしない(Copilot が押し切って危ないコードを別表現で出してくる罠がある)。
+# - **危険パターン(risky_lines)にヒットしたら実行せずに止める。** 人が見て
+#   「承知のうえで実行してよい」と答えたときだけ、その周に限って実行する
+#   (承認は覚えない。次に出てきたらまた聞く)。答えが無ければ止まる。
+#   自動で「別の書き方でお願いします」と繰り返すような挙動はしない
+#   (Copilot が押し切って危ないコードを別表現で出してくる罠がある)。
 # - **タイムアウトは3層。** PowerShell 単発、応答待ち、ループ全体。どれかに引っ掛かれば
 #   止まる。無限ループにならない。
 # - **キャンセルはファイルで受ける。** copilot_loop フォルダ配下の cancel フラグを
@@ -77,6 +79,33 @@ LOG_PATH = _HERE / "copilot_loop.log"
 # キャンセル用のファイル。次の周の頭で見て、あれば止める。
 CANCEL_FLAG = _HERE / ".copilot_loop_cancel"
 
+# 親(常駐)からの返事を受け取るファイル。止めるか続けるかを人に聞く場面で使う。
+#
+# 【なぜファイルか】
+# 進捗は子の標準出力で親へ流しているが、逆向きの経路が無かった。標準入力を使う手も
+# あるが、キャンセルが既にファイルで往復できているので同じ流儀に揃える。
+# ファイルなら、子が別のことで塞がっていても書ける。
+DECISION_FILE = _HERE / ".copilot_loop_decision"
+
+# 人に聞いたあと、何秒待つか。過ぎたら「答えなし」＝止める(今までと同じ挙動)。
+# 席を外している間に危険なコードが勝手に走らない、が既定であるべき。
+DEFAULT_APPROVAL_TIMEOUT = 300
+
+# スニペットの .ps1 を置く場所と、実行時の作業ディレクトリ。
+#
+# 【作業ディレクトリを分ける理由】
+# 以前は tray-tools 直下で実行していた。Copilot が `.\out.csv` のような相対パスを
+# 書くと、リポジトリ直下にファイルが生まれる。実際、身に覚えの無いファイルが repo に
+# 残っていたことがある(public リポジトリなので事故になり得る)。散らかる先を一箇所に
+# 決めておけば、掃除も .gitignore も1行で済む。
+SCRATCH_DIR = _HERE / "copilot_loop_scratch"
+WORK_DIR = SCRATCH_DIR / "work"
+
+# 残しておく .ps1 の本数。振り返りに使うのはせいぜい直近の数周なので、それ以上は
+# 溜めない(実測で38本まで溜まっていた)。work/ の中身は消さない — 成果物かもしれず、
+# 自動で捨ててよいものではない。
+KEEP_SNIPPET_FILES = 20
+
 # 停止理由の型。ログにそのまま残す。
 STOP_MAX_ROUNDS = "max-rounds"
 STOP_NO_SNIPPET = "no-snippet"
@@ -88,6 +117,7 @@ STOP_DRY_RUN = "dry-run"
 STOP_FINISH_WORD = "finish-word"
 STOP_STUCK = "stuck"
 STOP_NO_NEW_RESPONSE = "no-new-response"
+STOP_MULTI_SNIPPET = "multi-snippet"
 STOP_ERROR = "error"
 
 
@@ -113,12 +143,43 @@ def _write_snippet_file(code: str, snippet_id: str) -> Path:
     ヒアドキュメントで長いコードを PowerShell に渡すのは quoting の落とし穴が多い
     (シングル引用の中にシングル引用がある、絵文字が化ける等)ので、
     ファイルに書き出してから実行する方が確実。"""
-    scratch = _HERE / "copilot_loop_scratch"
-    scratch.mkdir(exist_ok=True)
-    path = scratch / f"snippet_{snippet_id}_{int(time.time())}.ps1"
+    SCRATCH_DIR.mkdir(exist_ok=True)
+    # 名前は「時刻が先、ID が後」。ナノ秒まで入れる。
+    #
+    # 【秒だと足りない】
+    # 以前は snippet_<ID>_<秒>.ps1 だった。同じ ID が同じ秒に2回出ると
+    # **同じ名前になって上書き**され、前の周のコードが消えていた。さらに掃除の
+    # 並べ替えも、秒までしか分からないと同着だらけになり、新しいほうを捨てることが
+    # ある(実測: 25本書いて残った20本のうち9本が最新のものではなかった)。
+    # 時刻を先頭に置いておけば、名前順がそのまま新しい順になる。
+    path = SCRATCH_DIR / f"snippet_{time.time_ns()}_{snippet_id}.ps1"
     with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(code)
+    _prune_snippet_files()
     return path
+
+
+def _prune_snippet_files(keep: int = KEEP_SNIPPET_FILES) -> None:
+    """古い .ps1 を捨てる。直近 keep 本だけ残す。
+
+    振り返りに使うのは直近の数周ぶんだけなので、それ以上は溜めても読まない。
+    消すのは自分が書いた snippet_*.ps1 だけ。work/ の中身(Copilot が作った成果物
+    かもしれないもの)には触らない。掃除のために作業を止めたくないので、
+    失敗しても黙って諦める。
+
+    並べ替えは更新時刻ではなく名前で行う。名前の先頭にナノ秒の時刻が入っている
+    ので名前順＝新しい順になる。更新時刻は環境によって秒までしか取れず、まとめて
+    書いたファイルが同着になって、新しいほうを捨てることがあった。"""
+    try:
+        files = sorted(SCRATCH_DIR.glob("snippet_*.ps1"),
+                       key=lambda p: p.name, reverse=True)
+        for old in files[keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _run_powershell(code: str, snippet_id: str, timeout: int) -> dict:
@@ -133,12 +194,15 @@ def _run_powershell(code: str, snippet_id: str, timeout: int) -> dict:
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
         f"& '{path}'"
     )
+    # 実行の作業ディレクトリは work/ に固定する。相対パスで書かれたファイルが
+    # リポジトリ直下に散らばるのを防ぐため(WORK_DIR のコメント参照)。
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-Command", wrapper],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
+            timeout=timeout, cwd=str(WORK_DIR),
         )
         return {
             "exit_code": result.returncode,
@@ -297,6 +361,7 @@ def run_loop(
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     wait_for_new: bool = True,
     watch_timeout: int = DEFAULT_WATCH_TIMEOUT,
+    approval_timeout: int = 0,
     on_event=None,
 ) -> dict:
     """疑似エージェントループを1回まわす。結果のサマリを辞書で返す。
@@ -312,6 +377,11 @@ def run_loop(
       残して停止する。新しい題材はまずここで安全に確かめる。
     - auto_run=True で初めて PowerShell に流す。危険パターン検出でそのまま止まる。
 
+    【人に聞いて続ける】
+    - approval_timeout > 0 なら、止まる前に一度だけ人に聞く(危険パターン・dry-run・
+      スニペット複数の3場面)。答えが 'run' なら、その周だけ実行して続行する。
+      答えが無いまま時間切れになれば、今までどおり止まる。0 なら聞かずに止まる。
+
     【イベント配信】
     - on_event を渡すと、進捗イベント(response / snippet / run / stop など)が
       その呼び出し可能に流れる。Qt のログ窓に反映するために使う。呼び出しは
@@ -319,9 +389,14 @@ def run_loop(
     """
     started = time.time()
     _cancel_clear()
+    # 前回の走行が残した返事を持ち越さない(合言葉で弾けるが、紛らわしいので消す)。
+    _clear_decision()
 
-    def emit(kind, **extra):
-        payload = {"event": kind, **extra}
+    # 第1引数の名前をアンダースコア始まりにしてあるのは、イベントの中身として
+    # kind= や name= を渡したいことがあるため。普通の名前だと衝突して
+    # 「got multiple values for argument」で落ちる。
+    def emit(_event, **extra):
+        payload = {"event": _event, **extra}
         _log(payload)
         if on_event is not None:
             try:
@@ -353,6 +428,8 @@ def run_loop(
         # 直前の周の標準出力。同じ結果が続く＝進んでいない、の判定に使う。
         last_output = None
         repeated_outputs = 0
+        # 直前の周に実行したコード。出力より先に「進んでいない」が分かる。
+        last_code = None
         while rounds < max_rounds:
             if _cancel_requested():
                 stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
@@ -456,31 +533,90 @@ def run_loop(
                      response_tail=response[-500:])
                 break
 
-            # 最後の1つだけを扱う(複数出されたら仕様確認のため止める方が安全)
+            # 扱うのは最後の1つ。ただし複数出されたときは黙って選ばない。
+            #
+            # 【なぜ止めるか】
+            # Copilot は「まず調べる #1、それから直す #2」のように2つ出すことがある。
+            # 最後だけを実行すると調査を飛ばして修正が走る。どちらを実行してほしいのかは
+            # こちらには判断できないので、人に見せる。
+            # (以前はコメントに「止める方が安全」と書きながら、黙って最後を実行していた。)
             sid, code = snippets[-1]
+            if len(snippets) > 1:
+                ids = "・".join(f"#{s}" for s, _c in snippets)
+                emit("snippet", round=rounds, id=sid, chars=len(code),
+                     risks=0, code=code, siblings=len(snippets))
+                if not _ask_approval(
+                        emit, "multi-snippet",
+                        f"スニペットが {len(snippets)} 個あります（{ids}）",
+                        f"最後の #{sid} だけを実行して続けますか？\n\n{code}",
+                        approval_timeout):
+                    stopped_by = STOP_MULTI_SNIPPET
+                    stop_detail = (f"応答にスニペットが {len(snippets)} 個({ids})。"
+                                   "どれを実行すべきか判断できないので止めました。")
+                    emit("round_end", round=rounds,
+                         reason=stopped_by, elapsed=time.time() - round_started)
+                    break
+
             risks = copilot_loop.risky_lines(code)
             emit("snippet", round=rounds, id=sid,
                  chars=len(code), risks=len(risks), code=code)
 
             if risks:
-                stopped_by = STOP_RISKY
-                stop_detail = f"#{sid} に危険パターン {len(risks)} 件"
-                # Copilot に理由だけ伝える(応答は取らずに終わる。人が判断する場面)
-                try:
-                    cp.set_input(format_risky_report(sid, risks))
-                except Exception:  # noqa: BLE001  ここは best-effort
-                    pass
-                emit("round_end", round=rounds,
-                     reason=stopped_by, elapsed=time.time() - round_started,
-                     risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
-                break
+                # 危険パターン。自動で押し切らせない場面なので、人に聞く。
+                # 許可は**この周だけ**。次に出てきたらまた聞く(覚えさせない)。
+                why = "・".join(sorted({rr for _ln, rr in risks}))
+                if not _ask_approval(
+                        emit, "risky-code",
+                        f"#{sid} が危険パターンに触れています（{why}）",
+                        format_risky_report(sid, risks), approval_timeout):
+                    stopped_by = STOP_RISKY
+                    stop_detail = f"#{sid} に危険パターン {len(risks)} 件"
+                    # Copilot に理由だけ伝える(応答は取らずに終わる。人が判断する場面)
+                    try:
+                        cp.set_input(format_risky_report(sid, risks))
+                    except Exception:  # noqa: BLE001  ここは best-effort
+                        pass
+                    emit("round_end", round=rounds,
+                         reason=stopped_by, elapsed=time.time() - round_started,
+                         risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
+                    break
+                emit("approval_override", round=rounds, id=sid,
+                     kind="risky-code", risks=len(risks))
 
             # 6) 実行(auto_run のときだけ)
             if not auto_run:
-                stopped_by = STOP_DRY_RUN
-                stop_detail = f"dry-run。#{sid}({len(code)}文字) は実行せず、ログに残しました"
+                # dry-run。コードは取れていて、あとは実行するだけの状態。ここで完全に
+                # 終わると、目で見て納得しても最初からやり直しになる。「これを実行して
+                # 続ける」と答えられれば、安全確認の意味は保ったまま二度手間だけが消える。
                 emit("dry_run", round=rounds, id=sid, code=code)
+                if not _ask_approval(
+                        emit, "dry-run",
+                        f"dry-run です。#{sid}（{len(code)}文字）を実行しますか？",
+                        code, approval_timeout):
+                    stopped_by = STOP_DRY_RUN
+                    stop_detail = (f"dry-run。#{sid}({len(code)}文字) は実行せず、"
+                                   "ログに残しました")
+                    break
+                # この周だけ実行に回る。次の周はまた dry-run として聞く。
+                emit("approval_override", round=rounds, id=sid, kind="dry-run")
+
+            # 前の周とまったく同じコードが返ってきたら、そこで足踏みしている。
+            #
+            # 【出力の一致だけでは足りない】
+            # 既に「同じ標準出力が続いたら中断」を入れてあるが、出力に時刻やパスが
+            # 一つでも混ざると毎回違う文字列になり、検出をすり抜ける。コード自体が
+            # 同じなら、Copilot は直したつもりで何も変えていないということで、
+            # 実行するまでもなく結果は分かっている。1回で止めてよい。
+            normalized = "\n".join(
+                line.rstrip() for line in code.strip().splitlines())
+            if last_code is not None and normalized == last_code:
+                stopped_by = STOP_STUCK
+                stop_detail = ("前の周とまったく同じコードが返ってきました。"
+                               "直したつもりで変わっていないので中断します。")
+                emit("round_end", round=rounds,
+                     reason=stopped_by, elapsed=time.time() - round_started)
                 break
+            last_code = normalized
 
             result = _run_powershell(code, sid, ps_timeout)
             emit("run", round=rounds, id=sid,
@@ -562,7 +698,8 @@ PARENT_PID = 0
 
 def spawn(prompt_path=None, watch=False, auto=False, max_rounds=None,
           ps_timeout=None, response_timeout=None, paste_limit=None,
-          finish_word="", loop_timeout=None, on_event=None, parent_pid=None):
+          finish_word="", loop_timeout=None, on_event=None, parent_pid=None,
+          approval_timeout=None):
     """このループを別プロセスで起こし、進捗を on_event に流す。(proc, thread) を返す。
 
     【常駐の中で run_loop を直接呼んではいけない】
@@ -593,7 +730,8 @@ def spawn(prompt_path=None, watch=False, auto=False, max_rounds=None,
     for flag, value in (("--max-rounds", max_rounds), ("--ps-timeout", ps_timeout),
                         ("--response-timeout", response_timeout),
                         ("--paste-limit", paste_limit),
-                        ("--loop-timeout", loop_timeout)):
+                        ("--loop-timeout", loop_timeout),
+                        ("--approval-timeout", approval_timeout)):
         if value is not None:
             argv += [flag, str(value)]
     if finish_word:
@@ -664,6 +802,89 @@ def request_cancel() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 人に聞く(承認)
+# ---------------------------------------------------------------------------
+# 【何のためにあるか】
+# ループが止まる理由のうち、危険パターン検出・dry-run・スニペット複数は、
+# 「危ないから止めた」ではなく「人に一度見てほしいから止めた」もの。ところが今までは
+# そこで完全に終了していたので、見て納得しても最初からやり直しだった。
+# ここは、その場で「続けてよい」と答えられるようにするための往復。
+#
+# 【安全の作法】
+# - 答えは1回きり。次に同じ場面が来たらまた聞く。覚えさせない。
+# - 答えが来なければ止まる(今までと同じ)。席を外している間に走り出さない。
+# - 待っている間もキャンセルは効く。
+def answer_approval(token: str, answer: str) -> None:
+    """親(常駐)から返事を書く。answer は 'run'(続行) か 'stop'(中止)。
+
+    token は聞いた側が発行した合言葉。古い返事が次の場面に効いてしまわないよう、
+    子は token が一致したときだけ受け取る。"""
+    try:
+        DECISION_FILE.write_text(
+            json.dumps({"token": token, "answer": answer}, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_decision() -> None:
+    try:
+        DECISION_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _read_decision(token: str):
+    """自分が聞いた件への返事なら 'run'/'stop' を返す。無ければ None。"""
+    try:
+        raw = DECISION_FILE.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("token") != token:
+        return None
+    answer = data.get("answer")
+    return answer if answer in ("run", "stop") else None
+
+
+def _ask_approval(emit, kind, summary, detail, timeout, poll=0.5):
+    """人に「続けてよいか」を聞いて、返事を待つ。続けてよければ True。
+
+    聞いた事実はイベントで親へ流す。ログ窓がそれを見てボタンを出し、押されたら
+    answer_approval() が返事を書く。ここはその返事をポーリングするだけなので、
+    ログ窓が開いていなくても(＝誰も答えなくても)時間切れで安全側に倒れる。"""
+    if timeout <= 0:
+        # 聞く相手が居ない設定。イベントも出さない — 誰も答えられないのに
+        # 「返事待ち」がログに残ると、答えそびれたように見えてしまう。
+        return False
+    token = f"{int(time.time() * 1000):x}"
+    _clear_decision()
+    emit("approval_request", kind=kind, token=token,
+         summary=summary, detail=detail, timeout=timeout)
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if _cancel_requested():
+            emit("approval_result", kind=kind, token=token, answer="stop",
+                 reason="停止要求")
+            return False
+        answer = _read_decision(token)
+        if answer is not None:
+            _clear_decision()
+            emit("approval_result", kind=kind, token=token, answer=answer)
+            return answer == "run"
+        time.sleep(poll)
+    _clear_decision()
+    emit("approval_result", kind=kind, token=token, answer="stop",
+         reason=f"{int(timeout)} 秒返事がありませんでした")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _load_prompt(path: str) -> str:
@@ -697,7 +918,18 @@ def main(argv=None) -> int:
                         help="監視モードで、新しい応答を待たず画面の最後の応答を引き取る")
     parser.add_argument("--watch-timeout", type=int, default=DEFAULT_WATCH_TIMEOUT,
                         help="監視モードで新しい応答を待つ上限(秒)")
+    parser.add_argument("--approval-timeout", type=int, default=None,
+                        help="止まる前に人へ聞いて待つ上限(秒)。0 なら聞かずに止まる。"
+                             "--emit-events のとき既定 %d、単独実行では既定 0"
+                             % DEFAULT_APPROVAL_TIMEOUT)
     args = parser.parse_args(argv)
+
+    # 聞く相手が居るときだけ聞く。--emit-events は常駐がログ窓で受けている印なので、
+    # そこには答えられる人が居る。単独で叩いたときは答える口が無いので、待たずに
+    # 今までどおり止める(黙って何分も固まるほうが困る)。
+    approval_timeout = args.approval_timeout
+    if approval_timeout is None:
+        approval_timeout = DEFAULT_APPROVAL_TIMEOUT if args.emit_events else 0
 
     global PARENT_PID
     PARENT_PID = args.parent_pid
@@ -738,6 +970,7 @@ def main(argv=None) -> int:
         loop_timeout=args.loop_timeout,
         max_consecutive_failures=args.max_consecutive_failures,
         wait_for_new=not args.take_last, watch_timeout=args.watch_timeout,
+        approval_timeout=approval_timeout,
     )
     if not args.emit_events:
         print(json.dumps(summary, ensure_ascii=False, indent=2))

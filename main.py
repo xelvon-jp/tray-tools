@@ -401,7 +401,11 @@ def _build_command_handlers(features) -> dict:
         # - cancel は「置きっぱなしのフラグ」だけで済むので、実行スレッドの応答性に
         #   関係なく効く(実行スレッドが PowerShell の完了待ちで詰まっていても、
         #   次の周の頭で拾って止まる)。
-        "agent-loop": lambda args, reply: _agent_loop_command(args, reply),
+        # screen を渡すのを忘れていて、この口からの start は **一度も動いていなかった**
+        # (NameError で落ちる)。トレイメニューからの開始は別経路(ScreenFeature)を
+        # 通るので、そちらでは表に出ていなかった。状態監視バーの右クリックが初めて
+        # ここを通って発覚した。他のコマンドと同じく引数で渡す。
+        "agent-loop": lambda args, reply: _agent_loop_command(screen, args, reply),
     }
 
 
@@ -614,8 +618,8 @@ def _agent_loop_status_text() -> str:
     return "agent-loop 未実行"
 
 
-def _agent_loop_command(args, reply) -> None:
-    """外部から agent-loop を操作する。start/status/cancel。
+def _agent_loop_command(screen, args, reply) -> None:
+    """外部から agent-loop を操作する。start / status / cancel / log。
 
     実処理は別プロセスで走らせる。Qtメインスレッドを塞がないためでもあるが、
     それ以上に、常駐の中で UIA を使うと pycaw と衝突して即死するため

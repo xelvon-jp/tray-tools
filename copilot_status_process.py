@@ -294,10 +294,14 @@ def format_loop_badge(status):
         maximum = int(status.get("max_rounds") or 0)
     except (TypeError, ValueError):
         return ""
+    # 「返事待ち」だけは文言も出す。人が答えるまで止まっているので、周回数だけ出しても
+    # 進んでいないように見えてしまう —— 実際には**こちらの番**で止まっている。
+    label = status.get("label") or ""
     if rounds <= 0:
         # まだ1周目に入っていない(開始した直後)。周回数より「始まった」ことを出す。
-        return "開始"
-    return f"{rounds}/{maximum}" if maximum > 0 else f"{rounds}周目"
+        return f"開始 {label}".rstrip() if label else "開始"
+    base = f"{rounds}/{maximum}" if maximum > 0 else f"{rounds}周目"
+    return f"{base} {label}" if label else base
 
 
 # 常駐の待ち受け(QLocalServer)。Windows では名前付きパイプなので素の open() で書ける。
@@ -593,7 +597,14 @@ class StatusPill(QWidget):
         elif key == "reset" and self._on_reset_position is not None:
             self._on_reset_position()
         elif key == "loop_start":
-            send_to_tray("agent-loop", ["start", "--watch", "--auto"])
+            # 完了語を渡すのを忘れないこと。トレイメニューからの開始は DONE を
+            # 渡しており、渡さないと定型文が「終わったら DONE」で締めていても
+            # 拾えない。実測では、Copilot が DONE と書いた回が finish-word ではなく
+            # no-snippet で止まった —— どちらも綺麗に終わってはいるが、**やり切ったのか
+            # 力尽きたのかが区別できない**。同じボタンで始めた以上、終わり方の
+            # 見え方も揃っている必要がある。
+            send_to_tray("agent-loop", ["start", "--watch", "--auto",
+                                        "--finish-word=DONE"])
         elif key == "loop_stop":
             send_to_tray("agent-loop", ["cancel"])
         elif key == "loop_log":

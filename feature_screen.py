@@ -1687,14 +1687,22 @@ class ScreenFeature:
             elif event == "loop_start":
                 self._agent_loop_round = 0
                 self._agent_loop_max_rounds = payload.get("max_rounds") or 0
-            elif event not in ("response", "snippet", "run", "approval_request"):
+            elif event not in ("approval_request", "approval_result"):
+                # 周の途中の細かいイベント(response / snippet / run)は書かない。
+                #
+                # 【一度は書いていた。無意味だった】
+                # 実ログでは、応答が来てから次の周に入るまでが1秒未満で終わる
+                # (01:11:08 に response → snippet → run → round_end → round_start が
+                # 全部並ぶ)。書いた文言は数ミリ秒で次の round_start に上書きされ、
+                # 札に出る隙が無い。周回数だけが意味を持つ。
                 return
-            labels = {"response": "応答受信", "snippet": "コード抽出",
-                      "run": "実行中", "approval_request": "返事待ち"}
+            # 例外は「返事待ち」。あれは人が答えるまで最大5分止まるので、
+            # 札に出る時間がある —— というより、**そこに出したい情報そのもの**。
+            label = "返事待ち" if event == "approval_request" else ""
             with open(cw.LOOP_STATUS_FILE, "w", encoding="utf-8") as f:
                 json.dump({"round": self._agent_loop_round or 0,
                            "max_rounds": self._agent_loop_max_rounds or 0,
-                           "label": labels.get(event, ""),
+                           "label": label,
                            "at": time.time()}, f, ensure_ascii=False)
         except OSError:
             pass

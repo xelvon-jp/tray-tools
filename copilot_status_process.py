@@ -239,6 +239,13 @@ class StatusPill(QWidget):
     def _pin_button_rect(self):
         return self._button_rect(1)
 
+    def is_dragging(self):
+        """いま Ctrl+ドラッグで掴まれているか。
+
+        掴まれている間は、追従(StatusWatcher._follow)に位置を触らせない。
+        触らせると150msごとに古い位置へ書き戻され、動かせなくなる。"""
+        return self._drag_origin is not None
+
     def _hit_button(self, pos):
         """押された場所がどのボタンか。'pause' / 'pin' / None。"""
         if self._pause_button_rect().contains(pos):
@@ -848,7 +855,8 @@ class StatusWatcher:
                 self._hide_all()
                 return
             self._flash.reset()   # 相手が見えないのに窓を光らせても意味が無い
-            self._show_pill_at(self._last_pos)
+            # ここでも掴んでいる間は位置に触らない(上と同じ理由)。
+            self._show_pill_at(None if self._pill.is_dragging() else self._last_pos)
             return
 
         elapsed = self._advance_elapsed()
@@ -860,13 +868,22 @@ class StatusWatcher:
         # 「一時停止中」になるので、状態のキーは何でもよい。
         self._pill.apply_state(self._state or "waiting_user", elapsed,
                                alert=alert, paused=self._paused)
-        # 手で動かされていたら、その場所を尊重する。自動配置に戻すと、直した
-        # そばから元へ引き戻されて動かせなくなる。
-        if self._manual_pos is not None:
-            self._show_pill_at(self._manual_pos)
-        else:
-            self._pill.place(rect, self._right_inset)
-            self._show_pill_at(None)
+        # 掴まれている間は位置に触らない。
+        #
+        # 【ここを見落として引き戻していた】
+        # 位置を覚えるのはマウスを離した時点なので、ドラッグ中の _manual_pos は
+        # まだ「掴む前の位置」(初回は None)。この追従は150msごとに走るため、
+        # 動かしている最中に古い位置へ書き戻していた。フレームの合間はマウス側が
+        # 勝つので、使う側からは「時々元に戻る」ように見える。
+        # 掴んでいる間、位置の持ち主はマウスだけ。こちらは黙って見ている。
+        if not self._pill.is_dragging():
+            if self._manual_pos is not None:
+                # 手で動かされた場所を尊重する。自動配置に戻すと、直したそばから
+                # 元へ引き戻されて動かせなくなる。
+                self._show_pill_at(self._manual_pos)
+            else:
+                self._pill.place(rect, self._right_inset)
+                self._show_pill_at(None)
         self._last_pos = self._pill.pos()
 
         if alert:

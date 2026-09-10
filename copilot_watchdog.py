@@ -36,8 +36,16 @@
 #   - 子プロセスの起動と停止(常駐が終わるときは道連れにする)
 #   ※ 閾値も位置もこちらは持たない。子が settings.json と自分の状態ファイルから
 #     直接読む(渡し口を2つ持つと、どちらが効いているのか追えなくなる)。
-#   - agent-loop が動いている間は止めておく
 #   - 子が自分から終わったら(札の右クリック)、メニューのチェックを外す
+#   ※ 以前は「agent-loop が動いている間は止めておく」もここの仕事だったが、やめた。
+#     ループ中こそ様子が知りたいのに、その間だけ札が消えていた(理由は下の
+#     _watch_timer のところ)。
+#
+# エージェントループとの関係
+# --------------------------
+# ループもこの札も、常駐の子プロセスで、どちらも UIA で Copilot を読む。互いに直接の
+# 連絡口は持たない。ループの周回数だけが LOOP_STATUS_FILE を通って札に届く。
+# 【1プロセスにまとめようと考える前に、このファイル冒頭の実測値を読むこと。】
 import os
 import subprocess
 import sys
@@ -83,12 +91,9 @@ class CopilotWatchdog:
     動かしていた頃と同じにしてある。feature_screen 側を書き換えずに済ませるため。"""
 
     def __init__(self, app_settings=None, settings_path=None,
-                 is_agent_loop_running=lambda: False, on_child_exit=None):
+                 on_child_exit=None):
         self._app_settings = app_settings
         self._settings_path = settings_path
-        # agent-loop が回っている間は止めておく。あれが回っているときの手番は
-        # 「tray-tools の番」であって、表示している4状態のどれでもない。
-        self._is_agent_loop_running = is_agent_loop_running
         # 子が自分から終わったときに、メニューのチェックを外してもらう連絡口。
         self._on_child_exit = on_child_exit
 
@@ -98,8 +103,15 @@ class CopilotWatchdog:
         self._enabled = False
         self._proc = None
 
-        # agent-loop の出入りに合わせて子を止める/起こす。ついでに、子が落ちて
-        # いたら起こし直す。
+        # 子が落ちていたら起こし直す。
+        #
+        # 【以前はここで agent-loop の出入りも見ていた】
+        # ループが回っている間は札を止める作りだった。「そのときの手番は
+        # tray-tools の番で、表示している4状態のどれでもない」という理屈だったが、
+        # 実際に困るのは逆だった。ループは何分も回ることがあり、その間ずっと札が
+        # 消えるので、**進んでいるのか固まったのかが分からない時間が一番長い**。
+        # いまは札に周回数(🤖 3/10)を出すので、手番が tray-tools にあることは
+        # その姿で分かる。止める理由が無くなった。
         self._watch_timer = QTimer()
         self._watch_timer.setInterval(RESPAWN_CHECK_MS)
         self._watch_timer.timeout.connect(self._on_watch)
@@ -135,8 +147,6 @@ class CopilotWatchdog:
 
     def _start_child(self) -> None:
         if self._child_alive():
-            return
-        if self._is_agent_loop_running():
             return
         # 閾値は子が settings.json から直接読む。渡し口を2つ持つと、どちらが
         # 効いているのか追えなくなる。
@@ -182,15 +192,12 @@ class CopilotWatchdog:
             pass
 
     def _on_watch(self) -> None:
-        """agent-loop の出入りに追従し、子が落ちていたら起こし直す。
+        """子が落ちていたら起こし直す。
 
         ただし子が終了コード0で終わったときは起こし直さない。それは札の右クリックで
         「終了」を選んだ場合で、起こし直すと消したものが即座に戻ってきてしまう。"""
         try:
             if not self._enabled:
-                return
-            if self._is_agent_loop_running():
-                self._stop_child()
                 return
             if self._child_alive():
                 return

@@ -288,13 +288,13 @@ class ScreenFeature:
 
         # Copilot の手番の常時表示(業務PC用: Pushover を使えない環境で、Copilot が
         # いま誰の番なのかを画面だけで分かるようにする)。
-        # 監視モード実行中は完全に休むように、agent-loop の状態を伝えるコールバックを
-        # 渡す(_agent_loop_state != "idle" のとき動いているとみなす)。
+        # エージェントループが回っている間も出したままにする。以前は休ませていたが、
+        # ループは何分も回ることがあり、**様子を知りたい時間帯がまるごと消えていた**。
+        # いまは札に周回数(🤖 3/10)が出るので、手番が tray-tools にあることは分かる。
         import copilot_watchdog as _cw
         self._copilot_watchdog = _cw.CopilotWatchdog(
             app_settings=app_settings,
             settings_path=settings_path,
-            is_agent_loop_running=lambda: self._agent_loop_state != "idle",
             # 札の右クリックで終了されたら、メニューのチェックも外す。
             on_child_exit=self._on_copilot_watchdog_exited,
         )

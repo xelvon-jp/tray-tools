@@ -401,6 +401,14 @@ def _build_command_handlers(features) -> dict:
         # - cancel は「置きっぱなしのフラグ」だけで済むので、実行スレッドの応答性に
         #   関係なく効く(実行スレッドが PowerShell の完了待ちで詰まっていても、
         #   次の周の頭で拾って止まる)。
+        # 常駐を起動し直す。**巻き添えが出る状態なら断る**(付箋・画面ミラー・
+        # エージェントループ・スリープ予約が生きていたら ERR で返す)。
+        # トレイの 🔄 は本人が押すので巻き添えを承知で押せるが、この口を叩くのは
+        # たいてい人ではない。判断材料を持たない側に、黙って落とす力を渡さない。
+        #
+        #   traytools_send.py restart          安全なときだけ再起動
+        #   traytools_send.py restart --check  落としてよいかだけ答える
+        "restart": lambda args, reply: reply(_restart_command(screen, args)),
         # screen を渡すのを忘れていて、この口からの start は **一度も動いていなかった**
         # (NameError で落ちる)。トレイメニューからの開始は別経路(ScreenFeature)を
         # 通るので、そちらでは表に出ていなかった。状態監視バーの右クリックが初めて
@@ -616,6 +624,19 @@ def _agent_loop_status_text() -> str:
                 f"経過={summary.get('elapsed')}秒 "
                 f"詳細={summary.get('detail', '')}")
     return "agent-loop 未実行"
+
+
+def _restart_command(screen, args) -> str:
+    """常駐を起動し直す。--check なら、落としてよいかを答えるだけで何もしない。
+
+    設定やコードを直したあと反映するための口。**危ないから避けているのではなく、
+    巻き添えが出るから避けている**ので、巻き添えが無いことを確かめてから落とす。"""
+    if any(str(a).strip().lower() in ("--check", "check", "-n") for a in args):
+        blockers = screen.restart_blockers()
+        if blockers:
+            return "OK 再起動は見送るべきです: " + "・".join(blockers)
+        return "OK いま再起動して差し支えありません"
+    return screen.restart_from_ipc()
 
 
 def _agent_loop_command(screen, args, reply) -> None:

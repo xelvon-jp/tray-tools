@@ -1927,6 +1927,56 @@ class ScreenFeature:
         """自分を起動し直す手段を受け取る。組み立ては main.py が行う。"""
         self._restart_app = restart
 
+    def restart_blockers(self) -> list:
+        """いま再起動すると巻き添えになるものを並べる。空なら落としても失われない。
+
+        【何のためにあるか】
+        この常駐を落とすと、ぶら下がっているものが道連れになる。付箋は貼ったまま
+        作業しているかもしれず、画面ミラーは見ている最中かもしれない。どちらも
+        「開き直せばいい」ものではない(付箋の中身は消える)。
+        トレイの 🔄 を押すのは本人なので巻き添えを承知で押せるが、**外から叩く口には
+        その判断が無い**。だから口の側に、落としてよいかを答えられる材料を持たせる。
+
+        数え落とすより数え過ぎるほうが安全なので、状態が読めないものは
+        「あるかもしれない」側に倒す。"""
+        blockers = []
+        try:
+            sticky = len(capture_process.list_sticky_pipes())
+            if sticky:
+                blockers.append(f"付箋 {sticky}枚")
+        except Exception:  # noqa: BLE001  読めないなら「あるかも」に倒す
+            blockers.append("付箋(枚数を読めず)")
+        try:
+            if self.screen_mirror.is_active():
+                blockers.append("画面ミラー")
+        except Exception:  # noqa: BLE001
+            blockers.append("画面ミラー(状態を読めず)")
+        if self._agent_loop_state != "idle":
+            blockers.append("エージェントループ")
+        if self.sleep_seconds_left() is not None:
+            # 予約は再起動で消える。寝るつもりだったのに寝ないのは、
+            # 気づきにくいぶん厄介。
+            blockers.append("スリープ予約")
+        return blockers
+
+    def restart_from_ipc(self) -> str:
+        """外から頼まれた再起動。巻き添えが出るなら断る。
+
+        戻り値は応答の1行。実際に落ちるのはイベントループが一巡してからなので、
+        呼んだ側へ先に返事を返せる。"""
+        blockers = self.restart_blockers()
+        if blockers:
+            return ("ERR 再起動しませんでした（"
+                    + "・".join(blockers)
+                    + " が道連れになります）。トレイの 🔄 から行ってください")
+        if self._restart_app is None:
+            return "ERR この起動のしかたでは再起動できません"
+        if not self._restart_app():
+            return "ERR 起動し直せませんでした（このまま動き続けます）"
+        # 返事を書いてから終わる。先に quit すると応答が届かない。
+        QTimer.singleShot(0, QApplication.instance().quit)
+        return "OK 再起動します（数秒で戻ります）"
+
     def _restart(self):
         """メニューからの再起動。
 

@@ -67,6 +67,7 @@ STOP_STYLES = {
     "loop-timeout": (COLOR_STOP_WARN, "⚠️ ループ全体タイムアウト"),
     "risky-code": (COLOR_STOP_ERR, "🛑 危険パターン検出で停止"),
     "multi-snippet": (COLOR_STOP_WARN, "⚠️ スニペットが複数あり停止"),
+    "empty-response": (COLOR_STOP_ERR, "❌ 応答を読み取れなかった"),
     "stuck": (COLOR_STOP_WARN, "⚠️ 足踏みを検知して停止"),
     "no-new-response": (COLOR_STOP_WARN, "⚪ 新しい応答が来なかった"),
     "error": (COLOR_STOP_ERR, "❌ エラーで停止"),
@@ -495,6 +496,14 @@ class LogViewer(QWidget):
                 self._append_block("=== STDOUT ===", COLOR_STDOUT, stdout, COLOR_STDOUT)
             if stderr.strip():
                 self._append_block("=== STDERR ===", COLOR_STDERR, stderr, COLOR_STDERR)
+        elif event == "empty_response":
+            # 「返ってきていない」のか「読めていない」のかは、この時点では
+            # 区別できない。待ち直していることだけ見せる(黙って固まって見えるより
+            # ましだが、無言で成功したように進むよりもっとまし)。
+            self.status.setText(f"round {payload.get('round')} 応答が空。待ち直します")
+            self._append(f"応答が空でした（{payload.get('waited')} 秒時点）。"
+                         "まだ書き始めていない可能性があるので待ち直します",
+                         COLOR_STOP_WARN)
         elif event == "dry_run":
             self.status.setText("dry-run（実行前）")
             self._append(f"dry-run: #{payload.get('id')} は自動では実行しません",

@@ -118,6 +118,7 @@ STOP_FINISH_WORD = "finish-word"
 STOP_STUCK = "stuck"
 STOP_NO_NEW_RESPONSE = "no-new-response"
 STOP_MULTI_SNIPPET = "multi-snippet"
+STOP_EMPTY_RESPONSE = "empty-response"
 STOP_ERROR = "error"
 
 
@@ -513,6 +514,37 @@ def run_loop(
             # 監視モードの1周目は人が手で投稿しているので、こちらは本文を知らない。
             response = cp.new_response(previous_length,
                                        sent_prompt=None if skip_send else prompt)
+
+            # **空の応答を「終わった」と読まない。**
+            #
+            # wait_until_idle は busy を一度も見なくても終われる作りになっている
+            # (busy を見逃して永久に待つ事故を避けるため)。その裏返しで、Copilot が
+            # 書き始める前に「落ち着いた」と判断することがある。実測(2026-09-11)では
+            # 送信から5.1秒で0文字を拾い、そのあと Copilot はちゃんと1207文字返して
+            # いた。会話が長くなる(実測26,626文字)ほど最初の一文字までが遅くなる。
+            #
+            # 空のまま進むとスニペットが無いので no-snippet になるが、あれは
+            # 「やり切った」ときの停止理由でもある。**競争に負けただけなのに完了と
+            # 報告される**のがいちばん困るので、空のときは待ち直す。
+            if not response.strip():
+                deadline = time.time() + response_timeout
+                while not response.strip() and time.time() < deadline:
+                    emit("empty_response", round=rounds,
+                         waited=round(wait_elapsed, 1))
+                    done, more = cp.wait_until_idle(
+                        timeout=max(5, min(30, int(deadline - time.time()))))
+                    wait_elapsed += more
+                    response = cp.new_response(
+                        previous_length,
+                        sent_prompt=None if skip_send else prompt)
+                if not response.strip():
+                    stopped_by = STOP_EMPTY_RESPONSE
+                    stop_detail = (f"{response_timeout} 秒待っても応答が空のままでした。"
+                                   "Copilot が返していないか、応答を読み取れていません。")
+                    emit("round_end", round=rounds, reason=stopped_by,
+                         elapsed=time.time() - round_started)
+                    break
+
             emit("response", round=rounds, chars=len(response),
                  wait_seconds=round(wait_elapsed, 1),
                  response_head=response[:800])

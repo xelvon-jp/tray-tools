@@ -580,11 +580,11 @@ def run_loop(
                 ids = "・".join(f"#{s}" for s, _c in snippets)
                 emit("snippet", round=rounds, id=sid, chars=len(code),
                      risks=0, code=code, siblings=len(snippets))
-                if not _ask_approval(
+                if _ask_approval(
                         emit, "multi-snippet",
                         f"スニペットが {len(snippets)} 個あります（{ids}）",
                         f"最後の #{sid} だけを実行して続けますか？\n\n{code}",
-                        approval_timeout):
+                        approval_timeout) != ANSWER_RUN:
                     stopped_by = STOP_MULTI_SNIPPET
                     stop_detail = (f"応答にスニペットが {len(snippets)} 個({ids})。"
                                    "どれを実行すべきか判断できないので止めました。")
@@ -600,17 +600,27 @@ def run_loop(
                 # 危険パターン。自動で押し切らせない場面なので、人に聞く。
                 # 許可は**この周だけ**。次に出てきたらまた聞く(覚えさせない)。
                 why = "・".join(sorted({rr for _ln, rr in risks}))
-                if not _ask_approval(
-                        emit, "risky-code",
-                        f"#{sid} が危険パターンに触れています（{why}）",
-                        format_risky_report(sid, risks), approval_timeout):
+                answer = _ask_approval(
+                    emit, "risky-code",
+                    f"#{sid} が危険パターンに触れています（{why}）",
+                    format_risky_report(sid, risks), approval_timeout)
+                if answer != ANSWER_RUN:
                     stopped_by = STOP_RISKY
                     stop_detail = f"#{sid} に危険パターン {len(risks)} 件"
-                    # Copilot に理由だけ伝える(応答は取らずに終わる。人が判断する場面)
-                    try:
-                        cp.set_input(format_risky_report(sid, risks))
-                    except Exception:  # noqa: BLE001  ここは best-effort
-                        pass
+                    # 誰も答えなかったときだけ、Copilot の入力欄に理由を残す。
+                    #
+                    # 【自分で止めた人に「人の判断が必要です」と書かない】
+                    # 承認を出すようにする前は、ここが唯一の伝え方だった。いまは
+                    # 人が「ここで止める」を選んでいる場合があり、その人は理由を
+                    # 分かっている。それでも書き込むと、判断が済んでいるのに
+                    # 判断を求める文面が残り、しかも次に打つときに消す手間になる
+                    # (実測で117文字)。答えが無かったときは、あとで気づく手がかりが
+                    # 要るので今までどおり残す。
+                    if answer == ANSWER_NONE:
+                        try:
+                            cp.set_input(format_risky_report(sid, risks))
+                        except Exception:  # noqa: BLE001  ここは best-effort
+                            pass
                     emit("round_end", round=rounds,
                          reason=stopped_by, elapsed=time.time() - round_started,
                          risky_lines=[{"line": ln, "reason": rr} for ln, rr in risks])
@@ -624,10 +634,10 @@ def run_loop(
                 # 終わると、目で見て納得しても最初からやり直しになる。「これを実行して
                 # 続ける」と答えられれば、安全確認の意味は保ったまま二度手間だけが消える。
                 emit("dry_run", round=rounds, id=sid, code=code)
-                if not _ask_approval(
+                if _ask_approval(
                         emit, "dry-run",
                         f"dry-run です。#{sid}（{len(code)}文字）を実行しますか？",
-                        code, approval_timeout):
+                        code, approval_timeout) != ANSWER_RUN:
                     stopped_by = STOP_DRY_RUN
                     stop_detail = (f"dry-run。#{sid}({len(code)}文字) は実行せず、"
                                    "ログに残しました")
@@ -887,16 +897,28 @@ def _read_decision(token: str):
     return answer if answer in ("run", "stop") else None
 
 
+# _ask_approval の返り値。「続けてよい」以外を一緒くたにしない。
+ANSWER_RUN = "run"        # 人が「実行して続行」を選んだ
+ANSWER_STOP = "stop"      # 人が「ここで止める」を選んだ
+ANSWER_NONE = "none"      # 誰も答えなかった(時間切れ・聞かない設定・停止要求)
+
+
 def _ask_approval(emit, kind, summary, detail, timeout, poll=0.5):
-    """人に「続けてよいか」を聞いて、返事を待つ。続けてよければ True。
+    """人に「続けてよいか」を聞いて、返事を待つ。ANSWER_* のどれかを返す。
 
     聞いた事実はイベントで親へ流す。ログ窓がそれを見てボタンを出し、押されたら
     answer_approval() が返事を書く。ここはその返事をポーリングするだけなので、
-    ログ窓が開いていなくても(＝誰も答えなくても)時間切れで安全側に倒れる。"""
+    ログ窓が開いていなくても(＝誰も答えなくても)時間切れで安全側に倒れる。
+
+    【「止める」と「誰も答えなかった」を区別する理由】
+    どちらも続行しない点は同じだが、**後始末が違う**。人が自分で止めたなら、
+    その人は理由を分かっている。誰も答えなかったなら、あとで気づく手がかりが要る。
+    まとめて False にしていたせいで、自分で止めたのに Copilot の入力欄へ
+    「人の判断が必要です」と書き込まれていた(判断はたった今済んでいる)。"""
     if timeout <= 0:
         # 聞く相手が居ない設定。イベントも出さない — 誰も答えられないのに
         # 「返事待ち」がログに残ると、答えそびれたように見えてしまう。
-        return False
+        return ANSWER_NONE
     token = f"{int(time.time() * 1000):x}"
     _clear_decision()
     emit("approval_request", kind=kind, token=token,
@@ -906,17 +928,17 @@ def _ask_approval(emit, kind, summary, detail, timeout, poll=0.5):
         if _cancel_requested():
             emit("approval_result", kind=kind, token=token, answer="stop",
                  reason="停止要求")
-            return False
+            return ANSWER_NONE
         answer = _read_decision(token)
         if answer is not None:
             _clear_decision()
             emit("approval_result", kind=kind, token=token, answer=answer)
-            return answer == "run"
+            return ANSWER_RUN if answer == "run" else ANSWER_STOP
         time.sleep(poll)
     _clear_decision()
     emit("approval_result", kind=kind, token=token, answer="stop",
          reason=f"{int(timeout)} 秒返事がありませんでした")
-    return False
+    return ANSWER_NONE
 
 
 # ---------------------------------------------------------------------------

@@ -483,8 +483,25 @@ class LogViewer(QWidget):
             sid = payload.get("id")
             exit_code = payload.get("exit_code")
             timed_out = payload.get("timed_out")
-            color = COLOR_RUN if (exit_code == 0 and not timed_out) else COLOR_RUN_ERR
-            status = "TIMEOUT" if timed_out else f"exit={exit_code}"
+            # 成否はループ側の判断(failed)に従う。
+            #
+            # 【終了コードで色を決めていて、失敗が緑になっていた】
+            # PowerShell は中で例外が出ても終了コード0を返すことがある。実測では
+            # AssertionError で落ちたテストが exit=0 として緑で表示された。
+            # ループ本体は標準エラーも見て失敗と判断しているのに、見ている人には
+            # 成功に見える —— いちばん困る食い違いかた。古いイベント(failed を
+            # 持たない)に当たったときだけ、従来どおり終了コードで決める。
+            bad = payload.get("failed")
+            if bad is None:
+                bad = timed_out or exit_code != 0
+            color = COLOR_RUN_ERR if bad else COLOR_RUN
+            if timed_out:
+                status = "TIMEOUT"
+            elif bad and exit_code == 0:
+                # 見た目の矛盾(失敗なのに exit=0)を、その場で言葉にしておく。
+                status = "exit=0 だが失敗（標準エラーあり）"
+            else:
+                status = f"exit={exit_code}"
             self.status.setText(f"round {r} 実行 #{sid} {status}")
             self._append(f"実行 #{sid} {status} "
                          f"(stdout {payload.get('stdout_chars')} 文字 / "

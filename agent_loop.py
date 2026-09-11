@@ -666,6 +666,11 @@ def run_loop(
             result = _run_powershell(code, sid, ps_timeout)
             emit("run", round=rounds, id=sid,
                  exit_code=result.get("exit_code"),
+                 # 成否は終了コードではなくこちらで判断する(failed の説明を参照)。
+                 # 見る側が自分で終了コードから判断すると、**PowerShell が例外を
+                 # 出しても0を返す**のでずれる。実測で、AssertionError で落ちた
+                 # テストが exit=0 として緑で表示されていた。判断は1か所に置く。
+                 failed=failed(result),
                  timed_out=result.get("timed_out"),
                  stdout_chars=len(result.get("stdout") or ""),
                  stderr_chars=len(result.get("stderr") or ""),

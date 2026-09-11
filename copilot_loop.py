@@ -137,6 +137,15 @@ SELECTORS = BUILTIN_PROFILES[0]
 
 SETTINGS_PROFILES_KEY = "copilot_profiles"
 
+# 入力欄の矩形を、どれだけ広げて「入力欄まわり」とみなすか(px)。
+#
+# 実測(2026-09-11, mscopilot のランディング画面):
+#   入力欄    top=447 bottom=469 left=420 right=1110
+#   送信ボタン top=488 left=1090 right=1126   ← 入力欄の真下41px、右端にほぼ重なる
+# 40px では際どいので、composer の行が丸ごと入る程度に取る。プロファイルごとに
+# composer_margin_px で上書きできる(アプリによって composer の作りが違う)。
+COMPOSER_MARGIN_PX = 120
+
 # 子孫がこれ未満なら、アクセシビリティツリーがまだ組み上がっていないとみなす。
 # 実測: 起きる前は窓枠だけの11個、起きると300〜371個。境目は広く空いている。
 MIN_AWAKE_DESCENDANTS = 30
@@ -409,21 +418,54 @@ class Copilot:
                 continue
         return None
 
-    def _bottom_buttons(self, root, desc):
-        """入力欄まわり(窓の下端から一定の帯)のボタン名。状態はここに出る。
+    def _composer_buttons(self, root, desc):
+        """入力欄まわりのボタン名。送信・停止の判定はここに出る。
 
-        帯の高さをプロファイルで変えられるようにしてあるのは、アプリごとに入力欄の
-        まわりの作りが違うため。M365 Copilot も 170px で送信・停止の両方が入ることを
-        実測で確かめてあるが、レイアウトが変わったときにコードを触らず直せる。"""
-        limit = root.CurrentBoundingRectangle.bottom - int(
-            self.profile.get("input_band_px") or 170)
+        【名前どおりに「入力欄」を基準にすること】
+        以前は `_bottom_buttons` という名で、**窓の下端から一定の帯**を見ていた。
+        会話中は入力欄が窓の下端にあるので、たまたま一致していただけだった。
+
+        会話を1つも始めていないランディング画面では、入力欄が画面の中ほどに座る。
+        実測(2026-09-11, mscopilot):
+
+            窓        bottom=1392
+            入力欄    top=447  bottom=469
+            送信ボタン top=488   Name='メッセージの送信'  InvokePattern あり
+            旧・帯の境目  top>=1222
+
+        送信ボタンは名前も申し分なく、押せる状態で**画面にも見えている**のに、
+        帯から900px以上外れているだけで捨てられていた。「送信ボタンが見つかりません」
+        で1周目に落ちるのはこれ。**名前の問題でもアイコンの問題でもなかった。**
+
+        だから入力欄の矩形を基準にする。送信ボタンは composer の一部として入力欄の
+        すぐ隣(実測では真下41px)に置かれるので、入力欄の位置さえ掴めていれば
+        画面のどこに composer があっても追いかけられる。
+
+        入力欄を掴めなかったときだけ、従来の「窓の下端からの帯」に落ちる。入力欄を
+        見失っている時点でどうせ書き込めないが、状態表示(copilot_watchdog)は
+        それでも何か出したいので、黙って空を返すよりはましな方を残す。"""
+        band = self._composer_band(desc)
+        if band is None:
+            top_limit = root.CurrentBoundingRectangle.bottom - int(
+                self.profile.get("input_band_px") or 170)
+            band = (top_limit, None, None, None)
+        lo, hi, left, right = band
+
         names = []
         for i in range(desc.Length):
             el = desc.GetElement(i)
             try:
                 if el.CurrentControlType != CONTROL_BUTTON:
                     continue
-                if el.CurrentBoundingRectangle.top < limit:
+                r = el.CurrentBoundingRectangle
+                if r.bottom < lo:
+                    continue
+                if hi is not None and r.top > hi:
+                    continue
+                # 横にも縛る。縛らないと、画面左の会話一覧に並ぶボタンまで
+                # 同じ高さというだけで入ってくる(実測で「オプションを表示する」が
+                # 5個混ざった)。送信ボタンは入力欄と横に重なる位置にある。
+                if left is not None and (r.right < left or r.left > right):
                     continue
                 name = (el.CurrentName or "").strip()
                 if name:
@@ -432,11 +474,24 @@ class Copilot:
                 continue
         return names
 
+    def _composer_band(self, desc):
+        """入力欄まわりとみなす矩形 (上, 下, 左, 右)。入力欄を掴めなければ None。"""
+        box = self._input_box(desc)
+        if box is None:
+            return None
+        try:
+            r = box.CurrentBoundingRectangle
+        except Exception:  # noqa: BLE001  要素が消えた直後など
+            return None
+        margin = int(self.profile.get("composer_margin_px") or COMPOSER_MARGIN_PX)
+        return (r.top - margin, r.bottom + margin,
+                r.left - margin, r.right + margin)
+
     # -- 状態 --------------------------------------------------------------
     def state(self):
         """'busy'(回答中) / 'ready'(送信できる) / 'idle'(入力待ち・空) を返す。"""
         root, desc = self._descendants()
-        names = [n for n, _ in self._bottom_buttons(root, desc)]
+        names = [n for n, _ in self._composer_buttons(root, desc)]
         if self._has(names, "busy_button"):
             return "busy"
         if self._has(names, "send_button"):
@@ -455,7 +510,7 @@ class Copilot:
         取れなかった項目は None。
         """
         root, desc = self._descendants()
-        names = [n for n, _ in self._bottom_buttons(root, desc)]
+        names = [n for n, _ in self._composer_buttons(root, desc)]
         if self._has(names, "busy_button"):
             state = "busy"
         elif self._has(names, "send_button"):
@@ -536,27 +591,35 @@ class Copilot:
     def send_prompt(self, text, attempts=2, wait=3.0):
         """入力欄に書いて送信する。送れたら True。
 
-        【なぜ一度書き直すか】
-        SetValue で値を入れても、アプリ側がそれに気づかず送信ボタンを出さないことが
-        まれにある。実測(2026-09-11)では、同じお題で3回続けて「送信ボタンが
-        見つかりません」で1周目に落ちたのに、直後に同じ手順を手でなぞったら
-        0.18秒で通った。**値は入っているので read_input では気づけない**
-        (中身も文字数も一致していた)。書き直すと再描画が走って直る。
+        【この再試行が効くのは「出るのが遅れた」場合だけ】
+        SetValue の直後は、アプリがまだ送信ボタンを描いていないことがある。
+        click_send は3秒までポーリングするので普通はそこで足りるが、足りなかった
+        ときの保険として、書き直してもう一度だけ試す。
 
-        当たりどころが分からないまま、1回の空振りでループ全体を諦めるのは代償が
-        大きすぎる。原因を突き止めるのは、まず落ちなくしてからでよい。
+        【以前ここに書いてあった説明は誤りだった】
+        「SetValue に気づかず送信ボタンが出ないことがあり、書き直すと再描画が走って
+        直る」と書いていた。根拠は「3回続けて落ちたのに、直後に手でなぞったら0.18秒で
+        通った」という観察。だが後日ちゃんと測ったところ、**原因は描画ではなく
+        送信ボタンの探し方だった** —— 会話を始めていないランディング画面では入力欄が
+        画面の中ほどにあり、「窓の下端からの帯」で探していたので900px以上外れていた
+        (_composer_buttons を参照)。手でなぞったときに通ったのは、その時点で会話が
+        始まっていて入力欄が下端に来ていたから。
 
-        押せなかったときは、そのとき下段に見えていたボタン名を last_bottom_buttons に
-        残す。次に起きたときに、また推測から始めないで済むように。"""
-        self.last_bottom_buttons = []
+        **同じ症状には複数の原因がありうる**、という教訓として残しておく。あのとき
+        分からないまま再試行だけ足したのは、落ちなくする手当てとしては正しかったが、
+        docstring に推測を断定として書いたのは間違いだった。
+
+        押せなかったときは、そのとき入力欄まわりに見えていたボタン名を
+        last_composer_buttons に残す。次に起きたときに、また推測から始めないで済むように。"""
+        self.last_composer_buttons = []
         for _attempt in range(max(1, attempts)):
             self.set_input(text)
             if self.click_send(wait=wait):
                 return True
             try:
                 root, desc = self._descendants()
-                self.last_bottom_buttons = [
-                    n for n, _el in self._bottom_buttons(root, desc)]
+                self.last_composer_buttons = [
+                    n for n, _el in self._composer_buttons(root, desc)]
             except Exception:  # noqa: BLE001  記録のために落ちない
                 pass
         return False
@@ -570,7 +633,7 @@ class Copilot:
         end = time.time() + max(0.0, wait)
         while True:
             root, desc = self._descendants()
-            for name, el in self._bottom_buttons(root, desc):
+            for name, el in self._composer_buttons(root, desc):
                 if name not in self._names("send_button"):
                     continue
                 pattern = el.GetCurrentPattern(INVOKE_PATTERN)

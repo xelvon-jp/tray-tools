@@ -54,7 +54,7 @@ comtypes.client.GetModule("UIAutomationCore.dll")
 import comtypes.gen.UIAutomationClient as UIA  # noqa: E402
 
 CONTROL_BUTTON, CONTROL_EDIT, CONTROL_COMBO, CONTROL_TEXT = 50000, 50003, 50004, 50020
-VALUE_PATTERN, TEXT_PATTERN = 10002, 10014
+VALUE_PATTERN, TEXT_PATTERN, INVOKE_PATTERN = 10002, 10014, 10000
 WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 
 TYPE_NAMES = {
@@ -248,6 +248,81 @@ def probe(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
             continue
     markers = [(n, c) for n, c in text_names.most_common(25) if c >= 2]
     return bottom_buttons, input_candidates, desc.Length, markers
+
+
+def dump_buttons(hwnd_main, hwnd_render, top_px=170, wake_wait=6.0):
+    """窓の中の Button を**1つも隠さず**並べる。
+
+    【なぜ専用のモードが要るか】
+    本番の探し方(copilot_loop._composer_buttons)は絞り込みを掛けている:
+      1. 入力欄まわりの矩形に入っているもの だけ
+      2. 名前が空でないもの だけ
+    どちらかに掛かると、そのボタンは存在ごと見えなくなる。「送信ボタンが
+    見つかりません」と言われたとき、**居ないのか、居るのに弾かれたのか**が
+    区別できない。ここでは判定結果を添えて全部出す。
+
+    この区別が実際に効いた: ランディング画面で送信ボタンが見つからなかった件は、
+    名前は合っていて**位置の帯から外れていただけ**だった(2026-09-11)。
+    ここで全部並べたから分かったこと。
+
+    --top-px は窓の下端からの帯(旧実装の見方)。入力欄がどこにあるかを見るには
+    この一覧の top と、--check が出す入力欄の位置を見比べる。
+    """
+    uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+    true_cond = uia.CreateTrueCondition()
+    root = uia.ElementFromHandle(ctypes.c_void_p(hwnd_main))
+
+    wake_accessibility(hwnd_render or hwnd_main)
+    deadline = time.time() + wake_wait
+    desc = root.FindAll(UIA.TreeScope_Descendants, true_cond)
+    while desc.Length < 30 and time.time() < deadline:
+        time.sleep(0.4)
+        wake_accessibility(hwnd_render or hwnd_main)
+        desc = root.FindAll(UIA.TreeScope_Descendants, true_cond)
+
+    win = root.CurrentBoundingRectangle
+    limit = win.bottom - top_px
+    rows = []
+    for i in range(desc.Length):
+        el = desc.GetElement(i)
+        try:
+            if el.CurrentControlType != CONTROL_BUTTON:
+                continue
+            r = el.CurrentBoundingRectangle
+            rows.append({
+                "name": (el.CurrentName or "").strip(),
+                "aid": (el.CurrentAutomationId or "").strip(),
+                "left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom,
+                "in_band": r.top >= limit,
+                "invoke": bool(el.GetCurrentPattern(INVOKE_PATTERN)),
+            })
+        except Exception:
+            continue
+    return rows, win, limit, desc.Length
+
+
+def print_buttons(rows, win, limit, total):
+    print(f"[ボタン一覧] 子孫 {total} 個中 Button {len(rows)} 個")
+    print(f"  窓: left={win.left} top={win.top} right={win.right} bottom={win.bottom}")
+    print(f"  下段の帯: top >= {limit}（窓の下端から {win.bottom - limit}px）")
+    print()
+    print(f"  {'帯':<3}{'押':<3}{'top':>7}{'right':>7}  {'AutomationId':<28} 名前")
+    print("  " + "-" * 96)
+    for r in sorted(rows, key=lambda x: (x["top"], x["left"])):
+        band = "○" if r["in_band"] else "×"
+        inv = "○" if r["invoke"] else "×"
+        name = r["name"] if r["name"] else "(名前なし)"
+        print(f"  {band:<3}{inv:<3}{r['top']:>7}{r['right']:>7}  {r['aid'][:28]:<28} {name[:40]}")
+    print()
+    print("  帯=下段の帯に入っているか / 押=InvokePattern を持つか")
+    hidden = [r for r in rows if not r["name"]]
+    outside = [r for r in rows if r["name"] and not r["in_band"]]
+    if hidden:
+        print(f"  ※ 名前の無いボタンが {len(hidden)} 個あります。"
+              "本番の探し方はこれを捨てています。")
+    if outside:
+        print(f"  ※ 帯の外に名前つきボタンが {len(outside)} 個あります。"
+              "本番の探し方はこれも捨てています。")
 
 
 def print_report(name, hwnd_main, hwnd_render, bottom, inputs, total, markers):
@@ -581,6 +656,8 @@ def main() -> int:
                         help="可視の窓を全部並べるだけ。まずこれで対象を見つける")
     parser.add_argument("--check", action="store_true",
                         help="仕込んだプロファイルで実際に掴めるかを診断する")
+    parser.add_argument("--buttons", action="store_true",
+                        help="窓の中の Button を全部並べる(名前が空のもの・帯の外も含む)")
     parser.add_argument("--markers", action="store_true",
                         help="1往復の前後を比べて発言マーカーの有無を突き止める")
     parser.add_argument("--watch", type=int, default=0,
@@ -655,6 +732,19 @@ def _run(args) -> int:
 
     for hwnd, cls, tt, exe in windows:
         render = find_render_child(hwnd)
+        if args.buttons:
+            # ボタンだけを見たいときは、ここで打ち切る(profile の組み立てや
+            # 読み上げ用のまとめは邪魔になる)。
+            print(f"[窓] class={cls!r} exe={exe!r} title={tt!r}")
+            try:
+                rows, win, limit, total = dump_buttons(hwnd, render,
+                                                       top_px=args.top_px)
+            except Exception as e:  # noqa: BLE001
+                print(f"  失敗: {e}")
+                continue
+            print_buttons(rows, win, limit, total)
+            print()
+            continue
         try:
             bottom, inputs, total, markers = probe(hwnd, render, top_px=args.top_px)
         except Exception as e:

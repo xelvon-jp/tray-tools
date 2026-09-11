@@ -492,7 +492,7 @@ def run_loop(
                 if not sent:
                     # 見えていたボタン名を残す。「見つかりません」だけだと、次に
                     # 起きたときにまた推測から始めることになる(実際そうなった)。
-                    seen = getattr(cp, "last_bottom_buttons", None) or []
+                    seen = getattr(cp, "last_composer_buttons", None) or []
                     stopped_by = STOP_ERROR
                     stop_detail = ("送信ボタンが見つかりません（書き直して2回試しました。"
                                    "そのとき見えていたボタン: "

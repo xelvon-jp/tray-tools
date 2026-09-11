@@ -740,10 +740,28 @@ def strip_echoed_prompt(text, prompt):
 # 末尾は (?!\d) で 1 と 12 を取り違えないようにする。
 SNIPPET_RE = re.compile(r"#start\s*(\d+)(.*?)#end\s*\1(?!\d)", re.DOTALL)
 
-# コードブロックの言語ラベルが1行目の頭に貼り付く（「Powershell# 集計…」）。
+# コードブロックの言語ラベルが、コードの1行目として紛れ込むことがある。
 # 表示上のラベルであってコードではないので剥がす。
-LANG_LABEL_RE = re.compile(r"^(?:powershell|pwsh|python|bash|cmd|batch|json|yaml)",
-                           re.IGNORECASE)
+#
+# 【剥がすのは「その行がラベルだけ」のときに限る】
+# 以前は先頭の言語名を無条件に削っていた。そのせいで、**本物のコードの先頭語まで
+# 食っていた**。実測(2026-09-11): Copilot が `python -c 'assert False'` と書いたのに
+# `-c 'assert False'` が実行され、「'-c' は認識されません」で失敗した。
+# `cmd /c ...` や `bash -lc ...` でも同じことが起きる。
+#
+# 実際の画面ではラベルは #start の**前**に付く(「Powershell#start 29」)ので、
+# コード側にラベルが来るのは、フェンスが別行に落ちた場合だけ。それは行まるごとが
+# ラベルになるので、その形だけを剥がせば足りる。
+LANG_LABELS = ("powershell", "pwsh", "python", "bash", "sh", "cmd", "batch",
+               "json", "yaml")
+
+
+def strip_lang_label(code):
+    """1行目がコードブロックの言語ラベルだけなら、その行を落とす。"""
+    lines = (code or "").split("\n")
+    if lines and lines[0].strip().lower() in LANG_LABELS:
+        return "\n".join(lines[1:])
+    return code
 
 
 # 画面から読んだコードで、アンダースコアが落ちた跡。
@@ -775,7 +793,7 @@ def extract_snippets(text):
     """[(ID, コード), ...] を返す。落ちたアンダースコアはここで戻す。"""
     result = []
     for hit in SNIPPET_RE.finditer(text or ""):
-        code = LANG_LABEL_RE.sub("", hit.group(2).strip("\n"), count=1)
+        code = strip_lang_label(hit.group(2).strip("\n"))
         code, _fixed = repair_lost_underscores(code.strip("\n"))
         result.append((hit.group(1), code))
     return result

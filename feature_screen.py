@@ -1652,10 +1652,24 @@ class ScreenFeature:
             if event == "loop_start":
                 new_state = "watching"
                 self._agent_loop_active = True
-                # ログ窓が閉じられていたら再表示(手で×を押した場合)
-                if self._agent_loop_viewer is not None:
-                    self._agent_loop_viewer.show()
-                    self._agent_loop_viewer.raise_()
+                # ログ窓を出す。無ければここで作る。
+                #
+                # 【無ければ何もしていなかった】
+                # 以前は「既にあれば前面に出す」だけだった。トレイのメニューから
+                # 始めたときは、その手前で窓を作っているので問題にならない。
+                # ところが**状態監視バーの右クリックや外からの traytools_send で
+                # 始めると窓が無く、実況を見る手段が無いまま走っていた**
+                # (実測 2026-09-11: バーから始めても窓が出なかった)。
+                # どこから始めても同じように見えるべきなので、ここで揃える。
+                # 窓が出せなくても、アイコンの更新・周回数の書き出し・通知は
+                # 続ける。ここで投げると、この下が丸ごと飛ぶ。
+                try:
+                    viewer = self._ensure_agent_loop_viewer()
+                    viewer.show()
+                    viewer.raise_()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[agent-loop] ログ窓を出せませんでした: {e}",
+                          file=sys.stderr)
             elif event in ("response", "snippet", "run"):
                 new_state = "busy"
             elif event == "round_end":

@@ -68,6 +68,7 @@ STOP_STYLES = {
     "risky-code": (COLOR_STOP_ERR, "🛑 危険パターン検出で停止"),
     "multi-snippet": (COLOR_STOP_WARN, "⚠️ スニペットが複数あり停止"),
     "empty-response": (COLOR_STOP_ERR, "❌ 応答を読み取れなかった"),
+    "unfenced-code": (COLOR_STOP_ERR, "🛑 コードが ``` で囲まれておらず文字が欠けた"),
     "stuck": (COLOR_STOP_WARN, "⚠️ 足踏みを検知して停止"),
     "no-new-response": (COLOR_STOP_WARN, "⚪ 新しい応答が来なかった"),
     "error": (COLOR_STOP_ERR, "❌ エラーで停止"),
@@ -513,6 +514,17 @@ class LogViewer(QWidget):
                 self._append_block("=== STDOUT ===", COLOR_STDOUT, stdout, COLOR_STDOUT)
             if stderr.strip():
                 self._append_block("=== STDERR ===", COLOR_STDERR, stderr, COLOR_STDERR)
+        elif event == "unfenced":
+            # 実行しなかったことと、なぜかを必ず見せる。黙って次に進むと
+            # 「なぜ実行されないのか」が分からない。
+            self.status.setText(
+                f"round {payload.get('round')} コードが囲まれていない（実行しません）")
+            self._append(
+                f"⚠ #{payload.get('id')} は ``` で囲まれていません（{payload.get('times')}回目）。"
+                "画面上で # や ` や _ が消えるため実行しません。囲み直してもらいます",
+                COLOR_STOP_ERR)
+            self._append_block("消えた文字のまま読み取れたコード", COLOR_STOP_ERR,
+                               payload.get("code") or "", COLOR_CODE)
         elif event == "empty_response":
             # 「返ってきていない」のか「読めていない」のかは、この時点では
             # 区別できない。待ち直していることだけ見せる(黙って固まって見えるより

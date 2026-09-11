@@ -76,6 +76,19 @@ DEFAULT_PASTE_LIMIT = 3000
 # ログの置き場所。個人の使用履歴なので .gitignore で追跡外にする。
 LOG_PATH = _HERE / "copilot_loop.log"
 
+# 応答とコードの**全文**を残す別ログ。
+#
+# 【なぜ分けるか】
+# copilot_loop.log には応答の先頭800文字(response_head)しか残していない。読み取りが
+# 壊れた件(2026-09-12)を追おうとしたとき、まさに後半が切れていて追えなかった。
+# かといって本体のログに全文を入れると、1周ごとに数KBずつ膨らんで読めなくなる。
+# 「ふだん読むログ」と「何かあったとき掘るログ」を分ける。
+RESPONSES_LOG_PATH = _HERE / "copilot_loop_responses.log"
+
+# 全文ログの上限(バイト)。超えたら1世代だけ退避して書き直す。
+# 無制限にすると、気づかないうちに数百MBになる類のファイルなので上限を置く。
+RESPONSES_LOG_MAX_BYTES = 4 * 1024 * 1024
+
 # キャンセル用のファイル。次の周の頭で見て、あれば止める。
 CANCEL_FLAG = _HERE / ".copilot_loop_cancel"
 
@@ -119,7 +132,13 @@ STOP_STUCK = "stuck"
 STOP_NO_NEW_RESPONSE = "no-new-response"
 STOP_MULTI_SNIPPET = "multi-snippet"
 STOP_EMPTY_RESPONSE = "empty-response"
+STOP_UNFENCED = "unfenced-code"
 STOP_ERROR = "error"
+
+# コードが ``` で囲まれずに返ってきた周を、続けて何回まで許すか。
+# 1回は言い直してもらう価値があるが、同じ形で返し続けるなら人に返したほうが早い
+# (実測で3周とも同じ壊れ方をした)。
+MAX_UNFENCED_ROUNDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +149,32 @@ def _log(record: dict) -> None:
     try:
         record.setdefault("time", time.strftime("%Y-%m-%d %H:%M:%S"))
         with open(LOG_PATH, "a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _log_full(kind: str, round_no, text: str, **extra) -> None:
+    """応答やコードの全文を、別ログへ1行1件で残す。
+
+    切り詰めないのが要点。ここは「何かあったときに掘る」ための記録で、読みやすさより
+    再現性を取る。記録のために作業を止めないので、失敗は黙って諦める。"""
+    try:
+        if (RESPONSES_LOG_PATH.exists()
+                and RESPONSES_LOG_PATH.stat().st_size > RESPONSES_LOG_MAX_BYTES):
+            # 1世代だけ退避する。2世代持つほどの価値は無いが、切り替わった瞬間に
+            # 直前のぶんまで消えると、いちばん見たい記録が消える。
+            backup = RESPONSES_LOG_PATH.with_suffix(".log.1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+                RESPONSES_LOG_PATH.rename(backup)
+            except OSError:
+                pass
+        record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
+                  "round": round_no, "chars": len(text or ""), "text": text or "",
+                  **extra}
+        with open(RESPONSES_LOG_PATH, "a", encoding="utf-8", newline="") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass
@@ -285,6 +330,68 @@ def format_paste(snippet_id: str, result: dict, paste_limit: int) -> str:
     return "\n".join(parts)
 
 
+def _looks_unfenced(cp, code) -> bool:
+    """このコードが ``` で囲まれずに描かれていたか。判定できなければ False。
+
+    【判定できないときに止めないこと】
+    目印(コードをコピー ボタンの名前)を持たないプロファイルでは code_blocks が
+    None を返す。そこで「囲まれていない」とみなすと、未実測のアプリ(M365)で
+    何も実行できなくなる。分からないときは通す —— 壊れたコードを実行する危険と、
+    使えなくなる不便を天秤にかけて、**分からないことを理由に止めない**ほうを取る。
+    判定できる相手(mscopilot)ではきちんと止まる。"""
+    try:
+        blocks = cp.code_blocks()
+    except Exception:  # noqa: BLE001  UIA は多様に落ちうる。判定不能として扱う
+        return False
+    if blocks is None:
+        return False
+
+    # **行ごとに照合する。部分文字列で見てはいけない。**
+    #
+    # 最初は「コード全体が、どれかのブロックの中に含まれるか」で見ていた。これだと
+    # 壊れたコードが通ってしまう。壊れ方は「文字が消える」なので、壊れたコードは
+    # 元のコードの部分列になり、**同じ内容の正しいブロックが会話に残っていると
+    # 部分文字列として一致する**(実測 2026-09-12: 前の周で囲み直してもらった正しい
+    # ブロックが残っていて、壊れたコードがそれに一致し、そのまま実行された)。
+    #
+    # 行で見れば、`#` が落ちてコメント行と次の行が繋がった行は、正しいブロックの
+    # どの行とも一致しない。行内で文字が落ちた場合(バッククォート等)も同じく外れる。
+    # 行内の空白は潰して比べる。インデントや語の間の詰め方は描画で変わりうるが、
+    # 消えるのは記号(# ` _)なので、空白を無視しても検出力は落ちない。
+    def norm(text):
+        return {" ".join(ln.split()) for ln in (text or "").splitlines() if ln.strip()}
+
+    block_lines = set()
+    for b in blocks:
+        block_lines |= norm(b)
+    code_lines = norm(code)
+    if not code_lines:
+        return False
+    return not code_lines <= block_lines
+
+
+def format_unfenced_report(snippet_id: str) -> str:
+    """コードが ``` で囲まれていなかったときに Copilot へ返す文面。
+
+    何が消えたかまで具体的に書く。「囲んでください」とだけ言うと、同じ形でもう一度
+    出してくることがある(実測では3周とも同じ壊れ方をした)。"""
+    return "\n".join([
+        f"#{snippet_id} は実行しませんでした。コードがコードブロックで囲まれて",
+        "いなかったため、画面上で Markdown として描画され、文字が消えています。",
+        "",
+        "消えたもの:",
+        "  行頭の #  … 見出しの記号として食われ、コメント行がコードに化ける",
+        "  `        … インラインコードの記号として食われ、`t などのエスケープが壊れる",
+        "  _        … 強調の記号として食われ、$_ が $ になる",
+        "",
+        "**同じコードを、今度は ``` で囲んで出し直してください。**",
+        "囲みの中は一字一句そのままで構いません。",
+        "",
+        f"#start {snippet_id} 〜 #end {snippet_id} も忘れずに付けてください。",
+        "（実測: 囲み直してもらったとき、この目印のほうが落ちて拾えなくなった）",
+    ])
+
+
 def format_risky_report(snippet_id: str, risks: list) -> str:
     """危険パターンを検出したときに Copilot へ返す文面。"""
     lines = [
@@ -431,6 +538,8 @@ def run_loop(
         repeated_outputs = 0
         # 直前の周に実行したコード。出力より先に「進んでいない」が分かる。
         last_code = None
+        # コードが ``` で囲まれずに返ってきた周の数。続くようなら人に返す。
+        unfenced_rounds = 0
         while rounds < max_rounds:
             if _cancel_requested():
                 stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
@@ -545,6 +654,8 @@ def run_loop(
                          elapsed=time.time() - round_started)
                     break
 
+            # 全文は別ログへ。本体のログには先頭だけ残す(RESPONSES_LOG_PATH の説明)。
+            _log_full("response", rounds, response)
             emit("response", round=rounds, chars=len(response),
                  wait_seconds=round(wait_elapsed, 1),
                  response_head=response[:800])
@@ -576,6 +687,35 @@ def run_loop(
             # こちらには判断できないので、人に見せる。
             # (以前はコメントに「止める方が安全」と書きながら、黙って最後を実行していた。)
             sid, code = snippets[-1]
+
+            # コードが ``` で囲まれて描かれているかを確かめる。
+            #
+            # 【囲まれていないと文字が消える】
+            # 囲まれていない本文は Markdown として描画され、行頭の `#`、`` ` ``、`_` が
+            # 記号として食われる。消えた文字はどの UIA 要素にも残っていないので、
+            # 読み取り方を変えても取り戻せない(copilot_loop.code_blocks を参照)。
+            #
+            # **これは「動かない」ではなく「別のコードに化ける」。** コメント行から
+            # `#` が落ちれば、コメントのつもりの行が実行される。だから実行しない。
+            # 実測(2026-09-12)では、3周とも同じ位置で構文エラーになって足踏みした。
+            if _looks_unfenced(cp, code):
+                unfenced_rounds += 1
+                emit("unfenced", round=rounds, id=sid, chars=len(code),
+                     code=code, times=unfenced_rounds)
+                if unfenced_rounds >= MAX_UNFENCED_ROUNDS:
+                    stopped_by = STOP_UNFENCED
+                    stop_detail = (
+                        f"{unfenced_rounds} 周続けて、コードが ``` で囲まれずに"
+                        "返ってきました。画面上で文字が消えるため実行できません。")
+                    emit("round_end", round=rounds, reason=stopped_by,
+                         elapsed=time.time() - round_started)
+                    break
+                # 1回は言い直してもらう。壊れたまま実行するよりずっとよい。
+                prompt = format_unfenced_report(sid)
+                emit("round_end", round=rounds,
+                     elapsed=time.time() - round_started)
+                continue
+
             if len(snippets) > 1:
                 ids = "・".join(f"#{s}" for s, _c in snippets)
                 emit("snippet", round=rounds, id=sid, chars=len(code),
@@ -593,6 +733,7 @@ def run_loop(
                     break
 
             risks = copilot_loop.risky_lines(code)
+            _log_full("snippet", rounds, code, id=sid, risks=len(risks))
             emit("snippet", round=rounds, id=sid,
                  chars=len(code), risks=len(risks), code=code)
 
@@ -664,6 +805,10 @@ def run_loop(
             last_code = normalized
 
             result = _run_powershell(code, sid, ps_timeout)
+            # 実行した内容と結果の全文。「何を実行したか」は後から必ず知りたくなる。
+            _log_full("run", rounds, result.get("stdout") or "", id=sid,
+                      exit_code=result.get("exit_code"),
+                      stderr=result.get("stderr") or "")
             emit("run", round=rounds, id=sid,
                  exit_code=result.get("exit_code"),
                  # 成否は終了コードではなくこちらで判断する(failed の説明を参照)。

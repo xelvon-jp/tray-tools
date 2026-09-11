@@ -47,3 +47,7 @@ copilot_loop_status.json
 
 # 「続けてよいか」への返事を子プロセスへ渡すファイル。聞いている間だけ存在する。
 .copilot_loop_decision
+
+# 応答とコードの全文ログ(何かあったとき掘る用)。*.log で既に外れるが、
+# 何を書くファイルなのかを残しておく。世代退避で .log.1 も作る。
+copilot_loop_responses.log*

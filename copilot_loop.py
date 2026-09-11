@@ -99,6 +99,9 @@ BUILTIN_PROFILES = [
         "user_marker": "あなたの発言",
         # 会話の末尾にくっついてくる入力欄のプレースホルダ。本文ではないので落とす。
         "idle_marker": ["Copilot へメッセージを送る", "Copilot と会話する"],
+        # コードブロックとして描かれた本文の直前に付くボタン。これが目印になる
+        # (code_blocks の説明を参照)。
+        "code_copy_button": ["コードをコピー"],
         "input_band_px": 170,
     },
     {
@@ -127,6 +130,9 @@ BUILTIN_PROFILES = [
         "user_marker": "",
         # M365 側の文言は未実測。分かったらここに足す。
         "idle_marker": [],
+        # 未実測。空のままだと「囲まれているか」を判定できないので、
+        # そのときは判定を諦めて従来どおり実行する(code_blocks を参照)。
+        "code_copy_button": [],
         "input_band_px": 170,
     },
 ]
@@ -778,6 +784,54 @@ class Copilot:
             if at != -1:
                 cut = min(cut, at)
         return new_part[:cut].strip()
+
+    def code_blocks(self):
+        """コードブロックとして描かれた本文だけを集めて返す。判定できなければ None。
+
+        【何のためにあるか】
+        Copilot がコードを ``` で囲まずに返すと、本文が Markdown として描画され、
+        **画面から文字が消える**。実測(2026-09-12):
+
+            元:  # collect .py files ...      → 読取: collect .py files ...
+            元:  "Lines`tPath"                → 読取: "LinestPath"
+            元:  $_.FullName                  → 読取: $.FullName
+
+        `#`(見出し)、`` ` ``(インラインコード)、`_`(強調)が Markdown の記号として
+        食われる。**消えた文字はどの UIA 要素にも存在しない**ので、読み取り方を
+        工夫しても取り戻せない(全型を走査して確認済み)。
+
+        たちが悪いのは、これが「動かない」ではなく「**別のコードに化ける**」こと。
+        コメント行から `#` が落ちれば、コメントのつもりの行が実行される。
+
+        【見分け方】
+        囲まれた本文には、直前に「コードをコピー」ボタンが付く。囲まれていない本文には
+        付かない。実測で、壊れていた3つの応答はいずれもボタンを伴わず、無傷だった
+        2つはいずれも伴っていた。名前はプロファイルで差し替えられる。
+
+        目印の名前を持たないプロファイル(M365 は未実測)では判定できないので None を
+        返す。呼ぶ側は「判定できない」と「囲まれていない」を混ぜないこと —— 混ぜると、
+        未実測のアプリで何も実行できなくなる。"""
+        wanted = self._names("code_copy_button")
+        if not wanted:
+            return None
+        _root, desc = self._descendants()
+        els = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                els.append((el.CurrentControlType, el.CurrentName or ""))
+            except Exception:  # noqa: BLE001  消えた要素は飛ばす
+                els.append((-1, ""))
+        blocks = []
+        for i, (t, name) in enumerate(els):
+            if t != CONTROL_BUTTON or name.strip() not in wanted:
+                continue
+            # ボタンと本文の間に Image が挟まるので、少し先まで見る。
+            for j in range(i + 1, min(i + 5, len(els))):
+                if els[j][0] == CONTROL_TEXT:
+                    blocks.append(els[j][1])
+                    break
+        return blocks
 
     def last_response(self):
         """互換のために残す。previous_length を知らずに呼ぶと会話が長くなるほど

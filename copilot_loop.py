@@ -635,6 +635,10 @@ class Copilot:
         while time.time() - start < timeout:
             text = self.document_text()
             n = len(text)
+            if n < previous_length:
+                # 全文が縮んだ。伸びるのを待っても埋まらないので、待たずに抜ける
+                # (下の取り出しが目安を捨てて全文から拾い直す)。
+                break
             if n == last_len and n - previous_length >= min_delta:
                 if stable_since is None:
                     stable_since = time.time()
@@ -646,6 +650,23 @@ class Copilot:
             time.sleep(poll)
         text = self.document_text()
         new_part = text[previous_length:]
+
+        # 目安が現在の全文より後ろを指していたら、目安を捨てて全文から拾う。
+        #
+        # 【永久に空になっていた】
+        # 会話が長くなると Copilot は古い発言をアクセシビリティツリーから外すので、
+        # **全文長は減ることがある**。送信直前に控えた previous_length が現在の
+        # 全文長を超えると text[previous_length:] は常に空で、いくら待っても
+        # 埋まらない。実測(2026-09-11): Copilot は既に DONE と答えていたのに、
+        # ループは空応答として3分待ち、最後は異常終了扱いになった。
+        # **やり切ったのに失敗として報告される**、いちばん困る誤りかた。
+        #
+        # 下の取り出しは「最後の AI 発言以降」を取るので、全文を渡しても直近の
+        # 応答に着地する。previous_length は「どこから見るか」の目安であって、
+        # そこに寄りかからない —— この関数はもともとその方針で書かれている。
+        if not new_part.strip():
+            new_part = text
+
         # 空判定を先に置くこと。空文字はどんな文字列にも「含まれる」ので、
         # マーカー未設定のプロファイル(M365 Copilot)では split("") が
         # ValueError: empty separator で落ちる。

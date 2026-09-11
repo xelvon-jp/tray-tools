@@ -273,7 +273,21 @@ class ScreenFeature:
         # エージェントループ(監視モード)の状態と、そのログ窓の参照。
         # 状態は "idle"(オフ) / "watching"(待機中) / "busy"(応答受信中や実行中) / "err"。
         # ログ窓は監視モードを開始したときだけ開く(参照はここで持たないと GC で消える)。
+        # 見た目の状態(トレイアイコンの色・メニューの見出し)。idle / watching /
+        # busy / err。**err は止まったあとも残す** —— 危ない止まりかたをしたことに
+        # 気づいてほしいので、次に始めるまで色を戻さない。
         self._agent_loop_state = "idle"
+        # いま実際に走っているか。**見た目の状態と混ぜないこと。**
+        #
+        # 【混ぜていて詰んだ】
+        # 以前は _agent_loop_state != "idle" を「走っている」の判定に使っていた。
+        # 危険パターンで止まると "err" のまま戻らないので、そのあと
+        #   - 次のループを開始できない(押しても無視される)
+        #   - 停止の項目だけ押せる(走っていないのに)
+        #   - 外からの再起動が「道連れになります」で断られ続ける
+        # という詰み方をした(実測 2026-09-11)。表示は残したいが、走っているかは
+        # 別の話なので、別に持つ。
+        self._agent_loop_active = False
         self._agent_loop_viewer = None
         # 監視モードの子プロセス。常駐の中で回すと UIA と pycaw の同居で落ちるので
         # 別プロセスにしてある(start_agent_loop_watch のコメント参照)。
@@ -1637,6 +1651,7 @@ class ScreenFeature:
             new_state = None
             if event == "loop_start":
                 new_state = "watching"
+                self._agent_loop_active = True
                 # ログ窓が閉じられていたら再表示(手で×を押した場合)
                 if self._agent_loop_viewer is not None:
                     self._agent_loop_viewer.show()
@@ -1649,8 +1664,12 @@ class ScreenFeature:
                 if not reason:
                     new_state = "watching"
             elif event == "loop_end":
+                # 走り終わったことは、止まりかたによらず必ず記録する。
+                # 見た目(err)は残しても、走っているかどうかは別。
+                self._agent_loop_active = False
                 reason = payload.get("reason") or ""
-                if reason in ("risky-code", "error", "response-timeout", "loop-timeout"):
+                if reason in ("risky-code", "error", "response-timeout",
+                              "loop-timeout", "empty-response", "stuck"):
                     new_state = "err"
                 else:
                     new_state = "idle"
@@ -1742,9 +1761,9 @@ class ScreenFeature:
         # 実行中なら二重起動しない
         import agent_loop as al
         # 既に走っていれば窓を前面に戻して終わり
-        # main._agent_loop_state の thread を見に行くのが正式だが、Feature からは
-        # 参照が見えないので、こちらの状態フラグで代替する(_agent_loop_state != "idle")。
-        if self._agent_loop_state != "idle":
+        # 見に行くのは「走っているか」だけ。表示の状態(err が残る)と混ぜると、
+        # 危ない止まりかたのあと二度と始められなくなる(_agent_loop_active を参照)。
+        if self._agent_loop_active:
             if self._agent_loop_viewer is not None:
                 self._agent_loop_viewer.show()
                 self._agent_loop_viewer.raise_()
@@ -1775,6 +1794,9 @@ class ScreenFeature:
             self._agent_loop_viewer.append_note(f"起こせませんでした: {e}")
             return
         self._agent_loop_proc = proc
+        # loop_start が届くのを待たずに立てる。子が起きて最初のイベントを返すまでの
+        # 隙間に二度押しされると、ループが2本走ってしまう。
+        self._agent_loop_active = True
         self._agent_loop_state = "watching"
         self._refresh_state()
         self._refresh_agent_loop_menu()
@@ -1797,6 +1819,8 @@ class ScreenFeature:
         残しても止める手段(トレイのメニュー)が無くなるうえ、Copilot に勝手に
         書き込み続けることになる。付箋と違って生き残らせる理由が無い。"""
         proc, self._agent_loop_proc = self._agent_loop_proc, None
+        # 殺すのだから、もう走っていない。loop_end は届かないので自分で下ろす。
+        self._agent_loop_active = False
         # 周回数の置き手紙も消す。残すと、次に札が出たときに終わったループの
         # 周回数が出る(古すぎれば札の側でも無視するが、待たせる理由が無い)。
         try:
@@ -1905,9 +1929,9 @@ class ScreenFeature:
         suffix = AGENT_LOOP_MENU_SUFFIX.get(self._agent_loop_state, "")
         self._agent_loop_menu.setTitle(AGENT_LOOP_MENU_TITLE + suffix)
         if self._agent_loop_start_action:
-            self._agent_loop_start_action.setEnabled(self._agent_loop_state == "idle")
+            self._agent_loop_start_action.setEnabled(not self._agent_loop_active)
         if self._agent_loop_stop_action:
-            self._agent_loop_stop_action.setEnabled(self._agent_loop_state != "idle")
+            self._agent_loop_stop_action.setEnabled(self._agent_loop_active)
         if self._agent_loop_show_log_action:
             self._agent_loop_show_log_action.setEnabled(self._agent_loop_viewer is not None)
 
@@ -1978,7 +2002,7 @@ class ScreenFeature:
                 blockers.append("画面ミラー")
         except Exception:  # noqa: BLE001
             blockers.append("画面ミラー(状態を読めず)")
-        if self._agent_loop_state != "idle":
+        if self._agent_loop_active:
             blockers.append("エージェントループ")
         if self.sleep_seconds_left() is not None:
             # 予約は再起動で消える。寝るつもりだったのに寝ないのは、

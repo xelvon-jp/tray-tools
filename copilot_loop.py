@@ -694,13 +694,27 @@ class Copilot:
         if marker_user and marker_user in new_part:
             new_part = new_part.split(marker_user)[0]
 
-        # 入力欄のプレースホルダ(「Copilot と会話する」等)が末尾に混ざる。
-        # 本文ではないので落とす。
+        # 入力欄まわりの UI 文字列(「Copilot へメッセージを送る」等)が末尾に混ざる。
+        # 本文ではないので、**最初に現れたところから後ろを丸ごと**落とす。
+        #
+        # 【末尾一致では足りなかった】
+        # 以前は「末尾がちょうどその文字列なら削る」だった。ところが実機では
+        # UI 文字列が続けて何本も並ぶ:
+        #   'DONE' + 'Copilot へメッセージを送る' + 'グループを開始する' + '一緒に…'
+        # 末尾は最後のものなので、どれとも一致せず素通りしていた。その結果、
+        # 応答が 'DONEC…' となって完了語 DONE が単語の途中扱いになり、
+        # **やり切ったのに finish-word で止まらなかった**(実測 2026-09-11)。
+        #
+        # 本文がこれらの文言を含むことは考えにくいが、含んでいればそこで切れる。
+        # 取りこぼすより切りすぎるほうが、症状が目に見えるぶん扱いやすい。
+        cut = len(new_part)
         for idle_marker in self._names("idle_marker"):
-            if idle_marker and new_part.rstrip().endswith(idle_marker):
-                new_part = new_part.rstrip()[: -len(idle_marker)]
-                break
-        return new_part.strip()
+            if not idle_marker:
+                continue
+            at = new_part.find(idle_marker)
+            if at != -1:
+                cut = min(cut, at)
+        return new_part[:cut].strip()
 
     def last_response(self):
         """互換のために残す。previous_length を知らずに呼ぶと会話が長くなるほど

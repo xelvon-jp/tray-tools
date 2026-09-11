@@ -581,9 +581,18 @@ class StatusPill(QWidget):
         # 起きない状態になり、効かないのか届いていないのかが分からない。どちらを
         # 出すかは札に出ている周回数と同じ根拠にする(＝見えているとおりに操作できる)。
         running = bool(self._loop_badge)
-        menu.addAction("⏹ エージェントループを停止" if running
-                       else "▶ エージェントループを開始（監視）"
-                       ).setData("loop_stop" if running else "loop_start")
+        if running:
+            menu.addAction("⏹ エージェントループを停止").setData("loop_stop")
+        else:
+            # 始めかたは2つある。混ぜずに別項目で出す。
+            #
+            # 【自動で決めない】
+            # 「新しい投稿を待つ」か「画面の最後の回答を引き取る」かは、押した人に
+            # しか分からない。こちらで気を利かせて最後の回答を拾うようにしていた
+            # 時期があり、前のやり取りが残っている状態で押した瞬間に走り出して
+            # 意図せず10周回った。取り違えたときの代償が大きいので、押す側に選ばせる。
+            menu.addAction("▶ ループ開始（これから投稿する）").setData("loop_start")
+            menu.addAction("▶ ループ開始（直前の回答から）").setData("loop_start_last")
         menu.addAction("🤖 ループのログ窓を開く").setData("loop_log")
 
         menu.addSeparator()
@@ -596,6 +605,11 @@ class StatusPill(QWidget):
             self._on_toggle_pause()
         elif key == "reset" and self._on_reset_position is not None:
             self._on_reset_position()
+        elif key == "loop_start_last":
+            # 画面に出ている最後の回答を引き取って回す。Copilot と何往復かしてから
+            # 「この続きを自動で回したい」というときの入口。
+            send_to_tray("agent-loop", ["start", "--watch", "--auto",
+                                        "--take-last", "--finish-word=DONE"])
         elif key == "loop_start":
             # 完了語を渡すのを忘れないこと。トレイメニューからの開始は DONE を
             # 渡しており、渡さないと定型文が「終わったら DONE」で締めていても

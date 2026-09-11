@@ -749,7 +749,7 @@ PARENT_PID = 0
 def spawn(prompt_path=None, watch=False, auto=False, max_rounds=None,
           ps_timeout=None, response_timeout=None, paste_limit=None,
           finish_word="", loop_timeout=None, on_event=None, parent_pid=None,
-          approval_timeout=None):
+          approval_timeout=None, take_last=False):
     """このループを別プロセスで起こし、進捗を on_event に流す。(proc, thread) を返す。
 
     【常駐の中で run_loop を直接呼んではいけない】
@@ -776,6 +776,10 @@ def spawn(prompt_path=None, watch=False, auto=False, max_rounds=None,
         argv.append("--watch")
     if auto:
         argv.append("--auto")
+    if take_last:
+        # 新しい応答を待たず、画面に出ている最後の応答を引き取る。
+        # 「Copilot とやり取りした続きから回したい」ときの入口。
+        argv.append("--take-last")
     argv.append("--emit-events")
     for flag, value in (("--max-rounds", max_rounds), ("--ps-timeout", ps_timeout),
                         ("--response-timeout", response_timeout),

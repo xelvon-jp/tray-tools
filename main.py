@@ -698,7 +698,8 @@ def _agent_loop_command(screen, args, reply) -> None:
     #   お題は人が Copilot に直接投稿する。tray-tools はその応答から引き取る。
     opts = {"auto": False, "watch": False, "max_rounds": None,
             "ps_timeout": None, "response_timeout": None,
-            "paste_limit": None, "finish_word": "", "loop_timeout": None}
+            "paste_limit": None, "finish_word": "", "loop_timeout": None,
+            "take_last": False}
 
     # 位置引数の1つ目は「--」で始まらなければ prompt_path、始まれば watch 前提
     positional = [t for t in args[1:] if not t.startswith("--")]
@@ -707,6 +708,10 @@ def _agent_loop_command(screen, args, reply) -> None:
             opts["watch"] = True
         elif tok == "--auto":
             opts["auto"] = True
+        elif tok == "--take-last":
+            # 新しい応答を待たず、画面に出ている最後の応答を引き取る。
+            # Copilot と一往復してから「その続きから回したい」ときの入口。
+            opts["take_last"] = True
         elif tok.startswith("--max=") or tok.startswith("--max-rounds="):
             opts["max_rounds"] = int(tok.split("=", 1)[1])
         elif tok.startswith("--ps-timeout="):
@@ -730,7 +735,8 @@ def _agent_loop_command(screen, args, reply) -> None:
             reply(f"ERR お題ファイルが見つかりません: {prompt_path}")
             return
 
-    prompt_label = ("<watch モード>" if opts["watch"]
+    prompt_label = ("<watch モード・直前の回答から>" if opts["watch"] and opts["take_last"]
+                    else "<watch モード>" if opts["watch"]
                     else os.path.basename(prompt_path))
 
     # **常駐の中で run_loop を呼んではいけない。** run_loop は UI Automation を使い、
@@ -769,7 +775,7 @@ def _agent_loop_command(screen, args, reply) -> None:
             response_timeout=opts["response_timeout"],
             paste_limit=opts["paste_limit"], finish_word=opts["finish_word"],
             loop_timeout=opts["loop_timeout"], on_event=on_loop_event,
-            parent_pid=os.getpid(),
+            take_last=opts["take_last"], parent_pid=os.getpid(),
         )
     except OSError as e:
         action_log.record("agent-loop 失敗", str(e)[:80], "external")

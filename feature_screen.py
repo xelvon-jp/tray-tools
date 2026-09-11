@@ -465,8 +465,15 @@ class ScreenFeature:
         # ここから下は「tray-tools が自分でコードを実行する」側。押すと何が起きるかを
         # 項目名に入れておく(危険パターンで止まる作りとはいえ、実行はする)。
         self._agent_loop_start_action = self._agent_loop_menu.addAction(
-            "▶ エージェントループを始める（応答を引き取って自動実行）",
+            "▶ ループを始める（これから投稿する）",
             lambda _checked=False: self.start_agent_loop_watch(),
+        )
+        # 始めかたは2つある。混ぜずに別項目で出す(どちらを望むかは押した人にしか
+        # 分からない。気を利かせて最後の回答を拾うようにしていた時期があり、前の
+        # やり取りが残っている状態で押した瞬間に走り出して意図せず10周回った)。
+        self._agent_loop_start_last_action = self._agent_loop_menu.addAction(
+            "▶ ループを始める（直前の回答から）",
+            lambda _checked=False: self.start_agent_loop_watch(take_last=True),
         )
         self._agent_loop_stop_action = self._agent_loop_menu.addAction(
             "⏹ エージェントループを止める",
@@ -1765,8 +1772,11 @@ class ScreenFeature:
         except Exception as e:  # noqa: BLE001  知らせられなくても作業は続く
             print(f"[agent-loop] 通知に失敗: {e}", file=sys.stderr)
 
-    def start_agent_loop_watch(self) -> None:
+    def start_agent_loop_watch(self, take_last: bool = False) -> None:
         """トレイメニューから呼ぶ「監視モード開始」。
+
+        take_last=True なら、新しい応答を待たず画面に出ている最後の応答を引き取る。
+        Copilot と何往復かしてから「この続きを自動で回したい」ときの入口。
 
         非同期で常駐スレッドを起こす。ここは Qt メインスレッド。実処理は
         main._agent_loop_command と同じ経路を通したいので、traytools_send 経由で
@@ -1801,6 +1811,7 @@ class ScreenFeature:
                 # 完了の合図として拾う。渡さないと上限まで回るか no-snippet で
                 # 止まり、やり切ったのか途中で力尽きたのか区別がつかない。
                 finish_word="DONE",
+                take_last=take_last,
                 on_event=self.on_agent_loop_event,
                 parent_pid=os.getpid(),
             )
@@ -1944,6 +1955,8 @@ class ScreenFeature:
         self._agent_loop_menu.setTitle(AGENT_LOOP_MENU_TITLE + suffix)
         if self._agent_loop_start_action:
             self._agent_loop_start_action.setEnabled(not self._agent_loop_active)
+        if getattr(self, "_agent_loop_start_last_action", None):
+            self._agent_loop_start_last_action.setEnabled(not self._agent_loop_active)
         if self._agent_loop_stop_action:
             self._agent_loop_stop_action.setEnabled(self._agent_loop_active)
         if self._agent_loop_show_log_action:

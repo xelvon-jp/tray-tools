@@ -211,8 +211,52 @@ def _report(response) -> int:
     return 0 if response.startswith("OK") else 1
 
 
+# 窓を開くコマンド。送る前に、常駐へ「前面を取ってよい」と許可を渡す。
+#
+# 【なぜ必要か】
+# Windows の前面化ロックが効いていると(実測: ForegroundLockTimeout = 2147483647ms
+# ＝実質無期限)、**前面でないプロセスからの SetForegroundWindow は黙って失敗する**。
+# 常駐は前面ではないので、ピッカーの activateWindow() が効かない。さらにピッカーは
+# WindowStaysOnTopHint なので、フォーカスが来なくても最前面に描かれる。結果として
+# 「窓は開いているのにフォーカスはあふｗに残ったまま」になり、打った文字が
+# あふｗへ飛ぶ(実測で起きている)。
+#
+# 【なぜここで渡せるのか】
+# AllowSetForegroundWindow は「前面を取る権利を持つプロセス」だけが呼べる。この
+# スクリプトはあふｗ(前面のプロセス)から起こされた子なので、その権利を持っている。
+# 権利を常駐へ手渡すのが Windows の正規の手順で、システム設定を書き換える必要も、
+# キー送信のような小細工も要らない。
+#
+# 【なぜコマンドを絞るのか】
+# 前面を渡してよいのは「人がいま開けと言った窓」だけ。通知や状態問い合わせにまで
+# 渡すと、裏で動いているものが前面を奪える状態を無闇に広げることになる。
+FOREGROUND_COMMANDS = {"bookmark"}
+
+# 「どのプロセスでもよい」を表す値。常駐の pid を知る手段がここに無いので、これを使う。
+# 権利は呼んだ側(このスクリプト)が持っているぶんの委譲で、期限も次の前面変更までと
+# 短い。とはいえ「誰でもよい」なので、上のとおり対象コマンドは絞っておくこと。
+ASFW_ANY = -1
+
+
+def _allow_foreground() -> bool:
+    """常駐が前面を取れるように許可を渡す。渡せたら True。
+
+    失敗しても送信は続ける。フォーカスが来ないだけで、窓は出るし操作もできる
+    (いままでと同じ状態に戻るだけ)。ここで送信ごと止めるほうが害が大きい。"""
+    try:
+        user32 = ctypes.windll.user32
+        user32.AllowSetForegroundWindow.argtypes = [ctypes.c_ulong]
+        user32.AllowSetForegroundWindow.restype = ctypes.c_bool
+        return bool(user32.AllowSetForegroundWindow(ctypes.c_ulong(ASFW_ANY)))
+    except OSError:
+        return False
+
+
 def send(command: str, args: list) -> int:
     timeout = _response_timeout(command)
+    if command in FOREGROUND_COMMANDS:
+        # 送る前に渡すこと。常駐は受け取った直後に窓を出すので、後からでは間に合わない。
+        _allow_foreground()
     try:
         return _report(_exchange(command, args, timeout))
     except FileNotFoundError:
@@ -226,6 +270,9 @@ def send(command: str, args: list) -> int:
 
     for _ in range(STARTUP_POLL_COUNT):
         time.sleep(STARTUP_POLL_INTERVAL)
+        if command in FOREGROUND_COMMANDS:
+            # 起動を待つ間に前面が変わっていることがあるので、送り直すたびに渡し直す。
+            _allow_foreground()
         try:
             return _report(_exchange(command, args, timeout))
         except FileNotFoundError:

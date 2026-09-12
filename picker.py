@@ -4,9 +4,10 @@
 #
 # 「表示名で絞り込んで1つ決める」以上のことはしない。決めた後に何をするか(コピー・移動・
 # 登録)は呼び出し側の on_accept が行い、ウインドウの開閉はこちらが受け持つ。
+import ctypes
 import sys
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QLabel,
@@ -259,6 +260,40 @@ class PickerWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.search.setFocus()
+        # 取れていなければ、もう一度だけ自分で前面を取りにいく。
+        #
+        # 【なぜ要るか】
+        # Windows の前面化ロックが効いていると(実測: ForegroundLockTimeout が
+        # 2147483647ms ＝実質無期限)、前面でないプロセスからの SetForegroundWindow は
+        # 黙って失敗する。activateWindow() の中身がこれ。さらにこの窓は常に最前面に
+        # 描かれる設定なので、**フォーカスが来なくても見た目には開いている**。
+        # 打った文字が前のアプリへ飛ぶ、といういちばん困る形になる。
+        #
+        # あふｗから開く経路では、呼び出し側(traytools_send)が前面化の許可を先に
+        # 渡している。許可があれば下の呼び出しは通る。許可が無い経路(ホットキー等)
+        # では通らないが、そのときは今までと同じ状態に戻るだけで、悪化はしない。
+        QTimer.singleShot(0, self._ensure_foreground)
+
+    def _ensure_foreground(self):
+        """前面が自分でなければ、明示的に取りにいく。取れなければ黙って諦める。"""
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            if user32.GetForegroundWindow() == hwnd:
+                return
+            user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            user32.SetForegroundWindow.restype = ctypes.c_bool
+            if not user32.SetForegroundWindow(ctypes.c_void_p(hwnd)):
+                # 取れなかった。窓は見えているので操作はできるが、打った文字は
+                # 前のアプリへ行く。原因を追えるように記録だけ残す。
+                print("[picker] 前面を取れませんでした（前面化ロック）",
+                      file=sys.stderr)
+                return
+            self.activateWindow()
+            self.search.setFocus()
+        except Exception as e:  # noqa: BLE001  フォーカスのために窓を落とさない
+            print(f"[picker] 前面化に失敗: {e}", file=sys.stderr)
 
     def closeEvent(self, event):
         super().closeEvent(event)

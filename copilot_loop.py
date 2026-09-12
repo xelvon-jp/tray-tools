@@ -888,9 +888,24 @@ def strip_echoed_prompt(text, prompt):
 # --- スニペットの切り出し ---------------------------------------------------
 # プロンプト側で #start <ID> 〜 #end <ID> で囲ませてあるので、それを拾う。
 # 言語フェンスを当てにするより確実で、IDで実行漏れ・重複実行も検知できる。
-# ID の直後に空白が入らない（#end 1Copilot… と続く）ので、ID は数字で取り、
-# 末尾は (?!\d) で 1 と 12 を取り違えないようにする。
-SNIPPET_RE = re.compile(r"#start\s*(\d+)(.*?)#end\s*\1(?!\d)", re.DOTALL)
+# ID の直後に空白が入らない（#end 1Copilot… と続く）ので、末尾は否定先読みで
+# 1 と 12 を取り違えないようにする。
+#
+# 【ID を数字だけにしていて拾えなかった】
+# 以前は (\d+) だった。プロンプトは「ID（採番はあなた）」としか言っていないので、
+# Copilot は数字以外も使う。実測(2026-09-12)で `#start PS-001` と採番され、
+# パターンに当たらず no-snippet で1周目に止まった。英数字とハイフン・下線を許す。
+#
+# ただし **数字を1つ以上含むこと** を条件にする。そうしないと、地の文の
+# 「#starting … #ending」のような並びを ID='ing' として拾ってしまう(数字縛りが
+# 偶然その防波堤になっていた)。実測で現れた ID は 1 / 001 / 24 / PS-001 で、
+# どれも数字を含む。
+#
+# ID の直後に区切りが無い場合(`#start PS-001Powershell(...)`)もあるが、#end 側との
+# 後方参照が効くので、正規表現のバックトラックで正しい境目に落ち着く。
+SNIPPET_ID = r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"
+SNIPPET_RE = re.compile(
+    r"#start\s*(" + SNIPPET_ID + r")(.*?)#end\s*\1(?![A-Za-z0-9_-])", re.DOTALL)
 
 # コードブロックの言語ラベルが、コードの1行目として紛れ込むことがある。
 # 表示上のラベルであってコードではないので剥がす。
@@ -908,11 +923,47 @@ LANG_LABELS = ("powershell", "pwsh", "python", "bash", "sh", "cmd", "batch",
                "json", "yaml")
 
 
+# ラベルの直後がこの文字なら、ラベルではなく**本物のコード**とみなして剥がさない。
+#   英数字 _ . -  … `pythonw.exe` のように別のコマンド名の途中
+#   空白        … `python -c ...` のように引数が続くコマンド
+_LABEL_CONTINUES = set("abcdefghijklmnopqrstuvwxyz"
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") | set(" \t\r\n")
+
+
 def strip_lang_label(code):
-    """1行目がコードブロックの言語ラベルだけなら、その行を落とす。"""
-    lines = (code or "").split("\n")
+    """先頭に紛れ込んだコードブロックの言語ラベルを落とす。
+
+    【2種類の紛れ込み方がある】
+    実測(2026-09-12)で、どちらも起きることを確かめた:
+
+      1. 行まるごとがラベル      "powershell\\nWrite-Output 'a'"
+      2. コードに直結している    "Powershell(Get-Item .).Name"
+                                 "Powershell# カレントフォルダの名前を表示"
+
+    2 は `#start <ID>` の直後にラベルが差し込まれる形。剥がさないと
+    `Powershell(Get-Item ...)` がそのまま実行され、コマンドとして解釈できずに失敗する。
+
+    【本物のコードを食わないこと】
+    以前は先頭の言語名を無条件に削っていて、`python -c 'assert False'` の python まで
+    食っていた(b01712e で修正)。今度は逆に、直結したラベルを剥がせなくなっていた。
+    両方を満たす境目は「ラベルの直後の文字」にある:
+
+      Powershell(   → ( はコマンド名に続かない  → ラベル。剥がす
+      Powershell#   → # も続かない              → ラベル。剥がす
+      python -c     → 空白。引数が続くコマンド   → 本物。残す
+      pythonw.exe   → w が続く。別のコマンド名   → 本物。残す
+    """
+    text = code or ""
+    lines = text.split("\n")
     if lines and lines[0].strip().lower() in LANG_LABELS:
         return "\n".join(lines[1:])
+    low = text.lower()
+    for label in LANG_LABELS:
+        if not low.startswith(label):
+            continue
+        rest = text[len(label):]
+        if rest and rest[0] not in _LABEL_CONTINUES:
+            return rest
     return code
 
 

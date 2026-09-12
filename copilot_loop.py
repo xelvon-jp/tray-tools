@@ -672,9 +672,24 @@ class Copilot:
             try:
                 if el.CurrentControlType != CONTROL_TEXT:
                     continue
-                parts.append(el.CurrentName or "")
+                name = el.CurrentName or ""
             except Exception:
                 continue
+            # コードブロックの言語ラベルは、**独立した Text 要素**として現れる
+            # (実測 2026-09-12: '#start GO-001' / 'Powershell' / 'go mod init demo'
+            #  の3要素が並ぶ)。素直に繋ぐと 'Powershellgo mod init demo' になり、
+            # そのまま実行されて「'Powershellgo' は認識されません」で失敗する。
+            #
+            # 【文字列で剥がすのをやめた理由】
+            # 繋いだ後から先頭の言語名を削る作りにしていたが、本物のコードの
+            # 先頭語(`python -c ...`)まで食う/`Powershellgo` は剥がせない、と
+            # どちらにも倒せなかった。**要素の切れ目が分かる読み取りの時点で
+            # 行を分ける**ほうが素直で、後段の「行まるごとがラベルなら落とす」が
+            # そのまま効く。情報も捨てていない。
+            if name.strip().lower() in LANG_LABELS:
+                parts.append("\n" + name.strip() + "\n")
+                continue
+            parts.append(name)
         return "".join(parts).replace(OBJECT_MARK, "")
 
     def snapshot_length(self):
@@ -923,47 +938,21 @@ LANG_LABELS = ("powershell", "pwsh", "python", "bash", "sh", "cmd", "batch",
                "json", "yaml")
 
 
-# ラベルの直後がこの文字なら、ラベルではなく**本物のコード**とみなして剥がさない。
-#   英数字 _ . -  … `pythonw.exe` のように別のコマンド名の途中
-#   空白        … `python -c ...` のように引数が続くコマンド
-_LABEL_CONTINUES = set("abcdefghijklmnopqrstuvwxyz"
-                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") | set(" \t\r\n")
-
-
 def strip_lang_label(code):
-    """先頭に紛れ込んだコードブロックの言語ラベルを落とす。
+    """1行目がコードブロックの言語ラベルだけなら、その行を落とす。
 
-    【2種類の紛れ込み方がある】
-    実測(2026-09-12)で、どちらも起きることを確かめた:
+    ラベルは独立した Text 要素として現れるので、document_text が読み取りの時点で
+    前後に改行を入れている。ここはその行を捨てるだけでよい。
 
-      1. 行まるごとがラベル      "powershell\\nWrite-Output 'a'"
-      2. コードに直結している    "Powershell(Get-Item .).Name"
-                                 "Powershell# カレントフォルダの名前を表示"
-
-    2 は `#start <ID>` の直後にラベルが差し込まれる形。剥がさないと
-    `Powershell(Get-Item ...)` がそのまま実行され、コマンドとして解釈できずに失敗する。
-
-    【本物のコードを食わないこと】
-    以前は先頭の言語名を無条件に削っていて、`python -c 'assert False'` の python まで
-    食っていた(b01712e で修正)。今度は逆に、直結したラベルを剥がせなくなっていた。
-    両方を満たす境目は「ラベルの直後の文字」にある:
-
-      Powershell(   → ( はコマンド名に続かない  → ラベル。剥がす
-      Powershell#   → # も続かない              → ラベル。剥がす
-      python -c     → 空白。引数が続くコマンド   → 本物。残す
-      pythonw.exe   → w が続く。別のコマンド名   → 本物。残す
+    【文字列の当てずっぽうはやめた】
+    一時期、繋がってしまったラベルを「直後の文字」から見分けて剥がそうとした
+    (`Powershell(` は剥がす、`python -c` は残す)。`Powershellgo mod init demo` の
+    ように直後が英字の場合に破綻し、`pythonw.exe` と区別できない。
+    切れ目が分かる読み取りの時点で分けるほうが素直で、ここは単純なままでいられる。
     """
-    text = code or ""
-    lines = text.split("\n")
+    lines = (code or "").split(chr(10))
     if lines and lines[0].strip().lower() in LANG_LABELS:
-        return "\n".join(lines[1:])
-    low = text.lower()
-    for label in LANG_LABELS:
-        if not low.startswith(label):
-            continue
-        rest = text[len(label):]
-        if rest and rest[0] not in _LABEL_CONTINUES:
-            return rest
+        return chr(10).join(lines[1:])
     return code
 
 

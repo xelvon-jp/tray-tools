@@ -133,6 +133,7 @@ STOP_NO_NEW_RESPONSE = "no-new-response"
 STOP_MULTI_SNIPPET = "multi-snippet"
 STOP_EMPTY_RESPONSE = "empty-response"
 STOP_UNFENCED = "unfenced-code"
+STOP_CLAIM_MISMATCH = "claim-mismatch"
 STOP_ERROR = "error"
 
 # コードが ``` で囲まれずに返ってきた周を、続けて何回まで許すか。
@@ -328,6 +329,74 @@ def format_paste(snippet_id: str, result: dict, paste_limit: int) -> str:
         "問題なければ次のステップへ進めてください。",
     ]
     return "\n".join(parts)
+
+
+# 自己申告の chars を、どれだけ外れたら「合っていない」とみなすか。
+#
+# 【行や記号は厳密に、文字数だけ緩める】
+# LLM に総文字数は正確に数えられない。実測でも数十ずれる。厳密に見ると、壊れて
+# いないのに毎回止まることになる。一方、行数と「# や ` の個数」のような小さい数は
+# 十分に正確で、しかも**今回の壊れ方(記号が消える)に直接効く**。
+# だから chars は「大きくずれたときだけ疑う」用に使い、細かい欠落は記号の個数で見る。
+CLAIM_CHARS_TOLERANCE_RATIO = 0.05
+CLAIM_CHARS_TOLERANCE_MIN = 20
+
+# 申告と合わないコードを、続けて何回まで出し直してもらうか。
+MAX_CLAIM_MISMATCH_ROUNDS = 2
+
+
+def _measure(code):
+    """自己申告と突き合わせるための実測値。"""
+    text = code or ""
+    return {
+        "lines": len([ln for ln in text.split(chr(10))]),
+        "chars": len(text),
+        "hashes": text.count("#"),
+        "backticks": text.count("`"),
+        "underscores": text.count("_"),
+    }
+
+
+def claim_mismatches(code, claim):
+    """自己申告と実測のズレを [(項目, 申告, 実測), ...] で返す。合っていれば空。
+
+    書かれたキーだけを見る。書かれていない項目は確かめようがないので黙って通す
+    (古いお題には申告そのものが無い。そこで止めると何も動かなくなる)。"""
+    if not claim:
+        return []
+    actual = _measure(code)
+    out = []
+    for key, said in claim.items():
+        got = actual.get(key)
+        if got is None:
+            continue
+        if key == "chars":
+            allow = max(CLAIM_CHARS_TOLERANCE_MIN,
+                        int(said * CLAIM_CHARS_TOLERANCE_RATIO))
+            if abs(got - said) > allow:
+                out.append((key, said, got))
+        elif got != said:
+            out.append((key, said, got))
+    return out
+
+
+def format_claim_mismatch_report(snippet_id, mismatches):
+    """申告と合わなかったときに Copilot へ返す文面。"""
+    lines = [
+        f"#{snippet_id} は実行しませんでした。あなたが #start の行に書いた申告と、",
+        "私の画面に届いた本文が一致しません。転送の途中で文字が欠けています。",
+        "",
+        "  項目        あなたの申告   私に届いた本文",
+    ]
+    for key, said, got in mismatches:
+        lines.append(f"  {key:<10}  {said:>10}   {got:>12}")
+    lines += [
+        "",
+        "**同じコードを、``` で囲んで出し直してください。**",
+        "囲まないと、行頭の # や ` や _ が Markdown の記号として画面から消えます。",
+        "出し直すときも #start の行に申告を付けてください。",
+    ]
+    return chr(10).join(lines)
 
 
 def _looks_unfenced(cp, code) -> bool:
@@ -562,6 +631,8 @@ def run_loop(
         last_code = None
         # コードが ``` で囲まれずに返ってきた周の数。続くようなら人に返す。
         unfenced_rounds = 0
+        # 自己申告と届いた本文が食い違った周の数。
+        claim_mismatch_rounds = 0
         while rounds < max_rounds:
             if _cancel_requested():
                 stopped_by, stop_detail = STOP_CANCEL, "cancel フラグを検知"
@@ -692,7 +763,7 @@ def run_loop(
                 break
 
             # 5) スニペット抽出
-            snippets = copilot_loop.extract_snippets(response)
+            snippets = copilot_loop.extract_snippets_with_claims(response)
             if not snippets:
                 stopped_by = STOP_NO_SNIPPET
                 stop_detail = "応答に #start/#end のスニペットがありません"
@@ -708,7 +779,7 @@ def run_loop(
             # 最後だけを実行すると調査を飛ばして修正が走る。どちらを実行してほしいのかは
             # こちらには判断できないので、人に見せる。
             # (以前はコメントに「止める方が安全」と書きながら、黙って最後を実行していた。)
-            sid, code = snippets[-1]
+            sid, code, claim = snippets[-1]
 
             # コードが ``` で囲まれて描かれているかを確かめる。
             #
@@ -739,7 +810,7 @@ def run_loop(
                 continue
 
             if len(snippets) > 1:
-                ids = "・".join(f"#{s}" for s, _c in snippets)
+                ids = "・".join(f"#{s}" for s, _c, _q in snippets)
                 emit("snippet", round=rounds, id=sid, chars=len(code),
                      risks=0, code=code, siblings=len(snippets))
                 if _ask_approval(
@@ -754,8 +825,34 @@ def run_loop(
                          reason=stopped_by, elapsed=time.time() - round_started)
                     break
 
+            # 【転送の完全性を、危険検知より前で見る】
+            # 危険検知はコードの中身を見るので、**届いた本文が正しいこと**が前提に
+            # なっている。前提のほうを先に確かめる。順番を逆にすると、化けたコードを
+            # 危険検知に通してから気づくことになる。
+            mismatches = claim_mismatches(code, claim)
+            if mismatches:
+                claim_mismatch_rounds += 1
+                emit("claim_mismatch", round=rounds, id=sid,
+                     claim=claim, actual=_measure(code),
+                     mismatches=[{"key": k, "said": a, "got": b}
+                                 for k, a, b in mismatches],
+                     times=claim_mismatch_rounds)
+                if claim_mismatch_rounds >= MAX_CLAIM_MISMATCH_ROUNDS:
+                    stopped_by = STOP_CLAIM_MISMATCH
+                    stop_detail = (
+                        f"{claim_mismatch_rounds} 周続けて、申告と届いた本文が"
+                        "一致しませんでした。転送の途中で文字が欠けています。")
+                    emit("round_end", round=rounds, reason=stopped_by,
+                         elapsed=time.time() - round_started)
+                    break
+                prompt = format_claim_mismatch_report(sid, mismatches)
+                emit("round_end", round=rounds,
+                     elapsed=time.time() - round_started)
+                continue
+
             risks = copilot_loop.risky_lines(code)
-            _log_full("snippet", rounds, code, id=sid, risks=len(risks))
+            _log_full("snippet", rounds, code, id=sid, risks=len(risks),
+                      claim=claim)
             emit("snippet", round=rounds, id=sid,
                  chars=len(code), risks=len(risks), code=code)
 

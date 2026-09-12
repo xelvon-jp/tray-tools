@@ -69,6 +69,7 @@ STOP_STYLES = {
     "multi-snippet": (COLOR_STOP_WARN, "⚠️ スニペットが複数あり停止"),
     "empty-response": (COLOR_STOP_ERR, "❌ 応答を読み取れなかった"),
     "unfenced-code": (COLOR_STOP_ERR, "🛑 コードが ``` で囲まれておらず文字が欠けた"),
+    "claim-mismatch": (COLOR_STOP_ERR, "🛑 申告と届いた本文が一致しない（文字が欠けた）"),
     "stuck": (COLOR_STOP_WARN, "⚠️ 足踏みを検知して停止"),
     "no-new-response": (COLOR_STOP_WARN, "⚪ 新しい応答が来なかった"),
     "error": (COLOR_STOP_ERR, "❌ エラーで停止"),
@@ -514,6 +515,21 @@ class LogViewer(QWidget):
                 self._append_block("=== STDOUT ===", COLOR_STDOUT, stdout, COLOR_STDOUT)
             if stderr.strip():
                 self._append_block("=== STDERR ===", COLOR_STDERR, stderr, COLOR_STDERR)
+        elif event == "claim_mismatch":
+            # 何がどう違ったかを並べる。「一致しません」だけだと、どこが欠けたのか
+            # 分からず、人が確かめようがない。
+            ms = payload.get("mismatches") or []
+            self.status.setText(
+                f"round {payload.get('round')} 申告と不一致（実行しません）")
+            self._append(
+                f"⚠ #{payload.get('id')} は申告と一致しません（{payload.get('times')}回目）。"
+                "転送で文字が欠けているので実行しません", COLOR_STOP_ERR)
+            body = ["項目        申告      届いた本文"]
+            for m in ms:
+                body.append(f"{m.get('key',''):<10}{m.get('said',''):>8}"
+                            f"{m.get('got',''):>12}")
+            self._append_block("突き合わせ", COLOR_STOP_ERR,
+                               chr(10).join(body), COLOR_CODE)
         elif event == "unfenced":
             # 実行しなかったことと、なぜかを必ず見せる。黙って次に進むと
             # 「なぜ実行されないのか」が分からない。

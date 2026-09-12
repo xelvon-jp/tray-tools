@@ -981,14 +981,58 @@ def repair_lost_underscores(code):
     return repaired, count
 
 
-def extract_snippets(text):
-    """[(ID, コード), ...] を返す。落ちたアンダースコアはここで戻す。"""
+# #start の行に書かせる「自己申告」。転送で文字が落ちていないかを実行前に見るため。
+#
+# 【なぜ要るか】
+# 画面から読む以上、描画の都合で文字が落ちる経路は塞ぎきれない(囲み忘れて Markdown
+# として描かれると # や ` や _ が消える)。囲み判定で大半は止まるが、複数のコード
+# ブロックの間に挟まった行までは見ていない。**原因が何であれ、届いた本文が送られた
+# 本文と違えば止める**という歯止めを、別の筋で1本持っておく。
+#
+#   #start 3 lines=24 chars=812
+#   #start 3 lines=24 hashes=3 backticks=2
+#
+# 書き方は「キー=数値」の並び。順番は問わない。書かれたキーだけ照合する。
+SNIPPET_CLAIM_RE = re.compile(
+    r"(lines|chars|hashes|backticks|underscores)\s*=\s*(\d+)", re.IGNORECASE)
+
+
+def split_claim(code):
+    """コードの1行目が自己申告だけなら (申告, 残りのコード) に分ける。
+
+    申告が無ければ ({}, コードそのまま)。申告の行にコードが混ざっている場合も
+    触らない —— 迷う形のときは**何もしないほうを選ぶ**。誤って1行目を捨てると、
+    黙ってコードが変わることになる。それは今まさに塞ごうとしている事故そのもの。"""
+    text = code or ""
+    lines = text.split(chr(10))
+    if not lines:
+        return {}, code
+    head = lines[0].strip()
+    if not head:
+        return {}, code
+    found = SNIPPET_CLAIM_RE.findall(head)
+    if not found:
+        return {}, code
+    if SNIPPET_CLAIM_RE.sub("", head).strip():
+        # 申告以外のものが同じ行にある。コードかもしれないので手を出さない。
+        return {}, code
+    return {k.lower(): int(v) for k, v in found}, chr(10).join(lines[1:])
+
+
+def extract_snippets_with_claims(text):
+    """[(ID, コード, 申告), ...] を返す。落ちたアンダースコアはここで戻す。"""
     result = []
     for hit in SNIPPET_RE.finditer(text or ""):
-        code = strip_lang_label(hit.group(2).strip("\n"))
-        code, _fixed = repair_lost_underscores(code.strip("\n"))
-        result.append((hit.group(1), code))
+        body = strip_lang_label(hit.group(2).strip(chr(10)))
+        claim, body = split_claim(body.strip(chr(10)))
+        code, _fixed = repair_lost_underscores(body.strip(chr(10)))
+        result.append((hit.group(1), code, claim))
     return result
+
+
+def extract_snippets(text):
+    """[(ID, コード), ...] を返す。自己申告は取り除いた本文を返す。"""
+    return [(sid, code) for sid, code, _claim in extract_snippets_with_claims(text)]
 
 
 # 実行前に必ず目視する。ここに引っかかるものは自動実行しない。

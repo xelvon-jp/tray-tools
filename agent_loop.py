@@ -294,11 +294,48 @@ def _clip(text: str, limit: int) -> str:
     return text[:half] + "\n…（中略 %d 文字省略）…\n" % (len(text) - half * 2) + text[-half:]
 
 
+# 貼り戻しの末尾に毎周付ける「返信の書き方」。
+#
+# 【なぜ「原因の一言だけ返せ」をやめたか】
+# 元の指示は、返信を短くして周回を速くする狙いだった。だが短くしたのは**考える
+# 部分**で、コードの量は変わらない。実測で見たのは、原因を1行で決め打ちして同じ
+# 直し方を繰り返す形の足踏み(10周のうち8周)だった。推論を書かせる形に変える。
+# これは「直す」ではなく「変える」で、効くかどうかは回してみないと分からない。
+# だから同時に、期待と実際を突き合わせた記録を残す(_log の protocol イベント)。
+#
+# 【この文面に書いてはいけないこと】
+# 実行の目印(start と end の綴り)を**対で書かないこと**。この文面は会話に残り、
+# 次の周に応答として読み返される。対で書くと抽出の正規表現に当たり、
+# **依頼文そのものがスニペットとして拾われて実行される**(実測 2026-09-12)。
+#
+# 【ラベルに ** を使わない理由】
+# 囲みの外は Markdown として描画されてから読むので、`**` は画面に残らない。
+# 行頭の語＋コロンなら、太字で書かれても素で書かれても同じ文字列で届く
+# (copilot_loop.parse_protocol を参照)。
+PROTOCOL_INSTRUCTIONS = "\n".join([
+    "--- 返信の書き方 ---",
+    "次の順に、どれも省略せずに書いてください。",
+    "",
+    "照合: 直前にあなたが書いた「期待」と、上の実際の結果を突き合わせる。",
+    "      「一致」か「不一致」のどちらかの語で始め、続けて違いを1行で書く。",
+    "      期待をまだ書いていなければ「照合: 初回」とだけ書く。",
+    "仮説: いま何が起きていて、次に何をすべきか。3行以内。",
+    "スニペット: 次の1ステップぶんだけ。``` で囲み、いつもの目印とIDと",
+    "      自己申告（lines= hashes= backticks=）を付ける。",
+    "期待: そのスニペットを実行すると何が起きるか。2行以内。",
+    "      標準出力に出る文字・終了コードなど、後で突き合わせられる形で書く。",
+    "確信度: 高・中・低 のどれか1語。",
+    "",
+    "やるべきことが残っていなければ、スニペットの代わりにその旨を書いてください。",
+])
+
+
 def format_paste(snippet_id: str, result: dict, paste_limit: int) -> str:
     """実行結果を Copilot に貼り戻す文字列に整形する。
 
-    テンプレは snippets/エージェントループ開始.txt の作法(エラーを貼ったら
-    「原因の一言 + 修正後のスニペット全体」だけ返してもらう)に合わせる。"""
+    返信の書き方(PROTOCOL_INSTRUCTIONS)は毎周ここから送られる。**お題の
+    テンプレートだけ直しても効かない。** 1周目はテンプレート、2周目以降はこの
+    文面が指示になるので、両方を同じ形に保つこと。"""
     if result.get("timed_out"):
         head = f"#{snippet_id} を実行しましたが、{DEFAULT_PS_TIMEOUT} 秒でタイムアウトしました。"
     elif not failed(result):
@@ -324,10 +361,7 @@ def format_paste(snippet_id: str, result: dict, paste_limit: int) -> str:
         parts += ["=== 標準エラー ===", stderr.rstrip(), ""]
     if not stdout.strip() and not stderr.strip():
         parts += ["（出力なし）", ""]
-    parts += [
-        "エラーがあれば「原因の一言 + 修正後のスニペット全体」だけ返してください。",
-        "問題なければ次のステップへ進めてください。",
-    ]
+    parts += [PROTOCOL_INSTRUCTIONS]
     return "\n".join(parts)
 
 
@@ -395,8 +429,30 @@ def format_claim_mismatch_report(snippet_id, mismatches):
         "**同じコードを、``` で囲んで出し直してください。**",
         "囲まないと、行頭の # や ` や _ が Markdown の記号として画面から消えます。",
         "出し直すときも #start の行に申告を付けてください。",
+        "",
+        # 【数え方を書かないと、欠けていないのに止まり続ける】
+        # 実測 2026-09-12: 囲みの ``` を backticks に数えて 6 と申告し、
+        # 2周続けて「不一致」で止まった。コードは1文字も欠けていなかった。
+        # 検査の目的は転送の欠落を捉えることで、数え方の流儀を正すことではない。
+        "数えるのは**囲みの中のコード本文だけ**です。",
+        "``` の行と、目印の行そのものは数に入れません。",
     ]
     return chr(10).join(lines)
+
+
+def protocol_summary(stats: dict) -> dict:
+    """期待と照合の集計に、的中率を添えて返す。
+
+    【分母に入れないもの】
+    `unclear`(指示どおりの語で書かれなかった) と `unstated`(照合そのものが無い)は
+    **的中率の分母に入れない。** 入れると「形式が守られなかった」が「予測を外した」
+    に化けて見える。守られなかったことは別の数字として、そのまま残す。"""
+    decided = stats.get("match", 0) + stats.get("mismatch", 0)
+    out = dict(stats)
+    out["decided"] = decided
+    out["match_rate"] = (round(stats.get("match", 0) / decided, 3)
+                         if decided else None)
+    return out
 
 
 def _looks_unfenced(cp, code) -> bool:
@@ -631,6 +687,13 @@ def run_loop(
         last_code = None
         # コードが ``` で囲まれずに返ってきた周の数。続くようなら人に返す。
         unfenced_rounds = 0
+        # 直前に**実行した**周の「期待」。次の周の照合が何を指しているかの手掛かり。
+        # 実行しなかった周(囲み忘れ・申告不一致で出し直してもらった周)は指さない。
+        # あの周は「同じものを出し直す」だけで、新しい期待は書かれないため。
+        pending_expectation = None
+        # 期待と照合の集計。A/B 検証で「周回数」以外に見る数字がこれ。
+        protocol_stats = {"stated": 0, "match": 0, "mismatch": 0,
+                          "unclear": 0, "first": 0, "unstated": 0}
         # 自己申告と届いた本文が食い違った周の数。
         claim_mismatch_rounds = 0
         while rounds < max_rounds:
@@ -752,6 +815,32 @@ def run_loop(
             emit("response", round=rounds, chars=len(response),
                  wait_seconds=round(wait_elapsed, 1),
                  response_head=response[:800])
+
+            # 【期待 vs 実際を、この場で構造化して残す】
+            # 応答が来た直後に読む。スニペットの抽出より前なのは、**スニペットが
+            # 無い周こそ照合が要る**から。最後の周(やり切った・詰まった)の照合が
+            # 一番知りたい1件で、抽出できたときだけ記録すると必ずそれを落とす。
+            # そのぶん id は持てない(この時点では未採番)。round で突き合わせる。
+            proto = copilot_loop.parse_protocol(response)
+            verdict = proto.get("verdict")
+            if verdict in ("match", "mismatch", "unclear"):
+                protocol_stats[verdict] += 1
+            elif verdict == "first":
+                protocol_stats["first"] += 1
+            elif pending_expectation:
+                # 期待を書かせたのに照合が返ってこなかった周。**ここを数えないと、
+                # 「守られなかった」が「そもそも測れていない」に見える。**
+                protocol_stats["unstated"] += 1
+            if proto.get("expectation"):
+                protocol_stats["stated"] += 1
+            emit("protocol", round=rounds,
+                 verdict=verdict, verdict_note=proto.get("verdict_note"),
+                 hypothesis=proto.get("hypothesis"),
+                 expectation=proto.get("expectation"),
+                 confidence=proto.get("confidence"),
+                 refers_to_round=(pending_expectation or {}).get("round"),
+                 refers_to_id=(pending_expectation or {}).get("id"),
+                 refers_to_expectation=(pending_expectation or {}).get("expectation"))
 
             # 4) 完了語チェック(コードより先に見る。コード内の変数名にヒットしても
             #    「完了語で止まる」方が事故が少ない)
@@ -923,6 +1012,11 @@ def run_loop(
                 break
             last_code = normalized
 
+            # 実行する周だけが、次の周の照合の相手になる。
+            pending_expectation = {"round": rounds, "id": sid,
+                                   "expectation": proto.get("expectation"),
+                                   "confidence": proto.get("confidence")}
+
             result = _run_powershell(code, sid, ps_timeout)
             # 実行した内容と結果の全文。「何を実行したか」は後から必ず知りたくなる。
             _log_full("run", rounds, result.get("stdout") or "", id=sid,
@@ -988,10 +1082,12 @@ def run_loop(
 
         total = time.time() - started
         emit("loop_end", reason=stopped_by, detail=stop_detail,
-             rounds=rounds, elapsed=round(total, 1))
+             rounds=rounds, elapsed=round(total, 1),
+             protocol=protocol_summary(protocol_stats))
         return {
             "stopped_by": stopped_by, "detail": stop_detail,
             "rounds": rounds, "elapsed": round(total, 1),
+            "protocol": protocol_summary(protocol_stats),
         }
     finally:
         # 掴んだのと同じスレッドで COM を手放す。GC 任せにすると解放が

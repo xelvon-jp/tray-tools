@@ -469,6 +469,42 @@ class LogViewer(QWidget):
             )
             if head:
                 self._append_block("応答の先頭", COLOR_RESP, head, COLOR_INFO)
+        elif event == "protocol":
+            # 「前の周に書いた期待」と「今回の照合」を**並べて**出す。
+            #
+            # 【並べないと確かめようがない】
+            # どちらも応答の先頭にはあるが、期待は前の周のスクロールの上のほうに
+            # ある。突き合わせるのに窓を遡る必要があるなら、人は見ない。
+            # 効いているかを判断するための表示なので、判断に要るものを隣に置く。
+            verdict = payload.get("verdict")
+            label, color = {
+                "match": ("✅ 一致", COLOR_RUN),
+                "mismatch": ("❌ 不一致", COLOR_RUN_ERR),
+                "first": ("・初回（照合なし）", COLOR_META),
+                "unclear": ("⚠ 照合が指示どおりの語で書かれていない", COLOR_STOP_WARN),
+            }.get(verdict, (None, COLOR_INFO))
+            before = payload.get("refers_to_expectation")
+            if label and before:
+                self._append_block(
+                    f"{label}  ← round {payload.get('refers_to_round')} "
+                    f"#{payload.get('refers_to_id')} の期待と突き合わせ",
+                    color,
+                    "期待: " + before + chr(10)
+                    + "所見: " + (payload.get("verdict_note") or "（なし）"),
+                    COLOR_INFO)
+            elif label:
+                self._append(label, color)
+            elif before:
+                # 期待を書かせたのに照合が返ってこなかった周。**黙って流さない。**
+                # これが続くなら「形式が守られていない」のであって、
+                # 「予測を外した」とは別の話。取り違えると改善の向きを間違える。
+                self._append("⚠ 前の周の期待に対する照合が書かれていません",
+                             COLOR_STOP_WARN)
+            exp = payload.get("expectation")
+            if exp:
+                conf = payload.get("confidence") or "?"
+                self._append_block(f"この周の期待（確信度 {conf}）",
+                                   COLOR_META, exp, COLOR_INFO)
         elif event == "snippet":
             r = payload.get("round")
             sid = payload.get("id")
@@ -589,6 +625,20 @@ class LogViewer(QWidget):
             self._append(f"■ 終了 {label} — {detail} "
                          f"(周回 {payload.get('rounds')} / "
                          f"経過 {payload.get('elapsed')} 秒)", color)
+            # 期待の的中率。A/B 検証で周回数と並べて見る数字。
+            # 古いイベント(この集計を持たない)では何も出さない。
+            proto = payload.get("protocol") or {}
+            if proto.get("stated"):
+                rate = proto.get("match_rate")
+                rate_text = ("―" if rate is None
+                             else f"{round(rate * 100)}%"
+                                  f"（{proto.get('match')}/{proto.get('decided')}）")
+                self._append(
+                    f"期待の的中 {rate_text}"
+                    f" ／ 期待を書いた周 {proto.get('stated')}"
+                    f" ／ 照合なし {proto.get('unstated', 0)}"
+                    f" ／ 書き方が違う {proto.get('unclear', 0)}",
+                    COLOR_META)
         else:
             # 未知のイベントは黙って出す(将来のイベント追加でも壊さない)
             self._append(f"[{event}] {payload}", COLOR_INFO)

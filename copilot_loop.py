@@ -837,15 +837,59 @@ class Copilot:
                 els.append((el.CurrentControlType, el.CurrentName or ""))
             except Exception:  # noqa: BLE001  消えた要素は飛ばす
                 els.append((-1, ""))
+        # **1本のブロックが、たくさんの Text 要素に割れている。**
+        #
+        # 【実測 2026-09-12】構文強調が効くと、トークンごとに要素が分かれる:
+        #   BTN 'コードをコピー' / '(' / 'Get-Content' / ' ' / 'R' / ':\claude\tray'
+        #   / '-tools' / '\src\hook.log ' / '| ' / 'Measure-Object' / ...
+        # 最初の1個だけを見ていたので、ブロックの中身が `(` になっていた。当然どの
+        # 行とも一致せず、**囲まれているのに「囲まれていない」と判定された**
+        # (実測: 2周続けてそうなり、実行されないまま停止した)。
+        # ヒアストリング(@' … '@)のときは丸ごと1要素になるので、これまでは表に
+        # 出なかった。たまたま当たっていただけ。
+        #
+        # 【どこまでが1本か】
+        # 同じブロックのトークンは**親が同じ**で、ブロックの外(`#end PS-003` や
+        # 「期待: …」の段落)は別の親になる(実測: 親の RuntimeId が 1188065 →
+        # 1188077/1188078 と変わる)。改行や行数では切れ目が分からないので、
+        # 親が変わったところで切る。
+        walker = None
+        try:
+            walker = self.uia.RawViewWalker
+        except Exception:  # noqa: BLE001  取れなければ従来どおり先頭だけ見る
+            walker = None
+
+        def parent_id(index):
+            """その要素の親の RuntimeId。取れなければ None(比べない)。"""
+            if walker is None:
+                return None
+            try:
+                par = walker.GetParentElement(desc.GetElement(index))
+                return tuple(par.GetRuntimeId()) if par else None
+            except Exception:  # noqa: BLE001  消えた要素・権限などで落ちうる
+                return None
+
         blocks = []
         for i, (t, name) in enumerate(els):
             if t != CONTROL_BUTTON or name.strip() not in wanted:
                 continue
             # ボタンと本文の間に Image が挟まるので、少し先まで見る。
+            head = None
             for j in range(i + 1, min(i + 5, len(els))):
                 if els[j][0] == CONTROL_TEXT:
-                    blocks.append(els[j][1])
+                    head = j
                     break
+            if head is None:
+                continue
+            own = parent_id(head)
+            parts = [els[head][1]]
+            j = head + 1
+            while j < len(els) and els[j][0] == CONTROL_TEXT:
+                if own is None or parent_id(j) != own:
+                    break
+                parts.append(els[j][1])
+                j += 1
+            blocks.append("".join(parts))
         return blocks
 
     def last_response(self):
@@ -1025,6 +1069,14 @@ def extract_snippets_with_claims(text):
     for hit in SNIPPET_RE.finditer(text or ""):
         body = strip_lang_label(hit.group(2).strip(chr(10)))
         claim, body = split_claim(body.strip(chr(10)))
+        # **申告を外したあとで、もう一度ラベルを見る。**
+        # ラベルが目印と申告の後ろに付くことがある(実測 2026-09-12:
+        # '#start PS-003 lines=3 …' / 'Powershell' / '(Get-Content …)')。
+        # 1回目の strip_lang_label のときは1行目が申告なので剥がれず、
+        # 申告を外した拍子にラベルがコードの1行目に昇格して、そのまま
+        # `Powershell` という行が実行される。剥がす条件は「その行がラベルだけ」
+        # なので、2回呼んでも本物のコードは削らない。
+        body = strip_lang_label(body.strip(chr(10)))
         code, _fixed = repair_lost_underscores(body.strip(chr(10)))
         result.append((hit.group(1), code, claim))
     return result
@@ -1033,6 +1085,122 @@ def extract_snippets_with_claims(text):
 def extract_snippets(text):
     """[(ID, コード), ...] を返す。自己申告は取り除いた本文を返す。"""
     return [(sid, code) for sid, code, _claim in extract_snippets_with_claims(text)]
+
+
+# ---------------------------------------------------------------------------
+# 返信の3ブロック形式（照合 / 仮説 / スニペット / 期待 / 確信度）
+# ---------------------------------------------------------------------------
+# 【なぜラベルを日本語の素の語で拾うのか】
+# この部分はコードブロックの**外**に書かれる。つまり Markdown として描画されてから
+# UIA で読むことになり、`**期待**` の `**` は画面に残らない。太字で書かれても素で
+# 書かれても、届く文字列はどちらも `期待:` になる。だから目印を `**` に置かず、
+# 行頭の語＋コロンに置く。囲みの中の記号が消える問題(split_claim 参照)と同じ理屈で、
+# **描画後に残るものだけを手掛かりにする。**
+PROTOCOL_KEYS = {
+    "照合": "verdict",
+    "仮説": "hypothesis",
+    "期待": "expectation",
+    "確信度": "confidence",
+}
+
+# ラベル行の見分け方。行頭の飾り(`-` `*` `#` `>` `・`、太字が消えた跡の空白)を
+# 落としてから語を見る。**語の直後にコロンか行末が要る。**
+# ここを緩めて「語で始まればラベル」にすると、「期待される結果は…」のような
+# 普通の文がラベルに化ける。緩い判定は、いつか必ず当たる。
+PROTOCOL_LABEL_RE = re.compile(
+    r"^[\s\-\*#>・:：]*(" + "|".join(PROTOCOL_KEYS) + r")\s*(?:[:：]|$)")
+
+# **画面から読んだ本文には、段落の切れ目が無い。**
+#
+# 【実測 2026-09-12】届いた文字列はこうなっていた:
+#   '照合: 初回仮説: まずは hook.log の行数だけを読み取ればよい。…'
+# 段落はそれぞれ独立した Text 要素なのに、document_text は要素を**繋ぐだけ**で
+# 改行を入れない(そうしないとコードが復元できない。トークンも独立した要素だから)。
+# 行頭だけを見ていると、2つ目以降のラベルが本文に飲み込まれる。実際それで
+# 「照合: 初回」が『照合の中に一致という語がある』と読まれ、**初回の周が
+# 「一致」として記録された**。記録が嘘になるのは、測れないことより悪い。
+#
+# ラベル＋コロンはこちらが決めた目印なので、そこに改行を入れ直してよい。
+# 直すのはこの層。document_text には触らない(あちらはコードの復元が仕事)。
+PROTOCOL_SPLIT_RE = re.compile(
+    r"(?<!^)(?=(?:" + "|".join(PROTOCOL_KEYS) + r")\s*[:：])", re.MULTILINE)
+
+# 照合の答え。**「不一致」を先に見ること**(「一致」は「不一致」の部分文字列)。
+VERDICT_WORDS = [("不一致", "mismatch"), ("一致", "match"), ("初回", "first")]
+
+# ログに残す1項目の上限。仮説3行・期待2行と指定しているので、これを超えるのは
+# 指示どおりに書けていないとき。切ってよいが、切れることは承知しておく。
+PROTOCOL_FIELD_LIMIT = 600
+
+
+def parse_protocol(text):
+    """応答から照合・仮説・期待・確信度を取り出す。無いキーは None。
+
+    スニペット本体は先に取り除く。コードのコメントに「# 期待: …」と書かれること
+    があり、それを拾うと**実行したコードの中身を AI の申告として記録する**ことに
+    なる。記録がずれれば、あとで見た人が間違った結論を出す。"""
+    stripped = SNIPPET_RE.sub(chr(10), text or "")
+    stripped = PROTOCOL_SPLIT_RE.sub(chr(10), stripped)
+    sections = {}
+    current = None
+    for raw in stripped.split(chr(10)):
+        hit = PROTOCOL_LABEL_RE.match(raw)
+        if hit:
+            current = PROTOCOL_KEYS[hit.group(1)]
+            rest = raw[hit.end():].strip()
+            sections.setdefault(current, [])
+            if rest:
+                sections[current].append(rest)
+            continue
+        if current is None:
+            continue
+        if not raw.strip():
+            # 空行でその項目は終わり。次の段落まで飲み込むと、仮説の続きに
+            # 見出しや雑談が混ざる。
+            current = None
+            continue
+        sections[current].append(raw.strip())
+
+    out = {}
+    for key in ("verdict", "hypothesis", "expectation", "confidence"):
+        joined = chr(10).join(sections.get(key, [])).strip()
+        out[key] = joined[:PROTOCOL_FIELD_LIMIT] if joined else None
+
+    # 照合は「一致」「不一致」「初回」のどれかで始まる約束。続きは所見として残す。
+    verdict_text = out.pop("verdict") or ""
+    out["verdict"] = None
+    out["verdict_note"] = None
+    if verdict_text:
+        # **語は「含まれるか」ではなく「そこから始まるか」で見る。**
+        # 含まれるかで見ていたせいで、「照合: 初回」に続く仮説の文中の『一致』を
+        # 拾い、初回の周を『一致』として記録した(実測 2026-09-12)。
+        # 判定を1文字ぶん緩めると、集計そのものが静かに嘘になる。
+        head = verdict_text.lstrip(" 　*-:：")
+        for word, name in VERDICT_WORDS:
+            if head.startswith(word):
+                out["verdict"] = name
+                # 所見は次の行に書かれることがある(実測)。改行も落とす。
+                out["verdict_note"] = (
+                    head[len(word):].strip().strip(" 　:：、。").strip() or None)
+                break
+        else:
+            # 指示どおりの語が無い。判定はしないが、何と書いてきたかは残す。
+            # 「どう書かせれば守られるか」はこれから測るところで、守られなかった
+            # 実例こそ材料になる。
+            out["verdict"] = "unclear"
+            out["verdict_note"] = verdict_text
+
+    # 確信度は「確信度:」の行ではなく、期待の文中に紛れることがある。
+    level = None
+    for src in (out.get("confidence"), out.get("expectation")):
+        if not src:
+            continue
+        m = re.search(r"(高|中|低)", src)
+        if m:
+            level = m.group(1)
+            break
+    out["confidence"] = level
+    return out
 
 
 # 実行前に必ず目視する。ここに引っかかるものは自動実行しない。

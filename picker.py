@@ -63,6 +63,15 @@ ITEM_PADDING_H = 6
 
 DEFAULT_PLACEHOLDER = "絞り込み（↑↓で選択 / Enterで決定 / Escで閉じる）"
 
+# 一覧の項目は Qt.UserRole に添字を持つ。既存項目(self._items)は 0 以上の添字、
+# dynamic_items から作った項目は元リストに実体が無いので負数を持たせて区別する。
+# i 番目の動的項目は -(i + 1)(0 は正負で区別できないので 1 からずらす)。
+
+
+def dynamic_role(index: int) -> int:
+    """動的項目の i 番目に持たせる UserRole の値。"""
+    return -(index + 1)
+
 
 class PickerWindow(QWidget):
     """枠なしの小さな選択ウインドウ。上の入力欄で絞り込み、下のリストから1つ決める。
@@ -78,10 +87,24 @@ class PickerWindow(QWidget):
 
     - preview_provider(データ) -> str … 選択中の項目の中身を下のプレビューに出す
     - preview_height … プレビュー欄の高さ(px)。既定は PREVIEW_HEIGHT
+    - dynamic_items(入力欄のテキスト) -> [(表示名, データ), ...] … items に無い項目を
+      入力から作って一覧の先頭に足す。渡すのは生のテキストで、strip も lower もしない
+      (引用符や空白をどう扱うかは呼び出し側にしか決められない)。ここでも「テキストが
+      何を意味するか」は解釈しない。返ってきた順にそのまま並べる(並べ替えない。
+      どの順に見せたいかを知っているのは呼び出し側だけ)
+    - tab_text(表示名, データ) -> str or None … Tab を押したときに入力欄へ入れる文字列。
+      返すと入力欄がそれに差し替わり(カーソルは末尾)、textChanged で一覧が組み直る。
+      窓は閉じない。渡した場合、None が返るときも Tab は食べる(Qtの既定のフォーカス
+      移動で入力欄から抜けると、打ち続けられなくなって使いにくい)。渡さなければ
+      Tab は今までどおり素通し
     - hint … ウインドウ下部に出す小さな説明(改行可)
     - on_new() / on_edit(表示名, データ) / on_open_folder() … Ctrl+N / Ctrl+E / Ctrl+O。
       いずれも実行後はこのウインドウを閉じる(外部エディタで直した結果を出すには
-      開き直す必要があり、古い一覧を残しておくと食い違うため)。"""
+      開き直す必要があり、古い一覧を残しておくと食い違うため)。
+    - on_delete(表示名, データ) / on_move(表示名, データ, step) … Ctrl+D / Ctrl+↑↓。
+      こちらは閉じない。続けて2件消す・何段も動かす、をそのままやれるようにするため。
+      呼び出し側は変更を反映した一覧を set_items で渡し直す(選択行の面倒はこちらで見る)。
+      動的項目では呼ばない(設定ファイルに実体が無い)。"""
 
     closed = Signal()
 
@@ -97,6 +120,10 @@ class PickerWindow(QWidget):
         on_edit=None,
         on_open_folder=None,
         preview_height: int = None,
+        dynamic_items=None,
+        tab_text=None,
+        on_delete=None,
+        on_move=None,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -112,6 +139,13 @@ class PickerWindow(QWidget):
         self._on_new = on_new
         self._on_edit = on_edit
         self._on_open_folder = on_open_folder
+        self._dynamic_items = dynamic_items
+        self._tab_text = tab_text
+        self._on_delete = on_delete
+        self._on_move = on_move
+        # 入力から作った項目。self._items には足さない(添字がずれると Qt側に持たせた
+        # UserRole の意味が変わってしまう)。一覧に出ている間だけここに居る。
+        self._dynamic = []
         self._closed_emitted = False
         # 決定は一度きり。Enterの押しっぱなしなど、閉じるまでの間に二度呼ばれても弾く。
         # Ctrl+N などの副作用を持つキーも、走り出したらこのフラグで後続を止める。
@@ -308,6 +342,8 @@ class PickerWindow(QWidget):
             if self._handle_shortcut(event):
                 return True
             key = event.key()
+            if key == Qt.Key_Tab and self._handle_tab():
+                return True
             if key in (Qt.Key_Up, Qt.Key_Down):
                 self._move_selection(-1 if key == Qt.Key_Up else 1)
                 return True
@@ -323,16 +359,19 @@ class PickerWindow(QWidget):
         # 入力欄以外(一覧やプレビュー)にフォーカスが移っていても効かせる。
         if self._handle_shortcut(event):
             return
+        if event.key() == Qt.Key_Tab and self._handle_tab():
+            return
         if event.key() == Qt.Key_Escape:
             self.close()
         else:
             super().keyPressEvent(event)
 
     def _handle_shortcut(self, event) -> bool:
-        """Ctrl+N / Ctrl+E / Ctrl+O を処理したら True を返す。
+        """Ctrl+N / Ctrl+E / Ctrl+O / Ctrl+D / Ctrl+↑↓ を処理したら True を返す。
 
         渡されなかった処理のキーは素通しする(フォルダブックマークのように編集手段を
-        持たない呼び出し側で、押しても何も起きない代わりに黙って握り潰さないため)。"""
+        持たない呼び出し側で、押しても何も起きない代わりに黙って握り潰さないため)。
+        Ctrl+↑↓ も同じで、on_move を渡していない窓では素の ↑↓ として扱われる。"""
         if not (event.modifiers() & Qt.ControlModifier):
             return False
         key = event.key()
@@ -341,15 +380,81 @@ class PickerWindow(QWidget):
             return True
         if key == Qt.Key_E and self._on_edit is not None:
             item = self.list.currentItem()
-            if item is None:
+            index = None if item is None else item.data(Qt.UserRole)
+            if isinstance(index, int) and index < 0:
+                # 入力から作った項目。設定ファイルに実体が無いので編集できない。
+                # 窓は閉じずに何もしない(打ち直しの途中で閉じられると使いにくい)。
+                return True
+            entry = self._entry_at(item)
+            if entry is None:
                 return True  # 選択が無いだけ。開くものが無いので何もしない。
-            name, data = self._items[item.data(Qt.UserRole)]
+            name, data = entry
             self._run_action(lambda: self._on_edit(name, data))
             return True
         if key == Qt.Key_O and self._on_open_folder is not None:
             self._run_action(lambda: self._on_open_folder())
             return True
+        if key == Qt.Key_D and self._on_delete is not None:
+            self._run_on_selection(self._on_delete)
+            return True
+        if key in (Qt.Key_Up, Qt.Key_Down) and self._on_move is not None:
+            step = -1 if key == Qt.Key_Up else 1
+            self._run_on_selection(
+                lambda name, data: self._on_move(name, data, step))
+            return True
         return False
+
+    def _run_on_selection(self, func) -> None:
+        """選択中の項目で func(表示名, データ) を呼ぶ。窓は閉じない。
+
+        _run_action と違って閉じないのは、削除・並べ替えが「続けて何度もやる」操作
+        だから。一覧の組み直しは呼び出し側が set_items でやる。
+
+        動的項目(入力から生えた行)では呼ばない。設定ファイルに実体が無く、消すことも
+        動かすこともできない。キーを食べるかどうかは呼び出し元が決める(ここまで来た
+        時点で処理は渡されているので、素通しさせるとフォーカスが飛んでしまう)。"""
+        if self._committing:
+            return
+        item = self.list.currentItem()
+        index = None if item is None else item.data(Qt.UserRole)
+        if isinstance(index, int) and index < 0:
+            return
+        entry = self._entry_at(item)
+        if entry is None:
+            return
+        name, data = entry
+        try:
+            func(name, data)
+        except Exception as e:
+            # Qtのスロット内で投げ切ると常駐ごと落ちる。窓は生かしたまま記録に残す。
+            print(f"[tray-tools] ピッカーの操作に失敗しました ({name}): {e}", file=sys.stderr)
+
+    def _handle_tab(self) -> bool:
+        """Tab を処理したら True(＝Qtに渡さない)。tab_text を渡されていなければ False。
+
+        Qt の既定では Tab はフォーカス移動なので、入力欄の eventFilter と一覧側の
+        keyPressEvent の両方で横取りしないと取りこぼす。tab_text がある窓では、
+        差し込む文字列が無い(None)ときも食べてしまう。入力欄からフォーカスが飛ぶと
+        そのまま打ち続けられなくなり、Tabを押しただけで操作不能に見えるため。
+
+        入力欄を書き換えるだけで、一覧の組み直しは textChanged に任せる。"""
+        if self._tab_text is None:
+            return False
+        entry = self._entry_at(self.list.currentItem())
+        if entry is None:
+            return True
+        name, data = entry
+        try:
+            text = self._tab_text(name, data)
+        except Exception as e:
+            # Tabが効かないだけで済ませる。Qtのスロット内で投げ切ると常駐ごと落ちる。
+            print(f"[tray-tools] Tabの行き先を決められません: {e}", file=sys.stderr)
+            return True
+        if not text:
+            return True
+        self.search.setText(text)
+        self.search.setCursorPosition(len(text))
+        return True
 
     def _run_action(self, func) -> None:
         """Ctrl+N/E/O の処理を走らせて、このウインドウを閉じる。
@@ -369,10 +474,11 @@ class PickerWindow(QWidget):
 
     def _on_current_changed(self, current, _previous):
         """選択が動くたびにプレビューを差し替える。preview_provider を渡した時だけ繋がる。"""
-        if current is None:
+        entry = self._entry_at(current)
+        if entry is None:
             self.preview.setPlainText("")
             return
-        _name, data = self._items[current.data(Qt.UserRole)]
+        _name, data = entry
         try:
             self.preview.setPlainText(self._preview_provider(data) or "")
         except Exception as e:
@@ -380,11 +486,66 @@ class PickerWindow(QWidget):
             print(f"[tray-tools] プレビューを作れません: {e}", file=sys.stderr)
             self.preview.setPlainText("(プレビューを作れませんでした)")
 
+    def _entry_at(self, item):
+        """一覧の項目から (表示名, データ) を取り出す。取れなければ None。
+
+        0 以上は self._items の添字、負数は dynamic_items から作った項目(i 番目が
+        -(i + 1))。self._items[-1] は「最後の要素」として黙って通ってしまい、Enter の
+        行き先が別物になるので、引く側は必ずここを通す。動的項目の側も同じ厳しさで
+        範囲を見る(一覧を組み直した直後に古い項目を引かされても取り違えないため)。"""
+        if item is None:
+            return None
+        index = item.data(Qt.UserRole)
+        if not isinstance(index, int):
+            return None
+        if index < 0:
+            dynamic_index = -index - 1
+            if not (0 <= dynamic_index < len(self._dynamic)):
+                return None
+            return self._dynamic[dynamic_index]
+        if not (index < len(self._items)):
+            return None
+        return self._items[index]
+
+    def _build_dynamic(self, text: str) -> list:
+        """dynamic_items を呼んで項目の一覧を作る。作れなければ空リスト。
+
+        この関数は1文字打つごとに呼ばれる。ここで例外を投げ切ると textChanged の
+        スロットの中で落ちることになり、打鍵そのものができなくなる。preview_provider と
+        同じく、理由だけ残して「項目なし」として続ける。"""
+        if self._dynamic_items is None:
+            return []
+        try:
+            entries = self._dynamic_items(text)
+        except Exception as e:
+            print(f"[tray-tools] 入力からの項目を作れません: {e}", file=sys.stderr)
+            return []
+        if not entries:
+            return []
+        built = []
+        try:
+            for entry in entries:
+                name, data = entry
+                built.append((name, data))
+        except (TypeError, ValueError) as e:
+            # 途中まで組めていても捨てる。半端な一覧を出すより出さない方が分かりやすい。
+            print(f"[tray-tools] 入力からの項目の形が違います: {e}", file=sys.stderr)
+            return []
+        return built
+
     def _refresh_list(self, text: str):
         """前方一致(大文字小文字を無視)で候補そのものを減らす。絞り込んだ結果が
-        見た目に残っていると ↑↓ で選べてしまい、Enterの行き先が分からなくなる。"""
+        見た目に残っていると ↑↓ で選べてしまい、Enterの行き先が分からなくなる。
+
+        dynamic_items がある場合、そこから作った項目を返ってきた順に先頭へ置く。
+        初期選択は先頭行なので、打った直後に Enter を押せばその1件目が選ばれる。"""
         keyword = text.strip().lower()
         self.list.clear()
+        self._dynamic = self._build_dynamic(text)
+        for dynamic_index, (name, _data) in enumerate(self._dynamic):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, dynamic_role(dynamic_index))
+            self.list.addItem(item)
         for index, (name, _data) in enumerate(self._items):
             if keyword and not name.lower().startswith(keyword):
                 continue
@@ -396,6 +557,37 @@ class PickerWindow(QWidget):
         if self.list.count():
             self.list.setCurrentRow(0)
 
+    def set_items(self, items: list) -> None:
+        """一覧の元データを差し替えて組み直す。選択行はできるだけ保つ。
+
+        Ctrl+D/Ctrl+↑↓ のように「窓を開けたまま一覧が変わる」操作のための口。
+        組み直すと選択は先頭に戻ってしまい、2件目を消す・何段も動かすたびに
+        選び直すことになるので、ここで面倒を見る。
+
+        選び方は2段構え。まず、選んでいたものと同じ (表示名, データ) が新しい一覧に
+        あればそれを選ぶ(並べ替えで行が動いても同じ項目を追いかける)。無ければ
+        同じ行番号に留まる(消したときは、その場所に繰り上がってきたものが選ばれる。
+        最後の行を消したときは行数に合わせて1つ上になる)。どちらも当てはまらない
+        (空になった)なら選択なし。"""
+        previous = self._entry_at(self.list.currentItem())
+        row = self.list.currentRow()
+
+        self._items = list(items)
+        self._refresh_list(self.search.text())
+
+        count = self.list.count()
+        if count == 0:
+            return
+        target = -1
+        if previous is not None:
+            for index in range(count):
+                if self._entry_at(self.list.item(index)) == previous:
+                    target = index
+                    break
+        if target < 0:
+            target = min(max(row, 0), count - 1)
+        self.list.setCurrentRow(target)
+
     def _move_selection(self, step: int):
         count = self.list.count()
         if count == 0:
@@ -406,11 +598,11 @@ class PickerWindow(QWidget):
     def _commit(self):
         if self._committing:
             return
-        item = self.list.currentItem()
-        if item is None:
+        entry = self._entry_at(self.list.currentItem())
+        if entry is None:
             return
         self._committing = True
-        name, data = self._items[item.data(Qt.UserRole)]
+        name, data = entry
         try:
             # 閉じる前に呼ぶ。on_accept が QInputDialog を出す場合、まだ生きている
             # このウインドウを親にできる(閉じた後だとダイアログの位置と前面化が怪しくなる)。

@@ -21,6 +21,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
@@ -57,6 +58,19 @@ PLACEHOLDER = "絞り込み（フルパス可 / ↑↓選択 / Enter移動 / Esc
 # 窓の下に出す早見表。Tab と編集キーはここに寄せる(PLACEHOLDER に全部を詰めると
 # 入力欄の幅に収まらず、打ち始めた時点で消えてしまう)。
 HINT = "Tab 下の階層へ / Ctrl+D 削除 / Ctrl+↑↓ 並べ替え"
+
+# 消したブックマークの控え。1行1件の JSON Lines で追記していく。
+#
+# 【なぜ要るか】
+# Ctrl+D を入れた当日の試用中に、実際に1件(soft → C:\soft)が誤って消えた。
+# settings.json は世代バックアップを取っていないので、たまたま手元にあった控えと
+# 突き合わせるまで「何が消えたか」すら分からなかった。設定ファイルを丸ごと控える
+# 代わりに、消したものだけを位置(index)ごと残せば、手で元に戻せる。
+#
+# .gitignore の *.log で追跡外になる(このリポジトリは public で、中身は個人の履歴)。
+DELETED_LOG_NAME = "bookmark_deleted.log"
+DELETED_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), DELETED_LOG_NAME)
 
 # ドライブ文字で始まるフルパス(C:\... / C:/...)。os.path.isabs は Windows では
 # "\foo" のような「カレントドライブのルートからの相対」も True にするため、
@@ -169,19 +183,46 @@ def save_bookmark(app_settings: dict, settings_path, name: str, path: str) -> bo
     return _rewrite_stored_bookmarks(settings_path, lambda bookmarks: bookmarks + [entry])
 
 
+def _log_deleted(name: str, path: str, index: int) -> None:
+    """消したブックマークを1行1件で控える(DELETED_LOG_PATH)。
+
+    書き方は agent_loop._log に揃える(1行1件の JSON Lines・ensure_ascii=False・
+    newline="" で開く)。向こうは失敗を黙って捨てているが、こちらは理由を標準エラーに
+    出す。控えが残らないこと自体がこの機能の目的に反するので、気づけるようにしておく。
+    それでも記録のために削除は止めない(呼び出し側は戻り値を見ない)。"""
+    record = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "name": name,
+        "path": path,
+        "index": index,
+    }
+    try:
+        with open(DELETED_LOG_PATH, "a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[tray-tools] 削除の控えを残せません: {e}", file=sys.stderr)
+
+
 def delete_bookmark(app_settings: dict, settings_path, name: str, path: str) -> bool:
-    """ブックマークを1件消す。成否を返す。
+    """ブックマークを1件消す。成否を返す。消した中身は DELETED_LOG_PATH に控える。
 
     ファイル側に (name, path) が見つからなければ False で、ファイルもメモリも変えない。
     手で編集されて既に消えている、といった食い違いのときに、別の行を巻き込まないため。"""
 
-    def change(bookmarks):
+    def change(bookmarks, log: bool = False):
         index = _find_bookmark(bookmarks, name, path)
         if index is None:
             return None
+        if log:
+            # 控えは**書き換える前**に残す。後に回すと、書き換えの途中で落ちたときに
+            # 「消えたのに記録が無い」という、いちばん困る形になりうる。この順なら
+            # 最悪でも「記録はあるが消えていない」で済み、それは実害が無い。
+            _log_deleted(name, path, index)
         return bookmarks[:index] + bookmarks[index + 1:]
 
-    if not _rewrite_stored_bookmarks(settings_path, change):
+    # 控えを残すのはファイル側の1回だけ。change はメモリ側にも同じものを使うので、
+    # log を付けずに呼ばないと同じ削除が2行に増える。
+    if not _rewrite_stored_bookmarks(settings_path, lambda b: change(b, log=True)):
         return False
     _rewrite_memory_bookmarks(app_settings, change)
     return True
@@ -547,7 +588,8 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
             return
         if delete_bookmark(app_settings, settings_path, name, path):
             picker.set_items(_build_items())
-            show_toast(f"フォルダブックマーク\n削除しました\n{name}")
+            # 「控えがある」ことを出すのは、消してすぐ気づいたときに探す先が分かるように。
+            show_toast(f"フォルダブックマーク\n削除しました\n{name}\n（控え: {DELETED_LOG_NAME}）")
         else:
             show_toast("フォルダブックマーク\n設定ファイルに保存できませんでした")
 

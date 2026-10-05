@@ -8,5 +8,6 @@ numpy
 opencv-python-headless
 # 任意: 背景透過(bg_remove.py)の「AIで抜く」を使うときだけ。無くても他は動く
 # (無ければボタンが押せなくなるだけ)。初回の import に数十秒かかる。
+# setup.py が途中で入れるか聞く(--with-ai / --no-ai で省略可)。
 # rembg
 # onnxruntime

@@ -149,6 +149,39 @@ def install_requirements() -> None:
     print("  OK")
 
 
+# 背景透過の「AIで抜く」だけが使う任意の依存。requirements.txt に入れていないのは、
+# 付随して入るものが多く(数百MB)、社内ネットワークでは弾かれやすいため。ここで失敗しても
+# 他の機能は動くので、セットアップは止めずに警告だけ出す。
+AI_PACKAGES = ["rembg", "onnxruntime"]
+
+
+def _ai_installed() -> bool:
+    code = "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % (AI_PACKAGES,)
+    return subprocess.run([str(VENV_PYTHON), "-c", code]).returncode == 0
+
+
+def install_ai_optional(with_ai) -> None:
+    print()
+    print("  [任意] 背景透過の「AIで抜く」(rembg / onnxruntime)")
+    if _ai_installed():
+        print("  既に入っているのでそのまま使います")
+        return
+    if with_ai is None:
+        print("  背景が複雑な画像を抜くのに使います。数百MBあり、入れなくても他の機能は動きます。")
+        with_ai = _ask_yes_no("  入れますか?", default=False)
+    if not with_ai:
+        print("  入れません(あとから setup.py --with-ai で入れられます)")
+        return
+    print("  pip install rembg onnxruntime を実行します (数分かかります)")
+    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *AI_PACKAGES])
+    if result.returncode != 0:
+        print()
+        print("  警告: インストールに失敗しました。「AIで抜く」ボタンが押せないだけで、他は使えます。")
+        print("  プロキシ等を解決したら、setup.py --with-ai をもう一度実行してください。")
+        return
+    print("  OK(AIモデルは初回に使ったときに %USERPROFILE%\\.u2net へダウンロードされます)")
+
+
 # ---------------------------------------------------------------
 # 4. 音声デバイスと settings.json
 # ---------------------------------------------------------------
@@ -428,7 +461,12 @@ def main() -> None:
                        help="音声デバイスを検出した内容で入れ替える(確認を省略)")
     audio.add_argument("--keep-audio", dest="redetect", action="store_false",
                        help="音声デバイスの登録をそのままにする(確認を省略)")
-    parser.set_defaults(startup=None, redetect=None)
+    ai = parser.add_mutually_exclusive_group()
+    ai.add_argument("--with-ai", dest="with_ai", action="store_true",
+                    help="背景透過の「AIで抜く」用の rembg / onnxruntime を入れる(確認を省略)")
+    ai.add_argument("--no-ai", dest="with_ai", action="store_false",
+                    help="rembg / onnxruntime を入れない(確認を省略)")
+    parser.set_defaults(startup=None, redetect=None, with_ai=None)
     args = parser.parse_args()
 
     print("tray-tools セットアップ")
@@ -437,6 +475,7 @@ def main() -> None:
     check_python()
     ensure_venv()
     install_requirements()
+    install_ai_optional(args.with_ai)
     setup_settings(args.redetect)
     setup_shortcut()
     setup_startup(args.startup)

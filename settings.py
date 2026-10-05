@@ -292,6 +292,26 @@ DEFAULT_SETTINGS = {
         "launcher_item_size": 36,
         "launcher_close_delay_ms": 300,
     },
+    # 背景を透過(bg_remove.py)。窓の中で変えた値がここへ書き戻され、次に開いたときの
+    # 初期値になる(アプリが自分で書く値なので、手で編集する必要はない)。
+    #   tolerance … 許容量。背景色からこの色差(ΔE、0〜100)までを完全に透明にする
+    #   feather … 境界のぼかし。許容量からさらにこの差(0〜60)までを半透明にする
+    #   decontaminate … 半透明の縁から背景色の混ざりを除く(白背景の縁が光るのを防ぐ)
+    #   trim … 透明になった余白を切り詰める
+    #   model … 「AIで抜く」のモデル(isnet-general-use / birefnet-general)
+    #   preview_bg … 結果の下に敷く背景(checker / white / black / green)
+    # 「画像の内側にある背景色に近い色」(残す／抜く)と、Ctrl+クリックの残す点は覚えない。
+    # 「抜く」のまま次の画像を開くと被写体の内側の白まで抜け、気付かずに載せる事故が
+    # 起きるため、毎回既定(残す)に戻す。
+    # このほか window_size(窓の大きさ)と last_dir(保存先フォルダ)もアプリが書き足す。
+    "bg_remove": {
+        "tolerance": 12,
+        "feather": 10,
+        "decontaminate": True,
+        "trim": False,
+        "model": "isnet-general-use",
+        "preview_bg": "checker",
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",
@@ -332,6 +352,10 @@ DEFAULT_SETTINGS = {
         # 静止(一時停止)。押すと今の1枚で止まり、もう一度押すと現在の画面へ戻る。
         # 手元で資料を切り替える間、その様子を見せないためのもの。
         "screen_mirror_freeze": "ctrl+alt+f",
+        # 背景を透過(bg_remove.py)。クリップボードの画像を読んでプレビュー窓を開く。
+        # e は erase の e。既に使っている h,r,s,m,c,t,v,l,o,b,w,p,q,f と win+j の
+        # どれとも重ならない。
+        "bg_remove": "ctrl+alt+e",
     },
 }
 

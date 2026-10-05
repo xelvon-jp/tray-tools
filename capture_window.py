@@ -22,6 +22,7 @@ from capture_grab import (
     render_annotated,
     save_image,
 )
+import bg_remove_launch
 from toast import dismiss, show_toast
 
 PEN_WIDTH_CHOICES = [1, 2, 3, 5, 8, 12]
@@ -424,6 +425,20 @@ class CaptureWindow(QWidget):
         rendered = render_annotated(self.base_image, self.actions_history)
         QGuiApplication.clipboard().setImage(rendered)
 
+    def _open_bg_remove(self):
+        """描き込みを焼き込んだ絵を、背景透過の窓(別プロセス)で開く。
+
+        クリップボードを経由しないのは、ユーザーがいま載せている中身を勝手に
+        書き換えないため。一時PNGで渡し、向こうが読み終えたら消す。"""
+        try:
+            rendered = render_annotated(self.base_image, self.actions_history)
+            # 高DPIの付箋は devicePixelRatio を持つが、背景透過は画素を扱うだけなので
+            # そのまま渡してよい(PNG には倍率が残らず、画素数は撮ったときのまま)。
+            bg_remove_launch.spawn_with_image(rendered)
+        except Exception as e:
+            # 付箋プロセスのスロット。投げ切るとプロセスごと消え、付箋の中身も失う。
+            show_toast(f"Rapture\n背景透過を開けませんでした\n{e}")
+
     # ---------------------------------------------------------------
     # 右クリックメニュー
     # ---------------------------------------------------------------
@@ -434,6 +449,8 @@ class CaptureWindow(QWidget):
         # 「コピー」はこのメニューで最も使う操作なので、カーソルの真下に来る先頭に置く。
         # 直後にセパレータを入れて、描画設定(色・線幅…)の並びとは別物だと分かるようにする。
         act_copy = menu.addAction("コピー (Ctrl+C)")
+        # コピーの直後に置く。「背景を抜いてからコピーしたい」ときに続けて探す場所なので。
+        act_bg_remove = menu.addAction("背景を透過...")
         menu.addSeparator()
 
         act_color = menu.addAction("色...")
@@ -484,6 +501,8 @@ class CaptureWindow(QWidget):
             self._save()
         elif chosen == act_copy:
             self._copy()
+        elif chosen == act_bg_remove:
+            self._open_bg_remove()
         elif chosen == act_open_folder:
             self._open_save_folder()
         elif chosen == act_ontop:

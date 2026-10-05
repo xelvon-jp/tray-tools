@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
 )
 
+import bg_remove_launch
 import capture_process
 import color_picker
 import explorer_nav
@@ -378,6 +379,12 @@ class ScreenFeature:
             self._with_hotkey("📋 定型文", hotkey_config.get("snippet_picker")),
             self.start_snippet_picker,
         )
+        # 定型文(クリップボードの書式を落とす口もここ)の隣に置く。どちらも
+        # 「クリップボードの中身を整えて戻す」道具なので、探す場所を揃える。
+        self.menu.addAction(
+            self._with_hotkey("🪄 背景を透過…", hotkey_config.get("bg_remove")),
+            self.start_bg_remove,
+        )
         # QAction.triggered は checked(bool) を渡してくる。引数を取れる関数を直接繋ぐと
         # current_path に False が入るので、ここは引数なしのラムダで包む。
         self.menu.addAction(
@@ -634,6 +641,7 @@ class ScreenFeature:
             "color_picker": self.start_color_picker,
             "always_on_top": self.toggle_always_on_top,
             "snippet_picker": self.start_snippet_picker,
+            "bg_remove": self.start_bg_remove,
             "launcher": lambda: self.start_launcher(),
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
@@ -903,6 +911,25 @@ class ScreenFeature:
         self.snippet_picker = None
         picker.close()
         picker.deleteLater()
+
+    # ---------------------------------------------------------------
+    # 背景を透過(bg_remove.py。窓は別プロセス)
+    # ---------------------------------------------------------------
+    def start_bg_remove(self):
+        """クリップボードの画像を背景透過の窓で開く。
+
+        窓は別プロセスなので、ここは起こすだけ。二重に押せば窓も2枚出るが、それぞれ
+        読んだ時点のクリップボードを抱えた独立した窓なので害は無い(付箋と同じ扱い)。"""
+        try:
+            # 画像が無いのに起こすと、numpy/cv2 の読み込みを待たされた末に「無い」と
+            # 言われる。Qt の型を見るだけの確認なので、先にここで弾く。
+            if not bg_remove_launch.clipboard_has_image():
+                self._notify("背景を透過", "クリップボードに画像がありません")
+                return
+            bg_remove_launch.spawn_from_clipboard()
+        except Exception as e:
+            # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
+            self._notify("背景を透過", f"起動できませんでした\n{e}")
 
     # ---------------------------------------------------------------
     # フォルダブックマーク

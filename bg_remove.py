@@ -67,6 +67,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSlider,
+    QStackedWidget,
     QSplitter,
     QToolButton,
     QVBoxLayout,
@@ -104,7 +105,77 @@ QUANT_STEP = 16
 TRIM_ALPHA_THRESHOLD = 8
 
 TOLERANCE_MAX = 100   # 許容量(ΔE)の上限
+
+# ---- 許容量の自動(auto_tolerance) ----
+# 外周の何 px を「背景のムラ」の標本にするか。2px だと JPEG のブロック1列ぶんしか拾えず、
+# ムラの上限を低く見積もりがち。
+AUTO_BORDER_PX = 4
+# 外周に掛かった被写体を標本から外す上限(ΔE)。これより背景色から遠い画素はムラではない。
+AUTO_OUTLIER_DE = 20.0
+# 測ったムラの上限(p99)に掛ける余裕と足す余裕。p99 ちょうどだと 1% の画素がぽつぽつ
+# 残って「ゴミ」に見える。足しすぎると薄いボックスを食う。
+AUTO_MARGIN_RATIO = 1.15
+AUTO_MARGIN_DE = 1.0
+AUTO_TOLERANCE_MIN = 2
+AUTO_TOLERANCE_MAX = 40
+
+# ---- 残す色(Ctrl+クリック、色で抜くとき) ----
+# 背景色との距離 d_bg と残す色との距離 d_keep から r = d_bg / (d_bg + d_keep) を作る
+# (0 = 背景色そのもの、1 = 残す色そのもの、0.5 = ちょうど中間)。境目のアンチエイリアスの
+# 画素は Lab でほぼ線形に混ざっているので、r はそのまま「ボックスが占める割合」に近い。
+# r が KEEP_R0 以下なら背景、KEEP_R1 以上なら残す色、その間は線形に半透明にする。
+# r は画素ごとに揺れる。JPEG の箱の中は平らな塗りでも ΔE 4〜5 ばらつき(色の間引きと
+# 文字・縁のまわりのリンギング)、背景との差が ΔE 6〜9 しかない薄い箱では r が 0.25〜0.4
+# まで落ちる画素が出た(合成素材で実測)。そこで r を 5×5 の中央値で均してから使う。
+# 中央値は段差(箱の縁)を鈍らせずにぽつぽつした外れだけを消すので、縁の半透明は保てる。
+# 均したあとでも、背景側は 0.23 以下、箱の内側は 0.49 以上に収まった。
+# 上端を 0.5 にしてあるのは「背景色より残す色のほうに近い画素は背景にしない」を
+# そのまま守るため。0.55 などにすると、箱の中の文字の縁(濃い文字と箱の色の混ざり。
+# どちらの色からも遠く、r が 0.5 をわずかに超える)が、許容量を大きくしたときに
+# 半透明になった。背景側を 0.25 まで下げたぶん、境目の画素はやや不透明寄りになるが、
+# 色かぶり除去で背景色を差し引くので白く光らない(テストで確かめてある)。
+KEEP_R0 = 0.25
+KEEP_R1 = 0.5
+KEEP_MEDIAN = 5
+
+# ---- 背景のムラ・グラデーションへの追従(fit_background_offset) ----
+# 背景の色を「一定の色 + 画像全体でゆるく変わるずれ」とみなし、ずれを Lab の各成分ごとに
+# (x, y) の2次多項式で当てはめる。ビネット(中央が明るく四隅が暗い)は2次でほぼ表せる。
+# 3次以上は被写体の無い隅で暴れやすいので上げない。
+GRADIENT_SAMPLES = 20000     # 当てはめに使う画素の上限(格子状に間引く)
+GRADIENT_ITERATIONS = 4      # 外れ値を除いて当て直す回数
+GRADIENT_INITIAL_DE = 15.0   # 最初に「背景らしい」とみなす背景色からの距離
+GRADIENT_MIN_SAMPLES = 200   # これより標本が少なければ当てはめない(ずれ 0 のまま)
+GRADIENT_MAX_DE = 20.0       # ずれの大きさの上限。標本の無い隅で外挿が暴れても、ここで止める
+# 最初の当てはめは外周のこの幅(画像に対する割合)の帯だけで行う。画像全体の「背景色に
+# 近い画素」から始めると、背景との差が ΔE 5〜8 しかない大きな薄いボックスまで標本に入り、
+# 面がボックスの色へ引っ張られた(合成素材で、ボックスとの差が 8.5 → 5.6 に縮んだ)。
+# 外周の帯だけでも2次の面(ビネット)は決まるので、そこから内側へ広げる。
+GRADIENT_SEED_BAND = 0.08
+
+# ---- AIの結果に対する補正(refine_ai_alpha) ----
+# 残す点: AI がこれ以下と判定した画素は「AI が背景と言い切った場所」とみなし、点を打っても
+# 効かせない(効かなかった点として報告する)。
+AI_PROTECT_FLOOR = 0.05
+# 残す点で不透明にする範囲は「点の値のこの割合より濃い部分」の連結成分。a > FLOOR の成分を
+# まるごと不透明にすると、実写の接地影(白い牛の足元で 0.2〜0.3 程度)や、トラックの荷台の
+# 中の半透明(0.35 前後)まで巻き込んで残ってしまった(テスト素材で実測)。点の値に対する
+# 相対値にしてあるのは、AI が被写体全体を薄く(0.5 前後に)判定した場合にも、それより
+# さらに薄い影とは分けられるようにするため。
+AI_PROTECT_RELATIVE = 0.5
+# 残す点で「もう不透明」とみなす値。これ以上の画素は塗り替える必要が無く、成分をつなぐ
+# 橋としても使わない(refine_ai_alpha のコメント参照)。
+AI_PROTECT_OPAQUE = 0.9
+# 抜く点: a がこれ未満の連結成分を抜く(脚の間の隙間などに残った薄い判定を消す)。
+AI_SEED_CEILING = 0.95
+# 点で塗り替えた範囲の縁をなじませるぼかし(ガウスの σ、px)。縁が1画素の階段になると、
+# 拡大したときにそこだけギザギザに見える。
+AI_EDGE_SIGMA = 1.0
 FEATHER_MAX = 60      # 境界のぼかし(ΔE)の上限
+# 境界のぼかしの既定。以前は 10 だったが、AI の図解の薄いボックス(背景との差 ΔE 5〜15)は
+# 許容量+ぼかしの範囲に丸ごと入って半透明になった。アンチエイリアスの縁をなじませるには
+# 2〜3 で足りる。
+DEFAULT_FEATHER = 2
 
 RANGE_CONNECTED = "connected"   # 外周(とスポイトの点)からつながった部分だけ
 RANGE_GLOBAL = "global"         # 画像全体の同色
@@ -116,6 +187,13 @@ PICK_PROTECT = "protect"   # Ctrl+クリック: ここは残す(色は足さな�
 
 METHOD_COLOR = "color"
 METHOD_AI = "ai"
+
+# 抜き方のラジオの横に出す「このモードで何が効くか」。効かない項目は隠すので、
+# 何で決まっているのかをここで一言で言っておく。
+METHOD_NOTES = {
+    METHOD_COLOR: "色で抜く：背景色・許容量・ぼかしで決める",
+    METHOD_AI: "AIの結果：AIの判定を基本に、スライダーと残す点／抜く点で補正",
+}
 
 # rembg のモデル。先頭が既定。どちらも C:\Users\<名前>\.u2net\ にキャッシュされ、
 # 無ければ初回に rembg がダウンロードする(birefnet は 900MB 超あるので注意)。
@@ -184,18 +262,26 @@ def estimate_background(rgb, alpha=None, border: int = BORDER_PX, step: int = QU
     return tuple(int(round(v)) for v in median)
 
 
-def color_distance(rgb, colors):
-    """各画素から、いちばん近い背景色までの ΔE と、その色の番号を返す。
+def color_distance(rgb, colors, offset=None, color_offsets=None):
+    """各画素から、いちばん近い色までの ΔE と、その色の番号を返す。
 
     戻り値は (dist: float32 HxW, index: int32 HxW)。colors が空なら dist は全部 inf
-    (=どこも背景ではない)。index は色かぶり除去で「どの背景色が混ざったか」に使う。"""
+    (=どこも背景ではない)。index は色かぶり除去で「どの背景色が混ざったか」に使う。
+
+    offset(HxWx3、Lab)を渡すと、色は場所ごとに offset だけずれているものとして測る
+    (背景のムラへの追従)。color_offsets はその色を拾った場所でのずれで、拾った色から
+    差し引いて「ずれの無い元の色」に戻してから、測る場所のずれを足す(残す色に使う)。"""
     rgb = np.asarray(rgb)
     h, w = rgb.shape[:2]
     index = np.zeros((h, w), dtype=np.int32)
     if not colors:
         return np.full((h, w), np.inf, dtype=np.float32), index
     lab = to_lab(rgb)
+    if offset is not None:
+        lab = lab - offset
     targets = to_lab(np.asarray(colors, dtype=np.uint8).reshape(-1, 3))
+    if color_offsets is not None:
+        targets = targets - np.asarray(color_offsets, dtype=np.float32).reshape(-1, 3)
     dist = None
     for i, target in enumerate(targets):
         diff = lab - target
@@ -207,6 +293,136 @@ def color_distance(rgb, colors):
             dist = np.where(closer, d, dist)
             index[closer] = i
     return dist.astype(np.float32), index
+
+
+def _poly_terms(u, v) -> np.ndarray:
+    """2次多項式の項 [1, u, v, u², uv, v²]。u, v は 0〜1 に正規化した座標。"""
+    u = np.asarray(u, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    return np.stack([np.ones_like(u), u, v, u * u, u * v, v * v], axis=-1)
+
+
+def _normalized_grid(h: int, w: int):
+    """画素の中心を 0〜1 に正規化した座標。縮小プレビューと原寸で同じ係数が使えるよう、
+    画素数ではなく画像に対する割合で表す。"""
+    u = (np.arange(w, dtype=np.float32) + 0.5) / w
+    v = (np.arange(h, dtype=np.float32) + 0.5) / h
+    return u, v
+
+
+def fit_background_offset(rgb, colors, keep_colors=(), threshold: float = GRADIENT_INITIAL_DE,
+                          iterations: int = GRADIENT_ITERATIONS,
+                          max_samples: int = GRADIENT_SAMPLES):
+    """背景のムラ(ビネット・ゆるいグラデーション)を、背景色からの Lab のずれとして
+    2次多項式で当てはめ、係数(6×3、float32)を返す。当てはめられなければ None。
+
+    標本は格子状に間引いた画素のうち、いちばん近い背景色から threshold 以内のもの。
+    残す色のほうが近い画素(薄いボックス)は最初から外す。当てはめたあと、面からの残差が
+    大きい画素(背景に似た被写体)を外して当て直すのを繰り返す。外す線は残差の中央値から
+    決める(ノイズの大きい JPEG でも、きれいな PNG でも同じ考えで効くように)。"""
+    rgb = np.asarray(rgb)
+    if not colors:
+        return None
+    h, w = rgb.shape[:2]
+    step = max(1, int(np.sqrt(h * w / float(max_samples))))
+    sub = np.ascontiguousarray(rgb[step // 2::step, step // 2::step])
+    sh, sw = sub.shape[:2]
+    if sh == 0 or sw == 0:
+        return None
+    lab = to_lab(sub).reshape(-1, 3)
+    ys = (np.arange(sh, dtype=np.float32) * step + step // 2 + 0.5) / h
+    xs = (np.arange(sw, dtype=np.float32) * step + step // 2 + 0.5) / w
+    uu, vv = np.meshgrid(xs, ys)
+    terms = _poly_terms(uu.reshape(-1), vv.reshape(-1))
+
+    dist, index = color_distance(sub, list(colors))
+    dist = dist.reshape(-1)
+    targets = to_lab(np.asarray(colors, dtype=np.uint8).reshape(-1, 3))
+    residual_target = lab - targets[index.reshape(-1)]
+    allowed = dist < threshold
+    if keep_colors:
+        keep_dist, _ = color_distance(sub, list(keep_colors))
+        allowed &= dist < keep_dist.reshape(-1)
+    uf, vf = uu.reshape(-1), vv.reshape(-1)
+    band = ((uf < GRADIENT_SEED_BAND) | (uf > 1 - GRADIENT_SEED_BAND)
+            | (vf < GRADIENT_SEED_BAND) | (vf > 1 - GRADIENT_SEED_BAND))
+    mask = allowed & band
+
+    coeffs = None
+    for _ in range(max(1, iterations)):
+        if mask.sum() < GRADIENT_MIN_SAMPLES:
+            return coeffs.astype(np.float32) if coeffs is not None else None
+        coeffs, *_rest = np.linalg.lstsq(terms[mask], residual_target[mask], rcond=None)
+        err = np.linalg.norm(residual_target - terms @ coeffs, axis=1)
+        spread = float(np.median(err[mask])) * 1.4826  # 中央値から標準偏差相当へ
+        # 2回目からは内側の画素も、面からの残差が小さければ標本に入れる。
+        mask = allowed & (err < max(2.0, 3.0 * spread))
+    return coeffs.astype(np.float32) if coeffs is not None else None
+
+
+def background_offset(coeffs, h: int, w: int):
+    """係数から、各画素での背景色のずれ(HxWx3、Lab、float32)を作る。coeffs が None なら None。"""
+    if coeffs is None:
+        return None
+    u, v = _normalized_grid(h, w)
+    uu, vv = np.meshgrid(u, v)
+    offset = (_poly_terms(uu, vv) @ np.asarray(coeffs, dtype=np.float32)).astype(np.float32)
+    norm = np.linalg.norm(offset, axis=2, keepdims=True)
+    too_far = norm > GRADIENT_MAX_DE
+    if too_far.any():
+        offset = np.where(too_far, offset * (GRADIENT_MAX_DE / np.maximum(norm, 1e-6)), offset)
+    return offset
+
+
+def offset_at(coeffs, x: float, y: float, h: int, w: int):
+    """画像座標 (x, y) でのずれ(Lab の3成分)。coeffs が None なら 0。"""
+    if coeffs is None:
+        return np.zeros(3, dtype=np.float32)
+    terms = _poly_terms(np.float32((x + 0.5) / w), np.float32((y + 0.5) / h))
+    offset = terms @ np.asarray(coeffs, dtype=np.float32)
+    norm = float(np.linalg.norm(offset))
+    if norm > GRADIENT_MAX_DE:
+        offset = offset * (GRADIENT_MAX_DE / norm)
+    return offset.astype(np.float32)
+
+
+def local_background_rgb(colors, index, offset):
+    """各画素での背景の色(RGB、0〜255 の float32、HxWx3)。色かぶり除去の B に使う。
+
+    ムラに追従しているときは、背景の色そのものが場所ごとに違う。一定の色で差し引くと、
+    ビネットで暗くなった隅では縁に暗い筋が、明るい中央では白い筋が出る。"""
+    targets = to_lab(np.asarray(colors, dtype=np.uint8).reshape(-1, 3))
+    lab = targets[np.asarray(index)] + offset
+    rgb = cv2.cvtColor(np.ascontiguousarray(lab, dtype=np.float32), cv2.COLOR_Lab2RGB)
+    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
+
+
+def auto_tolerance(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORDER_PX) -> int:
+    """外周の画素から背景のムラの上限を測り、許容量の目安(ΔE、整数)を返す。
+
+    外周 border px の画素と背景色との ΔE を集め、AUTO_OUTLIER_DE を超えるもの(外周に
+    掛かった被写体)を外してから p99 を取り、少し余裕を足す。AI の図解の白背景は、
+    ムラが ΔE 1〜3 程度しかないのに、上に載る薄いボックスとの差も ΔE 5〜15 しかない。
+    固定の初期値(以前は 12)では箱ごと抜けてしまうので、画像ごとにムラの実測から決める。"""
+    rgb = np.asarray(rgb)
+    if not colors:
+        return AUTO_TOLERANCE_MIN
+    h, w = rgb.shape[:2]
+    b = max(1, min(int(border), h // 2 or 1, w // 2 or 1))
+    dist, _ = color_distance(rgb, list(colors), offset)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[:b, :] = True
+    mask[-b:, :] = True
+    mask[:, :b] = True
+    mask[:, -b:] = True
+    if alpha is not None:
+        mask &= np.asarray(alpha) > 0
+    sample = dist[mask]
+    sample = sample[sample < AUTO_OUTLIER_DE]
+    if len(sample) == 0:
+        return AUTO_TOLERANCE_MIN
+    value = float(np.percentile(sample, 99)) * AUTO_MARGIN_RATIO + AUTO_MARGIN_DE
+    return int(max(AUTO_TOLERANCE_MIN, min(AUTO_TOLERANCE_MAX, np.ceil(value))))
 
 
 def scale_points(points, scale: float):
@@ -221,7 +437,7 @@ def scale_points(points, scale: float):
 
 
 def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONNECTED,
-                  seeds=(), protect=(), report: bool = False):
+                  seeds=(), protect=(), report: bool = False, keep_dist=None):
     """背景からの距離から不透明度(0〜1、float32)を作る。
 
     距離 ≦ 許容量 は完全に透明、許容量〜許容量+ぼかし は線形に半透明、それより遠ければ
@@ -239,6 +455,12 @@ def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONN
     背景まで丸ごと残ってしまうため。候補でない画素(もともと不透明)の上の保護点は、
     守るまでもないので黙って無視する。
 
+    keep_dist(Ctrl+クリックの「残す色」までの距離、HxW)を渡すと、背景色より残す色の
+    ほうに近い画素を候補から外す(r = d_bg / (d_bg + d_keep) が KEEP_R0〜KEEP_R1 で
+    背景→残す色へ線形に移る)。許容量の内側でも効くので、背景との差が ΔE 5 しかない
+    枠線の無いボックスでも、外周の背景から切り離して残せる。境目の画素は r がボックスの
+    占める割合に近く、そのまま半透明の度合いになる(色かぶり除去で背景色を差し引ける)。
+
     report が True なら (alpha, 効かなかった保護点の番号のリスト) を返す。番号は
     protect の並びでの位置。外周とつながっていて効かなかったものだけが入る。"""
     dist = np.asarray(dist, dtype=np.float32)
@@ -248,6 +470,16 @@ def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONN
         background = np.clip((tol + fea - dist) / fea, 0.0, 1.0)
     else:
         background = (dist <= tol).astype(np.float32)
+    if keep_dist is not None:
+        keep_dist = np.asarray(keep_dist, dtype=np.float32)
+        r = dist / np.maximum(dist + keep_dist, 1e-6)
+        # 背景色と残す色が同じ(d_bg = d_keep = 0)なら残す色は区別の役に立たないので、
+        # 背景のまま(r = 0)にしておく。
+        r = np.where(dist + keep_dist > 1e-6, r, 0.0).astype(np.float32)
+        if min(r.shape) >= KEEP_MEDIAN:
+            r = cv2.medianBlur(np.ascontiguousarray(r), KEEP_MEDIAN)
+        relative = np.clip((KEEP_R1 - r) / (KEEP_R1 - KEEP_R0), 0.0, 1.0)
+        background = np.minimum(background, relative).astype(np.float32)
 
     protect = list(protect or ())
     rejected = []
@@ -293,13 +525,115 @@ def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONN
     return alpha
 
 
-def decontaminate(rgb, alpha, colors, index=None) -> np.ndarray:
+def _soft_mask(mask) -> np.ndarray:
+    """0/1 のマスクを AI_EDGE_SIGMA だけぼかした float32(0〜1)。"""
+    return cv2.GaussianBlur(mask.astype(np.float32), (0, 0), AI_EDGE_SIGMA)
+
+
+def refine_ai_alpha(alpha, lo: float = 0.0, hi: float = 1.0, protect=(), seeds=(),
+                    report: bool = False):
+    """AI が出した不透明度(0〜1)を、一括の調整と点の指定で補正する。
+
+    1. 一括の調整: a' = clip((a − lo) / (hi − lo), 0, 1)。lo 未満は消え、hi 以上は不透明。
+       AI が白い被写体を背景と取り違えて半透明にしたとき、点を打たずにまとめて濃くできる。
+    2. 抜く点(seeds): a' < AI_SEED_CEILING の連結成分のうち点を含むものを 0 にする。
+       画像の外周に接する成分は「外側の背景そのもの」なので触らない(触ると被写体の輪郭の
+       なめらかさまで削れる)。外周につながった薄い判定は lo で消す。
+    3. 残す点(protect): 点の値 v に対して、a' > max(FLOOR, v·RELATIVE) の連結成分のうち
+       点を含むものを 1 にする。v ≦ FLOOR(AI が背景と言い切った場所)と、成分が画像の
+       半分を超える(背景ごと拾っている)場合は効かせず報告する。抜く点より後に掛けるので、
+       同じ場所なら残す側が勝つ(色で抜くときと同じ)。
+
+    塗り替えた範囲の縁は、マスクを少しぼかしてから max / 掛け算で元の値とつなぐ。
+
+    report が True なら (alpha, 効かなかった残す点の番号, 効かなかった抜く点の番号) を返す。"""
+    a = np.asarray(alpha, dtype=np.float32)
+    lo = min(max(float(lo), 0.0), 1.0)
+    hi = min(max(float(hi), 0.0), 1.0)
+    if hi <= lo:
+        hi = min(lo + 1e-3, 1.0)
+        lo = hi - 1e-3
+    out = np.clip((a - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+    h, w = out.shape
+
+    def inside(x, y):
+        return 0 <= int(x) < w and 0 <= int(y) < h
+
+    seeds_rejected = []
+    seeds = list(seeds or ())
+    if seeds:
+        count, labels = cv2.connectedComponents(
+            (out < AI_SEED_CEILING).astype(np.uint8), connectivity=8)
+        edge = np.zeros(count, dtype=bool)
+        edge[np.unique(np.concatenate(
+            (labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1])))] = True
+        chosen = np.zeros(count, dtype=bool)
+        for i, (x, y) in enumerate(seeds):
+            if not inside(x, y):
+                continue
+            label = labels[int(y), int(x)]
+            if out[int(y), int(x)] >= AI_SEED_CEILING:
+                continue  # 被写体の真ん中に打った点。抜く対象が無い
+            if edge[label]:
+                seeds_rejected.append(i)
+                continue
+            chosen[label] = True
+        if chosen.any():
+            mask = chosen[labels]
+            out = out * (1.0 - _soft_mask(mask))
+
+    protect_rejected = []
+    protect = list(protect or ())
+    if protect:
+        limit = h * w / 2.0
+        grown = np.zeros((h, w), dtype=bool)
+        opaque = out >= AI_PROTECT_OPAQUE
+        if opaque.any():
+            _n, opaque_labels = cv2.connectedComponents(opaque.astype(np.uint8), connectivity=8)
+        for i, (x, y) in enumerate(protect):
+            if not inside(x, y):
+                continue
+            xi, yi = int(x), int(y)
+            v = float(out[yi, xi])
+            if v <= AI_PROTECT_FLOOR:
+                protect_rejected.append(i)
+                continue
+            # 塗る候補は「薄すぎず、まだ不透明でもない」帯の画素だけ。すでに不透明な画素は
+            # つなぎ目に使わない。使うと、隣の黒い牛やトラック(不透明)を橋にして、
+            # 離れた所の接地影まで同じ成分になって残ってしまう(テスト素材で実際に起きた)。
+            threshold = max(AI_PROTECT_FLOOR, min(v, AI_PROTECT_OPAQUE) * AI_PROTECT_RELATIVE)
+            band = (out > threshold) & ~opaque
+            _count, labels = cv2.connectedComponents(band.astype(np.uint8), connectivity=8)
+            if v >= AI_PROTECT_OPAQUE:
+                # すでに不透明な所に打った点。その不透明な塊に接している帯の成分を濃くする
+                # (半分だけ透けた被写体の、透けている側を戻す)。
+                blob = opaque_labels == opaque_labels[yi, xi]
+                ring = cv2.dilate(blob.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+                touching = np.unique(labels[ring & band])
+                region = np.isin(labels, touching[touching > 0]) | blob
+            else:
+                region = labels == labels[yi, xi]
+            if region.sum() > limit:
+                protect_rejected.append(i)
+                continue
+            grown |= region
+        if grown.any():
+            out = np.maximum(out, _soft_mask(grown))
+
+    out = np.clip(out, 0.0, 1.0).astype(np.float32)
+    if report:
+        return out, protect_rejected, seeds_rejected
+    return out
+
+
+def decontaminate(rgb, alpha, colors, index=None, background=None) -> np.ndarray:
     """半透明の画素から背景色の混入を取り除いた RGB(uint8)を返す。
 
     境界の画素は「前景 C と背景 B が a : 1−a で混ざった色」なので、C = (観測 − (1−a)·B) / a
     で前景を取り出す。これをしないと、白背景から抜いた髪の毛の縁が白く光り、暗い背景に
     置いたときに輪郭が浮く。背景色が複数あるときは、その画素にいちばん近い色を B にする
-    (index は color_distance の戻り値)。不透明・完全透明の画素はそのまま。"""
+    (index は color_distance の戻り値)。background(HxWx3 の RGB)を渡すと、色ではなく
+    その場所の背景の色を B にする(ムラに追従しているとき)。不透明・完全透明の画素はそのまま。"""
     rgb = np.asarray(rgb)
     alpha = np.asarray(alpha, dtype=np.float32)
     if not colors:
@@ -310,7 +644,9 @@ def decontaminate(rgb, alpha, colors, index=None) -> np.ndarray:
         return rgb.copy()
     out = rgb.astype(np.float32)
     a = alpha[partial][:, None]
-    if index is None or len(palette) == 1:
+    if background is not None:
+        background = np.asarray(background, dtype=np.float32)[partial]
+    elif index is None or len(palette) == 1:
         background = palette[0][None, :]
     else:
         background = palette[np.asarray(index)[partial]]
@@ -333,14 +669,15 @@ def trim_box(alpha, threshold: float = 0.0):
 
 
 def compose_rgba(rgb, alpha, colors=(), index=None, decontaminate_edges: bool = True,
-                 trim: bool = False, src_alpha=None) -> np.ndarray:
+                 trim: bool = False, src_alpha=None, background=None) -> np.ndarray:
     """RGB と不透明度から、出力する RGBA(uint8)を組み立てる。
 
     src_alpha は元画像がもともと持っていたアルファ(0〜255)。元から透明な部分は
     透明のまま残したいので掛け合わせる。色かぶり除去は「背景を抜いて生まれた半透明」
     だけが対象なので、掛け合わせる前の alpha で行う。"""
     alpha = np.asarray(alpha, dtype=np.float32)
-    color = decontaminate(rgb, alpha, list(colors), index) if decontaminate_edges else np.asarray(rgb)
+    color = (decontaminate(rgb, alpha, list(colors), index, background)
+             if decontaminate_edges else np.asarray(rgb))
     out_alpha = alpha * 255.0
     if src_alpha is not None:
         out_alpha = out_alpha * (np.asarray(src_alpha, dtype=np.float32) / 255.0)
@@ -464,7 +801,7 @@ def _section(app_settings) -> dict:
     return section if isinstance(section, dict) else {}
 
 
-def _save_values(app_settings, settings_path, updates: dict) -> None:
+def _save_values(app_settings, settings_path, updates: dict, remove=()) -> None:
     """bg_remove セクションの該当キーだけを書き換える。
 
     clipboard_preview._save_size と同じ作法で、ファイルを読み直して差し替える
@@ -475,6 +812,8 @@ def _save_values(app_settings, settings_path, updates: dict) -> None:
         if not isinstance(section, dict):
             section = app_settings[SETTINGS_SECTION] = {}
         section.update(updates)
+        for key in remove:
+            section.pop(key, None)
     if not settings_path:
         return
     try:
@@ -488,6 +827,8 @@ def _save_values(app_settings, settings_path, updates: dict) -> None:
         if not isinstance(section, dict):
             section = stored[SETTINGS_SECTION] = {}
         section.update(updates)
+        for key in remove:
+            section.pop(key, None)
         settings_module.save_settings(stored, settings_path)
     except Exception as e:
         # 覚えられないだけ。窓の操作を止めるほどのことではない。
@@ -738,6 +1079,7 @@ class BgRemoveWindow(QWidget):
 
         # 距離の計算は背景色が変わったときだけで済む(スライダーでは変わらない)。
         self._dist_cache = {}
+        self._gradient_cache = None
         self._ai_alpha = None
         self._ai_alpha_preview = None
         self._ai_running = False
@@ -757,8 +1099,7 @@ class BgRemoveWindow(QWidget):
         layout.setSpacing(8)
         layout.addLayout(self._build_color_row())
         layout.addLayout(self._build_method_row(section))
-        layout.addLayout(self._build_range_row(section))
-        layout.addLayout(self._build_inside_row())
+        layout.addWidget(self._build_mode_pages(section))
         layout.addLayout(self._build_option_row(section))
         layout.addWidget(self._build_panes(), 1)
 
@@ -783,6 +1124,7 @@ class BgRemoveWindow(QWidget):
                                    (self._width, self._height))
         self._rebuild_swatches()
         self._update_method_controls()
+        self._apply_auto_tolerance()
         self._refresh_preview()
 
     # ------------------------------------------------------------------
@@ -800,7 +1142,8 @@ class BgRemoveWindow(QWidget):
     def _build_color_row(self):
         row = QHBoxLayout()
         row.setSpacing(6)
-        row.addWidget(self._heading("背景色"))
+        self._bg_heading = self._heading("背景色")
+        row.addWidget(self._bg_heading)
         self._swatch_row = QHBoxLayout()
         self._swatch_row.setSpacing(4)
         row.addLayout(self._swatch_row)
@@ -809,7 +1152,7 @@ class BgRemoveWindow(QWidget):
         # スウォッチに混ぜると「この色が背景色に入った」と読み違えられる)。
         self._protect_heading = self._heading("残す点")
         self._protect_heading.setToolTip(
-            "Ctrl+クリックで指した部分は、背景色に近くても透明にしない（「色で抜く」専用）")
+            "Ctrl+クリックで指した部分は透明にしない（色で抜く・AIの結果のどちらでも効く）")
         row.addWidget(self._protect_heading)
         self._protect_row = QHBoxLayout()
         self._protect_row.setSpacing(4)
@@ -837,8 +1180,14 @@ class BgRemoveWindow(QWidget):
         self.ai_radio.setEnabled(False)
         self.ai_radio.setToolTip("先に［AIで抜く］を押してください")
         self.color_radio.toggled.connect(self._on_method_changed)
+        self.method_note = QLabel(METHOD_NOTES[METHOD_COLOR])
+        self.method_note.setObjectName("bgNote")
+        self.method_note.setFont(self._font(8))
+        # 狭い窓では説明のほうを削る(ボタンやモデル選択を押し出させない)。全文はツールチップ。
+        self.method_note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        row.addWidget(self.method_note, 2)
 
-        row.addSpacing(16)
+        row.addSpacing(8)
         self.ai_button = QPushButton("AIで抜く")
         self.ai_button.setFont(self._font())
         self.ai_button.clicked.connect(self._start_ai)
@@ -888,18 +1237,75 @@ class BgRemoveWindow(QWidget):
     def _build_range_row(self, section):
         row = QHBoxLayout()
         row.setSpacing(6)
+        # 許容量は覚えない。画像ごとに背景のムラの大きさが違い、前の画像に合わせた値を
+        # 持ち越すと、薄いボックスごと抜ける(以前の既定 12 で実際に起きた)。開くたびに
+        # 外周のムラから測った「自動」の値で始める。
         self.tolerance_slider, self._tolerance_label = self._make_slider(
-            row, "許容量", TOLERANCE_MAX,
-            _int_setting(section, "tolerance", 12, 0, TOLERANCE_MAX),
+            row, "許容量", TOLERANCE_MAX, AUTO_TOLERANCE_MIN,
             "背景色からこの差(ΔE)までを完全に透明にする。2前後が見分けられる限界の差",
         )
+        self.tolerance_slider.valueChanged.connect(self._on_tolerance_moved)
+        self.auto_tolerance_button = QPushButton("自動")
+        self.auto_tolerance_button.setFont(self._font())
+        self.auto_tolerance_button.setCheckable(True)
+        self.auto_tolerance_button.setChecked(True)
+        self.auto_tolerance_button.setToolTip(
+            "外周の背景のムラ(ばらつきの上限)を測って許容量を決め直す。\n"
+            "押されている間は、背景色を変えたときにも測り直す。つまみを動かすと手動に戻る")
+        self.auto_tolerance_button.clicked.connect(self._on_auto_tolerance_clicked)
+        row.addWidget(self.auto_tolerance_button)
         row.addSpacing(12)
+        # ぼかしは覚える(画像よりも好みで決まる値なので)。キーを feather から edge_feather へ
+        # 変えたのは、以前の既定 10 が閉じるたびに書き込まれていて、それを好みとして
+        # 引き継ぐと薄いボックスの縁が溶けるため。
         self.feather_slider, self._feather_label = self._make_slider(
             row, "境界のぼかし", FEATHER_MAX,
-            _int_setting(section, "feather", 10, 0, FEATHER_MAX),
+            _int_setting(section, "edge_feather", DEFAULT_FEATHER, 0, FEATHER_MAX),
             "許容量からさらにこの差までを、離れるほど不透明になる半透明にする",
         )
         return row
+
+    def _build_ai_adjust_row(self):
+        """AIの結果の一括調整。lo 未満を消し、hi 以上を不透明にする。
+
+        白い被写体を AI が背景と取り違えて半透明にしたとき、点を打たずにまとめて濃くする
+        ためのもの(hi を下げる)。逆に背景に薄く残ったもや(接地影など)は lo を上げて消す。
+        画像ごとに変わる値なので覚えない。"""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.ai_lo_slider, _label = self._make_slider(
+            row, "これより薄い部分は消す（%）", 99, 0,
+            "AIの判定がこの値より薄い部分を完全に透明にする（背景に残ったもやを消す）")
+        row.addSpacing(12)
+        self.ai_hi_slider, _label = self._make_slider(
+            row, "これより濃い部分は不透明にする（%）", 100, 100,
+            "AIの判定がこの値より濃い部分を完全に不透明にする（半透明になった白い被写体を戻す）")
+        self.ai_lo_slider.setMinimum(0)
+        self.ai_hi_slider.setMinimum(1)
+        return row
+
+    def _build_mode_pages(self, section):
+        """モードごとに効く項目だけを出す。効かない項目はグレーにせず隠す。
+
+        グレーにして並べておくと「なぜ動かないのか」「どれを触れば変わるのか」を毎回
+        読み解くことになる(実機で、AIの結果を見ながら効かない許容量を触っていた)。"""
+        self.mode_pages = QStackedWidget()
+
+        color_page = QWidget()
+        color_column = QVBoxLayout(color_page)
+        color_column.setContentsMargins(0, 0, 0, 0)
+        color_column.setSpacing(8)
+        color_column.addLayout(self._build_range_row(section))
+        color_column.addLayout(self._build_inside_row())
+        self.mode_pages.addWidget(color_page)
+
+        ai_page = QWidget()
+        ai_column = QVBoxLayout(ai_page)
+        ai_column.setContentsMargins(0, 0, 0, 0)
+        ai_column.setSpacing(8)
+        ai_column.addLayout(self._build_ai_adjust_row())
+        self.mode_pages.addWidget(ai_page)
+        return self.mode_pages
 
     def _build_inside_row(self):
         """画像の内側にある背景色に近い色を、残すか抜くか(一括の切り替え)。
@@ -927,6 +1333,16 @@ class BgRemoveWindow(QWidget):
         self.range_combo.setToolTip(tooltip)
         self.range_combo.currentIndexChanged.connect(lambda _i: self._schedule())
         row.addWidget(self.range_combo)
+        row.addSpacing(16)
+        self.follow_check = QCheckBox("背景のムラに追従")
+        self.follow_check.setFont(self._font())
+        self.follow_check.setChecked(bool(_section(self._app_settings).get("follow_gradient", True)))
+        self.follow_check.setToolTip(
+            "背景を一定の色ではなく、画像全体でゆるく変わる面として推定する。\n"
+            "AI の画像に多いビネット(四隅が暗い)やグラデーションで、中央と四隅で\n"
+            "同じ許容量が合わない問題を防ぐ。ムラが無い画像では何も変わらない")
+        self.follow_check.toggled.connect(lambda _c: self._colors_changed())
+        row.addWidget(self.follow_check)
         row.addStretch(1)
         return row
 
@@ -1060,8 +1476,14 @@ class BgRemoveWindow(QWidget):
     def _colors(self):
         return [entry["color"] for entry in self._entries]
 
-    def _seeds(self):
-        return [entry["seed"] for entry in self._entries if entry["seed"] is not None]
+    def _seeds(self, shift_only=False):
+        """抜く起点。shift_only なら Shift+クリックで足した点だけ。
+
+        AIの結果では、ただのクリック(背景色の置き換え)の点は起点にしない。背景色を
+        指すクリックはたいてい外側の背景の上で、そこを「抜く」と言われても AI では
+        何も変わらず、効かなかったという警告が出るだけになるため。"""
+        return [entry["seed"] for entry in self._entries
+                if entry["seed"] is not None and (not shift_only or entry.get("kind") == PICK_ADD)]
 
     def _reset_to_estimate(self, schedule=True):
         color = estimate_background(self._rgb, self._src_alpha)
@@ -1072,12 +1494,15 @@ class BgRemoveWindow(QWidget):
     def _on_pick(self, x, y, kind):
         try:
             if kind == PICK_PROTECT:
-                if (x, y) not in self._protect:
-                    self._protect.append((x, y))
+                # 残す点は位置と色を組で持つ。色は「色で抜く」で背景から切り離すのに、
+                # 位置は点を含む部分を残すのと、AI の結果での補正に使う。
+                if all(entry["pos"] != (x, y) for entry in self._protect):
+                    color = tuple(int(c) for c in self._rgb[y, x])
+                    self._protect.append({"pos": (x, y), "color": color})
                 self._colors_changed()
                 return
             color = tuple(int(c) for c in self._rgb[y, x])
-            entry = {"color": color, "seed": (x, y)}
+            entry = {"color": color, "seed": (x, y), "kind": kind}
             if kind == PICK_ADD:
                 # 同じ色を2つ持っても距離は変わらない。点だけ足したいので色は重ねてよい。
                 self._entries.append(entry)
@@ -1103,8 +1528,18 @@ class BgRemoveWindow(QWidget):
         except Exception:
             self.status.setText(f"残す点を消せませんでした: {_log_exception('remove protect')}")
 
+    def _protect_points(self):
+        return [entry["pos"] for entry in self._protect]
+
+    def _keep_colors(self):
+        return [entry["color"] for entry in self._protect]
+
     def _colors_changed(self):
         self._rebuild_swatches()
+        # 背景色・残す色・追従の切り替えで背景の推定が変わるので、自動のままなら測り直す。
+        # 手で動かした許容量は上書きしない。
+        if self.auto_tolerance_button.isChecked():
+            self._apply_auto_tolerance()
         self._schedule()
 
     def _rebuild_swatches(self):
@@ -1139,7 +1574,7 @@ class BgRemoveWindow(QWidget):
             inner.addWidget(remove)
             self._swatch_row.addWidget(box)
         self._rebuild_protect_list()
-        self.source_view.set_markers(self._seeds(), self._protect)
+        self.source_view.set_markers(self._seeds(), self._protect_points())
 
     def _rebuild_protect_list(self):
         while self._protect_row.count():
@@ -1149,16 +1584,28 @@ class BgRemoveWindow(QWidget):
                 widget.deleteLater()
         # 1つも無いときは見出しごと隠す(使わない人には行を短く見せたい)。
         self._protect_heading.setVisible(bool(self._protect))
-        for index, (x, y) in enumerate(self._protect):
+        for index, entry in enumerate(self._protect):
+            x, y = entry["pos"]
             box = QWidget()
             inner = QHBoxLayout(box)
             inner.setContentsMargins(0, 0, 0, 0)
-            inner.setSpacing(0)
+            inner.setSpacing(2)
+            # 残す色のチップ。緑の ✓ は「残す」印で、その左に実際に残す色を並べる
+            # (薄い青と薄い黄を両方登録したとき、どれがどれか見分けるため)。
+            swatch = QLabel()
+            swatch.setFixedSize(16, 16)
+            swatch.setStyleSheet(
+                f"background-color: {_hex(entry['color'])}; border: 1px solid #808080;"
+                " border-radius: 3px;")
+            swatch.setToolTip(f"残す色 {_hex(entry['color'])}")
+            inner.addWidget(swatch)
             chip = QLabel(f"✓ {x},{y}")
             chip.setFont(self._font(8))
             chip.setStyleSheet(
                 "background-color: #16a34a; color: #ffffff; border-radius: 3px; padding: 2px 5px;")
-            chip.setToolTip(f"({x}, {y}) を含む部分は透明にしない")
+            chip.setToolTip(
+                f"色で抜く: {_hex(entry['color'])} に近い色を背景から切り離して残し、"
+                f"({x}, {y}) を含む部分も残す\nAIの結果: ({x}, {y}) を含む半透明の部分を不透明にする")
             inner.addWidget(chip)
             remove = QToolButton()
             remove.setObjectName("bgSwatchRemove")
@@ -1176,7 +1623,10 @@ class BgRemoveWindow(QWidget):
             color = tuple(int(c) for c in self._rgb[y, x])
             text = f"({x}, {y})  {_hex(color)}"
             if self._entries:
-                dist, _ = color_distance(np.array([[color]], dtype=np.uint8), self._colors())
+                coeffs = self._gradient_coeffs()
+                offset = offset_at(coeffs, x, y, self._height, self._width).reshape(1, 1, 3)
+                dist, _ = color_distance(np.array([[color]], dtype=np.uint8), self._colors(),
+                                         offset if coeffs is not None else None)
                 text += f"  背景色との差 ΔE {float(dist[0, 0]):.1f}"
             self.status.setText(text)
         except Exception:
@@ -1195,12 +1645,22 @@ class BgRemoveWindow(QWidget):
         self._schedule()
 
     def _update_method_controls(self):
-        # AI の結果を使っている間は、色の距離に関わるつまみは効かない。効かないつまみを
-        # 触れるままにすると「動かしても変わらない」で壊れたように見えるので止める。
-        color_mode = self._method() == METHOD_COLOR
-        for widget in (self.tolerance_slider, self.feather_slider, self.range_combo,
-                       self._tolerance_label, self._feather_label, self._range_label):
-            widget.setEnabled(color_mode)
+        method = self._method()
+        page = 1 if method == METHOD_AI else 0
+        self.mode_pages.setCurrentIndex(page)
+        # 隠れているページの高さぶん空白が残らないよう、見えていないページは大きさを
+        # 主張させない(QStackedWidget は既定で全ページの最大の大きさを取る)。
+        for i in range(self.mode_pages.count()):
+            self.mode_pages.widget(i).setSizePolicy(
+                QSizePolicy.Preferred,
+                QSizePolicy.Preferred if i == page else QSizePolicy.Ignored)
+        self.mode_pages.adjustSize()
+        note = METHOD_NOTES[method]
+        self.method_note.setText(note)
+        self.method_note.setToolTip(note)
+        # AIの結果では背景色は抜く判定に使わず、色かぶり除去だけに使う。見出しで言っておかないと
+        # 「背景色を変えたのに結果が変わらない」と迷う。
+        self._bg_heading.setText("背景色（色かぶり除去に使用）" if method == METHOD_AI else "背景色")
 
     def _set_preview_bg(self, key):
         self._preview_bg = key
@@ -1251,16 +1711,98 @@ class BgRemoveWindow(QWidget):
             alpha = np.full(self._p_rgb.shape[:2], 255, dtype=np.uint8)
         return np.dstack((self._p_rgb, alpha))
 
+    def _gradient_key(self):
+        return (tuple(self._colors()), tuple(self._keep_colors()), self.follow_check.isChecked())
+
+    def _gradient_coeffs(self):
+        """背景のムラの当てはめ(係数)。追従しないときや当てはめられないときは None。
+
+        当てはめは縮小プレビューの画像で1回だけ行い、原寸にも同じ係数を使う(座標を
+        画像に対する割合で表してあるので、そのまま使える)。原寸で当てはめ直すと、確定の
+        たびに待たされるうえ、プレビューと確定で結果がずれる。"""
+        key = self._gradient_key()
+        if self._gradient_cache is not None and self._gradient_cache[0] == key:
+            return self._gradient_cache[1]
+        coeffs = None
+        if self.follow_check.isChecked() and self._colors():
+            coeffs = fit_background_offset(self._p_rgb, self._colors(), self._keep_colors())
+        self._gradient_cache = (key, coeffs)
+        return coeffs
+
+    def _cached(self, name, preview, key, make):
+        """プレビュー用と原寸用を1つずつだけ持つキャッシュ(背景色を変えるたびに積むと、
+        大きな画像でメモリを食い潰す)。"""
+        slot = (name, preview)
+        cached = self._dist_cache.get(slot)
+        if cached is None or cached[0] != key:
+            cached = (key, make())
+            self._dist_cache[slot] = cached
+        return cached[1]
+
+    def _offset(self, preview: bool):
+        coeffs = self._gradient_coeffs()
+        rgb = self._p_rgb if preview else self._rgb
+        return self._cached("offset", preview, self._gradient_key(),
+                            lambda: background_offset(coeffs, *rgb.shape[:2]))
+
     def _distance(self, preview: bool):
-        key = (preview, tuple(self._colors()))
-        cached = self._dist_cache.get(key)
-        if cached is None:
-            # 原寸のぶんは確定のときにしか使わないので、プレビュー用と並べて1つずつだけ持つ
-            # (背景色を変えるたびに積むと、大きな画像でメモリを食い潰す)。
-            self._dist_cache = {k: v for k, v in self._dist_cache.items() if k[0] != preview}
-            cached = color_distance(self._p_rgb if preview else self._rgb, self._colors())
-            self._dist_cache[key] = cached
-        return cached
+        """(背景色までの距離, いちばん近い背景色の番号, 場所ごとのずれ)。"""
+        offset = self._offset(preview)
+        rgb = self._p_rgb if preview else self._rgb
+        dist, index = self._cached("dist", preview, self._gradient_key(),
+                                   lambda: color_distance(rgb, self._colors(), offset))
+        return dist, index, offset
+
+    def _keep_distance(self, preview: bool):
+        """残す色までの距離。残す色が無ければ None。
+
+        残す色は拾った場所でのムラを差し引いて「ずれの無い色」に戻し、測る場所のずれを
+        足して比べる。ビネットで四隅が暗い画像では、ボックスの色も四隅ほど暗く写るため。"""
+        if not self._protect:
+            return None
+        coeffs = self._gradient_coeffs()
+        offset = self._offset(preview)
+        rgb = self._p_rgb if preview else self._rgb
+        key = (self._gradient_key(), tuple(self._protect_points()))
+
+        def make():
+            color_offsets = None
+            if coeffs is not None:
+                color_offsets = [offset_at(coeffs, x, y, self._height, self._width)
+                                 for x, y in self._protect_points()]
+            return color_distance(rgb, self._keep_colors(), offset, color_offsets)[0]
+
+        return self._cached("keep", preview, key, make)
+
+    # ------------------------------------------------------------------
+    # 許容量の自動
+    # ------------------------------------------------------------------
+    _setting_tolerance = False
+
+    def _apply_auto_tolerance(self):
+        try:
+            value = auto_tolerance(self._p_rgb, self._colors(), self._offset(True),
+                                   self._p_src_alpha)
+        except Exception:
+            _log_exception("auto tolerance")
+            return
+        self._setting_tolerance = True
+        try:
+            self.tolerance_slider.setValue(value)
+        finally:
+            self._setting_tolerance = False
+        self.auto_tolerance_button.setChecked(True)
+
+    def _on_auto_tolerance_clicked(self, _checked=False):
+        try:
+            self._apply_auto_tolerance()
+            self._schedule()
+        except Exception:
+            self.status.setText(f"許容量を測れませんでした: {_log_exception('auto tolerance click')}")
+
+    def _on_tolerance_moved(self, _value):
+        if not self._setting_tolerance:
+            self.auto_tolerance_button.setChecked(False)
 
     def compute(self, preview: bool) -> np.ndarray:
         """いまの設定で RGBA を作る。preview なら縮小画像で、そうでなければ原寸で。"""
@@ -1273,28 +1815,47 @@ class BgRemoveWindow(QWidget):
         index = None
         if preview:
             self._protect_rejected = []
+            self._seed_rejected = []
         if self._method() == METHOD_AI:
-            alpha = self._ai_alpha_preview if preview else self._ai_alpha
+            base = self._ai_alpha_preview if preview else self._ai_alpha
+            ai_seeds = self._seeds(shift_only=True)
+            alpha, rejected, seed_rejected = refine_ai_alpha(
+                base,
+                self.ai_lo_slider.value() / 100.0,
+                self.ai_hi_slider.value() / 100.0,
+                protect=scale_points(self._protect_points(), scale),
+                seeds=scale_points(ai_seeds, scale),
+                report=True,
+            )
+            if preview:
+                self._protect_rejected = rejected
+                self._seed_rejected = [ai_seeds[i] for i in seed_rejected]
+            offset = None
             if decontam:
-                _dist, index = self._distance(preview)
+                _dist, index, offset = self._distance(preview)
         else:
-            dist, index = self._distance(preview)
+            dist, index, offset = self._distance(preview)
             alpha, rejected = compute_alpha(
                 dist,
                 self.tolerance_slider.value(),
                 self.feather_slider.value(),
                 self.range_combo.currentData(),
                 seeds=scale_points(self._seeds(), scale),
-                protect=scale_points(self._protect, scale),
+                protect=scale_points(self._protect_points(), scale),
                 report=True,
+                keep_dist=self._keep_distance(preview),
             )
             if preview:
                 self._protect_rejected = rejected
+        background = None
+        if decontam and offset is not None:
+            background = local_background_rgb(colors, index, offset)
         return compose_rgba(
             rgb, alpha, colors, index,
             decontaminate_edges=decontam,
             trim=self.trim_check.isChecked(),
             src_alpha=src_alpha,
+            background=background,
         )
 
     def _refresh_preview(self):
@@ -1313,14 +1874,10 @@ class BgRemoveWindow(QWidget):
                 out = f"{self._width}×{self._height}"
             self._summary = f"透明 {transparent:.0f}%  ·  出力 {out}px"
             if (opaque == 0).all():
-                self._summary += "  ·  全部透明になっています（許容量を下げてください）"
-            if self._protect and self._method() == METHOD_AI:
-                self._summary += "  ·  残す点は「色で抜く」専用です（AIの結果には効きません）"
-            elif self._protect_rejected:
-                where = "、".join(f"({self._protect[i][0]}, {self._protect[i][1]})"
-                                 for i in self._protect_rejected if i < len(self._protect))
-                self._summary += (f"  ·  残す点 {where}: この部分は外側の背景とつながっているため"
-                                  "残せません。許容量を下げるか、AIで抜いてください")
+                hint = ("「これより薄い部分は消す」を下げてください" if self._method() == METHOD_AI
+                        else "許容量を下げてください")
+                self._summary += f"  ·  全部透明になっています（{hint}）"
+            self._summary += self._point_warnings()
             self.status.setText(self._summary)
             # 窓が狭いと状態欄の末尾(残す点の警告など)が切れるので、全文をツールチップにも置く。
             self.status.setToolTip(self._summary)
@@ -1329,6 +1886,26 @@ class BgRemoveWindow(QWidget):
             self.status.setText(f"計算に失敗しました: {_log_exception('preview')}")
 
     _summary = ""
+    _seed_rejected = ()
+
+    def _point_warnings(self) -> str:
+        """効かなかった点の説明。点のリストは両モード共通なので、モードごとに理由を変える。"""
+        text = ""
+        points = self._protect_points()
+        where = "、".join(f"({points[i][0]}, {points[i][1]})"
+                         for i in self._protect_rejected if i < len(points))
+        if self._method() == METHOD_AI:
+            if where:
+                text += (f"  ·  残す点 {where}: AIが背景と判定した部分か、背景まで含む広すぎる範囲の"
+                         "ため残せません。「これより濃い部分は不透明にする」を下げてください")
+            if self._seed_rejected:
+                seeds = "、".join(f"({x}, {y})" for x, y in self._seed_rejected)
+                text += (f"  ·  抜く点 {seeds}: 外側の背景とつながっているため効きません。"
+                         "「これより薄い部分は消す」を上げてください")
+        elif where:
+            text += (f"  ·  残す点 {where}: この部分は外側の背景とつながっているため"
+                     "残せません。許容量を下げるか、AIで抜いてください")
+        return text
 
     # ------------------------------------------------------------------
     # 出力
@@ -1393,13 +1970,15 @@ class BgRemoveWindow(QWidget):
         try:
             _save_values(self._app_settings, self._settings_path, {
                 "window_size": [self.width(), self.height()],
-                "tolerance": self.tolerance_slider.value(),
-                "feather": self.feather_slider.value(),
+                "edge_feather": self.feather_slider.value(),
+                "follow_gradient": self.follow_check.isChecked(),
                 "decontaminate": self.decontam_check.isChecked(),
                 "trim": self.trim_check.isChecked(),
                 "model": self.model_combo.currentData(),
                 "preview_bg": self._preview_bg,
-            })
+            # 以前のキー。tolerance は覚えるのをやめ、feather は edge_feather へ移した
+            # (どちらも旧既定値が焼き込まれているだけなので、残すと読み違えのもとになる)。
+            }, remove=("tolerance", "feather"))
         except Exception:
             _log_exception("close")
         # AI が走っている最中に閉じられたら、結果はもう受け取らない。器(_AiBridge)は

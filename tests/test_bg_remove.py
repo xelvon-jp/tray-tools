@@ -138,6 +138,299 @@ def test_protect_point_scaled_for_preview():
     assert alpha_raw[150, 200] == 0.0
 
 
+# ---- AIの結果の補正(refine_ai_alpha) ----
+def _ai_scene():
+    """AIの判定を模した不透明度: 外は0、半透明(0.5)の白い被写体、その足元に薄い影(0.2)、
+    隣に不透明(1.0)の被写体。半透明の被写体と不透明の被写体は接していて、影は不透明の
+    被写体の下にも続いている(不透明な被写体を橋にして影まで残らないことを見る)。"""
+    a = np.zeros((100, 160), dtype=np.float32)
+    a[20:60, 20:70] = 0.5      # 半透明になった白い牛
+    a[20:60, 70:110] = 1.0     # 不透明な黒い牛
+    a[60:70, 20:110] = 0.2     # 足元の影
+    a[30:40, 120:140] = 0.5    # 離れた所にある別の半透明
+    return a
+
+
+def test_ai_lo_hi_makes_translucent_subject_opaque():
+    a = _ai_scene()
+    out = br.refine_ai_alpha(a, lo=0.3, hi=0.5)
+    assert out[40, 40] >= 0.999        # 0.5 → 不透明(割り算の丸めで 0.99999994 になりうる)
+    assert out[65, 40] == 0.0          # 影 0.2 < lo → 消える
+    assert out[5, 5] == 0.0
+    same = br.refine_ai_alpha(a)       # 既定(0〜1)なら何もしない
+    assert np.array_equal(same, a)
+
+
+def test_ai_protect_point_makes_component_opaque_without_shadow():
+    a = _ai_scene()
+    out, rejected, _ = br.refine_ai_alpha(a, protect=[(40, 40)], report=True)
+    assert rejected == []
+    assert out[40, 40] == 1.0 and out[25, 25] == 1.0   # 成分の内側は不透明
+    assert out[66, 40] < 0.3          # 影は(縁のなじませ以外)残らない
+    assert out[66, 90] < 0.3          # 不透明な牛を橋にして影が残ることもない
+    assert out[35, 130] == 0.5        # 離れた別の半透明は触らない
+    # 不透明な所に打った点でも、そこに接している半透明の部分が戻る
+    out2 = br.refine_ai_alpha(a, protect=[(90, 40)])
+    assert out2[40, 40] == 1.0 and out2[66, 40] < 0.3
+
+
+def test_ai_protect_on_background_is_rejected():
+    a = _ai_scene()
+    out, rejected, _ = br.refine_ai_alpha(a, protect=[(5, 5), (40, 40)], report=True)
+    assert rejected == [0]             # a ≈ 0 の点は効かない
+    assert out[5, 5] == 0.0
+
+
+def test_ai_protect_huge_component_is_rejected():
+    a = np.full((100, 100), 0.3, dtype=np.float32)   # 画面いっぱいのもや
+    a[40:60, 40:60] = 0.6
+    out, rejected, _ = br.refine_ai_alpha(a, protect=[(5, 5)], report=True)
+    assert rejected == [0]
+    assert np.array_equal(out, a)
+
+
+def test_ai_seed_clears_enclosed_gap():
+    a = np.zeros((100, 100), dtype=np.float32)
+    a[20:80, 20:80] = 1.0
+    a[40:60, 40:60] = 0.6              # 脚の間などに残った薄い判定(被写体に囲まれている)
+    out, _, seed_rejected = br.refine_ai_alpha(a, seeds=[(50, 50), (5, 5)], report=True)
+    assert seed_rejected == [1]        # 外側の背景の上の抜く点は効かない(と報告)
+    assert out[50, 50] < 0.01
+    assert out[30, 30] == 1.0          # 被写体本体は残る
+    assert 0.5 < out[40, 39] < 1.0     # 隙間に接する縁はなじませる(削りすぎない)
+
+
+def test_ai_protect_wins_over_seed():
+    a = np.zeros((100, 100), dtype=np.float32)
+    a[20:80, 20:80] = 1.0
+    a[40:60, 40:60] = 0.6
+    out = br.refine_ai_alpha(a, seeds=[(50, 50)], protect=[(52, 52)])
+    # 抜く点で 0 になった後に残す点が来ると、そこは a ≈ 0 なので効かない。
+    # 同じ場所に両方打つのは矛盾した指定なので、どちらかに倒れて壊れなければよい。
+    assert out[30, 30] == 1.0
+
+
+def test_ai_points_scaled_for_preview():
+    big = np.zeros((800, 1600), dtype=np.float32)
+    big[200:600, 200:700] = 0.5
+    small, scale = br.resize_long_side(big, 400)
+    out, rejected, _ = br.refine_ai_alpha(
+        small, protect=br.scale_points([(450, 400)], scale), report=True)
+    assert rejected == []
+    assert out[100, 112] == 1.0
+
+
+# ---- AI の図解: 白っぽい背景に枠線の無い薄いボックス(残す色・自動の許容量・ムラへの追従) ----
+DIAGRAM_BOXES = {
+    # 名前: (x0, y0, x1, y1, 角の半径, 塗り, 中の点)
+    "blue": (150, 150, 650, 400, 36, (231, 238, 250), (400, 300)),
+    "yellow": (720, 420, 1100, 680, 30, (253, 246, 214), (900, 450)),
+    "faint": (760, 120, 1080, 330, 28, (240, 243, 250), (940, 160)),
+}
+_diagram_cache = {}
+
+
+def _diagram():
+    """オフホワイト(#f6f5f1)にノイズ(±ΔE 1〜2)と四隅で10%暗くなるビネットを乗せ、
+    枠線の無い角丸のボックス(薄い青・薄い黄・ごく薄い青)に濃い文字を入れて、JPEG で
+    圧縮してから読み直した画像。AI が生成した図解の背景を模している。"""
+    if "rgb" in _diagram_cache:
+        return _diagram_cache["rgb"]
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    w, h = 1200, 800
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    r = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2) / np.sqrt(2)
+    base = np.array([246, 245, 241], np.float32)[None, None, :] * (1.0 - 0.10 * r ** 2)[..., None]
+    noisy = base + rng.normal(0, 1.2, (h, w, 1)) + rng.normal(0, 0.6, (h, w, 3))
+    image = Image.fromarray(np.clip(noisy, 0, 255).astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("arial.ttf", 44)
+    except OSError:
+        font = ImageFont.load_default()
+    for name, (x0, y0, x1, y1, radius, fill, _pt) in DIAGRAM_BOXES.items():
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=fill)
+        draw.text((x0 + 50, (y0 + y1) // 2 - 30), name.capitalize(), fill=(30, 40, 70), font=font)
+    draw.text((160, 600), "plain text", fill=(40, 40, 40), font=font)
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=85)
+    buffer.seek(0)
+    rgb = np.array(Image.open(buffer).convert("RGB"))
+    _diagram_cache["rgb"] = rgb
+    return rgb
+
+
+def _box_mask(shape, box, inset):
+    """角丸のボックスの内側(inset > 0)/外側に広げた範囲(inset < 0)のマスク。"""
+    x0, y0, x1, y1, radius = box[:5]
+    mask = np.zeros(shape[:2], np.uint8)
+    rr = max(radius - inset, 1)
+    cv2.rectangle(mask, (x0 + inset + radius, y0 + inset), (x1 - inset - radius, y1 - inset), 1, -1)
+    cv2.rectangle(mask, (x0 + inset, y0 + inset + radius), (x1 - inset, y1 - inset - radius), 1, -1)
+    for cx, cy in ((x0 + radius, y0 + radius), (x1 - radius, y1 - radius),
+                   (x0 + radius, y1 - radius), (x1 - radius, y0 + radius)):
+        cv2.circle(mask, (cx, cy), rr, 1, -1)
+    return mask.astype(bool)
+
+
+def _text_mask(rgb):
+    """濃い文字の画素(とその周り)。背景の判定から外すのに使う。"""
+    dark = (rgb.astype(int).sum(axis=2) < 450).astype(np.uint8)
+    return cv2.dilate(dark, np.ones((9, 9), np.uint8)).astype(bool)
+
+
+def _diagram_alpha(keep_names=(), follow=True, tol=None, feather=2):
+    rgb = _diagram()
+    h, w = rgb.shape[:2]
+    bg = br.estimate_background(rgb)
+    points = [DIAGRAM_BOXES[n][6] for n in keep_names]
+    keep = [tuple(int(c) for c in rgb[y, x]) for x, y in points]
+    coeffs = br.fit_background_offset(rgb, [bg], keep) if follow else None
+    offset = br.background_offset(coeffs, h, w)
+    if tol is None:
+        tol = br.auto_tolerance(rgb, [bg], offset)
+    dist, index = br.color_distance(rgb, [bg], offset)
+    keep_dist = None
+    if keep:
+        offsets = ([br.offset_at(coeffs, x, y, h, w) for x, y in points]
+                   if coeffs is not None else None)
+        keep_dist, _ = br.color_distance(rgb, keep, offset, offsets)
+    alpha = br.compute_alpha(dist, tol, feather, keep_dist=keep_dist,
+                             protect=points, report=False)
+    background = br.local_background_rgb([bg], index, offset) if offset is not None else None
+    out = br.compose_rgba(rgb, alpha, [bg], index, True, background=background)
+    return rgb, out, tol, bg
+
+
+def test_auto_tolerance_measures_border_noise():
+    rgb = _diagram()
+    bg = br.estimate_background(rgb)
+    h, w = rgb.shape[:2]
+    offset = br.background_offset(br.fit_background_offset(rgb, [bg]), h, w)
+    tol = br.auto_tolerance(rgb, [bg], offset)
+    # ムラ(ノイズ ±ΔE 1〜2 + JPEG)の上限に少し足した程度。以前の固定値 12 よりずっと小さい
+    assert 2 <= tol <= 8, tol
+    # 外周に被写体が掛かっていても、外れ値として除かれて大きく振れない
+    covered = rgb.copy()
+    covered[:, :40] = (20, 30, 160)
+    assert abs(br.auto_tolerance(covered, [bg], offset) - tol) <= 2
+
+
+def test_gradient_fit_follows_vignette_without_being_pulled_by_boxes():
+    rgb = _diagram()
+    bg = br.estimate_background(rgb)
+    h, w = rgb.shape[:2]
+    flat, _ = br.color_distance(rgb, [bg])
+    offset = br.background_offset(br.fit_background_offset(rgb, [bg]), h, w)
+    fitted, _ = br.color_distance(rgb, [bg], offset)
+    center = (slice(380, 420), slice(670, 710))      # 箱の無い中央の背景
+    corner = (slice(5, 45), slice(5, 45))
+    # 一定の色では、外周から推定した背景色に対して中央が ΔE 4 以上離れる(ビネット)
+    assert np.percentile(flat[center], 50) > 4
+    # 追従すると中央も四隅も、ノイズ程度の差に収まる
+    assert np.percentile(fitted[center], 99) < 4
+    assert np.percentile(fitted[corner], 99) < 4
+    # 大きな薄い箱に面が引っ張られていない(箱と背景の差が保たれる)
+    x, y = DIAGRAM_BOXES["blue"][6]
+    assert fitted[y, x] > 7, fitted[y, x]
+
+
+def test_keep_colors_make_boxes_opaque_and_background_clear():
+    rgb, out, _tol, _bg = _diagram_alpha(keep_names=("blue", "yellow", "faint"))
+    text = _text_mask(rgb)
+    for name, box in DIAGRAM_BOXES.items():
+        inside = _box_mask(rgb.shape, box, 6)
+        assert out[inside, 3].min() == 255, name          # 箱の内側は完全に不透明(文字も)
+    background = np.ones(rgb.shape[:2], bool)
+    for box in DIAGRAM_BOXES.values():
+        background &= ~_box_mask(rgb.shape, box, -12)
+    background &= ~text
+    assert (out[background, 3] == 0).mean() > 0.9999       # 背景は 0(JPEG のごく一部の点を除き)
+    # 箱の外の文字も残る
+    assert out[620, 175:400, 3].max() == 255
+
+
+def test_keep_colors_no_white_halo_on_box_edges():
+    """箱の縁に白いハローが出ない(黒地に置いたときに、縁が箱の色より明るく光らない)。"""
+    rgb, out, _tol, _bg = _diagram_alpha(keep_names=("blue", "yellow", "faint"))
+    pre = out[..., :3].astype(np.float32) * (out[..., 3:] / 255.0)   # 黒地に置いた見た目
+    for name, box in DIAGRAM_BOXES.items():
+        x, y = box[6]
+        box_lum = rgb[y, x].astype(np.float32).mean()
+        ring = _box_mask(rgb.shape, box, -4) & ~_box_mask(rgb.shape, box, 6)
+        ideal = box_lum * out[ring, 3] / 255.0
+        excess = pre[ring].mean(axis=1) - ideal
+        # 0〜255 の明るさで 12 以内(JPEG のリンギングとノイズのぶん)。背景色(白)が縁に
+        # 不透明で残ると、ここが 20〜30 になる。
+        assert excess.max() < 12, (name, float(excess.max()))
+
+
+def test_auto_tolerance_alone_keeps_visible_boxes():
+    """残す色を指定しなくても、自動の許容量だけで ΔE 7 以上の箱は残る。"""
+    rgb, out, tol, _bg = _diagram_alpha(keep_names=())
+    for name in ("blue", "yellow", "faint"):
+        inside = _box_mask(rgb.shape, DIAGRAM_BOXES[name], 6)
+        assert (out[inside, 3] == 255).mean() > 0.99, (name, tol)
+
+
+def test_keep_color_separates_box_connected_to_background():
+    """許容量が大きくて箱が背景とつながっていても、残す色で切り離せる。そのとき
+    「外側の背景とつながっている」という警告(rejected)は出さない。"""
+    rgb = _diagram()
+    bg = br.estimate_background(rgb)
+    h, w = rgb.shape[:2]
+    offset = br.background_offset(br.fit_background_offset(rgb, [bg]), h, w)
+    dist, _ = br.color_distance(rgb, [bg], offset)
+    point = DIAGRAM_BOXES["blue"][6]
+    # 以前の既定(許容量12・ぼかし10)では箱ごと候補になり、点は外周とつながって効かない
+    alpha, rejected = br.compute_alpha(dist, 12, 10, protect=[point], report=True)
+    assert rejected == [0]
+    assert alpha[point[1], point[0]] < 0.5
+    keep = [tuple(int(c) for c in rgb[point[1], point[0]])]
+    keep_dist, _ = br.color_distance(rgb, keep, offset)
+    alpha, rejected = br.compute_alpha(dist, 12, 10, protect=[point], report=True,
+                                       keep_dist=keep_dist)
+    assert rejected == []
+    inside = _box_mask(rgb.shape, DIAGRAM_BOXES["blue"], 6)
+    assert alpha[inside].min() == 1.0
+    for mode in (br.RANGE_CONNECTED, br.RANGE_GLOBAL):
+        alpha = br.compute_alpha(dist, 12, 10, mode, keep_dist=keep_dist)
+        # 許容量+ぼかしが ΔE 22 もあると、箱の中の文字の縁が数画素だけ 0.997 になる
+        # (中央値で均した r が 0.5 をわずかに下回る)。8bit にすれば 254 で見えない。
+        assert alpha[inside].min() >= 0.99, mode
+        assert alpha[30, 600] == 0.0, mode
+
+
+def test_keep_color_ramp_matches_mixture_ratio():
+    """背景と残す色が t : 1−t で混ざった境目の画素は、およそ t の不透明度になる。"""
+    bg = np.array([246, 245, 241], np.float32)
+    box = np.array([200, 215, 245], np.float32)
+    t = np.linspace(0, 1, 21, dtype=np.float32)
+    row = np.rint(t[:, None] * box + (1 - t[:, None]) * bg).astype(np.uint8)[None, :, :]
+    row = np.repeat(row, 7, axis=0)       # 中央値フィルタ(5×5)が掛かる高さにする
+    dist, _ = br.color_distance(row, [tuple(int(c) for c in bg)])
+    keep_dist, _ = br.color_distance(row, [tuple(int(c) for c in box)])
+    alpha = br.compute_alpha(dist, 100, 0, br.RANGE_GLOBAL, keep_dist=keep_dist)[3]
+    assert alpha[0] == 0.0 and alpha[-1] == 1.0
+    assert (np.diff(alpha) >= -1e-6).all()                 # 単調に増える
+    partial = np.flatnonzero((alpha > 0) & (alpha < 1))
+    assert len(partial) >= 3                               # 境目は段差ではなく半透明でつなぐ
+    assert 0.2 <= t[partial[0]] and t[partial[-1]] <= 0.6  # 半透明になるのは中間の混ざりだけ
+    assert alpha[3] == 0.0 and alpha[15] == 1.0            # 端の近くは揺れても振り切る
+
+
+def test_keep_color_equal_to_background_does_nothing():
+    rgb = _canvas(20, 20, (240, 240, 240))
+    dist, _ = br.color_distance(rgb, [(240, 240, 240)])
+    keep_dist, _ = br.color_distance(rgb, [(240, 240, 240)])
+    alpha = br.compute_alpha(dist, 5, 2, keep_dist=keep_dist)
+    assert (alpha == 0.0).all()
+
+
 def test_fake_checkerboard_needs_both_colors():
     """AI が「透過背景」のつもりで描き込んだ偽の市松模様(2色)。"""
     h, w, tile = 96, 128, 8

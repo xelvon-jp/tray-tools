@@ -508,6 +508,126 @@ def test_keep_color_equal_to_background_does_nothing():
     assert (alpha == 0.0).all()
 
 
+# ---- アイコンへの分割と GVML ----
+def _icon_sheet():
+    """透過済みのアイコン一覧を模した RGBA。2行×3列のアイコン、そのうち1つは下に離れた
+    ラベル(本体から 8px 下)付き、1つは右隣へ少しはみ出す飾り付き。ほかに 2×2 の点(ゴミ)。"""
+    rgba = np.zeros((300, 420, 4), np.uint8)
+    def blob(x0, y0, x1, y1, color):
+        rgba[y0:y1, x0:x1, :3] = color
+        rgba[y0:y1, x0:x1, 3] = 255
+    # 1行目(上端をずらしても同じ行として扱われること)
+    blob(20, 30, 100, 110, (200, 30, 30))      # 1
+    blob(160, 20, 240, 100, (30, 160, 30))     # 2
+    blob(300, 40, 380, 120, (30, 30, 200))     # 3
+    blob(160, 108, 240, 118, (30, 160, 30))    # 2 のラベル(本体の 8px 下)
+    # 2行目
+    blob(20, 180, 100, 260, (200, 200, 30))    # 4
+    blob(160, 180, 240, 260, (30, 200, 200))   # 5
+    blob(300, 180, 380, 260, (200, 30, 200))   # 6
+    blob(240, 200, 256, 210, (30, 200, 200))   # 5 の飾り(6 の箱の左端には届かない)
+    blob(400, 290, 402, 292, (0, 0, 0))        # ゴミ
+    return rgba
+
+
+def test_split_icons_groups_parts_drops_noise_and_orders():
+    rgba = _icon_sheet()
+    icons = br.split_icons(rgba[..., 3], merge_px=12, min_area=16)
+    assert len(icons) == 6, [i["box"] for i in icons]            # ゴミは捨てる
+    boxes = [i["box"] for i in icons]
+    # 読み順: 1行目が左から 1, 2, 3、2行目が 4, 5, 6
+    assert [b[0] for b in boxes] == [20, 160, 300, 20, 160, 300]
+    assert boxes[0][1] == 30 and boxes[3][1] == 180
+    # 離れたラベルは本体と1つにまとまり、外接矩形は膨らませる前の画素で決まる
+    assert boxes[1] == (160, 20, 240, 118)
+    # 飾りを含む 5 の箱
+    assert boxes[4] == (160, 180, 256, 260)
+    # まとめる距離が 0 なら、離れたラベルは別のアイコンになる(5 の飾りは本体に接しているので別にならない)
+    separate = br.split_icons(rgba[..., 3], merge_px=0, min_area=16)
+    assert len(separate) == 7
+
+
+def test_split_icons_clears_neighbor_overhang():
+    """外接矩形に隣のアイコンが入り込んでいても、切り出すとそこは透明になる。"""
+    rgba = np.zeros((100, 100, 4), np.uint8)
+    rgba[..., :3] = 128
+    rgba[10:90, 10:30, 3] = 255             # A: L字の縦棒
+    rgba[70:90, 10:90, 3] = 255             # A: L字の足
+    rgba[10:50, 50:90, 3] = 200             # B: L字のくぼみに置いた四角(A から 20px 離す)
+    icons = br.split_icons(rgba[..., 3], merge_px=5, min_area=16)
+    assert len(icons) == 2
+    a, b = icons
+    assert a["box"] == (10, 10, 90, 90)     # A の外接矩形は B を丸ごと含む
+    assert b["box"] == (50, 10, 90, 50)
+    (ax, ay, piece_a), (bx, by, piece_b) = br.cut_icons(rgba, icons)
+    assert (ax, ay) == (10, 10) and piece_a.shape[:2] == (80, 80)
+    assert piece_a[0:40, 40:80, 3].max() == 0      # A の切り出しに B の画素は入らない
+    assert piece_a[0:80, 0:20, 3].min() == 255     # A 自身(縦棒)は残る
+    assert piece_a[60:80, 0:80, 3].min() == 255    # A 自身(足)も残る
+    assert piece_b[..., 3].min() == 200            # B はそのまま(半透明も保つ)
+
+
+def test_split_icons_handles_empty_and_threshold():
+    assert br.split_icons(np.zeros((10, 10), np.uint8)) == []
+    faint = np.full((40, 40), 8, np.uint8)   # 8 以下は「中身」とみなさない
+    assert br.split_icons(faint) == []
+
+
+def test_build_gvml_structure():
+    import zipfile
+    import io as _io
+    import re as _re
+
+    rgba = _icon_sheet()
+    icons = br.split_icons(rgba[..., 3], merge_px=12, min_area=16)
+    data = br.gvml_from_rgba(rgba, icons)
+    archive = zipfile.ZipFile(_io.BytesIO(data))
+    names = archive.namelist()
+    for required in ("[Content_Types].xml", "_rels/.rels", "clipboard/drawings/drawing1.xml",
+                     "clipboard/drawings/_rels/drawing1.xml.rels"):
+        assert required in names, names
+    media = sorted(n for n in names if n.startswith("clipboard/media/"))
+    assert media == [f"clipboard/media/image{i}.png" for i in range(1, 7)]
+
+    types = archive.read("[Content_Types].xml").decode()
+    assert 'Extension="png"' in types and 'PartName="/clipboard/drawings/drawing1.xml"' in types
+    root = archive.read("_rels/.rels").decode()
+    assert 'Target="clipboard/drawings/drawing1.xml"' in root and "relationships/drawing" in root
+
+    drawing = archive.read("clipboard/drawings/drawing1.xml").decode()
+    assert "drawingml/2006/lockedCanvas" in drawing
+    ids = [int(v) for v in _re.findall(r'<a:cNvPr id="(\d+)"', drawing)]
+    assert ids == [0, 2, 3, 4, 5, 6, 7]                      # グループが 0、図は 2 からの連番
+    names_in = _re.findall(r'<a:cNvPr id="\d+" name="([^"]*)"', drawing)[1:]
+    assert names_in == [f"icon {i}" for i in range(1, 7)]
+    embeds = _re.findall(r'r:embed="(rId\d+)"', drawing)
+    assert embeds == [f"rId{i}" for i in range(1, 7)]
+
+    rels = archive.read("clipboard/drawings/_rels/drawing1.xml.rels").decode()
+    pairs = dict(_re.findall(r'Id="(rId\d+)"[^>]*Target="\.\./media/(image\d+\.png)"', rels))
+    assert pairs == {f"rId{i}": f"image{i}.png" for i in range(1, 7)}
+
+    # EMU の換算: 1px = 9525 EMU。位置は左上のアイコン(20, 20)を原点にずらす
+    offs = [tuple(int(v) for v in m) for m in _re.findall(r'<a:off x="(\d+)" y="(\d+)"/>', drawing)]
+    exts = [tuple(int(v) for v in m) for m in _re.findall(r'<a:ext cx="(\d+)" cy="(\d+)"/>', drawing)]
+    assert offs[0] == (0, 0)                                 # グループ
+    boxes = [i["box"] for i in icons]
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    for k, (x0, y0, x1, y1) in enumerate(boxes, 1):
+        assert offs[k] == ((x0 - left) * 9525, (y0 - top) * 9525)
+        assert exts[k] == ((x1 - x0) * 9525, (y1 - y0) * 9525)
+    right = max(b[2] for b in boxes)
+    bottom = max(b[3] for b in boxes)
+    assert exts[0] == ((right - left) * 9525, (bottom - top) * 9525)
+
+    # 中の PNG はアルファ付きで、切り出したアイコンと同じ大きさ
+    png = np.frombuffer(archive.read("clipboard/media/image2.png"), np.uint8)
+    decoded = cv2.imdecode(png, cv2.IMREAD_UNCHANGED)
+    assert decoded.shape == (98, 80, 4)
+    assert decoded[..., 3].max() == 255 and decoded[..., 3].min() == 0
+
+
 def test_theme_contrast_ratios():
     """配色の文字色と地の色の組み合わせが、決めたコントラスト比を満たす。
     本文・補足・警告は 4.5 以上、無効の文字は 3.0 以上(bg_remove.CONTRAST_REQUIREMENTS)。"""

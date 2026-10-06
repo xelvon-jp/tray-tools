@@ -299,6 +299,8 @@ DEFAULT_SETTINGS = {
     #   follow_gradient … 背景のムラ(ビネット・グラデーション)に追従する
     #   decontaminate … 半透明の縁から背景色の混ざりを除く(白背景の縁が光るのを防ぐ)
     #   trim … 透明になった余白を切り詰める
+    #   split_icons … アイコンに分ける(Office へ1つずつ別の図として貼る・連番で保存する)
+    #   split_merge_px … この距離(px)より近い部品は1つのアイコンにまとめる
     #   model … 「AIで抜く」のモデル(isnet-general-use / birefnet-general)
     #   preview_bg … 結果の下に敷く背景(checker / white / black / green)
     # 許容量は覚えない。開くたびに外周の背景のムラから測った「自動」の値で始める(画像ごとに
@@ -313,6 +315,8 @@ DEFAULT_SETTINGS = {
         "follow_gradient": True,
         "decontaminate": True,
         "trim": False,
+        "split_icons": False,
+        "split_merge_px": 12,
         "model": "isnet-general-use",
         "preview_bg": "checker",
     },

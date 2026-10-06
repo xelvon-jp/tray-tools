@@ -27,12 +27,14 @@
 import argparse
 import ctypes
 import importlib.util
+import io
 import json
 import os
 import sys
 import threading
 import time
 import traceback
+import zipfile
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +68,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -750,6 +753,207 @@ def compose_rgba(rgb, alpha, colors=(), index=None, decontaminate_edges: bool = 
     return np.ascontiguousarray(rgba)
 
 
+# ---------------------------------------------------------------
+# アイコンへの分割と、Office へ別々の図として貼るためのデータ
+# ---------------------------------------------------------------
+# 「中身がある」とみなすアルファ(0〜255)の下限。余白の切り詰めと同じ値にそろえる
+# (AI の判定やぼかしで背景に散る 1〜8 の値で、アイコン同士がつながらないように)。
+SPLIT_ALPHA_THRESHOLD = TRIM_ALPHA_THRESHOLD
+# まとめる距離(px、原寸)の既定。AI に描かせたアイコンの一覧(1024〜1536px 四方に
+# 3〜5列)では、アイコン同士の間は 30px 以上空くのが普通で、1つのアイコンの中の
+# 離れた部品(下に添えた文字のラベル、小さな飾り)との間は 5〜15px 程度だった。
+# その間を取って 12px にしてある。
+SPLIT_MERGE_DEFAULT = 12
+SPLIT_MERGE_MAX = 80
+# これより小さい成分(画素数、原寸)は捨てる。抜き残りの点やノイズを1つのアイコンとして
+# 貼らないため。画像の大きさに比例させる(1024×1024 で 52px ほど)が、下限は 16px。
+SPLIT_MIN_AREA_RATIO = 0.00005
+SPLIT_MIN_AREA_FLOOR = 16
+# 1px を EMU(Office の長さの単位)へ。96dpi で 1px = 1/96 インチ = 9525 EMU。
+EMU_PER_PX = 9525
+
+
+def split_min_area(h: int, w: int) -> int:
+    return max(SPLIT_MIN_AREA_FLOOR, int(round(h * w * SPLIT_MIN_AREA_RATIO)))
+
+
+def split_icons(alpha, merge_px: int = SPLIT_MERGE_DEFAULT, min_area: int = SPLIT_MIN_AREA_FLOOR):
+    """透過済みの画像のアルファ(uint8、HxW)を、アイコンごとに分ける。
+
+    戻り値はアイコンの並び(読み順)で、各要素は
+        {"box": (x0, y0, x1, y1), "member": bool の HxW(箱の中で、このアイコンに属する画素)}
+    x1, y1 は含まない。
+
+    - 不透明度が SPLIT_ALPHA_THRESHOLD を超える画素を merge_px だけ膨らませてから連結
+      成分に分ける。1つのアイコンの離れた部品(文字のラベルや小さな飾り)を1つにまとめる
+      ため。
+    - 外接矩形は膨らませる前の画素で求める(膨らませた分の余白を付けない)。
+    - 矩形の中でも、その成分に属さない画素(隣のアイコンのはみ出し)は member が False に
+      なる。切り出すときはそこを透明にする(cut_icons)。
+    - 画素数が min_area 未満の成分は捨てる(抜き残りの点などのゴミ)。"""
+    alpha = np.asarray(alpha)
+    solid = alpha > SPLIT_ALPHA_THRESHOLD
+    if not solid.any():
+        return []
+    merge_px = max(0, int(merge_px))
+    grown = solid.astype(np.uint8)
+    if merge_px > 0:
+        size = 2 * merge_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        grown = cv2.dilate(grown, kernel)
+    count, labels = cv2.connectedComponents(grown, connectivity=8)
+    icons = []
+    for label in range(1, count):
+        region = labels == label
+        pixels = solid & region
+        area = int(pixels.sum())
+        if area < max(1, int(min_area)):
+            continue
+        rows = np.flatnonzero(pixels.any(axis=1))
+        cols = np.flatnonzero(pixels.any(axis=0))
+        x0, y0, x1, y1 = int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+        icons.append({"box": (x0, y0, x1, y1), "member": region[y0:y1, x0:x1], "area": area})
+    return order_reading(icons)
+
+
+def order_reading(icons):
+    """上から下・左から右の読み順に並べる。
+
+    単純に上端で並べると、同じ行でも背の高いアイコンが先に来て順番が飛ぶ。そこで、
+    上端の順に見ていき、縦の中心がいまの行の縦の範囲に入るものを同じ行にまとめ、
+    行ごとに左から並べる。"""
+    rows = []
+    for icon in sorted(icons, key=lambda i: (i["box"][1], i["box"][0])):
+        x0, y0, x1, y1 = icon["box"]
+        center = (y0 + y1) / 2.0
+        for row in rows:
+            if row["top"] <= center <= row["bottom"]:
+                row["items"].append(icon)
+                row["top"] = min(row["top"], y0)
+                row["bottom"] = max(row["bottom"], y1)
+                break
+        else:
+            rows.append({"top": y0, "bottom": y1, "items": [icon]})
+    ordered = []
+    for row in sorted(rows, key=lambda r: r["top"]):
+        ordered.extend(sorted(row["items"], key=lambda i: i["box"][0]))
+    return ordered
+
+
+def cut_icons(rgba, icons):
+    """split_icons の結果で RGBA を切り出す。[(x0, y0, RGBA の配列)] を返す。
+    箱の中で、そのアイコンに属さない画素はアルファを 0 にする(隣のはみ出しを消す)。"""
+    rgba = np.asarray(rgba)
+    pieces = []
+    for icon in icons:
+        x0, y0, x1, y1 = icon["box"]
+        piece = rgba[y0:y1, x0:x1].copy()
+        piece[..., 3] = np.where(icon["member"], piece[..., 3], 0)
+        pieces.append((x0, y0, piece))
+    return pieces
+
+
+def encode_png(rgba) -> bytes:
+    """RGBA(uint8)を PNG のバイト列に。Qt を使わない(テストと GVML の組み立て用)。"""
+    rgba = np.ascontiguousarray(rgba)
+    ok, data = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+    if not ok:
+        raise ValueError("PNG に変換できませんでした")
+    return data.tobytes()
+
+
+_GVML_NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_GVML_XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+
+
+def build_gvml(pieces) -> bytes:
+    """Office の図形用クリップボード形式「Art::GVML ClipFormat」のデータ(zip)を作る。
+
+    pieces は [(x, y, png のバイト列, 幅 px, 高さ px)]。左上が最も小さい x, y に来るよう
+    ずらしてから、1つの lockedCanvas に図(a:pic)として並べる。これを貼ると Office は
+    図をそれぞれ別の図(PowerPoint・Word・Excel の Picture)として置き、位置関係もアルファ
+    も保つ(Excel 2013 で、N 個の Shape.Type=13 になることを確かめてある)。
+
+    中身は OPC の zip で、Office が自分で出すものからテーマ(theme1.xml)だけを省いた形。
+    テーマが無くても貼り付けには影響しなかった。"""
+    pieces = list(pieces)
+    if not pieces:
+        raise ValueError("アイコンがありません")
+    left = min(p[0] for p in pieces)
+    top = min(p[1] for p in pieces)
+    right = max(p[0] + p[3] for p in pieces)
+    bottom = max(p[1] + p[4] for p in pieces)
+    total_cx = (right - left) * EMU_PER_PX
+    total_cy = (bottom - top) * EMU_PER_PX
+
+    pics = []
+    rels = []
+    for index, (x, y, _png, width, height) in enumerate(pieces, 1):
+        pics.append(
+            '<a:pic><a:nvPicPr>'
+            f'<a:cNvPr id="{index + 1}" name="icon {index}"/>'
+            '<a:cNvPicPr><a:picLocks/></a:cNvPicPr></a:nvPicPr>'
+            f'<a:blipFill><a:blip xmlns:r="{_GVML_NS_REL}" r:embed="rId{index}"/>'
+            '<a:stretch><a:fillRect/></a:stretch></a:blipFill>'
+            '<a:spPr><a:xfrm>'
+            f'<a:off x="{(x - left) * EMU_PER_PX}" y="{(y - top) * EMU_PER_PX}"/>'
+            f'<a:ext cx="{width * EMU_PER_PX}" cy="{height * EMU_PER_PX}"/>'
+            '</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></a:spPr></a:pic>')
+        rels.append(
+            f'<Relationship Id="rId{index}" Type="{_GVML_NS_REL}/image" '
+            f'Target="../media/image{index}.png"/>')
+
+    drawing = (
+        _GVML_XML_HEAD
+        + '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/lockedCanvas">'
+        '<lc:lockedCanvas xmlns:lc="http://schemas.openxmlformats.org/drawingml/2006/lockedCanvas">'
+        '<a:nvGrpSpPr><a:cNvPr id="0" name=""/><a:cNvGrpSpPr/></a:nvGrpSpPr>'
+        '<a:grpSpPr><a:xfrm><a:off x="0" y="0"/>'
+        f'<a:ext cx="{total_cx}" cy="{total_cy}"/><a:chOff x="0" y="0"/>'
+        f'<a:chExt cx="{total_cx}" cy="{total_cy}"/></a:xfrm></a:grpSpPr>'
+        + "".join(pics)
+        + '</lc:lockedCanvas></a:graphicData></a:graphic>')
+    content_types = (
+        _GVML_XML_HEAD
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/clipboard/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>')
+    root_rels = (
+        _GVML_XML_HEAD
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{_GVML_NS_REL}/drawing" '
+        'Target="clipboard/drawings/drawing1.xml"/></Relationships>')
+    drawing_rels = (
+        _GVML_XML_HEAD
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(rels) + '</Relationships>')
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("clipboard/drawings/drawing1.xml", drawing)
+        archive.writestr("clipboard/drawings/_rels/drawing1.xml.rels", drawing_rels)
+        for index, (_x, _y, png, _w, _h) in enumerate(pieces, 1):
+            # PNG はもともと圧縮済みなので、もう一度縮めない(時間だけかかる)。
+            archive.writestr(f"clipboard/media/image{index}.png", png,
+                             compress_type=zipfile.ZIP_STORED)
+    return buffer.getvalue()
+
+
+def gvml_from_rgba(rgba, icons) -> bytes:
+    """切り出したアイコンから GVML のデータを作る(クリップボードへ載せる直前に使う)。"""
+    pieces = []
+    for x0, y0, piece in cut_icons(rgba, icons):
+        h, w = piece.shape[:2]
+        pieces.append((x0, y0, encode_png(piece), w, h))
+    return build_gvml(pieces)
+
+
 def resize_long_side(array, long_side: int):
     """長辺が long_side を超えていれば縮める。(縮めた配列, 倍率) を返す。"""
     h, w = array.shape[:2]
@@ -1100,6 +1304,7 @@ class ImageView(QWidget):
         self._background = "checker"
         self._markers = []          # Shift の「ここも抜く」点
         self._protect_markers = []  # Ctrl の「ここは残す」点
+        self._boxes = []            # アイコンに分けたときの枠(表示している画像の座標)
         self._pickable = pickable
         self._checker = _checker_brush()
         self.setMinimumSize(200, 160)
@@ -1114,6 +1319,11 @@ class ImageView(QWidget):
 
     def set_background(self, kind: str) -> None:
         self._background = kind
+        self.update()
+
+    def set_boxes(self, boxes) -> None:
+        """アイコンごとの枠 (x0, y0, x1, y1) を描く。番号は並びの順(1から)。"""
+        self._boxes = list(boxes)
         self.update()
 
     def set_markers(self, points, protect=()) -> None:
@@ -1151,6 +1361,8 @@ class ImageView(QWidget):
         scale = rect.width() / max(1, self._image.width())
         painter.setRenderHint(QPainter.SmoothPixmapTransform, scale < 2.0)
         painter.drawImage(rect, self._image)
+        if self._boxes:
+            self._paint_boxes(painter, rect)
         if self._markers or self._protect_markers:
             sw, sh = self._source_size
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1177,6 +1389,36 @@ class ImageView(QWidget):
                 painter.drawLine(QPointF(c.x() - 3.5, c.y()), QPointF(c.x() - 1, c.y() + 2.8))
                 painter.drawLine(QPointF(c.x() - 1, c.y() + 2.8), QPointF(c.x() + 3.8, c.y() - 2.8))
         painter.end()
+
+    def _paint_boxes(self, painter, rect):
+        """アイコンの枠と番号。どんな背景(市松・白・黒・緑)の上でも見えるよう、黒い縁取りを
+        下に敷いた強調色の線にし、番号は強調色の札に白抜きで書く。"""
+        sw, sh = self._source_size
+        sx, sy = rect.width() / sw, rect.height() / sh
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = QFont("Meiryo", FONT_SMALL)
+        font.setBold(True)
+        painter.setFont(font)
+        accent = QColor(THEME["accent"])
+        for number, (x0, y0, x1, y1) in enumerate(self._boxes, 1):
+            box = QRectF(rect.left() + x0 * sx, rect.top() + y0 * sy,
+                         (x1 - x0) * sx, (y1 - y0) * sy)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#000000"), 3))
+            painter.drawRect(box)
+            painter.setPen(QPen(accent, 1.5))
+            painter.drawRect(box)
+            label = str(number)
+            width = 8 + 8 * len(label)
+            tag = QRectF(box.left(), box.top() - 18, width, 18)
+            if tag.top() < rect.top():
+                tag.moveTop(box.top())
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(accent)
+            painter.drawRoundedRect(tag, 3, 3)
+            painter.setPen(QColor(THEME["accent_text"]))
+            painter.drawText(tag, Qt.AlignCenter, label)
+        painter.setBrush(Qt.NoBrush)
 
     def _to_source(self, pos):
         rect = self._target_rect()
@@ -1656,6 +1898,30 @@ class BgRemoveWindow(QWidget):
         self.trim_check.setToolTip("透明になった余白を落として、残った部分の外接矩形にする")
         self.trim_check.toggled.connect(lambda _c: self._schedule())
         layout.addWidget(self.trim_check)
+
+        # アイコンに分ける: Office へ貼ったときに1つずつ別の図になるようにする。
+        self.split_check = QCheckBox("アイコンに分ける")
+        self.split_check.setFont(self._font())
+        self.split_check.setChecked(bool(section.get("split_icons", False)))
+        self.split_check.setToolTip(
+            "離れて並んだ絵を1つずつに分ける。クリップボードへ載せると、PowerPoint・Excel・Word\n"
+            "に貼ったときに別々の図として並ぶ(1枚にまとめた透過PNGも一緒に載せる)。\n"
+            "保存するときは 名前_01.png、名前_02.png … と連番で保存する")
+        self.split_check.toggled.connect(self._on_split_toggled)
+        layout.addWidget(self.split_check)
+        self.split_box = QWidget()
+        split_layout = QVBoxLayout(self.split_box)
+        split_layout.setContentsMargins(22, 0, 0, 0)
+        split_layout.setSpacing(4)
+        self.split_merge_slider, _label = self._make_slider(
+            split_layout, "まとめる距離（px）", SPLIT_MERGE_MAX,
+            _int_setting(section, "split_merge_px", SPLIT_MERGE_DEFAULT, 0, SPLIT_MERGE_MAX),
+            "この距離より近い部品は1つのアイコンにまとめる(下に添えた文字のラベルなど)。\n"
+            "アイコン同士がくっついて1つになるなら下げ、ラベルが別になるなら上げる")
+        self.split_count = self._note("")
+        split_layout.addWidget(self.split_count)
+        layout.addWidget(self.split_box)
+        self.split_box.setVisible(self.split_check.isChecked())
         return layout
 
     def _build_display_section(self):
@@ -2044,6 +2310,24 @@ class BgRemoveWindow(QWidget):
         self.method_note.setText(METHOD_NOTES[selected])
         self.bg_ai_note.setVisible(selected == METHOD_AI)
 
+    def _on_split_toggled(self, checked):
+        self.split_box.setVisible(bool(checked))
+        self._schedule()
+
+    def _icon_params(self, preview: bool):
+        """(まとめる距離 px, 捨てる面積) をその解像度に換算して返す。"""
+        scale = self._p_scale if preview else 1.0
+        merge = int(round(self.split_merge_slider.value() * scale))
+        area = int(round(split_min_area(self._height, self._width) * scale * scale))
+        return merge, max(1, area)
+
+    def _split(self, rgba, preview: bool):
+        """分ける設定なら split_icons の結果、そうでなければ []。"""
+        if not self.split_check.isChecked():
+            return []
+        merge, area = self._icon_params(preview)
+        return split_icons(rgba[..., 3], merge, area)
+
     def _set_preview_bg(self, key):
         self._preview_bg = key
         self.result_view.set_background(key)
@@ -2262,6 +2546,11 @@ class BgRemoveWindow(QWidget):
                 self._rebuild_protect_list()
             rgba = self.compute(preview=True)
             self.result_view.set_image(array_to_qimage(rgba))
+            icons = self._split(rgba, preview=True)
+            self.result_view.set_boxes([icon["box"] for icon in icons])
+            if self.split_check.isChecked():
+                self.split_count.setText(
+                    f"アイコン {len(icons)} 個" if icons else "アイコンが見つかりません")
             opaque = rgba[..., 3]
             transparent = float((opaque == 0).mean()) * 100.0
             # 出力の大きさは原寸換算で出す(縮小プレビューの大きさを出すと、保存したものと
@@ -2323,10 +2612,15 @@ class BgRemoveWindow(QWidget):
     # ------------------------------------------------------------------
     def _final_image(self):
         """原寸で計算し直した QImage。失敗したら None(状態表示に理由を出す)。"""
+        rgba = self._final_rgba()
+        return None if rgba is None else array_to_qimage(rgba)
+
+    def _final_rgba(self):
+        """原寸で計算し直した RGBA の配列。失敗したら None(状態表示に理由を出す)。"""
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                return array_to_qimage(self.compute(preview=False))
+                return self.compute(preview=False)
             finally:
                 try:
                     QApplication.restoreOverrideCursor()
@@ -2338,12 +2632,22 @@ class BgRemoveWindow(QWidget):
 
     def _to_clipboard(self):
         try:
-            image = self._final_image()
-            if image is None:
+            rgba = self._final_rgba()
+            if rgba is None:
                 return
-            set_clipboard_image(image)
+            image = array_to_qimage(rgba)
+            icons = self._split(rgba, preview=False)
+            extra = {}
+            if icons:
+                # Office 用の「別々の図」と、1枚にまとめた透過PNGの両方を載せる。後者は
+                # Office 以外の貼り先や、独自形式を読めない Office のオンライン版への逃げ道。
+                extra[GVML_MIME] = gvml_from_rgba(rgba, icons)
+            set_clipboard_image(image, extra=extra)
             self._linger_ms = VISIBLE_MS + FADE_MS + 100
-            show_toast(f"背景を透過\nクリップボードへ載せました（{image.width()}×{image.height()}）")
+            if icons:
+                show_toast(f"背景を透過\n{len(icons)} 個のアイコンとして載せました")
+            else:
+                show_toast(f"背景を透過\nクリップボードへ載せました（{image.width()}×{image.height()}）")
             self.close()
         except Exception:
             self._set_status(f"クリップボードへ載せられませんでした: {_log_exception('clipboard')}", "error")
@@ -2363,6 +2667,9 @@ class BgRemoveWindow(QWidget):
                 return
             if not path.lower().endswith(".png"):
                 path += ".png"
+            if self.split_check.isChecked():
+                self._save_icons(path)
+                return
             image = self._final_image()
             if image is None:
                 return
@@ -2376,6 +2683,39 @@ class BgRemoveWindow(QWidget):
         except Exception:
             self._set_status(f"保存に失敗しました: {_log_exception('save')}", "error")
 
+    def _save_icons(self, path):
+        """アイコンごとに 名前_01.png、名前_02.png … と保存する。"""
+        rgba = self._final_rgba()
+        if rgba is None:
+            return
+        icons = self._split(rgba, preview=False)
+        if not icons:
+            self._set_status("アイコンが見つからないので保存しませんでした", "warning")
+            return
+        stem, _ext = os.path.splitext(path)
+        digits = max(2, len(str(len(icons))))
+        paths = [f"{stem}_{i:0{digits}d}.png" for i in range(1, len(icons) + 1)]
+        existing = [p for p in paths if os.path.exists(p)]
+        if existing:
+            # ファイルダイアログが確かめるのは選んだ名前だけで、連番の名前は確かめない。
+            names = "\n".join(os.path.basename(p) for p in existing[:5])
+            more = f"\nほか {len(existing) - 5} 個" if len(existing) > 5 else ""
+            answer = QMessageBox.question(
+                self, "上書きの確認",
+                f"次のファイルがすでにあります。上書きしますか？\n\n{names}{more}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        for target, (_x, _y, piece) in zip(paths, cut_icons(rgba, icons)):
+            if not array_to_qimage(piece).save(target, "PNG"):
+                self._set_status(f"保存できませんでした: {target}", "error")
+                return
+        _save_values(self._app_settings, self._settings_path,
+                     {"last_dir": os.path.dirname(path)})
+        first, last = os.path.basename(paths[0]), os.path.basename(paths[-1])
+        self._set_status(f"{len(paths)} 個のアイコンを保存しました: {first} 〜 {last}")
+        show_toast(f"背景を透過\n{len(paths)} 個のアイコンを保存しました\n{first} 〜 {last}")
+
     # ------------------------------------------------------------------
     def closeEvent(self, event):
         try:
@@ -2385,6 +2725,8 @@ class BgRemoveWindow(QWidget):
                 "follow_gradient": self.follow_check.isChecked(),
                 "decontaminate": self.decontam_check.isChecked(),
                 "trim": self.trim_check.isChecked(),
+                "split_icons": self.split_check.isChecked(),
+                "split_merge_px": self.split_merge_slider.value(),
                 "model": self.model_combo.currentData(),
                 "preview_bg": self._preview_bg,
             # 以前のキー。tolerance は覚えるのをやめ、feather は edge_feather へ移した
@@ -2407,15 +2749,20 @@ class BgRemoveWindow(QWidget):
 # "image/png" という MIME 名のままだと "image/png" という名前の形式で登録され、
 # Office やブラウザが探す "PNG" にはならない。
 WINDOWS_PNG_MIME = 'application/x-qt-windows-mime;value="PNG"'
+# Office の図形用の形式。中身は build_gvml が作る zip。これがあると Office は、並んだ
+# 図を1つずつ別の図として貼る(1枚の画像ではなく)。
+GVML_MIME = 'application/x-qt-windows-mime;value="Art::GVML ClipFormat"'
 
 
-def set_clipboard_image(image: QImage, clipboard=None) -> None:
+def set_clipboard_image(image: QImage, clipboard=None, extra=None) -> None:
     """アルファを保ったまま画像をクリップボードへ載せる。
 
     QClipboard.setImage() だけだと Windows では CF_DIB(とせいぜい CF_DIBV5)になり、
     貼り先の多くがアルファを無視して透明部分が黒や白に潰れる。透過PNGを理解する
     貼り先(Office・ブラウザ・多くの画像ソフト)は "PNG" 形式を優先して読むので、
-    PNG のバイト列を複数の名前で載せ、DIB 系は Qt の画像変換に任せて併載する。"""
+    PNG のバイト列を複数の名前で載せ、DIB 系は Qt の画像変換に任せて併載する。
+
+    extra は {MIME 名: バイト列} で、さらに載せたい形式(アイコンに分けたときの GVML)。"""
     buffer = QBuffer()
     buffer.open(QIODevice.WriteOnly)
     image.save(buffer, "PNG")
@@ -2426,6 +2773,8 @@ def set_clipboard_image(image: QImage, clipboard=None) -> None:
     mime.setData(WINDOWS_PNG_MIME, payload)
     mime.setData("image/png", payload)
     mime.setImageData(image)
+    for name, data in (extra or {}).items():
+        mime.setData(name, QByteArray(bytes(data)))
     (clipboard or QGuiApplication.clipboard()).setMimeData(mime)
 
 

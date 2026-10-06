@@ -431,6 +431,23 @@ def test_keep_color_equal_to_background_does_nothing():
     assert (alpha == 0.0).all()
 
 
+def test_theme_contrast_ratios():
+    """配色の文字色と地の色の組み合わせが、決めたコントラスト比を満たす。
+    本文・補足・警告は 4.5 以上、無効の文字は 3.0 以上(bg_remove.CONTRAST_REQUIREMENTS)。"""
+    assert abs(br.contrast_ratio("#ffffff", "#000000") - 21.0) < 1e-6
+    assert abs(br.contrast_ratio("#777777", "#777777") - 1.0) < 1e-6
+    failures = []
+    for fg, bg, minimum in br.CONTRAST_REQUIREMENTS:
+        ratio = br.contrast_ratio(br.THEME[fg], br.THEME[bg])
+        if ratio < minimum:
+            failures.append(f"{fg} on {bg}: {ratio:.2f} < {minimum}")
+    assert not failures, failures
+    # 補足説明・無効は、どの地(窓・パネル・入力欄)に置かれても基準を満たすこと
+    for fg, minimum in (("muted", 4.5), ("disabled", 3.0)):
+        for bg in ("bg", "panel", "field"):
+            assert (fg, bg, minimum) in br.CONTRAST_REQUIREMENTS, (fg, bg)
+
+
 def test_fake_checkerboard_needs_both_colors():
     """AI が「透過背景」のつもりで描き込んだ偽の市松模様(2色)。"""
     h, w, tile = 96, 128, 8

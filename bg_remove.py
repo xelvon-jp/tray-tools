@@ -51,6 +51,7 @@ from PySide6.QtGui import (
     QImageReader,
     QKeySequence,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QShortcut,
@@ -61,10 +62,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -213,8 +216,17 @@ PREVIEW_BACKGROUNDS = [
 # 既定の大きさは作業領域に対する割合で決める(clipboard_preview と同じ考え)。
 DEFAULT_WIDTH_RATIO = 0.7
 DEFAULT_HEIGHT_RATIO = 0.75
-MIN_WIDTH = 820
-MIN_HEIGHT = 520
+# 右の設定パネルを含めた最小。画像の2ペインがそれぞれ 280px 前後は取れるようにする。
+MIN_WIDTH = 960
+MIN_HEIGHT = 600
+# 右の設定パネルの幅。縦1列に並べるので固定にする(窓を広げたときに、スライダーが
+# 横に伸びてラベルと数値が両端に離れるのが「見づらい」の原因の1つだった)。
+PANEL_WIDTH = 310
+
+# 文字の大きさ(pt)。以前の 8〜9pt は小さすぎて読みづらいと言われた。
+FONT_BASE = 10
+FONT_SMALL = 9
+FONT_TITLE = 11
 
 SETTINGS_SECTION = "bg_remove"
 
@@ -845,28 +857,167 @@ def _int_setting(section: dict, key: str, default: int, low: int, high: int) -> 
 # ===============================================================
 # 窓
 # ===============================================================
-STYLE = (
-    "#bgWindow { background-color: #141414; color: #ffffff; }"
-    "#bgWindow QLabel, #bgWindow QCheckBox, #bgWindow QRadioButton { color: #d4d4d4; }"
-    "#bgNote { color: #8a8a8a; }"
-    "#bgHeading { color: #ffffff; font-weight: bold; }"
-    "#bgWindow QPushButton, #bgWindow QToolButton { background-color: #262626; color: #ffffff;"
-    " border: 1px solid #3c3c3c; border-radius: 4px; padding: 5px 10px; }"
-    "#bgWindow QPushButton:hover { background-color: #303030; }"
-    "#bgWindow QPushButton:checked { background-color: #2563eb; border-color: #2563eb; }"
-    "#bgWindow QPushButton:disabled { color: #6a6a6a; border-color: #2a2a2a; }"
-    "#bgWindow QComboBox { background-color: #262626; color: #ffffff;"
-    " border: 1px solid #3c3c3c; border-radius: 4px; padding: 3px 8px; }"
-    "#bgWindow QComboBox:disabled { color: #6a6a6a; }"
-    "#bgApply { background-color: #2563eb; border-color: #2563eb; }"
-    "#bgApply:hover { background-color: #3b7dff; }"
-    "#bgWindow QLabel:disabled { color: #5a5a5a; }"
-    # 「#bgWindow QToolButton」より強くするため親の名前から書く(id 1つだけの指定だと
-    # 詳細度で負けて、×が普通のボタンの枠を被ってしまう)。
-    "#bgWindow #bgSwatchRemove { padding: 0px 3px; border: none; background: transparent;"
-    " color: #a0a0a0; }"
-    "#bgWindow #bgSwatchRemove:hover { color: #ff6b6b; }"
-)
+# 配色はここで1か所に決める。個別のウィジェットに色を書かないこと。
+#
+# 以前は窓のスタイルシートで一部だけを暗くしていて、残りの部品(無効のラジオの文字、
+# コンボの一覧、ツールチップなど)は Windows の既定の配色=明るい地に黒文字の前提で
+# 描かれていた。そのため暗い地に黒文字が沈む所が出た。いまはこのプロセスの
+# QApplication を Fusion にして、パレットを Active / Inactive / Disabled の全部について
+# 明示的に塗り、OS の配色が入り込む余地を無くしている(apply_theme)。
+# 付箋や常駐本体とは別プロセスなので、ここで変えても向こうには影響しない。
+THEME = {
+    "bg": "#1e1f22",            # 窓の地
+    "panel": "#26282c",         # 右の設定パネル(一段明るい)
+    "field": "#313338",         # 入力欄・ボタン(さらに一段明るい)
+    "field_hover": "#3a3d43",
+    "field_pressed": "#2b2d31",
+    "border": "#4a4d55",
+    "separator": "#3a3d43",
+    "shadow": "#121315",
+    "text": "#e6e6e6",          # 本文
+    "heading": "#ffffff",
+    "muted": "#a0a4ab",         # 補足説明。地とのコントラスト 4.5 以上を守る
+    "disabled": "#878b93",      # 無効。薄いと分かる程度に、ただし 3:1 以上
+    "accent": "#2563eb",        # 強調色は1色の青に揃える(主ボタン・選択中・スライダー・チェック)
+    "accent_hover": "#1d4ed8",
+    "accent_pressed": "#1e40af",
+    "accent_text": "#ffffff",
+    "keep": "#15803d",          # 残す点の印(左ペインのマーカーと同じ緑)
+    "keep_text": "#ffffff",
+    "warning": "#f5a524",
+    "error": "#ff7a7a",
+    "link": "#8ab4ff",
+    "tooltip_bg": "#2b2d31",
+}
+
+# 文字色と地の色の組み合わせと、満たすべきコントラスト比。tests/test_bg_remove.py が
+# これを機械的に確かめる。本文・補足・警告は 4.5、無効の文字は 3.0(WCAG の基準)。
+CONTRAST_REQUIREMENTS = [
+    ("text", "bg", 4.5), ("text", "panel", 4.5), ("text", "field", 4.5),
+    ("text", "field_hover", 4.5), ("text", "tooltip_bg", 4.5),
+    ("heading", "panel", 4.5), ("heading", "bg", 4.5),
+    ("muted", "bg", 4.5), ("muted", "panel", 4.5), ("muted", "field", 4.5),
+    ("disabled", "panel", 3.0), ("disabled", "field", 3.0), ("disabled", "bg", 3.0),
+    ("accent_text", "accent", 4.5), ("accent_text", "accent_hover", 4.5),
+    ("accent_text", "accent_pressed", 4.5),
+    ("keep_text", "keep", 4.5),
+    ("warning", "bg", 4.5), ("error", "bg", 4.5), ("link", "bg", 4.5),
+    # 部品の輪郭(入力欄・ボタンの枠)は地から 3:1 は要らないが、見失わない程度に。
+    ("border", "panel", 1.6),
+]
+
+
+def _relative_luminance(color: str) -> float:
+    value = color.lstrip("#")
+    channels = [int(value[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def contrast_ratio(foreground: str, background: str) -> float:
+    """WCAG 2 のコントラスト比(1〜21)。"""
+    a = _relative_luminance(foreground)
+    b = _relative_luminance(background)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def build_palette() -> QPalette:
+    """全グループ(Active / Inactive / Disabled)を明示的に塗ったパレット。
+
+    1つのグループだけ塗ると、窓が非アクティブになった瞬間や無効の部品で、OS の既定
+    (明るい地に黒文字)が顔を出す。"""
+    t = THEME
+    normal = {
+        QPalette.Window: t["bg"], QPalette.WindowText: t["text"],
+        QPalette.Base: t["field"], QPalette.AlternateBase: t["panel"],
+        QPalette.Text: t["text"], QPalette.Button: t["field"],
+        QPalette.ButtonText: t["text"], QPalette.BrightText: t["heading"],
+        QPalette.Highlight: t["accent"], QPalette.HighlightedText: t["accent_text"],
+        QPalette.ToolTipBase: t["tooltip_bg"], QPalette.ToolTipText: t["text"],
+        QPalette.PlaceholderText: t["muted"], QPalette.Link: t["link"],
+        QPalette.LinkVisited: t["link"],
+        # Fusion が枠や溝の陰影に使う色。既定のままだと明るい地向けの灰色が混じる。
+        QPalette.Light: t["field_hover"], QPalette.Midlight: t["field"],
+        QPalette.Mid: t["border"], QPalette.Dark: t["shadow"], QPalette.Shadow: "#000000",
+    }
+    disabled = dict(normal)
+    disabled.update({
+        QPalette.WindowText: t["disabled"], QPalette.Text: t["disabled"],
+        QPalette.ButtonText: t["disabled"], QPalette.PlaceholderText: t["disabled"],
+        QPalette.Button: t["panel"], QPalette.Base: t["panel"],
+        QPalette.Highlight: t["border"], QPalette.HighlightedText: t["text"],
+    })
+    palette = QPalette()
+    for group, roles in ((QPalette.Active, normal), (QPalette.Inactive, normal),
+                         (QPalette.Disabled, disabled)):
+        for role, color in roles.items():
+            palette.setColor(group, role, QColor(color))
+    return palette
+
+
+def build_style() -> str:
+    """THEME から組み立てたスタイルシート。"""
+    t = THEME
+    return f"""
+    QWidget#bgWindow {{ background-color: {t['bg']}; }}
+    QFrame#bgPanel {{ background-color: {t['panel']}; border: 1px solid {t['separator']};
+        border-radius: 8px; }}
+    QScrollArea#bgPanelScroll, QWidget#bgPanelContent {{ background-color: {t['panel']};
+        border: none; }}
+    QWidget#bgOutput {{ background-color: {t['panel']}; border: none;
+        border-top: 1px solid {t['separator']}; border-bottom-left-radius: 8px;
+        border-bottom-right-radius: 8px; }}
+    QLabel {{ color: {t['text']}; background: transparent; }}
+    QLabel:disabled {{ color: {t['disabled']}; }}
+    QLabel#bgNote {{ color: {t['muted']}; }}
+    QLabel#bgHeading {{ color: {t['heading']}; font-weight: bold; }}
+    QLabel#bgSectionTitle {{ color: {t['heading']}; font-weight: bold; }}
+    QLabel#bgStatus {{ color: {t['muted']}; }}
+    QLabel#bgStatus[level="warning"] {{ color: {t['warning']}; }}
+    QLabel#bgStatus[level="error"] {{ color: {t['error']}; }}
+    QLabel#bgKeepChip {{ background-color: {t['keep']}; color: {t['keep_text']};
+        border-radius: 3px; padding: 2px 6px; }}
+    QFrame#bgSeparator {{ background-color: {t['separator']}; border: none;
+        min-height: 1px; max-height: 1px; }}
+    QPushButton {{ background-color: {t['field']}; color: {t['text']};
+        border: 1px solid {t['border']}; border-radius: 5px; padding: 6px 12px; }}
+    QPushButton:hover {{ background-color: {t['field_hover']}; }}
+    QPushButton:pressed {{ background-color: {t['field_pressed']}; }}
+    QPushButton:checked {{ background-color: {t['accent']}; border-color: {t['accent']};
+        color: {t['accent_text']}; }}
+    QPushButton:checked:hover {{ background-color: {t['accent_hover']}; }}
+    QPushButton:disabled {{ background-color: {t['panel']}; color: {t['disabled']};
+        border-color: {t['separator']}; }}
+    QPushButton#bgApply {{ background-color: {t['accent']}; border-color: {t['accent']};
+        color: {t['accent_text']}; font-weight: bold; padding: 10px 12px; }}
+    QPushButton#bgApply:hover {{ background-color: {t['accent_hover']}; }}
+    QPushButton#bgApply:pressed {{ background-color: {t['accent_pressed']}; }}
+    QToolButton#bgSwatchRemove {{ border: none; background: transparent; color: {t['muted']};
+        padding: 0px 3px; }}
+    QToolButton#bgSwatchRemove:hover {{ color: {t['error']}; }}
+    QCheckBox, QRadioButton {{ color: {t['text']}; spacing: 6px; }}
+    QCheckBox:disabled, QRadioButton:disabled {{ color: {t['disabled']}; }}
+    QToolTip {{ background-color: {t['tooltip_bg']}; color: {t['text']};
+        border: 1px solid {t['border']}; padding: 4px 6px; }}
+    """
+
+
+def swatch_style(color) -> str:
+    """色見本のチップ。地の色は画像の色(データ)なので、枠だけを配色から取る。"""
+    return (f"background-color: {_hex(color)}; border: 1px solid {THEME['border']};"
+            " border-radius: 3px;")
+
+
+def apply_theme(app) -> None:
+    """このプロセスの QApplication に配色を当てる。main() から1回だけ呼ぶ。
+
+    ツールチップやコンボの一覧は別のトップレベル窓なので、窓のスタイルシートでは
+    届かない。アプリ全体に掛ける必要がある。"""
+    app.setStyle("Fusion")
+    app.setPalette(build_palette())
+    app.setStyleSheet(build_style())
+    app.setFont(QFont("Meiryo", FONT_BASE))
 
 
 def _hex(color) -> str:
@@ -937,7 +1088,7 @@ class ImageView(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#1c1c1c"))
+        painter.fillRect(self.rect(), QColor(THEME["bg"]))
         rect = self._target_rect()
         if rect.isEmpty():
             painter.end()
@@ -946,7 +1097,7 @@ class ImageView(QWidget):
             painter.fillRect(rect, self._checker)
         else:
             painter.fillRect(rect, QColor({"white": "#ffffff", "black": "#000000",
-                                           "green": "#00b140"}.get(self._background, "#1c1c1c")))
+                                           "green": "#00b140"}.get(self._background, THEME["bg"])))
         # 小さい画像を大きく引き伸ばすときはぼかさない(ドット絵やアイコンの縁を
         # 確かめたいのに、補間で滲むと境界の判断ができない)。
         scale = rect.width() / max(1, self._image.width())
@@ -1092,24 +1243,34 @@ class BgRemoveWindow(QWidget):
         # 最前面に出す。DETACHED で起こされるため、Windows の前面化ロックで後ろに回されると
         # 「押したのに何も出ない」に見える(clipboard_preview も同じ理由で最前面にしている)。
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.setStyleSheet(STYLE)
+        # アプリ全体の配色(apply_theme)と同じものを窓にも掛けておく。テストなどで
+        # apply_theme を通さずに窓だけ作った場合にも、見た目が崩れないように。
+        self.setStyleSheet(build_style())
+        self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        layout.addLayout(self._build_color_row())
-        layout.addLayout(self._build_method_row(section))
-        layout.addWidget(self._build_mode_pages(section))
-        layout.addLayout(self._build_option_row(section))
-        layout.addWidget(self._build_panes(), 1)
+        saved_bg = section.get("preview_bg", "checker")
+        if saved_bg not in {key for key, _ in PREVIEW_BACKGROUNDS}:
+            saved_bg = "checker"
+        self._preview_bg = saved_bg
 
+        # 左に画像(元画像｜結果)と状態欄、右に設定の縦1列のパネル。以前は設定を画像の
+        # 上に横長の行で並べていて、視線があちこちに飛び、スライダーが窓の幅いっぱいに
+        # 伸びてラベルと数値が両端に離れた。作業の順に上から下へ読めるようにしてある。
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        left.addWidget(self._build_panes(), 1)
         self.status = QLabel("")
-        self.status.setObjectName("bgNote")
-        self.status.setFont(QFont("Meiryo", 8))
-        # ai_status と同じく、長い文言で窓の最小幅を押し広げさせない。
+        self.status.setObjectName("bgStatus")
+        self.status.setFont(self._font(FONT_SMALL))
+        # 長い文言(警告など)で窓の最小幅を押し広げさせない。全文はツールチップにも置く。
         self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        layout.addWidget(self.status)
-        layout.addLayout(self._build_button_row())
+        left.addWidget(self.status)
+        root.addLayout(left, 1)
+        root.addWidget(self._build_panel(section))
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -1130,8 +1291,10 @@ class BgRemoveWindow(QWidget):
     # ------------------------------------------------------------------
     # 組み立て
     # ------------------------------------------------------------------
-    def _font(self, size=9):
-        return QFont("Meiryo", size)
+    def _font(self, size=FONT_BASE, bold=False):
+        font = QFont("Meiryo", size)
+        font.setBold(bold)
+        return font
 
     def _heading(self, text):
         label = QLabel(text)
@@ -1139,59 +1302,107 @@ class BgRemoveWindow(QWidget):
         label.setFont(self._font())
         return label
 
-    def _build_color_row(self):
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self._bg_heading = self._heading("背景色")
-        row.addWidget(self._bg_heading)
-        self._swatch_row = QHBoxLayout()
-        self._swatch_row.setSpacing(4)
-        row.addLayout(self._swatch_row)
-        row.addSpacing(10)
-        # 「残す点」の一覧。背景色とは別に並べる(残す点は色を足さないので、色の
-        # スウォッチに混ぜると「この色が背景色に入った」と読み違えられる)。
-        self._protect_heading = self._heading("残す点")
-        self._protect_heading.setToolTip(
-            "Ctrl+クリックで指した部分は透明にしない（色で抜く・AIの結果のどちらでも効く）")
-        row.addWidget(self._protect_heading)
-        self._protect_row = QHBoxLayout()
-        self._protect_row.setSpacing(4)
-        row.addLayout(self._protect_row)
-        row.addStretch(1)
-        reset = QPushButton("自動推定に戻す")
-        reset.setFont(self._font())
-        reset.setToolTip("画像の外周でいちばん多い色を背景色にし直す")
-        reset.clicked.connect(lambda: self._reset_to_estimate())
-        row.addWidget(reset)
-        return row
+    def _note(self, text=""):
+        """補足説明(グレーの小さい字)。ラベルと見分けがつくよう、必ずこれを通す。"""
+        label = QLabel(text)
+        label.setObjectName("bgNote")
+        label.setFont(self._font(FONT_SMALL))
+        label.setWordWrap(True)
+        return label
 
-    def _build_method_row(self, section):
+    def _segment_row(self, items, group):
+        """セグメント(横に並んだトグルボタン)。items は (key, 表示) の並び。
+        ボタンを {key: ボタン} で返す。"""
         row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(self._heading("抜き方"))
+        row.setSpacing(4)
+        buttons = {}
+        for key, label in items:
+            button = QPushButton(label)
+            button.setFont(self._font())
+            button.setCheckable(True)
+            group.addButton(button)
+            row.addWidget(button, 1)
+            buttons[key] = button
+        return row, buttons
+
+    # ---- 右の設定パネル -------------------------------------------------
+    def _build_panel(self, section):
+        panel = QFrame()
+        panel.setObjectName("bgPanel")
+        panel.setFixedWidth(PANEL_WIDTH)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 窓の高さが足りないときは、パネルの中身だけがスクロールする(出力ボタンは下に固定)。
+        scroll = QScrollArea()
+        scroll.setObjectName("bgPanelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("bgPanelContent")
+        column = QVBoxLayout(content)
+        column.setContentsMargins(14, 14, 14, 14)
+        column.setSpacing(6)
+
+        sections = [
+            ("抜き方", self._build_method_section(section)),
+            ("背景色", self._build_background_section()),
+            ("残す色／点", self._build_protect_section()),
+            ("調整", self._build_adjust_section(section)),
+            ("仕上げ", self._build_finish_section(section)),
+            ("表示", self._build_display_section()),
+        ]
+        for index, (title, layout) in enumerate(sections):
+            if index:
+                column.addSpacing(8)
+                separator = QFrame()
+                separator.setObjectName("bgSeparator")
+                separator.setFrameShape(QFrame.NoFrame)
+                column.addWidget(separator)
+                column.addSpacing(6)
+            label = QLabel(title)
+            label.setObjectName("bgSectionTitle")
+            label.setFont(self._font(FONT_TITLE, bold=True))
+            if title == "残す色／点":
+                self._protect_heading = label
+                label.setToolTip(
+                    "Ctrl+クリックで指した部分は透明にしない（色で抜く・AIの結果のどちらでも効く）")
+            column.addWidget(label)
+            column.addLayout(layout)
+        column.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        outer.addWidget(self._build_output_section())
+        return panel
+
+    def _build_method_section(self, section):
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
         self._method_group = QButtonGroup(self)
-        self.color_radio = QRadioButton("色で抜く")
-        self.ai_radio = QRadioButton("AIの結果")
-        for radio in (self.color_radio, self.ai_radio):
-            radio.setFont(self._font())
-            self._method_group.addButton(radio)
-            row.addWidget(radio)
-        self.color_radio.setChecked(True)
-        self.ai_radio.setEnabled(False)
-        self.ai_radio.setToolTip("先に［AIで抜く］を押してください")
-        self.color_radio.toggled.connect(self._on_method_changed)
-        self.method_note = QLabel(METHOD_NOTES[METHOD_COLOR])
-        self.method_note.setObjectName("bgNote")
-        self.method_note.setFont(self._font(8))
-        # 狭い窓では説明のほうを削る(ボタンやモデル選択を押し出させない)。全文はツールチップ。
-        self.method_note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        row.addWidget(self.method_note, 2)
+        self._method_group.setExclusive(True)
+        row, buttons = self._segment_row(
+            [(METHOD_COLOR, "色で抜く"), (METHOD_AI, "AIで抜く")], self._method_group)
+        self.color_mode_button = buttons[METHOD_COLOR]
+        self.ai_mode_button = buttons[METHOD_AI]
+        self.color_mode_button.setChecked(True)
+        self.color_mode_button.setToolTip("背景色・許容量・ぼかしで抜く")
+        # 以前の「AIの結果」ラジオは、先に別のボタンで AI を走らせるまで押せず、両者の
+        # 関係が分かりにくかった。いまは「AIで抜く」を選ぶこと自体が実行の合図になる。
+        self._method_group.buttonClicked.connect(self._on_method_clicked)
+        layout.addLayout(row)
 
-        row.addSpacing(8)
-        self.ai_button = QPushButton("AIで抜く")
-        self.ai_button.setFont(self._font())
-        self.ai_button.clicked.connect(self._start_ai)
-        row.addWidget(self.ai_button)
+        # AI を選んだときだけ出す: モデル・実行(やり直す)・所要時間。
+        self.ai_box = QWidget()
+        ai_layout = QVBoxLayout(self.ai_box)
+        ai_layout.setContentsMargins(0, 2, 0, 0)
+        ai_layout.setSpacing(6)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+        model_label = QLabel("モデル")
+        model_label.setFont(self._font())
+        model_row.addWidget(model_label)
         self.model_combo = QComboBox()
         self.model_combo.setFont(self._font())
         for key, label in AI_MODELS:
@@ -1200,122 +1411,156 @@ class BgRemoveWindow(QWidget):
         for i in range(self.model_combo.count()):
             if self.model_combo.itemData(i) == saved_model:
                 self.model_combo.setCurrentIndex(i)
-        row.addWidget(self.model_combo)
+        model_row.addWidget(self.model_combo, 1)
+        ai_layout.addLayout(model_row)
+        self.ai_button = QPushButton("実行")
+        self.ai_button.setFont(self._font())
+        self.ai_button.clicked.connect(self._start_ai)
+        ai_layout.addWidget(self.ai_button)
+        self.ai_status = self._note("")
+        ai_layout.addWidget(self.ai_status)
+        layout.addWidget(self.ai_box)
+
         if not ai_available():
-            for widget in (self.ai_button, self.model_combo):
+            for widget in (self.ai_mode_button, self.ai_button, self.model_combo):
                 widget.setEnabled(False)
                 widget.setToolTip(AI_INSTALL_HINT)
         else:
-            self.ai_button.setToolTip(
-                "被写体をAIで切り抜く（初回はライブラリの読み込みに数十秒かかります）")
-        self.ai_status = QLabel("")
-        self.ai_status.setObjectName("bgNote")
-        self.ai_status.setFont(self._font(8))
-        # 長い文言(例外の要約など)で窓の最小幅が押し広げられないよう、幅は主張させない。
-        self.ai_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        row.addWidget(self.ai_status, 1)
-        return row
+            tip = "被写体をAIで切り抜く（初回はライブラリの読み込みに数十秒かかります）"
+            self.ai_mode_button.setToolTip(tip)
+            self.ai_button.setToolTip(tip)
 
-    def _make_slider(self, row, title, maximum, value, tooltip):
+        self.method_note = self._note(METHOD_NOTES[METHOD_COLOR])
+        layout.addWidget(self.method_note)
+        return layout
+
+    def _build_background_section(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        # 色が何個あっても横にはみ出さないよう、格子に並べる(パネルの幅は固定)。
+        self._swatch_grid = QGridLayout()
+        self._swatch_grid.setHorizontalSpacing(4)
+        self._swatch_grid.setVerticalSpacing(4)
+        row.addLayout(self._swatch_grid)
+        row.addStretch(1)
+        reset = QPushButton("自動推定に戻す")
+        reset.setFont(self._font(FONT_SMALL))
+        reset.setToolTip("画像の外周でいちばん多い色を背景色にし直す")
+        reset.clicked.connect(lambda: self._reset_to_estimate())
+        row.addWidget(reset, 0, Qt.AlignTop)
+        layout.addLayout(row)
+        # AIの結果では背景色は抜く判定に使わない。書いておかないと「背景色を変えたのに
+        # 結果が変わらない」と迷う。
+        self.bg_ai_note = self._note("AIで抜くときは、色かぶり除去にだけ使います")
+        layout.addWidget(self.bg_ai_note)
+        return layout
+
+    def _build_protect_section(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(4)
+        # 残す色は背景色とは別に並べる(混ぜると「この色が背景色に入った」と読み違える)。
+        self._protect_list = QVBoxLayout()
+        self._protect_list.setSpacing(4)
+        layout.addLayout(self._protect_list)
+        return layout
+
+    def _make_slider(self, layout, title, maximum, value, tooltip, extra=None):
+        """「ラベル……数値」の1行と、その下にパネル幅いっぱいのスライダー。"""
+        header = QHBoxLayout()
+        header.setSpacing(6)
         label = QLabel(title)
         label.setFont(self._font())
         label.setToolTip(tooltip)
-        row.addWidget(label)
+        header.addWidget(label, 1)
+        if extra is not None:
+            header.addWidget(extra)
+        value_label = QLabel(str(value))
+        value_label.setFont(self._font(bold=True))
+        value_label.setMinimumWidth(30)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header.addWidget(value_label)
+        layout.addLayout(header)
         slider = QSlider(Qt.Horizontal)
         slider.setRange(0, maximum)
         slider.setValue(value)
-        slider.setMinimumWidth(140)
         slider.setToolTip(tooltip)
-        row.addWidget(slider, 1)
-        value_label = QLabel(str(value))
-        value_label.setFont(self._font())
-        value_label.setMinimumWidth(28)
-        row.addWidget(value_label)
+        layout.addWidget(slider)
         slider.valueChanged.connect(lambda v: (value_label.setText(str(v)), self._schedule()))
         return slider, label
 
-    def _build_range_row(self, section):
-        row = QHBoxLayout()
-        row.setSpacing(6)
+    def _build_adjust_section(self, section):
+        """モードごとに効く項目だけを出す。効かない項目はグレーにせず隠す。
+
+        グレーにして並べておくと「なぜ動かないのか」「どれを触れば変わるのか」を毎回
+        読み解くことになる(実機で、AIの結果を見ながら効かない許容量を触っていた)。"""
+        layout = QVBoxLayout()
+        layout.setSpacing(0)
+        self.mode_pages = QStackedWidget()
+
+        color_page = QWidget()
+        color = QVBoxLayout(color_page)
+        color.setContentsMargins(0, 0, 0, 0)
+        color.setSpacing(4)
         # 許容量は覚えない。画像ごとに背景のムラの大きさが違い、前の画像に合わせた値を
         # 持ち越すと、薄いボックスごと抜ける(以前の既定 12 で実際に起きた)。開くたびに
         # 外周のムラから測った「自動」の値で始める。
-        self.tolerance_slider, self._tolerance_label = self._make_slider(
-            row, "許容量", TOLERANCE_MAX, AUTO_TOLERANCE_MIN,
-            "背景色からこの差(ΔE)までを完全に透明にする。2前後が見分けられる限界の差",
-        )
-        self.tolerance_slider.valueChanged.connect(self._on_tolerance_moved)
         self.auto_tolerance_button = QPushButton("自動")
-        self.auto_tolerance_button.setFont(self._font())
+        self.auto_tolerance_button.setFont(self._font(FONT_SMALL))
         self.auto_tolerance_button.setCheckable(True)
         self.auto_tolerance_button.setChecked(True)
         self.auto_tolerance_button.setToolTip(
             "外周の背景のムラ(ばらつきの上限)を測って許容量を決め直す。\n"
             "押されている間は、背景色を変えたときにも測り直す。つまみを動かすと手動に戻る")
         self.auto_tolerance_button.clicked.connect(self._on_auto_tolerance_clicked)
-        row.addWidget(self.auto_tolerance_button)
-        row.addSpacing(12)
+        self.tolerance_slider, self._tolerance_label = self._make_slider(
+            color, "許容量（ΔE）", TOLERANCE_MAX, AUTO_TOLERANCE_MIN,
+            "背景色からこの差(ΔE)までを完全に透明にする。2前後が見分けられる限界の差",
+            extra=self.auto_tolerance_button,
+        )
+        self.tolerance_slider.valueChanged.connect(self._on_tolerance_moved)
+        color.addSpacing(6)
         # ぼかしは覚える(画像よりも好みで決まる値なので)。キーを feather から edge_feather へ
         # 変えたのは、以前の既定 10 が閉じるたびに書き込まれていて、それを好みとして
         # 引き継ぐと薄いボックスの縁が溶けるため。
         self.feather_slider, self._feather_label = self._make_slider(
-            row, "境界のぼかし", FEATHER_MAX,
+            color, "境界のぼかし（ΔE）", FEATHER_MAX,
             _int_setting(section, "edge_feather", DEFAULT_FEATHER, 0, FEATHER_MAX),
             "許容量からさらにこの差までを、離れるほど不透明になる半透明にする",
         )
-        return row
-
-    def _build_ai_adjust_row(self):
-        """AIの結果の一括調整。lo 未満を消し、hi 以上を不透明にする。
-
-        白い被写体を AI が背景と取り違えて半透明にしたとき、点を打たずにまとめて濃くする
-        ためのもの(hi を下げる)。逆に背景に薄く残ったもや(接地影など)は lo を上げて消す。
-        画像ごとに変わる値なので覚えない。"""
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.ai_lo_slider, _label = self._make_slider(
-            row, "これより薄い部分は消す（%）", 99, 0,
-            "AIの判定がこの値より薄い部分を完全に透明にする（背景に残ったもやを消す）")
-        row.addSpacing(12)
-        self.ai_hi_slider, _label = self._make_slider(
-            row, "これより濃い部分は不透明にする（%）", 100, 100,
-            "AIの判定がこの値より濃い部分を完全に不透明にする（半透明になった白い被写体を戻す）")
-        self.ai_lo_slider.setMinimum(0)
-        self.ai_hi_slider.setMinimum(1)
-        return row
-
-    def _build_mode_pages(self, section):
-        """モードごとに効く項目だけを出す。効かない項目はグレーにせず隠す。
-
-        グレーにして並べておくと「なぜ動かないのか」「どれを触れば変わるのか」を毎回
-        読み解くことになる(実機で、AIの結果を見ながら効かない許容量を触っていた)。"""
-        self.mode_pages = QStackedWidget()
-
-        color_page = QWidget()
-        color_column = QVBoxLayout(color_page)
-        color_column.setContentsMargins(0, 0, 0, 0)
-        color_column.setSpacing(8)
-        color_column.addLayout(self._build_range_row(section))
-        color_column.addLayout(self._build_inside_row())
+        color.addSpacing(8)
+        self._build_inside_controls(color)
         self.mode_pages.addWidget(color_page)
 
         ai_page = QWidget()
-        ai_column = QVBoxLayout(ai_page)
-        ai_column.setContentsMargins(0, 0, 0, 0)
-        ai_column.setSpacing(8)
-        ai_column.addLayout(self._build_ai_adjust_row())
+        ai = QVBoxLayout(ai_page)
+        ai.setContentsMargins(0, 0, 0, 0)
+        ai.setSpacing(4)
+        # AIの結果の一括調整。lo 未満を消し、hi 以上を不透明にする。白い被写体を AI が
+        # 背景と取り違えて半透明にしたとき、点を打たずにまとめて濃くする(hi を下げる)。
+        # 背景に薄く残ったもや(接地影など)は lo を上げて消す。画像ごとに変わるので覚えない。
+        self.ai_lo_slider, _label = self._make_slider(
+            ai, "これより薄い部分は消す（%）", 99, 0,
+            "AIの判定がこの値より薄い部分を完全に透明にする（背景に残ったもやを消す）")
+        ai.addSpacing(6)
+        self.ai_hi_slider, _label = self._make_slider(
+            ai, "これより濃い部分は不透明に（%）", 100, 100,
+            "AIの判定がこの値より濃い部分を完全に不透明にする（半透明になった白い被写体を戻す）")
+        self.ai_lo_slider.setMinimum(0)
+        self.ai_hi_slider.setMinimum(1)
         self.mode_pages.addWidget(ai_page)
-        return self.mode_pages
 
-    def _build_inside_row(self):
-        """画像の内側にある背景色に近い色を、残すか抜くか(一括の切り替え)。
+        layout.addWidget(self.mode_pages)
+        return layout
+
+    def _build_inside_controls(self, layout):
+        """画像の内側にある背景色に近い色を、残すか抜くか(一括の切り替え)と、ムラへの追従。
 
         以前は「範囲: 外周からつながった部分だけ／画像全体の同色」と書いていたが、
         仕組みの名前で、何のための設定かが読み取れなかった。困りごとの側(被写体の中に
         背景と似た色がある)から名付け直してある。1か所ずつの指定は左ペインの
         Shift+クリック(ここも抜く)/ Ctrl+クリック(ここは残す)で行う。"""
-        row = QHBoxLayout()
-        row.setSpacing(6)
         tooltip = (
             "残す: 外周からつながった背景だけを抜き、被写体の内側にある白目やハイライトなどを守る\n"
             "抜く: 文字の穴や腕と胴の隙間など、外周に接していない部分の同じ色も抜く\n"
@@ -1323,7 +1568,8 @@ class BgRemoveWindow(QWidget):
         self._range_label = QLabel("画像の内側にある背景色に近い色")
         self._range_label.setFont(self._font())
         self._range_label.setToolTip(tooltip)
-        row.addWidget(self._range_label)
+        self._range_label.setWordWrap(True)
+        layout.addWidget(self._range_label)
         self.range_combo = QComboBox()
         self.range_combo.setFont(self._font())
         self.range_combo.addItem("残す（外周からつながった背景だけ抜く）", RANGE_CONNECTED)
@@ -1332,8 +1578,8 @@ class BgRemoveWindow(QWidget):
         # 気付かず載せる、という事故のほうが、毎回選び直す手間より重い。
         self.range_combo.setToolTip(tooltip)
         self.range_combo.currentIndexChanged.connect(lambda _i: self._schedule())
-        row.addWidget(self.range_combo)
-        row.addSpacing(16)
+        layout.addWidget(self.range_combo)
+        layout.addSpacing(6)
         self.follow_check = QCheckBox("背景のムラに追従")
         self.follow_check.setFont(self._font())
         self.follow_check.setChecked(bool(_section(self._app_settings).get("follow_gradient", True)))
@@ -1342,44 +1588,72 @@ class BgRemoveWindow(QWidget):
             "AI の画像に多いビネット(四隅が暗い)やグラデーションで、中央と四隅で\n"
             "同じ許容量が合わない問題を防ぐ。ムラが無い画像では何も変わらない")
         self.follow_check.toggled.connect(lambda _c: self._colors_changed())
-        row.addWidget(self.follow_check)
-        row.addStretch(1)
-        return row
+        layout.addWidget(self.follow_check)
 
-    def _build_option_row(self, section):
-        row = QHBoxLayout()
-        row.setSpacing(12)
+    def _build_finish_section(self, section):
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
         self.decontam_check = QCheckBox("色かぶり除去")
         self.decontam_check.setFont(self._font())
         self.decontam_check.setChecked(bool(section.get("decontaminate", True)))
         self.decontam_check.setToolTip("半透明の縁から背景色の混ざりを取り除く（白背景の縁が光るのを防ぐ）")
         self.decontam_check.toggled.connect(lambda _c: self._schedule())
-        row.addWidget(self.decontam_check)
+        layout.addWidget(self.decontam_check)
         self.trim_check = QCheckBox("余白を切り詰める")
         self.trim_check.setFont(self._font())
         self.trim_check.setChecked(bool(section.get("trim", False)))
         self.trim_check.setToolTip("透明になった余白を落として、残った部分の外接矩形にする")
         self.trim_check.toggled.connect(lambda _c: self._schedule())
-        row.addWidget(self.trim_check)
-        row.addStretch(1)
+        layout.addWidget(self.trim_check)
+        return layout
 
-        row.addWidget(self._heading("右の背景"))
+    def _build_display_section(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(4)
+        label = QLabel("結果の下に敷く背景")
+        label.setFont(self._font())
+        layout.addWidget(label)
         self._bg_group = QButtonGroup(self)
         self._bg_group.setExclusive(True)
-        saved_bg = section.get("preview_bg", "checker")
-        if saved_bg not in {key for key, _ in PREVIEW_BACKGROUNDS}:
-            saved_bg = "checker"
-        self._preview_bg = saved_bg
-        for key, label in PREVIEW_BACKGROUNDS:
-            button = QPushButton(label)
-            button.setFont(self._font())
-            button.setCheckable(True)
-            button.setChecked(key == saved_bg)
+        row, buttons = self._segment_row(PREVIEW_BACKGROUNDS, self._bg_group)
+        for key, button in buttons.items():
+            button.setChecked(key == self._preview_bg)
             button.clicked.connect(lambda _c, k=key: self._set_preview_bg(k))
-            self._bg_group.addButton(button)
-            row.addWidget(button)
-        return row
+        layout.addLayout(row)
+        layout.addWidget(self._note("抜け残りは黒、縁の白い光りは黒か緑で見ると分かりやすい"))
+        return layout
 
+    def _build_output_section(self):
+        """パネルの最下部に固定する出力ボタン。キーのヒントはツールチップへ。"""
+        box = QWidget()
+        box.setObjectName("bgOutput")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(8)
+        self.apply_button = QPushButton("クリップボードへ")
+        self.apply_button.setObjectName("bgApply")
+        self.apply_button.setFont(self._font(FONT_TITLE, bold=True))
+        self.apply_button.setDefault(True)
+        self.apply_button.setMinimumHeight(40)
+        self.apply_button.setToolTip("透過PNGをクリップボードへ載せて閉じる（Enter）")
+        self.apply_button.clicked.connect(self._to_clipboard)
+        layout.addWidget(self.apply_button)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        save = QPushButton("保存…")
+        save.setFont(self._font())
+        save.setToolTip("透過PNGとして保存する（Ctrl+S）")
+        save.clicked.connect(self._save)
+        row.addWidget(save, 1)
+        cancel = QPushButton("キャンセル")
+        cancel.setFont(self._font())
+        cancel.setToolTip("何もせずに閉じる（Esc）")
+        cancel.clicked.connect(self.close)
+        row.addWidget(cancel, 1)
+        layout.addLayout(row)
+        return box
+
+    # ---- 左の画像 -------------------------------------------------------
     def _build_panes(self):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -1388,49 +1662,38 @@ class BgRemoveWindow(QWidget):
         self.source_view.hovered.connect(self._on_hover)
         self.result_view = ImageView(pickable=False)
         self.result_view.set_background(self._preview_bg)
-        splitter.addWidget(self._wrap_pane(
-            "元の画像　　クリック: 背景色　Shift+クリック: ここも抜く　Ctrl+クリック: ここは残す",
-            self.source_view))
+        # 操作のヒントは見出しの横に残す。キーの部分だけを強調して短くする。
+        key = (f"<span style='background-color:{THEME['field_hover']}; color:{THEME['heading']};'>"
+               "&nbsp;{}&nbsp;</span>")
+        hint = (f"{key.format('クリック')} 背景色　"
+                f"{key.format('Shift')}+クリック 抜く　"
+                f"{key.format('Ctrl')}+クリック 残す")
+        splitter.addWidget(self._wrap_pane("元の画像", self.source_view, hint))
         splitter.addWidget(self._wrap_pane("結果", self.result_view))
         splitter.setSizes([1, 1])
         return splitter
 
-    def _wrap_pane(self, title, view):
+    def _wrap_pane(self, title, view, hint=None):
         box = QWidget()
         column = QVBoxLayout(box)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(4)
-        heading = self._heading(title)
-        # 左の見出しは操作の案内を兼ねていて長い。折り返さないと、その文字幅が左ペインの
-        # 最小幅になって分割の境目が右へ押しやられ、結果のペインが細くなる。
-        heading.setWordWrap(True)
-        column.addWidget(heading)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        header.addWidget(self._heading(title))
+        if hint:
+            label = QLabel(hint)
+            label.setTextFormat(Qt.RichText)
+            label.setFont(self._font(FONT_SMALL))
+            # 折り返して、文字幅で左ペインの最小幅を押し広げない。
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            header.addWidget(label, 1)
+        else:
+            header.addStretch(1)
+        column.addLayout(header)
         column.addWidget(view, 1)
         return box
-
-    def _build_button_row(self):
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        note = QLabel("Enter クリップボードへ  ·  Ctrl+S 保存  ·  Esc キャンセル")
-        note.setObjectName("bgNote")
-        note.setFont(self._font(8))
-        row.addWidget(note)
-        row.addStretch(1)
-        cancel = QPushButton("キャンセル")
-        cancel.setFont(self._font())
-        cancel.clicked.connect(self.close)
-        row.addWidget(cancel)
-        save = QPushButton("保存…")
-        save.setFont(self._font())
-        save.clicked.connect(self._save)
-        row.addWidget(save)
-        self.apply_button = QPushButton("クリップボードへ")
-        self.apply_button.setObjectName("bgApply")
-        self.apply_button.setFont(self._font())
-        self.apply_button.setDefault(True)
-        self.apply_button.clicked.connect(self._to_clipboard)
-        row.addWidget(self.apply_button)
-        return row
 
     def _install_shortcuts(self):
         """キーは QShortcut で持つ(keyPressEvent だとスライダーやコンボに先に食われる)。"""
@@ -1510,7 +1773,7 @@ class BgRemoveWindow(QWidget):
                 self._entries = [entry]
             self._colors_changed()
         except Exception:
-            self.status.setText(f"スポイトに失敗しました: {_log_exception('pick')}")
+            self._set_status(f"スポイトに失敗しました: {_log_exception('pick')}", "error")
 
     def _remove_entry(self, index):
         try:
@@ -1518,7 +1781,7 @@ class BgRemoveWindow(QWidget):
                 del self._entries[index]
             self._colors_changed()
         except Exception:
-            self.status.setText(f"背景色を消せませんでした: {_log_exception('remove color')}")
+            self._set_status(f"背景色を消せませんでした: {_log_exception('remove color')}", "error")
 
     def _remove_protect(self, index):
         try:
@@ -1526,7 +1789,7 @@ class BgRemoveWindow(QWidget):
                 del self._protect[index]
             self._colors_changed()
         except Exception:
-            self.status.setText(f"残す点を消せませんでした: {_log_exception('remove protect')}")
+            self._set_status(f"残す点を消せませんでした: {_log_exception('remove protect')}", "error")
 
     def _protect_points(self):
         return [entry["pos"] for entry in self._protect]
@@ -1542,17 +1805,20 @@ class BgRemoveWindow(QWidget):
             self._apply_auto_tolerance()
         self._schedule()
 
-    def _rebuild_swatches(self):
-        while self._swatch_row.count():
-            item = self._swatch_row.takeAt(0)
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
+    SWATCH_COLUMNS = 5
+
+    def _rebuild_swatches(self):
+        self._clear_layout(self._swatch_grid)
         if not self._entries:
-            empty = QLabel("（なし）")
-            empty.setObjectName("bgNote")
-            empty.setFont(self._font(8))
-            self._swatch_row.addWidget(empty)
+            self._swatch_grid.addWidget(self._note("（なし）クリックで指定"), 0, 0)
         for index, entry in enumerate(self._entries):
             box = QWidget()
             inner = QHBoxLayout(box)
@@ -1560,9 +1826,7 @@ class BgRemoveWindow(QWidget):
             inner.setSpacing(0)
             chip = QLabel()
             chip.setFixedSize(22, 22)
-            chip.setStyleSheet(
-                f"background-color: {_hex(entry['color'])}; border: 1px solid #808080;"
-                " border-radius: 3px;")
+            chip.setStyleSheet(swatch_style(entry["color"]))
             where = "自動推定" if entry["seed"] is None else f"({entry['seed'][0]}, {entry['seed'][1]}) から"
             chip.setToolTip(f"{_hex(entry['color'])}  {where}")
             inner.addWidget(chip)
@@ -1572,18 +1836,15 @@ class BgRemoveWindow(QWidget):
             remove.setToolTip("この背景色を外す")
             remove.clicked.connect(lambda _c=False, i=index: self._remove_entry(i))
             inner.addWidget(remove)
-            self._swatch_row.addWidget(box)
+            self._swatch_grid.addWidget(box, index // self.SWATCH_COLUMNS,
+                                        index % self.SWATCH_COLUMNS)
         self._rebuild_protect_list()
         self.source_view.set_markers(self._seeds(), self._protect_points())
 
     def _rebuild_protect_list(self):
-        while self._protect_row.count():
-            item = self._protect_row.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        # 1つも無いときは見出しごと隠す(使わない人には行を短く見せたい)。
-        self._protect_heading.setVisible(bool(self._protect))
+        self._clear_layout(self._protect_list)
+        if not self._protect:
+            self._protect_list.addWidget(self._note("Ctrl+クリックで追加"))
         for index, entry in enumerate(self._protect):
             x, y = entry["pos"]
             box = QWidget()
@@ -1593,16 +1854,13 @@ class BgRemoveWindow(QWidget):
             # 残す色のチップ。緑の ✓ は「残す」印で、その左に実際に残す色を並べる
             # (薄い青と薄い黄を両方登録したとき、どれがどれか見分けるため)。
             swatch = QLabel()
-            swatch.setFixedSize(16, 16)
-            swatch.setStyleSheet(
-                f"background-color: {_hex(entry['color'])}; border: 1px solid #808080;"
-                " border-radius: 3px;")
+            swatch.setFixedSize(18, 18)
+            swatch.setStyleSheet(swatch_style(entry["color"]))
             swatch.setToolTip(f"残す色 {_hex(entry['color'])}")
             inner.addWidget(swatch)
-            chip = QLabel(f"✓ {x},{y}")
-            chip.setFont(self._font(8))
-            chip.setStyleSheet(
-                "background-color: #16a34a; color: #ffffff; border-radius: 3px; padding: 2px 5px;")
+            chip = QLabel(f"✓ 残す　{_hex(entry['color'])}　({x}, {y})")
+            chip.setObjectName("bgKeepChip")
+            chip.setFont(self._font(FONT_SMALL))
             chip.setToolTip(
                 f"色で抜く: {_hex(entry['color'])} に近い色を背景から切り離して残し、"
                 f"({x}, {y}) を含む部分も残す\nAIの結果: ({x}, {y}) を含む半透明の部分を不透明にする")
@@ -1613,12 +1871,22 @@ class BgRemoveWindow(QWidget):
             remove.setToolTip("この残す点を外す")
             remove.clicked.connect(lambda _c=False, i=index: self._remove_protect(i))
             inner.addWidget(remove)
-            self._protect_row.addWidget(box)
+            inner.addStretch(1)
+            self._protect_list.addWidget(box)
+
+    def _set_status(self, text, level=""):
+        """状態欄に出す。level は "" / "warning" / "error"(色は配色から)。"""
+        self.status.setText(text)
+        self.status.setToolTip(text)
+        if self.status.property("level") != level:
+            self.status.setProperty("level", level)
+            self.status.style().unpolish(self.status)
+            self.status.style().polish(self.status)
 
     def _on_hover(self, x, y):
         try:
             if x < 0:
-                self.status.setText(self._summary)
+                self._set_status(self._summary, self._summary_level)
                 return
             color = tuple(int(c) for c in self._rgb[y, x])
             text = f"({x}, {y})  {_hex(color)}"
@@ -1628,25 +1896,37 @@ class BgRemoveWindow(QWidget):
                 dist, _ = color_distance(np.array([[color]], dtype=np.uint8), self._colors(),
                                          offset if coeffs is not None else None)
                 text += f"  背景色との差 ΔE {float(dist[0, 0]):.1f}"
-            self.status.setText(text)
+            self._set_status(text)
         except Exception:
             pass  # 状態表示が出ないだけ。ホバーごとに例外を積むよりは黙る
 
     # ------------------------------------------------------------------
     # 抜き方
     # ------------------------------------------------------------------
+    def _selected_method(self):
+        """パネルで選ばれている抜き方(AI がまだ走っていなくても AI を返す)。"""
+        return METHOD_AI if self.ai_mode_button.isChecked() else METHOD_COLOR
+
     def _method(self):
-        if self.ai_radio.isChecked() and self._ai_alpha is not None:
+        """実際に計算に使う抜き方。AI を選んでいても結果がまだ無ければ色で抜く。"""
+        if self._selected_method() == METHOD_AI and self._ai_alpha is not None:
             return METHOD_AI
         return METHOD_COLOR
 
-    def _on_method_changed(self, _checked=None):
-        self._update_method_controls()
-        self._schedule()
+    def _on_method_clicked(self, _button=None):
+        try:
+            # AI を選んだのに結果がまだ無ければ、そのまま実行を始める(選んだ＝やりたい)。
+            if (self._selected_method() == METHOD_AI and self._ai_alpha is None
+                    and not self._ai_running):
+                self._start_ai()
+            self._update_method_controls()
+            self._schedule()
+        except Exception:
+            self._set_status(f"抜き方を切り替えられませんでした: {_log_exception('method')}", "error")
 
     def _update_method_controls(self):
-        method = self._method()
-        page = 1 if method == METHOD_AI else 0
+        selected = self._selected_method()
+        page = 1 if selected == METHOD_AI else 0
         self.mode_pages.setCurrentIndex(page)
         # 隠れているページの高さぶん空白が残らないよう、見えていないページは大きさを
         # 主張させない(QStackedWidget は既定で全ページの最大の大きさを取る)。
@@ -1655,12 +1935,10 @@ class BgRemoveWindow(QWidget):
                 QSizePolicy.Preferred,
                 QSizePolicy.Preferred if i == page else QSizePolicy.Ignored)
         self.mode_pages.adjustSize()
-        note = METHOD_NOTES[method]
-        self.method_note.setText(note)
-        self.method_note.setToolTip(note)
-        # AIの結果では背景色は抜く判定に使わず、色かぶり除去だけに使う。見出しで言っておかないと
-        # 「背景色を変えたのに結果が変わらない」と迷う。
-        self._bg_heading.setText("背景色（色かぶり除去に使用）" if method == METHOD_AI else "背景色")
+        self.ai_box.setVisible(selected == METHOD_AI)
+        self.ai_button.setText("やり直す" if self._ai_alpha is not None else "実行")
+        self.method_note.setText(METHOD_NOTES[selected])
+        self.bg_ai_note.setVisible(selected == METHOD_AI)
 
     def _set_preview_bg(self, key):
         self._preview_bg = key
@@ -1674,6 +1952,7 @@ class BgRemoveWindow(QWidget):
         self.ai_button.setEnabled(False)
         self.model_combo.setEnabled(False)
         self.ai_status.setText("AIで抜いています…（初回はライブラリの読み込みに数十秒かかります）")
+        self._update_method_controls()
         thread = threading.Thread(
             target=_ai_worker, args=(self._ai_bridge, self._rgb, model),
             name="bg_remove-ai", daemon=True,
@@ -1687,13 +1966,17 @@ class BgRemoveWindow(QWidget):
             self.model_combo.setEnabled(True)
             if not result.get("ok"):
                 self.ai_status.setText(f"AIで抜けませんでした: {result.get('error', '')}")
+                # 一度も結果が無いまま AI を選んだ状態にしておくと、効かない AI の項目が
+                # 並んだままになる。色で抜くへ戻す。
+                if self._ai_alpha is None:
+                    self.color_mode_button.setChecked(True)
+                self._update_method_controls()
+                self._schedule()
                 return
             self._ai_alpha = result["alpha"]
             self._ai_alpha_preview, _ = resize_long_side(self._ai_alpha, PREVIEW_LONG_SIDE)
-            self.ai_status.setText(f"{result['model']}  {result['seconds']:.1f}秒")
-            self.ai_radio.setEnabled(True)
-            self.ai_radio.setToolTip("")
-            self.ai_radio.setChecked(True)  # toggled 経由で描き直しが走る
+            self.ai_status.setText(f"{result['model']}　{result['seconds']:.1f}秒")
+            self.ai_mode_button.setChecked(True)
             self._update_method_controls()
             self._schedule()
         except Exception:
@@ -1798,7 +2081,7 @@ class BgRemoveWindow(QWidget):
             self._apply_auto_tolerance()
             self._schedule()
         except Exception:
-            self.status.setText(f"許容量を測れませんでした: {_log_exception('auto tolerance click')}")
+            self._set_status(f"許容量を測れませんでした: {_log_exception('auto tolerance click')}", "error")
 
     def _on_tolerance_moved(self, _value):
         if not self._setting_tolerance:
@@ -1873,19 +2156,26 @@ class BgRemoveWindow(QWidget):
             else:
                 out = f"{self._width}×{self._height}"
             self._summary = f"透明 {transparent:.0f}%  ·  出力 {out}px"
+            warnings = ""
             if (opaque == 0).all():
                 hint = ("「これより薄い部分は消す」を下げてください" if self._method() == METHOD_AI
                         else "許容量を下げてください")
-                self._summary += f"  ·  全部透明になっています（{hint}）"
-            self._summary += self._point_warnings()
-            self.status.setText(self._summary)
-            # 窓が狭いと状態欄の末尾(残す点の警告など)が切れるので、全文をツールチップにも置く。
-            self.status.setToolTip(self._summary)
+                warnings += f"  ·  全部透明になっています（{hint}）"
+            if self._selected_method() == METHOD_AI and self._ai_running:
+                warnings += "  ·  AIで抜いている間は、色で抜いた結果を出しています"
+            warnings += self._point_warnings()
+            self._summary += warnings
+            # 警告があるときは目立つ色にする(読み流されると、残したつもりの所が抜けたまま
+            # 載ってしまう)。
+            self._summary_level = "warning" if warnings else ""
+            self._set_status(self._summary, self._summary_level)
         except Exception:
             self._summary = ""
-            self.status.setText(f"計算に失敗しました: {_log_exception('preview')}")
+            self._summary_level = "error"
+            self._set_status(f"計算に失敗しました: {_log_exception('preview')}", "error")
 
     _summary = ""
+    _summary_level = ""
     _seed_rejected = ()
 
     def _point_warnings(self) -> str:
@@ -1922,7 +2212,7 @@ class BgRemoveWindow(QWidget):
                 except Exception:
                     pass
         except Exception:
-            self.status.setText(f"原寸での計算に失敗しました: {_log_exception('final')}")
+            self._set_status(f"原寸での計算に失敗しました: {_log_exception('final')}", "error")
             return None
 
     def _to_clipboard(self):
@@ -1935,7 +2225,7 @@ class BgRemoveWindow(QWidget):
             show_toast(f"背景を透過\nクリップボードへ載せました（{image.width()}×{image.height()}）")
             self.close()
         except Exception:
-            self.status.setText(f"クリップボードへ載せられませんでした: {_log_exception('clipboard')}")
+            self._set_status(f"クリップボードへ載せられませんでした: {_log_exception('clipboard')}", "error")
 
     def _default_save_path(self):
         folder = _section(self._app_settings).get("last_dir") or ""
@@ -1956,14 +2246,14 @@ class BgRemoveWindow(QWidget):
             if image is None:
                 return
             if not image.save(path, "PNG"):
-                self.status.setText(f"保存できませんでした: {path}")
+                self._set_status(f"保存できませんでした: {path}", "error")
                 return
             _save_values(self._app_settings, self._settings_path,
                          {"last_dir": os.path.dirname(path)})
-            self.status.setText(f"保存しました: {path}")
+            self._set_status(f"保存しました: {path}")
             show_toast(f"背景を透過\n保存しました\n{os.path.basename(path)}")
         except Exception:
-            self.status.setText(f"保存に失敗しました: {_log_exception('save')}")
+            self._set_status(f"保存に失敗しました: {_log_exception('save')}", "error")
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):
@@ -2092,6 +2382,8 @@ def main(argv=None) -> int:
     # 終わり方は自分で決める。閉じ際に出したトースト(Qt.Tool の窓)を見せ切るまで
     # 待ちたいが、既定のままだと本体の窓が閉じた瞬間にプロセスが終わって消える。
     app.setQuitOnLastWindowClosed(False)
+    # このプロセスの部品すべてを、OS の配色ではなくこの窓の配色で描く(THEME の説明を参照)。
+    apply_theme(app)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
 

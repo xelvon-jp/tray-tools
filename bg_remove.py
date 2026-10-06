@@ -139,6 +139,11 @@ AUTO_TOLERANCE_MAX = 40
 # 色かぶり除去で背景色を差し引くので白く光らない(テストで確かめてある)。
 KEEP_R0 = 0.25
 KEEP_R1 = 0.5
+# 残す色が、拾った場所の背景の色からこれ(または背景のムラの大きさのどちらか大きいほう)
+# 以下しか離れていなければ、残す色としては使わない。背景そのものを Ctrl+クリックすると、
+# 背景とほぼ同じ色が残す色になり、背景のノイズの半分ほどが「残す色のほうが近い」と
+# 判定されて、背景がまだらに残った(しかも何の警告も出なかった)。
+KEEP_MIN_DE = 3.0
 KEEP_MEDIAN = 5
 
 # ---- 背景のムラ・グラデーションへの追従(fit_background_offset) ----
@@ -409,16 +414,16 @@ def local_background_rgb(colors, index, offset):
     return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
 
 
-def auto_tolerance(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORDER_PX) -> int:
-    """外周の画素から背景のムラの上限を測り、許容量の目安(ΔE、整数)を返す。
+def background_noise(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORDER_PX):
+    """外周の背景のムラの大きさ(ΔE の p99)。測れなければ None。
 
-    外周 border px の画素と背景色との ΔE を集め、AUTO_OUTLIER_DE を超えるもの(外周に
-    掛かった被写体)を外してから p99 を取り、少し余裕を足す。AI の図解の白背景は、
-    ムラが ΔE 1〜3 程度しかないのに、上に載る薄いボックスとの差も ΔE 5〜15 しかない。
-    固定の初期値(以前は 12)では箱ごと抜けてしまうので、画像ごとにムラの実測から決める。"""
+    外周 border px の画素と背景色(offset があればその場所の面の値)との ΔE を集め、
+    AUTO_OUTLIER_DE を超えるもの(外周に掛かった被写体)を外してから p99 を取る。
+    許容量の自動(auto_tolerance)と、残す色が背景と見分けられるか(keep_color_usable の
+    基準)の両方に使う。"""
     rgb = np.asarray(rgb)
     if not colors:
-        return AUTO_TOLERANCE_MIN
+        return None
     h, w = rgb.shape[:2]
     b = max(1, min(int(border), h // 2 or 1, w // 2 or 1))
     dist, _ = color_distance(rgb, list(colors), offset)
@@ -432,9 +437,51 @@ def auto_tolerance(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORD
     sample = dist[mask]
     sample = sample[sample < AUTO_OUTLIER_DE]
     if len(sample) == 0:
+        return None
+    return float(np.percentile(sample, 99))
+
+
+def auto_tolerance(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORDER_PX) -> int:
+    """外周の背景のムラ(background_noise)から、許容量の目安(ΔE、整数)を返す。
+
+    ムラの上限に少し余裕を足す。AI の図解の白背景は、ムラが ΔE 1〜3 程度しかないのに、
+    上に載る薄いボックスとの差も ΔE 5〜15 しかない。固定の初期値(以前は 12)では箱ごと
+    抜けてしまうので、画像ごとにムラの実測から決める。"""
+    noise = background_noise(rgb, colors, offset, alpha, border)
+    if noise is None:
         return AUTO_TOLERANCE_MIN
-    value = float(np.percentile(sample, 99)) * AUTO_MARGIN_RATIO + AUTO_MARGIN_DE
+    value = noise * AUTO_MARGIN_RATIO + AUTO_MARGIN_DE
     return int(max(AUTO_TOLERANCE_MIN, min(AUTO_TOLERANCE_MAX, np.ceil(value))))
+
+
+def keep_color_usable(keep_colors, positions, bg_colors, noise=None,
+                      coeffs=None, h: int = 1, w: int = 1):
+    """各残す色を使ってよいか(bool のリスト)と、拾った場所の背景との ΔE のリストを返す。
+
+    拾った場所 (x, y) での背景の色(ムラに追従していれば面の値)と比べ、ΔE が
+    max(noise, KEEP_MIN_DE) 以下なら使わない。noise は背景のムラの大きさ
+    (background_noise)で、その内側の色は背景のノイズと見分けがつかない。
+
+    基準に許容量(スライダー)を使わないこと。残す色は、許容量を上げたときに
+    その内側に入ってしまう薄い箱を救うためのもので、許容量で無効にすると、
+    いちばん必要な場面で効かなくなる(実際にそう作って、許容量 12 で薄い箱が
+    抜けた)。"""
+    keep_colors = list(keep_colors or ())
+    if not keep_colors:
+        return [], []
+    if not bg_colors:
+        return [True] * len(keep_colors), [float("inf")] * len(keep_colors)
+    keep_lab = to_lab(np.asarray(keep_colors, dtype=np.uint8).reshape(-1, 3))
+    if coeffs is not None:
+        # 拾った色からその場所のずれを引いて「ずれの無い色」にし、背景色と比べる
+        # (= 拾った場所での背景の色 bg + ずれ と比べるのと同じ)。
+        keep_lab = keep_lab - np.array([offset_at(coeffs, x, y, h, w) for x, y in positions],
+                                       dtype=np.float32).reshape(-1, 3)
+    bg_lab = to_lab(np.asarray(bg_colors, dtype=np.uint8).reshape(-1, 3))
+    diff = keep_lab[:, None, :] - bg_lab[None, :, :]
+    distances = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
+    threshold = max(float(noise or 0.0), KEEP_MIN_DE)
+    return [bool(d > threshold) for d in distances], [float(d) for d in distances]
 
 
 def scale_points(points, scale: float):
@@ -978,6 +1025,7 @@ def build_style() -> str:
     QLabel#bgStatus[level="error"] {{ color: {t['error']}; }}
     QLabel#bgKeepChip {{ background-color: {t['keep']}; color: {t['keep_text']};
         border-radius: 3px; padding: 2px 6px; }}
+    QLabel#bgKeepChip:disabled {{ background-color: {t['field']}; color: {t['disabled']}; }}
     QFrame#bgSeparator {{ background-color: {t['separator']}; border: none;
         min-height: 1px; max-height: 1px; }}
     QPushButton {{ background-color: {t['field']}; color: {t['text']};
@@ -1231,6 +1279,9 @@ class BgRemoveWindow(QWidget):
         # 距離の計算は背景色が変わったときだけで済む(スライダーでは変わらない)。
         self._dist_cache = {}
         self._gradient_cache = None
+        self._keep_usable_cache = None
+        self._base_coeffs_cache = None
+        self._shown_protect_state = None
         self._ai_alpha = None
         self._ai_alpha_preview = None
         self._ai_running = False
@@ -1794,8 +1845,39 @@ class BgRemoveWindow(QWidget):
     def _protect_points(self):
         return [entry["pos"] for entry in self._protect]
 
+    def _keep_usable(self):
+        """各残す点の色を、色で抜くときに使うか(bool のリスト)。
+
+        背景のムラは、残す色を使わずに当てはめた面で測る(使えるかどうかを決める前に、
+        その色を当てはめから外すと、背景そのものの色を外すことになって面が崩れる)。"""
+        if not self._protect:
+            return []
+        key = (tuple(self._colors()), self.follow_check.isChecked(),
+               tuple((e["color"], e["pos"]) for e in self._protect))
+        if self._keep_usable_cache is not None and self._keep_usable_cache[0] == key:
+            return self._keep_usable_cache[1]
+        coeffs = None
+        if self.follow_check.isChecked() and self._colors():
+            base_key = (tuple(self._colors()),)
+            if self._base_coeffs_cache is None or self._base_coeffs_cache[0] != base_key:
+                self._base_coeffs_cache = (
+                    base_key, fit_background_offset(self._p_rgb, self._colors()))
+            coeffs = self._base_coeffs_cache[1]
+        # 基準は背景のムラの大きさ(許容量のつまみには依存させない。keep_color_usable 参照)。
+        offset = background_offset(coeffs, *self._p_rgb.shape[:2])
+        noise = background_noise(self._p_rgb, self._colors(), offset, self._p_src_alpha)
+        usable, _distances = keep_color_usable(
+            [e["color"] for e in self._protect], self._protect_points(), self._colors(),
+            noise, coeffs, self._height, self._width)
+        self._keep_usable_cache = (key, usable)
+        return usable
+
+    def _active_protect(self):
+        """色で抜くときに使う残す点(背景とほぼ同じ色のものを除く)。"""
+        return [e for e, ok in zip(self._protect, self._keep_usable()) if ok]
+
     def _keep_colors(self):
-        return [entry["color"] for entry in self._protect]
+        return [entry["color"] for entry in self._active_protect()]
 
     def _colors_changed(self):
         self._rebuild_swatches()
@@ -1811,6 +1893,9 @@ class BgRemoveWindow(QWidget):
             item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # deleteLater だけだと、消えるまでの間(次にイベントループが回るまで)古い行が
+                # 新しい行と並んで見えることがある。先に隠しておく。
+                widget.hide()
                 widget.deleteLater()
 
     SWATCH_COLUMNS = 5
@@ -1845,10 +1930,19 @@ class BgRemoveWindow(QWidget):
         self._clear_layout(self._protect_list)
         if not self._protect:
             self._protect_list.addWidget(self._note("Ctrl+クリックで追加"))
+        usable = self._keep_usable() if self._selected_method() == METHOD_COLOR else []
+        self._shown_protect_state = self._protect_state()
         for index, entry in enumerate(self._protect):
             x, y = entry["pos"]
+            # 色で抜くときに使っていない残す色(背景とほぼ同じ色)。行は消さずに薄く出す
+            # (背景色を指し直すなどして基準を超えれば、そこから使われる)。
+            unused = bool(usable) and not usable[index]
             box = QWidget()
-            inner = QHBoxLayout(box)
+            outer = QVBoxLayout(box)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(1)
+            inner = QHBoxLayout()
+            outer.addLayout(inner)
             inner.setContentsMargins(0, 0, 0, 0)
             inner.setSpacing(2)
             # 残す色のチップ。緑の ✓ は「残す」印で、その左に実際に残す色を並べる
@@ -1872,7 +1966,17 @@ class BgRemoveWindow(QWidget):
             remove.clicked.connect(lambda _c=False, i=index: self._remove_protect(i))
             inner.addWidget(remove)
             inner.addStretch(1)
+            if unused:
+                swatch.setEnabled(False)
+                chip.setEnabled(False)
+                chip.setText(f"使っていない　{_hex(entry['color'])}　({x}, {y})")
+                outer.addWidget(self._note("背景とほぼ同じ色のため使っていません"))
             self._protect_list.addWidget(box)
+
+    def _protect_state(self):
+        """残す点の一覧の見た目を決める状態。変わったときだけ一覧を作り直す。"""
+        usable = tuple(self._keep_usable()) if self._selected_method() == METHOD_COLOR else ()
+        return (self._selected_method(), usable, len(self._protect))
 
     def _set_status(self, text, level=""):
         """状態欄に出す。level は "" / "warning" / "error"(色は配色から)。"""
@@ -2046,13 +2150,17 @@ class BgRemoveWindow(QWidget):
         coeffs = self._gradient_coeffs()
         offset = self._offset(preview)
         rgb = self._p_rgb if preview else self._rgb
-        key = (self._gradient_key(), tuple(self._protect_points()))
+        active = self._active_protect()
+        if not active:
+            return None
+        points = [e["pos"] for e in active]
+        key = (self._gradient_key(), tuple(points))
 
         def make():
             color_offsets = None
             if coeffs is not None:
                 color_offsets = [offset_at(coeffs, x, y, self._height, self._width)
-                                 for x, y in self._protect_points()]
+                                 for x, y in points]
             return color_distance(rgb, self._keep_colors(), offset, color_offsets)[0]
 
         return self._cached("keep", preview, key, make)
@@ -2111,7 +2219,8 @@ class BgRemoveWindow(QWidget):
                 report=True,
             )
             if preview:
-                self._protect_rejected = rejected
+                points = self._protect_points()
+                self._protect_rejected = [points[i] for i in rejected if i < len(points)]
                 self._seed_rejected = [ai_seeds[i] for i in seed_rejected]
             offset = None
             if decontam:
@@ -2124,12 +2233,16 @@ class BgRemoveWindow(QWidget):
                 self.feather_slider.value(),
                 self.range_combo.currentData(),
                 seeds=scale_points(self._seeds(), scale),
-                protect=scale_points(self._protect_points(), scale),
+                # 背景とほぼ同じ色の点は、点の成分を残す処理にも使わない(背景の上の点なので、
+                # 「外側の背景とつながっている」の警告が重ねて出るだけになる)。
+                protect=scale_points([e["pos"] for e in self._active_protect()], scale),
                 report=True,
                 keep_dist=self._keep_distance(preview),
             )
             if preview:
-                self._protect_rejected = rejected
+                active_points = [e["pos"] for e in self._active_protect()]
+                self._protect_rejected = [active_points[i] for i in rejected
+                                          if i < len(active_points)]
         background = None
         if decontam and offset is not None:
             background = local_background_rgb(colors, index, offset)
@@ -2143,6 +2256,10 @@ class BgRemoveWindow(QWidget):
 
     def _refresh_preview(self):
         try:
+            # 許容量や抜き方を変えると、残す色が使える/使えないが入れ替わる。一覧の見た目を
+            # それに合わせる(変わったときだけ作り直す。毎回だとつまみを動かすたびにちらつく)。
+            if self._protect_state() != self._shown_protect_state:
+                self._rebuild_protect_list()
             rgba = self.compute(preview=True)
             self.result_view.set_image(array_to_qimage(rgba))
             opaque = rgba[..., 3]
@@ -2181,9 +2298,13 @@ class BgRemoveWindow(QWidget):
     def _point_warnings(self) -> str:
         """効かなかった点の説明。点のリストは両モード共通なので、モードごとに理由を変える。"""
         text = ""
-        points = self._protect_points()
-        where = "、".join(f"({points[i][0]}, {points[i][1]})"
-                         for i in self._protect_rejected if i < len(points))
+        where = "、".join(f"({x}, {y})" for x, y in self._protect_rejected)
+        if self._method() == METHOD_COLOR:
+            unused = [e["pos"] for e, ok in zip(self._protect, self._keep_usable()) if not ok]
+            if unused:
+                spots = "、".join(f"({x}, {y})" for x, y in unused)
+                text += (f"  ·  残す色 {spots}: 背景とほぼ同じ色です。"
+                         "背景ではない部分を Ctrl+クリックしてください")
         if self._method() == METHOD_AI:
             if where:
                 text += (f"  ·  残す点 {where}: AIが背景と判定した部分か、背景まで含む広すぎる範囲の"

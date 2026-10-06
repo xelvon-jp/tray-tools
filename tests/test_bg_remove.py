@@ -423,6 +423,83 @@ def test_keep_color_ramp_matches_mixture_ratio():
     assert alpha[3] == 0.0 and alpha[15] == 1.0            # 端の近くは揺れても振り切る
 
 
+def _keep_from_point(rgb, point, tol, follow=True):
+    """UI と同じ手順: 拾った色が使えるか判定し、使える残す色だけで抜く。"""
+    h, w = rgb.shape[:2]
+    bg = br.estimate_background(rgb)
+    base = br.fit_background_offset(rgb, [bg]) if follow else None
+    noise = br.background_noise(rgb, [bg], br.background_offset(base, h, w))
+    keep = [tuple(int(c) for c in rgb[point[1], point[0]])]
+    usable, distances = br.keep_color_usable(keep, [point], [bg], noise, base, h, w)
+    active = [c for c, ok in zip(keep, usable) if ok]
+    coeffs = br.fit_background_offset(rgb, [bg], active) if follow else None
+    offset = br.background_offset(coeffs, h, w)
+    dist, _ = br.color_distance(rgb, [bg], offset)
+    keep_dist = None
+    if active:
+        offsets = [br.offset_at(coeffs, *point, h, w)] if coeffs is not None else None
+        keep_dist, _ = br.color_distance(rgb, active, offset, offsets)
+    alpha = br.compute_alpha(dist, tol, 2, keep_dist=keep_dist,
+                             protect=[point] if active else [])
+    return usable, distances, alpha
+
+
+def _plain_background_mask(rgb):
+    background = np.ones(rgb.shape[:2], bool)
+    for box in DIAGRAM_BOXES.values():
+        background &= ~_box_mask(rgb.shape, box, -12)
+    return background & ~_text_mask(rgb)
+
+
+def test_keep_point_on_background_is_ignored_at_any_tolerance():
+    """背景そのものを Ctrl+クリックしても、許容量によらず使わない(背景がまだらに残らない)。"""
+    rgb = _diagram()
+    background = _plain_background_mask(rgb)
+    for point in ((600, 60), (30, 30), (1150, 760)):     # 中央の上・四隅(ビネットで暗い所)
+        for tol in (0, 2, 12, 40):
+            usable, distances, alpha = _keep_from_point(rgb, point, tol)
+            assert usable == [False], (point, tol, distances)
+            if tol >= 2:
+                assert (alpha[background] == 0.0).mean() > 0.9999, (point, tol)
+    # 比べ: 判定を通さずにそのまま残す色にすると、背景の画素が点々と残る
+    # (r を中央値で均してあるのでこの素材では 1% 前後。ノイズの多い実画像ではもっと多い)
+    h, w = rgb.shape[:2]
+    bg = br.estimate_background(rgb)
+    offset = br.background_offset(br.fit_background_offset(rgb, [bg]), h, w)
+    dist, _ = br.color_distance(rgb, [bg], offset)
+    keep_dist, _ = br.color_distance(rgb, [tuple(int(c) for c in rgb[60, 600])], offset)
+    raw = br.compute_alpha(dist, 2, 2, keep_dist=keep_dist)
+    assert (raw[background] > 0).mean() > 0.005
+
+
+def test_keep_color_of_faint_box_stays_usable_at_high_tolerance():
+    """残す色は許容量の内側に入った薄い箱を救うためのもの。許容量を上げても無効にしない。"""
+    rgb = _diagram()
+    point = DIAGRAM_BOXES["faint"][6]
+    inside = _box_mask(rgb.shape, DIAGRAM_BOXES["faint"], 6)
+    background = _plain_background_mask(rgb)
+    for tol in (2, 6, 12):
+        usable, distances, alpha = _keep_from_point(rgb, point, tol)
+        assert usable == [True], (tol, distances)
+        assert alpha[inside].min() == 1.0, tol
+        assert (alpha[background] == 0.0).mean() > 0.9999, tol
+    # 残す色が無ければ、許容量 12 ではこの箱(背景との差 ΔE 6 前後)は抜けてしまう
+    _usable, _d, bare = _keep_from_point(rgb, (600, 60), 12)
+    assert bare[inside].mean() < 0.5
+
+
+def test_keep_color_threshold_uses_noise_not_tolerance():
+    bg = (246, 245, 241)
+    keep = (232, 236, 246)                                 # 背景から ΔE 6〜7 の薄い青
+    assert br.keep_color_usable([keep], [(0, 0)], [bg], noise=1.5)[0] == [True]
+    # ムラが大きい画像では、その内側の色は背景と見分けられないので使わない
+    assert br.keep_color_usable([keep], [(0, 0)], [bg], noise=8.0)[0] == [False]
+    # 下限 KEEP_MIN_DE: ムラが測れない(0)ときでも、背景から ΔE 3 以内の色は使わない
+    near = (244, 244, 241)
+    usable, d = br.keep_color_usable([near], [(0, 0)], [bg], noise=0.0)
+    assert d[0] <= br.KEEP_MIN_DE and usable == [False]
+
+
 def test_keep_color_equal_to_background_does_nothing():
     rgb = _canvas(20, 20, (240, 240, 240))
     dist, _ = br.color_distance(rgb, [(240, 240, 240)])

@@ -37,6 +37,7 @@ import pushover
 import screen_mirror
 import screen_ruler
 import snippets
+import teams_meeting
 import browser_open
 import capture_grab
 import taskbar_widget
@@ -178,6 +179,14 @@ class _AgentLoopBridge(QObject):
     state_changed = Signal(dict)
 
 
+class _TeamsMeetingBridge(QObject):
+    """一人会議の立ち上げ(teams_meeting の子プロセス)の進み具合を、読み役のスレッドから
+    メインスレッドへ渡す器。_AgentLoopBridge と同じ理由(ScreenFeature は QObject では
+    なく、トーストは Qt の窓なのでワーカーから直に作ると壊れる)。"""
+
+    event = Signal(dict)
+
+
 class ScreenFeature:
     """Featureの規約: コンストラクタでQSystemTrayIconを1つ構築してself.tray_iconに保持し、
     hotkeys()で{"設定キー名": 関数}を返す。"""
@@ -314,6 +323,16 @@ class ScreenFeature:
             on_child_exit=self._on_copilot_watchdog_exited,
         )
         self._copilot_watchdog_action = None  # メニュー項目(後で作る)
+
+        # Teams の一人会議の立ち上げ(teams_meeting.py)。UIA は常駐の中で使えないので
+        # (pycaw と同居すると即死する。copilot_watchdog.py 冒頭)、実処理は子プロセス。
+        # ここが持つのは子の参照と「テーマを聞いている最中か」だけ。
+        self._teams_meeting_proc = None
+        self._teams_meeting_asking = False
+        # 子の読み役スレッドからの知らせをメインスレッドで受ける橋。参照を持たないと
+        # GC で消え、シグナルの接続ごと失われる。
+        self._teams_meeting_bridge = _TeamsMeetingBridge()
+        self._teams_meeting_bridge.event.connect(self._on_teams_meeting_event)
 
         # マウスジグラー。「時限で有効化 → 残り時間を出す → 時間が来たら自動解除」は
         # スリープ抑止とまったく同じ形なので、メニューの組み立ても状態の持ち方も揃えてある。
@@ -457,6 +476,14 @@ class ScreenFeature:
         # 下位機能に見えてしまう。加えて、以前は「監視モード開始」という項目が
         # 並んでいて「監視」が2つの別物を指していた。親を Copilot にして、
         # ループ側は「エージェントループ」と名乗らせることで重複を解いた。
+        # 一人会議の立ち上げ。トップに置く: 続けて何度も使う(毎回新しい会議を立てる)
+        # 操作で、Copilot に渡すための前段なので Copilot の傘のすぐ上に並べる。
+        # サブメニューに入れないのは、Copilot の傘の中身(状態監視・エージェントループ)
+        # とは相手のアプリも性質も違うため。
+        self.menu.addAction(
+            self._with_hotkey("🎙 一人会議を開始…", hotkey_config.get("teams_meeting")),
+            lambda: self.start_teams_meeting("menu"),
+        )
         self._agent_loop_menu = self.menu.addMenu(AGENT_LOOP_MENU_TITLE)
         # 状態監視バー(独立機能。エージェントループが動いている間は休む)。
         # チェック項目にして、いま ON/OFF どちらかがひと目で分かるようにする。
@@ -655,6 +682,8 @@ class ScreenFeature:
             "screen_mirror": self.start_screen_mirror,
             "screen_mirror_stop": self.stop_screen_mirror,
             "screen_mirror_freeze": self.toggle_screen_mirror_freeze,
+            # Teams の一人会議を立ち上げる(テーマを聞いてから子プロセスで進める)。
+            "teams_meeting": lambda: self.start_teams_meeting("hotkey"),
         }
 
     @staticmethod
@@ -930,6 +959,101 @@ class ScreenFeature:
         except Exception as e:
             # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
             self._notify("背景を透過", f"起動できませんでした\n{e}")
+
+    # ---------------------------------------------------------------
+    # Teams の一人会議(teams_meeting.py。UIA の実処理は子プロセス)
+    # ---------------------------------------------------------------
+    def _teams_meeting_running(self) -> bool:
+        proc = self._teams_meeting_proc
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:  # noqa: BLE001  読めないなら「動いているかも」に倒す
+            return True
+
+    def start_teams_meeting(self, source: str = "menu") -> None:
+        """テーマを聞いて会議名を作り、立ち上げの子プロセスを起こす。
+
+        ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので、全体を try で受ける。
+
+        【実行中にもう一度呼ばれたら知らせて無視する】
+        2本走ると、同じ Teams の同じダイアログを取り合って、会議名が片方の値で
+        上書きされたり、片方の「会議を開始」がもう片方の会議を始めたりする。
+
+        【トーストで「キー入力を控えて」と言う理由】
+        Teams の「今すぐ会議」のダイアログは開くとフォーカスを取る。別の窓で打っていた
+        文字が会議名に混ざった実例がある(「susum」)。こちらは読み戻して入れ直すが、
+        打った文字が別の窓へ届かなくなるのはどうにもならないので、先に知らせる。"""
+        try:
+            if self._teams_meeting_asking:
+                return  # テーマの入力欄が既に出ている
+            if self._teams_meeting_running():
+                show_toast("一人会議\n立ち上げの途中です（実行中です）。終わるまで待ってください")
+                return
+            config = teams_meeting.load_config(self.app_settings)
+            fmt = config["title_format"]
+            topic = ""
+            if teams_meeting.needs_topic(fmt):
+                # 入力欄は定型文の {input} と同じく QInputDialog。会議名は1行なので
+                # 複数行ではなく getText にする(Enter で決定できるほうが速い)。
+                self._teams_meeting_asking = True
+                try:
+                    topic, ok = QInputDialog.getText(
+                        None, "一人会議を開始",
+                        "テーマ（空でも可。会議名の末尾に付きます）",
+                    )
+                finally:
+                    self._teams_meeting_asking = False
+                if not ok:
+                    return
+            title = teams_meeting.format_title(fmt, topic)
+            action_log.record("一人会議 開始", title, source)
+            show_toast(
+                f"一人会議を立ち上げます\n会議名: {title}\n"
+                "数秒間キー入力を控えてください（Teams が入力欄にフォーカスを取ります）",
+                5000,
+            )
+            self._teams_meeting_proc = teams_meeting.spawn(
+                title, on_event=self._on_teams_meeting_event_thread)
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("一人会議の開始")
+            self._notify("一人会議", f"立ち上げを始められませんでした\n{e}")
+
+    def _on_teams_meeting_event_thread(self, payload: dict) -> None:
+        """子の読み役スレッドから呼ばれる。Qt に触らずシグナルで渡すだけ。"""
+        try:
+            self._teams_meeting_bridge.event.emit(payload)
+        except Exception as e:  # noqa: BLE001  ここで投げると読み役が止まる
+            print(f"[teams_meeting] 知らせを渡せません: {e}", file=sys.stderr)
+
+    def _on_teams_meeting_event(self, payload: dict) -> None:
+        """メインスレッドで受ける。手順ごとに action.log へ残し、終わったら知らせる。
+
+        手順ごとに残すのは、止まったときに「どこまで進んだか」を後から辿れるように
+        するため(トーストは数秒で消える)。"""
+        try:
+            event = payload.get("event")
+            if event == "step_end":
+                action_log.record(
+                    f"一人会議 {payload.get('label', payload.get('key', '?'))}",
+                    f"{payload.get('status', '?')} {payload.get('detail', '')}".strip(),
+                    "teams_meeting",
+                )
+            elif event == "done":
+                self._teams_meeting_proc = None
+                outcome = "成功" if payload.get("ok") else (
+                    f"停止: {payload.get('stopped_label') or '?'}")
+                action_log.record(
+                    "一人会議 終了",
+                    f"{outcome} / 文字起こし={payload.get('transcript')} / "
+                    f"{payload.get('title', '')}",
+                    "teams_meeting",
+                )
+                # 結果は読んでから手で続けることがあるので、既定より長く出す。
+                show_toast(teams_meeting.describe_result(payload), 8000)
+        except Exception:  # noqa: BLE001  スロットで投げ切ると常駐ごと落ちる
+            self._log_failure("一人会議の知らせ")
 
     # ---------------------------------------------------------------
     # フォルダブックマーク
@@ -2058,6 +2182,10 @@ class ScreenFeature:
             blockers.append("画面ミラー(状態を読めず)")
         if self._agent_loop_active:
             blockers.append("エージェントループ")
+        if self._teams_meeting_running():
+            # 子は常駐が落ちても最後まで進むが、結果の知らせと記録が受け手ごと消える。
+            # 長くても数分(各手順の待ちの合計)で終わるので、待ってもらうほうが安い。
+            blockers.append("一人会議の立ち上げ")
         if self.sleep_seconds_left() is not None:
             # 予約は再起動で消える。寝るつもりだったのに寝ないのは、
             # 気づきにくいぶん厄介。

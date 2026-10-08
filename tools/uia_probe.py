@@ -1,6 +1,7 @@
 # tools/uia_probe.py
 # Copilot 系アプリの UI Automation ツリーを覗いて、
 # copilot_loop のプロファイル候補を提案する調査ツール。
+# --teams では、Teams の一人会議の立ち上げ(teams_meeting.py)の手順も調べる。
 #
 # 【何のためのファイルか】
 # 業務PCの M365 Copilot など、別のアプリで動かすにはプロファイル(窓のクラス、
@@ -20,6 +21,9 @@
 #   --exe "M365Copilot.exe" --watch 30   1往復させながら調べる
 #   --check                      仕込んだプロファイルで掴めるかを診断する
 #   --markers                    発言マーカーの有無を突き止める
+#   --teams [--watch 300]        Teams の一人会議の手順を調べる(teams_meeting.py 用)。
+#                                手で会議を立てる間に新しく出たボタン・メニューを記録し、
+#                                最後に読み上げ用のまとめと settings.json の断片を出す
 #
 # 【読み方】
 #   [窓]           見つけた窓の情報(class / exe / レンダラ / 子孫数)
@@ -640,6 +644,241 @@ def self_check():
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --teams: 一人会議の立ち上げ(teams_meeting.py)の手順を、業務PCで調べる
+# ---------------------------------------------------------------------------
+# 記録する要素の種類。文字起こしの入口はボタンかメニュー項目のどちらかに出るはずで、
+# ダイアログ(Window)は「どの段階で何が出たか」の目印になる。Text は数が多いので、
+# 下の語を含むものだけ拾う(「文字起こしが開始されました」の帯など)。
+TEAMS_TYPES = {50000: "Button", 50031: "SplitButton", 50011: "MenuItem",
+               50032: "Window", 50004: "ComboBox", 50003: "Edit",
+               50002: "CheckBox", 50013: "RadioButton"}
+TEAMS_KEYWORDS = ("文字起こし", "トランスクリプト", "録画", "transcri", "record")
+
+
+def _teams_keyword(text):
+    lowered = (text or "").lower()
+    return any(k.lower() in lowered for k in TEAMS_KEYWORDS)
+
+
+def _teams_stage(hwnd, title, first_hwnds):
+    """要素が出た段階の呼び名。窓の出自とタイトルで決める。
+
+    最初から居た窓はメイン(今すぐ会議のダイアログもここに出る)。あとから出た窓は、
+    タイトルが「会議への参加 | …」なら参加前、それ以外は会議中とみなす(参加すると
+    同じ窓のタイトルが「<会議名> | Microsoft Teams」に変わる。実測)。"""
+    if hwnd in first_hwnds:
+        return "メイン"
+    if title.startswith("会議への参加") or title.lower().startswith("join"):
+        return "参加前"
+    return "会議中"
+
+
+def _teams_snapshot(uia, true_cond, hwnd):
+    """窓の中の記録対象を [(種類, 名前, aid), ...] で返す。起こしてから読む。"""
+    wake_accessibility(hwnd)
+    render = find_render_child(hwnd)
+    if render:
+        wake_accessibility(render)
+    root = uia.ElementFromHandle(ctypes.c_void_p(hwnd))
+    desc = root.FindAll(UIA.TreeScope_Descendants, true_cond)
+    rows = []
+    for i in range(desc.Length):
+        el = desc.GetElement(i)
+        try:
+            t = el.CurrentControlType
+            name = (el.CurrentName or "").strip()
+            aid = (el.CurrentAutomationId or "").strip()
+        except Exception:  # noqa: BLE001  消えかけの要素は飛ばす
+            continue
+        if not (name or aid):
+            continue
+        if t in TEAMS_TYPES:
+            rows.append((TEAMS_TYPES[t], name, aid))
+        elif t == CONTROL_TEXT and _teams_keyword(name):
+            rows.append(("Text", name, aid))
+    return rows
+
+
+def _spec_seen(spec, records):
+    """手順の find が、記録した要素のどれかに当たるか(within は中身を問わず、
+    入れ物が出ていれば良しとする粗い判定)。"""
+    import teams_meeting as tm
+    if not spec:
+        return True
+    if spec.get("within") and not _spec_seen(spec["within"], records):
+        return False
+    types = set(tm._as_list(spec.get("control_type")))
+    aids = set(tm._as_list(spec.get("automation_id")))
+    names = set(tm._as_list(spec.get("name")))
+    prefixes = tm._as_list(spec.get("name_prefix"))
+    for kind, name, aid in records:
+        if types and kind not in types and not (kind == "ComboBox" and "Combo" in types):
+            continue
+        if aid and aid in aids:
+            return True
+        if name in names or any(name.startswith(p) for p in prefixes):
+            return True
+    return False
+
+
+def _teams_transcript_route(records):
+    """記録から「文字起こしの開始」までの経路を組み立てる。組めなければ None。
+
+    どれを押したかは UIA からは分からないので、経路は推測。既定と同じ
+    「その他 → 録画と文字起こし → 文字起こしの開始」の形に、実際に出た名前を当てはめる。"""
+    def lower(r):
+        return r[1].lower()
+
+    starts = [r for r in records if r[0] in ("MenuItem", "Button", "SplitButton")
+              and ("開始" in r[1] or "start" in lower(r))
+              and ("文字起こし" in r[1] or "トランスクリプト" in r[1] or "transcri" in lower(r))]
+    if not starts:
+        return None
+    menus = [r for r in records if r[0] in ("MenuItem", "Button", "SplitButton")
+             and r not in starts
+             and (("録画" in r[1] and "文字起こし" in r[1]) or "record and transcribe" in lower(r))]
+    more = [r for r in records if r[2] == "callingButtons-showMoreBtn"
+            or (r[0] == "Button" and r[1] in ("その他", "More"))]
+
+    def find_of(items):
+        spec = {}
+        aids = list(dict.fromkeys(r[2] for r in items if r[2]))
+        names = list(dict.fromkeys(r[1] for r in items if r[1]))
+        if aids:
+            spec["automation_id"] = aids
+        if names:
+            spec["name"] = names
+        return spec
+
+    route = []
+    if more:
+        route.append({"find": find_of(more[:1]), "action": "expand"})
+    if menus:
+        route.append({"find": find_of(menus), "action": "expand"})
+    route.append({"find": find_of(starts), "action": "invoke"})
+    return route
+
+
+def teams_watch(seconds, exe="ms-teams.exe"):
+    """Teams の窓を見張り、手で会議を立てる間に新しく出た要素を差分で記録する。
+
+    【なぜこの形か】業務PCからはデータを持ち出せず、画面を読み上げるしかない。
+    全部を吐くと数千行になるので、最初から居たものは捨てて「新しく出たもの」だけを
+    段階(メイン / 参加前 / 会議中)つきで流し、最後に数行のまとめを置く。
+    押すのは人。このモードは読むだけで、何も押さない。"""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import teams_meeting as tm
+
+    uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+    true_cond = uia.CreateTrueCondition()
+    first = find_windows(exe=exe)
+    if not first:
+        print(f"{exe} の窓が見つかりません。Teams を開いてから、もう一度実行してください。")
+        print('  (exe 名が違うときは --survey で探して --exe "名前" を付ける)')
+        return 1
+    first_hwnds = {hwnd for hwnd, _c, _t, _e in first}
+    classes = sorted({c for _h, c, _t, _e in first})
+    titles = {}
+    seen = {}         # (種類, 名前, aid) -> 段階
+    order = []        # 出た順
+    print(f"[teams] {exe} の窓 {len(first)}枚 / class={classes}")
+    print(f"  {seconds}秒見張ります(Ctrl+C で早めに終われます)。この間に手で")
+    print("  「今すぐ会議 → 会議を開始 → 今すぐ参加 → 文字起こしの開始」まで進めてください。")
+    print("  最初に見えていたものは記録しません(新しく出たものだけ流します)。")
+    print()
+    baseline = True
+    deadline = time.time() + seconds
+    try:
+        while time.time() < deadline:
+            for hwnd, _cls, title, _e in find_windows(exe=exe):
+                stage = _teams_stage(hwnd, title, first_hwnds)
+                if titles.get(hwnd) != title:
+                    if not baseline:
+                        print(f"  [{time.strftime('%H:%M:%S')}] 窓 {stage}: {title!r}")
+                    titles[hwnd] = title
+                try:
+                    rows = _teams_snapshot(uia, true_cond, hwnd)
+                except Exception as e:  # noqa: BLE001  閉じかけの窓
+                    print(f"  (読めませんでした: {e})")
+                    continue
+                for row in rows:
+                    if row in seen:
+                        continue
+                    seen[row] = None if baseline else stage
+                    if baseline:
+                        continue
+                    order.append((stage, row))
+                    kind, name, aid = row
+                    mark = "★" if _teams_keyword(name) or _teams_keyword(aid) else " "
+                    print(f"  {mark}[{stage}] {kind:<11} {name[:40]!r}  aid={aid[:40]!r}")
+            baseline = False
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n  (中断しました。ここまでの記録でまとめます)")
+
+    records = list(seen)
+    new_records = [row for _stage, row in order]
+
+    # --- 既定の手順で、要素が一度も見えなかったもの ---------------------------
+    config = tm.load_config(None)
+    missing = []
+    for raw in config["steps"]:
+        step = tm._expand(raw, {"title": "", "camera": "off", "mic": "on"})
+        specs = [step["find"]] if step.get("find") else []
+        for route in step.get("routes") or []:
+            specs.extend(sub.get("find") for sub in route if sub.get("find"))
+        for spec in specs:
+            if not _spec_seen(spec, records):
+                missing.append(f"{step['key']}({tm._first_name(spec)})")
+
+    route = _teams_transcript_route(new_records or records)
+    print()
+    print("=" * 68)
+    print("[settings.json に貼る断片] このPCの中でコピーして使う(読み上げ不要)")
+    print("=" * 68)
+    if route:
+        fragment = {"teams_meeting": {"steps": [{"key": "transcript", "routes": [route]}]}}
+        print(json.dumps(fragment, ensure_ascii=False, indent=2))
+        print("  ※ 経路(押す順)は推測です。違っていたら並びを直してください。")
+        print("  ※ 既にある teams_meeting に足すときは、steps の中身だけを移してください。")
+    else:
+        print("  文字起こしを開始する要素が出なかったので、断片は作れません。")
+
+    hits = [(stage, row) for stage, row in order
+            if _teams_keyword(row[1]) or _teams_keyword(row[2])]
+    print()
+    print("#" * 68)
+    print("#  ここから下だけ読み上げれば足ります")
+    print("#" * 68)
+    print(f"  1. 窓: {exe} / class={','.join(classes)}")
+    print("  2. 文字起こし・録画の候補（★）")
+    if not hits:
+        print("     (見つかりません。会議の中で「その他」などを開いてみてください)")
+    for stage, (kind, name, aid) in hits[:6]:
+        print(f"     [{stage}] {kind} {name[:30]!r} aid={aid[:30] or '-'}")
+    print("  3. 既定の手順で見えなかった要素")
+    if missing:
+        for item in missing[:8]:
+            print(f"     {item}")
+        if len(missing) > 8:
+            print(f"     …ほか {len(missing) - 8} 件")
+    else:
+        print("     (全部見えました)")
+    print("  4. 段階ごとに新しく出た主なボタン")
+    for stage in ("メイン", "参加前", "会議中"):
+        rows = [row for s, row in order if s == stage and row[0] in
+                ("Button", "SplitButton", "MenuItem", "Window")]
+        rows.sort(key=lambda r: (not r[2], r[0] != "Window"))  # aid つき・ダイアログを先に
+        if not rows:
+            continue
+        shown = ", ".join(f"{r[1][:16] or r[2][:16]}" + (f"[{r[2][:24]}]" if r[2] else "")
+                          for r in rows[:4])
+        print(f"     {stage}: {shown}")
+    print("#" * 68)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Copilot 系アプリの UIA ツリーを覗いて SELECTORS 候補を出す。")
@@ -660,6 +899,9 @@ def main() -> int:
                         help="窓の中の Button を全部並べる(名前が空のもの・帯の外も含む)")
     parser.add_argument("--markers", action="store_true",
                         help="1往復の前後を比べて発言マーカーの有無を突き止める")
+    parser.add_argument("--teams", action="store_true",
+                        help="Teams を見張り、手で一人会議を立てる間に出た要素を差分で記録する"
+                             "(秒数は --watch。既定300。--exe で exe 名を変えられる)")
     parser.add_argument("--watch", type=int, default=0,
                         help="この秒数だけ下段のボタン変化を眺める")
     parser.add_argument("--top-px", type=int, default=170,
@@ -700,6 +942,8 @@ def main() -> int:
 
 
 def _run(args) -> int:
+    if args.teams:
+        return teams_watch(args.watch or 300, exe=args.exe or "ms-teams.exe")
     if args.check:
         return self_check()
     if args.markers:

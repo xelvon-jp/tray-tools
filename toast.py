@@ -21,7 +21,7 @@ _current = None
 class Toast(QWidget):
     """枠なし・最前面・クリック透過の通知パネル。一定時間で自分をフェードアウトして閉じる。"""
 
-    def __init__(self, text: str):
+    def __init__(self, text: str, visible_ms: int = VISIBLE_MS):
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -47,7 +47,7 @@ class Toast(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fade_out)
-        self._timer.start(VISIBLE_MS)
+        self._timer.start(int(visible_ms or VISIBLE_MS))
 
     def _move_to_corner(self):
         """カーソルのある画面の右下に出す。primaryScreen固定だとマルチモニタで
@@ -106,9 +106,12 @@ def dismiss() -> None:
         _current = None
 
 
-def show_toast(text: str) -> None:
-    """即時表示の通知を出す。短時間に連続して呼ばれても積み上がらず、常に最新の1枚だけ残る。"""
+def show_toast(text: str, visible_ms: int = VISIBLE_MS) -> None:
+    """即時表示の通知を出す。短時間に連続して呼ばれても積み上がらず、常に最新の1枚だけ残る。
+
+    visible_ms は消え始めるまでの時間。既定の1.6秒は「押した結果が出た」程度の知らせ向け。
+    読んでから手で続ける必要がある知らせ(一人会議の立ち上げの結果など)は長めに渡す。"""
     global _current
     dismiss()
-    _current = Toast(text)
+    _current = Toast(text, visible_ms)
     _current.show()

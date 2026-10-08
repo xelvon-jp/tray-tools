@@ -320,6 +320,26 @@ DEFAULT_SETTINGS = {
         "model": "isnet-general-use",
         "preview_bg": "checker",
     },
+    # Teams の一人会議を立ち上げる(teams_meeting.py)。「今すぐ会議 → 会議名 → 開始 →
+    # 参加 → 文字起こしの開始」を UIA だけで進める(キー送信・マウスは使わない)。
+    #   title_format … 会議名。{date:書式} / {time} / {datetime} は定型文と同じ書き方、
+    #     {topic} は開始時に入力欄で聞く(空でもよく、残った空白は詰める)。{topic} を
+    #     書かなければ聞かない。日時を入れるのは名前をユニークにして、Copilot に
+    #     「『一人会議 10/08 14:30 ○○』の内容をまとめて」と名前で頼めるようにするため
+    #   camera / mic … 参加前の画面で揃える状態。"on" / "off" / "keep"(触らない)。
+    #     状態はボタン名から読む(「カメラをオンにします」なら今オフ)
+    #   steps … 手順の上書き・追加。[{"key": "transcript", ...}, ...] の形で、既定の
+    #     手順と同じ key なら書いた項目だけ差し替わる。新しい key は "after" / "before"
+    #     で位置を決めて足せる。"disabled": true で飛ばせる。業務PCでコードを直さずに
+    #     ボタン名の違いを吸収するための口(tools/uia_probe.py --teams が断片を出す)
+    #   app … 窓の探し方(process_name / window_class / launch)の上書き
+    #   poll_seconds … 要素を探し直す間隔(秒)
+    "teams_meeting": {
+        "title_format": "一人会議 {date:%m/%d %H:%M} {topic}",
+        "camera": "off",
+        "mic": "on",
+        "steps": [],
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",
@@ -364,6 +384,10 @@ DEFAULT_SETTINGS = {
         # e は erase の e。既に使っている h,r,s,m,c,t,v,l,o,b,w,p,q,f と win+j の
         # どれとも重ならない。
         "bg_remove": "ctrl+alt+e",
+        # Teams の一人会議を立ち上げる(teams_meeting.py)。n は new の n(毎回新しい
+        # 会議を立てるためのキー)。既に使っている h,r,s,m,c,t,v,l,o,b,w,p,q,f,e と
+        # win+j のどれとも重ならない。
+        "teams_meeting": "ctrl+alt+n",
     },
 }
 

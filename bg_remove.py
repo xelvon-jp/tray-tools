@@ -178,6 +178,10 @@ SMOOTH_SIGMA_MAX = 3.0
 MATTE_BAND_EXTRA = 1          # 未確定の帯の半径 = 2σ + これ
 MATTE_FG_SIGMA = 4.0          # 近くの前景の色を平均する範囲
 MATTE_MIN_CONTRAST = 1.5      # 前景と背景の差(ΔE)がこれ未満なら、混ざり具合は読まない
+MATTE_FOREIGN_DE = 4.0        # 画素の色が B→F の線からこれ以上外れたら、混ざりではなく別の部品(輪郭線など)
+MATTE_LINE_SIGMA = 1.5        # 輪郭線の色を拾う範囲
+MATTE_LINE_NEAR = 0.05        # 輪郭線の重みがこれを超える所を「線に接する」とみなす
+MATTE_RESIDUAL_RATIO = 0.5    # …または F と B の差のこの割合以上外れたら
 MATTE_SHARPEN_WIDTH = 2.5     # 均した縁を締め直す倍率(ぼけた段差の幅 ≒ 2.5σ)
 MATTE_SNR_LOW = 3.0           # 前景と背景の差 / 画素のノイズ がこれ以下なら均した t だけ
 MATTE_SNR_HIGH = 8.0          # これ以上なら画素ごとの t だけ。その間は混ぜる
@@ -699,8 +703,18 @@ def matte_edges(flat, background, region_alpha, sigma: float, smooth=None, noise
             break  # 帯の画素すべてに前景の色が届いた。広い範囲を探すまでもない
     span = fg - background
     span2 = np.einsum("ijk,ijk->ij", span, span)
-    t = np.einsum("ijk,ijk->ij", flat - background, span) / np.maximum(span2, 1e-6)
-    t = np.clip(t, 0.0, 1.0).astype(np.float32)
+    rel = flat - background
+    t_raw = np.einsum("ijk,ijk->ij", rel, span) / np.maximum(span2, 1e-6)
+    # B と F の混ざりでは説明できない色(B→F の線から大きく外れる)は、別の色の部品。
+    # 白い塗りの外側を囲む灰色の細い輪郭線は、帯にまるごと入り、F には内側の白が
+    # 来る。そのまま射影すると「白より背景寄り＝透明」になり、輪郭線が消えていた
+    # (実機のアイコン一覧で、雲や吹き出しの輪郭が抜けた)。
+    off_line = rel - t_raw[..., None] * span
+    residual = np.sqrt(np.einsum("ijk,ijk->ij", off_line, off_line))
+    behind = (t_raw < 0) & (np.sqrt(np.einsum("ijk,ijk->ij", rel, rel)) > MATTE_FOREIGN_DE)
+    foreign = band & ((residual > np.maximum(MATTE_FOREIGN_DE, MATTE_RESIDUAL_RATIO * np.sqrt(span2)))
+                      | behind)
+    t = np.clip(t_raw, 0.0, 1.0).astype(np.float32)
     t = cv2.medianBlur(np.ascontiguousarray(t), 3)
     if smooth is not None and noise:
         # 前景と背景の差がノイズに比べて小さい縁では、画素ごとの t がノイズで暴れ、縁が
@@ -718,6 +732,31 @@ def matte_edges(flat, background, region_alpha, sigma: float, smooth=None, noise
         t = (mix * t + (1.0 - mix) * ts).astype(np.float32)
     weak = (span2 < MATTE_MIN_CONTRAST ** 2) | ~have
     t = np.where(weak, region.astype(np.float32), t)
+
+    if foreign.any():
+        # 輪郭線(foreign)の扱い。線は内と外を分ける壁なので
+        #   - 線そのものは残す(領域の判定のまま)
+        #   - 線の内側(背景の芯へ線を越えずには行けない帯の画素)は、塗りの続き。残す
+        #   - 線の外側で線に接する画素は「線の色と背景」の混ざりとして読む
+        # とする。外側を内側の塗りの色で読むと、JPEG が濃い線の脇に作る明るいにじみ
+        # (リンギング)を「白い塗りと背景の混ざり」と取り違え、線の外に白い縁取りが
+        # 残った。線の色と比べれば、背景より明るいにじみは逆向きなので透明になる。
+        passable = (~foreign & ~fg_core).astype(np.uint8)
+        count, labels = cv2.connectedComponents(passable, connectivity=4)
+        reach = np.zeros(count, dtype=bool)
+        reach[np.unique(labels[bg_core])] = True
+        reach[0] = False
+        outside = reach[labels]
+        line, line_den = _blur_normalized(flat, foreign.astype(np.float32), MATTE_LINE_SIGMA)
+        near_line = line_den > MATTE_LINE_NEAR
+        line_span = line - background
+        line_span2 = np.einsum("ijk,ijk->ij", line_span, line_span)
+        t_line = np.einsum("ijk,ijk->ij", rel, line_span) / np.maximum(line_span2, 1e-6)
+        t_line = np.clip(t_line, 0.0, 1.0).astype(np.float32)
+        region_f = region.astype(np.float32)
+        t = np.where(foreign, region_f, t)
+        t = np.where(band & ~outside & ~foreign, region_f, t)
+        t = np.where(band & outside & near_line & ~foreign, t_line, t)
     alpha = np.where(band, t, region.astype(np.float32))
     return alpha.astype(np.float32)
 

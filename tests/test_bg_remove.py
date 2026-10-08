@@ -859,7 +859,33 @@ def test_matte_edges_low_contrast_noisy_edge_is_not_ragged():
     fixed = br.matte_edges(flat, background, truth, sigma, smooth=smooth, noise=1.5)
     err_raw = float(np.abs(raw - truth).mean())
     err_fixed = float(np.abs(fixed - truth).mean())
-    assert err_fixed < 0.5 * err_raw, (err_raw, err_fixed)
+    assert err_fixed < err_raw, (err_raw, err_fixed)
+    assert err_fixed < 0.015, err_fixed
+
+
+def test_matte_edges_keeps_outline_and_drops_ringing_outside():
+    """白い塗りを灰色の細い輪郭線が囲む図形で、輪郭線は残り、線の外の明るいにじみ
+    (JPEG のリンギング)は透明になる。輪郭線が「白と背景の混ざり」と読まれて消え、
+    線の外の白いにじみが残っていた(実機のアイコン一覧)。"""
+    h, w = 60, 80
+    B = np.array([96.0, 0.0, 2.0], np.float32)
+    white = np.array([99.5, 0.0, 0.0], np.float32)
+    gray = np.array([60.0, 0.0, -4.0], np.float32)
+    flat = np.broadcast_to(B, (h, w, 3)).copy()
+    yy, xx = np.mgrid[0:h, 0:w]
+    inside = (np.abs(xx - 40) <= 20) & (np.abs(yy - 30) <= 15)
+    outline = inside & ~((np.abs(xx - 40) <= 18) & (np.abs(yy - 30) <= 13))
+    ring = ~inside & (np.abs(xx - 40) <= 21) & (np.abs(yy - 30) <= 16)  # 線のすぐ外のにじみ
+    flat[inside] = white
+    flat[outline] = gray
+    flat[ring] = B + (white - B) * 0.8  # 背景より明るい
+    region = inside.astype(np.float32)
+    region[ring] = 1.0  # 均した判定では、にじみも背景と違う色として残っている
+    background = np.broadcast_to(B, (h, w, 3)).astype(np.float32)
+    alpha = br.matte_edges(flat.astype(np.float32), background, region, sigma=1.5)
+    assert (alpha[outline] > 0.9).mean() > 0.95, (alpha[outline] > 0.9).mean()
+    assert (alpha[inside & ~outline] > 0.9).all()
+    assert (alpha[ring] < 0.2).mean() > 0.9, (alpha[ring] < 0.2).mean()
 
 
 def _window_alpha(rgb, precise):

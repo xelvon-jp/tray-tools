@@ -167,6 +167,24 @@ GRADIENT_SEED_BAND = 0.08
 # ---- AIの結果に対する補正(refine_ai_alpha) ----
 # 残す点: AI がこれ以下と判定した画素は「AI が背景と言い切った場所」とみなし、点を打っても
 # 効かせない(効かなかった点として報告する)。
+# 精密モード(境目を混ざり具合から計算する)。背景と色の近い淡い箱を、画素ごとの
+# 色の差ではなく「均した面の色」で背景と分け、境目だけ混ざり具合で透明度を出す。
+# 値の根拠は matte_edges / smoothing_sigma の docstring を参照。
+NOISE_PROBE_SIGMA = 1.5       # ノイズを測るときに差し引く、ぼかしの強さ
+SMOOTH_SIGMA_BASE = 1.0
+SMOOTH_SIGMA_PER_NOISE = 0.9
+SMOOTH_SIGMA_MIN = 1.0
+SMOOTH_SIGMA_MAX = 3.0
+MATTE_BAND_EXTRA = 1          # 未確定の帯の半径 = 2σ + これ
+MATTE_FG_SIGMA = 4.0          # 近くの前景の色を平均する範囲
+MATTE_MIN_CONTRAST = 1.5      # 前景と背景の差(ΔE)がこれ未満なら、混ざり具合は読まない
+MATTE_SHARPEN_WIDTH = 2.5     # 均した縁を締め直す倍率(ぼけた段差の幅 ≒ 2.5σ)
+MATTE_SNR_LOW = 3.0           # 前景と背景の差 / 画素のノイズ がこれ以下なら均した t だけ
+MATTE_SNR_HIGH = 8.0          # これ以上なら画素ごとの t だけ。その間は混ぜる
+SPECK_CONTRAST_RATIO = 2.0    # 粒の背景との差がこの倍率×許容量に届かなければ、ノイズの粒とみなす
+PRECISE_MARGIN_DE = 0.3       # 精密モードの自動の許容量 = ムラ × 1.15 + これ
+PRECISE_TOLERANCE_MIN = 1.0
+TOLERANCE_STEP = 0.5          # 許容量のつまみの刻み(ΔE)。精密モードでは 1 刻みだと粗すぎる
 AI_PROTECT_FLOOR = 0.05
 # 残す点で不透明にする範囲は「点の値のこの割合より濃い部分」の連結成分。a > FLOOR の成分を
 # まるごと不透明にすると、実写の接地影(白い牛の足元で 0.2〜0.3 程度)や、トラックの荷台の
@@ -417,6 +435,12 @@ def local_background_rgb(colors, index, offset):
     return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
 
 
+def lab_to_rgb255(lab) -> np.ndarray:
+    """Lab(HxWx3)→ RGB(0〜255 の float32)。色かぶり除去の B に使う。"""
+    rgb = cv2.cvtColor(np.ascontiguousarray(lab, dtype=np.float32), cv2.COLOR_Lab2RGB)
+    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
+
+
 def background_noise(rgb, colors, offset=None, alpha=None, border: int = AUTO_BORDER_PX):
     """外周の背景のムラの大きさ(ΔE の p99)。測れなければ None。
 
@@ -496,6 +520,206 @@ def scale_points(points, scale: float):
     if scale >= 1.0:
         return [(int(x), int(y)) for x, y in points or ()]
     return [(int((x + 0.5) * scale), int((y + 0.5) * scale)) for x, y in points or ()]
+
+
+def estimate_pixel_noise(rgb, border: int = AUTO_BORDER_PX) -> float:
+    """画素ごとのノイズ(ざらつき)の大きさ(ΔE)を外周の帯で測る。
+
+    少しぼかした画像との差(高周波の成分)の p90 を取る。背景色との差で測ると、ムラや
+    ビネットまでノイズに数えてしまう(それは面の当てはめで別に扱う)ので、局所的な
+    ばらつきだけを見る。外周に被写体が掛かっていても、その縁は帯のごく一部なので
+    p90 はほとんど動かない。"""
+    rgb = np.asarray(rgb)
+    h, w = rgb.shape[:2]
+    lab = to_lab(rgb)
+    high = lab - cv2.GaussianBlur(lab, (0, 0), NOISE_PROBE_SIGMA)
+    b = max(1, min(int(border), h // 2 or 1, w // 2 or 1))
+    mask = np.zeros((h, w), dtype=bool)
+    mask[:b, :] = True
+    mask[-b:, :] = True
+    mask[:, :b] = True
+    mask[:, -b:] = True
+    return float(np.percentile(np.linalg.norm(high[mask], axis=1), 90))
+
+
+def smoothing_sigma(noise: float) -> float:
+    """ノイズの大きさから、領域の判定に使う平滑化の強さ(ガウスの σ、px)を決める。
+
+    合成の図解(ノイズ σ 0〜6 を JPEG で圧縮)で、σ 1.5 は弱いノイズで縁が最も正確だが
+    強いノイズで明るいグレーの箱が抜け、σ 2.5 はその逆だった。ノイズの実測(p90)が
+    0.12 / 0.51 / 0.96 / 1.72 のとき、それぞれ 1.1 / 1.5 / 1.9 / 2.5 になる式にしてある。"""
+    return float(np.clip(SMOOTH_SIGMA_BASE + SMOOTH_SIGMA_PER_NOISE * float(noise),
+                         SMOOTH_SIGMA_MIN, SMOOTH_SIGMA_MAX))
+
+
+def smooth_lab(lab, sigma: float) -> np.ndarray:
+    return cv2.GaussianBlur(np.ascontiguousarray(lab, dtype=np.float32), (0, 0), float(sigma))
+
+
+def lab_distance(lab, targets):
+    """Lab の画像(HxWx3)から、いちばん近い目標の色(Lab、Nx3)までの ΔE と番号。
+
+    color_distance と同じ戻り値だが、ムラを差し引いて均した Lab(精密モード)を
+    そのまま受ける。targets が空なら距離は全部 inf。"""
+    lab = np.asarray(lab, dtype=np.float32)
+    h, w = lab.shape[:2]
+    index = np.zeros((h, w), dtype=np.int32)
+    targets = np.asarray(targets, dtype=np.float32).reshape(-1, 3)
+    if len(targets) == 0:
+        return np.full((h, w), np.inf, dtype=np.float32), index
+    dist = None
+    for i, target in enumerate(targets):
+        diff = lab - target
+        d = np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))
+        if dist is None:
+            dist = d
+        else:
+            closer = d < dist
+            dist = np.where(closer, d, dist)
+            index[closer] = i
+    return dist.astype(np.float32), index
+
+
+def noise_from_distance(dist, alpha=None, border: int = AUTO_BORDER_PX):
+    """距離の画像の外周の帯から、背景のムラの大きさ(p99)を測る。測れなければ None。
+    background_noise と同じ考え方で、距離をすでに持っているとき(精密モード)に使う。"""
+    dist = np.asarray(dist)
+    h, w = dist.shape[:2]
+    b = max(1, min(int(border), h // 2 or 1, w // 2 or 1))
+    mask = np.zeros((h, w), dtype=bool)
+    mask[:b, :] = True
+    mask[-b:, :] = True
+    mask[:, :b] = True
+    mask[:, -b:] = True
+    if alpha is not None:
+        mask &= np.asarray(alpha) > 0
+    sample = dist[mask]
+    sample = sample[sample < AUTO_OUTLIER_DE]
+    if len(sample) == 0:
+        return None
+    return float(np.percentile(sample, 99))
+
+
+def precise_tolerance(noise) -> float:
+    """精密モードの許容量の目安(ΔE、TOLERANCE_STEP 刻み)。
+
+    均した画像の距離はノイズで揺れないので、auto_tolerance(余裕 +1、整数に切り上げ)
+    より詰めてよい。ノイズの強い合成図解(σ6)で、背景のムラ 1.9 に対し明るいグレーの
+    箱が 2.7 しか離れておらず、整数に切り上げた 4 では箱ごと抜けた。"""
+    if noise is None:
+        return PRECISE_TOLERANCE_MIN
+    value = noise * AUTO_MARGIN_RATIO + PRECISE_MARGIN_DE
+    value = np.ceil(value / TOLERANCE_STEP) * TOLERANCE_STEP
+    return float(max(PRECISE_TOLERANCE_MIN, min(AUTO_TOLERANCE_MAX, value)))
+
+
+def drop_faint_specks(region_alpha, dist, tolerance: float, sigma: float):
+    """背景の中に島のように残った、小さくて淡い粒を背景に戻す。
+
+    均した画像でも、ノイズがたまたま固まった所が許容量をわずかに超えて点々と残る
+    (黒地に置くと白い粒に見える)。均した範囲(面積 πσ²)より小さく、しかも背景との
+    差が許容量の SPECK_CONTRAST_RATIO 倍に届かない粒だけを消す。文字の点や細い線の
+    切れ端は差が大きいので残る。"""
+    region = (np.asarray(region_alpha) >= 0.5).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+    if count <= 1:
+        return np.asarray(region_alpha, dtype=np.float32)
+    min_area = int(np.ceil(np.pi * float(sigma) ** 2))
+    small = stats[:, cv2.CC_STAT_AREA] < min_area
+    small[0] = False
+    if not small.any():
+        return np.asarray(region_alpha, dtype=np.float32)
+    peak = np.zeros(count, dtype=np.float32)
+    np.maximum.at(peak, labels.reshape(-1), np.asarray(dist, dtype=np.float32).reshape(-1))
+    faint = small & (peak < float(tolerance) * SPECK_CONTRAST_RATIO)
+    return np.where(faint[labels], 0.0, region_alpha).astype(np.float32)
+
+
+def _blur_normalized(values, weight, sigma: float):
+    """重み付きの平均(重みの無い所は 0)。値と重みを同じだけぼかして割る。
+
+    広いぼかしを原寸で掛けるとプレビューの描き直しが 1 回 250ms かかった(つまみを
+    動かすたびに走る)。平均を取るだけなので、縮めてからぼかして戻しても結果は
+    ほぼ変わらない。σ/2 倍に縮め、σ 2 でぼかし、双線形で戻す。"""
+    h, w = weight.shape[:2]
+    factor = max(1, int(sigma // 2))
+    num = np.ascontiguousarray(values * weight[..., None], dtype=np.float32)
+    den = np.ascontiguousarray(weight, dtype=np.float32)
+    if factor > 1:
+        size = (max(1, w // factor), max(1, h // factor))
+        num = cv2.resize(num, size, interpolation=cv2.INTER_AREA)
+        den = cv2.resize(den, size, interpolation=cv2.INTER_AREA)
+    num = cv2.GaussianBlur(num, (0, 0), sigma / factor)
+    den = cv2.GaussianBlur(den, (0, 0), sigma / factor)
+    if factor > 1:
+        num = cv2.resize(num, (w, h), interpolation=cv2.INTER_LINEAR)
+        den = cv2.resize(den, (w, h), interpolation=cv2.INTER_LINEAR)
+    return num / np.maximum(den[..., None], 1e-6), den
+
+
+def matte_edges(flat, background, region_alpha, sigma: float, smooth=None, noise=None):
+    """領域の判定(region_alpha、0/1)を土台に、境目の画素だけ透明度を計算し直す。
+
+    人が淡い箱を背景と見分けられるのは、画素ごとの色の差ではなく「面の色が揃って
+    違うこと」と「境目で色が切り替わること」による。そこで
+      1. 領域は、ムラを差し引いて均した画像で決める(呼び出し側。ノイズに負けない)
+      2. 領域の境目から半径 r(=2σ+1)の帯だけを「未確定」にする
+      3. 帯の画素は、近くの前景(帯の外の被写体の芯)の色 F と、背景の色 B の
+         どちらにどれだけ寄っているか(C−B を F−B に射影した t)を不透明度にする
+    とする。アンチエイリアスの縁は「F と B が t : 1−t で混ざった色」なので、t は
+    その割合そのものになり、色かぶり除去で B を差し引くと縁の色も正しく戻る。
+
+    flat は均していないムラ抜きの Lab(縁の位置をぼかさないため)、background は
+    各画素での背景の色(同じ空間の Lab、HxWx3)。t は画素のノイズで揺れるので 3×3 の
+    中央値で整える(均したものから t を出すより縁が正確だった)。F と B の差が
+    MATTE_MIN_CONTRAST 未満の所は割合が読めないので、領域の判定をそのまま使う。"""
+    flat = np.asarray(flat, dtype=np.float32)
+    background = np.asarray(background, dtype=np.float32)
+    region = (np.asarray(region_alpha) >= 0.5).astype(np.uint8)
+    r = int(np.ceil(2.0 * float(sigma))) + MATTE_BAND_EXTRA
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    bg_core = cv2.erode(1 - region, kernel) > 0
+    fg_core = cv2.erode(region, kernel) > 0
+    band = ~(bg_core | fg_core)
+    if not band.any():
+        return region.astype(np.float32)
+
+    # 前景の色は芯の部分だけの重み付き平均。帯から芯が遠い(細い線など)と重みが 0 に
+    # なるので、届かなかった所は広い範囲で探し直す。
+    weight = fg_core.astype(np.float32)
+    fg = None
+    for scale in (1, 2, 4):
+        estimate, den = _blur_normalized(flat, weight, MATTE_FG_SIGMA * scale)
+        if fg is None:
+            fg, have = estimate, den > 1e-3
+        else:
+            fg = np.where(have[..., None], fg, estimate)
+            have |= den > 1e-3
+        if not (band & ~have).any():
+            break  # 帯の画素すべてに前景の色が届いた。広い範囲を探すまでもない
+    span = fg - background
+    span2 = np.einsum("ijk,ijk->ij", span, span)
+    t = np.einsum("ijk,ijk->ij", flat - background, span) / np.maximum(span2, 1e-6)
+    t = np.clip(t, 0.0, 1.0).astype(np.float32)
+    t = cv2.medianBlur(np.ascontiguousarray(t), 3)
+    if smooth is not None and noise:
+        # 前景と背景の差がノイズに比べて小さい縁では、画素ごとの t がノイズで暴れ、縁が
+        # 毛羽立つ(σ4 のノイズで淡い箱の縁が 3〜4px にわたってまだらになった)。
+        # そこでは均した画像から t を読み、均したぶん緩んだ傾きを締め直す(ガウスで
+        # ぼけた段差は幅およそ 2.5σ に広がるので、その倍率で 0.5 の周りを引き伸ばす。
+        # 段差の 50% の位置はぼかしても動かないので、縁の位置は保たれる)。
+        # 差が十分大きい縁は、画素ごとの t のほうが正確なので混ぜる割合で切り替える。
+        ts = np.einsum("ijk,ijk->ij", np.asarray(smooth, dtype=np.float32) - background,
+                       span) / np.maximum(span2, 1e-6)
+        stretch = MATTE_SHARPEN_WIDTH * float(sigma)
+        ts = np.clip((ts - 0.5) * stretch + 0.5, 0.0, 1.0).astype(np.float32)
+        snr = np.sqrt(span2) / max(float(noise), 1e-6)
+        mix = np.clip((snr - MATTE_SNR_LOW) / (MATTE_SNR_HIGH - MATTE_SNR_LOW), 0.0, 1.0)
+        t = (mix * t + (1.0 - mix) * ts).astype(np.float32)
+    weak = (span2 < MATTE_MIN_CONTRAST ** 2) | ~have
+    t = np.where(weak, region.astype(np.float32), t)
+    alpha = np.where(band, t, region.astype(np.float32))
+    return alpha.astype(np.float32)
 
 
 def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONNECTED,
@@ -1504,6 +1728,15 @@ class BgRemoveWindow(QWidget):
         self._height, self._width = self._rgb.shape[:2]
 
         self._p_rgb, self._p_scale = resize_long_side(self._rgb, PREVIEW_LONG_SIDE)
+        # 精密モードの平滑化の強さ。ノイズはプレビュー(縮小済み)で測り、原寸には同じ
+        # 広がり(画像に対する割合)になるよう σ / 倍率 を使う。原寸で測り直すと、縮小で
+        # 平均されていない分だけ判定が変わり、プレビューで残った箱が確定で抜けうる。
+        self._p_noise = estimate_pixel_noise(self._p_rgb)
+        self._full_noise = None
+        self._p_sigma = smoothing_sigma(self._p_noise)
+        # 背景のムラの当てはめは、均した画像で行う(ノイズの大きい画像で面が暴れ、
+        # 背景のムラが ΔE 4.8 に膨らんでいた。σ だけぼかすと 1.9 に収まった)。
+        self._p_fit_rgb = cv2.GaussianBlur(self._p_rgb, (0, 0), self._p_sigma)
         self._p_src_alpha = None
         if self._src_alpha is not None:
             self._p_src_alpha, _ = resize_long_side(self._src_alpha, PREVIEW_LONG_SIDE)
@@ -1523,6 +1756,8 @@ class BgRemoveWindow(QWidget):
         self._gradient_cache = None
         self._keep_usable_cache = None
         self._base_coeffs_cache = None
+        self._smooth_raw_cache = None
+        self._targets_cache = None
         self._shown_protect_state = None
         self._ai_alpha = None
         self._ai_alpha_preview = None
@@ -1759,8 +1994,9 @@ class BgRemoveWindow(QWidget):
         layout.addLayout(self._protect_list)
         return layout
 
-    def _make_slider(self, layout, title, maximum, value, tooltip, extra=None):
-        """「ラベル……数値」の1行と、その下にパネル幅いっぱいのスライダー。"""
+    def _make_slider(self, layout, title, maximum, value, tooltip, extra=None, fmt=str):
+        """「ラベル……数値」の1行と、その下にパネル幅いっぱいのスライダー。
+        fmt はつまみの整数値を表示する文字列にする関数(刻みが 1 でないつまみ用)。"""
         header = QHBoxLayout()
         header.setSpacing(6)
         label = QLabel(title)
@@ -1769,7 +2005,7 @@ class BgRemoveWindow(QWidget):
         header.addWidget(label, 1)
         if extra is not None:
             header.addWidget(extra)
-        value_label = QLabel(str(value))
+        value_label = QLabel(fmt(value))
         value_label.setFont(self._font(bold=True))
         value_label.setMinimumWidth(30)
         value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -1780,7 +2016,7 @@ class BgRemoveWindow(QWidget):
         slider.setValue(value)
         slider.setToolTip(tooltip)
         layout.addWidget(slider)
-        slider.valueChanged.connect(lambda v: (value_label.setText(str(v)), self._schedule()))
+        slider.valueChanged.connect(lambda v: (value_label.setText(fmt(v)), self._schedule()))
         return slider, label
 
     def _build_adjust_section(self, section):
@@ -1807,21 +2043,44 @@ class BgRemoveWindow(QWidget):
             "外周の背景のムラ(ばらつきの上限)を測って許容量を決め直す。\n"
             "押されている間は、背景色を変えたときにも測り直す。つまみを動かすと手動に戻る")
         self.auto_tolerance_button.clicked.connect(self._on_auto_tolerance_clicked)
+        # つまみの値は TOLERANCE_STEP 単位の整数(QSlider は整数しか持てない)。読むときは
+        # _tolerance() を通す。
         self.tolerance_slider, self._tolerance_label = self._make_slider(
-            color, "許容量（ΔE）", TOLERANCE_MAX, AUTO_TOLERANCE_MIN,
+            color, "許容量（ΔE）", int(TOLERANCE_MAX / TOLERANCE_STEP),
+            int(AUTO_TOLERANCE_MIN / TOLERANCE_STEP),
             "背景色からこの差(ΔE)までを完全に透明にする。2前後が見分けられる限界の差",
             extra=self.auto_tolerance_button,
+            fmt=lambda v: f"{v * TOLERANCE_STEP:g}",
         )
         self.tolerance_slider.valueChanged.connect(self._on_tolerance_moved)
         color.addSpacing(6)
+        # 精密モード。背景と色の近い淡い箱が抜ける問題(実機で頻発した)への本命の対策。
+        # 既定 ON・覚える。OFF にすると以前の画素ごとの判定に戻る(逃げ道として残す)。
+        self.precise_check = QCheckBox("境目を精密に計算（推奨）")
+        self.precise_check.setFont(self._font())
+        self.precise_check.setChecked(bool(section.get("precise_edges", True)))
+        self.precise_check.setToolTip(
+            "ノイズを均した面の色で背景と被写体を分け、境目だけは色の混ざり具合から\n"
+            "透明度を計算する。背景と色の近い淡い箱やグレーも残りやすく、縁も正確になる。\n"
+            "オフにすると画素ごとの色の差だけで判定する（以前の方式）")
+        self.precise_check.toggled.connect(self._on_precise_toggled)
+        color.addWidget(self.precise_check)
+        color.addSpacing(6)
         # ぼかしは覚える(画像よりも好みで決まる値なので)。キーを feather から edge_feather へ
         # 変えたのは、以前の既定 10 が閉じるたびに書き込まれていて、それを好みとして
-        # 引き継ぐと薄いボックスの縁が溶けるため。
+        # 引き継ぐと薄いボックスの縁が溶けるため。精密モードでは縁を混ざり具合から
+        # 計算するので効かない。効かないつまみは隠す(グレーにしない方針)。
+        self.feather_box = QWidget()
+        feather_layout = QVBoxLayout(self.feather_box)
+        feather_layout.setContentsMargins(0, 0, 0, 0)
+        feather_layout.setSpacing(0)
         self.feather_slider, self._feather_label = self._make_slider(
-            color, "境界のぼかし（ΔE）", FEATHER_MAX,
+            feather_layout, "境界のぼかし（ΔE）", FEATHER_MAX,
             _int_setting(section, "edge_feather", DEFAULT_FEATHER, 0, FEATHER_MAX),
             "許容量からさらにこの差までを、離れるほど不透明になる半透明にする",
         )
+        self.feather_box.setVisible(not self.precise_check.isChecked())
+        color.addWidget(self.feather_box)
         color.addSpacing(8)
         self._build_inside_controls(color)
         self.mode_pages.addWidget(color_page)
@@ -2118,24 +2377,84 @@ class BgRemoveWindow(QWidget):
         その色を当てはめから外すと、背景そのものの色を外すことになって面が崩れる)。"""
         if not self._protect:
             return []
-        key = (tuple(self._colors()), self.follow_check.isChecked(),
+        key = (tuple(self._colors()), self.follow_check.isChecked(), self._precise(),
                tuple((e["color"], e["pos"]) for e in self._protect))
         if self._keep_usable_cache is not None and self._keep_usable_cache[0] == key:
             return self._keep_usable_cache[1]
-        coeffs = None
-        if self.follow_check.isChecked() and self._colors():
-            base_key = (tuple(self._colors()),)
-            if self._base_coeffs_cache is None or self._base_coeffs_cache[0] != base_key:
-                self._base_coeffs_cache = (
-                    base_key, fit_background_offset(self._p_rgb, self._colors()))
-            coeffs = self._base_coeffs_cache[1]
+        coeffs = self._base_coeffs()
         # 基準は背景のムラの大きさ(許容量のつまみには依存させない。keep_color_usable 参照)。
         offset = background_offset(coeffs, *self._p_rgb.shape[:2])
-        noise = background_noise(self._p_rgb, self._colors(), offset, self._p_src_alpha)
-        usable, _distances = keep_color_usable(
-            [e["color"] for e in self._protect], self._protect_points(), self._colors(),
-            noise, coeffs, self._height, self._width)
+        if self._precise():
+            usable = self._keep_usable_precise(coeffs, offset)
+        else:
+            noise = background_noise(self._p_rgb, self._colors(), offset, self._p_src_alpha)
+            usable, _distances = keep_color_usable(
+                [e["color"] for e in self._protect], self._protect_points(), self._colors(),
+                noise, coeffs, self._height, self._width)
         self._keep_usable_cache = (key, usable)
+        return usable
+
+    def _base_coeffs(self):
+        """残す色を使わずに当てはめた背景のムラ(係数)。追従しないなら None。"""
+        if not (self.follow_check.isChecked() and self._colors()):
+            return None
+        base_key = (tuple(self._colors()),)
+        if self._base_coeffs_cache is None or self._base_coeffs_cache[0] != base_key:
+            self._base_coeffs_cache = (
+                base_key, fit_background_offset(self._p_fit_rgb, self._colors()))
+        return self._base_coeffs_cache[1]
+
+    def _smooth_raw_lab(self):
+        """均した Lab(ムラは差し引かない、プレビュー)。拾った点の色を読むのに使う。"""
+        if self._smooth_raw_cache is None:
+            self._smooth_raw_cache = smooth_lab(to_lab(self._p_rgb), self._p_sigma)
+        return self._smooth_raw_cache
+
+    def _flat_value_at(self, coeffs, x, y):
+        """原寸の点 (x, y) の、均してムラを差し引いた Lab。"""
+        smooth = self._smooth_raw_lab()
+        (px, py), = scale_points([(x, y)], self._p_scale)
+        value = smooth[min(py, smooth.shape[0] - 1), min(px, smooth.shape[1] - 1)].copy()
+        if coeffs is not None:
+            value -= offset_at(coeffs, x, y, self._height, self._width)
+        return value.astype(np.float32)
+
+    def _target_labs(self):
+        """精密モードの背景色(ムラ抜きの Lab、Nx3)。
+
+        スポイトで拾った色は1画素の値でノイズを含むので、均した画像のその点の値を使う。
+        自動推定の色(点を持たない)はそのまま Lab にする(外周の中央値なので揺れない)。
+        ムラは残す色を使わない当てはめ(_base_coeffs)で差し引く。残す色の判定がこの値に
+        頼るので、残す色に左右される当てはめを使うと循環する。"""
+        coeffs = self._base_coeffs()
+        key = (tuple((e["color"], e["seed"]) for e in self._entries), self.follow_check.isChecked())
+        if self._targets_cache is not None and self._targets_cache[0] == key:
+            return self._targets_cache[1]
+        values = []
+        for entry in self._entries:
+            if entry["seed"] is None:
+                values.append(to_lab(np.asarray([entry["color"]], dtype=np.uint8))[0])
+            else:
+                values.append(self._flat_value_at(coeffs, *entry["seed"]))
+        targets = np.asarray(values, dtype=np.float32).reshape(-1, 3)
+        self._targets_cache = (key, targets)
+        return targets
+
+    def _keep_usable_precise(self, coeffs, offset):
+        """精密モードでの判定。拾った点の色は均した画像から取る(1画素の値はノイズで
+        ぶれ、背景の上の点がたまたま遠い色に見えたり、その逆が起きたりする)。比べる
+        背景のムラも、均した画像の距離で測る。"""
+        flat = self._smooth_raw_lab()
+        if offset is not None:
+            flat = flat - offset
+        targets = self._target_labs()
+        dist, _ = lab_distance(flat, targets)
+        threshold = max(float(noise_from_distance(dist, self._p_src_alpha) or 0.0), KEEP_MIN_DE)
+        usable = []
+        for x, y in self._protect_points():
+            value = self._flat_value_at(coeffs, x, y)
+            d = float(np.min(np.linalg.norm(targets - value[None, :], axis=1)))
+            usable.append(d > threshold)
         return usable
 
     def _active_protect(self):
@@ -2260,7 +2579,14 @@ class BgRemoveWindow(QWidget):
                 return
             color = tuple(int(c) for c in self._rgb[y, x])
             text = f"({x}, {y})  {_hex(color)}"
-            if self._entries:
+            if self._entries and self._precise():
+                # 判定に使っているのと同じ、均した画像の値で出す(1画素の値で出すと、
+                # 同じ箱の上でもカーソルを動かすたびに数値が跳ねて読めない)。
+                targets = self._target_labs()
+                value = self._flat_value_at(self._base_coeffs(), x, y)
+                d = float(np.min(np.linalg.norm(targets - value[None, :], axis=1)))
+                text += f"  背景色との差 ΔE {d:.1f}（均した値）"
+            elif self._entries:
                 coeffs = self._gradient_coeffs()
                 offset = offset_at(coeffs, x, y, self._height, self._width).reshape(1, 1, 3)
                 dist, _ = color_distance(np.array([[color]], dtype=np.uint8), self._colors(),
@@ -2396,7 +2722,7 @@ class BgRemoveWindow(QWidget):
             return self._gradient_cache[1]
         coeffs = None
         if self.follow_check.isChecked() and self._colors():
-            coeffs = fit_background_offset(self._p_rgb, self._colors(), self._keep_colors())
+            coeffs = fit_background_offset(self._p_fit_rgb, self._colors(), self._keep_colors())
         self._gradient_cache = (key, coeffs)
         return coeffs
 
@@ -2416,10 +2742,67 @@ class BgRemoveWindow(QWidget):
         return self._cached("offset", preview, self._gradient_key(),
                             lambda: background_offset(coeffs, *rgb.shape[:2]))
 
-    def _distance(self, preview: bool):
-        """(背景色までの距離, いちばん近い背景色の番号, 場所ごとのずれ)。"""
+    def _pixel_noise(self, preview: bool) -> float:
+        """画素ごとのノイズの大きさ。縮小すると平均されて小さくなるので、原寸は原寸で測る。"""
+        if preview:
+            return self._p_noise
+        if self._full_noise is None:
+            self._full_noise = estimate_pixel_noise(self._rgb)
+        return self._full_noise
+
+    def _tolerance(self) -> float:
+        return self.tolerance_slider.value() * TOLERANCE_STEP
+
+    def _precise(self) -> bool:
+        check = getattr(self, "precise_check", None)
+        return bool(check is not None and check.isChecked())
+
+    def _on_precise_toggled(self, checked):
+        try:
+            self.feather_box.setVisible(not checked)
+            self._colors_changed()  # 距離の測り方が変わるので、自動の許容量も測り直す
+        except Exception:
+            self._set_status(f"切り替えに失敗しました: {_log_exception('precise toggle')}", "error")
+
+    def _sigma(self, preview: bool) -> float:
+        return self._p_sigma if preview else self._p_sigma / max(self._p_scale, 1e-6)
+
+    def _flat(self, preview: bool):
+        """ムラを差し引いた Lab(均していないもの)。精密モードで縁の混ざり具合を読む。"""
         offset = self._offset(preview)
         rgb = self._p_rgb if preview else self._rgb
+
+        def make():
+            lab = to_lab(rgb)
+            return lab - offset if offset is not None else lab
+
+        return self._cached("flat", preview, self._gradient_key(), make)
+
+    def _flat_smooth(self, preview: bool):
+        """ムラを差し引いて均した Lab。精密モードで領域を決める。ムラの面は滑らかなので、
+        均してから差し引いても、差し引いてから均しても同じとみなしてよい。"""
+        offset = self._offset(preview)
+
+        def make():
+            smooth = (self._smooth_raw_lab() if preview
+                      else smooth_lab(to_lab(self._rgb), self._sigma(False)))
+            return smooth - offset if offset is not None else smooth
+
+        return self._cached("flat_smooth", preview, self._gradient_key(), make)
+
+    def _distance(self, preview: bool):
+        """(背景色までの距離, いちばん近い背景色の番号, 場所ごとのずれ)。
+
+        精密モードでは、均した Lab から、均した画像で読んだ背景色までの距離。"""
+        offset = self._offset(preview)
+        rgb = self._p_rgb if preview else self._rgb
+        if self._precise():
+            targets = self._target_labs()
+            key = (self._gradient_key(), targets.tobytes())
+            dist, index = self._cached(
+                "dist_precise", preview, key,
+                lambda: lab_distance(self._flat_smooth(preview), targets))
+            return dist, index, offset
         dist, index = self._cached("dist", preview, self._gradient_key(),
                                    lambda: color_distance(rgb, self._colors(), offset))
         return dist, index, offset
@@ -2440,6 +2823,15 @@ class BgRemoveWindow(QWidget):
         points = [e["pos"] for e in active]
         key = (self._gradient_key(), tuple(points))
 
+        if self._precise():
+            # 残す色も、均した画像のその点の値(ムラ抜き)から測る。1画素の色はノイズで
+            # ぶれ、残す色と背景色の差がノイズと同じくらいの淡い箱で効き方が揺れる。
+            keep = np.asarray([self._flat_value_at(coeffs, x, y) for x, y in points],
+                              dtype=np.float32)
+            return self._cached(
+                "keep_precise", preview, key + (keep.tobytes(),),
+                lambda: lab_distance(self._flat_smooth(preview), keep)[0])
+
         def make():
             color_offsets = None
             if coeffs is not None:
@@ -2456,14 +2848,20 @@ class BgRemoveWindow(QWidget):
 
     def _apply_auto_tolerance(self):
         try:
-            value = auto_tolerance(self._p_rgb, self._colors(), self._offset(True),
-                                   self._p_src_alpha)
+            if self._precise():
+                # 均した画像の距離で測る(ムラの大きさがノイズのぶん小さく出る。そのぶん
+                # 許容量を小さくでき、淡い箱が残りやすくなる)。
+                dist, _index, _offset = self._distance(True)
+                value = precise_tolerance(noise_from_distance(dist, self._p_src_alpha))
+            else:
+                value = auto_tolerance(self._p_rgb, self._colors(), self._offset(True),
+                                       self._p_src_alpha)
         except Exception:
             _log_exception("auto tolerance")
             return
         self._setting_tolerance = True
         try:
-            self.tolerance_slider.setValue(value)
+            self.tolerance_slider.setValue(int(round(value / TOLERANCE_STEP)))
         finally:
             self._setting_tolerance = False
         self.auto_tolerance_button.setChecked(True)
@@ -2511,10 +2909,12 @@ class BgRemoveWindow(QWidget):
                 _dist, index, offset = self._distance(preview)
         else:
             dist, index, offset = self._distance(preview)
+            precise = self._precise()
             alpha, rejected = compute_alpha(
                 dist,
-                self.tolerance_slider.value(),
-                self.feather_slider.value(),
+                self._tolerance(),
+                # 精密モードでは領域は二値で決め、縁は matte_edges で混ざり具合から出す。
+                0 if precise else self.feather_slider.value(),
                 self.range_combo.currentData(),
                 seeds=scale_points(self._seeds(), scale),
                 # 背景とほぼ同じ色の点は、点の成分を残す処理にも使わない(背景の上の点なので、
@@ -2527,6 +2927,23 @@ class BgRemoveWindow(QWidget):
                 active_points = [e["pos"] for e in self._active_protect()]
                 self._protect_rejected = [active_points[i] for i in rejected
                                           if i < len(active_points)]
+            if precise:
+                background_flat = self._target_labs()[index]
+                alpha = drop_faint_specks(alpha, dist, self._tolerance(), self._sigma(preview))
+                alpha = matte_edges(self._flat(preview), background_flat, alpha,
+                                    self._sigma(preview), smooth=self._flat_smooth(preview),
+                                    noise=self._pixel_noise(preview))
+                if decontam:
+                    # 縁の割合は「この場所の背景の色」との混ざりとして出したので、色かぶり
+                    # 除去も同じ色を差し引く(ずれた色で引くと縁に筋が出る)。
+                    lab = background_flat + offset if offset is not None else background_flat
+                    return compose_rgba(
+                        rgb, alpha, colors, index,
+                        decontaminate_edges=True,
+                        trim=self.trim_check.isChecked(),
+                        src_alpha=src_alpha,
+                        background=lab_to_rgb255(lab),
+                    )
         background = None
         if decontam and offset is not None:
             background = local_background_rgb(colors, index, offset)
@@ -2723,6 +3140,7 @@ class BgRemoveWindow(QWidget):
                 "window_size": [self.width(), self.height()],
                 "edge_feather": self.feather_slider.value(),
                 "follow_gradient": self.follow_check.isChecked(),
+                "precise_edges": self.precise_check.isChecked(),
                 "decontaminate": self.decontam_check.isChecked(),
                 "trim": self.trim_check.isChecked(),
                 "split_icons": self.split_check.isChecked(),

@@ -763,6 +763,135 @@ def test_qimage_roundtrip():
 
 
 # ---------------------------------------------------------------
+# 精密モード(均した面で領域を決め、境目は混ざり具合から計算する)
+# ---------------------------------------------------------------
+NEAR_BG = (246, 245, 241)
+# 背景との差が ΔE 3〜5 しかない淡い図形。人の目でははっきり別物に見える。
+NEAR_SHAPES = [((236, 236, 234), (30, 30, 170, 130)),   # 明るいグレー(明るさだけ違う)
+               ((250, 238, 238), (210, 30, 370, 130)),  # 淡いピンク
+               ((238, 246, 236), (30, 170, 170, 270))]  # 淡い緑
+
+
+def _near_color_scene(noise, seed=3):
+    """オフホワイトの背景に淡い図形を置き、ノイズを足して JPEG で圧縮し直した画像と、
+    図形ごとのマスク(縁はアンチエイリアス)を返す。"""
+    import io
+    from PIL import Image, ImageDraw
+
+    h, w = 300, 400
+    canvas = np.empty((h, w, 3), np.float32)
+    canvas[:] = NEAR_BG
+    masks = []
+    for color, box in NEAR_SHAPES:
+        big = Image.new("L", (w * 4, h * 4), 0)
+        ImageDraw.Draw(big).rounded_rectangle([v * 4 for v in box], radius=60, fill=255)
+        m = np.asarray(big.resize((w, h), Image.BOX), np.float32) / 255.0
+        canvas = canvas * (1 - m[..., None]) + np.array(color, np.float32) * m[..., None]
+        masks.append(m)
+    canvas += np.random.default_rng(seed).normal(0, noise, canvas.shape)
+    buf = io.BytesIO()
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8)).save(buf, "JPEG", quality=85)
+    rgb = np.asarray(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+    return np.ascontiguousarray(rgb), masks
+
+
+def _inside(mask, inset=4):
+    return cv2.erode((mask > 0.99).astype(np.uint8), np.ones((2 * inset + 1,) * 2, np.uint8)) > 0
+
+
+def test_pixel_noise_and_sigma_grow_with_noise():
+    quiet, _ = _near_color_scene(0.5)
+    loud, _ = _near_color_scene(6.0)
+    n_quiet, n_loud = br.estimate_pixel_noise(quiet), br.estimate_pixel_noise(loud)
+    assert n_loud > 2 * n_quiet, (n_quiet, n_loud)
+    s_quiet, s_loud = br.smoothing_sigma(n_quiet), br.smoothing_sigma(n_loud)
+    assert br.SMOOTH_SIGMA_MIN <= s_quiet < s_loud <= br.SMOOTH_SIGMA_MAX
+    assert br.smoothing_sigma(1000.0) == br.SMOOTH_SIGMA_MAX
+    assert br.smoothing_sigma(0.0) == br.SMOOTH_SIGMA_MIN
+
+
+def test_lab_distance_matches_color_distance():
+    rgb, _ = _near_color_scene(2.0)
+    colors = [NEAR_BG, (250, 238, 238)]
+    d1, i1 = br.color_distance(rgb, colors)
+    d2, i2 = br.lab_distance(br.to_lab(rgb), br.to_lab(np.asarray(colors, np.uint8)))
+    assert np.allclose(d1, d2, atol=1e-3)
+    assert np.array_equal(i1, i2)
+    d3, _ = br.lab_distance(br.to_lab(rgb), np.zeros((0, 3), np.float32))
+    assert np.isinf(d3).all()
+
+
+def test_precise_tolerance_steps_and_floor():
+    assert br.precise_tolerance(None) == br.PRECISE_TOLERANCE_MIN
+    assert br.precise_tolerance(0.0) == br.PRECISE_TOLERANCE_MIN
+    value = br.precise_tolerance(1.91)  # σ6 の合成図解で測れた背景のムラ
+    assert value == 2.5, value          # 整数に切り上げた 4 では明るいグレーの箱が抜けた
+    assert (value / br.TOLERANCE_STEP) == int(value / br.TOLERANCE_STEP)
+
+
+def test_matte_edges_recovers_mixture_ratio():
+    """背景 B と前景 F が線形に混ざった縁で、不透明度がその割合になる。"""
+    h, w = 40, 60
+    B = np.array([90.0, 0.0, 2.0], np.float32)
+    F = np.array([80.0, 6.0, -12.0], np.float32)
+    ramp = np.clip((np.arange(w, dtype=np.float32) - 28.0) / 4.0, 0.0, 1.0)  # 4px の縁
+    t = np.broadcast_to(ramp, (h, w))
+    flat = (B * (1 - t[..., None]) + F * t[..., None]).astype(np.float32)
+    region = (t >= 0.5).astype(np.float32)
+    background = np.broadcast_to(B, (h, w, 3)).astype(np.float32)
+    alpha = br.matte_edges(flat, background, region, sigma=1.5)
+    assert np.abs(alpha - t).max() < 0.05, np.abs(alpha - t).max()
+
+
+def test_matte_edges_low_contrast_noisy_edge_is_not_ragged():
+    """差が小さくノイズが大きい縁でも、均した値から読むことで縁が毛羽立たない。"""
+    h, w = 60, 80
+    rng = np.random.default_rng(1)
+    B = np.array([90.0, 0.0, 2.0], np.float32)
+    F = np.array([87.0, 0.0, 0.0], np.float32)  # ΔE 3.6
+    truth = (np.arange(w) >= 40).astype(np.float32)[None, :].repeat(h, 0)
+    clean = B * (1 - truth[..., None]) + F * truth[..., None]
+    flat = (clean + rng.normal(0, 1.5, clean.shape)).astype(np.float32)
+    sigma = 2.0
+    smooth = br.smooth_lab(flat, sigma)
+    background = np.broadcast_to(B, (h, w, 3)).astype(np.float32)
+    raw = br.matte_edges(flat, background, truth, sigma)
+    fixed = br.matte_edges(flat, background, truth, sigma, smooth=smooth, noise=1.5)
+    err_raw = float(np.abs(raw - truth).mean())
+    err_fixed = float(np.abs(fixed - truth).mean())
+    assert err_fixed < 0.5 * err_raw, (err_raw, err_fixed)
+
+
+def _window_alpha(rgb, precise):
+    from PySide6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])  # noqa: F841
+    rgba = np.dstack((rgb, np.full(rgb.shape[:2], 255, np.uint8)))
+    win = br.BgRemoveWindow(rgba)
+    try:
+        win.precise_check.setChecked(precise)
+        win._apply_auto_tolerance()
+        return win.compute(preview=False)[..., 3].astype(np.float32) / 255.0
+    finally:
+        win.deleteLater()
+
+
+def test_precise_window_keeps_faint_shapes_that_pixel_mode_loses():
+    """窓の経路そのもので、淡い図形が精密モードでは残り、以前の方式では抜けること。"""
+    rgb, masks = _near_color_scene(4.0)
+    union = np.max(np.stack(masks), axis=0)
+    background = _inside(1.0 - union, 6) & (union < 0.01)
+    old = _window_alpha(rgb, precise=False)
+    new = _window_alpha(rgb, precise=True)
+    for m in masks:
+        inside = _inside(m)
+        assert (new[inside] > 0.9).mean() > 0.95, (new[inside] > 0.9).mean()
+    gray = _inside(masks[0])
+    assert (old[gray] > 0.9).mean() < 0.5  # 以前の方式では明るいグレーがほぼ抜ける
+    assert (new[background] < 0.1).mean() > 0.99
+
+
+# ---------------------------------------------------------------
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -1246,15 +1247,40 @@ _ai_sessions = {}
 _ai_lock = threading.Lock()
 
 
-def run_ai(rgb, model: str) -> np.ndarray:
+AI_STAGE_IMPORT = "import"
+AI_STAGE_LOAD = "load"
+AI_STAGE_INFER = "infer"
+AI_STAGE_TEXT = {
+    AI_STAGE_IMPORT: "AIのライブラリを読み込んでいます（初回は数十秒）",
+    AI_STAGE_LOAD: "AIのモデルを準備しています（初回はダウンロードあり）",
+    AI_STAGE_INFER: "AIが被写体を見分けています",
+}
+
+
+def run_ai(rgb, model: str, on_stage=None) -> np.ndarray:
     """rembg で前景マスクを作り、不透明度(0〜1、float32、元と同じ大きさ)で返す。
-    別スレッドから呼ばれる。セッションは同じモデルなら使い回す(作るのに1秒前後かかる)。"""
+    別スレッドから呼ばれる。セッションは同じモデルなら使い回す(作るのに1秒前後かかる)。
+
+    on_stage(段階) を渡すと、ライブラリの読み込み・モデルの準備・判定の各段階の頭で
+    呼ぶ。rembg は進み具合を教えてくれないので、せめて何をしている最中かを見せる
+    (初回の読み込みだけで 40 秒かかることがあり、判定の数秒と見分けがつかなかった)。"""
+    def stage(name):
+        if on_stage is not None:
+            try:
+                on_stage(name)
+            except Exception:
+                pass  # 表示の都合で AI そのものを止めない
+
     with _ai_lock:
+        if "rembg" not in sys.modules:
+            stage(AI_STAGE_IMPORT)
         from rembg import new_session, remove
 
         session = _ai_sessions.get(model)
         if session is None:
+            stage(AI_STAGE_LOAD)
             session = _ai_sessions[model] = new_session(model)
+        stage(AI_STAGE_INFER)
         mask = remove(np.ascontiguousarray(rgb), session=session, only_mask=True)
     mask = np.asarray(mask)
     if mask.ndim == 3:
@@ -1515,6 +1541,8 @@ def build_style() -> str:
     QCheckBox:disabled, QRadioButton:disabled {{ color: {t['disabled']}; }}
     QToolTip {{ background-color: {t['tooltip_bg']}; color: {t['text']};
         border: 1px solid {t['border']}; padding: 4px 6px; }}
+    QProgressBar {{ background-color: {t['field']}; border: none; border-radius: 4px; }}
+    QProgressBar::chunk {{ background-color: {t['accent']}; border-radius: 4px; }}
     """
 
 
@@ -1570,6 +1598,11 @@ class ImageView(QWidget):
         self._boxes = []            # アイコンに分けたときの枠(表示している画像の座標)
         self._pickable = pickable
         self._checker = _checker_brush()
+        self._busy_text = ""
+        self._busy_phase = 0
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setInterval(40)
+        self._busy_timer.timeout.connect(self._tick_busy)
         self.setMinimumSize(200, 160)
         if pickable:
             self.setMouseTracking(True)
@@ -1651,7 +1684,53 @@ class ImageView(QWidget):
                 painter.setPen(QPen(QColor("#ffffff"), 2))
                 painter.drawLine(QPointF(c.x() - 3.5, c.y()), QPointF(c.x() - 1, c.y() + 2.8))
                 painter.drawLine(QPointF(c.x() - 1, c.y() + 2.8), QPointF(c.x() + 3.8, c.y() - 2.8))
+        if self._busy_text:
+            self._paint_busy(painter)
         painter.end()
+
+    # ------------------------------------------------------------------
+    # 処理中の表示
+    # ------------------------------------------------------------------
+    def set_busy(self, text: str) -> None:
+        """結果の上に「処理中」を重ねる(空文字で消す)。
+
+        AI は初回に数十秒かかるのに、以前はパネルの小さな字が変わるだけで、固まった
+        のか動いているのかが見分けられなかった。いちばん目が行く結果の上に、回る輪と
+        何をしているかを出す。輪は時計で回すので、裏で処理が詰まっていても(別スレッドの
+        AI なら)回り続け、「動いている」ことが伝わる。"""
+        self._busy_text = text or ""
+        if self._busy_text:
+            if not self._busy_timer.isActive():
+                self._busy_timer.start()
+        else:
+            self._busy_timer.stop()
+        self.update()
+
+    def _tick_busy(self):
+        self._busy_phase = (self._busy_phase + 12) % 360
+        self.update()
+
+    def _paint_busy(self, painter):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+        center = QPointF(self.width() / 2.0, self.height() / 2.0 - 18)
+        radius = 22.0
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 5))
+        painter.drawEllipse(center, radius, radius)
+        pen = QPen(QColor(THEME["accent"]).lighter(140), 5)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        arc = QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
+        painter.drawArc(arc, int(-self._busy_phase * 16), int(100 * 16))
+        font = QFont(self.font())
+        font.setPointSize(FONT_TITLE)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#ffffff"))
+        text_rect = QRectF(0, center.y() + radius + 12, self.width(), 60)
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
+                         self._busy_text)
 
     def _paint_boxes(self, painter, rect):
         """アイコンの枠と番号。どんな背景(市松・白・黒・緑)の上でも見えるよう、黒い縁取りを
@@ -1726,14 +1805,22 @@ class _AiBridge(QObject):
     (feature_screen._PushoverBridge と同じ流儀)。"""
 
     finished = Signal(object)
+    stage = Signal(str)
 
 
 def _ai_worker(bridge: _AiBridge, rgb, model: str) -> None:
     """別スレッドで rembg を回す。ここで投げた例外はどこにも捕まらないので全部受ける。"""
     started = time.monotonic()
     result = {"model": model}
+
+    def on_stage(name):
+        try:
+            bridge.stage.emit(name)
+        except RuntimeError:
+            pass  # 窓が閉じられた
+
     try:
-        result["alpha"] = run_ai(rgb, model)
+        result["alpha"] = run_ai(rgb, model, on_stage)
         result["ok"] = True
     except Exception:
         result["ok"] = False
@@ -1801,8 +1888,17 @@ class BgRemoveWindow(QWidget):
         self._ai_alpha = None
         self._ai_alpha_preview = None
         self._ai_running = False
+        self._finalizing = False
         self._ai_bridge = _AiBridge()
         self._ai_bridge.finished.connect(self._on_ai_finished)
+        self._ai_bridge.stage.connect(self._on_ai_stage)
+        # 実行中の経過秒数を出す時計(rembg は進み具合を返さないので、止まっていない
+        # ことを数字の増え方で伝える)。
+        self._ai_stage = ""
+        self._ai_started = 0.0
+        self._ai_clock = QTimer(self)
+        self._ai_clock.setInterval(250)
+        self._ai_clock.timeout.connect(self._show_ai_progress)
 
         section = _section(app_settings)
         self.setWindowTitle("背景を透過")
@@ -1984,6 +2080,13 @@ class BgRemoveWindow(QWidget):
         self.ai_button.setFont(self._font())
         self.ai_button.clicked.connect(self._start_ai)
         ai_layout.addWidget(self.ai_button)
+        # 実行中だけ出す。進み具合は取れないので、動き続ける帯(範囲 0〜0)にする。
+        self.ai_progress = QProgressBar()
+        self.ai_progress.setRange(0, 0)
+        self.ai_progress.setTextVisible(False)
+        self.ai_progress.setFixedHeight(8)
+        self.ai_progress.setVisible(False)
+        ai_layout.addWidget(self.ai_progress)
         self.ai_status = self._note("")
         ai_layout.addWidget(self.ai_status)
         layout.addWidget(self.ai_box)
@@ -2671,7 +2774,10 @@ class BgRemoveWindow(QWidget):
                 QSizePolicy.Preferred if i == page else QSizePolicy.Ignored)
         self.mode_pages.adjustSize()
         self.ai_box.setVisible(selected == METHOD_AI)
-        self.ai_button.setText("やり直す" if self._ai_alpha is not None else "実行")
+        if self._ai_running:
+            self.ai_button.setText("実行中…")
+        else:
+            self.ai_button.setText("やり直す" if self._ai_alpha is not None else "実行")
         self.method_note.setText(METHOD_NOTES[selected])
         self.bg_ai_note.setVisible(selected == METHOD_AI)
 
@@ -2703,8 +2809,13 @@ class BgRemoveWindow(QWidget):
         model = self.model_combo.currentData()
         self._ai_running = True
         self.ai_button.setEnabled(False)
+        self.ai_button.setText("実行中…")
         self.model_combo.setEnabled(False)
-        self.ai_status.setText("AIで抜いています…（初回はライブラリの読み込みに数十秒かかります）")
+        self._ai_stage = AI_STAGE_TEXT[AI_STAGE_INFER]
+        self._ai_started = time.monotonic()
+        self.ai_progress.setVisible(True)
+        self._ai_clock.start()
+        self._show_ai_progress()
         self._update_method_controls()
         thread = threading.Thread(
             target=_ai_worker, args=(self._ai_bridge, self._rgb, model),
@@ -2712,9 +2823,30 @@ class BgRemoveWindow(QWidget):
         )
         thread.start()
 
+    def _on_ai_stage(self, name):
+        try:
+            self._ai_stage = AI_STAGE_TEXT.get(name, self._ai_stage)
+            self._show_ai_progress()
+        except Exception:
+            _log_exception("ai stage")
+
+    def _show_ai_progress(self):
+        if not self._ai_running:
+            return
+        seconds = time.monotonic() - self._ai_started
+        text = f"{self._ai_stage}…　{seconds:.0f}秒"
+        self.ai_status.setText(text)
+        self.result_view.set_busy(text)
+
+    def _stop_ai_progress(self):
+        self._ai_clock.stop()
+        self.ai_progress.setVisible(False)
+        self.result_view.set_busy("")
+
     def _on_ai_finished(self, result):
         try:
             self._ai_running = False
+            self._stop_ai_progress()
             self.ai_button.setEnabled(True)
             self.model_combo.setEnabled(True)
             if not result.get("ok"):
@@ -3073,15 +3205,24 @@ class BgRemoveWindow(QWidget):
 
     def _final_rgba(self):
         """原寸で計算し直した RGBA の配列。失敗したら None(状態表示に理由を出す)。"""
+        if self._finalizing:
+            return None  # 仕上げの最中にもう一度押された(描き直しの間に受け付けたもの)
         try:
+            self._finalizing = True
             QApplication.setOverrideCursor(Qt.WaitCursor)
+            # 原寸の計算は大きな画像で数秒かかり、その間は窓が描き直せない。先に「仕上げ
+            # 中」を描かせてから始める(何も出さないと、押したのに固まったように見える)。
+            self.result_view.set_busy("原寸で仕上げています…")
+            QApplication.processEvents()
             try:
                 return self.compute(preview=False)
             finally:
                 try:
+                    self.result_view.set_busy("")
                     QApplication.restoreOverrideCursor()
                 except Exception:
                     pass
+                self._finalizing = False
         except Exception:
             self._set_status(f"原寸での計算に失敗しました: {_log_exception('final')}", "error")
             return None

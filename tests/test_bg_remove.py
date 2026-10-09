@@ -628,6 +628,298 @@ def test_build_gvml_structure():
     assert decoded[..., 3].max() == 255 and decoded[..., 3].min() == 0
 
 
+# ---- ベクタ化 ----
+# VTracer 0.6.15 が実際に出した SVG(赤いドーナツ形と、白い四角を載せた緑の四角)。
+# 穴は1本のパスの2つ目の部分パスで、上に重ねる色は後ろのパスとして出てくる。
+_VTRACER_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generator: visioncortex VTracer 0.6.12 -->
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+<path d="M0 0 C26.73 0 53.46 0 81 0 C81 26.73 81 53.46 81 81 C54.27 81 27.54 81 0 81 C0 54.27 0 27.54 0 0 Z " fill="#28A028" transform="translate(110,20)"/>
+<path d="M0 0 C8.227 9.032 11.995 20.303 11.5 32.441 C-11.908 67.066 -68.101 42.911 0 0 Z M-38.375 16.375 C-42.285 19.884 -44.077 24.167 -44.375 29.375 C-26 44 -13.064 28.369 -38.375 16.375 Z " fill="#DC2828" transform="translate(79.375,31.625)"/>
+<path d="M0 0 C13.53 0 27.06 0 41 0 C41 13.53 41 27.06 41 41 C27.47 41 13.94 41 0 41 C0 27.47 0 13.94 0 0 Z " fill="#FAFAFA" transform="translate(130,40)"/>
+</svg>"""
+
+
+def _close(a, b, tol=1e-6):
+    return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def test_parse_svg_path_absolute_with_translate_and_order():
+    paths = br.parse_svg_paths(_VTRACER_SAMPLE)
+    assert [p["color"] for p in paths] == [(0x28, 0xA0, 0x28), (0xDC, 0x28, 0x28), (0xFA, 0xFA, 0xFA)]
+    green = paths[0]["commands"]
+    assert green[0] == ("M", [110.0, 20.0])                         # translate が足される
+    assert green[1][0] == "C" and _close(green[1][1], [136.73, 20, 163.46, 20, 191, 20])
+    assert green[-1] == ("Z", [])
+    red = paths[1]["commands"]
+    assert [op for op, _v in red].count("M") == 2                   # 穴は2つ目の部分パス
+    assert _close(red[[op for op, _v in red].index("M", 1)][1], [79.375 - 38.375, 31.625 + 16.375])
+    assert br.path_bbox(paths[2]["commands"]) == (130.0, 40.0, 171.0, 81.0)
+    # scale を掛けると座標が縮む(拡大して作業した結果を元の大きさへ戻す)
+    half = br.parse_svg_paths(_VTRACER_SAMPLE, 0.5)
+    assert half[0]["commands"][0] == ("M", [55.0, 10.0])
+
+
+def test_parse_svg_path_relative_and_other_commands():
+    cmds = br.parse_svg_path_d("m10 10 5 0 h5 v5 c1 1 2 2 3 3 l-1-1 z M0 0 L1e1 0 Z")
+    ops = [op for op, _v in cmds]
+    assert ops == ["M", "L", "L", "L", "C", "L", "Z", "M", "L", "Z"]
+    assert cmds[0][1] == [10, 10]
+    assert cmds[1][1] == [15, 10]           # M のあとの座標の組は(相対の)L
+    assert cmds[2][1] == [20, 10]           # h
+    assert cmds[3][1] == [20, 15]           # v
+    assert _close(cmds[4][1], [21, 16, 22, 17, 23, 18])
+    assert cmds[5][1] == [22, 17]
+    assert cmds[8][1] == [10, 0]            # 指数表記
+    # z のあとの相対命令は部分パスの始点から測る
+    after_z = br.parse_svg_path_d("M10 10 L20 10 Z l5 5")
+    assert after_z[-1] == ("L", [15, 15])
+    # Q は同じ曲線の3次ベジエへ: 制御点は 2/3 の位置。T は前の制御点を折り返す
+    q = br.parse_svg_path_d("M0 0 Q3 3 6 0 T12 0")
+    assert q[1][0] == "C" and _close(q[1][1], [2, 2, 4, 2, 6, 0])
+    assert _close(q[2][1], [8, -2, 10, -2, 12, 0])  # 折り返した制御点は (9, -3)
+    # S は前の C の2つ目の制御点を折り返す
+    s = br.parse_svg_path_d("M0 0 C0 1 2 1 2 0 S4 -1 4 0")
+    assert _close(s[2][1], [2, -1, 4, -1, 4, 0])
+
+
+def test_parse_svg_path_broken_input_does_not_raise():
+    assert br.parse_svg_path_d("") == []
+    assert br.parse_svg_path_d("1 2 3") == []
+    assert br.parse_svg_path_d("M1 2 L3") == [("M", [1, 2])]          # 数が足りない所で打ち切る
+    assert [op for op, _ in br.parse_svg_path_d("M0 0 A5 5 0 0 1 10 0 Z")] == ["M", "L", "Z"]
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0 L1 1" fill="none"/>'
+           '<path d="" fill="#000"/><path d="M0 0 L2 0 L2 2 Z" style="fill:#0f0"/>'
+           '<path d="M0 0 L1 0" fill="#123456" transform="matrix(2 0 0 2 1 1) translate(1,0)"/></svg>')
+    paths = br.parse_svg_paths(svg)
+    assert [p["color"] for p in paths] == [(0, 255, 0), (0x12, 0x34, 0x56)]
+    assert paths[1]["commands"][0] == ("M", [3.0, 1.0])   # matrix の中で translate が効く
+
+
+def test_paths_to_svg_roundtrip_and_icon_offset():
+    paths = br.parse_svg_paths(_VTRACER_SAMPLE)
+    text = br.paths_to_svg(paths, 200, 120)
+    again = br.parse_svg_paths(text)
+    assert [p["color"] for p in again] == [p["color"] for p in paths]
+    for a, b in zip(paths, again):
+        assert [op for op, _ in a["commands"]] == [op for op, _ in b["commands"]]
+        for (_, va), (_, vb) in zip(a["commands"], b["commands"]):
+            assert _close(va, vb, 0.006)
+    assert 'viewBox="0 0 200 120"' in text
+    shifted = br.parse_svg_paths(br.paths_to_svg(paths[:1], 81, 81, 110, 20))
+    assert shifted[0]["commands"][0] == ("M", [0.0, 0.0])
+
+
+def test_path_to_sp_xml_emu_commands_and_color():
+    import re as _re
+
+    path = {"color": (0x12, 0xAB, 0xEF),
+            "commands": [("M", [10, 20]), ("L", [30, 20]), ("C", [30, 30, 20, 40, 10, 40]),
+                         ("Z", []), ("M", [15, 25]), ("L", [20, 25]), ("L", [15, 30]), ("Z", [])]}
+    xml = br.path_to_sp_xml(path, 7, "p", left=10, top=10)
+    e = 9525
+    # 外接矩形 (10,20)-(30,40) を左上 (10,10) からの EMU に
+    assert f'<a:off x="0" y="{10 * e}"/>' in xml
+    assert f'<a:ext cx="{20 * e}" cy="{20 * e}"/>' in xml
+    assert f'<a:path w="{20 * e}" h="{20 * e}">' in xml
+    tags = _re.findall(r"<a:(moveTo|lnTo|cubicBezTo|close)", xml)
+    assert tags == ["moveTo", "lnTo", "cubicBezTo", "close", "moveTo", "lnTo", "lnTo", "close"]
+    pts = [tuple(int(v) for v in m) for m in _re.findall(r'<a:pt x="(-?\d+)" y="(-?\d+)"/>', xml)]
+    assert pts[:2] == [(0, 0), (20 * e, 0)]                          # 図形の左上からの座標
+    assert pts[2:5] == [(20 * e, 10 * e), (10 * e, 20 * e), (0, 20 * e)]
+    assert pts[5] == (5 * e, 5 * e)
+    assert '<a:srgbClr val="12ABEF"/>' in xml
+    assert "<a:ln><a:noFill/></a:ln>" in xml
+    assert '<a:cNvPr id="7" name="p"/>' in xml
+
+
+def _vector_icon_paths():
+    """2つのアイコン(左と右)。左は2本(下地と上に載る白)、右は1本。もう1本は
+    どのアイコンとも重ならない離れた点(いちばん近い右のアイコンに入るはず)。"""
+    def rect(x0, y0, x1, y1, color):
+        return {"color": color, "commands": [("M", [x0, y0]), ("L", [x1, y0]), ("L", [x1, y1]),
+                                             ("L", [x0, y1]), ("Z", [])]}
+    return [rect(10, 10, 50, 50, (200, 0, 0)), rect(100, 10, 140, 50, (0, 0, 200)),
+            rect(20, 20, 40, 40, (255, 255, 255)), rect(150, 60, 152, 62, (0, 0, 0))]
+
+
+def test_assign_paths_to_icons_by_overlap_then_nearest():
+    alpha = np.zeros((80, 160), np.uint8)
+    alpha[10:50, 10:50] = 255
+    alpha[10:50, 100:140] = 255
+    icons = br.split_icons(alpha, 5, 16)
+    assert [i["box"] for i in icons] == [(10, 10, 50, 50), (100, 10, 140, 50)]
+    groups = br.assign_paths_to_icons(_vector_icon_paths(), icons)
+    assert groups == [[0, 2], [1, 3]]        # 重ね順(番号の順)は保つ
+    assert br.assign_paths_to_icons(_vector_icon_paths(), []) == []
+    # はみ出したパスは、重なりの大きいほうへ
+    wide = [{"color": (0, 0, 0), "commands": [("M", [40, 10]), ("L", [130, 10]), ("L", [130, 20]), ("Z", [])]}]
+    assert br.assign_paths_to_icons(wide, icons) == [[], [0]]
+
+
+def test_build_vector_gvml_groups_and_shapes():
+    import io as _io
+    import re as _re
+    import zipfile
+
+    paths = _vector_icon_paths()
+    groups = [[0, 2], [1, 3]]
+    data = br.build_vector_gvml(paths, groups)
+    archive = zipfile.ZipFile(_io.BytesIO(data))
+    assert not [n for n in archive.namelist() if n.startswith("clipboard/media/")]
+    drawing = archive.read("clipboard/drawings/drawing1.xml").decode()
+    assert drawing.count("<a:grpSp>") == 2 and drawing.count("<a:sp>") == 4
+    assert "<a:pic>" not in drawing
+    ids = [int(v) for v in _re.findall(r'<a:cNvPr id="(\d+)"', drawing)]
+    assert ids[0] == 0 and len(set(ids)) == len(ids)
+    # グループの中の重ね順: 下地の赤 → 上に載る白
+    first = drawing.split("<a:grpSp>")[1]
+    assert first.index('val="C80000"') < first.index('val="FFFFFF"')
+    # キャンバスは全図形の外接矩形(10,10)-(152,62)
+    e = 9525
+    assert f'<a:ext cx="{142 * e}" cy="{52 * e}"/>' in drawing
+    # 2つ目のグループは (100,10) から: キャンバスの左上 (10,10) からの EMU
+    assert f'<a:off x="{90 * e}" y="0"/><a:ext cx="{52 * e}" cy="{52 * e}"/>' \
+           f'<a:chOff x="{90 * e}" y="0"/>' in drawing
+    # 分けないときは全部で1つのグループ
+    single = zipfile.ZipFile(_io.BytesIO(br.build_vector_gvml(paths)))
+    drawing = single.read("clipboard/drawings/drawing1.xml").decode()
+    assert drawing.count("<a:grpSp>") == 1 and drawing.count("<a:sp>") == 4
+    # 空のアイコンは飛ばす
+    sparse = zipfile.ZipFile(_io.BytesIO(br.build_vector_gvml(paths, [[0, 1, 2, 3], []])))
+    assert sparse.read("clipboard/drawings/drawing1.xml").decode().count("<a:grpSp>") == 1
+
+
+def test_icon_svgs_offsets_each_icon():
+    alpha = np.zeros((80, 160), np.uint8)
+    alpha[10:50, 10:50] = 255
+    alpha[10:50, 100:140] = 255
+    icons = br.split_icons(alpha, 5, 16)
+    texts = br.icon_svgs(_vector_icon_paths(), icons)
+    assert len(texts) == 2
+    left = br.parse_svg_paths(texts[0])
+    assert [p["color"] for p in left] == [(200, 0, 0), (255, 255, 255)]
+    assert left[0]["commands"][0] == ("M", [0.0, 0.0])
+    assert 'width="40" height="40"' in texts[0]
+
+
+def test_quantize_colors_limits_count_and_keeps_few_colors_exact():
+    yy, xx = np.mgrid[0:60, 0:80]
+    rgb = np.dstack(((xx * 3) % 256, (yy * 4) % 256, ((xx + yy) * 2) % 256)).astype(np.uint8)
+    mask = np.ones((60, 80), bool)
+    mask[:10] = False
+    out, palette = br.quantize_colors(rgb, mask, 8)
+    used = np.unique(out[mask].reshape(-1, 3), axis=0)
+    assert 2 <= len(used) <= 8 and len(palette) == len(used)
+    assert (out[~mask] == 0).all()
+    # 色が3つしか無ければ、20 色を頼んでも3色のまま(値もほぼそのまま)
+    few = np.zeros((30, 30, 3), np.uint8)
+    few[:, :10] = (200, 30, 30)
+    few[:, 10:20] = (30, 160, 30)
+    few[:, 20:] = (250, 250, 250)
+    out, palette = br.quantize_colors(few, np.ones((30, 30), bool), 20)
+    assert len(palette) == 3
+    assert np.abs(out.astype(int) - few.astype(int)).max() <= 2
+    # 似た2色(肌色と灰色)は、色数が足りていれば別の色に残る
+    pair = np.zeros((20, 40, 3), np.uint8)
+    pair[:, :20] = (240, 200, 170)
+    pair[:, 20:] = (190, 190, 190)
+    out, _ = br.quantize_colors(pair, np.ones((20, 40), bool), 20)
+    assert tuple(out[0, 0]) != tuple(out[0, 39])
+
+
+def test_fill_transparent_rgb_extends_nearest_opaque_color():
+    rgb = np.full((20, 30, 3), 255, np.uint8)      # 透明の所に残った背景の白
+    opaque = np.zeros((20, 30), bool)
+    rgb[5:15, 2:8] = (200, 30, 30)
+    opaque[5:15, 2:8] = True
+    rgb[5:15, 22:28] = (30, 30, 200)
+    opaque[5:15, 22:28] = True
+    out = br.fill_transparent_rgb(rgb, opaque)
+    assert (out[opaque] == rgb[opaque]).all()      # 不透明の画素は変えない
+    assert tuple(out[10, 10]) == (200, 30, 30)     # 左の赤に近い
+    assert tuple(out[10, 20]) == (30, 30, 200)     # 右の青に近い
+    assert tuple(out[0, 0]) == (200, 30, 30)
+    assert not (out == 255).all(axis=2).any()      # 白は残らない
+
+
+def test_vector_edges_do_not_pick_up_background_color():
+    """透明の画素に残った背景の色が、縁の色として拾われない(色が増えない)。"""
+    rgba = np.zeros((40, 40, 4), np.uint8)
+    rgba[..., :3] = 255
+    cv2.circle(rgba, (20, 20), 14, (200, 30, 30, 255), -1)
+    work, _scale = br.prepare_for_trace(rgba, 20)
+    colors = np.unique(work[work[..., 3] > 0][:, :3], axis=0)
+    assert len(colors) == 1 and np.abs(colors[0].astype(int) - (200, 30, 30)).max() <= 3, colors
+
+
+def test_prepare_for_trace_binarizes_upscales_and_clears_transparent():
+    rgba = np.zeros((40, 60, 4), np.uint8)
+    rgba[..., :3] = 255                         # 透明の画素に残った背景の白
+    rgba[5:35, 5:30] = (200, 30, 30, 255)
+    rgba[5:35, 30:55] = (30, 30, 200, 100)      # 半分より薄い → 透明に
+    work, scale = br.prepare_for_trace(rgba, 20)
+    assert scale == 3.0 and work.shape == (120, 180, 4)
+    assert set(np.unique(work[..., 3]).tolist()) <= {0, 255}
+    assert (work[work[..., 3] == 0][:, :3] == 0).all()
+    assert work[60, 50, 3] == 255 and work[60, 130, 3] == 0
+    assert np.abs(work[60, 50, :3].astype(int) - (200, 30, 30)).max() <= 3
+    # 長辺が上限を超えないよう倍率を下げる
+    assert br.vector_scale(100, 2000) == 2.25
+    assert br.vector_scale(100, 100) == 3.0
+    try:
+        br.prepare_for_trace(np.zeros((10, 10, 4), np.uint8))
+        raise AssertionError("全部透明なのに例外にならない")
+    except br.VectorizeError:
+        pass
+
+
+def test_vectorize_end_to_end_in_child_process():
+    """実際に VTracer を子プロセスで走らせる(入っていなければ飛ばす)。"""
+    if not br.vector_available():
+        print("      (vtracer が無いので飛ばします)")
+        return
+    rgba = np.zeros((120, 200, 4), np.uint8)
+    cv2.circle(rgba, (50, 60), 40, (220, 40, 40, 255), -1)
+    cv2.circle(rgba, (50, 60), 15, (0, 0, 0, 0), -1)            # 穴(透明)
+    cv2.rectangle(rgba, (110, 20), (190, 100), (40, 160, 40, 255), -1)
+    cv2.rectangle(rgba, (130, 40), (170, 80), (250, 250, 250, 255), -1)
+    result = br.vectorize(rgba, 20)
+    paths = result["paths"]
+    assert result["size"] == (200, 120) and len(paths) >= 3
+
+    def near(color, target):
+        return max(abs(a - b) for a, b in zip(color, target)) <= 12
+
+    red = [p for p in paths if near(p["color"], (220, 40, 40))]
+    green = [p for p in paths if near(p["color"], (40, 160, 40))]
+    white = [p for p in paths if near(p["color"], (250, 250, 250))]
+    assert red and green and white, [p["color"] for p in paths]
+    # 座標は元の大きさに戻っている(緑の四角の外接矩形がほぼ (110,20)-(191,101))
+    box = br.path_bbox(green[0]["commands"])
+    assert all(abs(a - b) <= 2 for a, b in zip(box, (110, 20, 191, 101))), box
+    # 穴は赤のパスの2つ目の部分パス。白は緑より後ろ(上に重なる)
+    assert any([op for op, _ in p["commands"]].count("M") >= 2 for p in red)
+    assert paths.index(white[0]) > paths.index(green[0])
+    assert result["svg"].startswith("<?xml")
+
+
+def test_run_vtracer_reports_child_failure():
+    """子プロセスが失敗したら VectorizeError になる(窓は落ちない)。"""
+    if not br.vector_available():
+        return
+    import tempfile
+    folder = tempfile.mkdtemp()
+    try:
+        try:
+            br.run_vtracer(os.path.join(folder, "missing.png"), os.path.join(folder, "out.svg"))
+            raise AssertionError("無いファイルなのに例外にならない")
+        except br.VectorizeError:
+            pass
+    finally:
+        os.rmdir(folder)
+
+
 def test_theme_contrast_ratios():
     """配色の文字色と地の色の組み合わせが、決めたコントラスト比を満たす。
     本文・補足・警告は 4.5 以上、無効の文字は 3.0 以上(bg_remove.CONTRAST_REQUIREMENTS)。"""

@@ -26,10 +26,12 @@
 #   許容量のスライダーはそのまま ΔE の値になっている(2 前後が見分けられる限界)。
 import argparse
 import ctypes
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -81,6 +83,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from PySide6.QtSvg import QSvgRenderer
+except ImportError:  # QtSvg の無い PySide6(ベクタの結果を描けないだけ)
+    QSvgRenderer = None
+
 import settings as settings_module
 from bg_remove_launch import CLIPBOARD_SOURCE, IMAGE_SUFFIXES
 from toast import FADE_MS, VISIBLE_MS, show_toast
@@ -99,6 +106,8 @@ PREVIEW_LONG_SIDE = 1200
 # スライダーを動かしてから計算を始めるまでの待ち。動かしている間は計算を積まず、
 # 止まった(か、ゆっくり動いている)ときだけ描き直す。
 DEBOUNCE_MS = 60
+# ベクタ化(数秒かかる)を走らせ直すまでの待ち。つまみを動かすたびに走らせないよう長めにする。
+VECTOR_DEBOUNCE_MS = 800
 
 # 背景色の自動推定で見る外周の太さ(px)と、数える前の量子化の刻み。
 # 量子化しないと、JPEG のノイズや AI のかすかなグラデーションで同じ「白」が数百色に
@@ -1147,12 +1156,10 @@ def build_gvml(pieces) -> bytes:
     top = min(p[1] for p in pieces)
     right = max(p[0] + p[3] for p in pieces)
     bottom = max(p[1] + p[4] for p in pieces)
-    total_cx = (right - left) * EMU_PER_PX
-    total_cy = (bottom - top) * EMU_PER_PX
 
     pics = []
-    rels = []
-    for index, (x, y, _png, width, height) in enumerate(pieces, 1):
+    media = []
+    for index, (x, y, png, width, height) in enumerate(pieces, 1):
         pics.append(
             '<a:pic><a:nvPicPr>'
             f'<a:cNvPr id="{index + 1}" name="icon {index}"/>'
@@ -1163,10 +1170,17 @@ def build_gvml(pieces) -> bytes:
             f'<a:off x="{(x - left) * EMU_PER_PX}" y="{(y - top) * EMU_PER_PX}"/>'
             f'<a:ext cx="{width * EMU_PER_PX}" cy="{height * EMU_PER_PX}"/>'
             '</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></a:spPr></a:pic>')
-        rels.append(
-            f'<Relationship Id="rId{index}" Type="{_GVML_NS_REL}/image" '
-            f'Target="../media/image{index}.png"/>')
+        media.append(png)
+    return _gvml_package("".join(pics), (right - left) * EMU_PER_PX,
+                         (bottom - top) * EMU_PER_PX, media)
 
+
+def _gvml_package(children_xml: str, total_cx: int, total_cy: int, media=()) -> bytes:
+    """lockedCanvas の子(a:pic / a:sp / a:grpSp の XML)を GVML の zip に包む。
+
+    media は PNG のバイト列の並びで、i 番目(1から)が r:embed="rId{i}" で参照される。
+    図形だけ(ベクタ化)のときは空でよい。"""
+    media = list(media)
     drawing = (
         _GVML_XML_HEAD
         + '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
@@ -1176,7 +1190,7 @@ def build_gvml(pieces) -> bytes:
         '<a:grpSpPr><a:xfrm><a:off x="0" y="0"/>'
         f'<a:ext cx="{total_cx}" cy="{total_cy}"/><a:chOff x="0" y="0"/>'
         f'<a:chExt cx="{total_cx}" cy="{total_cy}"/></a:xfrm></a:grpSpPr>'
-        + "".join(pics)
+        + children_xml
         + '</lc:lockedCanvas></a:graphicData></a:graphic>')
     content_types = (
         _GVML_XML_HEAD
@@ -1191,6 +1205,8 @@ def build_gvml(pieces) -> bytes:
         + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         f'<Relationship Id="rId1" Type="{_GVML_NS_REL}/drawing" '
         'Target="clipboard/drawings/drawing1.xml"/></Relationships>')
+    rels = [f'<Relationship Id="rId{index}" Type="{_GVML_NS_REL}/image" '
+            f'Target="../media/image{index}.png"/>' for index in range(1, len(media) + 1)]
     drawing_rels = (
         _GVML_XML_HEAD
         + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -1202,7 +1218,7 @@ def build_gvml(pieces) -> bytes:
         archive.writestr("_rels/.rels", root_rels)
         archive.writestr("clipboard/drawings/drawing1.xml", drawing)
         archive.writestr("clipboard/drawings/_rels/drawing1.xml.rels", drawing_rels)
-        for index, (_x, _y, png, _w, _h) in enumerate(pieces, 1):
+        for index, png in enumerate(media, 1):
             # PNG はもともと圧縮済みなので、もう一度縮めない(時間だけかかる)。
             archive.writestr(f"clipboard/media/image{index}.png", png,
                              compress_type=zipfile.ZIP_STORED)
@@ -1226,6 +1242,564 @@ def resize_long_side(array, long_side: int):
         return array, 1.0
     size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
     return cv2.resize(array, size, interpolation=cv2.INTER_AREA), scale
+
+
+# ---------------------------------------------------------------
+# ベクタ化(Office で色や大きさを編集できる図形として貼る)
+# ---------------------------------------------------------------
+# 手順と値は、AI に描かせたアイコン一覧(1408×768 に28個)で試して決めたもの。そこで
+# 約3秒・パス約2,100個・細い線も色も元にかなり近い結果になった。
+#   1. アルファを二値にする(> VECTOR_ALPHA_CUT を不透明)
+#   2. RGB を mean shift で均す。輪郭を保ったまま JPEG のノイズで揺れた色を平らにする。
+#      これが無いと、破片を消す設定(filter_speckle)に、細い線(吹き出しの中の横線など)
+#      が巻き込まれて消えた
+#   3. 拡大する(曲線がなめらかになり、細い線が残る)。作業用の長辺は VECTOR_MAX_SIDE まで
+#   4. 不透明の画素だけを Lab の k-means で k 色にまとめる。12色・16色では似た色が混ざり、
+#      人物の顔の肌色が灰色に吸収された。既定は 20
+#   5. VTracer でトレースする(子プロセス。下の罠を参照)
+#   6. 座標を倍率で割って、元の画像の座標に戻す
+VECTOR_ALPHA_CUT = 127
+VECTOR_MEANSHIFT_SP = 6
+VECTOR_MEANSHIFT_SR = 14
+VECTOR_UPSCALE = 3.0
+VECTOR_MAX_SIDE = 4500
+VECTOR_COLORS_DEFAULT = 20
+VECTOR_COLORS_MIN = 8
+VECTOR_COLORS_MAX = 32
+VECTOR_KMEANS_ATTEMPTS = 2
+# k-means を当てはめる画素の上限。拡大後の不透明の画素(数百万)を全部使うと遅いだけで、
+# 色の中心はほとんど変わらない。当てはめは間引いた標本で行い、全画素は最寄りの中心に割り当てる。
+VECTOR_KMEANS_SAMPLES = 200000
+VECTOR_TIMEOUT_S = 180
+VECTOR_INSTALL_HINT = "pip install vtracer で使えます（setup.py --with-vector でも入ります）"
+# convert_image_to_svg_py に渡す引数(この順番の位置引数で渡すこと。下の罠を参照)。
+VTRACER_ARGS = (
+    "color",     # colormode
+    "stacked",   # hierarchical: 穴は上に重ねる形で表す(重ね順が意味を持つ)
+    "spline",    # mode
+    10,          # filter_speckle
+    8,           # color_precision
+    8,           # layer_difference
+    60,          # corner_threshold
+    4.0,         # length_threshold
+    10,          # max_iterations
+    45,          # splice_threshold
+    3,           # path_precision
+)
+# VTracer(pip の vtracer 0.6.15)の罠(実測)
+#   - convert_raw_image_to_svg / convert_pixels_to_svg(メモリ上の画像を渡す関数)は、
+#     呼んだだけでプロセスごと Segmentation fault で落ちる
+#   - convert_image_to_svg_py(入力パス, 出力パス, ...)は動くが、キーワード引数を1つでも
+#     渡すと落ちる。位置引数なら動く
+# 落ちれば窓ごと道連れになるので、トレースは必ず子プロセス(同じインタプリタ)で行い、
+# 一時ファイルでやりとりする。子が落ちても「ベクタ化に失敗しました」と出すだけで済む。
+_VTRACER_CHILD = (
+    "import sys, json, vtracer; "
+    "vtracer.convert_image_to_svg_py(sys.argv[1], sys.argv[2], *json.loads(sys.argv[3]))"
+)
+
+
+class VectorizeError(RuntimeError):
+    """ベクタ化に失敗した(子プロセスが落ちた・時間切れ・中身が無い など)。"""
+
+
+def vector_available() -> bool:
+    """vtracer が入っているか。import はしない(落ちやすいので、このプロセスでは読み込まない)。"""
+    try:
+        return importlib.util.find_spec("vtracer") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def vector_scale(h: int, w: int, upscale: float = VECTOR_UPSCALE,
+                 max_side: int = VECTOR_MAX_SIDE) -> float:
+    """作業用に拡大する倍率。長辺が max_side を超えないよう min(upscale, max_side/長辺)。"""
+    return float(min(float(upscale), float(max_side) / max(1, h, w)))
+
+
+def quantize_colors(rgb, mask, k: int, seed: int = 0, samples: int = VECTOR_KMEANS_SAMPLES):
+    """mask の画素だけを Lab の k-means で k 色にまとめる。
+
+    戻り値は (色をまとめた RGB(uint8、mask の外は 0), 使った色(RGB uint8、k'×3))。
+    k' は実際に使った色の数(画素の色の種類が k より少なければ減る)。
+
+    当てはめは最大 samples 画素の標本で行う。全画素を最寄りの中心へ割り当てるのは、
+    RGB を各 6bit に丸めた表(64³)を先に引いておいて行う。拡大後の数百万画素を Lab に
+    直して中心と比べると 3 秒かかった(表なら 0.1 秒)。丸めの誤差は各成分 ±2 なので、
+    どの中心に近いかが入れ替わるのは中心どうしのちょうど境目だけ。"""
+    rgb = np.asarray(rgb)
+    mask = np.asarray(mask, dtype=bool)
+    out = np.zeros_like(rgb, dtype=np.uint8)
+    pixels = rgb[mask].reshape(-1, 3)
+    if len(pixels) == 0:
+        return out, np.zeros((0, 3), np.uint8)
+    rng = np.random.default_rng(seed)
+    sample = pixels[rng.choice(len(pixels), samples, replace=False)] if len(pixels) > samples else pixels
+    unique = np.unique(sample, axis=0)
+    k = int(max(1, min(int(k), len(unique))))
+    if k >= len(unique) and len(np.unique(pixels, axis=0)) == len(unique):
+        centers = to_lab(unique)       # 色の種類が k 以下。そのまま使う
+    else:
+        cv2.setRNGSeed(int(seed))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.2)
+        _compact, _labels, centers = cv2.kmeans(
+            np.ascontiguousarray(to_lab(sample), dtype=np.float32), k, None, criteria,
+            VECTOR_KMEANS_ATTEMPTS, cv2.KMEANS_PP_CENTERS)
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
+    # 表: 6bit に丸めた各色の箱の中心から、最寄りの中心の番号。
+    levels = (np.arange(64, dtype=np.uint8) << 2) + 2
+    grid = np.stack(np.meshgrid(levels, levels, levels, indexing="ij"), axis=-1).reshape(-1, 3)
+    grid_lab = to_lab(grid)
+    table = np.empty(len(grid_lab), dtype=np.int32)
+    for start in range(0, len(grid_lab), 65536):
+        part = grid_lab[start:start + 65536]
+        table[start:start + 65536] = np.argmin(
+            ((part[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2), axis=1)
+    q = pixels.astype(np.int32) >> 2
+    labels = table[(q[:, 0] << 12) | (q[:, 1] << 6) | q[:, 2]]
+    palette = np.clip(lab_to_rgb255(centers.reshape(1, -1, 3)).reshape(-1, 3) + 0.5,
+                      0, 255).astype(np.uint8)
+    out[mask] = palette[labels]
+    return out, palette[np.unique(labels)]
+
+
+def fill_transparent_rgb(rgb, opaque):
+    """透明の画素の RGB を、いちばん近い不透明の画素の色で埋める。
+
+    透明の画素には抜いた背景の色(白など)がそのまま残っている。そのまま均したり拡大
+    したりすると、縁の画素に背景の色が混ざり、輪郭線が一段明るい別の色の帯になった
+    (色をまとめる段で、その帯に色を1つ取られる)。外側へ縁の色を延ばしておけば、
+    混ざっても同じ色のまま。"""
+    rgb = np.asarray(rgb)
+    opaque = np.asarray(opaque, dtype=bool)
+    if opaque.all() or not opaque.any():
+        return rgb.copy()
+    _dist, labels = cv2.distanceTransformWithLabels(
+        (~opaque).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+    # ラベルは「距離 0 の画素(不透明の画素)」ごとの番号。番号 → その画素の色の表を作る。
+    seeds = labels[opaque]
+    table = np.zeros((int(labels.max()) + 1, 3), np.uint8)
+    table[seeds] = rgb[opaque]
+    return np.ascontiguousarray(table[labels])
+
+
+def prepare_for_trace(rgba, colors: int = VECTOR_COLORS_DEFAULT,
+                      upscale: float = VECTOR_UPSCALE, max_side: int = VECTOR_MAX_SIDE):
+    """トレースの下ごしらえ(二値のアルファ・均す・拡大・色をまとめる)。
+
+    戻り値は (作業用の RGBA(uint8、アルファは 0 か 255), 倍率)。透明の画素の RGB は 0 に
+    する(VTracer がアルファを見て塗らない画素なので、色が残っていても意味が無い)。"""
+    from PIL import Image
+
+    rgba = np.asarray(rgba)
+    h, w = rgba.shape[:2]
+    rgb = np.ascontiguousarray(rgba[..., :3])
+    alpha = np.where(rgba[..., 3] > VECTOR_ALPHA_CUT, 255, 0).astype(np.uint8)
+    if not alpha.any():
+        raise VectorizeError("不透明な部分がありません")
+    rgb = fill_transparent_rgb(rgb, alpha > 0)
+    rgb = cv2.pyrMeanShiftFiltering(rgb, VECTOR_MEANSHIFT_SP, VECTOR_MEANSHIFT_SR)
+    scale = vector_scale(h, w, upscale, max_side)
+    if abs(scale - 1.0) > 1e-6:
+        size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+        rgb = np.asarray(Image.fromarray(rgb, "RGB").resize(size, Image.LANCZOS))
+        alpha = np.asarray(Image.fromarray(alpha, "L").resize(size, Image.LANCZOS))
+        alpha = np.where(alpha > VECTOR_ALPHA_CUT, 255, 0).astype(np.uint8)
+        # 実際の倍率(丸めで縦横がわずかに違う)。座標を戻すときは横の倍率を使う。
+        scale = size[0] / float(w)
+    mask = alpha > 0
+    quantized, _palette = quantize_colors(rgb, mask, colors)
+    return np.ascontiguousarray(np.dstack((quantized, alpha))), float(scale)
+
+
+def run_vtracer(png_path, svg_path, timeout: float = VECTOR_TIMEOUT_S, on_start=None) -> str:
+    """子プロセスで VTracer を走らせ、出力した SVG の文字列を返す。
+
+    on_start(Popen) を渡すと、起こした直後に呼ぶ(窓を閉じたときに止めるため)。
+    子が落ちた・時間切れ・何も書かなかったときは VectorizeError。"""
+    import subprocess
+
+    executable = sys.executable
+    # 常駐やこの窓は pythonw.exe で動く。子も同じ venv の python で起こす(コンソールは出さない)。
+    command = [executable, "-I", "-c", _VTRACER_CHILD, str(png_path), str(svg_path),
+               json.dumps(list(VTRACER_ARGS))]
+    creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=creationflags)
+    if on_start is not None:
+        try:
+            on_start(proc)
+        except Exception:
+            pass
+    try:
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise VectorizeError(f"VTracer が {timeout:.0f} 秒で終わりませんでした")
+    if proc.returncode != 0:
+        tail = err.decode("utf-8", "replace").strip().splitlines()[-1:] if err else []
+        code = proc.returncode & 0xFFFFFFFF if proc.returncode < 0 else proc.returncode
+        raise VectorizeError(f"VTracer が異常終了しました (終了コード 0x{code:X})"
+                             + (f": {tail[0]}" if tail else ""))
+    try:
+        with open(svg_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        raise VectorizeError(f"VTracer の出力を読めませんでした: {e}") from e
+
+
+# ---- SVG のパスを読む ----
+_SVG_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_SVG_TOKEN = re.compile(rf"([MmLlHhVvCcSsQqTtAaZz])|({_SVG_NUMBER})")
+_SVG_ARGS = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
+
+
+def parse_svg_path_d(d: str):
+    """SVG の d を、絶対座標の M / L / C / Z だけの命令の並びに直す。
+
+    戻り値は [(命令, [数…])]。M・L は [x, y]、C は [x1, y1, x2, y2, x, y]、Z は []。
+    相対命令(小文字)・H/V・S・Q・T も直す(Q は同じ曲線の3次ベジエへ正確に上げる)。
+    A(円弧)は VTracer は出さないので、終点への直線で代える(形は崩れても壊れない)。
+    途中で数が足りない・知らない字が来たら、そこまでで打ち切る。"""
+    tokens = []
+    for match in _SVG_TOKEN.finditer(d or ""):
+        if match.group(1):
+            tokens.append(match.group(1))
+        else:
+            tokens.append(float(match.group(2)))
+    out = []
+    i = 0
+    cmd = None
+    cx = cy = 0.0          # いまの点
+    sx = sy = 0.0          # いまの部分パスの始点(Z で戻る先)
+    last_c2 = None         # 直前の C/S の2つ目の制御点(S の折り返し用)
+    last_q = None          # 直前の Q/T の制御点(T の折り返し用)
+    while i < len(tokens):
+        token = tokens[i]
+        if isinstance(token, str):
+            cmd = token
+            i += 1
+            if cmd in "Zz":
+                if out and out[-1][0] != "Z":
+                    out.append(("Z", []))
+                cx, cy = sx, sy
+                last_c2 = last_q = None
+                continue
+        elif cmd is None or cmd in "Zz":
+            break  # 命令の無い数(壊れた d)
+        upper = cmd.upper()
+        n = _SVG_ARGS[upper]
+        args = tokens[i:i + n]
+        if len(args) < n or any(isinstance(a, str) for a in args):
+            break
+        i += n
+        rel = cmd.islower()
+        ox, oy = (cx, cy) if rel else (0.0, 0.0)
+        if upper == "M":
+            cx, cy = args[0] + ox, args[1] + oy
+            sx, sy = cx, cy
+            out.append(("M", [cx, cy]))
+            # M のあとに続く座標の組は L として扱う(SVG の決まり)
+            cmd = "l" if rel else "L"
+            last_c2 = last_q = None
+        elif upper in "LHV" or upper == "A":
+            if upper == "L":
+                cx, cy = args[0] + ox, args[1] + oy
+            elif upper == "H":
+                cx = args[0] + (cx if rel else 0.0)
+            elif upper == "V":
+                cy = args[0] + (cy if rel else 0.0)
+            else:  # A: 終点への直線で代える
+                cx, cy = args[5] + ox, args[6] + oy
+            out.append(("L", [cx, cy]))
+            last_c2 = last_q = None
+        elif upper == "C":
+            x1, y1, x2, y2, x, y = (args[0] + ox, args[1] + oy, args[2] + ox, args[3] + oy,
+                                    args[4] + ox, args[5] + oy)
+            out.append(("C", [x1, y1, x2, y2, x, y]))
+            cx, cy, last_c2, last_q = x, y, (x2, y2), None
+        elif upper == "S":
+            x1, y1 = (2 * cx - last_c2[0], 2 * cy - last_c2[1]) if last_c2 else (cx, cy)
+            x2, y2, x, y = args[0] + ox, args[1] + oy, args[2] + ox, args[3] + oy
+            out.append(("C", [x1, y1, x2, y2, x, y]))
+            cx, cy, last_c2, last_q = x, y, (x2, y2), None
+        else:  # Q / T
+            if upper == "Q":
+                qx, qy, x, y = args[0] + ox, args[1] + oy, args[2] + ox, args[3] + oy
+            else:
+                qx, qy = (2 * cx - last_q[0], 2 * cy - last_q[1]) if last_q else (cx, cy)
+                x, y = args[0] + ox, args[1] + oy
+            out.append(("C", [cx + 2.0 / 3.0 * (qx - cx), cy + 2.0 / 3.0 * (qy - cy),
+                              x + 2.0 / 3.0 * (qx - x), y + 2.0 / 3.0 * (qy - y), x, y]))
+            cx, cy, last_c2, last_q = x, y, None, (qx, qy)
+    return out
+
+
+def parse_svg_transform(text: str):
+    """transform 属性を 2×3 のアフィン [a, b, c, d, e, f](x' = a x + c y + e, y' = b x + d y + f)
+    にする。translate / scale / matrix を読む。読めないものは無視する。"""
+    a, b, c, d, e, f = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+    for name, body in re.findall(r"(\w+)\s*\(([^)]*)\)", text or ""):
+        values = [float(v) for v in re.findall(_SVG_NUMBER, body)]
+        if name == "translate" and values:
+            m = (1.0, 0.0, 0.0, 1.0, values[0], values[1] if len(values) > 1 else 0.0)
+        elif name == "scale" and values:
+            m = (values[0], 0.0, 0.0, values[1] if len(values) > 1 else values[0], 0.0, 0.0)
+        elif name == "matrix" and len(values) == 6:
+            m = tuple(values)
+        else:
+            continue
+        # 左から順に掛ける(SVG の transform は書いた順に外側から効く)
+        a, b, c, d, e, f = (a * m[0] + c * m[1], b * m[0] + d * m[1],
+                            a * m[2] + c * m[3], b * m[2] + d * m[3],
+                            a * m[4] + c * m[5] + e, b * m[4] + d * m[5] + f)
+    return [a, b, c, d, e, f]
+
+
+def _parse_fill(value: str):
+    """'#rrggbb' / '#rgb' を (r, g, b) に。読めなければ None。"""
+    value = (value or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+    if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
+        return tuple(int(ch * 2, 16) for ch in value[1:])
+    match = re.fullmatch(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", value)
+    if match:
+        return tuple(min(255, int(v)) for v in match.groups())
+    return None
+
+
+def _apply_affine(commands, m, scale: float = 1.0):
+    a, b, c, d, e, f = m
+    out = []
+    for op, values in commands:
+        pts = []
+        for k in range(0, len(values), 2):
+            x, y = values[k], values[k + 1]
+            pts += [(a * x + c * y + e) * scale, (b * x + d * y + f) * scale]
+        out.append((op, pts))
+    return out
+
+
+def parse_svg_paths(svg_text: str, scale: float = 1.0):
+    """SVG の <path> を出てきた順(=重ね順)に読む。座標は transform を当て、scale を掛ける。
+
+    戻り値は [{"color": (r, g, b), "commands": [(命令, [数…])]}]。塗りの無い(fill="none"
+    や読めない色の)パスと、命令が空のパスは飛ばす。"""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(svg_text)
+    paths = []
+    for element in root.iter():
+        if not element.tag.endswith("path"):
+            continue
+        color = _parse_fill(element.get("fill", ""))
+        if color is None:
+            style = element.get("style", "")
+            match = re.search(r"fill\s*:\s*([^;]+)", style)
+            color = _parse_fill(match.group(1)) if match else None
+        if color is None:
+            continue
+        commands = parse_svg_path_d(element.get("d", ""))
+        if not any(op != "Z" for op, _v in commands):
+            continue
+        commands = _apply_affine(commands, parse_svg_transform(element.get("transform", "")), scale)
+        paths.append({"color": color, "commands": commands})
+    return paths
+
+
+def path_bbox(commands):
+    """命令の並びの外接矩形 (x0, y0, x1, y1)。制御点も含める(ベジエは制御点の凸包に入るので、
+    曲線は必ずこの中に収まる)。"""
+    xs = [v for _op, values in commands for v in values[0::2]]
+    ys = [v for _op, values in commands for v in values[1::2]]
+    if not xs:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _fmt(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def paths_to_svg(paths, width: int, height: int, dx: float = 0.0, dy: float = 0.0) -> str:
+    """パスを SVG の文字列にする(重ね順のまま)。座標から (dx, dy) を引く(アイコンごとに
+    切り出して保存するとき、アイコンの左上を原点にする)。"""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="{int(width)}" '
+        f'height="{int(height)}" viewBox="0 0 {int(width)} {int(height)}">',
+    ]
+    for path in paths:
+        parts = []
+        for op, values in path["commands"]:
+            if op == "Z":
+                parts.append("Z")
+                continue
+            coords = []
+            for k in range(0, len(values), 2):
+                coords.append(f"{_fmt(values[k] - dx)} {_fmt(values[k + 1] - dy)}")
+            parts.append(op + " ".join(coords))
+        lines.append(f'<path d="{" ".join(parts)}" fill="{_hex(path["color"])}"/>')
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+def vectorize(rgba, colors: int = VECTOR_COLORS_DEFAULT, workdir=None, on_start=None):
+    """透過済みの RGBA をベクタにする。{"paths", "svg", "scale", "seconds", "size"} を返す。
+
+    paths の座標は元の画像(rgba)の px。トレースは子プロセス(run_vtracer)。"""
+    import tempfile
+
+    started = time.monotonic()
+    rgba = np.asarray(rgba)
+    h, w = rgba.shape[:2]
+    work, scale = prepare_for_trace(rgba, colors)
+    folder = tempfile.mkdtemp(prefix="bg_vector_", dir=workdir)
+    png_path = os.path.join(folder, "in.png")
+    svg_path = os.path.join(folder, "out.svg")
+    try:
+        with open(png_path, "wb") as f:
+            f.write(encode_png(work))
+        svg_raw = run_vtracer(png_path, svg_path, on_start=on_start)
+    finally:
+        for path in (png_path, svg_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+    paths = parse_svg_paths(svg_raw, 1.0 / scale)
+    if not paths:
+        raise VectorizeError("図形が1つも得られませんでした")
+    return {"paths": paths, "svg": paths_to_svg(paths, w, h), "scale": scale,
+            "seconds": time.monotonic() - started, "size": (w, h)}
+
+
+# ---- DrawingML(Office の図形)にする ----
+def _emu(value: float) -> int:
+    return int(round(float(value) * EMU_PER_PX))
+
+
+def path_to_sp_xml(path, shape_id: int, name: str, left: float = 0.0, top: float = 0.0) -> str:
+    """1本のパスを、自由図形(a:sp + a:custGeom)の XML にする。
+
+    座標は px で、(left, top) を原点にずらしてから EMU にする。図形の位置と大きさは
+    外接矩形(path_bbox)で決め、パスの座標はその左上からの EMU で書く(w/h も EMU なので
+    拡大縮小なし)。塗りは srgbClr の単色、線は無し。1本のパスに部分パス(M…Z)が複数
+    あれば、そのまま1つの a:path に続けて書く(Office は重なった部分パスを穴として描く)。"""
+    x0, y0, x1, y1 = path_bbox(path["commands"])
+    off_x, off_y = _emu(x0 - left), _emu(y0 - top)
+    cx = max(1, _emu(x1 - left) - off_x)
+    cy = max(1, _emu(y1 - top) - off_y)
+    body = []
+    for op, values in path["commands"]:
+        if op == "Z":
+            body.append("<a:close/>")
+            continue
+        pts = "".join(
+            f'<a:pt x="{_emu(values[k] - left) - off_x}" y="{_emu(values[k + 1] - top) - off_y}"/>'
+            for k in range(0, len(values), 2))
+        tag = {"M": "a:moveTo", "L": "a:lnTo", "C": "a:cubicBezTo"}[op]
+        body.append(f"<{tag}>{pts}</{tag}>")
+    color = "{:02X}{:02X}{:02X}".format(*path["color"])
+    return (
+        f'<a:sp><a:nvSpPr><a:cNvPr id="{shape_id}" name="{name}"/><a:cNvSpPr/></a:nvSpPr>'
+        f'<a:spPr><a:xfrm><a:off x="{off_x}" y="{off_y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+        '<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>'
+        '<a:rect l="0" t="0" r="r" b="b"/>'
+        f'<a:pathLst><a:path w="{cx}" h="{cy}">{"".join(body)}</a:path></a:pathLst></a:custGeom>'
+        f'<a:solidFill><a:srgbClr val="{color}"/></a:solidFill>'
+        '<a:ln><a:noFill/></a:ln></a:spPr></a:sp>')
+
+
+def assign_paths_to_icons(paths, icons):
+    """各パスを、外接矩形の重なりがいちばん大きいアイコンへ割り当てる。
+
+    戻り値はアイコンごとのパスの番号の並び(アイコンの並びと同じ長さ。中は元の重ね順)。
+    どのアイコンとも重ならないパスは、外接矩形の中心がいちばん近いアイコンへ入れる
+    (捨てると、分けないときより図形が減ってしまう)。icons が空なら []。"""
+    if not icons:
+        return []
+    boxes = np.asarray([icon["box"] for icon in icons], dtype=np.float64)
+    groups = [[] for _ in icons]
+    for index, path in enumerate(paths):
+        x0, y0, x1, y1 = path_bbox(path["commands"])
+        iw = np.clip(np.minimum(boxes[:, 2], x1) - np.maximum(boxes[:, 0], x0), 0, None)
+        ih = np.clip(np.minimum(boxes[:, 3], y1) - np.maximum(boxes[:, 1], y0), 0, None)
+        overlap = iw * ih
+        if overlap.max() > 0:
+            chosen = int(np.argmax(overlap))
+        else:
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            bx = np.clip(cx, boxes[:, 0], boxes[:, 2]) - cx
+            by = np.clip(cy, boxes[:, 1], boxes[:, 3]) - cy
+            chosen = int(np.argmin(bx * bx + by * by))
+        groups[chosen].append(index)
+    return groups
+
+
+def build_vector_gvml(paths, groups=None) -> bytes:
+    """ベクタ化したパスを、自由図形として GVML にする。
+
+    groups(assign_paths_to_icons の戻り値)を渡すと、アイコンごとに a:grpSp でまとめる
+    (空のアイコンは飛ばす)。渡さなければ全部を1つの a:grpSp にまとめる(何千もの図形が
+    ばらばらに貼られると、動かすのも消すのも大変なため)。重ね順はパスの並びのまま。"""
+    paths = list(paths)
+    if not paths:
+        raise ValueError("図形がありません")
+    if groups is None:
+        groups = [list(range(len(paths)))]
+    groups = [list(g) for g in groups if g]
+    boxes = [path_bbox(p["commands"]) for p in paths]
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    right = max(b[2] for b in boxes)
+    bottom = max(b[3] for b in boxes)
+
+    next_id = 2
+    children = []
+    for number, members in enumerate(groups, 1):
+        gx0 = min(boxes[i][0] for i in members)
+        gy0 = min(boxes[i][1] for i in members)
+        gx1 = max(boxes[i][2] for i in members)
+        gy1 = max(boxes[i][3] for i in members)
+        off_x, off_y = _emu(gx0 - left), _emu(gy0 - top)
+        cx = max(1, _emu(gx1 - left) - off_x)
+        cy = max(1, _emu(gy1 - top) - off_y)
+        group_id = next_id
+        next_id += 1
+        shapes = []
+        for k, i in enumerate(members, 1):
+            shapes.append(path_to_sp_xml(paths[i], next_id, f"icon {number} path {k}", left, top))
+            next_id += 1
+        # 子の座標は、キャンバス(lockedCanvas)の座標のまま書く(chOff/chExt を off/ext と
+        # 同じにすれば、グループは子を動かしも伸ばしもしない)。
+        children.append(
+            f'<a:grpSp><a:nvGrpSpPr><a:cNvPr id="{group_id}" name="icon {number}"/>'
+            '<a:cNvGrpSpPr/></a:nvGrpSpPr>'
+            f'<a:grpSpPr><a:xfrm><a:off x="{off_x}" y="{off_y}"/><a:ext cx="{cx}" cy="{cy}"/>'
+            f'<a:chOff x="{off_x}" y="{off_y}"/><a:chExt cx="{cx}" cy="{cy}"/></a:xfrm></a:grpSpPr>'
+            + "".join(shapes) + '</a:grpSp>')
+    return _gvml_package("".join(children), max(1, _emu(right - left)),
+                         max(1, _emu(bottom - top)))
+
+
+def icon_svgs(paths, icons, groups=None):
+    """アイコンごとの SVG の文字列の並び。座標はアイコンの左上を原点にする。"""
+    if groups is None:
+        groups = assign_paths_to_icons(paths, icons)
+    out = []
+    for icon, members in zip(icons, groups):
+        x0, y0, x1, y1 = icon["box"]
+        chosen = [paths[i] for i in members]
+        out.append(paths_to_svg(chosen, x1 - x0, y1 - y0, x0, y0))
+    return out
 
 
 # ---------------------------------------------------------------
@@ -1832,6 +2406,59 @@ def _ai_worker(bridge: _AiBridge, rgb, model: str) -> None:
         pass  # 待っている間に窓が閉じられた。渡す先が無いだけ
 
 
+class _VectorBridge(QObject):
+    """ベクタ化のワーカースレッドから窓へ結果を戻す器(_AiBridge と同じ流儀)。"""
+
+    finished = Signal(object)
+
+
+def _vector_worker(bridge: _VectorBridge, job: dict, holder: dict) -> None:
+    """別スレッドで下ごしらえをし、トレースは子プロセスで行う(vectorize)。
+    ここで投げた例外はどこにも捕まらないので全部受ける。holder["proc"] には子プロセスを
+    入れる(窓を閉じたときに止めるため)。"""
+    result = {"job": job}
+    started = time.monotonic()
+    try:
+        result.update(vectorize(job["rgba"], job["colors"],
+                                on_start=lambda proc: holder.__setitem__("proc", proc)))
+        result["ok"] = True
+    except VectorizeError as e:
+        result["ok"] = False
+        result["error"] = str(e)
+        _log_exception(f"vectorize colors={job['colors']}")
+    except Exception:
+        result["ok"] = False
+        result["error"] = _log_exception(f"vectorize colors={job['colors']}")
+    result["seconds"] = time.monotonic() - started
+    holder.pop("proc", None)
+    try:
+        bridge.finished.emit(result)
+    except RuntimeError:
+        pass  # 待っている間に窓が閉じられた
+
+
+def render_svg_image(svg_text: str, width: int, height: int):
+    """SVG を width×height の QImage(透明の地)に描く。描けなければ None。"""
+    if QSvgRenderer is None:
+        return None
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    if not renderer.isValid():
+        return None
+    image = QImage(max(1, int(width)), max(1, int(height)), QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    renderer.render(painter, QRectF(0, 0, image.width(), image.height()))
+    painter.end()
+    return image
+
+
+def _array_key(rgba) -> str:
+    """配列の中身の指紋(ベクタ化の結果が、いまの透過の結果に対応しているかを見る)。"""
+    rgba = np.ascontiguousarray(rgba)
+    return f"{rgba.shape}:{hashlib.sha1(rgba.data).hexdigest()}"
+
+
 class BgRemoveWindow(QWidget):
     """背景を抜いた結果を見ながら調整し、クリップボードへ載せる/保存する窓。"""
 
@@ -1899,6 +2526,31 @@ class BgRemoveWindow(QWidget):
         self._ai_clock = QTimer(self)
         self._ai_clock.setInterval(250)
         self._ai_clock.timeout.connect(self._show_ai_progress)
+
+        # ベクタ化。結果は「どの透過の結果から作ったか」の指紋と組で持つ。
+        #   key   … 原寸の RGBA の指紋 + 色数(出力に使ってよいかの判定)
+        #   p_key … そのときのプレビューの指紋 + 色数(表示してよいかの判定。つまみを
+        #           動かすたびに原寸を計算し直さずに済むよう、プレビューで見る)
+        self._vector_ok = vector_available()
+        self._vector = None          # 最後に成功した結果
+        self._vector_image = None    # その結果をプレビューの大きさに描いたもの (大きさ, QImage)
+        self._vector_running = False
+        self._vector_wanted = None   # いちばん新しい依頼(走っている間に変わったら走らせ直す)
+        self._vector_pending = None  # 終わったらすること(クリップボードへ/保存)
+        self._vector_failed = None   # 失敗した依頼の p_key(同じ設定で走らせ直し続けない)
+        self._vector_error = ""
+        self._vector_started = 0.0
+        self._vector_holder = {}
+        self._preview_key = None
+        self._vector_bridge = _VectorBridge()
+        self._vector_bridge.finished.connect(self._on_vector_finished)
+        self._vector_clock = QTimer(self)
+        self._vector_clock.setInterval(250)
+        self._vector_clock.timeout.connect(self._update_busy)
+        self._vector_debounce = QTimer(self)
+        self._vector_debounce.setSingleShot(True)
+        self._vector_debounce.setInterval(VECTOR_DEBOUNCE_MS)
+        self._vector_debounce.timeout.connect(lambda: self._start_vector())
 
         section = _section(app_settings)
         self.setWindowTitle("背景を透過")
@@ -2323,6 +2975,44 @@ class BgRemoveWindow(QWidget):
         split_layout.addWidget(self.split_count)
         layout.addWidget(self.split_box)
         self.split_box.setVisible(self.split_check.isChecked())
+
+        # ベクタ化: PowerPoint などで色や大きさを編集できる図形(フリーフォーム)として貼る。
+        # 数秒かかるので、つまみを動かすたびには走らせない(VECTOR_DEBOUNCE_MS 待つ)。
+        self.vector_check = QCheckBox("ベクタ化（図形として貼る）")
+        self.vector_check.setFont(self._font())
+        self.vector_check.setChecked(bool(section.get("vectorize", False)) and self._vector_ok)
+        self.vector_check.setToolTip(
+            "色をまとめて輪郭をなぞり、図形(フリーフォーム)にする。クリップボードへ載せると、\n"
+            "PowerPoint・Excel・Word で色や大きさを変えられる図形として貼れる(アイコンに分けて\n"
+            "いればアイコンごとのグループになる)。透過PNGと SVG も一緒に載せる")
+        self.vector_check.toggled.connect(self._on_vector_toggled)
+        layout.addWidget(self.vector_check)
+        self.vector_box = QWidget()
+        vector_layout = QVBoxLayout(self.vector_box)
+        vector_layout.setContentsMargins(22, 0, 0, 0)
+        vector_layout.setSpacing(4)
+        self.vector_colors_slider, _label = self._make_slider(
+            vector_layout, "色数", VECTOR_COLORS_MAX,
+            _int_setting(section, "vector_colors", VECTOR_COLORS_DEFAULT,
+                         VECTOR_COLORS_MIN, VECTOR_COLORS_MAX),
+            "絵の色をこの数にまとめてから図形にする。似た色が混ざる(肌の色が灰色になる など)\n"
+            "なら上げ、図形が多すぎるなら下げる")
+        self.vector_colors_slider.setMinimum(VECTOR_COLORS_MIN)
+        self.vector_show_check = QCheckBox("ベクタの結果を表示")
+        self.vector_show_check.setFont(self._font())
+        self.vector_show_check.setChecked(True)
+        self.vector_show_check.setToolTip("右の結果を、図形にしたもの(SVG を描き直したもの)で見る。\n"
+                                          "外すと透過の結果(画素)に戻す")
+        self.vector_show_check.toggled.connect(lambda _c: self._schedule())
+        vector_layout.addWidget(self.vector_show_check)
+        self.vector_note = self._note("")
+        vector_layout.addWidget(self.vector_note)
+        layout.addWidget(self.vector_box)
+        self.vector_box.setVisible(self.vector_check.isChecked())
+        if not self._vector_ok:
+            self.vector_check.setEnabled(False)
+            self.vector_check.setToolTip(VECTOR_INSTALL_HINT)
+            layout.addWidget(self._note("ベクタ化は " + VECTOR_INSTALL_HINT))
         return layout
 
     def _build_display_section(self):
@@ -2360,7 +3050,7 @@ class BgRemoveWindow(QWidget):
         row.setSpacing(8)
         save = QPushButton("保存…")
         save.setFont(self._font())
-        save.setToolTip("透過PNGとして保存する（Ctrl+S）")
+        save.setToolTip("透過PNG、またはベクタ化した SVG として保存する（Ctrl+S）")
         save.clicked.connect(self._save)
         row.addWidget(save, 1)
         cancel = QPushButton("キャンセル")
@@ -2836,12 +3526,26 @@ class BgRemoveWindow(QWidget):
         seconds = time.monotonic() - self._ai_started
         text = f"{self._ai_stage}…　{seconds:.0f}秒"
         self.ai_status.setText(text)
-        self.result_view.set_busy(text)
+        self._update_busy()
 
     def _stop_ai_progress(self):
         self._ai_clock.stop()
         self.ai_progress.setVisible(False)
-        self.result_view.set_busy("")
+        self._update_busy()
+
+    def _update_busy(self):
+        """結果の上の「処理中」を、いま走っているものに合わせる(AI が優先、次にベクタ化)。
+        AI とベクタ化は同時に走りうるので、片方が終わったときに表示を消してしまわないよう、
+        いつもここで決め直す。"""
+        try:
+            text = ""
+            if self._ai_running:
+                text = f"{self._ai_stage}…　{time.monotonic() - self._ai_started:.0f}秒"
+            elif self._vector_running:
+                text = f"ベクタ化しています…　{time.monotonic() - self._vector_started:.0f}秒"
+            self.result_view.set_busy(text)
+        except Exception:
+            pass  # 表示の都合で処理を止めない
 
     def _on_ai_finished(self, result):
         try:
@@ -3133,7 +3837,8 @@ class BgRemoveWindow(QWidget):
             if self._protect_state() != self._shown_protect_state:
                 self._rebuild_protect_list()
             rgba = self.compute(preview=True)
-            self.result_view.set_image(array_to_qimage(rgba))
+            self._preview_key = (_array_key(rgba), self.vector_colors_slider.value())
+            self.result_view.set_image(self._result_image(rgba))
             icons = self._split(rgba, preview=True)
             self.result_view.set_boxes([icon["box"] for icon in icons])
             if self.split_check.isChecked():
@@ -3158,11 +3863,14 @@ class BgRemoveWindow(QWidget):
             if self._selected_method() == METHOD_AI and self._ai_running:
                 warnings += "  ·  AIで抜いている間は、色で抜いた結果を出しています"
             warnings += self._point_warnings()
-            self._summary += warnings
+            self._summary += warnings + self._vector_summary()
             # 警告があるときは目立つ色にする(読み流されると、残したつもりの所が抜けたまま
             # 載ってしまう)。
             self._summary_level = "warning" if warnings else ""
+            if self._vector_enabled() and self._vector_failed == self._preview_key:
+                self._summary_level = "error"
             self._set_status(self._summary, self._summary_level)
+            self._schedule_vector()
         except Exception:
             self._summary = ""
             self._summary_level = "error"
@@ -3196,6 +3904,210 @@ class BgRemoveWindow(QWidget):
         return text
 
     # ------------------------------------------------------------------
+    # ベクタ化
+    # ------------------------------------------------------------------
+    def _vector_enabled(self) -> bool:
+        check = getattr(self, "vector_check", None)
+        return bool(self._vector_ok and check is not None and check.isChecked())
+
+    def _vector_fresh(self) -> bool:
+        """いまのプレビューに対応したベクタの結果があるか。"""
+        return self._vector is not None and self._vector.get("p_key") == self._preview_key
+
+    def _result_image(self, rgba):
+        """右のペインに出す画像。ベクタの結果を表示する設定で、いまの透過の結果に対応した
+        ものがあればそれを描いたもの、そうでなければ透過の結果。"""
+        if (self._vector_enabled() and self.vector_show_check.isChecked()
+                and self._vector_fresh()):
+            h, w = rgba.shape[:2]
+            if self._vector_image is None or self._vector_image[0] != (w, h):
+                image = render_svg_image(self._vector["svg"], w, h)
+                self._vector_image = ((w, h), image)
+            if self._vector_image[1] is not None:
+                return self._vector_image[1]
+        return array_to_qimage(rgba)
+
+    def _vector_summary(self) -> str:
+        """状態欄に足すベクタ化の様子(パス数など)。パネルの補足も同じ内容にそろえる。"""
+        if not self._vector_enabled():
+            return ""
+        if self._vector_running:
+            text = "ベクタ化しています…"
+            if self._vector_pending is not None and self._vector_pending_label:
+                text += f"（終わったら{self._vector_pending_label}）"
+        elif self._vector_fresh():
+            text = (f"ベクタ {len(self._vector['paths'])} パス"
+                    f"（{self._vector.get('seconds', 0.0):.1f}秒）")
+        elif self._vector_failed == self._preview_key and self._vector_error:
+            text = f"ベクタ化に失敗しました: {self._vector_error}"
+        else:
+            text = "ベクタ化を待っています"
+        try:
+            self.vector_note.setText(text)
+        except Exception:
+            pass
+        return f"  ·  {text}"
+
+    def _schedule_vector(self):
+        """プレビューを描き直したあとに呼ぶ。ベクタの結果がいまの透過の結果と食い違って
+        いれば、しばらく待ってから(つまみが止まってから)走らせ直す。"""
+        if not self._vector_enabled() or self._vector_fresh():
+            return
+        if self._vector_failed == self._preview_key:
+            return  # 同じ設定で失敗したばかり。走らせ直し続けない
+        wanted = self._vector_wanted
+        if self._vector_running and wanted is not None and wanted["p_key"] == self._preview_key:
+            return  # いまの設定のものが走っている
+        self._vector_debounce.start()
+
+    def _on_vector_toggled(self, checked):
+        try:
+            self.vector_box.setVisible(bool(checked))
+            self._vector_debounce.stop()
+            self._refresh_preview()
+            if checked and not self._vector_fresh() and not self._vector_running:
+                self._start_vector()  # 入れたらすぐ始める(待たせる理由が無い)
+        except Exception:
+            self._set_status(f"ベクタ化を切り替えられませんでした: {_log_exception('vector toggle')}",
+                             "error")
+
+    _vector_pending_label = ""
+
+    def _start_vector(self, action=None, label=""):
+        """いまの設定の原寸の結果をベクタ化する。action(rgba を受ける関数)を渡すと、
+        いまの設定の結果ができた時点で呼ぶ(すでにあればすぐ呼ぶ)。label は待っている間に
+        状態欄へ出す「終わったら何をするか」。"""
+        try:
+            self._vector_debounce.stop()
+            rgba = self._final_rgba()
+            if rgba is None:
+                return
+            colors = self.vector_colors_slider.value()
+            key = (_array_key(rgba), colors)
+            if self._vector is not None and self._vector["key"] == key:
+                # 透過の結果は変わっていなかった(アイコンに分ける設定だけ変えた など)。
+                self._vector["p_key"] = self._preview_key
+                if action is not None:
+                    action(rgba)
+                else:
+                    self._refresh_preview()
+                return
+            self._vector_wanted = {"key": key, "p_key": self._preview_key, "rgba": rgba,
+                                   "colors": colors}
+            if action is not None:
+                self._vector_pending = action
+                self._vector_pending_label = label
+            if not self._vector_running:
+                self._launch_vector()
+            self._refresh_preview()
+        except Exception:
+            self._set_status(f"ベクタ化を始められませんでした: {_log_exception('vector start')}",
+                             "error")
+
+    def _launch_vector(self):
+        job = self._vector_wanted
+        self._vector_running = True
+        self._vector_started = time.monotonic()
+        self._vector_clock.start()
+        self._update_busy()
+        thread = threading.Thread(
+            target=_vector_worker, args=(self._vector_bridge, job, self._vector_holder),
+            name="bg_remove-vector", daemon=True)
+        thread.start()
+
+    def _on_vector_finished(self, result):
+        try:
+            job = result["job"]
+            wanted = self._vector_wanted
+            if result.get("ok"):
+                self._vector = {"key": job["key"], "p_key": job["p_key"],
+                                "paths": result["paths"], "svg": result["svg"],
+                                "seconds": result.get("seconds", 0.0)}
+                self._vector_image = None
+                self._vector_error = ""
+                self._vector_failed = None
+            else:
+                self._vector_error = result.get("error", "")
+                self._vector_failed = job["p_key"]
+            if wanted is not None and wanted["key"] != job["key"]:
+                # 走っている間に設定が変わった。いちばん新しい設定で走らせ直す。
+                self._launch_vector()
+                return
+            self._vector_running = False
+            self._vector_clock.stop()
+            self._update_busy()
+            pending, self._vector_pending = self._vector_pending, None
+            self._refresh_preview()
+            if not result.get("ok"):
+                hint = "（ベクタ化を外せば、画像としては載せられます）" if pending else ""
+                self._set_status(f"ベクタ化に失敗しました: {self._vector_error}{hint}", "error")
+                return
+            if pending is not None and wanted is not None:
+                pending(wanted["rgba"])
+        except Exception:
+            self._vector_running = False
+            self._vector_clock.stop()
+            self._update_busy()
+            self._set_status(f"ベクタ化の結果を扱えませんでした: {_log_exception('vector finished')}",
+                             "error")
+
+    def _vector_groups(self, rgba):
+        """(アイコン, アイコンごとのパスの番号)。分けない設定なら ([], None)。"""
+        icons = self._split(rgba, preview=False)
+        if not icons:
+            return [], None
+        return icons, assign_paths_to_icons(self._vector["paths"], icons)
+
+    def _vector_to_clipboard(self, rgba):
+        """ベクタの結果を、図形(GVML)・透過PNG・SVG の3つの形式で載せて閉じる。"""
+        try:
+            icons, groups = self._vector_groups(rgba)
+            paths = self._vector["paths"]
+            extra = {GVML_MIME: build_vector_gvml(paths, groups),
+                     SVG_MIME: self._vector["svg"].encode("utf-8")}
+            image = array_to_qimage(rgba)
+            set_clipboard_image(image, extra=extra)
+            self._linger_ms = VISIBLE_MS + FADE_MS + 100
+            if icons:
+                show_toast(f"背景を透過\n{len(icons)} 個のアイコンを図形として載せました"
+                           f"（{len(paths)} パス）")
+            else:
+                show_toast(f"背景を透過\n図形として載せました（{len(paths)} パス）")
+            self.close()
+        except Exception:
+            self._set_status(f"クリップボードへ載せられませんでした: {_log_exception('vector clipboard')}",
+                             "error")
+
+    def _save_svg(self, path, rgba):
+        """SVG を保存する。アイコンに分ける設定なら 名前_01.svg … と連番で。"""
+        try:
+            if self.split_check.isChecked():
+                icons, groups = self._vector_groups(rgba)
+                if not icons:
+                    self._set_status("アイコンが見つからないので保存しませんでした", "warning")
+                    return
+                paths = self._numbered_paths(path, len(icons), ".svg")
+                if not self._confirm_overwrite(paths):
+                    return
+                texts = icon_svgs(self._vector["paths"], icons, groups)
+            else:
+                paths, texts = [path], [self._vector["svg"]]
+            for target, text in zip(paths, texts):
+                with open(target, "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+            _save_values(self._app_settings, self._settings_path,
+                         {"last_dir": os.path.dirname(path)})
+            first, last = os.path.basename(paths[0]), os.path.basename(paths[-1])
+            if len(paths) > 1:
+                self._set_status(f"{len(paths)} 個の SVG を保存しました: {first} 〜 {last}")
+                show_toast(f"背景を透過\n{len(paths)} 個の SVG を保存しました\n{first} 〜 {last}")
+            else:
+                self._set_status(f"保存しました: {paths[0]}")
+                show_toast(f"背景を透過\n保存しました\n{first}")
+        except Exception:
+            self._set_status(f"SVG を保存できませんでした: {_log_exception('save svg')}", "error")
+
+    # ------------------------------------------------------------------
     # 出力
     # ------------------------------------------------------------------
     def _final_image(self):
@@ -3218,7 +4130,7 @@ class BgRemoveWindow(QWidget):
                 return self.compute(preview=False)
             finally:
                 try:
-                    self.result_view.set_busy("")
+                    self._update_busy()
                     QApplication.restoreOverrideCursor()
                 except Exception:
                     pass
@@ -3229,6 +4141,11 @@ class BgRemoveWindow(QWidget):
 
     def _to_clipboard(self):
         try:
+            if self._vector_enabled():
+                # ベクタの結果がいまの設定に追いついていれば、すぐ載せて閉じる。追いついて
+                # いなければ、できた時点で載せる。
+                self._start_vector(action=self._vector_to_clipboard, label="クリップボードへ載せます")
+                return
             rgba = self._final_rgba()
             if rgba is None:
                 return
@@ -3258,9 +4175,27 @@ class BgRemoveWindow(QWidget):
 
     def _save(self):
         try:
-            path, _filter = QFileDialog.getSaveFileName(
-                self, "透過PNGを保存", self._default_save_path(), "PNG 画像 (*.png)")
+            png_filter = "PNG 画像 (*.png)"
+            svg_filter = "SVG ベクタ (*.svg)"
+            filters = [png_filter]
+            if self._vector_ok:
+                filters.append(svg_filter)
+            default = self._default_save_path()
+            # ベクタ化しているなら SVG を先に選んでおく(たいていそれを残したい)。
+            initial = png_filter
+            if self._vector_enabled():
+                initial = svg_filter
+                default = os.path.splitext(default)[0] + ".svg"
+            path, chosen = QFileDialog.getSaveFileName(
+                self, "保存", default, ";;".join(filters), initial)
             if not path:
+                return
+            want_svg = self._vector_ok and (chosen == svg_filter or path.lower().endswith(".svg"))
+            if want_svg:
+                if not path.lower().endswith(".svg"):
+                    path = os.path.splitext(path)[0] + ".svg"
+                self._start_vector(action=lambda rgba, target=path: self._save_svg(target, rgba),
+                                   label="保存します")
                 return
             if not path.lower().endswith(".png"):
                 path += ".png"
@@ -3289,20 +4224,9 @@ class BgRemoveWindow(QWidget):
         if not icons:
             self._set_status("アイコンが見つからないので保存しませんでした", "warning")
             return
-        stem, _ext = os.path.splitext(path)
-        digits = max(2, len(str(len(icons))))
-        paths = [f"{stem}_{i:0{digits}d}.png" for i in range(1, len(icons) + 1)]
-        existing = [p for p in paths if os.path.exists(p)]
-        if existing:
-            # ファイルダイアログが確かめるのは選んだ名前だけで、連番の名前は確かめない。
-            names = "\n".join(os.path.basename(p) for p in existing[:5])
-            more = f"\nほか {len(existing) - 5} 個" if len(existing) > 5 else ""
-            answer = QMessageBox.question(
-                self, "上書きの確認",
-                f"次のファイルがすでにあります。上書きしますか？\n\n{names}{more}",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if answer != QMessageBox.Yes:
-                return
+        paths = self._numbered_paths(path, len(icons), ".png")
+        if not self._confirm_overwrite(paths):
+            return
         for target, (_x, _y, piece) in zip(paths, cut_icons(rgba, icons)):
             if not array_to_qimage(piece).save(target, "PNG"):
                 self._set_status(f"保存できませんでした: {target}", "error")
@@ -3313,10 +4237,31 @@ class BgRemoveWindow(QWidget):
         self._set_status(f"{len(paths)} 個のアイコンを保存しました: {first} 〜 {last}")
         show_toast(f"背景を透過\n{len(paths)} 個のアイコンを保存しました\n{first} 〜 {last}")
 
+    @staticmethod
+    def _numbered_paths(path, count, ext):
+        """名前_01.ext、名前_02.ext … の並び(桁は個数に合わせ、最低2桁)。"""
+        stem, _ext = os.path.splitext(path)
+        digits = max(2, len(str(count)))
+        return [f"{stem}_{i:0{digits}d}{ext}" for i in range(1, count + 1)]
+
+    def _confirm_overwrite(self, paths) -> bool:
+        """連番の名前のうち、すでにあるものを上書きしてよいか聞く(無ければ聞かずに True)。
+        ファイルダイアログが確かめるのは選んだ名前だけで、連番の名前は確かめない。"""
+        existing = [p for p in paths if os.path.exists(p)]
+        if not existing:
+            return True
+        names = "\n".join(os.path.basename(p) for p in existing[:5])
+        more = f"\nほか {len(existing) - 5} 個" if len(existing) > 5 else ""
+        answer = QMessageBox.question(
+            self, "上書きの確認",
+            f"次のファイルがすでにあります。上書きしますか？\n\n{names}{more}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return answer == QMessageBox.Yes
+
     # ------------------------------------------------------------------
     def closeEvent(self, event):
         try:
-            _save_values(self._app_settings, self._settings_path, {
+            values = {
                 "window_size": [self.width(), self.height()],
                 "edge_feather": self.feather_slider.value(),
                 "follow_gradient": self.follow_check.isChecked(),
@@ -3325,11 +4270,18 @@ class BgRemoveWindow(QWidget):
                 "trim": self.trim_check.isChecked(),
                 "split_icons": self.split_check.isChecked(),
                 "split_merge_px": self.split_merge_slider.value(),
+                "vector_colors": self.vector_colors_slider.value(),
                 "model": self.model_combo.currentData(),
                 "preview_bg": self._preview_bg,
+            }
+            # vtracer が無くてチェックが押せないときは覚え直さない(入れ直した PC で、
+            # 前に入れていた好みが消えないように)。
+            if self._vector_ok:
+                values["vectorize"] = self.vector_check.isChecked()
             # 以前のキー。tolerance は覚えるのをやめ、feather は edge_feather へ移した
             # (どちらも旧既定値が焼き込まれているだけなので、残すと読み違えのもとになる)。
-            }, remove=("tolerance", "feather"))
+            _save_values(self._app_settings, self._settings_path, values,
+                         remove=("tolerance", "feather"))
         except Exception:
             _log_exception("close")
         # AI が走っている最中に閉じられたら、結果はもう受け取らない。器(_AiBridge)は
@@ -3337,6 +4289,17 @@ class BgRemoveWindow(QWidget):
         try:
             self._ai_bridge.finished.disconnect(self._on_ai_finished)
         except (RuntimeError, TypeError):
+            pass
+        # ベクタ化も同じ。走っている子プロセス(VTracer)は待たずに止める。
+        try:
+            self._vector_bridge.finished.disconnect(self._on_vector_finished)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            proc = self._vector_holder.get("proc")
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
             pass
         super().closeEvent(event)
         self.finished.emit(self._linger_ms)
@@ -3350,6 +4313,8 @@ WINDOWS_PNG_MIME = 'application/x-qt-windows-mime;value="PNG"'
 # Office の図形用の形式。中身は build_gvml が作る zip。これがあると Office は、並んだ
 # 図を1つずつ別の図として貼る(1枚の画像ではなく)。
 GVML_MIME = 'application/x-qt-windows-mime;value="Art::GVML ClipFormat"'
+# SVG の文字列。Windows の登録形式 "image/svg+xml"(Office 365 やブラウザが読む名前)にする。
+SVG_MIME = 'application/x-qt-windows-mime;value="image/svg+xml"'
 
 
 def set_clipboard_image(image: QImage, clipboard=None, extra=None) -> None:

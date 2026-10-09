@@ -182,6 +182,38 @@ def install_ai_optional(with_ai) -> None:
     print("  OK(AIモデルは初回に使ったときに %USERPROFILE%\\.u2net へダウンロードされます)")
 
 
+# 背景透過の「ベクタ化（図形として貼る）」だけが使う任意の依存。小さい(数MB)が、無くても
+# 他は動くので AI と同じく任意にする。失敗してもセットアップは止めない。
+VECTOR_PACKAGES = ["vtracer"]
+
+
+def _vector_installed() -> bool:
+    code = "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % (VECTOR_PACKAGES,)
+    return subprocess.run([str(VENV_PYTHON), "-c", code]).returncode == 0
+
+
+def install_vector_optional(with_vector) -> None:
+    print()
+    print("  [任意] 背景透過の「ベクタ化（図形として貼る）」(vtracer)")
+    if _vector_installed():
+        print("  既に入っているのでそのまま使います")
+        return
+    if with_vector is None:
+        print("  抜いた絵を PowerPoint などで色や大きさを変えられる図形にします。入れなくても他の機能は動きます。")
+        with_vector = _ask_yes_no("  ベクタ化(vtracer)も入れますか?", default=False)
+    if not with_vector:
+        print("  入れません(あとから setup.py --with-vector で入れられます)")
+        return
+    print("  pip install vtracer を実行します")
+    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *VECTOR_PACKAGES])
+    if result.returncode != 0:
+        print()
+        print("  警告: インストールに失敗しました。「ベクタ化」が押せないだけで、他は使えます。")
+        print("  プロキシ等を解決したら、setup.py --with-vector をもう一度実行してください。")
+        return
+    print("  OK")
+
+
 # ---------------------------------------------------------------
 # 4. 音声デバイスと settings.json
 # ---------------------------------------------------------------
@@ -466,7 +498,12 @@ def main() -> None:
                     help="背景透過の「AIで抜く」用の rembg / onnxruntime を入れる(確認を省略)")
     ai.add_argument("--no-ai", dest="with_ai", action="store_false",
                     help="rembg / onnxruntime を入れない(確認を省略)")
-    parser.set_defaults(startup=None, redetect=None, with_ai=None)
+    vector = parser.add_mutually_exclusive_group()
+    vector.add_argument("--with-vector", dest="with_vector", action="store_true",
+                        help="背景透過の「ベクタ化」用の vtracer を入れる(確認を省略)")
+    vector.add_argument("--no-vector", dest="with_vector", action="store_false",
+                        help="vtracer を入れない(確認を省略)")
+    parser.set_defaults(startup=None, redetect=None, with_ai=None, with_vector=None)
     args = parser.parse_args()
 
     print("tray-tools セットアップ")
@@ -476,6 +513,7 @@ def main() -> None:
     ensure_venv()
     install_requirements()
     install_ai_optional(args.with_ai)
+    install_vector_optional(args.with_vector)
     setup_settings(args.redetect)
     setup_shortcut()
     setup_startup(args.startup)

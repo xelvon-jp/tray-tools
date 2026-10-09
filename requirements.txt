@@ -11,3 +11,7 @@ opencv-python-headless
 # setup.py が途中で入れるか聞く(--with-ai / --no-ai で省略可)。
 # rembg
 # onnxruntime
+# 任意: 背景透過の「ベクタ化（図形として貼る）」を使うときだけ。無くても他は動く
+# (無ければチェックが押せなくなるだけ)。setup.py が途中で入れるか聞く
+# (--with-vector / --no-vector で省略可)。トレースは子プロセスで行う(bg_remove.py 参照)。
+# vtracer

@@ -146,6 +146,19 @@ def _volume_step() -> float:
     return 1.0 / 50
 
 
+def _set_mute(muted: bool) -> bool:
+    """既定の出力デバイスのミュートを設定する。失敗したら False。
+
+    COMオブジェクトを持ち出さないのは _step_volume と同じ理由。"""
+    try:
+        _ensure_com_initialized()
+        endpoint = AudioUtilities.GetSpeakers().EndpointVolume
+        endpoint.SetMute(1 if muted else 0, None)
+        return True
+    except _AUDIO_ERRORS:
+        return False
+
+
 def _current_volume():
     """(音量0.0〜1.0, ミュートか)。取れなければ (None, None)。
 
@@ -801,6 +814,15 @@ class AudioFeature:
         if not _set_volume(level):
             return None
         return max(0.0, min(1.0, float(level)))
+
+    def set_output_mute(self, muted: bool):
+        """出力(スピーカー)のミュートを設定して、設定後の状態を返す(失敗したら None)。
+
+        タスクバーウィジェットの音量バーのボタンから呼ばれる。マイクのミュート
+        (mic_control)とは別物。"""
+        if not _set_mute(muted):
+            return None
+        return bool(muted)
 
     def step_volume(self, up: bool, steps: int = 1):
         """音量を上下させて、いまの音量を返す(取れなければ None)。

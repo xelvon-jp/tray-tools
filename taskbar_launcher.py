@@ -25,7 +25,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPixmap,
+    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPixmap, QPolygon,
 )
 from PySide6.QtWidgets import QWidget
 
@@ -50,6 +50,9 @@ VOLUME_LABEL_SIZE = 12
 VOLUME_TRACK_WIDTH = 6
 VOLUME_KNOB_SIZE = 14
 VOLUME_PADDING = 8
+# バーの下端のミュートボタンの高さ。パネルは項目を縦に並べるので(1項目 36px 前後)、
+# この分を取っても溝の長さは十分に残る。
+VOLUME_BUTTON_HEIGHT = 28
 VOLUME_GAP = 4
 VOLUME_ACCENT = "#2f6fed"
 # 値を触ってから実際に音量を送るまでの待ち(ms)。COM越しで1回20msかかるので、
@@ -573,8 +576,25 @@ class VolumeBar(QWidget):
         try:
             if self._audio is not None:
                 self._audio.set_volume(self._level)
+                # ミュート中に音量を動かしたら解除する(Windows の音量ミキサーと同じ動き)。
+                # 動かしたのに音が出ないままだと、つまみが壊れたように見える。
+                if self._muted and self._audio.set_output_mute(False) is not None:
+                    self._muted = False
+                    self.update()
         except Exception:
             _guard("音量の変更", notify=False)
+
+    def toggle_mute(self) -> None:
+        """出力のミュートを切り替える。下端のボタンから呼ばれる。"""
+        try:
+            if self._audio is None:
+                return
+            result = self._audio.set_output_mute(not self._muted)
+            if result is not None:
+                self._muted = result
+                self.update()
+        except Exception:
+            _guard("ミュートの切り替え", notify=False)
 
     def _level_at(self, y: int) -> float:
         """バーの中の縦位置を音量に直す。上が最大。"""
@@ -590,6 +610,9 @@ class VolumeBar(QWidget):
     def mousePressEvent(self, event):
         try:
             if event.button() != Qt.LeftButton:
+                return
+            if self._button_rect().contains(event.position().toPoint()):
+                self.toggle_mute()
                 return
             self._dragging = True
             self._set_level(self._level_at(event.position().toPoint().y()))
@@ -619,13 +642,48 @@ class VolumeBar(QWidget):
     # 描画
     # ---------------------------------------------------------------
     def _track_rect(self) -> QRect:
-        """バーの溝。上に数値を出すぶんだけ空ける。"""
+        """バーの溝。上に数値、下にミュートボタンを出すぶんだけ空ける。"""
         return QRect(
             (self.width() - VOLUME_TRACK_WIDTH) // 2,
             VOLUME_LABEL_HEIGHT,
             VOLUME_TRACK_WIDTH,
-            max(self.height() - VOLUME_LABEL_HEIGHT - VOLUME_PADDING, 1),
+            max(self.height() - VOLUME_LABEL_HEIGHT - VOLUME_PADDING - VOLUME_BUTTON_HEIGHT, 1),
         )
+
+    def _button_rect(self) -> QRect:
+        """下端のミュートボタン。"""
+        return QRect(2, self.height() - VOLUME_BUTTON_HEIGHT - 2,
+                     self.width() - 4, VOLUME_BUTTON_HEIGHT)
+
+    def _paint_mute_button(self, painter: QPainter) -> None:
+        """スピーカーの形。鳴っているときは音の波、ミュート中は斜線と赤い地。
+
+        16px 相当に潰れるトレイアイコンと違って 30px ほどあるので、形で見せる。
+        文字(「ミュート」)は幅 34px に入らず、絵文字はフォントによって形が変わる。"""
+        rect = self._button_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#b42318") if self._muted
+                         else _blend(self._background, self._foreground, 0.12))
+        painter.drawRoundedRect(rect, 5, 5)
+        color = QColor("#ffffff") if self._muted else self._foreground
+        cx, cy = rect.center().x() - 3, rect.center().y()
+        body = QPolygon([
+            QPoint(cx - 7, cy - 3), QPoint(cx - 3, cy - 3), QPoint(cx + 2, cy - 7),
+            QPoint(cx + 2, cy + 7), QPoint(cx - 3, cy + 3), QPoint(cx - 7, cy + 3),
+        ])
+        painter.setBrush(color)
+        painter.setPen(Qt.NoPen)
+        painter.drawPolygon(body)
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        if self._muted:
+            painter.drawLine(QPoint(cx + 5, cy - 4), QPoint(cx + 11, cy + 4))
+            painter.drawLine(QPoint(cx + 11, cy - 4), QPoint(cx + 5, cy + 4))
+        else:
+            for r in (4, 8):
+                painter.drawArc(QRect(cx + 2 - r, cy - r, r * 2, r * 2), -45 * 16, 90 * 16)
 
     def paintEvent(self, event):
         try:
@@ -670,6 +728,7 @@ class VolumeBar(QWidget):
             painter.setBrush(_blend(self._background, self._foreground, 0.5) if self._muted else self._accent)
             painter.setPen(self._border)
             painter.drawEllipse(knob)
+            self._paint_mute_button(painter)
         except Exception:
             _guard("音量バーの描画", notify=False)
 

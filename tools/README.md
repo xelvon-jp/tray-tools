@@ -85,3 +85,20 @@ Chromium は支援技術を検出するまで、アクセシビリティツリ�
 
 - `comtypes`（venv に入っている）
 - `PySide6` は不要。プローブは軽い。
+
+## `com_gc_harness.py`
+
+「GC → comtypes の `__del__` → `Release` で access violation」を、常駐を使わずに再現・調査する器。常駐が使う COM の**読み取り**経路（マイクのミュート状態・音量・既定デバイス・デバイス列挙・エクスプローラの窓列挙、任意で UIA）を、メイン＋別スレッド2本で回し、合間に小さな循環を作って GC を誘発する。音量・既定デバイス・ミュートは変えない。
+
+```powershell
+# 調査モード。循環 GC に回ってきた COM ポインタを com_gc_probe.log に記録する（落ちない）
+python R:\claude\tray-tools\tools\com_gc_harness.py --probe
+
+# 経路を絞る（mic / audio / list / explorer / uia）
+python R:\claude\tray-tools\tools\com_gc_harness.py --probe --only mic
+
+# 直す前の mic_control の書き方（ctypes.cast）。調査モードなしで回すと落ちる
+python R:\claude\tray-tools\tools\com_gc_harness.py --only mic_legacy
+```
+
+`com_gc_probe.log` の `GARBAGE_COM` の行が見つかった COM ポインタ。`created at` が作った場所、`抱えていたもの` が循環の中身。回帰は `tests/test_com_gc.py` で見ている。

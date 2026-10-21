@@ -30,6 +30,8 @@ Windows 常駐トレイアプリ（Python 3.14 + PySide6）。トレイアイコ
 - **PySide6 はスロット内で例外が投げ切られるとプロセスごと終了する。** 外部から叩かれる入口（`_handle_connection` など）は必ず `try` で受ける。通常起動は `pythonw.exe` なので標準エラーもどこにも出ず、理由が何も残らない。
 - **`comtypes.COMError` は `OSError` のサブクラスではない。** まとめて捕まえたつもりで抜ける。
 - **`ctypes` は `argtypes` / `restype` を必ず指定する。** 64bit でハンドルが int に切り詰められてアクセス違反になる（`GetClipboardData` で実際に踏んだ）。
+- **COM ポインタを `ctypes.cast` で型変換しない。`QueryInterface` を使う。** `cast` は AddRef しないので Release が1回多くなる。しかも元のポインタを自分の `_objects` に抱えさせる循環を作るので、元のポインタは循環 GC が来たときにだけ解放される。cast の結果が先に Release して COM オブジェクトが消え、あとから GC が残りを Release して解放済みメモリを触る。crash.log の「`Garbage-collecting` → `unknwn.py Release` → `__del__` ←（毎回違う処理）」の正体はこれだった（`mic_control` の旧 `_endpoint_volume`。2026-10-21 に突き止めた）。GC を呼び込んだ側（segno・psutil・mss・`_make_methods` など）は引き金にすぎない。`tests/test_com_gc.py` が、COM を使うモジュールに `cast(` の呼び出しが無いことを見張っている。
+- **COM ポインタを循環参照の中に置かない。** 循環に入った COM ポインタは、いつ・どのスレッドで GC が来るかで解放のされ方が変わる（ハーネスでは、作ったのと別のスレッドで GC されたものが半分以上あった）。確かめるには `tools/com_gc_harness.py --probe`（常駐の外で COM の読み取り経路を叩く）か、調査モード（`settings.json` の `"debug": {"com_gc_probe": true}`、または環境変数 `TRAYTOOLS_COM_GC_PROBE=1`）を使う。`com_gc_probe.log` に、循環 GC に回ってきた COM ポインタの型・作った場所とスレッド・抱えていたものが出る。**調査モードは GC 中の Release を止め、`gc.garbage` も解放しない（意図的なリーク）。終わったら必ず無効に戻すこと。** なお `gc.DEBUG_SAVEALL` だけでは落ちるのは止まらない（CPython は garbage に残す前に `__del__` を呼ぶ）。
 
 ## 外から叩ける口（`main.py` の `_build_command_handlers`）
 

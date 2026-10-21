@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QApplication
 import action_log
 import beep
 import capture_grab
+import com_gc_probe
 import pushover
 import settings as settings_module
 from feature_audio import AudioFeature
@@ -921,6 +922,10 @@ def _install_excepthook():
 def main():
     _install_crash_log()
     _install_excepthook()
+    # 調査モード(既定は無効)。COM ポインタが作られる前に入れないと作成元を記録できないので、
+    # Feature を組み立てるより先に置く。有効にする方法と中身は com_gc_probe.py の冒頭。
+    if com_gc_probe.is_requested():
+        com_gc_probe.enable()
     # COMを使う機能(音声デバイス)を組み立てる前に済ませる。理由は init_keyboard を参照。
     init_keyboard()
 
@@ -967,6 +972,8 @@ def main():
         show_toast(f"tray-tools\nホットキーの処理に失敗しました\n{summary}")
 
     hotkey_bridge = setup_hotkeys(app_settings, handlers, on_error=on_hotkey_error)  # noqa: F841
+    # 調査モードのときだけ、メインスレッドで定期的に gc.garbage を調べる(無効なら None)。
+    probe_timer = com_gc_probe.start_timer()  # noqa: F841
 
     sys.exit(app.exec())
 

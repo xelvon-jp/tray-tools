@@ -1209,6 +1209,34 @@ def test_precise_window_keeps_faint_shapes_that_pixel_mode_loses():
     assert (new[background] < 0.1).mean() > 0.99
 
 
+def test_precise_window_without_background_colors_does_not_crash():
+    """背景色を × で全部外しても落ちない(業務PCで IndexError: index 0 is out of bounds
+    for axis 0 with size 0。精密モードが空の背景色の一覧の index 番目を引いていた)。
+    背景色が無ければ何も抜けない(以前の方式と同じ)。"""
+    from PySide6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])  # noqa: F841
+    rgb, _masks = _near_color_scene(2.0)
+    rgba = np.dstack((rgb, np.full(rgb.shape[:2], 255, np.uint8)))
+    for decontam in (True, False):
+        win = br.BgRemoveWindow(rgba)
+        try:
+            win.precise_check.setChecked(True)
+            win.decontam_check.setChecked(decontam)
+            win._entries = []
+            win._colors_changed()
+            win._apply_auto_tolerance()
+            for preview in (True, False):
+                out = win.compute(preview=preview)
+                assert (out[..., 3] == 255).all()
+            # 残す点(Ctrl+クリック)を足しても、残す色の判定で落ちない
+            win._on_pick(30, 30, br.PICK_PROTECT)
+            out = win.compute(preview=True)
+            assert (out[..., 3] == 255).all()
+        finally:
+            win.deleteLater()
+
+
 # ---------------------------------------------------------------
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())

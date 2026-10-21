@@ -807,7 +807,11 @@ def compute_alpha(dist, tolerance: float, feather: float, mode: str = RANGE_CONN
         background = (dist <= tol).astype(np.float32)
     if keep_dist is not None:
         keep_dist = np.asarray(keep_dist, dtype=np.float32)
-        r = dist / np.maximum(dist + keep_dist, 1e-6)
+        # 背景色が無いと dist は全部 inf で、inf / inf が NaN になって不透明度が壊れた
+        # (背景色を全部外したまま残す点を打ったとき)。背景から無限に遠い=残す(r = 1)。
+        with np.errstate(invalid="ignore"):
+            r = dist / np.maximum(dist + keep_dist, 1e-6)
+        r = np.where(np.isfinite(dist), r, 1.0)
         # 背景色と残す色が同じ(d_bg = d_keep = 0)なら残す色は区別の役に立たないので、
         # 背景のまま(r = 0)にしておく。
         r = np.where(dist + keep_dist > 1e-6, r, 0.0).astype(np.float32)
@@ -3280,6 +3284,9 @@ class BgRemoveWindow(QWidget):
         if offset is not None:
             flat = flat - offset
         targets = self._target_labs()
+        if not len(targets):
+            # 背景色が無ければ「背景とほぼ同じ色」はありえない(keep_color_usable と同じ扱い)。
+            return [True] * len(self._protect)
         dist, _ = lab_distance(flat, targets)
         threshold = max(float(noise_from_distance(dist, self._p_src_alpha) or 0.0), KEEP_MIN_DE)
         usable = []
@@ -3802,7 +3809,10 @@ class BgRemoveWindow(QWidget):
                 active_points = [e["pos"] for e in self._active_protect()]
                 self._protect_rejected = [active_points[i] for i in rejected
                                           if i < len(active_points)]
-            if precise:
+            # 背景色を × で全部外すと、背景色の一覧が空になる。その「index 番目」を引くと
+            # IndexError で落ちていた(業務PC 2026-10-09)。背景色が無ければ何も抜けない
+            # (距離はすべて inf)ので、縁を計算し直すものも無い。以前の方式と同じ結果になる。
+            if precise and len(self._target_labs()):
                 background_flat = self._target_labs()[index]
                 alpha = drop_faint_specks(alpha, dist, self._tolerance(), self._sigma(preview))
                 alpha = matte_edges(self._flat(preview), background_flat, alpha,

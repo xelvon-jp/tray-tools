@@ -123,6 +123,17 @@ def ensure_venv() -> None:
 # ---------------------------------------------------------------
 # 3. 依存パッケージ
 # ---------------------------------------------------------------
+def _pip_env() -> dict:
+    """pip を UTF-8 モードで動かす環境変数。
+
+    古い pip は requirements.txt を Windows の既定の文字コード(日本語版は cp932)で
+    読むため、日本語のコメントで UnicodeDecodeError になって止まった(業務PC、
+    2026-10-22)。requirements.txt の1行目の文字コード指定と二重の守り。"""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
 def install_requirements() -> None:
     _step(3, "依存パッケージをインストールします")
     if not REQUIREMENTS.exists():
@@ -130,7 +141,8 @@ def install_requirements() -> None:
         sys.exit(1)
     print("  pip install -r requirements.txt を実行します (数分かかります)")
     result = subprocess.run(
-        [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS)]
+        [str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS)],
+        env=_pip_env(),
     )
     if result.returncode != 0:
         print()
@@ -173,7 +185,7 @@ def install_ai_optional(with_ai) -> None:
         print("  入れません(あとから setup.py --with-ai で入れられます)")
         return
     print("  pip install rembg onnxruntime を実行します (数分かかります)")
-    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *AI_PACKAGES])
+    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *AI_PACKAGES], env=_pip_env())
     if result.returncode != 0:
         print()
         print("  警告: インストールに失敗しました。「AIで抜く」ボタンが押せないだけで、他は使えます。")
@@ -205,7 +217,7 @@ def install_vector_optional(with_vector) -> None:
         print("  入れません(あとから setup.py --with-vector で入れられます)")
         return
     print("  pip install vtracer を実行します")
-    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *VECTOR_PACKAGES])
+    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *VECTOR_PACKAGES], env=_pip_env())
     if result.returncode != 0:
         print()
         print("  警告: インストールに失敗しました。「ベクタ化」が押せないだけで、他は使えます。")

@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+# ↑ 1行目の文字コード指定は消さないこと。古い pip(業務PCの venv)は requirements.txt を
+# Windows の既定の文字コード(日本語版は cp932)で読み、下の日本語コメントで
+# UnicodeDecodeError になってセットアップが止まった(2026-10-22)。新しい pip は先に
+# UTF-8 を試すので手元では再現しない。
 PySide6
 mss
 pycaw

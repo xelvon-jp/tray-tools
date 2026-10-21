@@ -636,6 +636,10 @@ class ScreenFeature:
         config_menu.addAction("📝 settings.json を開く", self._open_settings_file)
 
         self.menu.addSeparator()
+        # 落ちた手掛かりをまとめて、テキストと QR で出す(diagnostics.py)。業務PCから
+        # データを持ち出せないので、スマホで読み取ってもらうためのもの。まれにしか
+        # 使わないのでホットキーは付けない。
+        self.menu.addAction("🩺 診断…", self.open_diagnostics)
         self.menu.addAction("🔄 再起動", self._restart)
         self.menu.addAction("✖ 終了", QApplication.instance().quit)
 
@@ -2422,6 +2426,42 @@ class ScreenFeature:
                 self._mirror_screen_actions.append(action)
         except Exception:
             self._log_failure("画面ミラーのメニューの組み立て")
+
+    # ---------------------------------------------------------------
+    # 診断(diagnostics.py / diagnostics_window.py)
+    # ---------------------------------------------------------------
+    def open_diagnostics(self):
+        """診断の窓を別プロセスで開く(diagnostics.spawn_window)。
+
+        窓もまとめ作りも常駐の外で行う。常駐の中で QR を作ったら、そのときの GC が
+        comtypes のオブジェクトの解放に入って常駐ごと落ちたため(spawn_window の docstring)。
+        ここで渡すのは「いま動いているか」と常駐の起動時刻だけ。
+
+        import はここで行う。診断は「ファイルが抜けている・古い」PCで使うものなので、
+        診断のファイル自体が抜けていても常駐の起動を巻き添えにしない。"""
+        try:
+            import diagnostics
+            diagnostics.spawn_window(self._diagnostics_runtime(), self.settings_path)
+        except Exception as e:  # noqa: BLE001  メニューのスロット。投げ切ると常駐ごと落ちる
+            self._log_failure("診断の窓を開くの")
+            self._notify("診断", f"開けませんでした\n{e}")
+
+    def _diagnostics_runtime(self) -> dict:
+        """診断に載せる「いま動いているか」。設定ではなく状態のもの。読めないものは None。"""
+        def read(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001
+                return None
+
+        return {
+            "jiggler": read(lambda: bool(self._jiggle_active)),
+            "keep_awake": read(lambda: bool(self._awake_active)),
+            "copilot_bar": read(lambda: bool(self._copilot_watchdog.is_enabled())),
+            "agent_loop": read(lambda: bool(self._agent_loop_active)),
+            "mirror": read(lambda: bool(self.screen_mirror.is_active())),
+            "sticky": read(lambda: len(capture_process.list_sticky_pipes())),
+        }
 
     def _open_settings_file(self):
         """設定ダイアログUIは持たないため、settings.jsonを既定アプリ(メモ帳等)で開く。

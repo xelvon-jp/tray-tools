@@ -34,10 +34,19 @@ DEFAULT_KEYMAP = {
     "0040": "cursor_down",        # ↓
     "0033": "page_up",            # PgUp
     "0034": "page_down",          # PgDn
-    "2038": "page_up",            # Ctrl+↑
-    "2040": "page_down",          # Ctrl+↓
     "2033": "cursor_top",         # Ctrl+PgUp
     "2034": "cursor_bottom",      # Ctrl+PgDn
+    # --- 窓の大きさ・字の大きさ(あふｗ AFXW.TXT 148-149行と AFXW.key) ---
+    "4037": "split_left",         # Alt+← 左右の境界を左へ
+    "2037": "split_left",         # Ctrl+← (AFXW.key K0002 "2037:4037")
+    "4039": "split_right",        # Alt+→ 左右の境界を右へ
+    "2039": "split_right",        # Ctrl+→ (AFXW.key K0005 "2039:4039")
+    "4038": "log_grow",           # Alt+↑ メッセージ窓を大きく(境界が上へ)
+    "4040": "log_shrink",         # Alt+↓ メッセージ窓を小さく
+    "1038": "font_smaller",       # Shift+↑ (AFXW.key K0003 "1038:0045" ＝ INS 縮小)
+    "2038": "font_smaller",       # Ctrl+↑  (K0004 "2038:0045")
+    "1040": "font_larger",        # Shift+↓ (K0006 "1040:0046" ＝ DEL 拡大)
+    "2040": "font_larger",        # Ctrl+↓  (K0007 "2040:0046")
     # --- 窓・フォルダ移動 ---
     "0037": "focus_left",         # ← 左窓をアクティブに(既に左なら何もしない)
     "0039": "focus_right",        # → 右窓をアクティブに(既に右なら何もしない)
@@ -95,10 +104,54 @@ DEFAULT_KEYMAP = {
     "2046": "clip_cut",           # Ctrl+Del
     "1045": "clip_paste",         # Shift+Ins
     # --- 閉じる ---
+    # Esc は割り当てない。あふｗの Esc は「各処理の中止」で、ファイル窓を閉じない
+    # (サーチ中の Esc はサーチの終了として先に処理される)。
     "0081": "quit",               # Q
-    "0027": "quit",               # Esc (インクリメンタルサーチ中は検索の終了が先)
     "4115": "quit",               # Alt+F4 (AFXW.key 4115:0081)
 }
+
+# ---------------------------------------------------------------
+# 窓の配分と字の大きさ(Alt+矢印 / Shift・Ctrl+↑↓)
+# ---------------------------------------------------------------
+DEFAULT_SPLIT_RATIO = 0.5
+SPLIT_STEP = 0.03          # Alt+←→ 1回で動かす割合(窓幅の3%)
+SPLIT_MIN = 0.15           # 片方の窓がこれより細くならない
+DEFAULT_LOG_LINES = 5
+LOG_LINES_MIN = 1
+DEFAULT_FONT_SIZE = 10
+FONT_SIZE_MIN = 6
+FONT_SIZE_MAX = 32
+
+
+def step_split(ratio, direction: int) -> float:
+    """左窓の幅の割合を direction(-1 で左へ、+1 で右へ)に1段動かす。端に寄りすぎない。"""
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        ratio = DEFAULT_SPLIT_RATIO
+    ratio += SPLIT_STEP * direction
+    return round(min(max(ratio, SPLIT_MIN), 1.0 - SPLIT_MIN), 4)
+
+
+def clamp_split(ratio) -> float:
+    return step_split(ratio, 0)
+
+
+def clamp_log_lines(lines, max_lines: int) -> int:
+    """メッセージ窓の行数を 1〜max_lines に収める(max_lines は窓の高さの半分ほど)。"""
+    try:
+        lines = int(lines)
+    except (TypeError, ValueError):
+        lines = DEFAULT_LOG_LINES
+    return max(LOG_LINES_MIN, min(lines, max(LOG_LINES_MIN, int(max_lines))))
+
+
+def clamp_font_size(size) -> int:
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = DEFAULT_FONT_SIZE
+    return max(FONT_SIZE_MIN, min(size, FONT_SIZE_MAX))
 
 # filer.py が実装しているコマンドの名前。filer.keys で知らない名前を書かれたら捨てる
 # (綴り間違い1つで「押したら何か別のことが起きる」より「何も起きない」方が安全)。
@@ -335,14 +388,25 @@ def expand_typed_path(text: str):
 
 
 def read_folder(path: str, focus=None, walk_up: bool = False):
-    """別スレッドから呼ぶ一覧の読み取り。(実際に開いたフォルダ, 項目, カーソルを合わせる名前)。
+    """別スレッドから呼ぶ一覧の読み取り。
+    (実際に開いたフォルダ, 項目, カーソルを合わせる名前, 書庫の情報) を返す。
 
+    - 書庫(.zip/.7z)そのもの、または書庫の中のパス(D:\\x\\foo.zip\\sub)なら書庫の中を
+      読む。書庫の情報は (書庫ファイル, 中のパス, 危ないので除いたエントリ数)。
+      ふつうのフォルダなら None
     - path がファイルなら、その置き場所を開いてファイル名にカーソルを合わせる
       (Shift+J でファイルのパスを貼ったとき)
     - walk_up なら、無くなっていたフォルダを残っている親まで遡る(前回の復元用)。
       ふだんの移動では遡らない(入れなかったら元のフォルダに留まるのがあふｗの挙動)
-    読めなければ OSError を投げる。"""
+    読めなければ OSError(書庫として読めなければ filer_archive.ArchiveError)を投げる。"""
+    import filer_archive  # filer_archive が filer_core を読むので、ここで遅れて読む
+
     path = os.path.normpath(path)
+    found = filer_archive.split_archive_path(path)
+    if found is not None:
+        display, entries, (archive, inner), skipped = filer_archive.read_archive_folder(
+            found[0], found[1], walk_up=walk_up)
+        return display, entries, focus, (archive, inner, skipped)
     if not walk_up and os.path.isfile(path):
         focus = os.path.basename(path)
         path = os.path.dirname(path)
@@ -352,7 +416,7 @@ def read_folder(path: str, focus=None, walk_up: bool = False):
             raise FileNotFoundError(f"フォルダが見つかりません: {path}")
         path = found
     path = normalize_dir(path)
-    return path, list_entries(path), focus
+    return path, list_entries(path), focus, None
 
 
 # ---------------------------------------------------------------

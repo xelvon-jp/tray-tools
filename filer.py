@@ -43,8 +43,8 @@ from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
-    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
@@ -52,12 +52,16 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
+    QSizePolicy,
+    QSplitter,
     QStyledItemDelegate,
     QTableView,
     QVBoxLayout,
     QWidget,
 )
 
+import filer_archive
 import filer_core as core
 import filer_launch
 import filer_shell
@@ -88,11 +92,15 @@ DEFAULT_COLORS = {
 }
 
 DEFAULT_FONT_FAMILIES = ["MS Gothic", "ＭＳ ゴシック", "Consolas"]
-DEFAULT_FONT_SIZE = 10
+DEFAULT_FONT_SIZE = core.DEFAULT_FONT_SIZE
 DEFAULT_EDITOR = "notepad.exe"
 DEFAULT_LIST_TIMEOUT = 5.0
 RECENT_LIMIT = 50
-LOG_LINES = 5
+
+# 書庫の中では書き込み系を断る。あふｗも書庫の中(仮想フォルダ)は読むだけ。
+ARCHIVE_READONLY = "書庫内では使えません"
+ARCHIVE_NO_WRITE = "書庫内へは書き込めません"
+OVERWRITE, SKIP, CANCEL = "overwrite", "skip", "cancel"
 
 # offscreen(テスト)では QKeyEvent.nativeVirtualKey() が 0 で来る。そのときだけ
 # Qt のキーから仮想キーコードを引く。実機の Windows では常に native の値を使う
@@ -293,6 +301,13 @@ class FileView(QTableView):
             return True
         return super().event(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.pane.fit_columns()
+        except Exception:  # noqa: BLE001
+            _log_exception("viewResize")
+
     def focusInEvent(self, event):
         super().focusInEvent(event)
         try:
@@ -314,6 +329,9 @@ class ListBridge(QObject):
     """読み取りスレッド → メインスレッドへ結果を渡す口(Qt はスレッドを跨いで触れない)。"""
 
     finished = Signal(object)
+    # 書庫の展開: 進み具合 (済んだ数, 全体, 名前) と、終わったとき (ExtractResult)。
+    progress = Signal(object)
+    extracted = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -337,6 +355,9 @@ class Pane(QWidget):
         self.loading = False
         self.request_id = 0
         self.isearch_text = None   # None ならインクリメンタルサーチ中ではない
+        # 書庫の中を見ているときは (書庫ファイル, 中のパス)。ふつうのフォルダなら None。
+        # path の方は D:\x\foo.zip\sub の形で、履歴・O・H などはこちらを通す。
+        self.archive = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -358,26 +379,62 @@ class Pane(QWidget):
         self.view.setWordWrap(False)
         self.view.setTabKeyNavigation(False)
         self.view.setFocusPolicy(Qt.StrongFocus)
+        # 横には流さない。入りきらないときは fit_columns が列を減らす。
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.verticalHeader().hide()
         self.view.horizontalHeader().hide()
-        fm = QFontMetrics(window.list_font)
-        self.view.verticalHeader().setDefaultSectionSize(fm.height() + 2)
         self.view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         header = self.view.horizontalHeader()
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
-        for col, sample in ((COL_EXT, "MMMMMM"), (COL_SIZE, "9,999,999,999 "),
-                            (COL_DATE, "26-10-23 12:34 ")):
+        for col in (COL_EXT, COL_SIZE, COL_DATE):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
-            header.resizeSection(col, fm.horizontalAdvance(sample) + 8)
         self.view.doubleClicked.connect(self._on_double_clicked)
         layout.addWidget(self.view, 1)
 
         self.footer = QLabel()
-        self.footer.setFont(window.list_font)
         self.footer.setTextFormat(Qt.PlainText)
         self.footer.setContentsMargins(6, 1, 6, 1)
         layout.addWidget(self.footer)
+        # QLabel は既定だと文字列の幅を最小幅にする。深いパスを開くと窓がそれより狭く
+        # できなくなり、左右の境界も動かせなくなるので、横幅は文字に合わせない。
+        for label in (self.header, self.footer):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.apply_font(window.list_font)
         self.apply_style()
+
+    def apply_font(self, font) -> None:
+        """一覧の字を差し替える。行の高さと列の幅も字に合わせて測り直す
+        (Shift/Ctrl+↑↓ の拡大縮小で、行が詰まったり列が欠けたりしないように)。"""
+        for widget in (self.header, self.view, self.footer):
+            widget.setFont(font)
+        fm = QFontMetrics(font)
+        self.view.verticalHeader().setDefaultSectionSize(fm.height() + 2)
+        self._col_widths = {
+            col: fm.horizontalAdvance(sample) + 8
+            for col, sample in ((COL_EXT, "MMMMMM"), (COL_SIZE, "9,999,999,999 "),
+                                (COL_DATE, "26-10-23 12:34 "))}
+        self._name_min = fm.horizontalAdvance("M" * 12)
+        self.fit_columns()
+
+    def fit_columns(self) -> None:
+        """列の幅を窓に合わせる。名前の列が狭くなりすぎるなら、日時 → サイズ → 拡張子の
+        順に列を隠す(境界を寄せたり字を大きくしたりしたときに、名前が読めなくなって
+        横スクロールが出るのを防ぐ)。"""
+        widths = getattr(self, "_col_widths", None)
+        if not widths:
+            return
+        header = self.view.horizontalHeader()
+        available = self.view.viewport().width()
+        shown = [COL_EXT, COL_SIZE, COL_DATE]
+        while shown and available - sum(widths[c] for c in shown) < self._name_min:
+            shown.pop()
+        for col in (COL_EXT, COL_SIZE, COL_DATE):
+            if col in shown:
+                header.showSection(col)
+                header.resizeSection(col, widths[col])
+            else:
+                header.hideSection(col)
+        self.view.viewport().update()
 
     # --- 見た目 ---
     def is_active(self) -> bool:
@@ -400,6 +457,8 @@ class Pane(QWidget):
 
     def update_header(self) -> None:
         text = self.path or "(読み込み中)"
+        if self.archive is not None:
+            text += "\\"  # 書庫の中は D:\x\foo.zip\sub\ の形で見せる(あふｗと同じ)
         if not core.is_default_mask(self.mask_text):
             text += f"   [{self.mask_text}]"
         if self.sort != core.DEFAULT_SORT:
@@ -454,6 +513,12 @@ class Pane(QWidget):
     def target_paths(self) -> list:
         return [os.path.join(self.path, e.name) for e in self.targets()]
 
+    def real_dir(self):
+        """実在するフォルダ。書庫の中なら書庫ファイルのあるフォルダ。"""
+        if self.archive is not None:
+            return os.path.dirname(self.archive[0])
+        return self.path
+
     def _on_double_clicked(self, index):
         try:
             self.set_cursor(index.row())
@@ -472,7 +537,12 @@ class Pane(QWidget):
         request = self.request_id
         self.loading = True
         self.update_header()
-        timeout_ms = int(self.window_.list_timeout * 1000)
+        # 書庫の一覧は大きいと時間がかかる(ネットワーク上の書庫もある)ので、見切りを長めに。
+        # 書庫かどうかは字面だけで決める(ここは UI スレッドなので I/O をしない)。
+        timeout = self.window_.list_timeout
+        if filer_archive.looks_like_archive_path(path):
+            timeout = max(timeout, self.window_.archive_timeout)
+        timeout_ms = int(timeout * 1000)
         args = dict(path=path, focus=focus, history=history, keep_marks=keep_marks,
                     on_fail=on_fail)
         bridge = self.window_.bridge
@@ -489,9 +559,10 @@ class Pane(QWidget):
                 pass  # 窓が先に閉じた
 
         threading.Thread(target=worker, daemon=True, name=f"filer-list-{self.side}").start()
-        QTimer.singleShot(timeout_ms, lambda: self._on_timeout(request, path, on_fail, history))
+        QTimer.singleShot(timeout_ms, lambda: self._on_timeout(
+            request, path, on_fail, history, timeout))
 
-    def _on_timeout(self, request, path, on_fail, history) -> None:
+    def _on_timeout(self, request, path, on_fail, history, timeout) -> None:
         try:
             if request != self.request_id or not self.loading:
                 return
@@ -499,7 +570,7 @@ class Pane(QWidget):
             self.request_id += 1
             self.loading = False
             self.update_header()
-            self.window_.log(f"応答がありません({self.window_.list_timeout:g}秒): {path}")
+            self.window_.log(f"応答がありません({timeout:g}秒): {path}")
             self._undo_history(history)
             if on_fail is not None:
                 on_fail()
@@ -522,8 +593,18 @@ class Pane(QWidget):
             if args["on_fail"] is not None:
                 args["on_fail"]()
             return
-        new_path, entries, focus = result
+        new_path, entries, focus, archive = result
         same = core.same_dir(self.path, new_path) if self.path else False
+        if archive is not None:
+            archive_file, inner, skipped = archive
+            entering = self.archive is None or not core.same_dir(self.archive[0], archive_file)
+            if skipped and entering:
+                # 書庫に入ったときに1回だけ知らせる(中を移動するたびには出さない)。
+                self.window_.log(f"書庫: 危ないパスのエントリ {skipped}件を除外しました"
+                                 "（.. や絶対パス。展開もしません）")
+            self.archive = (archive_file, inner)
+        else:
+            self.archive = None
         previous_name = None
         previous_row = self.cursor_row()
         if same:
@@ -620,8 +701,18 @@ class FilerWindow(QWidget):
                                                or DEFAULT_LIST_TIMEOUT))
         except (TypeError, ValueError):
             self.list_timeout = DEFAULT_LIST_TIMEOUT
+        try:
+            self.archive_timeout = max(1.0, float(section.get("archive_timeout_seconds")
+                                                  or filer_archive.ARCHIVE_LIST_TIMEOUT))
+        except (TypeError, ValueError):
+            self.archive_timeout = filer_archive.ARCHIVE_LIST_TIMEOUT
         recent = section.get("recent")
         self.recent = [p for p in recent if isinstance(p, str)] if isinstance(recent, list) else []
+        # 窓の配分(Alt+←→ / Alt+↑↓ / 境界のドラッグ)。閉じるときに保存する。
+        self.split_ratio = core.clamp_split(section.get("split_ratio", core.DEFAULT_SPLIT_RATIO))
+        self.log_lines = core.clamp_log_lines(section.get("log_lines", core.DEFAULT_LOG_LINES), 99)
+        # 書庫の展開中(進捗の窓が出ている間)。重ねて始めない。
+        self._extracting = None
         # テストのときだけ SHFileOperation に足すフラグ(FOF_NOCONFIRMATION 等)。本番は 0。
         self.extra_op_flags = 0
         self._picker = None
@@ -633,10 +724,10 @@ class FilerWindow(QWidget):
         self.list_font = QFont()
         self.list_font.setFamilies([str(f) for f in families])
         self.list_font.setStyleHint(QFont.Monospace)
-        try:
-            self.list_font.setPointSize(int(section.get("font_size") or DEFAULT_FONT_SIZE))
-        except (TypeError, ValueError):
-            self.list_font.setPointSize(DEFAULT_FONT_SIZE)
+        self.list_font.setPointSize(core.clamp_font_size(section.get("font_size")
+                                                         or DEFAULT_FONT_SIZE))
+        # メッセージ窓の字は一覧の拡大縮小に付いていかない(行数で高さを決めているため)。
+        self.log_font = QFont(self.list_font)
 
         self.setWindowTitle("簡易ファイラ")
         self.setObjectName("filerWindow")
@@ -645,29 +736,42 @@ class FilerWindow(QWidget):
 
         self.bridge = ListBridge(self)
         self.bridge.finished.connect(self._on_list_finished)
+        self.bridge.progress.connect(self._on_extract_progress)
+        self.bridge.extracted.connect(self._on_extracted)
 
+        # 左右の窓とメッセージ窓は QSplitter で区切る。境界はマウスでも動かせ、
+        # Alt+矢印(あふｗと同じ)でも動かせる。どちらで動かしても同じ値を保存する。
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
-        row = QHBoxLayout()
-        row.setSpacing(4)
+        root.setSpacing(0)
+        self.vsplit = QSplitter(Qt.Vertical, self)
+        self.hsplit = QSplitter(Qt.Horizontal, self.vsplit)
+        self.hsplit.setChildrenCollapsible(False)
+        self.vsplit.setChildrenCollapsible(False)
+        self.hsplit.setHandleWidth(4)
+        self.vsplit.setHandleWidth(4)
         self.left = Pane(self, "left")
         self.right = Pane(self, "right")
-        row.addWidget(self.left, 1)
-        row.addWidget(self.right, 1)
-        root.addLayout(row, 1)
+        self.hsplit.addWidget(self.left)
+        self.hsplit.addWidget(self.right)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFocusPolicy(Qt.NoFocus)
         self.log_view.setMaximumBlockCount(500)
-        self.log_view.setFont(self.list_font)
+        self.log_view.setFont(self.log_font)
         self.log_view.setStyleSheet(
             f"background-color: {self.colors['log_background']}; color: {self.colors['log_text']};"
             " border: none;")
-        fm = QFontMetrics(self.list_font)
-        self.log_view.setFixedHeight(fm.lineSpacing() * LOG_LINES + 10)
-        root.addWidget(self.log_view)
+        self.log_view.setMinimumHeight(self._log_height(core.LOG_LINES_MIN))
+        self.vsplit.addWidget(self.hsplit)
+        self.vsplit.addWidget(self.log_view)
+        # 窓の大きさを変えたときは、増えた分をファイル窓に回す(メッセージ窓は行数を保つ)。
+        self.vsplit.setStretchFactor(0, 1)
+        self.vsplit.setStretchFactor(1, 0)
+        self.hsplit.splitterMoved.connect(self._on_hsplit_moved)
+        self.vsplit.splitterMoved.connect(self._on_vsplit_moved)
+        root.addWidget(self.vsplit)
 
         self._restore_geometry(section)
         for pane in (self.left, self.right):
@@ -695,11 +799,70 @@ class FilerWindow(QWidget):
                              area.y() + (area.height() - h) // 2, w, h)
         self._start_maximized = bool(section.get("maximized"))
 
+    # --- 窓の配分(左右の境界とメッセージ窓の高さ) ---
+    def _log_height(self, lines: int) -> int:
+        return QFontMetrics(self.log_font).lineSpacing() * lines + 10
+
+    def _max_log_lines(self) -> int:
+        """メッセージ窓の上限。窓全体の半分ほどまで。"""
+        total = sum(self.vsplit.sizes()) or self.vsplit.height() or self.height()
+        spacing = max(1, QFontMetrics(self.log_font).lineSpacing())
+        return max(core.LOG_LINES_MIN, (total // 2 - 10) // spacing)
+
+    def apply_layout(self) -> None:
+        """split_ratio と log_lines を splitter に反映する(setSizes は splitterMoved を出さない)。"""
+        width = sum(self.hsplit.sizes()) or self.hsplit.width()
+        if width > 0:
+            left = int(round(width * self.split_ratio))
+            self.hsplit.setSizes([left, width - left])
+        total = sum(self.vsplit.sizes()) or self.vsplit.height()
+        if total > 0:
+            self.log_lines = core.clamp_log_lines(self.log_lines, self._max_log_lines())
+            log_height = min(self._log_height(self.log_lines), total - 50)
+            self.vsplit.setSizes([total - log_height, log_height])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.apply_layout()
+        except Exception:  # noqa: BLE001
+            _log_exception("resize")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._apply_layout_safely)
+
+    def _apply_layout_safely(self) -> None:
+        try:
+            self.apply_layout()
+        except Exception:  # noqa: BLE001
+            _log_exception("layout")
+
+    def _on_hsplit_moved(self, _pos, _index) -> None:
+        try:
+            sizes = self.hsplit.sizes()
+            if sum(sizes) > 0:
+                self.split_ratio = core.clamp_split(sizes[0] / sum(sizes))
+        except Exception:  # noqa: BLE001
+            _log_exception("hsplit")
+
+    def _on_vsplit_moved(self, _pos, _index) -> None:
+        try:
+            log_height = self.vsplit.sizes()[1]
+            spacing = max(1, QFontMetrics(self.log_font).lineSpacing())
+            self.log_lines = core.clamp_log_lines(round((log_height - 10) / spacing),
+                                                  self._max_log_lines())
+        except Exception:  # noqa: BLE001
+            _log_exception("vsplit")
+
     def start(self) -> None:
         """前回のパスで両窓を開く。無くなっていれば残っている親まで遡り、全部だめなら
         ユーザープロファイル(それも読めなければ C:\\)。"""
         section = _section(self.app_settings)
         home = os.path.expanduser("~")
+        # 前回の終わりに消せなかった一時フォルダ(開いたままだったファイル)を片付ける。
+        # ファイラは1つしか起きないので、残っているものはすべて前回以前のもの。
+        threading.Thread(target=filer_archive.cleanup_temp, daemon=True).start()
         for pane, key in ((self.left, "left_path"), (self.right, "right_path")):
             saved = section.get(key)
             candidates = [p for p in (saved, home, "C:\\") if isinstance(p, str) and p]
@@ -721,6 +884,9 @@ class FilerWindow(QWidget):
             "recent": self.recent[:RECENT_LIMIT],
             "left_sort": self.left.sort,
             "right_sort": self.right.sort,
+            "split_ratio": self.split_ratio,
+            "log_lines": self.log_lines,
+            "font_size": self.list_font.pointSize(),
         }
         if self.left.path:
             updates["left_path"] = self.left.path
@@ -733,6 +899,11 @@ class FilerWindow(QWidget):
             self.save_state()
             if self._picker is not None:
                 self._picker.close()
+            if self._extracting is not None:
+                self._extracting["cancel"].set()
+            # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
+            # 次の起動で片付く。
+            filer_archive.cleanup_temp()
         except Exception:  # noqa: BLE001  閉じられなくなるのが最悪
             _log_exception("close")
         super().closeEvent(event)
@@ -950,15 +1121,27 @@ class FilerWindow(QWidget):
             self.cmd_parent()
         elif entry.is_dir:
             pane.load(os.path.join(pane.path, entry.name))
+        elif pane.archive is None and filer_archive.is_archive_name(entry.name):
+            # 書庫ファイルは中へ入る(あふｗの仮想フォルダ)。関連付けで開きたいときは Ctrl+Enter。
+            pane.load(os.path.join(pane.path, entry.name))
         else:
-            self.cmd_open_assoc()
+            self._open_file(entry)
 
     def cmd_open_assoc(self):
-        pane = self.active
-        entry = pane.cursor_entry()
+        entry = self.active.cursor_entry()
         if entry is None or entry.is_parent:
             return
-        path = os.path.join(pane.path, entry.name)
+        self._open_file(entry)
+
+    def _open_file(self, entry) -> None:
+        pane = self.active
+        if pane.archive is not None:
+            # 書庫の中のファイルは一時フォルダへ取り出してから開く。
+            self._extract_to_temp([entry], lambda paths: self._startfile(paths[0]))
+            return
+        self._startfile(os.path.join(pane.path, entry.name))
+
+    def _startfile(self, path: str) -> None:
         try:
             os.startfile(path)
             self.log(f"開く: {path}")
@@ -966,10 +1149,15 @@ class FilerWindow(QWidget):
             self.log(f"開けません: {path}  ({e})")
 
     def cmd_edit(self):
-        paths = [os.path.join(self.active.path, e.name)
-                 for e in self.active.targets() if not e.is_dir]
-        if not paths:
+        files = [e for e in self.active.targets() if not e.is_dir]
+        if not files:
             return
+        if self.active.archive is not None:
+            self._extract_to_temp(files, self._open_in_editor)
+            return
+        self._open_in_editor([os.path.join(self.active.path, e.name) for e in files])
+
+    def _open_in_editor(self, paths) -> None:
         # 1ファイルずつ起こす。メモ帳は引数を1つしか受け取らないので、まとめて渡すと
         # 2つ目以降が「ファイル名の続き」と解釈されて開けない。
         opened = 0
@@ -1109,7 +1297,9 @@ class FilerWindow(QWidget):
         # 差し替えるので、ファイラ自身の filer セクションとは消し合わない)。
         current = (settings_module.load_settings(self.settings_path)
                    if self.settings_path else self.app_settings)
-        add_path = self.active.path
+        # 書庫の中なら書庫のあるフォルダを登録する。ブックマークはあふｗ・エクスプローラ
+        # からも使うので、書庫の中のパスを渡しても向こうが開けない。
+        add_path = self.active.real_dir()
         picker = None
 
         def build_items() -> list:
@@ -1206,16 +1396,36 @@ class FilerWindow(QWidget):
         self.left.reload()
         self.right.reload()
 
+    def _refuse_archive(self, label: str, source: bool = True, dest_pane=None) -> bool:
+        """書庫の中で書き込み系を頼まれたら断る(メッセージだけ出して True)。
+
+        source … アクティブ窓が書庫の中なら断る(削除・改名・移動など、元を変える操作)
+        dest_pane … 書き込み先の窓。そこが書庫の中なら断る(書庫へは書き込めない)"""
+        if dest_pane is not None and dest_pane.archive is not None:
+            self.log(f"{label}: {ARCHIVE_NO_WRITE}")
+            return True
+        if source and self.active.archive is not None:
+            self.log(f"{label}: {ARCHIVE_READONLY}")
+            return True
+        return False
+
     def _transfer(self, move: bool) -> None:
         src = self.active
         dst = self.other
-        paths = src.target_paths()
-        if not paths:
-            return
         label = "移動" if move else "複写"
+        if self._refuse_archive(label, source=move, dest_pane=dst):
+            return
+        targets = src.targets()
+        if not targets:
+            return
         if not dst.path or core.same_dir(src.path, dst.path):
             self.log(f"{label}: 反対窓が同じフォルダです")
             return
+        if src.archive is not None:
+            # 書庫の中から実フォルダへの複写は「展開」になる。
+            self._extract_to_dir(targets, dst.path)
+            return
+        paths = src.target_paths()
         func = filer_shell.move_files if move else filer_shell.copy_files
         result = func(paths, dst.path, self._hwnd(), self.extra_op_flags)
         self._after_operation(label, result, paths, dst.path)
@@ -1243,6 +1453,8 @@ class FilerWindow(QWidget):
             self.log(f"クリップボード: {len(paths)}件の{'フルパス' if choice == 'path' else '名前'}")
 
     def cmd_move_menu(self):
+        if self._refuse_archive("移動", dest_pane=self.other):
+            return
         if not self.active.targets():
             return
         choice = self.choose_menu("移動", [
@@ -1253,6 +1465,8 @@ class FilerWindow(QWidget):
             self._transfer(move=True)
 
     def _delete(self, permanent: bool) -> None:
+        if self._refuse_archive("削除"):
+            return
         pane = self.active
         targets = pane.targets()
         if not targets:
@@ -1281,7 +1495,7 @@ class FilerWindow(QWidget):
     # --- 作成・改名 ---
     def cmd_mkdir(self):
         pane = self.active
-        if not pane.path:
+        if not pane.path or self._refuse_archive("フォルダ作成"):
             return
         name = self.ask_text("フォルダ作成", "新しいフォルダの名前", "")
         if name is None:
@@ -1306,7 +1520,7 @@ class FilerWindow(QWidget):
     def cmd_rename(self):
         pane = self.active
         entry = pane.cursor_entry()
-        if entry is None or entry.is_parent:
+        if entry is None or entry.is_parent or self._refuse_archive("改名"):
             return
         new = self.ask_text("改名", entry.name, entry.name,
                             select=core.rename_selection_length(entry.name, entry.is_dir))
@@ -1335,6 +1549,9 @@ class FilerWindow(QWidget):
     DROP_EFFECT_FORMAT = 'application/x-qt-windows-mime;value="Preferred DropEffect"'
 
     def _clip_set(self, move: bool) -> None:
+        # 書庫の中のものは実ファイルではないので、エクスプローラへ渡せない。
+        if self._refuse_archive("切り取り" if move else "クリップボードへコピー"):
+            return
         paths = self.active.target_paths()
         if not paths:
             return
@@ -1353,7 +1570,7 @@ class FilerWindow(QWidget):
 
     def cmd_clip_paste(self):
         pane = self.active
-        if not pane.path:
+        if not pane.path or self._refuse_archive("貼り付け", source=False, dest_pane=pane):
             return
         clipboard = QGuiApplication.clipboard()
         mime = clipboard.mimeData()
@@ -1383,6 +1600,187 @@ class FilerWindow(QWidget):
             result = filer_shell.copy_files(paths, pane.path, self._hwnd(),
                                             self.extra_op_flags | extra)
             self._after_operation("貼り付け(複写)", result, paths, pane.path)
+
+    # --- 書庫からの展開 ---
+    def _archive_plan(self, entries):
+        """アクティブ窓(書庫の中)の entries を展開する計画。(書庫の索引, 計画)。"""
+        archive, inner = self.active.archive
+        # 一覧を読んだときに作った索引がそのまま使われる(書庫が変わっていれば読み直す)。
+        index = filer_archive.get_index(archive)
+        return index, filer_archive.plan_extract(index, inner, [e.name for e in entries])
+
+    def _extract_to_dir(self, entries, dest: str) -> None:
+        """書庫の中のマーク(無ければカーソル)を dest へ展開する。フォルダは中身ごと。
+        上書きになるものは1件ずつ尋ねる(「残りも同じ」で以降を省ける)。"""
+        if self._extracting is not None:
+            self.log("展開: ほかの展開が終わるまで待ってください")
+            return
+        index, plan = self._archive_plan(entries)
+        if not plan:
+            self.log("展開: 対象がありません")
+            return
+        skip = set()
+        apply_all = None
+        conflicts = filer_archive.find_conflicts(plan, dest)
+        for number, rel in enumerate(conflicts):
+            if apply_all is not None:
+                decision = apply_all
+            else:
+                decision, same_for_rest = self.ask_overwrite(rel, len(conflicts) - number - 1)
+                if same_for_rest:
+                    apply_all = decision
+            if decision == CANCEL:
+                self.log("展開: 取り消しました")
+                return
+            if decision == SKIP:
+                skip.add(rel)
+        password = None
+        if filer_archive.needs_password(index, plan):
+            password = self.ask_password(os.path.basename(index.path))
+            if password is None:
+                self.log("展開: 取り消しました（パスワード）")
+                return
+
+        def done(result):
+            self._report_extract(result, dest)
+            self.left.reload()
+            self.right.reload()
+
+        self._start_extract(index, plan, dest, skip, password, "展開", done)
+
+    def _extract_to_temp(self, entries, on_paths) -> None:
+        """書庫の中のファイルを一時フォルダへ取り出し、取り出せたパスで on_paths を呼ぶ
+        (Enter / E / V)。一時フォルダはファイラを閉じるとき・次の起動で片付く。"""
+        if self._extracting is not None:
+            self.log("展開: ほかの展開が終わるまで待ってください")
+            return
+        index, plan = self._archive_plan(entries)
+        if not plan:
+            return
+        password = None
+        if filer_archive.needs_password(index, plan):
+            password = self.ask_password(os.path.basename(index.path))
+            if password is None:
+                return
+        dest = filer_archive.make_temp_dir()
+
+        def done(result):
+            if result.errors or result.cancelled:
+                self._report_extract(result, dest)
+            paths = [os.path.join(dest, e.name) for e in entries
+                     if os.path.isfile(os.path.join(dest, e.name))]
+            if paths:
+                on_paths(paths)
+
+        self._start_extract(index, plan, dest, (), password, "取り出し", done)
+
+    def _start_extract(self, index, plan, dest, skip, password, title, on_done) -> None:
+        """展開を別スレッドで走らせ、進み具合を QProgressDialog に出す(中止できる)。"""
+        cancel = threading.Event()
+        total = sum(1 for p in plan if not p.is_dir)
+        dialog = QProgressDialog(f"{title}: {os.path.basename(index.path)}", "中止",
+                                 0, max(total, 1), self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModal)
+        # 一瞬で終わる小さな展開でまで窓をちらつかせない。
+        dialog.setMinimumDuration(400)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(cancel.set)
+        self._extracting = {"cancel": cancel, "dialog": dialog, "on_done": on_done,
+                            "title": title}
+        bridge = self.bridge
+
+        def progress(done, all_, name):
+            try:
+                bridge.progress.emit((done, all_, name))
+            except RuntimeError:
+                pass
+
+        def worker():
+            try:
+                result = filer_archive.extract(index, plan, dest, skip=skip, password=password,
+                                               progress=progress, cancel=cancel)
+            except Exception as e:  # noqa: BLE001  何が来ても結果として返す
+                result = filer_archive.ExtractResult(errors=[f"{type(e).__name__}: {e}"])
+            try:
+                bridge.extracted.emit(result)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-extract").start()
+
+    def _on_extract_progress(self, payload) -> None:
+        try:
+            job = self._extracting
+            if job is None:
+                return
+            done, total, name = payload
+            dialog = job["dialog"]
+            dialog.setMaximum(max(total, 1))
+            dialog.setValue(min(done, max(total, 1)))
+            dialog.setLabelText(f"{job['title']}: {done}/{total}\n{name}")
+        except Exception:  # noqa: BLE001
+            _log_exception("extractProgress")
+
+    def _on_extracted(self, result) -> None:
+        job = self._extracting
+        self._extracting = None
+        try:
+            if job is None:
+                return
+            try:
+                job["dialog"].close()
+                job["dialog"].deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            job["on_done"](result)
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('extracted')}")
+
+    def _report_extract(self, result, dest) -> None:
+        text = f"展開: {result.written}件 → {dest}"
+        if result.skipped:
+            text += f"（スキップ {result.skipped}件）"
+        if result.cancelled:
+            text += "（中止しました）"
+        self.log(text)
+        for error in result.errors[:5]:
+            self.log(f"展開: 失敗 {error}")
+        if len(result.errors) > 5:
+            self.log(f"展開: ほか {len(result.errors) - 5}件失敗")
+
+    # --- 窓の大きさ・字の大きさ ---
+    def cmd_split_left(self):
+        self.split_ratio = core.step_split(self.split_ratio, -1)
+        self.apply_layout()
+
+    def cmd_split_right(self):
+        self.split_ratio = core.step_split(self.split_ratio, 1)
+        self.apply_layout()
+
+    def cmd_log_grow(self):
+        self.log_lines = core.clamp_log_lines(self.log_lines + 1, self._max_log_lines())
+        self.apply_layout()
+
+    def cmd_log_shrink(self):
+        self.log_lines = core.clamp_log_lines(self.log_lines - 1, self._max_log_lines())
+        self.apply_layout()
+
+    def _change_font(self, step: int) -> None:
+        size = core.clamp_font_size(self.list_font.pointSize() + step)
+        if size == self.list_font.pointSize():
+            return
+        self.list_font.setPointSize(size)
+        for pane in (self.left, self.right):
+            pane.apply_font(self.list_font)
+            pane.set_cursor(pane.cursor_row())  # カーソル行を見える所に保つ
+
+    def cmd_font_smaller(self):
+        self._change_font(-1)
+
+    def cmd_font_larger(self):
+        self._change_font(1)
 
     # --- ソート ---
     def _side_label(self) -> str:
@@ -1460,6 +1858,31 @@ class FilerWindow(QWidget):
         if dialog.exec() != QInputDialog.Accepted:
             return None
         return dialog.textValue()
+
+    def ask_overwrite(self, rel: str, remaining: int):
+        """展開先に同じ名前があるとき。(OVERWRITE|SKIP|CANCEL, 残りも同じにするか)。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("展開")
+        box.setText(f"同じ名前があります。上書きしますか？\n\n{rel}")
+        overwrite = box.addButton("上書き(&O)", QMessageBox.AcceptRole)
+        skip = box.addButton("スキップ(&S)", QMessageBox.RejectRole)
+        cancel = box.addButton("取消", QMessageBox.DestructiveRole)
+        box.setDefaultButton(skip)
+        box.setEscapeButton(cancel)
+        check = None
+        if remaining > 0:
+            check = QCheckBox(f"残り {remaining}件にも同じ扱いをする")
+            box.setCheckBox(check)
+        box.exec()
+        clicked = box.clickedButton()
+        decision = OVERWRITE if clicked is overwrite else SKIP if clicked is skip else CANCEL
+        return decision, bool(check is not None and check.isChecked())
+
+    def ask_password(self, archive_name: str):
+        """書庫のパスワード。取消なら None。"""
+        text, ok = QInputDialog.getText(self, "パスワード", f"{archive_name} のパスワード",
+                                        QLineEdit.Password)
+        return text if ok else None
 
     def confirm(self, title: str, text: str, default_yes: bool = True) -> bool:
         default = QMessageBox.Yes if default_yes else QMessageBox.No

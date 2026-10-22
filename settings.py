@@ -345,18 +345,24 @@ DEFAULT_SETTINGS = {
     #   editor … E / V / Shift+Enter で開くエディタ(1ファイルずつ起こす)
     #   list_timeout_seconds … フォルダの読み取りを見切るまでの秒数。UNC や切断された
     #     ネットワークドライブで窓が固まらないように、これを過ぎたら元のフォルダに留まる
+    #   archive_timeout_seconds … 書庫(.zip/.7z)の中の一覧を見切るまでの秒数。大きな書庫や
+    #     ネットワーク上の書庫は目録の読み取りに時間がかかるので、ふつうのフォルダより長い
     #   time_tolerance_sec … W(同名ファイル比較マーク)で時刻を「同じ」とみなす誤差(秒)。
     #     FAT は2秒刻み、ネットワーク越しでもずれるため
     #   keys … キー割り当ての上書き。あふｗの AFXW.KEY と同じ4桁(前1桁が SHIFT=1/CTRL=2/
     #     ALT=4 の和、後3桁が仮想キーコード)をキーに、コマンド名を値に書く。空文字で外せる。
     #     コマンド名は filer_core.DEFAULT_KEYMAP を参照
     #   colors … 色の上書き(名前は filer.DEFAULT_COLORS)。書いた色だけ差し替わる
-    #   font_families / font_size … 一覧の字(既定は MS Gothic 10pt)
+    #   font_families … 一覧の字(既定は MS Gothic)
     # このほか geometry / maximized / left_path / right_path / active / recent /
-    # left_sort / right_sort / compare_include_dirs はアプリが閉じるときなどに書き足す。
+    # left_sort / right_sort / compare_include_dirs / split_ratio(左右の境界) /
+    # log_lines(メッセージ窓の行数) / font_size(一覧の字の大きさ。Shift/Ctrl+↑↓ で変わる)
+    # はアプリが閉じるときなどに書き足す。left_path / right_path は書庫の中のパスのことも
+    # ある(次回もその書庫の中が開く)。
     "filer": {
         "editor": "notepad.exe",
         "list_timeout_seconds": 5,
+        "archive_timeout_seconds": 30,
         "time_tolerance_sec": 2,
         "keys": {},
         "colors": {},

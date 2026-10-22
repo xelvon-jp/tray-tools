@@ -15,7 +15,9 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import zipfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -50,6 +52,33 @@ def test_default_keymap_matches_afxw_key():
     assert km["0037"] == "focus_left" and km["0039"] == "focus_right"
     assert km["0008"] == "parent"
     assert [code for code, cmd in km.items() if cmd == "parent"] == ["0008"]
+
+
+def test_keymap_esc_layout_font():
+    km = core.DEFAULT_KEYMAP
+    # Esc は窓を閉じない(あふｗの Esc は「各処理の中止」)。閉じるのは Q と Alt+F4 だけ
+    assert "0027" not in km
+    assert sorted(code for code, cmd in km.items() if cmd == "quit") == ["0081", "4115"]
+    # Alt+←→ と、AFXW.key でそれに置き換えている Ctrl+←→
+    assert km["4037"] == km["2037"] == "split_left"
+    assert km["4039"] == km["2039"] == "split_right"
+    assert km["4038"] == "log_grow" and km["4040"] == "log_shrink"
+    # Shift/Ctrl+↑ で縮小、Shift/Ctrl+↓ で拡大(AFXW.key の INS/DEL 置き換え)
+    assert km["1038"] == km["2038"] == "font_smaller"
+    assert km["1040"] == km["2040"] == "font_larger"
+
+
+def test_layout_helpers():
+    assert core.step_split(0.5, -1) == 0.47 and core.step_split(0.5, 1) == 0.53
+    assert core.step_split(0.16, -1) == core.SPLIT_MIN
+    assert core.step_split(0.84, 1) == 1 - core.SPLIT_MIN
+    assert core.clamp_split("x") == 0.5 and core.clamp_split(5) == 1 - core.SPLIT_MIN
+    assert core.clamp_log_lines(0, 10) == 1 and core.clamp_log_lines(30, 10) == 10
+    assert core.clamp_log_lines("bad", 10) == core.DEFAULT_LOG_LINES
+    assert core.clamp_log_lines(5, 0) == 1
+    assert core.clamp_font_size(2) == core.FONT_SIZE_MIN
+    assert core.clamp_font_size(99) == core.FONT_SIZE_MAX
+    assert core.clamp_font_size(None) == core.DEFAULT_FONT_SIZE
 
 
 def test_build_keymap_overrides():
@@ -248,10 +277,11 @@ def test_list_entries_and_read_folder():
         assert [e.name for e in entries] == ["sub", "A.md", "b.txt"]
         assert entries[0].is_dir and entries[2].size == 5
         # ファイルのパスを渡すと置き場所を開いてファイル名に合わせる
-        path, listed, focus = core.read_folder(os.path.join(tmp, "b.txt"))
-        assert core.same_dir(path, tmp) and focus == "b.txt"
+        path, listed, focus, archive = core.read_folder(os.path.join(tmp, "b.txt"))
+        assert core.same_dir(path, tmp) and focus == "b.txt" and archive is None
         # 無くなったフォルダは walk_up で残っている親まで遡る
-        path, _listed, _focus = core.read_folder(os.path.join(tmp, "gone", "deeper"), walk_up=True)
+        path, _listed, _focus, _a = core.read_folder(os.path.join(tmp, "gone", "deeper"),
+                                                     walk_up=True)
         assert core.same_dir(path, tmp)
         try:
             core.read_folder(os.path.join(tmp, "gone"))
@@ -409,9 +439,16 @@ def test_drive_list():
 _app = None
 
 
+_TEST_TEMP = tempfile.mkdtemp(prefix="filer_test_tmp_")
+
+
 def _qapp():
     global _app
+    import filer_archive
     from PySide6.QtWidgets import QApplication
+    # 窓を閉じると一時フォルダを片付ける。本物のファイラが同じ場所を使っているかも
+    # しれないので、テストでは別の場所を使わせる。
+    filer_archive.TEMP_ROOT = _TEST_TEMP
     _app = QApplication.instance() or QApplication([])
     return _app
 
@@ -535,6 +572,8 @@ def test_window_keys_and_operations():
         assert _cursor_name(L) == "photo.JPG" and "検索: ph" in L.footer.text()
         key(Qt.Key_Escape)                      # サーチ中の Esc は検索の終了だけ
         assert L.isearch_text is None and w.isVisible()
+        key(Qt.Key_Escape)                      # サーチ外の Esc でも窓は閉じない
+        assert w.isVisible()
 
         # マスク(Shift+: で入力、: で戻す)
         w.ask_text = lambda *a, **k: "txt"
@@ -813,7 +852,11 @@ def test_single_instance_and_show():
     from PySide6.QtTest import QTest
 
     _qapp()
-    assert not filer_launch.is_running()
+    if filer_launch.is_running():
+        # 本物のファイラが開いている。ミューテックスも待ち受けの名前も同じなので、ここで
+        # 試すと本物に「前面に出して」を送ってしまう。閉じてから流すこと。
+        print("skip  test_single_instance_and_show: ファイラが開いているので飛ばします")
+        return
     assert filer.acquire_single_instance() is True
     assert filer_launch.is_running()
     assert filer.acquire_single_instance() is False      # 2つ目は弾かれる
@@ -839,6 +882,397 @@ def test_single_instance_and_show():
     w.deleteLater()
 
 
+# ---------------------------------------------------------------
+# 書庫(ZIP / 7z)
+# ---------------------------------------------------------------
+JP_NAME = "日本語.txt"            # cp932 で 10 バイト
+JP_PLACEHOLDER = "QQQQQQ.txt"     # 同じ長さの ASCII。書いた後でバイト列を差し替える
+
+
+def _make_zip(path):
+    """テスト用の ZIP。
+    - 日本語名を cp932 で格納(UTF-8 の印なし)。zipfile では作れないので後から差し替える
+    - ディレクトリのエントリを持たない(docs/sub/deep.txt だけで docs と docs/sub は無い)
+    - zip slip の危ないエントリ(.. / 絶対パス / ドライブ名)"""
+    import zipfile
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("readme.txt", b"hello")
+        z.writestr("docs/a.txt", b"aaaa")
+        z.writestr("docs/sub/deep.txt", b"deep")
+        z.writestr(JP_PLACEHOLDER, b"jp")
+        for bad in ("../evil.txt", "/abs.txt", "C:/drive.txt", "ok/../../x.txt"):
+            z.writestr(zipfile.ZipInfo(bad), b"bad")
+    raw = Path(path).read_bytes()
+    assert raw.count(JP_PLACEHOLDER.encode()) == 2  # ローカルヘッダと中央ディレクトリ
+    Path(path).write_bytes(raw.replace(JP_PLACEHOLDER.encode(), JP_NAME.encode("cp932")))
+
+
+def _make_7z(path):
+    import py7zr
+    with py7zr.SevenZipFile(path, "w") as z:
+        z.writestr(b"seven", "s1.txt")
+        z.writestr(b"inner", "folder/s2.txt")
+
+
+def test_archive_core():
+    import filer_archive as fa
+    with tempfile.TemporaryDirectory() as tmp:
+        zpath = os.path.join(tmp, "test.zip")
+        _make_zip(zpath)
+        # パスの分け方(書庫の拡張子を持つ所だけ isfile で確かめる)
+        assert fa.split_archive_path(zpath) == (zpath, "")
+        assert fa.split_archive_path(os.path.join(zpath, "docs", "sub")) == (zpath, "docs/sub")
+        assert fa.split_archive_path(tmp) is None
+        assert fa.looks_like_archive_path(r"D:\x\foo.ZIP\sub") and not fa.looks_like_archive_path(tmp)
+        assert fa.safe_relpath("a\\b/./c") == "a/b/c"
+        for bad in ("../x", "/x", "C:/x", "a/../../x", "", "a:b"):
+            assert fa.safe_relpath(bad) is None, bad
+
+        index = fa.get_index(zpath)
+        root = sorted(e.name for e in index.list_dir(""))
+        assert root == sorted(["docs", "readme.txt", JP_NAME]), root   # cp932 を読み直せている
+        assert index.skipped == 4                                      # 危ないものは出さない
+        assert [e.name for e in index.list_dir("docs")] == ["a.txt", "sub"] or \
+            sorted(e.name for e in index.list_dir("docs")) == ["a.txt", "sub"]
+        assert index.has_dir("docs/sub")                               # 合成した中間フォルダ
+        assert [e.name for e in index.list_dir("docs/sub")] == ["deep.txt"]
+
+        # read_folder から書庫の中を読める
+        path, entries, _f, info = core.read_folder(os.path.join(zpath, "docs"))
+        assert path == os.path.join(zpath, "docs") and info[:2] == (zpath, "docs")
+        _p, _e, _f, info = core.read_folder(os.path.join(zpath, "docs", "gone"), walk_up=True)
+        assert info[1] == "docs"
+        try:
+            core.read_folder(os.path.join(zpath, "nope"))
+            raise AssertionError("無い中のフォルダで例外にならない")
+        except FileNotFoundError:
+            pass
+
+        # 展開(フォルダは中身ごと、いま見ているフォルダからの相対で置く)
+        out = os.path.join(tmp, "out")
+        os.mkdir(out)
+        plan = fa.plan_extract(index, "", ["docs", JP_NAME])
+        rels = sorted(p.rel for p in plan)
+        assert rels == sorted(["docs", "docs/a.txt", "docs/sub", "docs/sub/deep.txt", JP_NAME]), rels
+        result = fa.extract(index, plan, out)
+        assert result.written == 3 and not result.errors, result
+        assert Path(out, "docs", "sub", "deep.txt").read_bytes() == b"deep"
+        assert Path(out, JP_NAME).read_bytes() == b"jp"
+        # 上書きの検出と、スキップ指定
+        Path(out, JP_NAME).write_bytes(b"mine")
+        assert sorted(fa.find_conflicts(plan, out)) == sorted(
+            ["docs/a.txt", "docs/sub/deep.txt", JP_NAME])
+        result = fa.extract(index, plan, out, skip={JP_NAME})
+        assert result.skipped == 1 and Path(out, JP_NAME).read_bytes() == b"mine"
+        # 中のフォルダから: 相対はそこから
+        plan = fa.plan_extract(index, "docs", ["sub"])
+        assert sorted(p.rel for p in plan) == ["sub", "sub/deep.txt"]
+        # zip slip: 計画に載らず、外に何もできない
+        assert not os.path.exists(os.path.join(tmp, "evil.txt"))
+        assert fa._target_path(out, "../x") is None
+        # 中止
+        cancel = threading.Event()
+        cancel.set()
+        result = fa.extract(index, fa.plan_extract(index, "", ["readme.txt"]),
+                            os.path.join(tmp, "out2"), cancel=cancel)
+        assert result.cancelled and result.written == 0
+
+        # 7z
+        spath = os.path.join(tmp, "t.7z")
+        _make_7z(spath)
+        sindex = fa.get_index(spath)
+        assert sorted(e.name for e in sindex.list_dir("")) == ["folder", "s1.txt"]
+        assert [e.name for e in sindex.list_dir("folder")] == ["s2.txt"]
+        out7 = os.path.join(tmp, "out7")
+        os.mkdir(out7)
+        result = fa.extract(sindex, fa.plan_extract(sindex, "", ["folder", "s1.txt"]), out7)
+        assert result.written == 2 and not result.errors, result.errors
+        assert Path(out7, "folder", "s2.txt").read_bytes() == b"inner"
+
+        # 一時フォルダの掃除
+        old = fa.TEMP_ROOT
+        fa.TEMP_ROOT = os.path.join(tmp, "tmproot")
+        try:
+            made = fa.make_temp_dir()
+            Path(made, "f.txt").write_bytes(b"x")
+            assert fa.cleanup_temp() == 1 and not os.path.exists(made)
+        finally:
+            fa.TEMP_ROOT = old
+
+
+def test_archive_password_and_missing_py7zr():
+    import filer_archive as fa
+    import py7zr
+    with tempfile.TemporaryDirectory() as tmp:
+        spath = os.path.join(tmp, "locked.7z")
+        with py7zr.SevenZipFile(spath, "w", password="pw") as z:
+            z.writestr(b"secret", "s.txt")
+        index = fa.get_index(spath)
+        plan = fa.plan_extract(index, "", ["s.txt"])
+        assert index.needs_password and fa.needs_password(index, plan)
+        result = fa.extract(index, plan, os.path.join(tmp, "ok"), password="pw")
+        assert result.written == 1 and Path(tmp, "ok", "s.txt").read_bytes() == b"secret"
+        for wrong in ("nope", None):                   # 違う・無いパスワードでも落ちない
+            result = fa.extract(index, plan, os.path.join(tmp, f"ng_{wrong}"), password=wrong)
+            assert result.written == 0 and result.errors, result
+
+        # 上書きを選んだ ZIP の展開が途中で失敗しても、元のファイルは消えない
+        # (壊れた書庫で CRC が合わない場合で確かめる。パスワード違いも同じ経路)
+        bad = os.path.join(tmp, "bad.zip")
+        with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as z:
+            z.writestr("k.txt", b"NEWDATA-NEWDATA")
+        raw = Path(bad).read_bytes()
+        Path(bad).write_bytes(raw.replace(b"NEWDATA-NEWDATA", b"XEWDATA-NEWDATA", 1))
+        keep_dir = Path(tmp, "keep")
+        keep_dir.mkdir()
+        (keep_dir / "k.txt").write_bytes(b"original")
+        bindex = fa.get_index(bad)
+        result = fa.extract(bindex, fa.plan_extract(bindex, "", ["k.txt"]), str(keep_dir))
+        assert result.written == 0 and result.errors, result
+        assert (keep_dir / "k.txt").read_bytes() == b"original"
+        assert sorted(p.name for p in keep_dir.iterdir()) == ["k.txt"]   # 書きかけも残らない
+
+        # py7zr が無い環境: 7z を開こうとしたら知らせるだけ(ZIP は使える)
+        other = os.path.join(tmp, "other.7z")
+        _make_7z(other)
+        saved = sys.modules.get("py7zr")
+        sys.modules["py7zr"] = None
+        try:
+            try:
+                fa.get_index(other)
+                raise AssertionError("py7zr が無いのに開けた")
+            except fa.ArchiveError as e:
+                assert "py7zr が必要です" in str(e)
+        finally:
+            sys.modules["py7zr"] = saved
+
+
+def _wait_extract(w, timeout=10.0):
+    from PySide6.QtTest import QTest
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QTest.qWait(20)
+        if w._extracting is None:
+            return
+    raise AssertionError("展開が終わらない")
+
+
+def test_window_archive():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        zpath = left / "pack.zip"
+        _make_zip(str(zpath))
+        _make_7z(str(left / "seven.7z"))
+        Path(right, "readme.txt").write_bytes(b"old")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "ed"}}, str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+
+        # Enter で書庫の中へ。パス表示は書庫＋中のパス
+        L.set_cursor(L._row_of("pack.zip"))
+        key(Qt.Key_Return)
+        _wait(w)
+        assert L.archive == (str(zpath), "") and L.path == str(zpath)
+        assert L.header.text().startswith(str(zpath) + "\\")
+        assert _names(L) == ["..", "docs", JP_NAME, "readme.txt"] or \
+            sorted(_names(L)) == sorted(["..", "docs", JP_NAME, "readme.txt"]), _names(L)
+        assert "危ないパスのエントリ 4件" in w.log_view.toPlainText()
+        # 中を移動・BS で一つ上・書庫のルートで BS すると書庫ファイルにカーソル
+        L.set_cursor(L._row_of("docs"))
+        key(Qt.Key_Return)
+        _wait(w)
+        assert L.archive == (str(zpath), "docs") and sorted(_names(L)) == ["..", "a.txt", "sub"]
+        key(Qt.Key_Backspace)
+        _wait(w)
+        assert L.archive == (str(zpath), "") and _cursor_name(L) == "docs"
+        key(Qt.Key_Backspace)
+        _wait(w)
+        assert L.archive is None and core.same_dir(L.path, left) and _cursor_name(L) == "pack.zip"
+        key(Qt.Key_B)                                   # 履歴で書庫の中へ戻れる
+        _wait(w)
+        assert L.archive == (str(zpath), "")
+
+        # マーク・マスク・サーチ・ソート・W も書庫の中で効く
+        key(Qt.Key_F)
+        QTest.keyClicks(L.view, "rea")
+        key(Qt.Key_Escape)
+        assert _cursor_name(L) == "readme.txt"
+        w.ask_compare = lambda title, include_dirs: {
+            "size": "any", "time": "any", "include_dirs": False, "strip_ext": False,
+            "unmark": False}
+        key(Qt.Key_W)                                   # 反対窓に readme.txt がある
+        assert L.marks == {"readme.txt"}, L.marks
+        L.marks.clear()
+
+        # 書き込み系は断る
+        for k, mods in ((Qt.Key_D, Qt.NoModifier), (Qt.Key_K, Qt.NoModifier),
+                        (Qt.Key_R, Qt.NoModifier), (Qt.Key_M, Qt.AltModifier),
+                        (Qt.Key_Delete, Qt.ControlModifier), (Qt.Key_Insert, Qt.ShiftModifier)):
+            before = w.log_view.toPlainText().count("書庫内")
+            key(k, mods)
+            assert w.log_view.toPlainText().count("書庫内") == before + 1, (k, mods)
+        assert zpath.exists()
+
+        # Alt+C: 反対窓へ展開。上書きは尋ねる(スキップ)、フォルダは中身ごと
+        asked = []
+        w.ask_overwrite = lambda rel, remaining: (asked.append(rel), (filer.SKIP, False))[1]
+        L.marks.update({"readme.txt", "docs"})
+        key(Qt.Key_C, Qt.AltModifier)
+        _wait_extract(w)
+        _wait(w)
+        assert asked == ["readme.txt"], asked
+        assert Path(right, "readme.txt").read_bytes() == b"old"          # スキップした
+        assert Path(right, "docs", "sub", "deep.txt").read_bytes() == b"deep"
+        assert "展開: 2件" in w.log_view.toPlainText()
+        # 上書き＋「残りも同じ」
+        asked.clear()
+        w.ask_overwrite = lambda rel, remaining: (asked.append(rel), (filer.OVERWRITE, True))[1]
+        L.marks.update({"readme.txt", "docs"})
+        key(Qt.Key_C, Qt.AltModifier)
+        _wait_extract(w)
+        _wait(w)
+        assert len(asked) == 1 and Path(right, "readme.txt").read_bytes() == b"hello"
+        # 取消なら何もしない
+        Path(right, "readme.txt").write_bytes(b"old")
+        w.ask_overwrite = lambda rel, remaining: (filer.CANCEL, False)
+        L.set_cursor(L._row_of("readme.txt"))
+        key(Qt.Key_C, Qt.AltModifier)
+        assert w._extracting is None and Path(right, "readme.txt").read_bytes() == b"old"
+        assert not Path(tmp, "evil.txt").exists() and not Path(right, "evil.txt").exists()
+
+        # Enter / E は一時フォルダへ取り出して開く
+        opened = []
+        w._startfile = lambda path: opened.append(path)
+        L.set_cursor(L._row_of(JP_NAME))
+        key(Qt.Key_Return)
+        _wait_extract(w)
+        assert len(opened) == 1 and Path(opened[0]).read_bytes() == b"jp"
+        assert opened[0].startswith(_TEST_TEMP)
+        calls = []
+        real_popen = filer.subprocess.Popen
+        filer.subprocess.Popen = lambda args, **kw: calls.append(args)
+        try:
+            key(Qt.Key_E)
+            _wait_extract(w)
+        finally:
+            filer.subprocess.Popen = real_popen
+        assert calls and calls[0][0] == "ed" and calls[0][1].endswith(JP_NAME)
+
+        # O: 反対窓を書庫の中へ(Shift+O)。反対窓が書庫の中なら Alt+C は断る
+        key(Qt.Key_O, Qt.ShiftModifier)
+        _wait(w)
+        assert R.archive == (str(zpath), "")
+        key(Qt.Key_Backspace)
+        _wait(w)
+        assert L.archive is None
+        L.set_cursor(L._row_of("alpha.txt"))
+        key(Qt.Key_C, Qt.AltModifier)
+        assert "書庫内へは書き込めません" in w.log_view.toPlainText()
+        R.load(str(right))
+        _wait(w)
+
+        # 7z も同じように入れて、展開できる
+        L.set_cursor(L._row_of("seven.7z"))
+        key(Qt.Key_Return)
+        _wait(w)
+        assert L.archive == (str(left / "seven.7z"), "") and "folder" in _names(L)
+        L.set_cursor(L._row_of("folder"))
+        key(Qt.Key_C, Qt.AltModifier)
+        _wait_extract(w)
+        _wait(w)
+        assert Path(right, "folder", "s2.txt").read_bytes() == b"inner"
+
+        # 閉じたとき、書庫の中のパスをそのまま保存する(次回もそこが開く)
+        key(Qt.Key_Q)
+        QTest.qWait(20)
+        stored = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert stored["filer"]["left_path"] == str(left / "seven.7z")
+        w.deleteLater()
+
+        # 次回: 書庫の中のパスから開ける
+        w2 = filer.FilerWindow({"filer": {"left_path": str(zpath / "docs" / "sub"),
+                                          "right_path": str(right)}}, None)
+        w2.show()
+        w2.start()
+        _wait(w2)
+        assert w2.left.archive == (str(zpath), "docs/sub")
+        w2.close()
+        w2.deleteLater()
+
+
+def test_window_layout_and_font():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "log_lines": 3, "split_ratio": 0.5, "font_size": 10}},
+                              str(settings_path))
+        w.resize(1000, 700)
+        w.show()
+        w.start()
+        _wait(w)
+        QTest.qWait(30)
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+
+        width0 = w.left.width()
+        key(Qt.Key_Left, Qt.AltModifier)
+        key(Qt.Key_Left, Qt.ControlModifier)            # AFXW.key で Ctrl+← = Alt+←
+        assert w.split_ratio == 0.44 and w.left.width() < width0, (w.split_ratio, w.left.width())
+        assert w.active_side == "left"                  # 窓の切り替えは起きない
+        key(Qt.Key_Right, Qt.AltModifier)
+        assert w.split_ratio == 0.47
+        for _ in range(30):
+            key(Qt.Key_Left, Qt.AltModifier)
+        assert w.split_ratio == core.SPLIT_MIN          # 端に寄りすぎない
+
+        log0 = w.log_view.height()
+        key(Qt.Key_Up, Qt.AltModifier)                  # メッセージ窓を大きく
+        assert w.log_lines == 4 and w.log_view.height() > log0
+        for _ in range(10):
+            key(Qt.Key_Down, Qt.AltModifier)
+        assert w.log_lines == 1
+        for _ in range(200):
+            key(Qt.Key_Up, Qt.AltModifier)
+        assert w.log_lines == w._max_log_lines() and w.log_view.height() <= w.height() // 2 + 20
+        key(Qt.Key_Down, Qt.AltModifier)
+
+        row_h = w.left.view.verticalHeader().defaultSectionSize()
+        key(Qt.Key_Down, Qt.ControlModifier)            # 拡大
+        key(Qt.Key_Down, Qt.ShiftModifier)
+        assert w.list_font.pointSize() == 12
+        assert w.left.view.verticalHeader().defaultSectionSize() >= row_h
+        assert w.right.view.font().pointSize() == 12    # 両窓に効く
+        key(Qt.Key_Up, Qt.ShiftModifier)                # 縮小
+        assert w.list_font.pointSize() == 11
+        assert _cursor_name(w.left) == ".."             # カーソルは動かない(PgUp ではない)
+
+        lines = w.log_lines
+        key(Qt.Key_Q)
+        QTest.qWait(20)
+        stored = json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
+        assert stored["split_ratio"] == core.SPLIT_MIN, stored["split_ratio"]
+        assert stored["log_lines"] == lines and stored["font_size"] == 11
+        w.deleteLater()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
@@ -858,5 +1292,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     code = main()
+    # os._exit は後始末を走らせないので、テスト用の一時フォルダはここで消す。
+    shutil.rmtree(_TEST_TEMP, ignore_errors=True)
     sys.stdout.flush()
     os._exit(code)

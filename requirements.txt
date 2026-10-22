@@ -16,6 +16,9 @@ segno
 # Copilot の窓を exe 名で見分ける(copilot_loop)・親プロセスの生存確認(agent_loop)など。
 # 無くても落ちはしないが、exe 名での照合を諦めるので業務PCの M365 Copilot を取り違えうる。
 psutil
+# 簡易ファイラ(filer.py)で 7z の書庫の中を見る・展開する。ZIP は標準の zipfile で足りる。
+# 無くても落ちはしない(7z を開こうとしたときに「py7zr が必要です」と出るだけ)。
+py7zr
 # 任意: 背景透過(bg_remove.py)の「AIで抜く」を使うときだけ。無くても他は動く
 # (無ければボタンが押せなくなるだけ)。初回の import に数十秒かかる。
 # setup.py が途中で入れるか聞く(--with-ai / --no-ai で省略可)。

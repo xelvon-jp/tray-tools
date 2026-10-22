@@ -1057,14 +1057,18 @@ class FilerWindow(QWidget):
         if target is not None:
             pane.load(target, history=("forward", previous))
 
-    def _open_picker(self, title, items, on_path, **kwargs) -> None:
-        """J/H/L の選択窓(picker.PickerWindow を流用)。決めたらアクティブ窓をそこへ。"""
+    def _open_picker(self, title, items, on_path, on_accept=None, **kwargs):
+        """J/H/L の選択窓(picker.PickerWindow を流用)。決めたらアクティブ窓をそこへ。
+        on_accept を渡すと (名前, data) をそのまま受け取る(J の「ここを登録」用)。"""
         from picker import PickerWindow
 
         if self._picker is not None:
             self._picker.close()
 
         def accept(_name, data):
+            if on_accept is not None:
+                on_accept(_name, data)
+                return
             path = data[1] if isinstance(data, tuple) else data
             on_path(path)
 
@@ -1072,6 +1076,7 @@ class FilerWindow(QWidget):
         picker.closed.connect(self._on_picker_closed)
         self._picker = picker
         picker.show()
+        return picker
 
     def _on_picker_closed(self) -> None:
         try:
@@ -1098,14 +1103,63 @@ class FilerWindow(QWidget):
         # ため、J を押したときに初めて読む(COM のオブジェクトは作らない。読み込むだけ)。
         import launcher
 
-        bookmarks = launcher.load_bookmarks(self.app_settings)
-        items = [(b["name"], (launcher.KIND_JUMP, b["path"])) for b in bookmarks]
-        if not items:
-            self.log("ブックマークがありません（トレイの「📁 フォルダブックマーク」で登録）")
-        self._open_picker(
-            "フォルダブックマーク", items, self.jump_to,
-            placeholder=launcher.PLACEHOLDER,
-            dynamic_items=launcher.typed_items, tab_text=launcher.tab_text)
+        # 押すたびに settings.json を読み直す。ファイラを開いている間に常駐側(Win+J や
+        # あふｗの Alt+J)で足したブックマークも、開き直さずに出るように。登録・削除・
+        # 並べ替えも読み直した dict に対して launcher の関数で行う(ファイルはキーだけ
+        # 差し替えるので、ファイラ自身の filer セクションとは消し合わない)。
+        current = (settings_module.load_settings(self.settings_path)
+                   if self.settings_path else self.app_settings)
+        add_path = self.active.path
+        picker = None
+
+        def build_items() -> list:
+            found = [(b["name"], (launcher.KIND_JUMP, b["path"]))
+                     for b in launcher.load_bookmarks(current)]
+            if add_path:
+                found.append((f"{launcher.ADD_ITEM_PREFIX}   {add_path}",
+                              (launcher.KIND_ADD, add_path)))
+            return found
+
+        def accept(_name, data):
+            kind, path = data
+            if kind != launcher.KIND_ADD:
+                self.jump_to(path)
+                return
+            # 名前の既定値はフォルダ名。ルート(C:\)は basename が空なのでパスそのもの。
+            default_name = os.path.basename(path.rstrip("\\/")) or path
+            name = launcher._ask_name(self, default_name)
+            if name is None:
+                return
+            if launcher.save_bookmark(current, self.settings_path, name, path):
+                self.log(f"ブックマーク: 登録しました（{name} → {path}）")
+            else:
+                self.log("ブックマーク: 設定ファイルに保存できませんでした")
+
+        def delete(name, data):
+            kind, path = data
+            if kind != launcher.KIND_JUMP:
+                return
+            if not self.confirm("フォルダブックマーク", f"{name} を削除しますか？",
+                                default_yes=False):
+                return
+            if launcher.delete_bookmark(current, self.settings_path, name, path):
+                picker.set_items(build_items())
+                self.log(f"ブックマーク: 削除しました（{name}。控え: {launcher.DELETED_LOG_NAME}）")
+            else:
+                self.log("ブックマーク: 設定ファイルに保存できませんでした")
+
+        def move(name, data, step):
+            kind, path = data
+            if kind != launcher.KIND_JUMP:
+                return
+            if launcher.move_bookmark(current, self.settings_path, name, path, step):
+                picker.set_items(build_items())
+
+        picker = self._open_picker(
+            "フォルダブックマーク", build_items(), self.jump_to, on_accept=accept,
+            placeholder=launcher.PLACEHOLDER, hint=launcher.HINT,
+            dynamic_items=launcher.typed_items, tab_text=launcher.tab_text,
+            on_delete=delete, on_move=move)
 
     def cmd_path_jump(self):
         text = self.ask_text("パスを入力", "移動先（フォルダかファイルのパス）",

@@ -745,6 +745,68 @@ def test_window_keys_and_operations():
         w.deleteLater()
 
 
+def test_bookmark_add_delete_move():
+    """J: 押すたびに settings.json を読み直し、「ここを登録」・削除・並べ替えができる。
+    ほかの設定(hotkeys・filer)は消さない。"""
+    import filer
+    import launcher
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        stored = {"hotkeys": {"x": "y"}, "filer": {"editor": "x"},
+                  "launcher": {"bookmarks": [{"name": "A", "path": str(right)}]}}
+        settings_path.write_text(json.dumps(stored), encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+
+        # 開いたあとに外(常駐側)で足されたブックマークも出る
+        stored["launcher"]["bookmarks"].append({"name": "B", "path": str(left / "sub1")})
+        settings_path.write_text(json.dumps(stored), encoding="utf-8")
+
+        w.run_command("bookmark_jump")
+        p = w._picker
+        names = [n for n, _ in p._items]
+        assert names[:2] == ["A", "B"], names
+        assert names[2].startswith(launcher.ADD_ITEM_PREFIX) and str(left) in names[2], names
+
+        # 「ここを登録」
+        original = launcher._ask_name
+        launcher._ask_name = lambda parent, default: default + "_new"
+        try:
+            p._on_accept(*p._items[2])
+        finally:
+            launcher._ask_name = original
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert [b["name"] for b in saved["launcher"]["bookmarks"]] == \
+            ["A", "B", os.path.basename(str(left)) + "_new"]
+        assert saved["hotkeys"] == {"x": "y"} and saved["filer"] == {"editor": "x"}
+
+        # 並べ替え(B を上へ)と削除(A)
+        w.run_command("bookmark_jump")
+        p = w._picker
+        p._on_move(*p._items[1], -1)
+        assert [n for n, _ in p._items][:2] == ["B", "A"]
+        w.confirm = lambda *a, **k: True
+        # 削除の控えは本物の bookmark_deleted.log ではなく一時フォルダへ
+        original_log = launcher.DELETED_LOG_PATH
+        launcher.DELETED_LOG_PATH = str(Path(tmp, "bookmark_deleted.log"))
+        try:
+            p._on_delete(*p._items[1])
+        finally:
+            launcher.DELETED_LOG_PATH = original_log
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert [b["name"] for b in saved["launcher"]["bookmarks"]] == \
+            ["B", os.path.basename(str(left)) + "_new"]
+        p.close()
+        w.close()
+
+
 def test_single_instance_and_show():
     import filer
     import filer_launch

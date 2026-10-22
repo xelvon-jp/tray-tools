@@ -340,6 +340,27 @@ DEFAULT_SETTINGS = {
         "mic": "on",
         "steps": [],
     },
+    # 簡易2画面ファイラ(filer.py)。あふｗを入れられない PC で、あふｗと同じキーで
+    # ファイルを扱うためのもの。窓は別プロセス。
+    #   editor … E / V / Shift+Enter で開くエディタ(1ファイルずつ起こす)
+    #   list_timeout_seconds … フォルダの読み取りを見切るまでの秒数。UNC や切断された
+    #     ネットワークドライブで窓が固まらないように、これを過ぎたら元のフォルダに留まる
+    #   time_tolerance_sec … W(同名ファイル比較マーク)で時刻を「同じ」とみなす誤差(秒)。
+    #     FAT は2秒刻み、ネットワーク越しでもずれるため
+    #   keys … キー割り当ての上書き。あふｗの AFXW.KEY と同じ4桁(前1桁が SHIFT=1/CTRL=2/
+    #     ALT=4 の和、後3桁が仮想キーコード)をキーに、コマンド名を値に書く。空文字で外せる。
+    #     コマンド名は filer_core.DEFAULT_KEYMAP を参照
+    #   colors … 色の上書き(名前は filer.DEFAULT_COLORS)。書いた色だけ差し替わる
+    #   font_families / font_size … 一覧の字(既定は MS Gothic 10pt)
+    # このほか geometry / maximized / left_path / right_path / active / recent /
+    # left_sort / right_sort / compare_include_dirs はアプリが閉じるときなどに書き足す。
+    "filer": {
+        "editor": "notepad.exe",
+        "list_timeout_seconds": 5,
+        "time_tolerance_sec": 2,
+        "keys": {},
+        "colors": {},
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",
@@ -388,6 +409,9 @@ DEFAULT_SETTINGS = {
         # 会議を立てるためのキー)。既に使っている h,r,s,m,c,t,v,l,o,b,w,p,q,f,e と
         # win+j のどれとも重ならない。
         "teams_meeting": "ctrl+alt+n",
+        # 簡易ファイラ(filer.py)を開く。既に開いていれば前面へ。a は afxw の a。
+        # 既に使っている h,r,s,m,c,t,v,l,o,b,w,p,q,f,e,n と win+j のどれとも重ならない。
+        "filer": "ctrl+alt+a",
     },
 }
 

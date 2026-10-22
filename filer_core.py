@@ -1,0 +1,724 @@
+# filer_core.py
+# 簡易2画面ファイラ(filer.py)の、Qt にも Win32 にも依存しない部分。
+#
+# なぜ分けたのか
+#   キー割り当て・パスの解決・マスク・並び順・履歴・マークの対象選びは、どれも
+#   「あふｗと同じ指の動きで同じ結果になるか」が肝で、間違えるとファイル操作の
+#   対象がずれる(＝事故になる)。窓を作らずに tests/test_filer.py で確かめられるよう、
+#   ここには os と標準ライブラリだけで書ける関数を集めてある。
+#   ファイル一覧の読み取り(list_entries / read_folder)だけは実ディスクを触るが、
+#   これも別スレッドから呼ぶ前提の素の関数にしてある(Qt のオブジェクトを触らない)。
+import fnmatch
+import os
+import re
+import stat
+import time
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------
+# キー割り当て
+# ---------------------------------------------------------------
+# あふｗの AFXW.KEY と同じ「SCAV」4桁表記で持つ。
+#   前1桁 … SHIFT=1 / CTRL=2 / ALT=4 の論理和
+#   後3桁 … 仮想キーコード(10進)
+# あふｗ側の設定と突き合わせるときに、そのまま横に並べて読めるようにするため。
+# 中身はユーザー自身の AFXW.key(あふｗ標準＋カスタマイズ)に寄せてある。
+# settings.json の filer.keys で上書きできる(build_keymap 参照)。
+SHIFT = 1
+CTRL = 2
+ALT = 4
+
+DEFAULT_KEYMAP = {
+    # --- カーソル ---
+    "0038": "cursor_up",          # ↑
+    "0040": "cursor_down",        # ↓
+    "0033": "page_up",            # PgUp
+    "0034": "page_down",          # PgDn
+    "2038": "page_up",            # Ctrl+↑
+    "2040": "page_down",          # Ctrl+↓
+    "2033": "cursor_top",         # Ctrl+PgUp
+    "2034": "cursor_bottom",      # Ctrl+PgDn
+    # --- 窓・フォルダ移動 ---
+    "0037": "focus_left",         # ← 左窓をアクティブに(既に左なら何もしない)
+    "0039": "focus_right",        # → 右窓をアクティブに(既に右なら何もしない)
+    "0008": "parent",             # BS
+    "0009": "switch",             # Tab 反対窓へ(あふｗ標準には無いが便利なので)
+    "0013": "enter",              # Enter フォルダなら入る/ファイルは関連付け
+    "2013": "open_assoc",         # Ctrl+Enter 関連付けで開く
+    "1013": "edit",               # Shift+Enter エディタ
+    "0069": "edit",               # E
+    "0086": "edit",               # V (AFXW.key 0086 &MENU edit.txt の代わり)
+    # --- マーク ---
+    "0032": "mark_down",          # Space
+    "1032": "mark_up",            # Shift+Space
+    "0036": "invert_files",       # Home ファイルだけ反転
+    "0065": "invert_files",       # A
+    "1036": "invert_all",         # Shift+Home フォルダも反転
+    "1065": "invert_all",         # Shift+A
+    # --- 再読込 ---
+    "0035": "reload",             # End (マーククリア)
+    "2035": "reload_keep",        # Ctrl+End (マーク保持)
+    "1035": "reload_other",       # Shift+End 反対窓
+    # --- 左右の窓のパス ---
+    "0079": "sync_to_other",      # O 自分を反対窓と同じパスに
+    "1079": "sync_other_to_me",   # Shift+O 反対窓をこちらと同じパスに
+    "4079": "swap_paths",         # Alt+O 入れ替え(AFXW.key の 4079 &EXCD)
+    # --- 履歴・ジャンプ ---
+    "0066": "back",               # B
+    "0188": "back",               # ,
+    "1066": "forward",            # Shift+B
+    "0190": "forward",            # .
+    "0072": "history_jump",       # H
+    "0074": "bookmark_jump",      # J (tray-tools のフォルダブックマーク)
+    "1074": "path_jump",          # Shift+J パス入力
+    "0078": "desktop",            # N (AFXW.key 0078 &EXCD Desktop)
+    "0076": "drive",              # L
+    "0070": "isearch",            # F
+    "0083": "sort_dialog",        # S ソート
+    "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
+    "0087": "compare_mark",       # W 同名ファイル比較マーク
+    # --- マスク ---
+    "0186": "mask_clear",         # :  (VK_OEM_1)
+    "1186": "mask_input",         # Shift+: (AFXW.key 1186 &MASK)
+    # --- ファイル操作 ---
+    "0067": "copy_menu",          # C (menu\copy.txt)
+    "4067": "copy_direct",        # Alt+C
+    "0077": "move_menu",          # M (menu\move.txt)
+    "4077": "move_direct",        # Alt+M
+    "0068": "delete",             # D ごみ箱
+    "0046": "delete",             # Del
+    "1068": "delete_permanent",   # Shift+D 完全削除
+    "1046": "delete_permanent",   # Shift+Del
+    "0075": "mkdir",              # K
+    "0082": "rename",             # R
+    "2045": "clip_copy",          # Ctrl+Ins
+    "2046": "clip_cut",           # Ctrl+Del
+    "1045": "clip_paste",         # Shift+Ins
+    # --- 閉じる ---
+    "0081": "quit",               # Q
+    "0027": "quit",               # Esc (インクリメンタルサーチ中は検索の終了が先)
+    "4115": "quit",               # Alt+F4 (AFXW.key 4115:0081)
+}
+
+# filer.py が実装しているコマンドの名前。filer.keys で知らない名前を書かれたら捨てる
+# (綴り間違い1つで「押したら何か別のことが起きる」より「何も起きない」方が安全)。
+COMMANDS = frozenset(DEFAULT_KEYMAP.values())
+
+_SCAV_RE = re.compile(r"^[0-7]\d{3}$")
+
+
+def scav(vk: int, shift: bool = False, ctrl: bool = False, alt: bool = False) -> str:
+    """仮想キーコードと修飾キーから、あふｗの4桁表記を作る。"""
+    mods = (SHIFT if shift else 0) | (CTRL if ctrl else 0) | (ALT if alt else 0)
+    return f"{mods}{int(vk) % 1000:03d}"
+
+
+def build_keymap(overrides=None) -> dict:
+    """既定の割り当てに settings.json の filer.keys を重ねた辞書を返す。
+
+    overrides は {"0067": "copy_menu", "0099": ""} の形。値が空文字(や null)なら
+    その割り当てを外す。形の違うキー・知らないコマンド名は黙って捨てる
+    (手で編集するファイルなので、1つの間違いで全部が効かなくなるのを避ける)。"""
+    keymap = dict(DEFAULT_KEYMAP)
+    if not isinstance(overrides, dict):
+        return keymap
+    for code, command in overrides.items():
+        if not isinstance(code, str) or not _SCAV_RE.match(code):
+            continue
+        if not command:
+            keymap.pop(code, None)
+            continue
+        if command in COMMANDS:
+            keymap[code] = command
+    return keymap
+
+
+def arrow_target(side: str, direction: str):
+    """←/→ を押したときにアクティブにする窓。既にその窓なら None(何もしない)。
+
+    あふｗの ←/→ は「その方向の窓をアクティブにする」だけで、親フォルダへは行かない
+    (親へ行くのは BS だけ。ユーザー確認済み)。side はいまアクティブな窓、
+    direction は押した矢印。どちらも "left" / "right"。"""
+    return None if side == direction else direction
+
+
+# ---------------------------------------------------------------
+# 一覧の項目
+# ---------------------------------------------------------------
+@dataclass(frozen=True)
+class Entry:
+    name: str
+    is_dir: bool
+    size: int = 0
+    mtime: float = 0.0
+    attrs: int = 0
+    is_parent: bool = False  # 先頭の ".."
+
+    @property
+    def hidden(self) -> bool:
+        return bool(self.attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
+
+
+PARENT_ENTRY = Entry("..", True, is_parent=True)
+
+
+# 並べ方。あふｗのソートダイアログ(S)の選択肢と同じ並び。
+SORT_KINDS = ("none", "name", "ext", "size", "time", "attr", "natural")
+SORT_LABELS = {
+    "none": "ソートなし",
+    "name": "ファイル名",
+    "ext": "拡張子名",
+    "size": "サイズ",
+    "time": "タイムスタンプ",
+    "attr": "属性",
+    "natural": "ファイル名(番号)",
+}
+# ダイアログで押すと即決する文字。
+SORT_SHORTCUTS = {"N": "none", "F": "name", "E": "ext", "S": "size", "T": "time",
+                  "A": "attr", "X": "natural"}
+DEFAULT_SORT = {"kind": "name", "descending": False, "dirs_first": True, "ignore_case": True}
+
+
+def normalize_sort(spec) -> dict:
+    """settings.json から来た並べ方を、知っている値だけに揃える(手で書かれても壊れない)。"""
+    result = dict(DEFAULT_SORT)
+    if isinstance(spec, dict):
+        if spec.get("kind") in SORT_KINDS:
+            result["kind"] = spec["kind"]
+        for key in ("descending", "dirs_first", "ignore_case"):
+            if isinstance(spec.get(key), bool):
+                result[key] = spec[key]
+    return result
+
+
+_NATURAL_RE = re.compile(r"(\d+)")
+
+
+def natural_key(text: str) -> tuple:
+    """file2 < file10 になる比較キー。数字の並びは数として、それ以外は文字として比べる。
+    同じ位置に数と文字が来ても比べられるよう、各部分を (種別, 数, 文字) の形に揃える。"""
+    parts = []
+    for part in _NATURAL_RE.split(text):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append((0, int(part), part))
+        else:
+            parts.append((1, 0, part))
+    return tuple(parts)
+
+
+def sort_key(entry: "Entry", kind: str, ignore_case: bool = True):
+    """1つの項目の並べ替えキー。同点は名前で決める(並びが実行ごとに揺れないように)。"""
+    name = entry.name.casefold() if ignore_case else entry.name
+    if kind == "ext":
+        return (split_name(entry)[1].casefold() if ignore_case else split_name(entry)[1], name)
+    if kind == "size":
+        return (entry.size, name)
+    if kind == "time":
+        return (entry.mtime, name)
+    if kind == "attr":
+        return (entry.attrs, name)
+    if kind == "natural":
+        return (natural_key(name), name)
+    return (name, entry.name)
+
+
+def sort_entries(entries, spec=None) -> list:
+    """並べ方(spec)に従って並べる。既定はフォルダが先・名前順(大文字小文字を無視)。
+
+    - dirs_first ならフォルダの塊を上に置き、昇順/降順はそれぞれの塊の中で効かせる
+      (降順にしてもフォルダが下へ行かない。あふｗと同じ)
+    - "none" は OS の列挙順のまま(降順なら逆順)
+    - ".." は渡さないこと(呼ぶ側が常に先頭に足す)"""
+    spec = normalize_sort(spec)
+    entries = list(entries)
+    groups = ([[e for e in entries if e.is_dir], [e for e in entries if not e.is_dir]]
+              if spec["dirs_first"] else [entries])
+    result = []
+    for group in groups:
+        if spec["kind"] == "none":
+            result.extend(reversed(group) if spec["descending"] else group)
+        else:
+            result.extend(sorted(group, key=lambda e: sort_key(e, spec["kind"], spec["ignore_case"]),
+                                 reverse=spec["descending"]))
+    return result
+
+
+def list_entries(path: str) -> list:
+    """path 直下の項目を Entry の並び(OS の列挙順のまま)で返す。".." は含めない。
+    並べ替えは表示側が窓ごとの設定で行う(「ソートなし」で列挙順を見せるため)。
+
+    フォルダかどうかは属性で見る(ジャンクションの先を辿りに行かない＝止まりうる I/O を
+    増やさない。launcher.list_subfolders と同じ考え方)。Windows の scandir は列挙で
+    受け取った情報を持っているので、stat(follow_symlinks=False) は改めてディスクを読まない。
+
+    フォルダ自体が読めなければ OSError を投げる(呼ぶ側がメッセージにする)。
+    1件だけ読めないものは、名前だけの項目として残す(消えて見えるより分かりやすい)。"""
+    found = []
+    with os.scandir(path) as it:
+        for entry in it:
+            try:
+                st = entry.stat(follow_symlinks=False)
+                attrs = getattr(st, "st_file_attributes", 0)
+                is_dir = bool(attrs & stat.FILE_ATTRIBUTE_DIRECTORY) if attrs else entry.is_dir()
+                found.append(Entry(entry.name, is_dir,
+                                   0 if is_dir else st.st_size, st.st_mtime, attrs))
+            except OSError:
+                found.append(Entry(entry.name, False))
+    return found
+
+
+# ---------------------------------------------------------------
+# パス
+# ---------------------------------------------------------------
+def normalize_dir(path: str) -> str:
+    """フォルダのパスを1つの形に揃える。ルートは末尾 \\ 付き(C:\\、\\\\host\\share\\)、
+    それ以外は末尾 \\ 無し。比較や履歴の重複判定をこの形で行う。"""
+    path = os.path.normpath(path)
+    drive, rest = os.path.splitdrive(path)
+    if rest in ("", "\\", "/"):
+        return drive + "\\"
+    return path.rstrip("\\/")
+
+
+def is_root(path: str) -> bool:
+    _drive, rest = os.path.splitdrive(normalize_dir(path))
+    return rest in ("", "\\")
+
+
+def parent_of(path: str):
+    """親フォルダ。ルート(ドライブ直下・UNC の共有直下)なら None。"""
+    path = normalize_dir(path)
+    if is_root(path):
+        return None
+    return normalize_dir(os.path.dirname(path))
+
+
+def same_dir(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return os.path.normcase(normalize_dir(a)) == os.path.normcase(normalize_dir(b))
+
+
+def existing_ancestor(path: str, isdir=os.path.isdir):
+    """path か、その親のうち実在する最も深いフォルダ。どれも無ければ None。
+
+    前回のパスを復元するときに使う(保存したフォルダが消えていたら、残っている親まで遡る)。
+    ネットワーク越しでは isdir が止まりうるので、UI スレッドからは呼ばないこと。"""
+    if not path:
+        return None
+    current = normalize_dir(path)
+    while current:
+        try:
+            if isdir(current):
+                return current
+        except OSError:
+            pass
+        current = parent_of(current)
+    return None
+
+
+def expand_typed_path(text: str):
+    """Shift+J で打たれた文字列をパスの形にする。空なら None。
+
+    引用符の囲みを1組外し、環境変数と ~ を展開する(launcher.normalize_typed_text と
+    同じ字面の扱い。こちらは comtypes を読み込まないよう同じことを自前で持つ)。"""
+    if not text:
+        return None
+    path = text.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+        path = path[1:-1].strip()
+    if not path:
+        return None
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def read_folder(path: str, focus=None, walk_up: bool = False):
+    """別スレッドから呼ぶ一覧の読み取り。(実際に開いたフォルダ, 項目, カーソルを合わせる名前)。
+
+    - path がファイルなら、その置き場所を開いてファイル名にカーソルを合わせる
+      (Shift+J でファイルのパスを貼ったとき)
+    - walk_up なら、無くなっていたフォルダを残っている親まで遡る(前回の復元用)。
+      ふだんの移動では遡らない(入れなかったら元のフォルダに留まるのがあふｗの挙動)
+    読めなければ OSError を投げる。"""
+    path = os.path.normpath(path)
+    if not walk_up and os.path.isfile(path):
+        focus = os.path.basename(path)
+        path = os.path.dirname(path)
+    if walk_up:
+        found = existing_ancestor(path)
+        if found is None:
+            raise FileNotFoundError(f"フォルダが見つかりません: {path}")
+        path = found
+    path = normalize_dir(path)
+    return path, list_entries(path), focus
+
+
+# ---------------------------------------------------------------
+# マスク
+# ---------------------------------------------------------------
+DEFAULT_MASK = "*.*"
+
+
+def parse_mask(text: str) -> list:
+    """マスク入力を照合用のパターンの並びにする。
+
+    セミコロン(と空白)区切りで複数。ワイルドカード(* ?)を含まない語は「含む」の意味で
+    *語* に広げる(あふｗで foo と打つと foo を含むものが残るのと同じ)。
+    空・*.*・* だけなら [](＝全部表示)。"""
+    patterns = []
+    for word in re.split(r"[;\s]+", text or ""):
+        word = word.strip()
+        if not word:
+            continue
+        if word in ("*", "*.*"):
+            return []
+        if "*" not in word and "?" not in word:
+            word = f"*{word}*"
+        patterns.append(word.casefold())
+    return patterns
+
+
+def is_default_mask(text: str) -> bool:
+    return not parse_mask(text)
+
+
+def mask_matches(name: str, patterns: list) -> bool:
+    if not patterns:
+        return True
+    folded = name.casefold()
+    return any(fnmatch.fnmatchcase(folded, p) for p in patterns)
+
+
+def filter_entries(entries, patterns: list) -> list:
+    """マスクで絞る。フォルダは常に残す(絞り込み中でも移動はできるように)。"""
+    if not patterns:
+        return list(entries)
+    return [e for e in entries if e.is_dir or mask_matches(e.name, patterns)]
+
+
+# ---------------------------------------------------------------
+# マーク
+# ---------------------------------------------------------------
+def pick_targets(entries, marks, cursor_index: int) -> list:
+    """操作の対象。マークがあればマークしたもの(一覧の並び順)、無ければカーソル位置。
+
+    ".." はどちらの場合も対象にしない(親フォルダを消す・コピーする事故を防ぐ)。"""
+    if marks:
+        return [e for e in entries if e.name in marks and not e.is_parent]
+    if 0 <= cursor_index < len(entries):
+        entry = entries[cursor_index]
+        if not entry.is_parent:
+            return [entry]
+    return []
+
+
+def invert_marks(entries, marks, include_dirs: bool) -> set:
+    """マークを反転した新しい集合。include_dirs が False ならフォルダのマークは触らない。"""
+    result = set(marks)
+    for e in entries:
+        if e.is_parent or (e.is_dir and not include_dirs):
+            continue
+        if e.name in result:
+            result.discard(e.name)
+        else:
+            result.add(e.name)
+    return result
+
+
+def marks_summary(entries, marks):
+    """(マーク数, マークしたファイルの合計バイト数)。フォルダの中身までは数えない
+    (数えに行くと大きなフォルダで固まる。あふｗも同じ)。"""
+    count = 0
+    total = 0
+    for e in entries:
+        if e.name in marks and not e.is_parent:
+            count += 1
+            if not e.is_dir:
+                total += e.size
+    return count, total
+
+
+# ---------------------------------------------------------------
+# 表示の書式
+# ---------------------------------------------------------------
+def split_name(entry: Entry):
+    """(名前, 拡張子)。フォルダと先頭がドットの名前(.gitignore)は分けない。"""
+    if entry.is_dir:
+        return entry.name, ""
+    stem, ext = os.path.splitext(entry.name)
+    return stem, ext[1:]
+
+
+def format_size(entry: Entry) -> str:
+    if entry.is_dir:
+        return "<DIR>"
+    return f"{entry.size:,}"
+
+
+def format_mtime(mtime: float) -> str:
+    if not mtime:
+        return ""
+    try:
+        return time.strftime("%y-%m-%d %H:%M", time.localtime(mtime))
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def format_bytes(total: int) -> str:
+    """マーク合計の表示。バイト数を桁区切りで、大きければ単位付きも添える。"""
+    text = f"{total:,}"
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if total >= size:
+            return f"{text} ({total / size:.1f}{unit})"
+    return text
+
+
+# ---------------------------------------------------------------
+# インクリメンタルサーチ
+# ---------------------------------------------------------------
+def isearch_index(entries, text: str):
+    """text で始まる最初の項目、無ければ text を含む最初の項目の添字。無ければ None。
+    大文字小文字は区別しない。".." は対象外。"""
+    if not text:
+        return None
+    key = text.casefold()
+    contains = None
+    for index, e in enumerate(entries):
+        if e.is_parent:
+            continue
+        name = e.name.casefold()
+        if name.startswith(key):
+            return index
+        if contains is None and key in name:
+            contains = index
+    return contains
+
+
+# ---------------------------------------------------------------
+# 履歴
+# ---------------------------------------------------------------
+class FolderHistory:
+    """窓ごとの「戻る/進む」。ブラウザと同じく、戻った先で別の場所へ行くと進む側は捨てる。"""
+
+    def __init__(self, limit: int = 100):
+        self.limit = limit
+        self.back_stack = []
+        self.forward_stack = []
+        self.current = None
+
+    def visit(self, path: str) -> None:
+        path = normalize_dir(path)
+        if self.current is not None and same_dir(self.current, path):
+            return
+        if self.current is not None:
+            self.back_stack.append(self.current)
+            del self.back_stack[:-self.limit]
+        self.forward_stack.clear()
+        self.current = path
+
+    def back(self):
+        """戻る先を返して状態を進める。無ければ None(状態は変えない)。"""
+        if not self.back_stack:
+            return None
+        if self.current is not None:
+            self.forward_stack.append(self.current)
+        self.current = self.back_stack.pop()
+        return self.current
+
+    def forward(self):
+        if not self.forward_stack:
+            return None
+        if self.current is not None:
+            self.back_stack.append(self.current)
+        self.current = self.forward_stack.pop()
+        return self.current
+
+    def undo_step(self, direction: str, previous: str) -> None:
+        """戻る/進むの移動に失敗したとき、状態を1手前に巻き戻す(元のフォルダに留まるので)。"""
+        if direction == "back" and self.forward_stack:
+            self.back_stack.append(self.current)
+            self.forward_stack.pop()
+        elif direction == "forward" and self.back_stack:
+            self.forward_stack.append(self.current)
+            self.back_stack.pop()
+        self.current = previous
+
+
+def push_recent(recent: list, path: str, limit: int = 50) -> list:
+    """最近使ったフォルダの一覧(新しいものが先頭・重複なし)へ path を足した新しい並び。"""
+    path = normalize_dir(path)
+    result = [path] + [p for p in recent if not same_dir(p, path)]
+    return result[:limit]
+
+
+# ---------------------------------------------------------------
+# 名前
+# ---------------------------------------------------------------
+_INVALID_NAME_RE = re.compile(r'[\\/:*?"<>|]')
+
+
+def validate_name(name: str):
+    """新しいフォルダ名・改名の入力を確かめる。問題なければ None、あれば理由の文字列。"""
+    if not name or not name.strip():
+        return "名前が空です"
+    if _INVALID_NAME_RE.search(name):
+        return '名前に使えない文字が入っています（\\ / : * ? " < > |）'
+    if name in (".", ".."):
+        return "その名前は使えません"
+    if name != name.rstrip(" ."):
+        return "末尾に空白やピリオドは置けません"
+    return None
+
+
+def unique_name(existing, base: str) -> str:
+    """existing(名前の集まり)と大文字小文字を無視して重ならない名前。
+    重なれば "base (2)", "base (3)" … とエクスプローラと同じ形で番号を振る。"""
+    taken = {n.casefold() for n in existing}
+    if base.casefold() not in taken:
+        return base
+    stem, ext = os.path.splitext(base)
+    number = 2
+    while True:
+        candidate = f"{stem} ({number}){ext}"
+        if candidate.casefold() not in taken:
+            return candidate
+        number += 1
+
+
+def rename_selection_length(name: str, is_dir: bool) -> int:
+    """改名の入力欄で最初に選んでおく文字数。拡張子の手前まで(エクスプローラと同じ)。"""
+    if is_dir:
+        return len(name)
+    stem, _ext = os.path.splitext(name)
+    return len(stem)
+
+
+def name_conflicts(existing, new_name: str, old_name: str = None) -> bool:
+    """new_name が既にある別の項目と(大文字小文字を無視して)重なるか。
+    old_name 自身との一致は除く(大文字小文字だけを変える改名を通すため)。"""
+    folded = new_name.casefold()
+    old = old_name.casefold() if old_name else None
+    return any(n.casefold() == folded and n.casefold() != old for n in existing)
+
+
+# ---------------------------------------------------------------
+# クリップボード(エクスプローラ互換のファイルのコピー/切り取り)
+# ---------------------------------------------------------------
+DROPEFFECT_COPY = 1
+DROPEFFECT_MOVE = 2
+
+
+def encode_drop_effect(move: bool) -> bytes:
+    """"Preferred DropEffect" 形式の中身(DWORD リトルエンディアン)。"""
+    return (DROPEFFECT_MOVE if move else DROPEFFECT_COPY).to_bytes(4, "little")
+
+
+def decode_drop_effect(data) -> bool:
+    """切り取り(移動)なら True。読めなければ False(＝コピー扱い。元を消さない側に倒す)。"""
+    try:
+        raw = bytes(data)
+    except TypeError:
+        return False
+    if len(raw) < 4:
+        return False
+    return bool(int.from_bytes(raw[:4], "little") & DROPEFFECT_MOVE)
+
+
+def double_null_join(paths) -> str:
+    """SHFileOperationW の pFrom/pTo の形。NUL 区切り、末尾は NUL 2つ。"""
+    return "".join(f"{p}\0" for p in paths) + "\0"
+
+
+def clip_text(paths, names_only: bool = False) -> str:
+    """C メニューの「フルパス/ファイル名のみをクリップボードへ」。改行(CRLF)区切り。"""
+    items = [os.path.basename(p.rstrip("\\")) if names_only else p for p in paths]
+    return "\r\n".join(items)
+
+
+# ---------------------------------------------------------------
+# 同名ファイル比較マーク(W)
+# ---------------------------------------------------------------
+# AFXW.TXT「同名ファイル比較マークについて」に合わせてある。
+# 条件の値。「小さい/古い」はアクティブ窓の側が反対側より小さい/古い、の意味。
+SIZE_CHOICES = ("smaller", "larger", "different", "any", "same")
+TIME_CHOICES = ("older", "newer", "different", "any", "same")
+SIZE_LABELS = ("小さい", "大きい", "異なる", "無関係", "同じ")
+TIME_LABELS = ("古い", "新しい", "異なる", "無関係", "同じ")
+DEFAULT_TIME_TOLERANCE = 2.0
+
+# ダイアログのショートカット。(サイズ, タイムスタンプ, 拡張子を除くか)。押した時点で決定する。
+COMPARE_SHORTCUTS = {
+    "A": ("same", "same", False),
+    "N": ("different", "different", False),
+    "S": ("same", "any", False),
+    "T": ("any", "same", False),
+    "E": ("any", "any", True),
+}
+
+
+def size_matches(cond: str, mine: int, theirs: int) -> bool:
+    if cond == "smaller":
+        return mine < theirs
+    if cond == "larger":
+        return mine > theirs
+    if cond == "different":
+        return mine != theirs
+    if cond == "same":
+        return mine == theirs
+    return True
+
+
+def time_matches(cond: str, mine: float, theirs: float, tolerance: float) -> bool:
+    """時刻の条件。許容誤差(秒)以内の差は「同じ」とみなす(FAT は2秒刻み、ネットワーク越しでも
+    ずれる)。古い/新しい/異なるも、誤差を超えたときだけ成り立つ。"""
+    diff = mine - theirs
+    tolerance = abs(tolerance or 0.0)
+    if cond == "older":
+        return diff < -tolerance
+    if cond == "newer":
+        return diff > tolerance
+    if cond == "different":
+        return abs(diff) > tolerance
+    if cond == "same":
+        return abs(diff) <= tolerance
+    return True
+
+
+def _compare_key(entry: Entry, strip_ext: bool) -> str:
+    name = split_name(entry)[0] if strip_ext else entry.name
+    return name.casefold()
+
+
+def compare_marks(mine, theirs, size_cond="any", time_cond="any", include_dirs=False,
+                  strip_ext=False, tolerance=DEFAULT_TIME_TOLERANCE) -> set:
+    """反対窓(theirs)に同名があるものの名前の集合(mine の側の名前)。
+
+    - 名前は大文字小文字を無視して比べる
+    - ファイルとフォルダの組み合わせでも同名ならマーク(条件は見ない)
+    - フォルダ同士は include_dirs のときだけ。そのときは条件を見ずにマーク
+    - strip_ext なら拡張子を除いた名前で比べる。反対側に候補が複数ありうるので
+      サイズとタイムスタンプの条件は使わない(どれか1つと同名なら成り立つ)
+    - ".." は対象外"""
+    others = {}
+    for o in theirs:
+        if o.is_parent:
+            continue
+        others.setdefault(_compare_key(o, strip_ext), []).append(o)
+    found = set()
+    for e in mine:
+        if e.is_parent:
+            continue
+        for o in others.get(_compare_key(e, strip_ext), ()):
+            if e.is_dir and o.is_dir:
+                ok = include_dirs
+            elif e.is_dir != o.is_dir or strip_ext:
+                ok = True
+            else:
+                ok = (size_matches(size_cond, e.size, o.size)
+                      and time_matches(time_cond, e.mtime, o.mtime, tolerance))
+            if ok:
+                found.add(e.name)
+                break
+    return found

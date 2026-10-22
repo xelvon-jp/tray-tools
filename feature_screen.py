@@ -27,6 +27,7 @@ import bg_remove_launch
 import capture_process
 import color_picker
 import explorer_nav
+import filer_launch
 import launcher
 import mouse_jiggler
 import presenter_overlay
@@ -410,6 +411,12 @@ class ScreenFeature:
             self._with_hotkey("📁 フォルダブックマーク", hotkey_config.get("launcher")),
             lambda: self.start_launcher(),
         )
+        # ブックマークの隣に置く。どちらも「フォルダへ行く」道具で、ファイラの J は
+        # このブックマークをそのまま使う。
+        self.menu.addAction(
+            self._with_hotkey("📁 簡易ファイラ…", hotkey_config.get("filer")),
+            self.start_filer,
+        )
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -674,6 +681,7 @@ class ScreenFeature:
             "snippet_picker": self.start_snippet_picker,
             "bg_remove": self.start_bg_remove,
             "launcher": lambda: self.start_launcher(),
+            "filer": self.start_filer,
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
             "presenter_laser": lambda: self.toggle_presenter_overlay("laser"),
@@ -963,6 +971,19 @@ class ScreenFeature:
         except Exception as e:
             # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
             self._notify("背景を透過", f"起動できませんでした\n{e}")
+
+    # ---------------------------------------------------------------
+    # 簡易ファイラ(filer.py。窓は別プロセス)
+    # ---------------------------------------------------------------
+    def start_filer(self):
+        """簡易ファイラを開く。既に開いていれば前面に出すだけ(判定は filer_launch が
+        名前付きミューテックスで行う)。窓は DETACHED の別プロセスなので、常駐を
+        再起動しても道連れにならず、restart_blockers に足す必要も無い。"""
+        try:
+            filer_launch.open_filer()
+        except Exception as e:
+            # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
+            self._notify("簡易ファイラ", f"起動できませんでした\n{e}")
 
     # ---------------------------------------------------------------
     # Teams の一人会議(teams_meeting.py。UIA の実処理は子プロセス)

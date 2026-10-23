@@ -559,7 +559,7 @@ def test_window_keys_and_operations():
         assert L.marks == {"photo.JPG"}, L.marks
         key(Qt.Key_Home, Qt.ShiftModifier)      # フォルダ込みで反転
         assert L.marks == {"sub1", "sub2", "alpha.txt", "beta.md", "gamma.txt"}, L.marks
-        assert "マーク 5" in L.footer.text(), L.footer.text()
+        assert "Mark 5 (31)" in L.footer.text(), L.footer.text()   # 10+20+1 バイト
         key(Qt.Key_End, Qt.ControlModifier)     # マーク保持の再読込
         _wait(w)
         assert len(L.marks) == 5
@@ -580,9 +580,9 @@ def test_window_keys_and_operations():
         w.ask_text = lambda *a, **k: "txt"
         key(Qt.Key_Colon, Qt.ShiftModifier)
         assert _names(L) == ["..", "sub1", "sub2", "alpha.txt", "gamma.txt"], _names(L)
-        assert "[txt]" in L.header.text()
+        assert L.header.text() == L.path + "\\ txt", L.header.text()   # あふｗと同じく常にマスク
         key(Qt.Key_Colon)
-        assert len(_names(L)) == 7 and "[" not in L.header.text()
+        assert len(_names(L)) == 7 and L.header.text() == L.path + "\\ *.*"
 
         # O: 自分を反対窓に合わせる / Shift+O: 反対窓をこちらへ / Alt+O: 入れ替え
         key(Qt.Key_O)
@@ -2209,6 +2209,151 @@ def test_window_winmerge():
             filer.core.find_winmerge, filer.subprocess.Popen = real_find, real_popen
         w.close()
         w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# 画面の構成(上の2行・下の行・ステータスバー・Fキーの段)
+# ---------------------------------------------------------------
+def test_screen_text_helpers():
+    gb = 1 << 30
+    assert core.format_gb(510770802688) == "475.69 GB" and core.format_gb(0) == "0.00 GB"
+    assert core.footer_text(58, 0, 510770802688, 107780108288) == \
+        "58 Dirs   0 File   475.69 GB ( 100.38 GB)"                   # あふｗの画面と同じ
+    assert core.footer_text(7, 56, 510770802688, 107780108288).startswith("7 Dirs   56 Files")
+    assert core.footer_text(1, 1) == "1 Dirs   1 File"                  # 容量が分からなければ出さない
+    assert core.footer_text(0, 2, 2 * gb, gb, mark_count=3, mark_bytes=12345) == \
+        "0 Dirs   2 Files   2.00 GB ( 1.00 GB)   Mark 3 (12,345)"
+    entries = [core.PARENT_ENTRY, F("d", is_dir=True), F("a"), F("b")]
+    assert core.count_dirs_files(entries) == (1, 2)                     # ".." は数えない
+    assert core.attr_letters(F("d", is_dir=True)) == "D"
+    assert core.attr_letters(F("x", attrs=READONLY | HIDDEN | SYSTEM | 0x20)) == "RHSA"
+    stamp = time.mktime((2026, 4, 9, 19, 52, 53, 0, 0, -1))
+    assert core.status_fields(F("7-Zip", is_dir=True, mtime=stamp)) == \
+        ("7-Zip", "<DIR>", "26/04/09 19:52:53", "D")
+    assert core.status_fields(F("a.txt", size=1234567, mtime=stamp))[1] == "1,234,567"
+    assert core.status_fields(core.PARENT_ENTRY) == ("..", "", "", "")
+    assert core.status_fields(None) == ("", "", "", "")
+    assert core.drive_root(r"C:\Program Files\x") == "C:\\"
+    assert core.drive_root(r"\\srv\share\dir") == "\\\\srv\\share\\"
+    assert core.drive_root("") is None
+    assert core.unc_label("\\\\srv\\share\\") == "srv\\share" and core.unc_label("C:\\") is None
+
+
+def test_fkey_labels():
+    km = core.build_keymap({"1121": "reload", "0112": ""})
+    labels = core.fkey_labels(km)
+    assert len(labels) == 12
+    assert labels[6] == "Menu" and labels[8] == "PowerShell" and labels[9] == "Explorer"
+    assert labels[0] == "" and labels[11] == ""                          # 割り当ての無いキーは空
+    shift = core.fkey_labels(km, core.SHIFT)
+    assert shift[9] == "Reload" and shift[6] == ""                       # Shift の割り当てに切り替わる
+    assert core.fkey_labels(km, core.ALT)[3] == "Quit"                   # Alt+F4
+    over = core.fkey_labels(km, 0, {"F7": "右クリ", "Shift+F10": "x"})
+    assert over[6] == "右クリ" and over[9] == "Explorer"
+    assert core.fkey_labels(km, core.SHIFT, {"Shift+F10": "再読込"})[9] == "再読込"
+    assert core.fkey_labels(km, 0, {"0120": "PS"})[8] == "PS"            # あふｗの4桁でも
+    assert core.fkey_command(km, 0, 10) == "open_explorer"
+    assert core.fkey_command(km, core.SHIFT, 10) == "reload"
+    assert core.fkey_command(km, 0, 1) is None
+
+
+def test_window_screen_layout():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtCore import QEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        reads = []
+        real_label, real_space = filer.FilerWindow._read_drive_label, filer.FilerWindow._read_drive_space
+        filer.FilerWindow._read_drive_label = staticmethod(
+            lambda root: (reads.append(("label", root)), "TESTVOL")[1])
+        filer.FilerWindow._read_drive_space = staticmethod(
+            lambda root: (reads.append(("space", root)), (510770802688, 107780108288))[1])
+        real_popen = filer.subprocess.Popen
+        try:
+            w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                             "keys": {"1121": "reload"}}}, str(settings_path))
+            w.resize(1000, 600)
+            w.show()
+            w.start()
+            _wait(w)
+            QTest.qWait(100)                   # ラベル・容量の読み取り(別スレッド)を待つ
+            L, R = w.left, w.right
+            # 上の2行: パスとマスク / ドライブのラベル
+            assert L.header.text() == f"{L.path}\\ *.*", L.header.text()
+            assert L.header2.text() == "TESTVOL"
+            # ラベルは同じドライブなら1回だけ読む(左右とも同じドライブ)
+            assert [r for r in reads if r[0] == "label"] == [("label", core.drive_root(str(left)))]
+            # 下の行: あふｗの書式
+            assert L.footer.text() == "2 Dirs   4 Files   475.69 GB ( 100.38 GB)", L.footer.text()
+            assert R.footer.text().startswith("0 Dirs   1 File   ")
+            L.marks.update({"alpha.txt", "beta.md"})
+            L.update_footer()
+            assert L.footer.text().endswith("Mark 2 (30)")
+            L.marks.clear()
+            # ステータスバー: Ready. / 名前 / <DIR> かサイズ / 日時 / 属性。カーソルで変わる
+            texts = lambda: [label.text() for label in w.status_labels]  # noqa: E731
+            assert texts()[:2] == ["Ready.", ".."]
+            QTest.keyClick(L.view, Qt.Key_Down)
+            t = texts()
+            assert t[1] == "sub1" and t[2] == "<DIR>" and t[4] == "D" and t[3].count("/") == 2
+            L.set_cursor(L._row_of("photo.JPG"))
+            assert texts()[1:3] == ["photo.JPG", "100"]
+            QTest.keyClick(L.view, Qt.Key_Tab)                 # 窓を替えれば反対窓のカーソル
+            assert texts()[1] == ".."
+            QTest.keyClick(R.view, Qt.Key_Tab)
+            # Fキーの段: 割り当てから作る。Shift を押している間は Shift の割り当て
+            buttons = [b.text() for b in w.fkey_buttons]
+            assert buttons[6] == "Menu" and buttons[8] == "PowerShell" and buttons[9] == "Explorer"
+            QApplication.sendEvent(L.view, QKeyEvent(QEvent.KeyPress, Qt.Key_Shift, Qt.ShiftModifier))
+            assert w.fkey_buttons[9].text() == "Reload" and w.fkey_buttons[6].text() == ""
+            QApplication.sendEvent(L.view, QKeyEvent(QEvent.KeyRelease, Qt.Key_Shift, Qt.ShiftModifier))
+            assert w.fkey_buttons[9].text() == "Explorer"
+            assert all(b.focusPolicy() == Qt.NoFocus for b in w.fkey_buttons)
+            # 区画をクリックすると、そのキーと同じコマンド(F10 = エクスプローラ)
+            calls = []
+            filer.subprocess.Popen = lambda argv, **kw: calls.append(argv)
+            QTest.mouseClick(w.fkey_buttons[9], Qt.LeftButton)
+            assert calls and calls[-1][0] == "explorer.exe"
+            count = len(calls)
+            QTest.mouseClick(w.fkey_buttons[0], Qt.LeftButton)  # 空の区画は何もしない
+            assert len(calls) == count
+            # 処理中はステータスバーの左端に出る
+            w.set_status_state("複写中 3/10")
+            assert texts()[0] == "複写中 3/10"
+            w.set_status_state("")
+            assert texts()[0] == "Ready."
+            # 狭くしても窓の最小幅を押し広げない(深いパスでも)
+            deep = left / ("x" * 60) / ("y" * 60)
+            deep.mkdir(parents=True)
+            L.load(str(deep))
+            _wait(w)
+            assert w.minimumSizeHint().width() < 600, w.minimumSizeHint().width()
+            # 書庫の中は容量を出さない(件数だけ)。ラベルは書庫のあるドライブ
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            QTest.qWait(50)
+            assert "GB" not in L.footer.text() and L.header2.text() == "TESTVOL"
+            # Fキーの段は settings で隠せる
+            w.close()
+            w.deleteLater()
+            w2 = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                              "show_fkey_bar": False}}, None)
+            assert w2.fkey_bar.isHidden()
+            w2.deleteLater()
+        finally:
+            filer.FilerWindow._read_drive_label = real_label
+            filer.FilerWindow._read_drive_space = real_space
+            filer.subprocess.Popen = real_popen
 
 
 def main() -> int:

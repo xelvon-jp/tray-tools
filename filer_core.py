@@ -595,6 +595,167 @@ def format_bytes(total: int) -> str:
 
 
 # ---------------------------------------------------------------
+# 窓の下の行・ステータスバー(あふｗの画面の書式)
+# ---------------------------------------------------------------
+def format_gb(size: int) -> str:
+    """ドライブの容量の表示。GB(2^30)で小数2桁(あふｗと同じ "475.69 GB")。"""
+    return f"{size / (1 << 30):.2f} GB"
+
+
+def footer_text(dirs: int, files: int, total=None, free=None,
+                mark_count: int = 0, mark_bytes: int = 0) -> str:
+    """ファイル窓の下の行。あふｗの "58 Dirs   0 File   475.69 GB ( 100.38 GB)"。
+
+    ファイルは1件以下なら "File"、2件以上なら "Files"(あふｗの表示どおり)。フォルダは
+    あふｗの画面では常に "Dirs" なので合わせる。容量(total)と空き(free)は分かったとき
+    だけ出す(書庫の中・読めないドライブでは出さない)。マークがあれば後ろに件数と合計。"""
+    text = f"{dirs} Dirs   {files} {'Files' if files >= 2 else 'File'}"
+    if total is not None and free is not None:
+        text += f"   {format_gb(total)} ( {format_gb(free)})"
+    if mark_count:
+        text += f"   Mark {mark_count} ({mark_bytes:,})"
+    return text
+
+
+def count_dirs_files(entries):
+    """(フォルダ数, ファイル数)。".." は数えない。"""
+    dirs = sum(1 for e in entries if e.is_dir and not e.is_parent)
+    files = sum(1 for e in entries if not e.is_dir)
+    return dirs, files
+
+
+def attr_letters(entry: "Entry") -> str:
+    """ステータスバーの属性の文字。D=フォルダ R=読み込み専用 H=隠し S=システム
+    A=アーカイブ(あふｗの並び)。"""
+    attrs = entry.attrs
+    letters = ""
+    if entry.is_dir:
+        letters += "D"
+    for flag, letter in ((stat.FILE_ATTRIBUTE_READONLY, "R"), (stat.FILE_ATTRIBUTE_HIDDEN, "H"),
+                         (stat.FILE_ATTRIBUTE_SYSTEM, "S"), (stat.FILE_ATTRIBUTE_ARCHIVE, "A")):
+        if attrs & flag:
+            letters += letter
+    return letters
+
+
+def status_fields(entry) -> tuple:
+    """ステータスバーのカーソルの欄。(名前, サイズか <DIR>, 日時, 属性)。
+    ".." は名前だけ。カーソルが無ければ全部空。"""
+    if entry is None:
+        return ("", "", "", "")
+    if entry.is_parent:
+        return ("..", "", "", "")
+    return (entry.name, format_size(entry), format_mtime(entry.mtime), attr_letters(entry))
+
+
+def drive_root(path: str):
+    """path のドライブの根。"C:\\" や "\\\\server\\share\\"。分からなければ None。"""
+    if not path:
+        return None
+    drive, _rest = os.path.splitdrive(os.path.normpath(path))
+    if not drive:
+        return None
+    return drive.rstrip("\\/") + "\\"
+
+
+def unc_label(root: str):
+    """UNC の根なら "server\\share"(窓の2行目にラベルの代わりに出す)。でなければ None。"""
+    if root and root.startswith("\\\\"):
+        return root.strip("\\")
+    return None
+
+
+# ---------------------------------------------------------------
+# ファンクションキーの一覧(窓の下の段)
+# ---------------------------------------------------------------
+# コマンドの短い表示名。ボタンの幅は窓の 1/12 なので、なるべく短く。
+# 書いていないコマンドはコマンド名をそのまま出す。settings の filer.fkey_labels で
+# キーごとに上書きできる(fkey_labels を参照)。
+COMMAND_SHORT_NAMES = {
+    "context_menu": "Menu",
+    "open_shell": "PowerShell",
+    "open_explorer": "Explorer",
+    "quit": "Quit",
+    "reload": "Reload",
+    "reload_keep": "Reload",
+    "reload_other": "Reload他",
+    "enter": "Open",
+    "open_assoc": "Assoc",
+    "edit": "Edit",
+    "copy_menu": "Copy",
+    "copy_direct": "Copy",
+    "move_menu": "Move",
+    "move_direct": "Move",
+    "delete": "Delete",
+    "delete_permanent": "Del!",
+    "mkdir": "MkDir",
+    "rename": "Rename",
+    "isearch": "Search",
+    "sort_dialog": "Sort",
+    "sort_reverse": "Sort逆",
+    "compare_mark": "Compare",
+    "winmerge": "WinMerge",
+    "zip_create": "Zip",
+    "mask_input": "Mask",
+    "mask_clear": "Mask*.*",
+    "history_jump": "History",
+    "bookmark_jump": "Bookmark",
+    "path_jump": "Jump",
+    "desktop": "Desktop",
+    "drive": "Drive",
+    "settings_menu": "Settings",
+    "swap_paths": "Swap",
+    "sync_to_other": "Sync",
+    "sync_other_to_me": "Sync他",
+    "parent": "Parent",
+    "switch": "Switch",
+}
+
+FKEY_COUNT = 12
+_FKEY_VK_BASE = 112  # VK_F1
+
+
+def fkey_command(keymap: dict, modifiers: int, number: int):
+    """F<number>(1〜12)に、修飾(SHIFT=1 / CTRL=2 / ALT=4 の和)付きで割り当てた
+    コマンド名。無ければ None。"""
+    return keymap.get(f"{modifiers}{_FKEY_VK_BASE + number - 1:03d}") or None
+
+
+def _fkey_override_names(modifiers: int, number: int) -> list:
+    """filer.fkey_labels で探す名前。"F7" / "Shift+F7" / "Ctrl+F7" / "Ctrl+Shift+F7" と、
+    あふｗの4桁("1118")のどちらでも書ける。"""
+    parts = []
+    if modifiers & CTRL:
+        parts.append("Ctrl")
+    if modifiers & SHIFT:
+        parts.append("Shift")
+    if modifiers & ALT:
+        parts.append("Alt")
+    name = "+".join(parts + [f"F{number}"])
+    return [name, name.lower(), f"{modifiers}{_FKEY_VK_BASE + number - 1:03d}"]
+
+
+def fkey_labels(keymap: dict, modifiers: int = 0, overrides=None) -> list:
+    """F1〜F12 の区画に出す12個の表示名(割り当ての無いキーは空)。
+
+    キー表(filer.keys の上書き込み)から作るので、割り当てを変えれば表示も変わる。
+    overrides(filer.fkey_labels)は表示名だけを差し替える。"""
+    overrides = overrides if isinstance(overrides, dict) else {}
+    labels = []
+    for number in range(1, FKEY_COUNT + 1):
+        command = fkey_command(keymap, modifiers, number)
+        label = ""
+        if command:
+            label = COMMAND_SHORT_NAMES.get(command, command)
+        for name in _fkey_override_names(modifiers, number):
+            if name in overrides and isinstance(overrides[name], str):
+                label = overrides[name]
+                break
+        labels.append(label)
+    return labels
+
+
+# ---------------------------------------------------------------
 # インクリメンタルサーチ
 # ---------------------------------------------------------------
 def isearch_index(entries, text: str):

@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressDialog,
+    QPushButton,
     QSizePolicy,
     QSplitter,
     QStyledItemDelegate,
@@ -107,6 +109,13 @@ DEFAULT_COLORS = {
     "isearch": "#ffd400",
     "log_background": "#00001c",
     "log_text": "#f9f9f9",
+    # 窓の一番下のステータスバーと、その上のファンクションキーの段。あふｗは灰色の地に
+    # 黒い字だが、ここではファイラの濃紺の配色に寄せる(filer.colors で灰色にもできる)。
+    "status_background": "#16163c",
+    "status_text": "#e0e0e8",
+    "fkey_background": "#24244e",
+    "fkey_text": "#e0e0e8",
+    "fkey_border": "#00001c",
 }
 
 # カーソルの下線の太さ(px)。アクティブ窓ははっきり、非アクティブ窓は控えめに。
@@ -322,7 +331,17 @@ class FileView(QTableView):
 
     def event(self, event):
         try:
-            if event.type() == QEvent.KeyPress:
+            kind = event.type()
+            if kind in (QEvent.KeyPress, QEvent.KeyRelease) and event.key() in (
+                    Qt.Key_Shift, Qt.Key_Control):
+                # Shift / Ctrl を押している間は、Fキー一覧をその修飾付きの割り当てに
+                # 切り替える(あふｗと同じ)。修飾キーそのものの押下・解放では
+                # modifiers() にそのキーが入っていたりいなかったりするので、自分で足し引きする。
+                flag = Qt.ShiftModifier if event.key() == Qt.Key_Shift else Qt.ControlModifier
+                mods = event.modifiers()
+                mods = (mods | flag) if kind == QEvent.KeyPress else (mods & ~flag)
+                self.pane.window_.update_fkey_bar(mods)
+            if kind == QEvent.KeyPress:
                 self.pane.window_.handle_key(self.pane, event)
                 return True
         except Exception:  # noqa: BLE001  スロットで投げ切るとプロセスごと落ちる
@@ -400,6 +419,8 @@ class FileView(QTableView):
         self.viewport().update()
         try:
             self.pane.update_footer()
+            if self.pane.is_active():
+                self.pane.window_.update_status_bar()
         except Exception:  # noqa: BLE001
             _log_exception("currentChanged")
 
@@ -413,6 +434,8 @@ class ListBridge(QObject):
     extracted = Signal(object)
     # F7 のコンテキストメニュー(子プロセス)が終わったとき。値は終了コード。
     context_done = Signal(object)
+    # ドライブのラベル・容量が読めたとき。(根, 種類 "label"|"space", 値)。
+    drive_info = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -445,10 +468,15 @@ class Pane(QWidget):
         layout.setSpacing(0)
         self.pane_font = QFont(window.list_font)
         self.pane_font.setPointSize(window.pane_font_sizes[side])
+        # 上の2行(あふｗと同じ): 1行目はパスとマスク、2行目はドライブのラベル。
         self.header = QLabel()
         self.header.setTextFormat(Qt.PlainText)
-        self.header.setContentsMargins(6, 2, 6, 2)
+        self.header.setContentsMargins(4, 0, 4, 0)
         layout.addWidget(self.header)
+        self.header2 = QLabel()
+        self.header2.setTextFormat(Qt.PlainText)
+        self.header2.setContentsMargins(4, 0, 4, 0)
+        layout.addWidget(self.header2)
 
         self.model = FileModel(self)
         self.view = FileView(self)
@@ -475,12 +503,13 @@ class Pane(QWidget):
 
         self.footer = QLabel()
         self.footer.setTextFormat(Qt.PlainText)
-        self.footer.setContentsMargins(6, 1, 6, 1)
+        self.footer.setContentsMargins(4, 0, 4, 0)
+        self.footer.setAlignment(Qt.AlignCenter)   # あふｗは窓の下の行を中央に出す
         layout.addWidget(self.footer)
         # QLabel は既定だと文字列の幅を最小幅にする。深いパスを開くと窓がそれより狭く
         # できなくなり、左右の境界も動かせなくなるので、横幅は文字に合わせない。
-        for label in (self.header, self.footer):
-            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        for label in (self.header, self.header2, self.footer):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.apply_font(self.pane_font)
         self.apply_style()
 
@@ -488,8 +517,15 @@ class Pane(QWidget):
         """一覧の字を差し替える。行の高さと列の幅も字に合わせて測り直す
         (Shift/Ctrl+↑↓ の拡大縮小で、行が重なったり列が欠けたりしないように)。"""
         self.pane_font = QFont(font)
-        for widget in (self.header, self.view, self.footer):
+        for widget in (self.header, self.view):
             widget.setFont(self.pane_font)
+        # 2行目(ラベル)と下の行はメッセージ窓と同じ基準の字(あふｗも小さい字で出す)。
+        # 高さは字の高さちょうど。
+        small = self.window_.log_font
+        for widget in (self.header2, self.footer):
+            widget.setFont(small)
+            widget.setFixedHeight(QFontMetrics(small).height())
+        self.header.setFixedHeight(QFontMetrics(self.pane_font).height())
         fm = QFontMetrics(self.pane_font)
         # 行の高さは字の高さちょうど(あふｗと同じく行間を空けない)。Qt の行は既定で
         # 字より数px高く、一覧が間延びして見える。最小の高さも外しておかないと縮まない。
@@ -530,9 +566,11 @@ class Pane(QWidget):
     def apply_style(self) -> None:
         c = self.colors
         active = self.is_active()
-        self.header.setStyleSheet(
+        header_style = (
             f"background-color: {c['header_active'] if active else c['header_inactive']};"
             f" color: {c['header_active_text'] if active else c['header_inactive_text']};")
+        self.header.setStyleSheet(header_style)
+        self.header2.setStyleSheet(header_style)
         border = c["header_active"] if active else c["header_inactive"]
         self.view.setStyleSheet(
             f"QTableView {{ background-color: {c['background']}; color: {c['text']};"
@@ -542,12 +580,19 @@ class Pane(QWidget):
         self.update_header()
         self.view.viewport().update()
 
+    def drive_root(self):
+        """この窓のドライブの根(書庫の中なら書庫のあるドライブ)。"""
+        return core.drive_root(self.archive[0] if self.archive is not None else self.path)
+
     def update_header(self) -> None:
-        text = self.path or "(読み込み中)"
-        if self.archive is not None:
-            text += "\\"  # 書庫の中は D:\x\foo.zip\sub\ の形で見せる(あふｗと同じ)
-        if not core.is_default_mask(self.mask_text):
-            text += f"   [{self.mask_text}]"
+        if not hasattr(self, "header2"):
+            return
+        # 1行目: "C:\Program Files\ *.*"(あふｗと同じく、パスの末尾に \ と空白とマスク)。
+        if self.path:
+            text = self.path if self.path.endswith("\\") else self.path + "\\"
+            text += f" {self.mask_text}"
+        else:
+            text = "(読み込み中)"
         if self.sort != core.DEFAULT_SORT:
             arrow = "↓" if self.sort["descending"] else "↑"
             text += f"   ({core.SORT_LABELS[self.sort['kind']]}{arrow})"
@@ -559,16 +604,19 @@ class Pane(QWidget):
         if self.loading:
             text += "   …"
         self.header.setText(text)
+        # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)。
+        self.header2.setText(self.window_.drive_label_text(self.drive_root()))
 
     def update_footer(self) -> None:
         if not hasattr(self, "footer"):
             return  # 組み立ての途中(ビューを作った時点で currentChanged が飛ぶ)
-        dirs = sum(1 for e in self.entries if e.is_dir and not e.is_parent)
-        files = sum(1 for e in self.entries if not e.is_dir)
-        text = f"フォルダ {dirs}  ファイル {files}"
+        dirs, files = core.count_dirs_files(self.entries)
         count, total = core.marks_summary(self.entries, self.marks)
-        if count:
-            text += f"   マーク {count}  {core.format_bytes(total)}"
+        space = None
+        if self.archive is None:
+            space = self.window_.drive_space(self.drive_root())
+        text = core.footer_text(dirs, files, *(space or (None, None)),
+                                mark_count=count, mark_bytes=total)
         if self.isearch_text is not None:
             text += f"   検索: {self.isearch_text}_"
             self.footer.setStyleSheet(
@@ -827,6 +875,18 @@ class FilerWindow(QWidget):
         self._viewers = []
         # Alt+W の WinMerge。空なら App Paths と既定の場所を探す。
         self.winmerge_setting = section.get("winmerge") or ""
+        # ドライブのラベルと容量(窓の2行目と下の行)。読み取りは別スレッドで、結果を
+        # ドライブの根ごとに覚える。ラベルはドライブが変わったときだけ、容量は読み直しの
+        # たびに読む。読めないうちは空のまま(固まらない方を取る)。
+        self._drive_labels = {}
+        self._drive_spaces = {}
+        self._drive_pending = set()
+        # Fキー一覧とステータスバー。
+        self.fkey_overrides = section.get("fkey_labels") if isinstance(
+            section.get("fkey_labels"), dict) else {}
+        self.show_fkey_bar = section.get("show_fkey_bar") is not False
+        self._fkey_mods = 0
+        self.status_state = "Ready."
         try:
             self.list_timeout = max(0.5, float(section.get("list_timeout_seconds")
                                                or DEFAULT_LIST_TIMEOUT))
@@ -880,6 +940,7 @@ class FilerWindow(QWidget):
         self.bridge.progress.connect(self._on_extract_progress)
         self.bridge.extracted.connect(self._on_extracted)
         self.bridge.context_done.connect(self._on_context_done)
+        self.bridge.drive_info.connect(self._on_drive_info)
 
         # 左右の窓とメッセージ窓は QSplitter で区切る。境界はマウスでも動かせ、
         # Alt+矢印(あふｗと同じ)でも動かせる。どちらで動かしても同じ値を保存する。
@@ -915,9 +976,56 @@ class FilerWindow(QWidget):
         self.vsplit.splitterMoved.connect(self._on_vsplit_moved)
         root.addWidget(self.vsplit)
 
+        # ファンクションキーの段(F1〜F12。押したのと同じコマンドを走らせるボタン)と、
+        # 一番下のステータスバー。字はメッセージ窓と同じ基準の大きさ。
+        self.fkey_bar = QWidget(self)
+        fkey_layout = QHBoxLayout(self.fkey_bar)
+        fkey_layout.setContentsMargins(0, 0, 0, 0)
+        fkey_layout.setSpacing(1)
+        self.fkey_buttons = []
+        c = self.colors
+        for number in range(1, core.FKEY_COUNT + 1):
+            button = QPushButton(self.fkey_bar)
+            button.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
+            button.setFont(self.log_font)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            button.setFixedHeight(QFontMetrics(self.log_font).height() + 2)
+            button.setStyleSheet(
+                f"QPushButton {{ background-color: {c['fkey_background']}; color: {c['fkey_text']};"
+                f" border: 1px solid {c['fkey_border']}; padding: 0px; }}")
+            button.clicked.connect(lambda _checked=False, n=number: self.press_fkey(n))
+            fkey_layout.addWidget(button, 1)
+            self.fkey_buttons.append(button)
+        root.addWidget(self.fkey_bar)
+        self.fkey_bar.setVisible(self.show_fkey_bar)
+
+        self.status_bar = QWidget(self)
+        self.status_bar.setObjectName("filerStatus")
+        self.status_bar.setStyleSheet(
+            f"#filerStatus {{ background-color: {c['status_background']}; }}"
+            f" #filerStatus QLabel {{ color: {c['status_text']}; }}")
+        status_layout = QHBoxLayout(self.status_bar)
+        status_layout.setContentsMargins(4, 0, 4, 0)
+        status_layout.setSpacing(12)
+        self.status_labels = []
+        # 状態 / 名前 / サイズ / 日時 / 属性。名前だけが伸び、ほかは字の幅ぶん。
+        for stretch, align in ((2, Qt.AlignLeft), (5, Qt.AlignLeft), (2, Qt.AlignRight),
+                               (2, Qt.AlignLeft), (1, Qt.AlignLeft)):
+            label = QLabel(self.status_bar)
+            label.setTextFormat(Qt.PlainText)
+            label.setFont(self.log_font)
+            label.setAlignment(align | Qt.AlignVCenter)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            label.setFixedHeight(QFontMetrics(self.log_font).height())
+            status_layout.addWidget(label, stretch)
+            self.status_labels.append(label)
+        root.addWidget(self.status_bar)
+        self.update_fkey_bar(Qt.NoModifier)
+
         self._restore_geometry(section)
         for pane in (self.left, self.right):
             pane.apply_style()
+        self.update_status_bar()
 
     # --- 窓の位置と前回のパス ---
     def _restore_geometry(self, section) -> None:
@@ -1076,6 +1184,7 @@ class FilerWindow(QWidget):
             for pane in (self.left, self.right):
                 pane.apply_style()
         self._update_title()
+        self.update_status_bar()
 
     def _update_title(self) -> None:
         path = self.active.path or ""
@@ -1084,6 +1193,137 @@ class FilerWindow(QWidget):
     def on_pane_loaded(self, pane) -> None:
         self.recent = core.push_recent(self.recent, pane.path, RECENT_LIMIT)
         self._update_title()
+        # 空き容量は読み直しのたび(ファイル操作の後も読み直しが走る)、ラベルは初めての
+        # ドライブのときだけ読む。書庫の中は容量を出さないが、ラベルは書庫のあるドライブ。
+        root = pane.drive_root()
+        if root:
+            self.request_drive_info(root, space=pane.archive is None)
+        if pane.is_active():
+            self.update_status_bar()
+
+    # --- ドライブのラベルと容量(別スレッドで読んで覚える) ---
+    def drive_label_text(self, root) -> str:
+        if not root:
+            return ""
+        return self._drive_labels.get(os.path.normcase(root), "")
+
+    def drive_space(self, root):
+        if not root:
+            return None
+        return self._drive_spaces.get(os.path.normcase(root))
+
+    def request_drive_info(self, root: str, space: bool = True) -> None:
+        """ラベル(まだ知らなければ)と容量を読みに行く。読むのは別スレッドで、終わったら
+        drive_info のシグナルで受け取る。同じドライブを同時に二重には読まない。
+        相手が切断されたネットワークドライブで止まっても、スレッドが残るだけで窓は
+        止まらない(結果が来なければ空のまま)。"""
+        key = os.path.normcase(root)
+        want_label = key not in self._drive_labels
+        if not (want_label or space) or key in self._drive_pending:
+            return
+        self._drive_pending.add(key)
+        bridge = self.bridge
+        reader_label, reader_space = self._read_drive_label, self._read_drive_space
+
+        def worker():
+            try:
+                if want_label:
+                    try:
+                        label = reader_label(root)
+                    except Exception:  # noqa: BLE001
+                        label = ""
+                    bridge.drive_info.emit((key, "label", label or ""))
+                if space:
+                    try:
+                        value = reader_space(root)
+                    except Exception:  # noqa: BLE001
+                        value = None
+                    bridge.drive_info.emit((key, "space", value))
+                bridge.drive_info.emit((key, "done", None))
+            except RuntimeError:
+                pass  # 窓が先に閉じた
+
+        threading.Thread(target=worker, daemon=True, name="filer-drive").start()
+
+    # テストではここを差し替える(実際のドライブを読まない)。
+    _read_drive_label = staticmethod(filer_shell.drive_label)
+    _read_drive_space = staticmethod(filer_shell.disk_space)
+
+    def _on_drive_info(self, payload) -> None:
+        try:
+            key, kind, value = payload
+            if kind == "label":
+                self._drive_labels[key] = value
+            elif kind == "space":
+                if value is None:
+                    self._drive_spaces.pop(key, None)
+                else:
+                    self._drive_spaces[key] = value
+            else:
+                self._drive_pending.discard(key)
+                return
+            for pane in (self.left, self.right):
+                root = pane.drive_root()
+                if root and os.path.normcase(root) == key:
+                    pane.update_header()
+                    pane.update_footer()
+        except Exception:  # noqa: BLE001
+            _log_exception("driveInfo")
+
+    # --- ステータスバー ---
+    def set_status_state(self, text: str) -> None:
+        """ステータスバーの左端(処理中の内容。待機中は "Ready.")。"""
+        self.status_state = text or "Ready."
+        self.update_status_bar()
+
+    def update_status_bar(self) -> None:
+        if not hasattr(self, "status_labels"):
+            return  # 組み立ての途中
+        fields = core.status_fields(self.active.cursor_entry())
+        for label, text in zip(self.status_labels, (self.status_state,) + fields):
+            label.setText(text)
+
+    # --- ファンクションキーの段 ---
+    def _mods_digit(self, mods) -> int:
+        digit = 0
+        if mods & Qt.ShiftModifier:
+            digit |= core.SHIFT
+        if mods & Qt.ControlModifier:
+            digit |= core.CTRL
+        return digit
+
+    def update_fkey_bar(self, mods) -> None:
+        """Fキーの段の表示を、いま押している修飾(Shift / Ctrl)の割り当てに合わせる。
+        Alt は切り替えない(Alt 付きの割り当ては Alt+F4 の終了だけで、押している間に
+        段を書き換えても見せるものがほぼ無い。Alt はメニューの起動にも使われる)。"""
+        if not hasattr(self, "fkey_buttons"):
+            return
+        digit = self._mods_digit(mods)
+        self._fkey_mods = digit
+        labels = core.fkey_labels(self.keymap, digit, self.fkey_overrides)
+        for button, label in zip(self.fkey_buttons, labels):
+            button.setText(label)
+
+    def press_fkey(self, number: int) -> None:
+        """Fキーの区画を押した(クリック)。そのキーを押したのと同じコマンドを走らせる。
+        空の区画では何もしない。フォーカスはファイル窓に残す。"""
+        try:
+            command = core.fkey_command(self.keymap, self._fkey_mods, number)
+            if command:
+                self.run_command(command)
+            self.active.view.setFocus()
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('fkey')}")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        try:
+            # 窓から離れたら Fキーの段を素の割り当てに戻す(Shift を押したまま別の窓へ
+            # 移ると、離したことが届かず切り替わったままになるため)。
+            if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
+                self.update_fkey_bar(Qt.NoModifier)
+        except Exception:  # noqa: BLE001
+            _log_exception("changeEvent")
 
     def _on_list_finished(self, payload) -> None:
         try:
@@ -1766,7 +2006,17 @@ class FilerWindow(QWidget):
             return
         paths = src.target_paths()
         func = filer_shell.move_files if move else filer_shell.copy_files
-        result = func(paths, dst.path, self._hwnd(), self.extra_op_flags)
+        # SHFileOperationW は終わるまで戻らない(進み具合は Windows の窓が出す)。
+        # ステータスバーには何をしているかだけ出しておく。
+        self.set_status_state(f"{label}中 {len(paths)}件")
+        QApplication.processEvents()
+        try:
+            result = func(paths, dst.path, self._hwnd(), self.extra_op_flags)
+        finally:
+            try:
+                self.set_status_state("Ready.")
+            except Exception:  # noqa: BLE001  finally の中で投げない(CLAUDE.md)
+                pass
         self._after_operation(label, result, paths, dst.path)
 
     def cmd_copy_direct(self):
@@ -2043,6 +2293,7 @@ class FilerWindow(QWidget):
         dialog.canceled.connect(cancel.set)
         self._extracting = {"cancel": cancel, "dialog": dialog, "on_done": on_done,
                             "title": title}
+        self.set_status_state(f"{title}中")
         bridge = self.bridge
 
         def progress(done, all_, name):
@@ -2073,6 +2324,7 @@ class FilerWindow(QWidget):
             dialog.setMaximum(max(total, 1))
             dialog.setValue(min(done, max(total, 1)))
             dialog.setLabelText(f"{job['title']}: {done}/{total}\n{name}")
+            self.set_status_state(f"{job['title']}中 {done}/{total}")
         except Exception:  # noqa: BLE001
             _log_exception("extractProgress")
 
@@ -2080,6 +2332,7 @@ class FilerWindow(QWidget):
         job = self._extracting
         self._extracting = None
         try:
+            self.set_status_state("Ready.")
             if job is None:
                 return
             try:

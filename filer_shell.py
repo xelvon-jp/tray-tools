@@ -213,6 +213,43 @@ def _volume_label(root: str):
     return buf.value if ok else None
 
 
+_GetDiskFreeSpaceExW = _kernel32.GetDiskFreeSpaceExW
+_GetDiskFreeSpaceExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
+                                 ctypes.POINTER(ctypes.c_ulonglong),
+                                 ctypes.POINTER(ctypes.c_ulonglong)]
+_GetDiskFreeSpaceExW.restype = wintypes.BOOL
+
+
+def disk_space(root: str):
+    """(総容量, 空き容量) をバイトで。読めなければ None。UNC の根(\\\\server\\share\\)も可。
+
+    ネットワーク越しでは止まりうるので、UI スレッドからは呼ばないこと。空きは
+    「このユーザーが使える空き」(クォータを考えた値。エクスプローラと同じ)。"""
+    free_to_caller = ctypes.c_ulonglong()
+    total = ctypes.c_ulonglong()
+    free = ctypes.c_ulonglong()
+    old = wintypes.DWORD()
+    _SetThreadErrorMode(SEM_FAILCRITICALERRORS, ctypes.byref(old))
+    if not _GetDiskFreeSpaceExW(root, ctypes.byref(free_to_caller), ctypes.byref(total),
+                                ctypes.byref(free)):
+        return None
+    return int(total.value), int(free_to_caller.value)
+
+
+def drive_label(root: str) -> str:
+    """窓の2行目に出すドライブの名前。ボリュームラベル、無ければ種別(ローカル等)。
+    UNC なら "server\\share"。止まりうるので UI スレッドからは呼ばないこと。"""
+    if root.startswith("\\\\"):
+        return root.strip("\\")
+    try:
+        label = _volume_label(root)
+    except OSError:
+        label = None
+    if label:
+        return label
+    return _DRIVE_KIND.get(drive_type(root), "")
+
+
 def list_drives(label_timeout: float = 1.0) -> list:
     """[(ルート "C:\\", 表示名), ...]。表示名は「C:  ラベル  [種別]」。
 

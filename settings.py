@@ -359,6 +359,9 @@ DEFAULT_SETTINGS = {
     #     従来どおり関連付けで開く。Ctrl+Enter は常に関連付け)
     #   winmerge … Alt+W で使う WinMergeU.exe。空ならレジストリの App Paths と
     #     Program Files / LOCALAPPDATA の既定の場所を探す
+    #   show_fkey_bar … 窓の下にファンクションキーの段(F1〜F12。押せる)を出すか
+    #   fkey_labels … その段の表示名だけの上書き。{"F7": "右クリ", "Shift+F10": "再読込"}
+    #     (あふｗの4桁 "0118" でも書ける)。割り当てそのものは keys で変える
     # このほか geometry / maximized / left_path / right_path / active / recent /
     # left_sort / right_sort / compare_include_dirs / split_ratio(左右の境界) /
     # log_lines(メッセージ窓の行数) / left_font_size・right_font_size(左右それぞれの一覧の
@@ -381,6 +384,8 @@ DEFAULT_SETTINGS = {
             "h", "cpp", "java", "sh",
         ],
         "winmerge": "",
+        "show_fkey_bar": True,
+        "fkey_labels": {},
     },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {

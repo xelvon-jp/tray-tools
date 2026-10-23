@@ -405,14 +405,9 @@ class ScreenFeature:
             self._with_hotkey("🪄 背景を透過…", hotkey_config.get("bg_remove")),
             self.start_bg_remove,
         )
-        # QAction.triggered は checked(bool) を渡してくる。引数を取れる関数を直接繋ぐと
-        # current_path に False が入るので、ここは引数なしのラムダで包む。
-        self.menu.addAction(
-            self._with_hotkey("📁 フォルダブックマーク", hotkey_config.get("launcher")),
-            lambda: self.start_launcher(),
-        )
-        # ブックマークの隣に置く。どちらも「フォルダへ行く」道具で、ファイラの J は
-        # このブックマークをそのまま使う。
+        # フォルダブックマークはメニューに出さない(Win+J とあふｗの Alt+J から呼ぶ。
+        # メニューから呼ぶことはほぼ無く、隣の「簡易ファイラ」と同じ 📁 で紛らわしい)。
+        # 機能とホットキーは残してあり、ファイラの J もこのブックマークをそのまま使う。
         self.menu.addAction(
             self._with_hotkey("📁 簡易ファイラ…", hotkey_config.get("filer")),
             self.start_filer,

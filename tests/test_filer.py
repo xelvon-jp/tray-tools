@@ -1199,14 +1199,22 @@ def test_window_archive():
         assert w._extracting is None and Path(right, "readme.txt").read_bytes() == b"old"
         assert not Path(tmp, "evil.txt").exists() and not Path(right, "evil.txt").exists()
 
-        # Enter / E は一時フォルダへ取り出して開く
+        # Ctrl+Enter(関連付け) / E は一時フォルダへ取り出して開く
         opened = []
         w._startfile = lambda path: opened.append(path)
         L.set_cursor(L._row_of(JP_NAME))
-        key(Qt.Key_Return)
+        key(Qt.Key_Return, Qt.ControlModifier)
         _wait_extract(w)
         assert len(opened) == 1 and Path(opened[0]).read_bytes() == b"jp"
         assert opened[0].startswith(_TEST_TEMP)
+        # Enter は .txt なのでビュアで(取り出してから。表示名は書庫の中のパス)
+        key(Qt.Key_Return)
+        _wait_extract(w)
+        assert len(opened) == 1 and len(w._viewers) == 1
+        viewer = w._viewers[0]
+        assert viewer.path.startswith(_TEST_TEMP) and viewer.title_name == str(zpath / JP_NAME)
+        viewer.close()
+        assert not w._viewers
         calls = []
         real_popen = filer.subprocess.Popen
         filer.subprocess.Popen = lambda args, **kw: calls.append(args)
@@ -1768,6 +1776,437 @@ def test_window_f7_jump_range():
         L.set_cursor(L._row_of("alpha.txt"))
         key(Qt.Key_Space, Qt.ControlModifier)                  # マークが無ければ何もしない
         assert L.marks == set()
+        w.close()
+        w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# 簡易テキストビュア
+# ---------------------------------------------------------------
+def test_viewer_encoding_and_index_logic():
+    import filer_viewer as fv
+    from array import array
+    assert fv.detect_encoding(b"\xef\xbb\xbfabc") == ("utf-8", 3)
+    assert fv.detect_encoding(b"\xff\xfea\x00") == ("utf-16-le", 2)
+    assert fv.detect_encoding(b"\xfe\xff\x00a") == ("utf-16-be", 2)
+    assert fv.detect_encoding("日本語".encode("utf-8")) == ("utf-8", 0)
+    assert fv.detect_encoding("日本語".encode("utf-8")[:-1]) == ("utf-8", 0)  # 末尾で切れても UTF-8
+    assert fv.detect_encoding("日本語".encode("cp932")) == ("cp932", 0)
+    assert fv.detect_encoding(b"plain ascii") == ("utf-8", 0)
+    assert fv.bom_length(b"\xef\xbb\xbfx", "utf-8") == 3 and fv.bom_length(b"\xef\xbb\xbfx", "cp932") == 0
+    assert fv.newline_of("utf-16-le") == b"\n\x00" and fv.newline_of("cp932") == b"\n"
+    # UTF-16LE で「文字の途中に見える \n\x00」(U+0A00 系の上位バイトなど)を取り違えない
+    data = "a\u0a0ab\nc".encode("utf-16-le")
+    out = array("Q", [0])
+    fv.scan_line_starts(data, 0, b"\n\x00", 2, out, len(data))
+    starts = list(out)
+    assert len(starts) == 2 and data[starts[1]:].decode("utf-16-le") == "c", starts
+    assert fv.decode_line(b"abc\r\n", "utf-8") == "abc"
+    assert fv.decode_line(b"\xff\xfe", "utf-8") == "\ufffd\ufffd"     # 読めないバイトは置換文字
+    assert fv.find_in_line("Hello World", "WORLD") == 6 and fv.find_in_line("x", "y") is None
+    # まとめ読みの検索(ブロックの境目をまたいでも、行と桁が合うこと)
+    with tempfile.TemporaryDirectory() as tmp:
+        for enc, start in (("utf-8", 0), ("utf-16-le", 2)):
+            path = os.path.join(tmp, f"s_{enc}.txt")
+            lines = [f"row {i} 本文" for i in range(10000)]
+            lines[3] = "xx Needle here"
+            lines[9001] = "\tthe NEEDLE"
+            body = "\r\n".join(lines).encode(enc)
+            with open(path, "wb") as f:
+                f.write((b"\xff\xfe" if start else b"") + body)
+            index = fv.LineIndex(path, enc, start)
+            deadline = time.monotonic() + 10
+            while not index.done and time.monotonic() < deadline:
+                time.sleep(0.01)
+            reader = fv.LineReader(index)
+            never = threading.Event()
+            try:
+                assert index.count() == 10000
+                assert fv.search_lines(reader, index, "needle", 0, False, never) == \
+                    ("hit", (3, 3, 6))
+                assert fv.search_lines(reader, index, "needle", 4, False, never) == \
+                    ("hit", (9001, 5, 6))
+                assert fv.search_lines(reader, index, "needle", 9000, True, never) == \
+                    ("hit", (3, 3, 6))
+                assert fv.search_lines(reader, index, "needle", 9999, True, never) == \
+                    ("hit", (9001, 5, 6))
+                assert fv.search_lines(reader, index, "nothing", 0, False, never)[0] == "none"
+                assert fv.search_lines(reader, index, "row 9999", 9999, True, never)[1][0] == 9999
+                stop = threading.Event()
+                stop.set()
+                assert fv.search_lines(reader, index, "nothing", 0, False, stop)[0] == "cancel"
+            finally:
+                reader.close()
+
+
+def _wait_viewer(viewer, cond, timeout=20.0):
+    from PySide6.QtTest import QTest
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        QTest.qWait(20)
+    raise AssertionError("ビュアが待ち時間内に終わらない")
+
+
+def test_viewer_window_big_file():
+    import filer_viewer as fv
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        big = Path(tmp, "big.log")
+        with open(big, "w", encoding="utf-8", newline="\n") as f:
+            for i in range(500000):
+                f.write(f"line {i} 日本語\tタブ\n")
+        edited = []
+        t0 = time.monotonic()
+        v = fv.TextViewer(str(big), editor_callback=edited.append)
+        v.resize(800, 600)
+        v.show()
+        v.area.viewport().grab()                       # 索引を作っている最中でも描ける
+        assert time.monotonic() - t0 < 2.0
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(v.area, k, mods)  # noqa: E731
+        try:
+            _check_big_viewer(v, key, big, edited)
+        finally:
+            v.close()                                  # 失敗しても掴んだファイルを手放す
+        _check_viewer_encodings(tmp)
+
+
+def _check_big_viewer(v, key, big, edited):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    if True:
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.line_count() == 500000 and v.encoding == "utf-8"
+        assert v.raw_line(0) == "line 0 日本語\tタブ" and v.raw_line(499999).startswith("line 499999 ")
+        # 題名は 0.1 秒ごとに更新する(索引作りのスレッドから Qt を触らないため)
+        _wait_viewer(v, lambda: "500,000行" in v.windowTitle())
+        assert "UTF-8" in v.windowTitle()
+        # 末尾・先頭・行ジャンプ
+        key(Qt.Key_End)
+        assert v.top_line() == 500000 - v.area.page_lines()
+        key(Qt.Key_Home)
+        assert v.top_line() == 0
+        key(Qt.Key_PageDown)
+        assert v.top_line() == v.area.page_lines()
+        key(Qt.Key_Right, Qt.ControlModifier)
+        assert v.top_line() == 500000 - v.area.page_lines()
+        v.ask_line = lambda: 250001
+        key(Qt.Key_J)
+        assert v.top_line() == 250000
+        # 検索(別スレッド)。ヒット行へ移って強調
+        v.ask_word = lambda title: "LINE 400000 "     # 大文字小文字は無視
+        key(Qt.Key_F)
+        _wait_viewer(v, lambda: v.highlight is not None)
+        assert v.highlight == (400000, 0, len("LINE 400000 "))
+        assert v.top_line() <= 400000 < v.top_line() + v.area.page_lines()
+        v.area.viewport().grab()
+        # 上方次検索(Shift+Space): 上には無い
+        key(Qt.Key_Space, Qt.ShiftModifier)
+        _wait_viewer(v, lambda: not v.searching())
+        QTest.qWait(150)
+        assert "見つかりません" in v.status.text()
+        # 上方検索で別の語
+        v.ask_word = lambda title: "line 7 "
+        key(Qt.Key_F, Qt.ShiftModifier)
+        _wait_viewer(v, lambda: v.highlight is not None and v.highlight[0] == 7)
+        # タブ幅・行番号・字の大きさ・エディタ・見えている行
+        key(Qt.Key_8)
+        assert v.tab_width == 8 and v.display_line(0) == "line 0 日本語\tタブ".expandtabs(8)
+        key(Qt.Key_N, Qt.ShiftModifier)
+        assert v.show_numbers
+        size = v.area.font().pointSize()
+        key(Qt.Key_Down, Qt.ControlModifier)
+        assert v.area.font().pointSize() == size + 1
+        key(Qt.Key_Insert)
+        assert v.area.font().pointSize() == size
+        key(Qt.Key_E)
+        assert edited == [str(big)]
+        assert v.visible_text().splitlines()[0] == v.raw_line(v.top_line())
+        # 閉じる(Q)。閉じたら大きさを知らせる
+        closed = []
+        v.closed.connect(closed.append)
+        key(Qt.Key_Q)
+        assert closed and len(closed[0]) == 4
+
+
+def _check_viewer_encodings(tmp):
+    import filer_viewer as fv
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    if True:
+        # 文字コード: cp932 は自動判定、Shift+O で UTF-8、Shift+S で戻す。UTF-16 BOM
+        sjis = Path(tmp, "sjis.txt")
+        sjis.write_bytes("一行目\r\n二行目\r\n".encode("cp932"))
+        v = fv.TextViewer(str(sjis))
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.encoding == "cp932" and [v.raw_line(i) for i in range(v.line_count())] == \
+            ["一行目", "二行目"]
+        QTest.keyClick(v.area, Qt.Key_O, Qt.ShiftModifier)
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.encoding == "utf-8" and "\ufffd" in v.raw_line(0)
+        QTest.keyClick(v.area, Qt.Key_S, Qt.ShiftModifier)
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.encoding == "cp932" and v.raw_line(1) == "二行目"
+        for letter, enc in (("U", "utf-16-le"), ("I", "utf-16-be"), ("E", "euc_jp"),
+                            ("J", "iso2022_jp")):
+            QTest.keyClick(v.area, getattr(Qt, f"Key_{letter}"), Qt.ShiftModifier)
+            assert v.encoding == enc, (letter, v.encoding)
+            _wait_viewer(v, lambda: v.index.done)
+        QTest.keyClick(v.area, Qt.Key_Escape)        # 検索中でなければ Esc で閉じる
+        assert not v.isVisible()
+        u16 = Path(tmp, "u16.txt")
+        u16.write_bytes(b"\xfe\xff" + "あ\nい".encode("utf-16-be"))
+        v = fv.TextViewer(str(u16))
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.encoding == "utf-16-be" and [v.raw_line(i) for i in range(v.line_count())] == \
+            ["あ", "い"]
+        v.close()
+        empty = Path(tmp, "empty.txt")
+        empty.write_bytes(b"")
+        v = fv.TextViewer(str(empty))
+        _wait_viewer(v, lambda: v.index.done)
+        assert v.line_count() == 0
+        v.area.viewport().grab()
+        v.close()
+
+
+def test_enter_viewer_routing():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    assert core.opens_in_viewer("a.LOG", core.normalize_viewer_extensions(None))
+    assert not core.opens_in_viewer("a.exe", core.normalize_viewer_extensions(None))
+    assert not core.opens_in_viewer("noext", core.normalize_viewer_extensions(None))
+    assert core.normalize_viewer_extensions(".Foo, bar") == {"foo", "bar"}
+    import settings as settings_module     # 既定値の二重持ちが食い違っていないこと
+    assert set(settings_module.DEFAULT_SETTINGS["filer"]["viewer_extensions"]) == \
+        set(core.DEFAULT_VIEWER_EXTENSIONS)
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "app.log").write_text("log line\n", encoding="utf-8")
+        Path(left, "tool.exe").write_bytes(b"MZ")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        opened = []
+        w._startfile = opened.append
+        L.set_cursor(L._row_of("tool.exe"))
+        QTest.keyClick(L.view, Qt.Key_Return)
+        assert opened == [os.path.join(L.path, "tool.exe")] and not w._viewers
+        L.set_cursor(L._row_of("app.log"))
+        QTest.keyClick(L.view, Qt.Key_Return)
+        assert len(w._viewers) == 1 and opened == [os.path.join(L.path, "tool.exe")]
+        viewer = w._viewers[0]
+        assert viewer.area.font().pointSize() == L.pane_font.pointSize()  # 字の大きさは窓から
+        QTest.keyClick(L.view, Qt.Key_Return, Qt.ControlModifier)          # Ctrl+Enter は関連付け
+        assert opened[-1] == os.path.join(L.path, "app.log")
+        QTest.keyClick(viewer.area, Qt.Key_Return)                         # Enter で閉じる
+        assert not w._viewers
+        stored = json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
+        assert len(stored["viewer_geometry"]) == 4
+        w.close()
+        w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# ZIP 圧縮(P)
+# ---------------------------------------------------------------
+def test_zip_plan_and_create():
+    import zipfile
+    import filer_archive as fa
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp, "src")
+        (src / "dir" / "empty").mkdir(parents=True)
+        (src / "dir" / "中.txt").write_bytes(b"naka")
+        (src / "a.txt").write_bytes(b"a" * 1000)
+        hidden = src / "dir" / "hidden.txt"
+        hidden.write_bytes(b"h")
+        _set_attrs(hidden, 0x02)
+        old = time.mktime((2020, 5, 6, 7, 8, 10, 0, 0, -1))
+        os.utime(src / "a.txt", (old, old))
+        dest = src / "out.zip"
+        plan = core.zip_plan(str(src), ["a.txt", "dir", "out.zip"], exclude=str(dest))
+        arcs = [arc for _p, arc, _d in plan]
+        assert arcs == ["a.txt", "dir/", "dir/empty/", "dir/hidden.txt", "dir/中.txt"], arcs
+        assert core.default_zip_name(str(src), [core.Entry("a.txt", False)]) == "a.zip"
+        assert core.default_zip_name(str(src), [core.Entry("dir.v2", True)]) == "dir.v2.zip"
+        assert core.default_zip_name(str(src), [core.Entry("a", False), core.Entry("b", False)]) == "src.zip"
+        assert core.default_zip_name("C:\\", [core.Entry("a", False), core.Entry("b", False)]) == "C.zip"
+
+        result = fa.create_zip(str(src), ["a.txt", "dir"], str(dest))
+        assert not result.error and not result.cancelled and result.files == 3 and result.folders == 2
+        assert result.source_bytes == 1000 + 4 + 1 and result.zip_bytes == dest.stat().st_size
+        assert not Path(str(dest) + ".filer-part").exists()
+        with zipfile.ZipFile(dest) as z:
+            infos = {i.filename: i for i in z.infolist()}
+            assert set(infos) == {"a.txt", "dir/", "dir/empty/", "dir/hidden.txt", "dir/中.txt"}
+            assert infos["dir/中.txt"].flag_bits & 0x800                   # UTF-8 の印
+            assert infos["a.txt"].compress_type == zipfile.ZIP_DEFLATED
+            assert infos["a.txt"].date_time[:5] == (2020, 5, 6, 7, 8)       # 更新日時を保つ
+            assert z.read("dir/中.txt") == b"naka"
+        # 自分自身(作る ZIP)をいまのフォルダの対象に含めても入らない
+        result = fa.create_zip(str(src), ["a.txt", "out.zip"], str(dest))
+        with zipfile.ZipFile(dest) as z:
+            assert z.namelist() == ["a.txt"]
+        # 中止: 作りかけを残さない
+        cancel = threading.Event()
+        cancel.set()
+        dest2 = src / "cancel.zip"
+        result = fa.create_zip(str(src), ["a.txt"], str(dest2), cancel=cancel)
+        assert result.cancelled and not dest2.exists() and not Path(str(dest2) + ".filer-part").exists()
+        # 失敗(書けない場所): 何も残さない
+        bad = Path(tmp, "nope", "x.zip")
+        result = fa.create_zip(str(src), ["a.txt"], str(bad))
+        assert result.error and not bad.exists()
+        _set_attrs(hidden, 0x80)
+
+
+def test_window_zip_create():
+    import zipfile
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        asked = []
+        w.ask_text = lambda title, label, text="", select=None: (asked.append(text), text)[1]
+        L.marks.update({"alpha.txt", "sub1"})
+        QTest.keyClick(L.view, Qt.Key_P)
+        _wait_extract(w)
+        _wait(w)
+        assert asked == ["L.zip"]
+        made = right / "L.zip"
+        with zipfile.ZipFile(made) as z:
+            assert set(z.namelist()) == {"alpha.txt", "sub1/", "sub1/deep/"}
+        assert _cursor_name(R) == "L.zip" and "圧縮: 1ファイル 2フォルダ" in w.log_view.toPlainText()
+        # 既にあれば上書きを確かめる(いいえなら作らない)
+        L.marks.clear()
+        L.set_cursor(L._row_of("beta.md"))
+        w.ask_text = lambda *a, **k: "L.zip"
+        w.confirm = lambda *a, **k: False
+        before = made.stat().st_size
+        QTest.keyClick(L.view, Qt.Key_P)
+        assert w._extracting is None and made.stat().st_size == before
+        w.confirm = lambda *a, **k: True
+        QTest.keyClick(L.view, Qt.Key_P)
+        _wait_extract(w)
+        with zipfile.ZipFile(made) as z:
+            assert z.namelist() == ["beta.md"]
+        # 書庫の中では作らない(自窓・反対窓とも)
+        zpath = left / "pack.zip"
+        _make_zip(str(zpath))
+        R.load(str(zpath))
+        _wait(w)
+        QTest.keyClick(L.view, Qt.Key_P)
+        assert "書庫内へは書き込めません" in w.log_view.toPlainText()
+        w.close()
+        w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# WinMerge(Alt+W)
+# ---------------------------------------------------------------
+def test_winmerge_rules_and_find():
+    pair = core.winmerge_pair
+    assert pair(["a"], ["b"]) == [("left", "a"), ("right", "b")]
+    assert pair(["a", "c"], []) == [("left", "a"), ("left", "c")]
+    assert pair([], ["x", "y"]) == [("right", "x"), ("right", "y")]
+    for left, right in (([], []), (["a"], []), ([], ["b"]), (["a", "b", "c"], []),
+                        (["a", "b"], ["c"]), (["a"], ["b", "c"])):
+        assert pair(left, right) is None, (left, right)
+    env = {"ProgramFiles": r"C:\PF", "ProgramFiles(x86)": r"C:\PF86", "LOCALAPPDATA": r"C:\L"}
+    exists = lambda p: p in present  # noqa: E731
+    present = {r"C:\PF86\WinMerge\WinMergeU.exe", r"D:\reg\WinMergeU.exe", r"E:\set\WinMergeU.exe"}
+    assert core.find_winmerge("", env, exists, lambda: []) == r"C:\PF86\WinMerge\WinMergeU.exe"
+    assert core.find_winmerge("", env, exists, lambda: [r"D:\reg\WinMergeU.exe"]) == r"D:\reg\WinMergeU.exe"
+    assert core.find_winmerge(r"E:\set\WinMergeU.exe", env, exists,
+                              lambda: [r"D:\reg\WinMergeU.exe"]) == r"E:\set\WinMergeU.exe"
+    present = set()
+    assert core.find_winmerge("", env, exists, lambda: []) is None
+    assert core.DEFAULT_KEYMAP["4087"] == "winmerge" and core.DEFAULT_KEYMAP["0080"] == "zip_create"
+
+
+def test_window_winmerge():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        exe = r"C:\WM dir\WinMergeU.exe"
+        real_find, real_popen = filer.core.find_winmerge, filer.subprocess.Popen
+        calls = []
+        filer.core.find_winmerge = lambda *a, **k: exe
+        filer.subprocess.Popen = lambda argv, **kw: calls.append(argv)
+        alt_w = lambda: QTest.keyClick(w.active.view, Qt.Key_W, Qt.AltModifier)  # noqa: E731
+        try:
+            alt_w()                                                     # マークなし
+            assert not calls and core.WINMERGE_HINT in w.log_view.toPlainText()
+            L.marks.add("alpha.txt")
+            alt_w()                                                     # 1件と0件
+            assert not calls
+            R.marks.add("r.txt")
+            alt_w()
+            assert calls[-1] == [exe, "/dl", str(left / "alpha.txt"), "/dr", str(right / "r.txt"),
+                                 str(left / "alpha.txt"), str(right / "r.txt")]
+            R.marks.clear()
+            L.marks.add("beta.md")
+            alt_w()                                                     # 片側に2件
+            assert calls[-1][-2:] == [str(left / "alpha.txt"), str(left / "beta.md")]
+            L.marks.add("gamma.txt")
+            count = len(calls)
+            alt_w()                                                     # 3件は断る
+            assert len(calls) == count
+            # 書庫の中は取り出してから(表示名は書庫の中のパス)
+            L.marks.clear()
+            L.marks.add("alpha.txt")
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            R.load(str(zpath))
+            _wait(w)
+            R.marks.add("readme.txt")
+            alt_w()
+            _wait_extract(w)
+            argv = calls[-1]
+            assert argv[4] == str(zpath / "readme.txt") and argv[6].startswith(_TEST_TEMP)
+            assert Path(argv[6]).read_bytes() == b"hello"
+            # 見つからなければ知らせるだけ
+            filer.core.find_winmerge = lambda *a, **k: None
+            count = len(calls)
+            alt_w()
+            assert len(calls) == count and "WinMerge が見つかりません" in w.log_view.toPlainText()
+        finally:
+            filer.core.find_winmerge, filer.subprocess.Popen = real_find, real_popen
         w.close()
         w.deleteLater()
 

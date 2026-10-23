@@ -355,11 +355,16 @@ DEFAULT_SETTINGS = {
     #     コマンド名は filer_core.DEFAULT_KEYMAP を参照
     #   colors … 色の上書き(名前は filer.DEFAULT_COLORS)。書いた色だけ差し替わる
     #   font_families … 一覧の字(既定は MS Gothic)
+    #   viewer_extensions … Enter で簡易テキストビュアに回す拡張子(点なし。ここに無いものは
+    #     従来どおり関連付けで開く。Ctrl+Enter は常に関連付け)
+    #   winmerge … Alt+W で使う WinMergeU.exe。空ならレジストリの App Paths と
+    #     Program Files / LOCALAPPDATA の既定の場所を探す
     # このほか geometry / maximized / left_path / right_path / active / recent /
     # left_sort / right_sort / compare_include_dirs / split_ratio(左右の境界) /
     # log_lines(メッセージ窓の行数) / left_font_size・right_font_size(左右それぞれの一覧の
     # 字の大きさ。Shift/Ctrl+↑↓ でアクティブ窓だけ変わる。無ければ以前の共通の font_size) /
-    # show_hidden・show_system(Shift+Z の隠し/システムファイルの表示。無ければ表示する)
+    # show_hidden・show_system(Shift+Z の隠し/システムファイルの表示。無ければ表示する) /
+    # viewer_geometry(ビュアの窓の位置と大きさ。ビュアを閉じたときに書く)
     # はアプリが閉じるときなどに書き足す。left_path / right_path は書庫の中のパスのことも
     # ある(次回もその書庫の中が開く)。
     "filer": {
@@ -370,6 +375,12 @@ DEFAULT_SETTINGS = {
         "time_tolerance_sec": 2,
         "keys": {},
         "colors": {},
+        "viewer_extensions": [
+            "log", "txt", "csv", "tsv", "md", "json", "xml", "ini", "cfg", "conf", "yaml",
+            "yml", "py", "ps1", "bat", "cmd", "sql", "html", "htm", "css", "js", "ts", "c",
+            "h", "cpp", "java", "sh",
+        ],
+        "winmerge": "",
     },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {

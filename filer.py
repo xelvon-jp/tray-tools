@@ -821,6 +821,12 @@ class FilerWindow(QWidget):
         self.disabled_keys = core.disabled_codes(section.get("keys"))
         self.editor = section.get("editor") or DEFAULT_EDITOR
         self.shell = section.get("shell") or DEFAULT_SHELL
+        # Enter でビュアに回す拡張子(あふｗの拡張子判別実行)。開いているビュアの窓。
+        self.viewer_extensions = core.normalize_viewer_extensions(
+            section.get("viewer_extensions"))
+        self._viewers = []
+        # Alt+W の WinMerge。空なら App Paths と既定の場所を探す。
+        self.winmerge_setting = section.get("winmerge") or ""
         try:
             self.list_timeout = max(0.5, float(section.get("list_timeout_seconds")
                                                or DEFAULT_LIST_TIMEOUT))
@@ -1038,6 +1044,8 @@ class FilerWindow(QWidget):
                 self._picker.close()
             if self._extracting is not None:
                 self._extracting["cancel"].set()
+            for viewer in list(self._viewers):
+                viewer.close()
             # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
             # 次の起動で片付く。
             filer_archive.cleanup_temp()
@@ -1281,8 +1289,61 @@ class FilerWindow(QWidget):
         elif pane.archive is None and filer_archive.is_archive_name(entry.name):
             # 書庫ファイルは中へ入る(あふｗの仮想フォルダ)。関連付けで開きたいときは Ctrl+Enter。
             pane.load(os.path.join(pane.path, entry.name))
+        elif core.opens_in_viewer(entry.name, self.viewer_extensions):
+            # テキストはビュアで(あふｗの拡張子判別実行)。関連付けは Ctrl+Enter。
+            self._view_entry(entry)
         else:
             self._open_file(entry)
+
+    # --- 簡易テキストビュア ---
+    def _view_entry(self, entry) -> None:
+        pane = self.active
+        display = os.path.join(pane.path, entry.name)
+        if pane.archive is not None:
+            # 書庫の中のファイルは一時フォルダへ取り出してから開く。表示名は書庫の中のパス。
+            self._extract_to_temp([entry], lambda paths: self.open_viewer(paths[0], display))
+            return
+        self.open_viewer(display)
+
+    def open_viewer(self, path: str, title: str = None):
+        """ビュアの窓を開く(モードレス。いくつ開いてもよい)。開いた窓を返す。"""
+        import filer_viewer  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        section = _section(self.app_settings)
+        geometry = section.get("viewer_geometry")
+        if not (isinstance(geometry, list) and len(geometry) == 4
+                and all(isinstance(v, int) for v in geometry)
+                and any(s.availableGeometry().intersects(QRect(*geometry))
+                        for s in QGuiApplication.screens())):
+            geometry = None
+        colors = {"background": self.colors["background"], "text": self.colors["text"]}
+        try:
+            viewer = filer_viewer.TextViewer(
+                path, title_name=title or path, font=self.active.pane_font, colors=colors,
+                editor_callback=lambda p: self._open_in_editor([p]), geometry=geometry)
+        except OSError as e:
+            self.log(f"ビュアで開けません: {path}  ({e})")
+            return None
+        viewer.closed.connect(lambda geo, v=viewer: self._on_viewer_closed(v, geo))
+        self._viewers.append(viewer)
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+        viewer.area.setFocus()
+        self.log(f"ビュア: {title or path}")
+        return viewer
+
+    def _on_viewer_closed(self, viewer, geometry) -> None:
+        try:
+            if viewer in self._viewers:
+                self._viewers.remove(viewer)
+            save_values(self.app_settings, self.settings_path, {"viewer_geometry": geometry})
+            if self.isVisible():
+                # 閉じたらファイラへ戻る(キーがすぐ効くように)。
+                self.activateWindow()
+                self.active.view.setFocus()
+        except Exception:  # noqa: BLE001
+            _log_exception("viewerClosed")
 
     def cmd_open_assoc(self):
         entry = self.active.cursor_entry()
@@ -1880,9 +1941,9 @@ class FilerWindow(QWidget):
             self._after_operation("貼り付け(複写)", result, paths, pane.path)
 
     # --- 書庫からの展開 ---
-    def _archive_plan(self, entries):
-        """アクティブ窓(書庫の中)の entries を展開する計画。(書庫の索引, 計画)。"""
-        archive, inner = self.active.archive
+    def _archive_plan(self, entries, pane=None):
+        """窓(既定はアクティブ窓。書庫の中)の entries を展開する計画。(書庫の索引, 計画)。"""
+        archive, inner = (pane or self.active).archive
         # 一覧を読んだときに作った索引がそのまま使われる(書庫が変わっていれば読み直す)。
         index = filer_archive.get_index(archive)
         return index, filer_archive.plan_extract(index, inner, [e.name for e in entries])
@@ -1926,13 +1987,14 @@ class FilerWindow(QWidget):
 
         self._start_extract(index, plan, dest, skip, password, "展開", done)
 
-    def _extract_to_temp(self, entries, on_paths) -> None:
-        """書庫の中のファイルを一時フォルダへ取り出し、取り出せたパスで on_paths を呼ぶ
-        (Enter / E / V)。一時フォルダはファイラを閉じるとき・次の起動で片付く。"""
+    def _extract_to_temp(self, entries, on_paths, pane=None) -> None:
+        """書庫の中のもの(ファイルもフォルダも)を一時フォルダへ取り出し、取り出せたパスで
+        on_paths を呼ぶ(Enter / E / V / Alt+W)。一時フォルダはファイラを閉じるとき・
+        次の起動で片付く。pane を省くとアクティブ窓。"""
         if self._extracting is not None:
             self.log("展開: ほかの展開が終わるまで待ってください")
             return
-        index, plan = self._archive_plan(entries)
+        index, plan = self._archive_plan(entries, pane)
         if not plan:
             return
         password = None
@@ -1946,7 +2008,7 @@ class FilerWindow(QWidget):
             if result.errors or result.cancelled:
                 self._report_extract(result, dest)
             paths = [os.path.join(dest, e.name) for e in entries
-                     if os.path.isfile(os.path.join(dest, e.name))]
+                     if os.path.exists(os.path.join(dest, e.name))]
             if paths:
                 on_paths(paths)
 
@@ -1954,10 +2016,24 @@ class FilerWindow(QWidget):
 
     def _start_extract(self, index, plan, dest, skip, password, title, on_done) -> None:
         """展開を別スレッドで走らせ、進み具合を QProgressDialog に出す(中止できる)。"""
-        cancel = threading.Event()
         total = sum(1 for p in plan if not p.is_dir)
-        dialog = QProgressDialog(f"{title}: {os.path.basename(index.path)}", "中止",
-                                 0, max(total, 1), self)
+
+        def run(progress, cancel):
+            try:
+                return filer_archive.extract(index, plan, dest, skip=skip, password=password,
+                                             progress=progress, cancel=cancel)
+            except Exception as e:  # noqa: BLE001  何が来ても結果として返す
+                return filer_archive.ExtractResult(errors=[f"{type(e).__name__}: {e}"])
+
+        self._start_job(title, os.path.basename(index.path), total, run, on_done)
+
+    def _start_job(self, title, label, total, run, on_done) -> None:
+        """時間のかかる処理(展開・圧縮)を別スレッドで走らせ、進み具合を QProgressDialog に
+        出す(中止できる)。run(progress, cancel) は読み取りスレッドで呼ばれ、結果を返す。
+        progress(済んだ数, 全体, 名前) で進み具合を知らせる。終わったら on_done(結果) を
+        UI スレッドで呼ぶ。同時に走らせるのは1つだけ(self._extracting)。"""
+        cancel = threading.Event()
+        dialog = QProgressDialog(f"{title}: {label}", "中止", 0, max(total, 1), self)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.WindowModal)
         # 一瞬で終わる小さな展開でまで窓をちらつかせない。
@@ -1977,16 +2053,15 @@ class FilerWindow(QWidget):
 
         def worker():
             try:
-                result = filer_archive.extract(index, plan, dest, skip=skip, password=password,
-                                               progress=progress, cancel=cancel)
+                result = run(progress, cancel)
             except Exception as e:  # noqa: BLE001  何が来ても結果として返す
-                result = filer_archive.ExtractResult(errors=[f"{type(e).__name__}: {e}"])
+                result = e
             try:
                 bridge.extracted.emit(result)
             except RuntimeError:
                 pass
 
-        threading.Thread(target=worker, daemon=True, name="filer-extract").start()
+        threading.Thread(target=worker, daemon=True, name="filer-job").start()
 
     def _on_extract_progress(self, payload) -> None:
         try:
@@ -2176,6 +2251,111 @@ class FilerWindow(QWidget):
             self.log(f"ドラッグ: {count}件を渡しました")
         self.left.reload(keep_marks=True)
         self.right.reload(keep_marks=True)
+
+    # --- ZIP 圧縮(P。反対窓に作る) ---
+    def cmd_zip_create(self):
+        src, dst = self.active, self.other
+        if self._refuse_archive("圧縮", source=True, dest_pane=dst):
+            return
+        targets = src.targets()
+        if not targets or not src.path or not dst.path:
+            return
+        if self._extracting is not None:
+            self.log("圧縮: ほかの処理が終わるまで待ってください")
+            return
+        name = self.ask_text("圧縮", f"反対窓（{dst.path}）に作る ZIP の名前",
+                             core.default_zip_name(src.path, targets))
+        if name is None:
+            return
+        name = name.strip()
+        problem = core.validate_name(name)
+        if problem:
+            self.log(f"圧縮: {problem}")
+            return
+        dest = os.path.join(dst.path, name)
+        if os.path.exists(dest):
+            if os.path.isdir(dest):
+                self.log(f"圧縮: 同じ名前のフォルダがあります: {name}")
+                return
+            if not self.confirm("圧縮", f"{name} は既にあります。上書きしますか？",
+                                default_yes=False):
+                return
+        folder = src.path
+        names = [e.name for e in targets]
+
+        def run(progress, cancel):
+            return filer_archive.create_zip(folder, names, dest, progress, cancel)
+
+        def done(result):
+            self._report_zip(result, dest)
+            dst.reload(focus=name)
+
+        self._start_job("圧縮", name, len(names), run, done)
+
+    def _report_zip(self, result, dest) -> None:
+        if isinstance(result, Exception):
+            self.log(f"圧縮: 失敗しました（{type(result).__name__}: {result}）")
+            return
+        if result.cancelled:
+            self.log("圧縮: 中止しました（作りかけの ZIP は残していません）")
+            return
+        if result.error:
+            self.log(f"圧縮: 失敗しました（{result.error}。作りかけの ZIP は残していません）")
+            return
+        self.log(f"圧縮: {result.files}ファイル {result.folders}フォルダ"
+                 f"（{core.format_bytes(result.source_bytes)}）→ {os.path.basename(dest)}"
+                 f"（{core.format_bytes(result.zip_bytes)}）")
+        for error in result.skipped[:5]:
+            self.log(f"圧縮: 入れられませんでした {error}")
+        if len(result.skipped) > 5:
+            self.log(f"圧縮: ほか {len(result.skipped) - 5}件入れられませんでした")
+
+    # --- WinMerge で比較(Alt+W) ---
+    def _marked_entries(self, pane) -> list:
+        return [e for e in pane.entries if e.name in pane.marks and not e.is_parent]
+
+    def cmd_winmerge(self):
+        pair = core.winmerge_pair(self._marked_entries(self.left),
+                                  self._marked_entries(self.right))
+        if pair is None:
+            self.log(f"比較: {core.WINMERGE_HINT}")
+            return
+        exe = core.find_winmerge(self.winmerge_setting, registry=core.registry_winmerge_paths)
+        if exe is None:
+            self.log("比較: WinMerge が見つかりません（filer.winmerge で指定できます）")
+            return
+        items = [(self.pane(side), entry) for side, entry in pair]
+        displays = [os.path.join(pane.path, entry.name) for pane, entry in items]
+        resolved = [None, None]
+
+        def step(i):
+            # 書庫の中のものは一時フォルダへ取り出してから渡す(1つずつ順に)。
+            if i == len(items):
+                self.launch_winmerge(exe, displays, resolved)
+                return
+            pane, entry = items[i]
+            if pane.archive is None:
+                resolved[i] = displays[i]
+                step(i + 1)
+                return
+
+            def got(paths, i=i):
+                resolved[i] = paths[0]
+                step(i + 1)
+
+            self._extract_to_temp([entry], got, pane)
+
+        step(0)
+
+    def launch_winmerge(self, exe, displays, paths) -> None:
+        """WinMerge を起こす。引数はリストで渡す(空白を含むパスで壊れない)。左右の表示名
+        (/dl /dr)はファイラ上のパス(書庫の中なら書庫の中のパス)。"""
+        argv = [exe, "/dl", displays[0], "/dr", displays[1], paths[0], paths[1]]
+        try:
+            subprocess.Popen(argv, close_fds=True)
+            self.log(f"比較: {displays[0]} ⇔ {displays[1]}")
+        except OSError as e:
+            self.log(f"比較: WinMerge を起動できません（{e}）")
 
     # --- 閉じる ---
     def cmd_quit(self):

@@ -521,3 +521,70 @@ def cleanup_temp(older_than: float = 0.0) -> int:
         except OSError:
             pass
     return removed
+
+
+# ---------------------------------------------------------------
+# ZIP を作る(ファイラの P)
+# ---------------------------------------------------------------
+@dataclass
+class ZipResult:
+    files: int = 0
+    folders: int = 0
+    source_bytes: int = 0
+    zip_bytes: int = 0
+    skipped: list = None      # 読めずに入れられなかったもの("名前: 理由")
+    cancelled: bool = False
+    error: str = ""           # これがあれば ZIP は作っていない
+
+    def __post_init__(self):
+        if self.skipped is None:
+            self.skipped = []
+
+
+def create_zip(folder: str, names, dest: str, progress=None,
+               cancel: threading.Event = None) -> ZipResult:
+    """folder の names(フォルダは中身ごと)を dest に ZIP で作る。読み取りスレッドで呼ぶ。
+
+    - ZIP_DEFLATED。名前に ASCII 以外があれば zipfile が UTF-8 の印を付けて書く
+      (Windows 標準の展開でも化けない)。更新日時は元のファイルのまま
+    - 隣の .filer-part に書いてから置き換える。中止・失敗のときは作りかけを消す
+      (途中までの ZIP が本物の名前で残ると、壊れた書庫を正しいものと取り違える)
+    - 作ろうとしている ZIP 自身は入れない(いまのフォルダに作るときの自己参照)
+    - 読めないファイル(使用中など)は飛ばして続け、skipped に残す"""
+    result = ZipResult()
+    cancel = cancel or threading.Event()
+    part = dest + ".filer-part"
+    try:
+        plan = core.zip_plan(folder, names, exclude=dest)
+        total = len(plan)
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
+            for done, (path, arc, is_dir) in enumerate(plan):
+                if cancel.is_set():
+                    result.cancelled = True
+                    break
+                if progress:
+                    progress(done, total, arc)
+                try:
+                    zf.write(path, arc)
+                except OSError as e:
+                    result.skipped.append(f"{arc}: {e}")
+                    continue
+                if is_dir:
+                    result.folders += 1
+                else:
+                    result.files += 1
+                    try:
+                        result.source_bytes += os.path.getsize(path)
+                    except OSError:
+                        pass
+        if result.cancelled:
+            _remove_quietly(part)
+            return result
+        os.replace(part, dest)
+        result.zip_bytes = os.path.getsize(dest)
+        if progress:
+            progress(total, total, "")
+    except Exception as e:  # noqa: BLE001  ディスクが一杯など。作りかけは残さない
+        _remove_quietly(part)
+        result.error = f"{type(e).__name__}: {e}"
+    return result

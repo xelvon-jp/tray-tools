@@ -89,6 +89,8 @@ DEFAULT_KEYMAP = {
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
     "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示)
     "0087": "compare_mark",       # W 同名ファイル比較マーク
+    "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
+    "0080": "zip_create",         # P ZIP 圧縮(反対窓に作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
     "1186": "mask_input",         # Shift+: (AFXW.key 1186 &MASK)
@@ -984,3 +986,154 @@ def range_mark_names(entries, marks, cursor: int, direction: int) -> set:
             return {e.name for e in entries[low:high + 1] if not e.is_parent}
         row += direction
     return set()
+
+
+# ---------------------------------------------------------------
+# 簡易テキストビュア(Enter の拡張子判別)
+# ---------------------------------------------------------------
+DEFAULT_VIEWER_EXTENSIONS = (
+    "log txt csv tsv md json xml ini cfg conf yaml yml py ps1 bat cmd sql html htm css js "
+    "ts c h cpp java sh"
+).split()
+
+
+def normalize_viewer_extensions(value) -> frozenset:
+    """settings.json の filer.viewer_extensions(配列か空白区切りの文字列)を、点なし・
+    小文字の集合にする。書かれていなければ既定。"""
+    if value is None:
+        value = DEFAULT_VIEWER_EXTENSIONS
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        value = DEFAULT_VIEWER_EXTENSIONS
+    return frozenset(str(v).strip().lstrip(".").lower() for v in value if str(v).strip())
+
+
+def opens_in_viewer(name: str, extensions) -> bool:
+    """Enter でビュアに回すファイルか(拡張子で判別。あふｗの「拡張子判別実行」)。"""
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    return bool(ext) and ext in extensions
+
+
+# ---------------------------------------------------------------
+# ZIP 圧縮(P)
+# ---------------------------------------------------------------
+def default_zip_name(folder: str, targets) -> str:
+    """作る ZIP の名前の既定。対象が1件ならその名前(拡張子を除く)、複数ならいまの
+    フォルダ名。ドライブ直下(C:\\)なら "C"。"""
+    if len(targets) == 1:
+        entry = targets[0]
+        stem = entry.name if entry.is_dir else os.path.splitext(entry.name)[0]
+        return f"{stem or entry.name}.zip"
+    base = os.path.basename(normalize_dir(folder).rstrip("\\/"))
+    if not base:
+        base = os.path.splitdrive(folder)[0].rstrip(":") or "archive"
+    return f"{base}.zip"
+
+
+def zip_plan(folder: str, names, exclude=None, walk=os.walk) -> list:
+    """folder の names を ZIP に入れる順の [(実パス, 書庫内の名前, フォルダか)]。
+
+    フォルダは中身ごと(空のフォルダも入れる)。書庫内の名前は folder からの相対で、
+    区切りは "/"。exclude(作ろうとしている ZIP 自身)は入れない。隠し・システム属性の
+    ものも入れる(Shift+Z の表示の絞り込みは「見え方」の設定で、中身を選ぶものではない)。"""
+    skip = os.path.normcase(os.path.abspath(exclude)) if exclude else None
+    plan = []
+
+    def add(path, arc, is_dir):
+        if skip and os.path.normcase(os.path.abspath(path)) == skip:
+            return
+        plan.append((path, arc, is_dir))
+
+    for name in names:
+        path = os.path.join(folder, name)
+        if os.path.isdir(path):
+            add(path, name + "/", True)
+            for root, dirs, files in walk(path):
+                dirs.sort(key=str.casefold)
+                rel_root = os.path.relpath(root, folder).replace(os.sep, "/")
+                for d in dirs:
+                    add(os.path.join(root, d), f"{rel_root}/{d}/", True)
+                for f in sorted(files, key=str.casefold):
+                    add(os.path.join(root, f), f"{rel_root}/{f}", False)
+        else:
+            add(path, name, False)
+    return plan
+
+
+# ---------------------------------------------------------------
+# WinMerge で比較(Alt+W)
+# ---------------------------------------------------------------
+WINMERGE_HINT = "左右に1件ずつ（または片側に2件）マークしてください"
+
+
+def winmerge_pair(left_marked, right_marked):
+    """比べる2つ。[(側, 名前), (側, 名前)] か、規則に合わなければ None。
+
+    - 左に1件・右に1件 → その2つ(左が先)
+    - 片側だけに2件(もう片側は0件) → その2件
+    - それ以外(0件、3件以上、1件と0件 など)は None"""
+    left, right = list(left_marked), list(right_marked)
+    if len(left) == 1 and len(right) == 1:
+        return [("left", left[0]), ("right", right[0])]
+    if len(left) == 2 and not right:
+        return [("left", left[0]), ("left", left[1])]
+    if len(right) == 2 and not left:
+        return [("right", right[0]), ("right", right[1])]
+    return None
+
+
+WINMERGE_APP_PATH_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WinMergeU.exe"
+
+
+def winmerge_candidates(setting, environ) -> list:
+    """WinMergeU.exe を探す順のうち、ファイルの場所として決まるもの(レジストリは別)。"""
+    found = []
+    if setting:
+        found.append(os.path.expandvars(str(setting)))
+    for var, rel in (("ProgramFiles", r"WinMerge\WinMergeU.exe"),
+                     ("ProgramFiles(x86)", r"WinMerge\WinMergeU.exe"),
+                     ("LOCALAPPDATA", r"Programs\WinMerge\WinMergeU.exe")):
+        base = environ.get(var)
+        if base:
+            found.append(os.path.join(base, rel))
+    return found
+
+
+def find_winmerge(setting=None, environ=None, exists=os.path.isfile, registry=None):
+    """WinMergeU.exe のパス。見つからなければ None。
+
+    探す順は settings の filer.winmerge → レジストリの App Paths(registry() が返す
+    パスの並び。HKLM・HKCU) → Program Files / Program Files (x86) / LOCALAPPDATA。
+    exists と registry は差し替えられる(テストで実際のディスクやレジストリを見ないため)。"""
+    environ = os.environ if environ is None else environ
+    candidates = []
+    if setting:
+        candidates.append(os.path.expandvars(str(setting)))
+    if registry is not None:
+        try:
+            candidates.extend(p for p in registry() if p)
+        except OSError:
+            pass
+    candidates.extend(winmerge_candidates(None, environ))
+    for path in candidates:
+        path = path.strip().strip('"')
+        if path and exists(path):
+            return path
+    return None
+
+
+def registry_winmerge_paths() -> list:
+    """レジストリの App Paths に登録された WinMergeU.exe(HKLM, HKCU の順)。"""
+    import winreg
+
+    paths = []
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, WINMERGE_APP_PATH_KEY) as key:
+                value, _kind = winreg.QueryValueEx(key, "")
+                if value:
+                    paths.append(os.path.expandvars(str(value)))
+        except OSError:
+            continue
+    return paths

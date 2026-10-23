@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from ctypes import wintypes
@@ -38,7 +39,15 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPen
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QLinearGradient,
+)
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -66,34 +75,49 @@ import filer_core as core
 import filer_launch
 import filer_shell
 import settings as settings_module
+from traytools_send import pythonw_executable
 
 SETTINGS_SECTION = "filer"
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "filer_error.log"
+# F7 のコンテキストメニューを出す子プロセス(COM を使うのはそちらだけ)。
+CONTEXT_MENU_SCRIPT = Path(__file__).resolve().parent / "filer_contextmenu.py"
 
-# 落ち着いた暗色系の既定。settings.json の filer.colors に同じ名前で書けば1色ずつ上書きできる。
+# 既定の配色は、ユーザーのあふｗの「表示色」設定から拾った値(濃紺の地に白、カーソルは
+# シアンの下線、マークは灰色のグラデーション)。settings.json の filer.colors に同じ名前で
+# 書けば1色ずつ上書きできる。キーの名前は変えないこと(既に書いている人の設定が効かなくなる)。
 DEFAULT_COLORS = {
-    "background": "#1b1d21",
-    "text": "#d0d4da",
-    "directory": "#8cc4ff",
-    "hidden": "#6b717a",          # 隠し/システム属性。表示はするが薄く
-    "cursor": "#2f4a6b",          # アクティブ窓のカーソル行
-    "cursor_inactive": "#5a6270",  # 非アクティブ窓のカーソル(下線だけ)
-    "mark": "#d8b85a",            # マークした行(色反転で目立たせる)
-    "mark_text": "#1b1d21",
-    "mark_cursor": "#f0d890",     # マーク行にカーソルが乗っているとき
-    "header_active": "#2563eb",
+    "background": "#00001c",
+    "text": "#ffffff",            # 通常のファイル
+    "directory": "#80ffff",       # フォルダ(属性に関係なくこの色)
+    "system": "#808080",          # システム属性
+    "hidden": "#6c6c6c",          # 隠し属性(システムより少し暗く)
+    "readonly": "#ff0080",        # 読み込み専用
+    "cursor": "#00ffff",          # アクティブ窓のカーソルの下線(行の背景は塗らない)
+    "cursor_inactive": "#2a4a66",  # 非アクティブ窓のカーソルの下線(細く暗く)
+    "mark": "#7f7f7f",            # マークした行の背景(左端の色)
+    "mark_end": "#0c0c0c",        # マークした行の背景(右端の色。左→右のグラデーション)
+    "mark_text": "",              # マーク行の字の色。空ならファイルの種類の色のまま
+    "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
+    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログで選んでいる行
+    "header_active": "#1a3a8a",   # アクティブ窓のパス表示の地と枠
     "header_active_text": "#ffffff",
-    "header_inactive": "#2b2f36",
-    "header_inactive_text": "#9aa0a8",
-    "footer_text": "#9aa0a8",
+    "header_inactive": "#00001c",
+    "header_inactive_text": "#c0c0c0",
+    "footer_text": "#a0a0b0",
     "isearch": "#ffd400",
-    "log_background": "#141518",
-    "log_text": "#b8bec6",
+    "log_background": "#00001c",
+    "log_text": "#f9f9f9",
 }
+
+# カーソルの下線の太さ(px)。アクティブ窓ははっきり、非アクティブ窓は控えめに。
+CURSOR_LINE_ACTIVE = 3
+CURSOR_LINE_INACTIVE = 1
 
 DEFAULT_FONT_FAMILIES = ["MS Gothic", "ＭＳ ゴシック", "Consolas"]
 DEFAULT_FONT_SIZE = core.DEFAULT_FONT_SIZE
 DEFAULT_EDITOR = "notepad.exe"
+# F9 で開くシェル。pwsh.exe(PowerShell 7)にしたければ settings の filer.shell で。
+DEFAULT_SHELL = "powershell.exe"
 DEFAULT_LIST_TIMEOUT = 5.0
 RECENT_LIMIT = 50
 
@@ -218,7 +242,10 @@ class FileModel(QAbstractTableModel):
             if col == COL_NAME:
                 return core.split_name(entry)[0]
             if col == COL_EXT:
-                return core.split_name(entry)[1]
+                # あふｗと同じく点付き(.url)。名前の列とは別にして、長い名前は名前の側を
+                # … で省いても拡張子は必ず見えるようにする。
+                ext = core.split_name(entry)[1]
+                return f".{ext}" if ext else ""
             if col == COL_SIZE:
                 return core.format_size(entry)
             if col == COL_DATE:
@@ -250,26 +277,28 @@ class RowDelegate(QStyledItemDelegate):
         active = self.pane.is_active()
         rect = option.rect
 
-        bg = None
-        if marked:
-            bg = colors["mark_cursor"] if (is_cursor and active) else colors["mark"]
+        # 字の色はファイルの種類(フォルダ/システム/隠し/読み込み専用/通常)で決まる。
+        # マーク行でも変えない(あふｗの「通常ファイルの色とマーク背景」と同じ見え方)。
+        kind = entry.color_kind if entry is not None else "text"
+        fg = colors.get(kind) or colors["text"]
+        if marked and colors.get("mark_text"):
             fg = colors["mark_text"]
-        else:
-            if is_cursor and active:
-                bg = colors["cursor"]
-            if entry is not None and entry.hidden:
-                fg = colors["hidden"]
-            elif entry is not None and entry.is_dir:
-                fg = colors["directory"]
-            else:
-                fg = colors["text"]
         painter.save()
         try:
-            if bg:
-                painter.fillRect(rect, QColor(bg))
-            if is_cursor and not active:
-                painter.setPen(QPen(QColor(colors["cursor_inactive"]), 1))
-                painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+            if marked:
+                # マークは灰色のグラデーション。行全体で1本に見えるよう、列ごとではなく
+                # ビューポートの左端〜右端を基準にする。
+                width = max(self.pane.view.viewport().width(), 1)
+                gradient = QLinearGradient(0, 0, width, 0)
+                gradient.setColorAt(0.0, QColor(colors["mark"]))
+                gradient.setColorAt(1.0, QColor(colors.get("mark_end") or colors["mark"]))
+                painter.fillRect(rect, QBrush(gradient))
+            if is_cursor:
+                # カーソル行は背景を塗らず、下線だけ(あふｗのカーソル表示)。
+                thick = CURSOR_LINE_ACTIVE if active else CURSOR_LINE_INACTIVE
+                color = colors["cursor"] if active else colors["cursor_inactive"]
+                painter.fillRect(QRect(rect.left(), rect.bottom() - thick + 1,
+                                       rect.width(), thick), QColor(color))
             text = index.data(Qt.DisplayRole) or ""
             painter.setPen(QColor(fg))
             painter.setFont(option.font)
@@ -308,6 +337,56 @@ class FileView(QTableView):
         except Exception:  # noqa: BLE001
             _log_exception("viewResize")
 
+    # --- マウス ---
+    # マウスでは何も選ばない・動かさない(あふｗと同じく、指はキーボードに置いたまま)。
+    # クリックでカーソルが飛んだり窓が切り替わったりすると、キーで決めた対象が
+    # 知らないうちに変わる。できるのは「窓にキーが効くようにする」ことと、マークした
+    # ものを外のアプリへドラッグすることだけ。
+    def mousePressEvent(self, event):
+        try:
+            # キーが効くように、いまのアクティブ窓へフォーカスを渡す(押した側の窓には
+            # 切り替えない)。押した位置はドラッグの始まりとして覚えておく。
+            self.pane.window_.active.view.setFocus()
+            self._press_pos = (event.position().toPoint()
+                               if event.button() == Qt.LeftButton else None)
+        except Exception:  # noqa: BLE001
+            _log_exception("mousePress")
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        try:
+            start = getattr(self, "_press_pos", None)
+            if start is None or not (event.buttons() & Qt.LeftButton):
+                event.accept()
+                return
+            moved = (event.position().toPoint() - start).manhattanLength()
+            if moved >= QApplication.startDragDistance():
+                self._press_pos = None
+                self.pane.window_.start_drag(self.pane)
+        except Exception:  # noqa: BLE001
+            self.pane.window_.log(f"エラー: {_log_exception('drag')}")
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._press_pos = None
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        event.accept()
+
+    def wheelEvent(self, event):
+        """ホイールは一覧をスクロールするだけで、カーソル行は基本動かさない。ただし
+        カーソルが画面の外へ出そうになったら、画面の端の行まで連れてくる(あふｗと同じ。
+        見えない行が Enter や C の対象のまま残ると、何に効くのか分からなくなる)。"""
+        super().wheelEvent(event)
+        try:
+            self.pane.keep_cursor_visible()
+        except Exception:  # noqa: BLE001
+            _log_exception("wheel")
+
+    def contextMenuEvent(self, event):
+        event.accept()
+
     def focusInEvent(self, event):
         super().focusInEvent(event)
         try:
@@ -332,6 +411,8 @@ class ListBridge(QObject):
     # 書庫の展開: 進み具合 (済んだ数, 全体, 名前) と、終わったとき (ExtractResult)。
     progress = Signal(object)
     extracted = Signal(object)
+    # F7 のコンテキストメニュー(子プロセス)が終わったとき。値は終了コード。
+    context_done = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -362,8 +443,9 @@ class Pane(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        self.pane_font = QFont(window.list_font)
+        self.pane_font.setPointSize(window.pane_font_sizes[side])
         self.header = QLabel()
-        self.header.setFont(window.list_font)
         self.header.setTextFormat(Qt.PlainText)
         self.header.setContentsMargins(6, 2, 6, 2)
         layout.addWidget(self.header)
@@ -372,13 +454,14 @@ class Pane(QWidget):
         self.view = FileView(self)
         self.view.setModel(self.model)
         self.view.setItemDelegate(RowDelegate(self))
-        self.view.setFont(window.list_font)
         self.view.setSelectionMode(QAbstractItemView.NoSelection)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setShowGrid(False)
         self.view.setWordWrap(False)
         self.view.setTabKeyNavigation(False)
-        self.view.setFocusPolicy(Qt.StrongFocus)
+        # クリックではフォーカスを取らない(取ると focusIn で押した側の窓がアクティブに
+        # なってしまう)。フォーカスはキー操作と mousePressEvent が明示的に渡す。
+        self.view.setFocusPolicy(Qt.TabFocus)
         # 横には流さない。入りきらないときは fit_columns が列を減らす。
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.verticalHeader().hide()
@@ -388,7 +471,6 @@ class Pane(QWidget):
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
         for col in (COL_EXT, COL_SIZE, COL_DATE):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
-        self.view.doubleClicked.connect(self._on_double_clicked)
         layout.addWidget(self.view, 1)
 
         self.footer = QLabel()
@@ -399,20 +481,25 @@ class Pane(QWidget):
         # できなくなり、左右の境界も動かせなくなるので、横幅は文字に合わせない。
         for label in (self.header, self.footer):
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.apply_font(window.list_font)
+        self.apply_font(self.pane_font)
         self.apply_style()
 
     def apply_font(self, font) -> None:
         """一覧の字を差し替える。行の高さと列の幅も字に合わせて測り直す
-        (Shift/Ctrl+↑↓ の拡大縮小で、行が詰まったり列が欠けたりしないように)。"""
+        (Shift/Ctrl+↑↓ の拡大縮小で、行が重なったり列が欠けたりしないように)。"""
+        self.pane_font = QFont(font)
         for widget in (self.header, self.view, self.footer):
-            widget.setFont(font)
-        fm = QFontMetrics(font)
-        self.view.verticalHeader().setDefaultSectionSize(fm.height() + 2)
+            widget.setFont(self.pane_font)
+        fm = QFontMetrics(self.pane_font)
+        # 行の高さは字の高さちょうど(あふｗと同じく行間を空けない)。Qt の行は既定で
+        # 字より数px高く、一覧が間延びして見える。最小の高さも外しておかないと縮まない。
+        header = self.view.verticalHeader()
+        header.setMinimumSectionSize(1)
+        header.setDefaultSectionSize(fm.height())
         self._col_widths = {
             col: fm.horizontalAdvance(sample) + 8
-            for col, sample in ((COL_EXT, "MMMMMM"), (COL_SIZE, "9,999,999,999 "),
-                                (COL_DATE, "26-10-23 12:34 "))}
+            for col, sample in ((COL_EXT, ".MMMMM"), (COL_SIZE, "9,999,999,999 "),
+                                (COL_DATE, "26/10/23 12:34:56 "))}
         self._name_min = fm.horizontalAdvance("M" * 12)
         self.fit_columns()
 
@@ -464,6 +551,11 @@ class Pane(QWidget):
         if self.sort != core.DEFAULT_SORT:
             arrow = "↓" if self.sort["descending"] else "↑"
             text += f"   ({core.SORT_LABELS[self.sort['kind']]}{arrow})"
+        # Shift+Z で隠しているものがあることを小さく出す(見えないものがあると気付けるように)。
+        hidden_kinds = [label for label, shown in (("隠", self.window_.show_hidden),
+                                                   ("シ", self.window_.show_system)) if not shown]
+        if hidden_kinds:
+            text += f"   〈{'/'.join(hidden_kinds)} 非表示〉"
         if self.loading:
             text += "   …"
         self.header.setText(text)
@@ -503,6 +595,28 @@ class Pane(QWidget):
         self.view.selectionModel().setCurrentIndex(index, QItemSelectionModel.NoUpdate)
         self.view.scrollTo(index)
 
+    def keep_cursor_visible(self) -> None:
+        """カーソル行が画面の外なら、画面に全部見えている行のうち近い端の行へ移す。
+        画面の中にあるなら動かさない(ホイール用)。"""
+        if not self.entries:
+            return
+        viewport = self.view.viewport().rect()
+        first = self.view.rowAt(0)
+        last = self.view.rowAt(viewport.height() - 1)
+        if first < 0:
+            return
+        if last < 0:  # 一覧が画面より短い
+            last = len(self.entries) - 1
+        rows = [row for row in range(first, last + 1)
+                if viewport.contains(self.view.visualRect(self.model.index(row, 0)))]
+        if not rows:
+            return
+        row = self.cursor_row()
+        if row < rows[0]:
+            self.set_cursor(rows[0])
+        elif row > rows[-1]:
+            self.set_cursor(rows[-1])
+
     def page_rows(self) -> int:
         height = self.view.verticalHeader().defaultSectionSize() or 1
         return max(1, self.view.viewport().height() // height - 1)
@@ -518,13 +632,6 @@ class Pane(QWidget):
         if self.archive is not None:
             return os.path.dirname(self.archive[0])
         return self.path
-
-    def _on_double_clicked(self, index):
-        try:
-            self.set_cursor(index.row())
-            self.window_.run_command("enter")
-        except Exception:  # noqa: BLE001
-            self.window_.log(f"エラー: {_log_exception('doubleClick')}")
 
     # --- 一覧の読み込み ---
     def load(self, path: str, focus=None, history="visit", keep_marks=False,
@@ -634,8 +741,9 @@ class Pane(QWidget):
 
     def _rebuild(self) -> None:
         """マスクを掛け直して表示の並びを作る。マークは表示に残ったものだけ持ち越す。"""
-        visible = core.sort_entries(
-            core.filter_entries(self.all_entries, self.patterns), self.sort)
+        win = self.window_
+        shown = core.filter_attrs(self.all_entries, win.show_hidden, win.show_system)
+        visible = core.sort_entries(core.filter_entries(shown, self.patterns), self.sort)
         names = {e.name for e in visible}
         self.marks = {m for m in self.marks if m in names}
         self.entries = ([] if core.is_root(self.path) else [core.PARENT_ENTRY]) + visible
@@ -653,6 +761,21 @@ class Pane(QWidget):
     def reload(self, keep_marks=False, focus=None) -> None:
         if self.path:
             self.load(self.path, focus=focus, history=None, keep_marks=keep_marks, walk_up=True)
+
+    def refilter(self) -> None:
+        """表示の絞り込み(Shift+Z)が変わったときに並べ直す。カーソルは同じ項目に付いて
+        いき、その項目が消えたら同じ行の辺りに留まる。マークは見えているものだけ残る。"""
+        if not self.path:
+            self.update_header()
+            return
+        entry = self.cursor_entry()
+        name = entry.name if entry is not None else None
+        row = self.cursor_row()
+        self._rebuild()
+        target = self._row_of(name)
+        self.set_cursor(target if target is not None else row)
+        self.update_header()
+        self.update_footer()
 
     def set_sort(self, spec) -> None:
         """並べ方を変えて並べ直す。カーソルは同じ項目に付いていく。マークはそのまま。"""
@@ -695,7 +818,9 @@ class FilerWindow(QWidget):
             self.colors.update({k: v for k, v in user_colors.items()
                                 if k in DEFAULT_COLORS and isinstance(v, str)})
         self.keymap = core.build_keymap(section.get("keys"))
+        self.disabled_keys = core.disabled_codes(section.get("keys"))
         self.editor = section.get("editor") or DEFAULT_EDITOR
+        self.shell = section.get("shell") or DEFAULT_SHELL
         try:
             self.list_timeout = max(0.5, float(section.get("list_timeout_seconds")
                                                or DEFAULT_LIST_TIMEOUT))
@@ -713,6 +838,9 @@ class FilerWindow(QWidget):
         self.log_lines = core.clamp_log_lines(section.get("log_lines", core.DEFAULT_LOG_LINES), 99)
         # 書庫の展開中(進捗の窓が出ている間)。重ねて始めない。
         self._extracting = None
+        # Shift+Z の「隠しファイル / システムファイルを表示する」。既定はどちらも表示。
+        self.show_hidden = section.get("show_hidden") is not False
+        self.show_system = section.get("show_system") is not False
         # テストのときだけ SHFileOperation に足すフラグ(FOF_NOCONFIRMATION 等)。本番は 0。
         self.extra_op_flags = 0
         self._picker = None
@@ -726,6 +854,13 @@ class FilerWindow(QWidget):
         self.list_font.setStyleHint(QFont.Monospace)
         self.list_font.setPointSize(core.clamp_font_size(section.get("font_size")
                                                          or DEFAULT_FONT_SIZE))
+        # 一覧の字の大きさは左右の窓ごとに持つ(あふｗと同じく Shift/Ctrl+↑↓ は
+        # アクティブ窓だけに効く)。窓ごとの値が無ければ、以前の共通の font_size を使う。
+        # list_font は大きさの基準と、ダイアログ・メッセージ窓の字として残す。
+        self.pane_font_sizes = {
+            side: core.clamp_font_size(section.get(f"{side}_font_size")
+                                       or self.list_font.pointSize())
+            for side in ("left", "right")}
         # メッセージ窓の字は一覧の拡大縮小に付いていかない(行数で高さを決めているため)。
         self.log_font = QFont(self.list_font)
 
@@ -738,6 +873,7 @@ class FilerWindow(QWidget):
         self.bridge.finished.connect(self._on_list_finished)
         self.bridge.progress.connect(self._on_extract_progress)
         self.bridge.extracted.connect(self._on_extracted)
+        self.bridge.context_done.connect(self._on_context_done)
 
         # 左右の窓とメッセージ窓は QSplitter で区切る。境界はマウスでも動かせ、
         # Alt+矢印(あふｗと同じ)でも動かせる。どちらで動かしても同じ値を保存する。
@@ -886,7 +1022,8 @@ class FilerWindow(QWidget):
             "right_sort": self.right.sort,
             "split_ratio": self.split_ratio,
             "log_lines": self.log_lines,
-            "font_size": self.list_font.pointSize(),
+            "left_font_size": self.left.pane_font.pointSize(),
+            "right_font_size": self.right.pane_font.pointSize(),
         }
         if self.left.path:
             updates["left_path"] = self.left.path
@@ -1015,11 +1152,26 @@ class FilerWindow(QWidget):
             return  # Win キーとの組み合わせは使わない
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
-        code = core.scav(_vk_of(event), bool(mods & Qt.ShiftModifier),
-                         bool(mods & Qt.ControlModifier), bool(mods & Qt.AltModifier))
+        vk = _vk_of(event)
+        shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
+                            bool(mods & Qt.AltModifier))
+        code = core.scav(vk, shift, ctrl, alt)
         command = self.keymap.get(code)
         if command:
             self.run_command(command)
+            return
+        # Ctrl+英字 / Ctrl+数字 は頭文字ジャンプ。36 個をキー表に並べず、ここで一括で拾う
+        # (filer.keys で個別に割り当てたキーは上で先に処理され、空文字で外したキーは
+        # ここでも動かさない)。
+        char = core.initial_jump_char(vk, shift, ctrl, alt)
+        if char is not None and code not in self.disabled_keys:
+            self.jump_initial(char)
+
+    def jump_initial(self, char: str) -> None:
+        pane = self.active
+        row = core.initial_jump_index(pane.entries, char, pane.cursor_row())
+        if row is not None:
+            pane.set_cursor(row)
 
     def run_command(self, command: str) -> None:
         method = getattr(self, f"cmd_{command}", None)
@@ -1058,6 +1210,11 @@ class FilerWindow(QWidget):
             self._isearch_move()
             return True
         if key in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt):
+            return True
+        if core.initial_jump_char(_vk_of(event), bool(mods & Qt.ShiftModifier),
+                                  bool(mods & Qt.ControlModifier),
+                                  bool(mods & Qt.AltModifier)) is not None:
+            # Ctrl+英数字(頭文字ジャンプ)はサーチ中は効かせない。サーチを続ける。
             return True
         self.end_isearch()
         return False
@@ -1171,6 +1328,112 @@ class FilerWindow(QWidget):
         if opened:
             self.log(f"エディタ: {opened}ファイル ({self.editor})")
 
+    # --- 外のアプリで開く(F9 / F10) ---
+    def _real_folder(self):
+        """いまの窓の実フォルダ。書庫の中なら書庫ファイルのあるフォルダ(書庫の中の
+        パスは PowerShell もエクスプローラも開けない)。"""
+        pane = self.active
+        if pane.archive is not None:
+            return os.path.dirname(pane.archive[0])
+        return pane.path
+
+    # --- エクスプローラの右クリックメニュー(F7) ---
+    def cmd_context_menu(self):
+        """F7: マーク(無ければカーソル行。".." ならいまのフォルダ自身)のコンテキストメニュー。
+
+        メニューは COM(IContextMenu)でしか出せないので、子プロセス filer_contextmenu.py に
+        出させる。シェル拡張がまるごと読み込まれる場所なので、ファイラ本体には持ち込まない
+        (落ちても子プロセスだけで済む。CLAUDE.md の COM の項)。終わりは待たずに戻り、
+        終わったら両窓を読み直す(削除・改名・貼り付けなどをメニューから行った場合)。"""
+        pane = self.active
+        if pane.archive is not None:
+            self.log("書庫内ではコンテキストメニューは使えません")
+            return
+        if not pane.path:
+            return
+        paths = core.context_targets(pane.path, pane.entries, pane.marks, pane.cursor_row())
+        if not paths:
+            return
+        x, y = self._context_point(pane)
+        self.spawn_context_menu(paths, x, y)
+
+    def _context_point(self, pane):
+        """メニューを出す位置(物理ピクセルの画面座標)。カーソル行の左下。"""
+        view = pane.view
+        rect = view.visualRect(view.currentIndex())
+        local = rect.bottomLeft() if rect.isValid() else view.viewport().rect().center()
+        point = view.viewport().mapToGlobal(local)
+        screen = QGuiApplication.screenAt(point) or self.screen()
+        if screen is None:
+            return point.x(), point.y()
+        origin = screen.geometry().topLeft()
+        return core.to_native_point(point.x(), point.y(), origin.x(), origin.y(),
+                                    screen.devicePixelRatio())
+
+    def spawn_context_menu(self, paths, x: int, y: int) -> None:
+        args = core.context_menu_args(paths, x, y, self._hwnd())
+        if args is None:
+            # マークが多くて引数に載らない。一時 JSON で渡す(子が読んだら消す)。
+            fd, json_path = tempfile.mkstemp(prefix="filer_ctx_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(core.context_menu_payload(paths, x, y, self._hwnd()), f,
+                          ensure_ascii=False)
+            args = ["--json", json_path]
+        argv = [pythonw_executable(), str(CONTEXT_MENU_SCRIPT)] + args
+        # メニューの持ち主(子の非表示窓)が前面を取れるように、権利を譲ってから起こす。
+        filer_launch._allow_foreground()
+        try:
+            proc = subprocess.Popen(argv, close_fds=True)
+        except OSError as e:
+            self.log(f"コンテキストメニューを起動できません  ({e})")
+            return
+        bridge = self.bridge
+
+        def wait():
+            try:
+                code = proc.wait()
+            except Exception:  # noqa: BLE001
+                code = -1
+            try:
+                bridge.context_done.emit(code)
+            except RuntimeError:
+                pass  # 窓が先に閉じた
+
+        threading.Thread(target=wait, daemon=True, name="filer-contextmenu").start()
+
+    def _on_context_done(self, code) -> None:
+        try:
+            if code not in (0, None):
+                self.log(f"コンテキストメニューを出せませんでした（終了コード {code}）")
+            self.left.reload(keep_marks=True)
+            self.right.reload(keep_marks=True)
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('contextDone')}")
+
+    def cmd_open_shell(self):
+        """F9: いまのフォルダを作業フォルダにして PowerShell を新しい窓で開く。
+        パスはコマンド文字列に埋めず cwd で渡す(' や $ を含むフォルダ名で壊れない)。"""
+        folder = self._real_folder()
+        if not folder:
+            return
+        try:
+            subprocess.Popen([self.shell, "-NoExit"], cwd=folder,
+                             creationflags=subprocess.CREATE_NEW_CONSOLE, close_fds=True)
+            self.log(f"PowerShell: {folder}")
+        except OSError as e:
+            self.log(f"PowerShell を起動できません: {self.shell}  ({e})")
+
+    def cmd_open_explorer(self):
+        """F10: いまのフォルダをエクスプローラで開く。"""
+        folder = self._real_folder()
+        if not folder:
+            return
+        try:
+            subprocess.Popen(["explorer.exe", os.path.normpath(folder)], close_fds=True)
+            self.log(f"エクスプローラ: {folder}")
+        except OSError as e:
+            self.log(f"エクスプローラを起動できません  ({e})")
+
     # --- マーク ---
     def _toggle_mark(self, step: int) -> None:
         pane = self.active
@@ -1189,6 +1452,21 @@ class FilerWindow(QWidget):
 
     def cmd_mark_up(self):
         self._toggle_mark(-1)
+
+    def _mark_range(self, direction: int) -> None:
+        pane = self.active
+        names = core.range_mark_names(pane.entries, pane.marks, pane.cursor_row(), direction)
+        if not names:
+            return
+        pane.marks.update(names)
+        pane.model.all_changed()
+        pane.update_footer()
+
+    def cmd_mark_range_up(self):
+        self._mark_range(-1)
+
+    def cmd_mark_range_down(self):
+        self._mark_range(1)
 
     def _invert(self, include_dirs: bool) -> None:
         pane = self.active
@@ -1768,13 +2046,15 @@ class FilerWindow(QWidget):
         self.apply_layout()
 
     def _change_font(self, step: int) -> None:
-        size = core.clamp_font_size(self.list_font.pointSize() + step)
-        if size == self.list_font.pointSize():
+        """アクティブ窓の字だけを大きく/小さくする(あふｗと同じく左右別々)。"""
+        pane = self.active
+        size = core.clamp_font_size(pane.pane_font.pointSize() + step)
+        if size == pane.pane_font.pointSize():
             return
-        self.list_font.setPointSize(size)
-        for pane in (self.left, self.right):
-            pane.apply_font(self.list_font)
-            pane.set_cursor(pane.cursor_row())  # カーソル行を見える所に保つ
+        font = QFont(pane.pane_font)
+        font.setPointSize(size)
+        pane.apply_font(font)
+        pane.set_cursor(pane.cursor_row())  # カーソル行を見える所に保つ
 
     def cmd_font_smaller(self):
         self._change_font(-1)
@@ -1838,6 +2118,64 @@ class FilerWindow(QWidget):
             self.log(f"比較マーク: {len(names)}件")
         pane.model.all_changed()
         pane.update_footer()
+
+    # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
+    def cmd_settings_menu(self):
+        menu, chosen = self.build_menu("各種設定一時切替", [
+            ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
+            ("S", "システムファイルを表示する", "system", self.show_system),
+        ])
+        choice = self._exec_menu(menu, chosen)
+        if choice is not None:
+            self.toggle_attr_filter(choice)
+
+    def toggle_attr_filter(self, which: str) -> None:
+        """隠し/システムファイルの表示を切り替えて、両窓を並べ直す(カーソルは同じ項目に
+        付いていく)。属性は一覧を読んだときに取ってあるので読み直しは要らない。"""
+        if which == "hidden":
+            self.show_hidden = not self.show_hidden
+            label, on = "隠しファイル", self.show_hidden
+        else:
+            self.show_system = not self.show_system
+            label, on = "システムファイル", self.show_system
+        save_values(self.app_settings, self.settings_path,
+                    {"show_hidden": self.show_hidden, "show_system": self.show_system})
+        for pane in (self.left, self.right):
+            pane.refilter()
+        self.log(f"設定: {label}を{'表示する' if on else '表示しない'}")
+
+    # --- ドラッグ(ファイラから外のアプリへ) ---
+    def drag_mime(self, pane):
+        """ドラッグで渡す QMimeData。運ぶものが無ければ None(ドラッグを始めない)。
+
+        運ぶのはマークしたものだけ。マークが無ければ何もしない(マウスでは選ばない)。
+        setUrls(ローカルファイル)は Windows では CF_HDROP になり、エクスプローラや
+        メールにそのまま落とせる。"""
+        paths = core.drag_paths(pane.path or "", pane.entries, pane.marks)
+        if not paths:
+            return None
+        if pane.archive is not None:
+            self.log("書庫内からはドラッグできません")
+            return None
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        return mime
+
+    def start_drag(self, pane) -> None:
+        mime = self.drag_mime(pane)
+        if mime is None:
+            return
+        drag = QDrag(pane.view)
+        drag.setMimeData(mime)
+        # 既定はコピー。落とし先が移動を選ぶこともあるので、終わったら両窓を読み直す。
+        result = drag.exec(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
+        count = len(mime.urls())
+        if result == Qt.MoveAction:
+            self.log(f"ドラッグ: {count}件を移動しました")
+        elif result == Qt.CopyAction:
+            self.log(f"ドラッグ: {count}件を渡しました")
+        self.left.reload(keep_marks=True)
+        self.right.reload(keep_marks=True)
 
     # --- 閉じる ---
     def cmd_quit(self):
@@ -1917,19 +2255,44 @@ class FilerWindow(QWidget):
             return "add"
         return None
 
-    def choose_menu(self, title: str, items):
-        """先頭の文字キーで即決する小さなメニュー(あふｗの &MENU)。選んだ値か None。"""
+    def build_menu(self, title: str, items):
+        """先頭の文字キーで即決する小さなメニューを組む。(QMenu, {QAction: 値})。
+
+        items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
+        項目はチェック付きで出す(Shift+Z の ON/OFF)。先頭の項目を選んだ状態にしておく
+        (あふｗと同じく、開いてすぐ Enter で先頭が実行できるように)。"""
         menu = QMenu(self)
         menu.setTitle(title)
         chosen = {}
-        for key, label, value in items:
+        for item in items:
+            key, label, value = item[:3]
             action = menu.addAction(f"&{key}:{label}")
+            if len(item) > 3:
+                action.setCheckable(True)
+                action.setChecked(bool(item[3]))
             chosen[action] = value
+        first = next((a for a in menu.actions() if a.isEnabled() and not a.isSeparator()), None)
+        if first is not None:
+            menu.setActiveAction(first)
+        return menu, chosen
+
+    def _menu_pos(self):
         view = self.active.view
         rect = view.visualRect(view.currentIndex())
-        pos = view.viewport().mapToGlobal(rect.bottomLeft() if rect.isValid() else view.rect().center())
-        action = menu.exec(pos)
-        return chosen.get(action)
+        return view.viewport().mapToGlobal(
+            rect.bottomLeft() if rect.isValid() else view.rect().center())
+
+    def _exec_menu(self, menu, chosen):
+        first = menu.activeAction()
+        # 出した直後にも選び直す。popup の中で選択が外れる版の Qt があっても先頭に戻るように。
+        if first is not None:
+            QTimer.singleShot(0, lambda: menu.setActiveAction(first) if menu.isVisible() else None)
+        return chosen.get(menu.exec(self._menu_pos()))
+
+    def choose_menu(self, title: str, items):
+        """先頭の文字キーで即決する小さなメニュー(あふｗの &MENU)。選んだ値か None。"""
+        menu, chosen = self.build_menu(title, items)
+        return self._exec_menu(menu, chosen)
 
 
 # ---------------------------------------------------------------
@@ -1971,7 +2334,7 @@ class _KeyDialog(QDialog):
             label.setText(text)
             style = f"color: {c['text']}; padding: 2px 8px;"
             if index == self.row:
-                style += f" background-color: {c['cursor']};"
+                style += f" background-color: {c['dialog_cursor']};"
             border = c["header_active"] if index == framed else "transparent"
             style += f" border: 1px solid {border};"
             label.setStyleSheet(style)

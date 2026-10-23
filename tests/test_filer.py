@@ -48,6 +48,7 @@ def test_default_keymap_matches_afxw_key():
     assert km["0188"] == "back" and km["0190"] == "forward"
     assert km["4115"] == "quit"
     assert km["0074"] == "bookmark_jump" and km["1074"] == "path_jump"
+    assert km["0120"] == "open_shell" and km["0121"] == "open_explorer"   # F9 / F10
     # ←/→ は窓のアクティブ化だけ。親へ行くのは BS だけ
     assert km["0037"] == "focus_left" and km["0039"] == "focus_right"
     assert km["0008"] == "parent"
@@ -311,7 +312,7 @@ def test_formatting():
     assert core.format_size(E("d", True)) == "<DIR>"
     assert core.format_size(E("f", size=1234567)) == "1,234,567"
     stamp = time.mktime((2026, 10, 23, 9, 5, 0, 0, 0, -1))
-    assert core.format_mtime(stamp) == "26-10-23 09:05"
+    assert core.format_mtime(stamp + 7) == "26/10/23 09:05:07"
     assert core.format_bytes(2048).startswith("2,048 (2.0KB")
 
 
@@ -846,6 +847,52 @@ def test_bookmark_add_delete_move():
         w.close()
 
 
+def test_open_shell_and_explorer():
+    """F9 は PowerShell を cwd=いまのフォルダで、F10 はエクスプローラでいまのフォルダを。
+    書庫の中なら書庫のあるフォルダ。実際には起動せず、渡す引数だけ確かめる。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        with zipfile.ZipFile(left / "pack.zip", "w") as z:
+            z.writestr("in/a.txt", b"a")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "shell": "pwsh.exe"}}, None)
+        w.resize(900, 500)
+        w.show()
+        w.start()
+        _wait(w)
+        calls = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                calls.append((args, kwargs.get("cwd")))
+
+        original = filer.subprocess.Popen
+        filer.subprocess.Popen = FakePopen
+        try:
+            QTest.keyClick(w.active.view, Qt.Key_F9)
+            QTest.keyClick(w.active.view, Qt.Key_F10)
+            assert calls[0] == (["pwsh.exe", "-NoExit"], str(left)), calls
+            assert calls[1][0] == ["explorer.exe", os.path.normpath(str(left))], calls
+            # 書庫の中では書庫のあるフォルダ
+            w.active.load(str(left / "pack.zip" / "in"))
+            _wait(w)
+            assert w.active.archive is not None
+            calls.clear()
+            QTest.keyClick(w.active.view, Qt.Key_F9)
+            QTest.keyClick(w.active.view, Qt.Key_F10)
+            assert calls[0][1] == str(left), calls
+            assert calls[1][0][1] == os.path.normpath(str(left)), calls
+        finally:
+            filer.subprocess.Popen = original
+        w.close()
+        w.deleteLater()
+
+
 def test_single_instance_and_show():
     import filer
     import filer_launch
@@ -1215,6 +1262,7 @@ def test_window_archive():
 def test_window_layout_and_font():
     import filer
     from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFontMetrics
     from PySide6.QtTest import QTest
 
     _qapp()
@@ -1254,22 +1302,473 @@ def test_window_layout_and_font():
         assert w.log_lines == w._max_log_lines() and w.log_view.height() <= w.height() // 2 + 20
         key(Qt.Key_Down, Qt.AltModifier)
 
+        # 字の大きさは以前の共通の font_size から始まり、左右別々に変わる
+        assert w.left.pane_font.pointSize() == w.right.pane_font.pointSize() == 10
         row_h = w.left.view.verticalHeader().defaultSectionSize()
+        # 行間は空けない(行の高さ＝字の高さ)
+        assert row_h == QFontMetrics(w.left.pane_font).height(), row_h
         key(Qt.Key_Down, Qt.ControlModifier)            # 拡大
         key(Qt.Key_Down, Qt.ShiftModifier)
-        assert w.list_font.pointSize() == 12
-        assert w.left.view.verticalHeader().defaultSectionSize() >= row_h
-        assert w.right.view.font().pointSize() == 12    # 両窓に効く
+        assert w.left.pane_font.pointSize() == 12
+        assert w.left.view.font().pointSize() == 12
+        assert w.left.view.verticalHeader().defaultSectionSize() > row_h
+        assert w.right.pane_font.pointSize() == 10      # 反対窓には効かない
+        assert w.right.view.font().pointSize() == 10
         key(Qt.Key_Up, Qt.ShiftModifier)                # 縮小
-        assert w.list_font.pointSize() == 11
+        assert w.left.pane_font.pointSize() == 11
         assert _cursor_name(w.left) == ".."             # カーソルは動かない(PgUp ではない)
+        key(Qt.Key_Tab)                                 # 右窓だけを小さく。8 より小さくならない
+        for _ in range(10):
+            key(Qt.Key_Up, Qt.ShiftModifier)
+        assert w.right.pane_font.pointSize() == core.FONT_SIZE_MIN == 8
+        assert w.left.pane_font.pointSize() == 11
+        key(Qt.Key_Tab)
 
         lines = w.log_lines
         key(Qt.Key_Q)
         QTest.qWait(20)
         stored = json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
         assert stored["split_ratio"] == core.SPLIT_MIN, stored["split_ratio"]
-        assert stored["log_lines"] == lines and stored["font_size"] == 11
+        assert stored["log_lines"] == lines
+        assert stored["left_font_size"] == 11 and stored["right_font_size"] == 8
+        w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# 属性(Shift+Z・表示色)・ドラッグ・マウス・カーソルの描画
+# ---------------------------------------------------------------
+import stat as _stat  # noqa: E402
+
+HIDDEN = _stat.FILE_ATTRIBUTE_HIDDEN
+SYSTEM = _stat.FILE_ATTRIBUTE_SYSTEM
+READONLY = _stat.FILE_ATTRIBUTE_READONLY
+
+
+def test_attr_filter_and_color_kind():
+    entries = [core.PARENT_ENTRY, F("plain"), F("h", attrs=HIDDEN), F("s", attrs=SYSTEM),
+               F("hs", attrs=HIDDEN | SYSTEM), F("hdir", is_dir=True, attrs=HIDDEN)]
+    names = lambda h, s: [e.name for e in core.filter_attrs(entries, h, s)]  # noqa: E731
+    assert names(True, True) == ["..", "plain", "h", "s", "hs", "hdir"]
+    assert names(False, True) == ["..", "plain", "s"]          # 隠しフォルダも消える
+    assert names(True, False) == ["..", "plain", "h", "hdir"]  # 両方持つものはどちらでも消える
+    assert names(False, False) == ["..", "plain"]
+    assert F("x").color_kind == "text"
+    assert F("x", attrs=READONLY).color_kind == "readonly"
+    assert F("x", attrs=HIDDEN | READONLY).color_kind == "hidden"
+    assert F("x", attrs=SYSTEM | HIDDEN).color_kind == "system"
+    assert F("d", is_dir=True, attrs=HIDDEN | READONLY).color_kind == "directory"  # 属性に関係なく
+    assert core.DEFAULT_KEYMAP["1090"] == "settings_menu"
+
+
+def test_zip_dos_attrs():
+    import zipfile
+    import filer_archive as fa
+
+    class Info:
+        def __init__(self, external_attr, create_system=0):
+            self.external_attr = external_attr
+            self.create_system = create_system
+
+    assert fa.zip_dos_attrs(Info(0x02 | 0x20)) == HIDDEN               # アーカイブ属性は落とす
+    assert fa.zip_dos_attrs(Info(0x07)) == HIDDEN | SYSTEM | READONLY
+    assert fa.zip_dos_attrs(Info((0o100644 << 16) | 0x02, create_system=3)) == 0  # Unix 製は見ない
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "attrs.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            for name, attr in (("plain.txt", 0x20), ("hidden.txt", 0x02), ("sys.txt", 0x04)):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 0
+                info.external_attr = attr
+                z.writestr(info, b"x")
+        index = fa.get_index(path)
+        attrs = {e.name: e.attrs for e in index.list_dir("")}
+        assert attrs == {"plain.txt": 0, "hidden.txt": HIDDEN, "sys.txt": SYSTEM}, attrs
+
+
+def test_drag_paths():
+    entries = [core.PARENT_ENTRY, F("a.txt"), F("d", is_dir=True), F("b.txt")]
+    assert core.drag_paths("C:\\x", entries, set()) == []           # マークが無ければ運ばない
+    assert core.drag_paths("C:\\x", entries, {"b.txt", "d", ".."}) == ["C:\\x\\d", "C:\\x\\b.txt"]
+
+
+def _set_attrs(path, attrs):
+    import ctypes
+    from ctypes import wintypes
+    fn = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+    fn.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    fn.restype = wintypes.BOOL
+    assert fn(str(path), attrs), ctypes.get_last_error()
+
+
+def test_window_menu_attrs_mouse_drag_drawing():
+    import filer
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QColor, QWheelEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        hidden = left / "zz_hidden.txt"
+        system = left / "zz_system.txt"
+        readonly = left / "zz_readonly.txt"
+        for p in (hidden, system, readonly):
+            p.write_bytes(b"x")
+        _set_attrs(hidden, 0x02)
+        _set_attrs(system, 0x04)
+        _set_attrs(readonly, 0x01)
+        many = right / "many"
+        many.mkdir()
+        for i in range(120):
+            (many / f"f{i:03d}.txt").write_bytes(b"x")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(many)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        try:
+            # 1. メニューは先頭の項目が選ばれた状態で開く(Enter 一発で先頭)
+            menu, chosen = w.build_menu("複写", [("O", "反対窓にコピー", "copy"),
+                                                 ("Q", "キャンセル", None)])
+            assert menu.activeAction() is menu.actions()[0]
+            menu.popup(w.mapToGlobal(QPoint(50, 50)))
+            QTest.qWait(30)
+            assert menu.activeAction() is menu.actions()[0]
+            menu.close()
+            # choose_menu も同じ組み方を通る(Enter 相当＝いま選ばれている項目を返す)
+            seen_first = []
+            w._exec_menu = lambda m, c: (seen_first.append(m.activeAction().text()),
+                                         c[m.activeAction()])[1]
+            L.set_cursor(L._row_of("alpha.txt"))
+            assert w.choose_menu("移動", [("O", "反対窓に移動", "move"),
+                                          ("Q", "キャンセル", None)]) == "move"
+
+            # 2. Shift+Z: 先頭(隠しファイル)を Enter → 隠しが消える。カーソルは付いていく
+            assert {"zz_hidden.txt", "zz_system.txt"} <= set(_names(L))
+            key(Qt.Key_Z, Qt.ShiftModifier)
+            assert seen_first[-1].startswith("&H")
+            assert "zz_hidden.txt" not in _names(L) and "zz_system.txt" in _names(L)
+            assert _cursor_name(L) == "alpha.txt" and "〈隠 非表示〉" in L.header.text()
+            w._exec_menu = lambda m, c: "system"
+            key(Qt.Key_Z, Qt.ShiftModifier)
+            assert "zz_system.txt" not in _names(L) and "〈隠/シ 非表示〉" in L.header.text()
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
+            assert stored["show_hidden"] is False and stored["show_system"] is False
+            w._exec_menu = lambda m, c: "hidden"
+            key(Qt.Key_Z, Qt.ShiftModifier)
+            w._exec_menu = lambda m, c: "system"
+            key(Qt.Key_Z, Qt.ShiftModifier)
+            assert {"zz_hidden.txt", "zz_system.txt"} <= set(_names(L))
+            assert "〈" not in L.header.text()
+
+            # 3. カーソル行は背景を塗らず下線だけ(アクティブはシアン、非アクティブは控えめ)
+            L.set_cursor(L._row_of("beta.md"))
+            QTest.qWait(30)
+            image = L.view.viewport().grab().toImage()
+            rect = L.view.visualRect(L.model.index(L.cursor_row(), 0))
+            x = rect.right() - 3
+            bg = QColor(filer.DEFAULT_COLORS["background"])
+            top_px = QColor(image.pixel(x, rect.top() + 1))
+            assert top_px == bg, top_px.name()
+            assert QColor(image.pixel(x, rect.bottom())).name() == filer.DEFAULT_COLORS["cursor"]
+            assert QColor(image.pixel(x, rect.bottom() - filer.CURSOR_LINE_ACTIVE)) == bg
+            image_r = R.view.viewport().grab().toImage()
+            rect_r = R.view.visualRect(R.model.index(R.cursor_row(), 0))
+            assert QColor(image_r.pixel(rect_r.right() - 3, rect_r.bottom())).name() == \
+                filer.DEFAULT_COLORS["cursor_inactive"]
+            # マーク行はマーク背景(左端は mark の灰色)。カーソルが乗れば下線も
+            L.marks.add("beta.md")
+            L.model.all_changed()
+            QTest.qWait(30)
+            image = L.view.viewport().grab().toImage()
+            mark_px = QColor(image.pixel(1, rect.top() + 1))
+            assert mark_px != bg and abs(mark_px.red() - 0x7f) < 12, mark_px.name()
+            assert QColor(image.pixel(x, rect.bottom())).name() == filer.DEFAULT_COLORS["cursor"]
+            L.marks.clear()
+            L.model.all_changed()
+
+            # 4. マウス: クリック・ダブルクリック・右クリックは何もしない
+            before = (L.path, _cursor_name(L), w.active_side)
+            sub_rect = L.view.visualRect(L.model.index(L._row_of("sub1"), 0))
+            QTest.mouseClick(L.view.viewport(), Qt.LeftButton, Qt.NoModifier, sub_rect.center())
+            QTest.mouseDClick(L.view.viewport(), Qt.LeftButton, Qt.NoModifier, sub_rect.center())
+            QTest.mouseClick(L.view.viewport(), Qt.RightButton, Qt.NoModifier, sub_rect.center())
+            _wait(w)
+            assert (L.path, _cursor_name(L), w.active_side) == before
+            r_rect = R.view.visualRect(R.model.index(5, 0))
+            QTest.mouseClick(R.view.viewport(), Qt.LeftButton, Qt.NoModifier, r_rect.center())
+            assert w.active_side == "left" and R.cursor_row() == 0    # 窓も切り替わらない
+            # ホイールは一覧のスクロール。カーソルは画面の外へ出そうなときだけ
+            # 画面の端の行へ付いてくる(あふｗと同じ)
+            bar = R.view.verticalScrollBar()
+            assert bar.maximum() > 0 and bar.value() == 0
+
+            def roll(delta):
+                QApplication.sendEvent(R.view.viewport(), QWheelEvent(
+                    QPointF(r_rect.center()),
+                    QPointF(R.view.viewport().mapToGlobal(r_rect.center())),
+                    QPoint(0, 0), QPoint(0, delta), Qt.NoButton, Qt.NoModifier,
+                    Qt.NoScrollPhase, False))
+
+            def top_visible_row():
+                rows = [r for r in range(len(R.entries))
+                        if R.view.viewport().rect().contains(
+                            R.view.visualRect(R.model.index(r, 0)))]
+                return rows[0], rows[-1]
+
+            roll(-120)                                     # 先頭にカーソル → 下へ回す
+            first, _last = top_visible_row()
+            assert bar.value() > 0 and first > 0
+            assert R.cursor_row() == first                 # 画面内の一番上の行へ
+            # 画面の中にあるカーソルは動かさない
+            R.set_cursor(first + 1)
+            roll(120)                                      # 上へ戻す(カーソルはまだ画面内)
+            assert R.cursor_row() == first + 1
+            # カーソルが画面の一番下の行にあるとき上へ回すと、下端の外へ出そうになるので
+            # 新しい画面の一番下の行へ付いてくる
+            roll(-120 * 3)
+            before_last = top_visible_row()[1]
+            R.set_cursor(before_last)
+            roll(120)
+            new_last = top_visible_row()[1]
+            assert new_last < before_last
+            assert R.cursor_row() == new_last, (R.cursor_row(), new_last)
+
+            # 5. ドラッグで運ぶのはマークしたものだけ。マークが無ければ始めない
+            assert w.drag_mime(L) is None
+            L.marks.update({"alpha.txt", "sub2"})
+            mime = w.drag_mime(L)
+            got = sorted(os.path.normcase(u.toLocalFile().replace("/", "\\")) for u in mime.urls())
+            want = sorted(os.path.normcase(str(p)) for p in (left / "alpha.txt", left / "sub2"))
+            assert got == want, got
+            L.marks.clear()
+            # 書庫の中からはドラッグしない
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            L.marks.add("readme.txt")
+            assert w.drag_mime(L) is None
+            assert "書庫内からはドラッグできません" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
+            for p in (hidden, system, readonly):
+                _set_attrs(p, 0x80)   # FILE_ATTRIBUTE_NORMAL。後片付けで消せるように
+
+
+# ---------------------------------------------------------------
+# F7 コンテキストメニュー・頭文字ジャンプ・範囲マーク
+# ---------------------------------------------------------------
+def test_context_targets_and_args():
+    entries = [core.PARENT_ENTRY, F("d", is_dir=True), F("a.txt"), F("b.txt")]
+    folder = "C:\\x"
+    assert core.context_targets(folder, entries, set(), 2) == ["C:\\x\\a.txt"]
+    assert core.context_targets(folder, entries, {"b.txt", "d"}, 0) == ["C:\\x\\d", "C:\\x\\b.txt"]
+    assert core.context_targets(folder, entries, set(), 0) == [folder]   # ".." ならフォルダ自身
+    assert core.context_targets(folder, [], set(), -1) == [folder]
+    assert core.DEFAULT_KEYMAP["0118"] == "context_menu"
+    # Qt の論理座標 → 物理座標(画面の左上はそのまま、中は拡大率で)
+    assert core.to_native_point(100, 50, 0, 0, 1.5) == (150, 75)
+    assert core.to_native_point(1920 + 100, 50, 1920, 0, 2.0) == (2120, 100)
+    assert core.to_native_point(10, 10, 0, 0, None) == (10, 10)
+    # 引数の受け渡し(往復で同じものが戻る。"-" で始まる名前も取り違えない)
+    paths = ["C:\\x\\a b.txt", "C:\\x\\-dash"]
+    args = core.context_menu_args(paths, 10, -20, 1234)
+    parsed = core.parse_context_args(args)
+    assert parsed["paths"] == paths and (parsed["x"], parsed["y"], parsed["owner"]) == (10, -20, 1234)
+    assert parsed["list"] is False and parsed["repeat"] == 1
+    assert core.parse_context_args(["--list", "--repeat", "3", "--", "C:\\a"])["repeat"] == 3
+    many = [f"C:\\folder\\{'x' * 100}_{i}.txt" for i in range(200)]
+    assert core.context_menu_args(many, 0, 0) is None                    # 長すぎれば JSON で
+    with tempfile.TemporaryDirectory() as tmp:
+        jpath = os.path.join(tmp, "a.json")
+        with open(jpath, "w", encoding="utf-8") as f:
+            json.dump(core.context_menu_payload(many, 5, 6, 7), f)
+        parsed = core.parse_context_args(["--json", jpath])
+        assert parsed["paths"] == many and (parsed["x"], parsed["y"], parsed["owner"]) == (5, 6, 7)
+
+
+def test_contextmenu_child_list_mode():
+    """子プロセスにメニューを組み立てさせて項目を出させる(画面には何も出さない)。
+    gc.collect を挟んで繰り返しても落ちないこと(CLAUDE.md の COM の寿命の教訓)。"""
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "filer_contextmenu.py"
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "a.txt").write_text("a", encoding="utf-8")
+        Path(tmp, "b.txt").write_text("b", encoding="utf-8")
+        Path(tmp, "sub").mkdir()
+        for targets, repeat in (([Path(tmp, "a.txt")], 20),
+                                ([Path(tmp, "a.txt"), Path(tmp, "b.txt"), Path(tmp, "sub")], 20),
+                                ([Path(tmp)], 5)):                     # フォルダ自身(".." の上)
+            proc = subprocess.run(
+                [sys.executable, str(script), "--list", "--repeat", str(repeat), "--"]
+                + [str(p) for p in targets],
+                capture_output=True, timeout=180)
+            out = proc.stdout.decode("utf-8", "replace")
+            assert proc.returncode == 0, (proc.returncode, proc.stderr.decode("utf-8", "replace"))
+            assert out.rstrip().endswith("done"), out[-500:]
+            rows = [line.split("\t") for line in out.splitlines() if line.count("\t") == 3]
+            rounds = {r[0] for r in rows}
+            assert len(rounds) == repeat, rounds
+            labels = [r[3] for r in rows if r[0] == "0" and r[3]]
+            assert len(labels) >= 3, labels
+            assert any(("プロパティ" in l) or ("Properties" in l) for l in labels), labels
+
+
+def test_initial_jump_and_range_mark_logic():
+    entries = [core.PARENT_ENTRY, F("Apple", is_dir=True), F("banana"), F("apricot.txt"),
+               F("1st.txt"), F("avocado")]
+    assert core.initial_jump_char(65, ctrl=True) == "a"
+    assert core.initial_jump_char(49, ctrl=True) == "1"
+    assert core.initial_jump_char(97, ctrl=True) == "1"                 # テンキーの 1
+    assert core.initial_jump_char(65, ctrl=True, shift=True) is None   # Ctrl+Shift は対象外
+    assert core.initial_jump_char(65, ctrl=True, alt=True) is None
+    assert core.initial_jump_char(65) is None
+    assert core.initial_jump_char(35, ctrl=True) is None                # Ctrl+End などは別
+    jump = core.initial_jump_index
+    assert jump(entries, "a", 0) == 1 and jump(entries, "a", 1) == 3
+    assert jump(entries, "a", 3) == 5 and jump(entries, "a", 5) == 1    # 末尾から先頭へ巡回
+    assert jump(entries, "1", 0) == 4 and jump(entries, "z", 0) is None
+    assert jump(entries, ".", 0) is None                                # ".." は対象外
+    assert core.disabled_codes({"2065": "", "2066": "quit", "bad": ""}) == {"2065"}
+
+    rows = [core.PARENT_ENTRY, F("d", is_dir=True), F("a"), F("b"), F("c"), F("e")]
+    rm = core.range_mark_names
+    assert rm(rows, {"d"}, 4, -1) == {"d", "a", "b", "c"}               # 直上のマークから
+    assert rm(rows, {"e"}, 2, 1) == {"a", "b", "c", "e"}                # 直下のマークから
+    assert rm(rows, {"e"}, 2, -1) == set()                              # その方向に無ければ何も
+    assert rm(rows, {"c"}, 4, -1) == set()                              # カーソル行自身は数えない
+    assert rm(rows, {"c", "a"}, 4, -1) == {"a", "b", "c"}
+    assert rm(rows, set(), 3, -1) == set()
+    assert core.DEFAULT_KEYMAP["2032"] == "mark_range_up"
+    assert core.DEFAULT_KEYMAP["3032"] == "mark_range_down"
+
+
+class _FakeProc:
+    def __init__(self, argv, **kwargs):
+        _FakeProc.calls.append(argv)
+
+    def wait(self):
+        return 0
+
+
+def test_window_f7_jump_range():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "keys": {"2071": ""}}}, str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        real_popen = filer.subprocess.Popen
+        _FakeProc.calls = []
+        filer.subprocess.Popen = _FakeProc
+        try:
+            # F7: カーソル行 → 子プロセスを正しい引数で起こす
+            L.set_cursor(L._row_of("alpha.txt"))
+            key(Qt.Key_F7)
+            argv = _FakeProc.calls[-1]
+            assert argv[1].endswith("filer_contextmenu.py") and "--" in argv
+            assert argv[argv.index("--") + 1:] == [os.path.join(L.path, "alpha.txt")]
+            assert int(argv[argv.index("--owner") + 1]) == int(w.winId())
+            _wait(w)
+            # マークがあればマーク、".." ならいまのフォルダ自身
+            L.marks.update({"beta.md", "sub1"})
+            key(Qt.Key_F7)
+            argv = _FakeProc.calls[-1]
+            assert argv[argv.index("--") + 1:] == [os.path.join(L.path, n) for n in ("sub1", "beta.md")]
+            L.marks.clear()
+            L.set_cursor(0)
+            key(Qt.Key_F7)
+            argv = _FakeProc.calls[-1]
+            assert argv[argv.index("--") + 1:] == [L.path]
+            # 長すぎるときは一時 JSON で渡す
+            old = core.CONTEXT_ARGS_MAX
+            core.CONTEXT_ARGS_MAX = 10
+            try:
+                L.set_cursor(L._row_of("alpha.txt"))
+                key(Qt.Key_F7)
+            finally:
+                core.CONTEXT_ARGS_MAX = old
+            argv = _FakeProc.calls[-1]
+            jpath = argv[argv.index("--json") + 1]
+            parsed = core.parse_context_args(["--json", jpath])
+            assert parsed["paths"] == [os.path.join(L.path, "alpha.txt")]
+            os.remove(jpath)
+            # 終わったら読み直す(エラーは出さない)
+            _wait(w)
+            assert "出せませんでした" not in w.log_view.toPlainText()
+            # 書庫の中では起こさない
+            count = len(_FakeProc.calls)
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            key(Qt.Key_F7)
+            assert len(_FakeProc.calls) == count
+            assert "書庫内ではコンテキストメニューは使えません" in w.log_view.toPlainText()
+            key(Qt.Key_Backspace)
+            _wait(w)
+        finally:
+            filer.subprocess.Popen = real_popen
+
+        # 頭文字ジャンプ: Ctrl+S で sub1 → sub2 → sub1(巡回)。書庫の中でも効く
+        L.set_cursor(0)
+        key(Qt.Key_S, Qt.ControlModifier)
+        assert _cursor_name(L) == "sub1"
+        key(Qt.Key_S, Qt.ControlModifier)
+        assert _cursor_name(L) == "sub2"
+        key(Qt.Key_S, Qt.ControlModifier)
+        assert _cursor_name(L) == "sub1"
+        key(Qt.Key_P, Qt.ControlModifier)
+        assert _cursor_name(L) == "pack.zip"                  # 上の書庫のテストで作ったもの
+        key(Qt.Key_P, Qt.ControlModifier)
+        assert _cursor_name(L) == "photo.JPG"                 # 大文字小文字は無視
+        key(Qt.Key_Z, Qt.ControlModifier)                      # 一致なし: 動かない
+        assert _cursor_name(L) == "photo.JPG"
+        key(Qt.Key_G, Qt.ControlModifier)                      # filer.keys で外したキーは動かない
+        assert _cursor_name(L) == "photo.JPG"
+        key(Qt.Key_S, Qt.ControlModifier | Qt.ShiftModifier)  # Ctrl+Shift は対象外
+        assert _cursor_name(L) == "photo.JPG"
+        key(Qt.Key_F)                                          # サーチ中はサーチ側が先
+        key(Qt.Key_B, Qt.ControlModifier)
+        assert _cursor_name(L) == "photo.JPG"
+        key(Qt.Key_Escape)
+
+        # 範囲マーク: Ctrl+Space は直上のマークから、Shift+Ctrl+Space は直下のマークから
+        L.marks.clear()
+        L.marks.add("sub2")
+        L.set_cursor(L._row_of("gamma.txt"))
+        key(Qt.Key_Space, Qt.ControlModifier)
+        assert L.marks == {"sub2", "alpha.txt", "beta.md", "gamma.txt"}, L.marks
+        assert _cursor_name(L) == "gamma.txt"                  # カーソルは動かない
+        L.marks.clear()
+        L.marks.add("photo.JPG")
+        L.set_cursor(L._row_of("alpha.txt"))
+        key(Qt.Key_Space, Qt.ControlModifier | Qt.ShiftModifier)
+        assert L.marks == {"alpha.txt", "beta.md", "gamma.txt", "pack.zip", "photo.JPG"}, L.marks
+        L.marks.clear()
+        L.set_cursor(L._row_of("alpha.txt"))
+        key(Qt.Key_Space, Qt.ControlModifier)                  # マークが無ければ何もしない
+        assert L.marks == set()
+        w.close()
         w.deleteLater()
 
 

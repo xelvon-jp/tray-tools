@@ -343,6 +343,7 @@ DEFAULT_SETTINGS = {
     # 簡易2画面ファイラ(filer.py)。あふｗを入れられない PC で、あふｗと同じキーで
     # ファイルを扱うためのもの。窓は別プロセス。
     #   editor … E / V / Shift+Enter で開くエディタ(1ファイルずつ起こす)
+    #   shell … F9 で開くシェル(既定 powershell.exe。pwsh.exe なども可)
     #   list_timeout_seconds … フォルダの読み取りを見切るまでの秒数。UNC や切断された
     #     ネットワークドライブで窓が固まらないように、これを過ぎたら元のフォルダに留まる
     #   archive_timeout_seconds … 書庫(.zip/.7z)の中の一覧を見切るまでの秒数。大きな書庫や
@@ -356,11 +357,14 @@ DEFAULT_SETTINGS = {
     #   font_families … 一覧の字(既定は MS Gothic)
     # このほか geometry / maximized / left_path / right_path / active / recent /
     # left_sort / right_sort / compare_include_dirs / split_ratio(左右の境界) /
-    # log_lines(メッセージ窓の行数) / font_size(一覧の字の大きさ。Shift/Ctrl+↑↓ で変わる)
+    # log_lines(メッセージ窓の行数) / left_font_size・right_font_size(左右それぞれの一覧の
+    # 字の大きさ。Shift/Ctrl+↑↓ でアクティブ窓だけ変わる。無ければ以前の共通の font_size) /
+    # show_hidden・show_system(Shift+Z の隠し/システムファイルの表示。無ければ表示する)
     # はアプリが閉じるときなどに書き足す。left_path / right_path は書庫の中のパスのことも
     # ある(次回もその書庫の中が開く)。
     "filer": {
         "editor": "notepad.exe",
+        "shell": "powershell.exe",
         "list_timeout_seconds": 5,
         "archive_timeout_seconds": 30,
         "time_tolerance_sec": 2,

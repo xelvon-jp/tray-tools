@@ -127,6 +127,22 @@ class Member:
     size: int = 0
     mtime: float = 0.0
     encrypted: bool = False
+    attrs: int = 0       # DOS 属性(隠し・システム・読み込み専用)。取れなければ 0
+
+
+# ZIP の external_attr の下位バイトに入る DOS 属性のうち、表示に使うもの。
+_DOS_ATTR_MASK = 0x01 | 0x02 | 0x04  # 読み込み専用 / 隠し / システム
+
+
+def zip_dos_attrs(info) -> int:
+    """ZIP のエントリの DOS 属性(読み込み専用・隠し・システム)。取れなければ 0。
+
+    external_attr の下位16ビットは、Windows(MS-DOS 互換)で作った ZIP なら DOS 属性。
+    Unix で作った ZIP は上位16ビットがモードで、下位は 0 か意味の無い値なので見ない
+    (create_system 3 = Unix。誤って「隠し」と読んで消えて見えるより、出す方がよい)。"""
+    if getattr(info, "create_system", 0) == 3:
+        return 0
+    return int(getattr(info, "external_attr", 0)) & _DOS_ATTR_MASK
 
 
 class ArchiveIndex:
@@ -161,7 +177,8 @@ class ArchiveIndex:
         else:
             self.members[inner] = member
         self.dirs.setdefault(parent, {})[name.casefold()] = core.Entry(
-            name, member.is_dir, 0 if member.is_dir else member.size, member.mtime)
+            name, member.is_dir, 0 if member.is_dir else member.size, member.mtime,
+            member.attrs)
         if member.is_dir:
             self.dirs.setdefault(inner, {})
 
@@ -197,7 +214,8 @@ def _build_zip(path: str) -> ArchiveIndex:
                 index.skipped += 1
                 continue
             index.add(inner, Member(info.filename, info.is_dir(), info.file_size,
-                                    _zip_mtime(info), bool(info.flag_bits & 0x1)))
+                                    _zip_mtime(info), bool(info.flag_bits & 0x1),
+                                    zip_dos_attrs(info)))
     return index
 
 

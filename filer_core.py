@@ -60,6 +60,8 @@ DEFAULT_KEYMAP = {
     # --- マーク ---
     "0032": "mark_down",          # Space
     "1032": "mark_up",            # Shift+Space
+    "2032": "mark_range_up",      # Ctrl+Space 直上のマークからカーソル位置まで全てマーク
+    "3032": "mark_range_down",    # Shift+Ctrl+Space 直下のマークからカーソル位置まで
     "0036": "invert_files",       # Home ファイルだけ反転
     "0065": "invert_files",       # A
     "1036": "invert_all",         # Shift+Home フォルダも反転
@@ -85,6 +87,7 @@ DEFAULT_KEYMAP = {
     "0070": "isearch",            # F
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
+    "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示)
     "0087": "compare_mark",       # W 同名ファイル比較マーク
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
@@ -103,6 +106,10 @@ DEFAULT_KEYMAP = {
     "2045": "clip_copy",          # Ctrl+Ins
     "2046": "clip_cut",           # Ctrl+Del
     "1045": "clip_paste",         # Shift+Ins
+    # --- 外のアプリで開く ---
+    "0120": "open_shell",         # F9 いまのフォルダで PowerShell
+    "0121": "open_explorer",      # F10 いまのフォルダをエクスプローラで
+    "0118": "context_menu",       # F7 エクスプローラの右クリックメニュー(AFXW.key K0054 "0118:0226")
     # --- 閉じる ---
     # Esc は割り当てない。あふｗの Esc は「各処理の中止」で、ファイル窓を閉じない
     # (サーチ中の Esc はサーチの終了として先に処理される)。
@@ -119,7 +126,7 @@ SPLIT_MIN = 0.15           # 片方の窓がこれより細くならない
 DEFAULT_LOG_LINES = 5
 LOG_LINES_MIN = 1
 DEFAULT_FONT_SIZE = 10
-FONT_SIZE_MIN = 6
+FONT_SIZE_MIN = 8
 FONT_SIZE_MAX = 32
 
 
@@ -210,6 +217,39 @@ class Entry:
     @property
     def hidden(self) -> bool:
         return bool(self.attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
+
+    @property
+    def color_kind(self) -> str:
+        """表示色の種類。あふｗの表示色設定と同じ分け方で、フォルダは属性に関係なく
+        フォルダの色(「フォルダは属性に関係無く指定色」にチェックが入った設定)。
+        ファイルはシステム > 隠し > 読み込み専用 > 通常 の順に見る。"""
+        if self.is_dir:
+            return "directory"
+        if self.attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+            return "system"
+        if self.attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+            return "hidden"
+        if self.attrs & stat.FILE_ATTRIBUTE_READONLY:
+            return "readonly"
+        return "text"
+
+
+def attr_visible(entry: "Entry", show_hidden: bool = True, show_system: bool = True) -> bool:
+    """Shift+Z の「隠しファイル / システムファイルを表示する」に照らして見せるか。
+    両方の属性を持つものは、どちらか一方でも非表示ならば見せない。".." は常に見せる。"""
+    if entry.is_parent:
+        return True
+    if not show_hidden and entry.attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+        return False
+    if not show_system and entry.attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+        return False
+    return True
+
+
+def filter_attrs(entries, show_hidden: bool = True, show_system: bool = True) -> list:
+    if show_hidden and show_system:
+        return list(entries)
+    return [e for e in entries if attr_visible(e, show_hidden, show_system)]
 
 
 PARENT_ENTRY = Entry("..", True, is_parent=True)
@@ -465,6 +505,17 @@ def filter_entries(entries, patterns: list) -> list:
 # ---------------------------------------------------------------
 # マーク
 # ---------------------------------------------------------------
+def drag_paths(folder: str, entries, marks) -> list:
+    """マウスのドラッグで外へ運ぶファイルのフルパス。マークしたものだけ(一覧の並び順)。
+
+    あふｗと同じく、マウスでは選ばない。押した位置の行もカーソル行も運ばない。
+    マークが無ければ空(＝ドラッグを始めない)。".." は運ばない。"""
+    if not marks:
+        return []
+    return [os.path.join(folder, e.name) for e in entries
+            if e.name in marks and not e.is_parent]
+
+
 def pick_targets(entries, marks, cursor_index: int) -> list:
     """操作の対象。マークがあればマークしたもの(一覧の並び順)、無ければカーソル位置。
 
@@ -525,7 +576,9 @@ def format_mtime(mtime: float) -> str:
     if not mtime:
         return ""
     try:
-        return time.strftime("%y-%m-%d %H:%M", time.localtime(mtime))
+        # あふｗと同じ書式(26/10/23 09:05:00)。秒まで出すのは、同じ分に保存した
+        # ファイルの新旧を見分けるため(W の比較マークの前の目視にも効く)。
+        return time.strftime("%y/%m/%d %H:%M:%S", time.localtime(mtime))
     except (OSError, OverflowError, ValueError):
         return ""
 
@@ -786,3 +839,148 @@ def compare_marks(mine, theirs, size_cond="any", time_cond="any", include_dirs=F
                 found.add(e.name)
                 break
     return found
+
+
+# ---------------------------------------------------------------
+# エクスプローラの右クリックメニュー(F7)
+# ---------------------------------------------------------------
+# メニューそのものは COM(IContextMenu)が要るので、ファイラ本体ではなく子プロセス
+# (filer_contextmenu.py)が出す。ここには、どちらのプロセスでも使う「何を・どこに」を
+# 決める部分だけを置く(COM も Qt も使わない)。
+
+# コマンドラインに載せる長さの上限(文字)。Windows の上限は 32767 文字だが、余裕を
+# 見てこれを超えたら一時 JSON で渡す(マークを何百件もしたとき)。
+CONTEXT_ARGS_MAX = 8000
+
+
+def context_targets(folder: str, entries, marks, cursor_index: int) -> list:
+    """F7 のメニューの対象(フルパス)。
+
+    マークがあればマークしたもの、無ければカーソル行。カーソルが ".." でマークも
+    無ければ、いま見ているフォルダ自身(あふｗで「..」の上から出すと「.」が対象になる
+    のと同じ)。"""
+    targets = pick_targets(entries, marks, cursor_index)
+    if targets:
+        return [os.path.join(folder, e.name) for e in targets]
+    return [folder] if folder else []
+
+
+def to_native_point(x: float, y: float, origin_x: int, origin_y: int, dpr: float):
+    """Qt の論理座標(画面の左上は物理座標のまま、その中が拡大率で縮んでいる)を、
+    Win32 の物理座標にする。拡大率の違う画面が並んでいても、その画面の左上を基準に
+    戻せば合う(Qt 6 の Windows での座標の持ち方)。"""
+    dpr = dpr or 1.0
+    return (int(round(origin_x + (x - origin_x) * dpr)),
+            int(round(origin_y + (y - origin_y) * dpr)))
+
+
+def context_menu_args(paths, x: int, y: int, owner: int = 0):
+    """子プロセスへ渡す引数。長すぎるなら None(呼ぶ側が一時 JSON で渡す)。
+
+    パスは "--" の後ろに並べる("-" で始まる名前を指定と取り違えないように)。"""
+    args = ["--x", str(int(x)), "--y", str(int(y)), "--owner", str(int(owner or 0)), "--"]
+    args += [str(p) for p in paths]
+    if sum(len(a) + 3 for a in args) > CONTEXT_ARGS_MAX:
+        return None
+    return args
+
+
+def context_menu_payload(paths, x: int, y: int, owner: int = 0) -> dict:
+    """一時 JSON で渡すときの中身(context_menu_args と同じ情報)。"""
+    return {"paths": [str(p) for p in paths], "x": int(x), "y": int(y),
+            "owner": int(owner or 0)}
+
+
+def parse_context_args(argv) -> dict:
+    """子プロセス側の引数の読み取り。{"paths", "x", "y", "owner", "list", "repeat", "json"}。
+
+    --json があればそのファイルから paths/x/y/owner を読む(読んだら消すのは呼ぶ側)。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="filer_contextmenu.py", add_help=False)
+    parser.add_argument("--x", type=int, default=0)
+    parser.add_argument("--y", type=int, default=0)
+    parser.add_argument("--owner", type=int, default=0)
+    parser.add_argument("--json")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("paths", nargs="*")
+    ns = parser.parse_args(list(argv))
+    result = {"paths": list(ns.paths), "x": ns.x, "y": ns.y, "owner": ns.owner,
+              "list": ns.list, "repeat": max(1, ns.repeat), "json": ns.json}
+    if ns.json:
+        import json
+
+        with open(ns.json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        result.update(paths=[str(p) for p in data.get("paths", [])],
+                      x=int(data.get("x", 0)), y=int(data.get("y", 0)),
+                      owner=int(data.get("owner", 0)))
+    return result
+
+
+# ---------------------------------------------------------------
+# 頭文字ジャンプ(Ctrl+英字 / Ctrl+数字。あふｗ AFXW.TXT 290-291行)
+# ---------------------------------------------------------------
+def initial_jump_char(vk: int, shift: bool = False, ctrl: bool = False, alt: bool = False):
+    """Ctrl だけを押した英数字キーなら、その文字(英字は小文字)。それ以外は None。
+
+    テンキーの 0〜9(VK 96〜105)も数字として扱う。Ctrl+Shift / Ctrl+Alt は対象外。"""
+    if not ctrl or shift or alt:
+        return None
+    if 65 <= vk <= 90:
+        return chr(vk).lower()
+    if 48 <= vk <= 57:
+        return chr(vk)
+    if 96 <= vk <= 105:
+        return chr(vk - 48)
+    return None
+
+
+def disabled_codes(overrides) -> set:
+    """settings.json の filer.keys で空文字(や null)にして外したキー。
+    頭文字ジャンプのように一括で割り当てるものも、ここに挙がったキーでは動かさない。"""
+    if not isinstance(overrides, dict):
+        return set()
+    return {code for code, command in overrides.items()
+            if isinstance(code, str) and _SCAV_RE.match(code) and not command}
+
+
+def initial_jump_index(entries, char: str, current: int):
+    """名前が char で始まる(大文字小文字を無視)次の項目の添字。無ければ None。
+
+    カーソルの次の行から下へ探し、末尾まで無ければ先頭から巡回する(押すたびに次へ)。
+    ".." は対象外。一致がカーソル行1つだけなら、そこに留まる。"""
+    if not char or not entries:
+        return None
+    key = char.casefold()
+    count = len(entries)
+    start = current if 0 <= current < count else -1
+    for step in range(1, count + 1):
+        index = (start + step) % count
+        entry = entries[index]
+        if not entry.is_parent and entry.name.casefold().startswith(key):
+            return index
+    return None
+
+
+# ---------------------------------------------------------------
+# 範囲マーク(Ctrl+Space / Shift+Ctrl+Space。AFXW.TXT「直上/直下のマークから
+# カーソル位置まで全てマーク」)
+# ---------------------------------------------------------------
+def range_mark_names(entries, marks, cursor: int, direction: int) -> set:
+    """新しくマークする名前の集まり。
+
+    direction が -1 ならカーソルより上で一番近いマーク行から、+1 なら下で一番近い
+    マーク行から、カーソル行までを全部(フォルダも)。カーソル行自身のマークは数えない
+    (「直上/直下のマーク」なので、その行から外側を探す)。その方向にマークが無ければ
+    空(何もしない)。".." はマークしない。カーソルは動かさない(呼ぶ側も動かさない)。"""
+    if not (0 <= cursor < len(entries)) or not marks:
+        return set()
+    row = cursor + direction
+    while 0 <= row < len(entries):
+        if entries[row].name in marks and not entries[row].is_parent:
+            low, high = sorted((row, cursor))
+            return {e.name for e in entries[low:high + 1] if not e.is_parent}
+        row += direction
+    return set()

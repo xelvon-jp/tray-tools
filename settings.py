@@ -359,6 +359,10 @@ DEFAULT_SETTINGS = {
     #     従来どおり関連付けで開く。Ctrl+Enter は常に関連付け)
     #   winmerge … Alt+W で使う WinMergeU.exe。空ならレジストリの App Paths と
     #     Program Files / LOCALAPPDATA の既定の場所を探す
+    #   ext_colors … 拡張子別表示色。[{"color": "#RRGGBB", "exts": ["zip", "7z"]}, ...] の並びで、
+    #     上の行が勝つ。色が付くのは一覧の拡張子の列だけ。書かれていなければ
+    #     filer_core.DEFAULT_EXT_COLORS(あふｗの設定から拾った色)。Z の設定ダイアログで
+    #     変えるとここが書き換わる
     #   show_fkey_bar … 窓の下にファンクションキーの段(F1〜F12。押せる)を出すか
     #   fkey_labels … その段の表示名だけの上書き。{"F7": "右クリ", "Shift+F10": "再読込"}
     #     (あふｗの4桁 "0118" でも書ける)。割り当てそのものは keys で変える
@@ -370,6 +374,8 @@ DEFAULT_SETTINGS = {
     # viewer_geometry(ビュアの窓の位置と大きさ。ビュアを閉じたときに書く)
     # はアプリが閉じるときなどに書き足す。left_path / right_path は書庫の中のパスのことも
     # ある(次回もその書庫の中が開く)。
+    # よく行くフォルダ(Shift+H)の記録と一括改名(Shift+R)の履歴は settings.json ではなく
+    # リポジトリの外(%LOCALAPPDATA%\traytools)に置く(公開リポジトリに入れないため)。
     "filer": {
         "editor": "notepad.exe",
         "shell": "powershell.exe",

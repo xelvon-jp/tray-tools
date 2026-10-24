@@ -69,6 +69,7 @@ DEFAULT_KEYMAP = {
     # --- 再読込 ---
     "0035": "reload",             # End (マーククリア)
     "2035": "reload_keep",        # Ctrl+End (マーク保持)
+    "0116": "reload_keep",        # F5 (エクスプローラの F5 と同じく最新にするだけ。マークは保持)
     "1035": "reload_other",       # Shift+End 反対窓
     # --- 左右の窓のパス ---
     "0079": "sync_to_other",      # O 自分を反対窓と同じパスに
@@ -88,7 +89,14 @@ DEFAULT_KEYMAP = {
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
     "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示)
+    "1072": "frecency_jump",      # Shift+H よく行くフォルダへ(zoxide 風)
+    "4066": "flat_view",          # Alt+B フラット表示(Total Commander の Ctrl+B)
+    "0114": "preview_toggle",     # F3 プレビュー(反対窓の位置に出す)
+    "1082": "batch_rename",       # Shift+R 一括改名(Renemo 風)
+    "4082": "rename_menu",        # Alt+R 改名メニュー(AFXW.key の Alt+R と同じ指で)
     "0087": "compare_mark",       # W 同名ファイル比較マーク
+    "0090": "settings_dialog",    # Z 設定(あふｗの Z ＝設定プログラム起動)
+    "0191": "live_filter",        # / ライブ絞り込み(XYplorer の Live Filter / yazi の filter)
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
     "0080": "zip_create",         # P ZIP 圧縮(反対窓に作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
@@ -505,6 +513,90 @@ def filter_entries(entries, patterns: list) -> list:
 
 
 # ---------------------------------------------------------------
+# ライブ絞り込み(/)
+# ---------------------------------------------------------------
+def parse_live_filter(text: str) -> list:
+    """絞り込みの語。空白区切りで、すべてを含むものを残す(AND)。大文字小文字は無視。"""
+    return [word.casefold() for word in (text or "").split() if word]
+
+
+def live_filter_entries(entries, words: list) -> list:
+    """名前に words をすべて含むものだけ残す。フォルダは常に残す(マスクと同じく、
+    絞り込み中でも移動できるように)。フラット表示では名前が相対パスなので、
+    フォルダ名で絞ることもできる。"""
+    if not words:
+        return list(entries)
+    found = []
+    for e in entries:
+        if e.is_dir:
+            found.append(e)
+            continue
+        name = e.name.casefold()
+        if all(word in name for word in words):
+            found.append(e)
+    return found
+
+
+# ---------------------------------------------------------------
+# フラット表示(Alt+B。Total Commander のブランチビュー)
+# ---------------------------------------------------------------
+FLAT_LIMIT = 200_000
+
+
+def collect_flat(root: str, show_hidden: bool = True, show_system: bool = True,
+                 limit: int = FLAT_LIMIT, cancel=None, progress=None):
+    """root より下のファイルを全部集める(フォルダ自体は入れない)。読み取りスレッドで呼ぶ。
+
+    (項目, 状態) を返す。項目の名前は root からの相対パス("2026-10\\log_001.txt")。
+    状態は "done" / "limit"(limit 件で打ち切った) / "cancel"(cancel が立った)。
+    - シンボリックリンク・ジャンクション(再解析ポイント)のフォルダはたどらない(ループ防止)
+    - 隠し・システムは show_hidden / show_system(Shift+Z)に従う。隠しフォルダの中にも入らない
+    - 読めないフォルダは飛ばす(全体を止めない)
+    - progress(件数) をフォルダごとに呼ぶ"""
+    found = []
+    stack = [root]
+    while stack:
+        if cancel is not None and cancel.is_set():
+            return found, "cancel"
+        folder = stack.pop()
+        subdirs = []
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    attrs = getattr(st, "st_file_attributes", 0)
+                    if not show_hidden and attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+                        continue
+                    if not show_system and attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                        continue
+                    if attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
+                        if not attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                            subdirs.append(entry.path)
+                        continue
+                    found.append(Entry(os.path.relpath(entry.path, root), False,
+                                       st.st_size, st.st_mtime, attrs))
+                    if len(found) >= limit:
+                        return found, "limit"
+        except OSError:
+            continue
+        stack.extend(sorted(subdirs, key=str.casefold, reverse=True))
+        if progress is not None:
+            progress(len(found))
+    return found, "done"
+
+
+def flat_footer_text(files: int, total: int, mark_count: int = 0, mark_bytes: int = 0) -> str:
+    """フラット表示のときの窓の下の行。件数と合計サイズ。"""
+    text = f"{files} {'Files' if files >= 2 else 'File'}   {total:,} bytes"
+    if mark_count:
+        text += f"   Mark {mark_count} ({mark_bytes:,})"
+    return text
+
+
+# ---------------------------------------------------------------
 # マーク
 # ---------------------------------------------------------------
 def drag_paths(folder: str, entries, marks) -> list:
@@ -703,7 +795,14 @@ COMMAND_SHORT_NAMES = {
     "path_jump": "Jump",
     "desktop": "Desktop",
     "drive": "Drive",
+    "live_filter": "Filter",
+    "frecency_jump": "Frequent",
+    "flat_view": "Flat",
+    "preview_toggle": "Preview",
+    "batch_rename": "Renemo",
+    "rename_menu": "RenameMenu",
     "settings_menu": "Settings",
+    "settings_dialog": "Config",
     "swap_paths": "Swap",
     "sync_to_other": "Sync",
     "sync_other_to_me": "Sync他",
@@ -873,6 +972,186 @@ def rename_selection_length(name: str, is_dir: bool) -> int:
         return len(name)
     stem, _ext = os.path.splitext(name)
     return len(stem)
+
+
+# ---------------------------------------------------------------
+# ファイル情報の編集(R。あふｗの「ファイル情報の編集 / 一括変更」)
+# ---------------------------------------------------------------
+def caret_position(name: str, is_dir: bool) -> int:
+    """ファイル名の入力欄を開いたときのキャレットの位置。拡張子の手前(".webp" の "." の前)。
+    拡張子の無い名前・フォルダ・先頭がドットの名前(.gitignore)は末尾。何も選ばない。"""
+    return rename_selection_length(name, is_dir)
+
+
+CASE_MODES = ("lower", "swap", "upper")
+
+
+def _convert(text: str, mode: str) -> str:
+    if mode == "lower":
+        return text.lower()
+    if mode == "upper":
+        return text.upper()
+    if mode == "swap":
+        return text.swapcase()
+    return text
+
+
+def convert_case(name: str, part: str, mode: str, is_dir: bool = False) -> str:
+    """「変換」の枠。part は "all"(名前全体)か "ext"(拡張子だけ)、mode は
+    "lower" / "upper" / "swap"(大小の入れ替え)。フォルダの「拡張子」は変えない。"""
+    if part == "all":
+        return _convert(name, mode)
+    if is_dir:
+        return name
+    stem, ext = os.path.splitext(name)
+    return stem + _convert(ext, mode)
+
+
+# SetFileAttributesW で変えられる属性のうち、ダイアログで扱う4つ。
+ATTR_FLAGS = {
+    "readonly": stat.FILE_ATTRIBUTE_READONLY,
+    "system": stat.FILE_ATTRIBUTE_SYSTEM,
+    "hidden": stat.FILE_ATTRIBUTE_HIDDEN,
+    "archive": stat.FILE_ATTRIBUTE_ARCHIVE,
+}
+# SetFileAttributesW に渡してよい属性(これ以外のビット、例えばフォルダの印は渡さない)。
+SETTABLE_ATTRS = (stat.FILE_ATTRIBUTE_READONLY | stat.FILE_ATTRIBUTE_HIDDEN
+                  | stat.FILE_ATTRIBUTE_SYSTEM | stat.FILE_ATTRIBUTE_ARCHIVE
+                  | stat.FILE_ATTRIBUTE_TEMPORARY | stat.FILE_ATTRIBUTE_OFFLINE
+                  | stat.FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+FILE_ATTRIBUTE_NORMAL = stat.FILE_ATTRIBUTE_NORMAL
+
+
+def compose_attrs(current: int, changes: dict) -> int:
+    """今の属性に changes({"readonly": True/False, ...}。書いていないものは変えない)を
+    重ねた、SetFileAttributesW に渡す値。何も立たなければ FILE_ATTRIBUTE_NORMAL。"""
+    value = current & SETTABLE_ATTRS
+    for key, on in changes.items():
+        flag = ATTR_FLAGS[key]
+        value = (value | flag) if on else (value & ~flag)
+    return value or FILE_ATTRIBUTE_NORMAL
+
+
+def attrs_to_flags(attrs: int) -> dict:
+    return {key: bool(attrs & flag) for key, flag in ATTR_FLAGS.items()}
+
+
+def make_timestamp(year, month, day, hour, minute, second, base=None):
+    """入力された年月日時分秒を時刻(秒)にする。(時刻, None) か (None, 理由)。
+
+    一括変更であふｗと同じく年・月・日をすべて 0 にしたときは、base(そのファイルの
+    元の日時)の年月日のまま時分秒だけを変える。base が無ければ誤り。"""
+    from datetime import datetime
+
+    try:
+        values = [int(v) for v in (year, month, day, hour, minute, second)]
+    except (TypeError, ValueError):
+        return None, "日時が数字ではありません"
+    year, month, day, hour, minute, second = values
+    if year == month == day == 0:
+        if base is None:
+            return None, "年月日が 0 です"
+        original = datetime.fromtimestamp(base)
+        year, month, day = original.year, original.month, original.day
+    try:
+        stamp = datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None, (f"存在しない日時です: {year:04d}/{month:02d}/{day:02d} "
+                      f"{hour:02d}:{minute:02d}:{second:02d}")
+    if stamp.year < 1980:
+        # FAT や ZIP が扱えない古い日付。NTFS では持てるが、事故の元なので止める。
+        return None, "1980年より前の日時は設定できません"
+    try:
+        return time.mktime(stamp.timetuple()), None
+    except (OverflowError, ValueError) as e:
+        return None, f"日時を設定できません: {e}"
+
+
+def plan_file_info(entry, new_name=None, mtime=None, attr_changes=None) -> dict:
+    """1件ぶんの変更内容。変わらないものは入れない(何も無ければ空の dict)。
+
+    {"old": 元の名前, "new": 新しい名前, "mtime": 新しい日時, "attrs": 新しい属性}。
+    名前は大文字小文字だけの違いも「変わった」とみなす。日時は1秒未満の差を無視する。"""
+    plan = {}
+    if new_name is not None and new_name != entry.name:
+        plan["new"] = new_name
+    if mtime is not None and abs(mtime - entry.mtime) >= 1:
+        plan["mtime"] = mtime
+    if attr_changes:
+        current = entry.attrs & SETTABLE_ATTRS
+        wanted = compose_attrs(entry.attrs, attr_changes)
+        if (wanted & ~FILE_ATTRIBUTE_NORMAL) != current:
+            plan["attrs"] = wanted
+    if plan:
+        plan["old"] = entry.name
+    return plan
+
+
+def plan_bulk_info(entries, case_all=None, case_ext=None, stamp_fields=None,
+                   attr_changes=None):
+    """一括変更の計画。([1件ごとの変更], [(名前, 理由)])。
+
+    case_all / case_ext は変換("lower" / "upper" / "swap" か None)、stamp_fields は
+    (年, 月, 日, 時, 分, 秒) か None(変えない)、attr_changes は変えるものだけの dict。
+    年月日が 0/0/0 なら、それぞれのファイルの年月日のまま時分秒だけ変える(あふｗと同じ)。"""
+    plans, problems = [], []
+    for entry in entries:
+        if entry.is_parent:
+            continue
+        name = entry.name
+        if case_all:
+            name = convert_case(name, "all", case_all, entry.is_dir)
+        if case_ext:
+            name = convert_case(name, "ext", case_ext, entry.is_dir)
+        mtime = None
+        if stamp_fields is not None:
+            mtime, problem = make_timestamp(*stamp_fields, base=entry.mtime)
+            if problem:
+                problems.append((entry.name, problem))
+                continue
+        plan = plan_file_info(entry, name, mtime, attr_changes)
+        if plan:
+            plans.append(plan)
+    return plans, problems
+
+
+def rename_collision(existing, renames: dict):
+    """改名したあとの名前が、フォルダの中で(大文字小文字を無視して)重なるか。
+    重なる名前を返す。無ければ None。
+
+    existing はフォルダの中の名前、renames は {元の名前: 新しい名前}。自分自身の
+    大文字小文字だけの改名(a.txt → A.TXT)は重なりにしない。一括で小文字にしたら
+    2つが同じ名前になった、も見つける。"""
+    final = {name: renames.get(name, name) for name in existing}
+    for old, new in renames.items():
+        final.setdefault(old, new)
+    seen = {}
+    for old, name in final.items():
+        key = name.casefold()
+        if key in seen and seen[key] != old:
+            # 知らせるのは「付けようとした名前」の側(どれと重なったかが分かるように)。
+            other = seen[key]
+            return name if old in renames else final[other]
+        seen[key] = old
+    return None
+
+
+def describe_file_info(plan: dict) -> str:
+    """メッセージ窓に出す1件の変更点の要約。"""
+    parts = []
+    if "new" in plan:
+        parts.append(f"{plan['old']} → {plan['new']}")
+    else:
+        parts.append(plan["old"])
+    if "mtime" in plan:
+        parts.append("日時 " + time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(plan["mtime"])))
+    if "attrs" in plan:
+        flags = attrs_to_flags(plan["attrs"])
+        letters = "".join(letter for key, letter in (("readonly", "R"), ("hidden", "H"),
+                                                     ("system", "S"), ("archive", "A"))
+                          if flags[key])
+        parts.append(f"属性 {letters or '-'}")
+    return "  ".join(parts)
 
 
 def name_conflicts(existing, new_name: str, old_name: str = None) -> bool:
@@ -1177,6 +1456,47 @@ def opens_in_viewer(name: str, extensions) -> bool:
 
 
 # ---------------------------------------------------------------
+# プレビュー(F3)
+# ---------------------------------------------------------------
+PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico".split())
+PREVIEW_TEXT_LINES = 200
+PREVIEW_TEXT_BYTES = 256 * 1024
+PREVIEW_ARCHIVE_MAX = 4 * 1024 * 1024     # 書庫の中はこれ以下だけ取り出して見せる
+PREVIEW_FOLDER_NAMES = 40
+
+
+def preview_kind(entry, text_extensions) -> str:
+    """プレビューで何を出すか。"none"(何も無い・"..")/ "folder" / "text" / "image" / "info"。
+    テキストかどうかはビュアと同じ拡張子の表(filer.viewer_extensions)で決める。"""
+    if entry is None or entry.is_parent:
+        return "none"
+    if entry.is_dir:
+        return "folder"
+    ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+    if ext in PREVIEW_IMAGE_EXTS:
+        return "image"
+    if ext and ext in text_extensions:
+        return "text"
+    return "info"
+
+
+def fit_size(width: int, height: int, box_w: int, box_h: int):
+    """(width, height) を縦横比を保って box に収めた大きさ。拡大はしない。"""
+    if width <= 0 or height <= 0 or box_w <= 0 or box_h <= 0:
+        return max(width, 0), max(height, 0)
+    scale = min(box_w / width, box_h / height, 1.0)
+    return max(1, int(width * scale)), max(1, int(height * scale))
+
+
+def info_lines(name: str, entry) -> list:
+    """「その他」のプレビュー(名前・サイズ・日時・属性)。"""
+    return [name, "",
+            f"サイズ  {format_size(entry)}" + ("" if entry.is_dir else " バイト"),
+            f"日時    {format_mtime(entry.mtime)}",
+            f"属性    {attr_letters(entry) or '-'}"]
+
+
+# ---------------------------------------------------------------
 # ZIP 圧縮(P)
 # ---------------------------------------------------------------
 def default_zip_name(folder: str, targets) -> str:
@@ -1218,7 +1538,9 @@ def zip_plan(folder: str, names, exclude=None, walk=os.walk) -> list:
                 for f in sorted(files, key=str.casefold):
                     add(os.path.join(root, f), f"{rel_root}/{f}", False)
         else:
-            add(path, name, False)
+            # フラット表示では名前が "sub\file.txt" のような相対パスなので、書庫の中の
+            # 区切りは "/" に揃える(フォルダ構成を保ったまま入る)。
+            add(path, name.replace("\\", "/"), False)
     return plan
 
 
@@ -1298,3 +1620,223 @@ def registry_winmerge_paths() -> list:
         except OSError:
             continue
     return paths
+
+
+# ---------------------------------------------------------------
+# 拡張子別表示色(あふｗの「各種登録 > 拡張子別表示色」)
+# ---------------------------------------------------------------
+# 色はユーザーのあふｗの設定画面の色の帯から拾った値。拡張子の並びは本人と決めたもの。
+# 先に一致した行が勝つ(あふｗと同じ)。settings の filer.ext_colors で丸ごと差し替わる。
+DEFAULT_EXT_COLORS = [
+    {"color": "#0000ff", "exts": "zip 7z rar lzh cab tar gz tgz bz2 xz zst iso".split()},
+    {"color": "#ff0000", "exts": "exe msi msix bat cmd ps1 vbs".split()},
+    {"color": "#804000",
+     "exts": "jpg jpeg png gif bmp webp heic svg tif tiff ico psd ai eps".split()},
+    {"color": "#00ff00", "exts": "mp3 m4a aac flac wav ogg opus wma mid".split()},
+    {"color": "#0080ff", "exts": "html htm css js ts json xml yaml yml py sh ipynb".split()},
+    {"color": "#800040", "exts": "txt md log csv tsv ini inf cfg conf toml".split()},
+    {"color": "#008000", "exts": "reg db sqlite accdb".split()},
+    {"color": "#800080", "exts": "docx xlsx xlsm pptx doc xls ppt pdf vsdx msg".split()},
+    {"color": "#b5b500", "exts": "mp4 mov mkv webm avi wmv m4v mpg mpeg".split()},
+    {"color": "#808080", "exts": "dll sys ocx drv cpl".split()},
+    {"color": "#808080", "exts": "lnk url".split()},
+]
+
+_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def normalize_exts(value) -> list:
+    """拡張子の並びを、点や * を除いた小文字に揃える(重複は最初の1つだけ)。
+    文字列なら空白・カンマ・セミコロンで区切る("*.Zip .7z rar" → ["zip", "7z", "rar"])。"""
+    if isinstance(value, str):
+        value = re.split(r"[\s,;]+", value)
+    if not isinstance(value, (list, tuple)):
+        return []
+    found = []
+    for item in value:
+        ext = str(item).strip().lstrip("*").lstrip(".").lower()
+        if ext and ext not in found:
+            found.append(ext)
+    return found
+
+
+def normalize_ext_colors(value) -> list:
+    """settings.json の filer.ext_colors を [{"color", "exts"}] に揃える。
+
+    手で書かれた設定なので、色の書式が違う行・拡張子の無い行は黙って捨てる。値が
+    配列でなければ(書かれていなければ)既定。空の配列は「色を付けない」として尊重する。"""
+    if not isinstance(value, list):
+        value = DEFAULT_EXT_COLORS
+    rules = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        color = str(row.get("color", "")).strip()
+        exts = normalize_exts(row.get("exts"))
+        if _COLOR_RE.match(color) and exts:
+            rules.append({"color": color.lower(), "exts": exts})
+    return rules
+
+
+def ext_color_map(rules) -> dict:
+    """{拡張子: 色}。同じ拡張子が複数の行にあれば、上の行(先に一致したもの)が勝つ。"""
+    found = {}
+    for row in rules:
+        for ext in row["exts"]:
+            found.setdefault(ext, row["color"])
+    return found
+
+
+def ext_color_for(entry, color_map: dict):
+    """一覧の拡張子の列に付ける色。付けないなら None。
+
+    フォルダには付けない。隠し・システム・読み込み専用の属性色の行も付けない(行全体の
+    属性色を優先する。あふｗで desktop.ini が行全体灰色だったのと同じ)。名前の列には
+    付けない(呼ぶ側が拡張子の列だけに使う)。"""
+    if entry is None or entry.is_dir or entry.is_parent or entry.color_kind != "text":
+        return None
+    ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+    return color_map.get(ext) if ext else None
+
+
+def ext_duplicates(rules, row: int) -> dict:
+    """row 行目の拡張子のうち、ほかの行にもあるもの。{拡張子: [その行の番号, ...]}。"""
+    if not (0 <= row < len(rules)):
+        return {}
+    found = {}
+    for ext in rules[row]["exts"]:
+        others = [i for i, r in enumerate(rules) if i != row and ext in r["exts"]]
+        if others:
+            found[ext] = others
+    return found
+
+
+def remove_exts_from_others(rules, row: int, exts) -> list:
+    """row 以外の行から exts を外した新しい並び(空になった行は消す)。"""
+    exts = set(exts)
+    result = []
+    for i, r in enumerate(rules):
+        if i == row:
+            result.append(dict(r, exts=list(r["exts"])))
+            continue
+        kept = [e for e in r["exts"] if e not in exts]
+        if kept:
+            result.append(dict(r, exts=kept))
+    return result
+
+
+def ext_colors_to_settings(rules) -> list:
+    """settings.json に書く形(拡張子は配列のまま)。"""
+    return [{"color": r["color"], "exts": list(r["exts"])} for r in rules]
+
+
+# ---------------------------------------------------------------
+# 使った記録の置き場所(よく行くフォルダ・一括改名の履歴)
+# ---------------------------------------------------------------
+# リポジトリの外(%LOCALAPPDATA%\traytools)に置く。このリポジトリは公開なので、
+# 訪れたフォルダの一覧や改名の記録をうっかりコミットしないように、そもそも
+# 作業ツリーの中に作らない(.gitignore に頼らない)。テストでは環境変数で差し替える。
+DATA_DIR_ENV = "TRAYTOOLS_DATA_DIR"
+
+
+def data_dir() -> str:
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        return override
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "traytools")
+
+
+def load_store(name: str, default):
+    """記録を読む。無い・壊れている・形が違うなら default。"""
+    import json
+
+    try:
+        with open(os.path.join(data_dir(), name), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return data if isinstance(data, type(default)) else default
+
+
+def save_store(name: str, data) -> None:
+    """記録を書く。一時ファイルに書いてから置き換える(途中で落ちても壊れた記録を残さない)。"""
+    import json
+
+    folder = data_dir()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8", newline="") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(temp, path)
+
+
+# ---------------------------------------------------------------
+# よく行くフォルダ(Shift+H。zoxide の frecency)
+# ---------------------------------------------------------------
+FRECENCY_STORE = "filer_frecency.json"
+FRECENCY_LIMIT = 500
+
+
+def frecency_weight(age_seconds: float) -> float:
+    """最後に訪れてからの時間による重み(zoxide と同じ段の付け方)。"""
+    if age_seconds < 3600:
+        return 4.0
+    if age_seconds < 86400:
+        return 2.0
+    if age_seconds < 7 * 86400:
+        return 0.5
+    return 0.25
+
+
+def frecency_score(count: int, last: float, now: float) -> float:
+    return count * frecency_weight(now - last)
+
+
+def _frecency_key(data: dict, path: str):
+    folded = os.path.normcase(path)
+    return next((k for k in data if os.path.normcase(k) == folded), None)
+
+
+def frecency_add(data: dict, path: str, now: float, limit: int = FRECENCY_LIMIT) -> dict:
+    """path を訪れたことを記録する。data は {パス: [回数, 最後に訪れた時刻]}。
+
+    大文字小文字だけ違うパスは同じものとして数える。件数が limit を超えたら、
+    スコアの低いものから間引く(訪れたばかりのものは残る)。"""
+    path = normalize_dir(path)
+    key = _frecency_key(data, path)
+    count = data.pop(key)[0] if key is not None else 0
+    data[path] = [count + 1, now]
+    if len(data) > limit:
+        # 同じスコアなら最近訪れた方を残す。
+        ranked = sorted(data, key=lambda p: (frecency_score(data[p][0], data[p][1], now),
+                                             data[p][1]), reverse=True)
+        for stale in ranked[limit:]:
+            del data[stale]
+    return data
+
+
+def frecency_remove(data: dict, path: str) -> dict:
+    key = _frecency_key(data, normalize_dir(path))
+    if key is not None:
+        del data[key]
+    return data
+
+
+def frecency_query(data: dict, text: str, now: float) -> list:
+    """入力した語(空白区切り)をすべて含むパスを、スコアの高い順に。
+
+    最後の語がフォルダ名(パスの末尾の部分)に含まれるものを先に出す(zoxide と同じく、
+    最後に打つのは行き先のフォルダ名であることが多いため)。"""
+    words = [w.casefold() for w in (text or "").split()]
+    found = []
+    for path, (count, last) in data.items():
+        folded = path.casefold()
+        if not all(w in folded for w in words):
+            continue
+        tail = os.path.basename(path.rstrip("\\/")).casefold()
+        in_tail = (not words) or words[-1] in tail
+        found.append((not in_tail, -frecency_score(count, last, now), path))
+    found.sort()
+    return [path for _a, _b, path in found]

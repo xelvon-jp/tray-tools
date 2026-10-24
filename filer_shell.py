@@ -113,6 +113,86 @@ def delete_files(sources, hwnd: int = 0, permanent: bool = False, extra_flags: i
 
 
 # ---------------------------------------------------------------
+# ファイル情報の編集(R): 名前・更新日時・属性
+# ---------------------------------------------------------------
+_SetFileAttributesW = _kernel32.SetFileAttributesW
+_SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+_SetFileAttributesW.restype = wintypes.BOOL
+
+
+def set_attributes(path: str, attrs: int) -> None:
+    """属性を設定する。失敗したら OSError。"""
+    if not _SetFileAttributesW(path, attrs or filer_core.FILE_ATTRIBUTE_NORMAL):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def current_attributes(path: str) -> int:
+    return int(getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0))
+
+
+def _rename(old_path: str, new_path: str) -> None:
+    """改名。大文字小文字だけの違い(a.txt → A.TXT)も通す。
+
+    Windows は大小を区別しないので「同じ名前」だが、MoveFileEx(os.rename)は大小だけの
+    改名をそのまま受け付ける。念のため、受け付けたのに名前が変わっていなかったら、
+    一時的な名前を経由してやり直す。"""
+    os.rename(old_path, new_path)
+    folder = os.path.dirname(new_path)
+    wanted = os.path.basename(new_path)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    if wanted in names:
+        return
+    temp = new_path + ".filer-rename"
+    current = next((n for n in names if n.casefold() == wanted.casefold()), None)
+    if current is None:
+        return
+    os.rename(os.path.join(folder, current), temp)
+    os.rename(temp, new_path)
+
+
+def apply_file_info(folder: str, plan: dict) -> str:
+    """plan(filer_core.plan_file_info の形)を実際のファイルに当てる。新しいパスを返す。
+
+    順番に意味がある。読み込み専用のファイルは日時を変えられない(名前は変えられるが、
+    ネットワーク先では断られることがある)ので、先に読み込み専用を外し、名前・日時を
+    変えてから、最後に属性を決める(元が読み込み専用で属性を変えないなら元に戻す)。
+    失敗したら OSError(途中まで当たっている場合がある。呼ぶ側は読み直して見せる)。"""
+    path = os.path.join(folder, plan["old"])
+    attrs = current_attributes(path)
+    readonly = bool(attrs & filer_core.ATTR_FLAGS["readonly"])
+    needs_write = "new" in plan or "mtime" in plan
+    final_attrs = plan.get("attrs")
+    if readonly and needs_write:
+        set_attributes(path, (attrs & filer_core.SETTABLE_ATTRS)
+                       & ~filer_core.ATTR_FLAGS["readonly"])
+        if final_attrs is None:
+            final_attrs = attrs & filer_core.SETTABLE_ATTRS   # 読み込み専用を戻す
+    try:
+        if "new" in plan:
+            new_path = os.path.join(folder, plan["new"])
+            _rename(path, new_path)
+            path = new_path
+        if "mtime" in plan:
+            # アクセス日時は今の値のまま、更新日時だけを変える。フォルダも同じ呼び方で通る。
+            st = os.stat(path)
+            os.utime(path, (st.st_atime, plan["mtime"]))
+    except OSError:
+        # 外した読み込み専用を戻してから知らせる(戻せなくても元の失敗を優先して伝える)。
+        if readonly and needs_write:
+            try:
+                set_attributes(path, attrs & filer_core.SETTABLE_ATTRS)
+            except OSError:
+                pass
+        raise
+    if final_attrs is not None:
+        set_attributes(path, final_attrs)
+    return path
+
+
+# ---------------------------------------------------------------
 # 既知フォルダ(デスクトップ)
 # ---------------------------------------------------------------
 class GUID(ctypes.Structure):
@@ -218,6 +298,39 @@ _GetDiskFreeSpaceExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulong
                                  ctypes.POINTER(ctypes.c_ulonglong),
                                  ctypes.POINTER(ctypes.c_ulonglong)]
 _GetDiskFreeSpaceExW.restype = wintypes.BOOL
+
+
+class SHFILEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", wintypes.HICON),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", wintypes.DWORD),
+        ("szDisplayName", wintypes.WCHAR * 260),
+        ("szTypeName", wintypes.WCHAR * 80),
+    ]
+
+
+SHGFI_TYPENAME = 0x000000400
+SHGFI_USEFILEATTRIBUTES = 0x000000010
+_SHGetFileInfoW = _shell32.SHGetFileInfoW
+_SHGetFileInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW),
+                            wintypes.UINT, wintypes.UINT]
+_SHGetFileInfoW.restype = ctypes.c_size_t
+
+
+def file_type_name(name: str, is_dir: bool = False) -> str:
+    """エクスプローラの「種類」の名前(テキスト ドキュメント など)。取れなければ ""。
+
+    SHGFI_USEFILEATTRIBUTES で名前(拡張子)だけから引くので、ディスクにもネットワークにも
+    触らない(速く、止まらない)。アイコンは取らないので COM の後始末も要らない。"""
+    info = SHFILEINFOW()
+    attrs = 0x10 if is_dir else 0x80
+    try:
+        ok = _SHGetFileInfoW(name, attrs, ctypes.byref(info), ctypes.sizeof(info),
+                             SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES)
+    except OSError:
+        return ""
+    return info.szTypeName if ok else ""
 
 
 def disk_space(root: str):

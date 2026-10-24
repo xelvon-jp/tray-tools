@@ -440,7 +440,37 @@ def test_drive_list():
 _app = None
 
 
+def _run_stub(holder, dialog):
+    """exec を差し替えたダイアログで holder["do"](dialog) を走らせる。
+
+    ファイラはコマンドの中の例外を受け止めてメッセージ窓に出す(落ちないように)ので、
+    ダイアログの中で assert が外れても、そのままではテストに伝わらない。ここで控えて、
+    _checked_key がキーを送った後に投げ直す。"""
+    holder["dialog"] = True
+    try:
+        holder["do"](dialog)
+    except BaseException as e:  # noqa: BLE001
+        holder["error"] = e
+    holder["result"] = dialog.result()      # 戻ると deleteLater で消えるので先に控える
+    return holder["result"]
+
+
+def _checked_key(pane, holder):
+    """キーを送り、その中で開いたダイアログで起きた失敗を投げ直す key 関数。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    def key(k, mods=Qt.NoModifier):
+        QTest.keyClick(pane.view, k, mods)
+        error = holder.pop("error", None)
+        if error is not None:
+            raise error
+    return key
+
+
 _TEST_TEMP = tempfile.mkdtemp(prefix="filer_test_tmp_")
+# よく行くフォルダ・一括改名の履歴は、本物の記録(%LOCALAPPDATA%\traytools)に書かせない。
+os.environ[core.DATA_DIR_ENV] = os.path.join(_TEST_TEMP, "data")
 
 
 def _qapp():
@@ -646,17 +676,20 @@ def test_window_keys_and_operations():
         key(Qt.Key_K)                           # 同じ名前はメッセージだけ
         assert "同じ名前があります" in w.log_view.toPlainText()
 
-        # R: 改名(拡張子の手前までを選ぶ)
+        # R: ファイル情報の編集(キャレットは拡張子の手前・何も選ばない)。exec は差し替える
         L.set_cursor(L._row_of("gamma.txt"))
         seen = {}
 
-        def fake_ask(title, label, text="", select=None):
-            seen.update(text=text, select=select)
-            return "gamma2.txt"
-        w.ask_text = fake_ask
+        def fake_exec(dialog):
+            seen.update(text=dialog.name_edit.text(), caret=dialog.name_edit.cursorPosition(),
+                        selected=dialog.name_edit.hasSelectedText())
+            dialog.name_edit.setText("gamma2.txt")
+            dialog.try_accept()
+            return dialog.result()
+        w.exec_dialog = fake_exec
         key(Qt.Key_R)
         _wait(w)
-        assert seen == {"text": "gamma.txt", "select": 5}, seen
+        assert seen == {"text": "gamma.txt", "caret": 5, "selected": False}, seen
         assert (left / "gamma2.txt").exists() and _cursor_name(L) == "gamma2.txt"
 
         # Alt+C: 反対窓へコピー(マークしたもの)、Alt+M: 移動
@@ -2354,6 +2387,1176 @@ def test_window_screen_layout():
             filer.FilerWindow._read_drive_label = real_label
             filer.FilerWindow._read_drive_space = real_space
             filer.subprocess.Popen = real_popen
+
+
+# ---------------------------------------------------------------
+# R: ファイル情報の編集 / 一括変更、F5
+# ---------------------------------------------------------------
+def test_file_info_logic():
+    assert core.caret_position("1778326141-Wk.webp", False) == len("1778326141-Wk")
+    assert core.caret_position("noext", False) == 5
+    assert core.caret_position(".gitignore", False) == len(".gitignore")
+    assert core.caret_position("dir.v2", True) == len("dir.v2")
+    assert core.convert_case("Photo.WebP", "all", "lower") == "photo.webp"
+    assert core.convert_case("Photo.WebP", "all", "upper") == "PHOTO.WEBP"
+    assert core.convert_case("Photo.WebP", "all", "swap") == "pHOTO.wEBp"
+    assert core.convert_case("Photo.WebP", "ext", "upper") == "Photo.WEBP"
+    assert core.convert_case("Photo.WebP", "ext", "lower") == "Photo.webp"
+    assert core.convert_case("Dir.Ext", "ext", "upper", is_dir=True) == "Dir.Ext"   # フォルダは不変
+    assert core.compose_attrs(0x20, {"readonly": True}) == 0x21
+    assert core.compose_attrs(0x21, {"readonly": False, "archive": False}) == core.FILE_ATTRIBUTE_NORMAL
+    assert core.compose_attrs(0x10 | 0x02, {"system": True}) == 0x06       # フォルダの印は渡さない
+    assert core.attrs_to_flags(0x23) == {"readonly": True, "system": False, "hidden": True,
+                                         "archive": True}
+    stamp, problem = core.make_timestamp(2026, 5, 30, 0, 9, 36)
+    assert problem is None and time.localtime(stamp)[:6] == (2026, 5, 30, 0, 9, 36)
+    assert core.make_timestamp(2026, 2, 30, 0, 0, 0)[0] is None              # 存在しない日付
+    assert "存在しない" in core.make_timestamp(2026, 2, 30, 0, 0, 0)[1]
+    assert core.make_timestamp(2026, 13, 1, 0, 0, 0)[0] is None
+    assert core.make_timestamp(1970, 1, 2, 0, 0, 0)[0] is None
+    base = time.mktime((2020, 7, 8, 9, 10, 11, 0, 0, -1))
+    stamp, problem = core.make_timestamp(0, 0, 0, 12, 0, 0, base=base)     # 年月日 0 は時刻だけ
+    assert problem is None and time.localtime(stamp)[:6] == (2020, 7, 8, 12, 0, 0)
+    assert core.make_timestamp(0, 0, 0, 12, 0, 0)[0] is None
+    e = core.Entry("a.txt", False, 1, base, 0x20)
+    assert core.plan_file_info(e, "a.txt", base, {"archive": True}) == {}  # 何も変わらない
+    assert core.plan_file_info(e, "A.TXT") == {"old": "a.txt", "new": "A.TXT"}
+    plan = core.plan_file_info(e, None, base + 60, {"readonly": True})
+    assert plan == {"old": "a.txt", "mtime": base + 60, "attrs": 0x21}
+    entries = [core.PARENT_ENTRY, core.Entry("A.Txt", False, 1, base, 0x20),
+               core.Entry("b.txt", False, 1, base, 0x20), core.Entry("Dir", True, 0, base, 0x10)]
+    plans, problems = core.plan_bulk_info(entries, case_all="lower", case_ext="upper",
+                                          stamp_fields=(0, 0, 0, 1, 2, 3),
+                                          attr_changes={"hidden": True})
+    assert not problems and [p["old"] for p in plans] == ["A.Txt", "b.txt", "Dir"]
+    assert [p.get("new") for p in plans] == ["a.TXT", "b.TXT", "dir"]
+    assert all(time.localtime(p["mtime"])[3:6] == (1, 2, 3) for p in plans)
+    assert all(p["attrs"] & 0x02 for p in plans)
+    assert core.plan_bulk_info(entries, stamp_fields=(2026, 2, 30, 0, 0, 0))[1]
+    assert core.rename_collision(["a.txt", "B.txt"], {"a.txt": "A.TXT"}) is None
+    assert core.rename_collision(["a.txt", "B.txt"], {"a.txt": "b.TXT"}) == "b.TXT"
+    assert core.rename_collision(["A.txt", "a.TXT"], {"A.txt": "a.txt", "a.TXT": "a.txt"})
+    assert core.rename_collision(["x", "y"], {"x": "y", "y": "x"}) is None    # 入れ替えは重ならない
+    assert "日時" in core.describe_file_info({"old": "a", "mtime": base})
+    assert core.describe_file_info({"old": "a", "new": "b", "attrs": 0x03}) == "a → b  属性 RH"
+    assert core.DEFAULT_KEYMAP["0116"] == "reload_keep"
+    assert core.fkey_labels(core.DEFAULT_KEYMAP)[4] == "Reload"
+
+
+def _stat_attrs(path):
+    return os.stat(path).st_file_attributes
+
+
+def test_file_info_focus_and_checkbox_look():
+    """実機で起きた2件: ファイル名欄がフォーカスで全選択される / 濃紺の地でチェックの
+    四角が見えない。offscreen でも窓を表示してフォーカスの出来事を起こして確かめる
+    (実画面には出ない)。Tab で戻ってきたときの出来事は QFocusEvent を直接送って代用。"""
+    import filer_fileinfo
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QColor, QFocusEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "マスターキー_設定メモ.md").write_bytes(b"x")
+        entry = core.Entry("マスターキー_設定メモ.md", False, 1, time.time(), 0x20)
+        d = filer_fileinfo.FileInfoDialog(None, tmp, [entry])
+        d.show()
+        QTest.qWait(50)
+        caret = len("マスターキー_設定メモ")
+        assert d.name_edit.selectedText() == "" and d.name_edit.cursorPosition() == caret
+        # Tab でフォーカスが来たとき(QLineEdit は既定ではここで全選択する)も全選択しない
+        d.name_edit.clearFocus()
+        QApplication.sendEvent(d.name_edit, QFocusEvent(QEvent.FocusIn, Qt.TabFocusReason))
+        assert d.name_edit.selectedText() == "" and d.name_edit.cursorPosition() == caret
+        # 自分で動かした位置は、離れて戻っても保つ
+        d.name_edit.setCursorPosition(3)
+        QApplication.sendEvent(d.name_edit, QFocusEvent(QEvent.FocusOut, Qt.TabFocusReason))
+        QApplication.sendEvent(d.name_edit, QFocusEvent(QEvent.FocusIn, Qt.BacktabFocusReason))
+        assert d.name_edit.cursorPosition() == 3 and not d.name_edit.hasSelectedText()
+
+        def colors_of(check):
+            image = check.grab().toImage()
+            return {QColor(image.pixel(x, y)).name()
+                    for x in range(image.width()) for y in range(image.height())}
+        # 未チェックでも明るい枠が描かれる / ON は水色で塗る
+        assert "#c8c8f0" in colors_of(d.attr_checks["readonly"])
+        assert "#40d0ff" in colors_of(d.attr_checks["archive"])
+        d.close()
+        # 一括変更の「変えない」(中間)は灰色の帯で見分けられる
+        other = core.Entry("b.txt", False, 1, time.time(), 0x20)
+        Path(tmp, "b.txt").write_bytes(b"x")
+        bulk = filer_fileinfo.FileInfoDialog(None, tmp, [entry, other])
+        bulk.show()
+        QTest.qWait(30)
+        assert bulk.attr_checks["hidden"].checkState() == Qt.PartiallyChecked
+        assert "#a0a0a0" in colors_of(bulk.attr_checks["hidden"])
+        bulk.close()
+
+
+def test_window_file_info():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name in ("Image.webp", "Case.txt", "ro.txt", "b1.txt", "b2.txt", "b3.txt"):
+            Path(left, name).write_bytes(b"x")
+        _set_attrs(left / "ro.txt", 0x01 | 0x20)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        steps = {}
+        key = _checked_key(L, steps)
+
+        def run_dialog(dialog):
+            # 窓を出さずに操作する。steps["do"] が入力と OK を行う。
+            return _run_stub(steps, dialog)
+        w.exec_dialog = run_dialog
+        try:
+            # 1件: 変換ボタン・Alt+頭文字・日時・OK で実際に変わる
+            def single(d):
+                assert d.name_edit.cursorPosition() == len("Image")
+                assert not d.name_edit.hasSelectedText()
+                assert d.current_date.text().count("/") == 2
+                d.case_buttons[("all", "lower")].click()
+                assert d.name_edit.text() == "image.webp"
+                d.case_buttons[("ext", "upper")].click()
+                assert d.name_edit.text() == "image.WEBP"
+                d.case_buttons[("all", "swap")].click()
+                assert d.name_edit.text() == "IMAGE.webp"
+                before = d.attr_checks["readonly"].isChecked()
+                QTest.keyClick(d, Qt.Key_R, Qt.AltModifier)
+                assert d.attr_checks["readonly"].isChecked() != before
+                QTest.keyClick(d, Qt.Key_H, Qt.AltModifier)
+                for box, value in zip(d.stamp_edits, (2021, 2, 3, 4, 5, 6)):
+                    box.setValue(value)
+                d.try_accept()
+            steps["do"] = single
+            L.set_cursor(L._row_of("Image.webp"))
+            key(Qt.Key_R)
+            _wait(w)
+            assert steps["result"] == QDialog.Accepted
+            assert "IMAGE.webp" in os.listdir(left)
+            st = os.stat(left / "IMAGE.webp")
+            assert time.localtime(st.st_mtime)[:6] == (2021, 2, 3, 4, 5, 6)
+            assert st.st_file_attributes & 0x01 and st.st_file_attributes & 0x02
+            assert _cursor_name(L) == "IMAGE.webp"
+            assert "IMAGE.webp" in w.log_view.toPlainText()
+            _set_attrs(left / "IMAGE.webp", 0x80)
+
+            # 大文字小文字だけの改名
+            def case_only(d):
+                d.name_edit.setText("CASE.TXT")
+                d.try_accept()
+            steps["do"] = case_only
+            L.set_cursor(L._row_of("Case.txt"))
+            key(Qt.Key_R)
+            _wait(w)
+            assert "CASE.TXT" in os.listdir(left) and "Case.txt" not in os.listdir(left)
+
+            # 読み込み専用のファイルでも名前と日時を変えられ、読み込み専用は残る
+            def readonly(d):
+                assert d.attr_checks["readonly"].isChecked()
+                d.name_edit.setText("ro2.txt")
+                d.stamp_edits[0].setValue(2022)
+                d.try_accept()
+            steps["do"] = readonly
+            L.set_cursor(L._row_of("ro.txt"))
+            key(Qt.Key_R)
+            _wait(w)
+            st = os.stat(left / "ro2.txt")
+            assert time.localtime(st.st_mtime).tm_year == 2022 and st.st_file_attributes & 0x01
+
+            # 存在しない日付: 閉じずに理由を出し、何も変えない
+            def bad_date(d):
+                d.name_edit.setText("never.txt")
+                d.stamp_edits[1].setValue(2)
+                d.stamp_edits[2].setValue(30)
+                d.try_accept()
+                assert "存在しない" in d.error_text and d.result() != QDialog.Accepted
+            steps["do"] = bad_date
+            L.set_cursor(L._row_of("b1.txt"))
+            key(Qt.Key_R)
+            assert not (left / "never.txt").exists() and (left / "b1.txt").exists()
+
+            # 名前が重なる: 閉じずに理由を出す
+            def clash(d):
+                d.name_edit.setText("B2.TXT")
+                d.try_accept()
+                assert "同じ名前" in d.error_text and d.result() != QDialog.Accepted
+            steps["do"] = clash
+            key(Qt.Key_R)
+
+            # 一括変更: 大文字に・時刻だけ(年月日 0)・隠しを ON
+            def bulk(d):
+                assert d.bulk and not d.name_edit.isEnabled()
+                assert "3 件" in d.original_label.text()
+                d.case_buttons[("all", "upper")].click()
+                assert d.chosen_case("all") == "upper"
+                d.case_buttons[("all", "lower")].click()      # 行ごとにどれか1つ
+                d.case_buttons[("all", "upper")].click()
+                assert d.chosen_case("all") == "upper" and d.chosen_case("ext") is None
+                d.stamp_check.setChecked(True)
+                for box, value in zip(d.stamp_edits, (0, 0, 0, 12, 34, 56)):
+                    box.setValue(value)
+                QTest.keyClick(d, Qt.Key_H, Qt.AltModifier)   # 中間 → ON
+                assert d.attr_changes() == {"hidden": True}
+                d.try_accept()
+            steps["do"] = bulk
+            L.marks.clear()
+            L.marks.update({"b1.txt", "b2.txt", "b3.txt"})
+            key(Qt.Key_R)
+            _wait(w)
+            names = os.listdir(left)
+            for n in ("B1.TXT", "B2.TXT", "B3.TXT"):
+                assert n in names, names
+                st = os.stat(left / n)
+                assert time.localtime(st.st_mtime)[3:6] == (12, 34, 56) and st.st_file_attributes & 0x02
+                _set_attrs(left / n, 0x80)
+
+            # F5: 最新にするだけでマークは消さない
+            L.marks.add("alpha.txt")
+            key(Qt.Key_F5)
+            _wait(w)
+            assert L.marks == {"alpha.txt"}
+            L.marks.clear()
+
+            # 書庫の中では開かない
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            steps.clear()
+            key(Qt.Key_R)
+            assert "dialog" not in steps and "書庫内では編集できません" in w.log_view.toPlainText()
+        finally:
+            for p in left.iterdir():
+                if p.is_file():
+                    _set_attrs(p, 0x80)
+            w.close()
+            w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# 拡張子別表示色・Z の設定ダイアログ
+# ---------------------------------------------------------------
+def test_ext_color_logic():
+    assert core.normalize_exts("*.Zip .7z  rar,zip;LZH") == ["zip", "7z", "rar", "lzh"]
+    assert core.normalize_exts(["TXT", "", ".md"]) == ["txt", "md"]
+    rules = core.normalize_ext_colors(None)                      # 書かれていなければ既定
+    assert rules[0] == {"color": "#0000ff", "exts": core.DEFAULT_EXT_COLORS[0]["exts"]}
+    assert core.normalize_ext_colors([]) == []                   # 空は「色を付けない」
+    assert core.normalize_ext_colors([{"color": "red", "exts": "a"},
+                                      {"color": "#ABCDEF", "exts": ".Foo bar"},
+                                      {"color": "#000000", "exts": []}]) == \
+        [{"color": "#abcdef", "exts": ["foo", "bar"]}]
+    cmap = core.ext_color_map([{"color": "#111111", "exts": ["a", "b"]},
+                               {"color": "#222222", "exts": ["b", "c"]}])
+    assert cmap == {"a": "#111111", "b": "#111111", "c": "#222222"}   # 先に一致した行が勝つ
+    dmap = core.ext_color_map(core.normalize_ext_colors(None))
+    assert core.ext_color_for(F("a.TXT"), dmap) == "#800040"
+    assert core.ext_color_for(F("x.lnk"), dmap) == "#808080"
+    assert core.ext_color_for(F("x.ZIP"), dmap) == "#0000ff"
+    assert core.ext_color_for(F("x.html"), dmap) == "#0080ff"
+    assert core.ext_color_for(F("noext"), dmap) is None
+    assert core.ext_color_for(F("d.zip", is_dir=True), dmap) is None         # フォルダは付けない
+    assert core.ext_color_for(F("desktop.ini", attrs=HIDDEN | SYSTEM), dmap) is None  # 属性色が優先
+    assert core.ext_color_for(F("ro.txt", attrs=READONLY), dmap) is None
+    assert core.ext_color_for(F("arc.txt", attrs=0x20), dmap) == "#800040"   # アーカイブ属性は関係ない
+    rows = [{"color": "#1", "exts": ["a", "b"]}, {"color": "#2", "exts": ["b", "c"]},
+            {"color": "#3", "exts": ["a"]}]
+    assert core.ext_duplicates(rows, 0) == {"a": [2], "b": [1]}
+    assert core.remove_exts_from_others(rows, 0, ["a", "b"]) == \
+        [{"color": "#1", "exts": ["a", "b"]}, {"color": "#2", "exts": ["c"]}]  # 空の行は消える
+    assert core.ext_colors_to_settings(rules)[0]["exts"] == rules[0]["exts"]
+    assert core.DEFAULT_KEYMAP["0090"] == "settings_dialog"
+
+
+def test_window_ext_colors_and_settings_dialog():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "notes.txt").write_bytes(b"x")
+        Path(left, "app.lnk").write_bytes(b"x")
+        Path(left, "desktop.ini").write_bytes(b"x")
+        _set_attrs(left / "desktop.ini", 0x02 | 0x04)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text(json.dumps({"other": 1}), encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        try:
+            entry = lambda name: L.entries[L._row_of(name)]  # noqa: E731
+            colors = filer.DEFAULT_COLORS
+            # 拡張子の列だけに色。名前の列は種類の色のまま
+            assert L.text_color(entry("notes.txt"), filer.COL_EXT) == "#800040"
+            assert L.text_color(entry("notes.txt"), filer.COL_NAME) == colors["text"]
+            assert L.text_color(entry("app.lnk"), filer.COL_EXT) == "#808080"
+            assert L.text_color(entry("photo.JPG"), filer.COL_EXT) == "#804000"
+            assert L.text_color(entry("sub1"), filer.COL_EXT) == colors["directory"]
+            # 隠し+システムの行は行全体の属性色(拡張子の色は付けない)
+            assert L.text_color(entry("desktop.ini"), filer.COL_EXT) == colors["system"]
+            # 描いた絵でも: 拡張子の列に、えんじの字の画素がある
+            QTest.qWait(30)
+            image = L.view.viewport().grab().toImage()
+            rect = L.view.visualRect(L.model.index(L._row_of("notes.txt"), filer.COL_EXT))
+            found = {QColor(image.pixel(x, y)).name()
+                     for x in range(rect.left(), rect.right()) for y in range(rect.top(), rect.bottom())}
+            assert "#800040" in found, found
+
+            # Z: 新規・変更・削除・上下・色 → 決定で保存され、その場で反映
+            answers = {}
+
+            def run(dialog):
+                d = dialog
+                d.ask_exts = lambda title, text="": answers.pop("exts")
+                d.ask_color = lambda initial: answers.pop("color", None)
+                d.confirm = lambda text: answers.pop("confirm", True)
+                return _run_stub(answers, d)
+            w.exec_dialog = run
+
+            def edit(d):
+                assert d.tree.topLevelItemCount() == len(core.DEFAULT_EXT_COLORS)
+                # 新規: txt を入れる。ほかの行(えんじ)にもあるので外す
+                d.tree.setCurrentItem(d.tree.topLevelItem(0))
+                answers.update(exts="*.TXT .foo", color="#123456", confirm=True)
+                d.new_button.click()
+                assert d.rules[1] == {"color": "#123456", "exts": ["txt", "foo"]}
+                assert all("txt" not in r["exts"] for i, r in enumerate(d.rules) if i != 1)
+                # 上へ(先頭に)、色を変える
+                d.up_button.click()
+                assert d.rules[0]["exts"] == ["txt", "foo"]
+                answers["color"] = "#ABCDEF"
+                d.color_button.click()
+                assert d.rules[0]["color"] == "#abcdef"
+                # 変更: 拡張子を差し替え
+                answers.update(exts="txt foo bar")
+                d.edit_button.click()
+                assert d.rules[0]["exts"] == ["txt", "foo", "bar"]
+                # 下へ・削除(確認付き。いいえなら消えない)
+                d.down_button.click()
+                assert d.rules[1]["exts"] == ["txt", "foo", "bar"] and d.current_row() == 1
+                count = len(d.rules)
+                answers["confirm"] = False
+                d.delete_button.click()
+                assert len(d.rules) == count
+                d.tree.setCurrentItem(d.tree.topLevelItem(2))
+                removed = d.rules[2]["exts"]
+                answers["confirm"] = True
+                d.delete_button.click()
+                assert len(d.rules) == count - 1 and removed not in [r["exts"] for r in d.rules]
+                d.ok_button.click()
+            answers["do"] = edit
+            _checked_key(L, answers)(Qt.Key_Z)
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert stored["other"] == 1                                 # 他のキーはそのまま
+            assert stored["filer"]["ext_colors"][1] == {"color": "#abcdef", "exts": ["txt", "foo", "bar"]}
+            assert L.text_color(entry("notes.txt"), filer.COL_EXT) == "#abcdef"   # その場で反映
+
+            # 中止なら何も変わらない
+            def cancel(d):
+                answers.update(confirm=True)
+                d.reset_button.click()
+                assert d.rules == core.normalize_ext_colors(None)
+                d.cancel_button.click()
+            answers["do"] = cancel
+            _checked_key(L, answers)(Qt.Key_Z)
+            assert L.text_color(entry("notes.txt"), filer.COL_EXT) == "#abcdef"
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["ext_colors"][1][
+                "color"] == "#abcdef"
+
+            # 一覧の上の Enter は変更、Del は削除
+            def keys(d):
+                d.tree.setCurrentItem(d.tree.topLevelItem(0))
+                answers.update(exts="zzz")
+                QTest.keyClick(d.tree, Qt.Key_Return)
+                assert d.rules[0]["exts"] == ["zzz"] and d.result() != QDialog.Accepted
+                answers.update(confirm=True)
+                QTest.keyClick(d.tree, Qt.Key_Delete)
+                assert d.rules[0]["exts"] != ["zzz"]
+                d.cancel_button.click()
+            answers["do"] = keys
+            _checked_key(L, answers)(Qt.Key_Z)
+        finally:
+            _set_attrs(left / "desktop.ini", 0x80)
+            w.close()
+            w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# A. ライブ絞り込み(/)
+# ---------------------------------------------------------------
+def test_live_filter_logic():
+    assert core.parse_live_filter("  Foo  bar ") == ["foo", "bar"]
+    assert core.parse_live_filter("") == []
+    entries = [F("dir", is_dir=True), F("Foo_bar.txt"), F("foo.txt"), F("bar.md")]
+    names = lambda words: [e.name for e in core.live_filter_entries(entries, words)]  # noqa: E731
+    assert names(["foo", "bar"]) == ["dir", "Foo_bar.txt"]          # AND・フォルダは残す
+    assert names(["md"]) == ["dir", "bar.md"]
+    assert names([]) == ["dir", "Foo_bar.txt", "foo.txt", "bar.md"]
+    assert core.DEFAULT_KEYMAP["0191"] == "live_filter"
+
+
+def _type(widget, text):
+    from PySide6.QtTest import QTest
+    QTest.keyClicks(widget, text)
+
+
+def test_window_live_filter():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            L.marks.update({"alpha.txt", "beta.md"})
+            key(Qt.Key_Slash)
+            assert L.filter_edit.isVisible() and L.filter_edit.hasFocus()
+            _type(L.filter_edit, "a t")                          # "a" と "t" を両方含む
+            assert _names(L) == ["..", "sub1", "sub2", "alpha.txt", "beta.md", "gamma.txt"], _names(L)
+            for _ in range(3):
+                QTest.keyClick(L.filter_edit, Qt.Key_Backspace)
+            _type(L.filter_edit, "PH")                           # 大文字小文字は無視
+            assert _names(L) == ["..", "sub1", "sub2", "alpha.txt", "photo.JPG"], _names(L)
+            QTest.keyClick(L.filter_edit, Qt.Key_Return)         # 確定: 絞ったまま閉じる
+            assert not L.filter_edit.isVisible() and L.live_filter == "PH"
+            assert "[絞込: PH]" in L.header.text()
+            # 見えなくなったマーク(beta.md)は持っているが、操作の対象は見えているものだけ
+            assert L.marks == {"alpha.txt", "beta.md"}
+            assert [e.name for e in L.targets()] == ["alpha.txt"]
+            # 絞ったままカーソル・マークが普通に動く
+            L.set_cursor(L._row_of("photo.JPG"))
+            key(Qt.Key_Space)
+            assert "photo.JPG" in L.marks
+            key(Qt.Key_Escape)                                   # 入力欄が閉じていれば解かない
+            assert L.live_filter == "PH"
+            # / で再編集 → Esc で解除
+            key(Qt.Key_Slash)
+            assert L.filter_edit.text() == "PH"
+            QTest.keyClick(L.filter_edit, Qt.Key_Escape)
+            assert L.live_filter == "" and len(_names(L)) == 7 and "絞込" not in L.header.text()
+            # 空にして Enter でも解除、: でも解除
+            key(Qt.Key_Slash)
+            _type(L.filter_edit, "zz")
+            assert _names(L) == ["..", "sub1", "sub2"]
+            QTest.keyClick(L.filter_edit, Qt.Key_Return)
+            key(Qt.Key_Colon)
+            assert L.live_filter == "" and len(_names(L)) == 7
+            # マスクとは重ねがけ
+            w.ask_text = lambda *a, **k: "*.txt"
+            key(Qt.Key_Colon, Qt.ShiftModifier)
+            L.set_live_filter("al")
+            assert _names(L) == ["..", "sub1", "sub2", "alpha.txt"]
+            key(Qt.Key_Colon)
+            # フォルダを移ったら解除
+            L.set_live_filter("alpha")
+            L.set_cursor(L._row_of("sub1"))
+            key(Qt.Key_Return)
+            _wait(w)
+            assert L.live_filter == "" and "絞込" not in L.header.text()
+            # 数万件では打ち終わりを待ってから絞る(打鍵ごとには並べ直さない)
+            many = Path(tmp, "many")
+            many.mkdir()
+            for i in range(filer.LIVE_FILTER_IMMEDIATE + 10):
+                (many / f"f{i:05d}.txt").write_bytes(b"")
+            # 作った直後の大量のファイルは、ウイルス対策の検査で列挙が待たされることがある。
+            # このテストで見たいのは絞り込みなので、読み取りの見切りは長めにしておく。
+            w.list_timeout = 60
+            L.load(str(many))
+            _wait(w, timeout=60)
+            key(Qt.Key_Slash)
+            _type(L.filter_edit, "f0001")
+            assert L._filter_timer.isActive()                      # 打鍵ごとには絞らず待っている
+            QTest.qWait(filer.LIVE_FILTER_DELAY_MS + 200)
+            assert [e.name for e in L.entries if not e.is_parent] == \
+                [f"f0001{i}.txt" for i in range(10)]
+            QTest.keyClick(L.filter_edit, Qt.Key_Escape)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# B. よく行くフォルダ(Shift+H)
+# ---------------------------------------------------------------
+def test_frecency_logic():
+    now = 1_000_000_000.0
+    assert core.frecency_weight(10) == 4 and core.frecency_weight(7200) == 2
+    assert core.frecency_weight(3 * 86400) == 0.5 and core.frecency_weight(30 * 86400) == 0.25
+    data = {}
+    core.frecency_add(data, "C:\\Work\\Proj\\", now - 40 * 86400)
+    core.frecency_add(data, "c:\\work\\proj", now - 40 * 86400)     # 大小違いは同じもの
+    assert list(data) == ["c:\\work\\proj"] and data["c:\\work\\proj"][0] == 2
+    core.frecency_add(data, "C:\\Work\\Other", now - 60)
+    core.frecency_add(data, "D:\\proj-archive", now - 60)
+    # 古くて回数が多いもの(2×0.25)より、最近のもの(1×4)が上
+    assert core.frecency_query(data, "", now)[-1] == "c:\\work\\proj"
+    # 語は AND、最後の語がフォルダ名にあるものが先
+    assert core.frecency_query(data, "work", now) == ["C:\\Work\\Other", "c:\\work\\proj"]
+    assert core.frecency_query(data, "proj", now) == ["D:\\proj-archive", "c:\\work\\proj"]
+    assert core.frecency_query(data, "work proj", now) == ["c:\\work\\proj"]
+    assert core.frecency_query(data, "nothing", now) == []
+    # 上限を超えたらスコアの低いものから間引く
+    small = {}
+    for i in range(5):
+        core.frecency_add(small, f"C:\\d{i}", now - (5 - i) * 86400 * 10, limit=3)
+    assert sorted(small) == ["C:\\d2", "C:\\d3", "C:\\d4"]
+    core.frecency_remove(small, "c:\\D3")
+    assert sorted(small) == ["C:\\d2", "C:\\d4"]
+    # 置き場所はリポジトリの外(テストでは差し替えてある)
+    assert not core.data_dir().startswith(str(Path(__file__).resolve().parent.parent))
+    core.save_store("t.json", {"a": [1, 2]})
+    assert core.load_store("t.json", {}) == {"a": [1, 2]}
+    assert core.load_store("missing.json", {}) == {}
+    assert core.load_store("t.json", []) == []                         # 形が違えば既定
+    assert core.DEFAULT_KEYMAP["1072"] == "frecency_jump"
+
+
+def test_window_frecency_jump():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        store = Path(core.data_dir(), core.FRECENCY_STORE)
+        if store.exists():
+            store.unlink()
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            for _ in range(3):                       # sub1 に3回、deep に1回行く
+                L.load(str(left / "sub1"))
+                _wait(w)
+                L.load(str(left))
+                _wait(w)
+            L.load(str(left / "sub1" / "deep"))
+            _wait(w)
+            key(Qt.Key_F5)                           # 再読込は数えない
+            _wait(w)
+            saved = core.load_store(core.FRECENCY_STORE, {})
+            sub1 = [v for p, v in saved.items() if p.casefold() == str(left / "sub1").casefold()]
+            deep = [v for p, v in saved.items() if p.casefold().endswith("deep")]
+            assert sub1 and sub1[0][0] == 3 and deep and deep[0][0] == 1, saved
+            # 書庫の中は記録しない
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            assert not any(p.casefold().endswith("pack.zip") for p in w.frecency)
+            # Shift+H: 語で絞ってスコア順。Enter でそこへ
+            key(Qt.Key_H, Qt.ShiftModifier)
+            picker = w._picker
+            assert picker is not None
+            picker.search.setText("sub")
+            rows = [picker.list.item(i).text() for i in range(picker.list.count())]
+            assert rows[0].casefold() == str(left / "sub1").casefold(), rows
+            picker._commit()
+            _wait(w)
+            assert core.same_dir(L.path, left / "sub1")
+            # 無くなったフォルダは候補から外し、記録からも消す
+            shutil.rmtree(left / "sub1" / "deep")
+            key(Qt.Key_H, Qt.ShiftModifier)
+            picker = w._picker
+            rows = [picker.list.item(i).text() for i in range(picker.list.count())]
+            assert not any(r.casefold().endswith("deep") for r in rows), rows
+            picker.close()
+            assert not any(p.casefold().endswith("deep") for p in w.frecency)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# C. フラット表示(Alt+B)
+# ---------------------------------------------------------------
+def _make_flat_tree(root):
+    """フラット表示の試験用。サブフォルダ・隠しファイル・隠しフォルダ・ジャンクション。"""
+    import subprocess
+    root = Path(root)
+    (root / "2026-10").mkdir()
+    (root / "2026-10" / "log_001.txt").write_bytes(b"1" * 10)
+    (root / "2026-10" / "deep").mkdir()
+    (root / "2026-10" / "deep" / "x.md").write_bytes(b"22")
+    (root / "top.txt").write_bytes(b"333")
+    (root / "hid.txt").write_bytes(b"4")
+    _set_attrs(root / "hid.txt", 0x02)
+    (root / ".secret").mkdir()
+    (root / ".secret" / "in_hidden.txt").write_bytes(b"5")
+    _set_attrs(root / ".secret", 0x02 | 0x10)
+    # ジャンクション(たどらないこと)。作れない環境では飛ばす
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "loop"), str(root)],
+                   capture_output=True)
+    return root
+
+
+def test_collect_flat_logic():
+    import threading as th
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_flat_tree(Path(tmp, "r").mkdir() or Path(tmp, "r"))
+        entries, status = core.collect_flat(str(root))
+        names = sorted(e.name for e in entries)
+        assert status == "done"
+        assert names == sorted(["2026-10\\log_001.txt", "2026-10\\deep\\x.md", "top.txt",
+                                "hid.txt", ".secret\\in_hidden.txt"]), names
+        assert not any(n.startswith("loop") for n in names)               # ジャンクションはたどらない
+        assert all(not e.is_dir for e in entries)                          # フォルダ自体は入れない
+        assert {e.name: e.size for e in entries}["2026-10\\deep\\x.md"] == 2
+        entries, _ = core.collect_flat(str(root), show_hidden=False)        # Shift+Z に従う
+        assert sorted(e.name for e in entries) == sorted(
+            ["2026-10\\log_001.txt", "2026-10\\deep\\x.md", "top.txt"])
+        entries, status = core.collect_flat(str(root), limit=2)
+        assert status == "limit" and len(entries) == 2
+        stop = th.Event()
+        stop.set()
+        assert core.collect_flat(str(root), cancel=stop)[1] == "cancel"
+        seen = []
+        core.collect_flat(str(root), progress=seen.append)
+        assert seen and seen[-1] == 5
+        assert core.flat_footer_text(3, 1234, 1, 10) == "3 Files   1,234 bytes   Mark 1 (10)"
+        # ZIP でもフォルダ構成を保つ(書庫の中の区切りは /)
+        plan = core.zip_plan(str(root), ["2026-10\\log_001.txt"])
+        assert [arc for _p, arc, _d in plan] == ["2026-10/log_001.txt"]
+        for p in (root / "hid.txt", root / ".secret"):
+            _set_attrs(p, 0x80 if p.is_file() else 0x10)
+        if (root / "loop").exists():
+            os.rmdir(root / "loop")                              # ジャンクションだけ消す
+    assert core.DEFAULT_KEYMAP["4066"] == "flat_view"
+
+
+def test_window_flat_view():
+    import zipfile
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp, "src")
+        root.mkdir()
+        _make_flat_tree(root)
+        right = Path(tmp, "dst")
+        right.mkdir()
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(root), "right_path": str(right)}},
+                              str(settings_path))
+        w.extra_op_flags = _quiet_flags()
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w, timeout=30)
+            assert L.flat and "[フラット]" in L.header.text()
+            assert ".." not in _names(L)
+            assert "2026-10\\deep\\x.md" in _names(L) and "top.txt" in _names(L)
+            assert L.footer.text().startswith("5 Files   ")
+            # 絞り込み・マーク・コピーが普通に効く(対象は相対パスを解決したフルパス)
+            L.set_live_filter("2026")
+            assert sorted(_names(L)) == ["2026-10\\deep\\x.md", "2026-10\\log_001.txt"]
+            assert L.targets() and L.target_paths()[0].startswith(str(root))
+            L.marks.update({"2026-10\\deep\\x.md", "2026-10\\log_001.txt"})
+            key(Qt.Key_C, Qt.AltModifier)
+            _wait(w, timeout=30)
+            assert (right / "x.md").exists() and (right / "log_001.txt").exists()
+            assert L.flat                                       # 再読込してもフラットのまま
+            # ZIP はフォルダ構成を保って入る
+            L.set_live_filter("")
+            L.marks.clear()
+            L.marks.update({"2026-10\\deep\\x.md", "top.txt"})
+            w.ask_text = lambda *a, **k: "flat.zip"
+            key(Qt.Key_P)
+            _wait_extract(w)
+            _wait(w, timeout=30)
+            with zipfile.ZipFile(right / "flat.zip") as z:
+                assert sorted(z.namelist()) == ["2026-10/deep/x.md", "top.txt"]
+            # R・K はフラット表示中は断る
+            key(Qt.Key_R)
+            key(Qt.Key_K)
+            assert w.log_view.toPlainText().count("フラット表示中は使えません") == 2
+            # BS で通常の表示へ(親へは行かない)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert not L.flat and core.same_dir(L.path, root) and "[フラット]" not in L.header.text()
+            # Alt+B でもう一度入り、Alt+B で戻る
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w, timeout=30)
+            assert L.flat
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w)
+            assert not L.flat and ".." in _names(L)
+            # 集めている間の Esc は中止(通常の表示に戻る)
+            real = filer.core.collect_flat
+
+            def slow(root_, show_hidden, show_system, limit, cancel, progress):
+                progress(7)
+                cancel.wait(10)
+                return [], "cancel" if cancel.is_set() else "done"
+            filer.core.collect_flat = slow
+            try:
+                key(Qt.Key_B, Qt.AltModifier)
+                QTest.qWait(300)
+                assert L.flat_loading and "収集中 7件" in L.footer.text()
+                key(Qt.Key_Escape)
+                _wait(w, timeout=15)
+                QTest.qWait(50)
+                _wait(w, timeout=15)
+                assert not L.flat and "中止しました" in w.log_view.toPlainText()
+            finally:
+                filer.core.collect_flat = real
+            # 上限で打ち切ったら知らせる
+            w.flat_limit = 2
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w, timeout=30)
+            assert len(_names(L)) == 2 and "打ち切りました" in w.log_view.toPlainText()
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w)
+            # 書庫の中では断る
+            zpath = root / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            key(Qt.Key_B, Qt.AltModifier)
+            assert not L.flat and "書庫内ではフラット表示できません" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
+            for p in (root / "hid.txt",):
+                if p.exists():
+                    _set_attrs(p, 0x80)
+            if (root / ".secret").exists():
+                _set_attrs(root / ".secret", 0x10)
+            if (root / "loop").exists():
+                os.rmdir(root / "loop")                          # ジャンクションだけ消す(中身は消さない)
+
+
+# ---------------------------------------------------------------
+# D. プレビュー(F3)
+# ---------------------------------------------------------------
+def test_preview_logic():
+    exts = core.normalize_viewer_extensions(None)
+    assert core.preview_kind(None, exts) == "none"
+    assert core.preview_kind(core.PARENT_ENTRY, exts) == "none"
+    assert core.preview_kind(F("d", is_dir=True), exts) == "folder"
+    assert core.preview_kind(F("a.LOG"), exts) == "text"
+    assert core.preview_kind(F("p.JPEG"), exts) == "image"
+    assert core.preview_kind(F("x.bin"), exts) == "info"
+    assert core.fit_size(4000, 3000, 400, 400) == (400, 300)
+    assert core.fit_size(100, 50, 400, 400) == (100, 50)               # 拡大はしない
+    assert core.fit_size(0, 0, 10, 10) == (0, 0)
+    assert core.info_lines("x.bin", F("x.bin", size=1234))[2].startswith("サイズ  1,234")
+    assert core.DEFAULT_KEYMAP["0114"] == "preview_toggle"
+    assert core.fkey_labels(core.DEFAULT_KEYMAP)[2] == "Preview"
+
+
+def _wait_preview(w, title, timeout=15.0):
+    from PySide6.QtTest import QTest
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QTest.qWait(30)
+        widget = w.preview_widget
+        if widget is not None and widget.last and widget.last.get("title") == title:
+            return widget.last
+    raise AssertionError(f"プレビューが出ない: {title}")
+
+
+def test_window_preview():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "notes.txt").write_text("\n".join(f"line {i}" for i in range(500)),
+                                           encoding="utf-8")
+        big = QImage(3000, 2000, QImage.Format_RGB32)
+        big.fill(QColor("#336699"))
+        assert big.save(str(left / "pic.png"))
+        Path(left, "x.bin").write_bytes(b"\x00\x01")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            right_path = R.path
+            L.set_cursor(L._row_of("notes.txt"))
+            key(Qt.Key_F3)
+            assert w.preview_on and w.preview_widget.isVisible() and not R.isVisible()
+            result = _wait_preview(w, "notes.txt")
+            assert result["kind"] == "text" and len(result["lines"]) == core.PREVIEW_TEXT_LINES
+            assert result["lines"][0] == "line 0" and result["note"] == "UTF-8"
+            assert w.preview_widget.text.toPlainText().startswith("line 0\nline 1")
+            # 画像は窓に収まる大きさで読む(元の 3000×2000 のままにしない)
+            L.set_cursor(L._row_of("pic.png"))
+            result = _wait_preview(w, "pic.png")
+            box = w.preview_widget.image_box()
+            assert result["image"].width() <= box[0] and result["image"].height() <= box[1]
+            assert result["note"] == "3000×2000"
+            # フォルダ・その他
+            L.set_cursor(L._row_of("sub1"))
+            result = _wait_preview(w, "sub1")
+            assert result["lines"][0] == "1 フォルダ / 0 ファイル" and "deep\\" in result["lines"]
+            L.set_cursor(L._row_of("x.bin"))
+            result = _wait_preview(w, "x.bin")
+            assert result["kind"] == "info" and result["lines"][0] == "x.bin"
+            # 書庫の中の小さなファイルは取り出して見せる
+            zpath = left / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            L.set_cursor(L._row_of("readme.txt"))
+            result = _wait_preview(w, "readme.txt")
+            assert result["lines"] == ["hello"]
+            # キーはアクティブ窓に効いたまま(プレビュー中もカーソルが動く)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert L.archive is None and w.preview_on
+            # プレビューの側へ移ろうとしたら、プレビューを終えてその窓へ
+            key(Qt.Key_Tab)
+            assert not w.preview_on and w.active_side == "right" and R.isVisible()
+            assert R.path == right_path and w.preview_widget is None
+            # F3 でもう一度 → F3 で戻る
+            QTest.keyClick(R.view, Qt.Key_F3)
+            assert w.preview_on and not L.isVisible()
+            QTest.keyClick(R.view, Qt.Key_F3)
+            assert not w.preview_on and L.isVisible()
+            assert w.fkey_buttons[2].text() == "Preview"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+# ---------------------------------------------------------------
+# E. 一括改名(Renemo 風。Shift+R / Alt+R)
+# ---------------------------------------------------------------
+def test_rename_logic():
+    import filer_rename as fr
+    assert fr.to_halfwidth("ＡＢＣ１２３　ガパ") == "ABC123 ｶﾞﾊﾟ"
+    assert fr.to_fullwidth("ABC 123 ｶﾞﾊﾟｱ") == "ＡＢＣ　１２３　ガパア"
+    assert fr.to_halfwidth("漢字ひらがな") == "漢字ひらがな"
+    assert fr.convert("Ab", "upper") == "AB" and fr.convert("Ab", "lower") == "ab"
+    assert fr.replace_name("a.b.txt", ".", "_", keep_ext=True) == "a_b.txt"
+    assert fr.replace_name("a.b.txt", ".", "_") == "a_b_txt"
+    assert fr.replace_name("photo12.jpg", r"(\d+)", r"_\1", regex=True) == "photo_12.jpg"
+    assert fr.replace_name("Abc", "a", "x") == "xbc" and fr.replace_name("Abc", "a", "x", case_sensitive=True) == "Abc"
+    assert fr.replace_name("a1", "1", r"\1") == "a\\1"                    # 正規表現でなければそのまま
+    try:
+        fr.replace_name("a", "(", "x", regex=True)
+        raise AssertionError("壊れた正規表現で止まらない")
+    except ValueError:
+        pass
+    assert fr.format_number("p_{n:03}", 7) == "p_007" and fr.format_number("p{n}", 7, 2) == "p07"
+    assert fr.numbered_names(["a.jpg", "b.PNG", "d"], "photo_{n:03}", 1, 1, 1, True,
+                             [False, False, True]) == ["photo_001.jpg", "photo_002.PNG", "photo_003"]
+    assert fr.numbered_names(["a.jpg"], "p_", 5, 2, 3) == ["p_005.jpg"]   # {n} が無ければ末尾に
+    assert fr.name_problem("con.txt") and fr.name_problem("LPT1") and fr.name_problem("a ")
+    assert fr.name_problem("a?b") and fr.name_problem("") and fr.name_problem("ok.txt") is None
+    items = [("C:\\d", "a.txt"), ("C:\\d", "b.txt"), ("C:\\d", "c.txt")]
+    existing = {"C:\\d": ["a.txt", "b.txt", "c.txt", "other.txt"]}
+    assert fr.validate_batch(items, ["b.txt", "a.txt", "c.txt"], existing) == {}   # 入れ替えは通る
+    assert fr.validate_batch(items, ["A.TXT", "b.txt", "c.txt"], existing) == {}   # 大小だけも通る
+    assert fr.validate_batch(items, ["x.txt", "x.TXT", "c.txt"], existing) == {
+        0: "結果の名前が重なっています", 1: "結果の名前が重なっています"}
+    assert fr.validate_batch(items, ["other.txt", "b.txt", "c.txt"], existing) == {
+        0: "同じ名前のファイルが既にあります"}
+    assert fr.validate_batch(items, ["a?.txt", "b.txt", "con"], existing).keys() == {0, 2}
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b, c = (os.path.join(tmp, n) for n in ("a.txt", "b.txt", "c.txt"))
+        for path, data in ((a, b"A"), (b, b"B"), (c, b"C")):
+            Path(path).write_bytes(data)
+        pairs = [(a, b), (b, a), (c, os.path.join(tmp, "C.TXT"))]      # 入れ替えと大小だけ
+        count, error = fr.execute_plan(fr.plan_renames(pairs))
+        assert error is None and count == 6
+        assert Path(a).read_bytes() == b"B" and Path(b).read_bytes() == b"A"
+        assert "C.TXT" in os.listdir(tmp)
+        # 途中で失敗したら、それまでの改名を巻き戻す
+        calls = []
+
+        def flaky(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 3:
+                raise OSError(13, "使用中")
+            os.rename(src, dst)
+        before = sorted(os.listdir(tmp))
+        count, error = fr.execute_plan(fr.plan_renames(
+            [(a, os.path.join(tmp, "x.txt")), (b, os.path.join(tmp, "y.txt"))]), rename=flaky)
+        assert count == 0 and "元に戻しました" in error and sorted(os.listdir(tmp)) == before
+    history = fr.add_history([], [("C:\\d\\a", "C:\\d\\b")], now=100)
+    history = fr.add_history(history, [("C:\\d\\x", "C:\\d\\x")], now=200)   # 変化なしは記録しない
+    assert len(history) == 1 and fr.undo_pairs(history[0]) == [("C:\\d\\b", "C:\\d\\a")]
+    exists = {"C:\\d\\b"}.__contains__
+    assert fr.undo_problems(history[0], exists) == []
+    assert fr.undo_problems(history[0], lambda p: True)                      # 元の名前が埋まっている
+    assert "1件" in fr.describe_history(history[0])
+    many = []
+    for i in range(fr.HISTORY_LIMIT + 5):
+        many = fr.add_history(many, [(f"a{i}", f"b{i}")], now=i)
+    assert len(many) == fr.HISTORY_LIMIT and many[0]["pairs"] == [["a54", "b54"]]
+    assert core.DEFAULT_KEYMAP["1082"] == "batch_rename" and core.DEFAULT_KEYMAP["4082"] == "rename_menu"
+
+
+def test_window_renemo():
+    import filer
+    import filer_rename as fr
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QTextCursor
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp, "work")
+        folder.mkdir()
+        for name in ("data.txt", "memo.md", "Photo.JPG", "keep.bin"):
+            Path(folder, name).write_bytes(name.encode())
+        Path(folder, "sub").mkdir()
+        right = Path(tmp, "other")
+        right.mkdir()
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        history_file = Path(core.data_dir(), fr.HISTORY_STORE)
+        if history_file.exists():
+            history_file.unlink()
+        w = filer.FilerWindow({"filer": {"left_path": str(folder), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        steps = {}
+        key = _checked_key(L, steps)
+
+        def run(dialog):
+            return _run_stub(steps, dialog)
+        w.exec_dialog = run
+        try:
+            # Alt+R のメニューは先頭(一括改名)が選ばれた状態 → Enter 相当で開く
+            seen = []
+            w._exec_menu = lambda m, c: (seen.append(m.activeAction().text()), c[m.activeAction()])[1]
+
+            def first_look(d):
+                # 名前の列は拡張子付き、編集名は拡張子を隠す
+                assert d.names_view.toPlainText().split("\n") == ["sub", "data.txt", "keep.bin",
+                                                                   "memo.md", "Photo.JPG"]
+                assert d.editor_lines() == ["sub", "data", "keep", "memo", "Photo"]
+                # 種類はエクスプローラと同じ名前(この PC では「テキスト ドキュメント」)
+                info_lines = d.info_view.toPlainText().splitlines()
+                import filer_shell
+                assert info_lines[1].endswith(filer_shell.file_type_name("data.txt"))
+                assert filer_shell.file_type_name("data.txt")
+                # 編集 → .ext を出しても編集は残る、拡張子も直せる
+                d.editor.setPlainText("sub\nDATA2\nkeep\nmemo\nPhoto")
+                d.act_ext.setChecked(True)
+                d.toggle_ext()
+                assert d.editor_lines() == ["sub", "DATA2.txt", "keep.bin", "memo.md", "Photo.JPG"]
+                lines = d.editor_lines()
+                lines[4] = "Photo.jpg"
+                d.editor.setPlainText("\n".join(lines))
+                # フルパス表示
+                d.act_fullpath.setChecked(True)
+                d.toggle_fullpath()
+                assert d.names_view.toPlainText().split("\n")[1] == str(folder / "data.txt")
+                d.reject()
+            steps["do"] = first_look
+            key(Qt.Key_R, Qt.AltModifier)
+            assert seen and seen[0].startswith("&B") and steps["result"] == QDialog.Rejected
+
+            # 変換(全行)・置換・連番・並べ替え → 実行
+            def convert_and_run(d):
+                d.convert_selection("upper")                         # 選択が無ければ全行
+                assert d.editor_lines() == ["SUB", "DATA", "KEEP", "MEMO", "PHOTO"]
+                d.editor.undo()                                       # 取り消せる
+                assert d.editor_lines() == ["sub", "data", "keep", "memo", "Photo"]
+                d.ask_replace = lambda: {"find": "e", "repl": "E", "regex": False, "case": True,
+                                         "keep_ext": True}
+                d.replace_dialog()
+                assert d.editor_lines() == ["sub", "data", "kEEp", "mEmo", "Photo"]
+                # 3〜4行目だけに連番
+                c = d.editor.textCursor()
+                c.setPosition(d.editor.document().findBlockByNumber(2).position())
+                c.setPosition(d.editor.document().findBlockByNumber(3).position() + 1,
+                              QTextCursor.KeepAnchor)
+                d.editor.setTextCursor(c)
+                d.ask_numbering = lambda: {"fmt": "file_{n:02}", "start": 1, "step": 1, "digits": 1}
+                d.number_dialog()
+                assert d.editor_lines() == ["sub", "data", "file_01", "file_02", "Photo"]
+                # 選んだ部分だけ全角に
+                c = d.editor.textCursor()
+                block = d.editor.document().findBlockByNumber(1)
+                c.setPosition(block.position())
+                c.setPosition(block.position() + 4, QTextCursor.KeepAnchor)
+                d.editor.setTextCursor(c)
+                d.convert_selection("full")
+                assert d.editor_lines()[1] == "ｄａｔａ"
+                # 並べ替えても元の名前との組は崩れない
+                d.sort_rows("edited")
+                assert d.editor_lines()[:3] == ["ｄａｔａ", "file_01", "file_02"]
+                assert d.names_view.toPlainText().split("\n")[:3] == ["data.txt", "keep.bin", "memo.md"]
+                d.execute()
+            steps["do"] = convert_and_run
+            key(Qt.Key_R, Qt.ShiftModifier)
+            _wait(w)
+            names = sorted(os.listdir(folder))
+            assert names == sorted(["sub", "ｄａｔａ.txt", "file_01.bin", "file_02.md", "Photo.JPG"]), names
+            assert "一括改名: 3件" in w.log_view.toPlainText()
+            assert len(fr.load_history()) == 1
+
+            # 問題のある行は赤で示して実行しない(既存のファイルとの衝突・予約名・行数)
+            Path(right, "dummy").write_bytes(b"")
+
+            def problems(d):
+                lines = d.editor_lines()
+                lines[d.editor_lines().index("Photo")] = "file_01"      # 名前の部分が重なる
+                d.act_ext.setChecked(True)
+                d.editor.setPlainText("\n".join(lines))
+                d.toggle_ext()
+                lines = d.editor_lines()
+                lines[0] = "con"
+                d.editor.setPlainText("\n".join(lines))
+                d.execute()
+                assert d.result() != QDialog.Accepted and "問題のある行" in d.message
+                assert len(d.problems) == 1 and len(d.editor.extraSelections()) >= 1
+                d.editor.setPlainText("\n".join(lines[:-1]))          # 行を消した
+                d.execute()
+                assert "行数が合いません" in d.message
+                d.reject()
+            steps["do"] = problems
+            L.marks.clear()
+            L.marks.update({"sub", "Photo.JPG"})
+            key(Qt.Key_R, Qt.ShiftModifier)
+            assert sorted(os.listdir(folder)) == names
+
+            # 入れ替え(file_01 ⇔ file_02 の名前部分)と大文字小文字だけの変更
+            def swap(d):
+                d.act_ext.setChecked(True)
+                d.toggle_ext()
+                lines = d.editor_lines()
+                lines = ["file_02.bin" if l == "file_01.bin" else "file_01.md" if l == "file_02.md"
+                         else "photo.jpg" if l == "Photo.JPG" else l for l in lines]
+                d.editor.setPlainText("\n".join(lines))
+                d.execute()
+            steps["do"] = swap
+            L.marks.clear()
+            key(Qt.Key_R, Qt.ShiftModifier)
+            _wait(w)
+            names2 = sorted(os.listdir(folder))
+            assert "file_02.bin" in names2 and "file_01.md" in names2 and "photo.jpg" in names2
+            assert Path(folder, "file_02.bin").read_bytes() == b"keep.bin"
+
+            # 途中で失敗したら巻き戻す(何も変わらない)
+            count = [0]
+
+            def flaky(src, dst):
+                count[0] += 1
+                if count[0] == 2:
+                    raise OSError(13, "使用中")
+                os.rename(src, dst)
+            w.rename_func = flaky
+
+            def fail(d):
+                d.editor.setPlainText("\n".join(l + "_x" for l in d.editor_lines()))
+                d.execute()
+                assert d.result() != QDialog.Accepted and "元に戻しました" in d.message
+                d.reject()
+            steps["do"] = fail
+            key(Qt.Key_R, Qt.ShiftModifier)
+            _wait(w)
+            assert sorted(os.listdir(folder)) == names2
+            w.rename_func = os.rename
+
+            # 履歴から元に戻す(最後の一括改名 = 入れ替えを戻す)
+            def undo(d):
+                assert len(d.history) == 2
+                d.choose_history = lambda: 0
+                d.history_dialog()
+            steps["do"] = undo
+            key(Qt.Key_R, Qt.ShiftModifier)
+            _wait(w)
+            assert sorted(os.listdir(folder)) == names
+            assert len(fr.load_history()) == 1
+
+            # Esc: 編集があれば確かめる(いいえなら閉じない)
+            def esc(d):
+                d.editor.setPlainText("\n".join(l + "!" for l in d.editor_lines()))
+                finished = []
+                d.finished.connect(finished.append)    # result() は最初から 0(=Rejected)なので
+                asked = []
+                d.confirm = lambda text: (asked.append(text), False)[1]
+                QTest.keyClick(d.editor, Qt.Key_Escape)
+                assert asked and not finished          # 確かめて、いいえなら閉じない
+                d.confirm = lambda text: True
+                QTest.keyClick(d.editor, Qt.Key_Escape)
+                assert finished == [QDialog.Rejected]
+            steps["do"] = esc
+            key(Qt.Key_R, Qt.ShiftModifier)
+            # Enter は改行しない(行の数を変えない)
+            def no_newline(d):
+                QTest.keyClick(d.editor, Qt.Key_Return)
+                assert len(d.editor_lines()) == len(d.order)
+                d.reject()
+            steps["do"] = no_newline
+            key(Qt.Key_R, Qt.ShiftModifier)
+            # 書庫の中・フラット表示中は断る
+            steps.clear()
+            zpath = folder / "pack.zip"
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            key(Qt.Key_R, Qt.ShiftModifier)
+            assert "dialog" not in steps and "書庫内では使えません" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def main() -> int:

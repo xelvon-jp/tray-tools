@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from ctypes import wintypes
 from datetime import datetime
@@ -129,6 +130,11 @@ DEFAULT_EDITOR = "notepad.exe"
 DEFAULT_SHELL = "powershell.exe"
 DEFAULT_LIST_TIMEOUT = 5.0
 RECENT_LIMIT = 50
+# ライブ絞り込み: この件数より少なければ打鍵ごとにすぐ絞り、多ければ打ち終わりを待つ。
+LIVE_FILTER_IMMEDIATE = 3000
+LIVE_FILTER_DELAY_MS = 150
+# プレビュー: カーソルが止まってからこれだけ待って読む(連打で読み込みを積まない)。
+PREVIEW_DELAY_MS = 120
 
 # 書庫の中では書き込み系を断る。あふｗも書庫の中(仮想フォルダ)は読むだけ。
 ARCHIVE_READONLY = "書庫内では使えません"
@@ -144,7 +150,7 @@ _QT_TO_VK = {int(k): v for k, v in {
     Qt.Key_End: 35, Qt.Key_Home: 36, Qt.Key_Left: 37, Qt.Key_Up: 38, Qt.Key_Right: 39,
     Qt.Key_Down: 40, Qt.Key_Insert: 45, Qt.Key_Delete: 46,
     Qt.Key_Colon: 186, Qt.Key_Asterisk: 186, Qt.Key_Comma: 188, Qt.Key_Less: 188,
-    Qt.Key_Period: 190, Qt.Key_Greater: 190,
+    Qt.Key_Period: 190, Qt.Key_Greater: 190, Qt.Key_Slash: 191, Qt.Key_Question: 191,
 }.items()}
 
 
@@ -288,10 +294,7 @@ class RowDelegate(QStyledItemDelegate):
 
         # 字の色はファイルの種類(フォルダ/システム/隠し/読み込み専用/通常)で決まる。
         # マーク行でも変えない(あふｗの「通常ファイルの色とマーク背景」と同じ見え方)。
-        kind = entry.color_kind if entry is not None else "text"
-        fg = colors.get(kind) or colors["text"]
-        if marked and colors.get("mark_text"):
-            fg = colors["mark_text"]
+        fg = self.pane.text_color(entry, index.column(), marked)
         painter.save()
         try:
             if marked:
@@ -421,6 +424,7 @@ class FileView(QTableView):
             self.pane.update_footer()
             if self.pane.is_active():
                 self.pane.window_.update_status_bar()
+                self.pane.window_.schedule_preview()
         except Exception:  # noqa: BLE001
             _log_exception("currentChanged")
 
@@ -436,6 +440,8 @@ class ListBridge(QObject):
     context_done = Signal(object)
     # ドライブのラベル・容量が読めたとき。(根, 種類 "label"|"space", 値)。
     drive_info = Signal(object)
+    # プレビューの中身ができたとき。(要求番号, 結果)。
+    preview_ready = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -462,6 +468,15 @@ class Pane(QWidget):
         # 書庫の中を見ているときは (書庫ファイル, 中のパス)。ふつうのフォルダなら None。
         # path の方は D:\x\foo.zip\sub の形で、履歴・O・H などはこちらを通す。
         self.archive = None
+        # ライブ絞り込み(/)。語は空白区切りで AND。
+        self.live_filter = ""
+        self.live_words = []
+        self._pending_filter = ""
+        # フラット表示(Alt+B)。いまのフォルダ以下のファイルを1つの一覧に。
+        self.flat = False
+        self.flat_loading = False
+        self.flat_cancel = None
+        self.flat_count = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -500,6 +515,22 @@ class Pane(QWidget):
         for col in (COL_EXT, COL_SIZE, COL_DATE):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
         layout.addWidget(self.view, 1)
+
+        # ライブ絞り込みの入力欄(/ で出る)。窓の下の行のすぐ上。
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("絞り込み（空白区切りで AND。Enter 確定 / Esc 解除）")
+        self.filter_edit.setStyleSheet(
+            f"background-color: {window.colors['background']}; color: {window.colors['isearch']};"
+            f" border: 1px solid {window.colors['header_active']};")
+        self.filter_edit.textChanged.connect(self._on_filter_text)
+        self.filter_edit.installEventFilter(self)
+        self.filter_edit.hide()
+        layout.addWidget(self.filter_edit)
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._apply_pending_filter)
+        self._flat_timer = QTimer(self)
+        self._flat_timer.timeout.connect(self._tick_flat)
 
         self.footer = QLabel()
         self.footer.setTextFormat(Qt.PlainText)
@@ -580,6 +611,20 @@ class Pane(QWidget):
         self.update_header()
         self.view.viewport().update()
 
+    def text_color(self, entry, column: int, marked: bool = False) -> str:
+        """1つの欄の字の色。ファイルの種類(フォルダ/システム/隠し/読み込み専用/通常)で
+        決まり、拡張子の列だけは拡張子別表示色(filer.ext_colors)を重ねる。名前の列は
+        種類の色のまま。属性色の行(隠し等)やフォルダには拡張子の色を付けない。
+        マーク行でも変えない(filer.colors の mark_text を書いたときだけそれにする)。"""
+        colors = self.colors
+        if marked and colors.get("mark_text"):
+            return colors["mark_text"]
+        kind = entry.color_kind if entry is not None else "text"
+        color = colors.get(kind) or colors["text"]
+        if column == COL_EXT:
+            color = core.ext_color_for(entry, self.window_.ext_color_map) or color
+        return color
+
     def drive_root(self):
         """この窓のドライブの根(書庫の中なら書庫のあるドライブ)。"""
         return core.drive_root(self.archive[0] if self.archive is not None else self.path)
@@ -593,6 +638,10 @@ class Pane(QWidget):
             text += f" {self.mask_text}"
         else:
             text = "(読み込み中)"
+        if self.flat or self.flat_loading:
+            text += "   [フラット]"
+        if self.live_filter:
+            text += f"   [絞込: {self.live_filter}]"
         if self.sort != core.DEFAULT_SORT:
             arrow = "↓" if self.sort["descending"] else "↑"
             text += f"   ({core.SORT_LABELS[self.sort['kind']]}{arrow})"
@@ -612,11 +661,17 @@ class Pane(QWidget):
             return  # 組み立ての途中(ビューを作った時点で currentChanged が飛ぶ)
         dirs, files = core.count_dirs_files(self.entries)
         count, total = core.marks_summary(self.entries, self.marks)
-        space = None
-        if self.archive is None:
-            space = self.window_.drive_space(self.drive_root())
-        text = core.footer_text(dirs, files, *(space or (None, None)),
-                                mark_count=count, mark_bytes=total)
+        if self.flat_loading:
+            text = f"収集中 {self.flat_count:,}件（Esc で中止）"
+        elif self.flat:
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            text = core.flat_footer_text(files, size, count, total)
+        else:
+            space = None
+            if self.archive is None:
+                space = self.window_.drive_space(self.drive_root())
+            text = core.footer_text(dirs, files, *(space or (None, None)),
+                                    mark_count=count, mark_bytes=total)
         if self.isearch_text is not None:
             text += f"   検索: {self.isearch_text}_"
             self.footer.setStyleSheet(
@@ -688,6 +743,8 @@ class Pane(QWidget):
 
         history … "visit"(履歴に積む) / None(積まない。再読込) / ("back"|"forward", 直前のパス)
         on_fail … 読めなかったときに呼ぶ(起動時の復元で、次の候補へ回すため)。"""
+        # ふつうの読み込みはフラット表示を終える(フォルダを移る・BS・O など)。
+        self._stop_flat()
         self.request_id += 1
         request = self.request_id
         self.loading = True
@@ -767,6 +824,11 @@ class Pane(QWidget):
             previous_name = entry.name if entry is not None else None
         if not (same and args["keep_marks"]):
             self.marks = set()
+        if not same:
+            # フォルダを移ったらライブ絞り込みは解く(前のフォルダの語が残ると、何も
+            # 無いように見えて混乱する)。
+            self.clear_live_filter(rebuild=False)
+        self.last_load_moved = not same     # よく行くフォルダの記録は「移った」ときだけ
         self.path = new_path
         self.all_entries = entries
         self._rebuild()
@@ -788,13 +850,20 @@ class Pane(QWidget):
         self.update_footer()
 
     def _rebuild(self) -> None:
-        """マスクを掛け直して表示の並びを作る。マークは表示に残ったものだけ持ち越す。"""
+        """マスク・ライブ絞り込み・Shift+Z を掛け直して表示の並びを作る。
+
+        マークは「まだ一覧にあるもの」だけ持ち越す。絞り込みで見えなくなったマークは
+        消さずに持っておく(絞り込みを解けば戻る)。ただし操作の対象になるのは見えている
+        マークだけ(pick_targets は表示中の項目から選ぶ)。見えないものまで消したり
+        コピーしたりするのは事故の元なので、安全な側に倒した。"""
         win = self.window_
         shown = core.filter_attrs(self.all_entries, win.show_hidden, win.show_system)
-        visible = core.sort_entries(core.filter_entries(shown, self.patterns), self.sort)
-        names = {e.name for e in visible}
+        masked = core.filter_entries(shown, self.patterns)
+        visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
+        names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
-        self.entries = ([] if core.is_root(self.path) else [core.PARENT_ENTRY]) + visible
+        parent = [] if (self.flat or core.is_root(self.path)) else [core.PARENT_ENTRY]
+        self.entries = parent + visible
         self.model.set_entries(self.entries, self.marks)
 
     def _row_of(self, name):
@@ -807,8 +876,102 @@ class Pane(QWidget):
         return None
 
     def reload(self, keep_marks=False, focus=None) -> None:
+        if self.flat and self.path:
+            self.load_flat(keep_marks=keep_marks)   # フラット表示のまま集め直す
+            return
         if self.path:
             self.load(self.path, focus=focus, history=None, keep_marks=keep_marks, walk_up=True)
+
+    # --- フラット表示(Alt+B) ---
+    def _stop_flat(self) -> None:
+        if self.flat_cancel is not None:
+            self.flat_cancel.set()
+        self.flat_cancel = None
+        self.flat = False
+        self.flat_loading = False
+
+    def load_flat(self, keep_marks: bool = False) -> None:
+        """いまのフォルダより下のファイルを別スレッドで集めて1つの一覧にする。
+        集めている間は窓の下の行に件数を出し、Esc で中止できる(cancel_flat)。"""
+        if self.flat_cancel is not None:
+            self.flat_cancel.set()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.flat_cancel = cancel
+        self.flat_loading = True
+        self.loading = True
+        self.flat_count = 0
+        root = self.path
+        win = self.window_
+        args = dict(path=root, flat=True, keep_marks=keep_marks)
+        bridge = win.bridge
+        show_hidden, show_system = win.show_hidden, win.show_system
+
+        def progress(count):
+            self.flat_count = count
+
+        def worker():
+            try:
+                entries, status = core.collect_flat(root, show_hidden, show_system,
+                                                    win.flat_limit, cancel, progress)
+                payload = (self.side, request, True, (entries, status), args)
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
+            try:
+                bridge.finished.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name=f"filer-flat-{self.side}").start()
+        self._flat_timer.start(200)
+        self.update_header()
+        self.update_footer()
+
+    def cancel_flat(self) -> None:
+        if self.flat_loading and self.flat_cancel is not None:
+            self.flat_cancel.set()
+
+    def _tick_flat(self) -> None:
+        try:
+            if self.flat_loading:
+                self.update_footer()
+            else:
+                self._flat_timer.stop()
+        except Exception:  # noqa: BLE001
+            _log_exception("flatTick")
+
+    def on_flat_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id:
+            return
+        self.loading = False
+        self.flat_loading = False
+        self.flat_cancel = None
+        self._flat_timer.stop()
+        if not ok:
+            self.window_.log(f"フラット表示: 集められません: {args['path']}  ({result})")
+            self.flat = False
+            self.update_header()
+            self.update_footer()
+            return
+        entries, status = result
+        if status == "cancel":
+            self.window_.log("フラット表示: 中止しました")
+            self.flat = False
+            self.reload()
+            return
+        if status == "limit":
+            self.window_.log(f"フラット表示: {len(entries):,}件で打ち切りました（多すぎるため）")
+        if not args.get("keep_marks"):
+            self.marks = set()
+        self.flat = True
+        self.all_entries = entries
+        self._rebuild()
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
 
     def refilter(self) -> None:
         """表示の絞り込み(Shift+Z)が変わったときに並べ直す。カーソルは同じ項目に付いて
@@ -836,6 +999,80 @@ class Pane(QWidget):
             self.set_cursor(row if row is not None else 0)
         self.update_header()
         self.update_footer()
+
+    # --- ライブ絞り込み(/) ---
+    def open_live_filter(self) -> None:
+        """入力欄を出す。打つたびに一覧を絞る(Enter で確定、Esc で解除)。"""
+        self.filter_edit.blockSignals(True)
+        self.filter_edit.setText(self.live_filter)
+        self.filter_edit.blockSignals(False)
+        self.filter_edit.show()
+        self.filter_edit.setFocus()
+        self.filter_edit.end(False)
+
+    def _on_filter_text(self, text: str) -> None:
+        # 少ない一覧ならすぐ、多いときは打ち終わりを少し待ってから絞る(数万件で打鍵ごとに
+        # 並べ直すと、打つのが追いつかなくなるため)。
+        self._pending_filter = text
+        if len(self.all_entries) < LIVE_FILTER_IMMEDIATE:
+            self._apply_pending_filter()
+        else:
+            self._filter_timer.start(LIVE_FILTER_DELAY_MS)
+
+    def _apply_pending_filter(self) -> None:
+        try:
+            self.set_live_filter(self._pending_filter)
+        except Exception:  # noqa: BLE001
+            _log_exception("liveFilter")
+
+    def set_live_filter(self, text: str) -> None:
+        self.live_filter = (text or "").strip()
+        self.live_words = core.parse_live_filter(self.live_filter)
+        if self.path:
+            self.refilter()
+        else:
+            self.update_header()
+
+    def close_live_filter(self, keep: bool) -> None:
+        """入力欄を閉じる。keep なら絞ったまま(確定)、でなければ解除。"""
+        self._filter_timer.stop()
+        if keep:
+            self.set_live_filter(self.filter_edit.text())
+        else:
+            self.set_live_filter("")
+        self.filter_edit.hide()
+        self.view.setFocus()
+
+    def clear_live_filter(self, rebuild: bool = True) -> None:
+        self._filter_timer.stop()
+        self.filter_edit.hide()
+        if not self.live_filter:
+            return
+        self.live_filter = ""
+        self.live_words = []
+        if rebuild and self.path:
+            self.refilter()
+
+    def _filter_key(self, event) -> bool:
+        """入力欄の Enter / Esc。"""
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self.close_live_filter(keep=True)
+            return True
+        if key == Qt.Key_Escape:
+            self.close_live_filter(keep=False)
+            return True
+        return False
+
+    def eventFilter(self, obj, event):
+        try:
+            if obj is self.filter_edit and event.type() == QEvent.KeyPress:
+                if self._filter_key(event):
+                    return True
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("filterKey")
+            return True
+        return super().eventFilter(obj, event)
 
     def set_mask(self, text: str) -> None:
         self.mask_text = text if not core.is_default_mask(text) else core.DEFAULT_MASK
@@ -875,6 +1112,15 @@ class FilerWindow(QWidget):
         self._viewers = []
         # Alt+W の WinMerge。空なら App Paths と既定の場所を探す。
         self.winmerge_setting = section.get("winmerge") or ""
+        # フラット表示で集める上限(テストでは小さくする)。
+        self.flat_limit = core.FLAT_LIMIT
+        # 拡張子別表示色(Z の設定ダイアログで変えられる)。
+        self.ext_rules = core.normalize_ext_colors(section.get("ext_colors"))
+        self.ext_color_map = core.ext_color_map(self.ext_rules)
+        # よく行くフォルダの記録(リポジトリの外。形の違う行は捨てる)。
+        stored = core.load_store(core.FRECENCY_STORE, {})
+        self.frecency = {p: v for p, v in stored.items()
+                         if isinstance(p, str) and isinstance(v, list) and len(v) == 2}
         # ドライブのラベルと容量(窓の2行目と下の行)。読み取りは別スレッドで、結果を
         # ドライブの根ごとに覚える。ラベルはドライブが変わったときだけ、容量は読み直しの
         # たびに読む。読めないうちは空のまま(固まらない方を取る)。
@@ -941,6 +1187,15 @@ class FilerWindow(QWidget):
         self.bridge.extracted.connect(self._on_extracted)
         self.bridge.context_done.connect(self._on_context_done)
         self.bridge.drive_info.connect(self._on_drive_info)
+        self.bridge.preview_ready.connect(self._on_preview_ready)
+        # プレビュー(F3)。ON の間は反対窓の場所にプレビューを出す。
+        self.preview_on = False
+        self.preview_side = None
+        self.preview_widget = None
+        self._preview_request = 0
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._start_preview)
 
         # 左右の窓とメッセージ窓は QSplitter で区切る。境界はマウスでも動かせ、
         # Alt+矢印(あふｗと同じ)でも動かせる。どちらで動かしても同じ値を保存する。
@@ -1175,6 +1430,10 @@ class FilerWindow(QWidget):
 
     def activate(self, side: str, focus: bool = True) -> None:
         changed = side != self.active_side
+        if changed and getattr(self, "preview_on", False) and side == self.preview_side:
+            # プレビューを出している側へ移ろうとしたら、プレビューを終えて元の窓に戻す
+            # (隠れたままの窓へキーが行くと、見えない所で操作してしまうため)。
+            self.preview_off()
         if changed and self.active.isearch_text is not None:
             self.end_isearch()
         self.active_side = side
@@ -1198,8 +1457,67 @@ class FilerWindow(QWidget):
         root = pane.drive_root()
         if root:
             self.request_drive_info(root, space=pane.archive is None)
+        if getattr(pane, "last_load_moved", False) and pane.archive is None:
+            self.record_visit(pane.path)
         if pane.is_active():
             self.update_status_bar()
+            self.schedule_preview()
+
+    # --- よく行くフォルダ(Shift+H) ---
+    def record_visit(self, path: str) -> None:
+        """フォルダを訪れたことを記録する(書庫の中は記録しない。呼ぶ側で除いてある)。
+        記録はリポジトリの外(%LOCALAPPDATA%\\traytools)。書けなくても操作は止めない。"""
+        try:
+            core.frecency_add(self.frecency, path, time.time())
+            core.save_store(core.FRECENCY_STORE, self.frecency)
+        except (OSError, ValueError, TypeError) as e:
+            print(f"[filer] よく行くフォルダを記録できません: {e}", file=sys.stderr)
+
+    def _prune_missing_frecency(self) -> None:
+        """ローカルの固定ドライブにあって、もう無いフォルダを記録から消す。ネットワーク
+        ドライブ・UNC は確かめない(止まりうるので。移動に失敗したときに消す)。"""
+        changed = False
+        for path in list(self.frecency):
+            root = core.drive_root(path)
+            if not root or root.startswith("\\\\"):
+                continue
+            try:
+                if filer_shell.drive_type(root) == filer_shell.DRIVE_FIXED and \
+                        not os.path.isdir(path):
+                    del self.frecency[path]
+                    changed = True
+            except OSError:
+                continue
+        if changed:
+            try:
+                core.save_store(core.FRECENCY_STORE, self.frecency)
+            except OSError:
+                pass
+
+    def cmd_frecency_jump(self):
+        """Shift+H: よく行くフォルダへ(zoxide 風)。打った語をすべて含むパスを、
+        回数と最近さのスコア順に出す。最後の語がフォルダ名に入るものが先。"""
+        self._prune_missing_frecency()
+        if not self.frecency:
+            self.log("よく行くフォルダの記録がまだありません")
+            return
+
+        def candidates(text):
+            return [(path, path) for path in core.frecency_query(self.frecency, text, time.time())]
+
+        def go(path):
+            def failed(path=path):
+                core.frecency_remove(self.frecency, path)
+                try:
+                    core.save_store(core.FRECENCY_STORE, self.frecency)
+                except OSError:
+                    pass
+                self.log(f"よく行くフォルダ: 開けないので記録から消しました: {path}")
+            self.active.load(path, on_fail=failed)
+
+        self._open_picker("よく行くフォルダ", [], go,
+                          placeholder="語を空白区切りで（最後の語はフォルダ名に）",
+                          dynamic_items=candidates)
 
     # --- ドライブのラベルと容量(別スレッドで読んで覚える) ---
     def drive_label_text(self, root) -> str:
@@ -1328,7 +1646,10 @@ class FilerWindow(QWidget):
     def _on_list_finished(self, payload) -> None:
         try:
             side, request, ok, result, args = payload
-            self.pane(side).on_loaded(request, ok, result, args)
+            if args.get("flat"):
+                self.pane(side).on_flat_loaded(request, ok, result, args)
+            else:
+                self.pane(side).on_loaded(request, ok, result, args)
         except Exception:  # noqa: BLE001
             self.log(f"エラー: {_log_exception('list')}")
 
@@ -1398,6 +1719,9 @@ class FilerWindow(QWidget):
         mods = event.modifiers()
         if mods & Qt.MetaModifier:
             return  # Win キーとの組み合わせは使わない
+        if event.key() == Qt.Key_Escape and self.active.flat_loading:
+            self.active.cancel_flat()   # Esc は「処理の中止」: フラット表示の収集を止める
+            return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
         vk = _vk_of(event)
@@ -1510,6 +1834,10 @@ class FilerWindow(QWidget):
     def cmd_parent(self):
         pane = self.active
         if not pane.path:
+            return
+        if pane.flat or pane.flat_loading:
+            # フラット表示中の BS は「通常の表示へ戻る」(親へは行かない)。
+            pane.load(pane.path, history=None)
             return
         parent = core.parent_of(pane.path)
         if parent is None:
@@ -1654,6 +1982,11 @@ class FilerWindow(QWidget):
             return
         paths = core.context_targets(pane.path, pane.entries, pane.marks, pane.cursor_row())
         if not paths:
+            return
+        if len({os.path.normcase(os.path.dirname(p)) for p in paths}) > 1:
+            # フラット表示で別々のフォルダのものをマークしたとき。エクスプローラの
+            # メニューは同じフォルダの中のものしか1つにまとめられない。
+            self.log("右クリックメニュー: 別々のフォルダのものは1つのメニューにできません")
             return
         x, y = self._context_point(pane)
         self.spawn_context_menu(paths, x, y)
@@ -1946,7 +2279,115 @@ class FilerWindow(QWidget):
 
     # --- マスク ---
     def cmd_mask_clear(self):
+        # : はマスクを *.* に戻す。ライブ絞り込みもいっしょに解く(「全部見せる」キー)。
+        self.active.clear_live_filter(rebuild=False)
         self.active.set_mask(core.DEFAULT_MASK)
+
+    # --- プレビュー(F3) ---
+    def cmd_preview_toggle(self):
+        if self.preview_on:
+            self.preview_off()
+        else:
+            self.preview_show()
+
+    def preview_show(self) -> None:
+        """反対窓の場所をプレビューに差し替える(反対窓のパスやマークはそのまま持っておく)。"""
+        import filer_preview  # 使うときに読む
+
+        other = self.other
+        self.preview_side = other.side
+        if self.preview_widget is None:
+            self.preview_widget = filer_preview.PreviewWidget(self, self.colors, self.log_font)
+        index = self.hsplit.indexOf(other)
+        self.hsplit.insertWidget(index, self.preview_widget)
+        other.hide()
+        self.preview_widget.show()
+        self.preview_on = True
+        self.apply_layout()
+        self.active.view.setFocus()
+        self.schedule_preview(immediate=True)
+
+    def preview_off(self) -> None:
+        if not self.preview_on:
+            return
+        self.preview_on = False
+        self._preview_timer.stop()
+        self._preview_request += 1          # 走っている読み込みの結果は捨てる
+        pane = self.pane(self.preview_side)
+        if self.preview_widget is not None:
+            self.preview_widget.hide()
+            self.preview_widget.setParent(None)
+            self.preview_widget.deleteLater()
+            self.preview_widget = None
+        index = 0 if pane.side == "left" else 1
+        self.hsplit.insertWidget(index, pane)
+        pane.show()
+        self.preview_side = None
+        self.apply_layout()
+
+    def schedule_preview(self, immediate: bool = False) -> None:
+        """カーソルが動いたらプレビューを作り直す。連打で重くならないよう少し待つ。"""
+        if not getattr(self, "preview_on", False):
+            return
+        self._preview_timer.start(0 if immediate else PREVIEW_DELAY_MS)
+
+    def _start_preview(self) -> None:
+        try:
+            if not self.preview_on or self.preview_widget is None:
+                return
+            import filer_preview
+
+            pane = self.active
+            entry = pane.cursor_entry()
+            kind = core.preview_kind(entry, self.viewer_extensions)
+            self._preview_request += 1
+            request = self._preview_request
+            widget = self.preview_widget
+            if kind == "none":
+                widget.show_result({"title": "..", "lines": [], "image": None})
+                return
+            widget.show_loading(entry.name)
+            path = os.path.join(pane.path, entry.name)
+            box = widget.image_box()
+            archive = pane.archive
+            bridge = self.bridge
+
+            def worker():
+                result = filer_preview.load_preview(path, kind, entry, box, archive)
+                try:
+                    bridge.preview_ready.emit((request, result))
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True, name="filer-preview").start()
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('preview')}")
+
+    def _on_preview_ready(self, payload) -> None:
+        try:
+            request, result = payload
+            if request != self._preview_request or self.preview_widget is None:
+                return     # カーソルが先へ動いた後に届いた古い結果
+            self.preview_widget.show_result(result)
+        except Exception:  # noqa: BLE001
+            _log_exception("previewReady")
+
+    def cmd_live_filter(self):
+        self.active.open_live_filter()
+
+    def cmd_flat_view(self):
+        """Alt+B: フラット表示の入り切り。入ると、いまのフォルダより下のファイルを全部
+        1つの一覧に並べる(名前は相対パス)。もう一度 Alt+B・BS・フォルダの移動で戻る。"""
+        pane = self.active
+        if not pane.path:
+            return
+        if pane.archive is not None:
+            self.log("書庫内ではフラット表示できません")
+            return
+        if pane.flat or pane.flat_loading:
+            pane.load(pane.path, history=None)
+            return
+        pane.load_flat()
 
     def cmd_mask_input(self):
         current = self.active.mask_text
@@ -1974,6 +2415,15 @@ class FilerWindow(QWidget):
             self.log(f"{label}: {names}{where}")
         self.left.reload()
         self.right.reload()
+
+    def _refuse_flat(self, label: str) -> bool:
+        """フラット表示中は、名前の付け替え・フォルダ作成を断る。名前が相対パス
+        ("sub\\a.txt")なので、改名がフォルダをまたぐ移動になったり、どのフォルダに
+        作るのかが曖昧になったりするため。"""
+        if self.active.flat or self.active.flat_loading:
+            self.log(f"{label}: フラット表示中は使えません（Alt+B で通常の表示へ）")
+            return True
+        return False
 
     def _refuse_archive(self, label: str, source: bool = True, dest_pane=None) -> bool:
         """書庫の中で書き込み系を頼まれたら断る(メッセージだけ出して True)。
@@ -2084,7 +2534,7 @@ class FilerWindow(QWidget):
     # --- 作成・改名 ---
     def cmd_mkdir(self):
         pane = self.active
-        if not pane.path or self._refuse_archive("フォルダ作成"):
+        if not pane.path or self._refuse_archive("フォルダ作成") or self._refuse_flat("フォルダ作成"):
             return
         name = self.ask_text("フォルダ作成", "新しいフォルダの名前", "")
         if name is None:
@@ -2107,32 +2557,174 @@ class FilerWindow(QWidget):
         pane.reload(focus=name)
 
     def cmd_rename(self):
+        """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更
+        (あふｗと同じ)。対象はマーク、無ければカーソル行。".." は対象外。"""
         pane = self.active
-        entry = pane.cursor_entry()
-        if entry is None or entry.is_parent or self._refuse_archive("改名"):
+        if not pane.path or self._refuse_flat("ファイル情報の編集"):
             return
-        new = self.ask_text("改名", entry.name, entry.name,
-                            select=core.rename_selection_length(entry.name, entry.is_dir))
-        if new is None:
+        if pane.archive is not None:
+            self.log("書庫内では編集できません")
             return
-        new = new.strip()
-        if new == entry.name:
+        if pane.marks:
+            entries = [e for e in pane.entries if e.name in pane.marks and not e.is_parent]
+        else:
+            entry = pane.cursor_entry()
+            entries = [] if entry is None or entry.is_parent else [entry]
+        if not entries:
             return
-        problem = core.validate_name(new)
-        if problem:
-            self.log(f"改名: {problem}")
+        import filer_fileinfo  # 使うときに読む
+
+        colors = {"background": self.colors["background"], "text": self.colors["text"]}
+        dialog = filer_fileinfo.FileInfoDialog(
+            self, pane.path, entries, colors=colors, font=self.log_font,
+            on_apply=lambda plans: self._apply_file_info(pane, plans))
+        self.exec_dialog(dialog)
+        dialog.deleteLater()
+
+    # --- 設定(Z) ---
+    def cmd_settings_dialog(self):
+        """Z: 設定ダイアログ(あふｗの Z ＝設定プログラム起動)。いまは拡張子別表示色だけ。
+        決定で settings.json の filer.ext_colors だけを差し替え、両窓をその場で描き直す。"""
+        import filer_settings  # 使うときに読む
+
+        dialog = filer_settings.SettingsDialog(self, self.ext_rules, font=self.log_font)
+        accepted = self.exec_dialog(dialog) == QDialog.Accepted
+        rules = dialog.rules
+        dialog.deleteLater()
+        if not accepted:
             return
-        if core.name_conflicts([e.name for e in pane.all_entries], new, entry.name):
-            self.log(f"改名: 同じ名前があります: {new}")
+        self.set_ext_rules(rules)
+        save_values(self.app_settings, self.settings_path,
+                    {"ext_colors": core.ext_colors_to_settings(rules)})
+        self.log(f"設定: 拡張子別表示色を保存しました（{len(rules)}行）")
+
+    def set_ext_rules(self, rules) -> None:
+        self.ext_rules = core.normalize_ext_colors(core.ext_colors_to_settings(rules))
+        self.ext_color_map = core.ext_color_map(self.ext_rules)
+        for pane in (self.left, self.right):
+            pane.view.viewport().update()
+
+    # --- 一括改名(Renemo 風。Shift+R / Alt+R → Enter) ---
+    def cmd_rename_menu(self):
+        """Alt+R: 改名のメニュー。先頭が一括改名(あふｗで Alt+R → Enter で Renemo を
+        起こしていた指の動きのまま)。2番目は R と同じファイル情報の編集。"""
+        choice = self.choose_menu("改名", [
+            ("B", "一括改名（Renemo風）", "batch"),
+            ("I", "ファイル情報の編集", "info"),
+            ("Q", "キャンセル", None),
+        ])
+        if choice == "batch":
+            self.cmd_batch_rename()
+        elif choice == "info":
+            self.cmd_rename()
+
+    def cmd_batch_rename(self):
+        """Shift+R: 一括改名の窓。対象は見えているマーク、無ければ一覧の全部(".." 以外)。"""
+        pane = self.active
+        if not pane.path or self._refuse_flat("一括改名"):
             return
-        old_path = os.path.join(pane.path, entry.name)
+        if pane.archive is not None:
+            self.log("一括改名: 書庫内では使えません")
+            return
+        entries = [e for e in pane.entries if e.name in pane.marks and not e.is_parent]
+        if not entries:
+            entries = [e for e in pane.entries if not e.is_parent]
+        if not entries:
+            return
+        import filer_rename
+        import filer_renemo  # 使うときに読む
+
+        items = [{"folder": pane.path, "name": e.name, "is_dir": e.is_dir, "size": e.size,
+                  "mtime": e.mtime} for e in entries]
+        existing = {pane.path: [e.name for e in pane.all_entries]}
+        dialog = filer_renemo.RenemoWindow(
+            self, items, existing, history=filer_rename.load_history(),
+            on_execute=lambda pairs: self._run_batch_rename(pane, pairs),
+            on_undo=lambda entry: self._undo_batch_rename(pane, entry),
+            font=self.log_font)
+        self.exec_dialog(dialog)
+        dialog.deleteLater()
+
+    # 実際の改名に使う関数(テストで失敗を起こすために差し替える)。
+    rename_func = staticmethod(os.rename)
+
+    def _run_batch_rename(self, pane, pairs):
+        """一括改名を行う。失敗の理由か None。途中で失敗したら、それまでの分は巻き戻す。"""
+        import filer_rename
+
+        steps = filer_rename.plan_renames(pairs)
+        count, error = filer_rename.execute_plan(steps, rename=self.rename_func)
+        pane.reload(keep_marks=False)
+        if error:
+            self.log(f"一括改名: 失敗 {error}")
+            return error
+        changed = [(s, d) for s, d in pairs if s != d]
         try:
-            os.rename(old_path, os.path.join(pane.path, new))
+            filer_rename.save_history(filer_rename.add_history(filer_rename.load_history(), changed))
         except OSError as e:
-            self.log(f"改名: できません: {entry.name} → {new}  ({e})")
-            return
-        self.log(f"改名: {entry.name} → {new}")
-        pane.reload(keep_marks=False, focus=new)
+            self.log(f"一括改名: 履歴を残せませんでした（{e}）")
+        self.log(f"一括改名: {len(changed)}件")
+        return None
+
+    def _undo_batch_rename(self, pane, entry):
+        """履歴の1件を元に戻す。戻せない理由か None。戻せたら、その記録は履歴から消す。"""
+        import filer_rename
+
+        problems = filer_rename.undo_problems(entry)
+        if problems:
+            return f"元に戻せません: {problems[0]}"
+        steps = filer_rename.plan_renames(filer_rename.undo_pairs(entry))
+        count, error = filer_rename.execute_plan(steps, rename=self.rename_func)
+        pane.reload(keep_marks=False)
+        if error:
+            self.log(f"一括改名: 元に戻せませんでした {error}")
+            return error
+        history = [e for e in filer_rename.load_history() if e != entry]
+        try:
+            filer_rename.save_history(history)
+        except OSError:
+            pass
+        self.log(f"一括改名: 元に戻しました（{len(entry.get('pairs', []))}件）")
+        return None
+
+    def exec_dialog(self, dialog) -> int:
+        """モーダルで開く(テストではここを差し替えて、窓を出さずに操作する)。"""
+        return dialog.exec()
+
+    def _apply_file_info(self, pane, plans):
+        """ファイル情報の変更を当てる。失敗の理由(文字列)か None を返す。
+
+        名前がほかと重なるもの(一括で小文字にしたら重なった、も含む)は、何も変えずに
+        理由を返す。当てている途中で失敗したら、そこまでの分は当たったまま読み直して見せ、
+        理由を返す(ダイアログは開いたまま)。"""
+        folder = pane.path
+        for plan in plans:
+            if "new" in plan:
+                problem = core.validate_name(plan["new"])
+                if problem:
+                    return f"{plan['old']}: {problem}"
+        problem = core.rename_collision(
+            [e.name for e in pane.all_entries],
+            {p["old"]: p["new"] for p in plans if "new" in p})
+        if problem:
+            return f"同じ名前があります: {problem}"
+        done = []
+        error = None
+        for plan in plans:
+            try:
+                filer_shell.apply_file_info(folder, plan)
+                done.append(plan)
+            except OSError as e:
+                error = f"{plan['old']}: {e.strerror or e}"
+                break
+        for plan in done:
+            self.log(f"ファイル情報: {core.describe_file_info(plan)}")
+        if done:
+            focus = done[0].get("new", done[0]["old"])
+            pane.reload(keep_marks=False, focus=focus)
+        if error:
+            self.log(f"ファイル情報: 失敗 {error}")
+        return error
 
     # --- クリップボード(エクスプローラと相互に貼れる形) ---
     DROP_EFFECT_FORMAT = 'application/x-qt-windows-mime;value="Preferred DropEffect"'

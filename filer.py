@@ -1770,6 +1770,15 @@ class FilerWindow(QWidget):
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
+        # ログ(メッセージ窓)に選択範囲があれば、Ctrl+C はその文字列のコピーにする。
+        # ログはフォーカスを持たない(NoFocus)のでキーはここへ来てしまい、通常は
+        # Ctrl+英字の頭文字ジャンプに取られて、選択しても写せなかった。
+        if ctrl and not shift and not alt and vk == 67:  # 67 = C
+            cursor = self.log_view.textCursor()
+            if cursor.hasSelection():
+                QGuiApplication.clipboard().setText(
+                    core.log_selection_text(cursor.selectedText()))
+                return
         code = core.scav(vk, shift, ctrl, alt)
         command = self.keymap.get(code)
         if command:

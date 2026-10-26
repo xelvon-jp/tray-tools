@@ -1210,6 +1210,13 @@ def sha256_of_file(path) -> str:
     return digest.hexdigest()
 
 
+def log_selection_text(selected: str) -> str:
+    """ログの選択範囲(QTextCursor.selectedText)をクリップボード用に直す。
+
+    Qt は段落の区切りを U+2029 で返すので、通常の改行(CRLF)へ置き換える。"""
+    return selected.replace("\u2029", "\r\n")
+
+
 def hash_clip_text(results) -> str:
     """(名前, ハッシュ) の並び → クリップボード用テキスト。
 

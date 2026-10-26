@@ -396,6 +396,8 @@ def test_hash_helpers():
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     assert core.hash_clip_text([("a.txt", "abc")]) == "abc"
     assert core.hash_clip_text([("a.txt", "aaa"), ("b.txt", "bbb")]) == "aaa  a.txt\r\nbbb  b.txt"
+    assert core.log_selection_text("1行目\u20292行目") == "1行目\r\n2行目"
+    assert core.log_selection_text("選択のみ") == "選択のみ"
 
 
 # ---------------------------------------------------------------
@@ -958,6 +960,45 @@ def test_hash_copy():
             w.left.set_cursor(w.left._row_of("sub1"))
             w.cmd_copy_menu()
             assert "フォルダは計算しません" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_log_selection_ctrl_c():
+    """ログで範囲選択して Ctrl+C すると、選択した文字列がクリップボードへ入る。
+
+    ログは NoFocus でキーを受け取らないため、Ctrl+C は一覧側の handle_key に
+    届く。選択が無いときの Ctrl+英字(頭文字ジャンプ)は従来どおり。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication, QTextCursor
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            w.log("1行目")
+            w.log("2行目")
+            cursor = w.log_view.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            w.log_view.setTextCursor(cursor)
+            assert w.log_view.textCursor().hasSelection()
+            QTest.keyClick(w.active.view, Qt.Key_C, Qt.ControlModifier)
+            QTest.qWait(30)
+            expected = w.log_view.toPlainText().replace("\n", "\r\n")
+            assert QGuiApplication.clipboard().text() == expected, \
+                QGuiApplication.clipboard().text()
         finally:
             w.close()
             w.deleteLater()

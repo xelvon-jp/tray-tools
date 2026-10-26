@@ -1091,6 +1091,45 @@ class Pane(QWidget):
 # ---------------------------------------------------------------
 # 窓
 # ---------------------------------------------------------------
+class _ChooserMenu(QMenu):
+    """文字キーは項目を選ぶだけで、実行は Enter(とクリック)に限るメニュー。
+
+    QMenu の既定では & の付いた文字キーを押した時点で項目が実行される(あふｗの
+    &MENU と同じ即決)。それだと C → P のつもりが選択のつもりでもパスコピーが
+    走ってしまうので、文字キーは「その項目を選ぶ」までに止める(2026-10-26
+    ユーザー要望)。Enter・クリックは従来どおり実行、矢印・Esc も従来どおり。"""
+
+    def keyPressEvent(self, event):  # noqa: N802 (Qt の上書き)
+        text = event.text()
+        modifiers = event.modifiers()
+        plain = not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
+        if plain and len(text) == 1 and text.isalnum():
+            char = text.upper()
+            for action in self.actions():
+                if not action.isEnabled() or action.isSeparator():
+                    continue
+                if _menu_key_of(action) == char:
+                    self.setActiveAction(action)
+                    event.accept()
+                    return
+            event.accept()  # 対応する項目が無い文字も、実行には使わない
+            return
+        super().keyPressEvent(event)
+
+
+def _menu_key_of(action) -> str:
+    """メニュー項目の選択キー(大文字1字)。build_menu が付けた property を優先し、
+    無ければ表示テキストの & の次の字から取る。"""
+    stored = action.property("filer_menu_key")
+    if isinstance(stored, str) and stored:
+        return stored.upper()
+    text = action.text()
+    if "&" in text:
+        rest = text.split("&", 1)[1]
+        return rest[:1].upper() if rest else ""
+    return text[:1].upper() if text else ""
+
+
 class FilerWindow(QWidget):
     def __init__(self, app_settings=None, settings_path=None):
         super().__init__()
@@ -1933,6 +1972,25 @@ class FilerWindow(QWidget):
             self.log(f"開く: {path}")
         except OSError as e:
             self.log(f"開けません: {path}  ({e})")
+
+    def cmd_open_in_other(self):
+        """Shift+Enter: カーソルのフォルダを反対窓で開く。ファイルならエディタで開く。
+
+        あふｗの Shift+Enter はエディタだが、フォルダをエディタへ渡しても開けないので、
+        フォルダのときだけ反対窓で開く動きに倒した(2026-10-26 ユーザー要望)。対象は
+        マークではなくカーソル行。`..` のときは親フォルダを反対窓で開く。書庫の中の
+        フォルダも、cmd_enter と同じパスの組み立てで反対窓へ渡せる。"""
+        pane = self.active
+        entry = pane.cursor_entry()
+        if entry is not None and entry.is_dir:
+            if entry.is_parent:
+                parent = core.parent_of(pane.path) if pane.path else None
+                if parent is not None:
+                    self.other.load(parent)
+            else:
+                self.other.load(os.path.join(pane.path, entry.name))
+            return
+        self.cmd_edit()
 
     def cmd_edit(self):
         files = [e for e in self.active.targets() if not e.is_dir]
@@ -3281,17 +3339,18 @@ class FilerWindow(QWidget):
         return None
 
     def build_menu(self, title: str, items):
-        """先頭の文字キーで即決する小さなメニューを組む。(QMenu, {QAction: 値})。
+        """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
         items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
         項目はチェック付きで出す(Shift+Z の ON/OFF)。先頭の項目を選んだ状態にしておく
-        (あふｗと同じく、開いてすぐ Enter で先頭が実行できるように)。"""
-        menu = QMenu(self)
+        (開いてすぐ Enter で先頭が実行できるように)。"""
+        menu = _ChooserMenu(self)
         menu.setTitle(title)
         chosen = {}
         for item in items:
             key, label, value = item[:3]
             action = menu.addAction(f"&{key}:{label}")
+            action.setProperty("filer_menu_key", key)
             if len(item) > 3:
                 action.setCheckable(True)
                 action.setChecked(bool(item[3]))
@@ -3315,7 +3374,7 @@ class FilerWindow(QWidget):
         return chosen.get(menu.exec(self._menu_pos()))
 
     def choose_menu(self, title: str, items):
-        """先頭の文字キーで即決する小さなメニュー(あふｗの &MENU)。選んだ値か None。"""
+        """文字キーは選択のみ・Enter で実行する小さなメニュー。選んだ値か None。"""
         menu, chosen = self.build_menu(title, items)
         return self._exec_menu(menu, chosen)
 

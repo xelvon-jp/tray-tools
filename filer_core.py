@@ -54,7 +54,7 @@ DEFAULT_KEYMAP = {
     "0009": "switch",             # Tab 反対窓へ(あふｗ標準には無いが便利なので)
     "0013": "enter",              # Enter フォルダなら入る/ファイルは関連付け
     "2013": "open_assoc",         # Ctrl+Enter 関連付けで開く
-    "1013": "edit",               # Shift+Enter エディタ
+    "1013": "open_in_other",      # Shift+Enter フォルダは反対窓で開く/ファイルはエディタ
     "0069": "edit",               # E
     "0086": "edit",               # V (AFXW.key 0086 &MENU edit.txt の代わり)
     # --- マーク ---
@@ -774,6 +774,7 @@ COMMAND_SHORT_NAMES = {
     "enter": "Open",
     "open_assoc": "Assoc",
     "edit": "Edit",
+    "open_in_other": "Open他",
     "copy_menu": "Copy",
     "copy_direct": "Copy",
     "move_menu": "Move",

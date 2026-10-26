@@ -709,7 +709,7 @@ def test_window_keys_and_operations():
         _wait(w)
         assert (right / "beta.md").exists() and not (left / "beta.md").exists()
 
-        # C メニュー(先頭文字で即決)は choose_menu を差し替えて通す
+        # C メニューは choose_menu を差し替えて通す(文字キーの選択のみの動きは別テスト)
         w.choose_menu = lambda title, items: "copy"
         L.set_cursor(L._row_of("photo.JPG"))
         key(Qt.Key_C)
@@ -816,6 +816,88 @@ def test_window_keys_and_operations():
         assert stored["filer"]["left_sort"]["kind"] == "size"
         assert stored["filer"]["left_sort"]["descending"] is True
         w.deleteLater()
+
+
+def test_shift_enter_and_menu_select_only():
+    """Shift+Enter はフォルダを反対窓で開き、メニューの文字キーは選択のみ。
+
+    - フォルダで Shift+Enter → 反対窓がそのフォルダに移る(自窓は動かない)。
+      ファイルで Shift+Enter → 従来どおりエディタ。`..` → 親を反対窓で開く。
+    - C → P では「フルパス」の項目が選ばれるだけで、クリップボードへは書かない。
+      実行は Enter を押して初めて行われる(2026-10-26 ユーザー要望)。
+    """
+    import filer
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        try:
+            assert core.DEFAULT_KEYMAP["1013"] == "open_in_other"
+            assert core.DEFAULT_KEYMAP["0069"] == "edit"  # E は従来どおりエディタ
+
+            # フォルダ: 反対窓で開く。自窓はそのまま、フォーカスも移らない
+            L.set_cursor(L._row_of("sub1"))
+            key(Qt.Key_Return, Qt.ShiftModifier)
+            _wait(w)
+            assert core.same_dir(R.path, left / "sub1"), R.path
+            assert core.same_dir(L.path, left) and w.active_side == "left"
+
+            # ファイル: エディタで開く(従来どおり)
+            calls = []
+            real_popen = filer.subprocess.Popen
+            filer.subprocess.Popen = lambda args, **kw: calls.append(args)  # noqa: E731
+            try:
+                L.set_cursor(L._row_of("alpha.txt"))
+                key(Qt.Key_Return, Qt.ShiftModifier)
+            finally:
+                filer.subprocess.Popen = real_popen
+            assert [os.path.basename(a[1]) for a in calls] == ["alpha.txt"], calls
+
+            # `..`: 親フォルダを反対窓で開く
+            R.set_cursor(R._row_of(".."))
+            w.activate("right")
+            key(Qt.Key_Return, Qt.ShiftModifier)
+            _wait(w)
+            assert core.same_dir(L.path, left), L.path
+
+            # メニュー: P は選択のみ。実行(triggered)は Enter を押して初めて起きる。
+            # 実物の exec() はモーダルでテストのスレッドを止めるので、popup で開いて
+            # triggered を直接見る(choose_menu / _exec_menu の中身は既存テストが通している)。
+            menu, chosen = w.build_menu("複写", [
+                ("O", "反対窓にコピー", "copy"),
+                ("P", "フルパスをクリップボードへ", "path"),
+                ("Q", "キャンセル", None),
+            ])
+            fired = []
+            menu.triggered.connect(lambda action: fired.append(chosen[action]))
+            menu.popup(w.mapToGlobal(QPoint(50, 50)))
+            QTest.qWait(30)
+            assert menu.isVisible()
+            assert menu.activeAction().text().startswith("&O")  # 先頭が選ばれている
+            QTest.keyClick(menu, Qt.Key_P)
+            QTest.qWait(30)
+            assert menu.isVisible(), "文字キーでメニューが閉じてしまった"
+            assert menu.activeAction().text().startswith("&P")
+            assert fired == [], "文字キーで実行されてしまった"
+            QTest.keyClick(menu, Qt.Key_Return)
+            QTest.qWait(30)
+            assert fired == ["path"], fired
+            assert not menu.isVisible()
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def test_bookmark_add_delete_move():

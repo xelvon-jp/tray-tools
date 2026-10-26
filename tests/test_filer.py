@@ -381,6 +381,23 @@ def test_clipboard_helpers():
     assert core.clip_text(["C:\\x\\a.txt", "C:\\x\\d"], names_only=True) == "a.txt\r\nd"
 
 
+def test_hash_helpers():
+    """ハッシュ計算とクリップボード用テキスト(表示なしで確かめられる部分)。"""
+    import hashlib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp, "data.bin")
+        data = bytes(range(256)) * 5000  # 1MB を超えて分割読みの経路も通す
+        p.write_bytes(data)
+        assert core.sha256_of_file(str(p)) == hashlib.sha256(data).hexdigest()
+        empty = Path(tmp, "empty")
+        empty.write_bytes(b"")
+        assert core.sha256_of_file(str(empty)) == \
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    assert core.hash_clip_text([("a.txt", "abc")]) == "abc"
+    assert core.hash_clip_text([("a.txt", "aaa"), ("b.txt", "bbb")]) == "aaa  a.txt\r\nbbb  b.txt"
+
+
 # ---------------------------------------------------------------
 # Win32(SHFileOperationW / 既知フォルダ)
 # ---------------------------------------------------------------
@@ -895,6 +912,52 @@ def test_shift_enter_and_menu_select_only():
             QTest.qWait(30)
             assert fired == ["path"], fired
             assert not menu.isVisible()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_hash_copy():
+    """C→H: ファイルの SHA-256 を裏で計算し、クリップボードへ入れる。
+
+    メニュー選択そのものは test_shift_enter_and_menu_select_only が見ているので、
+    ここでは choose_menu を差し替えて「H を選んだ」ことにし、計算スレッドの
+    完了(bridge.hashed → _on_hashed)までを確かめる。"""
+    import hashlib
+
+    import filer
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            expected = hashlib.sha256(b"a" * 10).hexdigest()  # alpha.txt の中身
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            w.choose_menu = lambda title, items: "hash"
+            w.cmd_copy_menu()
+            deadline = time.monotonic() + 5.0
+            while w._hash_busy and time.monotonic() < deadline:
+                QTest.qWait(20)
+            assert not w._hash_busy, "ハッシュ計算が終わらない"
+            QTest.qWait(30)
+            assert f"SHA-256 alpha.txt: {expected}" in w.log_view.toPlainText()
+            assert "クリップボード: 1件のハッシュ" in w.log_view.toPlainText()
+            assert QGuiApplication.clipboard().text() == expected
+
+            # フォルダだけのときは計算しない(案内だけ出す)
+            w.left.set_cursor(w.left._row_of("sub1"))
+            w.cmd_copy_menu()
+            assert "フォルダは計算しません" in w.log_view.toPlainText()
         finally:
             w.close()
             w.deleteLater()

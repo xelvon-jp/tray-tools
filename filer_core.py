@@ -9,6 +9,7 @@
 #   ファイル一覧の読み取り(list_entries / read_folder)だけは実ディスクを触るが、
 #   これも別スレッドから呼ぶ前提の素の関数にしてある(Qt のオブジェクトを触らない)。
 import fnmatch
+import hashlib
 import os
 import re
 import stat
@@ -1195,6 +1196,28 @@ def clip_text(paths, names_only: bool = False) -> str:
     """C メニューの「フルパス/ファイル名のみをクリップボードへ」。改行(CRLF)区切り。"""
     items = [os.path.basename(p.rstrip("\\")) if names_only else p for p in paths]
     return "\r\n".join(items)
+
+
+def sha256_of_file(path) -> str:
+    """ファイルの SHA-256 ハッシュ(16進小文字)。大きいファイルでも少しずつ読む。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_clip_text(results) -> str:
+    """(名前, ハッシュ) の並び → クリップボード用テキスト。
+
+    1 件ならハッシュだけ(照合先の入力欄にそのまま貼れる)。
+    複数なら sha256sum と同じ「ハッシュ␣␣名前」の行を改行(CRLF)区切りにする。"""
+    if len(results) == 1:
+        return results[0][1]
+    return "\r\n".join(f"{digest}  {name}" for name, digest in results)
 
 
 # ---------------------------------------------------------------

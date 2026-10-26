@@ -442,6 +442,8 @@ class ListBridge(QObject):
     drive_info = Signal(object)
     # プレビューの中身ができたとき。(要求番号, 結果)。
     preview_ready = Signal(object)
+    # ハッシュの計算が終わったとき。[(パス, 名前, ハッシュ or None, エラー文字列 or "")]。
+    hashed = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -1227,6 +1229,8 @@ class FilerWindow(QWidget):
         self.bridge.context_done.connect(self._on_context_done)
         self.bridge.drive_info.connect(self._on_drive_info)
         self.bridge.preview_ready.connect(self._on_preview_ready)
+        self.bridge.hashed.connect(self._on_hashed)
+        self._hash_busy = False
         # プレビュー(F3)。ON の間は反対窓の場所にプレビューを出す。
         self.preview_on = False
         self.preview_side = None
@@ -2540,6 +2544,7 @@ class FilerWindow(QWidget):
             ("O", "反対窓にコピー", "copy"),
             ("P", "フルパスをクリップボードへ（改行区切り）", "path"),
             ("N", "ファイル名のみクリップボードへ", "name"),
+            ("H", "ハッシュ(SHA-256)をクリップボードへ", "hash"),
             ("Q", "キャンセル", None),
         ])
         if choice == "copy":
@@ -2548,6 +2553,51 @@ class FilerWindow(QWidget):
             paths = self.active.target_paths()
             QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=choice == "name"))
             self.log(f"クリップボード: {len(paths)}件の{'フルパス' if choice == 'path' else '名前'}")
+        elif choice == "hash":
+            self._copy_hash()
+
+    def _copy_hash(self):
+        """C→H: 対象ファイルの SHA-256 を計算してクリップボードへ入れる。
+
+        大きいファイルでも画面が固まらないよう計算は裏のスレッドで行い、
+        終わったら _on_hashed が受け取ってクリップボードへ入れる。"""
+        pane = self.active
+        if pane.archive is not None:
+            self.log("ハッシュ: 書庫の中では使えません")
+            return
+        files = [e for e in pane.targets() if not e.is_dir]
+        if not files:
+            self.log("ハッシュ: ファイルが選ばれていません(フォルダは計算しません)")
+            return
+        if self._hash_busy:
+            self.log("ハッシュ: 計算中です。終わってからもう一度どうぞ")
+            return
+        items = [(os.path.join(pane.path, e.name), e.name) for e in files]
+        self._hash_busy = True
+        self.log(f"ハッシュ計算中: {len(items)}件")
+
+        def worker():
+            results = []
+            for path, name in items:
+                try:
+                    results.append((name, core.sha256_of_file(path), ""))
+                except OSError as e:
+                    results.append((name, None, str(e)))
+            self.bridge.hashed.emit(results)
+
+        threading.Thread(target=worker, daemon=True, name="filer-hash").start()
+
+    def _on_hashed(self, results) -> None:
+        self._hash_busy = False
+        done = [(name, digest) for name, digest, _err in results if digest]
+        for name, digest, err in results:
+            if digest:
+                self.log(f"SHA-256 {name}: {digest}")
+            else:
+                self.log(f"ハッシュ: 計算できません: {name}  ({err})")
+        if done:
+            QGuiApplication.clipboard().setText(core.hash_clip_text(done))
+            self.log(f"クリップボード: {len(done)}件のハッシュ")
 
     def cmd_move_menu(self):
         if self._refuse_archive("移動", dest_pane=self.other):

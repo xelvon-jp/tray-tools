@@ -2425,7 +2425,14 @@ class FilerWindow(QWidget):
         if delay and core.preview_kind(self.active.cursor_entry(),
                                         self.viewer_extensions) == "image":
             delay = 0
-        self._preview_timer.start(delay)
+        if delay:
+            self._preview_timer.start(delay)
+            return
+        # 待ち時間が無いときはタイマーを経由せず、その場で待ち行列へ積む。
+        # 0ミリ秒タイマーだと、イベントが回る前に続いたカーソル移動が1件に
+        # 潰れてしまい、通り過ぎた画像が積まれないことがあるため。
+        self._preview_timer.stop()
+        self._start_preview()
 
     def _start_preview(self) -> None:
         """いまのカーソルのファイルを待ち行列へ積む(実際の読み取りは _drain_preview)。"""
@@ -2445,6 +2452,8 @@ class FilerWindow(QWidget):
             item = (self._preview_generation, os.path.join(pane.path, entry.name),
                     kind, entry, widget.image_box(), pane.archive)
             with self._preview_lock:
+                if self._preview_queue and self._preview_queue[-1][1] == item[1]:
+                    return      # 同じファイルが続けて積まれるだけなら1件でよい
                 self._preview_queue.append(item)
                 if self._preview_worker_on:
                     return

@@ -3479,6 +3479,8 @@ def test_preview_esc_and_image_enter():
         img = QImage(120, 80, QImage.Format_RGB32)
         img.fill(QColor("#cc6633"))
         assert img.save(str(left / "pic.png"))
+        img.fill(QColor("#3366cc"))
+        assert img.save(str(left / "pic2.png"))
         settings_path = Path(tmp, "settings.json")
         settings_path.write_text("{}", encoding="utf-8")
         w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
@@ -3514,9 +3516,10 @@ def test_preview_esc_and_image_enter():
             assert result["kind"] == "image" and result["image"] is not None
 
             # プレビュー中に別の画像へ Enter しても開いたまま切り替わる
-            L.set_cursor(L._row_of("photo.JPG"))
+            # (photo.JPG は中身が画像でないダミーなので、実画像の pic2.png で見る)
+            L.set_cursor(L._row_of("pic2.png"))
             key(Qt.Key_Return)
-            result = _wait_preview(w, "photo.JPG")
+            result = _wait_preview(w, "pic2.png")
             assert result["kind"] == "image" and w.preview_on
             key(Qt.Key_Escape)
             assert not w.preview_on

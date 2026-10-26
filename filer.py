@@ -1235,7 +1235,13 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self.preview_side = None
         self.preview_widget = None
-        self._preview_request = 0
+        # プレビューの待ち行列。通り過ぎたファイルも飛ばさず順に出すため、
+        # 要求はここへ積んで1つのスレッドが先頭から読む。世代はプレビューを
+        # 閉じたときに進め、古い結果を捨てる印にする。
+        self._preview_queue = []
+        self._preview_lock = threading.Lock()
+        self._preview_worker_on = False
+        self._preview_generation = 0
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._start_preview)
@@ -2392,7 +2398,9 @@ class FilerWindow(QWidget):
             return
         self.preview_on = False
         self._preview_timer.stop()
-        self._preview_request += 1          # 走っている読み込みの結果は捨てる
+        with self._preview_lock:
+            self._preview_generation += 1   # 待ち行列と読み込み中の結果は捨てる
+            self._preview_queue.clear()
         pane = self.pane(self.preview_side)
         if self.preview_widget is not None:
             self.preview_widget.hide()
@@ -2420,42 +2428,62 @@ class FilerWindow(QWidget):
         self._preview_timer.start(delay)
 
     def _start_preview(self) -> None:
+        """いまのカーソルのファイルを待ち行列へ積む(実際の読み取りは _drain_preview)。"""
         try:
             if not self.preview_on or self.preview_widget is None:
                 return
-            import filer_preview
-
             pane = self.active
             entry = pane.cursor_entry()
             kind = core.preview_kind(entry, self.viewer_extensions)
-            self._preview_request += 1
-            request = self._preview_request
             widget = self.preview_widget
             if kind == "none":
+                with self._preview_lock:
+                    self._preview_queue.clear()
                 widget.show_result({"title": "..", "lines": [], "image": None})
                 return
             widget.show_loading(entry.name)
-            path = os.path.join(pane.path, entry.name)
-            box = widget.image_box()
-            archive = pane.archive
-            bridge = self.bridge
-
-            def worker():
-                result = filer_preview.load_preview(path, kind, entry, box, archive)
-                try:
-                    bridge.preview_ready.emit((request, result))
-                except RuntimeError:
-                    pass
-
-            threading.Thread(target=worker, daemon=True, name="filer-preview").start()
+            item = (self._preview_generation, os.path.join(pane.path, entry.name),
+                    kind, entry, widget.image_box(), pane.archive)
+            with self._preview_lock:
+                self._preview_queue.append(item)
+                if self._preview_worker_on:
+                    return
+                self._preview_worker_on = True
+            threading.Thread(target=self._drain_preview, daemon=True,
+                             name="filer-preview").start()
         except Exception:  # noqa: BLE001
             self.log(f"エラー: {_log_exception('preview')}")
 
+    def _drain_preview(self) -> None:
+        """待ち行列を先頭から1件ずつ読み、順番どおりに表示へ回す(読み取りス레ッド)。
+
+        「最新だけ出す」作りだと、読み終わる前にカーソルが進んだファイルは
+        表示されないまま捨てられ、下キーの長押しで歯抜けになる。行列にして
+        全部出すと、表示はカーソルに遅れても必ず追いつく。"""
+        import filer_preview
+
+        while True:
+            with self._preview_lock:
+                if not self._preview_queue:
+                    self._preview_worker_on = False
+                    return
+                generation, path, kind, entry, box, archive = self._preview_queue.pop(0)
+            try:
+                result = filer_preview.load_preview(path, kind, entry, box, archive)
+            except Exception as e:  # noqa: BLE001  1件の失敗で行列を止めない
+                result = {"kind": "info", "title": entry.name, "image": None,
+                          "lines": core.info_lines(entry.name, entry)
+                          + ["", f"（読めません: {e}）"]}
+            try:
+                self.bridge.preview_ready.emit((generation, result))
+            except RuntimeError:
+                pass
+
     def _on_preview_ready(self, payload) -> None:
         try:
-            request, result = payload
-            if request != self._preview_request or self.preview_widget is None:
-                return     # カーソルが先へ動いた後に届いた古い結果
+            generation, result = payload
+            if generation != self._preview_generation or self.preview_widget is None:
+                return     # プレビューを閉じた(開き直した)あとに届いた結果
             self.preview_widget.show_result(result)
         except Exception:  # noqa: BLE001
             _log_exception("previewReady")

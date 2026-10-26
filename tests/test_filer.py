@@ -3528,6 +3528,65 @@ def test_preview_esc_and_image_enter():
             w.deleteLater()
 
 
+def test_preview_shows_every_image_in_order():
+    """プレビューは、カーソルが通り過ぎた画像も飛ばさず順番に全部出す。
+
+    待ち行列方式の確認: 素早くカーソルを進めても、表示された題名の並びが
+    通った順と一致し、最後はカーソルの画像で止まる(2026-10-27 ユーザー要望)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        pics = Path(tmp, "pics")
+        pics.mkdir()
+        names = [f"img{i:02d}.png" for i in range(1, 7)]
+        img = QImage(400, 300, QImage.Format_RGB32)
+        for i, name in enumerate(names):
+            img.fill(QColor.fromHsv(i * 50, 200, 200))
+            assert img.save(str(pics / name))
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(pics), "right_path": tmp,
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        try:
+            shown = []
+            L.set_cursor(L._row_of(names[0]))
+            QTest.keyClick(L.view, Qt.Key_F3)
+            assert w.preview_on
+            real_show = w.preview_widget.show_result
+
+            def record(result):
+                if result.get("kind") == "image":
+                    shown.append(result.get("title"))
+                real_show(result)
+
+            w.preview_widget.show_result = record
+            # いったん先頭(..)へ戻してから、間を空けずに最後まで進める
+            # (長押しで通り過ぎる動き)
+            L.set_cursor(L._row_of(".."))
+            for name in names:
+                L.set_cursor(L._row_of(name))
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                QTest.qWait(30)
+                if shown and shown[-1] == names[-1]:
+                    break
+            deduped = [t for i, t in enumerate(shown) if i == 0 or t != shown[i - 1]]
+            assert deduped == names, shown
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 # ---------------------------------------------------------------
 # E. 一括改名(Renemo 風。Shift+R / Alt+R)
 # ---------------------------------------------------------------

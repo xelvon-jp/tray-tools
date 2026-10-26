@@ -1767,6 +1767,9 @@ class FilerWindow(QWidget):
             return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
+        if event.key() == Qt.Key_Escape and self.preview_on:
+            self.preview_off()      # Esc はプレビュー(F3)を抜ける
+            return
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
@@ -1909,6 +1912,12 @@ class FilerWindow(QWidget):
         elif pane.archive is None and filer_archive.is_archive_name(entry.name):
             # 書庫ファイルは中へ入る(あふｗの仮想フォルダ)。関連付けで開きたいときは Ctrl+Enter。
             pane.load(os.path.join(pane.path, entry.name))
+        elif core.preview_kind(entry, self.viewer_extensions) == "image":
+            # 画像は内部ビューア(プレビュー)で開く。関連付けで開きたいときは Ctrl+Enter。
+            if self.preview_on:
+                self.schedule_preview(immediate=True)
+            else:
+                self.preview_show()
         elif core.opens_in_viewer(entry.name, self.viewer_extensions):
             # テキストはビュアで(あふｗの拡張子判別実行)。関連付けは Ctrl+Enter。
             self._view_entry(entry)
@@ -2397,10 +2406,18 @@ class FilerWindow(QWidget):
         self.apply_layout()
 
     def schedule_preview(self, immediate: bool = False) -> None:
-        """カーソルが動いたらプレビューを作り直す。連打で重くならないよう少し待つ。"""
+        """カーソルが動いたらプレビューを作り直す。連打で重くならないよう少し待つ。
+
+        画像だけは待たない。下キーの長押しで次々と切り替えたいので、その場で
+        読み始める(画像は表示の大きさに縮小して読むので1枚が速い。古い結果は
+        要求番号で捨てられる)。"""
         if not getattr(self, "preview_on", False):
             return
-        self._preview_timer.start(0 if immediate else PREVIEW_DELAY_MS)
+        delay = 0 if immediate else PREVIEW_DELAY_MS
+        if delay and core.preview_kind(self.active.cursor_entry(),
+                                        self.viewer_extensions) == "image":
+            delay = 0
+        self._preview_timer.start(delay)
 
     def _start_preview(self) -> None:
         try:

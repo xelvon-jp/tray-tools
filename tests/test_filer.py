@@ -3462,6 +3462,69 @@ def test_window_preview():
             w.deleteLater()
 
 
+def test_preview_esc_and_image_enter():
+    """Esc でプレビューを抜ける／画像の Enter は内部ビューア(プレビュー)で開く。
+
+    - 画像で Enter → 関連付けではなくプレビューが開く(2026-10-27 ユーザー要望)
+    - Esc → プレビューが閉じて反対窓が戻る。プレビューが無いときの Esc は何もしない
+    - 画像のプレビューは待ち時間なしで読み始める(schedule_preview の遅延が 0)"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        img = QImage(120, 80, QImage.Format_RGB32)
+        img.fill(QColor("#cc6633"))
+        assert img.save(str(left / "pic.png"))
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            # 画像のプレビューは待たない(タイマーの遅延が 0 になる)
+            L.set_cursor(L._row_of("photo.JPG"))
+            assert not w.preview_on
+            key(Qt.Key_F3)
+            assert w.preview_on
+            w.schedule_preview()
+            assert not w._preview_timer.isActive() or w._preview_timer.interval() == 0
+
+            # Esc で抜ける
+            key(Qt.Key_Escape)
+            assert not w.preview_on and R.isVisible() and w.preview_widget is None
+            # プレビューが無いときの Esc は無害(窓は閉じない)
+            key(Qt.Key_Escape)
+            assert w.isVisible()
+
+            # 画像で Enter → プレビューが開いて画像が出る
+            L.set_cursor(L._row_of("pic.png"))
+            key(Qt.Key_Return)
+            assert w.preview_on
+            result = _wait_preview(w, "pic.png")
+            assert result["kind"] == "image" and result["image"] is not None
+
+            # プレビュー中に別の画像へ Enter しても開いたまま切り替わる
+            L.set_cursor(L._row_of("photo.JPG"))
+            key(Qt.Key_Return)
+            result = _wait_preview(w, "photo.JPG")
+            assert result["kind"] == "image" and w.preview_on
+            key(Qt.Key_Escape)
+            assert not w.preview_on
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 # ---------------------------------------------------------------
 # E. 一括改名(Renemo 風。Shift+R / Alt+R)
 # ---------------------------------------------------------------

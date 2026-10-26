@@ -746,9 +746,9 @@ def test_window_keys_and_operations():
             asked["default_yes"] = default_yes
             return True
         w.confirm = yes
-        key(Qt.Key_Delete, Qt.ShiftModifier)    # 完全削除は既定ボタンが「いいえ」
+        key(Qt.Key_Delete, Qt.ShiftModifier)    # 完全削除も既定ボタンは「はい」
         _wait(w)
-        assert asked["default_yes"] is False and not (left / "photo.JPG").exists()
+        assert asked["default_yes"] is True and not (left / "photo.JPG").exists()
 
         # W: 同名ファイル比較マーク(反対窓にもある alpha.txt だけ。sub2 はフォルダ同士なので外れる)
         assert L.marks == set()

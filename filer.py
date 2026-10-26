@@ -2688,8 +2688,9 @@ class FilerWindow(QWidget):
             question = f"{len(targets)}件を完全に削除します（ごみ箱に入りません）。よろしいですか？"
         else:
             question = f"{len(targets)}件をごみ箱へ送ります。よろしいですか？"
-        # 完全削除は既定のボタンを「いいえ」にする(Enter の押し間違いで消さない)。
-        if not self.confirm("削除", f"{question}\n\n{shown}", default_yes=not permanent):
+        # 完全削除も既定のボタンは「はい」(2026-10-27 ユーザー要望。Shift+D は
+        # 意図が明確な操作なので、Enter でそのまま実行できるようにする)。
+        if not self.confirm("削除", f"{question}\n\n{shown}", default_yes=True):
             return
         paths = [os.path.join(pane.path, e.name) for e in targets]
         result = filer_shell.delete_files(paths, self._hwnd(), permanent=permanent,

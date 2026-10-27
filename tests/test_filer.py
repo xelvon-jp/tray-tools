@@ -1004,6 +1004,40 @@ def test_log_selection_ctrl_c():
             w.deleteLater()
 
 
+def test_click_activates_pane():
+    """ファイル窓のクリックで、押した側の窓がアクティブになる(本人の指定)。
+    カーソル行は両窓とも動かず、フォーカスも押した側へ移る。"""
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "a.txt").write_text("a", encoding="utf-8")
+        (base / "b.txt").write_text("b", encoding="utf-8")
+        win = filer.FilerWindow({}, base / "settings.json")
+        try:
+            win.left.load(str(base)); win.right.load(str(base))
+            _wait(win)
+            win.activate("left")
+            left_row, right_row = win.left.cursor_row(), win.right.cursor_row()
+            rect = win.right.view.visualRect(win.right.model.index(right_row, 0))
+            QTest.mouseClick(win.right.view.viewport(), Qt.LeftButton,
+                             Qt.NoModifier, rect.center())
+            _wait(win)
+            assert win.active_side == "right"
+            assert win.right.view.hasFocus()
+            assert win.left.cursor_row() == left_row
+            assert win.right.cursor_row() == right_row
+            rect = win.left.view.visualRect(win.left.model.index(left_row, 0))
+            QTest.mouseClick(win.left.view.viewport(), Qt.LeftButton,
+                             Qt.NoModifier, rect.center())
+            _wait(win)
+            assert win.active_side == "left"
+        finally:
+            win.close()
+            app.processEvents()
+
+
 def test_preload_modules():
     """起動後の先読みで launcher / picker が読み込み済みになり、初回の J が重くならない。"""
     import sys
@@ -1753,7 +1787,8 @@ def test_window_menu_attrs_mouse_drag_drawing():
             L.marks.clear()
             L.model.all_changed()
 
-            # 4. マウス: クリック・ダブルクリック・右クリックは何もしない
+            # 4. マウス: クリックでは行も中身も動かないが、押した側の窓が
+            # アクティブになる(窓の切り替えだけはマウスでもできる。本人の指定)
             before = (L.path, _cursor_name(L), w.active_side)
             sub_rect = L.view.visualRect(L.model.index(L._row_of("sub1"), 0))
             QTest.mouseClick(L.view.viewport(), Qt.LeftButton, Qt.NoModifier, sub_rect.center())
@@ -1763,7 +1798,9 @@ def test_window_menu_attrs_mouse_drag_drawing():
             assert (L.path, _cursor_name(L), w.active_side) == before
             r_rect = R.view.visualRect(R.model.index(5, 0))
             QTest.mouseClick(R.view.viewport(), Qt.LeftButton, Qt.NoModifier, r_rect.center())
-            assert w.active_side == "left" and R.cursor_row() == 0    # 窓も切り替わらない
+            assert w.active_side == "right" and R.cursor_row() == 0   # 窓は切り替わるが行は動かない
+            QTest.mouseClick(L.view.viewport(), Qt.LeftButton, Qt.NoModifier, sub_rect.center())
+            assert w.active_side == "left"                            # 逆側クリックで戻る
             # ホイールは一覧のスクロール。カーソルは画面の外へ出そうなときだけ
             # 画面の端の行へ付いてくる(あふｗと同じ)
             bar = R.view.verticalScrollBar()

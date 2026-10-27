@@ -113,7 +113,7 @@ DEFAULT_COLORS = {
     "log_text": "#f9f9f9",
     # 窓の一番下のステータスバーと、その上のファンクションキーの段。あふｗは灰色の地に
     # 黒い字だが、ここではファイラの濃紺の配色に寄せる(filer.colors で灰色にもできる)。
-    "stash_background": "#123524",  # 一時置き場を表示している窓の地(通常と見分ける)
+    "stash_background": "#14532d",  # 一時置き場を表示している窓の地(通常の #00001c と見分けがつく緑)
     "status_background": "#16163c",
     "status_text": "#e0e0e8",
     "fkey_background": "#24244e",

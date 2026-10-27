@@ -1,0 +1,30 @@
+# テストの自動実行。push と手動実行で tests/test_filer.py を回す。
+#
+# test_filer.py は自分で QT_QPA_PLATFORM=offscreen を設定するので、画面のない
+# ランナーでもそのまま動く(手元のPCで走らせているのと同じ条件)。
+# 他のテストファイルは重い任意依存(rembg等)や実機前提のものがあるので、
+# まずはファイラだけを対象にする。
+name: test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  filer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存を入れる
+        run: pip install -r requirements.txt
+
+      - name: ファイラのテスト
+        run: python tests/test_filer.py

@@ -3984,6 +3984,13 @@ def acquire_single_instance() -> bool:
 
 
 def main() -> int:
+    # タスクバーで pythonw の汎用アプリとしてまとめられ、汎用アイコンの
+    # ままになるのを防ぐ。専用のアプリ ID を名乗ると窓のアイコンが勝つ。
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "traytools.affx")
+    except Exception:  # noqa: BLE001  名乗れなくても起動は続ける
+        pass
     app = QApplication(sys.argv)
     # 窓とタスクバーのアイコン(本家 AfxW 風のドット明朝。affx_icon が持つ)。
     app.setWindowIcon(affx_icon.qicon())

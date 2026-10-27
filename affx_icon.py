@@ -161,30 +161,3 @@ def qicon() -> QIcon:
     _cached = icon
     return icon
 
-
-def qicon_menu() -> QIcon:
-    """メニュー項目用のアイコン。Qt は QAction のアイコンを左端の決まった
-    溝に描くため、他の項目の絵文字(文字の先頭)より左に寄って見える。
-    そこで大きめの透明キャンバスの右寄りに小さく字を置き、字の位置が
-    絵文字の列に揃うようにしてある(実機の並びに合わせた調整)。"""
-    icon = QIcon()
-    for canvas_size, glyph_size, dpr in ((48, 16, 1.0), (96, 32, 2.0)):
-        rows = PIXELS[glyph_size]
-        data = bytearray(canvas_size * canvas_size * 4)
-        # 字の左端がキャンバスの約65%に来るよう右へ寄せる(実機で測った
-        # 絵文字の列: 溝の左端から約 (36-13)/35 の位置)。
-        ox = canvas_size - glyph_size - max(1, canvas_size // 48)
-        oy = (canvas_size - glyph_size) // 2
-        for gy, row in enumerate(rows):
-            for gx, ch in enumerate(row):
-                rgba = bytes(PALETTE[ch])
-                if rgba == bytes(PALETTE["."]):
-                    continue  # 白は透明に(地はメニューの色に任せる)
-                pos = ((oy + gy) * canvas_size + (ox + gx)) * 4
-                data[pos:pos + 4] = rgba
-        img = QImage(bytes(data), canvas_size, canvas_size,
-                     canvas_size * 4, QImage.Format_RGBA8888).copy()
-        pix = QPixmap.fromImage(img)
-        pix.setDevicePixelRatio(dpr)
-        icon.addPixmap(pix)
-    return icon

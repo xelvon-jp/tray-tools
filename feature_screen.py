@@ -17,10 +17,11 @@ import traceback
 from pathlib import Path
 
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QObject, QRect, QTimer, Signal
+from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
+    QToolButton, QWidgetAction,
 )
 
 import affx_icon
@@ -412,12 +413,27 @@ class ScreenFeature:
         # フォルダブックマークはメニューに出さない(Win+J とあふｗの Alt+J から呼ぶ。
         # メニューから呼ぶことはほぼ無く、隣の「あっふ」と同じ 📁 で紛らわしい)。
         # 機能とホットキーは残してあり、ファイラの J もこのブックマークをそのまま使う。
-        # あっふ の項目だけ、絵文字でなく専用アイコン(本家風ドット明朝)を出す。
-        filer_action = self.menu.addAction(
-            self._with_hotkey("あっふ…", hotkey_config.get("filer")),
-            self.start_filer,
-        )
-        filer_action.setIcon(affx_icon.qicon_menu())
+        # あっふ の項目は専用アイコン(本家風ドット明朝)を出す。QAction の
+        # アイコンだと Qt が左端の決まった溝に描き、他の項目の絵文字の列と
+        # 揃わない(実機で確認)。ボタンごと自前の行(QWidgetAction)にし、
+        # 左の余白でアイコンの位置を絵文字の列に合わせる(余白は実測で調整)。
+        filer_button = QToolButton()
+        filer_button.setFont(self.menu.font())
+        filer_button.setText(self._with_hotkey("あっふ…", hotkey_config.get("filer")))
+        filer_button.setIcon(affx_icon.qicon())
+        filer_button.setIconSize(QSize(16, 16))
+        filer_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        filer_button.setAutoRaise(True)
+        filer_button.setStyleSheet(
+            "QToolButton { border: none; padding: 3px 6px 3px 24px;"
+            " text-align: left; }"
+            "QToolButton:hover { background: palette(highlight);"
+            " color: palette(highlighted-text); }")
+        filer_button.clicked.connect(
+            lambda: (self.menu.hide(), self.start_filer()))
+        filer_row = QWidgetAction(self.menu)
+        filer_row.setDefaultWidget(filer_button)
+        self.menu.addAction(filer_row)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、

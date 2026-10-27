@@ -21,6 +21,10 @@
 #   --exe "M365Copilot.exe" --watch 30   1往復させながら調べる
 #   --check                      仕込んだプロファイルで掴めるかを診断する
 #   --markers                    発言マーカーの有無を突き止める
+#   --spot                       いま触っている部品(フォーカス/マウス下)を掴んで
+#                                名前・aid・祖先の連なりを見せる
+#   --record 120                 本番と同じ状態判定を回して遷移を記録する
+#                                (busy の見逃し・idle に戻らない等の切り分け用)
 #   --teams [--watch 300]        Teams の一人会議の手順を調べる(teams_meeting.py 用)。
 #                                手で会議を立てる間に新しく出たボタン・メニューを記録し、
 #                                最後に読み上げ用のまとめと settings.json の断片を出す
@@ -62,10 +66,12 @@ VALUE_PATTERN, TEXT_PATTERN, INVOKE_PATTERN = 10002, 10014, 10000
 WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 
 TYPE_NAMES = {
-    50000: "Button", 50003: "Edit", 50004: "ComboBox", 50005: "Link",
-    50006: "Image", 50007: "ListItem", 50008: "List", 50011: "MenuItem",
-    50020: "Text", 50021: "ToolBar", 50026: "Group", 50030: "Document",
-    50032: "Window", 50033: "Pane", 50025: "Custom",
+    50000: "Button", 50002: "CheckBox", 50003: "Edit", 50004: "ComboBox",
+    50005: "Link", 50006: "Image", 50007: "ListItem", 50008: "List",
+    50011: "MenuItem", 50013: "RadioButton", 50020: "Text", 50021: "ToolBar",
+    50023: "Tree", 50024: "TreeItem", 50025: "Custom", 50026: "Group",
+    50030: "Document", 50031: "SplitButton", 50032: "Window", 50033: "Pane",
+    50034: "Header",
 }
 
 user32 = ctypes.windll.user32
@@ -645,6 +651,339 @@ def self_check():
 
 
 # ---------------------------------------------------------------------------
+# --spot: いま触っている部品をその場で掴む
+# --record: 本番の状態判定がどう遷移したかを記録する
+# ---------------------------------------------------------------------------
+# 【なぜ要るか】
+# プロファイル作り(--survey → --watch)や診断(--check)は「窓全体」を相手にする。
+# でも実際に困るのは:
+#   - 「このボタン、実物は何て名前で、aid は何か」をピンポイントで知りたい
+#     → ツリー全体から探し直すのは回りくどい。いま触っている要素を掴めば一発。
+#   - 状態判定が本番でどう振る舞ったか(busy を見逃したのか、idle に戻らなかった
+#     のか)を知りたい → --watch はボタン集合だけを見る別実装で、本番の判定
+#     (copilot_loop の status_snapshot と同じ計算)とは食い違うことがある。
+# そこでこの2モードを足した。どちらも読むだけで、何も押さない・書かない。
+
+PATTERN_NAMES = {
+    10000: "Invoke", 10001: "Selection", 10002: "Value", 10003: "RangeValue",
+    10005: "ExpandCollapse", 10006: "Grid", 10007: "GridItem",
+    10008: "MultipleView", 10009: "Window", 10010: "SelectionItem",
+    10011: "Dock", 10012: "Table", 10013: "TableItem", 10014: "Text",
+    10015: "Toggle", 10016: "Transform", 10017: "ScrollItem",
+    10018: "LegacyIAccessible", 10019: "ItemContainer", 10020: "VirtualizedItem",
+}
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+user32.GetCursorPos.restype = ctypes.c_bool
+
+
+def _pattern_names(el):
+    """要素が持っているパターンの名前を短く並べる。送信ボタンなら Invoke、
+    入力欄なら Value が付く、という見分けに使う。"""
+    names = []
+    for pid, label in PATTERN_NAMES.items():
+        try:
+            if el.GetCurrentPattern(pid):
+                names.append(label)
+        except Exception:  # noqa: BLE001
+            continue
+    return names
+
+
+def _element_summary(el):
+    """(種類, 名前, aid, class, 矩形) を取る。取れない項目は空・None。"""
+    t = el.CurrentControlType
+    kind = TYPE_NAMES.get(t, str(t))
+    name = (el.CurrentName or "").strip()
+    aid = (el.CurrentAutomationId or "").strip()
+    cls = (el.CurrentClassName or "").strip()
+    try:
+        r = el.CurrentBoundingRectangle
+        rect = (r.left, r.top, r.right, r.bottom)
+    except Exception:  # noqa: BLE001
+        rect = None
+    return kind, name, aid, cls, rect
+
+
+def _print_chain(uia, el, label):
+    """要素と、その祖先の連なりを出す。戻り値は (最上位のHWND, 先頭要素の要約)。
+
+    プロファイルに要るのは aid だけのことが多いが、aid が空の要素も珍しくない。
+    祖先のどれに aid が付いているか(イベントは親で受ける作りのアプリもある)を
+    一緒に見せておくと、その場で「どの段を掴めばいいか」が判断できる。"""
+    print(f"[{label}]")
+    if el is None:
+        print("  (取れませんでした)")
+        return 0, None
+    walker = uia.ControlViewWalker
+    node, depth, top_hwnd, first = el, 0, 0, None
+    while node is not None and depth < 14:
+        try:
+            summary = _element_summary(node)
+        except Exception:  # noqa: BLE001  消えかけの要素
+            break
+        kind, name, aid, cls, rect = summary
+        if first is None:
+            first = summary
+        line = "  " + "  " * depth + kind
+        if name:
+            line += f" name={name[:40]!r}"
+        if aid:
+            line += f" aid={aid[:48]!r}"
+        if cls:
+            line += f" class={cls[:32]!r}"
+        if depth == 0:
+            if rect:
+                line += f" rect={rect}"
+            pats = _pattern_names(node)
+            if pats:
+                line += f" patterns={pats}"
+            try:
+                line += (f" focus={bool(node.CurrentHasKeyboardFocus)}"
+                         f" enabled={bool(node.CurrentIsEnabled)}")
+            except Exception:  # noqa: BLE001
+                pass
+        print(line)
+        try:
+            if not top_hwnd:
+                top_hwnd = int(node.CurrentNativeWindowHandle or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            node = walker.GetParentElement(node)
+        except Exception:  # noqa: BLE001
+            break
+        depth += 1
+    return top_hwnd, first
+
+
+def _grab_focus_and_point(uia):
+    """(フォーカス要素, マウス下の要素, カーソル座標) を取る。"""
+    focused = under = None
+    try:
+        focused = uia.GetFocusedElement()
+    except Exception:  # noqa: BLE001
+        pass
+    pt = _POINT()
+    xy = (0, 0)
+    if user32.GetCursorPos(ctypes.byref(pt)):
+        xy = (pt.x, pt.y)
+        try:
+            tag = UIA.tagPOINT()
+            tag.x, tag.y = pt.x, pt.y
+            under = uia.ElementFromPoint(tag)
+        except Exception:  # noqa: BLE001
+            pass
+    return focused, under, xy
+
+
+def spot_grab(wait_seconds=3.0):
+    """いまフォーカスしている要素と、マウスの下にある要素を掴んで素性を見せる。
+
+    カウントダウンの間に、対象アプリで調べたい部品をクリックするか、
+    マウスを乗せたままにしてもらう。フォーカスは奪わない(起こすのは
+    WM_GETOBJECT だけ)ので、掴んだ時点の状態はそのまま保たれる。"""
+    uia = comtypes.client.CreateObject(UIA.CUIAutomation, interface=UIA.IUIAutomation)
+    print("[spot] フォーカス要素とマウス下の要素を掴みます")
+    print("  対象アプリで、調べたい部品をクリックするか、マウスを乗せたままに")
+    print(f"  してください。{int(wait_seconds)}秒後に掴みます。")
+    for left in range(int(wait_seconds), 0, -1):
+        print(f"  {left}…")
+        time.sleep(1.0)
+    focused, under, xy = _grab_focus_and_point(uia)
+    # Chromium はツリーが起きていないと中身の要素を返さない。掴んだ要素の
+    # 最上位の窓を起こして、もう一度掴み直す(1回目が窓枠だけだった場合の保険)。
+    walker = uia.ControlViewWalker
+    hwnd = 0
+    for el in (focused, under):
+        node = el
+        while node is not None:
+            try:
+                h = int(node.CurrentNativeWindowHandle or 0)
+            except Exception:  # noqa: BLE001
+                h = 0
+            if h:
+                hwnd = h
+                break
+            try:
+                node = walker.GetParentElement(node)
+            except Exception:  # noqa: BLE001
+                break
+        if hwnd:
+            break
+    if hwnd:
+        wake_accessibility(hwnd)
+        render = find_render_child(hwnd)
+        if render:
+            wake_accessibility(render)
+        time.sleep(0.8)
+        focused, under, xy = _grab_focus_and_point(uia)
+    print()
+    _h1, first_focus = _print_chain(uia, focused, "フォーカス要素")
+    print()
+    _h2, first_under = _print_chain(uia, under, f"マウス下の要素 (x={xy[0]}, y={xy[1]})")
+    print()
+    print("#" * 68)
+    print("#  ここから下だけ読み上げれば足ります")
+    print("#" * 68)
+    for label, first in (("フォーカス", first_focus), ("マウス下", first_under)):
+        if first is None:
+            print(f"  {label}: (取れませんでした)")
+            continue
+        kind, name, aid, cls, _rect = first
+        print(f"  {label}: {kind} aid={aid or '(なし)'} name={name[:30]!r} class={cls[:30]!r}")
+    print("  ※ aid があれば、それがプロファイルに入れる値です。")
+    print("     aid が無い要素は、祖先の段の aid と種類の組で探すことになります。")
+    print("#" * 68)
+    return 0
+
+
+def compress_states(events, end):
+    """[(経過秒, 状態)] を [(状態, 継続秒)] に畳む。連続する同じ状態はまとめる。
+
+    記録のまとめ用。遷移の列が「idle → ready → busy → idle」の形で読めるように
+    するための、ただの整形(判定には使わない)。"""
+    out = []
+    for i, (t, state) in enumerate(events):
+        nxt = events[i + 1][0] if i + 1 < len(events) else end
+        dur = max(0.0, nxt - t)
+        if out and out[-1][0] == state:
+            out[-1] = (state, out[-1][1] + dur)
+        else:
+            out.append((state, dur))
+    return out
+
+
+def _mmss(seconds):
+    s = int(seconds)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def record_transitions(seconds, poll=0.4):
+    """本番の状態判定(copilot_loop と同じ計算)を回し続け、遷移を記録する。
+
+    【--watch との違い】
+    --watch は「下段のボタン集合」というプローブ独自の見方で変化を見る。
+    こちらは copilot_loop の status_snapshot と同じ材料・同じ規則で状態を
+    計算するので、「本番では busy と判定されていたか」がそのまま出る。
+    あわせて会話の長さ(Text 要素の名前の合計)も追う。状態が idle に戻ったのに
+    本文が伸び続けているなら、完了判定(settle)の側が怪しい、と切り分けられる。
+
+    押すのは人。このモードは読むだけで、何も押さない・書かない。"""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import copilot_loop
+
+    cp = None
+    for profile in copilot_loop.profiles():
+        main_hwnd, _render = copilot_loop.find_window(profile)
+        if not main_hwnd:
+            continue
+        try:
+            cp = copilot_loop.Copilot(profile=profile)
+        except Exception:  # noqa: BLE001
+            continue
+        break
+    if cp is None:
+        print("対象の窓が見つかりません。Copilot を開いてから、もう一度実行してください。")
+        return 1
+    cp.wait_awake(timeout=6.0)
+    print(f"[record] プロファイル: {cp.profile['name']} / {seconds}秒、状態の遷移を記録します")
+    print("  この間に Copilot へ実際に1往復させてください(Ctrl+C で早めに終われます)。")
+    print()
+    start = time.time()
+    deadline = start + seconds
+    events = []            # (経過秒, 状態) 状態かボタン集合が変わるたび
+    last_key = None
+    last_log = 0.0
+    prev_len = None
+    first_len = None
+    max_len = 0
+    last_len = 0
+    input_seen = False
+    try:
+        while time.time() < deadline:
+            try:
+                root, desc = cp._descendants()
+                names = [n for n, _ in cp._composer_buttons(root, desc)]
+                # status_snapshot と同じ規則(材料も本番の _composer_buttons を使う)
+                if cp._has(names, "busy_button"):
+                    state = "busy"
+                elif cp._has(names, "send_button"):
+                    state = "ready"
+                else:
+                    state = "idle"
+                doc_len = 0
+                for i in range(desc.Length):
+                    el = desc.GetElement(i)
+                    try:
+                        if el.CurrentControlType == CONTROL_TEXT:
+                            doc_len += len(el.CurrentName or "")
+                    except Exception:  # noqa: BLE001
+                        continue
+                has_input = cp._input_box(desc) is not None
+            except Exception as e:  # noqa: BLE001  窓が閉じかけ等
+                print(f"  読み取り失敗: {e}")
+                time.sleep(1.0)
+                continue
+            now = time.time() - start
+            if first_len is None:
+                first_len = doc_len
+            max_len = max(max_len, doc_len)
+            last_len = doc_len
+            input_seen = input_seen or has_input
+            key = (state, tuple(sorted(set(names))), has_input)
+            if key != last_key:
+                events.append((now, state))
+                btns = ", ".join(sorted(set(names))) or "(なし)"
+                print(f"  [{_mmss(now)}] {state:<5} ボタン=[{btns}] "
+                      f"会話={doc_len}字 入力欄={'OK' if has_input else '無し'}")
+                last_key = key
+                last_log = now
+            elif prev_len is not None and doc_len != prev_len and now - last_log >= 2.0:
+                # 状態は同じでも本文が伸びている間は、生成の進みを薄く流す
+                print(f"  [{_mmss(now)}] {state:<5} 会話={doc_len}字 ({doc_len - prev_len:+d})")
+                last_log = now
+            prev_len = doc_len
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("\n  (中断しました。ここまでの記録でまとめます)")
+    end = time.time() - start
+    seq = compress_states(events, end)
+    flips = max(0, len(seq) - 1)
+    saw_busy = any(s == "busy" for s, _d in seq)
+    print()
+    print("#" * 68)
+    print("#  ここから下だけ読み上げれば足ります")
+    print("#" * 68)
+    print(f"  1. プロファイル: {cp.profile['name']} / 記録 {end:.0f}秒")
+    if seq:
+        print("  2. 状態の遷移: " + " → ".join(f"{s}({d:.0f}秒)" for s, d in seq))
+    else:
+        print("  2. 状態の遷移: (記録なし。読み取りが一度も成功しませんでした)")
+    print(f"  3. busy を見たか: {'はい' if saw_busy else 'いいえ'} / 状態の切り替わり {flips}回")
+    print(f"  4. 会話の長さ: {first_len or 0} → {last_len}字 (最大 {max_len}字)")
+    print(f"  5. 入力欄: {'掴めた' if input_seen else '一度も掴めなかった'}")
+    if not saw_busy:
+        print("  ※ busy を一度も見ていません。生成していたのに出ないなら、"
+              "busy_button の名前が実物と合っていません。")
+        print("     生成中に --spot で停止ボタンを掴むと、実物の名前と aid が分かります。")
+    if flips >= 8:
+        print("  ※ 切り替わりが多すぎます。状態がちらつくと、完了待ち(wait_until_idle の")
+        print("     settle 判定)が誤判定しやすくなります。どの状態同士を行き来したか、")
+        print("     上の遷移の列で見てください。")
+    if seq and seq[-1][0] == "idle" and max_len > last_len:
+        print("  ※ 会話の最大長が最終長より大きいです。表示が縮んだ可能性があり、"
+              "長さで応答を切り出す側(new_response)に影響します。")
+    print("#" * 68)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # --teams: 一人会議の立ち上げ(teams_meeting.py)の手順を、業務PCで調べる
 # ---------------------------------------------------------------------------
 # 記録する要素の種類。文字起こしの入口はボタンかメニュー項目のどちらかに出るはずで、
@@ -899,6 +1238,14 @@ def main() -> int:
                         help="窓の中の Button を全部並べる(名前が空のもの・帯の外も含む)")
     parser.add_argument("--markers", action="store_true",
                         help="1往復の前後を比べて発言マーカーの有無を突き止める")
+    parser.add_argument("--spot", action="store_true",
+                        help="カウントダウンのあと、いまフォーカスしている要素と"
+                             "マウス下の要素を掴んで、祖先の連なりまで見せる")
+    parser.add_argument("--spot-wait", type=float, default=3.0,
+                        help="--spot で掴むまでの秒数(既定3)")
+    parser.add_argument("--record", type=int, default=0,
+                        help="この秒数だけ、本番と同じ状態判定を回して遷移を記録する"
+                             "(busy の見逃しや idle に戻らない等の切り分け用)")
     parser.add_argument("--teams", action="store_true",
                         help="Teams を見張り、手で一人会議を立てる間に出た要素を差分で記録する"
                              "(秒数は --watch。既定300。--exe で exe 名を変えられる)")
@@ -948,6 +1295,10 @@ def _run(args) -> int:
         return self_check()
     if args.markers:
         return hunt_markers()
+    if args.spot:
+        return spot_grab(args.spot_wait)
+    if args.record:
+        return record_transitions(args.record)
     if args.survey:
         print("[可視の窓 一覧] 対象アプリを前面に出した状態で見てください")
         print(f"{'class':<28} {'exe':<24} title")

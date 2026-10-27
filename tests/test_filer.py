@@ -3691,6 +3691,56 @@ def test_preview_esc_and_image_enter():
             w.deleteLater()
 
 
+def test_preview_image_lr_keys():
+    """画像ビューア(プレビューで画像を表示中)は ←→ で前・次のファイルへ移る。
+
+    本家 AfxW のビューアと同じ(2026-10-27 ユーザー要望)。プレビューを
+    閉じているときの → は従来どおり右窓への切り替えのまま。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        img = QImage(120, 80, QImage.Format_RGB32)
+        for i, name in enumerate(("pic.png", "pic2.png", "pic3.png")):
+            img.fill(QColor.fromHsv(i * 60, 200, 200))
+            assert img.save(str(left / name))
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k: QTest.keyClick(L.view, k)  # noqa: E731
+        try:
+            L.set_cursor(L._row_of("pic.png"))
+            key(Qt.Key_F3)
+            assert w.preview_on
+            result = _wait_preview(w, "pic.png")
+            assert result["kind"] == "image"
+            row = L.cursor_row()
+            key(Qt.Key_Right)          # → 次のファイルへ
+            assert L.cursor_row() == row + 1, (row, L.cursor_row())
+            assert w.active_side == "left"   # 窓の切り替えにはならない
+            key(Qt.Key_Left)           # ← 前のファイルへ
+            assert L.cursor_row() == row
+            # プレビューを閉じたら → は従来どおり右窓への切り替え
+            key(Qt.Key_Escape)
+            assert not w.preview_on
+            key(Qt.Key_Right)
+            assert w.active_side == "right"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_preview_shows_every_image_in_order():
     """プレビューは、カーソルが通り過ぎた画像も飛ばさず順番に全部出す。
 

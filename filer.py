@@ -2042,6 +2042,14 @@ class FilerWindow(QWidget):
                 QGuiApplication.clipboard().setText(
                     core.log_selection_text(cursor.selectedText()))
                 return
+        # 画像ビューア(プレビューで画像を表示中)は、本家と同じく ←→ で
+        # 前・次のファイルへ移る。←→ の通常の割当(窓の切り替え)より優先。
+        if (self.preview_on and not (shift or ctrl or alt)
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)
+                and self._preview_showing_image(pane)):
+            pane.set_cursor(pane.cursor_row()
+                            + (1 if event.key() == Qt.Key_Right else -1))
+            return
         code = core.scav(vk, shift, ctrl, alt)
         command = self.keymap.get(code)
         if command:
@@ -2053,6 +2061,18 @@ class FilerWindow(QWidget):
         char = core.initial_jump_char(vk, shift, ctrl, alt)
         if char is not None and code not in self.disabled_keys:
             self.jump_initial(char)
+
+    def _preview_showing_image(self, pane) -> bool:
+        """プレビューが画像を出しているか。カーソル下が画像のときと、
+        表示中の結果が画像のとき(読み替えの途中)のどちらかで判定する。"""
+        if not self.preview_on:
+            return False
+        if core.preview_kind(pane.cursor_entry(),
+                             self.viewer_extensions) == "image":
+            return True
+        widget = self.preview_widget
+        return bool(widget is not None and widget.last
+                    and widget.last.get("image") is not None)
 
     def jump_initial(self, char: str) -> None:
         pane = self.active
@@ -3983,6 +4003,23 @@ def acquire_single_instance() -> bool:
     return True
 
 
+def _apply_taskbar_identity(window) -> None:
+    """ピン留めされても、あっふ のアイコンと起動コマンドで戻れるように
+    窓へ再起動情報を書く。icons/affx.ico はピンが参照する実ファイルで、
+    無ければ描画して置く(失敗しても起動は続ける)。"""
+    try:
+        icon_path = Path(__file__).resolve().parent / "icons" / "affx.ico"
+        if not icon_path.exists():
+            affx_icon.render(256).save(str(icon_path), "ICO")
+        command = (f'"{pythonw_executable()}" '
+                   f'"{Path(__file__).resolve()}"')
+        filer_shell.set_taskbar_identity(
+            int(window.winId()), "traytools.affx", command,
+            str(icon_path), "あっふ")
+    except Exception:  # noqa: BLE001
+        _log_exception("taskbar")
+
+
 def main() -> int:
     # タスクバーで pythonw の汎用アプリとしてまとめられ、汎用アイコンの
     # ままになるのを防ぐ。専用のアプリ ID を名乗ると窓のアイコンが勝つ。
@@ -4010,6 +4047,7 @@ def main() -> int:
         else:
             window.show()
         window.start()
+        _apply_taskbar_identity(window)
         window.bring_to_front()
     except Exception:  # noqa: BLE001
         _log_exception("open")

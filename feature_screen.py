@@ -422,11 +422,11 @@ class ScreenFeature:
         filer_button.setText(self._with_hotkey("あっふ", hotkey_config.get("filer")))
         # メニューでは白地なし(字だけ)。白い四角が浮いて見えるため。
         filer_button.setIcon(affx_icon.qicon_glyph())
-        filer_button.setIconSize(QSize(16, 16))
+        filer_button.setIconSize(QSize(20, 20))
         filer_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         filer_button.setAutoRaise(True)
         filer_button.setStyleSheet(
-            "QToolButton { border: none; padding: 3px 6px 3px 24px;"
+            "QToolButton { border: none; padding: 5px 6px 1px 24px;"
             " text-align: left; }"
             "QToolButton:hover { background: palette(highlight);"
             " color: palette(highlighted-text); }")

@@ -402,3 +402,80 @@ def list_drives(label_timeout: float = 1.0) -> list:
             parts.append(f"[{kind}]")
         result.append((root, "  ".join(parts)))
     return result
+
+
+# ---------------------------------------------------------------
+# タスクバーのピン留め情報(SHGetPropertyStoreForWindow)
+# ---------------------------------------------------------------
+# 実行中の窓をタスクバーにピン留めすると、Windows は窓のプロパティストアに
+# ある Relaunch* を見て、起動コマンドとアイコンを決める。書いておかないと
+# 実行ファイル(pythonw.exe)の汎用アイコンでピンが作られてしまう。
+# IPropertyStore は COM だが、使うのは SetValue / Commit / Release だけで、
+# ここでは vtable 経由の素通しに留める(寿命はこの呼び出しの中だけ)。
+class _GUID(ctypes.Structure):
+    _fields_ = [("data1", wintypes.DWORD), ("data2", wintypes.WORD),
+                ("data3", wintypes.WORD), ("data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(text: str) -> _GUID:
+    guid = _GUID()
+    ctypes.windll.ole32.CLSIDFromString(text, ctypes.byref(guid))
+    return guid
+
+
+class _PROPERTYKEY(ctypes.Structure):
+    _fields_ = [("fmtid", _GUID), ("pid", wintypes.DWORD)]
+
+
+_IID_IPROPERTYSTORE = "{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}"
+_APPUSERMODEL_FMTID = "{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"
+# System.AppUserModel の propID(Propkey.h / Microsoft Learn で確認)
+_PID_RELAUNCH_COMMAND = 2
+_PID_RELAUNCH_ICON = 3
+_PID_RELAUNCH_NAME = 4
+_PID_APP_ID = 5
+_VT_LPWSTR = 31
+
+
+def _vtable_func(store, index, restype, *argtypes):
+    vtable = ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0]
+    func_ptr = ctypes.cast(vtable, ctypes.POINTER(ctypes.c_void_p))[index]
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(func_ptr)
+
+
+def set_taskbar_identity(hwnd: int, app_id: str, command: str,
+                         icon_path: str, display_name: str) -> None:
+    """ピン留め用の再起動情報(アプリID・起動コマンド・アイコン・表示名)を
+    窓に書く。失敗したら例外を上げる(呼び出し側で握る)。"""
+    shell32 = ctypes.windll.shell32
+    shell32.SHGetPropertyStoreForWindow.argtypes = [
+        wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p]
+    shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+    iid = _guid(_IID_IPROPERTYSTORE)
+    store = ctypes.c_void_p()
+    hr = shell32.SHGetPropertyStoreForWindow(
+        hwnd, ctypes.byref(iid), ctypes.byref(store))
+    if hr != 0 or not store:
+        raise OSError(f"SHGetPropertyStoreForWindow hr={hr:#x}")
+    try:
+        set_value = _vtable_func(
+            store, 6, ctypes.c_long,
+            ctypes.POINTER(_PROPERTYKEY), ctypes.c_void_p)
+        commit = _vtable_func(store, 7, ctypes.c_long)
+        fmtid = _guid(_APPUSERMODEL_FMTID)
+        values = ((_PID_APP_ID, app_id), (_PID_RELAUNCH_COMMAND, command),
+                  (_PID_RELAUNCH_ICON, f"{icon_path},0"),
+                  (_PID_RELAUNCH_NAME, display_name))
+        for pid, text in values:
+            key = _PROPERTYKEY(fmtid, pid)
+            buffer = ctypes.create_unicode_buffer(text)
+            variant = (ctypes.c_ubyte * 24)()
+            ctypes.cast(variant, ctypes.POINTER(wintypes.USHORT))[0] = _VT_LPWSTR
+            ctypes.cast(ctypes.byref(variant, 8),
+                        ctypes.POINTER(ctypes.c_void_p))[0] = \
+                ctypes.addressof(buffer)
+            set_value(store, ctypes.byref(key), variant)
+        commit(store)
+    finally:
+        release = _vtable_func(store, 2, ctypes.c_ulong)
+        release(store)

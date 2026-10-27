@@ -4007,7 +4007,13 @@ def main() -> int:
             import traceback
             traceback.print_exc()
             print(f"FAIL  {name}: {type(e).__name__}: {e}")
+            if os.environ.get("GITHUB_ACTIONS"):
+                # CI では失敗内容を run ページの注釈に出す(ログを開かずに読めるように)
+                tb = traceback.format_exc().replace("%", "%25").replace("\r", "%0D")
+                print(f"::error title={name}::" + tb[-900:].replace("\n", "%0A"))
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::notice::{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
 

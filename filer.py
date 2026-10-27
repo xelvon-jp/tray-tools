@@ -820,8 +820,13 @@ class Pane(QWidget):
         # (フォルダを移る・BS・O など)。
         self._stop_flat()
         self._stop_grep()
+        was_stash = self.stash
         self.stash = False
         self.stash_from = None
+        if was_stash:
+            # 地の色を通常へ戻す。ここで戻しておかないと、緑のスタイルシートが
+            # 残ったままになり、窓をクリック(アクティブ化)するまで直らない。
+            self.apply_style()
         self.request_id += 1
         request = self.request_id
         self.loading = True

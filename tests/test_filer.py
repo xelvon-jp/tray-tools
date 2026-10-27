@@ -453,6 +453,10 @@ def test_stash_pane():
             assert L.stash and L.entries == []
             key(Qt.Key_T)              # 戻る
             _wait(w)
+            # 地の色も通常へ戻る(クリックするまで緑のまま、の回帰防止)
+            style = L.view.styleSheet()
+            assert w.colors["background"] in style, style
+            assert w.colors["stash_background"] not in style, style
             assert not L.stash and L.path == str(left)
         finally:
             w.close()

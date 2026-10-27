@@ -87,6 +87,7 @@ DEFAULT_KEYMAP = {
     "0078": "desktop",            # N (AFXW.key 0078 &EXCD Desktop)
     "0076": "drive",              # L
     "0070": "isearch",            # F
+    "0071": "grep",               # G 文字列検索(内容で探して結果をフラット表示)
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
     "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示)
@@ -598,6 +599,115 @@ def flat_footer_text(files: int, total: int, mark_count: int = 0, mark_bytes: in
 
 
 # ---------------------------------------------------------------
+# 文字列検索(Grep。G キー)
+# ---------------------------------------------------------------
+GREP_LIMIT = 2_000            # ヒット件数の上限(結果が一覧にならない量は実用でないため)
+GREP_FILE_MAX = 32 * 1024 * 1024   # これより大きいファイルは中身を見ない
+GREP_LINE_MAX = 200           # ログに出すヒット行の長さ
+
+def _decode_text(data: bytes):
+    """UTF-8(BOM付き含む)→ cp932 の順に試す。どちらでもなければ None(バイナリ扱い)。"""
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def grep_in_bytes(data: bytes, needle: str, case_sensitive: bool = False):
+    """1ファイル分のバイト列から needle を探す。(ヒット行数, 最初のヒット行) か None。
+
+    テキストとして読めたら行ごとに探す(ヒット行の文字列も返る)。読めなければ
+    バイト列のまま探し、ヒット行は空文字(行番号が分からないため件数だけ数える)。
+    大文字小文字の区別なしは casefold で比べる(バイト列のときは ASCII 範囲だけ実質効く)。"""
+    text = _decode_text(data)
+    if text is not None:
+        probe = needle if case_sensitive else needle.casefold()
+        count = 0
+        first = ""
+        for line in text.splitlines():
+            hay = line if case_sensitive else line.casefold()
+            if probe in hay:
+                count += 1
+                if not first:
+                    first = line.strip()[:GREP_LINE_MAX]
+        return (count, first) if count else None
+    needles = {needle.encode("utf-8"), needle.encode("cp932", "ignore")}
+    needles.discard(b"")
+    if not needles:
+        return None
+    count = 0
+    for chunk in data.split(b"\n"):
+        hay = chunk if case_sensitive else chunk.lower()
+        if any((n if case_sensitive else n.lower()) in hay for n in needles):
+            count += 1
+    return (count, "") if count else None
+
+
+def grep_files(root: str, needle: str, case_sensitive: bool = False,
+               show_hidden: bool = True, show_system: bool = True,
+               limit: int = GREP_LIMIT, cancel=None, progress=None):
+    """root より下のファイルの中身から needle を探す。読み取りスレッドで呼ぶ。
+
+    (項目, ヒット情報, 状態) を返す。項目は collect_flat と同じ相対パス名の Entry。
+    ヒット情報は {相対パス: (ヒット行数, 最初のヒット行)}。状態は "done" /
+    "limit" / "cancel"。たどる規則(再解析ポイントは入らない・隠し/システムの
+    扱い・読めないフォルダは飛ばす)は collect_flat と同じ。書庫の中は見ない。
+    progress(走査したファイル数) をフォルダごとに呼ぶ。"""
+    found = []
+    matches = {}
+    scanned = 0
+    stack = [root]
+    while stack:
+        if cancel is not None and cancel.is_set():
+            return found, matches, "cancel"
+        folder = stack.pop()
+        subdirs = []
+        try:
+            with os.scandir(folder) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            if cancel is not None and cancel.is_set():
+                return found, matches, "cancel"
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            attrs = getattr(st, "st_file_attributes", 0)
+            if not show_hidden and attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+                continue
+            if not show_system and attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                continue
+            if attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
+                if not attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                    subdirs.append(entry.path)
+                continue
+            scanned += 1
+            if st.st_size > GREP_FILE_MAX:
+                continue
+            try:
+                with open(entry.path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            hit = grep_in_bytes(data, needle, case_sensitive)
+            if hit is None:
+                continue
+            rel = os.path.relpath(entry.path, root)
+            found.append(Entry(rel, False, st.st_size, st.st_mtime, attrs))
+            matches[rel] = hit
+            if len(found) >= limit:
+                return found, matches, "limit"
+        stack.extend(sorted(subdirs, key=str.casefold, reverse=True))
+        if progress is not None:
+            progress(scanned)
+    return found, matches, "done"
+
+
+# ---------------------------------------------------------------
 # マーク
 # ---------------------------------------------------------------
 def drag_paths(folder: str, entries, marks) -> list:
@@ -785,6 +895,7 @@ COMMAND_SHORT_NAMES = {
     "mkdir": "MkDir",
     "rename": "Rename",
     "isearch": "Search",
+    "grep": "Grep",
     "sort_dialog": "Sort",
     "sort_reverse": "Sort逆",
     "compare_mark": "Compare",

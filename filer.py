@@ -481,6 +481,14 @@ class Pane(QWidget):
         self.flat_loading = False
         self.flat_cancel = None
         self.flat_count = 0
+        # 文字列検索(G)。結果はフラット表示の形で出す。grep_query が検索語、
+        # grep_matches は {相対パス: (ヒット行数, 最初のヒット行)}。
+        self.grep_query = None
+        self.grep_case = False
+        self.grep_matches = {}
+        self.grep_loading = False
+        self.grep_cancel = None
+        self.grep_count = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -642,7 +650,9 @@ class Pane(QWidget):
             text += f" {self.mask_text}"
         else:
             text = "(読み込み中)"
-        if self.flat or self.flat_loading:
+        if self.grep_query is not None or self.grep_loading:
+            text += f"   [検索: {self.grep_query or ''}]"
+        elif self.flat or self.flat_loading:
             text += "   [フラット]"
         if self.live_filter:
             text += f"   [絞込: {self.live_filter}]"
@@ -665,7 +675,15 @@ class Pane(QWidget):
             return  # 組み立ての途中(ビューを作った時点で currentChanged が飛ぶ)
         dirs, files = core.count_dirs_files(self.entries)
         count, total = core.marks_summary(self.entries, self.marks)
-        if self.flat_loading:
+        if self.grep_loading:
+            text = f"検索中 {self.grep_count:,}ファイル走査（Esc で中止）"
+        elif self.grep_query is not None:
+            lines = sum(c for c, _ in self.grep_matches.values())
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            text = f"検索「{self.grep_query}」 {files}件 / {lines:,}行ヒット   {size:,} bytes"
+            if count:
+                text += f"   Mark {count} ({total:,})"
+        elif self.flat_loading:
             text = f"収集中 {self.flat_count:,}件（Esc で中止）"
         elif self.flat:
             size = sum(e.size for e in self.entries if not e.is_dir)
@@ -747,8 +765,9 @@ class Pane(QWidget):
 
         history … "visit"(履歴に積む) / None(積まない。再読込) / ("back"|"forward", 直前のパス)
         on_fail … 読めなかったときに呼ぶ(起動時の復元で、次の候補へ回すため)。"""
-        # ふつうの読み込みはフラット表示を終える(フォルダを移る・BS・O など)。
+        # ふつうの読み込みはフラット表示・検索結果を終える(フォルダを移る・BS・O など)。
         self._stop_flat()
+        self._stop_grep()
         self.request_id += 1
         request = self.request_id
         self.loading = True
@@ -880,6 +899,9 @@ class Pane(QWidget):
         return None
 
     def reload(self, keep_marks=False, focus=None) -> None:
+        if self.grep_query is not None and self.path:
+            self.load_grep(self.grep_query, self.grep_case, keep_marks=keep_marks)
+            return
         if self.flat and self.path:
             self.load_flat(keep_marks=keep_marks)   # フラット表示のまま集め直す
             return
@@ -938,7 +960,7 @@ class Pane(QWidget):
 
     def _tick_flat(self) -> None:
         try:
-            if self.flat_loading:
+            if self.flat_loading or self.grep_loading:
                 self.update_footer()
             else:
                 self._flat_timer.stop()
@@ -976,6 +998,105 @@ class Pane(QWidget):
         self.update_footer()
         if self.is_active():
             self.window_.update_status_bar()
+
+    # --- 文字列検索(G) ---
+    def _stop_grep(self) -> None:
+        if self.grep_cancel is not None:
+            self.grep_cancel.set()
+        self.grep_cancel = None
+        self.grep_query = None
+        self.grep_matches = {}
+        self.grep_loading = False
+
+    def load_grep(self, query: str, case_sensitive: bool = False,
+                  keep_marks: bool = False) -> None:
+        """いまのフォルダより下のファイルの中身から query を別スレッドで探し、
+        ヒットしたファイルをフラット表示の形(相対パス名)で並べる。
+        探している間は窓の下の行に走査数を出し、Esc で中止できる(cancel_grep)。"""
+        self._stop_flat()
+        if self.grep_cancel is not None:
+            self.grep_cancel.set()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.grep_cancel = cancel
+        self.grep_query = query
+        self.grep_case = case_sensitive
+        self.grep_loading = True
+        self.loading = True
+        self.grep_count = 0
+        root = self.path
+        win = self.window_
+        args = dict(path=root, grep=query, keep_marks=keep_marks)
+        bridge = win.bridge
+        show_hidden, show_system = win.show_hidden, win.show_system
+
+        def progress(count):
+            self.grep_count = count
+
+        def worker():
+            try:
+                entries, matches, status = core.grep_files(
+                    root, query, case_sensitive, show_hidden, show_system,
+                    core.GREP_LIMIT, cancel, progress)
+                payload = (self.side, request, True, (entries, matches, status), args)
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
+            try:
+                bridge.finished.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name=f"filer-grep-{self.side}").start()
+        self._flat_timer.start(200)
+        self.update_header()
+        self.update_footer()
+
+    def cancel_grep(self) -> None:
+        if self.grep_loading and self.grep_cancel is not None:
+            self.grep_cancel.set()
+
+    def on_grep_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id:
+            return
+        self.loading = False
+        self.grep_loading = False
+        self.grep_cancel = None
+        self._flat_timer.stop()
+        query = args["grep"]
+        if not ok:
+            self.window_.log(f"文字列検索: 探せません: {args['path']}  ({result})")
+            self._stop_grep()
+            self.update_header()
+            self.update_footer()
+            return
+        entries, matches, status = result
+        if status == "cancel":
+            self.window_.log("文字列検索: 中止しました")
+            self._stop_grep()
+            self.reload()
+            return
+        if status == "limit":
+            self.window_.log(f"文字列検索: {len(entries):,}件で打ち切りました（多すぎるため）")
+        if not args.get("keep_marks"):
+            self.marks = set()
+        self.flat = True
+        self.grep_matches = matches
+        self.all_entries = entries
+        self._rebuild()
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
+        lines = sum(c for c, _ in matches.values())
+        self.window_.log(f"文字列検索: 「{query}」 {len(entries)}件 / {lines:,}行ヒット")
+        for e in entries[:50]:
+            count, first = matches.get(e.name, (0, ""))
+            if first:
+                self.window_.log(f"  {e.name}（{count}行）: {first}")
+        if len(entries) > 50:
+            self.window_.log(f"  …ほか {len(entries) - 50}件")
 
     def refilter(self) -> None:
         """表示の絞り込み(Shift+Z)が変わったときに並べ直す。カーソルは同じ項目に付いて
@@ -1716,7 +1837,9 @@ class FilerWindow(QWidget):
     def _on_list_finished(self, payload) -> None:
         try:
             side, request, ok, result, args = payload
-            if args.get("flat"):
+            if args.get("grep"):
+                self.pane(side).on_grep_loaded(request, ok, result, args)
+            elif args.get("flat"):
                 self.pane(side).on_flat_loaded(request, ok, result, args)
             else:
                 self.pane(side).on_loaded(request, ok, result, args)
@@ -1791,6 +1914,9 @@ class FilerWindow(QWidget):
             return  # Win キーとの組み合わせは使わない
         if event.key() == Qt.Key_Escape and self.active.flat_loading:
             self.active.cancel_flat()   # Esc は「処理の中止」: フラット表示の収集を止める
+            return
+        if event.key() == Qt.Key_Escape and self.active.grep_loading:
+            self.active.cancel_grep()   # Esc は「処理の中止」: 文字列検索を止める
             return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
@@ -2535,6 +2661,21 @@ class FilerWindow(QWidget):
             return
         pane.load_flat()
 
+    def cmd_grep(self):
+        """G: 文字列検索。いまのフォルダより下のファイルの中身から探し、ヒットした
+        ファイルをフラット表示の形(相対パス)で並べる。書庫の中は探さない。"""
+        pane = self.active
+        if not pane.path:
+            return
+        if pane.archive is not None:
+            self.log("文字列検索: 書庫内では使えません")
+            return
+        word = self.ask_text("文字列検索", "探す文字列（サブフォルダも含む・大文字小文字は区別しない）",
+                             pane.grep_query or "")
+        if word is None or not word.strip():
+            return
+        pane.load_grep(word.strip(), case_sensitive=False)
+
     def cmd_mask_input(self):
         current = self.active.mask_text
         text = self.ask_text("マスク", "表示するファイル（*.txt;*.md / 語だけなら「含む」）",
@@ -2567,7 +2708,7 @@ class FilerWindow(QWidget):
         ("sub\\a.txt")なので、改名がフォルダをまたぐ移動になったり、どのフォルダに
         作るのかが曖昧になったりするため。"""
         if self.active.flat or self.active.flat_loading:
-            self.log(f"{label}: フラット表示中は使えません（Alt+B で通常の表示へ）")
+            self.log(f"{label}: フラット表示・検索結果では使えません（Alt+B で通常の表示へ）")
             return True
         return False
 
@@ -3578,7 +3719,7 @@ class _KeyDialog(QDialog):
 
 class SortDialog(_KeyDialog):
     """あふｗの「ソート」。↑↓で種類、←→/Tab で昇順・降順、G/C でチェック、
-    先頭文字(N/F/E/S/T/A/X)で即決、Enter で決定、Esc で取消。"""
+    先頭文字(N/F/E/S/T/A/X)は選択だけ、Enter で決定、Esc で取消。"""
 
     def __init__(self, parent, title, spec, colors, font):
         super().__init__(parent, title, colors, font)
@@ -3628,14 +3769,15 @@ class SortDialog(_KeyDialog):
         elif letter == "C":
             self.spec["ignore_case"] = not self.spec["ignore_case"]
         elif letter in core.SORT_SHORTCUTS:
-            self._decide(core.SORT_SHORTCUTS[letter])
-            return
+            # 文字キーは種類の選択だけ。決定は Enter(メニューと同じ作法)。
+            self.row = core.SORT_KINDS.index(core.SORT_SHORTCUTS[letter])
         self.refresh()
 
 
 class CompareDialog(_KeyDialog):
     """あふｗの「同名ファイル比較マーク」の条件。↑↓で行、←→で選択肢、Space でチェック、
-    Enter で決定、Esc で取消。A/N/S/T/E は即決。Shift を押しながら決めるとマークを外す。"""
+    A/N/S/T/E は条件プリセットの選択だけ、Enter で決定、Esc で取消。
+    Shift を押しながら決定するとマークを外す。"""
 
     ROW_SIZE, ROW_TIME, ROW_DIRS, ROW_EXT = range(4)
 
@@ -3679,8 +3821,17 @@ class CompareDialog(_KeyDialog):
                          self.row == self.ROW_EXT, shift)
             return
         if letter in core.COMPARE_SHORTCUTS:
+            # 文字キーは条件プリセットの選択だけ。決定は Enter(メニューと同じ作法)。
+            # 除拡張子は「最下行を選んで決定したか」で表すので、プリセットに
+            # 合わせてカーソル行も動かす(外すプリセットなら最下行から離す)。
             size, time_, strip_ext = core.COMPARE_SHORTCUTS[letter]
-            self._decide(size, time_, strip_ext, shift)
+            self.size_index = core.SIZE_CHOICES.index(size)
+            self.time_index = core.TIME_CHOICES.index(time_)
+            if strip_ext:
+                self.row = self.ROW_EXT
+            elif self.row == self.ROW_EXT:
+                self.row = self.ROW_SIZE
+            self.refresh()
             return
         if key in (Qt.Key_Up, Qt.Key_Down):
             self.row = (self.row + (-1 if key == Qt.Key_Up else 1)) % len(self.rows)

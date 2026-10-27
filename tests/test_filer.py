@@ -228,10 +228,16 @@ def test_dialogs():
         return d.result_value
 
     N = Qt.NoModifier
-    assert compare((Qt.Key_A, N)) == {"size": "same", "time": "same", "include_dirs": False,
-                                       "strip_ext": False, "unmark": False}
-    assert compare((Qt.Key_T, Qt.ShiftModifier))["unmark"] is True
-    assert compare((Qt.Key_E, N))["strip_ext"] is True
+    # 文字キーはプリセットの選択だけ。決定は Enter(メニューと同じ作法)
+    assert compare((Qt.Key_A, N)) is None
+    assert compare((Qt.Key_A, N), (Qt.Key_Return, N)) == {
+        "size": "same", "time": "same", "include_dirs": False,
+        "strip_ext": False, "unmark": False}
+    assert compare((Qt.Key_T, N), (Qt.Key_Return, Qt.ShiftModifier))["unmark"] is True
+    assert compare((Qt.Key_E, N), (Qt.Key_Return, N))["strip_ext"] is True
+    # E で最下行(除拡張子)を選んだあと A を押すと、最下行から離れて除拡張子は外れる
+    r = compare((Qt.Key_E, N), (Qt.Key_A, N), (Qt.Key_Return, N))
+    assert r["strip_ext"] is False and r["size"] == "same"
     # ←→で選択肢、↓で行、Space でフォルダ、Enter で決定
     r = compare((Qt.Key_Left, N), (Qt.Key_Left, N), (Qt.Key_Down, N), (Qt.Key_Right, N),
                 (Qt.Key_Space, N), (Qt.Key_Return, N))
@@ -247,8 +253,9 @@ def test_dialogs():
             QTest.keyClick(d, k)
         return d.result_value
 
-    assert sort(None, Qt.Key_X)["kind"] == "natural"
-    r = sort(None, Qt.Key_Right, Qt.Key_G, Qt.Key_C, Qt.Key_S)
+    assert sort(None, Qt.Key_X) is None    # 文字キーは選択だけ(即決しない)
+    assert sort(None, Qt.Key_X, Qt.Key_Return)["kind"] == "natural"
+    r = sort(None, Qt.Key_Right, Qt.Key_G, Qt.Key_C, Qt.Key_S, Qt.Key_Return)
     assert r == {"kind": "size", "descending": True, "dirs_first": False, "ignore_case": False}, r
     assert sort({"kind": "time"}, Qt.Key_Down, Qt.Key_Tab, Qt.Key_Return) == {
         "kind": "attr", "descending": True, "dirs_first": True, "ignore_case": True}
@@ -1002,6 +1009,47 @@ def test_log_selection_ctrl_c():
         finally:
             w.close()
             w.deleteLater()
+
+
+def test_grep_search():
+    """G: 文字列検索。core の照合(UTF-8/cp932・大小区別・中止)と、窓側で
+    結果がフラット表示の形(相対パス)で並び、通常表示へ戻れること。"""
+    import filer
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "sub").mkdir()
+        (base / "a.txt").write_text("Hello World\nsecond HELLO line\n", encoding="utf-8")
+        (base / "sub" / "b.txt").write_bytes("テスト hello\n".encode("cp932"))
+        (base / "c.txt").write_text("nothing\n", encoding="utf-8")
+
+        entries, matches, status = core.grep_files(str(base), "hello")
+        assert status == "done"
+        names = {e.name for e in entries}
+        assert names == {"a.txt", str(Path("sub") / "b.txt")}, names
+        assert matches["a.txt"] == (2, "Hello World")
+        entries, matches, _ = core.grep_files(str(base), "HELLO", case_sensitive=True)
+        assert matches["a.txt"][0] == 1 and str(Path("sub") / "b.txt") not in matches
+
+        win = filer.FilerWindow({}, base / "settings.json")
+        try:
+            win.left.load(str(base)); win.right.load(str(base))
+            _wait(win)
+            win.ask_text = lambda title, label, text="", select=None: "hello"
+            win.cmd_grep()
+            _wait(win)
+            pane = win.left
+            assert pane.grep_query == "hello" and pane.flat
+            shown = {e.name for e in pane.entries if not e.is_parent}
+            assert shown == {"a.txt", str(Path("sub") / "b.txt")}, shown
+            assert "文字列検索" in win.log_view.toPlainText()
+            assert "2件" in win.log_view.toPlainText()
+            # Alt+B で通常表示へ戻る
+            win.cmd_flat_view()
+            _wait(win)
+            assert pane.grep_query is None and not pane.flat
+        finally:
+            win.close()
 
 
 def test_click_activates_pane():

@@ -4057,6 +4057,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if os.environ.get("GITHUB_ACTIONS"):
+        # CI の pwsh は、テスト本体が標準エラーへ書いた分(picker の警告など)でも
+        # ステップを失敗にしてしまう(テストが全部通ってもジョブが赤くなる)。
+        # CI のときだけ標準エラーを標準出力へ寄せる(fd ごと寄せるので、
+        # Qt など C 側の警告も一緒に流れる)。
+        try:
+            os.dup2(1, 2)
+            sys.stderr = sys.stdout
+        except Exception:
+            pass
     code = main()
     # os._exit は後始末を走らせないので、テスト用の一時フォルダはここで消す。
     shutil.rmtree(_TEST_TEMP, ignore_errors=True)

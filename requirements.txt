@@ -11,7 +11,7 @@ keyboard
 Pillow
 numpy
 opencv-python-headless
-# 診断(diagnostics.py)の QR コード。
+# 診断(diagnostics.py)と、あっふ のスマホ送信(filer_phone.py)の QR コード。
 segno
 # Copilot の窓を exe 名で見分ける(copilot_loop)・親プロセスの生存確認(agent_loop)など。
 # 無くても落ちはしないが、exe 名での照合を諦めるので業務PCの M365 Copilot を取り違えうる。

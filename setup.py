@@ -82,6 +82,39 @@ def _ask_yes_no(question: str, default: bool = False) -> bool:
     return answer in ("y", "yes")
 
 
+def _resolve_environment(current, flag):
+    """この PC の「環境」(1/2/3)を決めて返す。
+
+    今のところ環境で変わるのは、あっふ の「スマホへ送る(QR)」を有効にするか
+    どうかだけ(有効なのは環境1のみ。無効な環境ではメニューにも出ない)。
+    --env の指定が最優先、次に settings.json に既にある値(再実行で勝手に
+    変えない=冪等)、どちらも無ければ対話で聞く(対話できなければ 1)。"""
+    if flag in (1, 2, 3):
+        return flag
+    if current in (1, 2, 3):
+        return current
+    print("  この PC の環境を選んでください:")
+    print("    環境1: あっふ の「スマホへ送る(QR)」が使えます")
+    print("    環境2 / 環境3: スマホ送信は使えません(メニューにも出ません)")
+    print("    (あとから setup.py --env 2 のように指定して変えられます)")
+    for _ in range(3):
+        try:
+            answer = input("  環境番号 [1/2/3] (既定: 1): ").strip()
+        except EOFError:
+            return 1
+        if not answer:
+            return 1
+        if answer in ("1", "2", "3"):
+            return int(answer)
+        print("    1, 2, 3 のどれかを入力してください")
+    return 1
+
+
+def _print_environment(value) -> None:
+    note = "あっふ のスマホ送信(QR)が有効です" if value == 1 else "あっふ のスマホ送信(QR)は無効です"
+    print(f"  環境: {value}({note})")
+
+
 # ---------------------------------------------------------------
 # 1. Python のバージョン
 # ---------------------------------------------------------------
@@ -310,7 +343,7 @@ def _print_devices(title: str, devices: list) -> None:
         print(f"    {index}. {item.get('label', '(名称未設定)')}")
 
 
-def _update_existing_settings(detected: list, redetect) -> None:
+def _update_existing_settings(detected: list, redetect, env=None) -> None:
     """既存の settings.json を、値を壊さない範囲で今の版に追いつかせる。"""
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
@@ -338,6 +371,11 @@ def _update_existing_settings(detected: list, redetect) -> None:
             print(f"    {path} = {shown}")
     else:
         print("  設定項目は最新の状態です")
+
+    # 1.5. 環境(1/2/3)。未設定か --env の指定があるときだけ決め直す
+    env_value = _resolve_environment(current.get("environment"), env)
+    current["environment"] = env_value
+    _print_environment(env_value)
 
     # 2. 音声デバイスの入れ替え(必ず確認してから)
     registered = current.get("audio", {}).get("devices") or []
@@ -369,8 +407,8 @@ def _update_existing_settings(detected: list, redetect) -> None:
     print(f"  {SETTINGS_PATH.name} を更新しました(控え: {backup.name})")
 
 
-def setup_settings(redetect=None) -> None:
-    _step(4, "音声デバイスを検出して settings.json を用意します")
+def setup_settings(redetect=None, env=None) -> None:
+    _step(4, "settings.json を用意します(環境の選択・音声デバイス)")
     detected = detect_devices()
     if detected:
         print("  検出した出力デバイス:")
@@ -382,13 +420,16 @@ def setup_settings(redetect=None) -> None:
 
     if SETTINGS_PATH.exists():
         print(f"  {SETTINGS_PATH.name} が既にあります")
-        _update_existing_settings(detected, redetect)
+        _update_existing_settings(detected, redetect, env)
         return
 
     sys.path.insert(0, str(PROJECT_DIR))
     import settings as settings_module
 
     new_settings = json.loads(json.dumps(settings_module.DEFAULT_SETTINGS))
+    env_value = _resolve_environment(new_settings.get("environment"), env)
+    new_settings["environment"] = env_value
+    _print_environment(env_value)
     new_settings["audio"]["devices"] = _build_devices(detected)
     _save_settings(new_settings)
     print(f"  {SETTINGS_PATH} を作成しました(デバイス {len(new_settings['audio']['devices'])} 件)")
@@ -515,6 +556,8 @@ def main() -> None:
                         help="背景透過の「ベクタ化」用の vtracer を入れる(確認を省略)")
     vector.add_argument("--no-vector", dest="with_vector", action="store_false",
                         help="vtracer を入れない(確認を省略)")
+    parser.add_argument("--env", dest="env", type=int, choices=[1, 2, 3], default=None,
+                        help="この PC の環境(1/2/3)。あっふ のスマホ送信(QR)が有効なのは環境1だけ(確認を省略)")
     parser.set_defaults(startup=None, redetect=None, with_ai=None, with_vector=None)
     args = parser.parse_args()
 
@@ -526,7 +569,7 @@ def main() -> None:
     install_requirements()
     install_ai_optional(args.with_ai)
     install_vector_optional(args.with_vector)
-    setup_settings(args.redetect)
+    setup_settings(args.redetect, args.env)
     setup_shortcut()
     setup_startup(args.startup)
     print_next_steps()

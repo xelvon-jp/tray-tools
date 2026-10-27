@@ -553,6 +553,86 @@ def test_transfer_cursor_follows_to_other_pane():
             w.deleteLater()
 
 
+def test_phone_share_server():
+    """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
+    そのまま表示され、ダウンロードは attachment で届く。"""
+    import urllib.request
+    import urllib.error
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        img = base / "photo.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+        txt = base / "メモ.txt"
+        txt.write_bytes("hello".encode("utf-8"))
+        server = filer_phone.ShareServer(
+            [str(img), str(txt), str(base / "gone.bin")])
+        assert len(server.files) == 2       # 無いファイルは落ちる
+        server.start()
+        try:
+            url = f"http://127.0.0.1:{server.port}/k/{server.token}/"
+            page = urllib.request.urlopen(url).read().decode("utf-8")
+            assert '<img src="f/0"' in page and page.count("<img") == 1
+            assert "photo.png" in page and "ダウンロード" in page
+            r = urllib.request.urlopen(url + "f/0")
+            assert r.headers["Content-Type"] == "image/png"
+            assert "inline" in r.headers["Content-Disposition"]
+            assert r.read() == img.read_bytes()
+            r = urllib.request.urlopen(url + "d/1")
+            assert "attachment" in r.headers["Content-Disposition"]
+            assert r.read() == "hello".encode("utf-8")
+            for bad in (f"http://127.0.0.1:{server.port}/",
+                        f"http://127.0.0.1:{server.port}/k/wrong/",
+                        url + "f/9"):
+                try:
+                    urllib.request.urlopen(bad)
+                    raise AssertionError(f"404のはず: {bad}")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 404
+            kinds = [kind for kind, _name in server.pop_events()]
+            assert kinds == ["view", "download"], kinds
+        finally:
+            server.stop()
+    assert filer_phone.is_image("a.JPG") and not filer_phone.is_image("a.txt")
+
+
+def test_phone_menu_gating():
+    """スマホ送信の項目は「環境1」のときだけ複写メニューに出る。"""
+    import filer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        section = {"left_path": str(left), "right_path": str(right), "editor": "x"}
+        seen = {}
+
+        def capture(title, items):
+            seen["items"] = items
+            return None
+
+        for app_settings, expected in (
+                ({"environment": 1, "filer": section}, True),
+                ({"environment": 2, "filer": section}, False),
+                ({"filer": section}, False)):
+            w = filer.FilerWindow(app_settings, str(settings_path))
+            try:
+                w.show()
+                w.start()
+                _wait(w)
+                assert w.phone_enabled is expected
+                w.choose_menu = capture
+                w.left.set_cursor(w.left._row_of("alpha.txt"))
+                w.cmd_copy_menu()
+                values = [item[2] for item in seen["items"]]
+                assert ("phone" in values) is expected, values
+            finally:
+                w.close()
+                w.deleteLater()
+
+
 def test_desktop_path():
     """デスクトップのパスが取れる(N キーの移動先)。
 

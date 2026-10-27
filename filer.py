@@ -77,6 +77,7 @@ import affx_icon
 import filer_archive
 import filer_core as core
 import filer_launch
+import filer_phone
 import filer_shell
 import settings as settings_module
 from traytools_send import pythonw_executable
@@ -1414,6 +1415,9 @@ class FilerWindow(QWidget):
             self.archive_timeout = filer_archive.ARCHIVE_LIST_TIMEOUT
         recent = section.get("recent")
         self.recent = [p for p in recent if isinstance(p, str)] if isinstance(recent, list) else []
+        # スマホへ送る(QR)は「環境1」の PC だけ(setup.py の環境選択が
+        # settings.json の environment に書く)。既定は無効で、メニューにも出ない。
+        self.phone_enabled = self.app_settings.get("environment") == 1
         # 一時置き場(T)に登録されたパスの一覧。filer.stash に保存する。
         stash = section.get("stash")
         self.stash_paths = ([os.path.normpath(p) for p in stash if isinstance(p, str)]
@@ -3099,21 +3103,52 @@ class FilerWindow(QWidget):
     def cmd_copy_menu(self):
         if not self.active.targets():
             return
-        choice = self.choose_menu("複写", [
+        items = [
             ("O", "反対窓にコピー", "copy"),
             ("P", "フルパスをクリップボードへ（改行区切り）", "path"),
             ("N", "ファイル名のみクリップボードへ", "name"),
             ("H", "ハッシュ(SHA-256)をクリップボードへ", "hash"),
-            ("Q", "キャンセル", None),
-        ])
+        ]
+        if self.phone_enabled:
+            # 環境1のときだけ出す(無効な PC では項目自体を見せない)
+            items.append(("S", "スマホへ送る（QR）", "phone"))
+        items.append(("Q", "キャンセル", None))
+        choice = self.choose_menu("複写", items)
         if choice == "copy":
             self._transfer(move=False)
+        elif choice == "phone":
+            self.cmd_phone_send()
         elif choice in ("path", "name"):
             paths = self.active.target_paths()
             QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=choice == "name"))
             self.log(f"クリップボード: {len(paths)}件の{'フルパス' if choice == 'path' else '名前'}")
         elif choice == "hash":
             self._copy_hash()
+
+    def cmd_phone_send(self):
+        """C→S(環境1のときだけ): 対象ファイルをスマホへ QR で渡す。
+
+        ダイアログを開いている間だけ filer_phone の小さなサーバが動き、
+        閉じれば URL は無効になる。フォルダと書庫の中身は渡せない。"""
+        pane = self.active
+        if pane.archive is not None:
+            self.log("スマホへ送る: 書庫の中では使えません")
+            return
+        targets = pane.targets()
+        if not targets:
+            return
+        paths = [p for p in pane.target_paths()
+                 if os.path.isfile(p)]
+        if not paths:
+            self.log("スマホへ送る: ファイルが選ばれていません（フォルダは送れません）")
+            return
+        try:
+            downloads = filer_phone.show_share_dialog(self, paths)
+        except ImportError:
+            self.log("スマホへ送る: QR の生成に segno が必要です"
+                     "（setup.py を実行すると入ります）")
+            return
+        self.log(f"スマホへ送る: 終わりました（{downloads}件ダウンロード）")
 
     def _copy_hash(self):
         """C→H: 対象ファイルの SHA-256 を計算してクリップボードへ入れる。

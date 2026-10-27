@@ -417,7 +417,7 @@ class ScreenFeature:
             self._with_hotkey("あっふ…", hotkey_config.get("filer")),
             self.start_filer,
         )
-        filer_action.setIcon(affx_icon.qicon())
+        filer_action.setIcon(affx_icon.qicon_menu())
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、

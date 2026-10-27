@@ -21,10 +21,8 @@ from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
-    QToolButton, QWidgetAction,
 )
 
-import affx_icon
 import bg_remove_launch
 import capture_process
 import color_picker
@@ -55,9 +53,9 @@ from toast import show_toast
 from window_tools import TopmostTracker
 
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
-# あっふ のアイコンは affx_icon モジュールが持つ(本家 AfxW 風のドット明朝)。
-# トレイの右クリックメニューの「あっふ」項目にだけ付け、トレイ自体の
-# アイコンは従来どおり rapture(常駐全体の顔なので変えない。本人の指定)。
+# トレイ自体のアイコンは従来どおり rapture(常駐全体の顔なので変えない。
+# 本人の指定)。あっふ の専用アイコンは affx_icon が持ち、窓とタスクバー
+# (ピン)で使う。トレイメニューの項目は 📁 の絵文字(本人の指定)。
 
 # 同梱の発表者ツール。HTMLのプレゼン資料にカンペ・次スライド・タイマー・レーザーを
 # 付ける単一ファイルのビューアで、サーバー不要でブラウザに投げるだけで動く。
@@ -413,28 +411,14 @@ class ScreenFeature:
         # フォルダブックマークはメニューに出さない(Win+J とあふｗの Alt+J から呼ぶ。
         # メニューから呼ぶことはほぼ無く、隣の「あっふ」と同じ 📁 で紛らわしい)。
         # 機能とホットキーは残してあり、ファイラの J もこのブックマークをそのまま使う。
-        # あっふ の項目は専用アイコン(本家風ドット明朝)を出す。QAction の
-        # アイコンだと Qt が左端の決まった溝に描き、他の項目の絵文字の列と
-        # 揃わない(実機で確認)。ボタンごと自前の行(QWidgetAction)にし、
-        # 左の余白でアイコンの位置を絵文字の列に合わせる(余白は実測で調整)。
-        filer_button = QToolButton()
-        filer_button.setFont(self.menu.font())
-        filer_button.setText(self._with_hotkey("あっふ", hotkey_config.get("filer")))
-        # メニューでは白地なし(字だけ)。白い四角が浮いて見えるため。
-        filer_button.setIcon(affx_icon.qicon_kana())
-        filer_button.setIconSize(QSize(20, 20))
-        filer_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        filer_button.setAutoRaise(True)
-        filer_button.setStyleSheet(
-            "QToolButton { border: none; padding: 3px 6px 3px 24px;"
-            " text-align: left; }"
-            "QToolButton:hover { background: palette(highlight);"
-            " color: palette(highlighted-text); }")
-        filer_button.clicked.connect(
-            lambda: (self.menu.hide(), self.start_filer()))
-        filer_row = QWidgetAction(self.menu)
-        filer_row.setDefaultWidget(filer_button)
-        self.menu.addAction(filer_row)
+        # あっふ の項目は、他の項目と同じく絵文字つきの通常の項目にする
+        # (本人の指定で 📁)。専用アイコンを行に描く試みは、どう調整しても
+        # 絵文字の列と揃わず実機で不評だったためやめた。専用アイコンは
+        # 窓とタスクバー(ピン)で使う。
+        self.menu.addAction(
+            self._with_hotkey("📁 あっふ", hotkey_config.get("filer")),
+            self.start_filer,
+        )
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、

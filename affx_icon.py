@@ -130,23 +130,6 @@ def qicon() -> QIcon:
     return _icon(False)
 
 
-def qicon_glyph() -> QIcon:
-    """字だけ(白地なし)の QIcon。メニューの行用で、地の色に馴染む。"""
-    return _icon(True)
-
-
-def qicon_kana() -> QIcon:
-    """メニュー行専用: かなの帯だけを切り出したアイコン。
-
-    2段組の図案を1行の文字の横に置くと、上の Affx が浮いて行の中心が
-    合って見えない。メニューでは かな だけを大きく見せる。"""
-    pm = render(512)
-    top = int(512 * 0.50)
-    icon = QIcon()
-    icon.addPixmap(pm.copy(0, top, 512, 512 - top))
-    return icon
-
-
 ICO_SIZES = (16, 20, 24, 32, 48, 64, 128, 256)
 
 

@@ -439,6 +439,26 @@ def expand_typed_path(text: str):
     return os.path.expanduser(os.path.expandvars(path))
 
 
+def folder_signature(path: str):
+    """フォルダの中身の指紋。(名前, フォルダか, サイズ, 更新時刻ns) の組を名前順に並べたもの。
+
+    外部で中身が変わったかを安く検めるためのもの(自動再読込の判定に使う)。
+    scandir の stat は Windows では検索データのキャッシュが効くので、項目数ぶんの
+    追加の読み取りにはならない。読めない項目(走査中に消えた等)は飛ばす。
+    フォルダ自体が読めなければ例外(OSError)が上がるので、呼び側で受けること。"""
+    items = []
+    with os.scandir(path) as it:
+        for entry in it:
+            try:
+                st = entry.stat(follow_symlinks=False)
+                items.append((entry.name, entry.is_dir(follow_symlinks=False),
+                              st.st_size, st.st_mtime_ns))
+            except OSError:
+                continue
+    items.sort(key=lambda x: x[0])
+    return tuple(items)
+
+
 def read_folder(path: str, focus=None, walk_up: bool = False):
     """別スレッドから呼ぶ一覧の読み取り。
     (実際に開いたフォルダ, 項目, カーソルを合わせる名前, 書庫の情報) を返す。

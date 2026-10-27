@@ -388,6 +388,33 @@ def test_clipboard_helpers():
     assert core.clip_text(["C:\\x\\a.txt", "C:\\x\\d"], names_only=True) == "a.txt\r\nd"
 
 
+def test_folder_signature():
+    """自動監視の指紋: 触らなければ同じ、追加・サイズ変更・改名・削除で変わる。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "a.txt").write_text("aa", encoding="utf-8")
+        (base / "sub").mkdir()
+        s1 = core.folder_signature(str(base))
+        assert s1 == core.folder_signature(str(base))
+        assert len(s1) == 2
+        (base / "b.txt").write_text("b", encoding="utf-8")
+        s2 = core.folder_signature(str(base))
+        assert s2 != s1                       # 追加
+        (base / "a.txt").write_text("aaaa", encoding="utf-8")
+        s3 = core.folder_signature(str(base))
+        assert s3 != s2                       # サイズ変更
+        (base / "b.txt").rename(base / "c.txt")
+        s4 = core.folder_signature(str(base))
+        assert s4 != s3                       # 改名
+        (base / "c.txt").unlink()
+        assert core.folder_signature(str(base)) != s4   # 削除
+        try:
+            core.folder_signature(str(base / "nope"))
+            raise AssertionError("無いフォルダは例外のはず")
+        except OSError:
+            pass
+
+
 def test_hash_helpers():
     """ハッシュ計算とクリップボード用テキスト(表示なしで確かめられる部分)。"""
     import hashlib
@@ -2375,6 +2402,56 @@ def test_zip_plan_and_create():
         result = fa.create_zip(str(src), ["a.txt"], str(bad))
         assert result.error and not bad.exists()
         _set_attrs(hidden, 0x80)
+
+
+def test_auto_refresh_on_external_change():
+    """表示中のフォルダが外部で変わったら、監視が検めて自動で再読込する。"""
+    import time as _time
+
+    import filer
+    from PySide6.QtTest import QTest
+
+    _qapp()
+
+    def wait_until(pred, timeout=6.0):
+        end = _time.time() + timeout
+        while _time.time() < end:
+            QTest.qWait(50)
+            if pred():
+                return True
+        return pred()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        win = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                                str(settings_path))
+        win.resize(1000, 600)
+        win.show()
+        win.start()
+        _wait(win)
+        try:
+            # 最初の監視は基準を取るだけ(再読込はしない)
+            win._watch_tick()
+            assert wait_until(lambda: win.left.watch_signature is not None
+                              and win.right.watch_signature is not None)
+            # 外部でファイルが増えたら、次の一覧に出る
+            (left / "external.txt").write_text("x", encoding="utf-8")
+            win._watch_tick()
+            assert wait_until(lambda: "external.txt" in _names(win.left))
+            _wait(win)
+            # 外部で消えたら、一覧からも消える
+            (left / "alpha.txt").unlink()
+            win._watch_tick()
+            assert wait_until(lambda: "alpha.txt" not in _names(win.left))
+            # 変わっていない右窓はそのまま(カーソルも動かない)
+            row = win.right.cursor_row()
+            win._watch_tick()
+            QTest.qWait(300)
+            assert win.right.cursor_row() == row
+        finally:
+            win.close()
 
 
 def test_window_zip_create():

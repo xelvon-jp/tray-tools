@@ -130,6 +130,9 @@ DEFAULT_EDITOR = "notepad.exe"
 DEFAULT_SHELL = "powershell.exe"
 DEFAULT_LIST_TIMEOUT = 5.0
 RECENT_LIMIT = 50
+# フォルダの自動監視の間隔。短いほど外部の変更に早く追いつくが、指紋の走査
+# (フォルダ1つ分の scandir)がその分増える。2秒なら体感の遅れも無く、走査も軽い。
+WATCH_INTERVAL_MS = 2000
 # ライブ絞り込み: この件数より少なければ打鍵ごとにすぐ絞り、多ければ打ち終わりを待つ。
 LIVE_FILTER_IMMEDIATE = 3000
 LIVE_FILTER_DELAY_MS = 150
@@ -446,6 +449,8 @@ class ListBridge(QObject):
     preview_ready = Signal(object)
     # ハッシュの計算が終わったとき。[(パス, 名前, ハッシュ or None, エラー文字列 or "")]。
     hashed = Signal(object)
+    # フォルダの自動監視(外部で中身が変わったら再読込)の結果。
+    folder_watch = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -485,6 +490,9 @@ class Pane(QWidget):
         # grep_matches は {相対パス: (ヒット行数, 最初のヒット行)}。
         self.grep_query = None
         self.grep_case = False
+        # 自動監視の基準にしたフォルダの指紋(core.folder_signature)。
+        # None の間は「まだ基準が無い」。フォルダを移るたびに捨てる。
+        self.watch_signature = None
         self.grep_matches = {}
         self.grep_loading = False
         self.grep_cancel = None
@@ -830,6 +838,10 @@ class Pane(QWidget):
             return
         new_path, entries, focus, archive = result
         same = core.same_dir(self.path, new_path) if self.path else False
+        if not same:
+            # フォルダを移ったら、自動監視の指紋は旧フォルダのものなので捨てる
+            # (次の監視で新しいフォルダの基準を取り直す)。
+            self.watch_signature = None
         if archive is not None:
             archive_file, inner, skipped = archive
             entering = self.archive is None or not core.same_dir(self.archive[0], archive_file)
@@ -1354,6 +1366,14 @@ class FilerWindow(QWidget):
         self.bridge.preview_ready.connect(self._on_preview_ready)
         self.bridge.hashed.connect(self._on_hashed)
         self._hash_busy = False
+        # フォルダの自動監視。表示中のフォルダの中身が外部で変わったら再読込する。
+        # 指紋の走査は別スレッド、判定と再読込はここ(UIスレッド)。
+        self.bridge.folder_watch.connect(self._on_folder_watch)
+        self._watch_checking = False
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(WATCH_INTERVAL_MS)
+        self._watch_timer.timeout.connect(self._watch_tick)
+        self._watch_timer.start()
         # プレビュー(F3)。ON の間は反対窓の場所にプレビューを出す。
         self.preview_on = False
         self.preview_side = None
@@ -1564,6 +1584,89 @@ class FilerWindow(QWidget):
             import picker  # noqa: F401
         except Exception:  # noqa: BLE001  先読みできなくても、J のときに読み直すだけ
             _log_exception("preload")
+
+    # --- フォルダの自動監視 ---
+    def _watch_tick(self) -> None:
+        """タイマーから。監視できる状態の窓があれば、指紋を取りに別スレッドを出す。
+
+        ここ(UIスレッド)では I/O をしない。ネットワークのフォルダが固まっても
+        画面が止まらないようにするため(読み込み本体と同じ作法)。
+        次のどれかなら今回は見送る: 窓が見えていない / 最小化 / モーダル表示中 /
+        入力欄(名前変更・絞り込み等)にフォーカス / マウスボタンを押している
+        (ドラッグ中) / 前回の走査がまだ終わっていない。"""
+        try:
+            if self._watch_checking or not self.isVisible() or self.isMinimized():
+                return
+            if QApplication.activeModalWidget() is not None:
+                return
+            if isinstance(QApplication.focusWidget(), QLineEdit):
+                return
+            if QApplication.mouseButtons() != Qt.NoButton:
+                return
+            targets = []
+            for pane in (self.left, self.right):
+                if (pane.path and pane.archive is None and not pane.flat
+                        and pane.grep_query is None and not pane.loading
+                        and not pane.flat_loading and not pane.grep_loading):
+                    targets.append((pane.side, pane.path))
+            if not targets:
+                return
+            self._watch_checking = True
+            bridge = self.bridge
+
+            def worker():
+                results = {}
+                for side, path in targets:
+                    if not os.path.isdir(path):
+                        results[side] = (path, "gone", None)
+                        continue
+                    try:
+                        results[side] = (path, "ok", core.folder_signature(path))
+                    except OSError:
+                        results[side] = (path, "error", None)
+                try:
+                    bridge.folder_watch.emit(results)
+                except RuntimeError:
+                    pass  # 窓が先に閉じた
+
+            threading.Thread(target=worker, daemon=True, name="filer-watch").start()
+        except Exception:  # noqa: BLE001
+            self._watch_checking = False
+            _log_exception("watch_tick")
+
+    def _on_folder_watch(self, results) -> None:
+        """監視の結果を受ける。指紋が基準と違えば、その窓だけ再読込する。
+
+        再読込は load の「同じフォルダ」経路を通るので、カーソルは名前で戻り、
+        マークは keep_marks で持ち越す。書庫・フラット・検索結果は対象外
+        (フラットは配下全部が対象で重いし、頻繁に変わる。検索結果は問い合わせの
+        写しなので、要れば F5 で探し直す)。"""
+        self._watch_checking = False
+        try:
+            for pane in (self.left, self.right):
+                found = results.get(pane.side)
+                if found is None:
+                    continue
+                path, status, signature = found
+                if not pane.path or not core.same_dir(pane.path, path):
+                    continue  # 走査の間にフォルダを移った。結果は捨てる
+                if (pane.archive is not None or pane.flat or pane.grep_query is not None
+                        or pane.loading or pane.flat_loading or pane.grep_loading):
+                    pane.watch_signature = None
+                    continue
+                if status == "gone":
+                    # フォルダ自体が消えた。再読込の walk_up で親へ遡らせる。
+                    pane.watch_signature = None
+                    pane.reload(keep_marks=True)
+                elif status == "ok":
+                    if pane.watch_signature is None:
+                        pane.watch_signature = signature   # 基準を取るだけ
+                    elif signature != pane.watch_signature:
+                        pane.watch_signature = signature
+                        pane.reload(keep_marks=True)
+                # "error"(読めなかった)は一時的なものとして何もしない
+        except Exception:  # noqa: BLE001
+            _log_exception("folder_watch")
 
     def _load_first(self, pane, candidates) -> None:
         if not candidates:

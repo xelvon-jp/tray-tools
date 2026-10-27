@@ -590,6 +590,33 @@ class Pane(QWidget):
                                 (COL_DATE, "26/10/23 12:34:56 "))}
         self._name_min = fm.horizontalAdvance("M" * 12)
         self.fit_columns()
+        self._fit_ext_column()
+
+    def _fit_ext_column(self) -> None:
+        """拡張子の列は、そのフォルダで一番長い拡張子が欠けずに入る幅にする。
+
+        あふｗと同じく、長いときは名前の側を削って拡張子は必ず見せる。
+        固定の見本 ".MMMMM" の幅では、.safetensors のような長い拡張子が
+        … で省かれてしまう。上限だけ付け、病的に長いものは従来どおり省く。"""
+        widths = getattr(self, "_col_widths", None)
+        entries = getattr(self, "entries", None)
+        if not widths or not entries:
+            return
+        fm = QFontMetrics(self.pane_font)
+        need = fm.horizontalAdvance(".MMMMM") + 8
+        cap = fm.horizontalAdvance("M" * 24) + 8
+        for entry in entries:
+            if entry.is_parent:
+                continue
+            ext = core.split_name(entry)[1]
+            if ext:
+                need = max(need, fm.horizontalAdvance(f".{ext}") + 8)
+                if need >= cap:
+                    need = cap
+                    break
+        if widths[COL_EXT] != need:
+            widths[COL_EXT] = need
+            self.fit_columns()
 
     def fit_columns(self) -> None:
         """列の幅を窓に合わせる。名前の列が狭くなりすぎるなら、日時 → サイズ → 拡張子の
@@ -901,6 +928,7 @@ class Pane(QWidget):
         parent = [] if (self.flat or core.is_root(self.path)) else [core.PARENT_ENTRY]
         self.entries = parent + visible
         self.model.set_entries(self.entries, self.marks)
+        self._fit_ext_column()
 
     def _row_of(self, name):
         if not name:

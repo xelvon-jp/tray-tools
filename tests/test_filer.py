@@ -398,6 +398,40 @@ def test_desktop_path():
     assert path and Path(path).is_dir(), path
 
 
+def test_ext_column_fits_long_ext():
+    """長い拡張子(.safetensors 等)は … で省かず、列を広げて全部見せる。
+
+    あふｗに合わせた表示(2026-10-27 ユーザー要望)。列の幅はそのフォルダで
+    一番長い拡張子に追随し、短い拡張子だけのフォルダでは従来の幅に戻る。"""
+    import filer
+    from PySide6.QtGui import QFontMetrics
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        (left / "model.safetensors").write_bytes(b"x")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            L, R = w.left, w.right
+            fm = QFontMetrics(L.pane_font)
+            need = fm.horizontalAdvance(".safetensors") + 8
+            assert L._col_widths[filer.COL_EXT] >= need, L._col_widths
+            assert L.view.columnWidth(filer.COL_EXT) >= need
+            base = fm.horizontalAdvance(".MMMMM") + 8
+            assert R._col_widths[filer.COL_EXT] == base   # 右は従来の幅のまま
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_folder_signature():
     """自動監視の指紋: 触らなければ同じ、追加・サイズ変更・改名・削除で変わる。"""
     with tempfile.TemporaryDirectory() as tmp:

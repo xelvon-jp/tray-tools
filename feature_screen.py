@@ -406,10 +406,10 @@ class ScreenFeature:
             self.start_bg_remove,
         )
         # フォルダブックマークはメニューに出さない(Win+J とあふｗの Alt+J から呼ぶ。
-        # メニューから呼ぶことはほぼ無く、隣の「簡易ファイラ」と同じ 📁 で紛らわしい)。
+        # メニューから呼ぶことはほぼ無く、隣の「あっふ」と同じ 📁 で紛らわしい)。
         # 機能とホットキーは残してあり、ファイラの J もこのブックマークをそのまま使う。
         self.menu.addAction(
-            self._with_hotkey("📁 簡易ファイラ…", hotkey_config.get("filer")),
+            self._with_hotkey("📁 あっふ…", hotkey_config.get("filer")),
             self.start_filer,
         )
 
@@ -973,17 +973,17 @@ class ScreenFeature:
             self._notify("背景を透過", f"起動できませんでした\n{e}")
 
     # ---------------------------------------------------------------
-    # 簡易ファイラ(filer.py。窓は別プロセス)
+    # あっふ(filer.py。窓は別プロセス)
     # ---------------------------------------------------------------
     def start_filer(self):
-        """簡易ファイラを開く。既に開いていれば前面に出すだけ(判定は filer_launch が
+        """あっふを開く。既に開いていれば前面に出すだけ(判定は filer_launch が
         名前付きミューテックスで行う)。窓は DETACHED の別プロセスなので、常駐を
         再起動しても道連れにならず、restart_blockers に足す必要も無い。"""
         try:
             filer_launch.open_filer()
         except Exception as e:
             # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
-            self._notify("簡易ファイラ", f"起動できませんでした\n{e}")
+            self._notify("あっふ", f"起動できませんでした\n{e}")
 
     # ---------------------------------------------------------------
     # Teams の一人会議(teams_meeting.py。UIA の実処理は子プロセス)

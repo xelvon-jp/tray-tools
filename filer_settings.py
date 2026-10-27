@@ -1,5 +1,5 @@
 # filer_settings.py
-# 簡易ファイラの Z「設定」ダイアログ(あふｗの設定画面に寄せたもの)。
+# あっふの Z「設定」ダイアログ(あふｗの設定画面に寄せたもの)。
 #
 # 将来ほかの設定も入れられるようにタブにしてあるが、いまは「拡張子別表示色」だけ。
 # 配色は Windows 標準のまま(ファイラの濃紺には寄せない)。色の帯がそのままの色で
@@ -31,7 +31,7 @@ import filer_core as core
 class SettingsDialog(QDialog):
     def __init__(self, parent, ext_rules, font=None):
         super().__init__(parent)
-        self.setWindowTitle("簡易ファイラの設定")
+        self.setWindowTitle("あっふの設定")
         if font is not None:
             self.setFont(font)
         # 編集用の写し。決定までは呼び出し側の設定に触らない。

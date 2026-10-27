@@ -1352,7 +1352,7 @@ class FilerWindow(QWidget):
         # メッセージ窓の字は一覧の拡大縮小に付いていかない(行数で高さを決めているため)。
         self.log_font = QFont(self.list_font)
 
-        self.setWindowTitle("簡易ファイラ")
+        self.setWindowTitle("あっふ")
         self.setObjectName("filerWindow")
         self.setStyleSheet(f"#filerWindow {{ background-color: {self.colors['background']}; }}")
         self.active_side = section.get("active") if section.get("active") in ("left", "right") else "left"
@@ -1741,7 +1741,7 @@ class FilerWindow(QWidget):
 
     def _update_title(self) -> None:
         path = self.active.path or ""
-        self.setWindowTitle(f"{path} - 簡易ファイラ" if path else "簡易ファイラ")
+        self.setWindowTitle(f"{path} - あっふ" if path else "あっふ")
 
     def on_pane_loaded(self, pane) -> None:
         self.recent = core.push_recent(self.recent, pane.path, RECENT_LIMIT)

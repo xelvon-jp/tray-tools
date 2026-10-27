@@ -1,5 +1,5 @@
 # tests/test_filer.py
-# 簡易ファイラ(filer.py / filer_core.py / filer_shell.py / filer_launch.py)を確かめる。
+# あっふ(filer.py / filer_core.py / filer_shell.py / filer_launch.py)を確かめる。
 #
 #   C:\Users\<名前>\.venvs\tray-tools\Scripts\python.exe tests\test_filer.py
 #

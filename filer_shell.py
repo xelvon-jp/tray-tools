@@ -1,5 +1,5 @@
 # filer_shell.py
-# 簡易ファイラ(filer.py)が使う Win32 の呼び出し。ctypes だけで書き、COM は使わない。
+# あっふ(filer.py)が使う Win32 の呼び出し。ctypes だけで書き、COM は使わない。
 #
 # - ファイルのコピー/移動/削除 … SHFileOperationW。COM(IFileOperation)ではないので、
 #   CLAUDE.md の「COM ポインタの寿命で落ちる」類の罠を持ち込まない。上書きの確認や

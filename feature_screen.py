@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
 )
 
+import affx_icon
 import bg_remove_launch
 import capture_process
 import color_picker
@@ -53,6 +54,9 @@ from toast import show_toast
 from window_tools import TopmostTracker
 
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
+# あっふ のアイコンは affx_icon モジュールが持つ(本家 AfxW 風のドット明朝)。
+# トレイの右クリックメニューの「あっふ」項目にだけ付け、トレイ自体の
+# アイコンは従来どおり rapture(常駐全体の顔なので変えない。本人の指定)。
 
 # 同梱の発表者ツール。HTMLのプレゼン資料にカンペ・次スライド・タイマー・レーザーを
 # 付ける単一ファイルのビューアで、サーバー不要でブラウザに投げるだけで動く。
@@ -408,10 +412,12 @@ class ScreenFeature:
         # フォルダブックマークはメニューに出さない(Win+J とあふｗの Alt+J から呼ぶ。
         # メニューから呼ぶことはほぼ無く、隣の「あっふ」と同じ 📁 で紛らわしい)。
         # 機能とホットキーは残してあり、ファイラの J もこのブックマークをそのまま使う。
-        self.menu.addAction(
-            self._with_hotkey("📁 あっふ…", hotkey_config.get("filer")),
+        # あっふ の項目だけ、絵文字でなく専用アイコン(本家風ドット明朝)を出す。
+        filer_action = self.menu.addAction(
+            self._with_hotkey("あっふ…", hotkey_config.get("filer")),
             self.start_filer,
         )
+        filer_action.setIcon(affx_icon.qicon())
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、

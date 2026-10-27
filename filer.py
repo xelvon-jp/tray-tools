@@ -73,6 +73,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import affx_icon
 import filer_archive
 import filer_core as core
 import filer_launch
@@ -3981,6 +3982,8 @@ def acquire_single_instance() -> bool:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    # 窓とタスクバーのアイコン(本家 AfxW 風のドット明朝。affx_icon が持つ)。
+    app.setWindowIcon(affx_icon.qicon())
     if not acquire_single_instance():
         # 先客が居る。前面に出してもらって引き返す。
         try:

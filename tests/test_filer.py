@@ -1066,6 +1066,7 @@ def test_click_activates_pane():
         (base / "b.txt").write_text("b", encoding="utf-8")
         win = filer.FilerWindow({}, base / "settings.json")
         try:
+            win.show()   # 表示していない窓ではクリックもフォーカスも届かない
             win.left.load(str(base)); win.right.load(str(base))
             _wait(win)
             win.activate("left")

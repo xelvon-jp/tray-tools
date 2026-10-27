@@ -1058,17 +1058,19 @@ def test_click_activates_pane():
     import filer
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
+
+    _qapp()
     with tempfile.TemporaryDirectory() as tmp:
-        base = Path(tmp)
-        (base / "a.txt").write_text("a", encoding="utf-8")
-        (base / "b.txt").write_text("b", encoding="utf-8")
-        win = filer.FilerWindow({}, base / "settings.json")
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        win = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                                str(settings_path))
+        win.resize(1000, 600)
+        win.show()
+        win.start()
+        _wait(win)
         try:
-            win.show()   # 表示していない窓ではクリックもフォーカスも届かない
-            win.left.load(str(base)); win.right.load(str(base))
-            _wait(win)
             win.activate("left")
             left_row, right_row = win.left.cursor_row(), win.right.cursor_row()
             rect = win.right.view.visualRect(win.right.model.index(right_row, 0))
@@ -1086,7 +1088,6 @@ def test_click_activates_pane():
             assert win.active_side == "left"
         finally:
             win.close()
-            app.processEvents()
 
 
 def test_preload_modules():

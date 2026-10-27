@@ -94,3 +94,56 @@ def qicon() -> QIcon:
 def qicon_glyph() -> QIcon:
     """字だけ(白地なし)の QIcon。メニューの行用で、地の色に馴染む。"""
     return _icon(True)
+
+
+def qicon_kana() -> QIcon:
+    """メニュー行専用: かなの帯だけを切り出したアイコン。
+
+    2段組の図案を1行の文字の横に置くと、上の Affx が浮いて行の中心が
+    合って見えない。メニューでは かな だけを大きく見せる。"""
+    pm = render(512)
+    top = int(512 * 0.50)
+    icon = QIcon()
+    icon.addPixmap(pm.copy(0, top, 512, 512 - top))
+    return icon
+
+
+ICO_SIZES = (16, 20, 24, 32, 48, 64, 128, 256)
+
+
+def ico_bytes() -> bytes:
+    """ピン留め用 .ico(複数サイズ・PNG 圧縮)のバイト列を組み立てる。
+
+    QPixmap の ICO 保存は 256px の BMP が1個だけで、小さい表示では
+    潰れて汚く見える。各サイズを描画して PNG のまま格納するのが
+    Windows の作法。"""
+    import struct
+
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    blobs = []
+    for size in ICO_SIZES:
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        render(size).save(buf, "PNG")
+        blobs.append(bytes(buf.data()))
+    out = bytearray(struct.pack("<HHH", 0, 1, len(blobs)))
+    offset = 6 + 16 * len(blobs)
+    for size, blob in zip(ICO_SIZES, blobs):
+        out += struct.pack("<BBBBHHII",
+                           size if size < 256 else 0,
+                           size if size < 256 else 0,
+                           0, 0, 1, 32, len(blob), offset)
+        offset += len(blob)
+    for blob in blobs:
+        out += blob
+    return bytes(out)
+
+
+def ico_entry_count(data: bytes) -> int:
+    """ICO の先頭バイト列から収録サイズ数を返す(形式が違うときは 0)。"""
+    import struct
+
+    if len(data) < 6 or data[:4] != b"\x00\x00\x01\x00":
+        return 0
+    return struct.unpack("<H", data[4:6])[0]

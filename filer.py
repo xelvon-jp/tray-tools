@@ -4009,8 +4009,13 @@ def _apply_taskbar_identity(window) -> None:
     無ければ描画して置く(失敗しても起動は続ける)。"""
     try:
         icon_path = Path(__file__).resolve().parent / "icons" / "affx.ico"
-        if not icon_path.exists():
-            affx_icon.render(256).save(str(icon_path), "ICO")
+        count = 0
+        if icon_path.exists():
+            with icon_path.open("rb") as fh:
+                count = affx_icon.ico_entry_count(fh.read(6))
+        if count != len(affx_icon.ICO_SIZES):
+            # 無い、または旧式(256px BMP 1個だけ)のときは作り直す
+            icon_path.write_bytes(affx_icon.ico_bytes())
         command = (f'"{pythonw_executable()}" '
                    f'"{Path(__file__).resolve()}"')
         filer_shell.set_taskbar_identity(

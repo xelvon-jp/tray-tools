@@ -71,6 +71,39 @@ def render(size: int, glyph_only: bool = False) -> QPixmap:
     return pixmap
 
 
+# 本人が描いた 24x24 のドット絵(2026-10-27、本家ドット絵の画風)。
+# 小さい表示ではフォント描画よりこの絵の方が潰れないので、24px 以下と
+# 32px はこの絵から作る。PNG そのものは置けないので base85 で埋め込む。
+_ART24_B85 = (
+    "iBL{Q4GJ0x0000DNk~Le0000O0000O2nGNE0N{5$_y7O^0drDELIAGL9O(c600d`2O+f$vv5yP<V"
+    "FdsH010qNS#tmY4#NNd4#NS*Z>VGd00N&$L_t(YOSM$pZW2)t-"
+    "WT9Cc!a(|AEI~lrWfAy&PQl4Hu2IXMB<egFK9w4m?p%g0SP2cYt<l9r3>^A%Fn_s`^Pe7W;4e<?6"
+    "#<>UozS6%$YOaoH+vu{AVbOj)%s*0+!=}X?v3I{Mvv=i6i)?PN1faiQfz?DJF<}1@JH$qtVf6-"
+    "Mlj3>Fe*rKmXL=y8jOXTpbIzvpMm6<r-|)Bi`;#K{H%&W-"
+    "xXrE{I5hvEfpJ^4Go)V6iBB`R*J(ooU3etwBTzEG9q<CywC7(_6t2kDs5=TCUwkNTAa*DcEs680o"
+    "*0p8oJFM7+wYf;;XUp1k-1Z$EUTJPb*ItE{&tw4O};R$=n@l^c=tS=xVKZXr$-"
+    "emmW1Fdab>z}}x-=rFZrwAQCCT-=&q+B09c<qPu-"
+    "@q4S;<iogN+Zdr1EuuTLVDIA<9X>f5!J9%SGSOXFD$v(#O6YlW@gw^i2mxK!A)C#@U@(v)mO#@qm"
+    "`wcEMM1j3+S(dyZEX?n_xs>^@=Qme*Xz+aG!$Eeg3e4P1C>gJg4Wm9VRLg6R#sNv=;+Vdv9q%yL}"
+    "oL8Ko|--"
+    "coS`VdmB=z6x8c=Dex{_US5i`jYcDM>rjiZYHSnoLZJ}cCX7ZSX?=KjNU?W;1m^R(bc>*^uCCG};"
+    "sCG@Im5Cn;m7x=R;$!*A;2w4r_=OJCX-"
+    "S{@pzopwr$fR9v>fvD&||D9UL48uBs|1oEX6yhGB@q_}IM9#o!Hw!y)mFjSYHaUZb_!ZNU{LySux"
+    ">$=KiDhgd8IwOUR15W&$*BoZ_brfCXav)P1Vu?XdI85Ep%-"
+    "spC_6o>&ldZkiHO3ujTa*)sGiSv21R;wk&h5jlW$5}cVQCJ*LMo8eH@e5+Z0tEn%BZ2?`002ovPD"
+    "HLkV1f"
+)
+
+
+def art24() -> QPixmap:
+    """本人の 24x24 ドット絵を返す。"""
+    import base64
+
+    pixmap = QPixmap()
+    pixmap.loadFromData(base64.b85decode(_ART24_B85))
+    return pixmap
+
+
 _cached = {}
 
 
@@ -80,8 +113,14 @@ def _icon(glyph_only: bool) -> QIcon:
         master = render(512, glyph_only)
         icon = QIcon()
         for size in (16, 24, 32, 48, 256):
-            icon.addPixmap(master.scaled(
-                size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            if not glyph_only and size <= 32:
+                # 小さいサイズは本人のドット絵から(フォント描画は潰れる)
+                pixmap = art24().scaled(
+                    size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            else:
+                pixmap = master.scaled(
+                    size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            icon.addPixmap(pixmap)
         _cached[key] = icon
     return _cached[key]
 
@@ -125,7 +164,12 @@ def ico_bytes() -> bytes:
     for size in ICO_SIZES:
         buf = QBuffer()
         buf.open(QIODevice.WriteOnly)
-        render(size).save(buf, "PNG")
+        if size <= 32:
+            # 小さいサイズは本人のドット絵から作る(24px はそのまま)
+            art24().scaled(size, size, Qt.KeepAspectRatio,
+                           Qt.SmoothTransformation).save(buf, "PNG")
+        else:
+            render(size).save(buf, "PNG")
         blobs.append(bytes(buf.data()))
     out = bytearray(struct.pack("<HHH", 0, 1, len(blobs)))
     offset = 6 + 16 * len(blobs)
@@ -138,12 +182,3 @@ def ico_bytes() -> bytes:
     for blob in blobs:
         out += blob
     return bytes(out)
-
-
-def ico_entry_count(data: bytes) -> int:
-    """ICO の先頭バイト列から収録サイズ数を返す(形式が違うときは 0)。"""
-    import struct
-
-    if len(data) < 6 or data[:4] != b"\x00\x00\x01\x00":
-        return 0
-    return struct.unpack("<H", data[4:6])[0]

@@ -388,6 +388,77 @@ def test_clipboard_helpers():
     assert core.clip_text(["C:\\x\\a.txt", "C:\\x\\d"], names_only=True) == "a.txt\r\nd"
 
 
+def test_stash_entries():
+    """一時置き場の項目づくり: 実在するものだけが残り、名前はフルパス。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "a.txt").write_text("hello", encoding="utf-8")
+        (base / "sub").mkdir()
+        entries, missing = core.stash_entries(
+            [str(base / "a.txt"), str(base / "sub"), str(base / "gone.txt")])
+        assert [e.name for e in entries] == [str(base / "a.txt"), str(base / "sub")]
+        assert entries[0].size == 5 and not entries[0].is_dir
+        assert entries[1].is_dir
+        assert missing == [str(base / "gone.txt")]
+
+
+def test_stash_pane():
+    """一時置き場: 登録 → アクティブ窓に出す(背景色が変わる) → 外す → 戻る。
+
+    操作は通常時を踏襲し、削除キーは実ファイルを消さず登録だけを外す。
+    J の一覧にも置き場の項目が出る(2026-10-27 ユーザー仕様)。"""
+    import filer
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k: QTest.keyClick(L.view, k)  # noqa: E731
+        try:
+            target = str(left / "alpha.txt")
+            L.set_cursor(L._row_of("alpha.txt"))
+            key(Qt.Key_T)              # T だけでは登録されない(開く/戻る)
+            assert L.stash and L.entries == []
+            key(Qt.Key_T)              # もう一度で元のフォルダへ
+            _wait(w)
+            assert not L.stash and L.path == str(left)
+            L.set_cursor(L._row_of("alpha.txt"))
+            w.cmd_stash_add()
+            assert w.stash_paths == [target]
+            saved = Path(settings_path).read_text(encoding="utf-8")
+            assert "alpha.txt" in saved   # filer.stash に保存される
+            key(Qt.Key_T)              # 置き場を開く
+            assert L.stash
+            assert [e.name for e in L.entries] == [target]
+            assert L.path == ""
+            style = L.view.styleSheet()
+            assert w.colors["stash_background"] in style, style
+            # 削除キー = 登録を外すだけ(実ファイルは残る)
+            w.confirm = lambda *a, **k: True
+            L.set_cursor(0)
+            key(Qt.Key_Delete)
+            assert w.stash_paths == []
+            assert (left / "alpha.txt").exists()
+            assert L.stash and L.entries == []
+            key(Qt.Key_T)              # 戻る
+            _wait(w)
+            assert not L.stash and L.path == str(left)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_desktop_path():
     """デスクトップのパスが取れる(N キーの移動先)。
 

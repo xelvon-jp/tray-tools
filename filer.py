@@ -113,6 +113,7 @@ DEFAULT_COLORS = {
     "log_text": "#f9f9f9",
     # 窓の一番下のステータスバーと、その上のファンクションキーの段。あふｗは灰色の地に
     # 黒い字だが、ここではファイラの濃紺の配色に寄せる(filer.colors で灰色にもできる)。
+    "stash_background": "#123524",  # 一時置き場を表示している窓の地(通常と見分ける)
     "status_background": "#16163c",
     "status_text": "#e0e0e8",
     "fkey_background": "#24244e",
@@ -482,6 +483,10 @@ class Pane(QWidget):
         self.live_filter = ""
         self.live_words = []
         self._pending_filter = ""
+        # 一時置き場(T)。パスの一覧を1つの一覧として出す。stash_from は
+        # 置き場を開く前にいたフォルダ(T でもう一度押すと戻る)。
+        self.stash = False
+        self.stash_from = None
         # フラット表示(Alt+B)。いまのフォルダ以下のファイルを1つの一覧に。
         self.flat = False
         self.flat_loading = False
@@ -645,6 +650,8 @@ class Pane(QWidget):
     def apply_style(self) -> None:
         c = self.colors
         active = self.is_active()
+        # 一時置き場の表示中は地の色を変えて、通常のフォルダと一目で見分ける。
+        background = c["stash_background"] if self.stash else c["background"]
         header_style = (
             f"background-color: {c['header_active'] if active else c['header_inactive']};"
             f" color: {c['header_active_text'] if active else c['header_inactive_text']};")
@@ -652,10 +659,10 @@ class Pane(QWidget):
         self.header2.setStyleSheet(header_style)
         border = c["header_active"] if active else c["header_inactive"]
         self.view.setStyleSheet(
-            f"QTableView {{ background-color: {c['background']}; color: {c['text']};"
+            f"QTableView {{ background-color: {background}; color: {c['text']};"
             f" border: 2px solid {border}; }}")
         self.footer.setStyleSheet(
-            f"background-color: {c['background']}; color: {c['footer_text']};")
+            f"background-color: {background}; color: {c['footer_text']};")
         self.update_header()
         self.view.viewport().update()
 
@@ -681,7 +688,9 @@ class Pane(QWidget):
         if not hasattr(self, "header2"):
             return
         # 1行目: "C:\Program Files\ *.*"(あふｗと同じく、パスの末尾に \ と空白とマスク)。
-        if self.path:
+        if self.stash:
+            text = f"一時置き場 {self.mask_text}"
+        elif self.path:
             text = self.path if self.path.endswith("\\") else self.path + "\\"
             text += f" {self.mask_text}"
         else:
@@ -711,7 +720,12 @@ class Pane(QWidget):
             return  # 組み立ての途中(ビューを作った時点で currentChanged が飛ぶ)
         dirs, files = core.count_dirs_files(self.entries)
         count, total = core.marks_summary(self.entries, self.marks)
-        if self.grep_loading:
+        if self.stash:
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            text = f"一時置き場 {dirs + files}件   {size:,} bytes"
+            if count:
+                text += f"   Mark {count} ({total:,})"
+        elif self.grep_loading:
             text = f"検索中 {self.grep_count:,}ファイル走査（Esc で中止）"
         elif self.grep_query is not None:
             lines = sum(c for c, _ in self.grep_matches.values())
@@ -730,13 +744,14 @@ class Pane(QWidget):
                 space = self.window_.drive_space(self.drive_root())
             text = core.footer_text(dirs, files, *(space or (None, None)),
                                     mark_count=count, mark_bytes=total)
+        background = self.colors["stash_background"] if self.stash else self.colors["background"]
         if self.isearch_text is not None:
             text += f"   検索: {self.isearch_text}_"
             self.footer.setStyleSheet(
-                f"background-color: {self.colors['background']}; color: {self.colors['isearch']};")
+                f"background-color: {background}; color: {self.colors['isearch']};")
         else:
             self.footer.setStyleSheet(
-                f"background-color: {self.colors['background']};"
+                f"background-color: {background};"
                 f" color: {self.colors['footer_text']};")
         self.footer.setText(text)
 
@@ -801,9 +816,12 @@ class Pane(QWidget):
 
         history … "visit"(履歴に積む) / None(積まない。再読込) / ("back"|"forward", 直前のパス)
         on_fail … 読めなかったときに呼ぶ(起動時の復元で、次の候補へ回すため)。"""
-        # ふつうの読み込みはフラット表示・検索結果を終える(フォルダを移る・BS・O など)。
+        # ふつうの読み込みはフラット表示・検索結果・一時置き場を終える
+        # (フォルダを移る・BS・O など)。
         self._stop_flat()
         self._stop_grep()
+        self.stash = False
+        self.stash_from = None
         self.request_id += 1
         request = self.request_id
         self.loading = True
@@ -925,7 +943,7 @@ class Pane(QWidget):
         visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
-        parent = [] if (self.flat or core.is_root(self.path)) else [core.PARENT_ENTRY]
+        parent = [] if (self.flat or self.stash or core.is_root(self.path)) else [core.PARENT_ENTRY]
         self.entries = parent + visible
         self.model.set_entries(self.entries, self.marks)
         self._fit_ext_column()
@@ -940,6 +958,9 @@ class Pane(QWidget):
         return None
 
     def reload(self, keep_marks=False, focus=None) -> None:
+        if self.stash:
+            self.show_stash()
+            return
         if self.grep_query is not None and self.path:
             self.load_grep(self.grep_query, self.grep_case, keep_marks=keep_marks)
             return
@@ -948,6 +969,44 @@ class Pane(QWidget):
             return
         if self.path:
             self.load(self.path, focus=focus, history=None, keep_marks=keep_marks, walk_up=True)
+
+    # --- 一時置き場(T) ---
+    def show_stash(self) -> None:
+        """一時置き場をこの窓に出す。項目の名前はフルパス(コア側の注記参照)。
+
+        置き場に登録されたパスをその場で stat し直すので、移動・削除された
+        実体はここで落ちる(登録からも外し、ログに残す)。"""
+        win = self.window_
+        if not self.stash:
+            self.stash_from = self.real_dir() if self.archive else self.path
+        self._stop_flat()
+        self._stop_grep()
+        self.request_id += 1   # 進行中のフォルダ読み込みを無効化する
+        self.loading = False
+        entries, missing = core.stash_entries(win.stash_paths)
+        if missing:
+            win.remove_stash_paths(missing)
+            win.log(f"一時置き場: 無くなっていた {len(missing)}件を登録から外しました")
+        self.stash = True
+        self.path = ""
+        self.all_entries = entries
+        self._rebuild()
+        self.set_cursor(0)
+        self.apply_style()
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            win.update_status_bar()
+
+    def close_stash(self) -> None:
+        """置き場を閉じて、開く前にいたフォルダへ戻る。"""
+        back = self.stash_from
+        self.stash = False
+        self.stash_from = None
+        if back:
+            self.load(back, history=None)
+        else:
+            self.apply_style()
 
     # --- フラット表示(Alt+B) ---
     def _stop_flat(self) -> None:
@@ -1350,6 +1409,10 @@ class FilerWindow(QWidget):
             self.archive_timeout = filer_archive.ARCHIVE_LIST_TIMEOUT
         recent = section.get("recent")
         self.recent = [p for p in recent if isinstance(p, str)] if isinstance(recent, list) else []
+        # 一時置き場(T)に登録されたパスの一覧。filer.stash に保存する。
+        stash = section.get("stash")
+        self.stash_paths = ([os.path.normpath(p) for p in stash if isinstance(p, str)]
+                            if isinstance(stash, list) else [])
         # 窓の配分(Alt+←→ / Alt+↑↓ / 境界のドラッグ)。閉じるときに保存する。
         self.split_ratio = core.clamp_split(section.get("split_ratio", core.DEFAULT_SPLIT_RATIO))
         self.log_lines = core.clamp_log_lines(section.get("log_lines", core.DEFAULT_LOG_LINES), 99)
@@ -2196,6 +2259,10 @@ class FilerWindow(QWidget):
 
     def cmd_parent(self):
         pane = self.active
+        if pane.stash:
+            # 置き場での BS は「開く前にいたフォルダへ戻る」(フラット表示と同じ作法)。
+            pane.close_stash()
+            return
         if not pane.path:
             return
         if pane.flat or pane.flat_loading:
@@ -2579,6 +2646,76 @@ class FilerWindow(QWidget):
         (判定は読み取りスレッドの read_folder がやる。ネットワーク越しでも固まらない)。"""
         self.active.load(path)
 
+    # --- 一時置き場(T / Shift+T) ---
+    def _save_stash(self) -> None:
+        save_values(self.app_settings, self.settings_path,
+                    {"stash": list(self.stash_paths)})
+
+    def add_stash_paths(self, paths) -> int:
+        """パスを置き場へ登録する(重複は除く)。登録できた件数を返す。"""
+        known = {os.path.normcase(p) for p in self.stash_paths}
+        added = 0
+        for path in paths:
+            path = os.path.normpath(path)
+            if os.path.normcase(path) in known:
+                continue
+            known.add(os.path.normcase(path))
+            self.stash_paths.append(path)
+            added += 1
+        if added:
+            self._save_stash()
+        return added
+
+    def remove_stash_paths(self, paths) -> None:
+        drop = {os.path.normcase(os.path.normpath(p)) for p in paths}
+        kept = [p for p in self.stash_paths if os.path.normcase(p) not in drop]
+        if len(kept) != len(self.stash_paths):
+            self.stash_paths = kept
+            self._save_stash()
+
+    def cmd_stash_add(self):
+        pane = self.active
+        if pane.stash:
+            self.log("一時置き場: 置き場の中からは登録できません")
+            return
+        if self._refuse_archive("一時置き場への登録"):
+            return
+        targets = pane.targets()
+        if not targets:
+            return
+        added = self.add_stash_paths(pane.target_paths())
+        total = len(self.stash_paths)
+        if added:
+            self.log(f"一時置き場: {added}件を登録しました（全{total}件）")
+            other = self.other
+            if other.stash:
+                other.show_stash()
+        else:
+            self.log(f"一時置き場: すでに登録されています（全{total}件）")
+
+    def cmd_stash_toggle(self):
+        pane = self.active
+        if pane.stash:
+            pane.close_stash()
+        else:
+            pane.show_stash()
+
+    def _stash_remove_selected(self) -> None:
+        """置き場での削除キー: 実ファイルは消さず、登録だけを外す。"""
+        pane = self.active
+        targets = pane.targets()
+        if not targets:
+            return
+        names = [e.name for e in targets]
+        if not self.confirm("一時置き場",
+                            f"{len(names)}件を一時置き場から外しますか？\n"
+                            "（ファイル自体は削除されません）",
+                            default_yes=True):
+            return
+        self.remove_stash_paths(names)
+        pane.show_stash()
+        self.log(f"一時置き場: {len(names)}件を外しました（全{len(self.stash_paths)}件）")
+
     def cmd_history_jump(self):
         if not self.recent:
             self.log("履歴がありません")
@@ -2603,8 +2740,9 @@ class FilerWindow(QWidget):
         picker = None
 
         def build_items() -> list:
-            found = [(b["name"], (launcher.KIND_JUMP, b["path"]))
-                     for b in launcher.load_bookmarks(current)]
+            found = [(f"🧺 一時置き場（{len(self.stash_paths)}件）", ("stash", ""))]
+            found += [(b["name"], (launcher.KIND_JUMP, b["path"]))
+                      for b in launcher.load_bookmarks(current)]
             if add_path:
                 found.append((f"{launcher.ADD_ITEM_PREFIX}   {add_path}",
                               (launcher.KIND_ADD, add_path)))
@@ -2612,6 +2750,9 @@ class FilerWindow(QWidget):
 
         def accept(_name, data):
             kind, path = data
+            if kind == "stash":
+                self.active.show_stash()
+                return
             if kind != launcher.KIND_ADD:
                 self.jump_to(path)
                 return
@@ -2867,6 +3008,14 @@ class FilerWindow(QWidget):
             return True
         return False
 
+    def _refuse_stash(self, label: str) -> bool:
+        """一時置き場の表示中は、名前の付け替え・フォルダ作成を断る(フラット
+        表示と同じ理由: 名前がフルパスで、置き場所が1つに定まらないため)。"""
+        if self.active.stash:
+            self.log(f"{label}: 一時置き場では使えません（T で通常の表示へ）")
+            return True
+        return False
+
     def _refuse_archive(self, label: str, source: bool = True, dest_pane=None) -> bool:
         """書庫の中で書き込み系を頼まれたら断る(メッセージだけ出して True)。
 
@@ -2884,6 +3033,9 @@ class FilerWindow(QWidget):
         src = self.active
         dst = self.other
         label = "移動" if move else "複写"
+        if dst.stash:
+            self.log(f"{label}: 一時置き場へは Shift+T で登録します")
+            return
         if self._refuse_archive(label, source=move, dest_pane=dst):
             return
         targets = src.targets()
@@ -2904,6 +3056,9 @@ class FilerWindow(QWidget):
         QApplication.processEvents()
         try:
             result = func(paths, dst.path, self._hwnd(), self.extra_op_flags)
+            if move and src.stash and result == (0, False):
+                # 置き場から移動し終えたものは、登録からも外す(実体が移ったため)
+                self.remove_stash_paths(paths)
         finally:
             try:
                 self.set_status_state("Ready.")
@@ -3015,14 +3170,23 @@ class FilerWindow(QWidget):
         self._after_operation("完全削除" if permanent else "削除(ごみ箱)", result, paths)
 
     def cmd_delete(self):
+        if self.active.stash:
+            self._stash_remove_selected()
+            return
         self._delete(permanent=False)
 
     def cmd_delete_permanent(self):
+        if self.active.stash:
+            # 置き場では完全削除も「登録を外す」だけにする(実ファイルは消さない)
+            self._stash_remove_selected()
+            return
         self._delete(permanent=True)
 
     # --- 作成・改名 ---
     def cmd_mkdir(self):
         pane = self.active
+        if self._refuse_stash("フォルダ作成"):
+            return
         if not pane.path or self._refuse_archive("フォルダ作成") or self._refuse_flat("フォルダ作成"):
             return
         name = self.ask_text("フォルダ作成", "新しいフォルダの名前", "")
@@ -3049,6 +3213,8 @@ class FilerWindow(QWidget):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更
         (あふｗと同じ)。対象はマーク、無ければカーソル行。".." は対象外。"""
         pane = self.active
+        if self._refuse_stash("ファイル情報の編集"):
+            return
         if not pane.path or self._refuse_flat("ファイル情報の編集"):
             return
         if pane.archive is not None:
@@ -3110,6 +3276,8 @@ class FilerWindow(QWidget):
     def cmd_batch_rename(self):
         """Shift+R: 一括改名の窓。対象は見えているマーク、無ければ一覧の全部(".." 以外)。"""
         pane = self.active
+        if self._refuse_stash("一括改名"):
+            return
         if not pane.path or self._refuse_flat("一括改名"):
             return
         if pane.archive is not None:
@@ -3240,6 +3408,9 @@ class FilerWindow(QWidget):
 
     def cmd_clip_paste(self):
         pane = self.active
+        if pane.stash:
+            self.log("貼り付け: 一時置き場へは貼り付けられません")
+            return
         if not pane.path or self._refuse_archive("貼り付け", source=False, dest_pane=pane):
             return
         clipboard = QGuiApplication.clipboard()

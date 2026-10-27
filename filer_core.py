@@ -105,6 +105,8 @@ DEFAULT_KEYMAP = {
     "0186": "mask_clear",         # :  (VK_OEM_1)
     "1186": "mask_input",         # Shift+: (AFXW.key 1186 &MASK)
     # --- ファイル操作 ---
+    "0084": "stash_toggle",       # T 一時置き場を開く/戻る
+    "1084": "stash_add",          # Shift+T 一時置き場へ登録
     "0067": "copy_menu",          # C (menu\copy.txt)
     "4067": "copy_direct",        # Alt+C
     "0077": "move_menu",          # M (menu\move.txt)
@@ -727,6 +729,27 @@ def grep_files(root: str, needle: str, case_sensitive: bool = False,
     return found, matches, "done"
 
 
+def stash_entries(paths):
+    """一時置き場のパス一覧から (項目, 消えていたパス) を作る。
+
+    項目の名前はフルパスそのものにする。そうしておくと、窓側の
+    os.path.join(窓のパス, 名前) が絶対パスの規則でそのまま実パスに
+    なるので、コピー・移動・プレビュー等の既存の操作が置き場でも
+    そのまま動く(フラット表示が相対パスでやっていることの絶対版)。"""
+    entries, missing = [], []
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            missing.append(path)
+            continue
+        is_dir = stat.S_ISDIR(st.st_mode)
+        entries.append(Entry(path, is_dir, 0 if is_dir else st.st_size,
+                             st.st_mtime,
+                             getattr(st, "st_file_attributes", 0)))
+    return entries, missing
+
+
 # ---------------------------------------------------------------
 # マーク
 # ---------------------------------------------------------------
@@ -925,6 +948,8 @@ COMMAND_SHORT_NAMES = {
     "mask_clear": "Mask*.*",
     "history_jump": "History",
     "bookmark_jump": "Bookmark",
+    "stash_toggle": "Stash",
+    "stash_add": "Stash+",
     "path_jump": "Jump",
     "desktop": "Desktop",
     "drive": "Drive",

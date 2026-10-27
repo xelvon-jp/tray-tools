@@ -171,7 +171,9 @@ def qicon_menu() -> QIcon:
     for canvas_size, glyph_size, dpr in ((48, 16, 1.0), (96, 32, 2.0)):
         rows = PIXELS[glyph_size]
         data = bytearray(canvas_size * canvas_size * 4)
-        ox = canvas_size - int(canvas_size * 0.36) - glyph_size
+        # 字の左端がキャンバスの約65%に来るよう右へ寄せる(実機で測った
+        # 絵文字の列: 溝の左端から約 (36-13)/35 の位置)。
+        ox = canvas_size - glyph_size - max(1, canvas_size // 48)
         oy = (canvas_size - glyph_size) // 2
         for gy, row in enumerate(rows):
             for gx, ch in enumerate(row):

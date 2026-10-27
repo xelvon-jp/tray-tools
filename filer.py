@@ -1354,6 +1354,9 @@ class FilerWindow(QWidget):
         self.log_font = QFont(self.list_font)
 
         self.setWindowTitle("あっふ")
+        # アプリ既定(main で設定)に加え窓自体にも付ける。タスクバーが
+        # 実行ファイル側の汎用アイコンを拾う環境でも窓のアイコンが勝つ。
+        self.setWindowIcon(affx_icon.qicon())
         self.setObjectName("filerWindow")
         self.setStyleSheet(f"#filerWindow {{ background-color: {self.colors['background']}; }}")
         self.active_side = section.get("active") if section.get("active") in ("left", "right") else "left"

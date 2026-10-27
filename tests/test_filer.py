@@ -1004,6 +1004,39 @@ def test_log_selection_ctrl_c():
             w.deleteLater()
 
 
+def test_preload_modules():
+    """起動後の先読みで launcher / picker が読み込み済みになり、初回の J が重くならない。"""
+    import sys
+
+    import filer
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            w._preload_modules()
+            assert w._preloaded
+            assert "launcher" in sys.modules and "picker" in sys.modules
+            w._preload_modules()    # 二度呼んでも何もしない
+            # 先読み後も J のピッカーは通常どおり開く
+            w.run_command("bookmark_jump")
+            QTest.qWait(30)
+            assert w._picker is not None
+            w._picker.close()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_bookmark_add_delete_move():
     """J: 押すたびに settings.json を読み直し、「ここを登録」・削除・並べ替えができる。
     ほかの設定(hotkeys・filer)は消さない。"""

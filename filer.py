@@ -1422,6 +1422,25 @@ class FilerWindow(QWidget):
             candidates = [p for p in (saved, home, "C:\\") if isinstance(p, str) and p]
             self._load_first(pane, candidates)
         self.activate(self.active_side)
+        # J(ブックマーク)の初回が重くならないよう、重いモジュールを空き時間に先読みする。
+        QTimer.singleShot(1000, self._preload_modules)
+
+    def _preload_modules(self) -> None:
+        """launcher(→ explorer_nav → comtypes)と picker を先に読み込んでおく。
+
+        ファイラ本体の起動を軽く保つため、これらは使うときに読む作りだが、
+        そのままだと J を初めて押したときに読み込みの時間(特に comtypes)が
+        丸ごと乗り、ピッカーの立ち上がりが引っかかる。起動して少し経った
+        空き時間に読み込んでしまえば、初回の J も2回目以降と同じ速さになる。
+        読み込むだけで、COM のオブジェクトは作らない。"""
+        if getattr(self, "_preloaded", False):
+            return
+        self._preloaded = True
+        try:
+            import launcher  # noqa: F401
+            import picker  # noqa: F401
+        except Exception:  # noqa: BLE001  先読みできなくても、J のときに読み直すだけ
+            _log_exception("preload")
 
     def _load_first(self, pane, candidates) -> None:
         if not candidates:

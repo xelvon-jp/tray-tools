@@ -1056,6 +1056,7 @@ def test_click_activates_pane():
     """ファイル窓のクリックで、押した側の窓がアクティブになる(本人の指定)。
     カーソル行は両窓とも動かず、フォーカスも押した側へ移る。"""
     import filer
+    from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])

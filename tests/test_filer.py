@@ -253,9 +253,9 @@ def test_dialogs():
             QTest.keyClick(d, k)
         return d.result_value
 
-    assert sort(None, Qt.Key_X) is None    # 文字キーは選択だけ(即決しない)
-    assert sort(None, Qt.Key_X, Qt.Key_Return)["kind"] == "natural"
-    r = sort(None, Qt.Key_Right, Qt.Key_G, Qt.Key_C, Qt.Key_S, Qt.Key_Return)
+    # 文字キーは押した時点で即決定(あふｗと同じ。本人の指定)
+    assert sort(None, Qt.Key_X)["kind"] == "natural"
+    r = sort(None, Qt.Key_Right, Qt.Key_G, Qt.Key_C, Qt.Key_S)
     assert r == {"kind": "size", "descending": True, "dirs_first": False, "ignore_case": False}, r
     assert sort({"kind": "time"}, Qt.Key_Down, Qt.Key_Tab, Qt.Key_Return) == {
         "kind": "attr", "descending": True, "dirs_first": True, "ignore_case": True}

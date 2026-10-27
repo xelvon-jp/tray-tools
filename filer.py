@@ -3822,7 +3822,7 @@ class _KeyDialog(QDialog):
 
 class SortDialog(_KeyDialog):
     """あふｗの「ソート」。↑↓で種類、←→/Tab で昇順・降順、G/C でチェック、
-    先頭文字(N/F/E/S/T/A/X)は選択だけ、Enter で決定、Esc で取消。"""
+    先頭文字(N/F/E/S/T/A/X)を押すと即決定(あふｗと同じ)、Enter でも決定、Esc で取消。"""
 
     def __init__(self, parent, title, spec, colors, font):
         super().__init__(parent, title, colors, font)
@@ -3872,8 +3872,9 @@ class SortDialog(_KeyDialog):
         elif letter == "C":
             self.spec["ignore_case"] = not self.spec["ignore_case"]
         elif letter in core.SORT_SHORTCUTS:
-            # 文字キーは種類の選択だけ。決定は Enter(メニューと同じ作法)。
-            self.row = core.SORT_KINDS.index(core.SORT_SHORTCUTS[letter])
+            # 文字キーは押した時点で決定(あふｗと同じ。本人の指定で即時反映)。
+            self._decide(core.SORT_SHORTCUTS[letter])
+            return
         self.refresh()
 
 

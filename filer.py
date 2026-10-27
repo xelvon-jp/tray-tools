@@ -2712,8 +2712,17 @@ class FilerWindow(QWidget):
                             "（ファイル自体は削除されません）",
                             default_yes=True):
             return
+        # カーソルの行き先は通常窓の削除と同じ: 元の名前が残ればその行、
+        # 無ければ元の行(次に来たもの)に留まる。先頭へは戻さない。
+        entry = pane.cursor_entry()
+        prev_name = entry.name if entry is not None else None
+        prev_row = pane.cursor_row()
         self.remove_stash_paths(names)
         pane.show_stash()
+        if pane.entries:
+            target = pane._row_of(prev_name) if prev_name else None
+            pane.set_cursor(target if target is not None
+                            else min(prev_row, len(pane.entries) - 1))
         self.log(f"一時置き場: {len(names)}件を外しました（全{len(self.stash_paths)}件）")
 
     def cmd_history_jump(self):
@@ -2986,7 +2995,8 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001
             return 0
 
-    def _after_operation(self, label, result, sources, dest=None) -> None:
+    def _after_operation(self, label, result, sources, dest=None,
+                         dest_pane=None, dest_focus=None) -> None:
         code, aborted = result
         names = f"{len(sources)}件"
         where = f" → {dest}" if dest else ""
@@ -2996,8 +3006,13 @@ class FilerWindow(QWidget):
             self.log(f"{label}: 失敗しました（コード 0x{code:X}、{names}{where}）")
         else:
             self.log(f"{label}: {names}{where}")
-        self.left.reload()
-        self.right.reload()
+        for pane in (self.left, self.right):
+            if (pane is dest_pane and dest_focus and code == 0 and not aborted):
+                # あふｗと同じく、送り先の窓では送ったものの行にカーソルを置く
+                # (後からフォーカスを移したとき、その行に居るように)。
+                pane.reload(focus=dest_focus)
+            else:
+                pane.reload()
 
     def _refuse_flat(self, label: str) -> bool:
         """フラット表示中は、名前の付け替え・フォルダ作成を断る。名前が相対パス
@@ -3034,7 +3049,9 @@ class FilerWindow(QWidget):
         dst = self.other
         label = "移動" if move else "複写"
         if dst.stash:
-            self.log(f"{label}: 一時置き場へは Shift+T で登録します")
+            # 反対窓が一時置き場なら、複写・移動のキーは「登録」として働く
+            # (実体は動かさない。本人の要望: Shift+T より C/M の方が分かりやすい)
+            self.cmd_stash_add()
             return
         if self._refuse_archive(label, source=move, dest_pane=dst):
             return
@@ -3064,7 +3081,9 @@ class FilerWindow(QWidget):
                 self.set_status_state("Ready.")
             except Exception:  # noqa: BLE001  finally の中で投げない(CLAUDE.md)
                 pass
-        self._after_operation(label, result, paths, dst.path)
+        self._after_operation(label, result, paths, dst.path,
+                              dest_pane=dst,
+                              dest_focus=os.path.basename(paths[0]) if paths else None)
 
     def cmd_copy_direct(self):
         self._transfer(move=False)

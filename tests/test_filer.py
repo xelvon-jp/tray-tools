@@ -459,6 +459,96 @@ def test_stash_pane():
             w.deleteLater()
 
 
+def test_stash_register_keys_and_cursor():
+    """置き場: 反対窓が置き場なら C/M は登録として働く(実体は動かない)。
+    登録解除後のカーソルは通常窓の削除と同じく、元の名前→元の行に留まる。"""
+    import filer
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, m=Qt.NoModifier: QTest.keyClick(L.view, k, m)  # noqa: E731
+        try:
+            paths = [str(left / n) for n in ("alpha.txt", "beta.md", "gamma.txt")]
+            w.add_stash_paths(paths)
+            L.show_stash()
+            assert [Path(e.name).name for e in L.entries] == ["alpha.txt", "beta.md", "gamma.txt"]
+            w.confirm = lambda *a, **k: True
+            L.set_cursor(1)                       # beta.md を外す
+            key(Qt.Key_Delete)
+            assert w.stash_paths == [paths[0], paths[2]]
+            assert L.cursor_row() == 1 and _cursor_name(L).endswith("gamma.txt")
+            L.set_cursor(1)                       # gamma.txt(末尾)を外す
+            key(Qt.Key_Delete)
+            assert w.stash_paths == [paths[0]]
+            assert L.cursor_row() == 0 and _cursor_name(L).endswith("alpha.txt")
+            L.close_stash()
+            _wait(w)
+            R.show_stash()                        # 反対窓を置き場にする
+            L.set_cursor(L._row_of("beta.md"))
+            key(Qt.Key_C, Qt.AltModifier)         # 複写キーで登録
+            assert str(left / "beta.md") in w.stash_paths
+            assert (left / "beta.md").exists()
+            L.set_cursor(L._row_of("photo.JPG"))
+            key(Qt.Key_M, Qt.AltModifier)         # 移動キーでも登録(移動はしない)
+            assert str(left / "photo.JPG") in w.stash_paths
+            assert (left / "photo.JPG").exists()
+            assert any(e.name.endswith("photo.JPG") for e in R.entries)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_transfer_cursor_follows_to_other_pane():
+    """あふｗ準拠: 反対窓へ移動/複写したら、反対窓のカーソルは送った
+    ファイルの行に置かれる(後からフォーカスを移したときにそこに居る)。"""
+    import filer
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        key = lambda k, m=Qt.NoModifier: QTest.keyClick(L.view, k, m)  # noqa: E731
+        try:
+            R.set_cursor(R._row_of("r.txt"))
+            L.set_cursor(L._row_of("gamma.txt"))
+            key(Qt.Key_M, Qt.AltModifier)         # 移動
+            _wait(w)
+            assert (right / "gamma.txt").exists() and not (left / "gamma.txt").exists()
+            assert _cursor_name(R) == "gamma.txt"
+            L.set_cursor(L._row_of("alpha.txt"))
+            key(Qt.Key_C, Qt.AltModifier)         # 複写でも同じ
+            _wait(w)
+            assert (right / "alpha.txt").exists()
+            assert _cursor_name(R) == "alpha.txt"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_desktop_path():
     """デスクトップのパスが取れる(N キーの移動先)。
 

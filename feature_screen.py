@@ -667,6 +667,11 @@ class ScreenFeature:
         if self._prewarm_enabled():
             self._prewarm_timer.start(PREWARM_STARTUP_DELAY_MS)
 
+        # 画面取得(mss の実体)も先に作っておく。初回のキャプチャで生成コスト
+        # (GDI 関数の解決とモニタ列挙)を払うと、押してから撮れるまでが目に見えて
+        # 遅れる。待機役を起こすのと同じだけ遅らせて、起動直後の混雑を避ける。
+        QTimer.singleShot(PREWARM_STARTUP_DELAY_MS, capture_grab.prewarm_sct)
+
     def hotkeys(self) -> dict:
         return {
             "capture_now": lambda: self.start_capture(0),

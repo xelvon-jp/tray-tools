@@ -69,6 +69,7 @@ from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import QApplication
 
 import settings as settings_module
+import capture_grab
 from capture_window import CaptureWindow
 from toast import show_toast
 # 窓の出ない実行ファイルの割り出しと、親から切り離して起動するフラグ。本体の再起動
@@ -733,6 +734,10 @@ class _WarmHost:
         self.parent_timer.timeout.connect(self._check_parent)
         self.parent_timer.start(WARM_PARENT_CHECK_MS)
 
+        # 待っている間に画面取得(mss の実体)も作っておく。付箋になってからの
+        # 初回の連番キャプチャで、生成コストを払わずに済むようにするため。
+        QTimer.singleShot(0, capture_grab.prewarm_sct)
+
     # -----------------------------------------------------------
     def _listen_as(self, name: str) -> None:
         """待ち受けの名前を張り替える。QLocalServer は作り直さず使い回すこと。
@@ -898,6 +903,9 @@ def _run_sticky(app, args) -> int:
     # 参照を捨てるとGCで待ち受けごと消えるため、ローカル変数で持ち続ける。
     server = _listen(window)  # noqa: F841
     window.show()
+    # 画面取得(mss の実体)を先に作っておく。初回の連番キャプチャで生成コストを
+    # 払うと、撮れるまでが目に見えて遅れるため(待機役と同じ対策)。
+    QTimer.singleShot(0, capture_grab.prewarm_sct)
     return app.exec()
 
 

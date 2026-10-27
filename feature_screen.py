@@ -419,8 +419,9 @@ class ScreenFeature:
         # 左の余白でアイコンの位置を絵文字の列に合わせる(余白は実測で調整)。
         filer_button = QToolButton()
         filer_button.setFont(self.menu.font())
-        filer_button.setText(self._with_hotkey("あっふ…", hotkey_config.get("filer")))
-        filer_button.setIcon(affx_icon.qicon())
+        filer_button.setText(self._with_hotkey("あっふ", hotkey_config.get("filer")))
+        # メニューでは白地なし(字だけ)。白い四角が浮いて見えるため。
+        filer_button.setIcon(affx_icon.qicon_glyph())
         filer_button.setIconSize(QSize(16, 16))
         filer_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         filer_button.setAutoRaise(True)

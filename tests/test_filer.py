@@ -1055,6 +1055,7 @@ def test_grep_search():
 def test_click_activates_pane():
     """ファイル窓のクリックで、押した側の窓がアクティブになる(本人の指定)。
     カーソル行は両窓とも動かず、フォーカスも押した側へ移る。"""
+    import filer
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
@@ -1964,7 +1965,9 @@ def test_contextmenu_child_list_mode():
             assert len(rounds) == repeat, rounds
             labels = [r[3] for r in rows if r[0] == "0" and r[3]]
             assert len(labels) >= 3, labels
-            assert any(("プロパティ" in l) or ("Properties" in l) for l in labels), labels
+            # ニーモニックの & の位置は環境で違う(P&roperties 等)ので、外して比べる
+            plain = [l.replace("&", "") for l in labels]
+            assert any(("プロパティ" in l) or ("Properties" in l) for l in plain), labels
 
 
 def test_initial_jump_and_range_mark_logic():
@@ -3419,7 +3422,7 @@ def test_window_flat_view():
             # R・K はフラット表示中は断る
             key(Qt.Key_R)
             key(Qt.Key_K)
-            assert w.log_view.toPlainText().count("フラット表示中は使えません") == 2
+            assert w.log_view.toPlainText().count("フラット表示・検索結果では使えません") == 2
             # BS で通常の表示へ(親へは行かない)
             key(Qt.Key_Backspace)
             _wait(w)

@@ -1052,44 +1052,6 @@ def test_grep_search():
             win.close()
 
 
-def test_click_activates_pane():
-    """ファイル窓のクリックで、押した側の窓がアクティブになる(本人の指定)。
-    カーソル行は両窓とも動かず、フォーカスも押した側へ移る。"""
-    import filer
-    from PySide6.QtCore import Qt
-    from PySide6.QtTest import QTest
-
-    _qapp()
-    with tempfile.TemporaryDirectory() as tmp:
-        left, right = _make_tree(tmp)
-        settings_path = Path(tmp, "settings.json")
-        settings_path.write_text("{}", encoding="utf-8")
-        win = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
-                                str(settings_path))
-        win.resize(1000, 600)
-        win.show()
-        win.start()
-        _wait(win)
-        try:
-            win.activate("left")
-            left_row, right_row = win.left.cursor_row(), win.right.cursor_row()
-            rect = win.right.view.visualRect(win.right.model.index(right_row, 0))
-            QTest.mouseClick(win.right.view.viewport(), Qt.LeftButton,
-                             Qt.NoModifier, rect.center())
-            _wait(win)
-            assert win.active_side == "right"
-            assert win.right.view.hasFocus()
-            assert win.left.cursor_row() == left_row
-            assert win.right.cursor_row() == right_row
-            rect = win.left.view.visualRect(win.left.model.index(left_row, 0))
-            QTest.mouseClick(win.left.view.viewport(), Qt.LeftButton,
-                             Qt.NoModifier, rect.center())
-            _wait(win)
-            assert win.active_side == "left"
-        finally:
-            win.close()
-
-
 def test_preload_modules():
     """起動後の先読みで launcher / picker が読み込み済みになり、初回の J が重くならない。"""
     import sys

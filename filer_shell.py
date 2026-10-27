@@ -412,19 +412,10 @@ def list_drives(label_timeout: float = 1.0) -> list:
 # 実行ファイル(pythonw.exe)の汎用アイコンでピンが作られてしまう。
 # IPropertyStore は COM だが、使うのは SetValue / Commit / Release だけで、
 # ここでは vtable 経由の素通しに留める(寿命はこの呼び出しの中だけ)。
-class _GUID(ctypes.Structure):
-    _fields_ = [("data1", wintypes.DWORD), ("data2", wintypes.WORD),
-                ("data3", wintypes.WORD), ("data4", ctypes.c_ubyte * 8)]
-
-
-def _guid(text: str) -> _GUID:
-    guid = _GUID()
-    ctypes.windll.ole32.CLSIDFromString(text, ctypes.byref(guid))
-    return guid
-
-
 class _PROPERTYKEY(ctypes.Structure):
-    _fields_ = [("fmtid", _GUID), ("pid", wintypes.DWORD)]
+    # fmtid は既存の GUID(上の既知フォルダ用)を使う。_guid もそちらを使う
+    # (同名の定義を足すと desktop_path 側が巻き込まれて壊れる)。
+    _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
 
 
 _IID_IPROPERTYSTORE = "{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}"

@@ -388,6 +388,16 @@ def test_clipboard_helpers():
     assert core.clip_text(["C:\\x\\a.txt", "C:\\x\\d"], names_only=True) == "a.txt\r\nd"
 
 
+def test_desktop_path():
+    """デスクトップのパスが取れる(N キーの移動先)。
+
+    filer_shell の _guid / GUID の型が噛み合わないと ArgumentError で
+    落ちる(タスクバー identity 用の同名定義が巻き込んだ事故の回帰防止)。"""
+    import filer_shell
+    path = filer_shell.desktop_path()
+    assert path and Path(path).is_dir(), path
+
+
 def test_folder_signature():
     """自動監視の指紋: 触らなければ同じ、追加・サイズ変更・改名・削除で変わる。"""
     with tempfile.TemporaryDirectory() as tmp:

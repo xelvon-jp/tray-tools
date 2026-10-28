@@ -50,6 +50,21 @@ def test_clean_text():
     assert clean("") == "" and clean(None) == ""
 
 
+def test_layout_text():
+    """単語の位置から改行・インデント・空行を再現する。"""
+    # 1行目は x=0 から、2行目は x=40 始まり(字幅10px → 4字分字下げ)、
+    # 3行目は行間が大きく空いている(空行が入る)。
+    lines = [
+        [("def", 0, 0, 30, 20), ("foo():", 40, 0, 60, 20)],
+        [("return", 40, 24, 60, 20), ("1", 110, 24, 10, 20)],
+        [("終 わ り", 0, 100, 70, 20)],
+    ]
+    text = ocr_win.layout_text(lines)
+    assert text == "def foo():\n    return 1\n\n終わり", text
+    assert ocr_win.layout_text([]) == ""
+    assert ocr_win.layout_text([[]]) == ""
+
+
 def test_ocr_scale():
     """短辺 1600px 未満は広げ(最大3倍)、上限 10000px は超えない。"""
     scale = ocr_win.ocr_scale

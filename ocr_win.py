@@ -67,24 +67,65 @@ def ocr_scale(width: int, height: int, max_dim: int = 10000) -> float:
 _CJK_CHAR = re.compile(r"[぀-ヿ㐀-鿿豈-﫿＀-｠　-〿]")
 
 
+def _clean_line(line: str) -> str:
+    """1行分の文字間空白を落とす(clean_text の中身。行頭の空白は残す)。"""
+    chars = []
+    for i, ch in enumerate(line):
+        if ch in (" ", "　"):
+            prev = line[i - 1] if i > 0 else ""
+            nxt = line[i + 1] if i + 1 < len(line) else ""
+            if (prev and _CJK_CHAR.match(prev)) or (nxt and _CJK_CHAR.match(nxt)):
+                continue
+        chars.append(ch)
+    return "".join(chars)
+
+
 def clean_text(text: str) -> str:
     """OCR 結果の空白を整える。
 
     Windows OCR の日本語エンジンは、文字ごとに空白を挟んで返すことが
     ある(「確 か に 酷 い」)。和文の隣にある空白は落として読み形に戻す。
     英単語どうしの区切り(前後とも英字)はそのまま残す。"""
-    out_lines = []
-    for line in (text or "").splitlines():
-        chars = []
-        for i, ch in enumerate(line):
-            if ch in (" ", "　"):
-                prev = line[i - 1] if i > 0 else ""
-                nxt = line[i + 1] if i + 1 < len(line) else ""
-                if (prev and _CJK_CHAR.match(prev)) or (nxt and _CJK_CHAR.match(nxt)):
-                    continue
-            chars.append(ch)
-        out_lines.append("".join(chars).strip())
-    return "\n".join(out_lines).strip()
+    lines = [_clean_line(line).strip() for line in (text or "").splitlines()]
+    return "\n".join(lines).strip()
+
+
+def layout_text(lines) -> str:
+    """単語の位置から、改行とインデントを再現した文字列を組み立てる。
+
+    lines は行ごとの [(文字列, x, y, 幅, 高さ)]。エンジンの返す
+    result.text は全文を空白でつないでしまうので、こちらを使う。
+    インデントは「その行の先頭の単語の x − 全体の最小 x」を、文字幅の
+    中央値で割って空白の個数にする(上限40)。行間が空いていれば空行も入れる。"""
+    rows = []
+    all_words = [w for line in lines for w in line]
+    if not all_words:
+        return ""
+    widths = sorted(w[3] / max(1, len(w[0])) for w in all_words if w[0])
+    char_w = widths[len(widths) // 2] if widths else 0.0
+    if char_w <= 0:
+        char_w = 1.0
+    heights = sorted(max(w[4] for w in line) for line in lines if line)
+    line_h = heights[len(heights) // 2] if heights else char_w
+    base_x = min(w[1] for w in all_words)
+    for line in lines:
+        words = sorted((w for w in line if w[0]), key=lambda w: w[1])
+        if not words:
+            continue
+        top = min(w[2] for w in words)
+        bottom = max(w[2] + w[4] for w in words)
+        indent = round((min(w[1] for w in words) - base_x) / char_w)
+        content = _clean_line(" ".join(w[0] for w in words)).strip()
+        rows.append((top, bottom, max(0, min(indent, 40)), content))
+    rows.sort(key=lambda r: r[0])
+    out = []
+    prev_bottom = None
+    for top, bottom, indent, content in rows:
+        if prev_bottom is not None and top - prev_bottom > line_h * 1.2:
+            out.append("")
+        out.append(" " * indent + content)
+        prev_bottom = bottom
+    return "\n".join(out).strip()
 
 
 def recognize_png(png_bytes: bytes) -> str:
@@ -94,7 +135,7 @@ def recognize_png(png_bytes: bytes) -> str:
     呼ばれる前提(イベントループはここで回す)。失敗は例外で上げる。"""
     if not png_bytes:
         raise ValueError("画像が空です")
-    return clean_text(asyncio.run(_recognize(png_bytes)))
+    return asyncio.run(_recognize(png_bytes))
 
 
 async def _recognize(png_bytes: bytes) -> str:
@@ -126,4 +167,13 @@ async def _recognize(png_bytes: bytes) -> str:
     if engine is None:
         raise RuntimeError(f"OCR エンジンを作れませんでした（言語: {tag}）")
     result = await engine.recognize_async(bitmap)
-    return result.text or ""
+    # result.text は全文が空白でつながってしまう。単語の位置から
+    # 改行とインデントを再現する(layout_text)。
+    lines = []
+    for line in result.lines:
+        words = []
+        for word in line.words:
+            rect = word.bounding_rect
+            words.append((word.text, rect.x, rect.y, rect.width, rect.height))
+        lines.append(words)
+    return layout_text(lines)

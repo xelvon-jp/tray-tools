@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRect,
+    QRectF,
     QTimer,
     Signal,
 )
@@ -23,6 +24,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QImage,
     QPainter,
+    QPen,
     QPixmap,
     qGray,
 )
@@ -125,6 +127,10 @@ class CaptureWindow(QWidget):
 
         self._drawing = False
         self._current_stroke = None
+        # OCR の範囲指定中かどうかと、ドラッグ中の矩形(画像座標)。
+        self._ocr_selecting = False
+        self._ocr_drag_start = None
+        self._ocr_drag_current = None
         # キャプチャ＆保存の実行中フラグ。hide() → 待つ → 撮る、の非同期処理なので、
         # 待っている間に(連打やホットキー経由で)もう一度入られると hide()/show() の
         # 順序が乱れ、同じ絵を二重に保存してしまう。ScreenFeature.start_capture() が
@@ -181,6 +187,9 @@ class CaptureWindow(QWidget):
         self._drawing = False
         self._current_stroke = None
         self._capturing = False
+        self._ocr_selecting = False
+        self._ocr_drag_start = None
+        self._ocr_drag_current = None
 
         self.pen_color = QColor(self.capture_settings.get("pen_color", "#ff0000"))
         self.pen_width = self.capture_settings.get("pen_width", 3)
@@ -240,6 +249,13 @@ class CaptureWindow(QWidget):
         if self._current_stroke is not None:
             draw_action(painter, self._current_stroke)
 
+        # OCR の範囲指定中は、ドラッグ中の矩形を画像座標で重ねて描く。
+        if self._ocr_drag_start is not None and self._ocr_drag_current is not None:
+            rect = QRectF(self._ocr_drag_start, self._ocr_drag_current).normalized()
+            painter.setPen(QPen(QColor(0, 120, 215), 2.0 / max(self.zoom_factor, 0.01)))
+            painter.setBrush(QColor(0, 120, 215, 40))
+            painter.drawRect(rect)
+
         # バッジはウィジェットへの直接描画で済ませる。保存/コピーが使う render_annotated() は
         # base_image と actions_history からしか絵を作らないため、これで保存画像には混ざらない。
         painter.resetTransform()
@@ -276,6 +292,12 @@ class CaptureWindow(QWidget):
     # マウス操作: Ctrl+左ドラッグ=ペン描画 / 移動はタイトルバーのドラッグ(OS任せ)
     # ---------------------------------------------------------------
     def mousePressEvent(self, event):
+        # OCR の範囲指定中は、左ドラッグが矩形の指定になる(描画より優先)。
+        if self._ocr_selecting and event.button() == Qt.LeftButton:
+            self._ocr_drag_start = self._to_image_coords(event.position())
+            self._ocr_drag_current = self._ocr_drag_start
+            self.update()
+            return
         # 画像部分の左ドラッグでウインドウを動かす機能は廃止した。描き込もうとして
         # (Ctrlを押し損ねて)付箋ごと動かしてしまう事故が多かったため。この付箋は
         # FramelessWindowHint を使っておらずOS標準のタイトルバーがあるので、移動手段は
@@ -296,11 +318,20 @@ class CaptureWindow(QWidget):
             }
 
     def mouseMoveEvent(self, event):
+        if self._ocr_selecting and self._ocr_drag_start is not None:
+            self._ocr_drag_current = self._to_image_coords(event.position())
+            self.update()
+            return
         if self._drawing and self._current_stroke is not None:
             self._current_stroke["points"].append(self._to_image_coords(event.position()))
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if (self._ocr_selecting and event.button() == Qt.LeftButton
+                and self._ocr_drag_start is not None):
+            self._ocr_drag_current = self._to_image_coords(event.position())
+            self._finish_ocr_selection()
+            return
         if event.button() == Qt.LeftButton:
             if self._drawing and self._current_stroke is not None:
                 if len(self._current_stroke["points"]) > 1:
@@ -342,6 +373,10 @@ class CaptureWindow(QWidget):
     # キーボード: Ctrl+Z でアンドゥ / Ctrl+S で保存 / Ctrl+C でコピー
     # ---------------------------------------------------------------
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self._ocr_selecting:
+            self._cancel_ocr_selection()
+            show_toast("Rapture\nOCR を中止しました")
+            return
         # 修飾キーは & ではなく == で見る。& だと「Ctrlが含まれていれば真」なので、
         # 連番キャプチャのホットキー(既定 Ctrl+Alt+S)を付箋にフォーカスがある状態で
         # 押したときに Ctrl+S とも解釈され、同じ絵が単発の名前と連番の名前の両方で
@@ -454,11 +489,40 @@ class CaptureWindow(QWidget):
         rendered = render_annotated(self.base_image, self.actions_history)
         QGuiApplication.clipboard().setImage(rendered)
 
-    def _ocr_target_image(self):
+    def _begin_ocr(self):
+        """OCR の範囲指定を始める。付箋の上でドラッグした矩形だけを読む。
+        その場のクリック(ドラッグなし)なら全体、Esc で中止。"""
+        self._ocr_selecting = True
+        self._ocr_drag_start = None
+        self._ocr_drag_current = None
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()
+        show_toast("Rapture\n読み取る範囲をドラッグしてください（クリックで全体 / Escで中止）")
+
+    def _cancel_ocr_selection(self):
+        self._ocr_selecting = False
+        self._ocr_drag_start = None
+        self._ocr_drag_current = None
+        self.unsetCursor()
+        self.update()
+
+    def _finish_ocr_selection(self):
+        start, current = self._ocr_drag_start, self._ocr_drag_current
+        self._cancel_ocr_selection()
+        if start is None or current is None:
+            return
+        rect = QRectF(start, current).normalized().toRect()
+        rect = rect.intersected(self.base_image.rect())
+        if rect.width() < 8 or rect.height() < 8:
+            self._run_ocr(self.base_image)   # クリックだけ = 全体を読む
+            return
+        self._run_ocr(self.base_image.copy(rect))
+
+    def _ocr_target_image(self, source):
         """OCR に渡す絵を用意する。Windows OCR は白地に黒文字・大きめの
         文字が得意なので、地が暗ければ反転し、小さい絵は広げる
         (判断は ocr_win の純関数。暗い画面の一覧が化けた実例からの対策)。"""
-        image = self.base_image.convertToFormat(QImage.Format_RGB32)
+        image = source.convertToFormat(QImage.Format_RGB32)
         thumb = image.scaled(8, 8, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         total = 0
         for y in range(thumb.height()):
@@ -474,8 +538,8 @@ class CaptureWindow(QWidget):
                                  Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         return image
 
-    def _run_ocr(self):
-        """撮った絵(描き込みなし)から文字を読んで、クリップボードへ載せる。
+    def _run_ocr(self, source):
+        """source(元の絵か、その切り抜き)から文字を読んでクリップボードへ載せる。
 
         読み取りは Windows 標準の OCR(ocr_win)。時間がかかるので別スレッドで
         回し、結果はシグナルで受けてからクリップボードとトーストへ出す。
@@ -483,7 +547,7 @@ class CaptureWindow(QWidget):
         try:
             buffer = QBuffer()
             buffer.open(QIODevice.WriteOnly)
-            self._ocr_target_image().save(buffer, "PNG")
+            self._ocr_target_image(source).save(buffer, "PNG")
             png = bytes(buffer.data())
             buffer.close()
         except Exception as e:
@@ -596,7 +660,7 @@ class CaptureWindow(QWidget):
         elif chosen == act_bg_remove:
             self._open_bg_remove()
         elif act_ocr is not None and chosen == act_ocr:
-            self._run_ocr()
+            self._begin_ocr()
         elif chosen == act_open_folder:
             self._open_save_folder()
         elif chosen == act_ontop:

@@ -155,6 +155,56 @@ def numbered_names(names, fmt: str, start: int = 1, step: int = 1, digits: int =
     return result
 
 
+_MASK_TOKEN_RE = re.compile(r"\{([^{}]*)\}")
+_MASK_KNOWN = ("name", "ext", "date", "time")
+
+
+def expand_mask(mask: str, name: str, mtime: float = 0, number: int = 1,
+                digits: int = 1, is_dir: bool = False) -> str:
+    """マスクを1件分の名前に展開する(Double Commander のマスク記法の考え方を、
+    このファイラの連番 {n} の書式に合わせたもの)。
+
+    使える部品:
+      {name}  拡張子を除いた名前  {ext} 拡張子(ドットなし)
+      {n} / {n:03}  連番(format_number と同じ)  {date} 更新日(YYYYMMDD)
+      {time}  更新時刻(HHMMSS)
+    知らない部品があれば ValueError。"""
+    stem, ext = split_ext(name, is_dir)
+    stamp = time.localtime(mtime) if mtime else None
+
+    def sub(match):
+        token = match.group(1)
+        if token == "name":
+            return stem
+        if token == "ext":
+            return ext.lstrip(".")
+        if token == "date":
+            return time.strftime("%Y%m%d", stamp) if stamp else ""
+        if token == "time":
+            return time.strftime("%H%M%S", stamp) if stamp else ""
+        if token == "n" or token.startswith("n:"):
+            return match.group(0)  # 連番は format_number に任せる
+        raise ValueError(f"マスクの部品 {{{token}}} は使えません"
+                         f"（使えるのは {', '.join('{'+k+'}' for k in _MASK_KNOWN)} と {{n}}）")
+
+    return format_number(_MASK_TOKEN_RE.sub(sub, mask), number, digits)
+
+
+def mask_names(names, mask: str, start: int = 1, step: int = 1, digits: int = 1,
+               mtimes=None, dir_flags=None) -> list:
+    """names の各行をマスクで組み立て直す。マスクが拡張子を含まなければ
+    ({ext} が無ければ)、元の拡張子を残す。"""
+    keep_ext = "{ext}" not in mask
+    result = []
+    for i, name in enumerate(names):
+        is_dir = bool(dir_flags[i]) if dir_flags else False
+        _stem, ext = split_ext(name, is_dir)
+        mtime = mtimes[i] if mtimes else 0
+        built = expand_mask(mask, name, mtime, start + i * step, digits, is_dir)
+        result.append(built + (ext if keep_ext else ""))
+    return result
+
+
 # ---------------------------------------------------------------
 # 検査
 # ---------------------------------------------------------------

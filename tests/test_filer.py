@@ -4112,6 +4112,21 @@ def test_rename_logic():
     assert fr.numbered_names(["a.jpg", "b.PNG", "d"], "photo_{n:03}", 1, 1, 1, True,
                              [False, False, True]) == ["photo_001.jpg", "photo_002.PNG", "photo_003"]
     assert fr.numbered_names(["a.jpg"], "p_", 5, 2, 3) == ["p_005.jpg"]   # {n} が無ければ末尾に
+    # マスク: 部品の展開・拡張子の保持・{ext} を含むときは付け直さない
+    import time as _time
+    _mt = _time.mktime((2026, 10, 28, 9, 5, 3, 0, 0, -1))
+    assert fr.expand_mask("{name}_{n:03}", "photo.jpg", _mt, 7) == "photo_007"
+    assert fr.expand_mask("{date}_{name}.{ext}", "photo.jpg", _mt, 1) == "20261028_photo.jpg"
+    assert fr.expand_mask("{time}", "a.txt", _mt, 1) == "090503"
+    assert fr.mask_names(["a.txt", "b.txt"], "img_{n}", start=5,
+                         mtimes=[_mt, _mt]) == ["img_5.txt", "img_6.txt"]
+    assert fr.mask_names(["a.txt"], "{name}_copy.{ext}",
+                         mtimes=[_mt]) == ["a_copy.txt"]
+    try:
+        fr.expand_mask("{size}", "a.txt", _mt, 1)
+        raise AssertionError("知らない部品で止まらない")
+    except ValueError:
+        pass
     assert fr.name_problem("con.txt") and fr.name_problem("LPT1") and fr.name_problem("a ")
     assert fr.name_problem("a?b") and fr.name_problem("") and fr.name_problem("ok.txt") is None
     items = [("C:\\d", "a.txt"), ("C:\\d", "b.txt"), ("C:\\d", "c.txt")]

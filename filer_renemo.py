@@ -224,6 +224,7 @@ class RenemoWindow(QDialog):
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_replace)
         edit_menu.addAction(self.act_number)
+        edit_menu.addAction(self.act_mask)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_undo)
         view_menu = menubar.addMenu("表示(&V)")
@@ -239,7 +240,7 @@ class RenemoWindow(QDialog):
 
         toolbar = QToolBar(self)
         for action in (self.act_execute, self.act_ext, self.act_fullpath, self.act_replace,
-                       self.act_number, self.act_history):
+                       self.act_number, self.act_mask, self.act_history):
             toolbar.addAction(action)
         layout.addWidget(toolbar)
 
@@ -315,6 +316,7 @@ class RenemoWindow(QDialog):
         self.act_full = act("半角→全角(&F)", lambda: self.convert_selection("full"))
         self.act_replace = act("置換(&R)…", self.replace_dialog, "Ctrl+H")
         self.act_number = act("連番(&N)…", self.number_dialog)
+        self.act_mask = act("マスク(&M)…", self.mask_dialog)
         self.act_undo = act("元に戻す(&Z)", lambda: self.editor.undo())
         self.act_history = act("履歴(&I)…", self.history_dialog)
 
@@ -550,6 +552,60 @@ class RenemoWindow(QDialog):
         return {"fmt": fmt.text(), "start": start.value(), "step": step.value(),
                 "digits": digits.value()}
 
+    def ask_mask(self):
+        """マスクの条件。{"mask", "start", "step"} か None。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("マスク")
+        form = QFormLayout(dialog)
+        mask = QLineEdit("{name}_{n:03}")
+        start, step = QSpinBox(), QSpinBox()
+        start.setRange(-999999, 999999)
+        start.setValue(1)
+        step.setRange(-1000, 1000)
+        step.setValue(1)
+        form.addRow("マスク（{name} 元の名前 / {ext} 拡張子 / {n} 連番 / "
+                    "{date} 更新日 / {time} 時刻）", mask)
+        form.addRow("開始番号", start)
+        form.addRow("増分", step)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return {"mask": mask.text(), "start": start.value(), "step": step.value()}
+
+    def mask_dialog(self) -> None:
+        """選んだ行(無ければ全行)をマスクで組み立て直す。マスクに {ext} が
+        無ければ元の拡張子を残す(計算は filer_rename.mask_names)。"""
+        options = self.ask_mask()
+        if not options or not options["mask"].strip():
+            return
+        if not self.show_ext and "{ext}" in options["mask"]:
+            # 拡張子を隠しているときは、編集欄の行が名前の部分だけになる。
+            # ここで {ext} を展開すると拡張子が二重になるので、先に断る
+            # (置換の keep_ext が show_ext と連動するのと同じ理由)。
+            self.message = "{ext} を使うときは、拡張子を表示してください（.ext ボタン）"
+            self._refresh_marks()
+            return
+        rows = self._selected_rows()
+        lines = self.editor_lines()
+        rows = [r for r in (rows if rows is not None else range(len(lines)))
+                if r < len(self.order)]
+        dir_flags = [self.items[self.order[r]]["is_dir"] for r in rows]
+        mtimes = [self.items[self.order[r]]["mtime"] for r in rows]
+        try:
+            named = fr.mask_names([lines[r] for r in rows], options["mask"],
+                                  options["start"], options["step"], 1,
+                                  mtimes=mtimes, dir_flags=dir_flags)
+        except ValueError as e:
+            self.message = str(e)
+            self._refresh_marks()
+            return
+        for r, name in zip(rows, named):
+            lines[r] = name
+        self._replace_lines(lines)
+
     def number_dialog(self) -> None:
         """選んだ行(無ければ全行)に連番。拡張子は残す。"""
         options = self.ask_numbering()
@@ -569,7 +625,7 @@ class RenemoWindow(QDialog):
     def _context_menu(self, pos) -> None:
         menu = QMenu(self)
         for action in (self.act_upper, self.act_lower, self.act_half, self.act_full,
-                       self.act_replace, self.act_number, self.act_undo):
+                       self.act_replace, self.act_number, self.act_mask, self.act_undo):
             menu.addAction(action)
         menu.exec(self.editor.mapToGlobal(pos))
 

@@ -452,6 +452,8 @@ class ListBridge(QObject):
     preview_ready = Signal(object)
     # ハッシュの計算が終わったとき。[(パス, 名前, ハッシュ or None, エラー文字列 or "")]。
     hashed = Signal(object)
+    # 転送キュー: 裏のスレッドで終わった転送の (op, result) を戻す。
+    op_done = Signal(object)
     # フォルダの自動監視(外部で中身が変わったら再読込)の結果。
     folder_watch = Signal(object)
 
@@ -1470,6 +1472,10 @@ class FilerWindow(QWidget):
         self.bridge.preview_ready.connect(self._on_preview_ready)
         self.bridge.hashed.connect(self._on_hashed)
         self._hash_busy = False
+        # ファイル転送のキュー(_transfer 参照)。実行中の op と待ちの列。
+        self.bridge.op_done.connect(self._on_op_done)
+        self._op_queue = []
+        self._op_running = None
         # フォルダの自動監視。表示中のフォルダの中身が外部で変わったら再読込する。
         # 指紋の走査は別スレッド、判定と再読込はここ(UIスレッド)。
         self.bridge.folder_watch.connect(self._on_folder_watch)
@@ -1799,6 +1805,17 @@ class FilerWindow(QWidget):
         save_values(self.app_settings, self.settings_path, updates)
 
     def closeEvent(self, event):
+        # 転送の実行中・待ちが残っていたら、先に確かめる(裏のスレッドごと
+        # プロセスが終わるので、黙って閉じると転送が途中で切れる)。
+        if getattr(self, "_op_running", None) is not None or getattr(self, "_op_queue", None):
+            running = 1 if self._op_running is not None else 0
+            if not self.confirm(
+                    "あっふ",
+                    f"ファイル転送が残っています（実行中 {running}件・"
+                    f"待ち {len(self._op_queue)}件）。\n閉じますか？",
+                    default_yes=False):
+                event.ignore()
+                return
         try:
             self.save_state()
             if self._picker is not None:
@@ -3075,24 +3092,82 @@ class FilerWindow(QWidget):
             self._extract_to_dir(targets, dst.path)
             return
         paths = src.target_paths()
-        func = filer_shell.move_files if move else filer_shell.copy_files
-        # SHFileOperationW は終わるまで戻らない(進み具合は Windows の窓が出す)。
-        # ステータスバーには何をしているかだけ出しておく。
-        self.set_status_state(f"{label}中 {len(paths)}件")
-        QApplication.processEvents()
-        try:
-            result = func(paths, dst.path, self._hwnd(), self.extra_op_flags)
-            if move and src.stash and result == (0, False):
-                # 置き場から移動し終えたものは、登録からも外す(実体が移ったため)
-                self.remove_stash_paths(paths)
-        finally:
+        self._enqueue_transfer(move, paths, src, dst)
+
+    # --- ファイル転送のキュー ---
+    # キューの管理だけ自前で、実行そのものは今までどおりシェルの転送
+    # (SHFileOperation。進捗の窓・ごみ箱の「元に戻す」は Windows 標準のまま)。
+    # 違うのは呼び出すスレッド: 裏のスレッドから呼ぶので、転送の間も窓は
+    # 操作でき、次の転送を積んでおける(Double Commander の操作キューの考え方)。
+
+    def _enqueue_transfer(self, move: bool, paths, src, dst) -> None:
+        op = {"move": move, "label": "移動" if move else "複写",
+              "paths": list(paths), "dest": dst.path, "dst_pane": dst,
+              "from_stash": bool(src.stash),
+              "focus": os.path.basename(paths[0]) if paths else None}
+        self._op_queue.append(op)
+        self._pump_op_queue()
+        waiting = f"（待ち {len(self._op_queue)}件）" if self._op_queue else ""
+        self.log(f"キューに追加: {op['label']} {len(paths)}件 → {dst.path}{waiting}")
+
+    def _pump_op_queue(self) -> None:
+        if self._op_running is not None or not self._op_queue:
+            self._refresh_op_status()
+            return
+        op = self._op_queue.pop(0)
+        self._op_running = op
+        self._refresh_op_status()
+        func = filer_shell.move_files if op["move"] else filer_shell.copy_files
+        hwnd, flags = self._hwnd(), self.extra_op_flags
+
+        def worker():
             try:
+                result = func(op["paths"], op["dest"], hwnd, flags)
+            except Exception:  # noqa: BLE001  結果として戻し、窓は落とさない
+                _log_exception("transfer worker")
+                result = (0x80004005, False)  # E_FAIL として失敗の形に寄せる
+            self.bridge.op_done.emit((op, result))
+
+        threading.Thread(target=worker, daemon=True, name="filer-transfer").start()
+
+    def _on_op_done(self, payload) -> None:
+        op, result = payload
+        self._op_running = None
+        try:
+            if op["move"] and op["from_stash"] and result == (0, False):
+                # 置き場から移動し終えたものは、登録からも外す(実体が移ったため)
+                self.remove_stash_paths(op["paths"])
+            self._after_operation(op["label"], result, op["paths"], op["dest"],
+                                  dest_pane=op["dst_pane"], dest_focus=op["focus"])
+        finally:
+            self._pump_op_queue()
+
+    def _refresh_op_status(self) -> None:
+        """キューの状態をステータスバー左端に出す(終われば Ready. に戻す)。"""
+        try:
+            if self._op_running is not None:
+                text = (f"{self._op_running['label']}中"
+                        f" {len(self._op_running['paths'])}件")
+                if self._op_queue:
+                    text += (f"（キュー待ち {len(self._op_queue)}件"
+                             "・Shift+Q で待ちを取り消し）")
+                self.set_status_state(text)
+            elif self._op_queue:
+                self.set_status_state(f"キュー待ち {len(self._op_queue)}件")
+            else:
                 self.set_status_state("Ready.")
-            except Exception:  # noqa: BLE001  finally の中で投げない(CLAUDE.md)
-                pass
-        self._after_operation(label, result, paths, dst.path,
-                              dest_pane=dst,
-                              dest_focus=os.path.basename(paths[0]) if paths else None)
+        except Exception:  # noqa: BLE001  ステータス表示で窓を落とさない
+            pass
+
+    def cmd_queue_clear(self):
+        """Shift+Q: 待ち行列を取り消す。実行中の転送はシェルの窓で止める。"""
+        count = len(self._op_queue)
+        if not count:
+            self.log("キュー: 待ちはありません")
+            return
+        self._op_queue.clear()
+        self.log(f"キュー: 待ち {count}件を取り消しました")
+        self._refresh_op_status()
 
     def cmd_copy_direct(self):
         self._transfer(move=False)

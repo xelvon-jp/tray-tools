@@ -129,6 +129,7 @@ DEFAULT_KEYMAP = {
     # Esc は割り当てない。あふｗの Esc は「各処理の中止」で、ファイル窓を閉じない
     # (サーチ中の Esc はサーチの終了として先に処理される)。
     "0081": "quit",               # Q
+    "1081": "queue_clear",        # Shift+Q 転送キューの待ちを取り消す
     "4115": "quit",               # Alt+F4 (AFXW.key 4115:0081)
 }
 
@@ -944,6 +945,7 @@ COMMAND_SHORT_NAMES = {
     "sort_reverse": "Sort逆",
     "compare_mark": "Compare",
     "sync_copy": "Sync",
+    "queue_clear": "QueueClear",
     "winmerge": "WinMerge",
     "zip_create": "Zip",
     "mask_input": "Mask",

@@ -574,6 +574,55 @@ def test_transfer_cursor_follows_to_other_pane():
             w.deleteLater()
 
 
+def test_window_transfer_queue():
+    """転送キュー(案A): 積んだ順に裏で実行され、Shift+Q で待ちだけを
+    取り消せる。実行中の1件は取り消されずに完了する。"""
+    import filer
+    import filer_shell as sh
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.extra_op_flags = _quiet_flags()
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        gate = threading.Event()
+        orig_copy = sh.copy_files
+
+        def gated_copy(paths, dest, hwnd, flags):
+            gate.wait(10)
+            return orig_copy(paths, dest, hwnd, flags)
+
+        sh.copy_files = gated_copy
+        try:
+            w._enqueue_transfer(False, [str(left / "alpha.txt")], L, R)
+            assert w._op_running is not None          # 1件目は実行中(ゲートで停止)
+            w._enqueue_transfer(False, [str(left / "beta.md")], L, R)
+            assert len(w._op_queue) == 1              # 2件目は待ち
+            w.cmd_queue_clear()                        # 待ちだけ取り消す
+            assert not w._op_queue and w._op_running is not None
+        finally:
+            gate.set()
+            sh.copy_files = orig_copy
+        _wait(w)                                       # 実行中の完了を待つ
+        assert w._op_running is None and not w._op_queue
+        assert (right / "alpha.txt").exists()          # 実行中だった1件は届く
+        assert not (right / "beta.md").exists()        # 取り消した待ちは届かない
+        assert "キュー: 待ち 1件を取り消しました" in w.log_view.toPlainText()
+        assert core.DEFAULT_KEYMAP["1081"] == "queue_clear"
+        w.close()
+        w.deleteLater()
+
+
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
     そのまま表示され、ダウンロードは attachment で届く。"""
@@ -852,7 +901,12 @@ def _wait(window, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         QTest.qWait(20)
-        if not (window.left.loading or window.right.loading):
+        # 転送キューが残っている間も待つ(転送は裏のスレッドで走り、完了で
+        # 両窓が再読込される。読み込みだけ見ると完了前に戻ってしまう)。
+        busy = (window.left.loading or window.right.loading
+                or getattr(window, "_op_running", None) is not None
+                or bool(getattr(window, "_op_queue", None)))
+        if not busy:
             QTest.qWait(10)
             return
     raise AssertionError("一覧の読み込みが終わらない")

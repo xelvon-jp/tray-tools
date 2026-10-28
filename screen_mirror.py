@@ -681,6 +681,46 @@ def preset_rects(app_settings: dict, anchor_screen=None, target_screen=None) -> 
     return rects
 
 
+# ---------------------------------------------------------------
+# 保存した設定: 今のミラー範囲とミラー先に名前を付けて持つ
+# ---------------------------------------------------------------
+def scene_entries(app_settings: dict) -> list:
+    """保存されたミラー設定の一覧(検証済みの辞書の並び、保存した順)。
+
+    形は {"name", "x", "y", "width", "height", "target_screen"}。座標は
+    仮想デスクトップの論理座標で、そのまま QRect になる(プリセットと違い、
+    実際に映していた範囲をそのまま写すのでモニタ基準の相対にはしない)。
+    書き損じの行と同名の重複は落とす(プリセットと同じ作法)。"""
+    raw = mirror_config(app_settings).get("scenes")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    scenes = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        width = _as_int(entry.get("width"), 0)
+        height = _as_int(entry.get("height"), 0)
+        if not name or name in seen or width <= 0 or height <= 0:
+            continue
+        seen.add(name)
+        scenes.append({
+            "name": name,
+            "x": _as_int(entry.get("x"), 0),
+            "y": _as_int(entry.get("y"), 0),
+            "width": width,
+            "height": height,
+            "target_screen": str(entry.get("target_screen") or ""),
+        })
+    return scenes
+
+
+def scene_rect(scene: dict) -> QRect:
+    """保存された設定の範囲(scene_entries で検証済みの前提)。"""
+    return QRect(scene["x"], scene["y"], scene["width"], scene["height"])
+
+
 def pick_target_screen(screens, wanted_name: str, source_rect: QRect = None):
     """ミラーを出すモニタを選ぶ。決められなければ None。
 
@@ -3011,6 +3051,72 @@ class MirrorController:
                 self._start_mirror(source_rect)
         except Exception:
             _guard("ミラー先の変更")
+
+    # ---------------------------------------------------------------
+    # 設定の保存・呼び出し(名前を付けたミラー範囲+ミラー先)
+    # ---------------------------------------------------------------
+    def saved_scenes(self) -> list:
+        return scene_entries(self.app_settings)
+
+    def current_scene(self, name: str):
+        """今のミラー状態を、保存できる形の辞書にする。動作中でなければ None。
+
+        ミラー窓はミラー先の全画面で固定なので、持つのは範囲(仮想デスクトップの
+        論理座標)とミラー先のモニタ名だけ。カンペのファイルや文字の大きさは
+        既に全体の設定として書き戻されているので、ここには含めない。"""
+        if not self.is_active():
+            return None
+        rect = self._mirror.source_rect
+        return {"name": name, "x": rect.x(), "y": rect.y(),
+                "width": rect.width(), "height": rect.height(),
+                "target_screen": self._mirror.screen_name}
+
+    def save_scene(self, name: str) -> bool:
+        scene = self.current_scene(name)
+        if scene is None:
+            return False
+        scenes = [s for s in self.saved_scenes() if s["name"] != name]
+        scenes.append(scene)
+        self._store_scenes(scenes)
+        self.notify(f"ミラーの設定「{name}」を保存しました"
+                    f"（{scene['width']}x{scene['height']}）")
+        return True
+
+    def delete_scene(self, name: str) -> bool:
+        scenes = self.saved_scenes()
+        kept = [s for s in scenes if s["name"] != name]
+        if len(kept) == len(scenes):
+            return False
+        self._store_scenes(kept)
+        self.notify(f"ミラーの設定「{name}」を削除しました")
+        return True
+
+    def _store_scenes(self, scenes: list) -> None:
+        self.app_settings.setdefault("screen_mirror", {})["scenes"] = scenes
+        self._save_keys({"scenes": scenes})
+
+    def apply_scene(self, name: str) -> bool:
+        """保存した設定を呼び出す。停止中なら開始し、動作中なら範囲を
+        切り替える。ミラー先が今と違えば、先にミラー先を切り替える
+        (set_target_screen が動作中なら出し直す)。静止の状態は保つ。"""
+        try:
+            scene = next((s for s in self.saved_scenes() if s["name"] == name), None)
+            if scene is None:
+                return False
+            wanted = scene.get("target_screen") or ""
+            current = (self._mirror.screen_name if self.is_active() else str(
+                mirror_config(self.app_settings).get("target_screen_name") or ""))
+            if wanted and wanted != current:
+                self.set_target_screen(wanted)
+            if self.is_active():
+                # _apply_source_rect は選び直しの作法で静止を _frozen_before へ
+                # 戻す。呼び出しでは今の静止をそのまま保ちたいので、先に写しておく。
+                self._frozen_before = bool(self._mirror.frozen)
+                return self._apply_source_rect(scene_rect(scene))
+            return self._start_mirror(scene_rect(scene))
+        except Exception:
+            _guard("ミラー設定の呼び出し")
+            return False
 
     def _save_keys(self, values: dict, section_name: str = "screen_mirror") -> None:
         """settings.json の指定セクションへ、指定したキーだけを書き戻す。

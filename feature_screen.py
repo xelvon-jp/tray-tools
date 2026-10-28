@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw
 from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon,
+    QApplication, QInputDialog, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon,
 )
 
 import bg_remove_launch
@@ -475,6 +475,16 @@ class ScreenFeature:
         # 中身は開く直前に作り直す(モニタは抜き差しされる)。項目はメニューが持つので
         # GCの心配は無いが、作り直しの前後で状態を見るためにここでも並びを持っておく。
         self._mirror_screen_actions = []
+        # 設定の保存・呼び出し(名前を付けた範囲+ミラー先)。中身は保存のたびに
+        # 変わるので、ミラー先と同じく開く直前に作り直す(_refresh_mirror_menu)。
+        self._mirror_menu.addSeparator()
+        self._mirror_save_scene_action = self._mirror_menu.addAction("💾 現在の設定を保存…")
+        self._mirror_save_scene_action.triggered.connect(
+            lambda _checked=False: self._save_mirror_scene())
+        self._mirror_scene_menu = self._mirror_menu.addMenu("📂 保存した設定")
+        self._mirror_scene_actions = []
+        self._mirror_scene_delete_menu = self._mirror_menu.addMenu("🗑 設定を削除")
+        self._mirror_scene_delete_actions = []
 
         # Copilot まわりのメニュー。中身は性質の違う2つで、区切り線で分けてある。
         #   上: 状態監視バー   … 見るだけ。Copilot の手番を画面に出す
@@ -2412,6 +2422,33 @@ class ScreenFeature:
             return
         self.screen_mirror.set_freeze(checked)
 
+    def _save_mirror_scene(self):
+        """今のミラー範囲+ミラー先に名前を付けて保存する。同名は上書きを確認する。"""
+        if not self.screen_mirror.is_active():
+            return
+        name, ok = QInputDialog.getText(
+            self.menu, "ミラーの設定を保存",
+            "名前（例: 会議用、配信用）:", QLineEdit.Normal, "")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if any(s["name"] == name for s in self.screen_mirror.saved_scenes()):
+            answer = QMessageBox.question(
+                self.menu, "ミラーの設定を保存",
+                f"「{name}」は既にあります。今の設定で上書きしますか？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        self.screen_mirror.save_scene(name)
+
+    def _delete_mirror_scene(self, name: str):
+        answer = QMessageBox.question(
+            self.menu, "ミラーの設定を削除",
+            f"「{name}」を削除しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.screen_mirror.delete_scene(name)
+
     def _refresh_mirror_menu(self):
         """開く直前に、状態のチェックとミラー先の一覧を作り直す。
 
@@ -2452,6 +2489,33 @@ class ScreenFeature:
                     lambda _checked, n=name: self.screen_mirror.set_target_screen(n)
                 )
                 self._mirror_screen_actions.append(action)
+
+            # 保存した設定の一覧も作り直す(保存・削除のたびに変わるため)。
+            self._mirror_save_scene_action.setEnabled(active)
+            scenes = self.screen_mirror.saved_scenes()
+            self._mirror_scene_menu.clear()
+            self._mirror_scene_actions = []
+            self._mirror_scene_delete_menu.clear()
+            self._mirror_scene_delete_actions = []
+            if not scenes:
+                empty = self._mirror_scene_menu.addAction("（まだ保存がありません）")
+                empty.setEnabled(False)
+                self._mirror_scene_actions.append(empty)
+                self._mirror_scene_delete_menu.setEnabled(False)
+            else:
+                self._mirror_scene_delete_menu.setEnabled(True)
+                for scene in scenes:
+                    label = (f"{scene['name']}"
+                             f"（{scene['width']}x{scene['height']}）")
+                    action = self._mirror_scene_menu.addAction(label)
+                    action.triggered.connect(
+                        lambda _checked, n=scene["name"]:
+                        self.screen_mirror.apply_scene(n))
+                    self._mirror_scene_actions.append(action)
+                    del_action = self._mirror_scene_delete_menu.addAction(scene["name"])
+                    del_action.triggered.connect(
+                        lambda _checked, n=scene["name"]: self._delete_mirror_scene(n))
+                    self._mirror_scene_delete_actions.append(del_action)
         except Exception:
             self._log_failure("画面ミラーのメニューの組み立て")
 

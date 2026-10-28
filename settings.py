@@ -201,6 +201,10 @@ DEFAULT_SETTINGS = {
             {"label": "上を100空ける", "x": 0, "y": 100, "width": 1600, "height": 900},
             {"label": "HD", "width": 1280, "height": 720},
         ],
+        # 名前を付けて保存したミラー設定({name, x, y, width, height, target_screen}
+        # の並び)。トレイメニューの「現在の設定を保存」で増え、「保存した設定」から
+        # 呼び出す。座標は仮想デスクトップの論理座標。
+        "scenes": [],
         "cursor_size": 34,
         "cursor_color": "#ffffff",
         "cursor_outline": "#101010",

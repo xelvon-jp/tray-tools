@@ -3758,6 +3758,62 @@ class FilerWindow(QWidget):
         pane.model.all_changed()
         pane.update_footer()
 
+    def cmd_sync_copy(self):
+        """フォルダ同期コピー(Shift+W)。今いるフォルダ同士で、相手に無いものと
+        差分のあるファイルを一方向にコピーする。削除はしない(コピーのみ)。
+        両方にあるフォルダの中身までは見ない(W の比較と同じ範囲)。"""
+        label = "同期コピー"
+        if self.active.archive is not None or self.other.archive is not None:
+            self.log(f"{label}: 書庫の中では使えません")
+            return
+        if (self.active.flat or self.other.flat
+                or self.active.flat_loading or self.other.flat_loading):
+            self.log(f"{label}: フラット表示・検索結果では使えません")
+            return
+        if self.active.stash or self.other.stash:
+            self.log(f"{label}: 一時置き場では使えません")
+            return
+        left, right = self.left, self.right
+        if not left.path or not right.path:
+            return
+        if core.same_dir(left.path, right.path):
+            self.log(f"{label}: 左右が同じフォルダです")
+            return
+        section = _section(self.app_settings)
+        try:
+            tolerance = float(section.get("time_tolerance_sec", core.DEFAULT_TIME_TOLERANCE))
+        except (TypeError, ValueError):
+            tolerance = core.DEFAULT_TIME_TOLERANCE
+
+        def plan(src, dst):
+            entries = core.sync_sources(src.entries, dst.entries, tolerance=tolerance)
+            total = sum(e.size for e in entries if not e.is_dir)
+            dirs = sum(1 for e in entries if e.is_dir)
+            return entries, total, dirs
+
+        plans = [plan(left, right), plan(right, left)]
+        choice = self.ask_sync(plans, initial=1 if self.active is right else 0)
+        if choice is None:
+            return
+        src, dst = (left, right) if choice == 0 else (right, left)
+        entries = plans[choice][0]
+        if not entries:
+            self.log(f"{label}: 送るものがありません")
+            return
+        paths = [os.path.join(src.path, e.name) for e in entries]
+        self.set_status_state(f"{label}中 {len(paths)}件")
+        QApplication.processEvents()
+        try:
+            result = filer_shell.copy_files(paths, dst.path, self._hwnd(),
+                                            self.extra_op_flags)
+        finally:
+            try:
+                self.set_status_state("Ready.")
+            except Exception:  # noqa: BLE001  finally の中で投げない(CLAUDE.md)
+                pass
+        self._after_operation(label, result, paths, dst.path,
+                              dest_pane=dst, dest_focus=entries[0].name)
+
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
         menu, chosen = self.build_menu("各種設定一時切替", [
@@ -3979,6 +4035,12 @@ class FilerWindow(QWidget):
     def ask_compare(self, title: str, include_dirs: bool):
         """同名ファイル比較マークの条件。取消なら None。"""
         dialog = CompareDialog(self, title, include_dirs, self.colors, self.list_font)
+        return dialog.result_value if dialog.exec() == QDialog.Accepted else None
+
+    def ask_sync(self, plans, initial: int):
+        """フォルダ同期コピーの確認。方向(0=左→右 / 1=右→左)か、取消なら None。"""
+        dialog = SyncDialog(self, "フォルダ同期コピー", plans, initial,
+                            self.colors, self.list_font)
         return dialog.result_value if dialog.exec() == QDialog.Accepted else None
 
     def ask_overlap(self):
@@ -4230,6 +4292,50 @@ class CompareDialog(_KeyDialog):
         elif key == Qt.Key_Space:
             self.include_dirs = not self.include_dirs
         self.refresh()
+
+
+class SyncDialog(_KeyDialog):
+    """フォルダ同期コピー(Shift+W)の確認。方向を ←→ で選ぶだけ(選択は選択、
+    実行は Enter。メニューと同じ作法)。削除はしないことと、両方にある
+    フォルダの中身は対象外であることを、押す前にここで明示する。"""
+
+    LABELS = ("左 → 右", "右 → 左")
+
+    def __init__(self, parent, title, plans, initial, colors, font):
+        super().__init__(parent, title, colors, font)
+        # plans は [(送るエントリ, 合計バイト, フォルダ件数)] × 2(0=左→右、1=右→左)
+        self.plans = plans
+        self.index = 1 if initial else 0
+        self.rows = [self.add_label(), self.add_label()]
+        self.add_label("削除はしません。両方にあるフォルダの中身は対象外です", hint=True)
+        self.add_label("Enter: コピー実行  Esc: 取消", hint=True)
+        self.refresh()
+
+    def refresh(self) -> None:
+        entries, total, dirs = self.plans[self.index]
+        options = " ".join(
+            f"〔{label}〕" if i == self.index else f" {label} "
+            for i, label in enumerate(self.LABELS))
+        if entries:
+            detail = (f"送るもの     {len(entries)}件"
+                      f"（合計 {core.format_bytes(total)}、うちフォルダ {dirs}件）")
+        else:
+            detail = "送るもの     ありません（差分なし）"
+        self.paint_rows([(self.rows[0], "方向         " + options),
+                         (self.rows[1], detail)])
+
+    def on_key(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key_Escape:
+            self.reject()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self.result_value = self.index
+            self.accept()
+            return
+        if key in (Qt.Key_Left, Qt.Key_Right):
+            self.index = 1 - self.index
+            self.refresh()
 
 
 # ---------------------------------------------------------------

@@ -97,6 +97,7 @@ DEFAULT_KEYMAP = {
     "1082": "batch_rename",       # Shift+R 一括改名(Renemo 風)
     "4082": "rename_menu",        # Alt+R 改名メニュー(AFXW.key の Alt+R と同じ指で)
     "0087": "compare_mark",       # W 同名ファイル比較マーク
+    "1087": "sync_copy",          # Shift+W フォルダ同期コピー(コピーのみ)
     "0090": "settings_dialog",    # Z 設定(あふｗの Z ＝設定プログラム起動)
     "0191": "live_filter",        # / ライブ絞り込み(XYplorer の Live Filter / yazi の filter)
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
@@ -942,6 +943,7 @@ COMMAND_SHORT_NAMES = {
     "sort_dialog": "Sort",
     "sort_reverse": "Sort逆",
     "compare_mark": "Compare",
+    "sync_copy": "Sync",
     "winmerge": "WinMerge",
     "zip_create": "Zip",
     "mask_input": "Mask",
@@ -1468,6 +1470,35 @@ def compare_marks(mine, theirs, size_cond="any", time_cond="any", include_dirs=F
                 found.add(e.name)
                 break
     return found
+
+
+def sync_sources(mine, theirs, tolerance=DEFAULT_TIME_TOLERANCE) -> list:
+    """フォルダ同期コピーで、送る側(mine)から反対窓(theirs)へ送るべきエントリ。
+
+    - 相手に同名が無いもの(ファイルもフォルダも。フォルダは中身ごと
+      シェルのコピーに任せる)
+    - 同名のファイルがあり、サイズが違うか、こちらが新しいもの
+      (許容誤差を超えたときだけ。こちらが古いものでは上書きしない)
+    両方にあるフォルダの中身は対象にしない(再帰しない。今いるフォルダ
+    同士だけを見る W の比較と同じ範囲)。名前の衝突するファイル⇔フォルダ
+    の組も送らない。削除は一切しない。"""
+    others = {}
+    for o in theirs:
+        if o.is_parent:
+            continue
+        others.setdefault(o.name.casefold(), o)
+    result = []
+    for e in mine:
+        if e.is_parent:
+            continue
+        other = others.get(e.name.casefold())
+        if other is None:
+            result.append(e)
+        elif not e.is_dir and not other.is_dir:
+            if (e.size != other.size
+                    or (e.mtime - other.mtime) > abs(tolerance or 0.0)):
+                result.append(e)
+    return result
 
 
 # ---------------------------------------------------------------

@@ -211,6 +211,27 @@ def test_compare_marks():
     assert core.DEFAULT_KEYMAP["0087"] == "compare_mark"
 
 
+def test_sync_sources():
+    """フォルダ同期コピー(Shift+W)の送る側の選別。相手に無いもの・サイズ違い・
+    こちらが新しいものだけ。古いものでは上書きせず、両方にあるフォルダと
+    名前が衝突するファイル⇔フォルダの組は送らない。"""
+    mine = [core.PARENT_ENTRY, F("same.txt", 10, 100), F("newer.txt", 10, 200),
+            F("older.txt", 10, 50), F("near.txt", 10, 101.5), F("diff.txt", 99, 100),
+            F("only_here.txt", 1, 1), F("only_dir", is_dir=True),
+            F("both_dir", is_dir=True), F("clash", 3, 3)]
+    theirs = [F("SAME.TXT", 10, 100), F("newer.txt", 10, 100), F("older.txt", 10, 100),
+              F("near.txt", 10, 100), F("diff.txt", 10, 100),
+              F("both_dir", is_dir=True), F("clash", is_dir=True)]
+    names = [e.name for e in core.sync_sources(mine, theirs)]
+    assert names == ["newer.txt", "diff.txt", "only_here.txt", "only_dir"], names
+    # 許容誤差を狭めれば、誤差の外に出た near(1.5秒新しい)も対象になる
+    assert [e.name for e in core.sync_sources(mine, theirs, tolerance=1)] == [
+        "newer.txt", "near.txt", "diff.txt", "only_here.txt", "only_dir"]
+    assert core.DEFAULT_KEYMAP["1087"] == "sync_copy"
+    assert "sync_copy" in core.COMMANDS
+    assert core.COMMAND_SHORT_NAMES["sync_copy"] == "Sync"
+
+
 def test_dialogs():
     import filer
     from PySide6.QtCore import Qt

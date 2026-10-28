@@ -276,7 +276,17 @@ _OCR_PROBE = ["winrt.windows.media.ocr"]
 
 
 def _ocr_installed() -> bool:
-    code = "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % (_OCR_PROBE,)
+    # find_spec は、親パッケージ(winrt)自体が無いと None でなく例外を出す。
+    # 「入っていない」が正常な初回で traceback を見せないよう、子側で受ける
+    # (AI / ベクタ化の探査はトップレベルの名前なので踏まない)。
+    code = (
+        "import importlib.util as u, sys\n"
+        "try:\n"
+        "    ok = all(u.find_spec(m) for m in %r)\n"
+        "except ModuleNotFoundError:\n"
+        "    ok = False\n"
+        "sys.exit(0 if ok else 1)\n"
+    ) % (_OCR_PROBE,)
     return subprocess.run([str(VENV_PYTHON), "-c", code]).returncode == 0
 
 

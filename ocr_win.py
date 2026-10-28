@@ -11,6 +11,7 @@
 # 関数の内側でだけ import するので、無くても import は通る。
 import asyncio
 import importlib.util
+import re
 
 # 認識に優先する言語(下のタグで始まるものを available から探す)。
 _PREFERRED = ("ja",)
@@ -62,6 +63,30 @@ def ocr_scale(width: int, height: int, max_dim: int = 10000) -> float:
     return scale
 
 
+# ひらがな・カタカナ・漢字・和文の約物(全角記号を含む)。
+_CJK_CHAR = re.compile(r"[぀-ヿ㐀-鿿豈-﫿＀-｠　-〿]")
+
+
+def clean_text(text: str) -> str:
+    """OCR 結果の空白を整える。
+
+    Windows OCR の日本語エンジンは、文字ごとに空白を挟んで返すことが
+    ある(「確 か に 酷 い」)。和文の隣にある空白は落として読み形に戻す。
+    英単語どうしの区切り(前後とも英字)はそのまま残す。"""
+    out_lines = []
+    for line in (text or "").splitlines():
+        chars = []
+        for i, ch in enumerate(line):
+            if ch in (" ", "　"):
+                prev = line[i - 1] if i > 0 else ""
+                nxt = line[i + 1] if i + 1 < len(line) else ""
+                if (prev and _CJK_CHAR.match(prev)) or (nxt and _CJK_CHAR.match(nxt)):
+                    continue
+            chars.append(ch)
+        out_lines.append("".join(chars).strip())
+    return "\n".join(out_lines).strip()
+
+
 def recognize_png(png_bytes: bytes) -> str:
     """PNG のバイト列を Windows OCR で読む。読めた文字列を返す。
 
@@ -69,7 +94,7 @@ def recognize_png(png_bytes: bytes) -> str:
     呼ばれる前提(イベントループはここで回す)。失敗は例外で上げる。"""
     if not png_bytes:
         raise ValueError("画像が空です")
-    return asyncio.run(_recognize(png_bytes))
+    return clean_text(asyncio.run(_recognize(png_bytes)))
 
 
 async def _recognize(png_bytes: bytes) -> str:

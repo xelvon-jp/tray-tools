@@ -38,6 +38,18 @@ def test_needs_invert():
     assert ocr_win.needs_invert(240.0) is False
 
 
+def test_clean_text():
+    """日本語エンジンが文字ごとに挟む空白を落とし、英単語の区切りは残す。"""
+    clean = ocr_win.clean_text
+    assert clean("確 か に 酷 い で す ね") == "確かに酷いですね"
+    assert clean("Windows OCR は 便利 で す") == "Windows OCRは便利です"
+    assert clean("the quick brown fox") == "the quick brown fox"
+    assert clean("最大 5 倍") == "最大5倍"
+    assert clean("短 辺 1600px を 目 安 に") == "短辺1600pxを目安に"
+    assert clean("  行 頭 の 空 白\n次の行 で す  ") == "行頭の空白\n次の行です"
+    assert clean("") == "" and clean(None) == ""
+
+
 def test_ocr_scale():
     """短辺 1600px 未満は広げ(最大3倍)、上限 10000px は超えない。"""
     scale = ocr_win.ocr_scale

@@ -1503,14 +1503,16 @@ def test_bookmark_add_delete_move():
         w.run_command("bookmark_jump")
         p = w._picker
         names = [n for n, _ in p._items]
-        assert names[:2] == ["A", "B"], names
-        assert names[2].startswith(launcher.ADD_ITEM_PREFIX) and str(left) in names[2], names
+        # 先頭は一時置き場の行(仕様)。ブックマークはその次から並ぶ
+        assert names[0].startswith("🧺 一時置き場"), names
+        assert names[1:3] == ["A", "B"], names
+        assert names[3].startswith(launcher.ADD_ITEM_PREFIX) and str(left) in names[3], names
 
         # 「ここを登録」
         original = launcher._ask_name
         launcher._ask_name = lambda parent, default: default + "_new"
         try:
-            p._on_accept(*p._items[2])
+            p._on_accept(*p._items[3])
         finally:
             launcher._ask_name = original
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -1518,17 +1520,17 @@ def test_bookmark_add_delete_move():
             ["A", "B", os.path.basename(str(left)) + "_new"]
         assert saved["hotkeys"] == {"x": "y"} and saved["filer"] == {"editor": "x"}
 
-        # 並べ替え(B を上へ)と削除(A)
+        # 並べ替え(B を上へ)と削除(A)。先頭の一時置き場の行は動かない
         w.run_command("bookmark_jump")
         p = w._picker
-        p._on_move(*p._items[1], -1)
-        assert [n for n, _ in p._items][:2] == ["B", "A"]
+        p._on_move(*p._items[2], -1)
+        assert [n for n, _ in p._items][1:3] == ["B", "A"]
         w.confirm = lambda *a, **k: True
         # 削除の控えは本物の bookmark_deleted.log ではなく一時フォルダへ
         original_log = launcher.DELETED_LOG_PATH
         launcher.DELETED_LOG_PATH = str(Path(tmp, "bookmark_deleted.log"))
         try:
-            p._on_delete(*p._items[1])
+            p._on_delete(*p._items[2])
         finally:
             launcher.DELETED_LOG_PATH = original_log
         saved = json.loads(settings_path.read_text(encoding="utf-8"))

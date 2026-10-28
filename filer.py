@@ -1009,11 +1009,15 @@ class Pane(QWidget):
     def close_stash(self) -> None:
         """置き場を閉じて、開く前にいたフォルダへ戻る。"""
         back = self.stash_from
-        self.stash = False
-        self.stash_from = None
         if back:
+            # 後始末(フラグを落とす・地の色を戻す)は load 側に任せる。ここで
+            # 先にフラグを落とすと、load の「置き場を終える」分岐(was_stash)が
+            # 素通りして、地の色が緑のまま残る。N でフォルダへ移る経路は
+            # 直に load を呼ぶので直っていたが、T で戻る経路はここを通る。
             self.load(back, history=None)
         else:
+            self.stash = False
+            self.stash_from = None
             self.apply_style()
 
     # --- フラット表示(Alt+B) ---

@@ -465,6 +465,14 @@ class ScreenFeature:
         # addAction(テキスト, 関数) で登録すると関数は引数なしで呼ばれる。チェック状態を
         # 受け取る項目はこの形で繋ぐこと(プレゼン支援・タスクバーと同じ理由)。
         self._mirror_freeze_action.triggered.connect(self._set_screen_mirror_freeze)
+        # 静止に加えて手元の道具も畳む(左下に再開ボタンだけ残る)。検証の合間に
+        # 手元で別の作業をするとき用。文面は状態で切り替える(_refresh_mirror_menu)。
+        self._mirror_minimize_action = self._mirror_menu.addAction(
+            "⏬ 一時停止して最小化"
+        )
+        self._mirror_minimize_action.triggered.connect(
+            lambda _checked=False: self._toggle_screen_mirror_minimized()
+        )
         # ホットキーが「選び直し」になったぶん、終わらせる手段をここに必ず置く
         # (手元のツールバーの ✕ と Ctrl+Alt+Q でも終われる)。
         self._mirror_stop_action = self._mirror_menu.addAction(
@@ -2422,6 +2430,13 @@ class ScreenFeature:
             return
         self.screen_mirror.set_freeze(checked)
 
+    def _toggle_screen_mirror_minimized(self):
+        """一時停止して最小化 ⇔ 再開。実体はコントローラが持つ。"""
+        if self.screen_mirror.is_minimized():
+            self.screen_mirror.restore()
+        else:
+            self.screen_mirror.minimize()
+
     def _save_mirror_scene(self):
         """今のミラー範囲+ミラー先に名前を付けて保存する。同名は上書きを確認する。"""
         if not self.screen_mirror.is_active():
@@ -2466,6 +2481,11 @@ class ScreenFeature:
             )
             self._mirror_freeze_action.setEnabled(active)
             self._mirror_freeze_action.setChecked(self.screen_mirror.is_frozen())
+            minimized = self.screen_mirror.is_minimized()
+            self._mirror_minimize_action.setEnabled(active)
+            self._mirror_minimize_action.setText(
+                "▶ 最小化を解く（再開）" if minimized else "⏬ 一時停止して最小化"
+            )
             self._mirror_stop_action.setEnabled(active or self.screen_mirror.is_selecting())
 
             self._mirror_screen_menu.clear()

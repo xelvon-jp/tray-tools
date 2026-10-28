@@ -1382,6 +1382,14 @@ def _icon_freeze(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.rectangle((35, 14, 44, 50), fill="white")
 
 
+def _icon_minimize(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """最小化。下向きの矢印と、受け止める横線(小さく畳むイメージ)。"""
+    draw.line((32, 10, 32, 36), fill="white", width=7)
+    draw.line((32, 38, 17, 24), fill="white", width=7)
+    draw.line((32, 38, 47, 24), fill="white", width=7)
+    draw.rectangle((13, 47, 51, 54), fill="white")
+
+
 def _icon_reselect(draw: ImageDraw.ImageDraw, color: str) -> None:
     """範囲を選び直す。選択範囲の四隅の鉤。"""
     for x, y, dx, dy in ((12, 12, 1, 1), (52, 12, -1, 1), (12, 52, 1, -1), (52, 52, -1, -1)):
@@ -1405,6 +1413,9 @@ _TOOLBAR_ITEMS = (
     # 静止の間に置く。押しても共有側は何も変わらない、手元だけの項目。
     ("notes", "カンペ（手元だけに出る）", "#0d9488", _icon_notes),
     ("freeze", "静止（もう一度で解除）", "#ff8c00", _icon_freeze),
+    # 最小化は静止を含むので静止の隣に置く。押すと手元の道具が全部畳まれ、
+    # 左下の小さなボタンだけが残る(向こうの絵は静止のまま)。
+    ("minimize", "一時停止して最小化", "#0ea5e9", _icon_minimize),
     ("reselect", "範囲を選び直す", "#2563eb", _icon_reselect),
     ("stop", "ミラーを終了", "#b91c1c", _icon_stop),
 )
@@ -2650,6 +2661,65 @@ class MirrorNotesWindow(_TopmostWindow):
 
 
 # ---------------------------------------------------------------
+# 最小化中の再開ボタン(左下の小さな窓)
+# ---------------------------------------------------------------
+PILL_WIDTH = 172
+PILL_HEIGHT = 40
+PILL_MARGIN = 8
+
+PILL_STYLE = """
+QWidget#mirrorPill { background: transparent; }
+QPushButton {
+    background: rgba(17, 24, 39, 235); color: #f9fafb;
+    border: 1px solid #4b5563; border-radius: 8px; padding: 6px 10px;
+}
+QPushButton:hover { background: rgba(13, 148, 136, 235); }
+"""
+
+
+def pill_geometry(area: QRect, width: int = PILL_WIDTH,
+                  height: int = PILL_HEIGHT,
+                  margin: int = PILL_MARGIN) -> QRect:
+    """画面の左下(タスクバーの上)に置く再開ボタンの矩形。
+
+    area は availableGeometry(タスクバーを除いた範囲)を渡す前提。
+    その左下に、少しだけ余白を空けて置く。"""
+    return QRect(area.left() + margin,
+                 area.bottom() - height + 1 - margin,
+                 width, height)
+
+
+class MirrorPillWindow(_TopmostWindow):
+    """最小化したミラーを戻すための、ボタン1つだけの小さな窓。
+
+    静止させて手元の道具を畳んだ間、手元の画面の左下にこれだけが残る。
+    押せば呼び元(コントローラの restore)が道具を戻して静止を解く。
+    フォーカスは奪わない(他の手元の窓と同じ作法)。"""
+
+    click_through = False
+
+    def __init__(self, geometry: QRect, on_click):
+        super().__init__(geometry)
+        self.setObjectName("mirrorPill")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(PILL_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        button = QPushButton("▶ ミラーを再開")
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setFont(QFont(NOTES_FONT_FAMILY, 10))
+        layout.addWidget(button)
+
+        def clicked():
+            try:
+                on_click()
+            except Exception:
+                _guard("ミラーの再開", notify=False)
+
+        button.clicked.connect(clicked)
+
+
+# ---------------------------------------------------------------
 # ミラー先の窓
 # ---------------------------------------------------------------
 class MirrorWindow(_TopmostWindow):
@@ -3100,6 +3170,8 @@ class MirrorController:
         self._frame = None         # 手元の枠
         self._toolbar = None       # 手元のツールバー
         self._notes = None         # 手元のカンペ(発表者だけが見るメモ)
+        self._pill = None          # 最小化中の再開ボタン(左下の小さな窓)
+        self._minimized = False    # 一時停止して道具を畳んでいるか
         # 「ミラーを続けたまま範囲だけ選び直している」最中か。選び終えたときの行き先
         # (新規に始めるのか、今の窓の範囲を差し替えるのか)がこれで決まる。
         self._reselecting = False
@@ -3399,6 +3471,9 @@ class MirrorController:
 
     def _open_overlay(self, reselecting: bool) -> bool:
         try:
+            if self._minimized:
+                # 範囲を選び直すなら道具が要る。静止はこの先の流れが扱う。
+                self._unhide_tools()
             fps_limit = min(
                 max(_as_int(mirror_config(self.app_settings).get("fps"), DEFAULT_FPS), 1), MAX_FPS
             )
@@ -3662,6 +3737,7 @@ class MirrorController:
             "white": lambda: self.toggle_presenter("white"),
             "notes": self.toggle_notes,
             "freeze": self.toggle_freeze,
+            "minimize": self.minimize,
             "reselect": self.start_reselect,
             "stop": self.stop,
         }
@@ -3679,6 +3755,8 @@ class MirrorController:
     def stop(self) -> None:
         """ミラーも枠もツールバーもカンペも選択も畳む。終了時の後始末からも呼ぶ。"""
         self._reselecting = False
+        self._minimized = False
+        self._close_pill()
         self._close_selection()
         # 大きさを変えている途中で終了されることがある(ツールバーの ✕ は掴みしろの
         # 隣にある)。畳んだ後に作り直しが走らないよう、控えも止める。
@@ -3782,6 +3860,13 @@ class MirrorController:
         try:
             if self._mirror is None:
                 return False
+            if self._minimized:
+                # 最小化中に静止を解く操作(ホットキー・メニュー)が来たら、
+                # 「戻る」操作として扱う。静止させる操作は既に静止している。
+                if frozen:
+                    return True
+                self.restore()
+                return False
             if self._reselecting:
                 # 選び直しの最中は静止を借りている。ここで解除されると、範囲選択の
                 # 減光オーバーレイがそのまま向こうへ映る。
@@ -3798,6 +3883,88 @@ class MirrorController:
 
     def toggle_freeze(self) -> bool:
         return self.set_freeze(not self.is_frozen())
+
+    # ---------------------------------------------------------------
+    # 一時停止して最小化(左下の小さなボタンだけ残す)
+    #
+    # 検証の合間など、手元で別の作業をするときに枠・ツールバー・カンペが
+    # 邪魔にならないようにするための畳み方。向こうの絵は静止のまま
+    # (最後の1枚が出続ける)。戻すのは左下のボタン1つ。
+    # ---------------------------------------------------------------
+    def is_minimized(self) -> bool:
+        return self._minimized
+
+    def minimize(self) -> bool:
+        """静止させて、手元の道具を全部畳み、左下に再開ボタンだけ残す。"""
+        try:
+            if not self.is_active() or self._minimized or self._reselecting:
+                return False
+            # 先に静止させる。再開ボタンが撮影範囲の中にあっても、止まって
+            # いる間は撮られないので映り込まない。
+            self.set_freeze(True)
+            for name in ("_frame", "_toolbar", "_notes"):
+                window = getattr(self, name, None)
+                if window is not None:
+                    window.hide()
+            self._minimized = True
+            self._show_pill()
+            return True
+        except Exception:
+            _guard("ミラーの最小化")
+            return False
+
+    def restore(self) -> None:
+        """最小化を解く。ボタンを消し、道具を戻し、最後に静止を解く
+        (ボタンが映り込む余地を無くすため、この順番)。"""
+        try:
+            if not self._minimized:
+                return
+            self._unhide_tools()
+            if self._mirror is not None:
+                self._mirror.set_frozen(False)
+            if self._frame is not None:
+                self._frame.set_frozen(False)
+            if self._toolbar is not None:
+                self._toolbar.refresh_state()
+        except Exception:
+            _guard("ミラーの再開")
+
+    def _unhide_tools(self) -> None:
+        """最小化を解いて道具を出し直す(静止には触らない)。範囲の
+        選び直しなど、静止を向こうの都合で扱う入口からも使う。"""
+        self._minimized = False
+        self._close_pill()
+        for name in ("_frame", "_toolbar", "_notes"):
+            window = getattr(self, name, None)
+            if window is not None:
+                window.show()
+
+    def _show_pill(self) -> None:
+        self._close_pill()
+        try:
+            screen = None
+            if self._mirror is not None:
+                screen = QGuiApplication.screenAt(
+                    self._mirror.source_rect.center())
+            if screen is None:
+                screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            self._pill = MirrorPillWindow(
+                pill_geometry(screen.availableGeometry()), self.restore)
+            self._pill.show()
+        except Exception:
+            _guard("再開ボタンの表示", notify=False)
+
+    def _close_pill(self) -> None:
+        pill, self._pill = self._pill, None
+        if pill is None:
+            return
+        try:
+            pill.close()
+            pill.deleteLater()
+        except Exception:
+            _guard("再開ボタンの後始末", notify=False)
 
     # ---------------------------------------------------------------
     # カンペ(発表者だけが見るメモ)

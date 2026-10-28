@@ -161,6 +161,88 @@ def test_saved_notes_rect():
     assert sm.saved_notes_rect({"screen_mirror": {"notes_rect": [1, 2]}}, far) is None
 
 
+def test_pill_geometry():
+    """再開ボタンは画面(タスクバーを除いた範囲)の左下に、余白を空けて置く。"""
+    g = sm.pill_geometry(QRect(0, 0, 1920, 1040))
+    assert (g.width(), g.height()) == (sm.PILL_WIDTH, sm.PILL_HEIGHT)
+    assert g.left() == sm.PILL_MARGIN
+    assert g.bottom() == 1040 - sm.PILL_MARGIN
+    g = sm.pill_geometry(QRect(100, 50, 1280, 720))
+    assert g.left() == 100 + sm.PILL_MARGIN
+    assert g.bottom() == 50 + 720 - sm.PILL_MARGIN
+
+
+def test_minimize_restore():
+    """最小化: 静止+道具が隠れる+ボタンが出る。再開で全部戻って静止が解ける。
+    最小化中の静止解除は「戻る」として扱い、終了でボタンも畳む。"""
+    controller = sm.MirrorController({"screen_mirror": {}}, "x",
+                                     lambda *args: None)
+
+    class _FakeMirror:
+        def __init__(self):
+            self.frozen = False
+            self.source_rect = QRect(0, 0, 100, 100)
+
+        def set_frozen(self, value):
+            self.frozen = bool(value)
+
+        def close(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    class _FakeWindow:
+        def __init__(self):
+            self.visible = True
+
+        def hide(self):
+            self.visible = False
+
+        def show(self):
+            self.visible = True
+
+        def set_frozen(self, value):
+            pass
+
+        def refresh_state(self):
+            pass
+
+        def close(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    controller._mirror = _FakeMirror()
+    controller._frame = _FakeWindow()
+    controller._toolbar = _FakeWindow()
+    controller._notes = _FakeWindow()
+    controller.is_active = lambda: True
+
+    assert controller.minimize() is True
+    assert controller.is_minimized()
+    assert controller._mirror.frozen is True
+    assert not controller._frame.visible
+    assert not controller._toolbar.visible
+    assert not controller._notes.visible
+    assert controller._pill is not None
+    assert controller.minimize() is False          # 二重にはならない
+
+    # 最小化中に静止を解く操作 = 戻る
+    assert controller.set_freeze(False) is False
+    assert not controller.is_minimized()
+    assert controller._frame.visible and controller._toolbar.visible
+    assert controller._mirror.frozen is False
+    assert controller._pill is None
+
+    # 最小化したまま終了したら、ボタンも残らない
+    assert controller.minimize() is True
+    controller.stop()
+    assert not controller.is_minimized()
+    assert controller._pill is None
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

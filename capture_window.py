@@ -30,9 +30,15 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QColorDialog,
+    QDialog,
+    QHBoxLayout,
     QInputDialog,
+    QLabel,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -72,6 +78,39 @@ BADGE_PADDING_Y = 1
 BADGE_RADIUS = 5
 BADGE_BG_COLOR = QColor(20, 20, 20, 160)
 BADGE_TEXT_COLOR = QColor(255, 255, 255, 225)
+
+
+class _OcrPreviewDialog(QDialog):
+    """読み取った文字を見せて、直してからコピーするための窓。
+
+    いきなりクリップボードへ入れると「期待通りコピーできたか」が
+    分からないので、確定はこの窓で行う。コピーは「コピーして閉じる」
+    を押したときだけ(閉じる・Esc では何もコピーしない)。"""
+
+    def __init__(self, parent, text):
+        super().__init__(parent)
+        self.setWindowTitle(f"OCR 結果（{len(text)}文字）")
+        self.setModal(True)
+        self.resize(560, 440)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("読み取った文字です。間違いは直してからコピーできます。"))
+        self.editor = QPlainTextEdit(self)
+        self.editor.setFont(QFont("Consolas", 10))
+        self.editor.setPlainText(text)
+        layout.addWidget(self.editor, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        copy_btn = QPushButton("コピーして閉じる", self)
+        copy_btn.setDefault(True)
+        copy_btn.clicked.connect(self.accept)
+        row.addWidget(copy_btn)
+        close_btn = QPushButton("閉じる", self)
+        close_btn.clicked.connect(self.reject)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+    def text(self):
+        return self.editor.toPlainText()
 
 
 class CaptureWindow(QWidget):
@@ -572,8 +611,13 @@ class CaptureWindow(QWidget):
             if not text:
                 show_toast("Rapture\n文字が見つかりませんでした")
                 return
-            QGuiApplication.clipboard().setText(text)
-            show_toast("Rapture\n読み取った文字をコピーしました")
+            # まず結果を見せる。コピーは、内容を確かめて(直して)から
+            # 「コピーして閉じる」を押したときだけ行う。
+            dialog = _OcrPreviewDialog(self, text)
+            if dialog.exec() == QDialog.Accepted:
+                copied = dialog.text()
+                QGuiApplication.clipboard().setText(copied)
+                show_toast(f"Rapture\n{len(copied)}文字をコピーしました")
         except Exception as e:
             show_toast(f"Rapture\nOCR の後処理に失敗しました\n{e}")
 

@@ -39,6 +39,29 @@ def choose_language(available_tags, preferred=_PREFERRED):
     return tags[0]
 
 
+def needs_invert(mean_luminance: float) -> bool:
+    """地が暗ければ反転する。Windows OCR は白地に黒文字が前提に近く、
+    暗い背景に白文字の画面(ファイラの一覧など)は壊滅的に化ける。"""
+    return mean_luminance < 128.0
+
+
+def ocr_scale(width: int, height: int, max_dim: int = 10000) -> float:
+    """OCR に渡す前の拡大率(1.0 はそのまま)。
+
+    小さい文字は広げた方が読めるので、短辺が 1600px 未満なら最大3倍まで
+    広げる。逆に、エンジンの上限(OcrEngine.MaxImageDimension = 10000)を
+    超える絵は縮める(超えると認識自体が失敗する)。"""
+    if width <= 0 or height <= 0:
+        return 1.0
+    scale = 1.0
+    short = min(width, height)
+    if short < 1600:
+        scale = min(3.0, 1600.0 / short)
+    if max(width, height) * scale > max_dim:
+        scale = max_dim / max(width, height)
+    return scale
+
+
 def recognize_png(png_bytes: bytes) -> str:
     """PNG のバイト列を Windows OCR で読む。読めた文字列を返す。
 

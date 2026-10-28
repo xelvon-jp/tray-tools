@@ -17,7 +17,15 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QImage,
+    QPainter,
+    QPixmap,
+    qGray,
+)
 from PySide6.QtWidgets import (
     QColorDialog,
     QInputDialog,
@@ -446,6 +454,26 @@ class CaptureWindow(QWidget):
         rendered = render_annotated(self.base_image, self.actions_history)
         QGuiApplication.clipboard().setImage(rendered)
 
+    def _ocr_target_image(self):
+        """OCR に渡す絵を用意する。Windows OCR は白地に黒文字・大きめの
+        文字が得意なので、地が暗ければ反転し、小さい絵は広げる
+        (判断は ocr_win の純関数。暗い画面の一覧が化けた実例からの対策)。"""
+        image = self.base_image.convertToFormat(QImage.Format_RGB32)
+        thumb = image.scaled(8, 8, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        total = 0
+        for y in range(thumb.height()):
+            for x in range(thumb.width()):
+                total += qGray(thumb.pixel(x, y))
+        mean = total / max(1, thumb.width() * thumb.height())
+        if ocr_win.needs_invert(mean):
+            image.invertPixels()
+        scale = ocr_win.ocr_scale(image.width(), image.height())
+        if scale != 1.0:
+            image = image.scaled(round(image.width() * scale),
+                                 round(image.height() * scale),
+                                 Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        return image
+
     def _run_ocr(self):
         """撮った絵(描き込みなし)から文字を読んで、クリップボードへ載せる。
 
@@ -455,7 +483,7 @@ class CaptureWindow(QWidget):
         try:
             buffer = QBuffer()
             buffer.open(QIODevice.WriteOnly)
-            self.base_image.save(buffer, "PNG")
+            self._ocr_target_image().save(buffer, "PNG")
             png = bytes(buffer.data())
             buffer.close()
         except Exception as e:

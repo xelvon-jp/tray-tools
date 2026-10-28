@@ -30,6 +30,25 @@ def test_available_matches_setup_probe():
     assert isinstance(ocr_win.available(), bool)
 
 
+def test_needs_invert():
+    """地の明るさの平均が半分未満なら暗い地とみなして反転する。"""
+    assert ocr_win.needs_invert(20.0) is True
+    assert ocr_win.needs_invert(127.9) is True
+    assert ocr_win.needs_invert(128.0) is False
+    assert ocr_win.needs_invert(240.0) is False
+
+
+def test_ocr_scale():
+    """短辺 1600px 未満は広げ(最大3倍)、上限 10000px は超えない。"""
+    scale = ocr_win.ocr_scale
+    assert scale(800, 600) == 1600 / 600          # 短辺を 1600 へ
+    assert scale(100, 100) == 3.0                  # 上限は3倍
+    assert scale(2400, 1600) == 1.0                # 十分大きい
+    assert scale(2000, 12000) == 10000 / 12000     # 上限に合わせて縮小
+    assert scale(9000, 9000) == 1.0
+    assert scale(0, 0) == 1.0
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

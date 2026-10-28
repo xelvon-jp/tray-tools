@@ -96,6 +96,71 @@ def test_apply_scene_starts_with_saved_rect():
     assert controller.apply_scene("無い名前") is False
 
 
+def test_notes_drag_zone_and_apply():
+    """カンペのドラッグ: 端の判定、移動の画面端クランプ、撮影範囲への
+    侵入防止(軸ごと)、伸縮の最小サイズと侵入防止。"""
+    from PySide6.QtCore import QPoint, Qt
+
+    zone = sm.notes_drag_zone
+    assert zone(QPoint(100, 30), 380, 600) == "move"
+    assert zone(QPoint(2, 30), 380, 600) == "l"
+    assert zone(QPoint(378, 598), 380, 600) == "br"
+    assert zone(QPoint(200, 2), 380, 600) == "t"
+    assert sm.notes_zone_cursor("br") == Qt.SizeFDiagCursor
+    assert sm.notes_zone_cursor("move") == Qt.ArrowCursor
+
+    area = QRect(0, 0, 1920, 1080)
+    apply_ = sm.notes_drag_apply
+    start = QRect(1500, 100, 380, 600)
+    r = apply_(start, "move", -100, 50, area)
+    assert (r.x(), r.y()) == (1400, 150)
+    r = apply_(start, "move", 1000, 0, area)
+    assert r.right() == 1919                      # 画面の外へは出ない
+
+    source = QRect(100, 100, 800, 600)            # 撮影範囲
+    start = QRect(1000, 100, 380, 600)
+    r = apply_(start, "move", -300, 0, area, avoid=(source,))
+    assert r.x() == 1000                          # 掛かる方向には動かない
+    r = apply_(start, "move", -300, 50, area, avoid=(source,))
+    assert (r.x(), r.y()) == (1000, 150)          # 掛からない軸だけ動く
+
+    r = apply_(QRect(100, 100, 380, 600), "r", 120, 0, area)
+    assert r.width() == 500
+    r = apply_(QRect(100, 100, 380, 600), "l", 300, 0, area)
+    assert r.width() == sm.NOTES_MIN_WIDTH and r.left() == 240
+    r = apply_(QRect(100, 100, 380, 600), "b", 0, -1000, area)
+    assert r.height() == sm.NOTES_MIN_HEIGHT
+    r = apply_(QRect(100, 100, 380, 600), "r", 2000, 0, area,
+               avoid=(QRect(600, 0, 500, 1080),))
+    assert r.width() == 380                       # 避ける矩形へは広げない
+
+
+def test_saved_notes_rect():
+    """手で置いた場所の持ち越し: 使える形だけが残り、撮影範囲に掛かる
+    保存値は自動配置へ落ちる(None)。"""
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    screen_area = None
+    from PySide6.QtGui import QGuiApplication
+    screen = QGuiApplication.primaryScreen()
+    assert screen is not None
+    screen_area = screen.geometry()
+    # 画面の左上に収まる小さな保存値で確かめる(実画面の大きさに依らない)
+    w = min(380, screen_area.width())
+    h = min(400, screen_area.height())
+    settings = {"screen_mirror": {"notes_rect": [
+        screen_area.left(), screen_area.top(), w, h]}}
+    far = QRect(screen_area.right() - 50, screen_area.bottom() - 50, 40, 40)
+    got = sm.saved_notes_rect(settings, far)
+    assert got is not None and got.width() == max(w, sm.NOTES_MIN_WIDTH)
+    # 撮影範囲に重なる保存値は使えない
+    assert sm.saved_notes_rect(settings, QRect(got)) is None
+    assert sm.saved_notes_rect({}, far) is None
+    assert sm.saved_notes_rect({"screen_mirror": {"notes_rect": []}}, far) is None
+    assert sm.saved_notes_rect({"screen_mirror": {"notes_rect": [1, 2]}}, far) is None
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

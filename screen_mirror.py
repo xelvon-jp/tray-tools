@@ -1953,6 +1953,121 @@ def notes_geometry(anchor_rect: QRect, source_rect: QRect, width: int = DEFAULT_
     return None
 
 
+# ---------------------------------------------------------------
+# カンペの移動・伸縮と、置き場所の持ち越し
+# ---------------------------------------------------------------
+# 端をつかむ幅(論理px)。レイアウトの余白(6px)と同じだけあれば、ボタンや
+# 本文のスクロールバーと取り合わない(ボタンは余白の内側から始まる)。
+NOTES_DRAG_EDGE = 6
+
+
+def notes_drag_zone(pos, width: int, height: int, edge: int = NOTES_DRAG_EDGE) -> str:
+    """窓の中の位置から、ドラッグの種類を決める。"move" か端の組み合わせ
+    ("l" / "r" / "t" / "b" / "tl" など)。端でなければ移動。"""
+    zone = ""
+    if pos.y() < edge:
+        zone += "t"
+    elif pos.y() >= height - edge:
+        zone += "b"
+    if pos.x() < edge:
+        zone += "l"
+    elif pos.x() >= width - edge:
+        zone += "r"
+    return zone or "move"
+
+
+def notes_zone_cursor(zone: str):
+    """ドラッグの種類に対応するカーソルの形(Qt.CursorShape)。"""
+    return {
+        "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+        "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+        "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+        "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+    }.get(zone, Qt.ArrowCursor)
+
+
+def _notes_hits(rect: QRect, avoid) -> bool:
+    return any(rect.intersects(other) for other in avoid
+               if other is not None and not other.isNull())
+
+
+def notes_drag_apply(start: QRect, zone: str, dx: int, dy: int,
+                     area: QRect, avoid=()) -> QRect:
+    """ドラッグ中の候補の矩形。最小の大きさ・画面の範囲・避ける矩形で丸める。
+
+    避ける矩形(撮影範囲とミラー先)に掛かる候補は通さない。移動は軸ごとに
+    試して掛からない方だけ動かし、伸縮は掛かる方向へは広げない。計算は
+    「掴んだ時点の矩形+動いた量」で行うので、通らなかった動きが後から
+    効いてくることは無い(指を戻せば窓も戻る)。"""
+    avoid = [QRect(rect) for rect in avoid if rect is not None]
+    if zone == "move":
+        def clamped(candidate: QRect) -> QRect:
+            rect = QRect(candidate)
+            rect.moveLeft(min(max(rect.left(), area.left()),
+                              max(area.right() - rect.width() + 1, area.left())))
+            rect.moveTop(min(max(rect.top(), area.top()),
+                             max(area.bottom() - rect.height() + 1, area.top())))
+            return rect
+
+        moved = clamped(QRect(start).translated(dx, dy))
+        if not _notes_hits(moved, avoid):
+            return moved
+        only_x = clamped(QRect(start).translated(dx, 0))
+        if not _notes_hits(only_x, avoid):
+            return only_x
+        only_y = clamped(QRect(start).translated(0, dy))
+        if not _notes_hits(only_y, avoid):
+            return only_y
+        return QRect(start)
+
+    left, top = start.left(), start.top()
+    right, bottom = start.right(), start.bottom()
+    if "l" in zone:
+        left = max(area.left(), min(start.left() + dx,
+                                    start.right() - NOTES_MIN_WIDTH + 1))
+    if "r" in zone:
+        right = min(area.right(), max(start.right() + dx,
+                                      start.left() + NOTES_MIN_WIDTH - 1))
+    if "t" in zone:
+        top = max(area.top(), min(start.top() + dy,
+                                  start.bottom() - NOTES_MIN_HEIGHT + 1))
+    if "b" in zone:
+        bottom = min(area.bottom(), max(start.bottom() + dy,
+                                        start.top() + NOTES_MIN_HEIGHT - 1))
+    rect = QRect(left, top, right - left + 1, bottom - top + 1)
+    if _notes_hits(rect, avoid):
+        return QRect(start)
+    return rect
+
+
+def saved_notes_rect(app_settings: dict, source_rect: QRect, avoid=()):
+    """手で動かして保存されたカンペの置き場所(screen_mirror.notes_rect)が、
+    今の撮影範囲でも使えるならその矩形。使えなければ None。
+
+    使える条件は notes_geometry と同じ: 置いたモニタの中に収まり、撮影範囲と
+    avoid(ツールバー・ミラー先)に掛からない。掛かるようなら自動配置へ
+    落ちる——発表者だけのメモが共有側へ映る事故だけは避ける。"""
+    raw = mirror_config(app_settings).get("notes_rect")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    rect = QRect(_as_int(raw[0], 0), _as_int(raw[1], 0),
+                 max(_as_int(raw[2], 0), NOTES_MIN_WIDTH),
+                 max(_as_int(raw[3], 0), NOTES_MIN_HEIGHT))
+    if rect.width() <= 0 or rect.height() <= 0:
+        return None
+    screen = QGuiApplication.screenAt(rect.center())
+    if screen is None:
+        return None
+    area = screen.geometry()
+    if not area.contains(rect):
+        return None
+    blocked = [QRect(source_rect)] + [QRect(rect2) for rect2 in avoid
+                                       if rect2 is not None]
+    if _notes_hits(rect, blocked):
+        return None
+    return rect
+
+
 def _clamp_notes_font(size) -> int:
     """本文の文字の大きさを扱える範囲へ丸める。設定ファイルからも来るので必ず通す。"""
     return min(max(_as_int(size, DEFAULT_NOTES_FONT_SIZE), NOTES_FONT_MIN), NOTES_FONT_MAX)
@@ -2008,7 +2123,8 @@ class MirrorNotesWindow(_TopmostWindow):
     click_through = False
 
     def __init__(self, geometry: QRect, note_name: str = "",
-                 font_size: int = DEFAULT_NOTES_FONT_SIZE, on_state=None):
+                 font_size: int = DEFAULT_NOTES_FONT_SIZE, on_state=None,
+                 on_geometry=None, avoid=()):
         super().__init__(geometry)
         self.setObjectName("mirrorNotes")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -2017,6 +2133,16 @@ class MirrorNotesWindow(_TopmostWindow):
         # 状態が変わったことを知らせる先。on_state(カンペ名, 文字の大きさ) を呼ぶ。
         # 設定への書き戻しは呼び元(MirrorController)がまとめて遅延させる。
         self._on_state = on_state
+        # 手で動かす・大きさを変えたときの知らせ先。on_geometry(新しい矩形)。
+        # 書き戻しと持ち越しは呼び元が持つ(この窓は範囲が変わると作り直される)。
+        self._on_geometry = on_geometry
+        # 掛かってはいけない矩形(撮影範囲・ミラー先・ツールバー)。ドラッグ中も
+        # ここへは重ならないようにする(notes_drag_apply が丸める)。
+        self._avoid = [QRect(rect) for rect in avoid if rect is not None]
+        self._drag_zone = None
+        self._drag_start_pos = None
+        self._drag_start_rect = None
+        self.setMouseTracking(True)
         self._name = ""
         self._font_size = _clamp_notes_font(font_size)
         # (見出しの深さ, 文字, 文書内の位置) を上から順に。目次も前後ボタンもこれを見る。
@@ -2034,6 +2160,10 @@ class MirrorNotesWindow(_TopmostWindow):
         self._build_ui()
         self._apply_font()
         self.load(note_name)
+        # 見出しの文字の上でもドラッグの当たりとカーソルが効くようにする。
+        # ラベルはマウスを自分で処理しないので、押下はこの窓へ伝わる。
+        for label in (self.title, self.position, self.status):
+            label.setMouseTracking(True)
 
     # ---------------------------------------------------------------
     # 組み立て
@@ -2425,6 +2555,62 @@ class MirrorNotesWindow(_TopmostWindow):
             self._draw_position()
         except Exception:
             _guard("カンペの再配置", notify=False)
+
+    # ---------------------------------------------------------------
+    # 移動と大きさの変更(見出しの行を掴んで移動、端を掴んで伸縮)
+    # ---------------------------------------------------------------
+    def set_avoid(self, avoid) -> None:
+        """掛かってはいけない矩形を差し替える(撮影範囲が動きながら変わるため)。"""
+        self._avoid = [QRect(rect) for rect in avoid
+                       if rect is not None and not rect.isNull()]
+
+    def mousePressEvent(self, event):
+        try:
+            if event.button() == Qt.LeftButton:
+                # ここへ来る押下は、ボタンや本文が自分で受けたもの以外
+                # (見出しの文字・余白・枠)。種類は位置から決める。
+                self._drag_zone = notes_drag_zone(
+                    event.pos(), self.width(), self.height())
+                self._drag_start_pos = event.globalPosition().toPoint()
+                self._drag_start_rect = QRect(self.geometry())
+                screen = QGuiApplication.screenAt(self._drag_start_rect.center())
+                self._drag_area = (screen.geometry() if screen is not None
+                                   else QRect(self._drag_start_rect))
+                event.accept()
+                return
+        except Exception:
+            _guard("カンペのドラッグ開始", notify=False)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        try:
+            if self._drag_zone is not None and self._drag_start_pos is not None:
+                delta = event.globalPosition().toPoint() - self._drag_start_pos
+                rect = notes_drag_apply(
+                    self._drag_start_rect, self._drag_zone,
+                    delta.x(), delta.y(), self._drag_area, self._avoid)
+                if rect != self.geometry():
+                    self.setGeometry(rect)
+                event.accept()
+                return
+            self.setCursor(notes_zone_cursor(notes_drag_zone(
+                event.pos(), self.width(), self.height())))
+        except Exception:
+            _guard("カンペのドラッグ", notify=False)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        try:
+            if self._drag_zone is not None and event.button() == Qt.LeftButton:
+                self._drag_zone = None
+                if (self._on_geometry is not None
+                        and self.geometry() != self._drag_start_rect):
+                    self._on_geometry(QRect(self.geometry()))
+                event.accept()
+                return
+        except Exception:
+            _guard("カンペのドラッグ終了", notify=False)
+        super().mouseReleaseEvent(event)
 
     # ---------------------------------------------------------------
     # ファイルを触る
@@ -3420,7 +3606,11 @@ class MirrorController:
         # カンペは最後。ツールバーの場所が決まってからでないと、そこを避けられない。
         if self._notes_wanted and bool(cfg.get("notes", DEFAULT_NOTES)):
             try:
-                geometry = notes_geometry(
+                # 手で動かした先が今の範囲でも使えるなら、そちらを優先する。
+                geometry = saved_notes_rect(
+                    self.app_settings, source_rect,
+                    avoid=(toolbar_rect, QRect(self._mirror.geometry())),
+                ) or notes_geometry(
                     anchor,
                     source_rect,
                     _as_int(cfg.get("notes_width"), DEFAULT_NOTES_WIDTH),
@@ -3438,6 +3628,9 @@ class MirrorController:
                         self._notes_name,
                         self._notes_font_size,
                         on_state=self._on_notes_state,
+                        on_geometry=self._on_notes_geometry,
+                        avoid=(source_rect, toolbar_rect,
+                               QRect(self._mirror.geometry())),
                     )
                     self._notes.show()
                     self._notes.restore_section(notes_section)
@@ -3649,14 +3842,33 @@ class MirrorController:
     def _flush_notes(self) -> None:
         """遅らせておいた書き戻し。タイマーのスロットなので必ず try で受ける。"""
         try:
-            self._save_keys(
-                {
-                    "notes_file": self._notes_name,
-                    "notes_font_size": self._notes_font_size,
-                }
-            )
+            values = {
+                "notes_file": self._notes_name,
+                "notes_font_size": self._notes_font_size,
+            }
+            cfg = mirror_config(self.app_settings)
+            raw = cfg.get("notes_rect")
+            if isinstance(raw, (list, tuple)) and len(raw) == 4:
+                # 手で動かした先があるときだけ、置き場所も一緒に書き戻す。
+                values["notes_rect"] = [_as_int(v, 0) for v in raw]
+                values["notes_width"] = _as_int(cfg.get("notes_width"),
+                                                DEFAULT_NOTES_WIDTH)
+            self._save_keys(values)
         except Exception:
             _guard("カンペの設定の保存", notify=False)
+
+    def _on_notes_geometry(self, rect: QRect) -> None:
+        """カンペを手で動かした・大きさを変えたときに呼ばれる。置き場所を
+        覚えて、書き戻しは遅らせる(_on_notes_state と同じ作法)。幅は
+        notes_width にも写す(自動配置へ落ちたときの幅も、直したものになる)。"""
+        try:
+            section = self.app_settings.setdefault("screen_mirror", {})
+            section["notes_rect"] = [rect.x(), rect.y(),
+                                     rect.width(), rect.height()]
+            section["notes_width"] = rect.width()
+            self._notes_save_timer.start(NOTES_SAVE_DELAY_MS)
+        except Exception:
+            _guard("カンペの置き場所の記録", notify=False)
 
     # ---------------------------------------------------------------
     # スポットライトの調整(発表中にその場で変える)
@@ -3971,12 +4183,19 @@ class MirrorController:
         notes_rect = None
         if self._notes is not None:
             cfg = mirror_config(self.app_settings)
-            notes_rect = notes_geometry(
+            # 手で置いた場所が新しい範囲でも使えるなら、動かさない。
+            notes_rect = saved_notes_rect(
+                self.app_settings, rect,
+                avoid=(toolbar_rect, QRect(self._mirror.geometry())),
+            ) or notes_geometry(
                 anchor,
                 rect,
                 _as_int(cfg.get("notes_width"), DEFAULT_NOTES_WIDTH),
                 avoid=(toolbar_rect, QRect(self._mirror.geometry())),
             )
+            # 避ける範囲(撮影範囲)が動いたので、カンペ側にも教え直す。
+            self._notes.set_avoid(
+                (rect, toolbar_rect, QRect(self._mirror.geometry())))
 
         # ここから先は失敗しない。映す範囲を先に差し替えてから手元の窓を追わせる。
         self._mirror.resize_source_rect(rect)

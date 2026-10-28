@@ -225,6 +225,9 @@ DEFAULT_SETTINGS = {
         "notes_width": 380,
         "notes_font_size": 11,
         "notes_file": "",
+        # カンペを手で動かした先([x, y, width, height]、論理座標)。空なら自動配置。
+        # 撮影範囲やミラー先に掛かるようになったら、その回は自動配置へ落ちる。
+        "notes_rect": [],
     },
     # フォルダブックマーク。bookmarks は {"name": 表示名, "path": フォルダパス} の配列で、
     # アプリからの登録で増える(削除・並べ替えは settings.json を直接編集する想定)。

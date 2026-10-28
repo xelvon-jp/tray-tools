@@ -4464,6 +4464,41 @@ def test_window_renemo():
             w.deleteLater()
 
 
+def test_window_renemo_block_and_gutter():
+    """Renemo: ガター余白の追随と、Alt+ドラッグの矩形選択の編集。"""
+    import filer_renemo as rm
+    from PySide6.QtGui import QFont
+
+    _qapp()
+    items = [{"folder": "C:\\x", "name": n, "is_dir": False, "size": 1, "mtime": 0}
+             for n in ("DSC0001.jpg", "DSC0002.jpg", "DSC0003.jpg")]
+    existing = {"C:\\x": {i["name"] for i in items}}
+    d = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    d.show()
+    try:
+        ed = d.editor
+        # 左端の欠け対策: 文字の開始位置(余白)が、ガターの絵の幅と一致する
+        assert ed.viewportMargins().left() == ed.gutter_width()
+        assert d.editor_lines() == ["DSC0001", "DSC0002", "DSC0003"]
+
+        # 矩形選択 → 全行まとめて打ち替え・削除(行の数は変わらない)
+        ed.set_block_selection((0, 3), (2, 7))
+        assert ed.block_rows() == [0, 1, 2]
+        assert ed.block_text() == "0001\n0002\n0003"
+        ed.block_insert_text("99")
+        assert d.editor_lines() == ["DSC99", "DSC99", "DSC99"]
+        ed.block_delete(backward=True)      # 幅0の矩形での BS は前1文字を全行で
+        assert d.editor_lines() == ["DSC9", "DSC9", "DSC9"]
+        # 矩形の編集は1回の取り消しで戻る
+        ed.set_block_selection((0, 0), (2, 3))
+        ed.block_insert_text("IMG")
+        assert d.editor_lines() == ["IMG9", "IMG9", "IMG9"]
+        ed.undo()
+        assert d.editor_lines() == ["DSC9", "DSC9", "DSC9"]
+    finally:
+        d.close()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

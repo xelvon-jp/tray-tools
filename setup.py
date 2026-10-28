@@ -259,6 +259,49 @@ def install_vector_optional(with_vector) -> None:
     print("  OK")
 
 
+# 付箋の「文字を読み取る（OCR）」だけが使う任意の依存。Windows 内蔵 OCR を
+# Python から呼ぶための WinRT パッケージ群(小さい)。OCR エンジン自体は
+# Windows 標準なのでモデル等のダウンロードは無い。AI と同じく任意にし、
+# 失敗してもセットアップは止めない。入っていない環境では入口が出ない。
+OCR_PACKAGES = [
+    "winrt-runtime",
+    "winrt-Windows.Foundation",
+    "winrt-Windows.Globalization",
+    "winrt-Windows.Graphics.Imaging",
+    "winrt-Windows.Media.Ocr",
+    "winrt-Windows.Storage.Streams",
+]
+# 入っているかの判定は、入口の出し分け(ocr_win.available)と揃える。
+_OCR_PROBE = ["winrt.windows.media.ocr"]
+
+
+def _ocr_installed() -> bool:
+    code = "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % (_OCR_PROBE,)
+    return subprocess.run([str(VENV_PYTHON), "-c", code]).returncode == 0
+
+
+def install_ocr_optional(with_ocr) -> None:
+    print()
+    print("  [任意] 付箋の「文字を読み取る（OCR）」(WinRT パッケージ群)")
+    if _ocr_installed():
+        print("  既に入っているのでそのまま使います")
+        return
+    if with_ocr is None:
+        print("  キャプチャした画像の文字を、Windows 標準の OCR で読み取ってコピーできるようにします。入れなくても他の機能は動きます。")
+        with_ocr = _ask_yes_no("  入れますか?", default=False)
+    if not with_ocr:
+        print("  入れません(あとから setup.py --with-ocr で入れられます)")
+        return
+    print("  pip install winrt-* を実行します")
+    result = subprocess.run([str(VENV_PYTHON), "-m", "pip", "install", *OCR_PACKAGES], env=_pip_env())
+    if result.returncode != 0:
+        print()
+        print("  警告: インストールに失敗しました。「文字を読み取る（OCR）」が出ないだけで、他は使えます。")
+        print("  プロキシ等を解決したら、setup.py --with-ocr をもう一度実行してください。")
+        return
+    print("  OK")
+
+
 # ---------------------------------------------------------------
 # 4. 音声デバイスと settings.json
 # ---------------------------------------------------------------
@@ -556,9 +599,15 @@ def main() -> None:
                         help="背景透過の「ベクタ化」用の vtracer を入れる(確認を省略)")
     vector.add_argument("--no-vector", dest="with_vector", action="store_false",
                         help="vtracer を入れない(確認を省略)")
+    ocr = parser.add_mutually_exclusive_group()
+    ocr.add_argument("--with-ocr", dest="with_ocr", action="store_true",
+                     help="付箋の OCR 用の WinRT パッケージ群を入れる(確認を省略)")
+    ocr.add_argument("--no-ocr", dest="with_ocr", action="store_false",
+                     help="WinRT パッケージ群を入れない(確認を省略)")
     parser.add_argument("--env", dest="env", type=int, choices=[1, 2, 3], default=None,
                         help="この PC の環境(1/2/3)。あっふ のスマホ送信(QR)が有効なのは環境1だけ(確認を省略)")
-    parser.set_defaults(startup=None, redetect=None, with_ai=None, with_vector=None)
+    parser.set_defaults(startup=None, redetect=None, with_ai=None, with_vector=None,
+                        with_ocr=None)
     args = parser.parse_args()
 
     print("tray-tools セットアップ")
@@ -569,6 +618,7 @@ def main() -> None:
     install_requirements()
     install_ai_optional(args.with_ai)
     install_vector_optional(args.with_vector)
+    install_ocr_optional(args.with_ocr)
     setup_settings(args.redetect, args.env)
     setup_shortcut()
     setup_startup(args.startup)

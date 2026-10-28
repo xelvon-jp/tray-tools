@@ -4,8 +4,19 @@
 # ダブルクリック一時非表示、右クリックメニュー、保存(Ctrl+S)/コピー(Ctrl+C)をここで扱う。
 # (rapture-py/capture_window.py から移設。不具合1〜5を修正)
 import os
+import threading
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QTimer
+from PySide6.QtCore import (
+    QBuffer,
+    QIODevice,
+    QObject,
+    Qt,
+    QPoint,
+    QPointF,
+    QRect,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QColorDialog,
@@ -23,7 +34,15 @@ from capture_grab import (
     save_image,
 )
 import bg_remove_launch
+import ocr_win
 from toast import dismiss, show_toast
+
+
+class _OcrBridge(QObject):
+    """OCR のワーカースレッドから結果を戻す器(bg_remove の _AiBridge と同じ流儀)。
+    中身は、成功なら読み取れた文字列、失敗なら例外。"""
+
+    done = Signal(object)
 
 PEN_WIDTH_CHOICES = [1, 2, 3, 5, 8, 12]
 HIGHLIGHTER_WIDTH_MULTIPLIER = 4
@@ -69,6 +88,8 @@ class CaptureWindow(QWidget):
 
         self.capture_settings = capture_settings
         self.settings_path = settings_path
+        self._ocr_bridge = _OcrBridge()
+        self._ocr_bridge.done.connect(self._on_ocr_done)
         # 「画面全体に書き込む」で使う全画面の付箋はタイトルバーの×が画面外に出るため、
         # Escで閉じられないと詰む。通常のキャプチャ付箋の挙動は変えたくないのでオプトインにする。
         self.close_on_escape = close_on_escape
@@ -425,6 +446,45 @@ class CaptureWindow(QWidget):
         rendered = render_annotated(self.base_image, self.actions_history)
         QGuiApplication.clipboard().setImage(rendered)
 
+    def _run_ocr(self):
+        """撮った絵(描き込みなし)から文字を読んで、クリップボードへ載せる。
+
+        読み取りは Windows 標準の OCR(ocr_win)。時間がかかるので別スレッドで
+        回し、結果はシグナルで受けてからクリップボードとトーストへ出す。
+        描き込み(ペンや蛍光ペン)は読み取りの邪魔になるので、元の絵で読む。"""
+        try:
+            buffer = QBuffer()
+            buffer.open(QIODevice.WriteOnly)
+            self.base_image.save(buffer, "PNG")
+            png = bytes(buffer.data())
+            buffer.close()
+        except Exception as e:
+            show_toast(f"Rapture\nOCR の準備に失敗しました\n{e}")
+            return
+        show_toast("Rapture\n文字を読み取っています…")
+
+        def work():
+            try:
+                self._ocr_bridge.done.emit(ocr_win.recognize_png(png))
+            except Exception as e:
+                self._ocr_bridge.done.emit(e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ocr_done(self, result):
+        try:
+            if isinstance(result, Exception):
+                show_toast(f"Rapture\n文字を読み取れませんでした\n{result}")
+                return
+            text = (result or "").strip()
+            if not text:
+                show_toast("Rapture\n文字が見つかりませんでした")
+                return
+            QGuiApplication.clipboard().setText(text)
+            show_toast("Rapture\n読み取った文字をコピーしました")
+        except Exception as e:
+            show_toast(f"Rapture\nOCR の後処理に失敗しました\n{e}")
+
     def _open_bg_remove(self):
         """描き込みを焼き込んだ絵を、背景透過の窓(別プロセス)で開く。
 
@@ -451,6 +511,10 @@ class CaptureWindow(QWidget):
         act_copy = menu.addAction("コピー (Ctrl+C)")
         # コピーの直後に置く。「背景を抜いてからコピーしたい」ときに続けて探す場所なので。
         act_bg_remove = menu.addAction("背景を透過...")
+        # OCR は任意の依存(WinRT)が入っているときだけ出す(段階開示)。
+        act_ocr = None
+        if ocr_win.available():
+            act_ocr = menu.addAction("文字を読み取る（OCR）")
         menu.addSeparator()
 
         act_color = menu.addAction("色...")
@@ -503,6 +567,8 @@ class CaptureWindow(QWidget):
             self._copy()
         elif chosen == act_bg_remove:
             self._open_bg_remove()
+        elif act_ocr is not None and chosen == act_ocr:
+            self._run_ocr()
         elif chosen == act_open_folder:
             self._open_save_folder()
         elif chosen == act_ontop:

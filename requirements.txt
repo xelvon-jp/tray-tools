@@ -28,3 +28,13 @@ py7zr
 # (無ければチェックが押せなくなるだけ)。setup.py が途中で入れるか聞く
 # (--with-vector / --no-vector で省略可)。トレースは子プロセスで行う(bg_remove.py 参照)。
 # vtracer
+# 任意: 付箋の「文字を読み取る（OCR）」を使うときだけ。Windows 内蔵 OCR を
+# Python から呼ぶための WinRT パッケージ群。無くても他は動く(無ければ
+# メニューに出ないだけ)。setup.py が途中で入れるか聞く
+# (--with-ocr / --no-ocr で省略可)。
+# winrt-runtime
+# winrt-Windows.Foundation
+# winrt-Windows.Globalization
+# winrt-Windows.Graphics.Imaging
+# winrt-Windows.Media.Ocr
+# winrt-Windows.Storage.Streams

@@ -2043,6 +2043,66 @@ def test_window_archive():
         w2.deleteLater()
 
 
+def test_collapsed_pane_is_never_active():
+    """境界を端まで寄せて畳んだ窓はアクティブにしない(2026-10-29 本人と相談)。
+
+    - 畳まれた窓がアクティブなら、見えている方の窓へ移る(キー・マウスどちらで畳んでも)
+    - 畳まれた窓へ ←→ / Tab で移ろうとしたら、境界を中央へ戻してから移る
+    - 仕切りのダブルクリックで中央へ戻る"""
+    import filer
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "split_ratio": 0.5}}, None)
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        QTest.qWait(30)
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        try:
+            assert w.active_side == "left"
+            # キーで左窓を畳むと、アクティブは見えている右窓へ移る
+            for _ in range(25):
+                key(Qt.Key_Left, Qt.AltModifier)
+            assert w.split_ratio == 0.0 and w.pane_collapsed("left")
+            assert w.active_side == "right", w.active_side
+            # 見えない左窓では何も起きない(↓ と Space は右窓に効く)
+            left_cursor = w.left.cursor_row()
+            key(Qt.Key_Down)
+            key(Qt.Key_Space)
+            assert w.left.cursor_row() == left_cursor and not w.left.marks
+            assert w.right.marks
+            # 畳まれた左窓へ ← で移ろうとすると、中央へ戻してから移る
+            key(Qt.Key_Left)
+            assert w.split_ratio == 0.5 and not w.pane_collapsed("left")
+            assert w.active_side == "left"
+            # 右窓を畳んでから Tab でも同じ
+            for _ in range(25):
+                key(Qt.Key_Right, Qt.AltModifier)
+            assert w.pane_collapsed("right") and w.active_side == "left"
+            key(Qt.Key_Tab)
+            assert w.split_ratio == 0.5 and w.active_side == "right"
+            # マウスで畳んだとき(splitterMoved の経路)も見える側へ移る
+            total = sum(w.hsplit.sizes())
+            w.hsplit.moveSplitter(total, 1)            # 右窓を畳む
+            QTest.qWait(20)
+            assert w.pane_collapsed("right"), w.hsplit.sizes()
+            assert w.active_side == "left"
+            # 仕切りのダブルクリックで中央へ
+            handle = w.hsplit.handle(1)
+            QTest.mouseDClick(handle, Qt.LeftButton, Qt.NoModifier,
+                              QPoint(handle.width() // 2, handle.height() // 2))
+            assert w.split_ratio == 0.5 and not w.pane_collapsed("right"), w.hsplit.sizes()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_window_layout_and_font():
     import filer
     from PySide6.QtCore import Qt
@@ -2076,9 +2136,12 @@ def test_window_layout_and_font():
         assert w.split_ratio == core.SPLIT_MIN == 0.0   # 端まで寄せられる
         QTest.qWait(30)
         assert w.hsplit.sizes()[0] <= 4                 # 左窓が畳み切れる
+        # 畳まれた左窓はアクティブにしない(test_collapsed_pane_is_never_active)
+        assert w.active_side == "right"
         for _ in range(16):
             key(Qt.Key_Right, Qt.AltModifier)
         assert w.split_ratio == 0.48                    # 戻しても普通に動く
+        w.activate("left")                              # 以降は左窓で字の大きさを見る
 
         log0 = w.log_view.height()
         key(Qt.Key_Up, Qt.AltModifier)                  # メッセージ窓を大きく

@@ -138,6 +138,10 @@ RECENT_LIMIT = 50
 # フォルダの自動監視の間隔。短いほど外部の変更に早く追いつくが、指紋の走査
 # (フォルダ1つ分の scandir)がその分増える。2秒なら体感の遅れも無く、走査も軽い。
 WATCH_INTERVAL_MS = 2000
+# 左右の境界を端まで寄せて、ファイル窓の幅がこれ以下になったら「畳まれた」とみなす。
+# 畳まれた窓はアクティブにしない(見えない窓でキーが効くと、見えない所のファイルを
+# 消したり移したりしてしまう。2026-10-29 本人と相談して、あふｗより安全側に寄せた)。
+COLLAPSED_PANE_PX = 4
 # ライブ絞り込み: この件数より少なければ打鍵ごとにすぐ絞り、多ければ打ち終わりを待つ。
 LIVE_FILTER_IMMEDIATE = 3000
 LIVE_FILTER_DELAY_MS = 150
@@ -1599,6 +1603,8 @@ class FilerWindow(QWidget):
         self.vsplit.setStretchFactor(1, 0)
         self.hsplit.splitterMoved.connect(self._on_hsplit_moved)
         self.vsplit.splitterMoved.connect(self._on_vsplit_moved)
+        # 左右の仕切りのダブルクリックで中央へ戻す(eventFilter 参照)。
+        self.hsplit.handle(1).installEventFilter(self)
         root.addWidget(self.vsplit)
 
         # ファンクションキーの段(F1〜F12。押したのと同じコマンドを走らせるボタン)と、
@@ -1695,6 +1701,47 @@ class FilerWindow(QWidget):
             self.log_lines = core.clamp_log_lines(self.log_lines, self._max_log_lines())
             log_height = min(self._log_height(self.log_lines), total - 50)
             self.vsplit.setSizes([total - log_height, log_height])
+        self._ensure_active_visible()
+
+    # --- 畳まれた窓の扱い ---
+    def pane_collapsed(self, side: str) -> bool:
+        """その窓が境界を端まで寄せて畳まれているか。
+
+        まだ並べ終わっていない(左右とも幅 0)ときや、プレビューで窓が仕切りから
+        外れているときは「畳まれていない」と答える(起動直後に中央へ戻したり、
+        アクティブを動かしたりしないように)。"""
+        sizes = self.hsplit.sizes()
+        if len(sizes) < 2 or sum(sizes) <= 0:
+            return False
+        index = self.hsplit.indexOf(self.pane(side))
+        if index < 0:
+            return False
+        return sizes[index] <= COLLAPSED_PANE_PX
+
+    def _ensure_active_visible(self) -> None:
+        """アクティブの窓が畳まれたら、見えている方の窓へアクティブを移す
+        (あふｗの &VSPMV L/R が端へ寄せるときにカーソルを反対側へ移すのと同じ考え方)。"""
+        if getattr(self, "preview_on", False) or not hasattr(self, "left"):
+            return
+        side = self.active_side
+        other = "right" if side == "left" else "left"
+        if self.pane_collapsed(side) and not self.pane_collapsed(other):
+            self.activate(other)
+
+    def center_split(self) -> None:
+        """左右の境界を中央へ戻す(仕切りのダブルクリック、畳まれた窓へ移るとき)。"""
+        self.split_ratio = core.DEFAULT_SPLIT_RATIO
+        self.apply_layout()
+
+    def eventFilter(self, obj, event):
+        try:
+            if (event.type() == QEvent.MouseButtonDblClick
+                    and obj is self.hsplit.handle(1)):
+                self.center_split()
+                return True
+        except Exception:  # noqa: BLE001  スロット内で投げ切るとプロセスごと落ちる
+            _log_exception("splitHandle")
+        return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1718,6 +1765,7 @@ class FilerWindow(QWidget):
             sizes = self.hsplit.sizes()
             if sum(sizes) > 0:
                 self.split_ratio = core.clamp_split(sizes[0] / sum(sizes))
+            self._ensure_active_visible()   # マウスで畳んだときも見える側へ
         except Exception:  # noqa: BLE001
             _log_exception("hsplit")
 
@@ -1938,6 +1986,10 @@ class FilerWindow(QWidget):
             self.preview_off()
         if changed and self.active.isearch_text is not None:
             self.end_isearch()
+        if changed and not getattr(self, "preview_on", False) and self.pane_collapsed(side):
+            # 畳まれた窓へ移ろうとしたら(←→/Tab/クリック)、境界を中央へ戻してから移る。
+            # 見えない窓をアクティブにしない。
+            self.center_split()
         self.active_side = side
         if focus:
             self.active.view.setFocus()

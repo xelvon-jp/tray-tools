@@ -13,6 +13,14 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# CI のコンソール(cp1252)で日本語の例外文を print して落ちないように
+# (tests/test_filer.py と同じ対策)。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from PySide6.QtCore import QRect  # noqa: E402
 
 import screen_mirror as sm  # noqa: E402

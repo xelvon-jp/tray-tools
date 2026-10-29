@@ -23,6 +23,16 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# CI(windows-latest)のコンソールは cp1252 で、日本語を含む traceback を
+# print すると UnicodeEncodeError になり、テストが全部通っていても
+# ジョブが失敗扱いになる(2026-10-27 以降の Actions 失敗の原因)。
+# 流れのエンコーディングを UTF-8 に寄せて、環境に依らず落とさない。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import filer_core as core  # noqa: E402
 
 

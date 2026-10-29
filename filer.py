@@ -183,7 +183,18 @@ def _log_exception(where: str) -> str:
             f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {where} =====\n{text}")
     except OSError:
         pass
-    print(text, file=sys.stderr)
+    try:
+        print(text, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        # コンソールが cp1252/cp932 の環境では日本語を含む traceback の
+        # print が UnicodeEncodeError になる(CI のジョブ失敗の原因)。
+        # 書けない文字は落としてでも、落とさずに出す。
+        try:
+            enc = getattr(sys.stderr, "encoding", None) or "utf-8"
+            sys.stderr.write(text.encode(enc, "replace").decode(enc))
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
     exc_type, exc_value = sys.exc_info()[:2]
     return f"{exc_type.__name__}: {exc_value}" if exc_type else "unknown error"
 

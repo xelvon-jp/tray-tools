@@ -3902,6 +3902,28 @@ def test_preview_logic():
     assert core.fit_size(100, 50, 400, 400) == (100, 50)               # 拡大はしない
     assert core.fit_size(0, 0, 10, 10) == (0, 0)
     assert core.info_lines("x.bin", F("x.bin", size=1234))[2].startswith("サイズ  1,234")
+
+
+def test_preview_image_orientation():
+    """EXIF 回転つき(スマホの縦撮り)の画像は、回転後の縦横で箱に収まる。
+
+    保存は横長・表示は縦長の写真を、横長で短い箱で読む。回転を考えずに
+    縮めると、回転したぶん高さが箱からはみ出し、窓の大きさまで変わった。"""
+    import filer_preview
+    from PIL import Image as PilImage
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "portrait.jpg")
+        exif = PilImage.Exif()
+        exif[274] = 6   # Orientation: 表示のときに時計回り90度
+        PilImage.new("RGB", (400, 300), (30, 120, 200)).save(str(path), exif=exif)
+        result = filer_preview.load_preview(str(path), "image", F("portrait.jpg"),
+                                            box=(200, 100))
+        image = result["image"]
+        assert image is not None and not image.isNull()
+        assert image.height() <= 100 and image.width() <= 200
+        assert image.height() > image.width()   # 縦長として出ている
     assert core.DEFAULT_KEYMAP["0114"] == "preview_toggle"
     assert core.fkey_labels(core.DEFAULT_KEYMAP)[2] == "Preview"
 

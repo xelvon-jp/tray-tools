@@ -11,9 +11,16 @@
 # QImage はスレッドをまたいで渡してよい(QPixmap にするのは UI スレッドで)。
 import os
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QImageReader, QPixmap
-from PySide6.QtWidgets import QLabel, QPlainTextEdit, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QFont, QImageIOHandler, QImageReader, QPixmap
+from PySide6.QtWidgets import (
+    QLabel,
+    QPlainTextEdit,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 import filer_archive
 import filer_core as core
@@ -36,8 +43,17 @@ def _read_image(path: str, box_w: int, box_h: int):
     reader.setAutoTransform(True)
     size = reader.size()
     if size.isValid():
-        w, h = core.fit_size(size.width(), size.height(), box_w, box_h)
-        reader.setScaledSize(size.scaled(w, h, Qt.KeepAspectRatio))
+        # EXIF の回転(スマホの縦撮り写真など)があると、読み出した後に
+        # 縦横が入れ替わる。縮小の大きさは「表示後の縦横」で決めないと、
+        # 回転したぶん箱からはみ出し、窓の大きさまで変わってしまう。
+        rotated = bool(reader.transformation()
+                       & QImageIOHandler.TransformationRotate90)
+        shown = QSize(size.height(), size.width()) if rotated else size
+        w, h = core.fit_size(shown.width(), shown.height(), box_w, box_h)
+        target = shown.scaled(w, h, Qt.KeepAspectRatio)
+        if rotated:
+            target = QSize(target.height(), target.width())
+        reader.setScaledSize(target)
     image = reader.read()
     if image.isNull():
         raise OSError(reader.errorString() or "画像として読めません")
@@ -130,6 +146,8 @@ class PreviewWidget(QWidget):
                                 f" color: {colors['text']}; border: none;")
         self.image = QLabel()
         self.image.setAlignment(Qt.AlignCenter)
+        # 絵の大きさで窓側の寸法が決まらないようにする(寸法は窓が決める)
+        self.image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.image.setStyleSheet(f"background-color: {colors['background']};")
         self.stack.addWidget(self.text)
         self.stack.addWidget(self.image)
@@ -148,7 +166,14 @@ class PreviewWidget(QWidget):
         note = result.get("note")
         self.header.setText(f"Preview: {result.get('title', '')}" + (f"  [{note}]" if note else ""))
         if result.get("image") is not None:
-            self.image.setPixmap(QPixmap.fromImage(result["image"]))
+            pixmap = QPixmap.fromImage(result["image"])
+            box_w, box_h = self.image_box()
+            if pixmap.width() > box_w or pixmap.height() > box_h:
+                # 大きさの分からない形式など、箱に収まらない絵が来ても
+                # ここで収める(窓の大きさを絵に合わせない)
+                pixmap = pixmap.scaled(box_w, box_h, Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation)
+            self.image.setPixmap(pixmap)
             self.stack.setCurrentWidget(self.image)
         else:
             self.text.setPlainText("\n".join(result.get("lines") or []))

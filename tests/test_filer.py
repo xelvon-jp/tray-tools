@@ -4787,4 +4787,18 @@ if __name__ == "__main__":
     # os._exit は後始末を走らせないので、テスト用の一時フォルダはここで消す。
     shutil.rmtree(_TEST_TEMP, ignore_errors=True)
     sys.stdout.flush()
+    sys.stderr.flush()
+    # os._exit でも Windows では DLL の切り離し処理が走り、offscreen のクリップボードが
+    # 抱えた QMimeData を Qt の静的デストラクタが解放しようとして 0xC0000005 で落ちる
+    # (README「検証時の注意」。CI では全部通ったあとにこれで失敗扱いになっていた)。
+    # TerminateProcess は DLL の切り離しを走らせないので、終了コードがそのまま残る。
+    try:
+        import ctypes
+        _k32 = ctypes.WinDLL("kernel32")
+        _k32.GetCurrentProcess.restype = ctypes.c_void_p
+        _k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        _k32.TerminateProcess.restype = ctypes.c_int
+        _k32.TerminateProcess(_k32.GetCurrentProcess(), code)
+    except Exception:  # noqa: BLE001  Windows 以外や失敗時は従来どおり
+        pass
     os._exit(code)

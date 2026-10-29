@@ -4072,14 +4072,58 @@ def test_preview_esc_and_image_enter():
             result = _wait_preview(w, "pic.png")
             assert result["kind"] == "image" and result["image"] is not None
 
-            # プレビュー中に別の画像へ Enter しても開いたまま切り替わる
-            # (photo.JPG は中身が画像でないダミーなので、実画像の pic2.png で見る)
+            # 画像ビューア中の Enter はビューアを抜ける(2026-10-29 要望。
+            # 以前は「開いたまま別の画像へ切り替わる」だった)
             L.set_cursor(L._row_of("pic2.png"))
             key(Qt.Key_Return)
-            result = _wait_preview(w, "pic2.png")
-            assert result["kind"] == "image" and w.preview_on
-            key(Qt.Key_Escape)
+            assert not w.preview_on and w.preview_widget is None
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_preview_fullscreen_from_right():
+    """右窓からビューア(プレビュー)に入るとフルスクリーン(あふｗ準拠)。
+
+    左窓からのときは従来どおり反対窓の場所だけ。抜ければ元の大きさに戻る。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        img = QImage(120, 80, QImage.Format_RGB32)
+        img.fill(QColor("#3366cc"))
+        assert img.save(str(right / "rpic.png"))
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        before = w.geometry()
+        try:
+            # 左窓から: フルスクリーンにはならない
+            QTest.keyClick(L.view, Qt.Key_F3)
+            assert w.preview_on and not w.isFullScreen()
+            QTest.keyClick(L.view, Qt.Key_F3)
             assert not w.preview_on
+            # 右窓から: フルスクリーンになる。抜ければ元の大きさへ戻る
+            w.activate("right")
+            R.set_cursor(R._row_of("rpic.png"))
+            QTest.keyClick(R.view, Qt.Key_F3)
+            assert w.preview_on and w.isFullScreen()
+            result = _wait_preview(w, "rpic.png")
+            assert result["kind"] == "image"
+            QTest.keyClick(R.view, Qt.Key_Escape)
+            assert not w.preview_on and not w.isFullScreen()
+            assert w.geometry() == before
         finally:
             w.close()
             w.deleteLater()

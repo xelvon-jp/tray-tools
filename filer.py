@@ -1492,6 +1492,8 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self.preview_side = None
         self.preview_widget = None
+        self._preview_fullscreen = False    # 右窓から入ったプレビューはフルスクリーン
+        self._preview_was_maximized = False
         # プレビューの待ち行列。通り過ぎたファイルも飛ばさず順に出すため、
         # 要求はここへ積んで1つのスレッドが先頭から読む。世代はプレビューを
         # 閉じたときに進め、古い結果を捨てる印にする。
@@ -1789,7 +1791,8 @@ class FilerWindow(QWidget):
         pane.load(first, walk_up=True, on_fail=lambda: self._load_first(pane, rest))
 
     def save_state(self) -> None:
-        geometry = self.normalGeometry() if self.isMaximized() else self.geometry()
+        geometry = (self.normalGeometry()
+                    if self.isMaximized() or self.isFullScreen() else self.geometry())
         updates = {
             "geometry": [geometry.x(), geometry.y(), geometry.width(), geometry.height()],
             "maximized": self.isMaximized(),
@@ -2154,6 +2157,12 @@ class FilerWindow(QWidget):
         if event.key() == Qt.Key_Backspace and self.preview_on:
             self.preview_off()      # ビューア(プレビュー)中の BS もプレビューを抜ける
             return                  # (親フォルダへは行かない。2026-10-29 要望)
+        if (event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.preview_on
+                and not (mods & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier))
+                and core.preview_kind(pane.cursor_entry(),
+                                      self.viewer_extensions) == "image"):
+            self.preview_off()      # 画像ビューア中の Enter もビューアを抜ける
+            return                  # (あふｗのビューアと同じ。2026-10-29 要望)
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
@@ -2866,14 +2875,31 @@ class FilerWindow(QWidget):
         other.hide()
         self.preview_widget.show()
         self.preview_on = True
+        # 右窓から入ったときはフルスクリーンで出す(あふｗのビューア準拠。
+        # 2026-10-29 要望)。左窓からのときは従来どおり反対窓の場所だけ。
+        self._preview_fullscreen = self.active_side == "right"
+        self._preview_was_maximized = self.isMaximized()
+        if self._preview_fullscreen:
+            self.showFullScreen()
         self.apply_layout()
         self.active.view.setFocus()
-        self.schedule_preview(immediate=True)
+        if self._preview_fullscreen:
+            # 大きさが変わってから読み始める(先に読むと小さい箱で縮められる)
+            QTimer.singleShot(0, lambda: self.preview_on
+                              and self.schedule_preview(immediate=True))
+        else:
+            self.schedule_preview(immediate=True)
 
     def preview_off(self) -> None:
         if not self.preview_on:
             return
         self.preview_on = False
+        if self._preview_fullscreen:
+            self._preview_fullscreen = False
+            if self._preview_was_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
         self._preview_timer.stop()
         with self._preview_lock:
             self._preview_generation += 1   # 待ち行列と読み込み中の結果は捨てる

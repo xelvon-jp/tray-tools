@@ -19,6 +19,11 @@ jobs:
   filer:
     runs-on: windows-latest
     timeout-minutes: 30
+    # windows-latest の標準出力/標準エラーは cp1252 なので、テストが日本語を print した
+    # 時点で UnicodeEncodeError になり、traceback の表示ごと落ちる(10/27 以降の全滅の原因)。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
 

@@ -97,14 +97,16 @@ DEFAULT_COLORS = {
     "system": "#808080",          # システム属性
     "hidden": "#6c6c6c",          # 隠し属性(システムより少し暗く)
     "readonly": "#ff0080",        # 読み込み専用
-    "cursor": "#00ffff",          # アクティブ窓のカーソルの下線(行の背景は塗らない)
+    "cursor": "#bfcddb",          # アクティブ窓のカーソルの下線(行の背景は塗らない。
+                                  # 本人のあふｗ実画面から採取した淡い鋼色 2026-10-29)
     "cursor_inactive": "#2a4a66",  # 非アクティブ窓のカーソルの下線(細く暗く)
     "mark": "#7f7f7f",            # マークした行の背景(左端の色)
     "mark_end": "#0c0c0c",        # マークした行の背景(右端の色。左→右のグラデーション)
     "mark_text": "",              # マーク行の字の色。空ならファイルの種類の色のまま
     "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
     "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログで選んでいる行
-    "header_active": "#1a3a8a",   # アクティブ窓のパス表示の地と枠
+    "header_active": "#00001c",   # アクティブ窓のパス表示の地と枠(あふｗと同じく
+                                  # 帯は付けず地のまま。区別は字の色とカーソルで)
     "header_active_text": "#ffffff",
     "header_inactive": "#00001c",
     "header_inactive_text": "#c0c0c0",
@@ -112,14 +114,14 @@ DEFAULT_COLORS = {
     "isearch": "#ffd400",
     "log_background": "#00001c",
     "log_text": "#f9f9f9",
-    # 窓の一番下のステータスバーと、その上のファンクションキーの段。あふｗは灰色の地に
-    # 黒い字だが、ここではファイラの濃紺の配色に寄せる(filer.colors で灰色にもできる)。
+    # 窓の一番下のステータスバーと、その上のファンクションキーの段。ファンクションキー段は
+    # あふｗと同じ明るい灰色の地に黒い字(2026-10-29、本人の実画面に合わせて寄せた)。
     "stash_background": "#14532d",  # 一時置き場を表示している窓の地(通常の #00001c と見分けがつく緑)
     "status_background": "#16163c",
     "status_text": "#e0e0e8",
-    "fkey_background": "#24244e",
-    "fkey_text": "#e0e0e8",
-    "fkey_border": "#00001c",
+    "fkey_background": "#f0f0f0",   # あふｗのファンクションキー段(明るい灰色に黒字)
+    "fkey_text": "#000000",
+    "fkey_border": "#808080",
 }
 
 # カーソルの下線の太さ(px)。アクティブ窓ははっきり、非アクティブ窓は控えめに。
@@ -536,6 +538,8 @@ class Pane(QWidget):
         self.view.setFocusPolicy(Qt.TabFocus)
         # 横には流さない。入りきらないときは fit_columns が列を減らす。
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 縦は、ファイルが多くて入りきらないときだけバーを出す(あふｗと同じ)。
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.view.verticalHeader().hide()
         self.view.horizontalHeader().hide()
         self.view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
@@ -577,15 +581,13 @@ class Pane(QWidget):
         """一覧の字を差し替える。行の高さと列の幅も字に合わせて測り直す
         (Shift/Ctrl+↑↓ の拡大縮小で、行が重なったり列が欠けたりしないように)。"""
         self.pane_font = QFont(font)
-        for widget in (self.header, self.view):
-            widget.setFont(self.pane_font)
-        # 2行目(ラベル)と下の行はメッセージ窓と同じ基準の字(あふｗも小さい字で出す)。
-        # 高さは字の高さちょうど。
+        self.view.setFont(self.pane_font)
+        # 上のパス行・2行目(ラベル)・下の行は固定の字(10pt)。一覧の拡大縮小に
+        # 連動させない(2026-10-29 要望。あふｗも小さい字で出す)。高さは字の高さちょうど。
         small = self.window_.log_font
-        for widget in (self.header2, self.footer):
+        for widget in (self.header, self.header2, self.footer):
             widget.setFont(small)
             widget.setFixedHeight(QFontMetrics(small).height())
-        self.header.setFixedHeight(QFontMetrics(self.pane_font).height())
         fm = QFontMetrics(self.pane_font)
         # 行の高さは字の高さちょうど(あふｗと同じく行間を空けない)。Qt の行は既定で
         # 字より数px高く、一覧が間延びして見える。最小の高さも外しておかないと縮まない。
@@ -663,7 +665,16 @@ class Pane(QWidget):
         border = c["header_active"] if active else c["header_inactive"]
         self.view.setStyleSheet(
             f"QTableView {{ background-color: {background}; color: {c['text']};"
-            f" border: 2px solid {border}; }}")
+            f" border: 2px solid {border}; }}"
+            # 縦スクロールバーは濃紺の地でも見える色で(素のままだと地に埋もれる)。
+            f" QScrollBar:vertical {{ background-color: {background}; width: 12px;"
+            f" margin: 0px; }}"
+            f" QScrollBar::handle:vertical {{ background-color: #54687f;"
+            f" min-height: 24px; }}"
+            f" QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            f" {{ height: 0px; }}"
+            f" QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+            f" {{ background-color: transparent; }}")
         self.footer.setStyleSheet(
             f"background-color: {background}; color: {c['footer_text']};")
         self.update_header()
@@ -1456,8 +1467,11 @@ class FilerWindow(QWidget):
             side: core.clamp_font_size(section.get(f"{side}_font_size")
                                        or self.list_font.pointSize())
             for side in ("left", "right")}
-        # メッセージ窓の字は一覧の拡大縮小に付いていかない(行数で高さを決めているため)。
+        # 一覧以外の字(メッセージ窓・パス表示・ダイアログ等)は 10pt 固定。一覧の
+        # 拡大縮小(Shift/Ctrl+↑↓)にも、設定の font_size にも付いていかない
+        # (2026-10-29 要望)。
         self.log_font = QFont(self.list_font)
+        self.log_font.setPointSize(10)
 
         self.setWindowTitle("あっふ")
         # アプリ既定(main で設定)に加え窓自体にも付ける。タスクバーが

@@ -71,9 +71,10 @@ def test_keymap_esc_layout_font():
 
 def test_layout_helpers():
     assert core.step_split(0.5, -1) == 0.47 and core.step_split(0.5, 1) == 0.53
-    assert core.step_split(0.16, -1) == core.SPLIT_MIN
-    assert core.step_split(0.84, 1) == 1 - core.SPLIT_MIN
-    assert core.clamp_split("x") == 0.5 and core.clamp_split(5) == 1 - core.SPLIT_MIN
+    # 境界は端まで寄せられる(片方を畳み切れる)
+    assert core.SPLIT_MIN == 0.0
+    assert core.step_split(0.02, -1) == 0.0 and core.step_split(0.98, 1) == 1.0
+    assert core.clamp_split("x") == 0.5 and core.clamp_split(5) == 1.0
     assert core.clamp_log_lines(0, 10) == 1 and core.clamp_log_lines(30, 10) == 10
     assert core.clamp_log_lines("bad", 10) == core.DEFAULT_LOG_LINES
     assert core.clamp_log_lines(5, 0) == 1
@@ -1990,7 +1991,11 @@ def test_window_layout_and_font():
         assert w.split_ratio == 0.47
         for _ in range(30):
             key(Qt.Key_Left, Qt.AltModifier)
-        assert w.split_ratio == core.SPLIT_MIN          # 端に寄りすぎない
+        assert w.split_ratio == core.SPLIT_MIN == 0.0   # 端まで寄せられる
+        assert w.hsplit.sizes()[0] <= 4                 # 左窓が畳み切れる
+        for _ in range(16):
+            key(Qt.Key_Right, Qt.AltModifier)
+        assert w.split_ratio == 0.48                    # 戻しても普通に動く
 
         log0 = w.log_view.height()
         key(Qt.Key_Up, Qt.AltModifier)                  # メッセージ窓を大きく
@@ -2012,6 +2017,10 @@ def test_window_layout_and_font():
         key(Qt.Key_Down, Qt.ShiftModifier)
         assert w.left.pane_font.pointSize() == 12
         assert w.left.view.font().pointSize() == 12
+        # 一覧以外(パス行・ラベル行・メッセージ窓)は 10pt 固定で連動しない
+        assert w.left.header.font().pointSize() == 10
+        assert w.left.header2.font().pointSize() == 10
+        assert w.log_font.pointSize() == 10
         assert w.left.view.verticalHeader().defaultSectionSize() > row_h
         assert w.right.pane_font.pointSize() == 10      # 反対窓には効かない
         assert w.right.view.font().pointSize() == 10
@@ -4077,6 +4086,37 @@ def test_preview_esc_and_image_enter():
             L.set_cursor(L._row_of("pic2.png"))
             key(Qt.Key_Return)
             assert not w.preview_on and w.preview_widget is None
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_window_vertical_scrollbar():
+    """ファイルが多くて入りきらないときは縦スクロールバーが出る(あふｗと同じ)。
+
+    少ないときは出ない(AsNeeded)。"""
+    import filer
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for i in range(200):
+            (left / f"bulk{i:03}.txt").write_text("x", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 500)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            bar = w.left.view.verticalScrollBar()
+            assert w.left.view.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+            assert bar.maximum() > 0                    # 200件は入りきらない
+            assert w.right.view.verticalScrollBar().maximum() == 0   # こちらは入る
         finally:
             w.close()
             w.deleteLater()

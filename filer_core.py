@@ -138,7 +138,7 @@ DEFAULT_KEYMAP = {
 # ---------------------------------------------------------------
 DEFAULT_SPLIT_RATIO = 0.5
 SPLIT_STEP = 0.03          # Alt+←→ 1回で動かす割合(窓幅の3%)
-SPLIT_MIN = 0.15           # 片方の窓がこれより細くならない
+SPLIT_MIN = 0.0            # 境界は窓の端まで寄せられる(片方を畳み切れる。2026-10-29 要望)
 DEFAULT_LOG_LINES = 5
 LOG_LINES_MIN = 1
 DEFAULT_FONT_SIZE = 10

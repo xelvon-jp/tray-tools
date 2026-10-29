@@ -4097,6 +4097,15 @@ def test_preview_image_lr_keys():
             assert w.active_side == "left"   # 窓の切り替えにはならない
             key(Qt.Key_Left)           # ← 前のファイルへ
             assert L.cursor_row() == row
+            # 画像でないファイルの上でも、プレビュー中の → はファイル移動の
+            # まま(窓の切り替えになってプレビューが終わらない。混在フォルダ用)
+            L.set_cursor(L._row_of("alpha.txt"))
+            result = _wait_preview(w, "alpha.txt")
+            assert result["kind"] == "text"
+            row = L.cursor_row()
+            key(Qt.Key_Right)
+            assert L.cursor_row() == row + 1 and w.preview_on
+            assert w.active_side == "left"
             # プレビューを閉じたら → は従来どおり右窓への切り替え
             key(Qt.Key_Escape)
             assert not w.preview_on

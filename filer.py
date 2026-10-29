@@ -2163,11 +2163,13 @@ class FilerWindow(QWidget):
                 QGuiApplication.clipboard().setText(
                     core.log_selection_text(cursor.selectedText()))
                 return
-        # 画像ビューア(プレビューで画像を表示中)は、本家と同じく ←→ で
-        # 前・次のファイルへ移る。←→ の通常の割当(窓の切り替え)より優先。
+        # プレビュー中は、本家ビューアと同じく ←→ で前・次のファイルへ移る。
+        # ←→ の通常の割当(窓の切り替え)より優先。もとは「画像を表示中」だけ
+        # だったが、画像とそれ以外が混ざるフォルダでは、画像でないファイルに
+        # 差しかかった途端に → が窓の切り替えになってプレビューが意図せず
+        # 終わってしまった(2026-10-29 指摘)。種類によらず効かせる。
         if (self.preview_on and not (shift or ctrl or alt)
-                and event.key() in (Qt.Key_Left, Qt.Key_Right)
-                and self._preview_showing_image(pane)):
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)):
             pane.set_cursor(pane.cursor_row()
                             + (1 if event.key() == Qt.Key_Right else -1))
             return
@@ -2182,18 +2184,6 @@ class FilerWindow(QWidget):
         char = core.initial_jump_char(vk, shift, ctrl, alt)
         if char is not None and code not in self.disabled_keys:
             self.jump_initial(char)
-
-    def _preview_showing_image(self, pane) -> bool:
-        """プレビューが画像を出しているか。カーソル下が画像のときと、
-        表示中の結果が画像のとき(読み替えの途中)のどちらかで判定する。"""
-        if not self.preview_on:
-            return False
-        if core.preview_kind(pane.cursor_entry(),
-                             self.viewer_extensions) == "image":
-            return True
-        widget = self.preview_widget
-        return bool(widget is not None and widget.last
-                    and widget.last.get("image") is not None)
 
     def jump_initial(self, char: str) -> None:
         pane = self.active

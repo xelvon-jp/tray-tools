@@ -2959,6 +2959,10 @@ class FilerWindow(QWidget):
         # 2026-10-29 要望)。左窓からのときは従来どおり反対窓の場所だけ。
         self._preview_fullscreen = self.active_side == "right"
         self._preview_was_maximized = self.isMaximized()
+        # 戻す先は自分で控える。showNormal() 任せだと、Qt が控えた大きさを失って
+        # 画面いっぱいのまま戻ることがある(offscreen のテストで実際に起きた)。
+        self._preview_normal_geometry = (
+            None if self._preview_was_maximized else self.geometry())
         if self._preview_fullscreen:
             self.showFullScreen()
         self.apply_layout()
@@ -2980,6 +2984,9 @@ class FilerWindow(QWidget):
                 self.showMaximized()
             else:
                 self.showNormal()
+                saved = getattr(self, "_preview_normal_geometry", None)
+                if saved is not None and saved.isValid():
+                    self.setGeometry(saved)
         self._preview_timer.stop()
         with self._preview_lock:
             self._preview_generation += 1   # 待ち行列と読み込み中の結果は捨てる

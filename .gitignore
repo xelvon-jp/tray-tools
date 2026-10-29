@@ -10,6 +10,10 @@ settings.json
 __pycache__/
 *.pyc
 
+# あっふのアイコンは起動時にコードから生成される(icons/affx.ico)。
+# 生成物なので追跡しない。
+icons/affx.ico
+
 # venv は %USERPROFILE%\.venvs\tray-tools に作る。中に作られた場合の保険。
 venv/
 .venv/

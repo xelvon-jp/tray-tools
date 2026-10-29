@@ -1479,6 +1479,15 @@ class FilerWindow(QWidget):
         # 窓の配分(Alt+←→ / Alt+↑↓ / 境界のドラッグ)。閉じるときに保存する。
         self.split_ratio = core.clamp_split(section.get("split_ratio", core.DEFAULT_SPLIT_RATIO))
         self.log_lines = core.clamp_log_lines(section.get("log_lines", core.DEFAULT_LOG_LINES), 99)
+        # ネットワークのフォルダの自動監視は間隔を空ける(2秒ごとの走査が
+        # 通信を出し続けるため)。filer.watch_network_seconds で変更可。
+        try:
+            self.watch_network_seconds = min(
+                120.0, max(2.0, float(section.get("watch_network_seconds") or 10.0)))
+        except (TypeError, ValueError):
+            self.watch_network_seconds = 10.0
+        self._watch_network_at = {}   # side -> 最後にネットワーク側を見た時刻
+        self._network_drive_cache = {}  # ドライブの根 -> ネットワークかどうか
         # 書庫の展開中(進捗の窓が出ている間)。重ねて始めない。
         self._extracting = None
         # Shift+Z の「隠しファイル / システムファイルを表示する」。既定はどちらも表示。
@@ -1755,6 +1764,18 @@ class FilerWindow(QWidget):
             _log_exception("preload")
 
     # --- フォルダの自動監視 ---
+    def _is_network_cached(self, path) -> bool:
+        """そのパスがネットワーク側かどうか(ドライブごとに覚える)。
+
+        GetDriveTypeW を2秒ごとに呼ぶのを避けるためのキャッシュ。
+        UNC はドライブを経ないので、そのまま判定する。"""
+        if str(path).startswith("\\\\"):
+            return True
+        root = os.path.splitdrive(os.path.abspath(str(path)))[0]
+        if root not in self._network_drive_cache:
+            self._network_drive_cache[root] = filer_shell.is_network_path(path)
+        return self._network_drive_cache[root]
+
     def _watch_tick(self) -> None:
         """タイマーから。監視できる状態の窓があれば、指紋を取りに別スレッドを出す。
 
@@ -1773,10 +1794,16 @@ class FilerWindow(QWidget):
             if QApplication.mouseButtons() != Qt.NoButton:
                 return
             targets = []
+            now = time.monotonic()
             for pane in (self.left, self.right):
                 if (pane.path and pane.archive is None and not pane.flat
                         and pane.grep_query is None and not pane.loading
                         and not pane.flat_loading and not pane.grep_loading):
+                    if self._is_network_cached(pane.path):
+                        last = self._watch_network_at.get(pane.side, 0.0)
+                        if now - last < self.watch_network_seconds:
+                            continue        # ネットワーク側は間隔を空ける
+                        self._watch_network_at[pane.side] = now
                     targets.append((pane.side, pane.path))
             if not targets:
                 return

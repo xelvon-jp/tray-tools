@@ -19,6 +19,27 @@ from ctypes import wintypes
 
 import filer_core
 
+
+def is_network_path(path) -> bool:
+    """ネットワークの場所(UNC、またはネットワークドライブ)かどうか。
+
+    フォルダの自動監視の間隔を空ける判定に使う。ドライブ種別の取得は
+    軽いが、呼び出し側ではドライブごとに覚えて毎回は呼ばないこと。"""
+    try:
+        if not path:
+            return False
+        if str(path).startswith("\\\\"):
+            return True
+        root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
+        if not root.strip("\\"):
+            return False
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetDriveTypeW.restype = ctypes.c_uint
+        return kernel32.GetDriveTypeW(root) == 4  # DRIVE_REMOTE
+    except Exception:  # noqa: BLE001  判定できなければローカルとして扱う
+        return False
+
 # ---------------------------------------------------------------
 # SHFileOperationW
 # ---------------------------------------------------------------

@@ -874,6 +874,19 @@ def _quiet_flags():
     return sh.FOF_NOCONFIRMATION | sh.FOF_SILENT | sh.FOF_NOERRORUI
 
 
+def test_is_network_path():
+    """ネットワークの場所の判定: UNC は即ネットワーク。ローカルの
+    ドライブはネットワークではない(ドライブ種別で見る)。"""
+    import filer_shell as sh
+
+    assert sh.is_network_path("\\\\server\\share\\dir") is True
+    assert sh.is_network_path("") is False
+    assert sh.is_network_path(None) is False
+    import os
+    local_root = os.path.splitdrive(os.path.abspath(os.sep))[0] + "\\"
+    assert sh.is_network_path(local_root) is False
+
+
 def test_shell_copy_move_delete():
     import filer_shell as sh
     with tempfile.TemporaryDirectory() as tmp:

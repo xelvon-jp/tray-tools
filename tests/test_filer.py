@@ -238,6 +238,14 @@ def test_sync_sources():
     # 許容誤差を狭めれば、誤差の外に出た near(1.5秒新しい)も対象になる
     assert [e.name for e in core.sync_sources(mine, theirs, tolerance=1)] == [
         "newer.txt", "near.txt", "diff.txt", "only_here.txt", "only_dir"]
+    # サイズが違っても、相手のほうが新しければ送らない(古いもので
+    # 新しいものを上書きしない)。時刻が誤差の範囲内ならサイズ違いは送る。
+    mine2 = [F("stale_big.txt", 99, 50), F("resized.txt", 99, 101),
+             F("fresh_same.txt", 10, 300)]
+    theirs2 = [F("stale_big.txt", 10, 100), F("resized.txt", 10, 100),
+               F("fresh_same.txt", 10, 100)]
+    assert [e.name for e in core.sync_sources(mine2, theirs2)] == [
+        "resized.txt", "fresh_same.txt"]
     assert core.DEFAULT_KEYMAP["1087"] == "sync_copy"
     assert "sync_copy" in core.COMMANDS
     assert core.COMMAND_SHORT_NAMES["sync_copy"] == "Sync"

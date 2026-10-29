@@ -1497,8 +1497,14 @@ def sync_sources(mine, theirs, tolerance=DEFAULT_TIME_TOLERANCE) -> list:
         if other is None:
             result.append(e)
         elif not e.is_dir and not other.is_dir:
-            if (e.size != other.size
-                    or (e.mtime - other.mtime) > abs(tolerance or 0.0)):
+            tol = abs(tolerance or 0.0)
+            newer = (e.mtime - other.mtime) > tol      # こちらがはっきり新しい
+            older = (other.mtime - e.mtime) > tol      # 相手がはっきり新しい
+            # サイズが違うだけでは送らない。相手のほうが新しいものを
+            # 古いこちらで上書きしてしまうため(以前はサイズ違いなら
+            # 無条件で送っていた)。時刻が誤差の範囲内なら、サイズ違いを
+            # 「中身が変わった」とみなして送る。
+            if newer or (e.size != other.size and not older):
                 result.append(e)
     return result
 

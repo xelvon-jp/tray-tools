@@ -2151,6 +2151,9 @@ class FilerWindow(QWidget):
         if event.key() == Qt.Key_Escape and self.preview_on:
             self.preview_off()      # Esc はプレビュー(F3)を抜ける
             return
+        if event.key() == Qt.Key_Backspace and self.preview_on:
+            self.preview_off()      # ビューア(プレビュー)中の BS もプレビューを抜ける
+            return                  # (親フォルダへは行かない。2026-10-29 要望)
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
@@ -2291,6 +2294,8 @@ class FilerWindow(QWidget):
             return
         parent = core.parent_of(pane.path)
         if parent is None:
+            # ドライブのルートでは、BS でドライブの選択へ(2026-10-29 要望)。
+            self.cmd_drive()
             return
         # 親に移ったら、いま居たフォルダにカーソルを合わせる(あふｗと同じ)。
         pane.load(parent, focus=os.path.basename(core.normalize_dir(pane.path)))

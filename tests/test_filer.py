@@ -3994,10 +3994,16 @@ def test_window_preview():
             L.set_cursor(L._row_of("readme.txt"))
             result = _wait_preview(w, "readme.txt")
             assert result["lines"] == ["hello"]
-            # キーはアクティブ窓に効いたまま(プレビュー中もカーソルが動く)
+            # プレビュー中の BS は、まずプレビューを抜ける(書庫は開いたまま)
             key(Qt.Key_Backspace)
             _wait(w)
-            assert L.archive is None and w.preview_on
+            assert not w.preview_on and L.archive is not None
+            # プレビューを抜けた後の BS で書庫を出る
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert L.archive is None
+            key(Qt.Key_F3)      # 後段のためにプレビューを開き直す
+            assert w.preview_on
             # プレビューの側へ移ろうとしたら、プレビューを終えてその窓へ
             key(Qt.Key_Tab)
             assert not w.preview_on and w.active_side == "right" and R.isVisible()
@@ -4133,6 +4139,46 @@ def test_preview_image_lr_keys():
             assert not w.preview_on
             key(Qt.Key_Right)
             assert w.active_side == "right"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_window_bs_at_drive_root():
+    """ドライブのルートで BS を押すと、ドライブの選択が開く。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k: QTest.keyClick(L.view, k)  # noqa: E731
+        calls = []
+        w.cmd_drive = lambda: calls.append(1)
+        try:
+            # ルートでない所の BS は従来どおり親へ(ドライブ選択は開かない)
+            L.load(str(left / "sub1"))
+            _wait(w)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert core.same_dir(L.path, str(left)) and not calls
+            # ルートの BS はドライブ選択へ(移動はしない)
+            root = os.path.splitdrive(str(left))[0] + "\\"
+            L.load(root)
+            _wait(w)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert calls == [1] and core.same_dir(L.path, root)
         finally:
             w.close()
             w.deleteLater()

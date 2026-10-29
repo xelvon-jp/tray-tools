@@ -199,6 +199,32 @@ def _log_exception(where: str) -> str:
     return f"{exc_type.__name__}: {exc_value}" if exc_type else "unknown error"
 
 
+def _thread_com_init() -> bool:
+    """このスレッドで COM(STA) を初期化する。初期化できた(または
+    初期化済みだった)なら True を返し、呼び出し側は対で
+    _thread_com_uninit() を呼ぶ。モード違いで初期化できなかった
+    (RPC_E_CHANGED_MODE)ときは False(戻す対が無い)。"""
+    try:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        ole32.CoInitializeEx.restype = ctypes.c_long  # HRESULT
+        # COINIT_APARTMENTTHREADED(0x2) | COINIT_DISABLE_OLE1DDE(0x4)
+        hr = ole32.CoInitializeEx(None, 0x2 | 0x4)
+        return hr in (0, 1)  # S_OK / S_FALSE
+    except Exception:  # noqa: BLE001  初期化できなくても転送自体は試す
+        return False
+
+
+def _thread_com_uninit() -> None:
+    try:
+        ole32 = ctypes.windll.ole32
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        ole32.CoUninitialize()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _section(app_settings) -> dict:
     section = (app_settings or {}).get(SETTINGS_SECTION)
     return section if isinstance(section, dict) else {}
@@ -3171,11 +3197,19 @@ class FilerWindow(QWidget):
         hwnd, flags = self._hwnd(), self.extra_op_flags
 
         def worker():
+            # シェルのファイル操作は、呼び出しスレッドで COM(STA)が
+            # 初期化されている前提。UI スレッド以外から呼ぶので、ここで
+            # 初期化して対で戻す(ごみ箱やコピーフック等のシェル拡張が
+            # 絡むときに効く)。
+            com_ready = _thread_com_init()
             try:
                 result = func(op["paths"], op["dest"], hwnd, flags)
             except Exception:  # noqa: BLE001  結果として戻し、窓は落とさない
                 _log_exception("transfer worker")
                 result = (0x80004005, False)  # E_FAIL として失敗の形に寄せる
+            finally:
+                if com_ready:
+                    _thread_com_uninit()
             self.bridge.op_done.emit((op, result))
 
         threading.Thread(target=worker, daemon=True, name="filer-transfer").start()

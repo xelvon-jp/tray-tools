@@ -593,6 +593,57 @@ def test_transfer_cursor_follows_to_other_pane():
             w.deleteLater()
 
 
+def test_window_transfer_com_init():
+    """転送キューの裏スレッドは、シェル操作の前に COM(STA) を初期化し、
+    終わったら対で戻す(初期化 → 転送 → 後始末 の順で各1回)。"""
+    import ctypes
+
+    import filer
+    import filer_shell as sh
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        calls = []
+        ole32 = ctypes.windll.ole32
+        orig_init, orig_uninit = ole32.CoInitializeEx, ole32.CoUninitialize
+        orig_copy = sh.copy_files
+
+        def fake_init(ptr, flags):
+            calls.append(("init", ptr, flags))
+            return 0  # S_OK
+
+        def fake_copy(paths, dest, hwnd, flags):
+            calls.append(("copy",))
+            return (0, False)
+
+        ole32.CoInitializeEx = fake_init
+        ole32.CoUninitialize = lambda: calls.append(("uninit",))
+        sh.copy_files = fake_copy
+        try:
+            w._enqueue_transfer(False, [str(left / "alpha.txt")], L, R)
+            for _ in range(100):
+                QTest.qWait(20)
+                if w._op_running is None and not w._op_queue:
+                    break
+        finally:
+            ole32.CoInitializeEx, ole32.CoUninitialize = orig_init, orig_uninit
+            sh.copy_files = orig_copy
+        assert calls == [("init", None, 0x2 | 0x4), ("copy",), ("uninit",)], calls
+        w.close()
+        w.deleteLater()
+
+
 def test_window_transfer_queue():
     """転送キュー(案A): 積んだ順に裏で実行され、Shift+Q で待ちだけを
     取り消せる。実行中の1件は取り消されずに完了する。"""

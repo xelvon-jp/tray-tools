@@ -36,4 +36,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: ファイラのテスト
+        # 既定の pwsh だと、テストが全部通って python が 0 で終わっても、ステップが
+        # exit code 1 で失敗扱いになっていた(10/27 から続いていた。手元で同じ条件に
+        # すると python の終了コードは 0)。cmd なら python の終了コードがそのまま
+        # ステップの結果になる。
+        shell: cmd
         run: python tests/test_filer.py

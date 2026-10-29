@@ -1563,7 +1563,9 @@ class FilerWindow(QWidget):
         root.setSpacing(0)
         self.vsplit = QSplitter(Qt.Vertical, self)
         self.hsplit = QSplitter(Qt.Horizontal, self.vsplit)
-        self.hsplit.setChildrenCollapsible(False)
+        # 境界は窓の端まで寄せられる(片方を畳み切るのも可。2026-10-29 要望)。
+        # False だと各窓の最小サイズで止まってしまい、端まで寄せられない。
+        self.hsplit.setChildrenCollapsible(True)
         self.vsplit.setChildrenCollapsible(False)
         self.hsplit.setHandleWidth(4)
         self.vsplit.setHandleWidth(4)

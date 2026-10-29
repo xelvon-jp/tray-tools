@@ -170,19 +170,31 @@ def test_saved_notes_rect():
 
 
 def test_pill_geometry():
-    """再開ボタンは画面(タスクバーを除いた範囲)の左下に、余白を空けて置く。"""
-    g = sm.pill_geometry(QRect(0, 0, 1920, 1040))
+    """再開ボタンは画面(タスクバーを除いた範囲)の左下に、余白を空けて置く。
+
+    下の余白は「下端同士の距離」で見る。QRect.bottom() は両端を含む
+    座標(top+height-1)なので、範囲の高さから引く書き方だと 1px ずれる。"""
+    area = QRect(0, 0, 1920, 1040)
+    g = sm.pill_geometry(area)
     assert (g.width(), g.height()) == (sm.PILL_WIDTH, sm.PILL_HEIGHT)
-    assert g.left() == sm.PILL_MARGIN
-    assert g.bottom() == 1040 - sm.PILL_MARGIN
-    g = sm.pill_geometry(QRect(100, 50, 1280, 720))
-    assert g.left() == 100 + sm.PILL_MARGIN
-    assert g.bottom() == 50 + 720 - sm.PILL_MARGIN
+    assert g.left() - area.left() == sm.PILL_MARGIN
+    assert area.bottom() - g.bottom() == sm.PILL_MARGIN
+    area = QRect(100, 50, 1280, 720)
+    g = sm.pill_geometry(area)
+    assert g.left() - area.left() == sm.PILL_MARGIN
+    assert area.bottom() - g.bottom() == sm.PILL_MARGIN
 
 
 def test_minimize_restore():
     """最小化: 静止+道具が隠れる+ボタンが出る。再開で全部戻って静止が解ける。
     最小化中の静止解除は「戻る」として扱い、終了でボタンも畳む。"""
+    # 再開ボタンは本物の窓なので QApplication が要る。このファイルの
+    # 実行順(名前順)では test_saved_notes_rect より先に走るため、他の
+    # テストが作ったアプリに頼らず自分で用意する(単体では通るのに
+    # ファイル全体で落ちていた原因)。
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
     controller = sm.MirrorController({"screen_mirror": {}}, "x",
                                      lambda *args: None)
 

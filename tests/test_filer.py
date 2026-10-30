@@ -4433,11 +4433,12 @@ def test_window_bs_at_drive_root():
             w.deleteLater()
 
 
-def test_preview_shows_every_image_in_order():
-    """プレビューは、カーソルが通り過ぎた画像も飛ばさず順番に全部出す。
+def test_preview_catches_up_with_cursor():
+    """プレビューは、カーソルを素早く動かしても最後はカーソルの画像で止まる。
 
-    待ち行列方式の確認: 素早くカーソルを進めても、表示された題名の並びが
-    通った順と一致し、最後はカーソルの画像で止まる(2026-10-27 ユーザー要望)。"""
+    まだ読み始めていない古い要求は捨てて最新だけ読む(2026-10-31 に「行列で
+    全部出す」から変更。長押しは読み込み中のオートリピートを捨てて抑えるので、
+    通り過ぎる画像が無くなった)。出た順は通った順のまま(逆戻りしない)。"""
     import filer
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QImage
@@ -4475,18 +4476,377 @@ def test_preview_shows_every_image_in_order():
                 real_show(result)
 
             w.preview_widget.show_result = record
-            # いったん先頭(..)へ戻してから、間を空けずに最後まで進める
-            # (長押しで通り過ぎる動き)
             L.set_cursor(L._row_of(".."))
             for name in names:
                 L.set_cursor(L._row_of(name))
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 QTest.qWait(30)
-                if shown and shown[-1] == names[-1]:
+                if shown and shown[-1] == names[-1] and w._image_wait_seq is None:
                     break
-            deduped = [t for i, t in enumerate(shown) if i == 0 or t != shown[i - 1]]
-            assert deduped == names, shown
+            assert shown and shown[-1] == names[-1], shown
+            order = [names.index(t) for t in shown]
+            assert order == sorted(order), shown
+            assert w._image_wait_seq is None
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def _repeat_key(widget, key, modifiers=None):
+    """オートリピート(押しっぱなし)のキーを1つ送る。"""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    event = QKeyEvent(QEvent.KeyPress, key, modifiers or Qt.NoModifier, "", True)
+    QApplication.sendEvent(widget, event)
+
+
+def test_preview_image_repeat_waits_for_display():
+    """画像の読み込み中は、オートリピートのカーソル移動を捨てる(長押しの速さ =
+    画像を出せる速さ。カーソルと表示がずれない)。単発の押下は受ける。閉じたら・
+    失敗したら・上限時間を過ぎたら解ける。テキストのプレビューでは捨てない。"""
+    import filer
+    import filer_preview
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        pics = Path(tmp, "pics")
+        pics.mkdir()
+        names = [f"img{i:02d}.png" for i in range(1, 8)]
+        img = QImage(200, 100, QImage.Format_RGB32)
+        for i, name in enumerate(names):
+            img.fill(QColor.fromHsv(i * 40, 200, 200))
+            assert img.save(str(pics / name))
+        for i in range(3):
+            Path(pics, f"t{i}.txt").write_text("x\n", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(pics), "right_path": tmp,
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        real_load = filer_preview.load_preview
+        gate = threading.Event()
+        gate.set()
+
+        def slow_load(*args, **kwargs):
+            gate.wait(10)
+            return real_load(*args, **kwargs)
+        filer_preview.load_preview = slow_load
+        try:
+            L.set_cursor(L._row_of(names[0]))
+            QTest.keyClick(L.view, Qt.Key_F3)
+            _wait_preview(w, names[0])
+            _wait_until(lambda: w._image_wait_seq is None)
+            gate.clear()                              # ここから読み込みが終わらない
+            QTest.keyClick(L.view, Qt.Key_Down)       # 単発は受ける
+            assert L.cursor_entry().name == names[1]
+            assert w._image_wait_seq is not None
+            _repeat_key(L.view, Qt.Key_Down)          # 読み込み中のリピートは捨てる
+            _repeat_key(L.view, Qt.Key_PageDown)
+            _repeat_key(L.view, Qt.Key_Right)         # 画像の ←→ も同じ
+            assert L.cursor_entry().name == names[1]
+            QTest.keyClick(L.view, Qt.Key_Down)       # 単発はやはり受ける
+            assert L.cursor_entry().name == names[2]
+            gate.set()                                # 表示が終われば
+            _wait_until(lambda: w._image_wait_seq is None)
+            assert w.preview_widget.last["title"] == names[2]   # カーソルと表示が一致
+            _repeat_key(L.view, Qt.Key_Down)          # 次のリピートで1つ進む
+            assert L.cursor_entry().name == names[3]
+            _wait_until(lambda: w._image_wait_seq is None)
+            # 読み込みに失敗しても解ける
+            filer_preview.load_preview = lambda *a, **k: (_ for _ in ()).throw(OSError("壊れ"))
+            _repeat_key(L.view, Qt.Key_Down)
+            assert L.cursor_entry().name == names[4]
+            _wait_until(lambda: w._image_wait_seq is None)
+            assert w.preview_widget.last["kind"] == "info"
+            filer_preview.load_preview = slow_load
+            # 上限時間を過ぎたら、読み込み中でもリピートを受ける(固まらない保険)
+            gate.clear()
+            QTest.keyClick(L.view, Qt.Key_Down)
+            assert L.cursor_entry().name == names[5] and w._image_wait_seq is not None
+            w._image_wait_since -= filer.IMAGE_WAIT_LIMIT + 1
+            _repeat_key(L.view, Qt.Key_Down)
+            assert L.cursor_entry().name == names[6]
+            # 閉じたら解ける
+            assert w._image_wait_seq is not None
+            QTest.keyClick(L.view, Qt.Key_Escape)
+            assert not w.preview_on and w._image_wait_seq is None
+            _repeat_key(L.view, Qt.Key_Up)           # プレビューを閉じればリピートは普通に効く
+            assert L.cursor_entry().name == names[5]
+            gate.set()
+            QTest.qWait(100)
+            # テキストのプレビューでは捨てない(従来の遅延タイマーのまま)
+            L.set_cursor(L._row_of("t0.txt"))
+            QTest.keyClick(L.view, Qt.Key_F3)
+            _repeat_key(L.view, Qt.Key_Down)
+            _repeat_key(L.view, Qt.Key_Down)
+            assert L.cursor_entry().name == "t2.txt" and w._image_wait_seq is None
+            QTest.keyClick(L.view, Qt.Key_Escape)
+        finally:
+            gate.set()
+            filer_preview.load_preview = real_load
+            w.close()
+            w.deleteLater()
+
+
+def _quadrants(image):
+    """絵の4隅寄り(左上・右上・左下・右下)の色。向きの判定に使う。"""
+    w, h = image.width(), image.height()
+    points = [(w // 4, h // 4), (3 * w // 4, h // 4), (w // 4, 3 * h // 4), (3 * w // 4, 3 * h // 4)]
+    result = []
+    for x, y in points:
+        c = image.pixelColor(x, y)
+        result.append((c.red(), c.green(), c.blue()))
+    return result
+
+
+def _pil_quadrants(pil):
+    w, h = pil.size
+    points = [(w // 4, h // 4), (3 * w // 4, h // 4), (w // 4, 3 * h // 4), (3 * w // 4, 3 * h // 4)]
+    return [pil.getpixel(p)[:3] for p in points]
+
+
+def _close_colors(a, b, tolerance=60):
+    return all(abs(x - y) <= tolerance for ca, cb in zip(a, b) for x, y in zip(ca, cb))
+
+
+def _quad_image(size=(160, 80)):
+    """4つの区画が違う色の絵(どの向き・裏返しでも見分けられる)。"""
+    from PIL import Image as PilImage
+    w, h = size
+    pil = PilImage.new("RGB", size)
+    colors = [(230, 30, 30), (30, 200, 30), (30, 30, 230), (240, 240, 240)]
+    for i, color in enumerate(colors):
+        x0, y0 = (i % 2) * w // 2, (i // 2) * h // 2
+        pil.paste(color, (x0, y0, x0 + w // 2, y0 + h // 2))
+    return pil
+
+
+def test_image_turn_logic():
+    """R / L / H / V と回転固定(Shift+R / Shift+L)の状態の動き。"""
+    t = core.ImageTurn()
+    ident = core.TURN_IDENTITY
+    t.press("R")
+    assert t.turn == core.TURN_OPS["R"] and core.turn_label(t.turn) == "右90°"
+    assert core.turn_swaps_size(t.turn)
+    t.press("R")
+    assert core.turn_label(t.turn) == "180°" and not core.turn_swaps_size(t.turn)
+    t.press("L")
+    t.press("L")
+    assert t.turn == ident and core.turn_label(ident) == ""
+    for _ in range(4):
+        t.press("L")
+    assert t.turn == ident
+    t.press("H")
+    assert core.turn_label(t.turn) == "左右反転"
+    t.press("H")
+    t.press("V")
+    assert core.turn_label(t.turn) == "上下反転"
+    t.press("V")
+    t.press("R")
+    t.press("H")       # 右に回してから(見た目を)左右反転
+    assert core.turn_label(t.turn) == "右90°+左右反転"
+    t.reset()
+    # 固定していなければ、別のファイルへ移ると戻る
+    t.on_path("a")
+    t.press("R")
+    assert not t.on_path("a") and t.turn != ident       # 同じファイルの読み直しでは戻さない
+    assert t.on_path("b") and t.turn == ident
+    # Shift+R: 右に回して固定。次のファイルでも同じ向き。もう一度で解除して元の向き
+    t.press("R", shift=True)
+    assert t.lock == "R" and t.suffix() == "_R" and t.turn == core.TURN_OPS["R"]
+    assert not t.on_path("c") and t.turn == core.TURN_OPS["R"]
+    t.press("R", shift=True)
+    assert t.lock is None and t.suffix() == "" and t.turn == ident
+    # 固定中に逆の Shift+L: 戻して解除
+    t.press("R", shift=True)
+    t.press("L", shift=True)
+    assert t.lock is None and t.turn == ident
+    t.press("L", shift=True)
+    assert t.lock == "L" and t.suffix() == "_L" and core.turn_label(t.turn) == "左90°"
+    # 固定中の R / H は固定したまま向きを変え、次のファイルにも持ち越す
+    t.press("R")
+    t.press("H")
+    assert t.lock == "L" and core.turn_label(t.turn) == "左右反転"
+    t.on_path("d")
+    assert core.turn_label(t.turn) == "左右反転"
+    t.press("H", shift=True)           # Shift+H は回転固定ではない(何もしない)
+    assert t.lock == "L"
+    t.reset()
+    assert t.turn == ident and t.lock is None
+    # EXIF の表は8通りすべてが別の向き
+    assert len(set(core.EXIF_ORIENTATION_TURNS.values())) == 8
+    assert all(core.turn_label(m) or m == ident for m in core.EXIF_ORIENTATION_TURNS.values())
+
+
+def test_preview_exif_orientation_all_formats():
+    """EXIF の向き(1〜8)が、JPEG(Qt の自動回転)・PNG / WebP(Qt は読まないので自前)の
+    どれでも正しく当たる。Pillow の exif_transpose と色の並びで比べる。縮めて読んでも同じ。"""
+    import filer_preview
+    from PIL import Image as PilImage, ImageOps
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = _quad_image()
+        for ext, options in (("jpg", {"quality": 95}), ("png", {}), ("webp", {"lossless": True})):
+            for orientation in range(1, 9):
+                path = Path(tmp, f"o{orientation}.{ext}")
+                exif = PilImage.Exif()
+                exif[274] = orientation
+                base.save(str(path), exif=exif.tobytes(), **options)
+                with PilImage.open(path) as opened:
+                    expected = ImageOps.exif_transpose(opened).convert("RGB")
+                for box in ((1000, 1000), (40, 40)):
+                    result = filer_preview.load_preview(str(path), "image", F(path.name), box=box)
+                    image = result["image"]
+                    assert image is not None and not image.isNull(), (ext, orientation, result)
+                    landscape = expected.size[0] > expected.size[1]
+                    assert (image.width() > image.height()) == landscape, (ext, orientation, box)
+                    assert image.width() <= box[0] and image.height() <= box[1]
+                    assert _close_colors(_quadrants(image), _pil_quadrants(expected)), \
+                        (ext, orientation, box, _quadrants(image), _pil_quadrants(expected))
+                    # 見出しの大きさは表示の向きで
+                    assert result["note"] == f"{expected.size[0]}×{expected.size[1]}", result["note"]
+        assert core.container_exif_orientation(str(Path(tmp, "o6.png"))) == 6
+        assert core.container_exif_orientation(str(Path(tmp, "o8.webp"))) == 8
+        plain = Path(tmp, "plain.png")
+        base.save(str(plain))
+        assert core.container_exif_orientation(str(plain)) == 1
+        assert core.container_exif_orientation(str(Path(tmp, "none.png"))) == 1   # 無いファイル
+        assert core.exif_orientation_from_tiff(b"") == 1
+        assert core.exif_orientation_from_tiff(b"Exif\0\0MM\0*\0\0\0\x08\0\x01"
+                                               b"\x01\x12\0\x03\0\0\0\x01\0\x03\0\0") == 3
+
+
+def test_preview_image_rotate_keys():
+    """画像ビュアの R / L / H / V と回転固定。表示だけ回してファイルは書き換えない。
+    画像ビュアの外(一覧・テキストのプレビュー)では R / L / H / V は従来どおり。
+    右窓からの全画面(画像で Enter)でも EXIF の自動回転と手動回転が効く。"""
+    import filer
+    from PIL import Image as PilImage
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name in ("p1.png", "p2.png", "p3.png"):
+            _quad_image().save(str(left / name))
+        stamps = {name: (left / name).read_bytes() for name in ("p1.png", "p2.png", "p3.png")}
+        exif = PilImage.Exif()
+        exif[274] = 6
+        _quad_image((400, 300)).save(str(right / "cam.jpg"), exif=exif.tobytes(), quality=95)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        calls = []
+        w.cmd_rename = lambda: calls.append("rename")
+        w.cmd_drive = lambda: calls.append("drive")
+        w.cmd_history_jump = lambda: calls.append("history")
+        w.cmd_edit = lambda: calls.append("edit")
+
+        def key(k, mods=Qt.NoModifier, view=None):
+            QTest.keyClick(view or w.active.view, k, mods)
+
+        def shown():
+            pixmap = w.preview_widget.image.pixmap()
+            return pixmap.toImage()
+
+        def header():
+            return w.preview_widget.header.text()
+        original = None
+        try:
+            # 一覧では R / L / H / V は従来どおり
+            L.set_cursor(L._row_of("p1.png"))
+            for k in (Qt.Key_R, Qt.Key_L, Qt.Key_H, Qt.Key_V):
+                key(k)
+            assert calls == ["rename", "drive", "history", "edit"], calls
+            calls.clear()
+            key(Qt.Key_F3)
+            _wait_preview(w, "p1.png")
+            original = _quadrants(shown())
+            assert shown().width() > shown().height()
+            tl, tr, bl, br = original
+            key(Qt.Key_R)                                   # 右90°
+            assert shown().height() > shown().width() and "右90°" in header(), header()
+            assert _close_colors(_quadrants(shown()), [bl, tl, br, tr], 10)
+            key(Qt.Key_L)                                   # 左90° で元へ
+            assert _close_colors(_quadrants(shown()), original, 10) and "90°" not in header()
+            key(Qt.Key_L)
+            assert _close_colors(_quadrants(shown()), [tr, br, tl, bl], 10)
+            key(Qt.Key_R)
+            key(Qt.Key_H)                                   # 左右反転
+            assert _close_colors(_quadrants(shown()), [tr, tl, br, bl], 10) and "左右反転" in header()
+            key(Qt.Key_H)
+            key(Qt.Key_V)                                   # 上下反転
+            assert _close_colors(_quadrants(shown()), [bl, br, tl, tr], 10) and "上下反転" in header()
+            assert calls == []                              # ビュアでは改名などにならない
+            # 次の画像へ移ると(固定していなければ)元の向き
+            key(Qt.Key_Right)
+            _wait_preview(w, "p2.png")
+            assert _close_colors(_quadrants(shown()), original, 10) and "反転" not in header()
+            # Shift+R: 回転固定。次の画像も右90°、見出しの末尾に _R
+            key(Qt.Key_R, Qt.ShiftModifier)
+            assert header().endswith("_R") and shown().height() > shown().width(), header()
+            key(Qt.Key_Right)
+            _wait_preview(w, "p3.png")
+            assert header().endswith("_R") and "右90°" in header(), header()
+            _wait_until(lambda: w._image_wait_seq is None)
+            img = shown()
+            assert img.height() > img.width()
+            # 回したぶん縦横を入れ替えた箱で読むので、窓に収まり、小さくもならない
+            box_w, box_h = w.preview_widget.image_box()
+            assert img.width() <= box_w and img.height() <= box_h
+            key(Qt.Key_R, Qt.ShiftModifier)                 # もう一度で解除・元の向き
+            assert not header().endswith("_R") and shown().width() > shown().height()
+            key(Qt.Key_L, Qt.ShiftModifier)                 # _L
+            assert header().endswith("_L")
+            key(Qt.Key_R, Qt.ShiftModifier)                 # 逆で解除
+            assert not header().endswith("_L") and shown().width() > shown().height()
+            # 画像ビュアでもテキストの上では R は改名のまま
+            L.set_cursor(L._row_of("alpha.txt"))
+            _wait_preview(w, "alpha.txt")
+            key(Qt.Key_R)
+            assert calls == ["rename"], calls
+            calls.clear()
+            key(Qt.Key_Escape)
+            assert not w.preview_on and w.image_turn.lock is None
+            # ファイルは書き換えない
+            assert all((left / n).read_bytes() == b for n, b in stamps.items())
+            # 右窓で画像に Enter → 全画面のビュア。EXIF の向き(縦撮り)が当たっている
+            key(Qt.Key_Right)
+            assert w.active_side == "right"
+            R = w.right
+            R.set_cursor(R._row_of("cam.jpg"))
+            key(Qt.Key_Return)
+            assert w.preview_on and w.isFullScreen()
+            _wait_preview(w, "cam.jpg")
+            _wait_until(lambda: w._image_wait_seq is None)
+            img = shown()
+            assert img.height() > img.width(), (img.width(), img.height())   # 300×400 で出る
+            assert "300×400" in header(), header()
+            key(Qt.Key_L)                                   # 手動は自動回転の後の向きにかかる
+            img = shown()
+            assert img.width() > img.height() and "左90°" in header()
+            assert _close_colors(_quadrants(img), original, 60)   # 元の保存の向きに戻る
+            key(Qt.Key_Escape)
+            assert not w.preview_on and not w.isFullScreen()
         finally:
             w.close()
             w.deleteLater()
@@ -5112,29 +5472,114 @@ def _make_git(root, packed=False, with_commit=True):
     return sha
 
 
+def _no_git(args, timeout):
+    import filer_update as u
+    raise u.GitError("git が見つかりません")
+
+
 def test_version_label_reads_git_and_zip():
+    """git コマンドが無い(業務PC)・失敗したときのフォールバック: .git を読んで日付だけ、
+    .git が無ければ ZIP と一番新しい .py の日付。"""
     import filer_update as u
     with tempfile.TemporaryDirectory() as tmp:
-        _make_git(tmp)
-        assert u.version_label(tmp) == "2f74ed1 (10/29)"
+        sha = _make_git(tmp)
+        assert u.version_label(tmp, run=_no_git) == "20261029"
+        assert u.quick_version(tmp) == {"label": "20261029", "sha": sha, "source": "git-file"}
+        assert u.version_info(tmp, run=_no_git)["sha"] == sha   # ハッシュは残す
     with tempfile.TemporaryDirectory() as tmp:
         _make_git(tmp, packed=True)                 # packed-refs だけ
-        assert u.version_label(tmp) == "2f74ed1 (10/29)"
+        assert u.version_label(tmp, run=_no_git) == "20261029"
     with tempfile.TemporaryDirectory() as tmp:
         _make_git(tmp, with_commit=False)           # コミットが読めなければ ref の更新時刻
-        label = u.version_label(tmp)
-        assert label.startswith("2f74ed1 (") and label.endswith(")"), label
+        label = u.version_label(tmp, run=_no_git)
+        assert len(label) == 8 and label.isdigit(), label
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_git(tmp)                              # git が失敗(終了コード≠0)も同じ
+        assert u.version_label(tmp, run=lambda a, t: (128, "", "fatal")) == "20261029"
     with tempfile.TemporaryDirectory() as tmp:      # ZIP 展開(.git 無し)
         py = Path(tmp, "a.py")
         py.write_text("x = 1\n", encoding="utf-8")
         stamp = time.mktime((2026, 10, 28, 9, 0, 0, 0, 0, -1))
         os.utime(py, (stamp, stamp))
-        assert u.version_label(tmp) == "ZIP 10/28"
-        assert not u.has_git(tmp)
+        called = []
+        assert u.version_label(tmp, run=lambda a, t: called.append(a)) == "ZIP 20261028"
+        assert not u.has_git(tmp) and not called    # .git が無ければ git は呼ばない
+        assert u.quick_version(tmp)["sha"] == ""
     with tempfile.TemporaryDirectory() as tmp:
         assert u.version_label(tmp) == ""           # どちらも取れない
-    assert u.window_title("C:\\x", "2f74ed1 (10/29)") == "C:\\x - あっふ 2f74ed1 (10/29)"
+    assert u.window_title("C:\\x", "20261031-02") == "C:\\x - あっふ 20261031-02"
     assert u.window_title("", "") == "あっふ" and u.window_title("C:\\x", "") == "C:\\x - あっふ"
+
+
+def test_version_sequence_label():
+    """版の連番: HEAD の日付(ローカル時刻)と同じ日付の first-parent のコミットの数。"""
+    import filer_update as u
+
+    def at(*t):
+        return int(time.mktime(t + (0, 0, -1)))
+    lines = [f"{'c' * 40} {at(2026, 10, 31, 1, 28, 0)}",
+             f"{'b' * 40} {at(2026, 10, 31, 0, 5, 0)}",
+             f"{'a' * 40} {at(2026, 10, 30, 23, 59, 0)}",
+             f"{'d' * 40} {at(2026, 10, 30, 12, 0, 0)}"]
+    assert u.sequence_label(lines) == ("20261031-02", "c" * 40)
+    assert u.sequence_label(lines[1:]) == ("20261031-01", "b" * 40)   # その日の最初が 01
+    assert u.sequence_label(lines[2:]) == ("20261030-02", "a" * 40)
+    assert u.sequence_label([]) == ("", "") and u.sequence_label(["壊れた行"]) == ("", "")
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, ".git").mkdir()
+        calls = []
+
+        def run(args, timeout):
+            calls.append((args, timeout))
+            return 0, "\n".join(lines) + "\n", ""
+        assert u.git_version(tmp, run=run) == {"label": "20261031-02", "sha": "c" * 40,
+                                               "source": "git"}
+        args, timeout = calls[0]
+        assert args[0] == "log" and "--first-parent" in args and args[-1] == "HEAD"
+        assert timeout == u.VERSION_TIMEOUT <= 5        # 固まっても長く待たない
+        assert u.git_version(tmp, run=_no_git) is None
+        assert u.git_version(tmp, run=lambda a, t: (128, "", "fatal")) is None
+        assert u.git_version(tmp, run=lambda a, t: (0, "", "")) is None
+    # ログ・確認文にはハッシュを添える。比べるのはハッシュ(表記は git の有無で変わる)
+    assert u.describe_version({"label": "20261031-02", "sha": "067f1b1" + "0" * 33}) == \
+        "20261031-02（067f1b1）"
+    assert u.describe_version({"label": "ZIP 20261028", "sha": ""}) == "ZIP 20261028"
+    assert u.same_version({"label": "20261031-02", "sha": "a" * 40},
+                          {"label": "20261031", "sha": "a" * 40})
+    assert not u.same_version({"label": "20261031-02", "sha": "a" * 40},
+                              {"label": "20261031-02", "sha": "b" * 40})
+    assert u.same_version({"label": "ZIP 1", "sha": ""}, {"label": "ZIP 1", "sha": ""})
+
+
+def test_version_with_real_git():
+    """本物の git で: 枝のコミットは数えず(first-parent)、同じ日の数が連番になる。"""
+    import subprocess
+    import filer_update as u
+    if not shutil.which("git"):
+        print("  (git が無いので飛ばす)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        def git(*args, when=None):
+            env = dict(os.environ)
+            if when:
+                env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = when
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "-c", "commit.gpgsign=false", *args], cwd=tmp, env=env,
+                           check=True, capture_output=True,
+                           creationflags=u.CREATE_NO_WINDOW)
+
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "c1", when="2026-10-30T23:00:00")
+        git("commit", "-q", "--allow-empty", "-m", "c2", when="2026-10-31T00:30:00")
+        git("checkout", "-q", "-b", "side")
+        git("commit", "-q", "--allow-empty", "-m", "s1", when="2026-10-31T00:40:00")
+        git("checkout", "-q", "main")
+        git("commit", "-q", "--allow-empty", "-m", "c3", when="2026-10-31T00:50:00")
+        git("merge", "-q", "--no-ff", "-m", "merge", "side", when="2026-10-31T01:00:00")
+        found = u.git_version(tmp)
+        assert found and found["label"] == "20261031-03", found   # merge, c3, c2(s1 は数えない)
+        assert found["sha"] == u.quick_version(tmp)["sha"]       # どちらで読んでも同じコミット
+        assert u.version_label(tmp) == "20261031-03"
 
 
 def _fake_git(outputs, calls=None):
@@ -5618,10 +6063,18 @@ def test_window_title_shows_version():
     with tempfile.TemporaryDirectory() as tmp:
         w, left, right, jp = _menu_window(tmp)
         try:
+            import re
+            _wait_until(lambda: w._version_done)
             assert w.version == filer_update.version_label(filer_update.REPO_DIR)
             assert w.windowTitle() == filer_update.window_title(w.left.path, w.version)
             if filer_update.has_git():
                 assert w.version and " - あっふ " in w.windowTitle(), w.windowTitle()
+                if shutil.which("git"):
+                    assert re.fullmatch(r"\d{8}-\d{2}", w.version), w.version
+                # タイトルは版だけ。ハッシュはメッセージ窓のログに残す
+                sha = w.version_info["sha"][:7]
+                assert sha not in w.windowTitle()
+                assert f"版: {w.version}（{sha}）" in w.log_view.toPlainText()
         finally:
             w.close()
             w.deleteLater()
@@ -5666,6 +6119,8 @@ def test_window_update_restart():
         w.pull_updates = lambda repo_dir: (pulls.append(repo_dir), {"ok": True,
                                                                     "message": "Fast-forward"})[1]
 
+        _wait_until(lambda: w._version_done)    # 起動時の版の読み込みと競らない
+
         def press():
             QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
             _wait_until(lambda: not w._update_busy)
@@ -5686,20 +6141,27 @@ def test_window_update_restart():
             defaults = []
             w.confirm = lambda title, text, default_yes=True: (
                 asked.append(text), defaults.append(default_yes), answers.pop(0))[2]
-            w.version = "ac042b0 (10/30)"
-            w.disk_version = lambda repo_dir: "c848f53 (10/31)"
+            w.version = "20261030-01"
+            w.version_info = {"label": "20261030-01", "sha": "a" * 40, "source": "git"}
+            w.disk_version = lambda repo_dir: {"label": "20261031-02", "sha": "c" * 40}
             answers[:] = [True]
             press()
-            assert "c848f53 (10/31)" in asked[-1] and "ac042b0 (10/30)" in asked[-1], asked[-1]
+            assert "20261031-02（ccccccc）" in asked[-1], asked[-1]
+            assert "20261030-01（aaaaaaa）" in asked[-1], asked[-1]
             assert "最新です" not in asked[-1] and defaults[-1] is True
             assert order == ["save", "release", "spawn", "exit"], order
             w._restarting = False
             # 版が同じなら従来どおり「最新です。再起動だけ」(既定は いいえ)。断れば何もしない
             order.clear()
-            w.disk_version = lambda repo_dir: "ac042b0 (10/30)"
+            w.disk_version = lambda repo_dir: {"label": "20261030-01", "sha": "a" * 40}
             answers[:] = [False]
             press()
             assert "最新です" in asked[-1] and defaults[-1] is False and order == []
+            # 同じコミットなら、表記が違っても(git が使えず日付だけになった等)同じ版
+            w.disk_version = lambda repo_dir: {"label": "20261030", "sha": "a" * 40}
+            answers[:] = [False]
+            press()
+            assert "最新です" in asked[-1] and order == []
             # 新しいコミットあり → 一覧を見せて OK → pull → 再起動。常駐側の変更も知らせる
             order.clear()
             w.check_updates = lambda repo_dir: {

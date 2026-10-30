@@ -151,6 +151,13 @@ LIVE_FILTER_IMMEDIATE = 3000
 LIVE_FILTER_DELAY_MS = 150
 # プレビュー: カーソルが止まってからこれだけ待って読む(連打で読み込みを積まない)。
 PREVIEW_DELAY_MS = 120
+# 画像ビュアの回転・反転のキー(仮想キーコード → core.ImageTurn の操作)。
+IMAGE_TURN_KEYS = {82: "R", 76: "L", 72: "H", 86: "V"}
+# 画像の読み込み中にオートリピートを捨てる、カーソルを動かすキー。
+PREVIEW_REPEAT_KEYS = frozenset((Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
+                                 Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End))
+# 画像の読み込みを待つ上限(秒)。これを過ぎたらリピートを捨てるのをやめる(固まらない保険)。
+IMAGE_WAIT_LIMIT = 2.0
 
 # 書庫の中では書き込み系を断る。あふｗも書庫の中(仮想フォルダ)は読むだけ。
 ARCHIVE_READONLY = "書庫内では使えません"
@@ -508,6 +515,8 @@ class ListBridge(QObject):
     # Shift+F5 の更新: fetch して調べた結果 / pull の結果。
     update_checked = Signal(object)
     update_pulled = Signal(object)
+    # 版の連番(git log)が数え終わったとき。filer_update.git_version の結果 or None。
+    version_ready = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -1687,8 +1696,12 @@ class FilerWindow(QWidget):
         self.menu_which = filer_extmenu.shutil.which
         self.menu_exists = os.path.isfile
         # 版(タイトルに出す)。起動時に1回だけ読む。Shift+F5 の更新は別スレッドで。
+        # まず .git を読むだけの速い方(日付だけ。ZIP 展開なら「ZIP 日付」)で出し、
+        # 連番は git コマンドで別スレッドで数えて差し替える(_start_version_lookup)。
+        # git が遅い・固まる PC でも起動を待たせないため。
         self.repo_dir = filer_update.REPO_DIR
-        self.version = filer_update.version_label(self.repo_dir)
+        self.version_info = filer_update.quick_version(self.repo_dir)
+        self.version = self.version_info["label"]
         self._update_busy = False
         self._restarting = False
 
@@ -1741,6 +1754,7 @@ class FilerWindow(QWidget):
         self.bridge.folder_watch.connect(self._on_folder_watch)
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.update_pulled.connect(self._on_update_pulled)
+        self.bridge.version_ready.connect(self._on_version_ready)
         self._watch_checking = False
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(WATCH_INTERVAL_MS)
@@ -1752,13 +1766,21 @@ class FilerWindow(QWidget):
         self.preview_widget = None
         self._preview_fullscreen = False    # 右窓から入ったプレビューはフルスクリーン
         self._preview_was_maximized = False
-        # プレビューの待ち行列。通り過ぎたファイルも飛ばさず順に出すため、
-        # 要求はここへ積んで1つのスレッドが先頭から読む。世代はプレビューを
-        # 閉じたときに進め、古い結果を捨てる印にする。
+        # プレビューの読み込み。要求はここへ積んで1つのスレッドが読む。新しい要求が
+        # 来たら、まだ読み始めていない古い要求は捨てる(最新だけ出す)。世代は
+        # プレビューを閉じたときに進め、古い結果を捨てる印にする。
         self._preview_queue = []
         self._preview_lock = threading.Lock()
         self._preview_worker_on = False
         self._preview_generation = 0
+        # 画像の読み込み中(まだ表示に回っていない)か。読み込み中はキーのオートリピートに
+        # よるカーソル移動を捨て、長押しの速さを画像を出せる速さに合わせる
+        # (_drops_repeat)。要求ごとの通し番号で、最後に積んだ画像が出たら解く。
+        self._preview_seq = 0
+        self._image_wait_seq = None         # 待っている画像の要求の番号(None なら待ちなし)
+        self._image_wait_since = 0.0
+        # 画像ビュアの手動の回転・反転と回転固定(R / L / H / V、Shift+R / Shift+L)
+        self.image_turn = core.ImageTurn()
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._start_preview)
@@ -1851,6 +1873,7 @@ class FilerWindow(QWidget):
         for pane in (self.left, self.right):
             pane.apply_style()
         self.update_status_bar()
+        self._start_version_lookup()    # メッセージ窓ができてから(ログに版を出す)
 
     # --- 窓の位置と前回のパス ---
     def _restore_geometry(self, section) -> None:
@@ -2505,6 +2528,18 @@ class FilerWindow(QWidget):
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
+        # 画像ビュア(プレビュー中でカーソルが画像)のときだけ、R / L / H / V を
+        # 回転・反転に使う(あふｗの画像ビュアのキー)。ファイル一覧やテキストの
+        # プレビューでは従来どおり(R=改名 など)。Shift+H / Shift+V は一覧側のまま。
+        if (self.preview_on and not (ctrl or alt) and vk in IMAGE_TURN_KEYS
+                and (not shift or IMAGE_TURN_KEYS[vk] in ("R", "L"))
+                and core.preview_kind(pane.cursor_entry(), self.viewer_extensions) == "image"):
+            self.turn_image(IMAGE_TURN_KEYS[vk], shift)
+            return
+        # 画像の読み込み中は、オートリピート(長押し)によるカーソル移動を捨てる。
+        # 長押しの速さが画像を出せる速さになり、カーソルと表示がずれない。
+        if self._drops_repeat(event):
+            return
         # ログ(メッセージ窓)に選択範囲があれば、Ctrl+C はその文字列のコピーにする。
         # ログはフォーカスを持たない(NoFocus)のでキーはここへ来てしまい、通常は
         # Ctrl+英字の頭文字ジャンプに取られて、選択しても写せなかった。
@@ -3151,8 +3186,47 @@ class FilerWindow(QWidget):
         return filer_update.pull(repo_dir)
 
     def disk_version(self, repo_dir):
-        """ディスク上の版(タイトルと同じ書き方)。起動時の self.version と比べる。"""
-        return filer_update.version_label(repo_dir)
+        """ディスク上の版({"label", "sha"})。起動時の self.version_info と比べる。"""
+        return filer_update.version_info(repo_dir)
+
+    def lookup_version(self, repo_dir):
+        """git コマンドで版の連番を数える(別スレッドから呼ぶ)。"""
+        return filer_update.git_version(repo_dir)
+
+    def _start_version_lookup(self) -> None:
+        self._version_done = False
+        if not filer_update.has_git(self.repo_dir):
+            self._version_done = True
+            if self.version_info.get("label"):
+                self.log(f"版: {filer_update.describe_version(self.version_info)}")
+            return
+        bridge, repo = self.bridge, self.repo_dir
+
+        def worker():
+            try:
+                found = self.lookup_version(repo)
+            except Exception:  # noqa: BLE001  版が日付だけになるだけ
+                found = None
+            try:
+                bridge.version_ready.emit(found)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-version").start()
+
+    def _on_version_ready(self, found) -> None:
+        try:
+            if found and found.get("label"):
+                self.version_info = dict(found)
+                self.version = found["label"]
+                self._update_title()
+            # ハッシュは調べ物用にログへ(タイトルは版だけ)
+            if self.version_info.get("label"):
+                self.log(f"版: {filer_update.describe_version(self.version_info)}")
+        except Exception:  # noqa: BLE001  スロットの中の例外で落とさない
+            _log_exception("versionReady")
+        finally:
+            self._version_done = True
 
     def cmd_update_restart(self):
         """Shift+F5: git で更新を取り込み、あっふだけを再起動する(常駐はそのまま)。"""
@@ -3202,9 +3276,16 @@ class FilerWindow(QWidget):
                 self.log(filer_update.describe_block(info))
                 return
             if state == "uptodate":
-                disk, running = info.get("disk_version") or "", self.version or ""
-                if disk and running and disk != running:
+                disk = info.get("disk_version") or {}
+                if isinstance(disk, str):
+                    disk = {"label": disk, "sha": ""}
+                running_info = dict(getattr(self, "version_info", None) or {})
+                running_info["label"] = self.version or ""
+                if (disk.get("label") and running_info["label"]
+                        and not filer_update.same_version(disk, running_info)):
                     # 動いているあっふが古いだけ。再起動すれば反映されるので「はい」を既定に
+                    disk = filer_update.describe_version(disk)
+                    running = filer_update.describe_version(running_info)
                     self.log(f"更新: ファイルは {disk}、動いているのは {running}")
                     if self.confirm("あっふの更新",
                                     f"ファイルは新しい版（{disk}）です。\n"
@@ -3617,6 +3698,8 @@ class FilerWindow(QWidget):
         other.hide()
         self.preview_widget.show()
         self.preview_on = True
+        self.image_turn.reset()
+        self._image_wait_seq = None
         # 右窓から入ったときはフルスクリーンで出す(あふｗのビューア準拠。
         # 2026-10-29 要望)。左窓からのときは従来どおり反対窓の場所だけ。
         self._preview_fullscreen = self.active_side == "right"
@@ -3653,6 +3736,8 @@ class FilerWindow(QWidget):
         with self._preview_lock:
             self._preview_generation += 1   # 待ち行列と読み込み中の結果は捨てる
             self._preview_queue.clear()
+        self._image_wait_seq = None         # 読み込み待ちは必ず解く(キーを捨て続けない)
+        self.image_turn.reset()             # 回転・回転固定はビュアを抜けたら解く
         pane = self.pane(self.preview_side)
         if self.preview_widget is not None:
             self.preview_widget.hide()
@@ -3686,8 +3771,11 @@ class FilerWindow(QWidget):
         self._preview_timer.stop()
         self._start_preview()
 
-    def _start_preview(self) -> None:
-        """いまのカーソルのファイルを待ち行列へ積む(実際の読み取りは _drain_preview)。"""
+    def _start_preview(self, force: bool = False) -> None:
+        """いまのカーソルのファイルを読み込みへ回す(実際の読み取りは _drain_preview)。
+
+        force は同じファイルでも読み直す(回転で縦横が入れ替わり、読み込みの縮小の
+        大きさが合わなくなったとき)。"""
         try:
             if not self.preview_on or self.preview_widget is None:
                 return
@@ -3695,32 +3783,48 @@ class FilerWindow(QWidget):
             entry = pane.cursor_entry()
             kind = core.preview_kind(entry, self.viewer_extensions)
             widget = self.preview_widget
+            path = os.path.join(pane.path, entry.name) if kind != "none" else None
+            # 別のファイルへ移ったら、回転固定していなければ向きを戻す
+            self.image_turn.on_path(path)
+            widget.set_turn(self.image_turn.turn, self.image_turn.suffix(), rerender=False)
             if kind == "none":
                 with self._preview_lock:
                     self._preview_queue.clear()
+                self._image_wait_seq = None
                 widget.show_result({"title": "..", "lines": [], "image": None})
                 return
+            box = widget.image_box()
+            odd = kind == "image" and core.turn_swaps_size(self.image_turn.turn)
+            if odd:
+                box = (box[1], box[0])   # 回して出すので、縦横を入れ替えた箱に収めて読む
             widget.show_loading(entry.name)
-            item = (self._preview_generation, os.path.join(pane.path, entry.name),
-                    kind, entry, widget.image_box(), pane.archive)
             with self._preview_lock:
-                if self._preview_queue and self._preview_queue[-1][1] == item[1]:
-                    return      # 同じファイルが続けて積まれるだけなら1件でよい
-                self._preview_queue.append(item)
+                pending = self._preview_queue
+                if not force and pending and pending[-1][2] == path:
+                    return      # 同じファイルがまだ読み始められずに待っているなら1件でよい
+                self._preview_seq += 1
+                item = (self._preview_generation, self._preview_seq, path,
+                        kind, entry, box, pane.archive, odd)
+                # まだ読み始めていない古い要求は捨てて、最新だけを読む。長押しは
+                # _drops_repeat で画像を出せる速さに抑えるので、通り過ぎる画像は
+                # 出ない。単発の連打では途中を飛ばして、表示がカーソルに早く追いつく。
+                self._preview_queue[:] = [item]
+                if kind == "image":
+                    self._image_wait_seq = self._preview_seq
+                    self._image_wait_since = time.monotonic()
+                else:
+                    self._image_wait_seq = None
                 if self._preview_worker_on:
                     return
                 self._preview_worker_on = True
             threading.Thread(target=self._drain_preview, daemon=True,
                              name="filer-preview").start()
         except Exception:  # noqa: BLE001
+            self._image_wait_seq = None
             self.log(f"エラー: {_log_exception('preview')}")
 
     def _drain_preview(self) -> None:
-        """待ち行列を先頭から1件ずつ読み、順番どおりに表示へ回す(読み取りス레ッド)。
-
-        「最新だけ出す」作りだと、読み終わる前にカーソルが進んだファイルは
-        表示されないまま捨てられ、下キーの長押しで歯抜けになる。行列にして
-        全部出すと、表示はカーソルに遅れても必ず追いつく。"""
+        """待ち行列を1件ずつ読み、表示へ回す(読み取りスレッド)。"""
         import filer_preview
 
         while True:
@@ -3728,13 +3832,17 @@ class FilerWindow(QWidget):
                 if not self._preview_queue:
                     self._preview_worker_on = False
                     return
-                generation, path, kind, entry, box, archive = self._preview_queue.pop(0)
+                generation, seq, path, kind, entry, box, archive, odd = \
+                    self._preview_queue.pop(0)
             try:
                 result = filer_preview.load_preview(path, kind, entry, box, archive)
             except Exception as e:  # noqa: BLE001  1件の失敗で行列を止めない
                 result = {"kind": "info", "title": entry.name, "image": None,
                           "lines": core.info_lines(entry.name, entry)
                           + ["", f"（読めません: {e}）"]}
+            result["seq"] = seq
+            result["path"] = path
+            result["turn_odd"] = odd
             try:
                 self.bridge.preview_ready.emit((generation, result))
             except RuntimeError:
@@ -3743,11 +3851,56 @@ class FilerWindow(QWidget):
     def _on_preview_ready(self, payload) -> None:
         try:
             generation, result = payload
+            seq = result.get("seq")
+            if self._image_wait_seq is not None and seq is not None \
+                    and seq >= self._image_wait_seq:
+                self._image_wait_seq = None     # 待っていた画像が出た(失敗でも解く)
             if generation != self._preview_generation or self.preview_widget is None:
                 return     # プレビューを閉じた(開き直した)あとに届いた結果
             self.preview_widget.show_result(result)
+            self._reload_if_turned(result)
         except Exception:  # noqa: BLE001
+            self._image_wait_seq = None
             _log_exception("previewReady")
+
+    def _drops_repeat(self, event) -> bool:
+        """画像の読み込み中に来た、オートリピートのカーソル移動か(捨てるもの)。
+
+        単発の押下は捨てない(取りこぼすとキーが効かないように感じる)。待ちが
+        IMAGE_WAIT_LIMIT 秒を超えたら、固まらないよう捨てるのをやめる。"""
+        if not self.preview_on or self._image_wait_seq is None:
+            return False
+        if not event.isAutoRepeat() or event.key() not in PREVIEW_REPEAT_KEYS:
+            return False
+        if time.monotonic() - self._image_wait_since > IMAGE_WAIT_LIMIT:
+            self._image_wait_seq = None
+            return False
+        return True
+
+    def turn_image(self, op: str, shift: bool = False) -> None:
+        """画像ビュアの R / L / H / V(Shift+R / Shift+L は回転固定)。表示だけを回し、
+        ファイルは書き換えない。向きは EXIF の自動回転を当てた後の絵にかかる。"""
+        self.image_turn.press(op, shift)
+        widget = self.preview_widget
+        if widget is None:
+            return
+        widget.set_turn(self.image_turn.turn, self.image_turn.suffix())
+        if widget.last is not None:
+            self._reload_if_turned(widget.last)
+
+    def _reload_if_turned(self, result) -> None:
+        """縮めて読んだ絵の縦横が、いまの向きと入れ替わっていれば読み直す。
+
+        読み込みは「回した後に窓に収まる」大きさに縮めるので、90°回すと箱の縦横が
+        入れ替わり、そのままでは小さく(粗く)出る。いま見ているファイルのときだけ。"""
+        if not (result.get("image") is not None and result.get("scaled")):
+            return
+        if bool(result.get("turn_odd")) == core.turn_swaps_size(self.image_turn.turn):
+            return
+        entry = self.active.cursor_entry()
+        if entry is None or result.get("path") != os.path.join(self.active.path, entry.name):
+            return
+        self._start_preview(force=True)
 
     def cmd_live_filter(self):
         self.active.open_live_filter()

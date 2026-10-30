@@ -1,10 +1,20 @@
 # filer_update.py
 # あっふのタイトルの版表記と、Shift+F5「更新を適用して再起動」の、Qt に依存しない部分。
 #
-# 版表記
-#   git コマンドは使わず .git を自前で読む(diagnostics.read_git_version と同じもの。
-#   業務PCには git が入っていないことがある)。.git が無い(GitHub の ZIP を展開した)
-#   ときは、ソースの一番新しい .py の更新日時を「ZIP 10/29」のように出す。
+# 版表記(「20261031-02」= HEAD のコミットの日付 + その日の何個目のコミットか)
+#   日付はコミット日時(committer date)をこの PC のローカル時刻(日本時間)で読んだもの。
+#   連番は HEAD から first-parent でたどったコミットのうち同じ日付のものの数(その日の
+#   最初が 01)。同じコミットなら、どの PC でも同じ表記になる(連番はコミットの並びだけで
+#   決まり、pull した時刻や PC の状態に左右されない)。
+#   短いハッシュ(c848f53 (10/31))は「どれが新しいか」が読めず分かりにくかったので
+#   タイトルからは外した。ハッシュは捨てず、メッセージ窓のログと Shift+F5 の確認文に残す。
+#
+#   連番は git コマンドで数える(git log --first-parent)。git が無い PC(業務PC)や失敗・
+#   時間切れのときは、これまでどおり .git を自前で読み(diagnostics.read_git_version)、
+#   日付だけ(20261031)を出す。.git が無い(GitHub の ZIP を展開した)ときは、ソースの
+#   一番新しい .py の更新日時を「ZIP 20261031」のように出す。
+#   起動を重くしないよう、窓は .git を読むだけの速い方(quick_version)で先に出し、
+#   git コマンドの方(git_version)は呼ぶ側が別スレッドで回してタイトルを差し替える。
 #
 # 更新
 #   git fetch → 取り込めるコミットを見せる → 本人が OK したら git pull --ff-only。
@@ -19,6 +29,8 @@ REPO_DIR = Path(__file__).resolve().parent
 FETCH_TIMEOUT = 60
 PULL_TIMEOUT = 120
 LOCAL_TIMEOUT = 15
+VERSION_TIMEOUT = 5          # 版の連番を数える git log の見切り(秒)
+VERSION_SCAN_LIMIT = 500     # 連番を数えるときにたどるコミットの数の上限
 LOG_LIMIT = 20
 CREATE_NO_WINDOW = 0x08000000
 
@@ -27,8 +39,12 @@ def has_git(repo_dir=REPO_DIR) -> bool:
     return (Path(repo_dir) / ".git").exists()
 
 
-def version_label(repo_dir=REPO_DIR, read_git=None, newest=None) -> str:
-    """タイトルに出す版。"2f74ed1 (10/29)" / "ZIP 10/29" / ""(どちらも取れない)。"""
+def quick_version(repo_dir=REPO_DIR, read_git=None, newest=None) -> dict:
+    """git コマンドを使わない版。{"label", "sha", "source"}。
+
+    label は "20261031"(.git を読めたとき。連番は数えられないので日付だけ) /
+    "ZIP 20261031"(.git が無い) / ""(どちらも取れない)。sha は .git から読めたときだけ。
+    source は "git-file" / "zip" / ""。"""
     import diagnostics
 
     read_git = read_git or diagnostics.read_git_version
@@ -43,16 +59,93 @@ def version_label(repo_dir=REPO_DIR, read_git=None, newest=None) -> str:
         date = info.get("date")
         if date is None:
             date = _head_file_time(repo_dir)
-        short = info["sha"][:7]
-        return f"{short} ({date:%m/%d})" if date else short
+        label = f"{date:%Y%m%d}" if date else info["sha"][:7]
+        return {"label": label, "sha": info["sha"], "source": "git-file"}
     if state == "nogit":
         try:
             found = newest(repo_dir)
         except Exception:  # noqa: BLE001
             found = None
         if found:
-            return f"ZIP {found[1]:%m/%d}"
-    return ""
+            return {"label": f"ZIP {found[1]:%Y%m%d}", "sha": "", "source": "zip"}
+    return {"label": "", "sha": "", "source": ""}
+
+
+def sequence_label(lines) -> tuple:
+    """git log --first-parent --format="%H %ct" の出力行から (表記, HEAD のハッシュ)。
+
+    先頭が HEAD。その日付(ローカル時刻)と同じ日付のコミットの数がその日の連番。
+    読めなければ ("", "")。"""
+    from datetime import datetime
+
+    commits = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            commits.append((parts[0], datetime.fromtimestamp(int(parts[1])).date()))
+        except (ValueError, OSError, OverflowError):
+            continue
+    if not commits:
+        return "", ""
+    sha, day = commits[0]
+    seq = sum(1 for _sha, d in commits if d == day)
+    return f"{day:%Y%m%d}-{seq:02d}", sha
+
+
+def git_version(repo_dir=REPO_DIR, run=None):
+    """git コマンドで数えた版。{"label": "20261031-02", "sha", "source": "git"}。
+
+    .git が無い・git が無い・失敗・時間切れ(VERSION_TIMEOUT 秒)は None
+    (呼ぶ側は quick_version のまま)。"""
+    if not has_git(repo_dir):
+        return None
+    run = run or (lambda args, timeout: run_git(args, repo_dir, timeout))
+    try:
+        code, out, _err = run(["log", "--first-parent", "--no-show-signature",
+                               f"--max-count={VERSION_SCAN_LIMIT}", "--format=%H %ct",
+                               "HEAD"], VERSION_TIMEOUT)
+    except GitError:
+        return None
+    except Exception:  # noqa: BLE001  版が出ないだけ
+        return None
+    if code != 0:
+        return None
+    label, sha = sequence_label(out.splitlines())
+    if not label:
+        return None
+    return {"label": label, "sha": sha, "source": "git"}
+
+
+def version_info(repo_dir=REPO_DIR, run=None, read_git=None, newest=None) -> dict:
+    """git コマンドで数えた版。だめなら quick_version(日付だけ / ZIP)。"""
+    found = git_version(repo_dir, run=run)
+    if found:
+        return found
+    return quick_version(repo_dir, read_git=read_git, newest=newest)
+
+
+def version_label(repo_dir=REPO_DIR, read_git=None, newest=None, run=None) -> str:
+    """タイトルに出す版。"20261031-02" / "20261031"(git コマンドが無い) /
+    "ZIP 20261031" / ""(どれも取れない)。"""
+    return version_info(repo_dir, run=run, read_git=read_git, newest=newest)["label"]
+
+
+def describe_version(info: dict) -> str:
+    """ログ・確認文に出す版。表記の後ろにハッシュ(調べ物用)を添える。"""
+    label = (info or {}).get("label") or "?"
+    sha = (info or {}).get("sha") or ""
+    return f"{label}（{sha[:7]}）" if sha else label
+
+
+def same_version(a: dict, b: dict) -> bool:
+    """2つの版が同じか。両方にハッシュがあればハッシュで比べる(表記は git の有無や
+    日付だけのフォールバックで変わりうるので)。無ければ表記で。"""
+    sha_a, sha_b = (a or {}).get("sha") or "", (b or {}).get("sha") or ""
+    if sha_a and sha_b:
+        return sha_a == sha_b
+    return ((a or {}).get("label") or "") == ((b or {}).get("label") or "")
 
 
 def _head_file_time(repo_dir: Path):

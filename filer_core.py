@@ -1832,6 +1832,184 @@ def fit_size(width: int, height: int, box_w: int, box_h: int):
     return max(1, int(width * scale)), max(1, int(height * scale))
 
 
+# ---------------------------------------------------------------
+# 画像ビュアの回転・反転(R / L / H / V、Shift+R / Shift+L の回転固定)
+# ---------------------------------------------------------------
+# 向きは 2x2 の整数行列 (m11, m12, m21, m22) で持つ。Qt の QTransform と同じ並び
+# (点は行ベクトル: x' = x*m11 + y*m21, y' = x*m12 + y*m22。y は下向き)で、
+# そのまま QTransform(m11, m12, m21, m22, 0, 0) に渡せる。整数のまま合成するので、
+# 何度回しても誤差が溜まらない。
+TURN_IDENTITY = (1, 0, 0, 1)
+TURN_OPS = {
+    "R": (0, 1, -1, 0),      # 右(時計回り)に90度
+    "L": (0, -1, 1, 0),      # 左(反時計回り)に90度
+    "H": (-1, 0, 0, 1),      # 左右反転
+    "V": (1, 0, 0, -1),      # 上下反転
+}
+# EXIF の Orientation(1〜8)を「保存されている絵 → 正しい向き」にする行列。
+EXIF_ORIENTATION_TURNS = {
+    1: TURN_IDENTITY,
+    2: (-1, 0, 0, 1),        # 左右反転
+    3: (-1, 0, 0, -1),       # 180度
+    4: (1, 0, 0, -1),        # 上下反転
+    5: (0, 1, 1, 0),         # 左上-右下の対角で裏返し(transpose)
+    6: (0, 1, -1, 0),        # 右に90度(スマホの縦撮りの多く)
+    7: (0, -1, -1, 0),       # 右上-左下の対角で裏返し(transverse)
+    8: (0, -1, 1, 0),        # 左に90度
+}
+_TURN_LABELS = {
+    (1, 0, 0, 1): "",
+    (0, 1, -1, 0): "右90°",
+    (-1, 0, 0, -1): "180°",
+    (0, -1, 1, 0): "左90°",
+    (-1, 0, 0, 1): "左右反転",
+    (1, 0, 0, -1): "上下反転",
+    (0, 1, 1, 0): "右90°+左右反転",
+    (0, -1, -1, 0): "左90°+左右反転",
+}
+
+
+def turn_compose(first, then):
+    """first を当ててから then を当てる向き(行ベクトルなので first × then)。"""
+    a11, a12, a21, a22 = first
+    b11, b12, b21, b22 = then
+    return (a11 * b11 + a12 * b21, a11 * b12 + a12 * b22,
+            a21 * b11 + a22 * b21, a21 * b12 + a22 * b22)
+
+
+def turn_apply(turn, op: str):
+    """いまの見た目に、さらに op("R" / "L" / "H" / "V")を当てた向き。"""
+    return turn_compose(turn, TURN_OPS[op])
+
+
+def turn_swaps_size(turn) -> bool:
+    """縦横が入れ替わる向きか(90度・270度と、その反転)。"""
+    return turn[0] == 0
+
+
+def turn_label(turn) -> str:
+    """見出しに出す向きの名前。元のままなら ""。"""
+    return _TURN_LABELS.get(tuple(turn), "")
+
+
+class ImageTurn:
+    """画像ビュアの手動の回転・反転と「回転固定」(Qt に依存しない状態だけ)。
+
+    - R / L / H / V: いまの見た目に右90°・左90°・左右反転・上下反転を足す
+    - Shift+R / Shift+L: 右(左)に90°回して「固定」する。固定中は次の画像へ移っても
+      同じ向きを当て続ける(あふｗの回転固定。見出しの末尾に _R / _L)
+    - 固定中にもう一度同じ Shift+R(L)を押すと、固定を解いて元の向きに戻す
+    - 固定中に逆の Shift+L(R)を押すと、逆に90°回して(=固定したぶんを戻して)固定を解く
+    - 固定中の R / L / H / V は、固定したままその向きを変える
+    - 固定していなければ、別のファイルへ移ったときに元の向きへ戻る(on_path)
+    向きは EXIF の自動回転を当てた後の絵に対してかかる。"""
+
+    def __init__(self):
+        self.turn = TURN_IDENTITY
+        self.lock = None          # None / "R" / "L"(どちらの Shift で固定したか)
+        self.path = None          # いまの向きを当てているファイル
+
+    def press(self, op: str, shift: bool = False) -> None:
+        if not shift:
+            self.turn = turn_apply(self.turn, op)
+            return
+        if op not in ("R", "L"):
+            return
+        if self.lock == op:
+            self.lock = None
+            self.turn = TURN_IDENTITY
+        elif self.lock is not None:
+            self.turn = turn_apply(self.turn, op)
+            self.lock = None
+        else:
+            self.turn = turn_apply(self.turn, op)
+            self.lock = op
+
+    def on_path(self, path) -> bool:
+        """表示するファイルが変わった。固定していなければ向きを戻す。戻したら True。"""
+        if path == self.path:
+            return False
+        self.path = path
+        if self.lock is None and self.turn != TURN_IDENTITY:
+            self.turn = TURN_IDENTITY
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.turn = TURN_IDENTITY
+        self.lock = None
+        self.path = None
+
+    def suffix(self) -> str:
+        """見出しの末尾に足す固定の印("_R" / "_L" / "")。"""
+        return f"_{self.lock}" if self.lock else ""
+
+
+def exif_orientation_from_tiff(data: bytes) -> int:
+    """EXIF(TIFF 構造。先頭が "II*\0" / "MM\0*")から Orientation(0x0112)を読む。
+    無い・読めないときは 1。"""
+    if data.startswith(b"Exif\0\0"):
+        data = data[6:]
+    if len(data) < 8:
+        return 1
+    if data[:2] == b"II":
+        order = "little"
+    elif data[:2] == b"MM":
+        order = "big"
+    else:
+        return 1
+    offset = int.from_bytes(data[4:8], order)
+    if offset + 2 > len(data):
+        return 1
+    count = int.from_bytes(data[offset:offset + 2], order)
+    for i in range(min(count, 512)):
+        pos = offset + 2 + i * 12
+        if pos + 12 > len(data):
+            break
+        if int.from_bytes(data[pos:pos + 2], order) == 0x0112:
+            value = int.from_bytes(data[pos + 8:pos + 10], order)
+            return value if value in EXIF_ORIENTATION_TURNS else 1
+    return 1
+
+
+def container_exif_orientation(path: str) -> int:
+    """WebP / PNG に入っている EXIF の Orientation。Qt はこの2つの EXIF を読まない
+    (JPEG / TIFF は QImageReader の自動回転が効く)ので自前で見る。
+    チャンクの見出しだけを読んで飛ばしていく(画素は読まない)。無ければ 1。"""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            if ext == ".webp":
+                head = f.read(12)
+                if head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+                    return 1
+                for _ in range(64):
+                    chunk = f.read(8)
+                    if len(chunk) < 8:
+                        return 1
+                    size = int.from_bytes(chunk[4:8], "little")
+                    if chunk[:4] == b"EXIF":
+                        return exif_orientation_from_tiff(f.read(min(size, 1 << 20)))
+                    f.seek(size + (size & 1), 1)
+            elif ext == ".png":
+                if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                    return 1
+                for _ in range(256):
+                    chunk = f.read(8)
+                    if len(chunk) < 8:
+                        return 1
+                    size = int.from_bytes(chunk[:4], "big")
+                    kind = chunk[4:8]
+                    if kind == b"eXIf":
+                        return exif_orientation_from_tiff(f.read(min(size, 1 << 20)))
+                    if kind in (b"IDAT", b"IEND"):
+                        return 1      # eXIf は IDAT より前に置く決まり
+                    f.seek(size + 4, 1)
+    except OSError:
+        return 1
+    return 1
+
+
 def info_lines(name: str, entry) -> list:
     """「その他」のプレビュー(名前・サイズ・日時・属性)。"""
     return [name, "",

@@ -4,7 +4,9 @@
 # ON にすると反対窓の場所をこの窓に差し替え、アクティブ窓のカーソルの中身を見せる。
 #   - テキスト(ビュアと同じ拡張子の表): 先頭 200 行まで(読むのは最大 256KB)
 #   - 画像(png jpg jpeg gif bmp webp ico): 窓に収まる大きさで読む(QImageReader に
-#     縮めて読ませるので、巨大な画像でも全部を展開しない)
+#     縮めて読ませるので、巨大な画像でも全部を展開しない)。EXIF の向きは自動で当てる
+#     (JPEG / TIFF は Qt、Qt が読まない PNG / WebP は自前)。手動の回転・反転
+#     (R / L / H / V。状態は filer_core.ImageTurn)は表示のときに PreviewWidget が当てる
 #   - フォルダ: 中のフォルダ・ファイルの数と、先頭の名前
 #   - そのほか: 名前・サイズ・日時・属性
 # 読み込みは load_preview を読み取りスレッドで呼ぶ(ネットワーク越しでも窓は止まらない)。
@@ -12,7 +14,7 @@
 import os
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QFont, QImageIOHandler, QImageReader, QPixmap
+from PySide6.QtGui import QFont, QImage, QImageIOHandler, QImageReader, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
@@ -38,26 +40,54 @@ def _read_text(path: str):
     return lines, label
 
 
+def turned_image(image: QImage, turn) -> QImage:
+    """core の向きの行列(TURN_*)を当てた絵。元のままならそのまま返す。
+    QImage.transformed は回したぶんの平行移動を自分で補うので、行列だけ渡せばよい。"""
+    if tuple(turn) == core.TURN_IDENTITY or image.isNull():
+        return image
+    m11, m12, m21, m22 = turn
+    return image.transformed(QTransform(m11, m12, m21, m22, 0, 0), Qt.FastTransformation)
+
+
 def _read_image(path: str, box_w: int, box_h: int):
+    """(絵, 表示の向きでの元の大きさ (幅, 高さ) or None, 縮めて読んだか)。
+
+    EXIF の向き(カメラ・スマホの縦撮り)は当ててから返す。JPEG / TIFF は Qt の
+    自動回転(setAutoTransform)で、Qt が EXIF を読まない WebP / PNG は自前で読んで
+    (core.container_exif_orientation)当てる。"""
     reader = QImageReader(path)
     reader.setAutoTransform(True)
     size = reader.size()
+    transformation = reader.transformation()
+    qt_rotated = bool(transformation & QImageIOHandler.TransformationRotate90)
+    own_turn = core.TURN_IDENTITY
+    if transformation == QImageIOHandler.TransformationNone:
+        own_turn = core.EXIF_ORIENTATION_TURNS.get(
+            core.container_exif_orientation(path), core.TURN_IDENTITY)
+    rotated = qt_rotated or core.turn_swaps_size(own_turn)
+    scaled = False
     if size.isValid():
         # EXIF の回転(スマホの縦撮り写真など)があると、読み出した後に
         # 縦横が入れ替わる。縮小の大きさは「表示後の縦横」で決めないと、
         # 回転したぶん箱からはみ出し、窓の大きさまで変わってしまう。
-        rotated = bool(reader.transformation()
-                       & QImageIOHandler.TransformationRotate90)
+        # setScaledSize は回転の前(保存されている向き)の大きさで渡す。
         shown = QSize(size.height(), size.width()) if rotated else size
         w, h = core.fit_size(shown.width(), shown.height(), box_w, box_h)
         target = shown.scaled(w, h, Qt.KeepAspectRatio)
         if rotated:
             target = QSize(target.height(), target.width())
-        reader.setScaledSize(target)
+        if target != size:
+            reader.setScaledSize(target)
+            scaled = True
     image = reader.read()
     if image.isNull():
         raise OSError(reader.errorString() or "画像として読めません")
-    return image, (size.width(), size.height()) if size.isValid() else None
+    image = turned_image(image, own_turn)
+    if size.isValid():
+        original = (size.height(), size.width()) if rotated else (size.width(), size.height())
+    else:
+        original = None
+    return image, original, scaled
 
 
 def _read_folder(path: str):
@@ -105,8 +135,9 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             lines, label = _read_text(path)
             result.update(lines=lines, note=label)
         elif kind == "image":
-            image, original = _read_image(path, *box)
-            result.update(image=image, note=f"{original[0]}×{original[1]}" if original else "")
+            image, original, scaled = _read_image(path, *box)
+            result.update(image=image, note=f"{original[0]}×{original[1]}" if original else "",
+                          scaled=scaled)
         elif kind == "folder":
             dirs, files, names = _read_folder(path)
             result.update(lines=[f"{dirs} フォルダ / {files} ファイル", ""] + names
@@ -153,20 +184,40 @@ class PreviewWidget(QWidget):
         self.stack.addWidget(self.image)
         layout.addWidget(self.stack, 1)
         self.last = None
+        self.turn = core.TURN_IDENTITY      # 手動の回転・反転(R / L / H / V)
+        self.turn_suffix = ""               # 回転固定の印(_R / _L)
 
     def image_box(self):
         size = self.stack.size()
         return max(size.width() - 8, 16), max(size.height() - 8, 16)
 
     def show_loading(self, title: str) -> None:
-        self.header.setText(f"Preview: {title}  …")
+        suffix = getattr(self, "turn_suffix", "")
+        self.header.setText(f"Preview: {title}  …" + (f"  {suffix}" if suffix else ""))
+
+    def set_turn(self, turn, suffix: str = "", rerender: bool = True) -> None:
+        """手動の回転・反転(core.ImageTurn の turn)と固定の印。rerender なら、いま出して
+        いる絵にも当て直す(別のファイルへ移るときは、古い絵を向きだけ変えて一瞬見せない
+        よう rerender=False で次の結果を待つ)。"""
+        self.turn = tuple(turn)
+        self.turn_suffix = suffix
+        if rerender and self.last is not None:
+            self.show_result(self.last)
 
     def show_result(self, result: dict) -> None:
         self.last = result
-        note = result.get("note")
-        self.header.setText(f"Preview: {result.get('title', '')}" + (f"  [{note}]" if note else ""))
-        if result.get("image") is not None:
-            pixmap = QPixmap.fromImage(result["image"])
+        note = result.get("note") or ""
+        image = result.get("image")
+        turn = getattr(self, "turn", core.TURN_IDENTITY)
+        if image is not None:
+            label = core.turn_label(turn)
+            if label:
+                note = f"{note} {label}" if note else label
+        suffix = getattr(self, "turn_suffix", "")
+        self.header.setText(f"Preview: {result.get('title', '')}" + (f"  [{note}]" if note else "")
+                            + (f"  {suffix}" if suffix else ""))
+        if image is not None:
+            pixmap = QPixmap.fromImage(turned_image(image, turn))
             box_w, box_h = self.image_box()
             if pixmap.width() > box_w or pixmap.height() > box_h:
                 # 大きさの分からない形式など、箱に収まらない絵が来ても

@@ -5680,6 +5680,26 @@ def test_window_update_restart():
             assert "最新です" in asked[-1] and order == ["save", "release", "spawn", "exit"], order
             assert w._restarting and json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
             w._restarting = False
+            # 取り込むものは無いが、起動後にこの PC で commit/pull していてファイルの方が新しい
+            # → 版を並べて「再起動して反映」を案内(既定は はい)
+            order.clear()
+            defaults = []
+            w.confirm = lambda title, text, default_yes=True: (
+                asked.append(text), defaults.append(default_yes), answers.pop(0))[2]
+            w.version = "ac042b0 (10/30)"
+            w.disk_version = lambda repo_dir: "c848f53 (10/31)"
+            answers[:] = [True]
+            press()
+            assert "c848f53 (10/31)" in asked[-1] and "ac042b0 (10/30)" in asked[-1], asked[-1]
+            assert "最新です" not in asked[-1] and defaults[-1] is True
+            assert order == ["save", "release", "spawn", "exit"], order
+            w._restarting = False
+            # 版が同じなら従来どおり「最新です。再起動だけ」(既定は いいえ)。断れば何もしない
+            order.clear()
+            w.disk_version = lambda repo_dir: "ac042b0 (10/30)"
+            answers[:] = [False]
+            press()
+            assert "最新です" in asked[-1] and defaults[-1] is False and order == []
             # 新しいコミットあり → 一覧を見せて OK → pull → 再起動。常駐側の変更も知らせる
             order.clear()
             w.check_updates = lambda repo_dir: {

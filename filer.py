@@ -3150,6 +3150,10 @@ class FilerWindow(QWidget):
     def pull_updates(self, repo_dir):
         return filer_update.pull(repo_dir)
 
+    def disk_version(self, repo_dir):
+        """ディスク上の版(タイトルと同じ書き方)。起動時の self.version と比べる。"""
+        return filer_update.version_label(repo_dir)
+
     def cmd_update_restart(self):
         """Shift+F5: git で更新を取り込み、あっふだけを再起動する(常駐はそのまま)。"""
         if self._update_busy:
@@ -3168,6 +3172,10 @@ class FilerWindow(QWidget):
         def worker():
             try:
                 info = self.check_updates(repo)
+                # 取り込むものが無くても、起動した後にこの PC で commit / pull していれば
+                # ファイルの方が新しい。それを見分けるためにディスク上の版も読んでおく
+                if isinstance(info, dict) and info.get("state") == "uptodate":
+                    info["disk_version"] = self.disk_version(repo)
             except Exception as e:  # noqa: BLE001
                 info = {"state": "error", "message": f"更新を確かめられません: {e}"}
             try:
@@ -3194,6 +3202,16 @@ class FilerWindow(QWidget):
                 self.log(filer_update.describe_block(info))
                 return
             if state == "uptodate":
+                disk, running = info.get("disk_version") or "", self.version or ""
+                if disk and running and disk != running:
+                    # 動いているあっふが古いだけ。再起動すれば反映されるので「はい」を既定に
+                    self.log(f"更新: ファイルは {disk}、動いているのは {running}")
+                    if self.confirm("あっふの更新",
+                                    f"ファイルは新しい版（{disk}）です。\n"
+                                    f"動いているあっふは起動時の版（{running}）のままです。\n\n"
+                                    "再起動して反映しますか？", default_yes=True):
+                        self.restart_filer()
+                    return
                 self.log("更新: 最新です")
                 if self.confirm("あっふの更新", "最新です。再起動だけしますか？",
                                 default_yes=False):

@@ -1,0 +1,6 @@
+afx video
+# 動画(_aliases.txt の video)のメニュー。
+"O:関連付けで開く" &OPEN $MF
+"V:VLC" {tool:vlc} $MF
+"S:エクスプローラで選択" explorer.exe /select, $MF
+"R:プロパティ" &PROPERTY $MF

@@ -1,0 +1,10 @@
+afx folder
+# あっふの Ctrl+Enter: フォルダ(と「..」の上ではいまのフォルダ自身)のメニュー。
+# 書式は README「拡張子ごとのメニュー」。個人のパスは書かないこと(public リポジトリ)。
+# ツールは {tool:名前} と書き、場所は各 PC の settings.json の filer.tools に書く。
+"P:開く" &EXCD -P$MF\
+"O:反対側で開く" &EXCD -O$MF\
+"E:エクスプローラ" explorer.exe $MF
+"C:PhotoCuller" {tool:photoculler} $MF
+"S:PowerShell" &SHELL $MF
+"R:プロパティ" &PROPERTY $MF

@@ -1,0 +1,8 @@
+afx image
+# 画像(_aliases.txt の image)のメニュー。
+"O:関連付けで開く" &OPEN $MF
+"V:内蔵ビュア" &VIEW $MF
+"I:IrfanView" {tool:i_view64} $MF
+"P:ペイント" mspaint.exe $MF
+"S:エクスプローラで選択" explorer.exe /select, $MF
+"R:プロパティ" &PROPERTY $MF

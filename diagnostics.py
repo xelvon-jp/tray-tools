@@ -353,6 +353,23 @@ def scan_files(repo_dir: Path, is_installed=None) -> dict:
             "missing": sorted(missing.items()), "broken": sorted(broken)}
 
 
+def newest_source(repo_dir: Path):
+    """リポジトリ直下と tools/ の .py のうち一番新しいものの (名前, 日時)。無ければ None。
+
+    scan_files の newest と同じ範囲。ast は読まないので軽い(あっふのタイトルの版表記が、
+    .git の無い ZIP 展開の PC で使う)。"""
+    repo_dir = Path(repo_dir)
+    newest = None
+    for path in list(repo_dir.glob("*.py")) + list((repo_dir / "tools").glob("*.py")):
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            continue
+        if newest is None or mtime > newest[1]:
+            newest = (path.name, mtime)
+    return newest
+
+
 def summarize_files(info: dict) -> list:
     lines = []
     newest = info.get("newest")

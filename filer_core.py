@@ -54,7 +54,8 @@ DEFAULT_KEYMAP = {
     "0008": "parent",             # BS
     "0009": "switch",             # Tab 反対窓へ(あふｗ標準には無いが便利なので)
     "0013": "enter",              # Enter フォルダなら入る/ファイルは関連付け
-    "2013": "open_assoc",         # Ctrl+Enter 関連付けで開く
+    "2013": "ext_menu",           # Ctrl+Enter 拡張子ごとのメニュー(あふｗの AfxExt。定義が
+                                  # 無い拡張子は関連付けで開く。filer_extmenu.py)
     "1013": "open_in_other",      # Shift+Enter フォルダは反対窓で開く/ファイルはエディタ
     "0069": "edit",               # E
     "0086": "edit",               # V (AFXW.key 0086 &MENU edit.txt の代わり)
@@ -71,6 +72,7 @@ DEFAULT_KEYMAP = {
     "0035": "reload",             # End (マーククリア)
     "2035": "reload_keep",        # Ctrl+End (マーク保持)
     "0116": "reload_keep",        # F5 (エクスプローラの F5 と同じく最新にするだけ。マークは保持)
+    "1116": "update_restart",     # Shift+F5 更新(git pull --ff-only)を適用してあっふを再起動
     "1035": "reload_other",       # Shift+End 反対窓
     # --- 左右の窓のパス ---
     "0079": "sync_to_other",      # O 自分を反対窓と同じパスに
@@ -929,6 +931,8 @@ COMMAND_SHORT_NAMES = {
     "reload_other": "Reload他",
     "enter": "Open",
     "open_assoc": "Assoc",
+    "ext_menu": "ExtMenu",
+    "update_restart": "更新",
     "edit": "Edit",
     "open_in_other": "Open他",
     "copy_menu": "Copy",
@@ -1542,25 +1546,34 @@ def to_native_point(x: float, y: float, origin_x: int, origin_y: int, dpr: float
             int(round(origin_y + (y - origin_y) * dpr)))
 
 
-def context_menu_args(paths, x: int, y: int, owner: int = 0):
+def context_menu_args(paths, x: int, y: int, owner: int = 0, verb: str = None):
     """子プロセスへ渡す引数。長すぎるなら None(呼ぶ側が一時 JSON で渡す)。
 
-    パスは "--" の後ろに並べる("-" で始まる名前を指定と取り違えないように)。"""
-    args = ["--x", str(int(x)), "--y", str(int(y)), "--owner", str(int(owner or 0)), "--"]
+    パスは "--" の後ろに並べる("-" で始まる名前を指定と取り違えないように)。
+    verb(properties など)を渡すと、子はメニューを出さずにその動詞を実行する。"""
+    args = ["--x", str(int(x)), "--y", str(int(y)), "--owner", str(int(owner or 0))]
+    if verb:
+        args += ["--verb", str(verb)]
+    args.append("--")
     args += [str(p) for p in paths]
     if sum(len(a) + 3 for a in args) > CONTEXT_ARGS_MAX:
         return None
     return args
 
 
-def context_menu_payload(paths, x: int, y: int, owner: int = 0) -> dict:
+def context_menu_payload(paths, x: int, y: int, owner: int = 0, verb: str = None) -> dict:
     """一時 JSON で渡すときの中身(context_menu_args と同じ情報)。"""
-    return {"paths": [str(p) for p in paths], "x": int(x), "y": int(y),
-            "owner": int(owner or 0)}
+    payload = {"paths": [str(p) for p in paths], "x": int(x), "y": int(y),
+               "owner": int(owner or 0)}
+    if verb:
+        payload["verb"] = str(verb)
+    return payload
 
 
 def parse_context_args(argv) -> dict:
-    """子プロセス側の引数の読み取り。{"paths", "x", "y", "owner", "list", "repeat", "json"}。
+    """子プロセス側の引数の読み取り。{"paths", "x", "y", "owner", "list", "repeat", "json", "verb"}。
+
+    --verb があれば、メニューを出さずにその動詞(properties など)を直接実行する。
 
     --json があればそのファイルから paths/x/y/owner を読む(読んだら消すのは呼ぶ側)。"""
     import argparse
@@ -1571,11 +1584,13 @@ def parse_context_args(argv) -> dict:
     parser.add_argument("--owner", type=int, default=0)
     parser.add_argument("--json")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--verb")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("paths", nargs="*")
     ns = parser.parse_args(list(argv))
     result = {"paths": list(ns.paths), "x": ns.x, "y": ns.y, "owner": ns.owner,
-              "list": ns.list, "repeat": max(1, ns.repeat), "json": ns.json}
+              "list": ns.list, "repeat": max(1, ns.repeat), "json": ns.json,
+              "verb": ns.verb}
     if ns.json:
         import json
 
@@ -1584,6 +1599,8 @@ def parse_context_args(argv) -> dict:
         result.update(paths=[str(p) for p in data.get("paths", [])],
                       x=int(data.get("x", 0)), y=int(data.get("y", 0)),
                       owner=int(data.get("owner", 0)))
+        if data.get("verb"):
+            result["verb"] = str(data["verb"])
     return result
 
 

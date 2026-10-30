@@ -1,0 +1,8 @@
+afx text
+# テキスト(_aliases.txt の text)のメニュー。
+"V:内蔵ビュア" &VIEW $MF
+"E:エディタ" &EDIT $MF
+"N:メモ帳" notepad.exe $MF
+"O:関連付けで開く" &OPEN $MF
+"S:エクスプローラで選択" explorer.exe /select, $MF
+"R:プロパティ" &PROPERTY $MF

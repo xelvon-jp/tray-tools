@@ -12,6 +12,9 @@
 # 使い方
 #   pythonw filer_contextmenu.py --x 物理X --y 物理Y --owner ファイラのHWND -- パス...
 #   pythonw filer_contextmenu.py --json 一時ファイル      (パスが多くて引数に載らないとき)
+#   pythonw filer_contextmenu.py --verb properties --owner ファイラのHWND -- パス...
+#       メニューを出さずに動詞を直接実行する(あっふの Ctrl+Enter の &PROPERTY。プロパティ窓は
+#       このプロセスで出るので、窓が閉じるまで待ってから終わる)。
 #   python  filer_contextmenu.py --list [--repeat N] -- パス...
 #       診断用。メニューを組み立てて項目を標準出力に出して終わる(画面には何も出さない)。
 #       --repeat で同じことを N 回、毎回 gc.collect を挟んで繰り返す(COM の寿命の確かめ)。
@@ -334,8 +337,11 @@ def _wait_for_shell_windows(owner_hwnd) -> None:
         time.sleep(WAIT_POLL_SECONDS)
 
 
-def show_menu(paths, x: int, y: int, list_only: bool = False, filer_hwnd: int = 0):
+def show_menu(paths, x: int, y: int, list_only: bool = False, filer_hwnd: int = 0,
+              verb: str = None):
     """paths のコンテキストメニューを出す(list_only なら項目を返すだけ)。
+
+    verb を渡すとメニューは出さず、その動詞(properties など)を InvokeCommand で直接実行する。
 
     COM のオブジェクトはこの関数の中だけで作って使い、出る前に手放す。"""
     global _menu_handler
@@ -395,6 +401,24 @@ def show_menu(paths, x: int, y: int, list_only: bool = False, filer_hwnd: int = 
         _menu_handler = handler
         if list_only:
             return _menu_items(hmenu)
+
+        if verb:
+            # 動詞は ANSI と Unicode の両方で渡す(拡張によって見る側が違う)。バッファは
+            # InvokeCommand が戻るまでこの関数の変数として生かしておく。
+            verb_a = ctypes.create_string_buffer(verb.encode("ascii", "replace"))
+            verb_w = ctypes.create_unicode_buffer(verb)
+            info = CMINVOKECOMMANDINFOEX()
+            info.cbSize = sizeof(CMINVOKECOMMANDINFOEX)
+            info.fMask = CMIC_MASK_UNICODE
+            info.hwnd = owner
+            info.lpVerb = ctypes.addressof(verb_a)
+            info.lpVerbW = ctypes.addressof(verb_w)
+            info.lpDirectoryW = os.path.dirname(os.path.normpath(paths[0]))
+            info.nShow = SW_SHOWNORMAL
+            menu.InvokeCommand(byref(info))
+            _wait_for_shell_windows(owner)
+            del verb_a, verb_w
+            return verb
 
         # 前面を取っておかないと、Esc や外側のクリックでメニューが閉じなくなる。
         # 取る権利はファイラが起こす前に譲ってくれている(AllowSetForegroundWindow)。
@@ -462,7 +486,8 @@ def main(argv=None) -> int:
     try:
         for round_ in range(args["repeat"]):
             items = show_menu(args["paths"], args["x"], args["y"],
-                              list_only=args["list"], filer_hwnd=args["owner"])
+                              list_only=args["list"], filer_hwnd=args["owner"],
+                              verb=None if args["list"] else args.get("verb"))
             if args["list"]:
                 for depth, item_id, label in items:
                     print(f"{round_}\t{depth}\t{item_id}\t{label}")

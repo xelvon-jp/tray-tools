@@ -1004,6 +1004,17 @@ def _cursor_name(pane):
     return entry.name if entry else None
 
 
+def _pick_menu(prefix):
+    """_exec_menu の差し替え: 表示が prefix で始まる項目を選んだことにする(exec はモーダルで
+    止まるので使わない)。"""
+    def run(menu, chosen):
+        for action, value in chosen.items():
+            if action.text().startswith(prefix):
+                return value
+        raise AssertionError(f"項目が無い: {prefix} / {[a.text() for a in chosen]}")
+    return run
+
+
 def _make_tree(tmp):
     left = Path(tmp, "L")
     right = Path(tmp, "R")
@@ -1975,9 +1986,10 @@ def test_window_archive():
         assert w._extracting is None and Path(right, "readme.txt").read_bytes() == b"old"
         assert not Path(tmp, "evil.txt").exists() and not Path(right, "evil.txt").exists()
 
-        # Ctrl+Enter(関連付け) / E は一時フォルダへ取り出して開く
+        # Ctrl+Enter のメニューの「関連付けで開く」(&OPEN) / E は一時フォルダへ取り出して開く
         opened = []
         w._startfile = lambda path: opened.append(path)
+        w._exec_menu = _pick_menu("&O:")
         L.set_cursor(L._row_of(JP_NAME))
         key(Qt.Key_Return, Qt.ControlModifier)
         _wait_extract(w)
@@ -2863,7 +2875,8 @@ def test_enter_viewer_routing():
         assert len(w._viewers) == 1 and opened == [os.path.join(L.path, "tool.exe")]
         viewer = w._viewers[0]
         assert viewer.area.font().pointSize() == L.pane_font.pointSize()  # 字の大きさは窓から
-        QTest.keyClick(L.view, Qt.Key_Return, Qt.ControlModifier)          # Ctrl+Enter は関連付け
+        w._exec_menu = _pick_menu("&O:")       # Ctrl+Enter のメニューの「関連付けで開く」
+        QTest.keyClick(L.view, Qt.Key_Return, Qt.ControlModifier)
         assert opened[-1] == os.path.join(L.path, "app.log")
         QTest.keyClick(viewer.area, Qt.Key_Return)                         # Enter で閉じる
         assert not w._viewers
@@ -4810,6 +4823,916 @@ def test_window_renemo_block_and_gutter():
         assert d.editor_lines() == ["DSC9", "DSC9", "DSC9"]
     finally:
         d.close()
+
+
+# ---------------------------------------------------------------
+# Ctrl+Enter の拡張子ごとのメニュー(filer_extmenu.py)
+# ---------------------------------------------------------------
+def test_extmenu_parse_and_format():
+    import filer_extmenu as m
+    text = ('afx jpg\n'
+            '# コメント\n'
+            '\n'
+            '"I:IrfanView" C:\\soft\\i_view64.exe $MF\n'
+            '"V:Avipreview"C:\\soft\\a.exe $MF\n'           # 空白の無い書き方
+            '"h:秀丸" hidemaru.exe $MF\n'                    # 小文字のキー
+            '"---------------------------"\n'
+            '"9:キャンセル" &NOP\n'
+            '"X:コマンド無し"\n'                              # コマンドの無い項目は捨てる
+            'でたらめな行\n')
+    items = m.parse_menu_text(text)
+    assert [(i.key, i.label) for i in items if not i.separator] == [
+        ("I", "IrfanView"), ("V", "Avipreview"), ("H", "秀丸"), ("9", "キャンセル")], items
+    assert items[3].separator
+    assert items[1].command == "C:\\soft\\a.exe $MF"
+    assert m.format_line("V", 'V"LC', "{tool:vlc} $MF") == '"V:V\'LC" {tool:vlc} $MF'
+    assert m.parse_line(m.format_line("A", "表示", "&NOP")).label == "表示"
+    assert m.kind_of_name("A.JPG") == "jpg" and m.kind_of_name("README") == ""
+    assert m.kind_of_name(".gitignore") == "" and m.kind_of_name("a.tar.gz") == "gz"
+    assert m.menu_kind(core.PARENT_ENTRY) == "folder"
+    assert m.menu_kind(F("d", is_dir=True)) == "folder" and m.menu_kind(F("x.Md")) == "md"
+
+
+def test_extmenu_split_command():
+    import filer_extmenu as m
+    assert m.split_command('"C:\\a b\\x.exe" -m "日本 語" x') == ["C:\\a b\\x.exe", "-m", "日本 語", "x"]
+    # あふｗで多い、引用符無しの空白入り exe パス
+    assert m.split_command("C:\\Program Files\\Hidemaru\\Hidemaru.exe $MF") == [
+        "C:\\Program Files\\Hidemaru\\Hidemaru.exe", "$MF"]
+    # \ は逃がしではない(パス末尾の \ が残る)
+    assert m.split_command('cmd.exe /k "cd $MF\\"') == ["cmd.exe", "/k", "cd $MF\\"]
+    assert m.split_command('explorer.exe /select, $MF') == ["explorer.exe", "/select,", "$MF"]
+    assert m.split_command('a "" b') == ["a", "", "b"]
+    assert m.split_command("") == []
+
+
+def test_extmenu_macros_and_excd():
+    import filer_extmenu as m
+    ctx = {"targets": ["C:\\日本 語\\a b.jpg", "C:\\日本 語\\c.jpg"], "P": "C:\\日本 語",
+           "F": "a b.jpg", "O": "D:\\other", "E": "jpg", "cwd": "C:\\日本 語"}
+    # まるごと $MF はマークの数だけ引数に。"$MF" と書いても二重に囲まない
+    assert m.expand_args(m.split_command('$MF'), ctx) == ctx["targets"]
+    assert m.expand_args(m.split_command('"$MF"'), ctx) == ctx["targets"]
+    assert m.expand_args(["$MF\\"], {"targets": ["C:\\x"]}) == ["C:\\x\\"]
+    # 文字列の中の $MF は、複数なら各々 "" で囲んで空白区切り(あふｗと同じ)
+    assert m.expand_args(["cd $MF"], ctx) == ['cd "C:\\日本 語\\a b.jpg" "C:\\日本 語\\c.jpg"']
+    assert m.expand_args(["$P\\$F", "-e=$E", "$O"], ctx) == [
+        "C:\\日本 語\\a b.jpg", "-e=jpg", "D:\\other"]
+    # &EXCD: -P/-O 大文字は「末尾 \ なら中を開く・無ければ親を開いて合わせる」
+    one = {"targets": ["C:\\x\\sub"], "P": "C:\\x"}
+    assert m.parse_excd("-P$MF\\", one) == ("P", "C:\\x\\sub", True)
+    assert m.parse_excd("-O$MF\\", one) == ("O", "C:\\x\\sub", True)
+    assert m.parse_excd("-P$MF", one) == ("P", "C:\\x\\sub", False)
+    assert m.parse_excd('-P"$MF\\"', one) == ("P", "C:\\x\\sub", True)
+    assert m.parse_excd("-pC:\\y\\", one) == ("P", "C:\\y", True)
+    assert m.parse_excd("-PC:\\", one) == ("P", "C:\\", True)
+    assert m.parse_excd("C:\\y", one) is None
+    assert m.internal_name("&excd -P$MF") == "EXCD" and m.internal_name("x.exe") is None
+    assert m.internal_targets("$MF", ctx) == ctx["targets"]
+    assert m.internal_targets("$MF\\", {"targets": ["C:\\x\\d"]}) == ["C:\\x\\d"]
+
+
+def _fake_resolver(m, tools=None, files=(), app_paths=None, on_path=None):
+    files = {os.path.normcase(f) for f in files}
+    app_paths = app_paths or {}
+    on_path = on_path or {}
+    return m.Resolver(tools or {}, app_path=lambda name: app_paths.get(name.lower()),
+                      which=lambda name: on_path.get(name.lower()),
+                      exists=lambda p: os.path.normcase(p) in files)
+
+
+def test_extmenu_tools_and_visibility():
+    import filer_extmenu as m
+    py = "C:\\Py\\pythonw.exe"
+    r = _fake_resolver(m, tools={"photoculler": {"command": [py, "-m", "photo_culler"],
+                                                 "cwd": "C:\\work"},
+                                 "simple": f'"{py}" -x',
+                                 "gone": "C:\\nowhere\\x.exe"},
+                       files=[py, "C:\\Irf\\i_view64.exe", "C:\\Win\\explorer.exe"],
+                       app_paths={"i_view64.exe": "C:\\Irf\\i_view64.exe"},
+                       on_path={"explorer.exe": "C:\\Win\\explorer.exe"})
+    assert r.tool("photoculler") == ([py, "-m", "photo_culler"], "C:\\work")
+    assert r.tool("simple") == ([py, "-x"], None)            # 文字列だけの簡易形
+    assert r.tool("gone") is None                             # 場所が無い PC では出ない
+    assert r.tool("i_view64") == (["C:\\Irf\\i_view64.exe"], None)   # App Paths
+    assert r.tool("vlc") is None
+    assert r.exe("explorer.exe") == "C:\\Win\\explorer.exe"   # PATH
+    lines = m.parse_menu_text(
+        '"P:開く" &EXCD -P$MF\\\n"C:PhotoCuller" {tool:photoculler} $MF\n'
+        '"V:VLC" {tool:vlc} $MF\n"---"\n"Z:謎" &UNKNOWN x\n"E:エクスプローラ" explorer.exe $MF\n'
+        '"R:プロパティ" &PROPERTY $MF\n')
+    visible = m.visible_items(lines, None, r)
+    assert [l.label for l in visible if not l.separator] == [
+        "開く", "PhotoCuller", "エクスプローラ", "プロパティ"], visible
+    # 書庫の中は外部ツールと &PROPERTY を出さない
+    inside = m.visible_items(lines, None, r, in_archive=True)
+    assert [l.label for l in inside] == ["開く"], inside
+    # 区切りの詰め方: 先頭・末尾・連続は落とす。この PC の分は区切りを挟んで後ろに
+    local = m.parse_menu_text('"---"\n"A:追加" &NOP\n"---"\n')
+    joined = m.visible_items(m.parse_menu_text('"B:共有" &NOP'), local, r)
+    assert [("-" if l.separator else l.label) for l in joined] == ["共有", "-", "追加"]
+    # 外部コマンドの組み立て(日本語・空白入りのパス、作業フォルダはツールの cwd が勝つ)
+    ctx = {"targets": ["C:\\写真 2026\\a b"], "P": "C:\\写真 2026", "cwd": "C:\\写真 2026"}
+    argv, cwd = m.build_external(lines[1], ctx, r)
+    assert argv == [py, "-m", "photo_culler", "C:\\写真 2026\\a b"] and cwd == "C:\\work"
+    argv, cwd = m.build_external(m.parse_line('"S:選択" explorer.exe /select, $MF'), ctx, r)
+    assert argv == ["C:\\Win\\explorer.exe", "/select,", "C:\\写真 2026\\a b"]
+    assert cwd == "C:\\写真 2026"
+    assert m.build_external(lines[2], ctx, r) is None
+
+
+def test_extmenu_find_menus_aliases_local():
+    import filer_extmenu as m
+    with tempfile.TemporaryDirectory() as tmp:
+        shared, local = Path(tmp, "shared"), Path(tmp, "local")
+        shared.mkdir()
+        local.mkdir()
+        (shared / "_aliases.txt").write_text("# c\nimage: jpg PNG\n", encoding="utf-8")
+        (shared / "image.txt").write_text('"A:共通" &NOP\n', encoding="utf-8")
+        (shared / "jpg.txt").write_text('"B:jpgだけ" &NOP\n', encoding="utf-8")
+        (shared / "folder.txt").write_text('"P:開く" &NOP\n', encoding="utf-8")
+        (local / "jpg.txt").write_text('"C:この PC" &NOP\n', encoding="utf-8-sig")
+        assert m.load_aliases(shared) == {"jpg": "image", "png": "image"}
+        s, l = m.find_menus("jpg", shared, local)
+        assert [i.label for i in s] == ["共通", "jpgだけ"] and [i.label for i in l] == ["この PC"]
+        s, l = m.find_menus("png", shared, local)
+        assert [i.label for i in s] == ["共通"] and l is None
+        assert m.find_menus("xyz", shared, local) == (None, None)
+        assert m.find_menus("", shared, local) == (None, None)
+        # 雛形: 無ければ作る(説明だけ)。あれば触らない
+        path = m.ensure_local_file("png", local)
+        assert Path(path).read_text(encoding="utf-8").startswith("#")
+        assert m.find_menus("png", shared, local)[1] == []
+        assert m.ensure_local_file("jpg", local) == str(local / "jpg.txt")
+        assert "この PC" in (local / "jpg.txt").read_text(encoding="utf-8-sig")
+    # リポジトリの初期メニュー: 個人のパスが無く、folder・画像・動画・テキストが引ける
+    for name in ("folder", "jpg", "heic", "mp4", "avi", "md", "json"):
+        s, _l = m.find_menus(name, m.MENU_DIR, os.path.join(_TEST_TEMP, "no_local"))
+        assert s, name
+    for path in m.MENU_DIR.glob("*.txt"):
+        data = path.read_bytes()
+        assert b"\r\n" not in data, path
+        for line in data.decode("utf-8").splitlines():
+            if not line.startswith("#"):
+                assert not m.has_personal_path(line), (path, line)
+
+
+def test_extmenu_editor_files_and_tools():
+    import filer_extmenu as m
+    with tempfile.TemporaryDirectory() as tmp:
+        shared, local = Path(tmp, "shared"), Path(tmp, "local")
+        shared.mkdir()
+        (shared / "txt.txt").write_text('"V:見る" &VIEW $MF\n', encoding="utf-8")
+        local.mkdir()
+        original = '# 自分のメモ\n"A:一" &NOP\n\n"B:二" &NOP\n'
+        (local / "txt.txt").write_bytes(original.encode("utf-8"))
+        exe = "C:\\Tools\\My App\\app.exe"
+        ed = m.MenuEditor({"old": {"command": ["C:\\x.exe"]}}, shared, local)
+        assert "txt" in ed.kinds() and ed.kinds()[0] == "folder"
+        assert [l.label for _s, l in ed.readonly_items("txt")] == ["見る"]
+        assert ed.used_keys("txt") == {"V", "A", "B"}
+        line = ed.add_item("txt", {"label": "アプリ", "key": "P", "program": ("exe", exe),
+                                   "args": "$MF", "cwd": ""})
+        assert line == '"P:アプリ" {tool:app} $MF'
+        assert ed.tool_updates == {"app": {"command": [exe]}}
+        # 同じ exe は使い回す(名前も値も増えない)。作業フォルダが違えば別名で
+        ed.add_item("txt", {"label": "再", "key": "Q", "program": ("exe", exe.lower()),
+                            "args": "", "cwd": ""})
+        ed.add_item("txt", {"label": "別", "key": "R", "program": ("exe", exe),
+                            "args": "$P", "cwd": "C:\\w"})
+        assert set(ed.tool_updates) == {"app", "app2"}
+        assert ed.tool_updates["app2"] == {"command": [exe], "cwd": "C:\\w"}
+        ed.add_item("txt", {"label": "既存", "key": "O", "program": ("tool", "old"), "args": "$MF"})
+        ed.move_local("txt", 0, 1)                 # 一 ↔ 二
+        ed.replace_local("txt", 2, {"label": "アプリ改", "key": "P", "program": ("tool", "app"),
+                                    "args": '"$MF"'})
+        ed.delete_local("txt", 3)                  # 再 を消す
+        # 共有には個人のパスを書かない(exe は tools へ、行は {tool:} だけ)
+        shared_line = ed.add_item("txt", {"label": "共有", "key": "S", "program": ("exe", exe),
+                                          "args": "$MF"}, scope="shared")
+        assert shared_line == '"S:共有" {tool:app} $MF'
+        try:
+            ed.add_item("txt", {"label": "x", "key": "X", "program": ("raw", exe),
+                                "args": ""}, scope="shared")
+            raise AssertionError("個人のパスが共有に入った")
+        except ValueError:
+            pass
+        # 決定前はファイルに触らない
+        assert (local / "txt.txt").read_bytes() == original.encode("utf-8")
+        written = ed.commit()
+        assert written["local"] == [str(local / "txt.txt")]
+        assert written["shared"] == [str(shared / "txt.txt")]
+        assert set(written["tools"]) == {"app", "app2"}
+        text = (local / "txt.txt").read_bytes().decode("utf-8")
+        assert "\r" not in text and text.endswith("\n")
+        assert text.splitlines() == ['# 自分のメモ', '"B:二" &NOP', '', '"A:一" &NOP',
+                                     '"P:アプリ改" {tool:app} "$MF"',
+                                     '"R:別" {tool:app2} $P', '"O:既存" {tool:old} $MF'], text
+        assert (local / "txt.txt.bak").read_bytes() == original.encode("utf-8")   # 1世代
+        assert not (shared / "txt.txt.bak").exists()                               # 共有は残さない
+        assert (shared / "txt.txt").read_text(encoding="utf-8").splitlines()[-1] == shared_line
+        # 書き換えた行を編集用に分け直せる
+        assert m.describe_program('{tool:app} "$MF"') == (("tool", "app"), '"$MF"')
+        assert m.describe_program('C:\\Program Files\\x.exe $MF') == (
+            ("raw", '"C:\\Program Files\\x.exe"'), "$MF")
+    assert m.suggest_key("VLC media player", {"V"}) == "L"
+    assert m.suggest_key("日本語", {"A"}) == "B"
+    assert m.tool_name_from_exe("C:\\x\\Photo Culler.EXE") == "photo_culler"
+    assert m.has_personal_path("{tool:x} C:\\Users\\me\\a") and m.has_personal_path("x \\\\srv\\s")
+    assert not m.has_personal_path('"P:開く" &EXCD -P$MF\\')
+
+
+class _FakeRegistry:
+    def __init__(self, values=None, subkeys=None):
+        self._values = values or {}
+        self._subkeys = subkeys or {}
+
+    def values(self, hive, path):
+        return dict(self._values.get((hive, path.lower()), {}))
+
+    def subkeys(self, hive, path):
+        return list(self._subkeys.get((hive, path.lower()), []))
+
+    def default(self, hive, path):
+        return self.values(hive, path).get("")
+
+
+def test_open_with_candidates():
+    import filer_extmenu as m
+    user = m.FILE_EXTS_KEY.lower() + "\\.mp4"
+    reg = _FakeRegistry(values={
+        ("HKCU", user + "\\openwithlist"): {"a": "vlc.exe", "b": "mpc.exe", "MRUList": "ba"},
+        ("HKCU", user + "\\openwithprogids"): {"VLC.mp4": b""},
+        ("HKCR", "applications\\vlc.exe\\shell\\open\\command"): {"": '"C:\\VLC\\vlc.exe" "%1"'},
+        ("HKCR", "vlc.mp4\\shell\\open\\command"): {"": '"C:\\VLC\\vlc.exe" --started "%1"'},
+        ("HKCR", ".mp4"): {"": "WMP.mp4"},
+        ("HKCR", "wmp.mp4\\shell\\open\\command"): {"": "C:\\Program Files\\WMP\\wmp.exe /x %1"},
+        ("HKCR", ".mp4\\openwithprogids"): {"AppX123": b""},
+        ("HKCR", "directory\\shell\\code\\command"): {"": '"C:\\Code\\Code.exe" "%V"'},
+        ("HKCR", "folder\\shell\\open\\command"): {"": "%SystemRoot%\\Explorer.exe"},
+    }, subkeys={("HKCR", "directory\\shell"): ["code", "none"],
+                ("HKCR", "folder\\shell"): ["open"]})
+    files = {"C:\\VLC\\vlc.exe", "C:\\MPC\\mpc.exe", "C:\\Program Files\\WMP\\wmp.exe",
+             "C:\\Code\\Code.exe", os.path.expandvars("%SystemRoot%\\Explorer.exe")}
+    found = m.open_with_candidates("mp4", registry=reg, exists=lambda p: p in files,
+                                   app_path=lambda n: {"mpc.exe": "C:\\MPC\\mpc.exe"}.get(n))
+    # MRUList 順(mpc → vlc)、ProgId は重複を除く、空白入りの引用符無しパスも取れる
+    assert found == ["C:\\MPC\\mpc.exe", "C:\\VLC\\vlc.exe", "C:\\Program Files\\WMP\\wmp.exe"], found
+    folder = m.open_with_candidates("folder", registry=reg, exists=lambda p: p in files)
+    assert folder == ["C:\\Code\\Code.exe", os.path.expandvars("%SystemRoot%\\Explorer.exe")], folder
+    assert m.exe_from_command('"C:\\a b\\x.exe" "%1"') == "C:\\a b\\x.exe"
+    assert m.exe_from_command(None) == ""
+    # 本物の exe の FileDescription(読めること・落ちないことだけ)
+    assert isinstance(m.file_description(os.path.join(os.environ.get("SystemRoot", "C:\\Windows"),
+                                                      "explorer.exe")), str)
+    assert m.file_description("C:\\no\\such.exe") == ""
+
+
+# ---------------------------------------------------------------
+# 版表記と更新(filer_update.py)
+# ---------------------------------------------------------------
+def _make_git(root, packed=False, with_commit=True):
+    import zlib
+    sha = "2f74ed1" + "a" * 33
+    git = Path(root, ".git")
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    if packed:
+        (git / "packed-refs").write_text(f"# pack-refs with: peeled\n{sha} refs/heads/main\n",
+                                         encoding="utf-8")
+    else:
+        (git / "refs" / "heads" / "main").write_text(sha + "\n", encoding="utf-8")
+    if with_commit:
+        stamp = int(time.mktime((2026, 10, 29, 12, 0, 0, 0, 0, -1)))
+        body = (f"tree {'b' * 40}\nauthor a <a@b> {stamp} +0900\n"
+                f"committer a <a@b> {stamp} +0900\n\nmsg\n").encode()
+        obj = git / "objects" / sha[:2]
+        obj.mkdir(parents=True)
+        (obj / sha[2:]).write_bytes(zlib.compress(b"commit %d\0" % len(body) + body))
+    return sha
+
+
+def test_version_label_reads_git_and_zip():
+    import filer_update as u
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_git(tmp)
+        assert u.version_label(tmp) == "2f74ed1 (10/29)"
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_git(tmp, packed=True)                 # packed-refs だけ
+        assert u.version_label(tmp) == "2f74ed1 (10/29)"
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_git(tmp, with_commit=False)           # コミットが読めなければ ref の更新時刻
+        label = u.version_label(tmp)
+        assert label.startswith("2f74ed1 (") and label.endswith(")"), label
+    with tempfile.TemporaryDirectory() as tmp:      # ZIP 展開(.git 無し)
+        py = Path(tmp, "a.py")
+        py.write_text("x = 1\n", encoding="utf-8")
+        stamp = time.mktime((2026, 10, 28, 9, 0, 0, 0, 0, -1))
+        os.utime(py, (stamp, stamp))
+        assert u.version_label(tmp) == "ZIP 10/28"
+        assert not u.has_git(tmp)
+    with tempfile.TemporaryDirectory() as tmp:
+        assert u.version_label(tmp) == ""           # どちらも取れない
+    assert u.window_title("C:\\x", "2f74ed1 (10/29)") == "C:\\x - あっふ 2f74ed1 (10/29)"
+    assert u.window_title("", "") == "あっふ" and u.window_title("C:\\x", "") == "C:\\x - あっふ"
+
+
+def _fake_git(outputs, calls=None):
+    """git の呼び出しの差し替え。outputs は {最初の引数: (code, out, err) か例外}。"""
+    import filer_update as u
+
+    def run(args, timeout):
+        if calls is not None:
+            calls.append(list(args))
+        value = outputs.get(args[0], (0, "", ""))
+        if isinstance(value, Exception):
+            raise value
+        if callable(value):
+            return value(args)
+        return value
+    return run
+
+
+def test_update_decide_and_check():
+    import filer_update as u
+    assert u.decide(0, 0, []) == "uptodate" and u.decide(2, 0, ["x"]) == "uptodate"
+    assert u.decide(0, 3, []) == "behind"
+    assert u.decide(1, 3, []) == "diverged" and u.decide(0, 3, ["a.py"]) == "dirty"
+    assert u.resident_files(["filer.py", "filer_menus/a.txt", "main.py", "tests/test_x.py",
+                             "README.md", "feature_screen.py", "tools/x.py"]) == [
+        "main.py", "feature_screen.py"]
+    with tempfile.TemporaryDirectory() as tmp:
+        assert u.check_updates(tmp, run=_fake_git({}))["state"] == "nogit"
+        Path(tmp, ".git").mkdir()
+        calls = []
+        info = u.check_updates(tmp, run=_fake_git({
+            "rev-parse": (0, "origin/main\n", ""),
+            "rev-list": (0, "0\t2\n", ""),
+            "status": (0, "", ""),
+            "log": (0, "abc1234 あっふ: 直す\ndef5678 常駐: 足す\n", ""),
+            "diff": (0, "filer.py\nmain.py\n", ""),
+        }, calls))
+        assert info["state"] == "behind" and info["behind"] == 2, info
+        assert info["commits"] == ["abc1234 あっふ: 直す", "def5678 常駐: 足す"]
+        assert info["files"] == ["filer.py", "main.py"]
+        assert calls[0][0] == "fetch" and ["pull", "--ff-only"] not in calls
+        info = u.check_updates(tmp, run=_fake_git({"rev-parse": (0, "origin/main", ""),
+                                                   "rev-list": (0, "1\t2", "")}))
+        assert info["state"] == "diverged" and "分岐" in u.describe_block(info)
+        info = u.check_updates(tmp, run=_fake_git({"rev-parse": (0, "origin/main", ""),
+                                                   "rev-list": (0, "0\t1", ""),
+                                                   "status": (0, " M filer.py\n", "")}))
+        assert info["state"] == "dirty" and "filer.py" in u.describe_block(info)
+        info = u.check_updates(tmp, run=_fake_git({"rev-list": (0, "0\t0", "")}))
+        assert info["state"] == "uptodate"
+        # 失敗は落ちずに一言で
+        info = u.check_updates(tmp, run=_fake_git({"fetch": (128, "", "fatal: unable to access "
+                                                                     "'https://x': Could not resolve host")}))
+        assert info["state"] == "error" and "ネットワーク" in info["message"], info
+        info = u.check_updates(tmp, run=_fake_git({"fetch": (128, "", "fatal: Authentication failed")}))
+        assert "認証" in info["message"]
+        info = u.check_updates(tmp, run=_fake_git({"fetch": u.GitError("git が見つかりません")}))
+        assert info == {"state": "error", "message": "git が見つかりません"}
+        info = u.check_updates(tmp, run=_fake_git({"rev-parse": (128, "", "no upstream")}))
+        assert info["state"] == "error" and "追跡" in info["message"]
+        assert u.pull(tmp, run=_fake_git({"pull": (0, "Fast-forward\n", "")})) == {
+            "ok": True, "message": "Fast-forward"}
+        result = u.pull(tmp, run=_fake_git({"pull": (1, "", "fatal: Not possible to fast-forward")}))
+        assert result["ok"] is False and "pull" in result["message"]
+    # git が無い環境でも GitError になる(落ちない)
+    real = u.subprocess.run
+
+    def missing(*_a, **_k):
+        raise FileNotFoundError("git")
+    u.subprocess.run = missing
+    try:
+        try:
+            u.run_git(["status"])
+            raise AssertionError("GitError にならない")
+        except u.GitError as e:
+            assert "git" in str(e)
+    finally:
+        u.subprocess.run = real
+
+
+# ---------------------------------------------------------------
+# 窓: Ctrl+Enter / ツールの追加 / 設定タブ / タイトル / Shift+F5
+# ---------------------------------------------------------------
+def _menu_window(tmp, tools=None, settings_path=None):
+    import filer
+    left, right = _make_tree(tmp)
+    jp = Path(left, "写真 フォルダ")
+    jp.mkdir()
+    Path(left, "data.xyz").write_bytes(b"x")
+    section = {"left_path": str(left), "right_path": str(right), "editor": "x"}
+    if tools is not None:
+        section["tools"] = tools
+    w = filer.FilerWindow({"filer": section}, settings_path)
+    w.menu_local_dir = os.path.join(tmp, "localmenus")
+    w.menu_app_path = lambda name: None
+    w.menu_which = lambda name: ("C:\\Windows\\explorer.exe" if name.lower() == "explorer.exe"
+                                 else None)
+    w.menu_exists = lambda p: os.path.isfile(p) or p == "C:\\Windows\\explorer.exe"
+    w.show()
+    w.start()
+    _wait(w)
+    return w, left, right, jp
+
+
+def _drive_menu(w, letters, seen=None):
+    """_exec_menu の差し替え: 実物の _ChooserMenu を popup で出し、文字キー → Enter を送って
+    triggered した値を返す(exec はモーダルで止まるので使わない)。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    def run(menu, chosen):
+        fired = []
+        menu.triggered.connect(lambda action: fired.append(chosen.get(action)))
+        if seen is not None:
+            seen.append([a.text() for a in menu.actions() if not a.isSeparator()])
+        menu.popup(w.mapToGlobal(QPoint(40, 40)))
+        QTest.qWait(30)
+        for letter in letters:
+            QTest.keyClick(menu, getattr(Qt, f"Key_{letter}"))
+            QTest.qWait(10)
+        assert not fired, "文字キーで実行された"
+        QTest.keyClick(menu, Qt.Key_Return)
+        QTest.qWait(30)
+        menu.hide()
+        return fired[0] if fired else None
+    return run
+
+
+def test_window_ext_menu():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        pyw = Path(tmp, "tools dir", "pythonw.exe")
+        pyw.parent.mkdir()
+        pyw.write_bytes(b"")
+        workdir = Path(tmp, "work")
+        workdir.mkdir()
+        w, left, right, jp = _menu_window(tmp)
+        L, R = w.left, w.right
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        calls = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                calls.append((list(args), kwargs.get("cwd")))
+        real_popen = filer.subprocess.Popen
+        filer.subprocess.Popen = FakePopen
+        try:
+            assert core.DEFAULT_KEYMAP["2013"] == "ext_menu"
+            # フォルダ: 頭文字 O で「反対側で開く」を選び、Enter で &EXCD -O が効く
+            seen = []
+            w._exec_menu = _drive_menu(w, "O", seen)
+            L.set_cursor(L._row_of("sub1"))
+            key(Qt.Key_Return, Qt.ControlModifier)
+            _wait(w)
+            assert core.same_dir(R.path, left / "sub1"), R.path
+            assert core.same_dir(L.path, left)
+            labels = seen[0]
+            assert labels[0].startswith("&P:開く"), labels
+            # PhotoCuller は tools に無く App Paths でも見つからないので出ない
+            assert not any("PhotoCuller" in t for t in labels), labels
+            assert labels[-2:] == ["&T:ツールを追加…", "&M:メニューを編集"], labels
+            # P(先頭のまま Enter)は今の窓でそのフォルダを開く(末尾 \ 付き → 中を開く)
+            w._exec_menu = _drive_menu(w, "")
+            L.set_cursor(L._row_of("sub2"))
+            key(Qt.Key_Return, Qt.ControlModifier)
+            _wait(w)
+            assert core.same_dir(L.path, left / "sub2"), L.path
+            # ".." の上は今のフォルダ自身が対象(E でエクスプローラへ今のフォルダ)
+            L.set_cursor(L._row_of(".."))
+            w._exec_menu = _drive_menu(w, "E")
+            key(Qt.Key_Return, Qt.ControlModifier)
+            assert calls[-1] == (["C:\\Windows\\explorer.exe", str(left / "sub2")],
+                                 str(left / "sub2")), calls
+            # 定義の無い拡張子は今までどおり関連付けで開く
+            L.load(str(left))
+            _wait(w)
+            opened = []
+            w._startfile = opened.append
+            w._exec_menu = lambda m, c: (_ for _ in ()).throw(AssertionError("メニューが出た"))
+            L.set_cursor(L._row_of("data.xyz"))
+            key(Qt.Key_Return, Qt.ControlModifier)
+            assert opened == [str(left / "data.xyz")], opened
+        finally:
+            filer.subprocess.Popen = real_popen
+            w.close()
+            w.deleteLater()
+
+        # tools に書けば出る。外部コマンドは日本語・空白入りのパスでも1引数のまま
+        tools = {"photoculler": {"command": [str(pyw), "-m", "photo_culler"], "cwd": str(workdir)}}
+        second = os.path.join(tmp, "b")
+        os.makedirs(second)
+        w, left, right, jp = _menu_window(second, tools=tools)
+        calls.clear()
+        filer.subprocess.Popen = FakePopen
+        try:
+            seen = []
+            w._exec_menu = _drive_menu(w, "C", seen)
+            w.left.set_cursor(w.left._row_of("写真 フォルダ"))
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert any("PhotoCuller" in t for t in seen[0]), seen
+            assert calls == [([str(pyw), "-m", "photo_culler", str(jp)], str(workdir))], calls
+            # 同じ文字の項目が複数あれば押すたびに次へ(この PC の分に P を足す)
+            Path(w.menu_local_dir).mkdir(parents=True, exist_ok=True)
+            Path(w.menu_local_dir, "folder.txt").write_text(
+                '"P:この PC の P" explorer.exe /select, $MF\n', encoding="utf-8")
+            calls.clear()
+            w._exec_menu = _drive_menu(w, "PP")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert calls == [(["C:\\Windows\\explorer.exe", "/select,", str(jp)],
+                              str(Path(jp).parent))], calls
+            # 「メニューを編集」: この PC の追加ファイルをエディタで(無ければ雛形を作る)
+            calls.clear()
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            w._exec_menu = _drive_menu(w, "M")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            made = Path(w.menu_local_dir, "txt.txt")
+            assert made.exists() and calls == [(["x", str(made)], None)], calls
+            # テキストの &EDIT はエディタ(filer.editor)で対象を
+            calls.clear()
+            w._exec_menu = _drive_menu(w, "E")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert calls == [(["x", str(Path(w.left.path, "alpha.txt"))], None)], calls
+        finally:
+            filer.subprocess.Popen = real_popen
+            w.close()
+            w.deleteLater()
+
+
+def test_window_ext_menu_property_and_archive():
+    """&PROPERTY は子プロセス(filer_contextmenu.py --verb properties)で。書庫の中では
+    外部ツール・&PROPERTY を出さない。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, right, jp = _menu_window(tmp)
+        with zipfile.ZipFile(left / "pack.zip", "w") as z:
+            z.writestr("in/a.txt", b"a")
+        calls = []
+        real_popen = filer.subprocess.Popen
+        filer.subprocess.Popen = lambda args, **kw: calls.append(list(args))  # noqa: E731
+        try:
+            w.left.reload()
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("sub1"))
+            w._exec_menu = _drive_menu(w, "R")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert calls and calls[0][1].endswith("filer_contextmenu.py"), calls
+            args = core.parse_context_args(calls[0][2:])
+            assert args["verb"] == "properties" and args["paths"] == [str(left / "sub1")], args
+            # 書庫の中
+            w.left.load(str(left / "pack.zip" / "in"))
+            _wait(w)
+            seen = []
+            w._exec_menu = lambda m, c: (seen.append([a.text() for a in m.actions()]), None)[1]
+            w.left.set_cursor(w.left._row_of("a.txt"))
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            texts = " ".join(seen[0])
+            assert "内蔵ビュア" in texts and "エディタ" in texts, texts
+            assert "メモ帳" not in texts and "プロパティ" not in texts and "選択" not in texts, texts
+        finally:
+            filer.subprocess.Popen = real_popen
+            w.close()
+            w.deleteLater()
+
+
+def test_window_add_tool_from_menu():
+    """Ctrl+Enter → ツールを追加: この PC だけ / 全 PC で共有 のそれぞれで、メニューの
+    ファイルと settings.json の filer.tools(キーだけ)がどうなるか。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text(json.dumps({"hotkeys": {"x": "y"}, "filer": {
+            "editor": "x", "tools": {"keep": "C:\\keep.exe"}}}), encoding="utf-8")
+        shared = Path(tmp, "shared")
+        shutil.copytree(Path(__file__).resolve().parent.parent / "filer_menus", shared)
+        w, left, right, jp = _menu_window(tmp, settings_path=str(settings_path))
+        w.menu_shared_dir = shared
+        exe = str(Path(tmp, "My Tool", "tool.exe"))
+        Path(exe).parent.mkdir()
+        Path(exe).write_bytes(b"")
+        try:
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            asked = []
+
+            def ask(kind, editor, initial=None):
+                asked.append(kind)
+                return {"label": "マイツール", "key": "Y", "program": ("exe", exe),
+                        "args": "$MF", "cwd": "", "scope": "local"}
+            w.ask_add_tool = ask
+            w._exec_menu = _drive_menu(w, "T")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert asked == ["txt"]
+            local = Path(w.menu_local_dir, "txt.txt")
+            assert local.read_text(encoding="utf-8") == '"Y:マイツール" {tool:tool} $MF\n'
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert stored["filer"]["tools"] == {"keep": "C:\\keep.exe",
+                                                "tool": {"command": [exe]}}, stored
+            assert stored["hotkeys"] == {"x": "y"} and stored["filer"]["editor"] == "x"
+            assert w.tools["tool"] == {"command": [exe]}
+            # 次の Ctrl+Enter ですぐ出る
+            seen = []
+            w._exec_menu = lambda m, c: (seen.append([a.text() for a in m.actions()]), None)[1]
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert "&Y:マイツール" in seen[0], seen
+            # 全 PC で共有: リポジトリ側(ここでは写し)に {tool:} で。ツールは使い回し
+            w.ask_add_tool = lambda kind, editor, initial=None: {
+                "label": "共有ツール", "key": "K", "program": ("exe", exe), "args": "$MF",
+                "cwd": "", "scope": "shared"}
+            w._exec_menu = _drive_menu(w, "T")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert (shared / "txt.txt").read_text(encoding="utf-8") == '"K:共有ツール" {tool:tool} $MF\n'
+            assert "commit・push" in w.log_view.toPlainText()
+            assert not (shared / "txt.txt.bak").exists()
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert set(stored["filer"]["tools"]) == {"keep", "tool"}
+            # 個人のパスが共有に入る書き方は断る(ファイルは変わらない)
+            w.ask_add_tool = lambda kind, editor, initial=None: {
+                "label": "直書き", "key": "Z", "program": ("raw", exe), "args": "",
+                "cwd": "", "scope": "shared"}
+            w._exec_menu = _drive_menu(w, "T")
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert "直書き" not in (shared / "txt.txt").read_text(encoding="utf-8")
+            assert "追加できません" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_add_tool_dialog():
+    import filer_extmenu as m
+    import filer_settings
+    from PySide6.QtWidgets import QWidget
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        ed = m.MenuEditor({"vlc": {"command": ["C:\\VLC\\vlc.exe"]}}, Path(tmp, "s"),
+                          Path(tmp, "l"))
+        parent = QWidget()
+        cand = ["C:\\VLC\\vlc.exe", "C:\\MPC\\mpc.exe"]
+        d = filer_settings.AddToolDialog(
+            parent, "mp4", ed, candidates=lambda kind: cand,
+            describe=lambda p: {"C:\\MPC\\mpc.exe": "Media Player Classic"}.get(p, ""))
+        try:
+            texts = [d.program_combo.itemText(i) for i in range(d.program_combo.count())]
+            assert texts[1].startswith("★ vlc"), texts
+            assert "Media Player Classic（mpc.exe）" in texts and "vlc.exe" in texts, texts
+            assert d.error_text() == "実行するものを選んでください"
+            d.program_combo.setCurrentIndex(texts.index("Media Player Classic（mpc.exe）"))
+            assert d.label_edit.text() == "Media Player Classic" and d.key_edit.text() == "M"
+            assert d.args_edit.text() == "$MF" and d.error_text() is None
+            d.insert_macro("$P")
+            assert d.args_edit.text() == "$MF $P"
+            # 参照で選んだ exe は候補に足されて選ばれる
+            d.pick_exe = lambda: "C:/Other/new app.exe"
+            d.browse_exe()
+            assert d.program_combo.currentData() == ("exe", os.path.normpath("C:/Other/new app.exe"))
+            d.scope_shared.setChecked(True)
+            value = d.result_value()
+            # 表示名を自分で変えていなければ、選び直した exe の名前に付いていく
+            assert value["label"] == "new app" and value["key"] == "N", value
+            assert value["scope"] == "shared" and value["args"] == "$MF $P", value
+            d.label_edit.setText("自分の名前")
+            d._label_edited("自分の名前")
+            d.add_exe("C:\\MPC\\mpc.exe")
+            assert d.label_edit.text() == "自分の名前"
+            d.key_edit.setText("あ")
+            assert "英数字" in d.error_text()
+        finally:
+            d.deleteLater()
+        # 変更: 初期値が入り、保存先は この PC に固定
+        d = filer_settings.AddToolDialog(parent, "mp4", ed, initial={
+            "label": "VLC", "key": "V", "program": ("tool", "vlc"), "args": '"$MF"'})
+        try:
+            assert d.program_combo.currentData() == ("tool", "vlc")
+            assert d.label_edit.text() == "VLC" and d.args_edit.text() == '"$MF"'
+            d.scope_shared.setChecked(True)
+            assert d.result_value()["scope"] == "local"
+        finally:
+            d.deleteLater()
+            parent.deleteLater()
+
+
+def test_window_settings_tool_tab():
+    """Z の「拡張子とツール」: 追加・変更・削除・上下。共有の分は変えられない。決定で書く。"""
+    import filer
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text(json.dumps({"filer": {"editor": "x"}}), encoding="utf-8")
+        shared = Path(tmp, "shared")
+        shared.mkdir()
+        (shared / "_aliases.txt").write_text("text: txt md\n", encoding="utf-8")
+        (shared / "text.txt").write_text('"V:見る" &VIEW $MF\n', encoding="utf-8")
+        w, left, right, jp = _menu_window(tmp, settings_path=str(settings_path))
+        w.menu_shared_dir = shared
+        Path(w.menu_local_dir).mkdir(parents=True)
+        Path(w.menu_local_dir, "md.txt").write_text('# memo\n"A:一" &NOP\n', encoding="utf-8")
+        exe = str(Path(tmp, "app.exe"))
+        Path(exe).write_bytes(b"")
+        state = {}
+
+        def drive(dialog):
+            if not hasattr(dialog, "kind_list"):
+                return QDialog.Rejected
+            try:
+                kinds = [dialog.kind_list.item(i).text() for i in range(dialog.kind_list.count())]
+                assert kinds[0] == "folder" and "md" in kinds and "txt" in kinds, kinds
+                assert "text" not in kinds                       # グループ名は出さない
+                dialog.select_kind("md")
+                rows = [dialog.tool_tree.topLevelItem(i).text(1)
+                        for i in range(dialog.tool_tree.topLevelItemCount())]
+                assert rows == ["見る", "一"], rows
+                dialog.select_tool_row(0)
+                assert dialog.current_local() is None            # 共有の分は編集できない
+                dialog.confirm = lambda text: True
+                dialog.tool_delete()
+                dialog.tool_edit()
+                assert dialog.tool_tree.topLevelItemCount() == 2
+                answers = [{"label": "アプリ", "key": "P", "program": ("exe", exe),
+                            "args": "$MF", "cwd": "", "scope": "local"},
+                           {"label": "二", "key": "B", "program": ("raw", "&NOP"), "args": ""}]
+                dialog.ask_tool = lambda kind, initial=None: (
+                    state.setdefault("initial", []).append(initial), answers.pop(0))[1]
+                dialog.tool_add()                                 # 一, アプリ
+                assert dialog.current_local() == 1
+                dialog.tool_edit()                                # アプリ → 二(&NOP)
+                assert state["initial"][1]["program"] == ("tool", "app"), state
+                dialog.tool_move(-1)                              # 二, 一
+                assert dialog.current_local() == 0
+                dialog.select_tool_row(2)                         # 一
+                dialog.tool_delete()
+                rows = [dialog.tool_tree.topLevelItem(i).text(1)
+                        for i in range(dialog.tool_tree.topLevelItemCount())]
+                assert rows == ["見る", "二"], rows
+                # 決定前はファイルに触らない
+                assert Path(w.menu_local_dir, "md.txt").read_text(encoding="utf-8") == \
+                    '# memo\n"A:一" &NOP\n'
+                dialog.ask_kind = lambda: ".PDF"
+                dialog.tool_add_kind()
+                assert dialog.current_kind() == "pdf"
+            except BaseException as e:  # noqa: BLE001
+                state["error"] = e
+                return QDialog.Rejected
+            return QDialog.Accepted
+        w.exec_dialog = drive
+        try:
+            w.cmd_settings_dialog()
+            if "error" in state:
+                raise state["error"]
+            text = Path(w.menu_local_dir, "md.txt").read_text(encoding="utf-8")
+            assert text == '# memo\n"B:二" &NOP\n', text
+            assert Path(w.menu_local_dir, "md.txt.bak").read_text(encoding="utf-8") == \
+                '# memo\n"A:一" &NOP\n'
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert stored["filer"]["tools"] == {"app": {"command": [exe]}}, stored
+            assert stored["filer"]["editor"] == "x"
+            assert (shared / "text.txt").read_text(encoding="utf-8") == '"V:見る" &VIEW $MF\n'
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_window_title_shows_version():
+    import filer
+    import filer_update
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, right, jp = _menu_window(tmp)
+        try:
+            assert w.version == filer_update.version_label(filer_update.REPO_DIR)
+            assert w.windowTitle() == filer_update.window_title(w.left.path, w.version)
+            if filer_update.has_git():
+                assert w.version and " - あっふ " in w.windowTitle(), w.windowTitle()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def _wait_until(cond, timeout=5.0):
+    from PySide6.QtTest import QTest
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        QTest.qWait(20)
+    raise AssertionError("待ちきれない")
+
+
+def test_window_update_restart():
+    """Shift+F5: 最新 / 新コミットあり→pull→再起動 / 早送り不可 / ZIP / 失敗。
+    本物の git・本物の再起動は使わず、呼び出しを差し替えて順序を見る。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w, left, right, jp = _menu_window(tmp, settings_path=str(settings_path))
+        repo = Path(tmp, "repo")
+        (repo / ".git").mkdir(parents=True)
+        w.repo_dir = repo
+        order = []
+        asked = []
+        answers = []
+        w.confirm = lambda title, text, default_yes=True: (asked.append(text), answers.pop(0))[1]
+        w.release_instance = lambda: order.append("release")
+        w.spawn_successor = lambda: order.append("spawn")
+        w.exit_app = lambda: order.append("exit")
+        w.reacquire_instance = lambda: order.append("reacquire")
+        real_save = w.save_state
+        w.save_state = lambda: (order.append("save"), real_save())
+        pulls = []
+        w.pull_updates = lambda repo_dir: (pulls.append(repo_dir), {"ok": True,
+                                                                    "message": "Fast-forward"})[1]
+
+        def press():
+            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            _wait_until(lambda: not w._update_busy)
+            QTest.qWait(30)
+        try:
+            assert core.DEFAULT_KEYMAP["1116"] == "update_restart"
+            assert core.fkey_labels(w.keymap, core.SHIFT)[4] == "更新"
+            # 最新 → 再起動だけ(OK)。順序は 保存 → 手放す → 起こす → 終わる
+            w.check_updates = lambda repo_dir: {"state": "uptodate"}
+            answers[:] = [True]
+            press()
+            assert "最新です" in asked[-1] and order == ["save", "release", "spawn", "exit"], order
+            assert w._restarting and json.loads(settings_path.read_text(encoding="utf-8"))["filer"]
+            w._restarting = False
+            # 新しいコミットあり → 一覧を見せて OK → pull → 再起動。常駐側の変更も知らせる
+            order.clear()
+            w.check_updates = lambda repo_dir: {
+                "state": "behind", "behind": 2, "ahead": 0, "dirty": [],
+                "commits": ["abc1234 あっふ: 直す", "def5678 常駐: 足す"],
+                "files": ["filer.py", "main.py"]}
+            answers[:] = [True]
+            press()
+            _wait_until(lambda: order)
+            assert "abc1234 あっふ: 直す" in asked[-1] and "2件" in asked[-1], asked[-1]
+            assert pulls == [repo] and order == ["save", "release", "spawn", "exit"], order
+            assert "常駐側も更新されました" in w.log_view.toPlainText()
+            w._restarting = False
+            # 取り込みを断れば何もしない
+            order.clear()
+            answers[:] = [False]
+            press()
+            assert order == [] and len(pulls) == 1
+            # 早送りできない → 何もせず理由を出す(確認も出さない)
+            asked.clear()
+            w.check_updates = lambda repo_dir: {"state": "diverged", "ahead": 1, "behind": 2,
+                                                "upstream": "origin/main"}
+            press()
+            assert asked == [] and order == [] and "分岐" in w.log_view.toPlainText()
+            w.check_updates = lambda repo_dir: {"state": "error",
+                                                "message": "git が見つかりません"}
+            press()
+            assert order == [] and "git が見つかりません" in w.log_view.toPlainText()
+            # 調べる側が例外でも落ちない
+            w.check_updates = lambda repo_dir: 1 / 0
+            press()
+            assert order == [] and "更新を確かめられません" in w.log_view.toPlainText()
+            # ZIP 展開(.git 無し) → 自動更新できない旨。断れば何もしない
+            w.repo_dir = Path(tmp, "zip")
+            w.repo_dir.mkdir()
+            answers[:] = [False]
+            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            assert "ZIP 展開" in asked[-1] and order == []
+            # 転送が残っていれば確かめる(断れば再起動しない)
+            w._op_queue = [object()]
+            answers[:] = [True, False]
+            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            assert "ファイル転送が残っています" in asked[-1] and order == [], order
+            w._op_queue = []
+            # 起こせなければ取り戻して残る
+            w.spawn_successor = lambda: (order.append("spawn"), (_ for _ in ()).throw(OSError("x")))
+            answers[:] = [True]
+            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            assert order == ["save", "release", "spawn", "reacquire"], order
+            assert not w._restarting
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def main() -> int:

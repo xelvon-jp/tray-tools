@@ -373,6 +373,10 @@ DEFAULT_SETTINGS = {
     #   show_fkey_bar … 窓の下にファンクションキーの段(F1〜F12。押せる)を出すか
     #   fkey_labels … その段の表示名だけの上書き。{"F7": "右クリ", "Shift+F10": "再読込"}
     #     (あふｗの4桁 "0118" でも書ける)。割り当てそのものは keys で変える
+    #   tools … Ctrl+Enter の拡張子ごとのメニュー(filer_menus/)で {tool:名前} と書いたツールの
+    #     この PC での場所。{"名前": "コマンド 引数"} か {"名前": {"command": [exe, 引数…],
+    #     "cwd": 作業フォルダ}}。無い名前は App Paths と PATH から探し、見つからなければ
+    #     その項目はメニューに出ない。「ツールを追加」でここに名前付きで書き足される
     # このほか geometry / maximized / left_path / right_path / active / recent /
     # left_sort / right_sort / compare_include_dirs / split_ratio(左右の境界) /
     # log_lines(メッセージ窓の行数) / left_font_size・right_font_size(左右それぞれの一覧の
@@ -399,6 +403,7 @@ DEFAULT_SETTINGS = {
         "winmerge": "",
         "show_fkey_bar": True,
         "fkey_labels": {},
+        "tools": {},
     },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {

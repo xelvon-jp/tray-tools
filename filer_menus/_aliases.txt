@@ -1,0 +1,5 @@
+# 同じメニューを使う拡張子のまとめ。「グループ: 拡張子 …」
+# jpg なら image.txt を使い、jpg.txt もあればその後ろに続ける。
+image: jpg jpeg png gif bmp webp heic
+video: mp4 mov mkv avi
+text: txt md log csv json ini

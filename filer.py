@@ -76,9 +76,11 @@ from PySide6.QtWidgets import (
 import affx_icon
 import filer_archive
 import filer_core as core
+import filer_extmenu
 import filer_launch
 import filer_phone
 import filer_shell
+import filer_update
 import settings as settings_module
 from traytools_send import pythonw_executable
 
@@ -499,6 +501,9 @@ class ListBridge(QObject):
     op_done = Signal(object)
     # フォルダの自動監視(外部で中身が変わったら再読込)の結果。
     folder_watch = Signal(object)
+    # Shift+F5 の更新: fetch して調べた結果 / pull の結果。
+    update_checked = Signal(object)
+    update_pulled = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -1394,13 +1399,18 @@ class _ChooserMenu(QMenu):
         plain = not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
         if plain and len(text) == 1 and text.isalnum():
             char = text.upper()
-            for action in self.actions():
-                if not action.isEnabled() or action.isSeparator():
-                    continue
-                if _menu_key_of(action) == char:
-                    self.setActiveAction(action)
-                    event.accept()
-                    return
+            matches = [a for a in self.actions()
+                       if a.isEnabled() and not a.isSeparator() and _menu_key_of(a) == char]
+            if matches:
+                # 同じ文字の項目が複数あれば、押すたびに次へ(Ctrl+Enter のメニューは
+                # 共有分とこの PC の分で文字が重なることがある)。
+                # 最初の1回は先頭の項目(開いた直後に先頭が選ばれていても、同じ文字の
+                # 1つ目へ)。同じ文字を続けて押したときだけ次へ進む。
+                current = self.activeAction()
+                repeat = getattr(self, "_last_char", None) == char and current in matches
+                index = matches.index(current) + 1 if repeat else 0
+                self.setActiveAction(matches[index % len(matches)])
+            self._last_char = char
             event.accept()  # 対応する項目が無い文字も、実行には使わない
             return
         super().keyPressEvent(event)
@@ -1501,6 +1511,20 @@ class FilerWindow(QWidget):
         self.extra_op_flags = 0
         self._picker = None
         self._server = None
+        # Ctrl+Enter の拡張子ごとのメニュー。ツールの場所は PC ごとの filer.tools。
+        # 共有のメニューの置き場・この PC の分の置き場・exe の探し方はテストで差し替える。
+        tools = section.get("tools")
+        self.tools = dict(tools) if isinstance(tools, dict) else {}
+        self.menu_shared_dir = filer_extmenu.MENU_DIR
+        self.menu_local_dir = None          # None なら LOCALAPPDATA の traytools/menus
+        self.menu_app_path = filer_extmenu.registry_app_path
+        self.menu_which = filer_extmenu.shutil.which
+        self.menu_exists = os.path.isfile
+        # 版(タイトルに出す)。起動時に1回だけ読む。Shift+F5 の更新は別スレッドで。
+        self.repo_dir = filer_update.REPO_DIR
+        self.version = filer_update.version_label(self.repo_dir)
+        self._update_busy = False
+        self._restarting = False
 
         families = section.get("font_families")
         if not (isinstance(families, list) and families):
@@ -1523,7 +1547,7 @@ class FilerWindow(QWidget):
         self.log_font = QFont(self.list_font)
         self.log_font.setPointSize(10)
 
-        self.setWindowTitle("あっふ")
+        self.setWindowTitle(filer_update.window_title("", self.version))
         # アプリ既定(main で設定)に加え窓自体にも付ける。タスクバーが
         # 実行ファイル側の汎用アイコンを拾う環境でも窓のアイコンが勝つ。
         self.setWindowIcon(affx_icon.qicon())
@@ -1547,6 +1571,8 @@ class FilerWindow(QWidget):
         # フォルダの自動監視。表示中のフォルダの中身が外部で変わったら再読込する。
         # 指紋の走査は別スレッド、判定と再読込はここ(UIスレッド)。
         self.bridge.folder_watch.connect(self._on_folder_watch)
+        self.bridge.update_checked.connect(self._on_update_checked)
+        self.bridge.update_pulled.connect(self._on_update_pulled)
         self._watch_checking = False
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(WATCH_INTERVAL_MS)
@@ -1939,20 +1965,28 @@ class FilerWindow(QWidget):
             updates["right_path"] = self.right.path
         save_values(self.app_settings, self.settings_path, updates)
 
-    def closeEvent(self, event):
-        # 転送の実行中・待ちが残っていたら、先に確かめる(裏のスレッドごと
-        # プロセスが終わるので、黙って閉じると転送が途中で切れる)。
+    def confirm_losses(self, verb: str = "閉じますか") -> bool:
+        """閉じると失われるもの(転送の実行中・待ち)があれば確かめる。閉じてよければ True。
+        裏のスレッドごとプロセスが終わるので、黙って閉じると転送が途中で切れる。"""
         if getattr(self, "_op_running", None) is not None or getattr(self, "_op_queue", None):
             running = 1 if self._op_running is not None else 0
             if not self.confirm(
                     "あっふ",
                     f"ファイル転送が残っています（実行中 {running}件・"
-                    f"待ち {len(self._op_queue)}件）。\n閉じますか？",
+                    f"待ち {len(self._op_queue)}件）。\n{verb}？",
                     default_yes=False):
-                event.ignore()
-                return
+                return False
+        return True
+
+    def closeEvent(self, event):
+        # 再起動(Shift+F5)では確認も保存も済ませてある(保存を後継の起動と書き合わない)。
+        restarting = getattr(self, "_restarting", False)
+        if not restarting and not self.confirm_losses():
+            event.ignore()
+            return
         try:
-            self.save_state()
+            if not restarting:
+                self.save_state()
             if self._picker is not None:
                 self._picker.close()
             if self._extracting is not None:
@@ -2001,7 +2035,7 @@ class FilerWindow(QWidget):
 
     def _update_title(self) -> None:
         path = self.active.path or ""
-        self.setWindowTitle(f"{path} - あっふ" if path else "あっふ")
+        self.setWindowTitle(filer_update.window_title(path, getattr(self, "version", "")))
 
     def on_pane_loaded(self, pane) -> None:
         self.recent = core.push_recent(self.recent, pane.path, RECENT_LIMIT)
@@ -2668,7 +2702,9 @@ class FilerWindow(QWidget):
     def cmd_open_shell(self):
         """F9: いまのフォルダを作業フォルダにして PowerShell を新しい窓で開く。
         パスはコマンド文字列に埋めず cwd で渡す(' や $ を含むフォルダ名で壊れない)。"""
-        folder = self._real_folder()
+        self._open_shell_at(self._real_folder())
+
+    def _open_shell_at(self, folder) -> None:
         if not folder:
             return
         try:
@@ -2688,6 +2724,388 @@ class FilerWindow(QWidget):
             self.log(f"エクスプローラ: {folder}")
         except OSError as e:
             self.log(f"エクスプローラを起動できません  ({e})")
+
+    # --- 拡張子ごとのメニュー(Ctrl+Enter。あふｗの AfxExt) ---
+    def menu_resolver(self):
+        return filer_extmenu.Resolver(self.tools, app_path=self.menu_app_path,
+                                      which=self.menu_which, exists=self.menu_exists)
+
+    def menu_editor(self):
+        return filer_extmenu.MenuEditor(self.tools, self.menu_shared_dir, self.menu_local_dir)
+
+    def _menu_context(self, pane, entries) -> dict:
+        """マクロの値。entries が空(".." の上)なら、いまのフォルダ自身が対象。"""
+        targets = [os.path.join(pane.path, e.name) for e in entries if not e.is_parent]
+        if not targets:
+            targets = [pane.path]
+        cursor = pane.cursor_entry()
+        if cursor is not None and not cursor.is_parent:
+            name = os.path.basename(cursor.name)
+        else:
+            name = os.path.basename(core.normalize_dir(pane.path).rstrip("\\")) or pane.path
+        return {"targets": targets, "P": pane.path, "F": name, "O": self.other.path or "",
+                "E": filer_extmenu.kind_of_name(name)
+                if cursor is not None and not cursor.is_dir else "",
+                "cwd": pane.real_dir()}
+
+    def cmd_ext_menu(self):
+        """Ctrl+Enter: 対象の拡張子(フォルダなら folder)のメニューを出す。
+
+        対象はマーク、無ければカーソル行。".." の上ならいまのフォルダ自身(あふｗと同じ)。
+        マークの拡張子が混ざっていたら、カーソル行がマークの中にあればその種類、
+        無ければマークの先頭の種類で決める。定義が無い拡張子は今までどおり関連付けで開く。"""
+        pane = self.active
+        entry = pane.cursor_entry()
+        if entry is None or not pane.path:
+            return
+        targets = pane.targets()
+        if targets and entry in targets:
+            kind_entry = entry
+        elif targets:
+            kind_entry = targets[0]
+        else:
+            kind_entry = entry
+        kind = filer_extmenu.menu_kind(kind_entry)
+        shared, local = filer_extmenu.find_menus(kind, self.menu_shared_dir, self.menu_local_dir)
+        if shared is None and local is None:
+            self.cmd_open_assoc()
+            return
+        resolver = self.menu_resolver()
+        lines = filer_extmenu.visible_items(shared, local, resolver,
+                                            in_archive=pane.archive is not None)
+        items = []
+        for line in lines:
+            items.append(None if line.separator else (line.key or "?", line.label, line))
+        if items:
+            items.append(None)
+        items.append(("T", "ツールを追加…", ("add",)))
+        items.append(("M", "メニューを編集", ("edit",)))
+        choice = self.choose_menu(kind, items)
+        if choice is None:
+            return
+        ctx = self._menu_context(pane, targets)
+        self.run_menu_choice(choice, kind, ctx, resolver)
+
+    def run_menu_choice(self, choice, kind, ctx, resolver) -> None:
+        pane = self.active
+        if choice == ("add",):
+            self.add_tool(kind)
+            return
+        if choice == ("edit",):
+            path = filer_extmenu.ensure_local_file(kind, self.menu_local_dir)
+            self._open_in_editor([path])
+            return
+        line = choice
+        name = filer_extmenu.internal_name(line.command)
+        if name is None:
+            built = filer_extmenu.build_external(line, ctx, resolver)
+            if built is None:
+                self.log(f"メニュー: 実行するものが見つかりません: {line.command}")
+                return
+            argv, cwd = built
+            try:
+                subprocess.Popen(argv, cwd=cwd if cwd and os.path.isdir(cwd) else None,
+                                 close_fds=True)
+                self.log(f"{line.label}: {' '.join(argv[1:]) or argv[0]}")
+            except OSError as e:
+                self.log(f"{line.label} を起動できません: {argv[0]}  ({e})")
+            return
+        arg = filer_extmenu.internal_arg(line.command)
+        if name == "NOP":
+            return
+        if name == "EXCD":
+            parsed = filer_extmenu.parse_excd(arg, ctx)
+            if parsed is None:
+                self.log(f"メニュー: &EXCD の書き方が読めません: {arg}")
+                return
+            side, path, inside = parsed
+            target = pane if side == "P" else self.other
+            if inside:
+                target.load(path)
+            else:
+                parent = core.parent_of(core.normalize_dir(path))
+                if parent is None:
+                    target.load(path)
+                else:
+                    target.load(parent, focus=os.path.basename(core.normalize_dir(path)))
+            return
+        paths = filer_extmenu.internal_targets(arg, ctx)
+        uses_targets = "$MF" in arg
+        if name == "EDIT":
+            if pane.archive is not None and uses_targets:
+                self.cmd_edit()
+                return
+            files = [p for p in paths if not os.path.isdir(p)]
+            if files:
+                self._open_in_editor(files)
+            return
+        if name == "SHELL":
+            folder = paths[0] if paths else pane.real_dir()
+            if not os.path.isdir(folder):
+                folder = os.path.dirname(folder)
+            self._open_shell_at(folder)
+            return
+        if name == "PROPERTY":
+            if paths:
+                self.spawn_properties(paths)
+            return
+        if name == "VIEW":
+            entry = pane.cursor_entry()
+            if uses_targets and entry is not None and not entry.is_dir:
+                if core.preview_kind(entry, self.viewer_extensions) == "image":
+                    if self.preview_on:
+                        self.schedule_preview(immediate=True)
+                    else:
+                        self.preview_show()
+                else:
+                    self._view_entry(entry)
+            elif paths and not os.path.isdir(paths[0]):
+                self.open_viewer(paths[0])
+            return
+        if name == "OPEN":
+            if pane.archive is not None and uses_targets:
+                for entry in pane.targets() or [pane.cursor_entry()]:
+                    if entry is not None and not entry.is_parent:
+                        self._open_file(entry)
+                return
+            for path in paths:
+                self._startfile(path)
+            return
+
+    def spawn_properties(self, paths) -> None:
+        """エクスプローラのプロパティ窓。COM が要るので F7 と同じ子プロセスに出させる
+        (filer_contextmenu.py --verb properties)。ファイラ本体は COM を読み込まない。"""
+        folders = {os.path.normcase(os.path.dirname(os.path.normpath(p))) for p in paths}
+        if len(folders) > 1:
+            self.log("プロパティ: 別々のフォルダのものは1つにまとめられません")
+            return
+        args = core.context_menu_args(paths, 0, 0, self._hwnd(), verb="properties")
+        if args is None:
+            fd, json_path = tempfile.mkstemp(prefix="filer_ctx_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(core.context_menu_payload(paths, 0, 0, self._hwnd(),
+                                                    verb="properties"), f, ensure_ascii=False)
+            args = ["--json", json_path]
+        filer_launch._allow_foreground()
+        try:
+            subprocess.Popen([pythonw_executable(), str(CONTEXT_MENU_SCRIPT)] + args,
+                             close_fds=True)
+            self.log(f"プロパティ: {paths[0]}" + (f" ほか{len(paths) - 1}件" if len(paths) > 1 else ""))
+        except OSError as e:
+            self.log(f"プロパティを開けません  ({e})")
+
+    # --- ツールの追加(Ctrl+Enter のメニュー末尾 / Z の設定「拡張子とツール」) ---
+    def open_with_candidates(self, kind: str) -> list:
+        """この拡張子を開ける exe(テストでは差し替える)。"""
+        return filer_extmenu.open_with_candidates(kind)
+
+    def describe_exe(self, path: str) -> str:
+        return filer_extmenu.file_description(path)
+
+    def ask_add_tool(self, kind: str, editor, initial=None):
+        """「ツールを追加」の小ダイアログ。結果の dict(scope 付き)か None。
+        テストではここを差し替える。"""
+        import filer_settings  # 使うときに読む
+
+        dialog = filer_settings.AddToolDialog(
+            self, kind, editor, candidates=self.open_with_candidates,
+            describe=self.describe_exe, folder=self.active.real_dir() or "",
+            initial=initial, font=self.log_font)
+        accepted = self.exec_dialog(dialog) == QDialog.Accepted
+        result = dialog.result_value() if accepted else None
+        dialog.deleteLater()
+        return result
+
+    def add_tool(self, kind: str) -> None:
+        editor = self.menu_editor()
+        result = self.ask_add_tool(kind, editor)
+        if not result:
+            return
+        try:
+            line = editor.add_item(kind, result, result.get("scope") or "local")
+        except ValueError as e:
+            self.log(f"ツールを追加できません: {e}")
+            return
+        self.commit_menu_editor(editor)
+        self.log(f"メニュー({kind}): 追加しました  {line}")
+
+    def commit_menu_editor(self, editor) -> dict:
+        """メニューの写しをファイルへ書き、新しいツールを settings.json の filer.tools に
+        (ツールのキーだけ)書き足す。"""
+        written = editor.commit()
+        if written["tools"]:
+            self.save_tools(written["tools"])
+        if written["shared"]:
+            self.log("リポジトリのファイルを変更しました（他の PC へ配るには commit・push が"
+                     "必要です）: " + ", ".join(os.path.basename(p) for p in written["shared"]))
+        return written
+
+    def save_tools(self, updates: dict) -> None:
+        """filer.tools の該当キーだけを差し替える(ほかのツールや filer の他のキーは触らない)。"""
+        self.tools.update(updates)
+        section = self.app_settings.setdefault(SETTINGS_SECTION, {}) if isinstance(
+            self.app_settings, dict) else {}
+        if isinstance(section, dict):
+            current = section.get("tools") if isinstance(section.get("tools"), dict) else {}
+            section["tools"] = {**current, **updates}
+        if not self.settings_path:
+            return
+        try:
+            stored = {}
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            if not isinstance(stored, dict):
+                stored = {}
+            filer_section = stored.get(SETTINGS_SECTION)
+            if not isinstance(filer_section, dict):
+                filer_section = stored[SETTINGS_SECTION] = {}
+            tools = filer_section.get("tools")
+            if not isinstance(tools, dict):
+                tools = filer_section["tools"] = {}
+            tools.update(updates)
+            settings_module.save_settings(stored, self.settings_path)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"settings.json に書けません: {e}")
+
+    # --- 更新を適用して再起動(Shift+F5) ---
+    def check_updates(self, repo_dir):
+        """fetch して調べる(別スレッドから呼ぶ。テストでは差し替える)。"""
+        return filer_update.check_updates(repo_dir)
+
+    def pull_updates(self, repo_dir):
+        return filer_update.pull(repo_dir)
+
+    def cmd_update_restart(self):
+        """Shift+F5: git で更新を取り込み、あっふだけを再起動する(常駐はそのまま)。"""
+        if self._update_busy:
+            self.log("更新: 確認の途中です")
+            return
+        if not filer_update.has_git(self.repo_dir):
+            if self.confirm("あっふの更新", "この PC は ZIP 展開なので自動更新できません。\n"
+                            "再起動だけしますか？", default_yes=False):
+                self.restart_filer()
+            return
+        self._update_busy = True
+        self.set_status_state("更新を確認中")
+        self.log("更新: 新しいコミットを確かめています（git fetch）…")
+        bridge, repo = self.bridge, self.repo_dir
+
+        def worker():
+            try:
+                info = self.check_updates(repo)
+            except Exception as e:  # noqa: BLE001
+                info = {"state": "error", "message": f"更新を確かめられません: {e}"}
+            try:
+                bridge.update_checked.emit(info)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-update-check").start()
+
+    def _on_update_checked(self, info) -> None:
+        try:
+            self._update_busy = False
+            self.set_status_state("Ready.")
+            state = info.get("state")
+            if state == "nogit":
+                if self.confirm("あっふの更新", "この PC は ZIP 展開なので自動更新できません。\n"
+                                "再起動だけしますか？", default_yes=False):
+                    self.restart_filer()
+                return
+            if state == "error":
+                self.log("更新: " + (info.get("message") or "失敗しました"))
+                return
+            if state in ("diverged", "dirty"):
+                self.log(filer_update.describe_block(info))
+                return
+            if state == "uptodate":
+                self.log("更新: 最新です")
+                if self.confirm("あっふの更新", "最新です。再起動だけしますか？",
+                                default_yes=False):
+                    self.restart_filer()
+                return
+            commits = info.get("commits") or []
+            text = f"新しいコミットが {info.get('behind')}件あります。\n\n" + "\n".join(
+                commits[:filer_update.LOG_LIMIT]) + "\n\n取り込んで（git pull --ff-only）再起動しますか？"
+            if not self.confirm("あっふの更新", text, default_yes=True):
+                self.log("更新: 取りやめました")
+                return
+            self._update_busy = True
+            self.set_status_state("更新中")
+            bridge, repo = self.bridge, self.repo_dir
+
+            def worker():
+                try:
+                    result = self.pull_updates(repo)
+                except Exception as e:  # noqa: BLE001
+                    result = {"ok": False, "message": f"git pull に失敗: {e}"}
+                try:
+                    bridge.update_pulled.emit((info, result))
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True, name="filer-update-pull").start()
+        except Exception:  # noqa: BLE001  スロットの中の例外で落とさない
+            self.log(f"エラー: {_log_exception('updateChecked')}")
+
+    def _on_update_pulled(self, payload) -> None:
+        try:
+            self._update_busy = False
+            self.set_status_state("Ready.")
+            info, result = payload
+            if not result.get("ok"):
+                self.log("更新: " + (result.get("message") or "失敗しました"))
+                return
+            self.log(f"更新: {result.get('message')}（{info.get('behind')}件）")
+            if filer_update.resident_files(info.get("files")):
+                self.log("常駐側も更新されました。トレイの 🔄 で再起動してください")
+            if not self.restart_filer():
+                self.log("更新は取り込みました。あとで Shift+F5 か閉じて開き直すと反映されます")
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('updatePulled')}")
+
+    def restart_filer(self) -> bool:
+        """あっふだけを再起動する。状態を保存 → 単一起動の権利を手放す → 後継を起こす →
+        自分は終わる。手放してから起こすのは main.py の _restart と同じ理由(後継が
+        「既に開いている」と判断して引き返すため)。起こせなければ取り戻して残る。"""
+        if not self.confirm_losses("再起動しますか"):
+            self.log("再起動を取りやめました")
+            return False
+        try:
+            self.save_state()
+        except Exception:  # noqa: BLE001  保存できなくても再起動はする
+            _log_exception("restartSave")
+        self.release_instance()
+        try:
+            self.spawn_successor()
+        except OSError as e:
+            self.log(f"再起動できません: {e}")
+            self.reacquire_instance()
+            return False
+        self._restarting = True
+        self.exit_app()
+        return True
+
+    def release_instance(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        QLocalServer.removeServer(filer_launch.SERVER_NAME)
+        release_single_instance()
+
+    def reacquire_instance(self) -> None:
+        acquire_single_instance()
+        self.listen()
+
+    def spawn_successor(self) -> None:
+        filer_launch.spawn()
+
+    def exit_app(self) -> None:
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
 
     # --- マーク ---
     def _toggle_mark(self, step: int) -> None:
@@ -3548,12 +3966,20 @@ class FilerWindow(QWidget):
         決定で settings.json の filer.ext_colors だけを差し替え、両窓をその場で描き直す。"""
         import filer_settings  # 使うときに読む
 
-        dialog = filer_settings.SettingsDialog(self, self.ext_rules, font=self.log_font)
+        editor = self.menu_editor()
+        dialog = filer_settings.SettingsDialog(
+            self, self.ext_rules, font=self.log_font, menu_editor=editor,
+            ask_tool=lambda kind, initial=None: self.ask_add_tool(kind, editor, initial))
         accepted = self.exec_dialog(dialog) == QDialog.Accepted
         rules = dialog.rules
         dialog.deleteLater()
         if not accepted:
             return
+        written = self.commit_menu_editor(editor)
+        if written["local"] or written["shared"]:
+            self.log("設定: 拡張子とツールを保存しました（"
+                     + ", ".join(os.path.basename(p)
+                                 for p in written["local"] + written["shared"]) + "）")
         self.set_ext_rules(rules)
         save_values(self.app_settings, self.settings_path,
                     {"ext_colors": core.ext_colors_to_settings(rules)})
@@ -4312,12 +4738,15 @@ class FilerWindow(QWidget):
         """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
         items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
-        項目はチェック付きで出す(Shift+Z の ON/OFF)。先頭の項目を選んだ状態にしておく
-        (開いてすぐ Enter で先頭が実行できるように)。"""
+        項目はチェック付きで出す(Shift+Z の ON/OFF)。None は区切り線。先頭の項目を選んだ
+        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。"""
         menu = _ChooserMenu(self)
         menu.setTitle(title)
         chosen = {}
         for item in items:
+            if item is None:
+                menu.addSeparator()
+                continue
             key, label, value = item[:3]
             action = menu.addAction(f"&{key}:{label}")
             action.setProperty("filer_menu_key", key)
@@ -4612,6 +5041,21 @@ def acquire_single_instance() -> bool:
         return False
     _mutex_handle = handle
     return True
+
+
+def release_single_instance() -> None:
+    """握っているミューテックスを手放す(再起動で後継に譲るため)。"""
+    global _mutex_handle
+    if not _mutex_handle:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(_mutex_handle)
+    except OSError:
+        pass
+    _mutex_handle = None
 
 
 def _apply_taskbar_identity(window) -> None:

@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -76,6 +77,7 @@ from PySide6.QtWidgets import (
 import affx_icon
 import filer_archive
 import filer_core as core
+import filer_everything
 import filer_extmenu
 import filer_launch
 import filer_phone
@@ -497,6 +499,8 @@ class ListBridge(QObject):
     preview_ready = Signal(object)
     # ハッシュの計算が終わったとき。[(パス, 名前, ハッシュ or None, エラー文字列 or "")]。
     hashed = Signal(object)
+    # フォルダ構成(C→I)のツリーができたとき。(根, 行の一覧 or None, エラー文字列)。
+    tree_built = Signal(object)
     # 転送キュー: 裏のスレッドで終わった転送の (op, result) を戻す。
     op_done = Signal(object)
     # フォルダの自動監視(外部で中身が変わったら再読込)の結果。
@@ -554,6 +558,14 @@ class Pane(QWidget):
         self.grep_loading = False
         self.grep_cancel = None
         self.grep_count = 0
+        # Everything 検索(Shift+F)。結果はフラット表示の形で出す(フラット表示・文字列検索と
+        # 同じ一覧の仕組みをそのまま使う)。es_query が検索語、es_all は「全体から探した」か、
+        # es_status は "done" / "limit"(上限で打ち切った)。
+        self.es_query = None
+        self.es_all = False
+        self.es_loading = False
+        self.es_cancel = None
+        self.es_status = "done"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -755,7 +767,10 @@ class Pane(QWidget):
             text += f" {self.mask_text}"
         else:
             text = "(読み込み中)"
-        if self.grep_query is not None or self.grep_loading:
+        if self.es_query is not None or self.es_loading:
+            scope = "全体" if self.es_all else "以下"
+            text += f"   [Everything({scope}): {self.es_query or ''}]"
+        elif self.grep_query is not None or self.grep_loading:
             text += f"   [検索: {self.grep_query or ''}]"
         elif self.flat or self.flat_loading:
             text += "   [フラット]"
@@ -783,6 +798,16 @@ class Pane(QWidget):
         if self.stash:
             size = sum(e.size for e in self.entries if not e.is_dir)
             text = f"一時置き場 {dirs + files}件   {size:,} bytes"
+            if count:
+                text += f"   Mark {count} ({total:,})"
+        elif self.es_loading:
+            text = "Everything で検索中（Esc で中止）"
+        elif self.es_query is not None:
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            text = f"Everything「{self.es_query}」 {dirs + files}件"
+            if self.es_status == "limit":
+                text += "（上限で打ち切り）"
+            text += f"   {size:,} bytes"
             if count:
                 text += f"   Mark {count} ({total:,})"
         elif self.grep_loading:
@@ -880,6 +905,7 @@ class Pane(QWidget):
         # (フォルダを移る・BS・O など)。
         self._stop_flat()
         self._stop_grep()
+        self._stop_es()
         was_stash = self.stash
         self.stash = False
         self.stash_from = None
@@ -1026,6 +1052,9 @@ class Pane(QWidget):
         if self.stash:
             self.show_stash()
             return
+        if self.es_query is not None and self.path:
+            self.load_everything(self.es_query, self.es_all, keep_marks=keep_marks)
+            return
         if self.grep_query is not None and self.path:
             self.load_grep(self.grep_query, self.grep_case, keep_marks=keep_marks)
             return
@@ -1046,6 +1075,7 @@ class Pane(QWidget):
             self.stash_from = self.real_dir() if self.archive else self.path
         self._stop_flat()
         self._stop_grep()
+        self._stop_es()
         self.request_id += 1   # 進行中のフォルダ読み込みを無効化する
         self.loading = False
         entries, missing = core.stash_entries(win.stash_paths)
@@ -1088,6 +1118,7 @@ class Pane(QWidget):
     def load_flat(self, keep_marks: bool = False) -> None:
         """いまのフォルダより下のファイルを別スレッドで集めて1つの一覧にする。
         集めている間は窓の下の行に件数を出し、Esc で中止できる(cancel_flat)。"""
+        self._stop_es()
         if self.flat_cancel is not None:
             self.flat_cancel.set()
         self.request_id += 1
@@ -1129,7 +1160,7 @@ class Pane(QWidget):
 
     def _tick_flat(self) -> None:
         try:
-            if self.flat_loading or self.grep_loading:
+            if self.flat_loading or self.grep_loading or self.es_loading:
                 self.update_footer()
             else:
                 self._flat_timer.stop()
@@ -1183,6 +1214,7 @@ class Pane(QWidget):
         ヒットしたファイルをフラット表示の形(相対パス名)で並べる。
         探している間は窓の下の行に走査数を出し、Esc で中止できる(cancel_grep)。"""
         self._stop_flat()
+        self._stop_es()
         if self.grep_cancel is not None:
             self.grep_cancel.set()
         self.request_id += 1
@@ -1266,6 +1298,106 @@ class Pane(QWidget):
                 self.window_.log(f"  {e.name}（{count}行）: {first}")
         if len(entries) > 50:
             self.window_.log(f"  …ほか {len(entries) - 50}件")
+
+    # --- Everything 検索(Shift+F) ---
+    def _stop_es(self) -> None:
+        if self.es_cancel is not None:
+            self.es_cancel.set()
+        self.es_cancel = None
+        self.es_query = None
+        self.es_loading = False
+        self.es_status = "done"
+
+    def load_everything(self, query: str, scope_all: bool = False,
+                        keep_marks: bool = False) -> None:
+        """es.exe で探し、結果をフラット表示の形で並べる(名前はこの窓のフォルダからの
+        相対パス。全体から探したときに外のものはフルパス)。es.exe は別スレッドで待つ
+        (UI を固めない)。Esc で中止できる(cancel_es)。"""
+        win = self.window_
+        es_argv = win.find_es()
+        if es_argv is None:
+            win.log(f"Everything検索: {filer_everything.NOT_FOUND_MESSAGE}")
+            return
+        self._stop_flat()
+        self._stop_grep()
+        if self.es_cancel is not None:
+            self.es_cancel.set()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.es_cancel = cancel
+        self.es_query = query
+        self.es_all = bool(scope_all)
+        self.es_loading = True
+        self.loading = True
+        root = self.path
+        args = dict(path=root, everything=query, scope_all=self.es_all, keep_marks=keep_marks)
+        bridge = win.bridge
+        limit, timeout = win.es_limit, win.es_timeout
+
+        def worker():
+            try:
+                found = filer_everything.run_search(
+                    es_argv, query, None if scope_all else root, limit, timeout, cancel)
+                entries, missing = filer_everything.to_entries(found.paths, root)
+                payload = (self.side, request, True, (found, entries, missing), args)
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
+            try:
+                bridge.finished.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name=f"filer-es-{self.side}").start()
+        self._flat_timer.start(200)
+        self.update_header()
+        self.update_footer()
+
+    def cancel_es(self) -> None:
+        if self.es_loading and self.es_cancel is not None:
+            self.es_cancel.set()
+
+    def on_es_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id:
+            return
+        self.loading = False
+        self.es_loading = False
+        self.es_cancel = None
+        self._flat_timer.stop()
+        query = args["everything"]
+        found = entries = None
+        missing = 0
+        if ok:
+            found, entries, missing = result
+        if not ok or found.status in ("error", "timeout", "cancel"):
+            if not ok:
+                self.window_.log(f"Everything検索: 探せません  ({result})")
+            elif found.status == "cancel":
+                self.window_.log("Everything検索: 中止しました")
+            else:
+                self.window_.log(f"Everything検索: {found.message}")
+            # 通常の表示へ戻す(前の検索結果が出ていたら、それも片付ける)。
+            self._stop_es()
+            self.load(args["path"], history=None)
+            return
+        if not args.get("keep_marks"):
+            self.marks = set()
+        self.flat = True
+        self.es_status = found.status
+        self.all_entries = entries
+        self._rebuild()
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
+        scope = "全体" if args["scope_all"] else args["path"]
+        text = f"Everything検索: 「{query}」 {len(entries)}件（範囲: {scope}）"
+        if found.status == "limit":
+            text += f"  ※{self.window_.es_limit:,}件で打ち切りました（語を足して絞ってください）"
+        if missing:
+            text += f"  ※索引にあって実在しない {missing}件は除きました"
+        self.window_.log(text)
 
     def refilter(self) -> None:
         """表示の絞り込み(Shift+Z)が変わったときに並べ直す。カーソルは同じ項目に付いて
@@ -1391,9 +1523,22 @@ class _ChooserMenu(QMenu):
     QMenu の既定では & の付いた文字キーを押した時点で項目が実行される(あふｗの
     &MENU と同じ即決)。それだと C → P のつもりが選択のつもりでもパスコピーが
     走ってしまうので、文字キーは「その項目を選ぶ」までに止める(2026-10-26
-    ユーザー要望)。Enter・クリックは従来どおり実行、矢印・Esc も従来どおり。"""
+    ユーザー要望)。Enter・クリックは従来どおり実行、矢印・Esc も従来どおり。
+
+    deletable を立てたメニューでは Del で「選んでいる項目の削除」を頼める(Alt+J の
+    ワークスペース)。その場合は何も実行せずに閉じ、delete_action に項目を残す。"""
+
+    deletable = False
+    delete_action = None
 
     def keyPressEvent(self, event):  # noqa: N802 (Qt の上書き)
+        if self.deletable and event.key() == Qt.Key_Delete:
+            current = self.activeAction()
+            if current is not None and current.isEnabled() and not current.isSeparator():
+                self.delete_action = current
+                self.close()
+            event.accept()
+            return
         text = event.text()
         modifiers = event.modifiers()
         plain = not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
@@ -1452,6 +1597,27 @@ class FilerWindow(QWidget):
         self.winmerge_setting = section.get("winmerge") or ""
         # フラット表示で集める上限(テストでは小さくする)。
         self.flat_limit = core.FLAT_LIMIT
+        # Everything 検索(Shift+F)。件数の上限と es.exe を待つ秒数、前回の範囲(全体か)。
+        try:
+            self.es_limit = max(1, int(section.get("everything_limit") or filer_everything.ES_LIMIT))
+        except (TypeError, ValueError):
+            self.es_limit = filer_everything.ES_LIMIT
+        try:
+            self.es_timeout = max(1.0, float(section.get("everything_timeout_seconds")
+                                             or filer_everything.ES_TIMEOUT))
+        except (TypeError, ValueError):
+            self.es_timeout = filer_everything.ES_TIMEOUT
+        self.es_scope_all = False
+        self.es_environ = None      # None なら os.environ(テストで差し替える)
+        # フォルダ構成をコピー(C→I)の深さと行数の上限。
+        try:
+            self.tree_depth = max(1, int(section.get("tree_depth") or core.TREE_DEPTH))
+        except (TypeError, ValueError):
+            self.tree_depth = core.TREE_DEPTH
+        try:
+            self.tree_lines = max(2, int(section.get("tree_lines") or core.TREE_LINES))
+        except (TypeError, ValueError):
+            self.tree_lines = core.TREE_LINES
         # 拡張子別表示色(Z の設定ダイアログで変えられる)。
         self.ext_rules = core.normalize_ext_colors(section.get("ext_colors"))
         self.ext_color_map = core.ext_color_map(self.ext_rules)
@@ -1564,6 +1730,8 @@ class FilerWindow(QWidget):
         self.bridge.preview_ready.connect(self._on_preview_ready)
         self.bridge.hashed.connect(self._on_hashed)
         self._hash_busy = False
+        self.bridge.tree_built.connect(self._on_tree_built)
+        self._tree_busy = False
         # ファイル転送のキュー(_transfer 参照)。実行中の op と待ちの列。
         self.bridge.op_done.connect(self._on_op_done)
         self._op_queue = []
@@ -2234,7 +2402,9 @@ class FilerWindow(QWidget):
     def _on_list_finished(self, payload) -> None:
         try:
             side, request, ok, result, args = payload
-            if args.get("grep"):
+            if args.get("everything") is not None:
+                self.pane(side).on_es_loaded(request, ok, result, args)
+            elif args.get("grep"):
                 self.pane(side).on_grep_loaded(request, ok, result, args)
             elif args.get("flat"):
                 self.pane(side).on_flat_loaded(request, ok, result, args)
@@ -2314,6 +2484,9 @@ class FilerWindow(QWidget):
             return
         if event.key() == Qt.Key_Escape and self.active.grep_loading:
             self.active.cancel_grep()   # Esc は「処理の中止」: 文字列検索を止める
+            return
+        if event.key() == Qt.Key_Escape and self.active.es_loading:
+            self.active.cancel_es()     # Esc は「処理の中止」: Everything 検索を止める
             return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
@@ -2463,8 +2636,9 @@ class FilerWindow(QWidget):
             return
         if not pane.path:
             return
-        if pane.flat or pane.flat_loading:
+        if pane.flat or pane.flat_loading or pane.es_loading:
             # フラット表示中の BS は「通常の表示へ戻る」(親へは行かない)。
+            # 検索結果(G / Shift+F)もフラット表示の形なので同じ。
             pane.load(pane.path, history=None)
             return
         parent = core.parent_of(pane.path)
@@ -3589,6 +3763,36 @@ class FilerWindow(QWidget):
             return
         pane.load_grep(word.strip(), case_sensitive=False)
 
+    def find_es(self):
+        """es.exe を起こす引数の頭([exe, …])。見つからなければ None。
+        場所は filer.tools の "es" → App Paths・PATH → 既定のインストール先の順。"""
+        return filer_everything.find_es(self.menu_resolver(), self.es_environ,
+                                        exists=self.menu_exists)
+
+    def cmd_everything(self):
+        """Shift+F: Everything 検索。es.exe で名前を探し、結果をフラット表示の形で並べる
+        (範囲は既定でアクティブ窓のフォルダ以下。入力窓で全体に切り替えられる)。"""
+        pane = self.active
+        if pane.stash:
+            self.log("Everything検索: 一時置き場では使えません（T で通常の表示へ）")
+            return
+        if not pane.path:
+            return
+        if pane.archive is not None:
+            self.log("Everything検索: 書庫内では使えません")
+            return
+        if self.find_es() is None:
+            self.log(f"Everything検索: {filer_everything.NOT_FOUND_MESSAGE}")
+            return
+        answer = self.ask_everything(pane.es_query or "", self.es_scope_all)
+        if answer is None:
+            return
+        query, scope_all = answer
+        if not query.strip():
+            return
+        self.es_scope_all = bool(scope_all)
+        pane.load_everything(query.strip(), self.es_scope_all)
+
     def cmd_mask_input(self):
         current = self.active.mask_text
         text = self.ask_text("マスク", "表示するファイル（*.txt;*.md / 語だけなら「含む」）",
@@ -3773,6 +3977,7 @@ class FilerWindow(QWidget):
             ("P", "フルパスをクリップボードへ（改行区切り）", "path"),
             ("N", "ファイル名のみクリップボードへ", "name"),
             ("H", "ハッシュ(SHA-256)をクリップボードへ", "hash"),
+            ("I", "フォルダ構成をコピー", "tree"),
         ]
         if self.phone_enabled:
             # 環境1のときだけ出す(無効な PC では項目自体を見せない)
@@ -3789,6 +3994,8 @@ class FilerWindow(QWidget):
             self.log(f"クリップボード: {len(paths)}件の{'フルパス' if choice == 'path' else '名前'}")
         elif choice == "hash":
             self._copy_hash()
+        elif choice == "tree":
+            self._copy_tree()
 
     def cmd_phone_send(self):
         """C→S(環境1のときだけ): 対象ファイルをスマホへ QR で渡す。
@@ -3857,6 +4064,146 @@ class FilerWindow(QWidget):
         if done:
             QGuiApplication.clipboard().setText(core.hash_clip_text(done))
             self.log(f"クリップボード: {len(done)}件のハッシュ")
+
+    def tree_root(self):
+        """C→I で書き出すフォルダ。カーソルがフォルダならそのフォルダ、ファイル(や ..)なら
+        アクティブ窓のフォルダ。書庫の中では None。"""
+        pane = self.active
+        if pane.archive is not None:
+            return None
+        entry = pane.cursor_entry()
+        if entry is not None and entry.is_dir and not entry.is_parent:
+            return os.path.join(pane.path, entry.name)
+        if pane.path:
+            return pane.path
+        # 一時置き場(パスが無い)でファイルの上なら、そのファイルの置き場所
+        return os.path.dirname(entry.name) if entry is not None else None
+
+    def _copy_tree(self):
+        """C→I: フォルダ構成を罫線のツリーにしてクリップボードへ。走査は裏のスレッドで
+        (ネットワーク上の大きなフォルダでも窓を固めない)。"""
+        if self.active.archive is not None:
+            self.log("フォルダ構成: 書庫の中では使えません")
+            return
+        root = self.tree_root()
+        if not root:
+            return
+        if self._tree_busy:
+            self.log("フォルダ構成: 作成中です。終わってからもう一度どうぞ")
+            return
+        self._tree_busy = True
+        show_hidden, show_system = self.show_hidden, self.show_system
+        depth, max_lines = self.tree_depth, self.tree_lines
+        bridge = self.bridge
+
+        def worker():
+            try:
+                lines, _cut = core.folder_tree(root, show_hidden, show_system, depth, max_lines)
+                payload = (root, lines, "")
+            except Exception as e:  # noqa: BLE001  結果として返し、窓は落とさない
+                payload = (root, None, f"{type(e).__name__}: {e}")
+            try:
+                bridge.tree_built.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-tree").start()
+
+    def _on_tree_built(self, payload) -> None:
+        try:
+            self._tree_busy = False
+            root, lines, error = payload
+            if lines is None:
+                self.log(f"フォルダ構成: 読めません: {root}  ({error})")
+                return
+            QGuiApplication.clipboard().setText("\r\n".join(lines))
+            more = "（一部省略）" if lines and lines[-1].startswith(core.TREE_MORE) else ""
+            self.log(f"クリップボード: フォルダ構成 {len(lines)}行{more}  {root}")
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('tree')}")
+
+    # --- ワークスペース(Alt+J。左右のパスの組) ---
+    def _workspace_side_path(self, pane):
+        """保存に使う窓のパス。一時置き場なら開く前にいたフォルダ。"""
+        if pane.stash:
+            return pane.stash_from
+        return pane.path
+
+    def cmd_workspace(self):
+        """Alt+J: 左右の窓のパスを名前付きで保存・呼び出し・削除する小さなメニュー。
+        先頭は「今の左右を保存…」、続いて保存済みの一覧。Enter で左右を一度に移し、
+        Del で削除(確認あり)。保存先は %LOCALAPPDATA%\\traytools(PC ごとの個人データ)。"""
+        while True:
+            saved = core.load_workspaces()
+            keys = "123456789ABCDEFGHIJKLMNOPRTUVWXYZ"   # S(保存)と Q(キャンセル)は除く
+            items = [("S", "今の左右を保存…", ("save", None)), None]
+            for index, ws in enumerate(saved):
+                key = keys[index] if index < len(keys) else "-"
+                items.append((key, f"{ws['name']}    {ws['left']} → {ws['right']}",
+                              ("open", ws)))
+            if not saved:
+                items.append(("-", "（保存したワークスペースはまだありません）", None))
+            items.append(None)
+            items.append(("Q", "キャンセル", None))
+            kind, value = self.choose_menu_deletable("ワークスペース（Del で削除）", items)
+            if kind == "delete" and (value is None or value[0] != "open"):
+                continue   # 保存・キャンセルの行の Del は何もしない(メニューはそのまま)
+            if value is None:
+                return
+            action, ws = value
+            if kind == "delete":
+                if self.confirm("ワークスペース", f"「{ws['name']}」を削除しますか？\n"
+                                f"（{ws['left']} → {ws['right']}）", default_yes=False):
+                    try:
+                        core.save_workspaces(core.workspace_remove(saved, ws["name"]))
+                        self.log(f"ワークスペース: 削除しました（{ws['name']}）")
+                    except OSError as e:
+                        self.log(f"ワークスペース: 保存できません  ({e})")
+                        return
+                continue   # 一覧を出し直す(続けて消せるように)
+            if action == "save":
+                self._save_workspace(saved)
+            elif action == "open":
+                self.open_workspace(ws)
+            return
+
+    def _save_workspace(self, saved) -> None:
+        left = self._workspace_side_path(self.left)
+        right = self._workspace_side_path(self.right)
+        if not left or not right:
+            self.log("ワークスペース: 左右のどちらかのパスが決まっていません")
+            return
+        default = " / ".join(os.path.basename(core.normalize_dir(p).rstrip("\\/")) or p
+                             for p in (left, right))
+        name = self.ask_text("ワークスペースを保存", f"名前（{left} → {right}）", default)
+        if name is None or not name.strip():
+            return
+        name = name.strip()
+        index = core.workspace_find(saved, name)
+        if index is not None and not self.confirm(
+                "ワークスペース", f"「{saved[index]['name']}」を上書きしますか？",
+                default_yes=False):
+            return
+        try:
+            core.save_workspaces(core.workspace_put(saved, name, left, right))
+        except OSError as e:
+            self.log(f"ワークスペース: 保存できません  ({e})")
+            return
+        self.log(f"ワークスペース: 保存しました（{name}: {left} → {right}）")
+
+    def open_workspace(self, ws) -> None:
+        """左右を一度に移す。開けない側(消えた・繋がらない)はその側だけ移さず知らせる。
+        読み取りは窓ごとの別スレッド(load)なので、ネットワークのパスでも固まらない。"""
+        self.log(f"ワークスペース: {ws['name']}")
+        for pane, key, label in ((self.left, "left", "左"), (self.right, "right", "右")):
+            path = ws.get(key)
+            if not path:
+                continue
+
+            def failed(path=path, label=label):
+                self.log(f"ワークスペース: {label}は移動しません（開けません: {path}）")
+
+            pane.load(path, on_fail=failed)
 
     def cmd_move_menu(self):
         if self._refuse_archive("移動", dest_pane=self.other):
@@ -4776,6 +5123,38 @@ class FilerWindow(QWidget):
         """文字キーは選択のみ・Enter で実行する小さなメニュー。選んだ値か None。"""
         menu, chosen = self.build_menu(title, items)
         return self._exec_menu(menu, chosen)
+
+    def choose_menu_deletable(self, title: str, items):
+        """choose_menu の Del 付き。("choose", 値) か、Del を押した項目の ("delete", 値)。
+        何も選ばなければ ("choose", None)。"""
+        menu, chosen = self.build_menu(title, items)
+        menu.deletable = True
+        value = self._exec_menu(menu, chosen)
+        if menu.delete_action is not None:
+            return "delete", chosen.get(menu.delete_action)
+        return "choose", value
+
+    def ask_everything(self, text: str, scope_all: bool):
+        """Everything 検索の入力窓。(検索語, 全体から探すか) か、取消なら None。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Everything 検索")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("探す名前（空白区切りで AND・\"...\" で語句・ext:pdf など Everything の書き方）")
+        layout.addWidget(label)
+        edit = QLineEdit(text)
+        edit.selectAll()
+        layout.addWidget(edit)
+        check = QCheckBox("全体から探す(&A)（オフならアクティブ窓のフォルダより下だけ）")
+        check.setChecked(bool(scope_all))
+        layout.addWidget(check)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        edit.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return edit.text(), check.isChecked()
 
 
 # ---------------------------------------------------------------

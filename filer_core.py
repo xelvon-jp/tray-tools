@@ -86,9 +86,11 @@ DEFAULT_KEYMAP = {
     "0072": "history_jump",       # H
     "0074": "bookmark_jump",      # J (tray-tools のフォルダブックマーク)
     "1074": "path_jump",          # Shift+J パス入力
+    "4074": "workspace",          # Alt+J ワークスペース(左右のパスの組を名前付きで保存・呼び出し)
     "0078": "desktop",            # N (AFXW.key 0078 &EXCD Desktop)
     "0076": "drive",              # L
     "0070": "isearch",            # F
+    "1070": "everything",         # Shift+F Everything 検索(es.exe。結果はフラット表示の形)
     "0071": "grep",               # G 文字列検索(内容で探して結果をフラット表示)
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
@@ -945,6 +947,8 @@ COMMAND_SHORT_NAMES = {
     "rename": "Rename",
     "isearch": "Search",
     "grep": "Grep",
+    "everything": "Everything",
+    "workspace": "Workspace",
     "sort_dialog": "Sort",
     "sort_reverse": "Sort逆",
     "compare_mark": "Compare",
@@ -1354,6 +1358,103 @@ def decode_drop_effect(data) -> bool:
 def double_null_join(paths) -> str:
     """SHFileOperationW の pFrom/pTo の形。NUL 区切り、末尾は NUL 2つ。"""
     return "".join(f"{p}\0" for p in paths) + "\0"
+
+
+# ---------------------------------------------------------------
+# フォルダ構成をコピー(C メニューの I)
+# ---------------------------------------------------------------
+TREE_DEPTH = 5            # 何段下まで書くか(根の直下が1段目)
+TREE_LINES = 2000         # 何行まで書くか(根の行を含む)
+TREE_MORE = "…（以下省略）"
+TREE_LINK = "  [リンク]"      # ジャンクション・シンボリックリンク(中へは潜らない)
+TREE_DENIED = "  [読めません]"
+
+
+def _tree_children(folder: str, show_hidden: bool, show_system: bool, scandir=os.scandir):
+    """folder の中の (名前, フルパス, フォルダか, リンクか)。フォルダが先、それぞれ名前順。
+    フォルダ自体が読めなければ OSError。"""
+    dirs, files = [], []
+    with scandir(folder) as it:
+        for entry in it:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            attrs = getattr(st, "st_file_attributes", 0)
+            if not show_hidden and attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+                continue
+            if not show_system and attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                continue
+            link = bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT) or stat.S_ISLNK(st.st_mode)
+            is_dir = bool(attrs & stat.FILE_ATTRIBUTE_DIRECTORY) or stat.S_ISDIR(st.st_mode)
+            if link and not is_dir:
+                try:
+                    is_dir = entry.is_dir()   # ディレクトリへのシンボリックリンク
+                except OSError:
+                    pass
+            (dirs if is_dir else files).append((entry.name, entry.path, is_dir, link))
+    key = lambda item: natural_key(item[0].casefold())  # noqa: E731
+    return sorted(dirs, key=key) + sorted(files, key=key)
+
+
+def folder_tree(root: str, show_hidden: bool = True, show_system: bool = True,
+                max_depth: int = TREE_DEPTH, max_lines: int = TREE_LINES,
+                scandir=os.scandir):
+    """root 以下を罫線のツリーにした行の一覧と、省略したかどうか。
+
+        写真
+        ├── 2026
+        │   ├── 春
+        │   └── 秋
+        └── memo.txt
+
+    - フォルダを先、それぞれ名前順(数字は数の大きさで並べる)
+    - max_depth 段より深いところと、max_lines 行を超えたところは書かず、末尾に
+      TREE_MORE で始まる行を足す
+    - ジャンクション・シンボリックリンクは名前だけ書いて中へは潜らない(ループ防止)
+    - 読めないフォルダ(アクセス拒否など)は名前の後ろに TREE_DENIED を付けて先へ進む
+    - 隠し・システムは Shift+Z の表示設定(show_hidden / show_system)に従う
+    root 自体が読めなければ OSError。読み取りスレッドから呼ぶ。"""
+    base = normalize_dir(root)
+    lines = [os.path.basename(base.rstrip("\\/")) or base]
+    cut = {"depth": False, "lines": False}
+    first = _tree_children(base, show_hidden, show_system, scandir)
+
+    def walk(items, prefix, depth):
+        for index, (name, path, is_dir, link) in enumerate(items):
+            if len(lines) >= max_lines:
+                cut["lines"] = True
+                return
+            last = index == len(items) - 1
+            row = len(lines)
+            lines.append(prefix + ("└── " if last else "├── ") + name
+                         + (TREE_LINK if is_dir and link else ""))
+            if not is_dir or link:
+                continue
+            try:
+                children = _tree_children(path, show_hidden, show_system, scandir)
+            except OSError:
+                lines[row] += TREE_DENIED
+                continue
+            if not children:
+                continue
+            if depth >= max_depth:
+                cut["depth"] = True
+                continue
+            walk(children, prefix + ("    " if last else "│   "), depth + 1)
+            if cut["lines"]:
+                return
+
+    walk(first, "", 1)
+    truncated = cut["depth"] or cut["lines"]
+    if truncated:
+        reasons = []
+        if cut["depth"]:
+            reasons.append(f"{max_depth}段より深いところ")
+        if cut["lines"]:
+            reasons.append(f"{max_lines:,}行より後")
+        lines.append(f"{TREE_MORE} {'・'.join(reasons)}は書いていません")
+    return lines, truncated
 
 
 def clip_text(paths, names_only: bool = False) -> str:
@@ -2013,6 +2114,56 @@ def save_store(name: str, data) -> None:
     with open(temp, "w", encoding="utf-8", newline="") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(temp, path)
+
+
+# ---------------------------------------------------------------
+# ワークスペース(Alt+J。左右のパスの組を名前付きで)
+# ---------------------------------------------------------------
+# PC ごとの個人データなので、settings.json ではなく data_dir() に置く
+# (パスの一覧は公開リポジトリに入れたくない。frecency と同じ理由)。
+WORKSPACE_STORE = "filer_workspaces.json"
+
+
+def load_workspaces() -> list:
+    """保存済みのワークスペース [{"name", "left", "right"}]。形の違うものは捨てる。"""
+    data = load_store(WORKSPACE_STORE, {})
+    items = data.get("workspaces") if isinstance(data, dict) else None
+    result = []
+    for item in items if isinstance(items, list) else []:
+        if (isinstance(item, dict) and isinstance(item.get("name"), str)
+                and item["name"].strip() and isinstance(item.get("left"), str)
+                and isinstance(item.get("right"), str)):
+            result.append({"name": item["name"].strip(), "left": item["left"],
+                           "right": item["right"]})
+    return result
+
+
+def save_workspaces(items) -> None:
+    """一時ファイルに書いてから置き換える(save_store)。書けなければ OSError。"""
+    save_store(WORKSPACE_STORE, {"version": 1, "workspaces": list(items)})
+
+
+def workspace_find(items, name: str):
+    """名前(大文字小文字は区別しない)が同じものの添字。無ければ None。"""
+    folded = (name or "").strip().casefold()
+    return next((i for i, item in enumerate(items) if item["name"].casefold() == folded), None)
+
+
+def workspace_put(items, name: str, left: str, right: str) -> list:
+    """同じ名前があればその場所で差し替え、無ければ末尾に足した新しい一覧。"""
+    items = [dict(item) for item in items]
+    entry = {"name": name.strip(), "left": left, "right": right}
+    index = workspace_find(items, name)
+    if index is None:
+        items.append(entry)
+    else:
+        items[index] = entry
+    return items
+
+
+def workspace_remove(items, name: str) -> list:
+    index = workspace_find(items, name)
+    return [dict(item) for i, item in enumerate(items) if i != index]
 
 
 # ---------------------------------------------------------------

@@ -5735,6 +5735,588 @@ def test_window_update_restart():
             w.deleteLater()
 
 
+# ---------------------------------------------------------------
+# Everything 検索(Shift+F) / フォルダ構成をコピー(C→I) / ワークスペース(Alt+J)
+# ---------------------------------------------------------------
+# es.exe の代わりに起こす小さな偽物。本物の Everything が無い CI でも通るように、
+# 引数を本物と同じ形で受け取り、-path(無ければ FAKE_ES_ROOT)の下を歩いて名前で探し、
+# -export-txt のファイルへ書く(-utf8-bom なら BOM 付き UTF-8)。
+#   FAKE_ES_EXIT … その終了コードで終わる(8 = Everything が起動していない)
+#   FAKE_ES_SLEEP … 応答までの秒数(タイムアウト・中止の試験)
+#   FAKE_ES_LOG … 受け取った引数を JSON で書く
+_FAKE_ES = r'''
+import json, os, sys, time
+args = sys.argv[1:]
+if os.environ.get("FAKE_ES_LOG"):
+    with open(os.environ["FAKE_ES_LOG"], "w", encoding="utf-8") as f:
+        json.dump(args, f, ensure_ascii=False)
+if os.environ.get("FAKE_ES_SLEEP"):
+    time.sleep(float(os.environ["FAKE_ES_SLEEP"]))
+if os.environ.get("FAKE_ES_EXIT"):
+    sys.stderr.write("Error: fake\n")
+    sys.exit(int(os.environ["FAKE_ES_EXIT"]))
+limit, out, bom, root, words = 1000000, None, False, None, []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-n":
+        limit = int(args[i + 1]); i += 2; continue
+    if a == "-export-txt":
+        out = args[i + 1]; i += 2; continue
+    if a == "-path":
+        root = args[i + 1]; i += 2; continue
+    if a == "-utf8-bom":
+        bom = True; i += 1; continue
+    if a.startswith("-"):
+        sys.exit(6)          # 本物と同じく、知らないスイッチは 6
+    words.append(a.strip("*").casefold()); i += 1
+root = root or os.environ["FAKE_ES_ROOT"]
+found = []
+for folder, dirs, files in os.walk(root):
+    for name in sorted(dirs) + sorted(files):
+        if all(w in name.casefold() for w in words):
+            path = os.path.join(folder, name)
+            found.append(path + ("\\" if name in dirs else ""))
+text = "".join(p + "\r\n" for p in found[:limit])
+with open(out, "wb") as f:
+    f.write((b"\xef\xbb\xbf" + text.encode("utf-8")) if bom else text.encode("cp932", "replace"))
+'''
+
+
+def _fake_es(tmp):
+    path = Path(tmp, "fake_es.py")
+    path.write_text(_FAKE_ES, encoding="utf-8")
+    return [sys.executable, str(path)]
+
+
+class _FakeEnv:
+    """FAKE_ES_* を一時的に立てる(終わったら必ず戻す)。"""
+
+    def __init__(self, **values):
+        self.values = values
+
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in self.values}
+        for k, v in self.values.items():
+            os.environ[k] = str(v)
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_everything_keys_and_names():
+    km = core.DEFAULT_KEYMAP
+    assert km["1070"] == "everything" and km["0070"] == "isearch"
+    assert km["4074"] == "workspace" and km["0074"] == "bookmark_jump"
+    assert core.COMMAND_SHORT_NAMES["everything"] and core.COMMAND_SHORT_NAMES["workspace"]
+    import filer
+    for command in ("everything", "workspace"):
+        assert hasattr(filer.FilerWindow, f"cmd_{command}"), command
+
+
+def test_everything_query_args_and_parse():
+    import filer_everything as fe
+    # 空白区切りで1語1引数。"..." は1つの語句。- / で始まる語はスイッチと取り違えないよう *語*
+    assert fe.split_query("写真  春") == ["写真", "春"]
+    assert fe.split_query('"a b" ext:pdf') == ["a b", "ext:pdf"]
+    assert fe.split_query("-dash /ad") == ["*-dash*", "*/ad*"]
+    assert fe.split_query('  "" ') == []
+    args = fe.build_args(["es.exe", "-instance", "1.5a"], ["x"], "C:\\Users\\a\\", 1000, "o.txt")
+    assert args[:3] == ["es.exe", "-instance", "1.5a"]
+    assert args[args.index("-n") + 1] == "1001"          # 上限の判定のため1件多く取る
+    assert args[args.index("-export-txt") + 1] == "o.txt" and "-utf8-bom" in args
+    assert args[args.index("-path") + 1] == "C:\\Users\\a"   # 末尾の \ は落とす
+    assert args[-1] == "x"
+    assert "-path" not in fe.build_args(["es.exe"], ["x"], None, 10, "o.txt")   # 全体
+    assert fe.build_args(["es.exe"], ["x"], "D:\\", 10, "o")[-2] == "D:\\"     # ドライブ直下
+    # 書き出しの読み取り: BOM 付き UTF-8(日本語・cp932 に無い字も化けない)、フォルダの \ を落とす
+    text = "C:\\写真\\春\\\r\nC:\\写真\\🍣メモ.txt\r\n\r\n"
+    assert fe.parse_export(b"\xef\xbb\xbf" + text.encode("utf-8")) == [
+        "C:\\写真\\春", "C:\\写真\\🍣メモ.txt"]
+    # BOM 無しで UTF-8 として読めなければ cp932
+    assert fe.parse_export("D:\\表\\".encode("cp932")) == ["D:\\表"]
+    assert fe.parse_export(b"\xef\xbb\xbf") == []
+    assert "起動していません" in fe.error_message(8)
+    assert "99" in fe.error_message(99, b"Error: x")
+
+
+def test_everything_find_es():
+    import filer_everything as fe
+
+    class R:
+        def __init__(self, spec):
+            self.spec = spec
+
+        def tool(self, name):
+            assert name == "es"
+            return self.spec
+
+    # filer.tools の "es"(追加の引数ごと)が最優先
+    assert fe.find_es(R((["D:\\t\\es.exe", "-instance", "1.5a"], None)), {}) == [
+        "D:\\t\\es.exe", "-instance", "1.5a"]
+    # 無ければ既定のインストール先
+    env = {"ProgramFiles": "C:\\PF", "ProgramFiles(x86)": "C:\\PF86"}
+    assert fe.find_es(R(None), env, exists=lambda p: p == "C:\\PF86\\Everything\\es.exe") == [
+        "C:\\PF86\\Everything\\es.exe"]
+    assert fe.find_es(R(None), env, exists=lambda p: False) is None
+    assert fe.find_es(None, {}, exists=lambda p: False) is None
+
+
+def test_everything_run_search_fake_exe():
+    """偽の es.exe(Python スクリプト)を本当に子プロセスで起こして、引数・UTF-8 の
+    受け取り・上限・エラー・タイムアウト・中止を確かめる。"""
+    import filer_everything as fe
+    with tempfile.TemporaryDirectory() as tmp:
+        es = _fake_es(tmp)
+        root = Path(tmp, "写真")
+        (root / "春").mkdir(parents=True)
+        (root / "春" / "メモ🍣.txt").write_text("x", encoding="utf-8")
+        (root / "メモ2.txt").write_text("x", encoding="utf-8")
+        (root / "-dash メモ.txt").write_text("x", encoding="utf-8")
+        log = Path(tmp, "args.json")
+        with _FakeEnv(FAKE_ES_LOG=log):
+            found = fe.run_search(es, "メモ", str(root), temp_dir=tmp)
+        assert found.status == "done", found.message
+        assert sorted(found.paths) == sorted([str(root / "春" / "メモ🍣.txt"),
+                                              str(root / "メモ2.txt"),
+                                              str(root / "-dash メモ.txt")]), found.paths
+        sent = json.loads(log.read_text(encoding="utf-8"))
+        assert sent[sent.index("-path") + 1] == str(root) and "-utf8-bom" in sent
+        assert not list(Path(tmp).glob("affx_es_*"))         # 一時ファイルは片付ける
+        # - で始まる語もスイッチにならない
+        found = fe.run_search(es, "-dash", str(root), temp_dir=tmp)
+        assert found.status == "done" and [os.path.basename(p) for p in found.paths] == [
+            "-dash メモ.txt"], (found.status, found.message, found.paths)
+        # 上限: 2件までにすると limit(2件で打ち切り)
+        found = fe.run_search(es, "メモ", str(root), limit=2, temp_dir=tmp)
+        assert found.status == "limit" and len(found.paths) == 2
+        # 全体(-path 無し)
+        with _FakeEnv(FAKE_ES_ROOT=root, FAKE_ES_LOG=log):
+            found = fe.run_search(es, "春", None, temp_dir=tmp)
+        assert found.paths == [str(root / "春")]
+        assert "-path" not in json.loads(log.read_text(encoding="utf-8"))
+        # Everything が起動していない(終了コード 8)
+        with _FakeEnv(FAKE_ES_EXIT=8):
+            found = fe.run_search(es, "メモ", str(root), temp_dir=tmp)
+        assert found.status == "error" and "起動していません" in found.message
+        # タイムアウト・中止(子プロセスは止める)
+        with _FakeEnv(FAKE_ES_SLEEP=20):
+            started = time.monotonic()
+            found = fe.run_search(es, "メモ", str(root), timeout=1.0, temp_dir=tmp)
+            assert found.status == "timeout" and time.monotonic() - started < 8
+            cancel = threading.Event()
+            threading.Timer(0.5, cancel.set).start()
+            found = fe.run_search(es, "メモ", str(root), timeout=30, cancel=cancel, temp_dir=tmp)
+            assert found.status == "cancel"
+        # 起動できない exe
+        found = fe.run_search([str(Path(tmp, "nothing.exe"))], "x", str(root), temp_dir=tmp)
+        assert found.status == "error" and "起動できません" in found.message
+        # 黒い窓を出さない(CREATE_NO_WINDOW)・shell を通さない
+        seen = {}
+
+        class FakePopen:
+            def __init__(self, args, **kw):
+                seen.update(kw, args=args)
+                self.returncode = 0
+
+            def communicate(self, timeout=None):
+                Path(seen["args"][seen["args"].index("-export-txt") + 1]).write_bytes(
+                    b"\xef\xbb\xbfC:\\x\r\n")
+                return b"", b""
+
+        found = fe.run_search(["es.exe"], "x", None, popen=FakePopen, temp_dir=tmp)
+        assert found.paths == ["C:\\x"]
+        assert seen["creationflags"] & 0x08000000 and not seen.get("shell")
+        assert isinstance(seen["args"], list)
+
+
+def test_everything_to_entries():
+    import filer_everything as fe
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp, "r")
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "a.txt").write_bytes(b"abc")
+        other = Path(tmp, "other.txt")
+        other.write_bytes(b"1")
+        entries, missing = fe.to_entries(
+            [str(root / "sub"), str(root / "sub" / "a.txt"), str(other),
+             str(root / "gone.txt"), str(root / "sub" / "a.txt")], str(root))
+        assert missing == 1
+        got = {e.name: (e.is_dir, e.size) for e in entries}
+        # root より下は相対パス、外はフルパス(どちらも join で実パスになる)。重複は1つに
+        assert got == {"sub": (True, 0), "sub\\a.txt": (False, 3), str(other): (False, 1)}, got
+        assert all(os.path.exists(os.path.join(str(root), n)) for n in got)
+
+
+def test_window_everything_search():
+    """Shift+F: 結果がフラット表示と同じ一覧で出て、マーク・コピー・Enter・BS・F5 が効く。
+    es.exe が無い・Everything が起動していないときはメッセージだけで落ちない。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        es = _fake_es(tmp)
+        left = Path(tmp, "写真")
+        right = Path(tmp, "dst")
+        (left / "春").mkdir(parents=True)
+        right.mkdir()
+        (left / "春" / "メモ.txt").write_bytes(b"12345")
+        (left / "メモ帳.md").write_bytes(b"1")
+        (left / "zz.txt").write_bytes(b"1")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.extra_op_flags = _quiet_flags()
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        asked = []
+        try:
+            # es.exe が見つからない: 入力窓も出さずにメッセージだけ
+            w.find_es = lambda: None
+            w.ask_everything = lambda text, scope_all: (asked.append(1), ("メモ", False))[1]
+            key(Qt.Key_F, Qt.ShiftModifier)
+            assert not asked and "es.exe が見つかりません" in w.log_view.toPlainText()
+            assert not L.flat
+
+            w.find_es = lambda: list(es)
+            key(Qt.Key_F, Qt.ShiftModifier)
+            _wait(w, timeout=20)
+            assert L.flat and L.es_query == "メモ", (L.flat, L.es_query, w.log_view.toPlainText())
+            assert "Everything" in L.header.text() and "メモ" in L.header.text()
+            assert ".." not in _names(L)
+            assert sorted(_names(L)) == sorted(["春\\メモ.txt", "メモ帳.md"]), _names(L)
+            assert L.footer.text().startswith("Everything「メモ」 2件"), L.footer.text()
+            assert "Everything検索: 「メモ」 2件" in w.log_view.toPlainText()
+            # R・K は断る(フラット表示と同じ)
+            key(Qt.Key_K)
+            assert "フラット表示・検索結果では使えません" in w.log_view.toPlainText()
+            # マークして反対窓へコピー(対象は相対パスを解決したフルパス)
+            L.marks.add("春\\メモ.txt")
+            key(Qt.Key_C, Qt.AltModifier)
+            _wait(w, timeout=30)
+            assert (right / "メモ.txt").read_bytes() == b"12345"
+            assert L.flat and L.es_query == "メモ"            # 再読込しても検索結果のまま
+            # BS で通常の表示へ(親へは行かない)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert not L.flat and L.es_query is None and core.same_dir(L.path, left)
+            assert "Everything" not in L.header.text()
+            # 範囲を全体に: 外のものはフルパスで出る
+            with _FakeEnv(FAKE_ES_ROOT=tmp):
+                w.ask_everything = lambda text, scope_all: ("メモ", True)
+                key(Qt.Key_F, Qt.ShiftModifier)
+                _wait(w, timeout=20)
+            assert L.es_all and "全体" in L.header.text() and w.es_scope_all
+            names = _names(L)
+            assert str(right / "メモ.txt") in names and "春\\メモ.txt" in names, names
+            # フォルダの結果で Enter → そのフォルダへ入る(検索結果を抜ける)
+            w.ask_everything = lambda text, scope_all: ("春", False)
+            key(Qt.Key_F, Qt.ShiftModifier)
+            _wait(w, timeout=20)
+            assert _names(L) == ["春"], _names(L)
+            L.set_cursor(0)
+            key(Qt.Key_Return)
+            _wait(w)
+            assert not L.flat and core.same_dir(L.path, left / "春")
+            key(Qt.Key_Backspace)
+            _wait(w)
+            # 上限を超えたら打ち切って知らせる
+            w.es_limit = 1
+            w.ask_everything = lambda text, scope_all: ("メモ", False)
+            key(Qt.Key_F, Qt.ShiftModifier)
+            _wait(w, timeout=20)
+            assert len(_names(L)) == 1 and "上限で打ち切り" in L.footer.text()
+            assert "1件で打ち切りました" in w.log_view.toPlainText()
+            w.es_limit = 1000
+            # Everything が起動していない: 通常の表示へ戻ってメッセージ
+            with _FakeEnv(FAKE_ES_EXIT=8):
+                key(Qt.Key_F, Qt.ShiftModifier)
+                _wait(w, timeout=20)
+            assert not L.flat and L.es_query is None and core.same_dir(L.path, left)
+            assert "Everything が起動していません" in w.log_view.toPlainText()
+            # Esc で中止
+            with _FakeEnv(FAKE_ES_SLEEP=20):
+                key(Qt.Key_F, Qt.ShiftModifier)
+                QTest.qWait(300)
+                assert L.es_loading and "検索中" in L.footer.text()
+                key(Qt.Key_Escape)
+                _wait(w, timeout=10)
+            assert not L.flat and "Everything検索: 中止しました" in w.log_view.toPlainText()
+            assert w.isVisible()                                 # Esc で窓は閉じない
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_folder_tree_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp, "写真")
+        for d in ("2026/春", "2026/秋", "a10", "a9", "z_deep/1/2/3/4/5/6"):
+            (root / d).mkdir(parents=True)
+        (root / "memo.txt").write_text("x", encoding="utf-8")
+        (root / "b.txt").write_text("x", encoding="utf-8")
+        (root / "2026" / "春" / "p.jpg").write_bytes(b"")
+        (root / "hid.txt").write_bytes(b"")
+        _set_attrs(root / "hid.txt", 0x02)
+        lines, cut = core.folder_tree(str(root), show_hidden=False, max_depth=10)
+        assert not cut
+        assert lines[:8] == [
+            "写真",
+            "├── 2026",
+            "│   ├── 春",
+            "│   │   └── p.jpg",
+            "│   └── 秋",
+            "├── a9",                 # 数は数の大きさで(a9 < a10)
+            "├── a10",
+            "├── z_deep",
+        ], lines
+        assert lines[-2:] == ["├── b.txt", "└── memo.txt"], lines   # フォルダが先、ファイルは後
+        assert "hid.txt" not in "\n".join(lines)                     # Shift+Z に従う
+        lines, _ = core.folder_tree(str(root), show_hidden=True, max_depth=10)
+        assert any(line.endswith("hid.txt") for line in lines)
+        # 深さの上限: 5段目より下は書かず、末尾に省略の行
+        lines, cut = core.folder_tree(str(root), max_depth=5)
+        assert cut and lines[-1].startswith(core.TREE_MORE) and "5段" in lines[-1]
+        text = "\n".join(lines)
+        assert "── 4" in text and "── 5" not in text, text
+        # 行数の上限
+        lines, cut = core.folder_tree(str(root), max_lines=4)
+        assert cut and len(lines) == 5 and lines[-1].startswith(core.TREE_MORE), lines
+        assert "4行" in lines[-1]
+        # ジャンクションは名前だけ(中へは潜らない＝ループしない)
+        import subprocess
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / "2026" / "loop"),
+                               str(root)], capture_output=True).returncode == 0
+        if made:
+            lines, cut = core.folder_tree(str(root), max_depth=50, max_lines=100000)
+            assert not cut
+            assert any(line.endswith("loop" + core.TREE_LINK) for line in lines), lines
+            assert len(lines) < 40, len(lines)
+        # 読めないフォルダは印を付けて先へ(全体を止めない)
+        real = os.scandir
+
+        def scandir(path):
+            if os.path.basename(path) == "秋":
+                raise PermissionError(5, "アクセスが拒否されました")
+            return real(path)
+
+        lines, _ = core.folder_tree(str(root), max_depth=10, scandir=scandir)
+        assert "│   └── 秋" + core.TREE_DENIED in lines, lines
+        assert lines[-1].endswith("memo.txt")
+        # ドライブ直下は名前の代わりにパス
+        assert core.folder_tree("C:\\", max_depth=1, max_lines=2)[0][0] == "C:\\"
+        # 根が読めなければ OSError
+        try:
+            core.folder_tree(str(root / "nothing"))
+        except OSError:
+            pass
+        else:
+            raise AssertionError("OSError にならない")
+
+
+def test_window_copy_tree():
+    """C→I: カーソルがフォルダならそのフォルダ、ファイルならアクティブ窓のフォルダを
+    ツリーにしてクリップボードへ(裏のスレッドで作る)。"""
+    import filer
+    from PySide6.QtGui import QGuiApplication
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        items = []
+
+        def choose(title, menu_items):
+            items.extend(menu_items)
+            return "tree"
+
+        w.choose_menu = choose
+        try:
+            L.set_cursor(_names(L).index("sub1"))
+            QGuiApplication.clipboard().setText("")
+            w.run_command("copy_menu")
+            assert ("I", "フォルダ構成をコピー", "tree") in items
+            _wait_until(lambda: QGuiApplication.clipboard().text() != "", timeout=10)
+            assert QGuiApplication.clipboard().text() == "sub1\r\n└── deep"
+            L.set_cursor(_names(L).index("alpha.txt"))
+            QGuiApplication.clipboard().setText("")
+            w.run_command("copy_menu")
+            _wait_until(lambda: QGuiApplication.clipboard().text() != "", timeout=10)
+            text = QGuiApplication.clipboard().text()
+            assert text.split("\r\n")[:4] == ["L", "├── sub1", "│   └── deep", "├── sub2"], text
+            assert "クリップボード: フォルダ構成" in w.log_view.toPlainText()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_workspace_store():
+    """ワークスペースの保存先はデータ置き場(テストでは一時フォルダ。本物の
+    %LOCALAPPDATA% には書かない)。一時ファイル→置き換えで書く。"""
+    data = core.data_dir()
+    assert data.startswith(_TEST_TEMP), data
+    path = os.path.join(data, core.WORKSPACE_STORE)
+    if os.path.exists(path):
+        os.remove(path)
+    assert core.load_workspaces() == []
+    items = core.workspace_put([], "仕事", "C:\\a", "D:\\b")
+    items = core.workspace_put(items, "家", "C:\\h", "C:\\i")
+    items = core.workspace_put(items, "仕事", "C:\\a2", "D:\\b2")     # 同じ名前は差し替え
+    assert [i["name"] for i in items] == ["仕事", "家"] and items[0]["left"] == "C:\\a2"
+    core.save_workspaces(items)
+    assert os.path.exists(path) and not os.path.exists(path + ".tmp")
+    assert core.load_workspaces() == items
+    assert core.workspace_find(items, "家") == 1 and core.workspace_find(items, "x") is None
+    assert [i["name"] for i in core.workspace_remove(items, "仕事")] == ["家"]
+    # 壊れた・形の違う記録は空として読む
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"workspaces": [{"name": 1}, {"name": "ok", "left": "a", "right": "b"}]}')
+    assert core.load_workspaces() == [{"name": "ok", "left": "a", "right": "b"}]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{broken")
+    assert core.load_workspaces() == []
+    os.remove(path)
+
+
+def test_chooser_menu_delete_key():
+    """Del を押すと、選んでいる項目を「削除の依頼」として残して閉じる(実行はしない)。
+    deletable でないメニューでは Del は何もしない。"""
+    import filer
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    _qapp()
+    w = filer.FilerWindow({}, None)
+    try:
+        menu, chosen = w.build_menu("t", [("S", "保存", "save"), ("1", "仕事", "ws1")])
+        menu.deletable = True
+        second = [a for a in menu.actions() if chosen.get(a) == "ws1"][0]
+        menu.setActiveAction(second)
+        menu.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+        assert menu.delete_action is second
+        plain, _ = w.build_menu("t", [("S", "保存", "save")])
+        plain.setActiveAction(plain.actions()[0])
+        plain.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+        assert plain.delete_action is None
+        # choose_menu_deletable は Del の項目を ("delete", 値) で返す
+        menu2, chosen2 = w.build_menu("t", [("1", "仕事", "ws1")])
+        target = menu2.actions()[0]
+        w.build_menu = lambda title, items: (menu2, chosen2)
+        w._exec_menu = lambda m, c: (setattr(m, "delete_action", target), None)[1]
+        assert w.choose_menu_deletable("t", []) == ("delete", "ws1")
+        assert menu2.deletable
+    finally:
+        w.close()
+        w.deleteLater()
+
+
+def test_window_workspace():
+    """Alt+J: 今の左右を保存 → 別の場所へ移ってから呼び出すと左右が一度に戻る。
+    存在しないパスの側だけは移さず知らせる。Del で削除(確認あり)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    store = os.path.join(core.data_dir(), core.WORKSPACE_STORE)
+    if os.path.exists(store):
+        os.remove(store)
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text('{"filer": {"editor": "x"}}', encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L, R = w.left, w.right
+        answers = []
+        menus = []
+
+        def choose(title, items):
+            menus.append([i for i in items if i is not None])
+            return answers.pop(0)(items)
+
+        def pick(prefix, kind="choose"):
+            def run(items):
+                for item in items:
+                    if item is not None and item[1].startswith(prefix):
+                        return kind, item[2]
+                raise AssertionError(f"項目が無い: {prefix}")
+            return run
+
+        w.choose_menu_deletable = choose
+        try:
+            # 保存(最初の項目は「今の左右を保存…」)
+            answers.append(pick("今の左右を保存"))
+            w.ask_text = lambda *a, **k: "作業A"
+            QTest.keyClick(L.view, Qt.Key_J, Qt.AltModifier)
+            assert menus[-1][0][:2] == ("S", "今の左右を保存…")
+            saved = core.load_workspaces()
+            assert saved == [{"name": "作業A", "left": core.normalize_dir(str(left)),
+                              "right": core.normalize_dir(str(right))}], saved
+            assert "ワークスペース: 保存しました" in w.log_view.toPlainText()
+            assert "作業A" not in settings_path.read_text(encoding="utf-8")   # settings には入れない
+            # 別の場所へ移ってから呼び出す
+            L.load(str(left / "sub1"))
+            R.load(str(left / "sub2"))
+            _wait(w)
+            answers.append(pick("作業A"))
+            w.run_command("workspace")
+            _wait(w)
+            assert any("作業A" in i[1] and "→" in i[1] for i in menus[-1])  # 名前と 左→右
+            assert core.same_dir(L.path, left) and core.same_dir(R.path, right)
+            # 右だけ消えたパスにすると、右は移らず知らせる
+            gone = str(Path(tmp, "gone"))
+            core.save_workspaces([{"name": "壊れ", "left": str(left / "sub2"), "right": gone}])
+            answers.append(pick("壊れ"))
+            w.run_command("workspace")
+            _wait(w)
+            assert core.same_dir(L.path, left / "sub2") and core.same_dir(R.path, right)
+            assert f"右は移動しません（開けません: {gone}）" in w.log_view.toPlainText()
+            # Del で削除(確認で「いいえ」なら残る、「はい」なら消える。消したら一覧を出し直す)
+            core.save_workspaces([{"name": "消す", "left": str(left), "right": str(right)}])
+            asked = []
+            w.confirm = lambda title, text, default_yes=True: (asked.append(text), False)[1]
+            answers.extend([pick("消す", "delete"), lambda items: ("choose", None)])
+            w.run_command("workspace")
+            assert asked and "消す" in asked[0] and core.load_workspaces()
+            w.confirm = lambda *a, **k: True
+            answers.extend([pick("消す", "delete"), lambda items: ("choose", None)])
+            w.run_command("workspace")
+            assert core.load_workspaces() == [] and not answers
+            assert "ワークスペース: 削除しました（消す）" in w.log_view.toPlainText()
+            # 保存の行の Del は何もしない(メニューはそのまま)
+            answers.extend([pick("今の左右を保存", "delete"), lambda items: ("choose", None)])
+            w.run_command("workspace")
+            assert not answers
+        finally:
+            w.close()
+            w.deleteLater()
+            if os.path.exists(store):
+                os.remove(store)
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

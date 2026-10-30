@@ -1,0 +1,3 @@
+# あっふの共有メニュー。Windows の clone（core.autocrlf=true）でも LF のまま取り出す
+# （メニュー編集で書き戻すときに改行が混ざらないように。テストでも確かめている）
+filer_menus/*.txt text eol=lf

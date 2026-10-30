@@ -3479,8 +3479,7 @@ class FilerWindow(QWidget):
 
         def accept(_name, data):
             if on_accept is not None:
-                on_accept(_name, data)
-                return
+                return on_accept(_name, data)   # True なら選択窓を閉じない
             path = data[1] if isinstance(data, tuple) else data
             on_path(path)
 
@@ -3622,6 +3621,13 @@ class FilerWindow(QWidget):
             if kind != launcher.KIND_ADD:
                 self.jump_to(path)
                 return
+            # 登録済みのフォルダなら増やさない。知らせて、その行を選んだまま窓を開けておく
+            existing = launcher.find_bookmark_by_path(current, path)
+            if existing is not None:
+                picker.select_data((launcher.KIND_JUMP, existing["path"]),
+                                   name=existing["name"])
+                self.log(f"ブックマーク: 登録済みです（{existing['name']} → {existing['path']}）")
+                return True
             # 名前の既定値はフォルダ名。ルート(C:\)は basename が空なのでパスそのもの。
             default_name = os.path.basename(path.rstrip("\\/")) or path
             name = launcher._ask_name(self, default_name)

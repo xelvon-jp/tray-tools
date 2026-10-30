@@ -111,6 +111,24 @@ def load_bookmarks(app_settings: dict) -> list:
     ]
 
 
+def _path_key(path: str) -> str:
+    """同じフォルダかを比べるための形。大文字小文字・/ と \ の向き・末尾の \ の有無を無視する。"""
+    text = os.path.normcase(os.path.normpath(str(path).strip()))
+    return text.rstrip("\\/") or text
+
+
+def find_bookmark_by_path(app_settings: dict, path: str):
+    """path と同じフォルダを指す登録済みのブックマーク(最初の1件)。無ければ None。
+
+    「ここを登録」で同じフォルダが2件目として増えるのを防ぐために使う(名前が違っても
+    同じフォルダなら登録済みとみなす。別名で2つ持ちたい場面より、うっかりの方が多い)。"""
+    key = _path_key(path)
+    for entry in load_bookmarks(app_settings):
+        if _path_key(entry["path"]) == key:
+            return entry
+    return None
+
+
 def _find_bookmark(bookmarks: list, name: str, path: str):
     """(name, path) が一致する最初の要素の添字。無ければ None。
 
@@ -563,6 +581,13 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
         if kind == KIND_JUMP:
             jump(path, exe, target=target, hwnd=hwnd)
             return
+        # 登録済みのフォルダなら増やさない。知らせて、その行を選んだまま窓を開けておく
+        # (そのまま Enter で飛べる)。
+        existing = find_bookmark_by_path(app_settings, path)
+        if existing is not None:
+            picker.select_data((KIND_JUMP, existing["path"]), name=existing["name"])
+            show_toast(f"フォルダブックマーク\n登録済みです\n{existing['name']}")
+            return True
         # 「ここを登録」。既定値はフォルダ名。ルート直下(C:\)だと basename が空になるので、
         # その場合はパスそのものを初期値にする。
         default_name = os.path.basename(path.rstrip("\\/")) or path

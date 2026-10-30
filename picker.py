@@ -603,13 +603,37 @@ class PickerWindow(QWidget):
             return
         self._committing = True
         name, data = entry
+        keep_open = False
         try:
             # 閉じる前に呼ぶ。on_accept が QInputDialog を出す場合、まだ生きている
             # このウインドウを親にできる(閉じた後だとダイアログの位置と前面化が怪しくなる)。
-            self._on_accept(name, data)
+            # True を返したら窓を閉じない(「登録済みです」でその行を選んで見せるとき)。
+            keep_open = self._on_accept(name, data) is True
         except Exception as e:
             # Qtのスロット内で例外を投げ切るとアプリごと落ちうる。1件の失敗で常駐を
             # 巻き添えにしないよう、ここで止めて標準エラーに残す。
             print(f"[tray-tools] 選択の処理に失敗しました ({name}): {e}", file=sys.stderr)
         finally:
-            self.close()
+            if keep_open:
+                self._committing = False
+            else:
+                self.close()
+
+    def select_data(self, data, name=None) -> bool:
+        """data(と name)が一致する行を選ぶ。絞り込みで隠れていれば絞り込みを解いて探す。"""
+        def find() -> int:
+            for row in range(self.list.count()):
+                entry = self._entry_at(self.list.item(row))
+                if entry is not None and entry[1] == data and (name is None or entry[0] == name):
+                    return row
+            return -1
+
+        row = find()
+        if row < 0 and self.search.text():
+            self.search.clear()
+            self._refresh_list("")
+            row = find()
+        if row < 0:
+            return False
+        self.list.setCurrentRow(row)
+        return True

@@ -1631,6 +1631,30 @@ def test_bookmark_add_delete_move():
         assert [b["name"] for b in saved["launcher"]["bookmarks"]] == \
             ["B", os.path.basename(str(left)) + "_new"]
         p.close()
+
+        # 登録済みのフォルダで「ここを登録」→ 増やさず、知らせて、その行を選んだまま開けておく
+        new_name = os.path.basename(str(left)) + "_new"
+        w.run_command("bookmark_jump")
+        p = w._picker
+        add_item = next(e for e in p._items if e[1][0] == launcher.KIND_ADD)
+        asked = []
+        original = launcher._ask_name
+        launcher._ask_name = lambda parent, default: asked.append(default) or "dup"
+        try:
+            assert p.select_data(add_item[1])
+            p._commit()
+        finally:
+            launcher._ask_name = original
+        assert asked == [] and p.isVisible() and w._picker is p
+        assert p._entry_at(p.list.currentItem()) == (new_name, (launcher.KIND_JUMP, str(left)))
+        assert "登録済みです" in w.log_view.toPlainText()
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert [b["name"] for b in saved["launcher"]["bookmarks"]] == ["B", new_name]
+        p.close()
+        # 大文字小文字・/ と \・末尾の \ の違いは同じフォルダとみなす
+        found = launcher.find_bookmark_by_path(saved, str(left).upper().replace("\\", "/") + "/")
+        assert found is not None and found["name"] == new_name
+        assert launcher.find_bookmark_by_path(saved, str(left / "sub2")) is None
         w.close()
 
 

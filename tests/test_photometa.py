@@ -1,5 +1,5 @@
 # tests/test_photometa.py
-# 写真の★の共通パッケージ photometa（xmp / config / filter_expr / writer）を確かめる。
+# 写真の★の共通パッケージ photometa（xmp / config / filter_expr / writer / export）を確かめる。
 #
 #   C:\Users\<名前>\.venvs\tray-tools\Scripts\python.exe tests\test_photometa.py
 #
@@ -728,6 +728,397 @@ def test_writer_restart_after_exit():
     finally:
         et.close()
     assert et._proc is None
+
+
+# ------------------------------------------------------------------ export(書き出し)
+
+from photometa import export as pe  # noqa: E402
+
+
+def _exif_jpeg(path, size=(3000, 2000), orientation=None, when="2024:09:03 02:23:44",
+               gps=True, packet=None, color_split=True):
+    """EXIF(向き・撮影日時・GPS)入りの JPEG。左半分が赤・右半分が青。"""
+    from PIL import Image
+    img = Image.new("RGB", size, (0, 0, 255))
+    if color_split:
+        img.paste((255, 0, 0), (0, 0, size[0] // 2, size[1]))
+    exif = Image.Exif()
+    exif[0x010F] = "TestMaker"                 # Make(フレーム用には残さない)
+    if orientation:
+        exif[0x0112] = orientation
+    if when:
+        exif[0x0132] = when
+        exif.get_ifd(0x8769)[0x9003] = when
+    if gps:
+        gi = exif.get_ifd(0x8825)
+        gi[1] = "N"
+        gi[2] = (35.0, 39.0, 29.0)
+        gi[3] = "E"
+        gi[4] = (139.0, 44.0, 28.0)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90, exif=exif.tobytes())
+    data = buf.getvalue()
+    if packet is not None:
+        payload = b"http://ns.adobe.com/xap/1.0/\x00" + packet
+        seg = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+        data = data[:2] + seg + data[2:]
+    Path(path).write_bytes(data)
+    return str(path)
+
+
+def _rated(path, rating, keywords=(), **kw):
+    return _exif_jpeg(path, size=kw.pop("size", (64, 48)), packet=_packet(rating, keywords), **kw)
+
+
+def _junction(link, target):
+    try:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+        return True
+    except (ImportError, OSError, AttributeError):
+        return False
+
+
+def test_export_config_and_menu():
+    cfg = pc.default_config()
+    assert cfg["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": True}
+    assert cfg["mitene_dir"] == ""
+    bad = pc.normalize({"frame": {"max_long_edge": 10, "quality": "x", "strip_gps": False},
+                        "mitene_dir": "  X:\\m  "})
+    assert bad["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": False}
+    assert bad["mitene_dir"] == "X:\\m"
+    assert pc.normalize({"frame": "broken"})["frame"]["quality"] == 85
+    assert pc.normalize({"frame": {"max_long_edge": 1920.0}})["frame"]["max_long_edge"] == 1920
+    # I メニュー: export=True のときだけ E。既存のキーと重ならない
+    keys = [m.key for m in pc.menu_items(cfg, export=True) if m.action[0] != "separator"]
+    assert keys == ["5", "4", "3", "0", "-", "K", "/", "E"] and len(set(keys)) == len(keys)
+    assert "E" not in [m.key for m in pc.menu_items(cfg)]
+    assert pc.menu_items(cfg, export=True)[-1].action == ("export_menu", None)
+    # E は段階のキーに使えない
+    lv = pc.normalize({"levels": [{"key": "E", "name": "x", "min": 3},
+                                  {"key": "3", "name": "y", "min": 3}]})["levels"]
+    assert [x["key"] for x in lv] == ["3"]
+    items = pc.export_menu_items(cfg)
+    assert [m.key for m in items] == ["F", "M", "D"]
+    assert [m.action[0] for m in items] == ["frame_sync", "mitene_collect", "mitene_finish"]
+    # 式
+    assert pe.frame_expr(cfg) == "★>=4"
+    assert pe.mitene_expr(cfg) == "★=5 && !#みてね済"
+    cfg2 = pc.default_config()
+    cfg2["presets"] = []
+    assert pe.mitene_expr(cfg2) == "@みてね用 && !#みてね済"
+    fe.parse(pe.mitene_expr(cfg2))
+    cfg2["levels"][1]["min"] = 3
+    cfg2["levels"][2]["min"] = 2
+    assert pe.frame_expr(cfg2) == "★>=3"
+    assert pe.mitene_keyword(cfg) == "みてね済"
+    assert pe.mitene_dir(cfg).endswith("みてね用")
+    assert pe.mitene_dir({"mitene_dir": "%TEMP%\\mm"}) == os.path.abspath(
+        os.path.expandvars("%TEMP%\\mm"))
+
+
+def test_collect_excludes_and_expr():
+    import stat as _stat
+    import subprocess
+    import threading
+    d = _tmpdir("collect")
+    root = d / "root"
+    for sub in ("sub/deep", "print", "Bestshot", "delete_candidates", "extract_たろう",
+                ".hidden", "attr_hidden", "frame_out", "mitene_out"):
+        (root / sub).mkdir(parents=True)
+    _rated(root / "a5.jpg", 5)
+    _rated(root / "b4.jpg", 4, ["みてね済"])
+    _rated(root / "c3.jpg", 3)
+    _rated(root / "sub" / "deep" / "d4.jpg", 4)
+    (root / "sub" / "broken.jpg").write_bytes(b"\xff\xd8\xff\xe1")
+    (root / "memo.txt").write_text("x", encoding="utf-8")
+    for sub in ("print", "Bestshot", "delete_candidates", "extract_たろう", ".hidden",
+                "attr_hidden", "frame_out", "mitene_out"):
+        _rated(root / sub / "x5.jpg", 5)
+    subprocess.run(["attrib", "+h", str(root / "attr_hidden")], check=False,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    outside = d / "outside"
+    outside.mkdir()
+    _rated(outside / "j5.jpg", 5)
+    has_junction = _junction(root / "link", outside)
+    cfg = pc.default_config()
+    cfg["frame_targets"] = [str(root / "frame_out")]
+    cfg["mitene_dir"] = str(root / "mitene_out")
+    seen = []
+    res = pe.collect(root, "★>=4", cfg, progress=lambda a, b, n: seen.append((a, b, n)))
+    names = [os.path.relpath(p, root) for p in res.paths]
+    assert names == ["a5.jpg", "b4.jpg", os.path.join("sub", "deep", "d4.jpg")], names
+    assert res.metas[str(root / "a5.jpg")].rating == 5
+    assert [os.path.basename(p) for p in res.unknown] == ["broken.jpg"]
+    assert res.scanned == 5 and not res.cancelled
+    assert seen and all(b == 0 for _a, b, _n in seen)
+    if has_junction:
+        assert (root / "link" / "j5.jpg").exists()
+    # 構文木でも・式なし(全部)でも
+    res = pe.collect(root, fe.parse("★=5 && !#みてね済"), cfg)
+    assert [os.path.basename(p) for p in res.paths] == ["a5.jpg"]
+    res = pe.collect(root, None, cfg)
+    assert len(res.paths) == 4
+    # 中止
+    ev = threading.Event()
+    ev.set()
+    assert pe.collect(root, "★>=4", cfg, cancel=ev).cancelled
+    # 属性の後始末(一時フォルダを消せるように)
+    try:
+        os.chmod(root / "attr_hidden", _stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def _frame_setup(name):
+    d = _tmpdir(name)
+    src = d / "photos"
+    src.mkdir()
+    t1, t2 = d / "frame1", d / "frame2"
+    t1.mkdir()
+    t2.mkdir()
+    ledger = d / "ledger"
+    return d, src, t1, t2, ledger
+
+
+def test_sync_frame_jpeg():
+    """縮小・向き補正・GPS 消去・日時保持・名前。"""
+    from PIL import Image
+    d, src, t1, t2, ledger = _frame_setup("frame_jpeg")
+    a = _exif_jpeg(src / "IMG_0001.jpg", size=(3000, 2000), orientation=6)
+    small = _exif_jpeg(src / "small.jpg", size=(800, 600), when=None, gps=False)
+    old = time.mktime((2023, 1, 2, 3, 4, 5, 0, 0, -1))
+    os.utime(small, (old, old))
+    res = pe.sync_frame([a, small], [str(t1)], {}, str(ledger))
+    assert not res.failed and not res.error, res
+    assert sorted(n for _t, n, _s in res.added) == ["20230102_030405_small.jpg",
+                                                     "20240903_022344_IMG_0001.jpg"]
+    out = t1 / "20240903_022344_IMG_0001.jpg"
+    with Image.open(out) as im:
+        # 3000x2000 を右に90°回して 2000x3000 → 長辺 2560
+        assert im.format == "JPEG" and im.size == (1707, 2560), im.size
+        exif = im.getexif()
+        assert 0x0112 not in exif                      # 向き情報は付けない
+        assert 0x010F not in exif                      # ほかの EXIF も付けない
+        assert exif.get(0x0132) == "2024:09:03 02:23:44"
+        assert exif.get_ifd(0x8769).get(0x9003) == "2024:09:03 02:23:44"
+        assert not exif.get_ifd(0x8825) and 0x8825 not in exif     # GPS なし
+        # 元の左(赤)が上に来ている
+        top = im.getpixel((im.size[0] // 2, 20))
+        bottom = im.getpixel((im.size[0] // 2, im.size[1] - 20))
+        assert top[0] > 200 and top[2] < 60, top
+        assert bottom[2] > 200 and bottom[0] < 60, bottom
+    with Image.open(t1 / "20230102_030405_small.jpg") as im:
+        assert im.size == (800, 600)                   # 拡大しない
+    # 元の写真は触らない
+    with Image.open(a) as im:
+        assert im.size == (3000, 2000) and im.getexif().get(0x0112) == 6
+    # strip_gps=False なら GPS を残す・品質を変えると作り直し
+    res = pe.sync_frame([a], [str(t2)], {"strip_gps": False, "max_long_edge": 1000,
+                                         "quality": 70}, str(ledger))
+    with Image.open(t2 / "20240903_022344_IMG_0001.jpg") as im:
+        assert im.size == (667, 1000)
+        assert im.getexif().get_ifd(0x8825).get(1) == "N"
+    # 台帳は同期先ごと(t1 の台帳に t2 の分は入らない)
+    l1 = pe.load_ledger(str(ledger), str(t1))
+    assert set(l1) == {"20240903_022344_IMG_0001.jpg", "20230102_030405_small.jpg"}
+    rec = l1["20240903_022344_IMG_0001.jpg"]
+    assert rec["source"] == a and rec["out_size"] == out.stat().st_size
+    assert rec["settings"]["max_long_edge"] == 2560
+    # 一時ファイルを残さない
+    assert not [n for n in os.listdir(t1) if n.endswith(".tmp")]
+
+
+def test_sync_frame_ledger_and_manual_files():
+    import threading
+    d, src, t1, t2, ledger = _frame_setup("frame_ledger")
+    a = _exif_jpeg(src / "a.jpg", size=(400, 300), when="2024:01:01 10:00:00")
+    b = _exif_jpeg(src / "b.jpg", size=(400, 300), when="2024:01:02 10:00:00")
+    c = _exif_jpeg(src / "c.jpg", size=(400, 300), when="2024:01:03 10:00:00")
+    # 手で入れた写真(同期と同じ名前のものも)
+    (t1 / "手で入れた.jpg").write_bytes(b"manual photo")
+    (t1 / "20240101_100000_a.jpg").write_bytes(b"manual same name")
+    targets = [str(t1), str(t2)]
+    res = pe.sync_frame([a, b, c], targets, {}, str(ledger))
+    assert len(res.added) == 6 and not res.failed, res
+    l1 = pe.load_ledger(str(ledger), str(t1))
+    name_a1 = next(n for n, r in l1.items() if r["source"] == a)
+    assert name_a1 == "20240101_100000_a_2.jpg"        # ぶつかったら連番(手置きは上書きしない)
+    assert (t1 / "20240101_100000_a.jpg").read_bytes() == b"manual same name"
+    assert (t2 / "20240101_100000_a.jpg").exists()     # t2 ではぶつからない
+    # 同じものを全部の同期先へ(作るのは1回)
+    assert (t1 / name_a1).read_bytes() == (t2 / "20240101_100000_a.jpg").read_bytes()
+
+    # 2回目: 変更なし
+    res = pe.sync_frame([a, b, c], targets, {}, str(ledger))
+    assert len(res.unchanged) == 6 and not (res.added or res.updated or res.deleted), res
+
+    # 元の写真が変わったものだけ作り直す
+    _exif_jpeg(src / "b.jpg", size=(500, 300), when="2024:01:02 10:00:00")
+    res = pe.sync_frame([a, b, c], targets, {}, str(ledger))
+    assert sorted(s for _t, _n, s in res.updated) == [b, b] and len(res.unchanged) == 4, res
+
+    # 設定が変わったら全部作り直す
+    res = pe.sync_frame([a, b, c], targets, {"quality": 60}, str(ledger))
+    assert len(res.updated) == 6, res
+
+    # 手で差し替えられたファイル: 上書きしない(元の写真が変わっても)
+    replaced = t2 / "20240103_100000_c.jpg"
+    replaced.write_bytes(b"replaced by hand")
+    _exif_jpeg(src / "c.jpg", size=(410, 300), when="2024:01:03 10:00:00")
+    res = pe.sync_frame([a, b, c], targets, {"quality": 60}, str(ledger))
+    assert replaced.read_bytes() == b"replaced by hand"
+    assert any(p == str(replaced) for p, _r in res.kept), res.kept
+    assert any("手で差し替え" in n for n in res.notes())
+
+    # ★が下がって c が外れた: 台帳にあるものだけ消す。手で差し替えたものは消さない
+    res = pe.sync_frame([a, b], targets, {"quality": 60}, str(ledger))
+    assert [(os.path.basename(t), n) for t, n, _s in res.deleted] == \
+        [("frame1", "20240103_100000_c.jpg")], res.deleted
+    assert replaced.exists() and replaced.read_bytes() == b"replaced by hand"
+    assert not (t1 / "20240103_100000_c.jpg").exists()
+    assert (t1 / "手で入れた.jpg").read_bytes() == b"manual photo"
+    assert (t1 / "20240101_100000_a.jpg").read_bytes() == b"manual same name"
+    # 差し替えたものは台帳から外れる(以後は手で入れた扱い)
+    assert "20240103_100000_c.jpg" not in pe.load_ledger(str(ledger), str(t2))
+
+    # 全部外れても、手で入れたものは残る
+    res = pe.sync_frame([], targets, {"quality": 60}, str(ledger))
+    assert len(res.deleted) == 4, res
+    assert sorted(os.listdir(t1)) == ["20240101_100000_a.jpg", "手で入れた.jpg"]
+    assert sorted(os.listdir(t2)) == ["20240103_100000_c.jpg"]
+
+    # scope の外・keep の下の写真は消さない。中止したら消さない
+    res = pe.sync_frame([a, b], targets, {}, str(ledger))
+    assert len(res.added) == 4
+    res = pe.sync_frame([], targets, {}, str(ledger), scope=[str(d / "elsewhere")])
+    assert not res.deleted
+    res = pe.sync_frame([], targets, {}, str(ledger), scope=[str(src)], keep=[a])
+    assert sorted(s for _t, _n, s in res.deleted) == [b, b]
+    ev = threading.Event()
+    ev.set()
+    res = pe.sync_frame([], targets, {}, str(ledger), cancel=ev)
+    assert res.cancelled and not res.deleted
+    assert len(pe.load_ledger(str(ledger), str(t1))) == 1
+
+    # 同期先から消されていたら置き直す
+    name = next(iter(pe.load_ledger(str(ledger), str(t1))))
+    os.remove(t1 / name)
+    res = pe.sync_frame([a], [str(t1)], {}, str(ledger))
+    assert [n for _t, n, _s in res.added] == [name] and (t1 / name).exists()
+
+    # 同期先が空・元の写真が無い
+    assert pe.sync_frame([a], [], {}, str(ledger)).error == \
+        "同期先がありません（photo_ratings.json の frame_targets）"
+    res = pe.sync_frame([str(src / "missing.jpg")], [str(t1)], {}, str(ledger))
+    assert res.failed and "ありません" in res.failed[0][1]
+
+
+def test_sync_frame_heic_raw_and_formats():
+    from PIL import Image
+    d, src, t1, _t2, ledger = _frame_setup("frame_formats")
+    png = src / "p.png"
+    Image.new("RGBA", (300, 200), (255, 0, 0, 0)).save(png)
+    os.utime(png, (1700000000, 1700000000))
+    heic = src / "h.heic"
+    heic.write_bytes(b"not really heic")
+    raw = src / "r.ARW"
+    raw.write_bytes(b"raw")
+    saved = list(pe._heif_state)
+    pe._heif_state[:] = [False]
+    try:
+        res = pe.sync_frame([str(png), str(heic), str(raw)], [str(t1)], {}, str(ledger))
+    finally:
+        pe._heif_state[:] = saved
+    assert res.skipped_heic == [str(heic)] and res.skipped_raw == [str(raw)]
+    notes = res.notes()
+    assert any(n.startswith("HEIC は読めないので飛ばしました（1 枚") for n in notes), notes
+    assert len(res.added) == 1
+    out = t1 / res.added[0][1]
+    assert out.name.endswith("_p.jpg")
+    with Image.open(out) as im:
+        assert im.mode == "RGB" and im.getpixel((5, 5))[1] > 200   # 透明は白で埋める
+
+
+def test_mitene_collect_and_finish():
+    d = _tmpdir("mitene")
+    root = d / "root"
+    root.mkdir()
+    dest = d / "みてね用"
+    a = _rated(root / "a.jpg", 5, when="2024:05:05 05:05:05")
+    b = _rated(root / "b.jpg", 5, when=None)
+    c = _rated(root / "c.jpg", 5)
+    _rated(root / "done.jpg", 5, ["みてね済"])
+    _rated(root / "four.jpg", 4)
+    old = time.mktime((2022, 2, 2, 2, 2, 2, 0, 0, -1))
+    os.utime(b, (old, old))
+    cfg = pc.default_config()
+    cfg["mitene_dir"] = str(dest)
+    found = pe.collect(root, pe.mitene_expr(cfg), cfg)
+    assert [os.path.basename(p) for p in found.paths] == ["a.jpg", "b.jpg", "c.jpg"]
+    res = pe.collect_mitene(found.paths, dest)
+    names = sorted(n for n, _s in res.copied)
+    assert names == sorted(["20240505_050505_a.jpg", "20220202_020202_b.jpg",
+                            "20240903_022344_c.jpg"]), names
+    # そのままコピー(縮小しない)
+    assert (dest / "20240505_050505_a.jpg").read_bytes() == Path(a).read_bytes()
+    man = pe.load_manifest(str(dest))
+    assert sorted(it["source"] for it in man) == sorted([a, b, c])
+    # 2回目は飛ばす
+    res = pe.collect_mitene(found.paths, dest)
+    assert not res.copied and len(res.already) == 3
+    # 上げないことにした1枚を集めた先から消しておく
+    os.remove(dest / "20240903_022344_c.jpg")
+
+    exe = _exiftool()
+    if exe:
+        session = pw.ExifToolSession(exe, journal_path=os.path.join(_TEST_TEMP, "mitene.jsonl"))
+    else:
+        print("      test_mitene_collect_and_finish: ExifTool が無いのでフェイクで書きます")
+        session = _FakeKeywordSession(fail={"b.jpg"})
+    try:
+        if exe:
+            os.chmod(b, 0o444)        # 読み取り専用で1枚失敗させる
+        try:
+            fin = pe.finish_mitene(str(dest), session, "みてね済")
+        finally:
+            os.chmod(b, 0o666)
+    finally:
+        if exe:
+            session.close()
+    assert fin.marked == [a], fin
+    assert fin.missing == [c]
+    assert [p for p, _r in fin.failed] == [b]
+    assert not (dest / "20240505_050505_a.jpg").exists()
+    assert (dest / "20220202_020202_b.jpg").exists()      # 失敗したものは残る
+    assert [it["source"] for it in pe.load_manifest(str(dest))] == [b]
+    if exe:
+        assert "みてね済" in px.read_meta(a).keywords
+        assert "みてね済" not in px.read_meta(c).keywords
+        assert px.read_meta(a).rating == 5
+    # 残りを片付けると一覧ファイルも消える
+    fin = pe.finish_mitene(str(dest), _FakeKeywordSession(), "みてね済")
+    assert fin.marked == [b] and not pe.load_manifest(str(dest))
+    assert not (dest / pe.MITENE_MANIFEST).exists()
+    assert pe.finish_mitene(str(dest), _FakeKeywordSession(), "").error
+
+
+class _FakeKeywordSession:
+    def __init__(self, fail=()):
+        self.fail = set(fail)
+        self.calls = []
+
+    def set_keyword(self, paths, keyword, on):
+        out = []
+        for p in paths:
+            self.calls.append((p, keyword, on))
+            before = px.read_meta(p)
+            if os.path.basename(p) in self.fail:
+                out.append(pw.WriteResult(p, False, "読み取り専用のファイルです", before=before))
+            else:
+                after = PhotoMeta(before.rating, before.keywords + (keyword,))
+                out.append(pw.WriteResult(p, True, before=before, after=after))
+        return out
 
 
 # ------------------------------------------------------------------ 実行器

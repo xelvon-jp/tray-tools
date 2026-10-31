@@ -31,7 +31,7 @@ def data_dir() -> str:
 CONFIG_PATH = os.path.join(data_dir(), "photo_ratings.json")
 
 # 写真メニュー・絞り込みメニューで固定の意味を持つキー（設定の段階・キーワードには使えない）
-MENU_FIXED_KEYS = frozenset({"0", "-", "/"})
+MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E"})
 FILTER_FIXED_KEYS = frozenset({"U", "E", "A"})
 
 # filter_key（段階の）と key（プリセットの）は §7 の既定に足した任意の項目。
@@ -50,8 +50,15 @@ DEFAULT_CONFIG: dict = {
         {"name": "削除候補", "expr": "reject", "key": "D", "label": "削除候補だけ"},
     ],
     "frame_targets": [],
+    # フォトフレーム用に作る JPEG（photometa.export.sync_frame）
+    "frame": {"max_long_edge": 2560, "quality": 85, "strip_gps": True},
+    # みてね用に集める先。空なら %TEMP%\みてね用（photometa.export.mitene_dir）
+    "mitene_dir": "",
     "exiftool": "",
 }
+
+FRAME_EDGE_RANGE = (256, 20000)
+FRAME_QUALITY_RANGE = (1, 100)
 
 
 def default_config() -> dict:
@@ -139,6 +146,30 @@ def _norm_presets(v) -> list | None:
     return out
 
 
+def _int_in(v, lo: int, hi: int) -> int | None:
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        return None
+    return v
+
+
+def normalize_frame(v) -> dict:
+    """"frame"（フォトフレーム用 JPEG の作り方）を項目ごとに正規化する。壊れた項目は既定。"""
+    out = dict(DEFAULT_CONFIG["frame"])
+    if not isinstance(v, dict):
+        return out
+    edge = _int_in(v.get("max_long_edge"), *FRAME_EDGE_RANGE)
+    if edge is not None:
+        out["max_long_edge"] = edge
+    quality = _int_in(v.get("quality"), *FRAME_QUALITY_RANGE)
+    if quality is not None:
+        out["quality"] = quality
+    if isinstance(v.get("strip_gps"), bool):
+        out["strip_gps"] = v["strip_gps"]
+    return out
+
+
 def normalize(cfg) -> dict:
     """壊れた値を既定に戻した設定を返す（元の辞書は変えない）。知らないキーは残す。"""
     out = default_config()
@@ -162,6 +193,10 @@ def normalize(cfg) -> dict:
     ft = cfg.get("frame_targets")
     if isinstance(ft, list):
         out["frame_targets"] = [s for s in (_str(x) for x in ft) if s]
+    out["frame"] = normalize_frame(cfg.get("frame"))
+    md = cfg.get("mitene_dir")
+    if isinstance(md, str):
+        out["mitene_dir"] = md.strip()
     et = cfg.get("exiftool")
     if isinstance(et, str):
         out["exiftool"] = et.strip()
@@ -261,12 +296,13 @@ def menu_title(count: int) -> str:
     return f"写真の★（{count}枚）"
 
 
-def menu_items(config: dict) -> list[MenuItem]:
+def menu_items(config: dict, export: bool = False) -> list[MenuItem]:
     """写真メニュー（I）の行。動作は次のどれか：
 
     ("rating", 5) / ("rating", 0) / ("rating", -1) … 選んだ写真に★を付ける
     ("keyword", "みてね済")                          … キーワードを付ける／外す
     ("filter_menu", None)                             … 絞り込みの小メニューを開く
+    ("export_menu", None)                             … 書き出しの小メニューを開く（export=True のときだけ）
     ("separator", None)                               … 区切り線（SEPARATOR）
     """
     items = [MenuItem(lv["key"], lv["name"], f"★{lv['min']}", ("rating", lv["min"]))
@@ -281,7 +317,27 @@ def menu_items(config: dict) -> list[MenuItem]:
                                   ("keyword", kw["name"])))
     items.append(SEPARATOR)
     items.append(MenuItem("/", "★で絞り込む ▸", "", ("filter_menu", None)))
+    if export:
+        items.append(MenuItem("E", "書き出し ▸", "", ("export_menu", None)))
     return items
+
+
+def export_menu_items(config: dict) -> list[MenuItem]:
+    """書き出しの小メニュー（I → E）の行。動作は次のどれか：
+
+    ("frame_sync", None)     … フォトフレームへ同期（photometa.export.sync_frame）
+    ("mitene_collect", None) … みてね用に集める（photometa.export.collect_mitene）
+    ("mitene_finish", None)  … みてね済にして片付ける（photometa.export.finish_mitene）
+    """
+    from . import export as ex
+
+    kws = config.get("keywords") or []
+    done = kws[0]["name"] if kws else "みてね済"
+    return [
+        MenuItem("F", "フォトフレームへ同期", ex.frame_expr(config), ("frame_sync", None)),
+        MenuItem("M", "みてね用に集める", ex.mitene_expr(config), ("mitene_collect", None)),
+        MenuItem("D", f"{done}にして片付ける", "", ("mitene_finish", None)),
+    ]
 
 
 def filter_menu_items(config: dict) -> list[MenuItem]:

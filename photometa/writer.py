@@ -166,6 +166,10 @@ class ExifToolSession:
                     proc.wait(timeout)
                 except (OSError, subprocess.SubprocessError):
                     pass
+            try:
+                proc.stdout.close()     # 閉じないと ResourceWarning（unclosed file）が出る
+            except (OSError, ValueError):
+                pass
 
     def __enter__(self):
         return self

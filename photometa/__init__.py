@@ -6,4 +6,5 @@
 - config      … 共通設定 %LOCALAPPDATA%\\traytools\\photo_ratings.json と写真メニューの中身
 - writer      … ExifTool を常駐させて★・キーワードを書く。変更記録（journal）も
 - filter_expr … 表示フィルタの条件式（人物名・★・キーワード・選択中など）
+- export      … 書き出し（フォトフレームへの同期・みてね用の収集と片付け）
 """

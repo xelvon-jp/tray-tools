@@ -85,6 +85,7 @@ import filer_shell
 import filer_update
 import settings as settings_module
 from photometa import config as photo_config
+from photometa import export as photo_export
 from photometa import filter_expr as photo_filter
 from photometa import writer as photo_writer
 from photometa import xmp as photo_xmp
@@ -1776,7 +1777,8 @@ class Pane(QWidget):
         self._photo_requested.update(key for key, _p in wanted)
         gen = self.photo_gen
         cancel = self._photo_cancel
-        bridge = self.window_.bridge
+        signal = self.window_.bridge.photo_meta
+        emit = self.window_.safe_emit      # 閉じた後は送らない(閉じる側が終わるのを待つ)
         side = self.side
 
         def worker():
@@ -1792,18 +1794,13 @@ class Pane(QWidget):
                 batch.append((key, meta))
                 now = time.monotonic()
                 if len(batch) >= PHOTO_READ_BATCH or now - flushed >= PHOTO_READ_FLUSH_SECONDS:
-                    try:
-                        bridge.photo_meta.emit((side, gen, batch))
-                    except RuntimeError:
+                    if cancel.is_set() or not emit(signal, (side, gen, batch)):
                         return
                     batch, flushed = [], now
             if batch and not cancel.is_set():
-                try:
-                    bridge.photo_meta.emit((side, gen, batch))
-                except RuntimeError:
-                    pass
+                emit(signal, (side, gen, batch))
 
-        threading.Thread(target=worker, daemon=True, name=f"filer-photo-{side}").start()
+        self.window_.spawn_tracked(worker, f"filer-photo-{side}")
 
     def on_photo_meta(self, gen, items) -> None:
         """読み取りスレッドから★が届いた(UI スレッド)。古い世代は捨てる。"""
@@ -2048,6 +2045,13 @@ class FilerWindow(QWidget):
         self._photo_session = None
         self._photo_jobs = {}           # 書き込みの番号 → (操作, 書く前の★の控え)
         self._photo_job_seq = 0
+        # 閉じるときに終わるのを待つ裏のスレッド(★の読み書き・書き出しなどの長い処理)。
+        # 閉じ始めたら _closing を立て、以後 safe_emit は何も送らない(壊れかけの bridge に
+        # Signal を送ると 0xC0000005 で落ちる)。旗の確認と emit は同じ Lock の中でやるので、
+        # 「見てから送るまでの隙間」に閉じる側が割り込めない。
+        self._closing = False
+        self._emit_lock = threading.RLock()
+        self._tracked_threads = []
 
         self.setWindowTitle(filer_update.window_title("", self.version))
         # アプリ既定(main で設定)に加え窓自体にも付ける。タスクバーが
@@ -2500,6 +2504,39 @@ class FilerWindow(QWidget):
                 return False
         return True
 
+    def safe_emit(self, signal, payload) -> bool:
+        """裏のスレッドから Signal を送る。閉じ始めていたら送らずに False。"""
+        with self._emit_lock:
+            if self._closing:
+                return False
+            try:
+                signal.emit(payload)
+            except RuntimeError:        # bridge がもう無い
+                return False
+        return True
+
+    def spawn_tracked(self, target, name: str) -> threading.Thread:
+        """閉じるときに終わりを待つ裏のスレッドを起こす(stop_tracked_threads)。"""
+        self._tracked_threads = [t for t in self._tracked_threads if t.is_alive()]
+        thread = threading.Thread(target=target, daemon=True, name=name)
+        self._tracked_threads.append(thread)
+        thread.start()
+        return thread
+
+    def stop_tracked_threads(self, timeout: float = 3.0) -> None:
+        """以後は emit させず、起こした裏のスレッドが終わるのを待つ(長くても timeout 秒)。
+        待ちきれなかったものも emit はしないので、窓を壊してよい。"""
+        with self._emit_lock:
+            self._closing = True
+        deadline = time.monotonic() + timeout
+        for thread in self._tracked_threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if thread is not threading.current_thread():
+                thread.join(remaining)
+        self._tracked_threads = [t for t in self._tracked_threads if t.is_alive()]
+
     def closeEvent(self, event):
         # 再起動(Shift+F5)では確認も保存も済ませてある(保存を後継の起動と書き合わない)。
         restarting = getattr(self, "_restarting", False)
@@ -2519,6 +2556,8 @@ class FilerWindow(QWidget):
             for pane in (self.left, self.right):
                 pane._photo_cancel.set()
             self._photo_journal_timer.stop()
+            # 裏のスレッド(★の読み書き・書き出し)が終わるのを待ってから ExifTool と窓を壊す
+            self.stop_tracked_threads()
             self._close_photo_session()
             # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
             # 次の起動で片付く。
@@ -5166,23 +5205,19 @@ class FilerWindow(QWidget):
         self.set_status_state(f"{title}中")
         bridge = self.bridge
 
+        emit = self.safe_emit
+
         def progress(done, all_, name):
-            try:
-                bridge.progress.emit((done, all_, name))
-            except RuntimeError:
-                pass
+            emit(bridge.progress, (done, all_, name))
 
         def worker():
             try:
                 result = run(progress, cancel)
             except Exception as e:  # noqa: BLE001  何が来ても結果として返す
                 result = e
-            try:
-                bridge.extracted.emit(result)
-            except RuntimeError:
-                pass
+            emit(bridge.extracted, result)
 
-        threading.Thread(target=worker, daemon=True, name="filer-job").start()
+        self.spawn_tracked(worker, "filer-job")
 
     def _on_extract_progress(self, payload) -> None:
         try:
@@ -5191,10 +5226,17 @@ class FilerWindow(QWidget):
                 return
             done, total, name = payload
             dialog = job["dialog"]
-            dialog.setMaximum(max(total, 1))
-            dialog.setValue(min(done, max(total, 1)))
-            dialog.setLabelText(f"{job['title']}: {done}/{total}\n{name}")
-            self.set_status_state(f"{job['title']}中 {done}/{total}")
+            if total > 0:
+                dialog.setMaximum(total)
+                dialog.setValue(min(done, total))
+                dialog.setLabelText(f"{job['title']}: {done}/{total}\n{name}")
+                self.set_status_state(f"{job['title']}中 {done}/{total}")
+            else:
+                # 全体が分からない(写真を探している途中)。done は見た数
+                dialog.setMaximum(0)            # 行ったり来たりの表示
+                dialog.setValue(0)              # 待ち時間が過ぎていれば窓を出す
+                dialog.setLabelText(f"{job['title']}: 探しています（{done} 枚見ました）\n{name}")
+                self.set_status_state(f"{job['title']}中 {done}枚見ました")
         except Exception:  # noqa: BLE001
             _log_exception("extractProgress")
 
@@ -5727,7 +5769,7 @@ class FilerWindow(QWidget):
         ratings = {m.rating for m in metas if m is not None}
         same = next(iter(ratings)) if known and len(ratings) == 1 else None
         items = []
-        for item in photo_config.menu_items(self.photo_config):
+        for item in photo_config.menu_items(self.photo_config, export=True):
             kind, value = item.action
             if kind == "separator":
                 items.append(None)
@@ -5749,6 +5791,9 @@ class FilerWindow(QWidget):
         kind, value = action
         if kind == "filter_menu":
             self.photo_filter_menu()
+            return
+        if kind == "export_menu":
+            self.photo_export_menu()
             return
         if kind not in ("rating", "keyword"):
             return
@@ -5822,6 +5867,7 @@ class FilerWindow(QWidget):
         job = self._photo_job_seq
         self._photo_jobs[job] = (op, before)
         bridge = self.bridge
+        emit = self.safe_emit
 
         def worker():
             try:
@@ -5832,12 +5878,9 @@ class FilerWindow(QWidget):
                 payload = (job, results, "")
             except Exception as e:  # noqa: BLE001  何が来ても結果として返す
                 payload = (job, None, f"{type(e).__name__}: {e}")
-            try:
-                bridge.photo_written.emit(payload)
-            except RuntimeError:
-                pass
+            emit(bridge.photo_written, payload)
 
-        threading.Thread(target=worker, daemon=True, name="filer-photo-write").start()
+        self.spawn_tracked(worker, "filer-photo-write")
 
     @staticmethod
     def _photo_done_text(op, count: int) -> str:
@@ -5931,6 +5974,187 @@ class FilerWindow(QWidget):
                                                    self.photo_config) or "☆"
                 color = pane.text_color(entry, COL_RATING)
         widget.set_rating_text(text, color)
+
+    # --- 書き出し(I → E。フォトフレーム同期・みてね) ---
+    def photo_export_menu(self) -> None:
+        """I → E: 書き出しの小メニュー(F フォトフレームへ同期 / M みてね用に集める /
+        D みてね済にして片付ける)。"""
+        self._reload_photo_config()
+        items = []
+        for item in photo_config.export_menu_items(self.photo_config):
+            label = f"{item.label}  {item.detail}" if item.detail else item.label
+            items.append((item.key, label, item.action))
+        menu, chosen = self.build_menu("書き出し", items)
+        choice = self._exec_menu(menu, chosen)
+        if choice is None:
+            return
+        kind = choice[0]
+        if kind == "frame_sync":
+            self.photo_frame_sync()
+        elif kind == "mitene_collect":
+            self.photo_mitene_collect()
+        elif kind == "mitene_finish":
+            self.photo_mitene_finish()
+
+    def _export_root(self, title: str):
+        """書き出しで集める元(今の窓のフォルダ)。使えなければログに出して None。"""
+        pane = self.active
+        if pane.archive is not None:
+            self.log(f"{title}: {ARCHIVE_READONLY}")
+            return None
+        if not pane.path or not os.path.isdir(pane.path):
+            self.log(f"{title}: 今の窓がフォルダではありません")
+            return None
+        if self._extracting is not None:
+            self.log(f"{title}: ほかの処理が終わるまで待ってください")
+            return None
+        return pane.path
+
+    def photo_frame_sync(self) -> None:
+        """今の窓のフォルダ配下の★4以上(段階「フォトフレーム用」)を、共通設定の
+        frame_targets の各フォルダへ同期する(縮小した JPEG。台帳にあるものだけを足し引き)。
+        対象から外れた写真を消すのは、このフォルダ配下から同期したものだけ。"""
+        title = "フォトフレーム同期"
+        cfg = self.photo_config
+        targets = list(cfg.get("frame_targets") or [])
+        if not targets:
+            self.log(f"{title}: 同期先がありません（photo_ratings.json の frame_targets）")
+            return
+        root = self._export_root(title)
+        if root is None:
+            return
+        expr = photo_export.frame_expr(cfg)
+        shown = "\n".join(f"  {t}" for t in targets)
+        if not self.confirm(title, f"{root} 配下から {expr} を集めて、同期先 {len(targets)} か所へ。"
+                                   f"よろしいですか？\n\n{shown}"):
+            return
+        settings = cfg.get("frame")
+        ledger_dir = photo_export.default_ledger_dir()
+
+        def run(progress, cancel):
+            found = photo_export.collect(root, expr, cfg, cancel=cancel, progress=progress)
+            if found.cancelled:
+                return found, None
+            # ★が読めなかった写真・読めなかったフォルダの分は消さない
+            keep = list(found.unknown) + list(found.error_dirs)
+            return found, photo_export.sync_frame(found.paths, targets, settings, ledger_dir,
+                                                  cancel=cancel, progress=progress,
+                                                  scope=[root], keep=keep)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
+                return
+            found, synced = result
+            if synced is None:
+                self.log(f"{title}: 中止しました（集めている途中。同期先は変えていません）")
+                return
+            self.log(f"{title}: {len(found.paths)} 枚 → {len(targets)} か所　{synced.summary()}")
+            for note in synced.notes():
+                self.log(f"{title}: {note}")
+            if found.unknown:
+                self.log(f"{title}: ★が読めなかった写真 {len(found.unknown)} 枚は"
+                         "足しも消しもしていません")
+            for pane in (self.left, self.right):
+                if pane.path and any(core.same_dir(pane.path, t) for t in targets):
+                    pane.reload(keep_marks=True)
+
+        self._start_job(title, root, 0, run, done)
+
+    def photo_mitene_collect(self) -> None:
+        """今の窓のフォルダ配下の「みてね用でまだ上げていない」写真を、集める先へコピーする。
+        終わったら集めた先を反対窓で開く。"""
+        title = "みてね用に集める"
+        cfg = self.photo_config
+        root = self._export_root(title)
+        if root is None:
+            return
+        expr = photo_export.mitene_expr(cfg)
+        dest = photo_export.mitene_dir(cfg)
+
+        def run(progress, cancel):
+            found = photo_export.collect(root, expr, cfg, cancel=cancel, progress=progress)
+            if found.cancelled:
+                return found, None
+            return found, photo_export.collect_mitene(found.paths, dest, cancel=cancel,
+                                                      progress=progress)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
+                return
+            found, got = result
+            if got is None:
+                self.log(f"{title}: 中止しました")
+                return
+            text = f"{title}: {len(got.copied)} 枚 → {dest}"
+            if got.already:
+                text += f"（集めてあった {len(got.already)} 枚はそのまま）"
+            if got.cancelled:
+                text += "（中止しました）"
+            self.log(text)
+            for path, reason in got.failed[:5]:
+                self.log(f"{title}: 失敗 {os.path.basename(path)}：{reason}")
+            if os.path.isdir(dest):
+                self.other.load(dest)
+
+        self._start_job(title, root, 0, run, done)
+
+    def photo_mitene_finish(self) -> None:
+        """集めた先の一覧にある元の写真に「みてね済」を付け、付けられたものを集めた先から消す。"""
+        title = "みてね済にして片付ける"
+        cfg = self.photo_config
+        dest = photo_export.mitene_dir(cfg)
+        keyword = photo_export.mitene_keyword(cfg)
+        if not keyword:
+            self.log(f"{title}: みてね済に当たるキーワードがありません（photo_ratings.json の keywords）")
+            return
+        items = photo_export.load_manifest(dest)
+        if not items:
+            self.log(f"{title}: 集めた写真がありません（{dest}）")
+            return
+        if self._extracting is not None:
+            self.log(f"{title}: ほかの処理が終わるまで待ってください")
+            return
+        if not self.confirm(title, f"{dest} に集めた {len(items)} 枚の元の写真に「{keyword}」を付けて、"
+                                   "集めた先から消します。よろしいですか？\n\n"
+                                   "（集めた先から消してあった写真には付けません）",
+                            default_yes=False):
+            return
+        session = self._get_photo_session()
+        if session is None:
+            self.log(f"{title}: {EXIFTOOL_NOT_FOUND}")
+            return
+
+        def run(progress, cancel):
+            return photo_export.finish_mitene(dest, session, keyword, cancel=cancel,
+                                              progress=progress)
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
+                self._close_photo_session()
+                return
+            if result.error:
+                self.log(f"{title}: {result.error}")
+                return
+            metas = {photo_key(r.path): r.after for r in result.results
+                     if r.ok and r.after is not None}
+            if metas:
+                self._apply_photo_metas_all(metas)
+            text = f"{title}: {len(result.marked)} 枚に{keyword}を付けて片付けました"
+            if result.missing:
+                text += f"（集めた先から消されていた {len(result.missing)} 枚には付けていません）"
+            if result.cancelled:
+                text += "（中止しました）"
+            self.log(text)
+            for path, reason in result.failed[:5]:
+                self.log(f"{title}: 失敗 {os.path.basename(path)}：{reason}")
+            for pane in (self.left, self.right):
+                if pane.path and core.same_dir(pane.path, dest):
+                    pane.reload(keep_marks=True)
+
+        self._start_job(title, dest, len(items), run, done)
 
     def photo_filter_menu(self) -> None:
         """I → /: ★で絞り込む小メニュー(段階・プリセット・未選別・式を入力・解く)。"""

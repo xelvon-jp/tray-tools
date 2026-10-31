@@ -7359,6 +7359,84 @@ def test_photo_write_with_exiftool():
         assert not session.alive()
 
 
+def test_photo_export_menu():
+    """I → E 書き出し: F フォトフレームへ同期 / M みてね用に集める / D みてね済にして片付ける。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        frame = Path(tmp, "frame")
+        frame.mkdir()
+        (frame / "手で入れた.jpg").write_bytes(b"manual")
+        mitene = Path(tmp, "mitene")
+        cfg = filer.photo_config.default_config()
+        cfg["frame_targets"] = [str(frame)]
+        cfg["mitene_dir"] = str(mitene)
+        # 共通設定と台帳はこのテストの一時フォルダへ(データの置き場 _TEST_TEMP は、窓の起動時の
+        # 書庫の一時フォルダの片付け(filer_archive.cleanup_temp)が裏で消すことがある)
+        saved = (filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir)
+        filer.photo_config.CONFIG_PATH = str(Path(tmp, "data", "photo_ratings.json"))
+        filer.photo_export.default_ledger_dir = lambda: str(Path(tmp, "data", "ledger"))
+        filer.photo_config.save_config(cfg)
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        fake = _FakePhotoSession()
+        w._photo_session = fake
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        asked = []
+        w.confirm = lambda title, text, default_yes=True: (asked.append(text), True)[1]
+        try:
+            # I メニューに「E 書き出し ▸」の行。キーは既存と重ならない
+            seen, picks = [], ["&E:", "&F:"]
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[0][0].startswith("写真の★") and seen[1][0] == "書き出し", (seen, log())
+            assert asked and "同期先 1 か所" in asked[-1] and str(photos) in asked[-1], log()
+            _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
+            names = sorted(os.listdir(frame))
+            assert "手で入れた.jpg" in names and len(names) == 4, names
+            assert sum(n.endswith("_a5.jpg") or n.endswith("_b4.jpg") or n.endswith("_one.jpg")
+                       for n in names) == 3
+            assert "追加 3" in log()
+
+            # M: ★5 でみてね済でないもの(a5 と sub/one)を集め、反対窓で開く
+            picks += ["&E:", "&M:"]
+            QTest.keyClick(L.view, Qt.Key_I)
+            _wait_until(lambda: "みてね用に集める: 2 枚" in log(), timeout=30, what="集め終わり")
+            _wait(w)
+            assert core.same_dir(w.right.path, mitene)
+            copies = sorted(n for n in os.listdir(mitene) if n.endswith(".jpg"))
+            assert len(copies) == 2, copies
+
+            # D: 確かめてから、フェイクの ExifTool でみてね済を付けて片付ける
+            picks += ["&E:", "&D:"]
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert "2 枚の元の写真に「みてね済」" in asked[-1]
+            _wait_until(lambda: "2 枚にみてね済を付けて片付けました" in log(), timeout=30,
+                        what="片付けの終わり")
+            assert fake.calls[-1][0] == "keyword" and fake.calls[-1][2:] == ("みてね済", True)
+            assert not [n for n in os.listdir(mitene) if n.endswith(".jpg")]
+            _wait_until(lambda: _rating_texts(L)["a5.jpg"] == "★5済", what="済の表示")
+
+            # 同期先が無ければ実行しない
+            filer.photo_config.save_config(filer.photo_config.default_config())
+            picks += ["&E:", "&F:"]
+            n = len(asked)
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert len(asked) == n
+            assert "同期先がありません（photo_ratings.json の frame_targets）" in log()
+        finally:
+            w.close()
+            w.deleteLater()
+            filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

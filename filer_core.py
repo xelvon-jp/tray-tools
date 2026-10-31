@@ -16,6 +16,10 @@ import stat
 import time
 from dataclasses import dataclass
 
+# 写真の判定(拡張子だけ)。photometa.xmp は Qt に依存せず、読み込み時に設定ファイルの
+# 場所を決めたりもしない(config / writer と違う)ので、ここで読んでよい。
+from photometa.xmp import is_photo
+
 # ---------------------------------------------------------------
 # キー割り当て
 # ---------------------------------------------------------------
@@ -104,6 +108,18 @@ DEFAULT_KEYMAP = {
     "1087": "sync_copy",          # Shift+W フォルダ同期コピー(コピーのみ)
     "0090": "settings_dialog",    # Z 設定(あふｗの Z ＝設定プログラム起動)
     "0191": "live_filter",        # / ライブ絞り込み(XYplorer の Live Filter / yazi の filter)
+    # --- 写真の★(photometa) ---
+    "0073": "photo_menu",         # I 写真メニュー(★を付ける・★で絞り込む。AFXW.key の
+                                  # Alt+I(IrfanView)と同じ指で「画像まわり」)
+    "4049": "photo_preset_1",     # Alt+1〜9 ★の絞り込みのプリセット(photo_ratings.json の
+    "4050": "photo_preset_2",     # presets の N 番目。AFXW.key でも空いている)
+    "4051": "photo_preset_3",
+    "4052": "photo_preset_4",
+    "4053": "photo_preset_5",
+    "4054": "photo_preset_6",
+    "4055": "photo_preset_7",
+    "4056": "photo_preset_8",
+    "4057": "photo_preset_9",
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
     "0080": "zip_create",         # P ZIP 圧縮(反対窓に作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
@@ -2489,3 +2505,66 @@ def frecency_query(data: dict, text: str, now: float) -> list:
         found.append((not in_tail, -frecency_score(count, last, now), path))
     found.sort()
     return [path for _a, _b, path in found]
+
+
+# ---------------------------------------------------------------
+# 写真フォルダモード(★の列と写真のボタン段を出すか)
+# ---------------------------------------------------------------
+# 自動で切り替わる条件(窓ごと)。ファイル(フォルダと ".." は数えない)のうち、拡張子で
+# 写真とみなせるもの(photometa.xmp.is_photo)が
+#   - min_count 枚以上 かつ ファイルの min_ratio 以上、または
+#   - small_min_count 枚以上 かつ small_min_ratio 以上
+# のとき。「10枚以上 OR 8割以上」だけだと、アイコンが10個入った開発フォルダや写真1枚だけの
+# フォルダまで写真モードになるので、両方に下限を付けてある。settings.json の
+# filer.photo_mode で数値を変えられる。ファイルは開かない(拡張子だけで決める)。
+PHOTO_MODE_DEFAULTS = {"min_count": 10, "min_ratio": 0.5,
+                       "small_min_count": 3, "small_min_ratio": 0.8}
+PHOTO_MODE_OVERRIDES = ("auto", "on", "off")
+
+
+def normalize_photo_mode(value) -> dict:
+    """filer.photo_mode を整える。形の違う値・範囲外の値は項目ごとに既定へ戻す。"""
+    out = dict(PHOTO_MODE_DEFAULTS)
+    if not isinstance(value, dict):
+        return out
+    for key in ("min_count", "small_min_count"):
+        v = value.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 1:
+            out[key] = int(v)
+    for key in ("min_ratio", "small_min_ratio"):
+        v = value.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 1:
+            out[key] = float(v)
+    return out
+
+
+def count_photos(entries):
+    """(写真の数, ファイルの数)。フォルダと ".." は数えない。"""
+    photos = files = 0
+    for e in entries:
+        if e.is_dir or e.is_parent:
+            continue
+        files += 1
+        if is_photo(e.name):
+            photos += 1
+    return photos, files
+
+
+def is_photo_folder(entries, params=None) -> bool:
+    """この一覧を写真フォルダモードで見せるか(自動判定)。"""
+    p = normalize_photo_mode(params)
+    photos, files = count_photos(entries)
+    if not files:
+        return False
+    ratio = photos / files
+    return ((photos >= p["min_count"] and ratio >= p["min_ratio"])
+            or (photos >= p["small_min_count"] and ratio >= p["small_min_ratio"]))
+
+
+def photo_mode_on(override: str, auto: bool) -> bool:
+    """手動の切り替え(Shift+Z。"auto" / "on" / "off")と自動判定から、モードを決める。"""
+    if override == "on":
+        return True
+    if override == "off":
+        return False
+    return bool(auto)

@@ -6823,6 +6823,542 @@ def test_window_workspace():
                 os.remove(store)
 
 
+# ---------------------------------------------------------------
+# 写真の★(写真フォルダモード・★の列・I メニュー・★の絞り込み・変更記録)
+# ---------------------------------------------------------------
+def test_photo_mode_judgement():
+    def entries(photos, others, dirs=0):
+        return ([E(f"d{i}", is_dir=True) for i in range(dirs)] + [core.PARENT_ENTRY]
+                + [E(f"p{i}.jpg") for i in range(photos)] + [E(f"o{i}.txt") for i in range(others)])
+
+    # 10枚以上かつ5割以上
+    assert core.is_photo_folder(entries(10, 10))
+    assert not core.is_photo_folder(entries(10, 11))          # 5割を切る
+    assert not core.is_photo_folder(entries(9, 9))            # 10枚に届かない(8割にも)
+    # 3枚以上かつ8割以上
+    assert core.is_photo_folder(entries(4, 1))                # 0.8 ちょうど
+    assert not core.is_photo_folder(entries(3, 1))            # 0.75
+    assert core.is_photo_folder(entries(3, 0))
+    assert not core.is_photo_folder(entries(2, 0))            # 2枚だけは写真モードにしない
+    # フォルダと ".." は数えない。ファイルが無ければ False
+    assert core.is_photo_folder(entries(3, 0, dirs=50))
+    assert not core.is_photo_folder(entries(0, 0, dirs=3))
+    assert core.count_photos(entries(3, 2, dirs=4)) == (3, 5)
+    # RAW・HEIC も写真。大文字の拡張子も
+    assert core.count_photos([E("a.ARW"), E("b.HEIC"), E("c.Jpg"), E("d.gif")]) == (3, 4)
+    # 数値は settings.json の filer.photo_mode で変えられる(壊れた値は項目ごとに既定)
+    params = {"min_count": 2, "min_ratio": 0.4, "small_min_count": "x", "small_min_ratio": 3}
+    norm = core.normalize_photo_mode(params)
+    assert norm == {"min_count": 2, "min_ratio": 0.4, "small_min_count": 3, "small_min_ratio": 0.8}
+    assert core.is_photo_folder(entries(2, 3), params)
+    assert not core.is_photo_folder(entries(2, 3))
+    assert core.normalize_photo_mode(None) == core.PHOTO_MODE_DEFAULTS
+    assert core.normalize_photo_mode({"min_count": True}) == core.PHOTO_MODE_DEFAULTS
+    # 手動の切り替え
+    assert core.photo_mode_on("auto", True) and not core.photo_mode_on("auto", False)
+    assert core.photo_mode_on("on", False) and not core.photo_mode_on("off", True)
+    # キー: I と Alt+1〜9
+    assert core.DEFAULT_KEYMAP["0073"] == "photo_menu"
+    assert [core.DEFAULT_KEYMAP[f"40{49 + i}"] for i in range(9)] == [
+        f"photo_preset_{i}" for i in range(1, 10)]
+
+
+def _photo_packet(rating=None, keywords=()):
+    attrs = f' xmp:Rating="{rating}"' if rating is not None else ""
+    body = ""
+    if keywords:
+        body = ("<dc:subject><rdf:Bag>" + "".join(f"<rdf:li>{k}</rdf:li>" for k in keywords)
+                + "</rdf:Bag></dc:subject>")
+    return ("<x:xmpmeta xmlns:x='adobe:ns:meta/'>"
+            "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+            "<rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/'"
+            f" xmlns:dc='http://purl.org/dc/elements/1.1/'{attrs}>{body}</rdf:Description>"
+            "</rdf:RDF></x:xmpmeta>").encode("utf-8")
+
+
+def _photo_jpeg(path, rating=None, keywords=()):
+    """XMP(★・キーワード)入りの小さな JPEG を作る。"""
+    import struct
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QColor, QImage
+
+    image = QImage(64, 48, QImage.Format_RGB32)
+    image.fill(QColor(200, 120, 40))
+    data_ba = QByteArray()
+    buf = QBuffer(data_ba)
+    buf.open(QIODevice.WriteOnly)
+    image.save(buf, "JPG")
+    buf.close()
+    data = bytes(data_ba)
+    if rating is not None or keywords:
+        payload = b"http://ns.adobe.com/xap/1.0/\x00" + _photo_packet(rating, keywords)
+        seg = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+        data = data[:2] + seg + data[2:]      # SOI の直後に差し込む
+    Path(path).write_bytes(data)
+    return str(path)
+
+
+class _FakePhotoSession:
+    """ExifToolSession の代わり。ファイルには書かず、書いたことにして結果を返す。
+    fail に入れた名前は「読み取り専用」で失敗させる。"""
+
+    def __init__(self, fail=()):
+        self.calls = []
+        self.fail = set(fail)
+        self.closed = False
+
+    def _results(self, paths, op, change):
+        from photometa import writer, xmp
+        out = []
+        for p in paths:
+            before = xmp.read_meta(p)
+            if os.path.basename(p) in self.fail:
+                out.append(writer.WriteResult(p, False, error="読み取り専用です",
+                                              before=before, op=op))
+            else:
+                out.append(writer.WriteResult(p, True, before=before,
+                                              after=change(before or xmp.PhotoMeta()), op=op))
+        return out
+
+    def set_rating(self, paths, rating):
+        from photometa import xmp
+        paths = list(paths)
+        self.calls.append(("rating", paths, rating))
+        return self._results(paths, ("rating", rating),
+                             lambda m: xmp.PhotoMeta(rating, m.keywords))
+
+    def set_keyword(self, paths, keyword, on):
+        from photometa import xmp
+        paths = list(paths)
+        self.calls.append(("keyword", paths, keyword, on))
+
+        def change(m):
+            kws = tuple(k for k in m.keywords if k != keyword)
+            return xmp.PhotoMeta(m.rating, kws + ((keyword,) if on else ()))
+        return self._results(paths, ("keyword", keyword, on), change)
+
+    def close(self):
+        self.closed = True
+
+
+def _wait_until(cond, timeout=5.0, what="条件"):
+    from PySide6.QtTest import QTest
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        QTest.qWait(20)
+    raise AssertionError(f"{what} にならない")
+
+
+def _make_photo_tree(tmp):
+    photos = Path(tmp, "photos")
+    sub = photos / "sub"
+    sub.mkdir(parents=True)
+    _photo_jpeg(photos / "a5.jpg", 5)
+    _photo_jpeg(photos / "b4.jpg", 4)
+    _photo_jpeg(photos / "c3.jpg", 3, ["みてね済"])
+    _photo_jpeg(photos / "d_reject.jpg", -1)
+    _photo_jpeg(photos / "e_none.jpg")
+    (photos / "memo.txt").write_text("x", encoding="utf-8")
+    _photo_jpeg(sub / "one.jpg", 5)
+    for i in range(5):
+        (sub / f"t{i}.txt").write_text("x", encoding="utf-8")
+    other = Path(tmp, "other")
+    other.mkdir()
+    (other / "x.txt").write_text("x", encoding="utf-8")
+    return photos, sub, other
+
+
+def _rating_texts(pane):
+    import filer
+    return {e.name: pane.model.data(pane.model.index(row, filer.COL_RATING))
+            for row, e in enumerate(pane.entries)}
+
+
+def _photo_window(photos, other, settings_path):
+    import filer
+    w = filer.FilerWindow({"filer": {"left_path": str(photos), "right_path": str(other)}},
+                          str(settings_path))
+    w.resize(1100, 600)
+    w.show()
+    w.start()
+    _wait(w)
+    _wait_until(lambda: len(w.left.photo_meta) >= 5 and not w.left._photo_requested,
+                what="★の読み取りが終わる")
+    return w
+
+
+def _photo_menu_runner(w, picks, seen):
+    """_exec_menu の差し替え。picks の頭の文字(&5: など)の項目を順に選んだことにする。
+    seen には (見出し, 印の付いた項目) を積む。"""
+    def run(menu, chosen):
+        seen.append((menu.title(), [a.text() for a in chosen if a.isChecked()]))
+        prefix = picks.pop(0)
+        for action, value in chosen.items():
+            if action.text().startswith(prefix):
+                return value
+        raise AssertionError(f"項目が無い: {prefix} / {[a.text() for a in chosen]}")
+    return run
+
+
+def test_photo_mode_window_and_rating_column():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L, R = w.left, w.right
+        try:
+            # 5枚 / 6ファイル(8割以上・3枚以上)で写真フォルダモード。右(テキストだけ)は通常
+            assert L.photo_mode and not R.photo_mode
+            assert L.header.text().startswith("📷 ") and not R.header.text().startswith("📷")
+            hh = L.view.horizontalHeader()
+            assert not hh.isSectionHidden(filer.COL_RATING)
+            assert R.view.horizontalHeader().isSectionHidden(filer.COL_RATING)
+            # ★の列は拡張子の右(列の並びも、見た目の位置も)
+            assert hh.sectionPosition(filer.COL_EXT) < hh.sectionPosition(filer.COL_RATING) \
+                < hh.sectionPosition(filer.COL_SIZE)
+            texts = _rating_texts(L)
+            assert texts["a5.jpg"] == "★5" and texts["b4.jpg"] == "★4"
+            assert texts["c3.jpg"] == "★3済" and texts["d_reject.jpg"] == "✖"
+            assert texts["e_none.jpg"] == "" and texts["memo.txt"] == "" and texts["sub"] == ""
+            # 段階ごとの色
+            entry = lambda n: L.entries[L._row_of(n)]  # noqa: E731
+            assert L.text_color(entry("a5.jpg"), filer.COL_RATING) == filer.DEFAULT_COLORS["rating_5"]
+            assert L.text_color(entry("b4.jpg"), filer.COL_RATING) == filer.DEFAULT_COLORS["rating_4"]
+            assert L.text_color(entry("d_reject.jpg"), filer.COL_RATING) \
+                == filer.DEFAULT_COLORS["rating_reject"]
+            # 写真のボタン段(写真フォルダモードの窓だけ。フォーカスを取らない)
+            assert L.photo_bar.isVisible() and not R.photo_bar.isVisible()
+            assert [b.text() for b in L.photo_buttons] == [
+                "★5 みてね", "★4 フレーム", "★3 ベスト", "★外す", "✖ 削除候補", "済", "絞り込み▾"]
+            assert all(b.focusPolicy() == Qt.NoFocus for b in L.photo_buttons)
+            # 窓が狭いときは ★ の列を拡張子より先に隠す(日時 → サイズ → ★ → 拡張子)
+            name_min = L._name_min
+            L._name_min = L.view.viewport().width() - L._col_widths[filer.COL_EXT] - 2
+            L.fit_columns()
+            assert hh.isSectionHidden(filer.COL_RATING) and not hh.isSectionHidden(filer.COL_EXT)
+            L._name_min = name_min
+            L.fit_columns()
+            assert not hh.isSectionHidden(filer.COL_RATING)
+
+            if os.environ.get("FILER_PHOTO_SHOT"):
+                QTest.qWait(50)
+                w.grab().save(os.environ["FILER_PHOTO_SHOT"])
+
+            # Shift+Z: 写真フォルダモードを手動で切り替える(今の窓だけ)
+            seen = []
+            w._exec_menu = lambda m, c: (seen.append(
+                {v: a.isChecked() for a, v in c.items()}), "photo_off")[1]
+            QTest.keyClick(L.view, Qt.Key_Z, Qt.ShiftModifier)
+            assert seen[-1]["photo_auto"] and not seen[-1]["photo_off"]
+            assert not L.photo_mode and not L.header.text().startswith("📷")
+            assert hh.isSectionHidden(filer.COL_RATING) and not L.photo_bar.isVisible()
+            assert _rating_texts(L)["a5.jpg"] == ""
+            assert R.photo_override == "auto"           # 反対窓は変わらない
+            w._exec_menu = lambda m, c: "photo_on"
+            w.activate("right")
+            QTest.keyClick(R.view, Qt.Key_Z, Qt.ShiftModifier)
+            assert R.photo_mode and R.header.text().startswith("📷 ")
+            w.activate("left")
+            # 別のフォルダへ移ったら自動に戻る(sub は写真1枚・テキスト5つ → 通常)
+            L.load(str(sub))
+            _wait(w)
+            assert L.photo_override == "auto" and not L.photo_mode
+            w._exec_menu = lambda m, c: "photo_on"
+            QTest.keyClick(L.view, Qt.Key_Z, Qt.ShiftModifier)
+            assert L.photo_mode
+            _wait_until(lambda: _rating_texts(L).get("one.jpg") == "★5", what="sub の★")
+            QTest.keyClick(L.view, Qt.Key_Backspace)
+            _wait(w)
+            assert core.same_dir(L.path, photos)
+            assert L.photo_override == "auto" and L.photo_mode
+            _wait_until(lambda: _rating_texts(L).get("a5.jpg") == "★5", what="戻ったあとの★")
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_photo_menu_targets_and_write():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        fake = _FakePhotoSession(fail={"d_reject.jpg"})
+        w._photo_session = fake
+        path = lambda n: str(photos / n)  # noqa: E731
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        try:
+            # カーソル位置の1枚。★が全部同じならその行に印
+            seen, picks = [], ["&4:"]
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "写真の★（1枚）", seen
+            assert len(seen[-1][1]) == 1 and seen[-1][1][0].startswith("&5:")
+            assert fake.calls[-1] == ("rating", [path("a5.jpg")], 4)
+            _wait_until(lambda: "★4 を 1 枚に付けました" in log(), what="書き込みのログ")
+            assert _rating_texts(L)["a5.jpg"] == "★4"
+
+            # マーク中のファイル(写真でないものは飛ばしてログに件数)。実行後はマークを解く
+            L.marks.update({"b4.jpg", "c3.jpg", "memo.txt"})
+            picks.append("&5:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "写真の★（2枚）" and seen[-1][1] == []   # ★4 と ★3 で不揃い
+            assert fake.calls[-1] == ("rating", [path("b4.jpg"), path("c3.jpg")], 5)
+            assert "写真ではないもの 1 件を飛ばしました" in log()
+            assert not L.marks
+            _wait_until(lambda: "★5 を 2 枚に付けました" in log(), what="2枚のログ")
+            assert _rating_texts(L)["b4.jpg"] == "★5" and _rating_texts(L)["c3.jpg"] == "★5済"
+
+            # 失敗したものは表示を戻して理由を出す
+            L.marks.update({"d_reject.jpg", "e_none.jpg"})
+            picks.append("&3:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            _wait_until(lambda: "★3 を 1 枚に付けました（失敗 1：読み取り専用です）" in log(),
+                        what="失敗のログ")
+            assert _rating_texts(L)["d_reject.jpg"] == "✖" and _rating_texts(L)["e_none.jpg"] == "★3"
+
+            # K: 全部に付いていれば外す、そうでなければ付ける
+            L.marks.update({"b4.jpg", "c3.jpg"})
+            picks.append("&K:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", True)
+            _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "★5済", what="キーワードが付く")
+            L.marks.update({"b4.jpg", "c3.jpg"})
+            picks.append("&K:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert any(t.startswith("&K:") for t in seen[-1][1])     # 全部に付いている印
+            assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", False)
+            _wait_until(lambda: _rating_texts(L)["c3.jpg"] == "★5", what="キーワードが外れる")
+
+            # フォルダの上では対象なし(書かない)
+            n = len(fake.calls)
+            L.set_cursor(L._row_of("sub"))
+            picks.append("&5:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "写真の★（0枚）" and len(fake.calls) == n
+            assert "対象の写真がありません" in log()
+
+            # 写真のボタン段: I メニューで選んだのと同じ(対象はカーソル位置)
+            L.set_cursor(L._row_of("e_none.jpg"))
+            w.press_photo_button(L, ("rating", -1))
+            assert fake.calls[-1] == ("rating", [path("e_none.jpg")], -1)
+            _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "✖", what="ボタンの書き込み")
+
+            # 画像ビュア(F3)の間は、マークがあっても表示中の1枚だけ。隅に★
+            L.marks.add("b4.jpg")
+            L.set_cursor(L._row_of("a5.jpg"))
+            w.run_command("preview_toggle")
+            _wait_until(lambda: w.preview_widget is not None
+                        and w.preview_widget.rating.text() == "★4", what="ビュアの★")
+            picks.append("&5:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "写真の★（1枚）"
+            assert fake.calls[-1] == ("rating", [path("a5.jpg")], 5)
+            _wait_until(lambda: w.preview_widget.rating.text() == "★5", what="ビュアの★の更新")
+            w.preview_off()
+
+            # ExifTool が見つからない
+            w._photo_session = None
+            original = filer.photo_writer.open_session
+            filer.photo_writer.open_session = lambda config=None, **k: None
+            try:
+                w.run_photo_action(("rating", 5))
+            finally:
+                filer.photo_writer.open_session = original
+            assert filer.EXIFTOOL_NOT_FOUND in log()
+            assert "%LOCALAPPDATA%\\traytools\\photo_ratings.json" in filer.EXIFTOOL_NOT_FOUND
+            w._photo_session = fake
+        finally:
+            w.close()
+            w.deleteLater()
+        assert fake.closed                       # あっふを閉じたら ExifTool も閉じる
+
+
+def test_photo_rating_filter_and_presets():
+    import filer
+    import threading as _threading
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        try:
+            # I → / → B(ベストショットだけ ★>=3)。フォルダと .. は残る
+            seen, picks = [], ["&/:", "&B:"]
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "★で絞り込む"
+            assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
+            assert L.rating_filter == "★>=3" and "★絞り込み: ★>=3" in L.header2.text()
+            # : (全部見せる)で解く
+            QTest.keyClick(L.view, Qt.Key_Colon)
+            assert "memo.txt" in _names(L) and "★絞り込み" not in L.header2.text()
+
+            # E: 式を入力(構文エラーはその場で日本語)
+            assert "文字目" in w.filter_expr_error("★>=") and w.filter_expr_error("★>=3") == ""
+            w.ask_filter_expr = lambda text: "reject || #みてね済"
+            picks.extend(["&/:", "&E:"])
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert _names(L) == ["..", "sub", "c3.jpg", "d_reject.jpg"]
+            assert not w.apply_rating_filter("(★>=3")
+            assert "式が読めません（" in log() and L.rating_filter == "reject || #みてね済"
+            # A: 解く
+            picks.extend(["&/:", "&A:"])
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert L.rating_filter == "" and "memo.txt" in _names(L)
+
+            # sel はマーク中か。人物名は不明(隠れる)
+            L.marks.add("e_none.jpg")
+            w.apply_rating_filter("sel")
+            assert _names(L) == ["..", "sub", "e_none.jpg"]
+            w.apply_rating_filter("たろう || ★=5")
+            assert _names(L) == ["..", "sub", "a5.jpg"]
+            w.apply_rating_filter("")
+
+            # Alt+1〜9 は共通設定の presets の N 番目
+            QTest.keyClick(L.view, Qt.Key_1, Qt.AltModifier)
+            assert L.rating_filter == "★>=3" and "★の絞り込み: ベスト（★>=3）" in log()
+            QTest.keyClick(L.view, Qt.Key_3, Qt.AltModifier)
+            assert L.rating_filter == "reject" and _names(L) == ["..", "sub", "d_reject.jpg"]
+            QTest.keyClick(L.view, Qt.Key_9, Qt.AltModifier)
+            assert "プリセット 9 はありません" in log() and L.rating_filter == "reject"
+
+            # フォルダを移ったら解く(ライブ絞り込みと同じ)
+            L.load(str(sub))
+            _wait(w)
+            assert L.rating_filter == "" and L.rating_node is None
+            L.load(str(photos))
+            _wait(w)
+
+            # ★が未読み取りの写真は「不明」で隠れ、読めたら掛け直して出る
+            gate = _threading.Event()
+            original = filer._read_photo_meta
+            filer._read_photo_meta = lambda p: (gate.wait(5), original(p))[1]
+            try:
+                L.reset_photo()
+                w.apply_rating_filter("★>=4")
+                QTest.qWait(50)
+                assert _names(L) == ["..", "sub"]
+                gate.set()
+                _wait_until(lambda: _names(L) == ["..", "sub", "a5.jpg", "b4.jpg"],
+                            what="読み取り後に掛け直す")
+            finally:
+                gate.set()
+                filer._read_photo_meta = original
+            w.apply_rating_filter("")
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_photo_journal_reflects_changes():
+    import filer
+    from photometa import writer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        journal = Path(tmp, "journal.jsonl")
+        w = _photo_window(photos, other, settings_path)
+        w._photo_journal = writer.JournalReader(str(journal))
+        L = w.left
+        try:
+            line = lambda p, r, k=(), pid=1: json.dumps(  # noqa: E731
+                {"path": str(p), "rating": r, "keywords": list(k), "time": 0, "pid": pid},
+                ensure_ascii=False) + "\n"
+            with open(journal, "a", encoding="utf-8") as f:
+                f.write(line(photos / "e_none.jpg", 5, ["みてね済"]))
+                f.write(line(Path(tmp, "elsewhere.jpg"), 3))          # 一覧に無いもの
+                f.write(line(photos / "a5.jpg", 1, pid=os.getpid()))  # 自分の書き込みは除く
+                f.write("{壊れた行\n")
+            w._poll_photo_journal()
+            texts = _rating_texts(L)
+            assert texts["e_none.jpg"] == "★5済" and texts["a5.jpg"] == "★5"
+            # タイマー(1秒ごと)でも拾う。絞り込み中なら掛け直す
+            w.apply_rating_filter("★=2")
+            assert _names(L) == ["..", "sub"]
+            with open(journal, "a", encoding="utf-8") as f:
+                f.write(line(str(photos / "b4.jpg").upper(), 2))     # 大文字小文字は問わない
+            _wait_until(lambda: _names(L) == ["..", "sub", "b4.jpg"], timeout=4,
+                        what="変更記録の反映")
+            assert filer.PHOTO_JOURNAL_MS <= 1000
+            w.apply_rating_filter("")
+            # 更新日時が変わったファイル(エクスプローラーで★を変えたなど)は、読み直しで読み直す
+            target = photos / "e_none.jpg"
+            old = os.stat(target).st_mtime
+            _photo_jpeg(target, 2)
+            os.utime(target, (old + 100, old + 100))
+            L.reload(keep_marks=True)
+            _wait(w)
+            _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "★2", what="日時の変わった写真")
+            assert _rating_texts(L)["b4.jpg"] == "★2"     # 日時の変わらないものは記録の値のまま
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_photo_write_with_exiftool():
+    """実際に ExifTool で書く(環境変数 PHOTOMETA_EXIFTOOL があるときだけ。一時フォルダのコピーに1件)。"""
+    exe_setting = os.environ.get("PHOTOMETA_EXIFTOOL")
+    if not exe_setting:
+        print("skip  test_photo_write_with_exiftool: PHOTOMETA_EXIFTOOL がありません")
+        return
+    from photometa import config as pc, writer, xmp
+    exe = pc.find_exiftool({"exiftool": exe_setting})
+    assert exe, exe_setting
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        session = writer.ExifToolSession(exe, journal_path=str(Path(tmp, "journal.jsonl")))
+        w._photo_session = session
+        L = w.left
+        target = photos / "e_none.jpg"
+        mtime = os.stat(target).st_mtime_ns
+        try:
+            seen, picks = [], ["&4:"]
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            L.set_cursor(L._row_of("e_none.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            _wait_until(lambda: "★4 を 1 枚に付けました" in w.log_view.toPlainText(),
+                        timeout=30, what="ExifTool の書き込み")
+            assert xmp.read_meta(target).rating == 4
+            assert os.stat(target).st_mtime_ns == mtime          # 更新日時は変えない
+            assert _rating_texts(L)["e_none.jpg"] == "★4"
+        finally:
+            w.close()
+            w.deleteLater()
+        assert not session.alive()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

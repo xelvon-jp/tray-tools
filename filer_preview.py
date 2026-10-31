@@ -14,7 +14,7 @@
 # QImage はスレッドをまたいで渡してよい(QPixmap にするのは UI スレッドで)。
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
@@ -144,6 +144,40 @@ class PreviewWidget(QWidget):
         self.last = None
         self.turn = core.TURN_IDENTITY      # 手動の回転・反転(R / L / H / V)
         self.turn_suffix = ""               # 回転固定の印(_R / _L)
+        # 写真の★(右上の隅)。絵の上に重ねる。絵でないとき(テキスト等)は絵ごと隠れる。
+        self.rating = QLabel(self.image)
+        self.rating.setTextFormat(Qt.PlainText)
+        self.rating.setAttribute(Qt.WA_TransparentForMouseEvents)
+        rating_font = QFont(font)
+        rating_font.setPointSize(max(font.pointSize(), 10) + 4)
+        rating_font.setBold(True)
+        self.rating.setFont(rating_font)
+        self.rating.hide()
+        self.image.installEventFilter(self)
+
+    def set_rating_text(self, text: str, color: str = "#ffd400") -> None:
+        """隅に出す★の文字(★5 / ✖ / ☆ など)。空なら消す。"""
+        if not text:
+            self.rating.hide()
+            return
+        self.rating.setStyleSheet(f"color: {color}; background-color: rgba(0, 0, 0, 150);"
+                                  " padding: 2px 6px;")
+        self.rating.setText(text)
+        self.rating.adjustSize()
+        self._place_rating()
+        self.rating.show()
+        self.rating.raise_()
+
+    def _place_rating(self) -> None:
+        self.rating.move(max(self.image.width() - self.rating.width() - 6, 0), 6)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt の上書き)
+        try:
+            if obj is self.image and event.type() == QEvent.Resize:
+                self._place_rating()
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            pass
+        return super().eventFilter(obj, event)
 
     def image_box(self):
         size = self.stack.size()

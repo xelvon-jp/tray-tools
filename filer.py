@@ -84,6 +84,10 @@ import filer_phone
 import filer_shell
 import filer_update
 import settings as settings_module
+from photometa import config as photo_config
+from photometa import filter_expr as photo_filter
+from photometa import writer as photo_writer
+from photometa import xmp as photo_xmp
 from traytools_send import pythonw_executable
 
 SETTINGS_SECTION = "filer"
@@ -127,6 +131,13 @@ DEFAULT_COLORS = {
     "fkey_background": "#f0f0f0",   # あふｗのファンクションキー段(明るい灰色に黒字)
     "fkey_text": "#000000",
     "fkey_border": "#808080",
+    # 写真フォルダモードの★の列(段階ごとに色を変える)。rating_other は ★1・★2 と、
+    # ★なしで「済」だけのもの。
+    "rating_5": "#ffd400",
+    "rating_4": "#ff9a3c",
+    "rating_3": "#7ee787",
+    "rating_reject": "#ff4060",
+    "rating_other": "#c0c0c0",
 }
 
 # カーソルの下線の太さ(px)。アクティブ窓ははっきり、非アクティブ窓は控えめに。
@@ -280,7 +291,26 @@ def save_values(app_settings, settings_path, updates: dict) -> None:
 ENTRY_ROLE = Qt.UserRole + 1
 MARK_ROLE = Qt.UserRole + 2
 
-COL_NAME, COL_EXT, COL_SIZE, COL_DATE = range(4)
+# ★の列(COL_RATING)は拡張子の右。写真フォルダモードのときだけ見せる(fit_columns)。
+COL_NAME, COL_EXT, COL_RATING, COL_SIZE, COL_DATE = range(5)
+COLUMN_COUNT = 5
+
+# 写真の★を読む関数(裏のスレッドで呼ぶ)。テストで差し替えられるよう、ここを通す。
+_read_photo_meta = photo_xmp.read_meta
+# ★の読み取りスレッドが結果を渡す単位(読めた順に描き直すが、1枚ごとには送らない)。
+PHOTO_READ_BATCH = 32
+PHOTO_READ_FLUSH_SECONDS = 0.15
+PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★)を読みに行く間隔
+# 写真のボタン段の表示名(段階名が既定のままのとき。設定に "short" があればそれを使う)。
+PHOTO_SHORT_NAMES = {"みてね用": "みてね", "フォトフレーム用": "フレーム",
+                     "ベストショット": "ベスト"}
+EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
+                      " exiftool に場所を書いてください")
+
+
+def photo_key(path: str) -> str:
+    """★のキャッシュのキー(大文字小文字・区切りをそろえたフルパス)。"""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
 class FileModel(QAbstractTableModel):
@@ -290,6 +320,8 @@ class FileModel(QAbstractTableModel):
         super().__init__(parent)
         self.entries = []
         self.marks = set()
+        # ★の列の文字(Pane が差し替える。写真フォルダモードでなければ空)。
+        self.rating_text = lambda entry: ""
 
     def set_entries(self, entries, marks) -> None:
         self.beginResetModel()
@@ -301,7 +333,7 @@ class FileModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.entries)
 
     def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else 4
+        return 0 if parent.isValid() else COLUMN_COUNT
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.entries)):
@@ -322,6 +354,8 @@ class FileModel(QAbstractTableModel):
                 # … で省いても拡張子は必ず見えるようにする。
                 ext = core.split_name(entry)[1]
                 return f".{ext}" if ext else ""
+            if col == COL_RATING:
+                return self.rating_text(entry)
             if col == COL_SIZE:
                 return core.format_size(entry)
             if col == COL_DATE:
@@ -330,11 +364,12 @@ class FileModel(QAbstractTableModel):
 
     def row_changed(self, row: int) -> None:
         if 0 <= row < len(self.entries):
-            self.dataChanged.emit(self.index(row, 0), self.index(row, 3))
+            self.dataChanged.emit(self.index(row, 0), self.index(row, COLUMN_COUNT - 1))
 
     def all_changed(self) -> None:
         if self.entries:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.entries) - 1, 3))
+            self.dataChanged.emit(self.index(0, 0),
+                                  self.index(len(self.entries) - 1, COLUMN_COUNT - 1))
 
 
 class RowDelegate(QStyledItemDelegate):
@@ -518,6 +553,10 @@ class ListBridge(QObject):
     update_pulled = Signal(object)
     # 版の連番(git log)が数え終わったとき。filer_update.git_version の結果 or None。
     version_ready = Signal(object)
+    # 写真の★が読めたとき (side, 世代, [(photo_key, PhotoMeta or None)])。
+    photo_meta = Signal(object)
+    # ★・キーワードを書き終えたとき (書き込みの番号, 結果の一覧 or None, エラー文字列)。
+    photo_written = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -576,6 +615,26 @@ class Pane(QWidget):
         self.es_loading = False
         self.es_cancel = None
         self.es_status = "done"
+        # 写真フォルダモード(★の列とボタン段)。photo_override は Shift+Z の手動切り替え
+        # ("auto" / "on" / "off")で、別のフォルダへ移ったら "auto" に戻る(保存しない)。
+        self.photo_override = "auto"
+        self.photo_mode = False
+        # ★のキャッシュ(photo_key → PhotoMeta。読めなかったものは None)。フォルダを移ったら
+        # 捨て、世代(photo_gen)を進めて、まだ届いていない古い読み取りの結果も捨てる。
+        self.photo_meta = {}
+        self.photo_gen = 0
+        self._photo_requested = set()
+        # 読みに行ったときの更新日時(photo_key → mtime)。一覧を読み直して日時が変わって
+        # いたら読み直す(エクスプローラーで★を変えたときなど)。ExifTool は日時を保つので、
+        # あっふ・PhotoCuller の書き込みは変更記録と書いた結果で直す。
+        self._photo_mtimes = {}
+        self._photo_cancel = threading.Event()
+        self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
+        self._photo_auto = False
+        self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
+        # ★の絞り込み(I → / と Alt+数字)。式の文字列と解析済みの木。フォルダを移ったら解く。
+        self.rating_filter = ""
+        self.rating_node = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -613,8 +672,9 @@ class Pane(QWidget):
         self.view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         header = self.view.horizontalHeader()
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
-        for col in (COL_EXT, COL_SIZE, COL_DATE):
+        for col in (COL_EXT, COL_RATING, COL_SIZE, COL_DATE):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
+        header.hideSection(COL_RATING)
         layout.addWidget(self.view, 1)
 
         # ライブ絞り込みの入力欄(/ で出る)。窓の下の行のすぐ上。
@@ -638,6 +698,16 @@ class Pane(QWidget):
         self.footer.setContentsMargins(4, 0, 4, 0)
         self.footer.setAlignment(Qt.AlignCenter)   # あふｗは窓の下の行を中央に出す
         layout.addWidget(self.footer)
+        # 写真のボタン段(写真フォルダモードのときだけ。窓の下端に1段)。
+        self.photo_bar = QWidget(self)
+        self.photo_buttons = []
+        QHBoxLayout(self.photo_bar)
+        self.photo_bar.layout().setContentsMargins(0, 0, 0, 0)
+        self.photo_bar.layout().setSpacing(1)
+        self.photo_bar.hide()
+        layout.addWidget(self.photo_bar)
+        self.build_photo_bar()
+        self.model.rating_text = self.rating_text
         # QLabel は既定だと文字列の幅を最小幅にする。深いパスを開くと窓がそれより狭く
         # できなくなり、左右の境界も動かせなくなるので、横幅は文字に合わせない。
         for label in (self.header, self.header2, self.footer):
@@ -666,6 +736,11 @@ class Pane(QWidget):
             col: fm.horizontalAdvance(sample) + 8
             for col, sample in ((COL_EXT, ".MMMMM"), (COL_SIZE, "9,999,999,999 "),
                                 (COL_DATE, "26/10/23 12:34:56 "))}
+        self._col_widths[COL_RATING] = max(fm.horizontalAdvance(t) for t in ("★5済", "✖済")) + 8
+        small = QFontMetrics(self.window_.log_font)
+        for button in getattr(self, "photo_buttons", []):
+            button.setFont(self.window_.log_font)
+            button.setFixedHeight(small.height() + 2)
         self._name_min = fm.horizontalAdvance("M" * 12)
         self.fit_columns()
         self._fit_ext_column()
@@ -697,18 +772,18 @@ class Pane(QWidget):
             self.fit_columns()
 
     def fit_columns(self) -> None:
-        """列の幅を窓に合わせる。名前の列が狭くなりすぎるなら、日時 → サイズ → 拡張子の
+        """列の幅を窓に合わせる。名前の列が狭くなりすぎるなら、日時 → サイズ → ★ → 拡張子の
         順に列を隠す(境界を寄せたり字を大きくしたりしたときに、名前が読めなくなって
-        横スクロールが出るのを防ぐ)。"""
+        横スクロールが出るのを防ぐ)。★の列は写真フォルダモードのときだけ出す。"""
         widths = getattr(self, "_col_widths", None)
         if not widths:
             return
         header = self.view.horizontalHeader()
         available = self.view.viewport().width()
-        shown = [COL_EXT, COL_SIZE, COL_DATE]
+        shown = [COL_EXT] + ([COL_RATING] if getattr(self, "photo_mode", False) else [])             + [COL_SIZE, COL_DATE]
         while shown and available - sum(widths[c] for c in shown) < self._name_min:
             shown.pop()
-        for col in (COL_EXT, COL_SIZE, COL_DATE):
+        for col in (COL_EXT, COL_RATING, COL_SIZE, COL_DATE):
             if col in shown:
                 header.showSection(col)
                 header.resizeSection(col, widths[col])
@@ -760,6 +835,12 @@ class Pane(QWidget):
         color = colors.get(kind) or colors["text"]
         if column == COL_EXT:
             color = core.ext_color_for(entry, self.window_.ext_color_map) or color
+        elif column == COL_RATING:
+            meta = self.meta_of(entry)
+            if meta is not None:
+                key = {5: "rating_5", 4: "rating_4", 3: "rating_3", -1: "rating_reject"}.get(
+                    meta.rating, "rating_other")
+                color = colors.get(key) or color
         return color
 
     def drive_root(self):
@@ -777,6 +858,8 @@ class Pane(QWidget):
             text += f" {self.mask_text}"
         else:
             text = "(読み込み中)"
+        if self.photo_mode:
+            text = "📷 " + text
         if self.es_query is not None or self.es_loading:
             scope = "全体" if self.es_all else "以下"
             text += f"   [Everything({scope}): {self.es_query or ''}]"
@@ -797,8 +880,11 @@ class Pane(QWidget):
         if self.loading:
             text += "   …"
         self.header.setText(text)
-        # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)。
-        self.header2.setText(self.window_.drive_label_text(self.drive_root()))
+        # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)と★の絞り込み。
+        text2 = self.window_.drive_label_text(self.drive_root())
+        if self.rating_filter:
+            text2 = (f"{text2}   " if text2 else "") + f"★絞り込み: {self.rating_filter}"
+        self.header2.setText(text2)
 
     def update_footer(self) -> None:
         if not hasattr(self, "footer"):
@@ -1008,8 +1094,10 @@ class Pane(QWidget):
             self.marks = set()
         if not same:
             # フォルダを移ったらライブ絞り込みは解く(前のフォルダの語が残ると、何も
-            # 無いように見えて混乱する)。
+            # 無いように見えて混乱する)。★の絞り込みと写真フォルダモードの手動切り替え、
+            # ★のキャッシュも同じく捨てる。
             self.clear_live_filter(rebuild=False)
+            self.reset_photo()
         self.last_load_moved = not same     # よく行くフォルダの記録は「移った」ときだけ
         self.path = new_path
         self.all_entries = entries
@@ -1044,10 +1132,13 @@ class Pane(QWidget):
         visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
+        if self.rating_node is not None:
+            visible = [e for e in visible if e.is_dir or self.rating_match(e)]
         parent = [] if (self.flat or self.stash or core.is_root(self.path)) else [core.PARENT_ENTRY]
         self.entries = parent + visible
         self.model.set_entries(self.entries, self.marks)
         self._fit_ext_column()
+        self.update_photo_mode()
 
     def _row_of(self, name):
         if not name:
@@ -1523,6 +1614,227 @@ class Pane(QWidget):
         self.update_header()
         self.update_footer()
 
+    # --- 写真の★(写真フォルダモード・★の列・★の絞り込み) ---
+    def build_photo_bar(self) -> None:
+        """写真のボタン段を(作り直して)並べる。中身は写真メニュー(I)の項目と同じ。"""
+        win = self.window_
+        layout = self.photo_bar.layout()
+        for button in self.photo_buttons:
+            layout.removeWidget(button)
+            button.deleteLater()
+        self.photo_buttons = []
+        c = self.colors
+        small = QFontMetrics(win.log_font)
+        for label, action in win.photo_bar_items():
+            button = QPushButton(label, self.photo_bar)
+            button.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
+            button.setFont(win.log_font)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            button.setFixedHeight(small.height() + 2)
+            button.setStyleSheet(
+                f"QPushButton {{ background-color: {c['fkey_background']}; color: {c['fkey_text']};"
+                f" border: 1px solid {c['fkey_border']}; padding: 0px; }}")
+            button.clicked.connect(
+                lambda _checked=False, a=action: win.press_photo_button(self, a))
+            layout.addWidget(button, 1)
+            self.photo_buttons.append(button)
+
+    def reset_photo(self) -> None:
+        """フォルダを移ったとき: 手動の切り替え・★の絞り込み・キャッシュを捨て、
+        まだ走っている読み取りを止める(届いた結果も世代で捨てる)。"""
+        self._photo_cancel.set()
+        self._photo_cancel = threading.Event()
+        self.photo_gen += 1
+        self.photo_meta = {}
+        self._photo_requested = set()
+        self._photo_mtimes = {}
+        self._photo_scan_src = None
+        self._photo_keys = {}
+        self.photo_override = "auto"
+        self.rating_filter = ""
+        self.rating_node = None
+
+    def entry_path(self, entry) -> str:
+        """一覧の項目のフルパス(フラット表示・検索結果は相対パス、一時置き場はフルパスの名前)。"""
+        return os.path.join(self.path or "", entry.name)
+
+    def is_photo_entry(self, entry) -> bool:
+        return (entry is not None and not entry.is_dir and not entry.is_parent
+                and photo_xmp.is_photo(entry.name))
+
+    def meta_of(self, entry):
+        """その項目の★(PhotoMeta)。写真でない・まだ読めていない・読めないなら None。"""
+        if not self.is_photo_entry(entry):
+            return None
+        return self.photo_meta.get(photo_key(self.entry_path(entry)))
+
+    def rating_text(self, entry) -> str:
+        """★の列の文字(★5 / ✖ / ★3済 など)。写真フォルダモードでなければ空。"""
+        if not self.photo_mode:
+            return ""
+        meta = self.meta_of(entry)
+        if meta is None:
+            return ""
+        return photo_config.rating_display(meta.rating, meta.keywords, self.window_.photo_config)
+
+    def rating_match(self, entry) -> bool:
+        """★の絞り込みの式に合うか。読めていない写真・写真以外は「不明」で隠す。
+        人物名と face は不明(あっふは顔を見ない)、sel はマーク中か。"""
+        def other(kind, _name):
+            if kind == "sel":
+                return entry.name in self.marks
+            return None
+        meta = self.meta_of(entry)
+        fn = photo_filter.meta_atom_fn(meta, self.window_.photo_config, other)
+        return photo_filter.evaluate(self.rating_node, fn) is True
+
+    def needs_photo_meta(self) -> bool:
+        return self.photo_mode or self.rating_node is not None
+
+    def _photo_key_map(self) -> dict:
+        if not self._photo_keys:
+            self._photo_keys = {photo_key(self.entry_path(e)): e.name
+                                for e in self.all_entries if self.is_photo_entry(e)}
+        return self._photo_keys
+
+    def update_photo_mode(self) -> None:
+        """写真フォルダモードを決め直す(一覧を作り直したとき・手動で切り替えたとき)。
+        変わったら列・ボタン段・見出しを合わせる。★が要るなら裏で読み始める。"""
+        if self._photo_scan_src is not self.all_entries:
+            self._photo_scan_src = self.all_entries
+            self._photo_auto = core.is_photo_folder(self.all_entries,
+                                                    self.window_.photo_mode_params)
+            self._photo_keys = {}
+        mode = (self.archive is None and bool(self.path or self.stash)
+                and core.photo_mode_on(self.photo_override, self._photo_auto))
+        changed = mode != self.photo_mode
+        self.photo_mode = mode
+        if changed:
+            self.photo_bar.setVisible(mode)
+            self.fit_columns()
+            self.update_header()
+        if self.needs_photo_meta():
+            QTimer.singleShot(0, self._start_photo_read_safely)
+
+    def set_photo_override(self, value: str) -> None:
+        self.photo_override = value if value in core.PHOTO_MODE_OVERRIDES else "auto"
+        self.update_photo_mode()
+        self.update_header()
+
+    def set_rating_filter(self, expr: str) -> None:
+        """★の絞り込みを掛ける(空なら解く)。式が書けていなければ FilterSyntaxError。"""
+        node = photo_filter.parse(expr)
+        self.rating_filter = (expr or "").strip() if node is not None else ""
+        self.rating_node = node
+        if self.path or self.stash:
+            self.refilter()
+            self.update_photo_mode()
+        else:
+            self.update_header()
+
+    def _start_photo_read_safely(self) -> None:
+        try:
+            self.start_photo_read()
+        except Exception:  # noqa: BLE001  タイマーから呼ぶ。投げ切ると落ちる
+            _log_exception("photoRead")
+
+    def start_photo_read(self) -> None:
+        """まだ★を読んでいない写真を裏のスレッドで読む。見えている行から先に。"""
+        if not self.needs_photo_meta() or self.archive is not None:
+            return
+        wanted = []
+        seen = set()
+
+        def add(entry):
+            if not self.is_photo_entry(entry):
+                return
+            path = self.entry_path(entry)
+            key = photo_key(path)
+            if key in seen or key in self._photo_requested:
+                return
+            if key in self.photo_meta:
+                recorded = self._photo_mtimes.get(key)
+                if recorded is None or recorded == entry.mtime:
+                    return      # 読んだときから変わっていない(書いた結果・変更記録で直したもの)
+            seen.add(key)
+            self._photo_mtimes[key] = entry.mtime
+            wanted.append((key, path))
+
+        first = self.view.rowAt(0)
+        last = self.view.rowAt(max(self.view.viewport().height() - 1, 0))
+        if first >= 0:
+            if last < 0:
+                last = len(self.entries) - 1
+            for row in range(first, min(last, len(self.entries) - 1) + 1):
+                add(self.entries[row])
+        for e in self.entries:
+            add(e)
+        for e in self.all_entries:     # 絞り込みで隠れているものも(掛け直しで出せるように)
+            add(e)
+        if not wanted:
+            return
+        self._photo_requested.update(key for key, _p in wanted)
+        gen = self.photo_gen
+        cancel = self._photo_cancel
+        bridge = self.window_.bridge
+        side = self.side
+
+        def worker():
+            batch = []
+            flushed = time.monotonic()
+            for key, path in wanted:
+                if cancel.is_set():
+                    return
+                try:
+                    meta = _read_photo_meta(path)
+                except Exception:  # noqa: BLE001  1枚読めないだけ。不明として返す
+                    meta = None
+                batch.append((key, meta))
+                now = time.monotonic()
+                if len(batch) >= PHOTO_READ_BATCH or now - flushed >= PHOTO_READ_FLUSH_SECONDS:
+                    try:
+                        bridge.photo_meta.emit((side, gen, batch))
+                    except RuntimeError:
+                        return
+                    batch, flushed = [], now
+            if batch and not cancel.is_set():
+                try:
+                    bridge.photo_meta.emit((side, gen, batch))
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True, name=f"filer-photo-{side}").start()
+
+    def on_photo_meta(self, gen, items) -> None:
+        """読み取りスレッドから★が届いた(UI スレッド)。古い世代は捨てる。"""
+        if gen != self.photo_gen:
+            return
+        for key, meta in items:
+            self.photo_meta[key] = meta
+            self._photo_requested.discard(key)
+        self.refresh_photo()
+
+    def apply_photo_metas(self, metas: dict) -> bool:
+        """外から分かった★(書いた結果・変更記録)を、この窓に出ている写真にだけ当てる。"""
+        keys = self._photo_key_map() if (self.path or self.stash) else {}
+        changed = False
+        for key, meta in metas.items():
+            if key in keys or key in self.photo_meta:
+                self.photo_meta[key] = meta
+                self._photo_requested.discard(key)
+                changed = True
+        if changed:
+            self.refresh_photo()
+        return changed
+
+    def refresh_photo(self) -> None:
+        """★が変わった。絞り込み中なら掛け直し、そうでなければ描き直すだけ。"""
+        if self.rating_node is not None:
+            self.refilter()
+        else:
+            self.model.all_changed()
+            self.view.viewport().update()
+
 
 # ---------------------------------------------------------------
 # 窓
@@ -1552,10 +1864,12 @@ class _ChooserMenu(QMenu):
         text = event.text()
         modifiers = event.modifiers()
         plain = not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
-        if plain and len(text) == 1 and text.isalnum():
-            char = text.upper()
-            matches = [a for a in self.actions()
-                       if a.isEnabled() and not a.isSeparator() and _menu_key_of(a) == char]
+        char = text.upper() if len(text) == 1 else ""
+        matches = [a for a in self.actions()
+                   if a.isEnabled() and not a.isSeparator() and _menu_key_of(a) == char] \
+            if plain and char and char.isprintable() and not char.isspace() else []
+        # 英数字のほか、項目の頭にある記号(写真メニューの - と /)も選択だけにする。
+        if plain and len(text) == 1 and (text.isalnum() or matches):
             if matches:
                 # 同じ文字の項目が複数あれば、押すたびに次へ(Ctrl+Enter のメニューは
                 # 共有分とこの PC の分で文字が重なることがある)。
@@ -1726,6 +2040,14 @@ class FilerWindow(QWidget):
         # (2026-10-29 要望)。
         self.log_font = QFont(self.list_font)
         self.log_font.setPointSize(10)
+        # 写真の★(photometa)。共通設定は写真メニューを開くたびに読み直す。写真フォルダモードの
+        # 自動判定の数値は settings.json の filer.photo_mode。ExifTool は初めて書くときに
+        # 起こし、あっふを閉じるまで1つを使い回す(_photo_session)。
+        self.photo_config = photo_config.load_config()
+        self.photo_mode_params = core.normalize_photo_mode(section.get("photo_mode"))
+        self._photo_session = None
+        self._photo_jobs = {}           # 書き込みの番号 → (操作, 書く前の★の控え)
+        self._photo_job_seq = 0
 
         self.setWindowTitle(filer_update.window_title("", self.version))
         # アプリ既定(main で設定)に加え窓自体にも付ける。タスクバーが
@@ -1756,6 +2078,14 @@ class FilerWindow(QWidget):
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.update_pulled.connect(self._on_update_pulled)
         self.bridge.version_ready.connect(self._on_version_ready)
+        self.bridge.photo_meta.connect(self._on_photo_meta)
+        self.bridge.photo_written.connect(self._on_photo_written)
+        # 変更記録(PhotoCuller などが付けた★)。今の末尾から読む。自分の書き込みは除く。
+        self._photo_journal = photo_writer.JournalReader(photo_writer.JOURNAL_PATH)
+        self._photo_journal_timer = QTimer(self)
+        self._photo_journal_timer.setInterval(PHOTO_JOURNAL_MS)
+        self._photo_journal_timer.timeout.connect(self._poll_photo_journal)
+        self._photo_journal_timer.start()
         self._watch_checking = False
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(WATCH_INTERVAL_MS)
@@ -2185,6 +2515,11 @@ class FilerWindow(QWidget):
                 self._extracting["cancel"].set()
             for viewer in list(self._viewers):
                 viewer.close()
+            # ★の読み取りを止める(閉じたあとも写真を開いたままにしない)
+            for pane in (self.left, self.right):
+                pane._photo_cancel.set()
+            self._photo_journal_timer.stop()
+            self._close_photo_session()
             # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
             # 次の起動で片付く。
             filer_archive.cleanup_temp()
@@ -3704,8 +4039,10 @@ class FilerWindow(QWidget):
 
     # --- マスク ---
     def cmd_mask_clear(self):
-        # : はマスクを *.* に戻す。ライブ絞り込みもいっしょに解く(「全部見せる」キー)。
+        # : はマスクを *.* に戻す。ライブ絞り込みと★の絞り込みもいっしょに解く(「全部見せる」キー)。
         self.active.clear_live_filter(rebuild=False)
+        self.active.rating_filter = ""
+        self.active.rating_node = None
         self.active.set_mask(core.DEFAULT_MASK)
 
     # --- プレビュー(F3) ---
@@ -3889,6 +4226,7 @@ class FilerWindow(QWidget):
                 return     # プレビューを閉じた(開き直した)あとに届いた結果
             self.preview_widget.show_result(result)
             self._reload_if_turned(result)
+            self._update_preview_rating()
         except Exception:  # noqa: BLE001
             self._image_wait_seq = None
             _log_exception("previewReady")
@@ -5037,12 +5375,24 @@ class FilerWindow(QWidget):
 
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
+        override = self.active.photo_override
         menu, chosen = self.build_menu("各種設定一時切替", [
             ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
             ("S", "システムファイルを表示する", "system", self.show_system),
+            None,
+            # 写真フォルダモードは今の窓だけ。別のフォルダへ移ったら自動に戻る(保存しない)。
+            ("A", "写真フォルダモード：自動", "photo_auto", override == "auto"),
+            ("N", "写真フォルダモード：常にオン", "photo_on", override == "on"),
+            ("F", "写真フォルダモード：常にオフ", "photo_off", override == "off"),
         ])
         choice = self._exec_menu(menu, chosen)
-        if choice is not None:
+        if choice in ("photo_auto", "photo_on", "photo_off"):
+            value = choice.split("_", 1)[1]
+            pane = self.active
+            pane.set_photo_override(value)
+            label = {"auto": "自動", "on": "常にオン", "off": "常にオフ"}[value]
+            self.log(f"設定: 写真フォルダモードを{label}にしました（この窓・このフォルダの間だけ）")
+        elif choice is not None:
             self.toggle_attr_filter(choice)
 
     def toggle_attr_filter(self, which: str) -> None:
@@ -5282,6 +5632,401 @@ class FilerWindow(QWidget):
             return "add"
         return None
 
+    # --- 写真の★(I メニュー・ボタン段・★の絞り込み・変更記録) ---
+    def photo_bar_items(self) -> list:
+        """写真のボタン段の [(表示名, 動作)]。写真メニュー(I)の項目から作り、名前は短く。"""
+        cfg = self.photo_config
+        levels = {lv["name"]: lv for lv in cfg.get("levels") or []}
+        keywords = cfg.get("keywords") or []
+        out = []
+        for item in photo_config.menu_items(cfg):
+            kind, value = item.action
+            if kind == "rating":
+                if value > 0:
+                    level = levels.get(item.label) or {}
+                    short = level.get("short") or PHOTO_SHORT_NAMES.get(item.label) or item.label
+                    label = f"★{value} {short}"
+                elif value == 0:
+                    label = "★外す"
+                else:
+                    label = "✖ 削除候補"
+            elif kind == "keyword":
+                # ★の列と同じく、1つ目のキーワードは「済」で見せる
+                label = "済" if keywords and value == keywords[0]["name"] else value
+            elif kind == "filter_menu":
+                label = "絞り込み▾"
+            else:
+                continue
+            out.append((label, item.action))
+        return out
+
+    def _reload_photo_config(self) -> None:
+        """共通設定を読み直す。メニューの中身が変わっていたらボタン段も作り直す。"""
+        before = self.photo_bar_items()
+        self.photo_config = photo_config.load_config()
+        if self.photo_bar_items() != before:
+            for pane in (self.left, self.right):
+                pane.build_photo_bar()
+
+    def press_photo_button(self, pane, action) -> None:
+        """写真のボタン段を押した。I メニューで選んだのと同じ動作(対象はその窓の
+        マーク中のファイル、無ければカーソル位置)。フォーカスはファイル窓に残す。"""
+        try:
+            if pane.side != self.active_side:
+                self.activate(pane.side, focus=False)
+            self.run_photo_action(action)
+            self.active.view.setFocus()
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('photoButton')}")
+
+    def photo_targets(self):
+        """写真の★を付ける対象。(写真のフルパスの一覧, 写真でないので飛ばした数, 断る理由)。
+
+        マーク中のファイル、無ければカーソル位置(pick_targets と同じ)。画像ビュア
+        (F3 のプレビュー)を出している間は、表示中の1枚だけ。"""
+        pane = self.active
+        if pane.archive is not None:
+            return [], 0, ARCHIVE_READONLY
+        if self.preview_on:
+            entry = pane.cursor_entry()
+            entries = [entry] if entry is not None and not entry.is_parent else []
+        else:
+            entries = pane.targets()
+        photos = [e for e in entries if pane.is_photo_entry(e)]
+        return [pane.entry_path(e) for e in photos], len(entries) - len(photos), None
+
+    def _photo_metas_for(self, paths) -> list:
+        """対象の今の★(読めていなければその場で読む。読めなければ None)。"""
+        pane = self.active
+        out = []
+        for path in paths:
+            meta = pane.photo_meta.get(photo_key(path))
+            if meta is None:
+                try:
+                    meta = _read_photo_meta(path)
+                except Exception:  # noqa: BLE001
+                    meta = None
+            out.append(meta)
+        return out
+
+    @staticmethod
+    def _has_keyword(meta, name: str) -> bool:
+        folded = name.casefold()
+        return meta is not None and any(k.casefold() == folded for k in meta.keywords)
+
+    def cmd_photo_menu(self):
+        """I: 写真メニュー(★を付ける・キーワード・★で絞り込む)。写真フォルダモードで
+        なくても効く。"""
+        self._reload_photo_config()
+        paths, skipped, refused = self.photo_targets()
+        if refused:
+            self.log(f"写真の★: {refused}")
+            return
+        metas = self._photo_metas_for(paths)
+        known = bool(paths) and all(m is not None for m in metas)
+        ratings = {m.rating for m in metas if m is not None}
+        same = next(iter(ratings)) if known and len(ratings) == 1 else None
+        items = []
+        for item in photo_config.menu_items(self.photo_config):
+            kind, value = item.action
+            if kind == "separator":
+                items.append(None)
+                continue
+            label = f"{item.label}  {item.detail}" if item.detail else item.label
+            mark = ((kind == "rating" and same == value)
+                    or (kind == "keyword" and known
+                        and all(self._has_keyword(m, value) for m in metas)))
+            # 印は「対象の★が全部同じ」行(とキーワードが全部に付いている行)だけ
+            items.append((item.key, label, item.action, True) if mark
+                         else (item.key, label, item.action))
+        menu, chosen = self.build_menu(photo_config.menu_title(len(paths)), items)
+        choice = self._exec_menu(menu, chosen)
+        if choice is not None:
+            self.run_photo_action(choice, paths=paths, skipped=skipped, metas=metas)
+
+    def run_photo_action(self, action, paths=None, skipped=0, metas=None) -> None:
+        """写真メニュー・ボタン段の動作を実行する。paths を渡さなければ今の対象で。"""
+        kind, value = action
+        if kind == "filter_menu":
+            self.photo_filter_menu()
+            return
+        if kind not in ("rating", "keyword"):
+            return
+        if paths is None:
+            paths, skipped, refused = self.photo_targets()
+            if refused:
+                self.log(f"写真の★: {refused}")
+                return
+        if skipped:
+            self.log(f"写真の★: 写真ではないもの {skipped} 件を飛ばしました")
+        if not paths:
+            self.log("写真の★: 対象の写真がありません")
+            return
+        if metas is None:
+            metas = self._photo_metas_for(paths)
+        if kind == "rating":
+            op = ("rating", int(value))
+        else:
+            # 対象の全部に付いていれば外す、そうでなければ付ける
+            on = not all(self._has_keyword(m, value) for m in metas)
+            op = ("keyword", value, on)
+        self.photo_write(paths, op, metas)
+
+    @staticmethod
+    def _predict_meta(meta, op):
+        base = meta if meta is not None else photo_xmp.PhotoMeta()
+        if op[0] == "rating":
+            return photo_xmp.PhotoMeta(op[1], base.keywords)
+        name, on = op[1], op[2]
+        kws = tuple(k for k in base.keywords if k.casefold() != name.casefold())
+        return photo_xmp.PhotoMeta(base.rating, kws + ((name,) if on else ()))
+
+    def _get_photo_session(self):
+        if self._photo_session is None:
+            self._photo_session = photo_writer.open_session(self.photo_config)
+        return self._photo_session
+
+    def _close_photo_session(self) -> None:
+        session, self._photo_session = self._photo_session, None
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:  # noqa: BLE001  閉じるときに止めない
+            _log_exception("photoSessionClose")
+
+    def _apply_photo_metas_all(self, metas: dict) -> None:
+        for pane in (self.left, self.right):
+            pane.apply_photo_metas(metas)
+        self._update_preview_rating()
+
+    def photo_write(self, paths, op, metas) -> None:
+        """★・キーワードを裏のスレッドで書く。表示は先に変え、失敗したものは戻す。
+        書き終えたらマークを解く(コピーの後と同じ)。"""
+        session = self._get_photo_session()
+        if session is None:
+            self.log(f"写真の★: {EXIFTOOL_NOT_FOUND}")
+            return
+        keys = [photo_key(p) for p in paths]
+        before = dict(zip(keys, metas))
+        self._apply_photo_metas_all({k: self._predict_meta(m, op) for k, m in before.items()})
+        pane = self.active
+        if pane.marks:
+            pane.marks.clear()          # model と同じ集合なので clear で解く
+            if pane.rating_node is not None:
+                pane.refilter()         # sel を使った式なら見え方が変わる
+            pane.view.viewport().update()
+            pane.update_footer()
+            self.update_status_bar()
+        self._photo_job_seq += 1
+        job = self._photo_job_seq
+        self._photo_jobs[job] = (op, before)
+        bridge = self.bridge
+
+        def worker():
+            try:
+                if op[0] == "rating":
+                    results = session.set_rating(paths, op[1])
+                else:
+                    results = session.set_keyword(paths, op[1], op[2])
+                payload = (job, results, "")
+            except Exception as e:  # noqa: BLE001  何が来ても結果として返す
+                payload = (job, None, f"{type(e).__name__}: {e}")
+            try:
+                bridge.photo_written.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-photo-write").start()
+
+    @staticmethod
+    def _photo_done_text(op, count: int) -> str:
+        if op[0] == "rating":
+            n = op[1]
+            if n > 0:
+                return f"★{n} を {count} 枚に付けました"
+            if n == 0:
+                return f"★を {count} 枚から外しました"
+            return f"削除候補（✖）を {count} 枚に付けました"
+        if op[2]:
+            return f"{op[1]} を {count} 枚に付けました"
+        return f"{op[1]} を {count} 枚から外しました"
+
+    def _on_photo_written(self, payload) -> None:
+        try:
+            job, results, error = payload
+            op, before = self._photo_jobs.pop(job, (None, {}))
+            if op is None:
+                return
+            if results is None:
+                self._apply_photo_metas_all(before)     # 表示を戻す
+                self.log(f"写真の★: 書けませんでした（{error}）")
+                # ExifTool が落ちた・応答しないなら、次は起こし直す
+                self._close_photo_session()
+                return
+            updates = {}
+            ok = 0
+            failed = []
+            for r in results:
+                key = photo_key(r.path)
+                if r.ok:
+                    ok += 1
+                    updates[key] = r.after if r.after is not None \
+                        else self._predict_meta(before.get(key), op)
+                else:
+                    failed.append(r)
+                    updates[key] = before.get(key) if key in before else r.before
+            self._apply_photo_metas_all(updates)
+            text = f"写真の★: {self._photo_done_text(op, ok)}"
+            if failed:
+                text += f"（失敗 {len(failed)}：{failed[0].error or '理由が分かりません'}）"
+            self.log(text)
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('photoWritten')}")
+
+    def _on_photo_meta(self, payload) -> None:
+        try:
+            side, gen, items = payload
+            self.pane(side).on_photo_meta(gen, items)
+            self._update_preview_rating()
+        except Exception:  # noqa: BLE001
+            _log_exception("photoMeta")
+
+    def _poll_photo_journal(self) -> None:
+        """変更記録(PhotoCuller などが付けた★)を読み、一覧に出ている写真なら描き直す。"""
+        try:
+            entries = self._photo_journal.read_new(exclude_pid=os.getpid())
+            metas = {}
+            for e in entries:
+                rating = e.get("rating")
+                if isinstance(rating, bool) or not isinstance(rating, int):
+                    continue
+                kws = e.get("keywords")
+                kws = tuple(k for k in kws if isinstance(k, str)) if isinstance(kws, list) else ()
+                metas[photo_key(e["path"])] = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws)
+            if metas:
+                self._apply_photo_metas_all(metas)
+        except Exception:  # noqa: BLE001  タイマーから呼ぶ
+            _log_exception("photoJournal")
+
+    def _update_preview_rating(self) -> None:
+        """画像ビュア(F3)の隅の★を、表示中の1枚に合わせる。"""
+        widget = getattr(self, "preview_widget", None)
+        if not getattr(self, "preview_on", False) or widget is None:
+            return
+        pane = self.active
+        entry = pane.cursor_entry()
+        text, color = "", self.colors["rating_other"]
+        if pane.archive is None and pane.is_photo_entry(entry):
+            path = pane.entry_path(entry)
+            key = photo_key(path)
+            if pane.photo_meta.get(key) is None:
+                try:
+                    pane.photo_meta[key] = _read_photo_meta(path)
+                except Exception:  # noqa: BLE001
+                    pane.photo_meta[key] = None
+            meta = pane.photo_meta.get(key)
+            if meta is not None:
+                text = photo_config.rating_display(meta.rating, meta.keywords,
+                                                   self.photo_config) or "☆"
+                color = pane.text_color(entry, COL_RATING)
+        widget.set_rating_text(text, color)
+
+    def photo_filter_menu(self) -> None:
+        """I → /: ★で絞り込む小メニュー(段階・プリセット・未選別・式を入力・解く)。"""
+        pane = self.active
+        items = []
+        for item in photo_config.filter_menu_items(self.photo_config):
+            label = f"{item.label}  {item.detail}" if item.detail else item.label
+            items.append((item.key, label, item.action))
+        title = "★で絞り込む" + (f"（今: {pane.rating_filter}）" if pane.rating_filter else "")
+        menu, chosen = self.build_menu(title, items)
+        choice = self._exec_menu(menu, chosen)
+        if choice is None:
+            return
+        kind, value = choice
+        if kind == "filter":
+            self.apply_rating_filter(value)
+        elif kind == "filter_input":
+            text = self.ask_filter_expr(pane.rating_filter)
+            if text is not None:
+                self.apply_rating_filter(text)
+        elif kind == "filter_clear":
+            self.apply_rating_filter("")
+
+    def apply_rating_filter(self, expr: str, name: str = None) -> bool:
+        """今の窓に★の絞り込みを掛ける(空なら解く)。式が読めなければログに出して False。"""
+        pane = self.active
+        if pane.archive is not None:
+            self.log(f"★の絞り込み: {ARCHIVE_READONLY}")
+            return False
+        try:
+            pane.set_rating_filter(expr)
+        except photo_filter.FilterSyntaxError as e:
+            self.log(f"★の絞り込み: 式が読めません（{e.message}）")
+            return False
+        if pane.rating_filter:
+            shown = f"{name}（{pane.rating_filter}）" if name else pane.rating_filter
+            self.log(f"★の絞り込み: {shown}")
+        else:
+            self.log("★の絞り込みを解きました")
+        return True
+
+    def apply_photo_preset(self, number: int) -> None:
+        """Alt+数字: 共通設定の presets の N 番目で絞り込む。"""
+        self._reload_photo_config()
+        presets = self.photo_config.get("presets") or []
+        if not 1 <= number <= len(presets):
+            self.log(f"★の絞り込み: プリセット {number} はありません"
+                     "（photo_ratings.json の presets）")
+            return
+        preset = presets[number - 1]
+        self.apply_rating_filter(preset["expr"], preset.get("name"))
+
+    @staticmethod
+    def filter_expr_error(text: str) -> str:
+        """式の構文エラー(「N文字目: 内容」)。読めれば空。"""
+        try:
+            photo_filter.parse(text)
+        except photo_filter.FilterSyntaxError as e:
+            return e.message
+        return ""
+
+    def ask_filter_expr(self, text: str = ""):
+        """★の絞り込みの式を入力する窓。構文エラーはその場で出し、直すまで OK を押せない。
+        決めた式(空なら解く)か、取消なら None。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("★で絞り込む（式）")
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("例: ★>=3 / ★=5 && !#みてね済 / reject / unrated / sel"
+                      "（! && || ( ) が使えます。空で解除）")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        edit = QLineEdit(text or "")
+        layout.addWidget(edit)
+        error = QLabel("")
+        error.setStyleSheet("color: #d03030;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def check(value):
+            try:
+                message = self.filter_expr_error(value)
+                error.setText(message)
+                buttons.button(QDialogButtonBox.Ok).setEnabled(not message)
+            except Exception:  # noqa: BLE001
+                _log_exception("filterExprCheck")
+
+        edit.textChanged.connect(check)
+        check(edit.text())
+        edit.selectAll()
+        if self.exec_dialog(dialog) != QDialog.Accepted:
+            return None
+        return edit.text().strip()
+
     def build_menu(self, title: str, items):
         """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
@@ -5356,6 +6101,20 @@ class FilerWindow(QWidget):
         if dialog.exec() != QDialog.Accepted:
             return None
         return edit.text(), check.isChecked()
+
+
+def _photo_preset_command(number: int):
+    def command(self):
+        self.apply_photo_preset(number)
+    command.__name__ = f"cmd_photo_preset_{number}"
+    command.__doc__ = f"Alt+{number}: ★の絞り込みのプリセット {number} 番。"
+    return command
+
+
+# Alt+1〜9(photo_preset_1〜9)。9個並べて書く代わりにここで作る。
+for _number in range(1, 10):
+    setattr(FilerWindow, f"cmd_photo_preset_{_number}", _photo_preset_command(_number))
+del _number
 
 
 # ---------------------------------------------------------------

@@ -47,3 +47,9 @@ jobs:
         # ファイラと同じく offscreen で、自分で終了コードを返す(cmd で回す理由も同じ)。
         shell: cmd
         run: python tests/test_slideshow.py
+
+      - name: photometa のテスト
+        # 写真の★の共通パッケージ。Qt は使わない。ランナーには ExifTool が無いので、
+        # 実際に書くテストは skip と表示して成功扱いになる(読み取り・設定・式は全部回る)。
+        shell: cmd
+        run: python tests/test_photometa.py

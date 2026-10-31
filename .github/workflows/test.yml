@@ -40,16 +40,18 @@ jobs:
         # exit code 1 で失敗扱いになっていた(10/27 から続いていた。手元で同じ条件に
         # すると python の終了コードは 0)。cmd なら python の終了コードがそのまま
         # ステップの結果になる。
+        # -X faulthandler -u: アクセス違反で落ちたとき、どのテストのどこかをログに残す
+        # (落ちると print の溜まりごと消えて、何も分からなかったため)。
         shell: cmd
-        run: python tests/test_filer.py
+        run: python -X faulthandler -u tests/test_filer.py
 
       - name: スライドショーのテスト
         # ファイラと同じく offscreen で、自分で終了コードを返す(cmd で回す理由も同じ)。
         shell: cmd
-        run: python tests/test_slideshow.py
+        run: python -X faulthandler -u tests/test_slideshow.py
 
       - name: photometa のテスト
         # 写真の★の共通パッケージ。Qt は使わない。ランナーには ExifTool が無いので、
         # 実際に書くテストは skip と表示して成功扱いになる(読み取り・設定・式は全部回る)。
         shell: cmd
-        run: python tests/test_photometa.py
+        run: python -X faulthandler -u tests/test_photometa.py

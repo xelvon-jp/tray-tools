@@ -282,10 +282,21 @@ def attr_visible(entry: "Entry", show_hidden: bool = True, show_system: bool = T
     return True
 
 
+EXIFTOOL_TEMP_SUFFIX = "_exiftool_tmp"
+
+
+def is_exiftool_temp(entry: "Entry") -> bool:
+    """ExifTool が★を書いている間だけ写真の隣に作る一時ファイル(名前_exiftool_tmp)。
+    書き終われば元の名前に置き換わって消える。一覧の読み直しがその瞬間に当たると
+    見えてしまい、写真が増えたように見えるので出さない。"""
+    return not entry.is_parent and entry.name.lower().endswith(EXIFTOOL_TEMP_SUFFIX)
+
+
 def filter_attrs(entries, show_hidden: bool = True, show_system: bool = True) -> list:
     if show_hidden and show_system:
-        return list(entries)
-    return [e for e in entries if attr_visible(e, show_hidden, show_system)]
+        return [e for e in entries if not is_exiftool_temp(e)]
+    return [e for e in entries
+            if attr_visible(e, show_hidden, show_system) and not is_exiftool_temp(e)]
 
 
 PARENT_ENTRY = Entry("..", True, is_parent=True)

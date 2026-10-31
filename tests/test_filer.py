@@ -7159,8 +7159,7 @@ def test_photo_menu_targets_and_write():
             assert fake.calls[-1] == ("rating", [path("e_none.jpg")], -1)
             _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "✖", what="ボタンの書き込み")
 
-            # 画像ビュア(F3)の間は、マークがあっても表示中の1枚だけ。隅に★
-            L.marks.add("b4.jpg")
+            # 画像ビュア(F3)の間: マークが無ければ表示中の1枚。隅に★
             L.set_cursor(L._row_of("a5.jpg"))
             w.run_command("preview_toggle")
             _wait_until(lambda: w.preview_widget is not None
@@ -7170,7 +7169,21 @@ def test_photo_menu_targets_and_write():
             assert seen[-1][0] == "写真の★（1枚）"
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 5)
             _wait_until(lambda: w.preview_widget.rating.text() == "★5", what="ビュアの★の更新")
+            # ビュアで見ながらマークしたら、マークした全部(ビュア中でもマーク優先)
+            L.marks.update({"a5.jpg", "b4.jpg"})
+            picks.append("&3:")
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert seen[-1][0] == "写真の★（2枚）", seen[-1]
+            assert fake.calls[-1] == ("rating", [path("a5.jpg"), path("b4.jpg")], 3)
+            _wait_until(lambda: w.preview_widget.rating.text() == "★3", what="ビュアの★の更新")
             w.preview_off()
+
+            # ExifTool の書き込み途中の一時ファイル(名前_exiftool_tmp)は一覧に出さない
+            Path(photos, "a5.jpg_exiftool_tmp").write_bytes(b"x")
+            w.run_command("reload_keep")
+            _wait_until(lambda: L._row_of("b4.jpg") is not None, what="読み直し")
+            assert all(not e.name.endswith("_exiftool_tmp") for e in L.entries)
+            Path(photos, "a5.jpg_exiftool_tmp").unlink()
 
             # ExifTool が見つからない
             w._photo_session = None

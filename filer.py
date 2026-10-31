@@ -5725,15 +5725,13 @@ class FilerWindow(QWidget):
         """写真の★を付ける対象。(写真のフルパスの一覧, 写真でないので飛ばした数, 断る理由)。
 
         マーク中のファイル、無ければカーソル位置(pick_targets と同じ)。画像ビュア
-        (F3 のプレビュー)を出している間は、表示中の1枚だけ。"""
+        (F3 のプレビュー)を出している間も同じ(マークが無ければ表示中の1枚)。
+        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んで I で
+        まとめて付ける、というあっふの使い方で1枚にしか付かなかった(2026-11-01)。"""
         pane = self.active
         if pane.archive is not None:
             return [], 0, ARCHIVE_READONLY
-        if self.preview_on:
-            entry = pane.cursor_entry()
-            entries = [entry] if entry is not None and not entry.is_parent else []
-        else:
-            entries = pane.targets()
+        entries = pane.targets()
         photos = [e for e in entries if pane.is_photo_entry(e)]
         return [pane.entry_path(e) for e in photos], len(entries) - len(photos), None
 

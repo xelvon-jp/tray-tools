@@ -494,6 +494,23 @@ class ScreenFeature:
         self._mirror_scene_delete_menu = self._mirror_menu.addMenu("🗑 設定を削除")
         self._mirror_scene_delete_actions = []
 
+        # 写真のスライドショー(slideshow.py)。窓は常駐とは別のプロセス(slideshow_launch)。
+        # 画面ミラーの隣に置く: どちらも「別のモニタに全画面で出す」もので、モニタの選び方も
+        # 同じ(QScreen.name() を覚える。外れていれば主モニタ)。状態を持つ機能だが、
+        # アイコンは増やさない(動いているかは開く直前に見て「停止」の可否で示す)。
+        self._slideshow_menu = self.menu.addMenu("🖼 スライドショー")
+        self._slideshow_menu.addAction(
+            "▶ 開始", lambda: self.start_slideshow())
+        self._slideshow_stop_action = self._slideshow_menu.addAction(
+            "⏹ 停止", self.stop_slideshow)
+        self._slideshow_menu.addSeparator()
+        self._slideshow_menu.addAction(
+            "📂 フォルダと表示の設定…", self.open_slideshow_settings)
+        self._slideshow_screen_menu = self._slideshow_menu.addMenu("🖵 表示するモニタ")
+        self._slideshow_screen_actions = []
+        self._slideshow_dialog = None
+        self._slideshow_menu.aboutToShow.connect(self._refresh_slideshow_menu)
+
         # Copilot まわりのメニュー。中身は性質の違う2つで、区切り線で分けてある。
         #   上: 状態監視バー   … 見るだけ。Copilot の手番を画面に出す
         #   下: エージェントループ … tray-tools が応答を引き取ってコードまで実行する
@@ -1000,6 +1017,89 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # あっふ(filer.py。窓は別プロセス)
     # ---------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # 写真のスライドショー(slideshow.py。窓は別プロセス)
+    # ---------------------------------------------------------------
+    def start_slideshow(self, folders=None) -> None:
+        """登録済みのフォルダで再生する。動いていれば、動いているものに再生し直してもらう
+        (判定は slideshow_launch が名前付きミューテックスで行う)。"""
+        try:
+            import slideshow_launch
+            slideshow_launch.start(folders, self.settings_path)
+        except Exception as e:  # noqa: BLE001  メニューのスロット。投げ切ると常駐ごと落ちる
+            self._log_failure("スライドショーの開始")
+            self._notify("スライドショー", f"起動できませんでした\n{e}")
+
+    def stop_slideshow(self) -> None:
+        try:
+            import slideshow_launch
+            slideshow_launch.stop()
+        except Exception:  # noqa: BLE001
+            self._log_failure("スライドショーの停止")
+
+    def open_slideshow_settings(self) -> None:
+        """フォルダと表示の設定。開いていれば前に出すだけ。[OK] で書いたら、動いている
+        スライドショーにも読み直してもらう(フォルダの変更は次の開始から)。"""
+        try:
+            dialog = self._slideshow_dialog
+            if dialog is not None and dialog.isVisible():
+                dialog.raise_()
+                dialog.activateWindow()
+                return
+            import slideshow_settings
+            dialog = slideshow_settings.open_dialog(self.app_settings, self.settings_path)
+            dialog.accepted.connect(self._on_slideshow_settings_saved)
+            self._slideshow_dialog = dialog
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("スライドショーの設定を開くの")
+            self._notify("スライドショー", f"設定を開けませんでした\n{e}")
+
+    def _on_slideshow_settings_saved(self) -> None:
+        try:
+            import slideshow_launch
+            slideshow_launch.reload_config(self.settings_path)
+        except Exception:  # noqa: BLE001
+            self._log_failure("スライドショーへの設定の反映")
+
+    def _set_slideshow_monitor(self, name: str) -> None:
+        try:
+            import slideshow_core
+            import slideshow_launch
+            slideshow_core.save_config(self.settings_path, {"monitor": name}, self.app_settings)
+            slideshow_launch.reload_config(self.settings_path)
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("スライドショーのモニタの変更")
+            self._notify("スライドショー", f"モニタを保存できませんでした\n{e}")
+
+    def _refresh_slideshow_menu(self) -> None:
+        """開く直前に「動いているか」とモニタの一覧を作り直す(モニタは抜き差しされる)。"""
+        try:
+            import slideshow_launch
+            self._slideshow_stop_action.setEnabled(slideshow_launch.is_running())
+            current = ((self.app_settings.get("slideshow", {}) or {}).get("monitor") or "")
+            names = [screen.name() for screen in screen_mirror.available_screens()]
+            if current and current not in names:
+                current = ""        # 外れている。主モニタに出る
+            menu = self._slideshow_screen_menu
+            menu.clear()
+            self._slideshow_screen_actions = []
+            auto = menu.addAction("主モニタ")
+            auto.setCheckable(True)
+            auto.setChecked(current == "")
+            auto.triggered.connect(lambda _checked: self._set_slideshow_monitor(""))
+            self._slideshow_screen_actions.append(auto)
+            menu.addSeparator()
+            for screen in screen_mirror.available_screens():
+                name = screen.name()
+                action = menu.addAction(screen_mirror.screen_label(screen))
+                action.setCheckable(True)
+                action.setChecked(name == current)
+                action.triggered.connect(
+                    lambda _checked, n=name: self._set_slideshow_monitor(n))
+                self._slideshow_screen_actions.append(action)
+        except Exception:  # noqa: BLE001
+            self._log_failure("スライドショーのメニューの更新")
+
     def start_filer(self):
         """あっふを開く。既に開いていれば前面に出すだけ(判定は filer_launch が
         名前付きミューテックスで行う)。窓は DETACHED の別プロセスなので、常駐を

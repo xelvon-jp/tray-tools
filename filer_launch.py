@@ -65,15 +65,16 @@ def _allow_foreground() -> None:
         pass
 
 
-def is_running() -> bool:
-    """ファイラが既に動いているか(ミューテックスが既にあるか)。
+def is_running(mutex_name: str = MUTEX_NAME) -> bool:
+    """ファイラが既に動いているか(ミューテックスが既にあるか)。mutex_name を渡せば
+    別の窓(スライドショーなど)にも使える。
 
     判定できなければ False(＝起こしに行く)。二重に起きても、後から起きた側が
     自分でミューテックスを見て、先客を前面に出して引き返すので害は無い。"""
     if _OpenMutexW is None:
         return False
     try:
-        handle = _OpenMutexW(SYNCHRONIZE, False, MUTEX_NAME)
+        handle = _OpenMutexW(SYNCHRONIZE, False, mutex_name)
     except OSError:
         return False
     if not handle:
@@ -83,7 +84,13 @@ def is_running() -> bool:
 
 
 def send_show(timeout_ms: int = 1000) -> bool:
-    """動いているファイラに「前面に出して」を送る。届いたら True。
+    """動いているファイラに「前面に出して」を送る。届いたら True。"""
+    return send_command(SERVER_NAME, SHOW_COMMAND, timeout_ms)
+
+
+def send_command(server_name: str, payload: bytes, timeout_ms: int = 1000) -> bool:
+    """動いている窓の待ち受け(QLocalServer)へ1行送る。届いたら True。
+    スライドショー(slideshow_launch)も同じ口を使う。
 
     書いたあと相手の返事("ok")を少し待ってから切る。すぐ切ると、相手が読む前に
     接続ごと片付けられて依頼が消えることがある。返事が来なくても書けていれば True
@@ -93,10 +100,10 @@ def send_show(timeout_ms: int = 1000) -> bool:
     _allow_foreground()
     sock = QLocalSocket()
     try:
-        sock.connectToServer(SERVER_NAME)
+        sock.connectToServer(server_name)
         if not sock.waitForConnected(timeout_ms):
             return False
-        sock.write(SHOW_COMMAND)
+        sock.write(payload)
         sock.flush()
         # flush で書き切れていると waitForBytesWritten は待つものが無く False を返す。
         # 結果では判断せず、書き残しが無いかで見る。Windows のパイプは書き込みが非同期で、

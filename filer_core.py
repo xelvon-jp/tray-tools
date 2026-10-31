@@ -1945,69 +1945,146 @@ class ImageTurn:
         return f"_{self.lock}" if self.lock else ""
 
 
-def exif_orientation_from_tiff(data: bytes) -> int:
-    """EXIF(TIFF 構造。先頭が "II*\0" / "MM\0*")から Orientation(0x0112)を読む。
-    無い・読めないときは 1。"""
+def _tiff_header(data: bytes):
+    """EXIF(TIFF 構造)の (本体, バイト順, IFD0 の位置)。読めなければ None。"""
     if data.startswith(b"Exif\0\0"):
         data = data[6:]
     if len(data) < 8:
-        return 1
+        return None
     if data[:2] == b"II":
         order = "little"
     elif data[:2] == b"MM":
         order = "big"
     else:
-        return 1
-    offset = int.from_bytes(data[4:8], order)
+        return None
+    return data, order, int.from_bytes(data[4:8], order)
+
+
+def _tiff_entries(data: bytes, order: str, offset: int):
+    """IFD の項目を (タグ, 型, 個数, 値の4バイト) で順に返す。壊れていれば途中で止める。"""
     if offset + 2 > len(data):
-        return 1
+        return
     count = int.from_bytes(data[offset:offset + 2], order)
     for i in range(min(count, 512)):
         pos = offset + 2 + i * 12
         if pos + 12 > len(data):
-            break
-        if int.from_bytes(data[pos:pos + 2], order) == 0x0112:
-            value = int.from_bytes(data[pos + 8:pos + 10], order)
-            return value if value in EXIF_ORIENTATION_TURNS else 1
+            return
+        yield (int.from_bytes(data[pos:pos + 2], order),
+               int.from_bytes(data[pos + 2:pos + 4], order),
+               int.from_bytes(data[pos + 4:pos + 8], order),
+               data[pos + 8:pos + 12])
+
+
+def exif_orientation_from_tiff(data: bytes) -> int:
+    """EXIF(TIFF 構造。先頭が "II*\0" / "MM\0*")から Orientation(0x0112)を読む。
+    無い・読めないときは 1。"""
+    head = _tiff_header(data or b"")
+    if head is None:
+        return 1
+    data, order, offset = head
+    for tag, _kind, _count, value in _tiff_entries(data, order, offset):
+        if tag == 0x0112:
+            number = int.from_bytes(value[:2], order)
+            return number if number in EXIF_ORIENTATION_TURNS else 1
     return 1
+
+
+_EXIF_DATETIME_RE = re.compile(r"^\d{4}:\d\d:\d\d \d\d:\d\d")
+
+
+def exif_datetime_original(data: bytes) -> str:
+    """EXIF(TIFF 構造)の撮影日時 DateTimeOriginal(Exif IFD の 0x9003)を
+    "YYYY:MM:DD HH:MM:SS" のまま返す。無い・読めないときは ""。
+    IFD0 の DateTime(0x0132。編集ソフトが書き換える更新日時)は撮影日時ではないので見ない。"""
+    head = _tiff_header(data or b"")
+    if head is None:
+        return ""
+    data, order, offset = head
+    exif_ifd = None
+    for tag, _kind, _count, value in _tiff_entries(data, order, offset):
+        if tag == 0x8769:
+            exif_ifd = int.from_bytes(value, order)
+            break
+    if exif_ifd is None:
+        return ""
+    for tag, kind, count, value in _tiff_entries(data, order, exif_ifd):
+        if tag != 0x9003 or kind != 2 or count < 1:
+            continue
+        if count <= 4:
+            raw = value[:count]
+        else:
+            pos = int.from_bytes(value, order)
+            raw = data[pos:pos + count]
+        text = raw.split(b"\0", 1)[0].decode("ascii", "replace").strip()
+        return text if _EXIF_DATETIME_RE.match(text) else ""
+    return ""
+
+
+def exif_tiff_bytes(path: str) -> bytes:
+    """JPEG(APP1 の Exif)/ PNG(eXIf)/ WebP(EXIF チャンク)から EXIF の本体(TIFF 構造)を
+    取り出す。見出しだけをたどって飛ばしていく(画素は読まない)。無ければ b""。
+    向き(container_exif_orientation)とスライドショーの撮影日時が共通で使う。"""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            if ext in (".jpg", ".jpeg", ".jpe", ".jfif"):
+                if f.read(2) != b"\xff\xd8":
+                    return b""
+                for _ in range(64):
+                    marker = f.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        return b""
+                    if marker[1] in (0xD9, 0xDA):       # 終わり / 画素の始まり
+                        return b""
+                    if 0xD0 <= marker[1] <= 0xD7 or marker[1] == 0x01:
+                        continue                        # 長さを持たない印
+                    size = int.from_bytes(f.read(2), "big")
+                    if size < 2:
+                        return b""
+                    if marker[1] == 0xE1:
+                        body = f.read(size - 2)
+                        if body.startswith(b"Exif\0\0"):
+                            return body[6:]
+                        continue                        # XMP の APP1 など
+                    f.seek(size - 2, 1)
+            elif ext == ".webp":
+                head = f.read(12)
+                if head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+                    return b""
+                for _ in range(64):
+                    chunk = f.read(8)
+                    if len(chunk) < 8:
+                        return b""
+                    size = int.from_bytes(chunk[4:8], "little")
+                    if chunk[:4] == b"EXIF":
+                        return f.read(min(size, 1 << 20))
+                    f.seek(size + (size & 1), 1)
+            elif ext == ".png":
+                if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                    return b""
+                for _ in range(256):
+                    chunk = f.read(8)
+                    if len(chunk) < 8:
+                        return b""
+                    size = int.from_bytes(chunk[:4], "big")
+                    kind = chunk[4:8]
+                    if kind == b"eXIf":
+                        return f.read(min(size, 1 << 20))
+                    if kind in (b"IDAT", b"IEND"):
+                        return b""      # eXIf は IDAT より前に置く決まり
+                    f.seek(size + 4, 1)
+    except OSError:
+        return b""
+    return b""
 
 
 def container_exif_orientation(path: str) -> int:
     """WebP / PNG に入っている EXIF の Orientation。Qt はこの2つの EXIF を読まない
-    (JPEG / TIFF は QImageReader の自動回転が効く)ので自前で見る。
-    チャンクの見出しだけを読んで飛ばしていく(画素は読まない)。無ければ 1。"""
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        with open(path, "rb") as f:
-            if ext == ".webp":
-                head = f.read(12)
-                if head[:4] != b"RIFF" or head[8:12] != b"WEBP":
-                    return 1
-                for _ in range(64):
-                    chunk = f.read(8)
-                    if len(chunk) < 8:
-                        return 1
-                    size = int.from_bytes(chunk[4:8], "little")
-                    if chunk[:4] == b"EXIF":
-                        return exif_orientation_from_tiff(f.read(min(size, 1 << 20)))
-                    f.seek(size + (size & 1), 1)
-            elif ext == ".png":
-                if f.read(8) != b"\x89PNG\r\n\x1a\n":
-                    return 1
-                for _ in range(256):
-                    chunk = f.read(8)
-                    if len(chunk) < 8:
-                        return 1
-                    size = int.from_bytes(chunk[:4], "big")
-                    kind = chunk[4:8]
-                    if kind == b"eXIf":
-                        return exif_orientation_from_tiff(f.read(min(size, 1 << 20)))
-                    if kind in (b"IDAT", b"IEND"):
-                        return 1      # eXIf は IDAT より前に置く決まり
-                    f.seek(size + 4, 1)
-    except OSError:
+    (JPEG / TIFF は QImageReader の自動回転が効く)ので自前で見る。それ以外の形式は 1。
+    チャンクの見出しだけを読んで飛ばしていく(画素は読まない。exif_tiff_bytes)。"""
+    if os.path.splitext(path)[1].lower() not in (".webp", ".png"):
         return 1
-    return 1
+    return exif_orientation_from_tiff(exif_tiff_bytes(path))
 
 
 def info_lines(name: str, entry) -> list:

@@ -405,6 +405,24 @@ DEFAULT_SETTINGS = {
         "fkey_labels": {},
         "tools": {},
     },
+    # 写真のスライドショー(slideshow.py。全画面のフォトフレーム)。トレイの
+    # 「🖼 スライドショー」から開始・設定する。窓は常駐とは別のプロセス。
+    #   folders          … [{"path": フォルダ, "recursive": サブフォルダも含めるか}] の並び。
+    #                      複数あるときは、まずフォルダを等確率で選び、その中から一巡する
+    #                      まで同じ写真を出さずに選ぶ(大きいフォルダに小さいのが埋もれない)
+    #   interval_seconds … 1枚を出しておく秒数(フェードの始まりから次のフェードの始まりまで)
+    #   fade_seconds     … クロスフェードの秒数(0 で切り替えのみ)
+    #   ken_burns        … ゆっくりズーム(1.00→1.08 の拡大・平行移動。向きはランダム)
+    #   monitor          … 表示するモニタの QScreen.name()。空・見つからなければ主モニタ
+    #   fps              … 動かしている間の描画の頻度。重ければ 30 に下げる
+    "slideshow": {
+        "folders": [],
+        "interval_seconds": 10,
+        "fade_seconds": 1.5,
+        "ken_burns": True,
+        "monitor": "",
+        "fps": 60,
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",

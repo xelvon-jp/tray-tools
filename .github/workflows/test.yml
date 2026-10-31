@@ -1,9 +1,9 @@
-# テストの自動実行。push と手動実行で tests/test_filer.py を回す。
+# テストの自動実行。push と手動実行で tests/test_filer.py と tests/test_slideshow.py を回す。
 #
 # test_filer.py は自分で QT_QPA_PLATFORM=offscreen を設定するので、画面のない
 # ランナーでもそのまま動く(手元のPCで走らせているのと同じ条件)。
 # 他のテストファイルは重い任意依存(rembg等)や実機前提のものがあるので、
-# まずはファイラだけを対象にする。
+# まずはファイラと、それと読み込みを共通にしているスライドショーだけを対象にする。
 #
 # 失敗時の内容は tests/test_filer.py 自身が ::error 注釈で run ページに出す
 # (GITHUB_ACTIONS のときだけ)。以前ここにあった Issue 自動起票ステップは、
@@ -42,3 +42,8 @@ jobs:
         # ステップの結果になる。
         shell: cmd
         run: python tests/test_filer.py
+
+      - name: スライドショーのテスト
+        # ファイラと同じく offscreen で、自分で終了コードを返す(cmd で回す理由も同じ)。
+        shell: cmd
+        run: python tests/test_slideshow.py

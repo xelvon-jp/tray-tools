@@ -5,16 +5,17 @@
 #   - テキスト(ビュアと同じ拡張子の表): 先頭 200 行まで(読むのは最大 256KB)
 #   - 画像(png jpg jpeg gif bmp webp ico): 窓に収まる大きさで読む(QImageReader に
 #     縮めて読ませるので、巨大な画像でも全部を展開しない)。EXIF の向きは自動で当てる
-#     (JPEG / TIFF は Qt、Qt が読まない PNG / WebP は自前)。手動の回転・反転
-#     (R / L / H / V。状態は filer_core.ImageTurn)は表示のときに PreviewWidget が当てる
+#     (JPEG / TIFF は Qt、Qt が読まない PNG / WebP は自前。読み込みはスライドショーと
+#     共通の image_load)。手動の回転・反転(R / L / H / V。状態は filer_core.ImageTurn)
+#     は表示のときに PreviewWidget が当てる
 #   - フォルダ: 中のフォルダ・ファイルの数と、先頭の名前
 #   - そのほか: 名前・サイズ・日時・属性
 # 読み込みは load_preview を読み取りスレッドで呼ぶ(ネットワーク越しでも窓は止まらない)。
 # QImage はスレッドをまたいで渡してよい(QPixmap にするのは UI スレッドで)。
 import os
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QFont, QImage, QImageIOHandler, QImageReader, QPixmap, QTransform
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 
 import filer_archive
 import filer_core as core
+import image_load
 
 
 def _read_text(path: str):
@@ -40,54 +42,10 @@ def _read_text(path: str):
     return lines, label
 
 
-def turned_image(image: QImage, turn) -> QImage:
-    """core の向きの行列(TURN_*)を当てた絵。元のままならそのまま返す。
-    QImage.transformed は回したぶんの平行移動を自分で補うので、行列だけ渡せばよい。"""
-    if tuple(turn) == core.TURN_IDENTITY or image.isNull():
-        return image
-    m11, m12, m21, m22 = turn
-    return image.transformed(QTransform(m11, m12, m21, m22, 0, 0), Qt.FastTransformation)
-
-
-def _read_image(path: str, box_w: int, box_h: int):
-    """(絵, 表示の向きでの元の大きさ (幅, 高さ) or None, 縮めて読んだか)。
-
-    EXIF の向き(カメラ・スマホの縦撮り)は当ててから返す。JPEG / TIFF は Qt の
-    自動回転(setAutoTransform)で、Qt が EXIF を読まない WebP / PNG は自前で読んで
-    (core.container_exif_orientation)当てる。"""
-    reader = QImageReader(path)
-    reader.setAutoTransform(True)
-    size = reader.size()
-    transformation = reader.transformation()
-    qt_rotated = bool(transformation & QImageIOHandler.TransformationRotate90)
-    own_turn = core.TURN_IDENTITY
-    if transformation == QImageIOHandler.TransformationNone:
-        own_turn = core.EXIF_ORIENTATION_TURNS.get(
-            core.container_exif_orientation(path), core.TURN_IDENTITY)
-    rotated = qt_rotated or core.turn_swaps_size(own_turn)
-    scaled = False
-    if size.isValid():
-        # EXIF の回転(スマホの縦撮り写真など)があると、読み出した後に
-        # 縦横が入れ替わる。縮小の大きさは「表示後の縦横」で決めないと、
-        # 回転したぶん箱からはみ出し、窓の大きさまで変わってしまう。
-        # setScaledSize は回転の前(保存されている向き)の大きさで渡す。
-        shown = QSize(size.height(), size.width()) if rotated else size
-        w, h = core.fit_size(shown.width(), shown.height(), box_w, box_h)
-        target = shown.scaled(w, h, Qt.KeepAspectRatio)
-        if rotated:
-            target = QSize(target.height(), target.width())
-        if target != size:
-            reader.setScaledSize(target)
-            scaled = True
-    image = reader.read()
-    if image.isNull():
-        raise OSError(reader.errorString() or "画像として読めません")
-    image = turned_image(image, own_turn)
-    if size.isValid():
-        original = (size.height(), size.width()) if rotated else (size.width(), size.height())
-    else:
-        original = None
-    return image, original, scaled
+# 画像の読み込み(縮小・EXIF の向き)はスライドショーと共通の image_load にある。
+# ここでの名前(_read_image / turned_image)は今までどおり使えるように残す。
+turned_image = image_load.turned_image
+_read_image = image_load.read_image
 
 
 def _read_folder(path: str):

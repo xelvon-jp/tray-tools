@@ -6,5 +6,6 @@ afx folder
 "O:反対側で開く" &EXCD -O$MF\
 "E:エクスプローラ" explorer.exe $MF
 "C:PhotoCuller" {tool:photoculler} $MF
+"L:このフォルダでスライドショー" &SLIDESHOW $MF
 "S:PowerShell" &SHELL $MF
 "R:プロパティ" &PROPERTY $MF

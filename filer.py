@@ -3072,6 +3072,9 @@ class FilerWindow(QWidget):
             elif paths and not os.path.isdir(paths[0]):
                 self.open_viewer(paths[0])
             return
+        if name == "SLIDESHOW":
+            self.start_slideshow(paths)
+            return
         if name == "OPEN":
             if pane.archive is not None and uses_targets:
                 for entry in pane.targets() or [pane.cursor_entry()]:
@@ -3081,6 +3084,26 @@ class FilerWindow(QWidget):
             for path in paths:
                 self._startfile(path)
             return
+
+    def start_slideshow(self, paths) -> None:
+        """&SLIDESHOW: 写真のスライドショー(slideshow.py)を、そのフォルダ(サブフォルダ込み)で
+        一時的に再生する。登録済みのフォルダの設定は変えない。ファイルが渡されたらその
+        フォルダ。マークが複数なら全部を対象にする。窓は別プロセス(slideshow_launch)。"""
+        import slideshow_launch  # 使うときに読む
+        folders = []
+        for path in paths:
+            folder = path if os.path.isdir(path) else os.path.dirname(path)
+            if folder and os.path.isdir(folder) and folder not in folders:
+                folders.append(folder)
+        if not folders:
+            self.log("スライドショー: フォルダがありません")
+            return
+        try:
+            slideshow_launch.start(folders, self.settings_path)
+            self.log(f"スライドショー: {folders[0]}"
+                     + (f" ほか{len(folders) - 1}件" if len(folders) > 1 else ""))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"スライドショーを起動できません  ({e})")
 
     def spawn_properties(self, paths) -> None:
         """エクスプローラのプロパティ窓。COM が要るので F7 と同じ子プロセスに出させる

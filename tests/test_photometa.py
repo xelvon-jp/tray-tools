@@ -1795,7 +1795,14 @@ def test_frame_aspect_crop():
     face = [(0.4, 0.02, 0.2, 0.1)]                            # (x, y, w, h) 比率
     res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
                         faces_provider=lambda p: face)
-    assert len(res.updated) == 0, res   # 署名は顔に依存しない（作り直しにならない）
+    assert len(res.updated) == 1, res   # 顔が付くと署名が変わり、作り直しになる
+    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
+                        faces_provider=lambda p: face)
+    assert len(res.updated) == 0 and len(res.unchanged) == 1, res   # 同じ顔ならそのまま
+    other = [(0.1, 0.5, 0.2, 0.1)]
+    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
+                        faces_provider=lambda p: other)
+    assert len(res.updated) == 1, res   # 顔が変わればまた作り直し
     d2, src2, t3, _t4, ledger2 = _frame_setup("frame_aspect2")
     a2 = _exif_jpeg(src2 / "a.jpg", size=(1200, 1600))
     res = pe.sync_frame([a2], [str(t3)], settings, str(ledger2),
@@ -1809,6 +1816,24 @@ def test_frame_aspect_crop():
     res = pe.sync_frame([a3], [str(t5)], settings, str(ledger3))
     with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
         assert im.size == (1200, 800), im.size
+
+
+def test_edits_sanitized():
+    """外から来た補正値の検査: 範囲で切りそろえ、駄目な枠は捨て、NaN は 0。"""
+    from photometa import metacache
+    from photometa.xmp import Edits
+
+    e = Edits(crop=(0.9, 0.9, 0.1, 0.1), exposure=99.0, temperature=float("nan"),
+              tint=-500.0).sanitized()
+    assert e is not None and e.crop is None, e          # 逆転した枠は捨てる
+    assert e.exposure == 10.0 and e.temperature == 0.0 and e.tint == -100.0, e
+    e = Edits(crop=(-0.5, 0.0, 1.5, 1.0)).sanitized()
+    assert e is not None and e.crop == (0.0, 0.0, 1.0, 1.0), e   # 0〜1 に切りそろえ
+    assert Edits().sanitized() is None
+    # キャッシュの読み戻しでも検査される
+    bad = '{"crop": [0.9, 0.9, 0.1, 0.1], "exposure": 1.0}'
+    got = metacache._text_to_edits(bad)
+    assert got is not None and got.crop is None and got.exposure == 1.0, got
 
 
 def test_phone_share_renders_edits():

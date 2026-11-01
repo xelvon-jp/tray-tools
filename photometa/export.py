@@ -367,6 +367,14 @@ def photo_edits(path: str):
     return meta.edits if meta else None
 
 
+def _faces_sig(faces) -> str:
+    """顔の並び（(x, y, w, h) の比率）を署名用の文字列にする。"""
+    try:
+        return ";".join(",".join(f"{float(v):.3f}" for v in box) for box in faces)
+    except (TypeError, ValueError):
+        return ""
+
+
 def _sig_with_edits(sig: dict, edits) -> dict:
     """台帳の署名に、その写真の補正を含めたもの。補正が無ければ sig のまま
     （既存の台帳の記録と一致し続けるので、補正の無い写真は作り直しにならない）。"""
@@ -775,7 +783,18 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 result.failed.append((src, "元の写真がありません"))
                 continue
             edits = photo_edits(src)
+            # 顔基準の切り抜きが効くときだけ、顔も署名に入れる（顔の解析が
+            # 変わったら作り直しになる。手動の切り抜きがある写真では顔は無関係）
+            faces = None
+            if (faces_provider is not None and s.get("crop_aspect")
+                    and not (edits is not None and edits.crop is not None)):
+                try:
+                    faces = faces_provider(src)
+                except Exception:  # noqa: BLE001  顔が取れなくても中央で切り抜く
+                    faces = None
             sig_i = _sig_with_edits(sig, edits)
+            if faces:
+                sig_i = dict(sig_i, faces=_faces_sig(faces))
             plans = []
             for t in states:
                 action, name = _frame_action(t, key, st, sig_i)
@@ -791,12 +810,6 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
             if skip is not None:
                 (result.skipped_raw if skip == "raw" else result.skipped_heic).append(src)
                 continue
-            faces = None
-            if faces_provider is not None and s.get("crop_aspect"):
-                try:
-                    faces = faces_provider(src)
-                except Exception:  # noqa: BLE001  顔が取れなくても中央で切り抜く
-                    faces = None
             built = os.path.join(work, f"{i}.jpg")
             try:
                 stamp = build_frame_jpeg(src, built, s, edits=edits, faces=faces)
@@ -924,7 +937,8 @@ class FramePlan:
 
 
 def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, scope=None,
-                    keep=(), manual_delete=(), cancel=None, progress=None) -> FramePlan:
+                    keep=(), manual_delete=(), cancel=None, progress=None,
+                    faces_provider=None) -> FramePlan:
     """sync_frame の予行。同じ引数で、同期先ごとに追加・更新・削除・そのままを数える。
 
     判定は sync_frame と同じ部品（_frame_action / _cannot_build / _stale_entries）で行い、
@@ -960,7 +974,17 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
         except OSError:
             plan.missing.append(src)
             continue
-        sig_i = _sig_with_edits(sig, photo_edits(src))
+        edits = photo_edits(src)
+        faces = None
+        if (faces_provider is not None and frame_settings(settings).get("crop_aspect")
+                and not (edits is not None and edits.crop is not None)):
+            try:
+                faces = faces_provider(src)
+            except Exception:  # noqa: BLE001
+                faces = None
+        sig_i = _sig_with_edits(sig, edits)
+        if faces:
+            sig_i = dict(sig_i, faces=_faces_sig(faces))
         todo = []
         for t, out in pairs:
             action, name = _frame_action(t, key, st, sig_i)

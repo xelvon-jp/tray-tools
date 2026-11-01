@@ -81,7 +81,7 @@ def _text_to_edits(text) -> Edits | None:
             tint=float(d.get("tint") or 0.0))
     except (ValueError, TypeError, AttributeError):
         return None
-    return None if edits.is_empty() else edits
+    return edits.sanitized()
 
 
 def _stat_key(path: str):

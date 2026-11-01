@@ -68,6 +68,41 @@ class Edits:
                 and self.contrast == 0 and self.saturation == 0
                 and self.temperature == 0 and self.tint == 0)
 
+    def sanitized(self) -> "Edits | None":
+        """値の範囲を正した補正を返す（文章など外から来た値の検査用）。
+
+        数値は範囲で切りそろえ（NaN・無限大は 0）、切り抜きは 0〜1 に
+        切りそろえた上で、幅・高さが 1% 未満なら枠ごと捨てる。
+        全部空になれば None。
+        """
+        import math
+
+        def clamp(v, lo, hi):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(v):
+                return 0.0
+            return max(lo, min(hi, v))
+
+        crop = self.crop
+        if crop is not None:
+            try:
+                top, left, bottom, right = (clamp(v, 0.0, 1.0) for v in crop)
+                crop = ((top, left, bottom, right)
+                        if bottom - top >= 0.01 and right - left >= 0.01 else None)
+            except (TypeError, ValueError):
+                crop = None
+        out = Edits(crop=crop,
+                    angle=clamp(self.angle, -180.0, 180.0),
+                    exposure=clamp(self.exposure, -10.0, 10.0),
+                    contrast=clamp(self.contrast, -100.0, 100.0),
+                    saturation=clamp(self.saturation, -100.0, 100.0),
+                    temperature=clamp(self.temperature, -100.0, 100.0),
+                    tint=clamp(self.tint, -100.0, 100.0))
+        return None if out.is_empty() else out
+
     def signature(self) -> str:
         """台帳の「作り方の署名」に入れる安定した文字列。"""
         crop = "" if self.crop is None else ",".join(f"{v:.4f}" for v in self.crop)

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSizePolicy,
     QStackedWidget,
+    QHBoxLayout,
     QVBoxLayout,
     QWidget,
 )
@@ -134,16 +135,19 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             result.update(lines=lines, note=label)
         elif kind == "image":
             edited = None
+            orig_image = None
             if archive is None:
                 edits = _photo_edits(path)
                 if edits is not None:
                     edited = _edited_image(path, edits, box)
             if edited is not None:
                 image, original, scaled = edited
+                raw, _raw_size, _raw_scaled = _read_image(path, *box)
+                orig_image = raw   # 「元画像（押している間）」用
             else:
                 image, original, scaled = _read_image(path, *box)
             result.update(image=image, note=f"{original[0]}×{original[1]}" if original else "",
-                          scaled=scaled)
+                          scaled=scaled, orig_image=orig_image)
         elif kind == "folder":
             dirs, files, names = _read_folder(path)
             result.update(lines=[f"{dirs} フォルダ / {files} ファイル", ""] + names
@@ -172,7 +176,21 @@ class PreviewWidget(QWidget):
         self.header.setFont(font)
         self.header.setStyleSheet(f"background-color: {colors['header_inactive']};"
                                   f" color: {colors['header_inactive_text']}; padding: 0 4px;")
-        layout.addWidget(self.header)
+        from PySide6.QtWidgets import QPushButton
+        self.orig_btn = QPushButton("元画像（押している間）")
+        self.orig_btn.setFont(font)
+        self.orig_btn.setFocusPolicy(Qt.NoFocus)   # キーはファイル窓のまま
+        self.orig_btn.setEnabled(False)
+        self.orig_btn.pressed.connect(lambda: self._show_original(True))
+        self.orig_btn.released.connect(lambda: self._show_original(False))
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(0)
+        header_row.addWidget(self.header, 1)
+        header_row.addWidget(self.orig_btn)
+        layout.addLayout(header_row)
+        self._disp_pixmap = None    # いま出している（補正ありの）絵
+        self._orig_pixmap = None    # 元画像ボタンで出す絵
         self.stack = QStackedWidget()
         self.text = QPlainTextEdit()
         self.text.setReadOnly(True)
@@ -237,6 +255,13 @@ class PreviewWidget(QWidget):
         suffix = getattr(self, "turn_suffix", "")
         self.header.setText(f"Preview: {title}  …" + (f"  {suffix}" if suffix else ""))
 
+    def _show_original(self, on: bool) -> None:
+        """元画像ボタン: 押している間だけ補正なしの絵に差し替える。"""
+        if on and self._orig_pixmap is not None:
+            self.image.setPixmap(self._orig_pixmap)
+        elif not on and self._disp_pixmap is not None:
+            self.image.setPixmap(self._disp_pixmap)
+
     def set_turn(self, turn, suffix: str = "", rerender: bool = True) -> None:
         """手動の回転・反転(core.ImageTurn の turn)と固定の印。rerender なら、いま出して
         いる絵にも当て直す(別のファイルへ移るときは、古い絵を向きだけ変えて一瞬見せない
@@ -266,8 +291,21 @@ class PreviewWidget(QWidget):
                 # ここで収める(窓の大きさを絵に合わせない)
                 pixmap = pixmap.scaled(box_w, box_h, Qt.KeepAspectRatio,
                                        Qt.SmoothTransformation)
+            self._disp_pixmap = pixmap
+            orig = result.get("orig_image")
+            self._orig_pixmap = None
+            if orig is not None:
+                opix = QPixmap.fromImage(turned_image(orig, turn))
+                if opix.width() > box_w or opix.height() > box_h:
+                    opix = opix.scaled(box_w, box_h, Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation)
+                self._orig_pixmap = opix
+            self.orig_btn.setEnabled(self._orig_pixmap is not None)
             self.image.setPixmap(pixmap)
             self.stack.setCurrentWidget(self.image)
         else:
+            self._disp_pixmap = None
+            self._orig_pixmap = None
+            self.orig_btn.setEnabled(False)
             self.text.setPlainText("\n".join(result.get("lines") or []))
             self.stack.setCurrentWidget(self.text)

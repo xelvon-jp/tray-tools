@@ -4444,6 +4444,10 @@ def test_preview_applies_edits():
         image = result["image"]
         assert image is not None and not image.isNull()
         assert image.width() == 200 and image.height() == 300, image.size().toTuple()
+        # 元画像ボタン用に、補正なしの絵（元の大きさ）も一緒に返る
+        orig = result["orig_image"]
+        assert orig is not None and orig.width() == 400 and orig.height() == 300, \
+            None if orig is None else orig.size().toTuple()
 
 
 def _wait_preview(w, title, timeout=15.0):

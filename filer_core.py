@@ -108,9 +108,13 @@ DEFAULT_KEYMAP = {
     "1087": "sync_copy",          # Shift+W フォルダ同期コピー(コピーのみ)
     "0090": "settings_dialog",    # Z 設定(あふｗの Z ＝設定プログラム起動)
     "0191": "live_filter",        # / ライブ絞り込み(XYplorer の Live Filter / yazi の filter)
+    # --- 合計ファイルサイズ(あふｗ標準の I / Shift+I) ---
+    "0073": "size_total",         # I 占有合計ファイルサイズ表示(クラスタの倍数に切り上げて足す)
+    "1073": "size_total_simple",  # Shift+I 単純合計ファイルサイズ表示(サイズをそのまま足す)
     # --- 写真の★(photometa) ---
-    "0073": "photo_menu",         # I 写真メニュー(★を付ける・★で絞り込む。AFXW.key の
-                                  # Alt+I(IrfanView)と同じ指で「画像まわり」)
+    "4073": "photo_menu",         # Alt+I 写真メニュー(★を付ける・★で絞り込む。AFXW.key の
+                                  # Alt+I(IrfanView)と同じ指で「画像まわり」。I はあふｗに
+                                  # 合わせて合計ファイルサイズに譲った。2026-11-01)
     "4049": "photo_preset_1",     # Alt+1〜9 ★の絞り込みのプリセット(photo_ratings.json の
     "4050": "photo_preset_2",     # presets の N 番目。AFXW.key でも空いている)
     "4051": "photo_preset_3",
@@ -864,13 +868,19 @@ def format_mtime(mtime: float) -> str:
         return ""
 
 
+def bytes_unit(total: int) -> str:
+    """バイト数の単位付きの表示("11.5GB")。1KB 未満なら ""(format_bytes と同じ書式)。"""
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if total >= size:
+            return f"{total / size:.1f}{unit}"
+    return ""
+
+
 def format_bytes(total: int) -> str:
     """マーク合計の表示。バイト数を桁区切りで、大きければ単位付きも添える。"""
     text = f"{total:,}"
-    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
-        if total >= size:
-            return f"{text} ({total / size:.1f}{unit})"
-    return text
+    unit = bytes_unit(total)
+    return f"{text} ({unit})" if unit else text
 
 
 # ---------------------------------------------------------------
@@ -1517,6 +1527,170 @@ def hash_clip_text(results) -> str:
     if len(results) == 1:
         return results[0][1]
     return "\r\n".join(f"{digest}  {name}" for name, digest in results)
+
+
+# ---------------------------------------------------------------
+# 合計ファイルサイズ(I = 占有合計 / Shift+I = 単純合計。あふｗ標準のキー)
+# ---------------------------------------------------------------
+# 辿らない再解析ポイントの種類(シンボリックリンクとジャンクション)。ループや二重の数えを
+# 避けるため。OneDrive のオンライン専用ファイル・フォルダ(IO_REPARSE_TAG_CLOUD_*)も
+# 再解析ポイントだが、こちらは普通のファイル・フォルダとして数える(中身は読まない)。
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+IO_REPARSE_TAG_SYMLINK = 0xA000000C
+_LINK_TAGS = (IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK)
+SIZE_PROGRESS_SEC = 0.2   # 途中経過を知らせる間隔(秒)
+
+
+@dataclass
+class SizeTally:
+    """合計ファイルサイズの数えた結果。"""
+    files: int = 0
+    dirs: int = 0
+    logical: int = 0        # 単純合計(サイズをそのまま足す)
+    allocated: int = 0      # 占有合計(クラスタの倍数に切り上げて足す)
+    unreadable: int = 0     # 中を読めなかったフォルダ(アクセス拒否など)の数
+    cancelled: bool = False
+
+
+def round_to_cluster(size: int, cluster) -> int:
+    """size をクラスタの倍数に切り上げる。0 バイトは 0。クラスタが分からなければそのまま。"""
+    if size <= 0:
+        return 0
+    if not cluster or cluster <= 0:
+        return size
+    return -(-size // cluster) * cluster
+
+
+def _is_link_stat(st) -> bool:
+    """stat の結果がシンボリックリンクかジャンクションか(中へは潜らない)。"""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT) and         getattr(st, "st_reparse_tag", 0) in _LINK_TAGS
+
+
+def _is_dir_stat(st) -> bool:
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & stat.FILE_ATTRIBUTE_DIRECTORY) or stat.S_ISDIR(st.st_mode)
+
+
+def tally_sizes(paths, cluster_of=None, cancel=None, progress=None,
+                count_roots: bool = True, scandir=os.scandir) -> SizeTally:
+    """paths(ファイル・フォルダのフルパス)のファイル数・フォルダ数・合計バイト数。
+
+    - フォルダは中まで数える。count_roots が False なら paths のフォルダ自身は数えず、
+      中身だけを数える(".." の行で「いまのフォルダ全体」を数えるとき)
+    - 隠し・システムも数える(表示の設定に関係なく、ディスクの上の量を出すため)
+    - 見るのは os.scandir と stat(follow_symlinks=False) だけ。ファイルは開かない
+      (OneDrive のオンライン専用ファイルの中身をダウンロードさせない)
+    - シンボリックリンク・ジャンクションはフォルダとして1件数えるが、中へは潜らない
+    - 中を読めないフォルダは unreadable に数えて先へ進む
+    - cluster_of(パス) はそのパスのドライブのクラスタの大きさ(None なら切り上げない)。
+      根ごとに1回だけ呼ぶ(潜る先は同じドライブ。ジャンクションの先へは行かないので)
+    - cancel(threading.Event)が立ったらそこで止め、cancelled を立てて返す
+    - progress(数えた件数) を SIZE_PROGRESS_SEC 秒に1回ほど呼ぶ
+    読み取りスレッドから呼ぶ(ネットワーク越しでは止まりうる)。"""
+    tally = SizeTally()
+    last = [time.monotonic()]
+
+    def cancelled() -> bool:
+        if cancel is not None and cancel.is_set():
+            tally.cancelled = True
+            return True
+        return False
+
+    def tick() -> None:
+        if progress is None:
+            return
+        now = time.monotonic()
+        if now - last[0] >= SIZE_PROGRESS_SEC:
+            last[0] = now
+            progress(tally.files + tally.dirs)
+
+    def add_file(size: int, cluster) -> None:
+        tally.files += 1
+        tally.logical += max(0, size)
+        tally.allocated += round_to_cluster(size, cluster)
+
+    for root in paths:
+        if cancelled():
+            return tally
+        try:
+            st = os.lstat(root)
+        except OSError:
+            continue        # 数え始める前に消えたもの
+        cluster = cluster_of(root) if cluster_of is not None else None
+        if not _is_dir_stat(st):
+            add_file(st.st_size, cluster)
+            continue
+        if count_roots:
+            tally.dirs += 1
+        if _is_link_stat(st):
+            continue
+        stack = [root]
+        while stack:
+            if cancelled():
+                return tally
+            folder = stack.pop()
+            try:
+                with scandir(folder) as it:
+                    for entry in it:
+                        if cancelled():
+                            return tally
+                        try:
+                            est = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if _is_dir_stat(est):
+                            tally.dirs += 1
+                            if not _is_link_stat(est):
+                                stack.append(entry.path)
+                        else:
+                            add_file(est.st_size, cluster)
+                        tick()
+            except OSError:
+                tally.unreadable += 1
+    return tally
+
+
+def tally_archive(index, inner: str, names=None) -> SizeTally:
+    """書庫の中の合計(展開したときのサイズの単純合計)。占有もクラスタが無いので同じ値。
+
+    names を渡せば inner(いま見ている中のフォルダ)の中のその名前のもの(フォルダは中身ごと)、
+    None なら inner の中身全部(".." の行)。index は filer_archive.ArchiveIndex。"""
+    tally = SizeTally()
+    if names is None:
+        prefix = inner + "/" if inner else ""
+        found = [p for p in index.members if p and p.startswith(prefix)]
+    else:
+        found = []
+        for name in names:
+            top = f"{inner}/{name}" if inner else name
+            member = index.members.get(top)
+            if member is None:
+                continue
+            found.append(top)
+            if member.is_dir:
+                found.extend(index.descendants(top))
+    for path in dict.fromkeys(found):
+        member = index.members[path]
+        if member.is_dir:
+            tally.dirs += 1
+        else:
+            tally.files += 1
+            tally.logical += max(0, member.size)
+    tally.allocated = tally.logical
+    return tally
+
+
+def size_total_text(tally: SizeTally, allocated: bool, label: str = "") -> str:
+    """結果の1行目。「占有合計（sub）: 1,234 ファイル / 56 フォルダ　12,345,678 バイト（11.8MB）」。"""
+    kind = "占有合計" if allocated else "単純合計"
+    total = tally.allocated if allocated else tally.logical
+    unit = bytes_unit(total)
+    head = f"{kind}（{label}）" if label else kind
+    return (f"{head}: {tally.files:,} ファイル / {tally.dirs:,} フォルダ　{total:,} バイト"
+            + (f"（{unit}）" if unit else ""))
 
 
 # ---------------------------------------------------------------

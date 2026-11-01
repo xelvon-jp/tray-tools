@@ -370,6 +370,31 @@ def disk_space(root: str):
     return int(total.value), int(free_to_caller.value)
 
 
+_GetDiskFreeSpaceW = _kernel32.GetDiskFreeSpaceW
+_GetDiskFreeSpaceW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD),
+                               ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                               ctypes.POINTER(wintypes.DWORD)]
+_GetDiskFreeSpaceW.restype = wintypes.BOOL
+
+
+def cluster_size(root: str):
+    """ドライブのクラスタの大きさ(バイト。セクタ/クラスタ × バイト/セクタ)。読めなければ None。
+
+    占有合計(I)で、ファイルのサイズをこの倍数に切り上げるのに使う。UNC の根も可。
+    ネットワーク越しでは止まりうるので、UI スレッドからは呼ばないこと。"""
+    sectors = wintypes.DWORD()
+    per_sector = wintypes.DWORD()
+    free_clusters = wintypes.DWORD()
+    total_clusters = wintypes.DWORD()
+    old = wintypes.DWORD()
+    _SetThreadErrorMode(SEM_FAILCRITICALERRORS, ctypes.byref(old))
+    if not _GetDiskFreeSpaceW(root, ctypes.byref(sectors), ctypes.byref(per_sector),
+                              ctypes.byref(free_clusters), ctypes.byref(total_clusters)):
+        return None
+    size = int(sectors.value) * int(per_sector.value)
+    return size if size > 0 else None
+
+
 def drive_label(root: str) -> str:
     """窓の2行目に出すドライブの名前。ボリュームラベル、無ければ種別(ローカル等)。
     UNC なら "server\\share"。止まりうるので UI スレッドからは呼ばないこと。"""

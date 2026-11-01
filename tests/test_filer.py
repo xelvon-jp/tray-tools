@@ -6857,8 +6857,11 @@ def test_photo_mode_judgement():
     # 手動の切り替え
     assert core.photo_mode_on("auto", True) and not core.photo_mode_on("auto", False)
     assert core.photo_mode_on("on", False) and not core.photo_mode_on("off", True)
-    # キー: I と Alt+1〜9
-    assert core.DEFAULT_KEYMAP["0073"] == "photo_menu"
+    # キー: Alt+I と Alt+1〜9(I / Shift+I はあふｗ標準の合計ファイルサイズ)
+    assert core.DEFAULT_KEYMAP["4073"] == "photo_menu"
+    assert core.DEFAULT_KEYMAP["0073"] == "size_total"
+    assert core.DEFAULT_KEYMAP["1073"] == "size_total_simple"
+    assert [c for c, cmd in core.DEFAULT_KEYMAP.items() if cmd == "photo_menu"] == ["4073"]
     assert [core.DEFAULT_KEYMAP[f"40{49 + i}"] for i in range(9)] == [
         f"photo_preset_{i}" for i in range(1, 10)]
 
@@ -6987,6 +6990,24 @@ def _photo_window(photos, other, settings_path):
     _wait_until(lambda: len(w.left.photo_meta) >= 5 and not w.left._photo_requested,
                 what="★の読み取りが終わる")
     return w
+
+
+def _press_photo_menu(w, pane):
+    """写真メニューのキーを押す。キーはキー表(DEFAULT_KEYMAP の photo_menu)から引く
+    (割り当てを変えてもテストを1か所ずつ直さずに済むように。いまは Alt+I)。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    code = next(c for c, cmd in w.keymap.items() if cmd == "photo_menu")
+    mods, vk = int(code[0]), int(code[1:])
+    assert 65 <= vk <= 90, code         # 英字キーのつもり
+    qmods = Qt.NoModifier
+    if mods & core.SHIFT:
+        qmods |= Qt.ShiftModifier
+    if mods & core.CTRL:
+        qmods |= Qt.ControlModifier
+    if mods & core.ALT:
+        qmods |= Qt.AltModifier
+    QTest.keyClick(pane.view, Qt.Key(Qt.Key_A.value + vk - 65), qmods)
 
 
 def _photo_menu_runner(w, picks, seen):
@@ -7138,11 +7159,19 @@ def test_photo_menu_targets_and_write():
         path = lambda n: str(photos / n)  # noqa: E731
         log = lambda: w.log_view.toPlainText()  # noqa: E731
         try:
+            # I は写真メニューではなく占有合計(写真フォルダモードでも意味は変えない)
+            seen, picks = [], []
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            _wait_until(lambda: "占有合計（a5.jpg）: 1 ファイル" in log(), what="I の占有合計")
+            assert seen == [] and w._size_job is None
+
             # カーソル位置の1枚。★が全部同じならその行に印
             seen, picks = [], ["&4:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("a5.jpg"))
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "写真の★（1枚）", seen
             assert len(seen[-1][1]) == 1 and seen[-1][1][0].startswith("&5:")
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 4)
@@ -7152,7 +7181,7 @@ def test_photo_menu_targets_and_write():
             # マーク中のファイル(写真でないものは飛ばしてログに件数)。実行後はマークを解く
             L.marks.update({"b4.jpg", "c3.jpg", "memo.txt"})
             picks.append("&5:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "写真の★（2枚）" and seen[-1][1] == []   # ★4 と ★3 で不揃い
             assert fake.calls[-1] == ("rating", [path("b4.jpg"), path("c3.jpg")], 5)
             assert "写真ではないもの 1 件を飛ばしました" in log()
@@ -7163,7 +7192,7 @@ def test_photo_menu_targets_and_write():
             # 失敗したものは表示を戻して理由を出す
             L.marks.update({"d_reject.jpg", "e_none.jpg"})
             picks.append("&3:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             _wait_until(lambda: "★3 を 1 枚に付けました（失敗 1：読み取り専用です）" in log(),
                         what="失敗のログ")
             assert _rating_texts(L)["d_reject.jpg"] == "❌削除候補" and _rating_texts(L)["e_none.jpg"] == "ベストショット"
@@ -7171,12 +7200,12 @@ def test_photo_menu_targets_and_write():
             # K: 全部に付いていれば外す、そうでなければ付ける
             L.marks.update({"b4.jpg", "c3.jpg"})
             picks.append("&K:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", True)
             _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "みてね用 済", what="キーワードが付く")
             L.marks.update({"b4.jpg", "c3.jpg"})
             picks.append("&K:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert any(t.startswith("&K:") for t in seen[-1][1])     # 全部に付いている印
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", False)
             _wait_until(lambda: _rating_texts(L)["c3.jpg"] == "みてね用", what="キーワードが外れる")
@@ -7185,7 +7214,7 @@ def test_photo_menu_targets_and_write():
             n = len(fake.calls)
             L.set_cursor(L._row_of("sub"))
             picks.append("&5:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "写真の★（0枚）" and len(fake.calls) == n
             assert "対象の写真がありません" in log()
 
@@ -7204,14 +7233,14 @@ def test_photo_menu_targets_and_write():
             sheet = w.preview_widget.rating.styleSheet()
             assert filer.DEFAULT_COLORS["rating_4_bg"] in sheet and "border-radius" in sheet
             picks.append("&5:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "写真の★（1枚）"
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 5)
             _wait_until(lambda: w.preview_widget.rating.text() == "💌 みてね用", what="ビュアの★の更新")
             # ビュアで見ながらマークしたら、マークした全部(ビュア中でもマーク優先)
             L.marks.update({"a5.jpg", "b4.jpg"})
             picks.append("&3:")
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "写真の★（2枚）", seen[-1]
             assert fake.calls[-1] == ("rating", [path("a5.jpg"), path("b4.jpg")], 3)
             _wait_until(lambda: w.preview_widget.rating.text() == "⭐ ベストショット", what="ビュアの★の更新")
@@ -7259,7 +7288,7 @@ def test_photo_rating_filter_and_presets():
             # I → / → B(ベストショットだけ ★>=3)。フォルダと .. は残る
             seen, picks = [], ["&/:", "&B:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[-1][0] == "&/:★で絞り込む"   # 小メニューの見出しは行の表示と同じ(Qt)
             assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
             assert L.rating_filter == "★>=3" and "★絞り込み: ★>=3" in L.header2.text()
@@ -7271,13 +7300,13 @@ def test_photo_rating_filter_and_presets():
             assert "文字目" in w.filter_expr_error("★>=") and w.filter_expr_error("★>=3") == ""
             w.ask_filter_expr = lambda text: "reject || #みてね済"
             picks.extend(["&/:", "&E:"])
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert _names(L) == ["..", "sub", "c3.jpg", "d_reject.jpg"]
             assert not w.apply_rating_filter("(★>=3")
             assert "式が読めません（" in log() and L.rating_filter == "reject || #みてね済"
             # A: 解く
             picks.extend(["&/:", "&A:"])
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert L.rating_filter == "" and "memo.txt" in _names(L)
 
             # sel はマーク中か。人物名は不明(隠れる)
@@ -7559,7 +7588,7 @@ def test_photo_write_with_exiftool():
             seen, picks = [], ["&4:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("e_none.jpg"))
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             _wait_until(lambda: "★4 を 1 枚に付けました" in w.log_view.toPlainText(),
                         timeout=30, what="ExifTool の書き込み")
             assert xmp.read_meta(target).rating == 4
@@ -7607,7 +7636,7 @@ def test_photo_export_menu():
             seen, picks = [], ["&E:", "&F:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("a5.jpg"))
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert seen[0][0].startswith("写真の★") and seen[1][0] == "&E:書き出し", (seen, log())
             assert asked and "同期先 1 か所" in asked[-1] and str(photos) in asked[-1], log()
             _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
@@ -7619,7 +7648,7 @@ def test_photo_export_menu():
 
             # M: ★5 でみてね済でないもの(a5 と sub/one)を集め、反対窓で開く
             picks += ["&E:", "&M:"]
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             _wait_until(lambda: "みてね用に集める: 2 枚" in log(), timeout=30, what="集め終わり")
             _wait(w)
             assert core.same_dir(w.right.path, mitene)
@@ -7628,7 +7657,7 @@ def test_photo_export_menu():
 
             # D: 確かめてから、フェイクの ExifTool でみてね済を付けて片付ける
             picks += ["&E:", "&D:"]
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert "2 枚の元の写真に「みてね済」" in asked[-1]
             _wait_until(lambda: "2 枚にみてね済を付けて片付けました" in log(), timeout=30,
                         what="片付けの終わり")
@@ -7640,7 +7669,7 @@ def test_photo_export_menu():
             filer.photo_config.save_config(filer.photo_config.default_config())
             picks += ["&E:", "&F:"]
             n = len(asked)
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert len(asked) == n
             assert "同期先がありません（photo_ratings.json の frame_targets）" in log()
         finally:
@@ -7724,7 +7753,7 @@ def test_photo_menu_submenu_keys():
         try:
             w._exec_menu = drive
             L.set_cursor(L._row_of("a5.jpg"))
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert checked, w.log_view.toPlainText()
             assert L.rating_filter == "★>=3"
             assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
@@ -7850,12 +7879,12 @@ def test_photo_manual_delete_list():
                 return QDialog.Rejected
             w.exec_dialog = look
             L.set_cursor(L._row_of("a5.jpg"))
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert shown == [("手で消す写真の一覧（0枚）", "", False, True)], shown
 
             # 同期で old_c3.jpg を消す → 一覧に残り、ログに出る
             picks += ["&E:", "&F:"]
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
             _wait_until(lambda: "手で消す写真" in log(), what="手で消す写真のログ")
             assert not (frame / "old_c3.jpg").exists()
@@ -7887,7 +7916,7 @@ def test_photo_manual_delete_list():
                 return dialog.result()
             w.exec_dialog = drive
             picks += ["&E:", "&L:"]
-            QTest.keyClick(L.view, Qt.Key_I)
+            _press_photo_menu(w, L)
             assert "&L:手で消す写真の一覧（1枚）" in labels, labels
             title, text, enabled, parented = shown[-1]
             assert title == "手で消す写真の一覧（1枚）" and enabled and parented, shown[-1]
@@ -7901,6 +7930,306 @@ def test_photo_manual_delete_list():
             w.close()
             w.deleteLater()
             filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
+
+
+# ---------------------------------------------------------------
+# 合計ファイルサイズ(I = 占有合計 / Shift+I = 単純合計)と E / V の画像の確認
+# ---------------------------------------------------------------
+def _make_size_tree(root):
+    """一時フォルダに、サイズの分かったファイルとフォルダを作る。"""
+    root = Path(root)
+    (root / "sub" / "deep").mkdir(parents=True)
+    (root / "empty").mkdir()
+    for rel, size in (("zero.bin", 0), ("one.bin", 1), ("five.bin", 5000),
+                      ("sub/c.bin", 4096), ("sub/deep/e.bin", 4097)):
+        (root / rel).write_bytes(b"x" * size)
+    return root
+
+
+def _make_junction(link, target) -> bool:
+    """ジャンクションを作る(管理者権限は要らない)。作れなければ False。"""
+    import subprocess
+    try:
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       check=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return os.path.isdir(link)
+
+
+def _denied_scandir(name):
+    """name という名前のフォルダだけ読めない scandir(アクセス拒否の代わり)。"""
+    def scandir(path):
+        if os.path.basename(path) == name:
+            raise PermissionError(5, "アクセスが拒否されました", path)
+        return os.scandir(path)
+    return scandir
+
+
+def test_tally_sizes_core():
+    import filer_shell as sh
+    assert core.round_to_cluster(0, 4096) == 0
+    assert core.round_to_cluster(1, 4096) == 4096
+    assert core.round_to_cluster(4096, 4096) == 4096
+    assert core.round_to_cluster(4097, 4096) == 8192
+    assert core.round_to_cluster(5, None) == 5      # クラスタが分からなければそのまま
+    assert core.bytes_unit(1023) == "" and core.bytes_unit(5003) == "4.9KB"
+    assert core.format_bytes(5003) == "5,003 (4.9KB)" and core.format_bytes(10) == "10"
+    t = core.SizeTally(files=1234, dirs=56, logical=1, allocated=12345678901)
+    assert core.size_total_text(t, True, "sub") == (
+        "占有合計（sub）: 1,234 ファイル / 56 フォルダ　12,345,678,901 バイト（11.5GB）")
+    assert core.size_total_text(t, False) == "単純合計: 1,234 ファイル / 56 フォルダ　1 バイト"
+
+    cluster = lambda path: 4096  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _make_size_tree(tmp)
+        # フォルダ全体(根は数えない): ファイル 5・フォルダ 3(sub / deep / empty)
+        r = core.tally_sizes([str(root)], cluster, count_roots=False)
+        assert (r.files, r.dirs, r.unreadable, r.cancelled) == (5, 3, 0, False), r
+        assert r.logical == 0 + 1 + 5000 + 4096 + 4097
+        assert r.allocated == 0 + 4096 + 8192 + 4096 + 8192      # 0 バイトは 0
+        # 指定したフォルダ自身も数える・ファイル1つ・両方
+        r = core.tally_sizes([str(root / "sub")], cluster)
+        assert (r.files, r.dirs, r.logical, r.allocated) == (2, 2, 8193, 12288), r
+        r = core.tally_sizes([str(root / "one.bin")], cluster)
+        assert (r.files, r.dirs, r.logical, r.allocated) == (1, 0, 1, 4096), r
+        r = core.tally_sizes([str(root / "one.bin"), str(root / "empty")], None)
+        assert (r.files, r.dirs, r.logical, r.allocated) == (1, 1, 1, 1), r
+        # 消えたものは飛ばす
+        r = core.tally_sizes([str(root / "gone.bin")], cluster)
+        assert (r.files, r.dirs, r.unreadable) == (0, 0, 0)
+        # 読めないフォルダ: 数を飛ばして unreadable に数える(フォルダ自身は数える)
+        r = core.tally_sizes([str(root / "sub")], cluster, scandir=_denied_scandir("deep"))
+        assert (r.files, r.dirs, r.unreadable, r.logical) == (1, 2, 1, 4096), r
+        # 中止: 立っていれば何も数えずに cancelled
+        stop = threading.Event()
+        stop.set()
+        r = core.tally_sizes([str(root)], cluster, cancel=stop, count_roots=False)
+        assert r.cancelled and r.files == 0
+        # 途中で中止(2件目を見たところで立てる)。途中経過は増えていく件数
+        stop = threading.Event()
+        seen_count = []
+        old = core.SIZE_PROGRESS_SEC
+        core.SIZE_PROGRESS_SEC = 0
+        try:
+            def progress(n):
+                seen_count.append(n)
+                if n >= 2:
+                    stop.set()
+            r = core.tally_sizes([str(root)], cluster, cancel=stop, progress=progress,
+                                 count_roots=False)
+        finally:
+            core.SIZE_PROGRESS_SEC = old
+        assert r.cancelled and r.files + r.dirs < 8, r
+        assert seen_count and seen_count == sorted(seen_count)
+        # ジャンクションはフォルダとして1件数えるが、中へは潜らない
+        link = root / "link"
+        if _make_junction(link, root / "sub"):
+            try:
+                r = core.tally_sizes([str(root)], cluster, count_roots=False)
+                assert (r.files, r.dirs) == (5, 4), r
+                r = core.tally_sizes([str(link)], cluster)     # 根がジャンクションでも潜らない
+                assert (r.files, r.dirs) == (0, 1), r
+            finally:
+                os.rmdir(link)
+        # 本物のクラスタの大きさ(一時フォルダのドライブ)
+        size = sh.cluster_size(core.drive_root(str(root)))
+        assert size and size % 512 == 0, size
+
+    # 書庫の中: 展開したときのサイズの単純合計
+    import filer_archive
+    with tempfile.TemporaryDirectory() as tmp:
+        zpath = os.path.join(tmp, "a.zip")
+        with zipfile.ZipFile(zpath, "w") as z:
+            z.writestr("top.txt", b"t" * 10)
+            z.writestr("dir/in.txt", b"i" * 20)
+            z.writestr("dir/more/x.txt", b"x" * 30)
+        index = filer_archive.get_index(zpath)
+        r = core.tally_archive(index, "")
+        assert (r.files, r.dirs, r.logical, r.allocated) == (3, 2, 60, 60), r
+        r = core.tally_archive(index, "", ["dir"])
+        assert (r.files, r.dirs, r.logical) == (2, 2, 50), r
+        r = core.tally_archive(index, "dir", ["in.txt", "nothing"])
+        assert (r.files, r.dirs, r.logical) == (1, 0, 20), r
+        r = core.tally_archive(index, "dir")
+        assert (r.files, r.dirs, r.logical) == (2, 1, 50), r
+
+
+def _size_window(left, right, settings_path):
+    import filer
+    w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                     "editor": "ed"}}, str(settings_path))
+    w.resize(1000, 600)
+    w.show()
+    w.start()
+    _wait(w)
+    return w
+
+
+def _wait_size_threads(w, timeout=10.0):
+    _wait_until(lambda: not any(t.is_alive() and t.name == "filer-size-total"
+                                for t in w._tracked_threads),
+                timeout=timeout, what="合計ファイルサイズのスレッドが終わる")
+
+
+def test_size_total_keys():
+    import filer_shell as sh
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        (left / "sub1" / "s.txt").write_bytes(b"s" * 3)
+        (left / "sub1" / "deep" / "x.bin").write_bytes(b"x" * 5000)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _size_window(left, right, settings_path)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        cluster = sh.cluster_size(core.drive_root(str(left)))
+        up = lambda n: core.round_to_cluster(n, cluster)  # noqa: E731
+        menus = []
+        w._exec_menu = lambda menu, chosen: menus.append(menu.title())   # 開いたら記録だけ
+        real_tally = core.tally_sizes
+        try:
+            # I: カーソル行の1ファイル(占有はクラスタの倍数に切り上げ)。写真メニューは開かない
+            L.set_cursor(L._row_of("alpha.txt"))
+            key(Qt.Key_I)
+            _wait_until(lambda: w._size_job is None and "占有合計（alpha.txt）" in log(),
+                        what="I の結果")
+            assert f"占有合計（alpha.txt）: 1 ファイル / 0 フォルダ　{up(10):,} バイト" in log(), log()
+            assert w.status_state == "Ready." and menus == []
+
+            # Shift+I: カーソル行のフォルダ(中まで数え、フォルダ自身も数える)
+            L.set_cursor(L._row_of("sub1"))
+            key(Qt.Key_I, Qt.ShiftModifier)
+            _wait_until(lambda: "単純合計（sub1）" in log(), what="Shift+I の結果")
+            assert "単純合計（sub1）: 2 ファイル / 2 フォルダ　5,003 バイト（4.9KB）" in log(), log()
+
+            # マークあり: マークしたもの全部(件数を添える)
+            L.marks.update({"alpha.txt", "sub1"})
+            L.set_cursor(L._row_of("beta.md"))
+            key(Qt.Key_I)
+            _wait_until(lambda: "占有合計（マーク 2件）" in log(), what="マークの結果")
+            total = up(10) + up(3) + up(5000)
+            assert f"占有合計（マーク 2件）: 3 ファイル / 2 フォルダ　{total:,} バイト" in log(), log()
+            L.marks.clear()
+            L.model.all_changed()
+
+            # "..": いまのフォルダ全体(フォルダ自身は数えない)
+            L.set_cursor(0)
+            assert L.cursor_entry().is_parent
+            key(Qt.Key_I, Qt.ShiftModifier)
+            _wait_until(lambda: f"単純合計（{L.path} 全体）" in log(), what=".. の結果")
+            assert (f"単純合計（{L.path} 全体）: 6 ファイル / 3 フォルダ　"
+                    f"{10 + 20 + 1 + 100 + 3 + 5000:,} バイト（5.0KB）") in log(), log()
+
+            # 読めないフォルダ: 飛ばして2行目に件数
+            core.tally_sizes = lambda *a, **k: real_tally(*a, scandir=_denied_scandir("deep"), **k)
+            L.set_cursor(L._row_of("sub1"))
+            key(Qt.Key_I, Qt.ShiftModifier)
+            _wait_until(lambda: "読めなかったフォルダ 1 件" in log(), what="読めないフォルダ")
+            assert "単純合計（sub1）: 1 ファイル / 2 フォルダ　3 バイト" in log(), log()
+
+            # Esc で中止: 結果を待たずにすぐ知らせ、後から届いた結果は出さない。窓は閉じない
+            gate = threading.Event()
+
+            def slow(path):
+                gate.wait(10)
+                return os.scandir(path)
+            core.tally_sizes = lambda *a, **k: real_tally(*a, scandir=slow, **k)
+            before = log().count("占有合計（sub1）")
+            key(Qt.Key_I)
+            assert w._size_job is not None and w.status_state.startswith("数えています…")
+            key(Qt.Key_I, Qt.ShiftModifier)            # 数えている間はもう1つ始めない
+            assert "単純合計: 数えている途中です（Esc で中止）" in log()
+            key(Qt.Key_Escape)
+            assert w._size_job is None and w.status_state == "Ready."
+            assert log().rstrip().endswith("占有合計: 中止しました"), log()
+            gate.set()
+            _wait_size_threads(w)
+            QTest.qWait(50)
+            assert log().count("占有合計（sub1）") == before
+            assert w.isVisible()
+            core.tally_sizes = real_tally
+
+            # 書庫の中: 中の項目のサイズを足す(その場で出る)
+            zpath = left / "pack.zip"
+            with zipfile.ZipFile(zpath, "w") as z:
+                z.writestr("top.txt", b"t" * 10)
+                z.writestr("dir/in.txt", b"i" * 20)
+            L.load(str(left))
+            _wait(w)
+            L.set_cursor(L._row_of("pack.zip"))
+            key(Qt.Key_Return)
+            _wait(w)
+            assert L.archive == (str(zpath), "")
+            L.set_cursor(0)
+            key(Qt.Key_I)
+            assert "全体）: 2 ファイル / 1 フォルダ　30 バイト　※書庫の中は展開後のサイズ" in log(), log()
+            L.set_cursor(L._row_of("dir"))
+            key(Qt.Key_I, Qt.ShiftModifier)
+            assert "単純合計（dir）: 1 ファイル / 1 フォルダ　20 バイト" in log(), log()
+            assert menus == []
+        finally:
+            core.tally_sizes = real_tally
+            _wait_size_threads(w)
+            w.close()
+
+
+def test_edit_confirms_images():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        (left / "shot.CR2").write_bytes(b"raw")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _size_window(left, right, settings_path)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        asked, answers, calls = [], [], []
+
+        def confirm(title, text, default_yes=True, parent=None):
+            asked.append((text, default_yes))
+            return answers.pop(0)
+        w.confirm = confirm
+        real_popen = filer.subprocess.Popen
+        filer.subprocess.Popen = lambda args, **kw: calls.append(args)  # エディタは起こさない
+        try:
+            # 画像を含むマーク + E: 確かめる(既定は「いいえ」)。いいえなら開かない
+            L.marks.update({"alpha.txt", "photo.JPG"})
+            answers.append(False)
+            key(Qt.Key_E)
+            assert asked == [("画像 1 件を含む 2 件をエディタで開きますか？", False)], asked
+            assert calls == []
+            # はいなら全部開く
+            answers.append(True)
+            key(Qt.Key_E)
+            assert len(asked) == 2
+            assert sorted(os.path.basename(a[1]) for a in calls) == ["alpha.txt", "photo.JPG"]
+            # 画像を含まなければ確認なし(V も同じ)
+            calls.clear()
+            L.marks.clear()
+            L.marks.add("beta.md")
+            key(Qt.Key_V)
+            assert len(asked) == 2 and [os.path.basename(a[1]) for a in calls] == ["beta.md"]
+            # V でカーソル行の RAW: 確かめる。いいえなら開かない
+            calls.clear()
+            L.marks.clear()
+            L.set_cursor(L._row_of("shot.CR2"))
+            answers.append(False)
+            key(Qt.Key_V)
+            assert asked[-1] == ("画像 1 件を含む 1 件をエディタで開きますか？", False), asked
+            assert calls == [] and not answers
+        finally:
+            filer.subprocess.Popen = real_popen
+            w.close()
 
 
 def main() -> int:

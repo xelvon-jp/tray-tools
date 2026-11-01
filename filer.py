@@ -118,7 +118,7 @@ DEFAULT_COLORS = {
     "mark_end": "#0c0c0c",        # マークした行の背景(右端の色。左→右のグラデーション)
     "mark_text": "",              # マーク行の字の色。空ならファイルの種類の色のまま
     "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
-    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / I などの
+    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / Alt+I などの
                                   # メニューで選んでいる行(メニューは左端に cursor の色の縦線も)
     "header_active": "#00001c",   # アクティブ窓のパス表示の地と枠(あふｗと同じく
                                   # 帯は付けず地のまま。区別は字の色とカーソルで)
@@ -319,8 +319,8 @@ PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★
 RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
 RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
 RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
-# 写真メニュー(I)の小メニューの動作の種類(photometa.config の filter_menu_items /
-# export_menu_items)。I メニューの exec が小メニューの項目を返したとき、どちらかを見分ける。
+# 写真メニュー(Alt+I)の小メニューの動作の種類(photometa.config の filter_menu_items /
+# export_menu_items)。Alt+I メニューの exec が小メニューの項目を返したとき、どちらかを見分ける。
 PHOTO_FILTER_KINDS = ("filter", "filter_input", "filter_clear")
 PHOTO_EXPORT_KINDS = ("frame_sync", "mitene_collect", "mitene_finish", "frame_manual_list")
 EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
@@ -632,6 +632,10 @@ class ListBridge(QObject):
     photo_meta = Signal(object)
     # ★・キーワードを書き終えたとき (書き込みの番号, 結果の一覧 or None, エラー文字列)。
     photo_written = Signal(object)
+    # 合計ファイルサイズ(I / Shift+I): 途中経過 (番号, 数えた件数) と、終わったとき
+    # (番号, core.SizeTally or None, エラー文字列)。
+    size_progress = Signal(object)
+    size_done = Signal(object)
 
 
 # ---------------------------------------------------------------
@@ -707,7 +711,7 @@ class Pane(QWidget):
         self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
         self._photo_auto = False
         self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
-        # ★の絞り込み(I → / と Alt+数字)。rating_filter は文字の式、rating_range は下部の
+        # ★の絞り込み(Alt+I → / と Alt+数字)。rating_filter は文字の式、rating_range は下部の
         # ★の範囲スライダー(lo, hi)。rating_node はその2つを AND した式の解析済みの木
         # (どちらも無ければ None)。文字の式にスライダーの条件は書き込まない。
         # どちらもフォルダを移ったら解く(保存しない)。
@@ -1734,7 +1738,7 @@ class Pane(QWidget):
 
     # --- 写真の★(写真フォルダモード・★の列・★の絞り込み) ---
     def build_photo_bar(self) -> None:
-        """写真のボタン段を(作り直して)並べる。中身は写真メニュー(I)の項目と同じ。"""
+        """写真のボタン段を(作り直して)並べる。中身は写真メニュー(Alt+I)の項目と同じ。"""
         win = self.window_
         layout = self.photo_bar.layout()
         for button in self.photo_buttons:
@@ -2143,7 +2147,7 @@ class _SubMenu:
 
 
 def _menu_style_sheet(colors) -> str:
-    """C / M / I などのメニュー(_ChooserMenu)の見た目。ファイル窓と同じ地と字の色にし、
+    """C / M / Alt+I などのメニュー(_ChooserMenu)の見た目。ファイル窓と同じ地と字の色にし、
     選んでいる行はダイアログのカーソル行(dialog_cursor)の地＋左端にカーソルの色の縦線。
 
     以前は OS の既定の見た目のままで、地と選んでいる行の色が近すぎてどれが選ばれて
@@ -2339,6 +2343,12 @@ class FilerWindow(QWidget):
         self._hash_busy = False
         self.bridge.tree_built.connect(self._on_tree_built)
         self._tree_busy = False
+        # 合計ファイルサイズ(I / Shift+I)。数えている間は (番号, 中止の Event, 占有か, 見出し)。
+        self.bridge.size_progress.connect(self._on_size_progress)
+        self.bridge.size_done.connect(self._on_size_done)
+        self._size_job = None
+        self._size_seq = 0
+        self._cluster_cache = {}
         # ファイル転送のキュー(_transfer 参照)。実行中の op と待ちの列。
         self.bridge.op_done.connect(self._on_op_done)
         self._op_queue = []
@@ -3153,6 +3163,9 @@ class FilerWindow(QWidget):
         if event.key() == Qt.Key_Escape and self.active.es_loading:
             self.active.cancel_es()     # Esc は「処理の中止」: Everything 検索を止める
             return
+        if event.key() == Qt.Key_Escape and self._size_job is not None:
+            self.cancel_size_total()    # Esc は「処理の中止」: 合計ファイルサイズを止める
+            return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
         if event.key() == Qt.Key_Escape and self.preview_on:
@@ -3443,6 +3456,13 @@ class FilerWindow(QWidget):
     def cmd_edit(self):
         files = [e for e in self.active.targets() if not e.is_dir]
         if not files:
+            return
+        # 画像をマークしたまま E / V を押すと、その枚数だけエディタで画像を開こうとして
+        # しまう。画像(RAW も)が混ざっていたら確かめる。既定は「いいえ」。
+        images = sum(1 for e in files if photo_xmp.is_photo(e.name))
+        if images and not self.confirm(
+                "あっふ", f"画像 {images} 件を含む {len(files)} 件をエディタで開きますか？",
+                default_yes=False):
             return
         if self.active.archive is not None:
             self._extract_to_temp(files, self._open_in_editor)
@@ -4968,6 +4988,146 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001
             self.log(f"エラー: {_log_exception('tree')}")
 
+    # --- 合計ファイルサイズ(I = 占有合計 / Shift+I = 単純合計。あふｗ標準のキー) ---
+    def cmd_size_total(self):
+        """I: 占有合計ファイルサイズ表示(サイズをクラスタの倍数に切り上げて足す)。"""
+        self.start_size_total(allocated=True)
+
+    def cmd_size_total_simple(self):
+        """Shift+I: 単純合計ファイルサイズ表示(サイズをそのまま足す)。"""
+        self.start_size_total(allocated=False)
+
+    def size_total_targets(self):
+        """(フルパスの一覧, 中身だけ数えるか, 見出しに添える名前)。対象が無ければ None。
+
+        マークがあればマークしたもの全部、無ければカーソル行。カーソルが ".." なら
+        いまのフォルダ全体(フォルダ自身は数えず中身だけ)。"""
+        pane = self.active
+        entries = pane.targets()
+        if entries:
+            if pane.marks:
+                label = f"マーク {len(entries)}件"
+            else:
+                label = os.path.basename(entries[0].name.rstrip("\/")) or entries[0].name
+            return [pane.entry_path(e) for e in entries], False, label
+        entry = pane.cursor_entry()
+        if not pane.marks and entry is not None and entry.is_parent and pane.path:
+            return [pane.path], True, f"{pane.path} 全体"
+        return None
+
+    def start_size_total(self, allocated: bool) -> None:
+        """対象のファイル数・フォルダ数・合計バイト数を裏のスレッドで数え、メッセージ窓に出す。
+        数えている間はステータスバーに件数を出し、Esc で止められる。"""
+        kind = "占有合計" if allocated else "単純合計"
+        if self._size_job is not None:
+            self.log(f"{kind}: 数えている途中です（Esc で中止）")
+            return
+        pane = self.active
+        if pane.archive is not None:
+            self._size_total_archive(allocated)
+            return
+        picked = self.size_total_targets()
+        if picked is None:
+            return
+        paths, contents_only, label = picked
+        self._size_seq += 1
+        job = self._size_seq
+        cancel = threading.Event()
+        self._size_job = (job, cancel, allocated, label)
+        self.set_status_state("数えています… 0 件")
+        bridge = self.bridge
+        emit = self.safe_emit
+        cluster_of = self._cluster_of
+
+        def progress(count):
+            if not emit(bridge.size_progress, (job, count)):
+                cancel.set()        # 窓を閉じ始めた。数えるのをやめる
+
+        def worker():
+            try:
+                tally = core.tally_sizes(paths, cluster_of, cancel, progress,
+                                         count_roots=not contents_only)
+                payload = (job, tally, "")
+            except Exception as e:  # noqa: BLE001  何が来ても結果として返す
+                payload = (job, None, f"{type(e).__name__}: {e}")
+            emit(bridge.size_done, payload)
+
+        self.spawn_tracked(worker, "filer-size-total")
+
+    def _cluster_of(self, path: str):
+        """path のドライブのクラスタの大きさ(読み取りスレッドから呼ぶ。ドライブごとに覚える)。"""
+        root = core.drive_root(path)
+        if root is None:
+            return None
+        key = os.path.normcase(root)
+        if key not in self._cluster_cache:
+            try:
+                self._cluster_cache[key] = filer_shell.cluster_size(root)
+            except OSError:
+                self._cluster_cache[key] = None
+        return self._cluster_cache[key]
+
+    def _size_total_archive(self, allocated: bool) -> None:
+        """書庫の中: 中の項目の(展開したときの)サイズを足す。目録は読み込み済みなのでその場で。"""
+        kind = "占有合計" if allocated else "単純合計"
+        pane = self.active
+        archive, inner = pane.archive
+        entries = pane.targets()
+        entry = pane.cursor_entry()
+        if entries:
+            names = [e.name for e in entries]
+            label = f"マーク {len(entries)}件" if pane.marks else entries[0].name
+        elif not pane.marks and entry is not None and entry.is_parent:
+            names = None
+            label = f"{filer_archive.display_path(archive, inner)} 全体"
+        else:
+            return
+        try:
+            tally = core.tally_archive(filer_archive.get_index(archive), inner, names)
+        except Exception as e:  # noqa: BLE001  壊れた書庫など
+            self.log(f"{kind}: 書庫を読めません  ({type(e).__name__}: {e})")
+            return
+        self.log(core.size_total_text(tally, allocated, label) + "　※書庫の中は展開後のサイズ")
+
+    def cancel_size_total(self) -> None:
+        """Esc: 数えるのを止める。結果を待たずにすぐ知らせる(遅いネットワークでも待たせない)。"""
+        if self._size_job is None:
+            return
+        _job, cancel, allocated, _label = self._size_job
+        cancel.set()
+        self._size_job = None
+        self.set_status_state("Ready.")
+        self.log(f"{'占有合計' if allocated else '単純合計'}: 中止しました")
+
+    def _on_size_progress(self, payload) -> None:
+        try:
+            job, count = payload
+            if self._size_job is not None and self._size_job[0] == job:
+                self.set_status_state(f"数えています… {count:,} 件")
+        except Exception:  # noqa: BLE001
+            _log_exception("sizeProgress")
+
+    def _on_size_done(self, payload) -> None:
+        try:
+            job, tally, error = payload
+            if self._size_job is None or self._size_job[0] != job:
+                return      # 中止した後に届いたもの
+            _job, _cancel, allocated, label = self._size_job
+            self._size_job = None
+            self.set_status_state("Ready.")
+            kind = "占有合計" if allocated else "単純合計"
+            if tally is None:
+                self.log(f"{kind}: 数えられませんでした  ({error})")
+                return
+            if tally.cancelled:
+                self.log(f"{kind}: 中止しました")
+                return
+            self.log(core.size_total_text(tally, allocated, label))
+            if tally.unreadable:
+                self.log(f"　読めなかったフォルダ {tally.unreadable:,} 件（その中は数えていません）")
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('sizeTotal')}")
+
     # --- ワークスペース(Alt+J。左右のパスの組) ---
     def _workspace_side_path(self, pane):
         """保存に使う窓のパス。一時置き場なら開く前にいたフォルダ。"""
@@ -5944,9 +6104,9 @@ class FilerWindow(QWidget):
             return "add"
         return None
 
-    # --- 写真の★(I メニュー・ボタン段・★の絞り込み・変更記録) ---
+    # --- 写真の★(Alt+I メニュー・ボタン段・★の絞り込み・変更記録) ---
     def photo_bar_items(self) -> list:
-        """写真のボタン段の [(表示名, 動作)]。写真メニュー(I)の項目から作り、名前は短く。"""
+        """写真のボタン段の [(表示名, 動作)]。写真メニュー(Alt+I)の項目から作り、名前は短く。"""
         cfg = self.photo_config
         levels = {lv["name"]: lv for lv in cfg.get("levels") or []}
         keywords = cfg.get("keywords") or []
@@ -5983,7 +6143,7 @@ class FilerWindow(QWidget):
             pane.update_rating_bar()
 
     def press_photo_button(self, pane, action) -> None:
-        """写真のボタン段を押した。I メニューで選んだのと同じ動作(対象はその窓の
+        """写真のボタン段を押した。Alt+I メニューで選んだのと同じ動作(対象はその窓の
         マーク中のファイル、無ければカーソル位置)。フォーカスはファイル窓に残す。"""
         try:
             if pane.side != self.active_side:
@@ -5998,7 +6158,7 @@ class FilerWindow(QWidget):
 
         マーク中のファイル、無ければカーソル位置(pick_targets と同じ)。画像ビュア
         (F3 のプレビュー)を出している間も同じ(マークが無ければ表示中の1枚)。
-        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んで I で
+        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んで Alt+I で
         まとめて付ける、というあっふの使い方で1枚にしか付かなかった(2026-11-01)。"""
         pane = self.active
         if pane.archive is not None:
@@ -6027,8 +6187,9 @@ class FilerWindow(QWidget):
         return meta is not None and any(k.casefold() == folded for k in meta.keywords)
 
     def cmd_photo_menu(self):
-        """I: 写真メニュー(★を付ける・キーワード・★で絞り込む)。写真フォルダモードで
-        なくても効く。"""
+        """Alt+I: 写真メニュー(★を付ける・キーワード・★で絞り込む)。写真フォルダモードで
+        なくても効く(写真フォルダモードかどうかでキーの意味は変えない。I は合計ファイル
+        サイズ。あふｗに合わせた)。"""
         self._reload_photo_config()
         paths, skipped, refused = self.photo_targets()
         if refused:
@@ -6073,11 +6234,11 @@ class FilerWindow(QWidget):
             self.photo_export_menu()
             return
         if kind in PHOTO_FILTER_KINDS:
-            # I メニューの小メニュー(★で絞り込む)で選んだ項目
+            # Alt+I メニューの小メニュー(★で絞り込む)で選んだ項目
             self.run_photo_filter(action)
             return
         if kind in PHOTO_EXPORT_KINDS:
-            # I メニューの小メニュー(書き出し)で選んだ項目
+            # Alt+I メニューの小メニュー(書き出し)で選んだ項目
             self.run_photo_export(action)
             return
         if kind not in ("rating", "keyword"):
@@ -6275,7 +6436,7 @@ class FilerWindow(QWidget):
         key = rating_color_key(meta.rating)
         return text, self.colors[key], self.colors[f"{key}_bg"]
 
-    # --- 書き出し(I → E。フォトフレーム同期・みてね) ---
+    # --- 書き出し(Alt+I → E。フォトフレーム同期・みてね) ---
     def _photo_export_items(self) -> list:
         """書き出しの小メニューの行(build_menu の形)。件数などはこの時点の値。"""
         items = []
@@ -6286,7 +6447,7 @@ class FilerWindow(QWidget):
 
     def photo_export_menu(self) -> None:
         """書き出しのメニューを単独で開く(F フォトフレームへ同期 / M みてね用に集める /
-        D みてね済にして片付ける / L 手で消す写真の一覧)。I メニューからは小メニューで開く。"""
+        D みてね済にして片付ける / L 手で消す写真の一覧)。Alt+I メニューからは小メニューで開く。"""
         self._reload_photo_config()
         menu, chosen = self.build_menu("書き出し", self._photo_export_items())
         choice = self._exec_menu(menu, chosen)
@@ -6376,7 +6537,7 @@ class FilerWindow(QWidget):
         self._start_job(title, root, 0, run, done)
 
     def photo_manual_delete_list(self) -> None:
-        """I → E → L: 削除がクラウドへ反映されない同期先(frame_manual_delete)から消したので、
+        """Alt+I → E → L: 削除がクラウドへ反映されない同期先(frame_manual_delete)から消したので、
         クラウド(Amazon Photos など)で手で消す写真の一覧。同期先ごと・消した日時の順に名前を並べる。
         「ファイル名をコピー」(改行区切り。クラウドで検索するときに使う)/「消し終わった」
         (確かめてから一覧を空にする)/「閉じる」。"""
@@ -6569,7 +6730,7 @@ class FilerWindow(QWidget):
 
     def photo_filter_menu(self) -> None:
         """★で絞り込むメニューを単独で開く(写真のボタン段の「絞り込み▾」。段階・プリセット・
-        未選別・式を入力・解く)。I メニューからは小メニューで開く。"""
+        未選別・式を入力・解く)。Alt+I メニューからは小メニューで開く。"""
         menu, chosen = self.build_menu(*self._photo_filter_items())
         choice = self._exec_menu(menu, chosen)
         if choice is not None:

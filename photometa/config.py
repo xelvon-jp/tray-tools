@@ -1,6 +1,6 @@
 # photometa/config.py
 # 写真の★の共通設定 %LOCALAPPDATA%\traytools\photo_ratings.json（あっふと PhotoCuller が読む）と、
-# それから作る写真メニュー（I キー）・絞り込みの小メニュー（I → /）の中身。
+# それから作る写真メニュー（Alt+I キー）・絞り込みの小メニュー（Alt+I → /）の中身。
 #
 # 設定は辞書のまま扱う。読み込み時に normalize して、壊れた値は既定に戻す（項目ごと）。
 # 知らないキーは残す（後で項目が増えても、古い版が書き戻して消さないように）。
@@ -419,7 +419,7 @@ def menu_title(count: int) -> str:
 
 
 def menu_items(config: dict, export: bool = False) -> list[MenuItem]:
-    """写真メニュー（I）の行。動作は次のどれか：
+    """写真メニュー（Alt+I）の行。動作は次のどれか：
 
     ("rating", 5) / ("rating", 0) / ("rating", -1) … 選んだ写真に★を付ける
     ("keyword", "みてね済")                          … キーワードを付ける／外す
@@ -445,7 +445,7 @@ def menu_items(config: dict, export: bool = False) -> list[MenuItem]:
 
 
 def export_menu_items(config: dict) -> list[MenuItem]:
-    """書き出しの小メニュー（I → E）の行。動作は次のどれか：
+    """書き出しの小メニュー（Alt+I → E）の行。動作は次のどれか：
 
     ("frame_sync", None)     … フォトフレームへ同期（photometa.export.sync_frame）
     ("mitene_collect", None) … みてね用に集める（photometa.export.collect_mitene）
@@ -467,7 +467,7 @@ def export_menu_items(config: dict) -> list[MenuItem]:
 
 
 def filter_menu_items(config: dict) -> list[MenuItem]:
-    """絞り込みの小メニュー（I → /）の行。動作は次のどれか：
+    """絞り込みの小メニュー（Alt+I → /）の行。動作は次のどれか：
 
     ("filter", 式)           … その式で絞り込む
     ("filter_input", None)   … 式を入力する欄を出す

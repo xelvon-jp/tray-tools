@@ -4417,6 +4417,35 @@ def test_preview_image_orientation():
     assert core.fkey_labels(core.DEFAULT_KEYMAP)[2] == "Preview"
 
 
+def test_preview_applies_edits():
+    """補正（crs:）のある写真は、プレビューにも当てて出す（右半分の切り抜き）。"""
+    import struct
+
+    import filer_preview
+    from PIL import Image as PilImage
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "edited.jpg")
+        PilImage.new("RGB", (400, 300), (30, 120, 200)).save(str(path))
+        packet = ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+                  'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                  '<rdf:Description rdf:about="" '
+                  'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" '
+                  'crs:HasCrop="True" crs:CropTop="0" crs:CropLeft="0.5" '
+                  'crs:CropBottom="1" crs:CropRight="1"/>'
+                  "</rdf:RDF></x:xmpmeta>").encode("utf-8")
+        data = path.read_bytes()
+        payload = b"http://ns.adobe.com/xap/1.0/\x00" + packet
+        seg = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+        path.write_bytes(data[:2] + seg + data[2:])
+        result = filer_preview.load_preview(str(path), "image", F("edited.jpg"),
+                                            box=(800, 600))
+        image = result["image"]
+        assert image is not None and not image.isNull()
+        assert image.width() == 200 and image.height() == 300, image.size().toTuple()
+
+
 def _wait_preview(w, title, timeout=15.0):
     from PySide6.QtTest import QTest
     deadline = time.monotonic() + timeout

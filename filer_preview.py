@@ -48,6 +48,46 @@ turned_image = image_load.turned_image
 _read_image = image_load.read_image
 
 
+def _photo_edits(path: str):
+    """写真の補正（crs:）を読む（読み取りキャッシュ経由。無ければ None）。"""
+    try:
+        from photometa import metacache
+        meta = metacache.read_meta_cached(path)
+    except Exception:  # noqa: BLE001  補正が読めなくても見本は出す
+        return None
+    return meta.edits if meta else None
+
+
+def _edited_image(path: str, edits, box):
+    """補正を当てた画像を (QImage, 元の大きさ, 縮めたか) で返す。失敗したら None。
+
+    image_load.read_image と同じ返し方。向きも含めて photometa.render で当てる。
+    """
+    try:
+        from PIL import Image
+
+        from photometa import render
+        from PySide6.QtGui import QImage
+
+        with Image.open(path) as im:
+            img = render.apply_edits(im, edits)
+            img.load()
+        w, h = img.size
+        bw, bh = box
+        scaled = False
+        if w > bw or h > bh:
+            scale = min(bw / w, bh / h)
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                             Image.LANCZOS)
+            scaled = True
+        rgb = img.convert("RGB")
+        qimg = QImage(rgb.tobytes(), rgb.size[0], rgb.size[1], rgb.size[0] * 3,
+                      QImage.Format.Format_RGB888).copy()
+        return qimg, (w, h), scaled
+    except Exception:  # noqa: BLE001  当てられなければ通常の読み込みに任せる
+        return None
+
+
 def _read_folder(path: str):
     dirs, files, names = 0, 0, []
     with os.scandir(path) as it:
@@ -93,7 +133,15 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             lines, label = _read_text(path)
             result.update(lines=lines, note=label)
         elif kind == "image":
-            image, original, scaled = _read_image(path, *box)
+            edited = None
+            if archive is None:
+                edits = _photo_edits(path)
+                if edits is not None:
+                    edited = _edited_image(path, edits, box)
+            if edited is not None:
+                image, original, scaled = edited
+            else:
+                image, original, scaled = _read_image(path, *box)
             result.update(image=image, note=f"{original[0]}×{original[1]}" if original else "",
                           scaled=scaled)
         elif kind == "folder":

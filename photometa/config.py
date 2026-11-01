@@ -65,7 +65,8 @@ DEFAULT_CONFIG: dict = {
     # （photometa.export.pending_manual_deletes）。frame_targets の形は変えない（古い PhotoCuller も読む）
     "frame_manual_delete": [],
     # フォトフレーム用に作る JPEG（photometa.export.sync_frame）
-    "frame": {"max_long_edge": 2560, "quality": 85, "strip_gps": True},
+    "frame": {"max_long_edge": 2560, "quality": 85, "strip_gps": True,
+              "crop_aspect": None},
     # みてね用に集める先。空なら %TEMP%\みてね用（photometa.export.mitene_dir）
     "mitene_dir": "",
     "exiftool": "",
@@ -187,7 +188,27 @@ def normalize_frame(v) -> dict:
         out["quality"] = quality
     if isinstance(v.get("strip_gps"), bool):
         out["strip_gps"] = v["strip_gps"]
+    aspect = _aspect_value(v.get("crop_aspect"))
+    if aspect is not None:
+        out["crop_aspect"] = aspect
     return out
+
+
+def _aspect_value(v):
+    """縦横比（幅/高さ）を "16:10" の文字列か数で受けて float で返す。変なら None。"""
+    try:
+        if isinstance(v, str) and ":" in v:
+            w, h = v.split(":", 1)
+            value = float(w) / float(h)
+        elif isinstance(v, bool):
+            return None
+        elif isinstance(v, (int, float)):
+            value = float(v)
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+    return value if 0.2 <= value <= 5.0 else None
 
 
 def normalize(cfg) -> dict:

@@ -147,6 +147,27 @@ def suggest_crop(img_w: int, img_h: int, faces, aspect: float):
     return (by1 / img_h, bx1 / img_w, by2 / img_h, bx2 / img_w)
 
 
+def aspect_crop(img_w: int, img_h: int, aspect: float, faces=None):
+    """写真を縦横比に切り抜く枠（(top, left, bottom, right) の比率）。
+
+    顔があれば suggest_crop（顔基準）、無ければ中央（少し上寄り）。
+    すでに縦横比が合っていれば None（切り抜かない）。
+    """
+    if aspect <= 0 or img_w <= 0 or img_h <= 0:
+        return None
+    if abs(img_w / img_h - aspect) < 0.01:
+        return None
+    if faces:
+        return suggest_crop(img_w, img_h, faces, aspect)
+    if img_w / img_h > aspect:      # 横が余る → 高さいっぱい、幅を絞る
+        bw = img_h * aspect
+        left = (img_w - bw) / 2
+        return (0.0, left / img_w, 1.0, (left + bw) / img_w)
+    bh = img_w / aspect             # 縦が余る → 幅いっぱい、高さを絞る（中心は少し上）
+    top = min(max(img_h * 0.45 - bh / 2, 0.0), img_h - bh)
+    return (top / img_h, 0.0, (top + bh) / img_h, 1.0)
+
+
 def render_to_jpeg(src: str, out_path: str, edits: Edits | None,
                    quality: int = 92, strip_gps: bool = True) -> None:
     """補正を当てた JPEG を out_path に作る。撮影日時は元の EXIF から残す。"""

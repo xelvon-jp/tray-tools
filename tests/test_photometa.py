@@ -887,11 +887,11 @@ def _junction(link, target):
 
 def test_export_config_and_menu():
     cfg = pc.default_config()
-    assert cfg["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": True}
+    assert cfg["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": True, "crop_aspect": None}
     assert cfg["mitene_dir"] == ""
     bad = pc.normalize({"frame": {"max_long_edge": 10, "quality": "x", "strip_gps": False},
                         "mitene_dir": "  X:\\m  "})
-    assert bad["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": False}
+    assert bad["frame"] == {"max_long_edge": 2560, "quality": 85, "strip_gps": False, "crop_aspect": None}
     assert bad["mitene_dir"] == "X:\\m"
     assert pc.normalize({"frame": "broken"})["frame"]["quality"] == 85
     assert pc.normalize({"frame": {"max_long_edge": 1920.0}})["frame"]["max_long_edge"] == 1920
@@ -1766,6 +1766,43 @@ def test_frame_sync_applies_edits():
     assert len(res.updated) == 1, res
     with Image.open(os.path.join(res.updated[0][0], res.updated[0][1])) as im:
         assert im.size == (400, 75), im.size
+
+
+def test_frame_aspect_crop():
+    """frame.crop_aspect: 縦位置を 16:10 に切り抜く。顔があれば顔基準、手動の切り抜きが優先。"""
+    from PIL import Image
+
+    from photometa import config as pcfg
+
+    assert pcfg.normalize_frame({"crop_aspect": "16:10"})["crop_aspect"] == 1.6
+    assert pcfg.normalize_frame({"crop_aspect": "x"})["crop_aspect"] is None
+    assert pcfg.normalize_frame({})["crop_aspect"] is None
+
+    d, src, t1, _t2, ledger = _frame_setup("frame_aspect")
+    a = _exif_jpeg(src / "a.jpg", size=(1200, 1600))          # 縦位置
+    settings = {"crop_aspect": "16:10"}
+    res = pe.sync_frame([a], [str(t1)], settings, str(ledger))
+    assert len(res.added) == 1, res
+    with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
+        assert im.size == (1200, 750), im.size               # 幅いっぱい・16:10
+    # 顔が上端にあれば、枠も上端から（中央寄せと違う結果になる）
+    face = [(0.4, 0.02, 0.2, 0.1)]                            # (x, y, w, h) 比率
+    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
+                        faces_provider=lambda p: face)
+    assert len(res.updated) == 0, res   # 署名は顔に依存しない（作り直しにならない）
+    d2, src2, t3, _t4, ledger2 = _frame_setup("frame_aspect2")
+    a2 = _exif_jpeg(src2 / "a.jpg", size=(1200, 1600))
+    res = pe.sync_frame([a2], [str(t3)], settings, str(ledger2),
+                        faces_provider=lambda p: face)
+    with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
+        assert im.size[1] <= 750 and im.size[0] <= 1200, im.size
+    # 手動の切り抜きがある写真はそちらが優先（縦半分）
+    d3, src3, t5, _t6, ledger3 = _frame_setup("frame_aspect3")
+    a3 = _exif_jpeg(src3 / "a.jpg", size=(1200, 1600),
+                    packet=_crs_packet(crop=(0.0, 0.0, 0.5, 1.0)))
+    res = pe.sync_frame([a3], [str(t5)], settings, str(ledger3))
+    with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
+        assert im.size == (1200, 800), im.size
 
 
 def test_phone_share_renders_edits():

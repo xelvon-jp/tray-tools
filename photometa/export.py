@@ -375,13 +375,16 @@ def _sig_with_edits(sig: dict, edits) -> dict:
     return dict(sig, edits=edits.signature())
 
 
-def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None) -> str:
+def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None,
+                     faces=None) -> str:
     """フレーム用の JPEG を out_path に作る。名前に使う撮影日時（YYYYMMDD_HHMMSS）を返す。
 
     長辺を max_long_edge 以下に縮小（拡大しない・LANCZOS）、quality で保存。EXIF の向きは
     画素を回して直し、向き情報は付けない。日時のタグは残し、GPS は strip_gps なら消す
     （ほかの EXIF は付けない）。色の ICC プロファイルは残す。読めなければ例外。
     edits（補正）があれば、縮小の前に当てる（向き→傾き→切り抜き→明るさ）。
+    設定 crop_aspect があれば、手動の切り抜きが無い写真をその縦横比に切り抜く
+    （faces があれば顔基準、無ければ中央。render.aspect_crop）。
     """
     from PIL import Image, ImageOps
 
@@ -400,6 +403,15 @@ def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None) -> str
             if img is None:
                 img = im
         img.load()
+        if s.get("crop_aspect") and not (edits is not None and edits.crop is not None):
+            from . import render
+            crop = render.aspect_crop(img.size[0], img.size[1], s["crop_aspect"],
+                                      faces=faces)
+            if crop is not None:
+                top, left, bottom, right = crop
+                w, h = img.size
+                img = img.crop((round(left * w), round(top * h),
+                                round(right * w), round(bottom * h)))
         if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
             rgba = img.convert("RGBA")
             base = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -713,7 +725,7 @@ def _stale_entries(t: _Target, seen: set, scope_keys, keep_keys) -> list:
 
 
 def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progress=None,
-               scope=None, keep=(), manual_delete=()) -> SyncResult:
+               scope=None, keep=(), manual_delete=(), faces_provider=None) -> SyncResult:
     """フォトフレーム同期。sources（写真のパス）を、縮小した JPEG にして targets の各フォルダへ。
 
     台帳は ledger_dir に同期先ごと。scope（フォルダの並び）を渡したら、その下の写真だけを
@@ -779,9 +791,15 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
             if skip is not None:
                 (result.skipped_raw if skip == "raw" else result.skipped_heic).append(src)
                 continue
+            faces = None
+            if faces_provider is not None and s.get("crop_aspect"):
+                try:
+                    faces = faces_provider(src)
+                except Exception:  # noqa: BLE001  顔が取れなくても中央で切り抜く
+                    faces = None
             built = os.path.join(work, f"{i}.jpg")
             try:
-                stamp = build_frame_jpeg(src, built, s, edits=edits)
+                stamp = build_frame_jpeg(src, built, s, edits=edits, faces=faces)
             except Exception as e:  # noqa: BLE001  1枚の失敗で止めない
                 result.failed.append((src, f"{type(e).__name__}: {e}"))
                 continue

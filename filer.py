@@ -6768,6 +6768,8 @@ class FilerWindow(QWidget):
             text = f"{badge[0]} {name}".strip()
         if done:
             text += f" {RATING_DONE_MARK}"
+        if getattr(meta, "edits", None):
+            text += " ✂"      # 補正あり（プレビューにも当てて出す）
         key = rating_color_key(meta.rating)
         return text, self.colors[key], self.colors[f"{key}_bg"]
 

@@ -106,12 +106,20 @@ class FileInfoDialog(QDialog):
         keyword_now  今のキーワードの表示(「付いている」「付いていない」「いろいろ」)
 
     colors は "background" / "text"(ダイアログの地と字)と "cursor"(写真の★のボタンを
-    選んだときの枠)。"""
+    選んだときの枠)。
+
+    photo_only を立てると、名前・変換・タイムスタンプ・属性を隠して「写真の★」の欄だけに
+    する(★写真抽出の表示での R。名前が相対パスなので、名前などは変えない)。OK でも
+    on_apply は呼ばない(変更の計画は空)。"""
 
     def __init__(self, parent, folder: str, entries, colors=None, font=None, on_apply=None,
-                 photo=None):
+                 photo=None, photo_only=False):
         super().__init__(parent)
-        self.setWindowTitle("ファイル情報の一括変更" if len(entries) > 1 else "ファイル情報の編集")
+        self.photo_only = bool(photo_only and photo)
+        if self.photo_only:
+            self.setWindowTitle("写真の★")
+        else:
+            self.setWindowTitle("ファイル情報の一括変更" if len(entries) > 1 else "ファイル情報の編集")
         self.folder = folder
         self.entries = [e for e in entries if not e.is_parent]
         self.bulk = len(self.entries) > 1
@@ -153,7 +161,8 @@ class FileInfoDialog(QDialog):
 
         # ファイル名
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("ファイル名"))
+        self.name_label = QLabel("ファイル名")
+        name_row.addWidget(self.name_label)
         self.name_edit = NameEdit(first.name, core.caret_position(first.name, first.is_dir))
         name_row.addWidget(self.name_edit, 1)
         layout.addLayout(name_row)
@@ -227,6 +236,10 @@ class FileInfoDialog(QDialog):
             self.attr_checks[key] = check
         middle.addWidget(attrs, 2)
         layout.addLayout(middle)
+        if self.photo_only:
+            # 写真の★の欄だけにする(名前・変換・タイムスタンプ・属性は出さない)
+            for widget in (self.name_label, self.name_edit, convert, stamp, attrs):
+                widget.hide()
 
         # 写真の★(対象に画像があり★を書ける場所のときだけ)
         self.photo_box = None
@@ -267,7 +280,7 @@ class FileInfoDialog(QDialog):
             [self.ok_button, self.cancel_button]
         for a, b in zip(chain, chain[1:]):
             self.setTabOrder(a, b)
-        (self.name_edit if not self.bulk else self.ok_button).setFocus()
+        (self.name_edit if not (self.bulk or self.photo_only) else self.ok_button).setFocus()
 
     # --- 写真の★ ---
     def _build_photo_box(self, layout, photo: dict) -> None:
@@ -419,7 +432,7 @@ class FileInfoDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self.bulk:
+        if not (self.bulk or self.photo_only):
             self._place_caret()
             # 表示の直後に Qt が初期フォーカスを渡して全選択することがあるので、
             # 出来事が一巡した後でもう一度フォーカスとキャレットを置き直す。
@@ -456,7 +469,7 @@ class FileInfoDialog(QDialog):
     def _toggle_by_alt(self, event) -> bool:
         """Alt+R/S/H/A なら属性を切り替えて True。フォーカスは動かさない(写真の★と
         キーワードの Alt キーは QShortcut で受ける。_build_photo_box)。"""
-        if not event.modifiers() & Qt.AltModifier:
+        if self.photo_only or not event.modifiers() & Qt.AltModifier:
             return False
         letters = {letter: key for key, _label, letter in ATTR_ROWS}
         key = int(event.key())
@@ -498,6 +511,8 @@ class FileInfoDialog(QDialog):
 
     def build_plans(self):
         """入力から変更の計画を作る。([計画], 誤りの説明 or "")。"""
+        if self.photo_only:
+            return [], ""       # 写真の★の欄だけ(★は閉じた後に photo_changes で読む)
         if self.bulk:
             fields = self.stamp_fields() if self.stamp_check.isChecked() else None
             plans, problems = core.plan_bulk_info(

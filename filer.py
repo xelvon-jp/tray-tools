@@ -688,6 +688,17 @@ class Pane(QWidget):
         self.es_loading = False
         self.es_cancel = None
         self.es_status = "done"
+        # ★写真抽出(Shift+F → P)。配下の写真のうち★1以上をフラット表示の形で並べる(写真フォルダ
+        # モードを強制。窓の下の★の範囲スライダーとは AND)。pick_root は抽出した根(表示中だけ。
+        # 抜けたら None)。集めている間は pick_phase が "scan"(写真を探す) / "read"(★を読む)で、
+        # 進み具合は pick_count(見つけた数)・pick_read / pick_total(★を読んだ数 / 読む数)。
+        self.pick_root = None
+        self.pick_loading = False
+        self.pick_cancel = None
+        self.pick_phase = "scan"
+        self.pick_count = 0
+        self.pick_read = 0
+        self.pick_total = 0
         # 写真フォルダモード(★の列と★の範囲の段)。photo_override は Shift+Z の手動切り替え
         # ("auto" / "on" / "off")で、別のフォルダへ移ったら "auto" に戻る(保存しない)。
         self.photo_override = "auto"
@@ -958,7 +969,9 @@ class Pane(QWidget):
             text = "(読み込み中)"
         if self.photo_mode:
             text = "📷 " + text
-        if self.es_query is not None or self.es_loading:
+        if self.pick_root is not None or self.pick_loading:
+            text += "   [★写真抽出]"
+        elif self.es_query is not None or self.es_loading:
             scope = "全体" if self.es_all else "以下"
             text += f"   [Everything({scope}): {self.es_query or ''}]"
         elif self.grep_query is not None or self.grep_loading:
@@ -992,6 +1005,15 @@ class Pane(QWidget):
             text = f"一時置き場 {dirs + files}件   {size:,} bytes"
             if count:
                 text += f"   Mark {count} ({total:,})"
+        elif self.pick_loading:
+            if self.pick_phase == "read":
+                text = f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（Esc で中止）"
+            else:
+                text = f"写真を探しています… {self.pick_count:,}枚（Esc で中止）"
+        elif self.pick_root is not None:
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            text = core.pick_footer_text(self.pick_root, self.photo_shown, self.photo_total,
+                                         size, count, total)
         elif self.es_loading:
             text = "Everything で検索中（Esc で中止）"
         elif self.es_query is not None:
@@ -1098,6 +1120,7 @@ class Pane(QWidget):
         self._stop_flat()
         self._stop_grep()
         self._stop_es()
+        self._stop_pick()
         was_stash = self.stash
         self.stash = False
         self.stash_from = None
@@ -1228,6 +1251,9 @@ class Pane(QWidget):
         visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
+        if self.pick_root is not None:
+            # ★写真抽出の基準(★1以上)。R で★を外した写真は、ここで一覧から消える
+            visible = [e for e in visible if self.pick_match(e)]
         self.photo_total = sum(1 for e in visible if self.is_photo_entry(e))
         # ★の範囲は写真フォルダモードのときだけ効かせる(写真以外は★で絞らない)
         if self.rating_node is not None and self._photo_mode_now():
@@ -1255,6 +1281,9 @@ class Pane(QWidget):
         if self.stash:
             self.show_stash()
             return
+        if self.pick_root is not None and self.path:
+            self.load_pick(keep_marks=keep_marks)   # 抽出のまま集め直す(★は読んだものを使う)
+            return
         if self.es_query is not None and self.path:
             self.load_everything(self.es_query, self.es_all, keep_marks=keep_marks)
             return
@@ -1279,6 +1308,7 @@ class Pane(QWidget):
         self._stop_flat()
         self._stop_grep()
         self._stop_es()
+        self._stop_pick()
         self.request_id += 1   # 進行中のフォルダ読み込みを無効化する
         self.loading = False
         entries, missing = core.stash_entries(win.stash_paths)
@@ -1322,6 +1352,7 @@ class Pane(QWidget):
         """いまのフォルダより下のファイルを別スレッドで集めて1つの一覧にする。
         集めている間は窓の下の行に件数を出し、Esc で中止できる(cancel_flat)。"""
         self._stop_es()
+        self._stop_pick()
         if self.flat_cancel is not None:
             self.flat_cancel.set()
         self.request_id += 1
@@ -1363,7 +1394,7 @@ class Pane(QWidget):
 
     def _tick_flat(self) -> None:
         try:
-            if self.flat_loading or self.grep_loading or self.es_loading:
+            if self.flat_loading or self.grep_loading or self.es_loading or self.pick_loading:
                 self.update_footer()
             else:
                 self._flat_timer.stop()
@@ -1418,6 +1449,7 @@ class Pane(QWidget):
         探している間は窓の下の行に走査数を出し、Esc で中止できる(cancel_grep)。"""
         self._stop_flat()
         self._stop_es()
+        self._stop_pick()
         if self.grep_cancel is not None:
             self.grep_cancel.set()
         self.request_id += 1
@@ -1523,6 +1555,7 @@ class Pane(QWidget):
             return
         self._stop_flat()
         self._stop_grep()
+        self._stop_pick()
         if self.es_cancel is not None:
             self.es_cancel.set()
         self.request_id += 1
@@ -1600,6 +1633,145 @@ class Pane(QWidget):
             text += f"  ※{self.window_.es_limit:,}件で打ち切りました（語を足して絞ってください）"
         if missing:
             text += f"  ※索引にあって実在しない {missing}件は除きました"
+        self.window_.log(text)
+
+    # --- ★写真抽出(Shift+F → P) ---
+    def _stop_pick(self) -> None:
+        if self.pick_cancel is not None:
+            self.pick_cancel.set()
+        self.pick_cancel = None
+        self.pick_root = None
+        self.pick_loading = False
+
+    def pick_match(self, entry) -> bool:
+        """★写真抽出の基準に合うか(★1以上の写真。★を読めていないものは外す)。"""
+        meta = self.meta_of(entry)
+        return meta is not None and meta.rating >= core.PICK_MIN_RATING
+
+    def load_pick(self, keep_marks: bool = False) -> None:
+        """いまのフォルダより下の写真を裏のスレッドで集め、★を読み、★1以上のものを
+        フラット表示の形(相対パス名)で並べる。写真フォルダモードを強制するので、窓の下の
+        ★の範囲スライダーでさらに絞れる(基準とは AND)。
+
+        読み終わるまで一覧は差し替えない(窓の下の行に「★を読んでいます… n / m」)。
+        読めたものから順に出すと、数千枚では並べ直しのたびにカーソルの行がずれ、マークも
+        しにくいため。Esc で中止できる(cancel_pick)。★は読んである分(写真フォルダモードの
+        ★の列のキャッシュ)を使い、更新日時が変わっていなければ読み直さない。
+        オンライン専用の写真(OneDrive)は★を読むとダウンロードが始まるので飛ばす。"""
+        self._stop_flat()
+        self._stop_grep()
+        self._stop_es()
+        # 抽出の表示のまま集め直す(F5・複写の後)ときは、集め終わるまでフラット表示の形を保つ
+        self.flat = self.pick_root is not None
+        if self.pick_cancel is not None:
+            self.pick_cancel.set()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.pick_cancel = cancel
+        self.pick_loading = True
+        self.loading = True
+        self.pick_phase = "scan"
+        self.pick_count = self.pick_read = self.pick_total = 0
+        root = self.path
+        win = self.window_
+        args = dict(path=root, pick=True, keep_marks=keep_marks)
+        bridge = win.bridge
+        show_hidden, show_system = win.show_hidden, win.show_system
+        # 読んである★(UI スレッドの辞書の写し)。更新日時が同じものはそのまま使う
+        cache = {key: (meta, self._photo_mtimes.get(key))
+                 for key, meta in self.photo_meta.items() if meta is not None}
+
+        def progress(count):
+            self.pick_count = count
+
+        def worker():
+            try:
+                found, offline, status = core.collect_photos(
+                    root, show_hidden, show_system, core.PICK_LIMIT, cancel, progress)
+                metas, mtimes, picked = {}, {}, []
+                if status != "cancel":
+                    self.pick_total = len(found)
+                    self.pick_phase = "read"
+                    for e in found:
+                        if cancel.is_set():
+                            status = "cancel"
+                            break
+                        path = os.path.join(root, e.name)
+                        key = photo_key(path)
+                        hit = cache.get(key)
+                        if hit is not None and hit[1] == e.mtime:
+                            meta = hit[0]
+                        elif core.sidecar_online_only(path):
+                            offline += 1        # RAW のサイドカーがオンライン専用
+                            self.pick_read += 1
+                            continue
+                        else:
+                            try:
+                                meta = _read_photo_meta(path)
+                            except Exception:  # noqa: BLE001  1枚読めないだけ。不明として外す
+                                meta = None
+                        metas[key] = meta
+                        mtimes[key] = e.mtime
+                        if meta is not None and meta.rating >= core.PICK_MIN_RATING:
+                            picked.append(e)
+                        self.pick_read += 1
+                payload = (self.side, request, True,
+                           (picked, metas, mtimes, offline, status), args)
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
+            win.safe_emit(bridge.finished, payload)
+
+        win.spawn_tracked(worker, f"filer-pick-{self.side}")
+        self._flat_timer.start(200)
+        self.update_header()
+        self.update_footer()
+
+    def cancel_pick(self) -> None:
+        if self.pick_loading and self.pick_cancel is not None:
+            self.pick_cancel.set()
+
+    def on_pick_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id:
+            return
+        self.loading = False
+        self.pick_loading = False
+        self.pick_cancel = None
+        self._flat_timer.stop()
+        if not ok:
+            self.window_.log(f"★写真抽出: 集められません: {args['path']}  ({result})")
+            self._stop_pick()
+            self.update_header()
+            self.update_footer()
+            return
+        picked, metas, mtimes, offline, status = result
+        if status == "cancel":
+            self.window_.log("★写真抽出: 中止しました")
+            self._stop_pick()
+            self.reload()
+            return
+        # 読んだ★は写真フォルダモードの★の列のキャッシュに入れる(★の列・R の欄・再読込で使う)
+        self.photo_meta.update(metas)
+        self._photo_mtimes.update(mtimes)
+        self._photo_requested.difference_update(metas)
+        self._photo_keys = {}
+        if not args.get("keep_marks"):
+            self.marks = set()
+        self.flat = True
+        self.pick_root = args["path"]
+        self.all_entries = picked
+        self._rebuild()
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
+        text = (f"★写真抽出: {args['path']} の配下から★{core.PICK_MIN_RATING}以上を"
+                f" {len(picked):,} 枚（★を読んだ写真 {len(metas):,} 枚）")
+        if status == "limit":
+            text += f"  ※{core.PICK_LIMIT:,}枚で打ち切りました（多すぎるため）"
+        if offline:
+            text += f"  ※オンライン専用の写真 {offline:,} 枚は飛ばしました（ダウンロードさせないため）"
         self.window_.log(text)
 
     def refilter(self) -> None:
@@ -1792,6 +1964,8 @@ class Pane(QWidget):
     def _photo_mode_now(self) -> bool:
         """今の一覧と手動の切り替えから、写真フォルダモードかを決める(photo_mode は変えない。
         一覧を作り直すとき、★の範囲を効かせるかを先に知るため)。"""
+        if self.pick_root is not None and self.archive is None:
+            return True     # ★写真抽出の表示は写真フォルダモードに固定(Shift+Z でも外れない)
         if self._photo_scan_src is not self.all_entries:
             self._photo_scan_src = self.all_entries
             self._photo_auto = core.is_photo_folder(self.all_entries,
@@ -1998,8 +2172,9 @@ class Pane(QWidget):
         return changed
 
     def refresh_photo(self) -> None:
-        """★が変わった。絞り込み中なら掛け直し、そうでなければ描き直すだけ。"""
-        if self.rating_active():
+        """★が変わった。絞り込み中(★写真抽出の表示を含む)なら掛け直し、そうでなければ
+        描き直すだけ。"""
+        if self.rating_active() or self.pick_root is not None:
             self.refilter()
         else:
             self.model.all_changed()
@@ -2999,7 +3174,9 @@ class FilerWindow(QWidget):
     def _on_list_finished(self, payload) -> None:
         try:
             side, request, ok, result, args = payload
-            if args.get("everything") is not None:
+            if args.get("pick"):
+                self.pane(side).on_pick_loaded(request, ok, result, args)
+            elif args.get("everything") is not None:
                 self.pane(side).on_es_loaded(request, ok, result, args)
             elif args.get("grep"):
                 self.pane(side).on_grep_loaded(request, ok, result, args)
@@ -3084,6 +3261,9 @@ class FilerWindow(QWidget):
             return
         if event.key() == Qt.Key_Escape and self.active.es_loading:
             self.active.cancel_es()     # Esc は「処理の中止」: Everything 検索を止める
+            return
+        if event.key() == Qt.Key_Escape and self.active.pick_loading:
+            self.active.cancel_pick()   # Esc は「処理の中止」: ★写真抽出を止める
             return
         if event.key() == Qt.Key_Escape and self._size_job is not None:
             self.cancel_size_total()    # Esc は「処理の中止」: 合計ファイルサイズを止める
@@ -3248,9 +3428,9 @@ class FilerWindow(QWidget):
             return
         if not pane.path:
             return
-        if pane.flat or pane.flat_loading or pane.es_loading:
+        if pane.flat or pane.flat_loading or pane.es_loading or pane.pick_loading:
             # フラット表示中の BS は「通常の表示へ戻る」(親へは行かない)。
-            # 検索結果(G / Shift+F)もフラット表示の形なので同じ。
+            # 検索結果(G / Shift+F)・★写真抽出もフラット表示の形なので同じ。
             pane.load(pane.path, history=None)
             return
         parent = core.parent_of(pane.path)
@@ -4531,7 +4711,7 @@ class FilerWindow(QWidget):
         if pane.archive is not None:
             self.log("書庫内ではフラット表示できません")
             return
-        if pane.flat or pane.flat_loading:
+        if pane.flat or pane.flat_loading or pane.pick_loading:
             pane.load(pane.path, history=None)
             return
         pane.load_flat()
@@ -4558,7 +4738,32 @@ class FilerWindow(QWidget):
                                         exists=self.menu_exists)
 
     def cmd_everything(self):
-        """Shift+F: Everything 検索。es.exe で名前を探し、結果をフラット表示の形で並べる
+        """Shift+F: 検索のメニュー。E で Everything 検索、P で★写真抽出(頭の文字で選んで Enter)。"""
+        choice = self.choose_menu("検索", [
+            ("E", "Everything 検索", "everything_search"),
+            ("P", "★写真抽出（配下の★1以上の写真）", "photo_pick"),
+            ("Q", "キャンセル", None),
+        ])
+        if choice:
+            self.run_command(choice)
+
+    def cmd_photo_pick(self):
+        """Shift+F → P: ★写真抽出。アクティブ窓のフォルダより下の、★1以上の写真をすべて
+        集めて写真フォルダモードで並べる(フラット表示の形。名前は相対パス)。窓の下の★の範囲
+        スライダーでさらに絞れる。抜けるのはフラット表示と同じ(Alt+B・BS・フォルダの移動)。"""
+        pane = self.active
+        if pane.stash:
+            self.log("★写真抽出: 一時置き場では使えません（T で通常の表示へ）")
+            return
+        if not pane.path:
+            return
+        if pane.archive is not None:
+            self.log("★写真抽出: 書庫内では使えません")
+            return
+        pane.load_pick()
+
+    def cmd_everything_search(self):
+        """Shift+F → E: Everything 検索。es.exe で名前を探し、結果をフラット表示の形で並べる
         (範囲は既定でアクティブ窓のフォルダ以下。入力窓で全体に切り替えられる)。"""
         pane = self.active
         if pane.stash:
@@ -4618,7 +4823,7 @@ class FilerWindow(QWidget):
         """フラット表示中は、名前の付け替え・フォルダ作成を断る。名前が相対パス
         ("sub\\a.txt")なので、改名がフォルダをまたぐ移動になったり、どのフォルダに
         作るのかが曖昧になったりするため。"""
-        if self.active.flat or self.active.flat_loading:
+        if self.active.flat or self.active.flat_loading or self.active.pick_loading:
             self.log(f"{label}: フラット表示・検索結果では使えません（Alt+B で通常の表示へ）")
             return True
         return False
@@ -5218,6 +5423,9 @@ class FilerWindow(QWidget):
         pane = self.active
         if self._refuse_stash("ファイル情報の編集"):
             return
+        if pane.pick_root is not None and not pane.pick_loading:
+            self._rename_picked_photos(pane)
+            return
         if not pane.path or self._refuse_flat("ファイル情報の編集"):
             return
         if pane.archive is not None:
@@ -5251,6 +5459,33 @@ class FilerWindow(QWidget):
         dialog.deleteLater()
         if accepted and changes:
             self._apply_file_info_photo(pane, photos, renamed, changes)
+
+    def _rename_picked_photos(self, pane) -> None:
+        """★写真抽出の表示での R: 写真の★の欄だけのダイアログ(名前・日時・属性は変えない。
+        名前が相対パスなので、フラット表示と同じく名前の付け替えはしない)。"""
+        if pane.marks:
+            entries = [e for e in pane.entries if e.name in pane.marks and not e.is_parent]
+        else:
+            entry = pane.cursor_entry()
+            entries = [] if entry is None or entry.is_parent else [entry]
+        photos = [e for e in entries if pane.is_photo_entry(e)]
+        if not photos:
+            return
+        photo = self._file_info_photo(pane, photos)
+        if photo is None:
+            self.log(EXIFTOOL_NOT_FOUND)
+            return
+        import filer_fileinfo  # 使うときに読む
+
+        colors = {k: self.colors[k] for k in ("background", "text", "cursor")}
+        dialog = filer_fileinfo.FileInfoDialog(
+            self, pane.path, photos, colors=colors, font=self.log_font,
+            photo=photo, photo_only=True)
+        accepted = self.exec_dialog(dialog) == QDialog.Accepted
+        changes = dialog.photo_changes()
+        dialog.deleteLater()
+        if accepted and changes:
+            self._apply_file_info_photo(pane, photos, {}, changes)
 
     def _file_info_photo(self, pane, photos):
         """R のダイアログの「写真の★」の欄の中身(FileInfoDialog の photo)。★を書けない
@@ -5800,7 +6035,8 @@ class FilerWindow(QWidget):
             self.log(f"{label}: 書庫の中では使えません")
             return
         if (self.active.flat or self.other.flat
-                or self.active.flat_loading or self.other.flat_loading):
+                or self.active.flat_loading or self.other.flat_loading
+                or self.active.pick_loading or self.other.pick_loading):
             self.log(f"{label}: フラット表示・検索結果では使えません")
             return
         if self.active.stash or self.other.stash:

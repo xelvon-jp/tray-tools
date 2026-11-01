@@ -5332,14 +5332,15 @@ def test_window_renemo():
                                          "keep_ext": True}
                 d.replace_dialog()
                 assert d.editor_lines() == ["sub", "data", "kEEp", "mEmo", "Photo"]
-                # 3〜4行目だけに連番
+                # 3〜4行目だけに連番(書式で付け直す)
                 c = d.editor.textCursor()
                 c.setPosition(d.editor.document().findBlockByNumber(2).position())
                 c.setPosition(d.editor.document().findBlockByNumber(3).position() + 1,
                               QTextCursor.KeepAnchor)
                 d.editor.setTextCursor(c)
-                d.ask_numbering = lambda: {"fmt": "file_{n:02}", "start": 1, "step": 1, "digits": 1}
-                d.number_dialog()
+                d.ask_format = lambda rows: {"fmt": "file_{n:02}", "start": 1, "step": 1,
+                                             "digits": 1}
+                d.format_dialog()
                 assert d.editor_lines() == ["sub", "data", "file_01", "file_02", "Photo"]
                 # 選んだ部分だけ全角に
                 c = d.editor.textCursor()
@@ -5541,6 +5542,271 @@ def test_window_renemo_maximize_and_drag_scroll():
         QTest.mouseMove(vp, QPoint(80, 20))
         assert not ed._scroll_timer.isActive()
         QTest.mouseRelease(vp, Qt.LeftButton, Qt.AltModifier, QPoint(80, 20))
+    finally:
+        d.close()
+
+
+def _renemo_items():
+    """Renemo のテスト用の項目(実在しないフォルダ。窓は改名しない)。"""
+    import time as _time
+    mt = _time.mktime((2026, 10, 28, 9, 5, 3, 0, 0, -1))
+    names = (("DSC0001.jpg", False), ("DSC0002.jpg", False), ("a.b.txt", False), ("sub", True))
+    items = [{"folder": "C:\\x", "name": n, "is_dir": is_dir, "size": 1, "mtime": mt}
+             for n, is_dir in names]
+    return items, {"C:\\x": {i["name"] for i in items}}
+
+
+def test_window_renemo_toolbar_and_keys():
+    """Renemo: メニューバーが無く、入口はツールバー1段。キーはそのまま効く。
+    右クリックは「一括で直す」と同じ中身。実行はモック(改名しない)。"""
+    import filer_renemo as rm
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFont
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMenuBar
+
+    _qapp()
+    items, existing = _renemo_items()
+    d = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    try:
+        assert d.layout().menuBar() is None and not d.findChildren(QMenuBar)
+        assert d.toolbar_labels() == [
+            "▶ 実行 (Ctrl+Enter)", "|",
+            "一括で直す:", "置換… (Ctrl+H)", "書式で付け直す… (Ctrl+M)", "文字の変換 ▾", "|",
+            "☐ 拡張子も編集", "☐ フルパス表示", "並べ替え ▾", "|",
+            "↶ 元に戻す (Ctrl+Z)", "履歴…"]
+        # 実行のボタンだけ緑
+        run = d.toolbar.widgetForAction(d.act_execute)
+        _show_active(d)
+        img = run.grab().toImage()
+        c = img.pixelColor(img.width() // 2, 3)
+        assert c.green() > c.red() + 40 and c.green() > c.blue() + 40, c.name()
+        other = d.toolbar.widgetForAction(d.act_replace).grab().toImage()
+        oc = other.pixelColor(other.width() // 2, 3)
+        assert abs(oc.green() - oc.red()) < 20, oc.name()
+        # 文字の変換 ▾ と右クリック(一括で直す と同じ中身 + 元に戻す)
+        convert = [a.text() for a in d.convert_button.menu().actions()]
+        assert convert == ["大文字(&U)", "小文字(&L)", "全角→半角(&H)", "半角→全角(&F)"]
+        assert d.act_upper.shortcut().toString() == "Ctrl+Shift+U"
+        assert d.act_lower.shortcut().toString() == "Ctrl+U"
+        menu = d.build_context_menu()
+        top = [a.text() if not a.isSeparator() else "|" for a in menu.actions()]
+        assert top == ["置換(&R)…", "書式で付け直す(&M)…", "文字の変換(&C)", "|", "元に戻す(&Z)"]
+        assert [a.text() for a in menu.actions()[2].menu().actions()] == convert
+        assert [a.text() for a in d.sort_button.menu().actions()] == [l for _k, l in rm.SORT_KINDS]
+        # キー: Ctrl+U(小文字)・Ctrl+Shift+U(大文字)・Ctrl+H(置換)・Ctrl+M(書式)
+        QTest.keyClick(d.editor, Qt.Key_U, Qt.ControlModifier | Qt.ShiftModifier)
+        assert d.editor_lines() == ["DSC0001", "DSC0002", "A.B", "SUB"]
+        QTest.keyClick(d.editor, Qt.Key_U, Qt.ControlModifier)
+        assert d.editor_lines() == ["dsc0001", "dsc0002", "a.b", "sub"]
+        asked = []
+        d.ask_replace = lambda: (asked.append("H"), {"find": "dsc", "repl": "IMG", "regex": False,
+                                                     "case": False, "keep_ext": True})[1]
+        QTest.keyClick(d.editor, Qt.Key_H, Qt.ControlModifier)
+        assert asked == ["H"] and d.editor_lines()[:2] == ["IMG0001", "IMG0002"]
+        d.ask_format = lambda rows: (asked.append(("M", rows)), None)[1]
+        QTest.keyClick(d.editor, Qt.Key_M, Qt.ControlModifier)
+        assert asked[-1] == ("M", [0, 1, 2, 3])
+        # 元に戻す(ツールバー) = 編集欄の取り消し
+        d.act_undo.trigger()
+        assert d.editor_lines()[:2] == ["dsc0001", "dsc0002"]
+        # Ctrl+Enter で実行(on_execute はモック。1回だけ呼ばれる)
+        calls = []
+        d.on_execute = lambda pairs: (calls.append(pairs), None)[1]
+        QTest.keyClick(d.editor, Qt.Key_Return, Qt.ControlModifier)
+        assert len(calls) == 1 and calls[0][0] == ("C:\\x\\DSC0001.jpg", "C:\\x\\dsc0001.jpg")
+    finally:
+        d.close()
+
+
+def test_window_renemo_ext_fullpath_checks():
+    """Renemo: 「拡張子も編集」「フルパス表示」のチェックボックスは、今までの toggle と同じ結果。"""
+    import filer_renemo as rm
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtGui import QFont
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QCheckBox
+
+    _qapp()
+    items, existing = _renemo_items()
+    old = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    new = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    try:
+        assert isinstance(new.check_ext, QCheckBox) and new.check_ext.text() == "拡張子も編集"
+        assert isinstance(new.check_fullpath, QCheckBox) and new.check_fullpath.text() == "フルパス表示"
+        new.show()
+        for d in (old, new):
+            d.editor.setPlainText("DSC0001x\nDSC0002\na.b\nsub")      # 編集してから切り替える
+        # 今までのやり方(アクションを切り替えて toggle を呼ぶ)
+        old.act_ext.setChecked(True)
+        old.toggle_ext()
+        # チェックボックスをクリック
+        box = new.check_ext
+        QTest.mouseClick(box, Qt.LeftButton, Qt.NoModifier, QPoint(8, box.height() // 2))
+        assert new.check_ext.isChecked() and new.act_ext.isChecked() and new.show_ext
+        assert new.editor_lines() == old.editor_lines() == [
+            "DSC0001x.jpg", "DSC0002.jpg", "a.b.txt", "sub"]
+        assert "☑ 拡張子も編集" in new.toolbar_labels()
+        # アクション側を変えてもチェックボックスに写る
+        assert old.check_ext.isChecked()
+        old.act_fullpath.setChecked(True)
+        old.toggle_fullpath()
+        new.check_fullpath.click()
+        assert new.full_path and new.act_fullpath.isChecked()
+        assert new.names_view.toPlainText() == old.names_view.toPlainText()
+        assert new.names_view.toPlainText().split("\n")[0] == "C:\\x\\DSC0001.jpg"
+        # 外すと元に戻る(編集は残る)
+        new.check_ext.click()
+        old.act_ext.setChecked(False)
+        old.toggle_ext()
+        assert not new.show_ext and new.editor_lines() == old.editor_lines() == [
+            "DSC0001x", "DSC0002", "a.b", "sub"]
+        assert new.new_names() == old.new_names()
+    finally:
+        old.close()
+        new.close()
+
+
+def test_window_renemo_format_dialog():
+    """Renemo: 書式で付け直す(連番とマスクを1つにしたもの)。よく使う形・見本・誤りで OK を
+    押せないこと・選んだ行だけ・{ext} の扱い・今までの連番/マスクと同じ結果。"""
+    import filer_rename as fr
+    import filer_renemo as rm
+    from PySide6.QtGui import QFont
+
+    _qapp()
+    items, existing = _renemo_items()
+    d = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    try:
+        rows = d._format_targets()
+        assert rows == [0, 1, 2, 3]
+        dlg = d.make_format_dialog(rows)
+        assert dlg.fmt_edit.text() == "{name}_{n}" and dlg.digits_spin.value() == 3
+        assert dlg.ok_button.isEnabled()
+        # 見本は最初の3件の「元 → 新」(拡張子まで見せる)
+        assert dlg.preview_label.text().split("\n") == [
+            "DSC0001.jpg  →  DSC0001_001.jpg", "DSC0002.jpg  →  DSC0002_002.jpg",
+            "a.b.txt  →  a.b_003.txt"]
+        # よく使う形のボタン → 書式の欄に入って、見本も変わる
+        assert [b.text() for b in dlg.preset_buttons] == [
+            "連番 photo_{n}", "日付_名前 {date}_{name}", "名前_連番 {name}_{n}", "連番_名前 {n}_{name}"]
+        dlg.preset_buttons[0].click()
+        assert dlg.fmt_edit.text() == "photo_{n}"
+        assert dlg.preview_label.text().split("\n")[0] == "DSC0001.jpg  →  photo_001.jpg"
+        dlg.preset_buttons[1].click()
+        assert dlg.preview_label.text().split("\n")[0] == "DSC0001.jpg  →  20261028_DSC0001.jpg"
+        dlg.start_spin.setValue(10)
+        dlg.digits_spin.setValue(2)
+        dlg.preset_buttons[3].click()
+        assert dlg.preview_label.text().split("\n")[1] == "DSC0002.jpg  →  11_DSC0002.jpg"
+        # 誤った書式は赤字で理由を出し、OK を押せない
+        dlg.fmt_edit.setText("{size}_{n}")
+        assert not dlg.ok_button.isEnabled() and "{size}" in dlg.error_label.text()
+        assert dlg.preview_label.text() == ""
+        dlg.fmt_edit.setText("   ")
+        assert not dlg.ok_button.isEnabled() and "空" in dlg.error_label.text()
+        # 名前が重なる書式は注意だけ(OK は押せる)
+        dlg.fmt_edit.setText("same")
+        assert dlg.ok_button.isEnabled() and "重なる" in dlg.error_label.text()
+        dlg.fmt_edit.setText("x_{n}")
+        assert dlg.ok_button.isEnabled() and dlg.error_label.text() == ""
+        dlg.deleteLater()
+
+        # 実行すると全行(選択なし)。前回の値を覚えている
+        d.ask_format = lambda rows: {"fmt": "img_{n}", "start": 5, "step": 2, "digits": 2}
+        d.format_dialog()
+        assert d.editor_lines() == ["img_05", "img_07", "img_09", "img_11"]
+        assert d.sync_from_editor()
+        assert d.new_names() == ["img_05.jpg", "img_07.jpg", "img_09.txt", "img_11"]
+        dlg = d.make_format_dialog(rows)
+        assert dlg.options() == {"fmt": "img_{n}", "start": 5, "step": 2, "digits": 2}
+        dlg.deleteLater()
+        d.editor.undo()
+        assert d.editor_lines() == ["DSC0001", "DSC0002", "a.b", "sub"]
+
+        # 選んだ行だけ(矩形選択の行)
+        d.editor.set_block_selection((1, 0), (2, 1))
+        seen = []
+        d.ask_format = lambda rows: (seen.append(rows),
+                                     {"fmt": "{name}_{n}", "start": 1, "step": 1, "digits": 3})[1]
+        d.format_dialog()
+        assert seen == [[1, 2]]
+        assert d.editor_lines() == ["DSC0001", "DSC0002_001", "a.b_002", "sub"]
+        d.editor.undo()
+
+        # {ext}: 拡張子を隠しているときは空として扱い、元の拡張子を残す(二重にならない)。
+        # 拡張子を出しているときに同じ書式を使った結果と同じ名前になる。
+        hidden = d.format_lines({"fmt": "{name}_x.{ext}", "start": 1, "step": 1, "digits": 1},
+                                [0, 2])
+        assert hidden == ["DSC0001_x", "a.b_x"]
+        d.act_ext.setChecked(True)
+        d.toggle_ext()
+        shown = d.format_lines({"fmt": "{name}_x.{ext}", "start": 1, "step": 1, "digits": 1},
+                               [0, 2])
+        assert shown == ["DSC0001_x.jpg", "a.b_x.txt"]
+        assert [h + d.exts[i] for h, i in zip(hidden, (0, 2))] == shown
+        d.act_ext.setChecked(False)
+        d.toggle_ext()
+
+        # 今までの連番(numbered_names)・マスク(mask_names)と同じ結果
+        for show_ext in (False, True):
+            d.act_ext.setChecked(show_ext)
+            d.toggle_ext()
+            lines = d.editor_lines()
+            flags = [i["is_dir"] for i in d.items]
+            mtimes = [i["mtime"] for i in d.items]
+            for fmt, start, step, digits in (("photo_{n:03}", 1, 1, 1), ("file_{n}", 5, 2, 2),
+                                             ("{n}", -1, 1, 3)):
+                got = d.format_lines({"fmt": fmt, "start": start, "step": step,
+                                      "digits": digits}, rows)
+                want = fr.numbered_names(lines, fmt, start, step, digits, keep_ext=show_ext,
+                                         dir_flags=flags)
+                assert got == want, (show_ext, fmt, got, want)
+            if show_ext:
+                # 今までのマスクは拡張子を出しているときだけ {ext} を使えた(桁数は1)
+                for mask in ("{date}_{name}_{n:03}", "{name}_copy.{ext}", "{time}_{n}"):
+                    got = d.format_lines({"fmt": mask, "start": 3, "step": 1, "digits": 1}, rows)
+                    want = fr.mask_names(lines, mask, 3, 1, 1, mtimes=mtimes, dir_flags=flags)
+                    assert got == want, (mask, got, want)
+    finally:
+        d.close()
+
+
+def test_window_renemo_target_line():
+    """Renemo: ツールバーの下の「対象」の行。選択なし・範囲選択・矩形選択・編集のたびに変わる。"""
+    import filer_renemo as rm
+    from PySide6.QtGui import QFont, QTextCursor
+
+    _qapp()
+    items, existing = _renemo_items()
+    d = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    try:
+        label = d.target_label
+        assert label.text() == "対象: 全 4 行　｜　変更あり 0 件"
+        c = d.editor.textCursor()
+        c.setPosition(d.editor.document().findBlockByNumber(1).position())
+        c.setPosition(d.editor.document().findBlockByNumber(2).position() + 1,
+                      QTextCursor.KeepAnchor)
+        d.editor.setTextCursor(c)
+        assert label.text() == "対象: 選んだ 2 行　｜　変更あり 0 件"
+        c.clearSelection()
+        d.editor.setTextCursor(c)
+        assert label.text().startswith("対象: 全 4 行")
+        d.editor.set_block_selection((0, 0), (2, 3))
+        assert label.text() == "対象: 選んだ 3 行　｜　変更あり 0 件"
+        d.editor.block_insert_text("Z")         # 矩形の編集で3行が変わる
+        assert label.text() == "対象: 選んだ 3 行　｜　変更あり 3 件"
+        d.editor.clear_block_selection()
+        assert label.text() == "対象: 全 4 行　｜　変更あり 3 件"
+        d.editor.undo()
+        assert label.text() == "対象: 全 4 行　｜　変更あり 0 件"
+        # 隠している拡張子だけを変えた行も「変更あり」に数える
+        d.act_ext.setChecked(True)
+        d.toggle_ext()
+        d.editor.setPlainText("DSC0001.png\nDSC0002.jpg\na.b.txt\nsub")
+        d.act_ext.setChecked(False)
+        d.toggle_ext()
+        assert label.text() == "対象: 全 4 行　｜　変更あり 1 件"
     finally:
         d.close()
 
@@ -6824,6 +7090,8 @@ def test_window_everything_search():
         L = w.left
         key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
         asked = []
+        # Shift+F のメニューでは E(Everything 検索)を選ぶ(メニューは出さずに値だけ返す)
+        w._exec_menu = lambda menu, chosen: "everything_search"
         try:
             # es.exe が見つからない: 入力窓も出さずにメッセージだけ
             w.find_es = lambda: None
@@ -8602,6 +8870,310 @@ def test_edit_confirms_images():
         finally:
             filer.subprocess.Popen = real_popen
             w.close()
+
+
+# ---------------------------------------------------------------
+# Shift+F のメニュー(E: Everything 検索 / P: ★写真抽出)
+# ---------------------------------------------------------------
+def test_search_menu_shift_f():
+    """Shift+F でメニュー(頭の文字で選んで Enter)が出て、E で今までどおり Everything 検索
+    (es.exe を探す → 入力窓 → 検索)へ進む。es.exe の呼び出しはモックする。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = Path(tmp, "l"), Path(tmp, "r")
+        left.mkdir()
+        right.mkdir()
+        (left / "a.txt").write_text("x", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        menus, searched = [], []
+        try:
+            assert core.DEFAULT_KEYMAP["1070"] == "everything"
+            assert core.COMMAND_SHORT_NAMES["photo_pick"]
+            w.find_es = lambda: ["es.exe"]
+            w.ask_everything = lambda text, scope_all: ("メモ", False)
+            L.load_everything = lambda query, scope_all=False, keep_marks=False: \
+                searched.append((query, scope_all))
+
+            def choose(value):
+                def run(menu, chosen):
+                    menus.append((menu.title(), [(filer._menu_key_of(a), v)
+                                                 for a, v in chosen.items()]))
+                    return value
+                return run
+
+            w._exec_menu = choose("everything_search")
+            QTest.keyClick(L.view, Qt.Key_F, Qt.ShiftModifier)
+            title, items = menus[-1]
+            assert title == "検索", title
+            assert items == [("E", "everything_search"), ("P", "photo_pick"), ("Q", None)], items
+            assert searched == [("メモ", False)], searched
+            # キャンセル(Q / Esc)では何もしない
+            w._exec_menu = choose(None)
+            QTest.keyClick(L.view, Qt.Key_F, Qt.ShiftModifier)
+            assert searched == [("メモ", False)] and not L.pick_loading and not L.flat
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+class _FakeStat:
+    def __init__(self, attrs=0, size=1, is_dir=False, tag=0):
+        import stat as _stat
+        self.st_file_attributes = attrs | (_stat.FILE_ATTRIBUTE_DIRECTORY if is_dir else 0)
+        self.st_mode = _stat.S_IFDIR if is_dir else _stat.S_IFREG
+        self.st_size = size
+        self.st_mtime = 1.0
+        self.st_reparse_tag = tag
+
+
+class _FakeDirEntry:
+    def __init__(self, folder, name, st):
+        self.name = name
+        self.path = os.path.join(folder, name)
+        self._st = st
+
+    def stat(self, follow_symlinks=True):
+        return self._st
+
+
+def test_collect_photos_logic():
+    """★写真抽出の走査: 写真だけ・相対パス。ジャンクション/シンボリックリンクはたどらず、
+    OneDrive のフォルダはたどる。オンライン専用の写真は入れずに数える。中止・上限。"""
+    import stat as _stat
+    import threading as _threading
+
+    root = "C:\\pics"
+    reparse = _stat.FILE_ATTRIBUTE_REPARSE_POINT
+    tree = {
+        root: [("a.jpg", _FakeStat()), ("memo.txt", _FakeStat()),
+               ("cloud.jpg", _FakeStat(core.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | reparse,
+                                       tag=0x9000701A)),
+               ("off.png", _FakeStat(_stat.FILE_ATTRIBUTE_OFFLINE)),
+               ("hid.jpg", _FakeStat(_stat.FILE_ATTRIBUTE_HIDDEN)),
+               ("sub", _FakeStat(is_dir=True)),
+               ("od", _FakeStat(reparse, is_dir=True, tag=0x9000701A)),
+               ("junc", _FakeStat(reparse, is_dir=True, tag=core.IO_REPARSE_TAG_MOUNT_POINT)),
+               ("link", _FakeStat(reparse, is_dir=True, tag=core.IO_REPARSE_TAG_SYMLINK))],
+        root + "\\sub": [("b.HEIC", _FakeStat()), ("c.arw", _FakeStat())],
+        root + "\\od": [("d.jpg", _FakeStat())],
+        root + "\\junc": [("never.jpg", _FakeStat())],
+        root + "\\link": [("never2.jpg", _FakeStat())],
+    }
+    opened = []
+
+    class _It(list):
+        def __enter__(self):
+            return iter(self)
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_scandir(folder):
+        opened.append(folder)
+        return _It(_FakeDirEntry(folder, n, st) for n, st in tree[folder])
+
+    found, offline, status = core.collect_photos(root, scandir=fake_scandir)
+    names = sorted(e.name for e in found)
+    assert status == "done" and offline == 2, (status, offline)
+    assert names == ["a.jpg", "hid.jpg", "od\\d.jpg", "sub\\b.HEIC", "sub\\c.arw"], names
+    assert root + "\\junc" not in opened and root + "\\link" not in opened
+    # 隠しを見せない設定なら入れない
+    found, _o, _s = core.collect_photos(root, show_hidden=False, scandir=fake_scandir)
+    assert "hid.jpg" not in [e.name for e in found]
+    # 上限・中止
+    found, _o, status = core.collect_photos(root, limit=2, scandir=fake_scandir)
+    assert status == "limit" and len(found) == 2
+    cancel = _threading.Event()
+    cancel.set()
+    assert core.collect_photos(root, cancel=cancel, scandir=fake_scandir)[2] == "cancel"
+    assert core.is_online_only(_stat.FILE_ATTRIBUTE_OFFLINE)
+    assert not core.is_online_only(_stat.FILE_ATTRIBUTE_ARCHIVE | reparse)
+    # 窓の下の行
+    assert core.pick_footer_text("D:\\p", 5, 5, 10) == "★写真抽出: D:\\p（5 枚）   10 bytes"
+    assert core.pick_footer_text("D:\\p", 3, 5, 10, 1, 4).startswith("★写真抽出: D:\\p（3 / 5 枚）")
+
+
+def _make_pick_tree(tmp):
+    """入れ子のフォルダに★いろいろの写真(★は XMP に埋めた小さな JPEG)。"""
+    root = Path(tmp, "pics")
+    (root / "y2023" / "deep").mkdir(parents=True)
+    (root / "y2024").mkdir()
+    _photo_jpeg(root / "a3.jpg", 3)
+    _photo_jpeg(root / "top_none.jpg")
+    (root / "memo.txt").write_text("x", encoding="utf-8")
+    (root / "memo2.txt").write_text("x", encoding="utf-8")
+    _photo_jpeg(root / "y2023" / "b5.jpg", 5)
+    _photo_jpeg(root / "y2023" / "c1.jpg", 1)
+    _photo_jpeg(root / "y2023" / "d_reject.jpg", -1)
+    _photo_jpeg(root / "y2023" / "deep" / "e4.jpg", 4, ["みてね済"])
+    _photo_jpeg(root / "y2023" / "deep" / "f0.jpg", 0)
+    _photo_jpeg(root / "y2024" / "g2.jpg", 2)
+    other = Path(tmp, "dst")
+    other.mkdir()
+    return root, other
+
+
+PICKED = ["a3.jpg", "y2023\\b5.jpg", "y2023\\c1.jpg", "y2023\\deep\\e4.jpg", "y2024\\g2.jpg"]
+
+
+def test_photo_pick():
+    """Shift+F → P(★写真抽出): 配下の★1以上の写真をフラット表示の形で並べ、写真フォルダモード
+    (★の列・★の段)にする。スライダーとは AND。R で★を外すと消える。C の複写の後も抽出のまま。
+    Esc で中止・書庫の中では使えない・BS / Alt+B / フォルダの移動で元に戻る。"""
+    import filer
+    import threading as _threading
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        root, other = _make_pick_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(root), "right_path": str(other)}},
+                              str(settings_path))
+        w.extra_op_flags = _quiet_flags()
+        w.resize(1100, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        fake = _FakePhotoSession()
+        w._photo_session = fake
+        w._exec_menu = lambda menu, chosen: "photo_pick"
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+
+        def pick():
+            key(Qt.Key_F, Qt.ShiftModifier)
+            _wait(w, timeout=20)
+
+        try:
+            # 写真2枚・テキスト2つ: 抽出の前は写真フォルダモードではない
+            assert not L.photo_mode and not L.rating_bar.isVisible()
+            before = sorted(_names(L))
+            pick()
+            assert L.pick_root is not None and core.same_dir(L.pick_root, root)
+            assert L.flat and core.same_dir(L.path, root)
+            assert sorted(_names(L)) == sorted(PICKED), _names(L)      # ★1以上だけ。.. も無い
+            assert L.photo_mode and L.rating_bar.isVisible()
+            assert not L.view.horizontalHeader().isSectionHidden(filer.COL_RATING)
+            assert L.header.text().startswith("📷 ") and "[★写真抽出]" in L.header.text()
+            assert L.footer.text().startswith(f"★写真抽出: {root}（5 枚）"), L.footer.text()
+            assert "★1以上を 5 枚（★を読んだ写真 8 枚）" in log(), log()
+            texts = _rating_texts(L)
+            assert texts["y2023\\b5.jpg"] == "みてね用" and texts["y2023\\deep\\e4.jpg"] == "フォトフレーム用 済"
+            assert L.rating_bar.count_label.text() == "表示 5 / 5枚"
+
+            # スライダーを「ベストショット以上」に: ★3以上だけ(基準とは AND)
+            _drag_rating(L.rating_bar.slider, 1, 3)
+            assert L.rating_range == (3, 5)
+            assert L.rating_bar.range_label.text() == "ベストショット以上"
+            assert sorted(_names(L)) == ["a3.jpg", "y2023\\b5.jpg", "y2023\\deep\\e4.jpg"], _names(L)
+            assert "（3 / 5 枚）" in L.footer.text() and L.rating_bar.count_label.text() == "表示 3 / 5枚"
+            # 削除候補だけ・未選別だけでは 0 件(基準が★1以上なので)
+            L.set_rating_range(-1, -1)
+            assert _names(L) == []
+            L.set_rating_range(0, 0)
+            assert _names(L) == []
+            L.clear_rating()
+            assert sorted(_names(L)) == sorted(PICKED)
+            # Shift+Z で写真フォルダモードを切っても、抽出の表示では外れない
+            L.set_photo_override("off")
+            assert L.photo_mode and sorted(_names(L)) == sorted(PICKED)
+            L.set_photo_override("auto")
+
+            # R: ★の欄だけのダイアログ。★を外した写真は一覧から消える
+            L.set_cursor(L._row_of("y2023\\c1.jpg"))
+            dialog = _rate_with_R(w, 0)
+            assert dialog.photo_only and dialog.windowTitle() == "写真の★"
+            assert dialog.name_edit.isHidden() and dialog.photo_box is not None
+            assert fake.calls[-1] == ("rating", [str(root / "y2023" / "c1.jpg")], 0)
+            _wait_until(lambda: "y2023\\c1.jpg" not in _names(L), what="★を外した写真が消える")
+            assert len(_names(L)) == 4 and L.pick_root is not None and "（4 枚）" in L.footer.text()
+            # K(フォルダ作成)はフラット表示と同じく断る
+            key(Qt.Key_K)
+            assert "フラット表示・検索結果では使えません" in log()
+
+            # マークして C(複写)。転送の後の再読込でも抽出の表示のまま(★は読んだものを使う)
+            L.marks.add("y2023\\b5.jpg")
+            key(Qt.Key_C, Qt.AltModifier)
+            _wait(w, timeout=30)
+            _wait_until(lambda: not L.pick_loading, timeout=10, what="集め直し")
+            assert (other / "b5.jpg").is_file()
+            assert L.pick_root is not None and L.flat and L.photo_mode
+            assert len(_names(L)) == 4 and "y2023\\c1.jpg" not in _names(L), _names(L)
+
+            # F3(ビュア)は抽出の写真を開ける
+            L.set_cursor(L._row_of("y2023\\deep\\e4.jpg"))
+            w.run_command("preview_toggle")
+            _wait_until(lambda: w.preview_widget is not None
+                        and w.preview_widget.rating.text().startswith("🖼️ フォトフレーム用"),
+                        what="ビュアの★")
+            w.preview_off()
+
+            # BS で元の表示へ(親へは行かない)
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert L.pick_root is None and not L.flat and core.same_dir(L.path, root)
+            assert sorted(_names(L)) == before and not L.photo_mode
+            assert "★写真抽出" not in L.header.text() and not L.rating_bar.isVisible()
+            # Alt+B でも抜ける
+            pick()
+            assert L.pick_root is not None
+            key(Qt.Key_B, Qt.AltModifier)
+            _wait(w)
+            assert L.pick_root is None and not L.flat and sorted(_names(L)) == before
+            # フォルダを移っても抜ける
+            pick()
+            L.load(str(root / "y2024"))
+            _wait(w)
+            assert L.pick_root is None and not L.flat and _names(L) == ["..", "g2.jpg"]
+            L.load(str(root))
+            _wait(w)
+
+            # Esc で中止(★の読み取りを止めて、元の表示へ)
+            L.reset_photo()                     # 読んだ★を捨てて、読み取りを待たせる
+            gate = _threading.Event()
+            original = filer._read_photo_meta
+            filer._read_photo_meta = lambda p: (gate.wait(5), original(p))[1]
+            try:
+                key(Qt.Key_F, Qt.ShiftModifier)
+                _wait_until(lambda: "★を読んでいます…" in L.footer.text(), what="読み取り中の表示")
+                assert L.pick_loading and "/ 8（Esc で中止）" in L.footer.text(), L.footer.text()
+                key(Qt.Key_Escape)
+                gate.set()
+                _wait(w, timeout=10)
+            finally:
+                gate.set()
+                filer._read_photo_meta = original
+            assert "★写真抽出: 中止しました" in log()
+            assert not L.pick_loading and L.pick_root is None and not L.flat
+            assert sorted(_names(L)) == before and w.isVisible()
+
+            # 書庫の中では使えない
+            zpath = Path(tmp, "pack.zip")
+            _make_zip(str(zpath))
+            L.load(str(zpath))
+            _wait(w)
+            assert L.archive is not None
+            key(Qt.Key_F, Qt.ShiftModifier)
+            assert "★写真抽出: 書庫内では使えません" in log()
+            assert not L.pick_loading and L.pick_root is None
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def main() -> int:

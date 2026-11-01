@@ -3,17 +3,24 @@
 # filer_rename.py、実際の改名は呼び出し側(on_execute / on_undo)が行う。
 #
 #   列: 名前(元の名前・読み取り専用) | 編集名(1行1ファイルで編集) | サイズ | 更新日時 | 種類
-#   - 編集名は既定で拡張子を隠す(.ext のトグルで拡張子も編集の対象に)。名前の部分と
-#     拡張子の部分を分けて持つので、切り替えても編集した内容は消えない
-#   - C:¥ のトグルで「名前」の列をフルパスに
+#   - 編集名は既定で拡張子を隠す(「拡張子も編集」のチェックで拡張子も編集の対象に)。
+#     名前の部分と拡張子の部分を分けて持つので、切り替えても編集した内容は消えない
+#   - 「フルパス表示」のチェックで「名前」の列をフルパスに
 #   - 編集した行は色で示す。確定前の検査で問題のある行は赤で示して実行させない
 #   - 行の追加・削除はさせない(Enter は何もしない、行頭の BS・行末の Del で行を
 #     つなげない)。範囲を消して行数が変わったときは、実行のときに止める
 #   - 実行は Ctrl+Enter かツールバーの「実行」。Esc で閉じる(未実行の編集があれば確かめる)
 #
+# 入口はツールバー1段にまとめる(メニューバーは置かない。キーは窓に付けた QAction で効く)。
+#   [▶ 実行] | 一括で直す: [置換…] [書式で付け直す…] [文字の変換 ▾]
+#            | [☑ 拡張子も編集] [☐ フルパス表示] [並べ替え ▾] | [↶ 元に戻す] [履歴…]
+# 右クリックのメニューは「一括で直す」と同じ中身。ツールバーの下の1行に、いまの対象
+# (選んだ行か全行)と変更のある件数を出す。
+#
 # 配色は Renemo と同じ明るい配色(白地)にしている。ここは文字を打って直す
 # エディタなので、ファイラの濃紺より白地に黒の方が長い名前を読み書きしやすい。
 import os
+import re
 import time
 
 from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRect, QSize, Qt, QTimer
@@ -40,12 +47,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
-    QMenuBar,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QSpinBox,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -57,6 +65,16 @@ import filer_shell
 EDITED_COLOR = "#fff3b0"     # 編集した行
 ERROR_COLOR = "#ffc0c0"      # 確定前の検査で問題のある行
 SORT_KINDS = (("name", "名前順"), ("original", "元の並び"), ("edited", "編集済みを先に"))
+RUN_COLOR = "#2e8b3e"        # 実行のボタン(ツールバーでこれだけ目立たせる)
+
+# 書式で付け直す: よく使う形(ボタンの名前, 書式)と、書式で使える記号の説明。
+FORMAT_PRESETS = (("連番", "photo_{n}"), ("日付_名前", "{date}_{name}"),
+                  ("名前_連番", "{name}_{n}"), ("連番_名前", "{n}_{name}"))
+FORMAT_HELP = ("{name} 元の名前 / {n} 番号 / {date} 更新日 / {time} 時刻 / "
+               "{ext} 拡張子（書かなければ元の拡張子を残す）")
+FORMAT_DEFAULT = {"fmt": "{name}_{n}", "start": 1, "step": 1, "digits": 3}
+# 拡張子を隠しているときの {ext}(前のドットごと消して、元の拡張子を残す)。
+_EXT_TOKEN_RE = re.compile(r"\.?\{ext\}")
 
 
 class _Gutter(QWidget):
@@ -174,6 +192,10 @@ class RenameEdit(QPlainTextEdit):
 
     def _apply_selections(self) -> None:
         super().setExtraSelections(self._row_selections + self._block_selections())
+        # 矩形が変わると対象の行も変わる(窓の「対象」の行を追随させる)
+        update = getattr(self.window_, "update_target", None)
+        if update is not None:
+            update()
 
     def _block_range(self):
         """正規化した (先頭行, 末行, 左桁, 右桁)。矩形が無ければ None。"""
@@ -486,7 +508,13 @@ class RenemoWindow(QDialog):
             "#renemo { background-color: #f0f0f0; }"
             " #renemo QPlainTextEdit { background-color: #ffffff; color: #000000;"
             " border: 1px solid #c0c0c0; }"
-            " #renemo QLabel { color: #000000; }")
+            " #renemo QLabel { color: #000000; }"
+            f" #renemo QToolButton#renemo_run {{ background-color: {RUN_COLOR}; color: #ffffff;"
+            " font-weight: bold; border: 1px solid #1e6b2e; border-radius: 3px; padding: 3px 10px; }"
+            " #renemo QToolButton#renemo_run:hover { background-color: #379f4a; }"
+            " #renemo QToolButton#renemo_run:pressed { background-color: #23702f; }"
+            " #renemo QToolButton::menu-indicator { image: none; width: 0px; }"
+            " #renemo QLabel#renemo_target { color: #303030; background-color: #e4e4e4; }")
         self.items = [dict(item) for item in items]
         provider = QFileIconProvider()
         for item in self.items:
@@ -520,32 +548,16 @@ class RenemoWindow(QDialog):
         layout.setSpacing(0)
 
         self._build_actions()
-        menubar = QMenuBar(self)
-        edit_menu = menubar.addMenu("編集(&E)")
-        for action in (self.act_upper, self.act_lower, self.act_half, self.act_full):
-            edit_menu.addAction(action)
-        edit_menu.addSeparator()
-        edit_menu.addAction(self.act_replace)
-        edit_menu.addAction(self.act_number)
-        edit_menu.addAction(self.act_mask)
-        edit_menu.addSeparator()
-        edit_menu.addAction(self.act_undo)
-        view_menu = menubar.addMenu("表示(&V)")
-        view_menu.addAction(self.act_ext)
-        view_menu.addAction(self.act_fullpath)
-        sort_menu = view_menu.addMenu("並べ替え(&S)")
-        for kind, label in SORT_KINDS:
-            sort_menu.addAction(label, lambda k=kind: self.sort_rows(k))
-        run_menu = menubar.addMenu("実行(&X)")
-        run_menu.addAction(self.act_execute)
-        run_menu.addAction(self.act_history)
-        layout.setMenuBar(menubar)
+        # 書式で付け直すの前回の値(この窓の中だけで覚える。保存はしない)
+        self.format_last = dict(FORMAT_DEFAULT)
+        self.toolbar = self._build_toolbar()
+        layout.addWidget(self.toolbar)
 
-        toolbar = QToolBar(self)
-        for action in (self.act_execute, self.act_ext, self.act_fullpath, self.act_replace,
-                       self.act_number, self.act_mask, self.act_history):
-            toolbar.addAction(action)
-        layout.addWidget(toolbar)
+        # いまの対象と変更のある件数(選択・矩形・編集のたびに書き直す)
+        self.target_label = QLabel()
+        self.target_label.setObjectName("renemo_target")
+        self.target_label.setContentsMargins(6, 2, 6, 2)
+        layout.addWidget(self.target_label)
 
         headers = QHBoxLayout()
         headers.setContentsMargins(4, 2, 4, 2)
@@ -583,6 +595,7 @@ class RenemoWindow(QDialog):
             bar.valueChanged.connect(lambda value, src=bar: self._sync_scroll(src, value, bars))
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.cursorPositionChanged.connect(self._update_status)
+        self.editor.selectionChanged.connect(self.update_target)
         self.editor.setContextMenuPolicy(Qt.CustomContextMenu)
         self.editor.customContextMenuRequested.connect(self._context_menu)
 
@@ -601,27 +614,111 @@ class RenemoWindow(QDialog):
         return view
 
     def _build_actions(self) -> None:
-        def act(text, slot, shortcut=None, checkable=False):
+        def act(text, slot, shortcut=None, checkable=False, button=None):
+            # text はメニューの文字(キーはメニューが右に出す)、button はツールバーの
+            # ボタンの文字(キーがあるものは括弧で添える)。
             action = QAction(text, self)
             if shortcut:
                 action.setShortcut(QKeySequence(shortcut))
                 action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            if button:
+                action.setIconText(button)
             action.setCheckable(checkable)
             action.triggered.connect(slot)
             self.addAction(action)
             return action
-        self.act_execute = act("実行", self.execute, "Ctrl+Return")
-        self.act_ext = act(".ext", self.toggle_ext, checkable=True)
-        self.act_fullpath = act("C:¥", self.toggle_fullpath, checkable=True)
+        self.act_execute = act("実行", self.execute, "Ctrl+Return", button="▶ 実行 (Ctrl+Enter)")
+        # 拡張子・フルパスの切り替え。ツールバーではチェックボックス(_check_for)で見せる。
+        self.act_ext = act("拡張子も編集", self.toggle_ext, checkable=True)
+        self.act_fullpath = act("フルパス表示", self.toggle_fullpath, checkable=True)
         self.act_upper = act("大文字(&U)", lambda: self.convert_selection("upper"), "Ctrl+Shift+U")
         self.act_lower = act("小文字(&L)", lambda: self.convert_selection("lower"), "Ctrl+U")
         self.act_half = act("全角→半角(&H)", lambda: self.convert_selection("half"))
         self.act_full = act("半角→全角(&F)", lambda: self.convert_selection("full"))
-        self.act_replace = act("置換(&R)…", self.replace_dialog, "Ctrl+H")
-        self.act_number = act("連番(&N)…", self.number_dialog)
-        self.act_mask = act("マスク(&M)…", self.mask_dialog)
-        self.act_undo = act("元に戻す(&Z)", lambda: self.editor.undo())
-        self.act_history = act("履歴(&I)…", self.history_dialog)
+        self.act_replace = act("置換(&R)…", self.replace_dialog, "Ctrl+H",
+                               button="置換… (Ctrl+H)")
+        self.act_format = act("書式で付け直す(&M)…", self.format_dialog, "Ctrl+M",
+                              button="書式で付け直す… (Ctrl+M)")
+        # 元に戻すは編集欄の Ctrl+Z と同じもの(キーは編集欄が受ける)
+        self.act_undo = act("元に戻す(&Z)", lambda: self.editor.undo(),
+                            button="↶ 元に戻す (Ctrl+Z)")
+        self.act_history = act("履歴(&I)…", self.history_dialog, button="履歴…")
+
+    def _convert_menu(self, parent) -> QMenu:
+        """文字の変換のメニュー(ツールバーの ▾ と右クリックで同じもの)。"""
+        menu = QMenu("文字の変換(&C)", parent)
+        for action in (self.act_upper, self.act_lower, self.act_half, self.act_full):
+            menu.addAction(action)
+        return menu
+
+    def _menu_button(self, text, menu) -> QToolButton:
+        """押すとすぐメニューが開くツールバーのボタン(▾ は文字に含める)。"""
+        button = QToolButton(self)
+        button.setText(text)
+        button.setMenu(menu)
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        return button
+
+    def _check_for(self, action) -> QCheckBox:
+        """チェックできる action をチェックボックスで見せる(オン・オフが一目で分かるように)。
+        押したら action を切り替えて、その triggered(toggle_ext など)を走らせる。
+        action 側の変化(テストの setChecked など)はチェックボックスへ写す。"""
+        box = QCheckBox(action.text(), self)
+        box.setChecked(action.isChecked())
+        box.setFocusPolicy(Qt.NoFocus)      # 押しても編集欄からフォーカスを取らない
+        box.clicked.connect(lambda checked: action.isChecked() != checked and action.trigger())
+        action.toggled.connect(box.setChecked)
+        return box
+
+    def _build_toolbar(self) -> QToolBar:
+        toolbar = QToolBar(self)
+        toolbar.setObjectName("renemo_toolbar")
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        toolbar.addAction(self.act_execute)
+        toolbar.widgetForAction(self.act_execute).setObjectName("renemo_run")
+        toolbar.addSeparator()
+        group = QLabel("一括で直す:")
+        group.setContentsMargins(4, 0, 2, 0)
+        toolbar.addWidget(group)
+        toolbar.addAction(self.act_replace)
+        toolbar.addAction(self.act_format)
+        self.convert_button = self._menu_button("文字の変換 ▾", self._convert_menu(self))
+        toolbar.addWidget(self.convert_button)
+        toolbar.addSeparator()
+        self.check_ext = self._check_for(self.act_ext)
+        self.check_fullpath = self._check_for(self.act_fullpath)
+        toolbar.addWidget(self.check_ext)
+        toolbar.addWidget(self.check_fullpath)
+        sort_menu = QMenu(self)
+        for kind, label in SORT_KINDS:
+            sort_menu.addAction(label, lambda k=kind: self.sort_rows(k))
+        self.sort_button = self._menu_button("並べ替え ▾", sort_menu)
+        toolbar.addWidget(self.sort_button)
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_undo)
+        toolbar.addAction(self.act_history)
+        for action in toolbar.actions():
+            widget = toolbar.widgetForAction(action)
+            if isinstance(widget, QToolButton):
+                widget.setFocusPolicy(Qt.NoFocus)
+        return toolbar
+
+    def toolbar_labels(self) -> list:
+        """ツールバーの並び(区切りは "|")。ボタンは見えている文字、チェックは ☑/☐ を付ける。"""
+        labels = []
+        for action in self.toolbar.actions():
+            if action.isSeparator():
+                labels.append("|")
+                continue
+            widget = self.toolbar.widgetForAction(action)
+            if isinstance(widget, QCheckBox):
+                labels.append(("☑ " if widget.isChecked() else "☐ ") + widget.text())
+            elif isinstance(widget, (QLabel, QToolButton)) and widget.text():
+                labels.append(widget.text())
+            else:
+                labels.append(action.iconText())
+        return labels
 
     def icon_for_row(self, row: int):
         if 0 <= row < len(self.order):
@@ -697,17 +794,28 @@ class RenemoWindow(QDialog):
         self.message = ""
         self._refresh_marks()
 
+    def _changed_rows(self, lines=None) -> set:
+        """元の名前から変わった行(編集欄の行番号)。黄色の行と「変更あり」の件数はこれで決める。"""
+        if lines is None:
+            lines = self.editor_lines()
+        changed = set()
+        for row, index in enumerate(self.order):
+            original = self.items[index]["stem"] + (self.items[index]["ext"] if self.show_ext else "")
+            if row < len(lines) and (lines[row] != original or
+                                     (not self.show_ext and self.exts[index] != self.items[index]["ext"])):
+                changed.add(row)
+        return changed
+
     def _refresh_marks(self) -> None:
         """編集した行(黄)と問題のある行(赤)に色を付ける。"""
         lines = self.editor_lines()
+        changed = self._changed_rows(lines)
         selections = []
         for row, index in enumerate(self.order):
-            original = self.items[index]["stem"] + (self.items[index]["ext"] if self.show_ext else "")
             color = None
             if index in self.problems:
                 color = ERROR_COLOR
-            elif row < len(lines) and (lines[row] != original or
-                                       (not self.show_ext and self.exts[index] != self.items[index]["ext"])):
+            elif row in changed:
                 color = EDITED_COLOR
             if color is None:
                 continue
@@ -721,8 +829,20 @@ class RenemoWindow(QDialog):
             sel.format = fmt
             sel.cursor = QTextCursor(block)
             selections.append(sel)
-        self.editor.setExtraSelections(selections)
+        self.editor.setExtraSelections(selections)   # 対象の行(update_target)もここで書き直る
         self.status_message.setText(self.message)
+
+    def target_text(self) -> str:
+        """「対象: 選んだ n 行 ｜ 変更あり k 件」(選択が無ければ「対象: 全 m 行」)。"""
+        rows = self._selected_rows()
+        target = (f"対象: 選んだ {len(rows)} 行" if rows is not None
+                  else f"対象: 全 {len(self.order)} 行")
+        return f"{target}　｜　変更あり {len(self._changed_rows())} 件"
+
+    def update_target(self) -> None:
+        label = getattr(self, "target_label", None)
+        if label is not None:
+            label.setText(self.target_text())
 
     def _update_status(self) -> None:
         row = self.editor.textCursor().blockNumber()
@@ -762,7 +882,7 @@ class RenemoWindow(QDialog):
             self.order.sort(key=lambda i: (news[i] == self.items[i]["name"], position[i]))
         self.render()
 
-    # --- 変換・置換・連番(取り消しできるよう、文字の差し替えで行う) ---
+    # --- 変換・置換・書式(取り消しできるよう、文字の差し替えで行う) ---
     def _selected_rows(self):
         block_rows = self.editor.block_rows()
         if block_rows is not None:
@@ -834,108 +954,116 @@ class RenemoWindow(QDialog):
             return
         self._replace_lines(lines)
 
-    def ask_numbering(self):
-        """連番の条件。{"fmt", "start", "step", "digits"} か None。"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("連番")
-        form = QFormLayout(dialog)
-        fmt = QLineEdit("{n}")
-        start, step, digits = QSpinBox(), QSpinBox(), QSpinBox()
-        start.setRange(-999999, 999999)
-        start.setValue(1)
-        step.setRange(-1000, 1000)
-        step.setValue(1)
-        digits.setRange(1, 10)
-        digits.setValue(3)
-        form.addRow("書式（{n} が番号。例 photo_{n:03}）", fmt)
-        form.addRow("開始番号", start)
-        form.addRow("増分", step)
-        form.addRow("桁数（{n} のとき）", digits)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.Accepted:
-            return None
-        return {"fmt": fmt.text(), "start": start.value(), "step": step.value(),
-                "digits": digits.value()}
-
-    def ask_mask(self):
-        """マスクの条件。{"mask", "start", "step"} か None。"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("マスク")
-        form = QFormLayout(dialog)
-        mask = QLineEdit("{name}_{n:03}")
-        start, step = QSpinBox(), QSpinBox()
-        start.setRange(-999999, 999999)
-        start.setValue(1)
-        step.setRange(-1000, 1000)
-        step.setValue(1)
-        form.addRow("マスク（{name} 元の名前 / {ext} 拡張子 / {n} 連番 / "
-                    "{date} 更新日 / {time} 時刻）", mask)
-        form.addRow("開始番号", start)
-        form.addRow("増分", step)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.Accepted:
-            return None
-        return {"mask": mask.text(), "start": start.value(), "step": step.value()}
-
-    def mask_dialog(self) -> None:
-        """選んだ行(無ければ全行)をマスクで組み立て直す。マスクに {ext} が
-        無ければ元の拡張子を残す(計算は filer_rename.mask_names)。"""
-        options = self.ask_mask()
-        if not options or not options["mask"].strip():
-            return
-        if not self.show_ext and "{ext}" in options["mask"]:
-            # 拡張子を隠しているときは、編集欄の行が名前の部分だけになる。
-            # ここで {ext} を展開すると拡張子が二重になるので、先に断る
-            # (置換の keep_ext が show_ext と連動するのと同じ理由)。
-            self.message = "{ext} を使うときは、拡張子を表示してください（.ext ボタン）"
-            self._refresh_marks()
-            return
+    # --- 書式で付け直す(連番もマスクもこれ1つ。計算は filer_rename.mask_names) ---
+    def _format_targets(self) -> list:
+        """書式で付け直す行(選んだ行、無ければ全行)。"""
         rows = self._selected_rows()
+        count = min(len(self.order), len(self.editor_lines()))
+        return [r for r in (rows if rows is not None else range(count)) if r < count]
+
+    def format_lines(self, options, rows) -> list:
+        """rows の行を書式で組み立て直した、編集欄の新しい行。書式の誤りは ValueError。
+
+        書式に {ext} が無ければ元の拡張子を残す(mask_names と同じ)。拡張子を隠して
+        いるとき(編集欄の行が名前の部分だけ)は、{ext} を前のドットごと空として扱い、
+        元の拡張子を残す。展開すると、隠している拡張子と二重になるため。"""
+        fmt = options["fmt"]
+        if not self.show_ext:
+            fmt = _EXT_TOKEN_RE.sub("", fmt)
+        if not fmt.strip():
+            raise ValueError("書式が空です")
         lines = self.editor_lines()
-        rows = [r for r in (rows if rows is not None else range(len(lines)))
-                if r < len(self.order)]
-        dir_flags = [self.items[self.order[r]]["is_dir"] for r in rows]
-        mtimes = [self.items[self.order[r]]["mtime"] for r in rows]
+        indexes = [self.order[r] for r in rows]
+        # 拡張子を隠しているときは、行に拡張子が無い。ドットを含む名前(a.b)を
+        # 拡張子と取り違えないよう、フォルダと同じ「拡張子なし」として渡す。
+        dir_flags = [self.items[i]["is_dir"] or not self.show_ext for i in indexes]
+        mtimes = [self.items[i]["mtime"] for i in indexes]
         try:
-            named = fr.mask_names([lines[r] for r in rows], options["mask"],
-                                  options["start"], options["step"], 1,
-                                  mtimes=mtimes, dir_flags=dir_flags)
+            return fr.mask_names([lines[r] for r in rows], fmt, options["start"], options["step"],
+                                 options["digits"], mtimes=mtimes, dir_flags=dir_flags)
+        except ValueError as e:
+            # filer_rename の文言は「マスク」。この窓では「書式」と呼ぶので言い換える
+            raise ValueError(str(e).replace("マスクの部品", "書式の記号")) from e
+
+    def format_preview(self, options, rows, count=3):
+        """見本: (最初の count 件の [(元, 新)], 注意の文)。名前は拡張子まで含めて見せる。
+        書式の誤りは ValueError。"""
+        news = self.format_lines(options, rows)
+        lines = self.editor_lines()
+
+        def full(row, line):
+            return line + ("" if self.show_ext else self.exts[self.order[row]])
+        pairs = [(full(r, lines[r]), full(r, new)) for r, new in zip(rows[:count], news)]
+        for r, new in zip(rows, news):
+            lines[r] = new
+        seen, note = set(), ""
+        for row, index in enumerate(self.order[:len(lines)]):
+            key = (self.items[index]["folder"], full(row, lines[row]).casefold())
+            if key in seen:
+                note = "名前が重なる行があります（このままでは実行のときに止まります）"
+                break
+            seen.add(key)
+        return pairs, note
+
+    def make_format_dialog(self, rows):
+        """書式で付け直すダイアログ(初期値は前回の値)。テストはこれを直接操作する。"""
+        return FormatDialog(self, self.format_last,
+                            lambda options: self.format_preview(options, rows),
+                            f"対象: {len(rows)} 行"
+                            + ("（選んだ行）" if self._selected_rows() is not None else "（全行）"))
+
+    def ask_format(self, rows):
+        """書式の条件。{"fmt", "start", "step", "digits"} か None。"""
+        dialog = self.make_format_dialog(rows)
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                return None
+            return dialog.options()
+        finally:
+            try:
+                dialog.deleteLater()
+            except RuntimeError:
+                pass
+
+    def format_dialog(self) -> None:
+        """選んだ行(無ければ全行)を書式で付け直す。"""
+        rows = self._format_targets()
+        if not rows:
+            return
+        options = self.ask_format(rows)
+        if not options:
+            return
+        self.format_last = dict(options)
+        try:
+            news = self.format_lines(options, rows)
         except ValueError as e:
             self.message = str(e)
             self._refresh_marks()
             return
-        for r, name in zip(rows, named):
+        lines = self.editor_lines()
+        for r, name in zip(rows, news):
             lines[r] = name
         self._replace_lines(lines)
 
-    def number_dialog(self) -> None:
-        """選んだ行(無ければ全行)に連番。拡張子は残す。"""
-        options = self.ask_numbering()
-        if not options:
-            return
-        rows = self._selected_rows()
-        lines = self.editor_lines()
-        rows = [r for r in (rows if rows is not None else range(len(lines))) if r < len(self.order)]
-        dir_flags = [self.items[self.order[r]]["is_dir"] for r in rows]
-        named = fr.numbered_names([lines[r] for r in rows], options["fmt"], options["start"],
-                                  options["step"], options["digits"], keep_ext=self.show_ext,
-                                  dir_flags=dir_flags)
-        for r, name in zip(rows, named):
-            lines[r] = name
-        self._replace_lines(lines)
+    def build_context_menu(self) -> QMenu:
+        """右クリックのメニュー。ツールバーの「一括で直す」と同じ中身 + 元に戻す。"""
+        menu = QMenu(self)
+        menu.addAction(self.act_replace)
+        menu.addAction(self.act_format)
+        menu.addMenu(self._convert_menu(menu))
+        menu.addSeparator()
+        menu.addAction(self.act_undo)
+        return menu
 
     def _context_menu(self, pos) -> None:
-        menu = QMenu(self)
-        for action in (self.act_upper, self.act_lower, self.act_half, self.act_full,
-                       self.act_replace, self.act_number, self.act_mask, self.act_undo):
-            menu.addAction(action)
-        menu.exec(self.editor.mapToGlobal(pos))
+        menu = self.build_context_menu()
+        try:
+            menu.exec(self.editor.mapToGlobal(pos))
+        finally:
+            try:
+                menu.deleteLater()
+            except RuntimeError:
+                pass
 
     # --- 実行 ---
     def build_pairs(self):
@@ -1013,3 +1141,98 @@ class RenemoWindow(QDialog):
             self.reject()
             return
         super().keyPressEvent(event)
+
+
+class FormatDialog(QDialog):
+    """書式で付け直す(連番とマスクを1つにしたもの)。
+
+    preview(options) は (見本の [(元, 新)], 注意の文) を返す。書式が誤っていれば
+    ValueError で、そのときは理由を赤字で出して OK を押せなくする。"""
+
+    def __init__(self, parent, options, preview, target_text=""):
+        super().__init__(parent)
+        self.setWindowTitle("書式で付け直す")
+        self._preview = preview
+        layout = QVBoxLayout(self)
+
+        # よく使う形(押すと書式の欄に入る)
+        presets = QHBoxLayout()
+        presets.addWidget(QLabel("よく使う形:"))
+        self.preset_buttons = []
+        for label, fmt in FORMAT_PRESETS:
+            button = QPushButton(f"{label} {fmt}")
+            button.setAutoDefault(False)
+            button.clicked.connect(lambda _checked=False, f=fmt: self.fmt_edit.setText(f))
+            presets.addWidget(button)
+            self.preset_buttons.append(button)
+        presets.addStretch(1)
+        layout.addLayout(presets)
+
+        form = QFormLayout()
+        self.fmt_edit = QLineEdit(options["fmt"])
+        self.start_spin, self.step_spin, self.digits_spin = QSpinBox(), QSpinBox(), QSpinBox()
+        self.start_spin.setRange(-999999, 999999)
+        self.start_spin.setValue(options["start"])
+        self.step_spin.setRange(-1000, 1000)
+        self.step_spin.setValue(options["step"])
+        self.digits_spin.setRange(1, 10)
+        self.digits_spin.setValue(options["digits"])
+        form.addRow("書式", self.fmt_edit)
+        numbers = QHBoxLayout()
+        for text, spin in (("開始番号", self.start_spin), ("増分", self.step_spin),
+                           ("桁数", self.digits_spin)):
+            numbers.addWidget(QLabel(text))
+            numbers.addWidget(spin)
+        numbers.addStretch(1)
+        form.addRow(numbers)
+        help_label = QLabel(FORMAT_HELP)
+        help_label.setTextFormat(Qt.PlainText)
+        help_label.setStyleSheet("color: #505050;")
+        form.addRow(help_label)
+        layout.addLayout(form)
+
+        # 見本(対象の最初の数件の「元 → 新」。入力に合わせてその場で書き直す)
+        layout.addWidget(QLabel(f"見本　{target_text}" if target_text else "見本"))
+        self.preview_label = QLabel()
+        self.preview_label.setTextFormat(Qt.PlainText)
+        self.preview_label.setStyleSheet(
+            "background-color: #ffffff; border: 1px solid #c0c0c0; padding: 4px;")
+        self.preview_label.setMinimumHeight(QFontMetrics(self.font()).lineSpacing() * 3 + 10)
+        layout.addWidget(self.preview_label)
+        self.error_label = QLabel()
+        self.error_label.setTextFormat(Qt.PlainText)
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.ok_button = buttons.button(QDialogButtonBox.Ok)
+        layout.addWidget(buttons)
+
+        self.fmt_edit.textChanged.connect(self.update_preview)
+        for spin in (self.start_spin, self.step_spin, self.digits_spin):
+            spin.valueChanged.connect(self.update_preview)
+        self.update_preview()
+        self.fmt_edit.setFocus()
+        self.fmt_edit.selectAll()
+
+    def options(self) -> dict:
+        return {"fmt": self.fmt_edit.text(), "start": self.start_spin.value(),
+                "step": self.step_spin.value(), "digits": self.digits_spin.value()}
+
+    def update_preview(self) -> None:
+        try:
+            pairs, note = self._preview(self.options())
+        except ValueError as e:
+            self.preview_label.setText("")
+            self.error_label.setStyleSheet("color: #c00000;")
+            self.error_label.setText(str(e))
+            self.ok_button.setEnabled(False)
+            return
+        self.preview_label.setText("\n".join(f"{old}  →  {new}" for old, new in pairs))
+        # 重なりは書式の誤りではない(付け直した後に手で直せる。直さなければ実行の
+        # ときの検査で止まる)ので、注意だけ出して OK は押せるままにする
+        self.error_label.setStyleSheet("color: #a05a00;")
+        self.error_label.setText(note)
+        self.ok_button.setEnabled(True)

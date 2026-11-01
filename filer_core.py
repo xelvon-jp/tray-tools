@@ -94,7 +94,8 @@ DEFAULT_KEYMAP = {
     "0078": "desktop",            # N (AFXW.key 0078 &EXCD Desktop)
     "0076": "drive",              # L
     "0070": "isearch",            # F
-    "1070": "everything",         # Shift+F Everything 検索(es.exe。結果はフラット表示の形)
+    "1070": "everything",         # Shift+F 検索のメニュー(E: Everything 検索 / P: ★写真抽出。
+                                  # 結果はどちらもフラット表示の形)
     "0071": "grep",               # G 文字列検索(内容で探して結果をフラット表示)
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
@@ -979,6 +980,8 @@ COMMAND_SHORT_NAMES = {
     "isearch": "Search",
     "grep": "Grep",
     "everything": "Everything",
+    "everything_search": "Everything",
+    "photo_pick": "★抽出",
     "workspace": "Workspace",
     "sort_dialog": "Sort",
     "sort_reverse": "Sort逆",
@@ -2747,3 +2750,103 @@ def photo_mode_on(override: str, auto: bool) -> bool:
     if override == "off":
         return False
     return bool(auto)
+
+
+# ---------------------------------------------------------------
+# ★写真抽出(Shift+F → P)。配下の写真のうち★が基準以上のものをフラット表示の形で並べる
+# ---------------------------------------------------------------
+PICK_MIN_RATING = 1             # 抽出の基準(★1以上)。窓の下の★の範囲スライダーとは AND
+PICK_LIMIT = 200_000            # 集める写真の上限(フラット表示と同じ)
+PICK_PROGRESS_SEC = 0.2         # 途中経過を知らせる間隔(秒)
+# OneDrive のオンライン専用ファイル(中身を読むとダウンロードが始まる)の印。
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+_ONLINE_ONLY_ATTRS = (stat.FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                      | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def is_online_only(attrs: int) -> bool:
+    """中身がこの PC に無いファイルか(開くとダウンロードが始まる)。"""
+    return bool(attrs & _ONLINE_ONLY_ATTRS)
+
+
+def collect_photos(root: str, show_hidden: bool = True, show_system: bool = True,
+                   limit: int = PICK_LIMIT, cancel=None, progress=None, scandir=os.scandir):
+    """root より下の写真(拡張子で写真とみなせるもの)を集める。読み取りスレッドで呼ぶ。
+
+    (項目, オンライン専用で飛ばした数, 状態) を返す。項目の名前は root からの相対パス
+    (collect_flat と同じ形)。状態は "done" / "limit" / "cancel"。
+    - シンボリックリンク・ジャンクションのフォルダはたどらない(tally_sizes と同じ考え方。
+      OneDrive のフォルダは普通のフォルダとしてたどる。一覧を読むだけで中身は落とさない)
+    - オンライン専用の写真は入れない(★を読むには中身を開くので、ダウンロードさせない)
+    - 隠し・システムは show_hidden / show_system(Shift+Z)に従う
+    - 見るのは scandir と stat(follow_symlinks=False) だけ。ファイルは開かない
+    - 読めないフォルダは飛ばす。progress(集めた数) を PICK_PROGRESS_SEC 秒に1回ほど呼ぶ"""
+    found = []
+    offline = 0
+    stack = [root]
+    last = time.monotonic()
+    while stack:
+        if cancel is not None and cancel.is_set():
+            return found, offline, "cancel"
+        folder = stack.pop()
+        subdirs = []
+        try:
+            with scandir(folder) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    attrs = getattr(st, "st_file_attributes", 0)
+                    if not show_hidden and attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+                        continue
+                    if not show_system and attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                        continue
+                    if _is_dir_stat(st):
+                        if not _is_link_stat(st):
+                            subdirs.append(entry.path)
+                        continue
+                    if _is_link_stat(st) or not is_photo(entry.name):
+                        continue
+                    if is_online_only(attrs):
+                        offline += 1
+                        continue
+                    found.append(Entry(os.path.relpath(entry.path, root), False,
+                                       st.st_size, st.st_mtime, attrs))
+                    if len(found) >= limit:
+                        return found, offline, "limit"
+        except OSError:
+            continue
+        stack.extend(sorted(subdirs, key=str.casefold, reverse=True))
+        now = time.monotonic()
+        if progress is not None and now - last >= PICK_PROGRESS_SEC:
+            last = now
+            progress(len(found))
+    if progress is not None:
+        progress(len(found))
+    return found, offline, "done"
+
+
+def sidecar_online_only(path: str) -> bool:
+    """RAW のサイドカー(名前.xmp)がオンライン専用か(無い・読めないなら False)。"""
+    from photometa.xmp import is_raw, sidecar_path
+
+    if not is_raw(path):
+        return False
+    try:
+        st = os.stat(sidecar_path(path))
+    except OSError:
+        return False
+    return is_online_only(getattr(st, "st_file_attributes", 0))
+
+
+def pick_footer_text(root: str, shown: int, total: int, size: int,
+                     mark_count: int = 0, mark_bytes: int = 0) -> str:
+    """★写真抽出のときの窓の下の行。「★写真抽出: <フォルダ>（12 枚）」。スライダーで
+    さらに絞っているときは「12 / 340 枚」。"""
+    count = f"{shown:,} 枚" if shown == total else f"{shown:,} / {total:,} 枚"
+    text = f"★写真抽出: {root}（{count}）   {size:,} bytes"
+    if mark_count:
+        text += f"   Mark {mark_count} ({mark_bytes:,})"
+    return text

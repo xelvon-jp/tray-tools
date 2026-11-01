@@ -1930,6 +1930,7 @@ XYplorer の Live Filter / yazi の filter に当たるものです。`/` で窓
 - `Shift+Z` の「写真フォルダモード：自動／常にオン／常にオフ」で今の窓だけ切り替えられます。別のフォルダへ移ったら自動に戻ります（保存しない）
 - モード中は窓の見出しの頭に `📷`、拡張子の列の右に**★の列**（段階ごとの色の小さな角丸バッジ：`💌 みてね` `🖼️ フレーム` `⭐ ベスト` `❌ 削除`、段階の無い★は灰色の `★1` `★2`、未選別は空欄。`みてね済` が付いていれば右に緑の `✓`（未選別で済だけなら `✓` だけ）。マウスを載せると正式名（`フォトフレーム用 済` など）。絵文字と短い名前は共通設定の段階の `icon` / `short`。字の大きさは `filer.py` の `RATING_BADGE_PX`（いまは 8px）。色は `filer.colors` の `rating_5` / `rating_4` / `rating_3` / `rating_reject` / `rating_other`（字）と、それぞれ後ろに `_bg` を付けたもの（地）、`rating_done`（✓）。スライダーの色は `rating_accent`）、一覧の真下に**★の範囲の段**（下の「★の絞り込み」）
 - ★は裏のスレッドで読みます（見えている行から先に、読めた順に埋める。一覧の表示は待たせない）。読み取りは ExifTool を使わずファイル先頭の XMP だけ。フォルダを移ったら読みかけは捨てます。一覧を読み直したときは、更新日時が変わった写真だけ読み直します
+- 読み取り結果はディスクの永続キャッシュ（下の「写真の★」の節の「読み取りキャッシュ」）にも覚え、キャッシュに無いものは8本並行で読みます。オンライン専用の写真（OneDrive）は開くとダウンロードが始まるので読まず、★は不明として扱い、飛ばした枚数をログに出します。読み取りが1秒以上かかると、一覧の真ん中に進み具合（バーと %）を出します（★写真抽出では最初から出ます）
 - 窓が狭いときに隠す順は 日時 → サイズ → ★ → 拡張子（★の列の幅は一番長いバッジと ✓ に合わせて測る。既定で約 75px）
 
 **★を付ける（`R` の「写真の★」の欄）**。写真フォルダモードでなくても効きます。`R`（ファイル情報の編集）の対象（マーク中のファイル、無ければカーソル行）に画像（RAW も）が1つでもあり、★を書ける（書庫の中でない・ExifTool が見つかる）ときだけ、ダイアログの下部に欄が出ます。画像が無ければ従来と同じダイアログです。
@@ -2315,6 +2316,7 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 |---|---|
 | `photometa/xmp.py` | ★とキーワードを**ExifTool を使わずに**読む（`read_meta(path)` → `PhotoMeta(rating, keywords)`、読めなければ `None`＝不明）。対象の判定は `is_photo(name)` |
 | `photometa/writer.py` | ExifTool を常駐させて書く（`ExifToolSession.set_rating` / `set_keyword` / `restore`）。変更記録の読み書き（`JournalReader`） |
+| `photometa/metacache.py` | ★の読み取り結果の永続キャッシュ（SQLite。`MetaCache.read_cached` / `read_metas`。下の「読み取りキャッシュ」） |
 | `photometa/config.py` | 共通設定の読み書き、写真メニュー（`menu_items`。PhotoCuller の `I`）・絞り込みの小メニュー（`filter_menu_items`。PhotoCuller の `I` → `/`）・書き出しの小メニュー（`export_menu_items`。PhotoCuller の `I` → `E`）の中身 |
 | `photometa/filter_expr.py` | 条件式（PhotoCuller の表示フィルタを拡張したもの。下の表） |
 | `photometa/export.py` | 書き出し（`collect` / `sync_frame` / `collect_mitene` / `finish_mitene`。PhotoCuller の `I` → `E` から使う。下の「書き出し」） |
@@ -2337,6 +2339,8 @@ ExifTool は `-stay_open True -@ -` で1つだけ起こし、1枚ずつ送りま
 **読み取り**は、JPEG は APP1 の XMP セグメントをマーカーをたどって探し（画像データの始まりで打ち切る）、PNG は `iTXt`、WebP は `XMP ` チャンク、それ以外（HEIC / TIFF）は先頭 1MB から XMP パケットを探します。形式は拡張子ではなく先頭のバイト列で見分けます。
 
 **変更記録**（`%LOCALAPPDATA%\traytools\photometa_journal.jsonl`）: 書いた側が1行（パス・★・キーワード・時刻・pid）足し、もう一方のアプリが `JournalReader` で前回の位置から読んで、開いている一覧に反映します（更新日時を変えないので、日時では変更に気付けないため）。2MB を超えたら `.old` に回して新しく始めます。
+
+**読み取りキャッシュ**（`photometa/metacache.py`）: ★の読み取り結果を `%LOCALAPPDATA%\traytools\photometa_cache.sqlite`（SQLite、WAL）に覚え、あっふと PhotoCuller で共用します。キーは正規化したフルパス、照合はファイルのサイズと更新日時（RAW はサイドカーのサイズと更新日時も）。一致すればファイルを開かずに返し、違えば読み直して書き換えます。書き込みは更新日時を元に戻すため、`open_session` で作った `ExifToolSession` が成功時にキャッシュも新しい値へ更新し、変更記録を読んで反映する側も同じ更新をします。キャッシュに無い写真は8本並行で読みます（`READ_WORKERS`）。作り直したいときは、このファイルを消せば次回に自動で作り直します。
 
 **共通設定**（`%LOCALAPPDATA%\traytools\photo_ratings.json`。無ければ既定値）
 

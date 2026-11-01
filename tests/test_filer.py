@@ -8201,10 +8201,14 @@ def test_photo_rating_slider_only():
             assert L.rating_range == (-1, 5) and L.rating_node is None
             assert "memo.txt" in _names(L) and "★の絞り込みを解きました" in log()
 
-            # ★が未読み取りの写真は「不明」で隠れ、読めたら掛け直して出る
+            # ★が未読み取りの写真は「不明」で隠れ、読めたら掛け直して出る。
+            # 永続キャッシュが効いていると読み直さないので、この間だけ空のキャッシュに替える
             gate = _threading.Event()
             original = filer._read_photo_meta
             filer._read_photo_meta = lambda p: (gate.wait(5), original(p))[1]
+            saved_cache = filer._photo_metacache
+            filer._photo_metacache = filer.photo_metacache.MetaCache(
+                str(Path(tmp, "slider_gate_cache.sqlite")))
             try:
                 L.reset_photo()
                 L.set_rating_range(4, 5)
@@ -8216,6 +8220,7 @@ def test_photo_rating_slider_only():
             finally:
                 gate.set()
                 filer._read_photo_meta = original
+                filer._photo_metacache = saved_cache
             L.clear_rating()
         finally:
             w.close()
@@ -9027,6 +9032,128 @@ def _make_pick_tree(tmp):
 PICKED = ["a3.jpg", "y2023\\b5.jpg", "y2023\\c1.jpg", "y2023\\deep\\e4.jpg", "y2024\\g2.jpg"]
 
 
+def test_photo_read_metacache_progress_online():
+    """★の列の読み取り: 永続キャッシュ(2回目はファイルを開かない)・1秒以上で中央に
+    進み具合を出す・オンライン専用の写真は開かずに飛ばす。"""
+    import stat as _stat
+    import threading as _threading
+
+    import filer
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        saved_cache = filer._photo_metacache
+        original = filer._read_photo_meta
+        try:
+            # 1回目: 並行読みで★が入り、永続キャッシュにも入る
+            cache = filer.photo_metacache.MetaCache(str(Path(tmp, "meta.sqlite")))
+            filer._photo_metacache = cache
+            w = _photo_window(photos, other, settings_path)
+            L = w.left
+            try:
+                texts = _rating_texts(L)
+                assert texts["a5.jpg"] == "みてね用" and texts["b4.jpg"] == "フォトフレーム用"
+                assert texts["c3.jpg"] == "ベストショット 済" and texts["e_none.jpg"] == ""
+                hit = cache.get(str(photos / "a5.jpg"))
+                assert hit is not None and hit.rating == 5
+            finally:
+                w.close()
+                w.deleteLater()
+
+            # 2回目: 読み取り関数を数えるものに替えても、キャッシュで済んで呼ばれない
+            calls = []
+
+            def counting(p):
+                calls.append(p)
+                return original(p)
+
+            filer._read_photo_meta = counting
+            try:
+                w = _photo_window(photos, other, settings_path)
+                try:
+                    assert calls == [], calls
+                    assert _rating_texts(w.left)["b4.jpg"] == "フォトフレーム用"
+                finally:
+                    w.close()
+                    w.deleteLater()
+            finally:
+                filer._read_photo_meta = original
+
+            # 進み具合: 空のキャッシュ＋遅い読み取りで、1秒たつと中央表示が出て、
+            # 読み終わると消える
+            filer._photo_metacache = filer.photo_metacache.MetaCache(
+                str(Path(tmp, "meta_slow.sqlite")))
+            gate = _threading.Event()
+            filer._read_photo_meta = lambda p: (gate.wait(10), original(p))[1]
+            try:
+                w = filer.FilerWindow(
+                    {"filer": {"left_path": str(photos), "right_path": str(other)}},
+                    str(settings_path))
+                w.resize(1100, 600)
+                w.show()
+                w.start()
+                try:
+                    _wait_until(lambda: w.left.read_progress.isVisible(), timeout=8,
+                                what="中央の進み具合表示")
+                    assert "★を読んでいます…" in w.left.read_progress.label.text()
+                    assert "/ 5" in w.left.read_progress.label.text()
+                    gate.set()
+                    _wait_until(
+                        lambda: len(w.left.photo_meta) >= 5 and not w.left._photo_requested,
+                        what="★の読み取りが終わる")
+                    _wait_until(lambda: not w.left.read_progress.isVisible(), timeout=5,
+                                what="中央表示が消える")
+                finally:
+                    gate.set()
+                    w.close()
+                    w.deleteLater()
+            finally:
+                filer._read_photo_meta = original
+
+            # オンライン専用: 属性の立った写真は開かず、★は不明のまま。ログに枚数が出る
+            filer._photo_metacache = filer.photo_metacache.MetaCache(
+                str(Path(tmp, "meta_online.sqlite")))
+            filer._read_photo_meta = counting
+            calls.clear()
+            try:
+                w = _photo_window(photos, other, settings_path)
+                L = w.left
+                try:
+                    # 窓を開いた時点でもうキャッシュに入っているので、空のキャッシュに
+                    # 替えてから読み直させる(替えないと4枚もキャッシュで済んでしまう)
+                    filer._photo_metacache = filer.photo_metacache.MetaCache(
+                        str(Path(tmp, "meta_online2.sqlite")))
+                    L.reset_photo()
+                    calls.clear()
+                    # Entry は frozen なので、属性を立てた複製に入れ替える
+                    import dataclasses as _dc
+                    for lst in (L.entries, L.all_entries):
+                        for i, e in enumerate(lst):
+                            if e.name == "a5.jpg":
+                                lst[i] = _dc.replace(
+                                    e, attrs=e.attrs | _stat.FILE_ATTRIBUTE_OFFLINE)
+                    L.start_photo_read()
+                    _wait_until(
+                        lambda: len(L.photo_meta) >= 5 and not L._photo_requested,
+                        what="オンライン専用を除く読み取り")
+                    key = filer.photo_key(str(photos / "a5.jpg"))
+                    assert L.photo_meta[key] is None            # ★は不明として扱う
+                    assert not any(p.endswith("a5.jpg") for p in calls), calls
+                    assert len(calls) == 4                      # 残り4枚だけ読んだ
+                    assert "オンライン専用の写真 1 枚は飛ばしました" in w.log_view.toPlainText()
+                finally:
+                    w.close()
+                    w.deleteLater()
+            finally:
+                filer._read_photo_meta = original
+        finally:
+            filer._photo_metacache = saved_cache
+
+
 def test_photo_pick():
     """Shift+F → P(★写真抽出): 配下の★1以上の写真をフラット表示の形で並べ、写真フォルダモード
     (★の列・★の段)にする。スライダーとは AND。R で★を外すと消える。C の複写の後も抽出のまま。
@@ -9041,6 +9168,10 @@ def test_photo_pick():
         root, other = _make_pick_tree(tmp)
         settings_path = Path(tmp, "settings.json")
         settings_path.write_text("{}", encoding="utf-8")
+        # ★の永続キャッシュはテスト用の一時ファイルに差し替える(本物を汚さない)
+        saved_metacache = filer._photo_metacache
+        filer._photo_metacache = filer.photo_metacache.MetaCache(
+            str(Path(tmp, "pick_cache.sqlite")))
         w = filer.FilerWindow({"filer": {"left_path": str(root), "right_path": str(other)}},
                               str(settings_path))
         w.extra_op_flags = _quiet_flags()
@@ -9072,6 +9203,8 @@ def test_photo_pick():
             assert L.header.text().startswith("📷 ") and "[★写真抽出]" in L.header.text()
             assert L.footer.text().startswith(f"★写真抽出: {root}（5 枚）"), L.footer.text()
             assert "★1以上を 5 枚（★を読んだ写真 8 枚）" in log(), log()
+            # 完了ログに所要時間とキャッシュ/読み取りの内訳が出る(初回は全部読み取り)
+            assert "（キャッシュ 0 / 読み取り 8）" in log(), log()
             texts = _rating_texts(L)
             assert texts["y2023\\b5.jpg"] == "みてね用" and texts["y2023\\deep\\e4.jpg"] == "フォトフレーム用 済"
             assert L.rating_bar.count_label.text() == "表示 5 / 5枚"
@@ -9143,21 +9276,30 @@ def test_photo_pick():
             L.load(str(root))
             _wait(w)
 
-            # Esc で中止(★の読み取りを止めて、元の表示へ)
+            # Esc で中止(★の読み取りを止めて、元の表示へ)。
+            # 永続キャッシュが効いていると読み直さないので、この間だけ空のキャッシュに替える
             L.reset_photo()                     # 読んだ★を捨てて、読み取りを待たせる
             gate = _threading.Event()
             original = filer._read_photo_meta
             filer._read_photo_meta = lambda p: (gate.wait(5), original(p))[1]
+            pick_cache = filer._photo_metacache
+            filer._photo_metacache = filer.photo_metacache.MetaCache(
+                str(Path(tmp, "pick_cache_esc.sqlite")))
             try:
                 key(Qt.Key_F, Qt.ShiftModifier)
                 _wait_until(lambda: "★を読んでいます…" in L.footer.text(), what="読み取り中の表示")
                 assert L.pick_loading and "/ 8（Esc で中止）" in L.footer.text(), L.footer.text()
+                # 読み取り中は一覧の中央にも進み具合が出る
+                assert L.read_progress.isVisible()
+                assert "★を読んでいます…" in L.read_progress.label.text()
                 key(Qt.Key_Escape)
                 gate.set()
                 _wait(w, timeout=10)
             finally:
                 gate.set()
                 filer._read_photo_meta = original
+                filer._photo_metacache = pick_cache
+            assert not L.read_progress.isVisible()      # 終われば中央表示は消える
             assert "★写真抽出: 中止しました" in log()
             assert not L.pick_loading and L.pick_root is None and not L.flat
             assert sorted(_names(L)) == before and w.isVisible()
@@ -9174,6 +9316,7 @@ def test_photo_pick():
         finally:
             w.close()
             w.deleteLater()
+            filer._photo_metacache = saved_metacache
 
 
 def main() -> int:

@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QSizePolicy,
@@ -89,6 +90,7 @@ import filer_update
 import settings as settings_module
 from photometa import config as photo_config
 from photometa import filter_expr as photo_filter
+from photometa import metacache as photo_metacache
 from photometa import writer as photo_writer
 from photometa import xmp as photo_xmp
 from traytools_send import pythonw_executable
@@ -310,6 +312,31 @@ COLUMN_COUNT = 5
 
 # 写真の★を読む関数(裏のスレッドで呼ぶ)。テストで差し替えられるよう、ここを通す。
 _read_photo_meta = photo_xmp.read_meta
+
+# ★の読み取りの永続キャッシュ(photometa.metacache。ディスクに覚えて、2回目以降は
+# stat が一致すればファイルを開かずに返す)。テストで差し替えられるようモジュール
+# 変数に置き、初回に使うときに既定のものを遅延して作る。
+_photo_metacache = None
+
+
+def _get_photo_metacache():
+    global _photo_metacache
+    if _photo_metacache is None:
+        _photo_metacache = photo_metacache.default_cache()
+    return _photo_metacache
+
+
+def _read_photo_metas_parallel(paths, cancel=None, progress=None, on_result=None):
+    """★をキャッシュ＋並行読みで読む(裏のスレッドで呼ぶ)。
+
+    戻り値は photometa.metacache.read_metas と同じ (results, hits, reads, cancelled)。
+    results のキーは photo_key ではなく、渡したパスの文字列そのまま。
+    """
+    return photo_metacache.read_metas(
+        paths, cache=_get_photo_metacache(), cancel=cancel, progress=progress,
+        reader=lambda p: _read_photo_meta(p), on_result=on_result)
+
+
 # ★の読み取りスレッドが結果を渡す単位(読めた順に描き直すが、1枚ごとには送らない)。
 PHOTO_READ_BATCH = 32
 PHOTO_READ_FLUSH_SECONDS = 0.15
@@ -330,6 +357,73 @@ def rating_color_key(rating) -> str:
 def photo_key(path: str) -> str:
     """★のキャッシュのキー(大文字小文字・区切りをそろえたフルパス)。"""
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _format_duration(seconds: float) -> str:
+    """ログに出す所要時間(例: 3.5秒 / 1分40秒)。"""
+    if seconds < 10:
+        return f"{seconds:.1f}秒"
+    total = int(round(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes and secs:
+        return f"{minutes}分{secs}秒"
+    if minutes:
+        return f"{minutes}分"
+    return f"{secs}秒"
+
+
+class _ReadProgress(QWidget):
+    """★の読み取りの進み具合を、一覧の真ん中に出す表示。
+
+    窓の下の小さい行だけでは気づきにくいので、長い読み取りのときは一覧の中央に
+    大きめの文字とバーを出す。色は filer.colors に合わせ、終われば消す。
+    マウスは素通しする(下の一覧を触れるままにする)。
+    """
+
+    def __init__(self, colors, font, parent=None):
+        super().__init__(parent)
+        self._colors = colors
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(10)
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.PlainText)
+        self.label.setAlignment(Qt.AlignCenter)
+        big = QFont(font)
+        big.setPointSize(max(big.pointSize() + 4, 12))
+        big.setBold(True)
+        self.label.setFont(big)
+        layout.addWidget(self.label)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setMinimumWidth(320)
+        layout.addWidget(self.bar)
+        for w in (self, self.label, self.bar):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.apply_colors(colors)
+        self.hide()
+
+    def apply_colors(self, colors) -> None:
+        self._colors = colors
+        bg = colors["background"]
+        self.setStyleSheet(
+            f"_ReadProgress {{ background-color: {bg};"
+            f" border: 2px solid {colors['header_active']}; }}"
+            f" QLabel {{ color: {colors['text']}; background-color: transparent; }}"
+            f" QProgressBar {{ background-color: {bg};"
+            f" border: 1px solid {colors['header_active']}; height: 10px; }}"
+            f" QProgressBar::chunk {{ background-color: {colors['isearch']}; }}")
+
+    def set_progress(self, text: str, done: int = 0, total: int = 0) -> None:
+        self.label.setText(text)
+        if total > 0:
+            self.bar.setRange(0, total)
+            self.bar.setValue(min(done, total))
+            self.bar.show()
+        else:
+            self.bar.setRange(0, 0)     # 数がまだ分からない間は往復するバー
+            self.bar.show()
+        self.adjustSize()
 
 
 class FileModel(QAbstractTableModel):
@@ -699,6 +793,7 @@ class Pane(QWidget):
         self.pick_count = 0
         self.pick_read = 0
         self.pick_total = 0
+        self._pick_started = 0.0        # 抽出の所要時間(完了ログに出す)の起点
         # 写真フォルダモード(★の列と★の範囲の段)。photo_override は Shift+Z の手動切り替え
         # ("auto" / "on" / "off")で、別のフォルダへ移ったら "auto" に戻る(保存しない)。
         self.photo_override = "auto"
@@ -713,6 +808,14 @@ class Pane(QWidget):
         # あっふ・PhotoCuller の書き込みは変更記録と書いた結果で直す。
         self._photo_mtimes = {}
         self._photo_cancel = threading.Event()
+        # ★の列の読み取りの進み具合(中央表示用)。_photo_read_pending はまだ届いて
+        # いないキー、_photo_read_total は読み始めた総数。1秒以上かかったときだけ出す。
+        self._photo_read_pending = set()
+        self._photo_read_total = 0
+        self._photo_progress_timer = QTimer(self)
+        self._photo_progress_timer.setSingleShot(True)
+        self._photo_progress_timer.setInterval(1000)
+        self._photo_progress_timer.timeout.connect(self._show_photo_progress)
         self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
         self._photo_auto = False
         self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
@@ -767,6 +870,9 @@ class Pane(QWidget):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
         header.hideSection(COL_RATING)
         layout.addWidget(self.view, 1)
+
+        # ★の読み取りの進み具合(一覧の真ん中に出す)。長い読み取りのときだけ出す。
+        self.read_progress = _ReadProgress(window.colors, window.list_font, self)
 
         # ★の範囲の段(写真フォルダモードのときだけ。一覧の真下)。この窓の
         # ★の範囲・枚数を出し、操作もこの窓にだけ掛かる。ドラッグ中は間引いて掛ける。
@@ -931,6 +1037,8 @@ class Pane(QWidget):
             f" {{ background-color: transparent; }}")
         self.footer.setStyleSheet(
             f"background-color: {background}; color: {c['footer_text']};")
+        if hasattr(self, "read_progress"):
+            self.read_progress.apply_colors(c)
         self.update_header()
         self.view.viewport().update()
 
@@ -1396,6 +1504,8 @@ class Pane(QWidget):
         try:
             if self.flat_loading or self.grep_loading or self.es_loading or self.pick_loading:
                 self.update_footer()
+                if self.pick_loading:
+                    self._update_pick_progress()
             else:
                 self._flat_timer.stop()
         except Exception:  # noqa: BLE001
@@ -1642,6 +1752,7 @@ class Pane(QWidget):
         self.pick_cancel = None
         self.pick_root = None
         self.pick_loading = False
+        self._hide_read_progress()
 
     def pick_match(self, entry) -> bool:
         """★写真抽出の基準に合うか(★1以上の写真。★を読めていないものは外す)。"""
@@ -1673,6 +1784,7 @@ class Pane(QWidget):
         self.loading = True
         self.pick_phase = "scan"
         self.pick_count = self.pick_read = self.pick_total = 0
+        self._pick_started = time.monotonic()
         root = self.path
         win = self.window_
         args = dict(path=root, pick=True, keep_marks=keep_marks)
@@ -1690,34 +1802,55 @@ class Pane(QWidget):
                 found, offline, status = core.collect_photos(
                     root, show_hidden, show_system, core.PICK_LIMIT, cancel, progress)
                 metas, mtimes, picked = {}, {}, []
+                cache_hits = disk_reads = 0
                 if status != "cancel":
                     self.pick_total = len(found)
                     self.pick_phase = "read"
+                    # 読んである★(メモリ内・更新日時が同じもの)はそのまま使い、
+                    # 残りはディスクの永続キャッシュ＋並行読みで読む。
+                    meta_by_key, offline_keys, todo = {}, set(), []
                     for e in found:
-                        if cancel.is_set():
-                            status = "cancel"
-                            break
                         path = os.path.join(root, e.name)
                         key = photo_key(path)
                         hit = cache.get(key)
                         if hit is not None and hit[1] == e.mtime:
-                            meta = hit[0]
+                            meta_by_key[key] = hit[0]
+                            cache_hits += 1
                         elif core.sidecar_online_only(path):
                             offline += 1        # RAW のサイドカーがオンライン専用
-                            self.pick_read += 1
-                            continue
+                            offline_keys.add(key)
                         else:
-                            try:
-                                meta = _read_photo_meta(path)
-                            except Exception:  # noqa: BLE001  1枚読めないだけ。不明として外す
-                                meta = None
-                        metas[key] = meta
-                        mtimes[key] = e.mtime
-                        if meta is not None and meta.rating >= core.PICK_MIN_RATING:
-                            picked.append(e)
-                        self.pick_read += 1
+                            todo.append((e, path, key))
+                    self.pick_read = len(found) - len(todo)
+                    if todo:
+                        base = self.pick_read
+
+                        def read_progress(done, _total):
+                            self.pick_read = base + done
+
+                        results, hits, disk_reads, cancelled = \
+                            _read_photo_metas_parallel(
+                                [p for _e, p, _k in todo], cancel=cancel,
+                                progress=read_progress)
+                        cache_hits += hits
+                        for _e, path, key in todo:
+                            meta_by_key[key] = results.get(path)
+                        if cancelled:
+                            status = "cancel"
+                    if status != "cancel":
+                        for e in found:
+                            key = photo_key(os.path.join(root, e.name))
+                            if key in offline_keys:
+                                continue
+                            meta = meta_by_key.get(key)
+                            metas[key] = meta
+                            mtimes[key] = e.mtime
+                            if meta is not None and meta.rating >= core.PICK_MIN_RATING:
+                                picked.append(e)
+                        self.pick_read = len(found)
                 payload = (self.side, request, True,
-                           (picked, metas, mtimes, offline, status), args)
+                           (picked, metas, mtimes, offline, status,
+                            cache_hits, disk_reads), args)
             except Exception as e:  # noqa: BLE001
                 payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
             win.safe_emit(bridge.finished, payload)
@@ -1738,13 +1871,14 @@ class Pane(QWidget):
         self.pick_loading = False
         self.pick_cancel = None
         self._flat_timer.stop()
+        self._hide_read_progress()
         if not ok:
             self.window_.log(f"★写真抽出: 集められません: {args['path']}  ({result})")
             self._stop_pick()
             self.update_header()
             self.update_footer()
             return
-        picked, metas, mtimes, offline, status = result
+        picked, metas, mtimes, offline, status, cache_hits, disk_reads = result
         if status == "cancel":
             self.window_.log("★写真抽出: 中止しました")
             self._stop_pick()
@@ -1766,8 +1900,11 @@ class Pane(QWidget):
         self.update_footer()
         if self.is_active():
             self.window_.update_status_bar()
+        elapsed = _format_duration(time.monotonic() - self._pick_started) \
+            if self._pick_started else "?"
         text = (f"★写真抽出: {args['path']} の配下から★{core.PICK_MIN_RATING}以上を"
-                f" {len(picked):,} 枚（★を読んだ写真 {len(metas):,} 枚）")
+                f" {len(picked):,} 枚（★を読んだ写真 {len(metas):,} 枚）を {elapsed} で読みました"
+                f"（キャッシュ {cache_hits:,} / 読み取り {disk_reads:,}）")
         if status == "limit":
             text += f"  ※{core.PICK_LIMIT:,}枚で打ち切りました（多すぎるため）"
         if offline:
@@ -1897,6 +2034,10 @@ class Pane(QWidget):
         self.photo_gen += 1
         self.photo_meta = {}
         self._photo_requested = set()
+        self._photo_read_pending = set()
+        self._photo_read_total = 0
+        self._photo_progress_timer.stop()
+        self._hide_read_progress()
         self._photo_mtimes = {}
         self._photo_scan_src = None
         self._photo_keys = {}
@@ -2080,6 +2221,45 @@ class Pane(QWidget):
         except Exception:  # noqa: BLE001
             self.window_.log(f"エラー: {_log_exception('ratingClear')}")
 
+    # --- ★読み取りの進み具合(一覧の中央表示) ---
+
+    def _show_read_progress(self, text, done: int = 0, total: int = 0) -> None:
+        ov = self.read_progress
+        ov.set_progress(text, done, total)
+        rect = self.view.geometry()
+        x = rect.x() + max((rect.width() - ov.width()) // 2, 0)
+        y = rect.y() + max((rect.height() - ov.height()) // 3, 0)
+        ov.move(x, y)
+        ov.show()
+        ov.raise_()
+
+    def _hide_read_progress(self) -> None:
+        self.read_progress.hide()
+
+    def _update_pick_progress(self) -> None:
+        """★写真抽出の進み具合を中央に出す(_flat_timer の周期で呼ばれる)。"""
+        if self.pick_phase == "read" and self.pick_total > 0:
+            pct = int(self.pick_read * 100 / self.pick_total)
+            self._show_read_progress(
+                f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（{pct}%）　Esc で中止",
+                self.pick_read, self.pick_total)
+        else:
+            self._show_read_progress(f"写真を探しています… {self.pick_count:,}枚　Esc で中止")
+
+    def _show_photo_progress(self) -> None:
+        """★の列の読み取りが1秒以上続いているとき、中央表示を出す(タイマーから)。"""
+        if self._photo_read_pending:
+            self._update_photo_progress(force=True)
+
+    def _update_photo_progress(self, force: bool = False) -> None:
+        if not force and not self.read_progress.isVisible():
+            return
+        total = self._photo_read_total
+        done = total - len(self._photo_read_pending)
+        pct = int(done * 100 / total) if total else 0
+        self._show_read_progress(
+            f"★を読んでいます… {done:,} / {total:,}（{pct}%）", done, total)
+
     def _start_photo_read_safely(self) -> None:
         try:
             self.start_photo_read()
@@ -2087,13 +2267,20 @@ class Pane(QWidget):
             _log_exception("photoRead")
 
     def start_photo_read(self) -> None:
-        """まだ★を読んでいない写真を裏のスレッドで読む。見えている行から先に。"""
+        """まだ★を読んでいない写真を裏のスレッドで読む。見えている行から先に。
+
+        読み取りはディスクの永続キャッシュ＋並行読み(photometa.metacache)。
+        オンライン専用の写真(OneDrive)は開くとダウンロードが始まるので読まず、
+        ★は不明として扱い、飛ばした枚数をログに出す。
+        """
         if not self.needs_photo_meta() or self.archive is not None:
             return
         wanted = []
         seen = set()
+        skipped_online = 0
 
         def add(entry):
+            nonlocal skipped_online
             if not self.is_photo_entry(entry):
                 return
             path = self.entry_path(entry)
@@ -2106,6 +2293,11 @@ class Pane(QWidget):
                     return      # 読んだときから変わっていない(書いた結果・変更記録で直したもの)
             seen.add(key)
             self._photo_mtimes[key] = entry.mtime
+            if core.is_online_only(entry.attrs):
+                # オンライン専用は開かない。読んだものとして覚え(★は不明)、二度と試さない
+                self.photo_meta[key] = None
+                skipped_online += 1
+                return
             wanted.append((key, path))
 
         first = self.view.rowAt(0)
@@ -2119,31 +2311,48 @@ class Pane(QWidget):
             add(e)
         for e in self.all_entries:     # 絞り込みで隠れているものも(掛け直しで出せるように)
             add(e)
+        if skipped_online:
+            self.window_.log(
+                f"★の読み取り: オンライン専用の写真 {skipped_online:,} 枚は飛ばしました"
+                "（ダウンロードさせないため）")
         if not wanted:
             return
         self._photo_requested.update(key for key, _p in wanted)
+        new_keys = [key for key, _p in wanted if key not in self._photo_read_pending]
+        self._photo_read_pending.update(new_keys)
+        self._photo_read_total += len(new_keys)
+        if self._photo_read_pending and not self._photo_progress_timer.isActive():
+            self._photo_progress_timer.start()
         gen = self.photo_gen
         cancel = self._photo_cancel
         signal = self.window_.bridge.photo_meta
         emit = self.window_.safe_emit      # 閉じた後は送らない(閉じる側が終わるのを待つ)
         side = self.side
+        key_by_path = {path: key for key, path in wanted}
 
         def worker():
             batch = []
             flushed = time.monotonic()
-            for key, path in wanted:
-                if cancel.is_set():
-                    return
-                try:
-                    meta = _read_photo_meta(path)
-                except Exception:  # noqa: BLE001  1枚読めないだけ。不明として返す
-                    meta = None
-                batch.append((key, meta))
+
+            def on_result(path, meta):
+                nonlocal batch, flushed
+                batch.append((key_by_path[path], meta))
                 now = time.monotonic()
                 if len(batch) >= PHOTO_READ_BATCH or now - flushed >= PHOTO_READ_FLUSH_SECONDS:
-                    if cancel.is_set() or not emit(signal, (side, gen, batch)):
-                        return
-                    batch, flushed = [], now
+                    send, batch = batch, []
+                    flushed = now
+                    if cancel.is_set() or not emit(signal, (side, gen, send)):
+                        cancel.set()    # 送れない(閉じている等)なら読みも止める
+
+            # RAW のサイドカーがオンライン専用のものは開かずに不明として返す
+            todo = []
+            for _key, path in wanted:
+                if core.sidecar_online_only(path):
+                    on_result(path, None)
+                else:
+                    todo.append(path)
+            if todo:
+                _read_photo_metas_parallel(todo, cancel=cancel, on_result=on_result)
             if batch and not cancel.is_set():
                 emit(signal, (side, gen, batch))
 
@@ -2156,6 +2365,13 @@ class Pane(QWidget):
         for key, meta in items:
             self.photo_meta[key] = meta
             self._photo_requested.discard(key)
+            self._photo_read_pending.discard(key)
+        if not self._photo_read_pending:
+            self._photo_progress_timer.stop()
+            self._photo_read_total = 0
+            self._hide_read_progress()
+        elif self.read_progress.isVisible():
+            self._update_photo_progress()
         self.refresh_photo()
 
     def apply_photo_metas(self, metas: dict) -> bool:
@@ -6494,13 +6710,21 @@ class FilerWindow(QWidget):
         try:
             entries = self._photo_journal.read_new(exclude_pid=os.getpid())
             metas = {}
+            cache = _get_photo_metacache()
             for e in entries:
                 rating = e.get("rating")
                 if isinstance(rating, bool) or not isinstance(rating, int):
                     continue
                 kws = e.get("keywords")
                 kws = tuple(k for k in kws if isinstance(k, str)) if isinstance(kws, list) else ()
-                metas[photo_key(e["path"])] = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws)
+                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws)
+                metas[photo_key(e["path"])] = meta
+                # 変更記録で分かった★は永続キャッシュにも反映する(書き込みは更新日時を
+                # 戻すので、stat の照合だけでは古い値のまま当たってしまう)
+                try:
+                    cache.update(e["path"], meta)
+                except Exception:  # noqa: BLE001  キャッシュは付属。失敗しても反映は続ける
+                    pass
             if metas:
                 self._apply_photo_metas_all(metas)
         except Exception:  # noqa: BLE001  タイマーから呼ぶ

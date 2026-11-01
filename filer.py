@@ -89,7 +89,6 @@ import filer_shell
 import filer_update
 import settings as settings_module
 from photometa import config as photo_config
-from photometa import export as photo_export
 from photometa import filter_expr as photo_filter
 from photometa import writer as photo_writer
 from photometa import xmp as photo_xmp
@@ -118,7 +117,7 @@ DEFAULT_COLORS = {
     "mark_end": "#0c0c0c",        # マークした行の背景(右端の色。左→右のグラデーション)
     "mark_text": "",              # マーク行の字の色。空ならファイルの種類の色のまま
     "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
-    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / Alt+I などの
+    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / Shift+Z などの
                                   # メニューで選んでいる行(メニューは左端に cursor の色の縦線も)
     "header_active": "#00001c",   # アクティブ窓のパス表示の地と枠(あふｗと同じく
                                   # 帯は付けず地のまま。区別は字の色とカーソルで)
@@ -319,10 +318,9 @@ PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★
 RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
 RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
 RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
-# 写真メニュー(Alt+I)の小メニューの動作の種類(photometa.config の filter_menu_items /
-# export_menu_items)。Alt+I メニューの exec が小メニューの項目を返したとき、どちらかを見分ける。
+# ★で絞り込む小メニューの動作の種類(photometa.config の filter_menu_items)。Shift+Z の
+# メニューの exec が小メニューの項目を返したとき、ほかの設定の項目と見分ける。
 PHOTO_FILTER_KINDS = ("filter", "filter_input", "filter_clear")
-PHOTO_EXPORT_KINDS = ("frame_sync", "mitene_collect", "mitene_finish", "frame_manual_list")
 EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
                       " exiftool に場所を書いてください")
 
@@ -711,8 +709,9 @@ class Pane(QWidget):
         self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
         self._photo_auto = False
         self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
-        # ★の絞り込み(Alt+I → / と Alt+数字)。rating_filter は文字の式、rating_range は下部の
-        # ★の範囲スライダー(lo, hi)。rating_node はその2つを AND した式の解析済みの木
+        # ★の絞り込み(Shift+Z → / ・ボタン段の「絞り込み▾」・Alt+数字)。rating_filter は
+        # 文字の式、rating_range は下部の★の範囲スライダー(lo, hi)。rating_node はその2つを
+        # AND した式の解析済みの木
         # (どちらも無ければ None)。文字の式にスライダーの条件は書き込まない。
         # どちらもフォルダを移ったら解く(保存しない)。
         self.rating_filter = ""
@@ -1738,7 +1737,8 @@ class Pane(QWidget):
 
     # --- 写真の★(写真フォルダモード・★の列・★の絞り込み) ---
     def build_photo_bar(self) -> None:
-        """写真のボタン段を(作り直して)並べる。中身は写真メニュー(Alt+I)の項目と同じ。"""
+        """写真のボタン段を(作り直して)並べる。中身は photometa の menu_items(★・キーワード・
+        「絞り込み▾」)。"""
         win = self.window_
         layout = self.photo_bar.layout()
         for button in self.photo_buttons:
@@ -2094,7 +2094,7 @@ class _ChooserMenu(QMenu):
         matches = [a for a in self.actions()
                    if a.isEnabled() and not a.isSeparator() and _menu_key_of(a) == char] \
             if plain and char and char.isprintable() and not char.isspace() else []
-        # 英数字のほか、項目の頭にある記号(写真メニューの - と /)も選択だけにする。
+        # 英数字のほか、項目の頭にある記号(★で絞り込むの / など)も選択だけにする。
         if plain and len(text) == 1 and (text.isalnum() or matches):
             if matches:
                 # 同じ文字の項目が複数あれば、押すたびに次へ(Ctrl+Enter のメニューは
@@ -2139,7 +2139,7 @@ class _SubMenu:
     同じ形。中身は開く時点ではなく、メニューを組む時点の値で作る。
 
     QMenu のサブメニューは見出し(title)と行の表示が同じものなので、組んだ後の見出しは
-    行の表示(&E:書き出し など)になる。title は組む途中の仮の見出し。"""
+    行の表示(&/:★で絞り込む など)になる。title は組む途中の仮の見出し。"""
 
     def __init__(self, title: str, items):
         self.title = title
@@ -2147,7 +2147,7 @@ class _SubMenu:
 
 
 def _menu_style_sheet(colors) -> str:
-    """C / M / Alt+I などのメニュー(_ChooserMenu)の見た目。ファイル窓と同じ地と字の色にし、
+    """C / M / Shift+Z などのメニュー(_ChooserMenu)の見た目。ファイル窓と同じ地と字の色にし、
     選んでいる行はダイアログのカーソル行(dialog_cursor)の地＋左端にカーソルの色の縦線。
 
     以前は OS の既定の見た目のままで、地と選んでいる行の色が近すぎてどれが選ばれて
@@ -2308,7 +2308,7 @@ class FilerWindow(QWidget):
         # (2026-10-29 要望)。
         self.log_font = QFont(self.list_font)
         self.log_font.setPointSize(10)
-        # 写真の★(photometa)。共通設定は写真メニューを開くたびに読み直す。写真フォルダモードの
+        # 写真の★(photometa)。共通設定は R・Shift+Z を開くたびに読み直す。写真フォルダモードの
         # 自動判定の数値は settings.json の filer.photo_mode。ExifTool は初めて書くときに
         # 起こし、あっふを閉じるまで1つを使い回す(_photo_session)。
         self.photo_config = photo_config.load_config()
@@ -2316,7 +2316,7 @@ class FilerWindow(QWidget):
         self._photo_session = None
         self._photo_jobs = {}           # 書き込みの番号 → (操作, 書く前の★の控え)
         self._photo_job_seq = 0
-        # 閉じるときに終わるのを待つ裏のスレッド(★の読み書き・書き出しなどの長い処理)。
+        # 閉じるときに終わるのを待つ裏のスレッド(★の読み書きなどの長い処理)。
         # 閉じ始めたら _closing を立て、以後 safe_emit は何も送らない(壊れかけの bridge に
         # Signal を送ると 0xC0000005 で落ちる)。旗の確認と emit は同じ Lock の中でやるので、
         # 「見てから送るまでの隙間」に閉じる側が割り込めない。
@@ -2833,7 +2833,7 @@ class FilerWindow(QWidget):
             for pane in (self.left, self.right):
                 pane._photo_cancel.set()
             self._photo_journal_timer.stop()
-            # 裏のスレッド(★の読み書き・書き出し)が終わるのを待ってから ExifTool と窓を壊す
+            # 裏のスレッド(★の読み書き)が終わるのを待ってから ExifTool と窓を壊す
             self.stop_tracked_threads()
             self._close_photo_session()
             # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
@@ -5008,7 +5008,7 @@ class FilerWindow(QWidget):
             if pane.marks:
                 label = f"マーク {len(entries)}件"
             else:
-                label = os.path.basename(entries[0].name.rstrip("\/")) or entries[0].name
+                label = os.path.basename(entries[0].name.rstrip("\\/")) or entries[0].name
             return [pane.entry_path(e) for e in entries], False, label
         entry = pane.cursor_entry()
         if not pane.marks and entry is not None and entry.is_parent and pane.path:
@@ -5288,7 +5288,11 @@ class FilerWindow(QWidget):
 
     def cmd_rename(self):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更
-        (あふｗと同じ)。対象はマーク、無ければカーソル行。".." は対象外。"""
+        (あふｗと同じ)。対象はマーク、無ければカーソル行。".." は対象外。
+
+        対象に画像(RAW も)があり★を書ける(ExifTool がある)なら、ダイアログの下部に
+        「写真の★」の欄(★とキーワード)を足し、OK でファイル情報の変更を当てた後に
+        画像だけへ書く。以前は Alt+I(その前は I)の写真メニューで付けていた(2026-11-01)。"""
         pane = self.active
         if self._refuse_stash("ファイル情報の編集"):
             return
@@ -5306,12 +5310,79 @@ class FilerWindow(QWidget):
             return
         import filer_fileinfo  # 使うときに読む
 
+        photos = [e for e in entries if pane.is_photo_entry(e)]
+        photo = self._file_info_photo(pane, photos) if photos else None
+        renamed = {}
+
+        def apply(plans):
+            error = self._apply_file_info(pane, plans)
+            if not error:
+                renamed.update({p["old"]: p["new"] for p in plans if "new" in p})
+            return error
+
         colors = {"background": self.colors["background"], "text": self.colors["text"]}
         dialog = filer_fileinfo.FileInfoDialog(
             self, pane.path, entries, colors=colors, font=self.log_font,
-            on_apply=lambda plans: self._apply_file_info(pane, plans))
-        self.exec_dialog(dialog)
+            on_apply=apply, photo=photo)
+        accepted = self.exec_dialog(dialog) == QDialog.Accepted
+        changes = dialog.photo_changes()
         dialog.deleteLater()
+        if accepted and changes:
+            self._apply_file_info_photo(pane, photos, renamed, changes)
+
+    def _file_info_photo(self, pane, photos):
+        """R のダイアログの「写真の★」の欄の中身(FileInfoDialog の photo)。★を書けない
+        (ExifTool が見つからない)なら None で欄を出さない。書庫の中は R ごと断っている。"""
+        self._reload_photo_config()
+        cfg = self.photo_config
+        if self._photo_session is None and not photo_config.find_exiftool(cfg):
+            return None
+        metas = self._photo_metas_for([pane.entry_path(e) for e in photos])
+
+        def now(values, show):
+            values = set(values)
+            if len(values) != 1:
+                return "いろいろ"
+            value = next(iter(values))
+            return "不明" if value is None else show(value)
+
+        kws = cfg.get("keywords") or []
+        keyword = kws[0] if kws else None
+        ratings = [(-1, photo_config.rating_tag(-1, cfg))]
+        ratings += [(n, photo_config.rating_name(n, cfg))
+                    for n in range(0, photo_config.RATING_MAX + 1)]
+        return {
+            "count": len(photos),
+            "ratings": ratings,
+            "rating_now": now((m.rating if m is not None else None for m in metas),
+                              lambda r: photo_config.rating_name(r, cfg)),
+            "keyword": keyword["name"] if keyword else None,
+            "keyword_key": keyword["key"] if keyword else "",
+            "keyword_now": now(
+                (None if m is None else self._has_keyword(m, keyword["name"]) for m in metas),
+                lambda on: "付いている" if on else "付いていない") if keyword else "",
+        }
+
+    def _apply_file_info_photo(self, pane, photos, renamed, changes) -> None:
+        """R のダイアログで選んだ★・キーワードを画像だけに書く(ファイル情報の変更を当てた後。
+        名前を変えたものは新しい名前に)。書き込みは写真のボタン段と同じ photo_write。"""
+        paths = []
+        for e in photos:
+            old = pane.entry_path(e)
+            new = os.path.join(pane.path or "", renamed.get(e.name, e.name))
+            if new != old:
+                # 一覧の読み直しを待たずに書くので、読んである★を新しい名前へ移しておく
+                # (移さないと、まだ一覧に無い名前の★として、書いた結果が捨てられる)
+                meta = pane.photo_meta.pop(photo_key(old), None)
+                if meta is not None:
+                    pane.photo_meta[photo_key(new)] = meta
+            paths.append(new)
+        keywords = self.photo_config.get("keywords") or []
+        if "rating" in changes:
+            self.photo_write(paths, ("rating", changes["rating"]), self._photo_metas_for(paths))
+        if "keyword" in changes and keywords:
+            op = ("keyword", keywords[0]["name"], changes["keyword"])
+            self.photo_write(paths, op, self._photo_metas_for(paths))
 
     # --- 設定(Z) ---
     def cmd_settings_dialog(self):
@@ -5845,6 +5916,10 @@ class FilerWindow(QWidget):
 
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
+        """Shift+Z: 各種設定の一時切替。隠し/システムファイルの表示、写真フォルダモード、
+        ★で絞り込む(小メニュー。写真のボタン段の「絞り込み▾」と同じ中身。対象は今の窓)。
+        ★で絞り込むは、以前は Alt+I の写真メニューにあった(2026-11-01)。"""
+        self._reload_photo_config()
         override = self.active.photo_override
         menu, chosen = self.build_menu("各種設定一時切替", [
             ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
@@ -5854,9 +5929,13 @@ class FilerWindow(QWidget):
             ("A", "写真フォルダモード：自動", "photo_auto", override == "auto"),
             ("N", "写真フォルダモード：常にオン", "photo_on", override == "on"),
             ("F", "写真フォルダモード：常にオフ", "photo_off", override == "off"),
+            # 写真フォルダモードでなくても出す(書庫の中は apply_rating_filter が断る)
+            ("/", "★で絞り込む ▸", _SubMenu(*self._photo_filter_items())),
         ])
         choice = self._exec_menu(menu, chosen)
-        if choice in ("photo_auto", "photo_on", "photo_off"):
+        if isinstance(choice, tuple) and choice[0] in PHOTO_FILTER_KINDS:
+            self.run_photo_filter(choice)
+        elif choice in ("photo_auto", "photo_on", "photo_off"):
             value = choice.split("_", 1)[1]
             pane = self.active
             pane.set_photo_override(value)
@@ -6104,9 +6183,9 @@ class FilerWindow(QWidget):
             return "add"
         return None
 
-    # --- 写真の★(Alt+I メニュー・ボタン段・★の絞り込み・変更記録) ---
+    # --- 写真の★(R のダイアログ・ボタン段・★の絞り込み・変更記録) ---
     def photo_bar_items(self) -> list:
-        """写真のボタン段の [(表示名, 動作)]。写真メニュー(Alt+I)の項目から作り、名前は短く。"""
+        """写真のボタン段の [(表示名, 動作)]。photometa の menu_items から作り、名前は短く。"""
         cfg = self.photo_config
         levels = {lv["name"]: lv for lv in cfg.get("levels") or []}
         keywords = cfg.get("keywords") or []
@@ -6143,8 +6222,8 @@ class FilerWindow(QWidget):
             pane.update_rating_bar()
 
     def press_photo_button(self, pane, action) -> None:
-        """写真のボタン段を押した。Alt+I メニューで選んだのと同じ動作(対象はその窓の
-        マーク中のファイル、無ければカーソル位置)。フォーカスはファイル窓に残す。"""
+        """写真のボタン段を押した(対象はその窓のマーク中のファイル、無ければカーソル位置)。
+        フォーカスはファイル窓に残す。"""
         try:
             if pane.side != self.active_side:
                 self.activate(pane.side, focus=False)
@@ -6154,12 +6233,13 @@ class FilerWindow(QWidget):
             self.log(f"エラー: {_log_exception('photoButton')}")
 
     def photo_targets(self):
-        """写真の★を付ける対象。(写真のフルパスの一覧, 写真でないので飛ばした数, 断る理由)。
+        """写真のボタン段で★を付ける対象。(写真のフルパスの一覧, 写真でないので飛ばした数,
+        断る理由)。
 
         マーク中のファイル、無ければカーソル位置(pick_targets と同じ)。画像ビュア
         (F3 のプレビュー)を出している間も同じ(マークが無ければ表示中の1枚)。
-        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んで Alt+I で
-        まとめて付ける、というあっふの使い方で1枚にしか付かなかった(2026-11-01)。"""
+        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んでまとめて
+        付ける、というあっふの使い方で1枚にしか付かなかった(2026-11-01)。"""
         pane = self.active
         if pane.archive is not None:
             return [], 0, ARCHIVE_READONLY
@@ -6186,60 +6266,11 @@ class FilerWindow(QWidget):
         folded = name.casefold()
         return meta is not None and any(k.casefold() == folded for k in meta.keywords)
 
-    def cmd_photo_menu(self):
-        """Alt+I: 写真メニュー(★を付ける・キーワード・★で絞り込む)。写真フォルダモードで
-        なくても効く(写真フォルダモードかどうかでキーの意味は変えない。I は合計ファイル
-        サイズ。あふｗに合わせた)。"""
-        self._reload_photo_config()
-        paths, skipped, refused = self.photo_targets()
-        if refused:
-            self.log(f"写真の★: {refused}")
-            return
-        metas = self._photo_metas_for(paths)
-        known = bool(paths) and all(m is not None for m in metas)
-        ratings = {m.rating for m in metas if m is not None}
-        same = next(iter(ratings)) if known and len(ratings) == 1 else None
-        items = []
-        for item in photo_config.menu_items(self.photo_config, export=True):
-            kind, value = item.action
-            if kind == "separator":
-                items.append(None)
-                continue
-            label = f"{item.label}  {item.detail}" if item.detail else item.label
-            mark = ((kind == "rating" and same == value)
-                    or (kind == "keyword" and known
-                        and all(self._has_keyword(m, value) for m in metas)))
-            if kind == "filter_menu":
-                # 小メニューはメインを閉じずに右側に開く(Enter・→・頭の文字。← / Esc で戻る)
-                items.append((item.key, label, _SubMenu(*self._photo_filter_items())))
-                continue
-            if kind == "export_menu":
-                items.append((item.key, label, _SubMenu("書き出し", self._photo_export_items())))
-                continue
-            # 印は「対象の★が全部同じ」行(とキーワードが全部に付いている行)だけ
-            items.append((item.key, label, item.action, True) if mark
-                         else (item.key, label, item.action))
-        menu, chosen = self.build_menu(photo_config.menu_title(len(paths)), items)
-        choice = self._exec_menu(menu, chosen)
-        if choice is not None:
-            self.run_photo_action(choice, paths=paths, skipped=skipped, metas=metas)
-
     def run_photo_action(self, action, paths=None, skipped=0, metas=None) -> None:
-        """写真メニュー・ボタン段の動作を実行する。paths を渡さなければ今の対象で。"""
+        """写真のボタン段の動作を実行する。paths を渡さなければ今の対象で。"""
         kind, value = action
         if kind == "filter_menu":
             self.photo_filter_menu()
-            return
-        if kind == "export_menu":
-            self.photo_export_menu()
-            return
-        if kind in PHOTO_FILTER_KINDS:
-            # Alt+I メニューの小メニュー(★で絞り込む)で選んだ項目
-            self.run_photo_filter(action)
-            return
-        if kind in PHOTO_EXPORT_KINDS:
-            # Alt+I メニューの小メニュー(書き出し)で選んだ項目
-            self.run_photo_export(action)
             return
         if kind not in ("rating", "keyword"):
             return
@@ -6436,288 +6467,6 @@ class FilerWindow(QWidget):
         key = rating_color_key(meta.rating)
         return text, self.colors[key], self.colors[f"{key}_bg"]
 
-    # --- 書き出し(Alt+I → E。フォトフレーム同期・みてね) ---
-    def _photo_export_items(self) -> list:
-        """書き出しの小メニューの行(build_menu の形)。件数などはこの時点の値。"""
-        items = []
-        for item in photo_config.export_menu_items(self.photo_config):
-            label = f"{item.label}  {item.detail}" if item.detail else item.label
-            items.append((item.key, label, item.action))
-        return items
-
-    def photo_export_menu(self) -> None:
-        """書き出しのメニューを単独で開く(F フォトフレームへ同期 / M みてね用に集める /
-        D みてね済にして片付ける / L 手で消す写真の一覧)。Alt+I メニューからは小メニューで開く。"""
-        self._reload_photo_config()
-        menu, chosen = self.build_menu("書き出し", self._photo_export_items())
-        choice = self._exec_menu(menu, chosen)
-        if choice is not None:
-            self.run_photo_export(choice)
-
-    def run_photo_export(self, choice) -> None:
-        """書き出しの小メニューで選んだ項目を実行する。"""
-        kind = choice[0]
-        if kind == "frame_sync":
-            self.photo_frame_sync()
-        elif kind == "mitene_collect":
-            self.photo_mitene_collect()
-        elif kind == "mitene_finish":
-            self.photo_mitene_finish()
-        elif kind == "frame_manual_list":
-            self.photo_manual_delete_list()
-
-    def _export_root(self, title: str):
-        """書き出しで集める元(今の窓のフォルダ)。使えなければログに出して None。"""
-        pane = self.active
-        if pane.archive is not None:
-            self.log(f"{title}: {ARCHIVE_READONLY}")
-            return None
-        if not pane.path or not os.path.isdir(pane.path):
-            self.log(f"{title}: 今の窓がフォルダではありません")
-            return None
-        if self._extracting is not None:
-            self.log(f"{title}: ほかの処理が終わるまで待ってください")
-            return None
-        return pane.path
-
-    def photo_frame_sync(self) -> None:
-        """今の窓のフォルダ配下の★4以上(段階「フォトフレーム用」)を、共通設定の
-        frame_targets の各フォルダへ同期する(縮小した JPEG。台帳にあるものだけを足し引き)。
-        対象から外れた写真を消すのは、このフォルダ配下から同期したものだけ。"""
-        title = "フォトフレーム同期"
-        cfg = self.photo_config
-        targets = list(cfg.get("frame_targets") or [])
-        if not targets:
-            self.log(f"{title}: 同期先がありません（photo_ratings.json の frame_targets）")
-            return
-        root = self._export_root(title)
-        if root is None:
-            return
-        expr = photo_export.frame_expr(cfg)
-        shown = "\n".join(f"  {t}" for t in targets)
-        if not self.confirm(title, f"{root} 配下から {expr} を集めて、同期先 {len(targets)} か所へ。"
-                                   f"よろしいですか？\n\n{shown}"):
-            return
-        settings = cfg.get("frame")
-        ledger_dir = photo_export.default_ledger_dir()
-        # 削除がクラウドへ反映されない同期先(消したら「手で消す写真の一覧」に残す)
-        manual = list(cfg.get("frame_manual_delete") or [])
-
-        def run(progress, cancel):
-            found = photo_export.collect(root, expr, cfg, cancel=cancel, progress=progress)
-            if found.cancelled:
-                return found, None
-            # ★が読めなかった写真・読めなかったフォルダの分は消さない
-            keep = list(found.unknown) + list(found.error_dirs)
-            return found, photo_export.sync_frame(found.paths, targets, settings, ledger_dir,
-                                                  cancel=cancel, progress=progress,
-                                                  scope=[root], keep=keep,
-                                                  manual_delete=manual)
-
-        def done(result):
-            if isinstance(result, Exception):
-                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
-                return
-            found, synced = result
-            if synced is None:
-                self.log(f"{title}: 中止しました（集めている途中。同期先は変えていません）")
-                return
-            self.log(f"{title}: {len(found.paths)} 枚 → {len(targets)} か所　{synced.summary()}")
-            for note in synced.notes():
-                self.log(f"{title}: {note}")
-            for line in photo_export.manual_delete_report(synced, ledger_dir):
-                self.log(f"{title}: {line}")
-            if found.unknown:
-                self.log(f"{title}: ★が読めなかった写真 {len(found.unknown)} 枚は"
-                         "足しも消しもしていません")
-            for pane in (self.left, self.right):
-                if pane.path and any(core.same_dir(pane.path, t) for t in targets):
-                    pane.reload(keep_marks=True)
-
-        self._start_job(title, root, 0, run, done)
-
-    def photo_manual_delete_list(self) -> None:
-        """Alt+I → E → L: 削除がクラウドへ反映されない同期先(frame_manual_delete)から消したので、
-        クラウド(Amazon Photos など)で手で消す写真の一覧。同期先ごと・消した日時の順に名前を並べる。
-        「ファイル名をコピー」(改行区切り。クラウドで検索するときに使う)/「消し終わった」
-        (確かめてから一覧を空にする)/「閉じる」。"""
-        title = "手で消す写真の一覧"
-        items = photo_export.pending_manual_deletes()
-        names = [it["name"] for it in items]
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"{title}（{len(items)}枚）")
-        dialog.setFont(self.log_font)
-        bg, fg = self.colors["background"], self.colors["text"]
-        dialog.setObjectName("manualDelete")
-        dialog.setStyleSheet(
-            f"#manualDelete {{ background-color: {bg}; }}"
-            f" #manualDelete QLabel {{ color: {fg}; }}"
-            f" #manualDelete QPlainTextEdit {{ background-color: #10103a; color: {fg};"
-            f" border: 1px solid #50508a; }}"
-            f" #manualDelete QPushButton {{ background-color: #24244e; color: {fg};"
-            f" border: 1px solid #50508a; padding: 2px 8px; }}"
-            f" #manualDelete QPushButton:disabled {{ color: #808080; }}")
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        if items:
-            hint = QLabel("フォルダからは消しましたが、クラウドには残っています。"
-                          "クラウド側（Amazon Photos など）で手で消してください。")
-        else:
-            hint = QLabel("手で消す写真はありません。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        lines, last = [], None
-        for it in items:
-            target = os.path.normcase(os.path.abspath(it["target"]))
-            if target != last:
-                if lines:
-                    lines.append("")
-                folder = os.path.basename(os.path.normpath(it["target"])) or it["target"]
-                lines.append(f"■ {folder}（{it['target']}）")
-                last = target
-            lines.append(f"  {it['deleted_at'].replace('T', ' ')}  {it['name']}")
-        text = QPlainTextEdit("\n".join(lines))
-        text.setReadOnly(True)
-        text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        text.setMinimumSize(560, 320)
-        layout.addWidget(text, 1)
-        row = QHBoxLayout()
-        copy_button = QPushButton("ファイル名をコピー")
-        clear_button = QPushButton("消し終わった（一覧を空にする）")
-        close_button = QPushButton("閉じる")
-        copy_button.setEnabled(bool(items))
-        clear_button.setEnabled(bool(items))
-        row.addWidget(copy_button)
-        row.addWidget(clear_button)
-        row.addStretch(1)
-        row.addWidget(close_button)
-        layout.addLayout(row)
-        dialog.text_view = text            # テストから見る
-        dialog.copy_button, dialog.clear_button, dialog.close_button = (
-            copy_button, clear_button, close_button)
-
-        def copy():
-            try:
-                QGuiApplication.clipboard().setText("\n".join(names))
-                self.log(f"クリップボード: 手で消す写真のファイル名 {len(names)}件")
-            except Exception:  # noqa: BLE001
-                _log_exception("manualDeleteCopy")
-
-        def clear():
-            try:
-                if not self.confirm(title, f"一覧の {len(items)} 枚を、クラウドで消し終わったものとして"
-                                           "一覧から外します。よろしいですか？",
-                                    default_yes=False, parent=dialog):
-                    return
-                removed = photo_export.clear_manual_deletes(items)
-                self.log(f"{title}: {removed} 枚を一覧から外しました")
-                dialog.accept()
-            except Exception:  # noqa: BLE001
-                _log_exception("manualDeleteClear")
-
-        copy_button.clicked.connect(copy)
-        clear_button.clicked.connect(clear)
-        close_button.clicked.connect(dialog.reject)
-        close_button.setFocus()
-        self.exec_dialog(dialog)
-        dialog.deleteLater()
-
-    def photo_mitene_collect(self) -> None:
-        """今の窓のフォルダ配下の「みてね用でまだ上げていない」写真を、集める先へコピーする。
-        終わったら集めた先を反対窓で開く。"""
-        title = "みてね用に集める"
-        cfg = self.photo_config
-        root = self._export_root(title)
-        if root is None:
-            return
-        expr = photo_export.mitene_expr(cfg)
-        dest = photo_export.mitene_dir(cfg)
-
-        def run(progress, cancel):
-            found = photo_export.collect(root, expr, cfg, cancel=cancel, progress=progress)
-            if found.cancelled:
-                return found, None
-            return found, photo_export.collect_mitene(found.paths, dest, cancel=cancel,
-                                                      progress=progress)
-
-        def done(result):
-            if isinstance(result, Exception):
-                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
-                return
-            found, got = result
-            if got is None:
-                self.log(f"{title}: 中止しました")
-                return
-            text = f"{title}: {len(got.copied)} 枚 → {dest}"
-            if got.already:
-                text += f"（集めてあった {len(got.already)} 枚はそのまま）"
-            if got.cancelled:
-                text += "（中止しました）"
-            self.log(text)
-            for path, reason in got.failed[:5]:
-                self.log(f"{title}: 失敗 {os.path.basename(path)}：{reason}")
-            if os.path.isdir(dest):
-                self.other.load(dest)
-
-        self._start_job(title, root, 0, run, done)
-
-    def photo_mitene_finish(self) -> None:
-        """集めた先の一覧にある元の写真に「みてね済」を付け、付けられたものを集めた先から消す。"""
-        title = "みてね済にして片付ける"
-        cfg = self.photo_config
-        dest = photo_export.mitene_dir(cfg)
-        keyword = photo_export.mitene_keyword(cfg)
-        if not keyword:
-            self.log(f"{title}: みてね済に当たるキーワードがありません（photo_ratings.json の keywords）")
-            return
-        items = photo_export.load_manifest(dest)
-        if not items:
-            self.log(f"{title}: 集めた写真がありません（{dest}）")
-            return
-        if self._extracting is not None:
-            self.log(f"{title}: ほかの処理が終わるまで待ってください")
-            return
-        if not self.confirm(title, f"{dest} に集めた {len(items)} 枚の元の写真に「{keyword}」を付けて、"
-                                   "集めた先から消します。よろしいですか？\n\n"
-                                   "（集めた先から消してあった写真には付けません）",
-                            default_yes=False):
-            return
-        session = self._get_photo_session()
-        if session is None:
-            self.log(f"{title}: {EXIFTOOL_NOT_FOUND}")
-            return
-
-        def run(progress, cancel):
-            return photo_export.finish_mitene(dest, session, keyword, cancel=cancel,
-                                              progress=progress)
-
-        def done(result):
-            if isinstance(result, Exception):
-                self.log(f"{title}: 失敗しました（{type(result).__name__}: {result}）")
-                self._close_photo_session()
-                return
-            if result.error:
-                self.log(f"{title}: {result.error}")
-                return
-            metas = {photo_key(r.path): r.after for r in result.results
-                     if r.ok and r.after is not None}
-            if metas:
-                self._apply_photo_metas_all(metas)
-            text = f"{title}: {len(result.marked)} 枚に{keyword}を付けて片付けました"
-            if result.missing:
-                text += f"（集めた先から消されていた {len(result.missing)} 枚には付けていません）"
-            if result.cancelled:
-                text += "（中止しました）"
-            self.log(text)
-            for path, reason in result.failed[:5]:
-                self.log(f"{title}: 失敗 {os.path.basename(path)}：{reason}")
-            for pane in (self.left, self.right):
-                if pane.path and core.same_dir(pane.path, dest):
-                    pane.reload(keep_marks=True)
-
-        self._start_job(title, dest, len(items), run, done)
-
     def _photo_filter_items(self):
         """★で絞り込む小メニューの (見出し, 行)。行は build_menu の形。"""
         pane = self.active
@@ -6730,7 +6479,7 @@ class FilerWindow(QWidget):
 
     def photo_filter_menu(self) -> None:
         """★で絞り込むメニューを単独で開く(写真のボタン段の「絞り込み▾」。段階・プリセット・
-        未選別・式を入力・解く)。Alt+I メニューからは小メニューで開く。"""
+        未選別・式を入力・解く)。Shift+Z のメニューからは小メニューで開く。"""
         menu, chosen = self.build_menu(*self._photo_filter_items())
         choice = self._exec_menu(menu, chosen)
         if choice is not None:

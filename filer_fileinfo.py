@@ -5,10 +5,13 @@
 #   - マークあり: 「ファイル情報の一括変更」。名前は直接は打たせず、変換(小文字 /
 #     入れ替え / 大文字)を全件に当てる。日時は「変更する」を付けたときだけ、属性は
 #     3つの状態(変えない / ON / OFF)で、ON/OFF にしたものだけ全件に当てる
+#   - 対象に画像があり★を書ける場所なら、下部に「写真の★」の欄(★とキーワード)。
+#     画像が無ければ欄は出さない(見た目は従来どおり)
 #
 # ここは入力を集めて「何をどう変えるか」(filer_core.plan_file_info の形)を組み立てる
 # だけ。実際のファイルに当てるのは呼び出し側(on_apply)で、失敗したらその理由を
-# このダイアログに出して閉じない(打った内容を失わない)。
+# このダイアログに出して閉じない(打った内容を失わない)。写真の★も同じで、ここは
+# 「何をどう変えるか」(photo_changes)を返すだけ。書くのは呼び出し側(閉じた後)。
 import os
 import time
 
@@ -16,6 +19,7 @@ from PySide6.QtCore import QEvent, QFileInfo, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileIconProvider,
     QGridLayout,
@@ -47,6 +51,35 @@ CHECKBOX_STYLE = (
 ATTR_ROWS = (("readonly", "Read Only", "R"), ("system", "System", "S"),
              ("hidden", "Hidden", "H"), ("archive", "Archive", "A"))
 CASE_BUTTONS = (("lower", "小文字"), ("swap", "⇔"), ("upper", "大文字"))
+# 写真の★の選択で、★の欄にフォーカスがあるときに押すと選べるキー(★の値)。
+# 5〜1 はその★、0 は未選別、- は削除候補。ダイアログのほかのキー操作とはぶつからない
+# (この欄にフォーカスがあるときだけ見る)。
+RATING_KEYS = {"5": 5, "4": 4, "3": 3, "2": 2, "1": 1, "0": 0, "-": -1}
+
+
+class RatingCombo(QComboBox):
+    """写真の★の選択。項目のデータは★の値(「変えない」は None)。
+
+    フォーカスがあるとき、数字キー(5/4/3/2/1/0)と - でその★を選ぶ。Enter は自分で
+    使わずダイアログへ回す(OK)。上下の矢印で順に選べるのは QComboBox のまま。"""
+
+    def select_rating(self, rating) -> bool:
+        index = self.findData(rating)
+        if index < 0:
+            return False
+        self.setCurrentIndex(index)
+        return True
+
+    def keyPressEvent(self, event):
+        try:
+            text = event.text()
+            if (text in RATING_KEYS
+                    and not event.modifiers() & (Qt.AltModifier | Qt.ControlModifier)
+                    and self.select_rating(RATING_KEYS[text])):
+                return
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            return
+        super().keyPressEvent(event)
 
 
 class NameEdit(QLineEdit):
@@ -79,9 +112,19 @@ class FileInfoDialog(QDialog):
     """entries が1件ならその編集、複数なら一括変更。folder はその置き場所。
 
     on_apply(plans) は [plan, ...] を受け取り、失敗の理由(文字列)か None を返す。
-    None なら閉じる、文字列ならダイアログに出して開いたまま。"""
+    None なら閉じる、文字列ならダイアログに出して開いたまま。
 
-    def __init__(self, parent, folder: str, entries, colors=None, font=None, on_apply=None):
+    photo を渡すと下部に「写真の★」の欄を出す(対象に画像があり★を書ける場所のときだけ
+    呼び出し側が渡す)。中身は次の dict。選んだ結果は閉じた後に photo_changes() で読む。
+        count        ★を付ける画像の件数(見出しに「画像 n 件だけに付けます」)
+        ratings      ★の選択肢 [(★の値, 表示名), ...](「変えない」はここで先頭に足す)
+        rating_now   今の★の表示(「ベストショット」「いろいろ」など)
+        keyword      キーワードの名前(「みてね済」。無ければ None で行を出さない)
+        keyword_key  キーワードを Alt+この文字で切り替える(属性の頭文字と重なれば使わない)
+        keyword_now  今のキーワードの表示(「付いている」「付いていない」「いろいろ」)"""
+
+    def __init__(self, parent, folder: str, entries, colors=None, font=None, on_apply=None,
+                 photo=None):
         super().__init__(parent)
         self.setWindowTitle("ファイル情報の一括変更" if len(entries) > 1 else "ファイル情報の編集")
         self.folder = folder
@@ -103,6 +146,11 @@ class FileInfoDialog(QDialog):
             f" #fileInfo QPushButton {{ background-color: #24244e; color: {fg};"
             f" border: 1px solid #50508a; padding: 1px 6px; }}"
             f" #fileInfo QPushButton:checked {{ background-color: #1a3a8a; }}"
+            f" #fileInfo QComboBox {{ background-color: #10103a; color: {fg};"
+            f" border: 1px solid #50508a; padding: 0px 4px; }}"
+            f" #fileInfo QComboBox:focus {{ border: 1px solid #ffd400; }}"
+            f" #fileInfo QComboBox QAbstractItemView {{ background-color: #10103a; color: {fg};"
+            f" selection-background-color: #1a3a8a; }}"
             + CHECKBOX_STYLE.replace("SCOPE", "#fileInfo"))
 
         first = self.entries[0]
@@ -199,6 +247,14 @@ class FileInfoDialog(QDialog):
         middle.addWidget(attrs, 2)
         layout.addLayout(middle)
 
+        # 写真の★(対象に画像があり★を書ける場所のときだけ)
+        self.photo_box = None
+        self.rating_combo = None
+        self.keyword_check = None
+        self.keyword_key = ""
+        if photo:
+            self._build_photo_box(layout, photo)
+
         # エラーの表示と OK / キャンセル
         self.error_label = QLabel()
         self.error_label.setTextFormat(Qt.PlainText)
@@ -217,15 +273,67 @@ class FileInfoDialog(QDialog):
         buttons.addWidget(self.cancel_button)
         layout.addLayout(buttons)
 
-        # Tab の順: 名前 → 変換 → 日時 → 属性 → OK
+        # Tab の順: 名前 → 変換 → 日時 → 属性 → (写真の★ → キーワード) → OK
         chain = ([self.name_edit] if not self.bulk else []) + \
             [self.case_buttons[k] for k in (("all", m) for m, _t in CASE_BUTTONS)] + \
             [self.case_buttons[k] for k in (("ext", m) for m, _t in CASE_BUTTONS)] + \
             ([self.stamp_check] if self.stamp_check else []) + self.stamp_edits + \
-            [self.attr_checks[k] for k, _l, _a in ATTR_ROWS] + [self.ok_button, self.cancel_button]
+            [self.attr_checks[k] for k, _l, _a in ATTR_ROWS] + \
+            [w for w in (self.rating_combo, self.keyword_check) if w is not None] + \
+            [self.ok_button, self.cancel_button]
         for a, b in zip(chain, chain[1:]):
             self.setTabOrder(a, b)
         (self.name_edit if not self.bulk else self.ok_button).setFocus()
+
+    # --- 写真の★ ---
+    def _build_photo_box(self, layout, photo: dict) -> None:
+        """下部の「写真の★」の欄。★は「変えない」が既定、キーワードは3つの状態(変えない /
+        付ける / 外す。属性の一括変更と同じ中間の見せ方)。"""
+        box = QGroupBox(f"写真の★（画像 {photo.get('count', 0)} 件だけに付けます）")
+        grid = QGridLayout(box)
+        grid.addWidget(QLabel("★"), 0, 0)
+        self.rating_combo = RatingCombo()
+        self.rating_combo.addItem("変えない", None)
+        for value, label in photo.get("ratings") or ():
+            key = next((k for k, v in RATING_KEYS.items() if v == value), "")
+            self.rating_combo.addItem(f"{label}（{key}）" if key else label, value)
+        grid.addWidget(self.rating_combo, 0, 1)
+        self.rating_now_label = QLabel(f"今: {photo.get('rating_now') or 'いろいろ'}")
+        self.rating_now_label.setTextFormat(Qt.PlainText)
+        grid.addWidget(self.rating_now_label, 0, 2)
+        self.keyword_now_label = None
+        keyword = photo.get("keyword")
+        if keyword:
+            self.keyword_check = QCheckBox(keyword)
+            # 3つの状態: 変えない(中間) / 付ける / 外す。最初は「変えない」。
+            self.keyword_check.setTristate(True)
+            self.keyword_check.setCheckState(Qt.PartiallyChecked)
+            grid.addWidget(self.keyword_check, 1, 1)
+            self.keyword_now_label = QLabel(f"今: {photo.get('keyword_now') or 'いろいろ'}")
+            self.keyword_now_label.setTextFormat(Qt.PlainText)
+            grid.addWidget(self.keyword_now_label, 1, 2)
+            key = (photo.get("keyword_key") or "").upper()
+            if len(key) == 1 and "A" <= key <= "Z" and key not in {a for _k, _l, a in ATTR_ROWS}:
+                self.keyword_key = key
+        hint = QLabel("★は 5/4/3/2/1/0/- で選ぶ"
+                      + (f"　ALT+{self.keyword_key} {keyword}" if self.keyword_key else ""))
+        hint.setStyleSheet("font-size: 8pt;")
+        grid.addWidget(hint, 2, 0, 1, 3, Qt.AlignRight)
+        grid.setColumnStretch(2, 1)
+        layout.addWidget(box)
+        self.photo_box = box
+
+    def photo_changes(self) -> dict:
+        """写真の★の欄で変えるもの。{"rating": ★の値, "keyword": 付けるなら True / 外すなら
+        False}。「変えない」のものは入れない(欄が無ければ空)。"""
+        changes = {}
+        if self.rating_combo is not None and self.rating_combo.currentData() is not None:
+            changes["rating"] = int(self.rating_combo.currentData())
+        if self.keyword_check is not None:
+            state = self.keyword_check.checkState()
+            if state != Qt.PartiallyChecked:
+                changes["keyword"] = state == Qt.Checked
+        return changes
 
     # --- 名前 ---
     def _place_caret(self) -> None:
@@ -271,12 +379,16 @@ class FileInfoDialog(QDialog):
 
     # --- 属性(Alt+頭文字で切り替え。フォーカスは動かさない) ---
     def _toggle_by_alt(self, event) -> bool:
-        """Alt+R/S/H/A なら属性を切り替えて True。フォーカスは動かさない。"""
+        """Alt+R/S/H/A なら属性を、Alt+(キーワードの頭文字)なら写真のキーワードを切り替えて
+        True。フォーカスは動かさない。"""
         if not event.modifiers() & Qt.AltModifier:
             return False
         letters = {letter: key for key, _label, letter in ATTR_ROWS}
         key = int(event.key())
         letter = chr(key) if int(Qt.Key_A) <= key <= int(Qt.Key_Z) else ""
+        if letter and letter == self.keyword_key and self.keyword_check is not None:
+            self.keyword_check.nextCheckState()
+            return True
         if letter not in letters:
             return False
         self.attr_checks[letters[letter]].nextCheckState()

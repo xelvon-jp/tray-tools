@@ -98,7 +98,8 @@ DEFAULT_KEYMAP = {
     "0071": "grep",               # G 文字列検索(内容で探して結果をフラット表示)
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
-    "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示)
+    "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示・
+                                  # 写真フォルダモード・★で絞り込む)
     "1072": "frecency_jump",      # Shift+H よく行くフォルダへ(zoxide 風)
     "4066": "flat_view",          # Alt+B フラット表示(Total Commander の Ctrl+B)
     "0114": "preview_toggle",     # F3 プレビュー(反対窓の位置に出す)
@@ -112,9 +113,9 @@ DEFAULT_KEYMAP = {
     "0073": "size_total",         # I 占有合計ファイルサイズ表示(クラスタの倍数に切り上げて足す)
     "1073": "size_total_simple",  # Shift+I 単純合計ファイルサイズ表示(サイズをそのまま足す)
     # --- 写真の★(photometa) ---
-    "4073": "photo_menu",         # Alt+I 写真メニュー(★を付ける・★で絞り込む。AFXW.key の
-                                  # Alt+I(IrfanView)と同じ指で「画像まわり」。I はあふｗに
-                                  # 合わせて合計ファイルサイズに譲った。2026-11-01)
+    # ★を付けるのは R(画像を含むとダイアログの下部に★の欄)、★で絞り込むのは Shift+Z の
+    # 小メニュー。以前は Alt+I(その前は I)の写真メニューにまとめていたが、キーごとに1つの
+    # 役割に分けた(書き出しは PhotoCuller の I → E。2026-11-01)。Alt+I は空き。
     "4049": "photo_preset_1",     # Alt+1〜9 ★の絞り込みのプリセット(photo_ratings.json の
     "4050": "photo_preset_2",     # presets の N 番目。AFXW.key でも空いている)
     "4051": "photo_preset_3",
@@ -141,7 +142,7 @@ DEFAULT_KEYMAP = {
     "1068": "delete_permanent",   # Shift+D 完全削除
     "1046": "delete_permanent",   # Shift+Del
     "0075": "mkdir",              # K
-    "0082": "rename",             # R
+    "0082": "rename",             # R ファイル情報の編集(画像を含むと下部に★の欄)
     "2045": "clip_copy",          # Ctrl+Ins
     "2046": "clip_cut",           # Ctrl+Del
     "1045": "clip_paste",         # Shift+Ins

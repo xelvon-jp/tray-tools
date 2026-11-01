@@ -6824,7 +6824,7 @@ def test_window_workspace():
 
 
 # ---------------------------------------------------------------
-# 写真の★(写真フォルダモード・★の列・I メニュー・★の絞り込み・変更記録)
+# 写真の★(写真フォルダモード・★の列・R の★の欄・★の絞り込み・変更記録)
 # ---------------------------------------------------------------
 def test_photo_mode_judgement():
     def entries(photos, others, dirs=0):
@@ -6857,11 +6857,15 @@ def test_photo_mode_judgement():
     # 手動の切り替え
     assert core.photo_mode_on("auto", True) and not core.photo_mode_on("auto", False)
     assert core.photo_mode_on("on", False) and not core.photo_mode_on("off", True)
-    # キー: Alt+I と Alt+1〜9(I / Shift+I はあふｗ標準の合計ファイルサイズ)
-    assert core.DEFAULT_KEYMAP["4073"] == "photo_menu"
+    # キー: Alt+1〜9(I / Shift+I はあふｗ標準の合計ファイルサイズ)。写真メニュー(photo_menu)は
+    # 無くした(★は R・絞り込みは Shift+Z)。Alt+I は空き
+    assert "4073" not in core.DEFAULT_KEYMAP and "photo_menu" not in core.COMMANDS
     assert core.DEFAULT_KEYMAP["0073"] == "size_total"
     assert core.DEFAULT_KEYMAP["1073"] == "size_total_simple"
-    assert [c for c, cmd in core.DEFAULT_KEYMAP.items() if cmd == "photo_menu"] == ["4073"]
+    assert core.DEFAULT_KEYMAP["0082"] == "rename" and core.DEFAULT_KEYMAP["1090"] == "settings_menu"
+    # ユーザーの上書き設定に photo_menu が残っていても落ちず、黙って捨てる
+    keymap = core.build_keymap({"4073": "photo_menu", "0082": "rename"})
+    assert "4073" not in keymap and keymap["0082"] == "rename"
     assert [core.DEFAULT_KEYMAP[f"40{49 + i}"] for i in range(9)] == [
         f"photo_preset_{i}" for i in range(1, 10)]
 
@@ -6992,27 +6996,16 @@ def _photo_window(photos, other, settings_path):
     return w
 
 
-def _press_photo_menu(w, pane):
-    """写真メニューのキーを押す。キーはキー表(DEFAULT_KEYMAP の photo_menu)から引く
-    (割り当てを変えてもテストを1か所ずつ直さずに済むように。いまは Alt+I)。"""
+def _press_settings_menu(w, pane):
+    """Shift+Z(各種設定一時切替。★で絞り込むの小メニューもここ)を押す。"""
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
-    code = next(c for c, cmd in w.keymap.items() if cmd == "photo_menu")
-    mods, vk = int(code[0]), int(code[1:])
-    assert 65 <= vk <= 90, code         # 英字キーのつもり
-    qmods = Qt.NoModifier
-    if mods & core.SHIFT:
-        qmods |= Qt.ShiftModifier
-    if mods & core.CTRL:
-        qmods |= Qt.ControlModifier
-    if mods & core.ALT:
-        qmods |= Qt.AltModifier
-    QTest.keyClick(pane.view, Qt.Key(Qt.Key_A.value + vk - 65), qmods)
+    QTest.keyClick(pane.view, Qt.Key_Z, Qt.ShiftModifier)
 
 
 def _photo_menu_runner(w, picks, seen):
-    """_exec_menu の差し替え。picks の頭の文字(&5: など)の項目を順に選んだことにする。
-    小メニュー(▸)の行を選んだら、次の pick はその小メニューの中から選ぶ(I → E → F)。
+    """_exec_menu の差し替え。picks の頭の文字(&/: など)の項目を順に選んだことにする。
+    小メニュー(▸)の行を選んだら、次の pick はその小メニューの中から選ぶ(Shift+Z → / → B)。
     seen には (見出し, 印の付いた項目) を、開いたメニュー・小メニューの順に積む。"""
     def run(menu, chosen):
         while True:
@@ -7142,7 +7135,9 @@ def test_photo_mode_window_and_rating_column():
             w.deleteLater()
 
 
-def test_photo_menu_targets_and_write():
+def test_photo_button_targets_and_write():
+    """写真のボタン段(と run_photo_action)で★・キーワードを付ける。対象はマーク、無ければ
+    カーソル位置。画像でないものは飛ばす。I は占有合計のまま。"""
     import filer
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
@@ -7159,30 +7154,23 @@ def test_photo_menu_targets_and_write():
         path = lambda n: str(photos / n)  # noqa: E731
         log = lambda: w.log_view.toPlainText()  # noqa: E731
         try:
-            # I は写真メニューではなく占有合計(写真フォルダモードでも意味は変えない)
-            seen, picks = [], []
-            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            # I は写真のメニューではなく占有合計(写真フォルダモードでも意味は変えない)
+            seen = []
+            w._exec_menu = lambda menu, chosen: (seen.append(menu.title()), None)[1]
             L.set_cursor(L._row_of("a5.jpg"))
             QTest.keyClick(L.view, Qt.Key_I)
             _wait_until(lambda: "占有合計（a5.jpg）: 1 ファイル" in log(), what="I の占有合計")
             assert seen == [] and w._size_job is None
 
-            # カーソル位置の1枚。★が全部同じならその行に印
-            seen, picks = [], ["&4:"]
-            w._exec_menu = _photo_menu_runner(w, picks, seen)
-            L.set_cursor(L._row_of("a5.jpg"))
-            _press_photo_menu(w, L)
-            assert seen[-1][0] == "写真の★（1枚）", seen
-            assert len(seen[-1][1]) == 1 and seen[-1][1][0].startswith("&5:")
+            # カーソル位置の1枚
+            w.press_photo_button(L, ("rating", 4))
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 4)
             _wait_until(lambda: "★4 を 1 枚に付けました" in log(), what="書き込みのログ")
             assert _rating_texts(L)["a5.jpg"] == "フォトフレーム用"
 
             # マーク中のファイル(写真でないものは飛ばしてログに件数)。実行後はマークを解く
             L.marks.update({"b4.jpg", "c3.jpg", "memo.txt"})
-            picks.append("&5:")
-            _press_photo_menu(w, L)
-            assert seen[-1][0] == "写真の★（2枚）" and seen[-1][1] == []   # ★4 と ★3 で不揃い
+            w.press_photo_button(L, ("rating", 5))
             assert fake.calls[-1] == ("rating", [path("b4.jpg"), path("c3.jpg")], 5)
             assert "写真ではないもの 1 件を飛ばしました" in log()
             assert not L.marks
@@ -7191,38 +7179,26 @@ def test_photo_menu_targets_and_write():
 
             # 失敗したものは表示を戻して理由を出す
             L.marks.update({"d_reject.jpg", "e_none.jpg"})
-            picks.append("&3:")
-            _press_photo_menu(w, L)
+            w.press_photo_button(L, ("rating", 3))
             _wait_until(lambda: "★3 を 1 枚に付けました（失敗 1：読み取り専用です）" in log(),
                         what="失敗のログ")
             assert _rating_texts(L)["d_reject.jpg"] == "❌削除候補" and _rating_texts(L)["e_none.jpg"] == "ベストショット"
 
-            # K: 全部に付いていれば外す、そうでなければ付ける
+            # キーワード: 全部に付いていれば外す、そうでなければ付ける
             L.marks.update({"b4.jpg", "c3.jpg"})
-            picks.append("&K:")
-            _press_photo_menu(w, L)
+            w.press_photo_button(L, ("keyword", "みてね済"))
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", True)
             _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "みてね用 済", what="キーワードが付く")
             L.marks.update({"b4.jpg", "c3.jpg"})
-            picks.append("&K:")
-            _press_photo_menu(w, L)
-            assert any(t.startswith("&K:") for t in seen[-1][1])     # 全部に付いている印
+            w.press_photo_button(L, ("keyword", "みてね済"))
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", False)
             _wait_until(lambda: _rating_texts(L)["c3.jpg"] == "みてね用", what="キーワードが外れる")
 
             # フォルダの上では対象なし(書かない)
             n = len(fake.calls)
             L.set_cursor(L._row_of("sub"))
-            picks.append("&5:")
-            _press_photo_menu(w, L)
-            assert seen[-1][0] == "写真の★（0枚）" and len(fake.calls) == n
-            assert "対象の写真がありません" in log()
-
-            # 写真のボタン段: I メニューで選んだのと同じ(対象はカーソル位置)
-            L.set_cursor(L._row_of("e_none.jpg"))
-            w.press_photo_button(L, ("rating", -1))
-            assert fake.calls[-1] == ("rating", [path("e_none.jpg")], -1)
-            _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "❌削除候補", what="ボタンの書き込み")
+            w.press_photo_button(L, ("rating", 5))
+            assert len(fake.calls) == n and "対象の写真がありません" in log()
 
             # 画像ビュア(F3)の間: マークが無ければ表示中の1枚。隅に★
             L.set_cursor(L._row_of("a5.jpg"))
@@ -7232,16 +7208,12 @@ def test_photo_menu_targets_and_write():
             # 一覧のバッジと同じ色の角丸
             sheet = w.preview_widget.rating.styleSheet()
             assert filer.DEFAULT_COLORS["rating_4_bg"] in sheet and "border-radius" in sheet
-            picks.append("&5:")
-            _press_photo_menu(w, L)
-            assert seen[-1][0] == "写真の★（1枚）"
+            w.press_photo_button(L, ("rating", 5))
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 5)
             _wait_until(lambda: w.preview_widget.rating.text() == "💌 みてね用", what="ビュアの★の更新")
             # ビュアで見ながらマークしたら、マークした全部(ビュア中でもマーク優先)
             L.marks.update({"a5.jpg", "b4.jpg"})
-            picks.append("&3:")
-            _press_photo_menu(w, L)
-            assert seen[-1][0] == "写真の★（2枚）", seen[-1]
+            w.press_photo_button(L, ("rating", 3))
             assert fake.calls[-1] == ("rating", [path("a5.jpg"), path("b4.jpg")], 3)
             _wait_until(lambda: w.preview_widget.rating.text() == "⭐ ベストショット", what="ビュアの★の更新")
             w.preview_off()
@@ -7270,6 +7242,174 @@ def test_photo_menu_targets_and_write():
         assert fake.closed                       # あっふを閉じたら ExifTool も閉じる
 
 
+def _rename_dialog_runner(w, steps):
+    """exec_dialog の差し替え。R のダイアログを受け取り、steps の先頭の関数で操作して
+    try_accept(OK)する。関数が False を返したらキャンセル。開いたダイアログを積んで返す。"""
+    opened = []
+
+    def run(dialog):
+        opened.append(dialog)
+        step = steps.pop(0)
+        if step(dialog) is False:
+            return dialog.reject() or dialog.result()
+        dialog.try_accept()
+        return dialog.result()
+    w.exec_dialog = run
+    return opened
+
+
+def test_rename_photo_section():
+    """R: 画像を含むときだけ、ファイル情報の編集ダイアログの下部に「写真の★」の欄。
+    OK でファイル情報の変更を当てた後、★・キーワードを画像だけに書く(名前を変えたら新しい
+    名前に)。「変えない」なら書かない。画像が無ければ欄は無い(従来どおり)。"""
+    import filer
+    import filer_fileinfo
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QComboBox, QDialog, QGroupBox
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        fake = _FakePhotoSession()
+        w._photo_session = fake
+        path = lambda n: str(photos / n)  # noqa: E731
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        try:
+            # 画像が無ければ欄は無い(従来と同じ: 変換・タイムスタンプ・属性だけ)
+            steps = [lambda d: False]
+            opened = _rename_dialog_runner(w, steps)
+            L.set_cursor(L._row_of("memo.txt"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            d = opened[-1]
+            assert d.photo_box is None and d.rating_combo is None and d.keyword_check is None
+            assert not d.findChildren(QComboBox)
+            assert [g.title() for g in d.findChildren(QGroupBox)] == ["変換", "タイムスタンプ", "属性"]
+            assert d.photo_changes() == {}
+            # フォルダの上も同じ
+            steps.append(lambda d: False)
+            L.set_cursor(L._row_of("sub"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert opened[-1].photo_box is None
+
+            # 1件(★3・みてね済): 今の★とキーワードを見せる。「変えない」が既定
+            steps.append(lambda d: False)
+            L.set_cursor(L._row_of("c3.jpg"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            d = opened[-1]
+            assert d.photo_box is not None
+            assert d.photo_box.title() == "写真の★（画像 1 件だけに付けます）", d.photo_box.title()
+            assert d.rating_now_label.text() == "今: ベストショット"
+            assert d.keyword_now_label.text() == "今: 付いている"
+            assert d.rating_combo.currentText() == "変えない" and d.rating_combo.currentData() is None
+            items = [d.rating_combo.itemText(i) for i in range(d.rating_combo.count())]
+            assert items == ["変えない", "❌削除候補（-）", "未選別（0）", "★1（1）", "★2（2）",
+                             "ベストショット（3）", "フォトフレーム用（4）", "みてね用（5）"], items
+            assert d.keyword_check.checkState() == Qt.PartiallyChecked
+            assert d.photo_changes() == {}
+            assert not fake.calls                         # 開いて閉じただけでは書かない
+
+            # 複数(★5 と ★4)と画像でないもの: 「今: いろいろ」。数字キーで★を選ぶ。
+            # ★は画像だけに付く(memo.txt は飛ばす)
+            def pick3(d):
+                assert d.photo_box.title() == "写真の★（画像 2 件だけに付けます）", d.photo_box.title()
+                assert d.rating_now_label.text() == "今: いろいろ"
+                assert d.keyword_now_label.text() == "今: 付いていない"
+                QTest.keyClick(d.rating_combo, Qt.Key_3)
+                assert d.rating_combo.currentData() == 3
+                QTest.keyClick(d.rating_combo, Qt.Key_Minus)
+                assert d.rating_combo.currentData() == -1
+                QTest.keyClick(d.rating_combo, Qt.Key_3)
+            steps.append(pick3)
+            L.marks.update({"a5.jpg", "b4.jpg", "memo.txt"})
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert opened[-1].photo_changes() == {"rating": 3}
+            assert fake.calls == [("rating", [path("a5.jpg"), path("b4.jpg")], 3)], fake.calls
+            _wait_until(lambda: "★3 を 2 枚に付けました" in log(), what="R の★のログ")
+            assert _rating_texts(L)["a5.jpg"] == "ベストショット" and _rating_texts(L)["memo.txt"] == ""
+            assert not L.marks
+
+            # 複数で★が同じなら、その名前を見せる。キーワードは Alt+K で「付ける」
+            def keyword_on(d):
+                assert d.rating_now_label.text() == "今: ベストショット", d.rating_now_label.text()
+                QTest.keyClick(d, Qt.Key_K, Qt.AltModifier)
+                assert d.keyword_check.checkState() == Qt.Checked
+            steps.append(keyword_on)
+            L.marks.update({"a5.jpg", "b4.jpg"})
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert fake.calls[-1] == ("keyword", [path("a5.jpg"), path("b4.jpg")], "みてね済", True)
+            _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "ベストショット 済", what="キーワードが付く")
+
+            # キーワードを「外す」(★は変えない)
+            def keyword_off(d):
+                d.keyword_check.setCheckState(Qt.Unchecked)
+            steps.append(keyword_off)
+            n = len(fake.calls)
+            L.set_cursor(L._row_of("c3.jpg"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert fake.calls[n:] == [("keyword", [path("c3.jpg")], "みてね済", False)], fake.calls[n:]
+
+            # 「変えない」なら★を書かない(名前だけ変えても書かない)
+            def rename_only(d):
+                d.name_edit.setText("d_renamed.jpg")
+            steps.append(rename_only)
+            n = len(fake.calls)
+            L.set_cursor(L._row_of("d_reject.jpg"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert Path(photos, "d_renamed.jpg").exists() and len(fake.calls) == n
+            _wait_until(lambda: L._row_of("d_renamed.jpg") is not None, what="改名の読み直し")
+
+            # 名前と★を同時に変えたら、新しい名前のファイルに書く
+            def rename_and_rate(d):
+                d.name_edit.setText("e_renamed.jpg")
+                d.rating_combo.select_rating(5)
+            steps.append(rename_and_rate)
+            L.set_cursor(L._row_of("e_none.jpg"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert not Path(photos, "e_none.jpg").exists() and Path(photos, "e_renamed.jpg").exists()
+            assert fake.calls[-1] == ("rating", [path("e_renamed.jpg")], 5), fake.calls[-1]
+            _wait_until(lambda: _rating_texts(L).get("e_renamed.jpg") == "みてね用",
+                        what="新しい名前の★")
+
+            # ★の欄にいても Enter は OK(既存のキー操作を壊さない)。★だけ変えて閉じる
+            def enter_ok(d):
+                d.show()
+                d.rating_combo.setFocus()
+                QTest.qWait(30)
+                QTest.keyClick(d.rating_combo, Qt.Key_4)
+                QTest.keyClick(d.rating_combo, Qt.Key_Return)
+                QTest.qWait(30)
+                assert d.result() == QDialog.Accepted
+            steps.append(enter_ok)
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_R)
+            assert fake.calls[-1] == ("rating", [path("a5.jpg")], 4), fake.calls[-1]
+
+            # ExifTool が見つからなければ欄を出さない
+            w._photo_session = None
+            original = filer.photo_config.find_exiftool
+            filer.photo_config.find_exiftool = lambda config=None: None
+            try:
+                steps.append(lambda d: False)
+                QTest.keyClick(L.view, Qt.Key_R)
+                assert opened[-1].photo_box is None
+            finally:
+                filer.photo_config.find_exiftool = original
+                w._photo_session = fake
+
+            # ダイアログ単体: photo を渡さなければ欄は無い。数字キーは★の欄の中だけ
+            d = filer_fileinfo.FileInfoDialog(None, str(photos), [L.entries[L._row_of("b4.jpg")]])
+            assert d.photo_box is None and d.photo_changes() == {}
+            d.deleteLater()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_photo_rating_filter_and_presets():
     import filer
     import threading as _threading
@@ -7285,10 +7425,11 @@ def test_photo_rating_filter_and_presets():
         L = w.left
         log = lambda: w.log_view.toPlainText()  # noqa: E731
         try:
-            # I → / → B(ベストショットだけ ★>=3)。フォルダと .. は残る
+            # Shift+Z → / → B(ベストショットだけ ★>=3)。フォルダと .. は残る
             seen, picks = [], ["&/:", "&B:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
-            _press_photo_menu(w, L)
+            _press_settings_menu(w, L)
+            assert seen[0][0] == "各種設定一時切替"
             assert seen[-1][0] == "&/:★で絞り込む"   # 小メニューの見出しは行の表示と同じ(Qt)
             assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
             assert L.rating_filter == "★>=3" and "★絞り込み: ★>=3" in L.header2.text()
@@ -7300,14 +7441,23 @@ def test_photo_rating_filter_and_presets():
             assert "文字目" in w.filter_expr_error("★>=") and w.filter_expr_error("★>=3") == ""
             w.ask_filter_expr = lambda text: "reject || #みてね済"
             picks.extend(["&/:", "&E:"])
-            _press_photo_menu(w, L)
+            _press_settings_menu(w, L)
             assert _names(L) == ["..", "sub", "c3.jpg", "d_reject.jpg"]
             assert not w.apply_rating_filter("(★>=3")
             assert "式が読めません（" in log() and L.rating_filter == "reject || #みてね済"
             # A: 解く
             picks.extend(["&/:", "&A:"])
-            _press_photo_menu(w, L)
+            _press_settings_menu(w, L)
             assert L.rating_filter == "" and "memo.txt" in _names(L)
+            # 写真フォルダモードでない窓(右)でも出せる。対象はアクティブな窓
+            w.activate("right")
+            picks.extend(["&/:", "&U:"])
+            _press_settings_menu(w, w.right)
+            assert w.right.rating_filter == "unrated" and L.rating_filter == ""
+            picks.extend(["&/:", "&A:"])
+            _press_settings_menu(w, w.right)
+            assert w.right.rating_filter == "" and "x.txt" in _names(w.right)
+            w.activate("left")
 
             # sel はマーク中か。人物名は不明(隠れる)
             L.marks.add("e_none.jpg")
@@ -7585,10 +7735,8 @@ def test_photo_write_with_exiftool():
         target = photos / "e_none.jpg"
         mtime = os.stat(target).st_mtime_ns
         try:
-            seen, picks = [], ["&4:"]
-            w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("e_none.jpg"))
-            _press_photo_menu(w, L)
+            w.press_photo_button(L, ("rating", 4))
             _wait_until(lambda: "★4 を 1 枚に付けました" in w.log_view.toPlainText(),
                         timeout=30, what="ExifTool の書き込み")
             assert xmp.read_meta(target).rating == 4
@@ -7600,8 +7748,9 @@ def test_photo_write_with_exiftool():
         assert not session.alive()
 
 
-def test_photo_export_menu():
-    """I → E 書き出し: F フォトフレームへ同期 / M みてね用に集める / D みてね済にして片付ける。"""
+def test_photo_no_alt_i_and_no_export():
+    """写真メニュー(Alt+I)は無くした: Alt+I では何も起きない。書き出し(フォトフレーム同期・
+    みてね・手で消す写真の一覧)の UI もあっふには無い(PhotoCuller の I → E に任せる)。"""
     import filer
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
@@ -7611,75 +7760,41 @@ def test_photo_export_menu():
         photos, sub, other = _make_photo_tree(tmp)
         settings_path = Path(tmp, "settings.json")
         settings_path.write_text("{}", encoding="utf-8")
-        frame = Path(tmp, "frame")
-        frame.mkdir()
-        (frame / "手で入れた.jpg").write_bytes(b"manual")
-        mitene = Path(tmp, "mitene")
-        cfg = filer.photo_config.default_config()
-        cfg["frame_targets"] = [str(frame)]
-        cfg["mitene_dir"] = str(mitene)
-        # 共通設定と台帳はこのテストの一時フォルダへ(データの置き場 _TEST_TEMP は、窓の起動時の
-        # 書庫の一時フォルダの片付け(filer_archive.cleanup_temp)が裏で消すことがある)
-        saved = (filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir)
-        filer.photo_config.CONFIG_PATH = str(Path(tmp, "data", "photo_ratings.json"))
-        filer.photo_export.default_ledger_dir = lambda: str(Path(tmp, "data", "ledger"))
-        filer.photo_config.save_config(cfg)
         w = _photo_window(photos, other, settings_path)
         L = w.left
         fake = _FakePhotoSession()
         w._photo_session = fake
-        log = lambda: w.log_view.toPlainText()  # noqa: E731
-        asked = []
-        w.confirm = lambda title, text, default_yes=True: (asked.append(text), True)[1]
+        opened = []
+        w._exec_menu = lambda menu, chosen: (opened.append(menu.title()), None)[1]
+        w.exec_dialog = lambda dialog: (opened.append(dialog.windowTitle()), 0)[1]
         try:
-            # I メニューに「E 書き出し ▸」の行。キーは既存と重ならない
-            seen, picks = [], ["&E:", "&F:"]
-            w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("a5.jpg"))
-            _press_photo_menu(w, L)
-            assert seen[0][0].startswith("写真の★") and seen[1][0] == "&E:書き出し", (seen, log())
-            assert asked and "同期先 1 か所" in asked[-1] and str(photos) in asked[-1], log()
-            _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
-            names = sorted(os.listdir(frame))
-            assert "手で入れた.jpg" in names and len(names) == 4, names
-            assert sum(n.endswith("_a5.jpg") or n.endswith("_b4.jpg") or n.endswith("_one.jpg")
-                       for n in names) == 3
-            assert "追加 3" in log()
-
-            # M: ★5 でみてね済でないもの(a5 と sub/one)を集め、反対窓で開く
-            picks += ["&E:", "&M:"]
-            _press_photo_menu(w, L)
-            _wait_until(lambda: "みてね用に集める: 2 枚" in log(), timeout=30, what="集め終わり")
-            _wait(w)
-            assert core.same_dir(w.right.path, mitene)
-            copies = sorted(n for n in os.listdir(mitene) if n.endswith(".jpg"))
-            assert len(copies) == 2, copies
-
-            # D: 確かめてから、フェイクの ExifTool でみてね済を付けて片付ける
-            picks += ["&E:", "&D:"]
-            _press_photo_menu(w, L)
-            assert "2 枚の元の写真に「みてね済」" in asked[-1]
-            _wait_until(lambda: "2 枚にみてね済を付けて片付けました" in log(), timeout=30,
-                        what="片付けの終わり")
-            assert fake.calls[-1][0] == "keyword" and fake.calls[-1][2:] == ("みてね済", True)
-            assert not [n for n in os.listdir(mitene) if n.endswith(".jpg")]
-            _wait_until(lambda: _rating_texts(L)["a5.jpg"] == "みてね用 済", what="済の表示")
-
-            # 同期先が無ければ実行しない
-            filer.photo_config.save_config(filer.photo_config.default_config())
-            picks += ["&E:", "&F:"]
-            n = len(asked)
-            _press_photo_menu(w, L)
-            assert len(asked) == n
-            assert "同期先がありません（photo_ratings.json の frame_targets）" in log()
+            before = (w.log_view.toPlainText(), L.rating_filter, set(L.marks), L.path)
+            QTest.keyClick(L.view, Qt.Key_I, Qt.AltModifier)
+            QTest.qWait(30)
+            assert opened == [] and not fake.calls, opened
+            assert (w.log_view.toPlainText(), L.rating_filter, set(L.marks), L.path) == before
+            assert not hasattr(w, "cmd_photo_menu")
+            for name in ("run_photo_export", "photo_export_menu", "photo_frame_sync",
+                         "photo_mitene_collect", "photo_mitene_finish", "photo_manual_delete_list"):
+                assert not hasattr(w, name), name
+            assert not hasattr(filer, "PHOTO_EXPORT_KINDS")
+            # Shift+Z のメニューにも、写真のボタン段にも、書き出しの行は無い
+            rows = []
+            w._exec_menu = lambda menu, chosen: (rows.extend(
+                a.text() for a in menu.actions() if not a.isSeparator()), None)[1]
+            _press_settings_menu(w, L)
+            assert "&/:★で絞り込む" in rows and not any("書き出し" in t for t in rows), rows
+            labels = [label for label, _action in w.photo_bar_items()]
+            assert "絞り込み▾" in labels and not any("書き出し" in t for t in labels), labels
+            assert all(a[0] in ("rating", "keyword", "filter_menu") for _l, a in w.photo_bar_items())
         finally:
             w.close()
             w.deleteLater()
-            filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
 
 
 def test_photo_menu_submenu_keys():
-    """I メニューの小メニュー(書き出し・★で絞り込む)は、メインを閉じずに右側のその行の
+    """Shift+Z の「★で絞り込む ▸」(本物の小メニュー)は、メインを閉じずに右側のその行の
     高さに開く。→・Enter・頭の文字で開き、← / Esc でメインに戻る(元の行を選んだまま)。
     小メニューの中も文字は選ぶだけ・Enter で実行し、実行したら全部閉じる。"""
     from PySide6.QtCore import QPoint, Qt
@@ -7700,41 +7815,44 @@ def test_photo_menu_submenu_keys():
             menu.popup(w.mapToGlobal(QPoint(40, 40)))
             QTest.qWait(30)
             rows = {a.text()[:3]: a for a in menu.actions() if not a.isSeparator()}
-            export, filt = rows["&E:"], rows["&/:"]
-            ex_menu, filt_menu = export.menu(), filt.menu()
-            assert ex_menu is not None and filt_menu is not None
+            filt = rows["&/:"]
+            filt_menu = filt.menu()
+            assert filt_menu is not None
             # ▸ は Qt が描くので、表示の文字には入れない
-            assert export.text() == "&E:書き出し" and filt.text() == "&/:★で絞り込む", \
-                (export.text(), filt.text())
-            assert ex_menu.title() == export.text()   # 小メニューの見出しは行の表示と同じ(Qt)
-            assert [a.text()[:3] for a in ex_menu.actions()] == ["&F:", "&M:", "&D:", "&L:"]
+            assert filt.text() == "&/:★で絞り込む", filt.text()
+            assert filt_menu.title() == filt.text()   # 小メニューの見出しは行の表示と同じ(Qt)
+            keys = [a.text()[:3] for a in filt_menu.actions() if not a.isSeparator()]
+            assert keys[-2:] == ["&E:", "&A:"] and "&B:" in keys, keys
+            # 写真フォルダモードの切り替えの近く(すぐ下)
+            texts = [a.text()[:3] for a in menu.actions() if not a.isSeparator()]
+            assert texts.index("&/:") == texts.index("&F:") + 1, texts
 
             # → で開く。メインは開いたまま、その右側・その行の高さに出て、先頭が選ばれる
-            menu.setActiveAction(export)
+            menu.setActiveAction(filt)
             QTest.keyClick(menu, Qt.Key_Right)
             QTest.qWait(30)
-            assert ex_menu.isVisible() and menu.isVisible()
-            main_geo, sub_geo = menu.geometry(), ex_menu.geometry()
+            assert filt_menu.isVisible() and menu.isVisible()
+            main_geo, sub_geo = menu.geometry(), filt_menu.geometry()
             assert sub_geo.left() >= main_geo.right() - 8, (main_geo, sub_geo)
-            row_top = menu.mapToGlobal(menu.actionGeometry(export).topLeft()).y()
+            row_top = menu.mapToGlobal(menu.actionGeometry(filt).topLeft()).y()
             assert abs(sub_geo.top() - row_top) <= 8, (row_top, sub_geo)
-            assert ex_menu.activeAction() is ex_menu.actions()[0]
-            # ← で戻る(メインはそのまま、書き出しの行が選ばれた状態)
-            QTest.keyClick(ex_menu, Qt.Key_Left)
+            assert filt_menu.activeAction() is filt_menu.actions()[0]
+            # ← で戻る(メインはそのまま、★で絞り込むの行が選ばれた状態)
+            QTest.keyClick(filt_menu, Qt.Key_Left)
             QTest.qWait(30)
-            assert not ex_menu.isVisible() and menu.isVisible()
-            assert menu.activeAction() is export
+            assert not filt_menu.isVisible() and menu.isVisible()
+            assert menu.activeAction() is filt
             # Enter でも開く(何も実行しない)。Esc で戻る
             QTest.keyClick(menu, Qt.Key_Return)
             QTest.qWait(30)
-            assert ex_menu.isVisible() and not fired
-            QTest.keyClick(ex_menu, Qt.Key_Escape)
+            assert filt_menu.isVisible() and not fired
+            QTest.keyClick(filt_menu, Qt.Key_Escape)
             QTest.qWait(30)
-            assert not ex_menu.isVisible() and menu.isVisible()
-            assert menu.activeAction() is export and not fired
+            assert not filt_menu.isVisible() and menu.isVisible()
+            assert menu.activeAction() is filt and not fired
             # 頭の文字でも開く(ほかの行に移ってから / を押す)
-            QTest.keyClick(menu, Qt.Key_5)
-            assert menu.activeAction().text().startswith("&5:") and not filt_menu.isVisible()
+            QTest.keyClick(menu, Qt.Key_S)
+            assert menu.activeAction().text().startswith("&S:") and not filt_menu.isVisible()
             QTest.keyClick(menu, Qt.Key_Slash)
             QTest.qWait(30)
             assert filt_menu.isVisible() and menu.isVisible() and not fired
@@ -7753,10 +7871,11 @@ def test_photo_menu_submenu_keys():
         try:
             w._exec_menu = drive
             L.set_cursor(L._row_of("a5.jpg"))
-            _press_photo_menu(w, L)
+            _press_settings_menu(w, L)
             assert checked, w.log_view.toPlainText()
             assert L.rating_filter == "★>=3"
             assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
+            assert w.show_hidden is not None and L.photo_override == "auto"   # ほかの設定は変えない
             # 写真のボタン段の「絞り込み▾」からは今までどおり単独のメニュー
             titles = []
             w._exec_menu = lambda menu, chosen: (titles.append(menu.title()), None)[1]
@@ -7830,106 +7949,6 @@ def test_menu_selected_row_color():
         finally:
             w.close()
             w.deleteLater()
-
-
-def test_photo_manual_delete_list():
-    """削除がクラウドへ反映されない同期先(frame_manual_delete)から消した写真: 同期のログに
-    「Amazon 側(フォルダ名)で手で消す写真」、I → E → L で一覧のダイアログ(コピー・空にする)。"""
-    import filer
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QGuiApplication
-    from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QDialog
-
-    _qapp()
-    with tempfile.TemporaryDirectory() as tmp:
-        photos, sub, other = _make_photo_tree(tmp)
-        settings_path = Path(tmp, "settings.json")
-        settings_path.write_text("{}", encoding="utf-8")
-        frame = Path(tmp, "frame")
-        frame.mkdir()
-        cfg = filer.photo_config.default_config()
-        cfg["frame_targets"] = [str(frame)]
-        cfg["frame_manual_delete"] = [str(frame)]
-        saved = (filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir)
-        filer.photo_config.CONFIG_PATH = str(Path(tmp, "data", "photo_ratings.json"))
-        ledger_dir = str(Path(tmp, "data", "ledger"))
-        filer.photo_export.default_ledger_dir = lambda: ledger_dir
-        filer.photo_config.save_config(cfg)
-        # 前に同期した c3(★3 なので今回は対象外)が同期先に残っている
-        (frame / "old_c3.jpg").write_bytes(b"0123456789")
-        filer.photo_export.save_ledger(ledger_dir, str(frame), {
-            "old_c3.jpg": {"source": str(photos / "c3.jpg"), "out_size": 10}})
-        w = _photo_window(photos, other, settings_path)
-        L = w.left
-        log = lambda: w.log_view.toPlainText()  # noqa: E731
-        asked = []
-        answers = []
-        w.confirm = lambda title, text, default_yes=True, parent=None: (
-            asked.append((text, parent)), answers.pop(0) if answers else True)[1]
-        try:
-            # 一覧が空でも項目は出る
-            seen, picks = [], ["&E:", "&L:"]
-            w._exec_menu = _photo_menu_runner(w, picks, seen)
-            shown = []
-
-            def look(dialog):
-                shown.append((dialog.windowTitle(), dialog.text_view.toPlainText(),
-                              dialog.copy_button.isEnabled(), dialog.parent() is w))
-                return QDialog.Rejected
-            w.exec_dialog = look
-            L.set_cursor(L._row_of("a5.jpg"))
-            _press_photo_menu(w, L)
-            assert shown == [("手で消す写真の一覧（0枚）", "", False, True)], shown
-
-            # 同期で old_c3.jpg を消す → 一覧に残り、ログに出る
-            picks += ["&E:", "&F:"]
-            _press_photo_menu(w, L)
-            _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
-            _wait_until(lambda: "手で消す写真" in log(), what="手で消す写真のログ")
-            assert not (frame / "old_c3.jpg").exists()
-            assert "削除 1" in log()
-            assert "フォトフレーム同期: Amazon 側（frame）で手で消す写真：1枚（いま全部で 1枚）" in log(), log()
-            assert "フォトフレーム同期:   old_c3.jpg" in log()
-            items = filer.photo_export.pending_manual_deletes()
-            assert [(it["target"], it["name"]) for it in items] == [(str(frame), "old_c3.jpg")]
-            assert Path(tmp, "data", filer.photo_export.MANUAL_DELETE_FILE).exists()
-
-            # I → E → L: 一覧(項目に枚数)。コピー → 消し終わった(いいえ → はい)
-            labels = []
-            runner = _photo_menu_runner(w, picks, seen)
-
-            def menu_with_labels(menu, chosen):
-                labels.extend(a.text() for a in chosen)
-                return runner(menu, chosen)
-            w._exec_menu = menu_with_labels
-
-            def drive(dialog):
-                shown.append((dialog.windowTitle(), dialog.text_view.toPlainText(),
-                              dialog.copy_button.isEnabled(), dialog.parent() is w))
-                dialog.copy_button.click()
-                answers.append(False)
-                dialog.clear_button.click()
-                assert len(filer.photo_export.pending_manual_deletes()) == 1
-                answers.append(True)
-                dialog.clear_button.click()
-                return dialog.result()
-            w.exec_dialog = drive
-            picks += ["&E:", "&L:"]
-            _press_photo_menu(w, L)
-            assert "&L:手で消す写真の一覧（1枚）" in labels, labels
-            title, text, enabled, parented = shown[-1]
-            assert title == "手で消す写真の一覧（1枚）" and enabled and parented, shown[-1]
-            assert f"■ frame（{frame}）" in text and "old_c3.jpg" in text, text
-            assert QGuiApplication.clipboard().text() == "old_c3.jpg"
-            assert "クリップボード: 手で消す写真のファイル名 1件" in log()
-            assert len(asked) == 3 and asked[-1][1] is not None      # 同期＋2回。確かめる窓の親はダイアログ
-            assert filer.photo_export.pending_manual_deletes() == []
-            assert "手で消す写真の一覧: 1 枚を一覧から外しました" in log()
-        finally:
-            w.close()
-            w.deleteLater()
-            filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
 
 
 # ---------------------------------------------------------------

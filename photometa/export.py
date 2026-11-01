@@ -22,6 +22,14 @@
 #     scope を渡したら、その下の写真だけを消す対象にする（別のフォルダから同期した分を
 #     消さないため）。keep の下（★が読めなかった写真・読めなかったフォルダ）も消さない。
 #     中止したときは消さない
+#
+# 削除がクラウドへ反映されない同期先（設定の frame_manual_delete。Amazon Photos のデスクトップ
+# アプリが自動バックアップしているフォルダなど。足した写真は上がるが、消してもクラウドに残る）：
+#   - そこから消した写真を「クラウドで手で消す写真」として記録する（manual_delete_path の JSON）。
+#     項目は {同期先フォルダ, ファイル名, 元の写真のパス, 消した日時}
+#   - 同じ写真をまた同じ同期先に入れ直したら、その項目は外す（クラウドにはまだ残っているので、
+#     消す必要が無くなる）
+#   - 一覧は pending_manual_deletes()、手で消し終わったら clear_manual_deletes() で外す
 from __future__ import annotations
 
 import datetime as _dt
@@ -45,6 +53,8 @@ EXCLUDED_DIR_PREFIXES = ("extract_",)
 LEDGER_VERSION = 1
 FRAME_FORMAT = 1              # 作り方を変えたら上げる（全部作り直しになる）
 MITENE_MANIFEST = "photometa_mitene.json"
+MANUAL_DELETE_FILE = "frame_manual_delete.json"
+MANUAL_DELETE_VERSION = 1
 
 HEIC_EXTS = frozenset({".heic", ".heif"})
 
@@ -433,6 +443,116 @@ def save_ledger(ledger_dir: str, target: str, files: dict) -> None:
                 {"version": LEDGER_VERSION, "target": os.path.abspath(target), "files": files})
 
 
+# ------------------------------------------------------------------ 手で消す写真の一覧
+
+def manual_delete_path(ledger_dir: str | None = None) -> str:
+    """「クラウドで手で消す写真」の記録の場所。台帳のフォルダの隣（既定なら
+    %LOCALAPPDATA%\\traytools\\frame_manual_delete.json）。
+
+    ledger_dir を省くと default_ledger_dir() を呼んで決める（テストは default_ledger_dir を
+    一時フォルダへ差し替えれば、この記録も一時フォルダに入る）。"""
+    folder = ledger_dir if ledger_dir else default_ledger_dir()
+    return os.path.join(os.path.dirname(os.path.abspath(folder)), MANUAL_DELETE_FILE)
+
+
+def _manual_item(rec) -> dict | None:
+    """記録の1項目を確かめる（壊れていれば None）。"""
+    if not isinstance(rec, dict):
+        return None
+    out = {}
+    for k in ("target", "name", "source", "deleted_at"):
+        v = rec.get(k)
+        if not isinstance(v, str) or not v:
+            return None
+        out[k] = v
+    return out
+
+
+def _manual_ident(item: dict) -> tuple:
+    return (_key(item["target"]), item["name"].casefold(), _key(item["source"]),
+            item["deleted_at"])
+
+
+def _manual_sort_key(item: dict) -> tuple:
+    return (_key(item["target"]), item["deleted_at"], item["name"].casefold())
+
+
+def _load_manual(path: str) -> list:
+    data = _read_json(path)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [it for it in (_manual_item(r) for r in items) if it is not None]
+
+
+def _save_manual(path: str, items: list) -> None:
+    _write_json(path, {"version": MANUAL_DELETE_VERSION,
+                       "items": sorted(items, key=_manual_sort_key)})
+
+
+def pending_manual_deletes(ledger_dir: str | None = None) -> list:
+    """今の「クラウドで手で消す写真」の一覧。同期先ごと・消した日時の順。
+    項目は {"target": 同期先フォルダ, "name": ファイル名, "source": 元の写真, "deleted_at": 日時}。"""
+    return sorted(_load_manual(manual_delete_path(ledger_dir)), key=_manual_sort_key)
+
+
+def clear_manual_deletes(items=None, ledger_dir: str | None = None) -> int:
+    """一覧から items（pending_manual_deletes の項目）を外す。None なら全部。外した数を返す。"""
+    path = manual_delete_path(ledger_dir)
+    current = _load_manual(path)
+    if items is None:
+        keep = []
+    else:
+        drop = {_manual_ident(it) for it in (_manual_item(r) for r in items) if it is not None}
+        keep = [it for it in current if _manual_ident(it) not in drop]
+    removed = len(current) - len(keep)
+    if removed:
+        _save_manual(path, keep)
+    return removed
+
+
+def _update_manual(path: str, added: list, readded: set) -> None:
+    """記録を読み直して、入れ直した分（(同期先, 元の写真) の _key の組）を外し、added を足す。
+    同期のあいだにもう片方のアプリが書いた分を消さないよう、書く直前に読む。"""
+    current = _load_manual(path)
+    items = [it for it in current
+             if (_key(it["target"]), _key(it["source"])) not in readded]
+    seen = {_manual_ident(it) for it in items}
+    for it in added:
+        if _manual_ident(it) not in seen:
+            items.append(it)
+            seen.add(_manual_ident(it))
+    if items != current:
+        _save_manual(path, items)
+
+
+def manual_delete_report(result, ledger_dir: str | None = None, limit: int | None = None) -> list:
+    """同期の結果のうち、今回足した「クラウドで手で消す写真」を知らせる行。無ければ空。
+
+    同期先ごとに「Amazon 側（フォルダ名）で手で消す写真：n枚（いま全部で m枚）」と、
+    今回分のファイル名（limit を渡したらその数まで。残りは「ほか n 枚」）。"""
+    added = list(getattr(result, "manual_delete", None) or [])
+    if not added:
+        return []
+    totals: dict = {}
+    for it in pending_manual_deletes(ledger_dir):
+        k = _key(it["target"])
+        totals[k] = totals.get(k, 0) + 1
+    groups: dict = {}
+    for target, name, _src in added:
+        groups.setdefault(_key(target), (target, []))[1].append(name)
+    lines = []
+    for k, (target, names) in groups.items():
+        folder = os.path.basename(os.path.normpath(target)) or target
+        lines.append(f"Amazon 側（{folder}）で手で消す写真：{len(names)}枚"
+                     f"（いま全部で {totals.get(k, 0)}枚）")
+        shown = names if limit is None else names[:limit]
+        lines += [f"  {n}" for n in shown]
+        if len(names) > len(shown):
+            lines.append(f"  ほか {len(names) - len(shown)} 枚")
+    return lines
+
+
 # ------------------------------------------------------------------ フォトフレーム同期
 
 @dataclass
@@ -445,6 +565,9 @@ class SyncResult:
     kept: list = field(default_factory=list)       # (同期先のファイル, 理由) 手で差し替えられていた
     skipped_heic: list = field(default_factory=list)
     skipped_raw: list = field(default_factory=list)
+    # (同期先, 名前, 元の写真) 削除がクラウドへ反映されない同期先から消したので、今回
+    # 「クラウドで手で消す写真」の一覧に足したもの
+    manual_delete: list = field(default_factory=list)
     cancelled: bool = False
     error: str | None = None
 
@@ -488,11 +611,13 @@ class _Target:
 
 
 def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progress=None,
-               scope=None, keep=()) -> SyncResult:
+               scope=None, keep=(), manual_delete=()) -> SyncResult:
     """フォトフレーム同期。sources（写真のパス）を、縮小した JPEG にして targets の各フォルダへ。
 
     台帳は ledger_dir に同期先ごと。scope（フォルダの並び）を渡したら、その下の写真だけを
     「対象から外れたので消す」候補にする。keep（ファイルかフォルダ）の下は消さない。
+    manual_delete（フォルダの並び。設定の frame_manual_delete）に入っている同期先から消したものは、
+    「クラウドで手で消す写真」の一覧（manual_delete_path(ledger_dir)）に足す。
     progress(済んだ数, 全体, 名前)。
     """
     result = SyncResult()
@@ -523,6 +648,9 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
         return result
     scope_keys = None if scope is None else [_key(p) for p in scope]
     keep_keys = [_key(p) for p in keep]
+    manual_keys = {_key(p) for p in (manual_delete or ()) if isinstance(p, str) and p.strip()}
+    manual_added: list = []          # 一覧に足す項目
+    readded: set = set()             # 入れ直した (同期先, 元の写真)。一覧から外す
     heif_ok = None
     total = len(order)
     work = tempfile.mkdtemp(prefix="photometa_frame_")
@@ -598,6 +726,8 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 t.by_source[key] = name
                 t.taken.add(name.casefold())
                 (result.updated if action == "update" else result.added).append((t.dir, name, src))
+                if action == "add":
+                    readded.add((_key(t.dir), key))
             try:
                 os.remove(built)
             except OSError:
@@ -625,6 +755,11 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                             result.failed.append((dest, f"消せません（{e}）"))
                             continue
                         result.deleted.append((t.dir, name, rec["source"]))
+                        if _key(t.dir) in manual_keys:
+                            manual_added.append({
+                                "target": t.dir, "name": name, "source": rec["source"],
+                                "deleted_at": _dt.datetime.now().isoformat(timespec="seconds")})
+                            result.manual_delete.append((t.dir, name, rec["source"]))
                     del t.ledger[name]
                     t.by_source.pop(skey, None)
         elif not result.cancelled:
@@ -636,6 +771,12 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 save_ledger(ledger_dir, t.dir, t.ledger)
             except OSError as e:
                 result.failed.append((ledger_path(ledger_dir, t.dir), f"台帳を書けません（{e}）"))
+        if manual_added or readded:
+            mpath = manual_delete_path(ledger_dir)
+            try:
+                _update_manual(mpath, manual_added, readded)
+            except OSError as e:
+                result.failed.append((mpath, f"手で消す写真の一覧を書けません（{e}）"))
     return result
 
 

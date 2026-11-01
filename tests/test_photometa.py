@@ -240,6 +240,7 @@ def test_config_default_when_missing_or_broken():
     assert cfg["keywords"] == [{"key": "K", "name": "みてね済"}]
     assert [p["expr"] for p in cfg["presets"]] == ["★>=3", "★=5 && !#みてね済", "reject"]
     assert cfg["frame_targets"] == [] and cfg["exiftool"] == ""
+    assert cfg["frame_manual_delete"] == []
     os.makedirs(os.path.dirname(path), exist_ok=True)
     Path(path).write_text("{ broken", encoding="utf-8")
     assert pc.load_config() == pc.default_config()
@@ -254,6 +255,7 @@ def test_config_normalize_bad_values():
                      {"key": "0", "name": "固定キー"}, {"name": "キー無し"}],
         "presets": [{"name": "a", "expr": "★>=1", "key": "U"}, {"name": "", "expr": "x"}, 3],
         "frame_targets": ["", "  ", r"X:\frame", 5],
+        "frame_manual_delete": [None, " ", r"X:\frame"],
         "exiftool": 12,
         "future_option": {"a": 1},
     })
@@ -261,6 +263,8 @@ def test_config_normalize_bad_values():
     assert cfg["keywords"] == [{"key": "K", "name": "済"}]
     assert cfg["presets"] == [{"name": "a", "expr": "★>=1"}]   # U は固定キーなので落とす
     assert cfg["frame_targets"] == [r"X:\frame"]
+    assert cfg["frame_manual_delete"] == [r"X:\frame"]
+    assert pc.normalize({"frame_manual_delete": "X:\\frame"})["frame_manual_delete"] == []
     assert cfg["exiftool"] == ""
     assert cfg["future_option"] == {"a": 1}                     # 知らないキーは残す
     # 段階：範囲外・重複・固定キーは落とす。全部だめなら既定
@@ -806,6 +810,9 @@ def test_writer_restart_after_exit():
 
 from photometa import export as pe  # noqa: E402
 
+# 台帳の既定の場所(と、その隣の「手で消す写真の一覧」)も一時フォルダへ
+pe.default_ledger_dir = lambda: os.path.join(_TEST_TEMP, "data", "frame_ledger")
+
 
 def _exif_jpeg(path, size=(3000, 2000), orientation=None, when="2024:09:03 02:23:44",
                gps=True, packet=None, color_split=True):
@@ -871,8 +878,10 @@ def test_export_config_and_menu():
                                   {"key": "3", "name": "y", "min": 3}]})["levels"]
     assert [x["key"] for x in lv] == ["3"]
     items = pc.export_menu_items(cfg)
-    assert [m.key for m in items] == ["F", "M", "D"]
-    assert [m.action[0] for m in items] == ["frame_sync", "mitene_collect", "mitene_finish"]
+    assert [m.key for m in items] == ["F", "M", "D", "L"]
+    assert [m.action[0] for m in items] == ["frame_sync", "mitene_collect", "mitene_finish",
+                                            "frame_manual_list"]
+    assert items[-1].label == "手で消す写真の一覧（0枚）"
     # 式
     assert pe.frame_expr(cfg) == "★>=4"
     assert pe.mitene_expr(cfg) == "★=5 && !#みてね済"
@@ -1084,6 +1093,92 @@ def test_sync_frame_ledger_and_manual_files():
         "同期先がありません（photo_ratings.json の frame_targets）"
     res = pe.sync_frame([str(src / "missing.jpg")], [str(t1)], {}, str(ledger))
     assert res.failed and "ありません" in res.failed[0][1]
+
+
+def test_sync_frame_manual_delete():
+    """削除がクラウドへ反映されない同期先(manual_delete)から消したら「手で消す写真」に残す。
+    入れ直したら外れる。manual_delete でない同期先は記録しない。"""
+    d, src, t1, t2, ledger = _frame_setup("frame_manual")
+    record = d / pe.MANUAL_DELETE_FILE                  # 台帳のフォルダの隣
+    assert pe.manual_delete_path(str(ledger)) == str(record)
+    a = _exif_jpeg(src / "a.jpg", size=(400, 300), when="2024:01:01 10:00:00")
+    b = _exif_jpeg(src / "b.jpg", size=(400, 300), when="2024:01:02 10:00:00")
+    targets = [str(t1), str(t2)]
+    # 大文字小文字・区切りの違い・末尾の区切りは同じフォルダとして扱う
+    manual = [str(t1).upper().replace("\\", "/") + "/"]
+    res = pe.sync_frame([a, b], targets, {}, str(ledger), manual_delete=manual)
+    assert len(res.added) == 4 and not res.manual_delete
+    assert not record.exists()                          # 何も消していなければ書かない
+    assert pe.pending_manual_deletes(str(ledger)) == []
+
+    # b が外れた: t1(manual_delete)の分だけ記録。t2 は記録しない
+    res = pe.sync_frame([a], targets, {}, str(ledger), manual_delete=manual)
+    assert len(res.deleted) == 2
+    assert res.manual_delete == [(str(t1), "20240102_100000_b.jpg", b)], res.manual_delete
+    items = pe.pending_manual_deletes(str(ledger))
+    assert len(items) == 1
+    it = items[0]
+    assert (it["target"], it["name"], it["source"]) == (str(t1), "20240102_100000_b.jpg", b)
+    assert len(it["deleted_at"]) == 19 and it["deleted_at"][10] == "T"
+    lines = pe.manual_delete_report(res, str(ledger))
+    assert lines == ["Amazon 側（frame1）で手で消す写真：1枚（いま全部で 1枚）",
+                     "  20240102_100000_b.jpg"], lines
+    assert pe.manual_delete_report(pe.SyncResult(), str(ledger)) == []
+
+    # a も外れた: 足される(同期先ごと・消した日時の順。b は前に消した扱いに書き換えておく)
+    data = json.loads(record.read_text(encoding="utf-8"))
+    data["items"][0]["deleted_at"] = "2026-01-01T00:00:00"
+    record.write_text(json.dumps(data), encoding="utf-8")
+    res = pe.sync_frame([], targets, {}, str(ledger), manual_delete=manual)
+    assert [n for _t, n, _s in res.manual_delete] == ["20240101_100000_a.jpg"]
+    assert [x["name"] for x in pe.pending_manual_deletes(str(ledger))] == \
+        ["20240102_100000_b.jpg", "20240101_100000_a.jpg"]
+    lines = pe.manual_delete_report(res, str(ledger), limit=0)
+    assert lines == ["Amazon 側（frame1）で手で消す写真：1枚（いま全部で 2枚）", "  ほか 1 枚"], lines
+
+    # b をまた入れ直した: 一覧から外れる(クラウドにまだあるので消さなくてよい)
+    res = pe.sync_frame([b], targets, {}, str(ledger), manual_delete=manual)
+    assert len(res.added) == 2 and not res.manual_delete
+    assert [x["name"] for x in pe.pending_manual_deletes(str(ledger))] == ["20240101_100000_a.jpg"]
+
+    # manual_delete を渡さなければ記録しない(ほかの同期先は今までどおり)
+    res = pe.sync_frame([], targets, {}, str(ledger))
+    assert len(res.deleted) == 2 and not res.manual_delete
+    assert len(pe.pending_manual_deletes(str(ledger))) == 1
+
+    # 壊れた項目は読み飛ばす
+    data = json.loads(record.read_text(encoding="utf-8"))
+    data["items"].append({"target": str(t1), "name": 3})
+    data["items"].append("junk")
+    record.write_text(json.dumps(data), encoding="utf-8")
+    assert len(pe.pending_manual_deletes(str(ledger))) == 1
+    record.write_text("{ broken", encoding="utf-8")
+    assert pe.pending_manual_deletes(str(ledger)) == []
+
+
+def test_manual_delete_clear():
+    """clear_manual_deletes: 渡した項目だけ外す。None なら全部。省くと既定の場所。"""
+    d, src, t1, t2, ledger = _frame_setup("frame_manual_clear")
+    a = _exif_jpeg(src / "a.jpg", size=(400, 300), when="2024:01:01 10:00:00")
+    b = _exif_jpeg(src / "b.jpg", size=(400, 300), when="2024:01:02 10:00:00")
+    targets = [str(t1), str(t2)]
+    both = [str(t1), str(t2)]
+    pe.sync_frame([a, b], targets, {}, str(ledger), manual_delete=both)
+    res = pe.sync_frame([], targets, {}, str(ledger), manual_delete=both)
+    assert len(res.manual_delete) == 4
+    items = pe.pending_manual_deletes(str(ledger))
+    assert [os.path.basename(x["target"]) for x in items] == ["frame1", "frame1", "frame2", "frame2"]
+    assert pe.clear_manual_deletes([items[0]], str(ledger)) == 1
+    rest = pe.pending_manual_deletes(str(ledger))
+    assert rest == items[1:]
+    assert pe.clear_manual_deletes([], str(ledger)) == 0
+    assert pe.clear_manual_deletes(None, str(ledger)) == 3
+    assert pe.pending_manual_deletes(str(ledger)) == []
+    assert pe.clear_manual_deletes(None, str(ledger)) == 0
+    # ledger_dir を省くと default_ledger_dir() の隣(このテストでは一時フォルダ)
+    assert pe.manual_delete_path() == os.path.join(_TEST_TEMP, "data", pe.MANUAL_DELETE_FILE)
+    assert pe.pending_manual_deletes() == []
+    assert pe.clear_manual_deletes() == 0
 
 
 def test_sync_frame_heic_raw_and_formats():

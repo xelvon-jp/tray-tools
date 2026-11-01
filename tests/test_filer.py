@@ -7644,6 +7644,106 @@ def test_photo_export_menu():
             filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
 
 
+def test_photo_manual_delete_list():
+    """削除がクラウドへ反映されない同期先(frame_manual_delete)から消した写真: 同期のログに
+    「Amazon 側(フォルダ名)で手で消す写真」、I → E → L で一覧のダイアログ(コピー・空にする)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        frame = Path(tmp, "frame")
+        frame.mkdir()
+        cfg = filer.photo_config.default_config()
+        cfg["frame_targets"] = [str(frame)]
+        cfg["frame_manual_delete"] = [str(frame)]
+        saved = (filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir)
+        filer.photo_config.CONFIG_PATH = str(Path(tmp, "data", "photo_ratings.json"))
+        ledger_dir = str(Path(tmp, "data", "ledger"))
+        filer.photo_export.default_ledger_dir = lambda: ledger_dir
+        filer.photo_config.save_config(cfg)
+        # 前に同期した c3(★3 なので今回は対象外)が同期先に残っている
+        (frame / "old_c3.jpg").write_bytes(b"0123456789")
+        filer.photo_export.save_ledger(ledger_dir, str(frame), {
+            "old_c3.jpg": {"source": str(photos / "c3.jpg"), "out_size": 10}})
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        asked = []
+        answers = []
+        w.confirm = lambda title, text, default_yes=True, parent=None: (
+            asked.append((text, parent)), answers.pop(0) if answers else True)[1]
+        try:
+            # 一覧が空でも項目は出る
+            seen, picks = [], ["&E:", "&L:"]
+            w._exec_menu = _photo_menu_runner(w, picks, seen)
+            shown = []
+
+            def look(dialog):
+                shown.append((dialog.windowTitle(), dialog.text_view.toPlainText(),
+                              dialog.copy_button.isEnabled(), dialog.parent() is w))
+                return QDialog.Rejected
+            w.exec_dialog = look
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert shown == [("手で消す写真の一覧（0枚）", "", False, True)], shown
+
+            # 同期で old_c3.jpg を消す → 一覧に残り、ログに出る
+            picks += ["&E:", "&F:"]
+            QTest.keyClick(L.view, Qt.Key_I)
+            _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
+            _wait_until(lambda: "手で消す写真" in log(), what="手で消す写真のログ")
+            assert not (frame / "old_c3.jpg").exists()
+            assert "削除 1" in log()
+            assert "フォトフレーム同期: Amazon 側（frame）で手で消す写真：1枚（いま全部で 1枚）" in log(), log()
+            assert "フォトフレーム同期:   old_c3.jpg" in log()
+            items = filer.photo_export.pending_manual_deletes()
+            assert [(it["target"], it["name"]) for it in items] == [(str(frame), "old_c3.jpg")]
+            assert Path(tmp, "data", filer.photo_export.MANUAL_DELETE_FILE).exists()
+
+            # I → E → L: 一覧(項目に枚数)。コピー → 消し終わった(いいえ → はい)
+            labels = []
+            runner = _photo_menu_runner(w, picks, seen)
+
+            def menu_with_labels(menu, chosen):
+                labels.extend(a.text() for a in chosen)
+                return runner(menu, chosen)
+            w._exec_menu = menu_with_labels
+
+            def drive(dialog):
+                shown.append((dialog.windowTitle(), dialog.text_view.toPlainText(),
+                              dialog.copy_button.isEnabled(), dialog.parent() is w))
+                dialog.copy_button.click()
+                answers.append(False)
+                dialog.clear_button.click()
+                assert len(filer.photo_export.pending_manual_deletes()) == 1
+                answers.append(True)
+                dialog.clear_button.click()
+                return dialog.result()
+            w.exec_dialog = drive
+            picks += ["&E:", "&L:"]
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert "&L:手で消す写真の一覧（1枚）" in labels, labels
+            title, text, enabled, parented = shown[-1]
+            assert title == "手で消す写真の一覧（1枚）" and enabled and parented, shown[-1]
+            assert f"■ frame（{frame}）" in text and "old_c3.jpg" in text, text
+            assert QGuiApplication.clipboard().text() == "old_c3.jpg"
+            assert "クリップボード: 手で消す写真のファイル名 1件" in log()
+            assert len(asked) == 3 and asked[-1][1] is not None      # 同期＋2回。確かめる窓の親はダイアログ
+            assert filer.photo_export.pending_manual_deletes() == []
+            assert "手で消す写真の一覧: 1 枚を一覧から外しました" in log()
+        finally:
+            w.close()
+            w.deleteLater()
+            filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

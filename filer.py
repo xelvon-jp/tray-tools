@@ -6210,7 +6210,7 @@ class FilerWindow(QWidget):
     # --- 書き出し(I → E。フォトフレーム同期・みてね) ---
     def photo_export_menu(self) -> None:
         """I → E: 書き出しの小メニュー(F フォトフレームへ同期 / M みてね用に集める /
-        D みてね済にして片付ける)。"""
+        D みてね済にして片付ける / L 手で消す写真の一覧)。"""
         self._reload_photo_config()
         items = []
         for item in photo_config.export_menu_items(self.photo_config):
@@ -6227,6 +6227,8 @@ class FilerWindow(QWidget):
             self.photo_mitene_collect()
         elif kind == "mitene_finish":
             self.photo_mitene_finish()
+        elif kind == "frame_manual_list":
+            self.photo_manual_delete_list()
 
     def _export_root(self, title: str):
         """書き出しで集める元(今の窓のフォルダ)。使えなければログに出して None。"""
@@ -6262,6 +6264,8 @@ class FilerWindow(QWidget):
             return
         settings = cfg.get("frame")
         ledger_dir = photo_export.default_ledger_dir()
+        # 削除がクラウドへ反映されない同期先(消したら「手で消す写真の一覧」に残す)
+        manual = list(cfg.get("frame_manual_delete") or [])
 
         def run(progress, cancel):
             found = photo_export.collect(root, expr, cfg, cancel=cancel, progress=progress)
@@ -6271,7 +6275,8 @@ class FilerWindow(QWidget):
             keep = list(found.unknown) + list(found.error_dirs)
             return found, photo_export.sync_frame(found.paths, targets, settings, ledger_dir,
                                                   cancel=cancel, progress=progress,
-                                                  scope=[root], keep=keep)
+                                                  scope=[root], keep=keep,
+                                                  manual_delete=manual)
 
         def done(result):
             if isinstance(result, Exception):
@@ -6284,6 +6289,8 @@ class FilerWindow(QWidget):
             self.log(f"{title}: {len(found.paths)} 枚 → {len(targets)} か所　{synced.summary()}")
             for note in synced.notes():
                 self.log(f"{title}: {note}")
+            for line in photo_export.manual_delete_report(synced, ledger_dir):
+                self.log(f"{title}: {line}")
             if found.unknown:
                 self.log(f"{title}: ★が読めなかった写真 {len(found.unknown)} 枚は"
                          "足しも消しもしていません")
@@ -6292,6 +6299,93 @@ class FilerWindow(QWidget):
                     pane.reload(keep_marks=True)
 
         self._start_job(title, root, 0, run, done)
+
+    def photo_manual_delete_list(self) -> None:
+        """I → E → L: 削除がクラウドへ反映されない同期先(frame_manual_delete)から消したので、
+        クラウド(Amazon Photos など)で手で消す写真の一覧。同期先ごと・消した日時の順に名前を並べる。
+        「ファイル名をコピー」(改行区切り。クラウドで検索するときに使う)/「消し終わった」
+        (確かめてから一覧を空にする)/「閉じる」。"""
+        title = "手で消す写真の一覧"
+        items = photo_export.pending_manual_deletes()
+        names = [it["name"] for it in items]
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{title}（{len(items)}枚）")
+        dialog.setFont(self.log_font)
+        bg, fg = self.colors["background"], self.colors["text"]
+        dialog.setObjectName("manualDelete")
+        dialog.setStyleSheet(
+            f"#manualDelete {{ background-color: {bg}; }}"
+            f" #manualDelete QLabel {{ color: {fg}; }}"
+            f" #manualDelete QPlainTextEdit {{ background-color: #10103a; color: {fg};"
+            f" border: 1px solid #50508a; }}"
+            f" #manualDelete QPushButton {{ background-color: #24244e; color: {fg};"
+            f" border: 1px solid #50508a; padding: 2px 8px; }}"
+            f" #manualDelete QPushButton:disabled {{ color: #808080; }}")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        if items:
+            hint = QLabel("フォルダからは消しましたが、クラウドには残っています。"
+                          "クラウド側（Amazon Photos など）で手で消してください。")
+        else:
+            hint = QLabel("手で消す写真はありません。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        lines, last = [], None
+        for it in items:
+            target = os.path.normcase(os.path.abspath(it["target"]))
+            if target != last:
+                if lines:
+                    lines.append("")
+                folder = os.path.basename(os.path.normpath(it["target"])) or it["target"]
+                lines.append(f"■ {folder}（{it['target']}）")
+                last = target
+            lines.append(f"  {it['deleted_at'].replace('T', ' ')}  {it['name']}")
+        text = QPlainTextEdit("\n".join(lines))
+        text.setReadOnly(True)
+        text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        text.setMinimumSize(560, 320)
+        layout.addWidget(text, 1)
+        row = QHBoxLayout()
+        copy_button = QPushButton("ファイル名をコピー")
+        clear_button = QPushButton("消し終わった（一覧を空にする）")
+        close_button = QPushButton("閉じる")
+        copy_button.setEnabled(bool(items))
+        clear_button.setEnabled(bool(items))
+        row.addWidget(copy_button)
+        row.addWidget(clear_button)
+        row.addStretch(1)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+        dialog.text_view = text            # テストから見る
+        dialog.copy_button, dialog.clear_button, dialog.close_button = (
+            copy_button, clear_button, close_button)
+
+        def copy():
+            try:
+                QGuiApplication.clipboard().setText("\n".join(names))
+                self.log(f"クリップボード: 手で消す写真のファイル名 {len(names)}件")
+            except Exception:  # noqa: BLE001
+                _log_exception("manualDeleteCopy")
+
+        def clear():
+            try:
+                if not self.confirm(title, f"一覧の {len(items)} 枚を、クラウドで消し終わったものとして"
+                                           "一覧から外します。よろしいですか？",
+                                    default_yes=False, parent=dialog):
+                    return
+                removed = photo_export.clear_manual_deletes(items)
+                self.log(f"{title}: {removed} 枚を一覧から外しました")
+                dialog.accept()
+            except Exception:  # noqa: BLE001
+                _log_exception("manualDeleteClear")
+
+        copy_button.clicked.connect(copy)
+        clear_button.clicked.connect(clear)
+        close_button.clicked.connect(dialog.reject)
+        close_button.setFocus()
+        self.exec_dialog(dialog)
+        dialog.deleteLater()
 
     def photo_mitene_collect(self) -> None:
         """今の窓のフォルダ配下の「みてね用でまだ上げていない」写真を、集める先へコピーする。

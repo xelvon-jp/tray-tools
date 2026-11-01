@@ -57,6 +57,10 @@ DEFAULT_CONFIG: dict = {
         {"name": "削除候補", "expr": "reject", "key": "D", "label": "削除候補だけ"},
     ],
     "frame_targets": [],
+    # frame_targets のうち、削除がクラウドへ反映されない同期先（Amazon Photos のデスクトップアプリが
+    # 自動バックアップしているフォルダなど）。ここから消した写真は「手で消す写真の一覧」に残す
+    # （photometa.export.pending_manual_deletes）。frame_targets の形は変えない（古い PhotoCuller も読む）
+    "frame_manual_delete": [],
     # フォトフレーム用に作る JPEG（photometa.export.sync_frame）
     "frame": {"max_long_edge": 2560, "quality": 85, "strip_gps": True},
     # みてね用に集める先。空なら %TEMP%\みてね用（photometa.export.mitene_dir）
@@ -206,6 +210,9 @@ def normalize(cfg) -> dict:
     ft = cfg.get("frame_targets")
     if isinstance(ft, list):
         out["frame_targets"] = [s for s in (_str(x) for x in ft) if s]
+    fm = cfg.get("frame_manual_delete")
+    if isinstance(fm, list):
+        out["frame_manual_delete"] = [s for s in (_str(x) for x in fm) if s]
     out["frame"] = normalize_frame(cfg.get("frame"))
     md = cfg.get("mitene_dir")
     if isinstance(md, str):
@@ -443,15 +450,19 @@ def export_menu_items(config: dict) -> list[MenuItem]:
     ("frame_sync", None)     … フォトフレームへ同期（photometa.export.sync_frame）
     ("mitene_collect", None) … みてね用に集める（photometa.export.collect_mitene）
     ("mitene_finish", None)  … みてね済にして片付ける（photometa.export.finish_mitene）
+    ("frame_manual_list", None) … 手で消す写真の一覧（photometa.export.pending_manual_deletes）
+                                  知らない動作の行は、古いアプリが飛ばす
     """
     from . import export as ex
 
     kws = config.get("keywords") or []
     done = kws[0]["name"] if kws else "みてね済"
+    pending = len(ex.pending_manual_deletes())
     return [
         MenuItem("F", "フォトフレームへ同期", ex.frame_expr(config), ("frame_sync", None)),
         MenuItem("M", "みてね用に集める", ex.mitene_expr(config), ("mitene_collect", None)),
         MenuItem("D", f"{done}にして片付ける", "", ("mitene_finish", None)),
+        MenuItem("L", f"手で消す写真の一覧（{pending}枚）", "", ("frame_manual_list", None)),
     ]
 
 

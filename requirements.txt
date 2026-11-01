@@ -13,6 +13,9 @@ numpy
 opencv-python-headless
 # 診断(diagnostics.py)と、あっふ のスマホ送信(filer_phone.py)の QR コード。
 segno
+# あっふ のスマホ送信(filer_phone.py)を HTTPS で出すためのローカル CA と証明書づくり。
+# 無くても落ちはしない(これまでどおり HTTP で出し、「まとめて写真に保存」が使えないだけ)。
+cryptography
 # Copilot の窓を exe 名で見分ける(copilot_loop)・親プロセスの生存確認(agent_loop)など。
 # 無くても落ちはしないが、exe 名での照合を諦めるので業務PCの M365 Copilot を取り違えうる。
 psutil

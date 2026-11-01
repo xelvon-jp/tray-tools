@@ -707,7 +707,7 @@ def test_phone_share_server():
         txt = base / "メモ.txt"
         txt.write_bytes("hello".encode("utf-8"))
         server = filer_phone.ShareServer(
-            [str(img), str(txt), str(base / "gone.bin")])
+            [str(img), str(txt), str(base / "gone.bin")], use_https=False)
         assert len(server.files) == 2       # 無いファイルは落ちる
         server.start()
         try:
@@ -735,6 +735,302 @@ def test_phone_share_server():
         finally:
             server.stop()
     assert filer_phone.is_image("a.JPG") and not filer_phone.is_image("a.txt")
+
+
+def _phone_ca_context(ca_dir, check_hostname=True):
+    """生成したローカル CA だけを信頼する、テスト用のクライアント側 SSLContext。"""
+    import ssl
+    import filer_phone
+
+    context = ssl.create_default_context(
+        cafile=os.path.join(ca_dir, filer_phone.CA_CERT_FILE))
+    context.check_hostname = check_hostname
+    return context
+
+
+def test_phone_ca_and_server_cert():
+    """スマホ送信のローカル CA: 作れて、2回目は読み直す(作り直さない)。
+    CA は名前制約(critical)付きの CA:TRUE、サーバ証明書は SAN に IP・EKU は
+    serverAuth・期限は iOS の上限(825日)以下で、CA の署名が通る。"""
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ca_dir = os.path.join(tmp, "phone_ca")
+        cert, key, created = filer_phone.ensure_ca(ca_dir, name_constraints=True)
+        assert created
+        assert sorted(os.listdir(ca_dir)) == [filer_phone.CA_CERT_FILE,
+                                              filer_phone.CA_KEY_FILE]
+        again, _key, created2 = filer_phone.ensure_ca(ca_dir, name_constraints=True)
+        assert not created2 and again.serial_number == cert.serial_number
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints)
+        assert bc.critical and bc.value.ca
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        assert ku.key_cert_sign
+        nc = cert.extensions.get_extension_for_class(x509.NameConstraints)
+        assert nc.critical
+        permitted = nc.value.permitted_subtrees
+        nets = {str(g.value) for g in permitted if isinstance(g, x509.IPAddress)}
+        assert nets == {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+        assert [g.value for g in permitted if isinstance(g, x509.DNSName)] == ["local"]
+        days = (cert.not_valid_after_utc - cert.not_valid_before_utc).days
+        assert days >= 3650
+        assert filer_phone.ip_permitted(cert, "192.168.1.23")
+        assert filer_phone.ip_permitted(cert, "10.1.2.3")
+        assert not filer_phone.ip_permitted(cert, "127.0.0.1")
+        assert not filer_phone.ip_permitted(cert, "8.8.8.8")
+
+        server_cert, _server_key = filer_phone.issue_server_cert(
+            cert, key, "192.168.1.23")
+        san = server_cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value
+        assert san.get_values_for_type(x509.IPAddress) == [
+            ipaddress.ip_address("192.168.1.23")]
+        eku = server_cert.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage).value
+        assert list(eku) == [ExtendedKeyUsageOID.SERVER_AUTH]
+        assert not server_cert.extensions.get_extension_for_class(
+            x509.BasicConstraints).value.ca
+        life = server_cert.not_valid_after_utc - server_cert.not_valid_before_utc
+        assert life <= datetime.timedelta(days=825)
+        assert server_cert.issuer == cert.subject
+        server_cert.verify_directly_issued_by(cert)   # 署名が CA のもの
+
+        # 名前制約を外す設定(iOS でうまくいかなかったとき用)
+        plain_dir = os.path.join(tmp, "plain_ca")
+        plain, _k, _c = filer_phone.ensure_ca(plain_dir, name_constraints=False)
+        try:
+            plain.extensions.get_extension_for_class(x509.NameConstraints)
+            raise AssertionError("名前制約は付かないはず")
+        except x509.ExtensionNotFound:
+            pass
+        assert filer_phone.ip_permitted(plain, "127.0.0.1")
+
+        # 壊れた CA は作り直す
+        Path(ca_dir, filer_phone.CA_CERT_FILE).write_text("broken", encoding="utf-8")
+        _cert, _key, created3 = filer_phone.ensure_ca(ca_dir)
+        assert created3
+
+
+def test_phone_https_share():
+    """HTTPS で出すと、生成した CA を信頼すればページもファイルも取れる。
+    ページには共有ボタンの処理が入る。証明書の入口(HTTP・別の合言葉)は
+    CA の公開証明書だけを返し、鍵は出さない。合言葉が違えば 404。"""
+    import ssl
+    import urllib.error
+    import urllib.request
+    from cryptography import x509
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        ca_dir = str(base / "phone_ca")
+        img = base / "photo.jpg"
+        img.write_bytes(b"\xff\xd8\xff" + b"x" * 200)
+        txt = base / "メモ.txt"
+        txt.write_bytes(b"hello")
+        # 名前制約なしの CA で、127.0.0.1 宛てにホスト名の確認まで通す
+        filer_phone.ensure_ca(ca_dir, name_constraints=False)
+        server = filer_phone.ShareServer([str(img), str(txt)], ca_dir=ca_dir,
+                                         host_ip="127.0.0.1")
+        assert server.https, server.https_error
+        assert server.url.startswith("https://127.0.0.1:")
+        assert server.ca_url.startswith("http://127.0.0.1:")
+        assert server.ca_token != server.token
+        # サーバ証明書の一時ファイルは読んだらすぐ消えている
+        assert sorted(os.listdir(ca_dir)) == [filer_phone.CA_CERT_FILE,
+                                              filer_phone.CA_KEY_FILE]
+        key_pem = Path(ca_dir, filer_phone.CA_KEY_FILE).read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(
+            Path(ca_dir, filer_phone.CA_CERT_FILE).read_bytes())
+        context = _phone_ca_context(ca_dir)
+        server.start()
+        try:
+            page = urllib.request.urlopen(server.url, context=context).read().decode("utf-8")
+            assert '<img src="f/0"' in page
+            assert "navigator.share" in page and "navigator.canShare" in page
+            assert "まとめて写真に保存（共有）" in page
+            assert "var CHUNK = 10" in page
+            assert '"name": "photo.jpg"' in page and "メモ.txt" in page
+            assert '"image/jpeg"' in page and '"i": 1' not in page   # txt は共有に入れない
+            r = urllib.request.urlopen(server.url + "f/0", context=context)
+            assert r.headers["Content-Type"] == "image/jpeg"
+            assert r.read() == img.read_bytes()
+            r = urllib.request.urlopen(server.url + "d/1", context=context)
+            assert "attachment" in r.headers["Content-Disposition"]
+            assert r.read() == b"hello"
+            https_root = f"https://127.0.0.1:{server.port}"
+            for bad in (https_root + "/", https_root + "/k/wrong/",
+                        f"{https_root}/k/{server.ca_token}/ca.crt", server.url + "f/9"):
+                try:
+                    urllib.request.urlopen(bad, context=context)
+                    raise AssertionError(f"404のはず: {bad}")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 404
+            # 信頼していない(既定の)コンテキストでは繋がらない
+            try:
+                urllib.request.urlopen(server.url, context=ssl.create_default_context())
+                raise AssertionError("証明書の検証で失敗するはず")
+            except urllib.error.URLError as e:
+                assert isinstance(e.reason, ssl.SSLCertVerificationError), e
+
+            # 証明書の入口: 案内ページと CA の公開証明書(DER)だけ
+            guide = urllib.request.urlopen(server.ca_url).read().decode("utf-8")
+            assert 'href="ca.crt"' in guide and "証明書信頼設定" in guide
+            r = urllib.request.urlopen(server.ca_url + "ca.crt")
+            assert r.headers["Content-Type"] == "application/x-x509-ca-cert"
+            body = r.read()
+            assert x509.load_der_x509_certificate(body) == ca_cert
+            assert b"PRIVATE KEY" not in body and key_pem not in body
+            ca_root = f"http://127.0.0.1:{server.ca_port}"
+            for bad in (ca_root + "/", ca_root + "/k/wrong/ca.crt",
+                        f"{ca_root}/k/{server.token}/",          # 本体の合言葉は効かない
+                        f"{ca_root}/k/{server.token}/f/0",
+                        server.ca_url + filer_phone.CA_KEY_FILE,
+                        server.ca_url + "../" + filer_phone.CA_KEY_FILE):
+                try:
+                    urllib.request.urlopen(bad)
+                    raise AssertionError(f"404のはず: {bad}")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 404
+            kinds = [kind for kind, _name in server.pop_events()]
+            assert kinds == ["view", "download", "ca"], kinds
+        finally:
+            server.stop()
+
+
+def test_phone_https_name_constraints():
+    """名前制約付きの CA: LAN の IP の証明書は OpenSSL の検証が通り、範囲外
+    (127.0.0.1)の証明書は CA の制約で弾かれる。範囲外の IP では HTTP に戻る。"""
+    import ssl
+    import urllib.error
+    import urllib.request
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        ca_dir = str(base / "phone_ca")
+        img = base / "a.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
+        filer_phone.ensure_ca(ca_dir, name_constraints=True)
+        # 範囲外の IP では HTTPS にしない(iPhone で必ず弾かれるため)
+        fallback = filer_phone.ShareServer([str(img)], ca_dir=ca_dir,
+                                           host_ip="127.0.0.1")
+        try:
+            assert not fallback.https and "範囲外" in fallback.https_error
+            assert fallback.url.startswith("http://") and fallback.ca_url is None
+        finally:
+            fallback.stop()
+        # LAN の IP の証明書。待ち受けは 0.0.0.0 なので 127.0.0.1 から繋ぎ、
+        # ホスト名の確認だけ外して、鎖と名前制約の検証を通す
+        server = filer_phone.ShareServer([str(img)], ca_dir=ca_dir,
+                                         host_ip="192.168.1.23")
+        assert server.https, server.https_error
+        server.start()
+        try:
+            local = f"https://127.0.0.1:{server.port}/k/{server.token}/f/0"
+            body = urllib.request.urlopen(
+                local, context=_phone_ca_context(ca_dir, check_hostname=False)).read()
+            assert body == img.read_bytes()
+            # 範囲外の IP の証明書に差し替えると、CA の名前制約で検証に失敗する
+            ca_cert, ca_key, _created = filer_phone.ensure_ca(ca_dir)
+            bad_cert, bad_key = filer_phone.issue_server_cert(ca_cert, ca_key, "127.0.0.1")
+            server._httpd.ssl_context = filer_phone.server_ssl_context(
+                bad_cert, bad_key, ca_dir)
+            try:
+                urllib.request.urlopen(
+                    local, context=_phone_ca_context(ca_dir, check_hostname=False))
+                raise AssertionError("名前制約で弾かれるはず")
+            except urllib.error.URLError as e:
+                assert isinstance(e.reason, ssl.SSLCertVerificationError), e
+        finally:
+            server.stop()
+
+
+def test_phone_share_page_split():
+    """件数が多いと分けて共有するボタンになる。共有できる種類が無ければ
+    共有の処理は入れず、長押しの案内だけ。"""
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        paths = []
+        for n in range(25):
+            p = base / f"img{n:02d}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            paths.append(str(p))
+        movie = base / "clip.mov"
+        movie.write_bytes(b"\x00" * 10)
+        paths.append(str(movie))
+        server = filer_phone.ShareServer(paths, use_https=False)
+        try:
+            page = server._index_html().decode("utf-8")
+        finally:
+            server.stop()
+        assert page.count('"type": "image/png"') == 25
+        assert '"type": "video/quicktime"' in page          # 動画も共有に入る
+        assert "var CHUNK = 10, ALL_MAX = 30" in page
+        assert "件を共有" in page and "MEDIA.slice(start, start + CHUNK)" in page
+        assert "NotAllowedError" in page and "AbortError" in page
+        assert "window.isSecureContext" in page
+        assert "長押しすると「写真に追加」" in page          # 使えないときの案内
+        assert '<div id="share" hidden>' in page
+
+        note = base / "note.txt"
+        note.write_bytes(b"x")
+        server = filer_phone.ShareServer([str(note)], use_https=False)
+        try:
+            page = server._index_html().decode("utf-8")
+        finally:
+            server.stop()
+        assert "<script>" not in page and "長押しすると" in page
+
+
+def test_phone_https_fallback():
+    """cryptography が無い・証明書が作れないときは、これまでどおり HTTP で出す。"""
+    import urllib.request
+    import filer_phone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        img = base / "a.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ca_dir = str(base / "phone_ca")
+        saved = {k: v for k, v in sys.modules.items()
+                 if k == "cryptography" or k.startswith("cryptography.")}
+        for k in saved:
+            del sys.modules[k]
+        sys.modules["cryptography"] = None      # import すると ImportError になる
+        try:
+            server = filer_phone.ShareServer([str(img)], ca_dir=ca_dir,
+                                             host_ip="127.0.0.1")
+        finally:
+            del sys.modules["cryptography"]
+            sys.modules.update(saved)
+        try:
+            assert not server.https and "cryptography" in server.https_error
+            assert server.url.startswith("http://127.0.0.1:")
+            assert server.ca_url is None and server.ca_port is None
+            assert not os.path.exists(ca_dir)        # 何も作らない
+            server.start()
+            page = urllib.request.urlopen(server.url).read().decode("utf-8")
+            assert '<img src="f/0"' in page
+        finally:
+            server.stop()
+
+        # CA の置き場所がファイルで塞がっている(作れない)ときも HTTP
+        blocked = base / "blocked"
+        blocked.write_bytes(b"x")
+        server = filer_phone.ShareServer([str(img)], ca_dir=str(blocked),
+                                         host_ip="192.168.1.23")
+        try:
+            assert not server.https and "証明書を用意できませんでした" in server.https_error
+            assert server.url.startswith("http://")
+        finally:
+            server.stop()
 
 
 def test_phone_menu_gating():

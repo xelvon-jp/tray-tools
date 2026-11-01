@@ -3900,9 +3900,9 @@ class FilerWindow(QWidget):
                     running = filer_update.describe_version(running_info)
                     self.log(f"更新: ファイルは {disk}、動いているのは {running}")
                     if self.confirm("あっふの更新",
-                                    f"ファイルは新しい版（{disk}）です。\n"
-                                    f"動いているあっふは起動時の版（{running}）のままです。\n\n"
-                                    "再起動して反映しますか？", default_yes=True):
+                                    f"このPCのファイルは最新版（{disk}）になっていますが、\n"
+                                    f"いま動いているのは前の版（{running}）です。\n\n"
+                                    "再起動して最新版にしますか？", default_yes=True):
                         self.restart_filer()
                     return
                 self.log("更新: 最新です")

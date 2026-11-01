@@ -2358,6 +2358,7 @@ ExifTool は `-stay_open True -@ -` で1つだけ起こし、1枚ずつ送りま
 |---|---|
 | `collect(root, 式, 設定, cancel, progress)` | root 配下を再帰で歩き、写真の★を読んで式に合うものを返す（`CollectResult.paths`）。`print` / `delete_candidates` / `bestshot` / `extract_*` という名前のフォルダ、隠しフォルダ（`.` で始まる・隠し属性）、ジャンクション・シンボリックリンク、同期先（`frame_targets`）、みてね用に集める先には降りません。★が読めなかった写真は `unknown` に |
 | `sync_frame(写真, 同期先, 設定, 台帳の置き場, cancel, progress, scope, keep, manual_delete)` | フォトフレーム同期（下の決まり）。`manual_delete` は削除がクラウドへ反映されない同期先（設定の `frame_manual_delete`） |
+| `plan_frame_sync(写真, 同期先, 設定, 台帳の置き場=None, scope, keep, manual_delete, cancel, progress)` | `sync_frame` の予行。同じ判定で、同期先ごとに追加・更新・削除・そのまま・手で消す（`manual_delete` の同期先で削除になるもの）を数えて `FramePlan` で返します（同期の確認に件数を出すため）。ファイル・台帳・一覧には何も書きません |
 | `pending_manual_deletes(ledger_dir=None)` | 今の「手で消す写真の一覧」（同期先ごと・消した日時の順。項目は `{"target", "name", "source", "deleted_at"}`） |
 | `clear_manual_deletes(items=None, ledger_dir=None)` | 一覧から `items` を外す（`None` なら全部）。外した数を返す |
 | `manual_delete_report(SyncResult, ledger_dir=None, limit=None)` | 同期の結果のうち、今回一覧に足した分を知らせる行（あっふ・PhotoCuller の結果の表示で使う） |

@@ -378,14 +378,40 @@ def test_menu_items():
     cfg = pc.default_config()
     items = pc.menu_items(cfg)
     keys = [m.key for m in items if m.action[0] != "separator"]
-    assert keys == ["5", "4", "3", "0", "-", "K", "/"]
+    assert keys == ["5", "4", "3", "2", "1", "0", "-", "K", "/"]
     acts = {m.key: m.action for m in items}
     assert acts["5"] == ("rating", 5) and acts["0"] == ("rating", 0)
     assert acts["-"] == ("rating", -1)
+    # 段階の無い★2・★1 も付けられる（名前は rating_name）
+    by = {m.key: m for m in items}
+    assert acts["2"] == ("rating", 2) and acts["1"] == ("rating", 1)
+    assert (by["2"].label, by["2"].detail) == ("★2", "2")
+    assert (by["1"].label, by["1"].detail) == ("★1", "1")
     assert acts["K"] == ("keyword", "みてね済")
     assert acts["/"] == ("filter_menu", None)
     assert sum(1 for m in items if m is pc.SEPARATOR) == 2
     assert pc.menu_title(3) == "写真の★（3枚）"
+
+
+def test_menu_items_plain_ratings():
+    """★2・★1 の行: 頭の文字 1・2 は段階・キーワードに使えない。段階のしきい値にあればその段階の行だけ。"""
+    assert {"1", "2"} <= pc.MENU_FIXED_KEYS
+    cfg = pc.normalize({"levels": [{"key": "1", "name": "a", "min": 5},
+                                   {"key": "2", "name": "b", "min": 4},
+                                   {"key": "4", "name": "c", "min": 4}],
+                        "keywords": [{"key": "2", "name": "x"}, {"key": "K", "name": "みてね済"}]})
+    assert [lv["key"] for lv in cfg["levels"]] == ["4"]
+    assert cfg["keywords"] == [{"key": "K", "name": "みてね済"}]
+    # しきい値 2 の段階があれば、★2 はその段階の行（「★2」の行は出さない）。並びは★の高い順
+    cfg = pc.normalize({"levels": [{"key": "5", "name": "みてね用", "min": 5},
+                                   {"key": "M", "name": "まあまあ", "min": 2},
+                                   {"key": "4", "name": "フォトフレーム用", "min": 4}]})
+    items = [m for m in pc.menu_items(cfg) if m.action[0] == "rating"]
+    assert [(m.key, m.label, m.action[1]) for m in items] == [
+        ("5", "みてね用", 5), ("4", "フォトフレーム用", 4), ("M", "まあまあ", 2), ("1", "★1", 1),
+        ("0", "★を外す", 0), ("-", "削除候補", -1)]
+    keys = [m.key for m in pc.menu_items(cfg, export=True) if m.action[0] != "separator"]
+    assert len(set(keys)) == len(keys)
 
 
 def test_filter_menu_items():
@@ -870,7 +896,7 @@ def test_export_config_and_menu():
     assert pc.normalize({"frame": {"max_long_edge": 1920.0}})["frame"]["max_long_edge"] == 1920
     # I メニュー: export=True のときだけ E。既存のキーと重ならない
     keys = [m.key for m in pc.menu_items(cfg, export=True) if m.action[0] != "separator"]
-    assert keys == ["5", "4", "3", "0", "-", "K", "/", "E"] and len(set(keys)) == len(keys)
+    assert keys == ["5", "4", "3", "2", "1", "0", "-", "K", "/", "E"] and len(set(keys)) == len(keys)
     assert "E" not in [m.key for m in pc.menu_items(cfg)]
     assert pc.menu_items(cfg, export=True)[-1].action == ("export_menu", None)
     # E は段階のキーに使えない
@@ -1179,6 +1205,120 @@ def test_manual_delete_clear():
     assert pe.manual_delete_path() == os.path.join(_TEST_TEMP, "data", pe.MANUAL_DELETE_FILE)
     assert pe.pending_manual_deletes() == []
     assert pe.clear_manual_deletes() == 0
+
+
+def _frame_snapshot(*folders):
+    """フォルダの中身（相対パス → 中身と更新日時）。予行で何も変わらないことを確かめる。"""
+    out = {}
+    for folder in folders:
+        folder = Path(folder)
+        if not folder.exists():
+            continue
+        for p in sorted(folder.rglob("*")):
+            if p.is_file():
+                out[str(p)] = (p.read_bytes(), p.stat().st_mtime_ns)
+            else:
+                out[str(p)] = None
+    return out
+
+
+def _by_target(items, target):
+    return [x for x in items if os.path.normcase(x[0]) == os.path.normcase(str(target))]
+
+
+def _check_plan_matches(sources, targets, settings, ledger, d, **kw):
+    """予行 → 実際に同期して、同期先ごとの数が一致することを確かめる。予行では何も書かない。"""
+    before = _frame_snapshot(d)
+    plan = pe.plan_frame_sync(sources, targets, settings, str(ledger), **kw)
+    assert _frame_snapshot(d) == before                 # 同期先・台帳・手で消す写真の一覧とも変えない
+    assert plan.sources == [os.path.abspath(p) for p in dict.fromkeys(sources)]
+    res = pe.sync_frame(sources, targets, settings, str(ledger), **kw)
+    assert not res.failed and not res.error, res
+    assert [pt.target for pt in plan.targets] == [os.path.abspath(t) for t in targets]
+    for pt in plan.targets:
+        assert len(pt.added) == len(_by_target(res.added, pt.target)), (pt, res)
+        assert len(pt.updated) == len(_by_target(res.updated, pt.target)), (pt, res)
+        assert len(pt.deleted) == len(_by_target(res.deleted, pt.target)), (pt, res)
+        assert len(pt.unchanged) == len(_by_target(res.unchanged, pt.target)), (pt, res)
+        assert len(pt.manual_delete) == len(_by_target(res.manual_delete, pt.target)), (pt, res)
+        assert sorted(pt.deleted) == sorted((n, s) for _t, n, s in _by_target(res.deleted, pt.target))
+    assert plan.changed == bool(res.added or res.updated or res.deleted)
+    return plan, res
+
+
+def test_plan_frame_sync():
+    """予行（plan_frame_sync）: 追加・更新・削除・そのまま・手で消す数が sync_frame の結果と一致する。
+    予行ではファイルも台帳も手で消す写真の一覧も変わらない。"""
+    import threading
+    d, src, t1, t2, ledger = _frame_setup("frame_plan")
+    a = _exif_jpeg(src / "a.jpg", size=(400, 300), when="2024:01:01 10:00:00")
+    b = _exif_jpeg(src / "b.jpg", size=(400, 300), when="2024:01:02 10:00:00")
+    c = _exif_jpeg(src / "c.jpg", size=(400, 300), when="2024:01:03 10:00:00")
+    (t1 / "手で入れた.jpg").write_bytes(b"manual photo")
+    targets = [str(t1), str(t2)]
+    manual = [str(t2)]
+    kw = {"manual_delete": manual, "scope": [str(src)]}
+
+    # 1回目: 全部追加（重複は1回だけ数える）
+    plan, _res = _check_plan_matches([a, b, c, a], targets, {}, ledger, d, **kw)
+    assert [len(pt.added) for pt in plan.targets] == [3, 3] and plan.changed
+    assert plan.targets[0].summary() == "追加 3／更新 0／削除 0／そのまま 0"
+    assert [pt.manual for pt in plan.targets] == [False, True]
+
+    # 2回目: 変化なし
+    plan, _res = _check_plan_matches([a, b, c], targets, {}, ledger, d, **kw)
+    assert not plan.changed and [len(pt.unchanged) for pt in plan.targets] == [3, 3]
+
+    # b が変わった（更新）・c が外れた（削除。t2 は手で消す）・同期先から消えていた a は置き直す
+    _exif_jpeg(src / "b.jpg", size=(500, 300), when="2024:01:02 10:00:00")
+    name_a = next(n for n, r in pe.load_ledger(str(ledger), str(t1)).items() if r["source"] == a)
+    os.remove(t1 / name_a)
+    plan, res = _check_plan_matches([a, b], targets, {}, ledger, d, **kw)
+    p1, p2 = plan.targets
+    assert (len(p1.added), len(p1.updated), len(p1.deleted), len(p1.unchanged)) == (1, 1, 1, 0)
+    assert (len(p2.added), len(p2.updated), len(p2.deleted), len(p2.unchanged)) == (0, 1, 1, 1)
+    assert p1.manual_delete == [] and p2.manual_delete == [("20240103_100000_c.jpg", c)]
+    assert p2.summary() == "追加 0／更新 1／削除 1（Amazon 側で手で消す 1）／そのまま 1"
+    assert len(pe.pending_manual_deletes(str(ledger))) == 1
+
+    # 縮小の設定が変わったら全部作り直し
+    plan, _res = _check_plan_matches([a, b], targets, {"quality": 60}, ledger, d, **kw)
+    assert [len(pt.updated) for pt in plan.targets] == [2, 2]
+
+    # 手で差し替えられたもの（そのままでも削除でもない）・keep の下は消さない
+    replaced = t1 / name_a
+    replaced.write_bytes(b"replaced by hand")
+    plan, res = _check_plan_matches([b], targets, {"quality": 60}, ledger, d,
+                                    keep=[str(src / "nothing.jpg")], **kw)
+    assert plan.targets[0].kept == [name_a] and not plan.targets[0].deleted
+    assert [len(pt.deleted) for pt in plan.targets] == [0, 1]
+    assert replaced.read_bytes() == b"replaced by hand"
+    plan = pe.plan_frame_sync([], targets, {"quality": 60}, str(ledger), keep=[b], **kw)
+    assert not plan.changed
+
+    # scope の外は消さない。同期先がまだ無くても作らない
+    t3 = d / "frame3"
+    plan = pe.plan_frame_sync([], targets + [str(t3)], {"quality": 60}, str(ledger),
+                              scope=[str(d / "elsewhere")])
+    assert not plan.changed and not t3.exists()
+    plan = pe.plan_frame_sync([b], [str(t3)], {}, str(ledger))
+    assert [len(pt.added) for pt in plan.targets] == [1] and not t3.exists()
+
+    # 元の写真が無い・RAW は数えない。同期先が空ならエラー。中止
+    raw = src / "r.ARW"
+    raw.write_bytes(b"raw")
+    plan = pe.plan_frame_sync([str(src / "missing.jpg"), str(raw)], [str(t3)], {}, str(ledger))
+    assert plan.missing == [str(src / "missing.jpg")] and plan.skipped_raw == [str(raw)]
+    assert not plan.changed
+    assert pe.plan_frame_sync([a], [], {}, str(ledger)).error == \
+        "同期先がありません（photo_ratings.json の frame_targets）"
+    ev = threading.Event()
+    ev.set()
+    plan = pe.plan_frame_sync([b], targets, {}, str(ledger), cancel=ev)
+    assert plan.cancelled and not plan.changed
+    # ledger_dir を省くと既定の場所（このテストでは一時フォルダ）の台帳を読む
+    plan = pe.plan_frame_sync([b], [str(t1)], {})
+    assert [len(pt.added) for pt in plan.targets] == [1]
 
 
 def test_sync_frame_heic_raw_and_formats():

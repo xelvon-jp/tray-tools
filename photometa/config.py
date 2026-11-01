@@ -31,8 +31,10 @@ def data_dir() -> str:
 
 CONFIG_PATH = os.path.join(data_dir(), "photo_ratings.json")
 
+# 写真メニューで、段階が無い★に付ける行（★2・★1。頭の文字は★の数）
+MENU_PLAIN_RATINGS = (2, 1)
 # 写真メニュー・絞り込みメニューで固定の意味を持つキー（設定の段階・キーワードには使えない）
-MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E"})
+MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E"} | {str(r) for r in MENU_PLAIN_RATINGS})
 FILTER_FIXED_KEYS = frozenset({"U", "E", "A"})
 
 # ★の値の範囲（-1=削除候補 / 0=未選別 / 1〜5）
@@ -423,13 +425,22 @@ def menu_items(config: dict, export: bool = False) -> list[MenuItem]:
     """写真メニュー（PhotoCuller の I）の行。動作は次のどれか：
 
     ("rating", 5) / ("rating", 0) / ("rating", -1) … 選んだ写真に★を付ける
+                                                      （段階の行 → ★2・★1 → ★を外す → 削除候補。
+                                                      ★2・★1 は段階のしきい値に無いときだけ。
+                                                      ★の高い順に並べる）
     ("keyword", "みてね済")                          … キーワードを付ける／外す
     ("filter_menu", None)                             … 絞り込みの小メニューを開く
     ("export_menu", None)                             … 書き出しの小メニューを開く（export=True のときだけ）
     ("separator", None)                               … 区切り線（SEPARATOR）
     """
-    items = [MenuItem(lv["key"], lv["name"], f"★{lv['min']}", ("rating", lv["min"]))
-             for lv in levels_by_min(config)]
+    rows = [(lv["min"], MenuItem(lv["key"], lv["name"], f"★{lv['min']}", ("rating", lv["min"])))
+            for lv in levels_by_min(config)]
+    # 段階の無い★（★2・★1）。頭の文字は MENU_FIXED_KEYS にあるので段階・キーワードとぶつからない
+    covered = {r for r, _ in rows}
+    rows += [(r, MenuItem(str(r), rating_name(r, config), str(r), ("rating", r)))
+             for r in MENU_PLAIN_RATINGS if r not in covered]
+    rows.sort(key=lambda row: row[0], reverse=True)     # 同じ★の段階どうしは元の順のまま
+    items = [item for _, item in rows]
     items.append(MenuItem("0", "★を外す", "0", ("rating", 0)))
     items.append(MenuItem("-", "削除候補", "-1", ("rating", -1)))
     kws = config.get("keywords") or []

@@ -3,6 +3,7 @@
 #
 #   collect(root, 式, 設定)          … root 配下を再帰で歩いて、式に合う写真を集める
 #   sync_frame(写真, 同期先, ...)    … フォトフレーム用に縮小した JPEG を同期先へ足し引きする
+#   plan_frame_sync(写真, 同期先, ...) … sync_frame の予行（何も書かずに、足す・消す数を数える）
 #   collect_mitene(写真, 集める先)   … みてね用に、そのままコピーして集める
 #   finish_mitene(集める先, session) … 集めた元の写真に「みてね済」を付け、集めた先から消す
 #
@@ -610,6 +611,84 @@ class _Target:
         self.taken = {n.casefold() for n in names} | {n.casefold() for n in ledger}
 
 
+# sync_frame と plan_frame_sync が同じ判定をするための共通の部品（どれもファイルには書かない）
+
+def _unique_sources(sources) -> tuple[list, set]:
+    """写真のパスを abspath にして、重複を除いた並びと、その _key の集合。"""
+    order, seen = [], set()
+    for p in sources:
+        p = os.path.abspath(os.fspath(p))
+        k = _key(p)
+        if k not in seen:
+            seen.add(k)
+            order.append(p)
+    return order, seen
+
+
+def _clean_targets(targets) -> list:
+    return [os.path.abspath(t) for t in (targets or []) if isinstance(t, str) and t.strip()]
+
+
+def _manual_keys(manual_delete) -> set:
+    return {_key(p) for p in (manual_delete or ()) if isinstance(p, str) and p.strip()}
+
+
+def _frame_action(t: _Target, key: str, st, sig: dict) -> tuple[str, str | None]:
+    """元の写真1枚（_key と os.stat の結果）を同期先 t でどうするか。(動作, 同期先の名前) を返す。
+
+    "add"（名前が None ならまだ無い。名前があれば同期先から消えていたので置き直す）/
+    "update"（元の写真か設定が変わった）/ "unchanged"（そのまま）/
+    "kept"（手で差し替えられているので触らない）"""
+    name = t.by_source.get(key)
+    if name is None:
+        return "add", None
+    rec = t.ledger[name]
+    have = _size(os.path.join(t.dir, name))
+    if have is None:
+        return "add", name
+    if have != rec["out_size"]:
+        return "kept", name
+    if (rec.get("mtime_ns") == st.st_mtime_ns and rec.get("size") == st.st_size
+            and rec.get("settings") == sig):
+        return "unchanged", name
+    return "update", name
+
+
+def _cannot_build(src: str, heif_cache: list) -> str | None:
+    """作れない写真なら "raw" / "heic"、作れるなら None。heif_cache は heif_available() の結果を
+    入れておく入れ物（初めて HEIC を見たときに調べる）。"""
+    if is_raw(src):
+        return "raw"
+    if _is_heic(src):
+        if not heif_cache:
+            heif_cache.append(heif_available())
+        if not heif_cache[0]:
+            return "heic"
+    return None
+
+
+def _stale_entries(t: _Target, seen: set, scope_keys, keep_keys) -> list:
+    """対象から外れたので片付ける台帳の項目。(名前, 記録, 動作) の並び。動作は
+    "delete"（消す）/ "kept"（手で差し替えられているので消さない）/ "gone"（もう無い。台帳から外すだけ）。"""
+    out = []
+    for name, rec in list(t.ledger.items()):
+        skey = _key(rec["source"])
+        if skey in seen:
+            continue
+        if scope_keys is not None and not any(_under(skey, r) for r in scope_keys):
+            continue
+        if any(_under(skey, k) for k in keep_keys):
+            continue
+        have = _size(os.path.join(t.dir, name))
+        if have is None:
+            out.append((name, rec, "gone"))
+        elif have != rec["out_size"]:
+            out.append((name, rec, "kept"))
+        else:
+            out.append((name, rec, "delete"))
+    return out
+
+
 def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progress=None,
                scope=None, keep=(), manual_delete=()) -> SyncResult:
     """フォトフレーム同期。sources（写真のパス）を、縮小した JPEG にして targets の各フォルダへ。
@@ -621,19 +700,13 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
     progress(済んだ数, 全体, 名前)。
     """
     result = SyncResult()
-    targets = [os.path.abspath(t) for t in (targets or []) if isinstance(t, str) and t.strip()]
+    targets = _clean_targets(targets)
     if not targets:
         result.error = "同期先がありません（photo_ratings.json の frame_targets）"
         return result
     s = frame_settings(settings)
     sig = dict(s, format=FRAME_FORMAT)
-    order, seen = [], set()
-    for p in sources:
-        p = os.path.abspath(os.fspath(p))
-        k = _key(p)
-        if k not in seen:
-            seen.add(k)
-            order.append(p)
+    order, seen = _unique_sources(sources)
     states: list[_Target] = []
     for t in targets:
         try:
@@ -648,10 +721,10 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
         return result
     scope_keys = None if scope is None else [_key(p) for p in scope]
     keep_keys = [_key(p) for p in keep]
-    manual_keys = {_key(p) for p in (manual_delete or ()) if isinstance(p, str) and p.strip()}
+    manual_keys = _manual_keys(manual_delete)
     manual_added: list = []          # 一覧に足す項目
     readded: set = set()             # 入れ直した (同期先, 元の写真)。一覧から外す
-    heif_ok = None
+    heif_cache: list = []
     total = len(order)
     work = tempfile.mkdtemp(prefix="photometa_frame_")
     try:
@@ -668,32 +741,19 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 continue
             plans = []
             for t in states:
-                name = t.by_source.get(key)
-                if name is None:
-                    plans.append((t, None, "add"))
-                    continue
-                rec = t.ledger[name]
-                have = _size(os.path.join(t.dir, name))
-                if have is None:
-                    plans.append((t, name, "add"))          # 同期先から消えていた → 置き直す
-                elif have != rec["out_size"]:
+                action, name = _frame_action(t, key, st, sig)
+                if action == "kept":
                     result.kept.append((os.path.join(t.dir, name), "手で差し替えられています"))
-                elif (rec.get("mtime_ns") == st.st_mtime_ns and rec.get("size") == st.st_size
-                      and rec.get("settings") == sig):
+                elif action == "unchanged":
                     result.unchanged.append((t.dir, name, src))
                 else:
-                    plans.append((t, name, "update"))
+                    plans.append((t, name, action))   # add（消えていたものは置き直す）/ update
             if not plans:
                 continue
-            if is_raw(src):
-                result.skipped_raw.append(src)
+            skip = _cannot_build(src, heif_cache)
+            if skip is not None:
+                (result.skipped_raw if skip == "raw" else result.skipped_heic).append(src)
                 continue
-            if _is_heic(src):
-                if heif_ok is None:
-                    heif_ok = heif_available()
-                if not heif_ok:
-                    result.skipped_heic.append(src)
-                    continue
             built = os.path.join(work, f"{i}.jpg")
             try:
                 stamp = build_frame_jpeg(src, built, s)
@@ -735,20 +795,13 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
         if not result.cancelled and not _cancelled(cancel):
             _notify(progress, total, total, "対象から外れた写真を片付けています")
             for t in states:
-                for name, rec in list(t.ledger.items()):
+                for name, rec, action in _stale_entries(t, seen, scope_keys, keep_keys):
                     skey = _key(rec["source"])
-                    if skey in seen:
-                        continue
-                    if scope_keys is not None and not any(_under(skey, r) for r in scope_keys):
-                        continue
-                    if any(_under(skey, k) for k in keep_keys):
-                        continue
                     dest = os.path.join(t.dir, name)
-                    have = _size(dest)
-                    if have is not None and have != rec["out_size"]:
+                    if action == "kept":
                         # 手で差し替えられたもの: 消さず、台帳からも外す（以後は手で入れた扱い）
                         result.kept.append((dest, "手で差し替えられていたので消しませんでした"))
-                    elif have is not None:
+                    elif action == "delete":
                         try:
                             os.remove(dest)
                         except OSError as e:
@@ -778,6 +831,123 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
             except OSError as e:
                 result.failed.append((mpath, f"手で消す写真の一覧を書けません（{e}）"))
     return result
+
+
+# ------------------------------------------------------------------ フォトフレーム同期の予行
+
+@dataclass
+class FramePlanTarget:
+    """同期先1か所の予行の結果。"""
+    target: str                                    # 同期先のフォルダ（abspath）
+    added: list = field(default_factory=list)      # 元の写真のパス（同期先の名前は作るときに決まる）
+    updated: list = field(default_factory=list)    # (同期先の名前, 元の写真) 元の写真か設定が変わった
+    deleted: list = field(default_factory=list)    # (同期先の名前, 元の写真) 対象から外れたので消す
+    unchanged: list = field(default_factory=list)  # (同期先の名前, 元の写真)
+    kept: list = field(default_factory=list)       # 同期先の名前。手で差し替えられていて触らない
+    manual: bool = False                           # 削除がクラウドへ反映されない同期先か
+
+    @property
+    def manual_delete(self) -> list:
+        """消したあとクラウドで手で消す必要があるもの（manual の同期先の deleted）。"""
+        return list(self.deleted) if self.manual else []
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.updated or self.deleted)
+
+    def summary(self) -> str:
+        """「追加 5／更新 0／削除 2（Amazon 側で手で消す 2）／そのまま 16」"""
+        deleted = f"削除 {len(self.deleted)}"
+        if self.manual_delete:
+            deleted += f"（Amazon 側で手で消す {len(self.manual_delete)}）"
+        return (f"追加 {len(self.added)}／更新 {len(self.updated)}／{deleted}"
+                f"／そのまま {len(self.unchanged)}")
+
+
+@dataclass
+class FramePlan:
+    targets: list = field(default_factory=list)       # FramePlanTarget（同期先の順）
+    sources: list = field(default_factory=list)       # 元の写真（重複を除いたもの）
+    missing: list = field(default_factory=list)       # 元の写真が無い
+    skipped_heic: list = field(default_factory=list)  # 作れないので飛ばす（足す・作り直すときだけ）
+    skipped_raw: list = field(default_factory=list)
+    cancelled: bool = False
+    error: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        """どこかの同期先で、追加・更新・削除のどれかがあるか。"""
+        return any(t.changed for t in self.targets)
+
+
+def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, scope=None,
+                    keep=(), manual_delete=(), cancel=None, progress=None) -> FramePlan:
+    """sync_frame の予行。同じ引数で、同期先ごとに追加・更新・削除・そのままを数える。
+
+    判定は sync_frame と同じ部品（_frame_action / _cannot_build / _stale_entries）で行い、
+    ファイルには一切書かない（同期先のフォルダも作らない。台帳・手で消す写真の一覧も変えない）。
+    ledger_dir を省くと default_ledger_dir()。中止したら cancelled（削除の数は数えない）。
+    実際の同期では、JPEG を作れなかった写真・書けなかった同期先の分だけ数が減ることがある。
+    """
+    plan = FramePlan()
+    targets = _clean_targets(targets)
+    if not targets:
+        plan.error = "同期先がありません（photo_ratings.json の frame_targets）"
+        return plan
+    ledger_dir = ledger_dir or default_ledger_dir()
+    sig = dict(frame_settings(settings), format=FRAME_FORMAT)
+    order, seen = _unique_sources(sources)
+    plan.sources = order
+    manual_keys = _manual_keys(manual_delete)
+    states = [_Target(t, load_ledger(ledger_dir, t)) for t in targets]
+    plan.targets = [FramePlanTarget(t.dir, manual=_key(t.dir) in manual_keys) for t in states]
+    pairs = list(zip(states, plan.targets))
+    scope_keys = None if scope is None else [_key(p) for p in scope]
+    keep_keys = [_key(p) for p in keep]
+    heif_cache: list = []
+    total = len(order)
+    for i, src in enumerate(order):
+        if _cancelled(cancel):
+            plan.cancelled = True
+            return plan
+        _notify(progress, i, total, os.path.basename(src))
+        key = _key(src)
+        try:
+            st = os.stat(src)
+        except OSError:
+            plan.missing.append(src)
+            continue
+        todo = []
+        for t, out in pairs:
+            action, name = _frame_action(t, key, st, sig)
+            if action == "kept":
+                out.kept.append(name)
+            elif action == "unchanged":
+                out.unchanged.append((name, src))
+            else:
+                todo.append((out, name, action))
+        if not todo:
+            continue
+        skip = _cannot_build(src, heif_cache)
+        if skip is not None:
+            (plan.skipped_raw if skip == "raw" else plan.skipped_heic).append(src)
+            continue
+        for out, name, action in todo:
+            if action == "update":
+                out.updated.append((name, src))
+            else:
+                out.added.append(src)
+    if _cancelled(cancel):
+        plan.cancelled = True
+        return plan
+    _notify(progress, total, total, "対象から外れた写真を数えています")
+    for t, out in pairs:
+        for name, rec, action in _stale_entries(t, seen, scope_keys, keep_keys):
+            if action == "delete":
+                out.deleted.append((name, rec["source"]))
+            elif action == "kept":
+                out.kept.append(name)
+    return plan
 
 
 # ------------------------------------------------------------------ みてね

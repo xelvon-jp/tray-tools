@@ -6991,14 +6991,19 @@ def _photo_window(photos, other, settings_path):
 
 def _photo_menu_runner(w, picks, seen):
     """_exec_menu の差し替え。picks の頭の文字(&5: など)の項目を順に選んだことにする。
-    seen には (見出し, 印の付いた項目) を積む。"""
+    小メニュー(▸)の行を選んだら、次の pick はその小メニューの中から選ぶ(I → E → F)。
+    seen には (見出し, 印の付いた項目) を、開いたメニュー・小メニューの順に積む。"""
     def run(menu, chosen):
-        seen.append((menu.title(), [a.text() for a in chosen if a.isChecked()]))
-        prefix = picks.pop(0)
-        for action, value in chosen.items():
-            if action.text().startswith(prefix):
-                return value
-        raise AssertionError(f"項目が無い: {prefix} / {[a.text() for a in chosen]}")
+        while True:
+            actions = [a for a in menu.actions() if not a.isSeparator()]
+            seen.append((menu.title(), [a.text() for a in actions if a.isChecked()]))
+            prefix = picks.pop(0)
+            action = next((a for a in actions if a.text().startswith(prefix)), None)
+            if action is None:
+                raise AssertionError(f"項目が無い: {prefix} / {[a.text() for a in actions]}")
+            if action.menu() is None:
+                return chosen[action]
+            menu = action.menu()
     return run
 
 
@@ -7255,7 +7260,7 @@ def test_photo_rating_filter_and_presets():
             seen, picks = [], ["&/:", "&B:"]
             w._exec_menu = _photo_menu_runner(w, picks, seen)
             QTest.keyClick(L.view, Qt.Key_I)
-            assert seen[-1][0] == "★で絞り込む"
+            assert seen[-1][0] == "&/:★で絞り込む"   # 小メニューの見出しは行の表示と同じ(Qt)
             assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
             assert L.rating_filter == "★>=3" and "★絞り込み: ★>=3" in L.header2.text()
             # : (全部見せる)で解く
@@ -7603,7 +7608,7 @@ def test_photo_export_menu():
             w._exec_menu = _photo_menu_runner(w, picks, seen)
             L.set_cursor(L._row_of("a5.jpg"))
             QTest.keyClick(L.view, Qt.Key_I)
-            assert seen[0][0].startswith("写真の★") and seen[1][0] == "書き出し", (seen, log())
+            assert seen[0][0].startswith("写真の★") and seen[1][0] == "&E:書き出し", (seen, log())
             assert asked and "同期先 1 か所" in asked[-1] and str(photos) in asked[-1], log()
             _wait_until(lambda: "フォトフレーム同期: 3 枚" in log(), timeout=30, what="同期の終わり")
             names = sorted(os.listdir(frame))
@@ -7642,6 +7647,160 @@ def test_photo_export_menu():
             w.close()
             w.deleteLater()
             filer.photo_config.CONFIG_PATH, filer.photo_export.default_ledger_dir = saved
+
+
+def test_photo_menu_submenu_keys():
+    """I メニューの小メニュー(書き出し・★で絞り込む)は、メインを閉じずに右側のその行の
+    高さに開く。→・Enter・頭の文字で開き、← / Esc でメインに戻る(元の行を選んだまま)。
+    小メニューの中も文字は選ぶだけ・Enter で実行し、実行したら全部閉じる。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L = w.left
+        checked = []
+
+        def drive(menu, chosen):
+            fired = []
+            menu.triggered.connect(lambda action: fired.append(chosen.get(action)))
+            menu.popup(w.mapToGlobal(QPoint(40, 40)))
+            QTest.qWait(30)
+            rows = {a.text()[:3]: a for a in menu.actions() if not a.isSeparator()}
+            export, filt = rows["&E:"], rows["&/:"]
+            ex_menu, filt_menu = export.menu(), filt.menu()
+            assert ex_menu is not None and filt_menu is not None
+            # ▸ は Qt が描くので、表示の文字には入れない
+            assert export.text() == "&E:書き出し" and filt.text() == "&/:★で絞り込む", \
+                (export.text(), filt.text())
+            assert ex_menu.title() == export.text()   # 小メニューの見出しは行の表示と同じ(Qt)
+            assert [a.text()[:3] for a in ex_menu.actions()] == ["&F:", "&M:", "&D:", "&L:"]
+
+            # → で開く。メインは開いたまま、その右側・その行の高さに出て、先頭が選ばれる
+            menu.setActiveAction(export)
+            QTest.keyClick(menu, Qt.Key_Right)
+            QTest.qWait(30)
+            assert ex_menu.isVisible() and menu.isVisible()
+            main_geo, sub_geo = menu.geometry(), ex_menu.geometry()
+            assert sub_geo.left() >= main_geo.right() - 8, (main_geo, sub_geo)
+            row_top = menu.mapToGlobal(menu.actionGeometry(export).topLeft()).y()
+            assert abs(sub_geo.top() - row_top) <= 8, (row_top, sub_geo)
+            assert ex_menu.activeAction() is ex_menu.actions()[0]
+            # ← で戻る(メインはそのまま、書き出しの行が選ばれた状態)
+            QTest.keyClick(ex_menu, Qt.Key_Left)
+            QTest.qWait(30)
+            assert not ex_menu.isVisible() and menu.isVisible()
+            assert menu.activeAction() is export
+            # Enter でも開く(何も実行しない)。Esc で戻る
+            QTest.keyClick(menu, Qt.Key_Return)
+            QTest.qWait(30)
+            assert ex_menu.isVisible() and not fired
+            QTest.keyClick(ex_menu, Qt.Key_Escape)
+            QTest.qWait(30)
+            assert not ex_menu.isVisible() and menu.isVisible()
+            assert menu.activeAction() is export and not fired
+            # 頭の文字でも開く(ほかの行に移ってから / を押す)
+            QTest.keyClick(menu, Qt.Key_5)
+            assert menu.activeAction().text().startswith("&5:") and not filt_menu.isVisible()
+            QTest.keyClick(menu, Qt.Key_Slash)
+            QTest.qWait(30)
+            assert filt_menu.isVisible() and menu.isVisible() and not fired
+            assert menu.activeAction() is filt
+            # 小メニューの中も、文字は選ぶだけ。Enter で実行して全部閉じる
+            QTest.keyClick(filt_menu, Qt.Key_B)
+            QTest.qWait(10)
+            assert not fired and filt_menu.activeAction().text().startswith("&B:")
+            QTest.keyClick(filt_menu, Qt.Key_Return)
+            QTest.qWait(30)
+            assert fired == [("filter", "★>=3")], fired
+            assert not menu.isVisible() and not filt_menu.isVisible()
+            checked.append(True)
+            return fired[0]
+
+        try:
+            w._exec_menu = drive
+            L.set_cursor(L._row_of("a5.jpg"))
+            QTest.keyClick(L.view, Qt.Key_I)
+            assert checked, w.log_view.toPlainText()
+            assert L.rating_filter == "★>=3"
+            assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
+            # 写真のボタン段の「絞り込み▾」からは今までどおり単独のメニュー
+            titles = []
+            w._exec_menu = lambda menu, chosen: (titles.append(menu.title()), None)[1]
+            w.run_photo_action(("filter_menu", None))
+            assert titles == ["★で絞り込む（今: ★>=3）"], titles
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_menu_selected_row_color():
+    """C / M / I などのメニュー(_ChooserMenu)の選んでいる行は、地とはっきり違う色
+    (dialog_cursor)で、字(text)とのコントラストも十分。小メニューにも同じ見た目が効く。"""
+    import filer
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QColor
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, right, jp = _menu_window(tmp)
+        try:
+            c = w.colors
+
+            def luminance(name):
+                def channel(v):
+                    v /= 255
+                    return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+                q = QColor(name)
+                return (0.2126 * channel(q.red()) + 0.7152 * channel(q.green())
+                        + 0.0722 * channel(q.blue()))
+
+            def contrast(a, b):
+                hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
+                return (hi + 0.05) / (lo + 0.05)
+
+            assert QColor(c["dialog_cursor"]) != QColor(c["background"])
+            assert contrast(c["text"], c["dialog_cursor"]) >= 4.5
+            assert contrast(c["text"], c["background"]) >= 4.5
+
+            menu, chosen = w.build_menu("t", [
+                ("O", "反対窓にコピー", "copy"), ("P", "フルパス", "path"),
+                ("S", "小メニュー", filer._SubMenu("小", [("A", "いち", "a"), ("B", "に", "b")]))])
+            first, second, group = [a for a in menu.actions() if not a.isSeparator()]
+            assert set(chosen.values()) == {"copy", "path", "a", "b"}
+            menu.popup(w.mapToGlobal(QPoint(40, 40)))
+            QTest.qWait(30)
+            assert menu.activeAction() is first
+            image = menu.grab().toImage()
+            dpr = image.devicePixelRatio()
+
+            def color_at(action, owner=menu, img=None):
+                rect = owner.actionGeometry(action)
+                x, y = rect.right() - 6, rect.center().y()   # 字の無い右の余白
+                return (img or image).pixelColor(int(x * dpr), int(y * dpr))
+
+            selected, plain = color_at(first), color_at(second)
+            assert selected == QColor(c["dialog_cursor"]), selected.name()
+            assert plain == QColor(c["background"]), plain.name()
+            # 小メニューも同じ見た目
+            sub = group.menu()
+            menu.setActiveAction(group)
+            QTest.keyClick(menu, filer.Qt.Key_Right)
+            QTest.qWait(30)
+            assert sub.isVisible() and sub.activeAction() is sub.actions()[0]
+            sub_image = sub.grab().toImage()
+            assert color_at(sub.actions()[0], sub, sub_image) == QColor(c["dialog_cursor"])
+            assert color_at(sub.actions()[1], sub, sub_image) == QColor(c["background"])
+            sub.hide()
+            menu.hide()
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def test_photo_manual_delete_list():

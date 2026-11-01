@@ -49,6 +49,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QLinearGradient,
+    QKeyEvent,
     QPainter,
 )
 from PySide6.QtNetwork import QLocalServer
@@ -117,7 +118,8 @@ DEFAULT_COLORS = {
     "mark_end": "#0c0c0c",        # マークした行の背景(右端の色。左→右のグラデーション)
     "mark_text": "",              # マーク行の字の色。空ならファイルの種類の色のまま
     "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
-    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログで選んでいる行
+    "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / I などの
+                                  # メニューで選んでいる行(メニューは左端に cursor の色の縦線も)
     "header_active": "#00001c",   # アクティブ窓のパス表示の地と枠(あふｗと同じく
                                   # 帯は付けず地のまま。区別は字の色とカーソルで)
     "header_active_text": "#ffffff",
@@ -317,6 +319,10 @@ PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★
 RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
 RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
 RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
+# 写真メニュー(I)の小メニューの動作の種類(photometa.config の filter_menu_items /
+# export_menu_items)。I メニューの exec が小メニューの項目を返したとき、どちらかを見分ける。
+PHOTO_FILTER_KINDS = ("filter", "filter_input", "filter_clear")
+PHOTO_EXPORT_KINDS = ("frame_sync", "mitene_collect", "mitene_finish", "frame_manual_list")
 EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
                       " exiftool に場所を書いてください")
 
@@ -2058,6 +2064,11 @@ class _ChooserMenu(QMenu):
     走ってしまうので、文字キーは「その項目を選ぶ」までに止める(2026-10-26
     ユーザー要望)。Enter・クリックは従来どおり実行、矢印・Esc も従来どおり。
 
+    小メニュー(build_menu で値に _SubMenu を渡した行。QMenu の本物のサブメニュー)は、
+    Enter・→・頭の文字・マウスで開き、親の右側(はみ出すなら左側)のその行の高さに出る。
+    小メニューで ← か Esc を押すと親に戻る(親はその行を選んだまま)。ここは Qt の既定の
+    動きで、小メニューの中でも文字キーは選ぶだけ・Enter で実行(2026-11-01 ユーザー要望)。
+
     deletable を立てたメニューでは Del で「選んでいる項目の削除」を頼める(Alt+J の
     ワークスペース)。その場合は何も実行せずに閉じ、delete_action に項目を残す。"""
 
@@ -2089,11 +2100,21 @@ class _ChooserMenu(QMenu):
                 current = self.activeAction()
                 repeat = getattr(self, "_last_char", None) == char and current in matches
                 index = matches.index(current) + 1 if repeat else 0
-                self.setActiveAction(matches[index % len(matches)])
+                target = matches[index % len(matches)]
+                self.setActiveAction(target)
+                if target.menu() is not None and len(matches) == 1:
+                    # 小メニュー(▸)の行は、頭の文字でそのまま開く(開くだけで何も実行しない)。
+                    # 開き方は → と同じにして、位置と戻り方(← / Esc)は Qt に任せる。
+                    self._open_submenu()
             self._last_char = char
             event.accept()  # 対応する項目が無い文字も、実行には使わない
             return
         super().keyPressEvent(event)
+
+    def _open_submenu(self) -> None:
+        """選んでいる小メニューの行を → と同じ方法で開く(右から左の言語なら ←)。"""
+        key = Qt.Key_Left if self.isRightToLeft() else Qt.Key_Right
+        super().keyPressEvent(QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier))
 
 
 def _menu_key_of(action) -> str:
@@ -2107,6 +2128,38 @@ def _menu_key_of(action) -> str:
         rest = text.split("&", 1)[1]
         return rest[:1].upper() if rest else ""
     return text[:1].upper() if text else ""
+
+
+class _SubMenu:
+    """build_menu の項目の値に使うと、その行が小メニュー(▸)になる。items は build_menu と
+    同じ形。中身は開く時点ではなく、メニューを組む時点の値で作る。
+
+    QMenu のサブメニューは見出し(title)と行の表示が同じものなので、組んだ後の見出しは
+    行の表示(&E:書き出し など)になる。title は組む途中の仮の見出し。"""
+
+    def __init__(self, title: str, items):
+        self.title = title
+        self.items = items
+
+
+def _menu_style_sheet(colors) -> str:
+    """C / M / I などのメニュー(_ChooserMenu)の見た目。ファイル窓と同じ地と字の色にし、
+    選んでいる行はダイアログのカーソル行(dialog_cursor)の地＋左端にカーソルの色の縦線。
+
+    以前は OS の既定の見た目のままで、地と選んでいる行の色が近すぎてどれが選ばれて
+    いるか分かりにくかった(2026-11-01 ユーザー要望)。"""
+    c = colors
+    return (
+        f"QMenu {{ background-color: {c['background']}; color: {c['text']};"
+        f" border: 1px solid {c['fkey_border']}; padding: 2px 0px; }}"
+        f"QMenu::item {{ background-color: transparent; padding: 3px 24px 3px 8px;"
+        f" border-left: 3px solid transparent; }}"
+        f"QMenu::item:selected {{ background-color: {c['dialog_cursor']}; color: {c['text']};"
+        f" border-left: 3px solid {c['cursor']}; }}"
+        f"QMenu::item:disabled {{ color: {c['system']}; }}"
+        f"QMenu::separator {{ height: 1px; background-color: {c['fkey_border']};"
+        f" margin: 3px 8px; }}"
+    )
 
 
 class FilerWindow(QWidget):
@@ -5995,6 +6048,13 @@ class FilerWindow(QWidget):
             mark = ((kind == "rating" and same == value)
                     or (kind == "keyword" and known
                         and all(self._has_keyword(m, value) for m in metas)))
+            if kind == "filter_menu":
+                # 小メニューはメインを閉じずに右側に開く(Enter・→・頭の文字。← / Esc で戻る)
+                items.append((item.key, label, _SubMenu(*self._photo_filter_items())))
+                continue
+            if kind == "export_menu":
+                items.append((item.key, label, _SubMenu("書き出し", self._photo_export_items())))
+                continue
             # 印は「対象の★が全部同じ」行(とキーワードが全部に付いている行)だけ
             items.append((item.key, label, item.action, True) if mark
                          else (item.key, label, item.action))
@@ -6011,6 +6071,14 @@ class FilerWindow(QWidget):
             return
         if kind == "export_menu":
             self.photo_export_menu()
+            return
+        if kind in PHOTO_FILTER_KINDS:
+            # I メニューの小メニュー(★で絞り込む)で選んだ項目
+            self.run_photo_filter(action)
+            return
+        if kind in PHOTO_EXPORT_KINDS:
+            # I メニューの小メニュー(書き出し)で選んだ項目
+            self.run_photo_export(action)
             return
         if kind not in ("rating", "keyword"):
             return
@@ -6208,18 +6276,25 @@ class FilerWindow(QWidget):
         return text, self.colors[key], self.colors[f"{key}_bg"]
 
     # --- 書き出し(I → E。フォトフレーム同期・みてね) ---
-    def photo_export_menu(self) -> None:
-        """I → E: 書き出しの小メニュー(F フォトフレームへ同期 / M みてね用に集める /
-        D みてね済にして片付ける / L 手で消す写真の一覧)。"""
-        self._reload_photo_config()
+    def _photo_export_items(self) -> list:
+        """書き出しの小メニューの行(build_menu の形)。件数などはこの時点の値。"""
         items = []
         for item in photo_config.export_menu_items(self.photo_config):
             label = f"{item.label}  {item.detail}" if item.detail else item.label
             items.append((item.key, label, item.action))
-        menu, chosen = self.build_menu("書き出し", items)
+        return items
+
+    def photo_export_menu(self) -> None:
+        """書き出しのメニューを単独で開く(F フォトフレームへ同期 / M みてね用に集める /
+        D みてね済にして片付ける / L 手で消す写真の一覧)。I メニューからは小メニューで開く。"""
+        self._reload_photo_config()
+        menu, chosen = self.build_menu("書き出し", self._photo_export_items())
         choice = self._exec_menu(menu, chosen)
-        if choice is None:
-            return
+        if choice is not None:
+            self.run_photo_export(choice)
+
+    def run_photo_export(self, choice) -> None:
+        """書き出しの小メニューで選んだ項目を実行する。"""
         kind = choice[0]
         if kind == "frame_sync":
             self.photo_frame_sync()
@@ -6482,18 +6557,27 @@ class FilerWindow(QWidget):
 
         self._start_job(title, dest, len(items), run, done)
 
-    def photo_filter_menu(self) -> None:
-        """I → /: ★で絞り込む小メニュー(段階・プリセット・未選別・式を入力・解く)。"""
+    def _photo_filter_items(self):
+        """★で絞り込む小メニューの (見出し, 行)。行は build_menu の形。"""
         pane = self.active
         items = []
         for item in photo_config.filter_menu_items(self.photo_config):
             label = f"{item.label}  {item.detail}" if item.detail else item.label
             items.append((item.key, label, item.action))
         title = "★で絞り込む" + (f"（今: {pane.rating_filter}）" if pane.rating_filter else "")
-        menu, chosen = self.build_menu(title, items)
+        return title, items
+
+    def photo_filter_menu(self) -> None:
+        """★で絞り込むメニューを単独で開く(写真のボタン段の「絞り込み▾」。段階・プリセット・
+        未選別・式を入力・解く)。I メニューからは小メニューで開く。"""
+        menu, chosen = self.build_menu(*self._photo_filter_items())
         choice = self._exec_menu(menu, chosen)
-        if choice is None:
-            return
+        if choice is not None:
+            self.run_photo_filter(choice)
+
+    def run_photo_filter(self, choice) -> None:
+        """★で絞り込む小メニューで選んだ項目を実行する。"""
+        pane = self.active
         kind, value = choice
         if kind == "filter":
             self.apply_rating_filter(value)
@@ -6580,20 +6664,32 @@ class FilerWindow(QWidget):
             return None
         return edit.text().strip()
 
-    def build_menu(self, title: str, items):
+    def build_menu(self, title: str, items, parent=None):
         """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
         items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
         項目はチェック付きで出す(Shift+Z の ON/OFF)。None は区切り線。先頭の項目を選んだ
-        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。"""
-        menu = _ChooserMenu(self)
+        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。
+
+        値が _SubMenu の項目は小メニュー(QMenu のサブメニュー)になり、その中の項目も
+        chosen に入る(exec は小メニューで選んだ項目も返す)。行の右の ▸ は Qt が描くので、
+        表示の末尾の ▸ は外す。"""
+        menu = _ChooserMenu(parent if parent is not None else self)
         menu.setTitle(title)
+        menu.setStyleSheet(_menu_style_sheet(self.colors))
         chosen = {}
         for item in items:
             if item is None:
                 menu.addSeparator()
                 continue
             key, label, value = item[:3]
+            if isinstance(value, _SubMenu):
+                sub, sub_chosen = self.build_menu(value.title, value.items, parent=menu)
+                action = menu.addMenu(sub)
+                action.setText(f"&{key}:{label.rstrip(' ▸')}")
+                action.setProperty("filer_menu_key", key)
+                chosen.update(sub_chosen)
+                continue
             action = menu.addAction(f"&{key}:{label}")
             action.setProperty("filer_menu_key", key)
             if len(item) > 3:

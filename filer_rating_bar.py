@@ -1,14 +1,14 @@
 # filer_rating_bar.py
 # あっふの写真フォルダモードで、左右の窓それぞれの一覧の真下に出す「★の範囲」の段。
 #
-#   ★ [範囲スライダー] ベストショット以上   絞り込み: #みてね済   表示 12 / 340枚  [✕]
+#   ★ [範囲スライダー] ベストショット以上   表示 12 / 340枚  [✕]
 #
 # - 範囲スライダーはつまみ2つ・7段(-1〜5)。目盛りは photometa.config.rating_short
 #   (❌ / 未 / 1 / 2 / ベスト / フレーム / みてね)。値は整数にスナップし、下限 <= 上限を保つ
-# - 状態(文字の式・★の範囲)はその窓(Pane)が持つ。この段は表示とマウス操作だけで、
-#   式への合成と一覧の絞り込みは filer.py(Pane)が行う
+# - あっふで★で絞り込む入口はこの段だけ。状態(★の範囲)はその窓(Pane)が持つ。この段は
+#   表示とマウス操作だけで、式への変換と一覧の絞り込みは filer.py(Pane)が行う
 # - 窓の幅は左右の境界で決まるので、段は窓を押し広げない。入りきらないときは
-#   「絞り込み: …」→ 範囲の名前 → 枚数 の順に隠す(★・スライダー・✕ は残す)
+#   範囲の名前 → 枚数 の順に隠す(★・スライダー・✕ は残す)
 # - どの部品もフォーカスを取らない(ファイル窓のキー操作を奪わない)
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
@@ -171,7 +171,7 @@ class RatingRangeSlider(QWidget):
 
 
 class RatingBar(QWidget):
-    """★の範囲スライダー・範囲の名前・今の式・表示枚数・解除(✕)を並べた1段。"""
+    """★の範囲スライダー・範囲の名前・表示枚数・解除(✕)を並べた1段。"""
 
     pressed = Signal()                  # スライダーか ✕ を押した(窓をアクティブにする)
     range_changed = Signal(int, int)    # スライダーを動かした(lo, hi)
@@ -181,7 +181,6 @@ class RatingBar(QWidget):
     def __init__(self, colors: dict, font, parent=None):
         super().__init__(parent)
         c = colors
-        self._expr = ""
         self.setObjectName("filerRatingBar")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -204,20 +203,16 @@ class RatingBar(QWidget):
         star = label("★")
         star.setStyleSheet(f"color: {c['rating_accent']};")
         self.slider = RatingRangeSlider(c, font, self)
-        self.slider.setToolTip("★の範囲で絞り込む(つまみ2つ。重ねると「〜だけ」。文字の式と同時に効く)")
+        self.slider.setToolTip("★の範囲で絞り込む(つまみ2つ。重ねると「〜だけ」)")
         self.slider.pressed.connect(self.pressed)
         self.slider.range_changed.connect(self.range_changed)
         self.slider.released.connect(self.released)
         self.range_label = label()
-        self.filter_label = label()
-        # 式が長くても窓の幅を押し広げない(はみ出した分は切れる)
-        self.filter_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.filter_label.setContentsMargins(6, 0, 0, 0)
         self.count_label = label()
         self.clear_button = QPushButton("✕", self)
         self.clear_button.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
         self.clear_button.setFont(font)
-        self.clear_button.setToolTip("★の絞り込み(文字の式とスライダー)を両方解く")
+        self.clear_button.setToolTip("★の範囲を「すべて」に戻す")
         self.clear_button.setFixedSize(fm.height() + 6, fm.height() + 2)
         self.clear_button.setStyleSheet(
             f"QPushButton {{ background-color: {c['status_background']}; color: {c['status_text']};"
@@ -229,8 +224,7 @@ class RatingBar(QWidget):
         layout.addWidget(star)
         layout.addWidget(self.slider)
         layout.addWidget(self.range_label)
-        layout.addWidget(self.filter_label, 1)
-        layout.addStretch()     # 「絞り込み: …」を隠したときも、枚数と ✕ は右端に寄せる
+        layout.addStretch()     # 枚数と ✕ は右端に寄せる
         layout.addWidget(self.count_label)
         layout.addWidget(self.clear_button)
 
@@ -239,8 +233,8 @@ class RatingBar(QWidget):
         self._fit_items()
 
     def _fit_items(self) -> None:
-        """幅に入るものだけ出す。★・スライダー・✕ は必ず、残りは 枚数 → 範囲の名前 →
-        「絞り込み: …」の順に、入るなら出す(「絞り込み: …」は残りの幅を使い、はみ出しは切れる)。"""
+        """幅に入るものだけ出す。★・スライダー・✕ は必ず、残りは 枚数 → 範囲の名前 の順に、
+        入るなら出す。"""
         layout = self.layout()
         margins = layout.contentsMargins()
         gap = layout.spacing()
@@ -255,10 +249,8 @@ class RatingBar(QWidget):
             w.setVisible(room >= need)
             if room >= need:
                 room -= need
-        self.filter_label.setVisible(room >= QFontMetrics(self.filter_label.font())
-                                     .horizontalAdvance("絞り込み: なし") + gap)
 
-    def show_state(self, lo: int, hi: int, expr: str, shown: int, total: int,
+    def show_state(self, lo: int, hi: int, shown: int, total: int,
                    config: dict, move_slider: bool = True) -> None:
         """表示を差し替える(range_changed は出さない)。move_slider=False ならつまみは
         動かさない(ドラッグ中で、窓の側がまだ追い付いていないとき)。"""
@@ -266,9 +258,6 @@ class RatingBar(QWidget):
                                    for v in range(RATING_MIN, RATING_MAX + 1))
         if move_slider:
             self.slider.set_values(lo, hi)
-        self._expr = expr or ""
-        self.filter_label.setText(f"絞り込み: {expr or 'なし'}")
-        self.filter_label.setToolTip(expr or "")
         self.count_label.setText(f"表示 {shown:,} / {total:,}枚")
         self.show_range(lo, hi, config)
         self._fit_items()
@@ -279,4 +268,4 @@ class RatingBar(QWidget):
         if text != self.range_label.text():
             self.range_label.setText(text)
             self._fit_items()
-        self.clear_button.setEnabled(bool(self._expr) or not photo_config.is_full_range(lo, hi))
+        self.clear_button.setEnabled(not photo_config.is_full_range(lo, hi))

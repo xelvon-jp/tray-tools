@@ -1,7 +1,7 @@
 # photometa/config.py
 # 写真の★の共通設定 %LOCALAPPDATA%\traytools\photo_ratings.json（あっふと PhotoCuller が読む）と、
-# それから作る写真メニュー（PhotoCuller の I キー。あっふは R のダイアログ・写真のボタン段）・
-# 絞り込みの小メニュー（PhotoCuller の I → /、あっふの Shift+Z → / と「絞り込み▾」）の中身。
+# それから作る写真メニュー（PhotoCuller の I キー）・絞り込みの小メニュー（PhotoCuller の I → /）の中身。
+# あっふは★の表示名（rating_name / rating_badge / rating_short / range_label）と range_expr を使う。
 #
 # 設定は辞書のまま扱う。読み込み時に normalize して、壊れた値は既定に戻す（項目ごと）。
 # 知らないキーは残す（後で項目が増えても、古い版が書き戻して消さないように）。
@@ -40,7 +40,7 @@ RATING_MIN, RATING_MAX = -1, 5
 
 # filter_key（段階の）と key（プリセットの）は §7 の既定に足した任意の項目。
 # 絞り込みの小メニュー（B/F/M/D/U/E/A）の頭の文字を決める。
-# short（段階の）は任意。★の範囲スライダーの目盛り・ボタン段・★列のバッジに出す短い名前。
+# short（段階の）は任意。★の範囲スライダーの目盛り・★列のバッジ・あっふの R の★のボタンに出す短い名前。
 # icon（段階の）は任意。★列のバッジの頭に付ける絵文字。
 DEFAULT_CONFIG: dict = {
     "levels": [
@@ -420,7 +420,7 @@ def menu_title(count: int) -> str:
 
 
 def menu_items(config: dict, export: bool = False) -> list[MenuItem]:
-    """写真メニュー（PhotoCuller の I）の行。あっふは写真のボタン段に使う。動作は次のどれか：
+    """写真メニュー（PhotoCuller の I）の行。動作は次のどれか：
 
     ("rating", 5) / ("rating", 0) / ("rating", -1) … 選んだ写真に★を付ける
     ("keyword", "みてね済")                          … キーワードを付ける／外す
@@ -468,7 +468,7 @@ def export_menu_items(config: dict) -> list[MenuItem]:
 
 
 def filter_menu_items(config: dict) -> list[MenuItem]:
-    """絞り込みの小メニュー（PhotoCuller の I → /、あっふの Shift+Z → /）の行。動作は次のどれか：
+    """絞り込みの小メニュー（PhotoCuller の I → /）の行。動作は次のどれか：
 
     ("filter", 式)           … その式で絞り込む
     ("filter_input", None)   … 式を入力する欄を出す

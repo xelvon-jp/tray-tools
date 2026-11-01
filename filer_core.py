@@ -99,7 +99,7 @@ DEFAULT_KEYMAP = {
     "0083": "sort_dialog",        # S ソート
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
     "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示・
-                                  # 写真フォルダモード・★で絞り込む)
+                                  # 写真フォルダモード)
     "1072": "frecency_jump",      # Shift+H よく行くフォルダへ(zoxide 風)
     "4066": "flat_view",          # Alt+B フラット表示(Total Commander の Ctrl+B)
     "0114": "preview_toggle",     # F3 プレビュー(反対窓の位置に出す)
@@ -113,18 +113,11 @@ DEFAULT_KEYMAP = {
     "0073": "size_total",         # I 占有合計ファイルサイズ表示(クラスタの倍数に切り上げて足す)
     "1073": "size_total_simple",  # Shift+I 単純合計ファイルサイズ表示(サイズをそのまま足す)
     # --- 写真の★(photometa) ---
-    # ★を付けるのは R(画像を含むとダイアログの下部に★の欄)、★で絞り込むのは Shift+Z の
-    # 小メニュー。以前は Alt+I(その前は I)の写真メニューにまとめていたが、キーごとに1つの
-    # 役割に分けた(書き出しは PhotoCuller の I → E。2026-11-01)。Alt+I は空き。
-    "4049": "photo_preset_1",     # Alt+1〜9 ★の絞り込みのプリセット(photo_ratings.json の
-    "4050": "photo_preset_2",     # presets の N 番目。AFXW.key でも空いている)
-    "4051": "photo_preset_3",
-    "4052": "photo_preset_4",
-    "4053": "photo_preset_5",
-    "4054": "photo_preset_6",
-    "4055": "photo_preset_7",
-    "4056": "photo_preset_8",
-    "4057": "photo_preset_9",
+    # ★を付けるのは R(画像を含むとダイアログの下部に「写真の★」の欄)、★で絞り込むのは
+    # 窓ごとの下の★の範囲スライダーの段だけ。キーには割り当てない。以前の Alt+I の写真
+    # メニュー・Alt+1〜9 の絞り込みのプリセット(photo_preset_1〜9)は、入口の重複を
+    # 減らすために外した(2026-11-01)。filer.keys に古い上書きが残っていても、知らない
+    # コマンドとして build_keymap が捨てる。Alt+I・Alt+1〜9 は空き。
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
     "0080": "zip_create",         # P ZIP 圧縮(反対窓に作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---

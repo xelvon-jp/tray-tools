@@ -49,7 +49,6 @@ from PySide6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QLinearGradient,
-    QKeyEvent,
     QPainter,
 )
 from PySide6.QtNetwork import QLocalServer
@@ -318,9 +317,6 @@ PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★
 RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
 RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
 RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
-# ★で絞り込む小メニューの動作の種類(photometa.config の filter_menu_items)。Shift+Z の
-# メニューの exec が小メニューの項目を返したとき、ほかの設定の項目と見分ける。
-PHOTO_FILTER_KINDS = ("filter", "filter_input", "filter_clear")
 EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
                       " exiftool に場所を書いてください")
 
@@ -692,7 +688,7 @@ class Pane(QWidget):
         self.es_loading = False
         self.es_cancel = None
         self.es_status = "done"
-        # 写真フォルダモード(★の列とボタン段)。photo_override は Shift+Z の手動切り替え
+        # 写真フォルダモード(★の列と★の範囲の段)。photo_override は Shift+Z の手動切り替え
         # ("auto" / "on" / "off")で、別のフォルダへ移ったら "auto" に戻る(保存しない)。
         self.photo_override = "auto"
         self.photo_mode = False
@@ -709,12 +705,11 @@ class Pane(QWidget):
         self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
         self._photo_auto = False
         self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
-        # ★の絞り込み(Shift+Z → / ・ボタン段の「絞り込み▾」・Alt+数字)。rating_filter は
-        # 文字の式、rating_range は下部の★の範囲スライダー(lo, hi)。rating_node はその2つを
-        # AND した式の解析済みの木
-        # (どちらも無ければ None)。文字の式にスライダーの条件は書き込まない。
-        # どちらもフォルダを移ったら解く(保存しない)。
-        self.rating_filter = ""
+        # ★の絞り込み。状態は下部の★の範囲スライダーの値 rating_range (lo, hi) だけで、
+        # rating_node はそれを式(photometa.config.range_expr)にして解析した木(すべてなら
+        # None)。窓ごとに持ち、フォルダを移っても保つ(写真フォルダモードでないフォルダでは
+        # 効かせないだけで、写真フォルダへ戻ればまた効く)。解くのは段の ✕ と :(マスク解除)。
+        # 保存はしない(起動し直せば「すべて」)。
         self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
         self.rating_node = None
         # 写真の枚数(★の絞り込みを掛ける前 / 掛けた後)。下部の段の「表示 12 / 340枚」
@@ -762,7 +757,7 @@ class Pane(QWidget):
         header.hideSection(COL_RATING)
         layout.addWidget(self.view, 1)
 
-        # ★の範囲の段(写真フォルダモードのときだけ。一覧の真下)。この窓の文字の式・
+        # ★の範囲の段(写真フォルダモードのときだけ。一覧の真下)。この窓の
         # ★の範囲・枚数を出し、操作もこの窓にだけ掛かる。ドラッグ中は間引いて掛ける。
         self.rating_bar = filer_rating_bar.RatingBar(window.colors, window.log_font, self)
         self.rating_bar.pressed.connect(self._on_rating_bar_pressed)
@@ -798,15 +793,6 @@ class Pane(QWidget):
         self.footer.setContentsMargins(4, 0, 4, 0)
         self.footer.setAlignment(Qt.AlignCenter)   # あふｗは窓の下の行を中央に出す
         layout.addWidget(self.footer)
-        # 写真のボタン段(写真フォルダモードのときだけ。窓の下端に1段)。
-        self.photo_bar = QWidget(self)
-        self.photo_buttons = []
-        QHBoxLayout(self.photo_bar)
-        self.photo_bar.layout().setContentsMargins(0, 0, 0, 0)
-        self.photo_bar.layout().setSpacing(1)
-        self.photo_bar.hide()
-        layout.addWidget(self.photo_bar)
-        self.build_photo_bar()
         self.model.rating_text = self.rating_text
         self.model.rating_badge = self.rating_badge
         # QLabel は既定だと文字列の幅を最小幅にする。深いパスを開くと窓がそれより狭く
@@ -838,10 +824,6 @@ class Pane(QWidget):
             for col, sample in ((COL_EXT, ".MMMMM"), (COL_SIZE, "9,999,999,999 "),
                                 (COL_DATE, "26/10/23 12:34:56 "))}
         self._col_widths[COL_RATING] = self._rating_col_width(fm)
-        small = QFontMetrics(self.window_.log_font)
-        for button in getattr(self, "photo_buttons", []):
-            button.setFont(self.window_.log_font)
-            button.setFixedHeight(small.height() + 2)
         self._name_min = fm.horizontalAdvance("M" * 12)
         self.fit_columns()
         self._fit_ext_column()
@@ -996,11 +978,9 @@ class Pane(QWidget):
         if self.loading:
             text += "   …"
         self.header.setText(text)
-        # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)と★の絞り込み。
-        text2 = self.window_.drive_label_text(self.drive_root())
-        if self.rating_node is not None:
-            text2 = (f"{text2}   " if text2 else "") + f"★絞り込み: {self.rating_expr()}"
-        self.header2.setText(text2)
+        # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)。★の絞り込みは
+        # 下の★の範囲の段に出す。
+        self.header2.setText(self.window_.drive_label_text(self.drive_root()))
 
     def update_footer(self) -> None:
         if not hasattr(self, "footer"):
@@ -1210,8 +1190,8 @@ class Pane(QWidget):
             self.marks = set()
         if not same:
             # フォルダを移ったらライブ絞り込みは解く(前のフォルダの語が残ると、何も
-            # 無いように見えて混乱する)。★の絞り込みと写真フォルダモードの手動切り替え、
-            # ★のキャッシュも同じく捨てる。
+            # 無いように見えて混乱する)。写真フォルダモードの手動切り替えと★のキャッシュも
+            # 捨てる。★の範囲(rating_range)は窓ごとに保つ。
             self.clear_live_filter(rebuild=False)
             self.reset_photo()
         self.last_load_moved = not same     # よく行くフォルダの記録は「移った」ときだけ
@@ -1249,7 +1229,8 @@ class Pane(QWidget):
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
         self.photo_total = sum(1 for e in visible if self.is_photo_entry(e))
-        if self.rating_node is not None:
+        # ★の範囲は写真フォルダモードのときだけ効かせる(写真以外は★で絞らない)
+        if self.rating_node is not None and self._photo_mode_now():
             visible = [e for e in visible if e.is_dir or self.rating_match(e)]
             self.photo_shown = sum(1 for e in visible if self.is_photo_entry(e))
         else:
@@ -1736,34 +1717,9 @@ class Pane(QWidget):
         self.update_footer()
 
     # --- 写真の★(写真フォルダモード・★の列・★の絞り込み) ---
-    def build_photo_bar(self) -> None:
-        """写真のボタン段を(作り直して)並べる。中身は photometa の menu_items(★・キーワード・
-        「絞り込み▾」)。"""
-        win = self.window_
-        layout = self.photo_bar.layout()
-        for button in self.photo_buttons:
-            layout.removeWidget(button)
-            button.deleteLater()
-        self.photo_buttons = []
-        c = self.colors
-        small = QFontMetrics(win.log_font)
-        for label, action in win.photo_bar_items():
-            button = QPushButton(label, self.photo_bar)
-            button.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
-            button.setFont(win.log_font)
-            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            button.setFixedHeight(small.height() + 2)
-            button.setStyleSheet(
-                f"QPushButton {{ background-color: {c['fkey_background']}; color: {c['fkey_text']};"
-                f" border: 1px solid {c['fkey_border']}; padding: 0px; }}")
-            button.clicked.connect(
-                lambda _checked=False, a=action: win.press_photo_button(self, a))
-            layout.addWidget(button, 1)
-            self.photo_buttons.append(button)
-
     def reset_photo(self) -> None:
-        """フォルダを移ったとき: 手動の切り替え・★の絞り込み・キャッシュを捨て、
-        まだ走っている読み取りを止める(届いた結果も世代で捨てる)。"""
+        """フォルダを移ったとき: 手動の切り替え・キャッシュを捨て、まだ走っている読み取りを
+        止める(届いた結果も世代で捨てる)。★の範囲は保つ(窓ごと。解くのは ✕ と :)。"""
         self._photo_cancel.set()
         self._photo_cancel = threading.Event()
         self.photo_gen += 1
@@ -1773,7 +1729,6 @@ class Pane(QWidget):
         self._photo_scan_src = None
         self._photo_keys = {}
         self.photo_override = "auto"
-        self.clear_rating(refresh=False)
 
     def entry_path(self, entry) -> str:
         """一覧の項目のフルパス(フラット表示・検索結果は相対パス、一時置き場はフルパスの名前)。"""
@@ -1816,18 +1771,17 @@ class Pane(QWidget):
         return label, rating_color_key(meta.rating), done
 
     def rating_match(self, entry) -> bool:
-        """★の絞り込みの式に合うか。読めていない写真・写真以外は「不明」で隠す。
-        人物名と face は不明(あっふは顔を見ない)、sel はマーク中か。"""
-        def other(kind, _name):
-            if kind == "sel":
-                return entry.name in self.marks
-            return None
+        """★の範囲に合うか。読めていない写真・写真以外は「不明」で隠す。"""
         meta = self.meta_of(entry)
-        fn = photo_filter.meta_atom_fn(meta, self.window_.photo_config, other)
+        fn = photo_filter.meta_atom_fn(meta, self.window_.photo_config)
         return photo_filter.evaluate(self.rating_node, fn) is True
 
+    def rating_active(self) -> bool:
+        """★の範囲で絞り込んでいるか(写真フォルダモードで、範囲が「すべて」でない)。"""
+        return self.photo_mode and self.rating_node is not None
+
     def needs_photo_meta(self) -> bool:
-        return self.photo_mode or self.rating_node is not None
+        return self.photo_mode
 
     def _photo_key_map(self) -> dict:
         if not self._photo_keys:
@@ -1835,20 +1789,24 @@ class Pane(QWidget):
                                 for e in self.all_entries if self.is_photo_entry(e)}
         return self._photo_keys
 
-    def update_photo_mode(self) -> None:
-        """写真フォルダモードを決め直す(一覧を作り直したとき・手動で切り替えたとき)。
-        変わったら列・ボタン段・見出しを合わせる。★が要るなら裏で読み始める。"""
+    def _photo_mode_now(self) -> bool:
+        """今の一覧と手動の切り替えから、写真フォルダモードかを決める(photo_mode は変えない。
+        一覧を作り直すとき、★の範囲を効かせるかを先に知るため)。"""
         if self._photo_scan_src is not self.all_entries:
             self._photo_scan_src = self.all_entries
             self._photo_auto = core.is_photo_folder(self.all_entries,
                                                     self.window_.photo_mode_params)
             self._photo_keys = {}
-        mode = (self.archive is None and bool(self.path or self.stash)
+        return (self.archive is None and bool(self.path or self.stash)
                 and core.photo_mode_on(self.photo_override, self._photo_auto))
+
+    def update_photo_mode(self) -> None:
+        """写真フォルダモードを決め直す(一覧を作り直したとき・手動で切り替えたとき)。
+        変わったら列・★の範囲の段・見出しを合わせる。★が要るなら裏で読み始める。"""
+        mode = self._photo_mode_now()
         changed = mode != self.photo_mode
         self.photo_mode = mode
         if changed:
-            self.photo_bar.setVisible(mode)
             self.fit_columns()
             self.update_header()
             self.update_rating_bar()
@@ -1857,15 +1815,10 @@ class Pane(QWidget):
 
     def set_photo_override(self, value: str) -> None:
         self.photo_override = value if value in core.PHOTO_MODE_OVERRIDES else "auto"
+        if self.path or self.stash:
+            self.refilter()     # ★の範囲を効かせる/外す(写真フォルダモードのときだけ効く)
         self.update_photo_mode()
         self.update_header()
-
-    def set_rating_filter(self, expr: str) -> None:
-        """★の絞り込みの文字の式を差し替える(空なら式だけ解く。★の範囲はそのまま)。
-        式が書けていなければ FilterSyntaxError。"""
-        node = photo_filter.parse(expr)
-        self.rating_filter = (expr or "").strip() if node is not None else ""
-        self._apply_rating()
 
     def set_rating_range(self, lo: int, hi: int) -> None:
         """★の範囲スライダーの値を差し替える(-1〜5。両端なら★では絞り込まない)。"""
@@ -1875,8 +1828,7 @@ class Pane(QWidget):
         self._apply_rating()
 
     def clear_rating(self, refresh: bool = True) -> None:
-        """★の絞り込みを文字の式・★の範囲とも解く。"""
-        self.rating_filter = ""
+        """★の絞り込みを解く(★の範囲を「すべて」に戻す)。"""
         self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
         if refresh:
             self._apply_rating()
@@ -1884,14 +1836,11 @@ class Pane(QWidget):
             self.rating_node = None
 
     def rating_expr(self) -> str:
-        """実際に掛ける★の絞り込みの式((文字の式) && ★の範囲)。無ければ空。"""
-        rng = photo_config.range_expr(*self.rating_range)
-        if self.rating_filter and rng:
-            return f"({self.rating_filter}) && {rng}"
-        return self.rating_filter or rng
+        """★の範囲を式にしたもの(「★>=3 && ★<=4」)。すべてなら空。"""
+        return photo_config.range_expr(*self.rating_range)
 
     def _apply_rating(self) -> None:
-        """文字の式と★の範囲から絞り込みの木を作り直し、一覧に掛け直す。"""
+        """★の範囲から絞り込みの木を作り直し、一覧に掛け直す。"""
         self.rating_node = photo_filter.parse(self.rating_expr())
         if self.path or self.stash:
             self.refilter()
@@ -1912,12 +1861,12 @@ class Pane(QWidget):
         pending = self._rating_pending
         lo, hi = pending if pending is not None else self.rating_range
         # ドラッグ中で窓の側がまだ追い付いていないときは、つまみを戻さない
-        bar.show_state(lo, hi, self.rating_filter, self.photo_shown, self.photo_total,
+        bar.show_state(lo, hi, self.photo_shown, self.photo_total,
                        self.window_.photo_config, move_slider=pending is None)
 
     def _on_rating_bar_pressed(self) -> None:
-        """段のスライダーか ✕ を押した: 写真のボタン段と同じく、この窓をアクティブにする
-        (フォーカスはファイル窓。段の部品はフォーカスを取らない)。"""
+        """段のスライダーか ✕ を押した: この窓をアクティブにする(フォーカスはファイル窓。
+        段の部品はフォーカスを取らない)。"""
         try:
             if not self.is_active():
                 self.window_.activate(self.side)
@@ -1948,7 +1897,7 @@ class Pane(QWidget):
             self.window_.log(f"エラー: {_log_exception('ratingSlider')}")
 
     def _on_rating_clear(self) -> None:
-        """段の ✕: この窓の文字の式と★の範囲を両方解く。"""
+        """段の ✕: この窓の★の範囲を「すべて」に戻す。"""
         try:
             self._rating_timer.stop()
             self._rating_pending = None
@@ -2050,7 +1999,7 @@ class Pane(QWidget):
 
     def refresh_photo(self) -> None:
         """★が変わった。絞り込み中なら掛け直し、そうでなければ描き直すだけ。"""
-        if self.rating_node is not None:
+        if self.rating_active():
             self.refilter()
         else:
             self.model.all_changed()
@@ -2067,11 +2016,6 @@ class _ChooserMenu(QMenu):
     &MENU と同じ即決)。それだと C → P のつもりが選択のつもりでもパスコピーが
     走ってしまうので、文字キーは「その項目を選ぶ」までに止める(2026-10-26
     ユーザー要望)。Enter・クリックは従来どおり実行、矢印・Esc も従来どおり。
-
-    小メニュー(build_menu で値に _SubMenu を渡した行。QMenu の本物のサブメニュー)は、
-    Enter・→・頭の文字・マウスで開き、親の右側(はみ出すなら左側)のその行の高さに出る。
-    小メニューで ← か Esc を押すと親に戻る(親はその行を選んだまま)。ここは Qt の既定の
-    動きで、小メニューの中でも文字キーは選ぶだけ・Enter で実行(2026-11-01 ユーザー要望)。
 
     deletable を立てたメニューでは Del で「選んでいる項目の削除」を頼める(Alt+J の
     ワークスペース)。その場合は何も実行せずに閉じ、delete_action に項目を残す。"""
@@ -2094,7 +2038,7 @@ class _ChooserMenu(QMenu):
         matches = [a for a in self.actions()
                    if a.isEnabled() and not a.isSeparator() and _menu_key_of(a) == char] \
             if plain and char and char.isprintable() and not char.isspace() else []
-        # 英数字のほか、項目の頭にある記号(★で絞り込むの / など)も選択だけにする。
+        # 英数字のほか、項目の頭にある記号も選択だけにする。
         if plain and len(text) == 1 and (text.isalnum() or matches):
             if matches:
                 # 同じ文字の項目が複数あれば、押すたびに次へ(Ctrl+Enter のメニューは
@@ -2104,21 +2048,11 @@ class _ChooserMenu(QMenu):
                 current = self.activeAction()
                 repeat = getattr(self, "_last_char", None) == char and current in matches
                 index = matches.index(current) + 1 if repeat else 0
-                target = matches[index % len(matches)]
-                self.setActiveAction(target)
-                if target.menu() is not None and len(matches) == 1:
-                    # 小メニュー(▸)の行は、頭の文字でそのまま開く(開くだけで何も実行しない)。
-                    # 開き方は → と同じにして、位置と戻り方(← / Esc)は Qt に任せる。
-                    self._open_submenu()
+                self.setActiveAction(matches[index % len(matches)])
             self._last_char = char
             event.accept()  # 対応する項目が無い文字も、実行には使わない
             return
         super().keyPressEvent(event)
-
-    def _open_submenu(self) -> None:
-        """選んでいる小メニューの行を → と同じ方法で開く(右から左の言語なら ←)。"""
-        key = Qt.Key_Left if self.isRightToLeft() else Qt.Key_Right
-        super().keyPressEvent(QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier))
 
 
 def _menu_key_of(action) -> str:
@@ -2132,18 +2066,6 @@ def _menu_key_of(action) -> str:
         rest = text.split("&", 1)[1]
         return rest[:1].upper() if rest else ""
     return text[:1].upper() if text else ""
-
-
-class _SubMenu:
-    """build_menu の項目の値に使うと、その行が小メニュー(▸)になる。items は build_menu と
-    同じ形。中身は開く時点ではなく、メニューを組む時点の値で作る。
-
-    QMenu のサブメニューは見出し(title)と行の表示が同じものなので、組んだ後の見出しは
-    行の表示(&/:★で絞り込む など)になる。title は組む途中の仮の見出し。"""
-
-    def __init__(self, title: str, items):
-        self.title = title
-        self.items = items
 
 
 def _menu_style_sheet(colors) -> str:
@@ -4367,7 +4289,7 @@ class FilerWindow(QWidget):
 
     # --- マスク ---
     def cmd_mask_clear(self):
-        # : はマスクを *.* に戻す。ライブ絞り込みと★の絞り込みもいっしょに解く(「全部見せる」キー)。
+        # : はマスクを *.* に戻す。ライブ絞り込みと★の範囲もいっしょに解く(「全部見せる」キー)。
         self.active.clear_live_filter(rebuild=False)
         self.active.clear_rating(refresh=False)
         self.active.set_mask(core.DEFAULT_MASK)
@@ -5320,7 +5242,7 @@ class FilerWindow(QWidget):
                 renamed.update({p["old"]: p["new"] for p in plans if "new" in p})
             return error
 
-        colors = {"background": self.colors["background"], "text": self.colors["text"]}
+        colors = {k: self.colors[k] for k in ("background", "text", "cursor")}
         dialog = filer_fileinfo.FileInfoDialog(
             self, pane.path, entries, colors=colors, font=self.log_font,
             on_apply=apply, photo=photo)
@@ -5348,9 +5270,20 @@ class FilerWindow(QWidget):
 
         kws = cfg.get("keywords") or []
         keyword = kws[0] if kws else None
-        ratings = [(-1, photo_config.rating_tag(-1, cfg))]
-        ratings += [(n, photo_config.rating_name(n, cfg))
-                    for n in range(0, photo_config.RATING_MAX + 1)]
+        # ★のボタン(❌ 削除 / 未選別 / ★1 / ★2 / ⭐ ベスト / 🖼️ フレーム / 💌 みてね)。
+        # 文字と色は★の列のバッジと同じ(rating_badge・rating_color_key)
+        ratings = []
+        for n in range(photo_config.RATING_MIN, photo_config.RATING_MAX + 1):
+            badge = photo_config.rating_badge(n, cfg)
+            name = photo_config.rating_name(n, cfg)
+            key = rating_color_key(n)
+            ratings.append({
+                "value": n,
+                "label": " ".join(t for t in badge if t) if badge else name,
+                "name": name,
+                "color": self.colors[key],
+                "background": self.colors[f"{key}_bg"],
+            })
         return {
             "count": len(photos),
             "ratings": ratings,
@@ -5365,7 +5298,7 @@ class FilerWindow(QWidget):
 
     def _apply_file_info_photo(self, pane, photos, renamed, changes) -> None:
         """R のダイアログで選んだ★・キーワードを画像だけに書く(ファイル情報の変更を当てた後。
-        名前を変えたものは新しい名前に)。書き込みは写真のボタン段と同じ photo_write。"""
+        名前を変えたものは新しい名前に)。書き込みは photo_write(裏のスレッド)。"""
         paths = []
         for e in photos:
             old = pane.entry_path(e)
@@ -5916,10 +5849,8 @@ class FilerWindow(QWidget):
 
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
-        """Shift+Z: 各種設定の一時切替。隠し/システムファイルの表示、写真フォルダモード、
-        ★で絞り込む(小メニュー。写真のボタン段の「絞り込み▾」と同じ中身。対象は今の窓)。
-        ★で絞り込むは、以前は Alt+I の写真メニューにあった(2026-11-01)。"""
-        self._reload_photo_config()
+        """Shift+Z: 各種設定の一時切替。隠し/システムファイルの表示と写真フォルダモード。
+        ★の絞り込みは置かない(窓の下の★の範囲の段だけ。2026-11-01)。"""
         override = self.active.photo_override
         menu, chosen = self.build_menu("各種設定一時切替", [
             ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
@@ -5929,13 +5860,9 @@ class FilerWindow(QWidget):
             ("A", "写真フォルダモード：自動", "photo_auto", override == "auto"),
             ("N", "写真フォルダモード：常にオン", "photo_on", override == "on"),
             ("F", "写真フォルダモード：常にオフ", "photo_off", override == "off"),
-            # 写真フォルダモードでなくても出す(書庫の中は apply_rating_filter が断る)
-            ("/", "★で絞り込む ▸", _SubMenu(*self._photo_filter_items())),
         ])
         choice = self._exec_menu(menu, chosen)
-        if isinstance(choice, tuple) and choice[0] in PHOTO_FILTER_KINDS:
-            self.run_photo_filter(choice)
-        elif choice in ("photo_auto", "photo_on", "photo_off"):
+        if choice in ("photo_auto", "photo_on", "photo_off"):
             value = choice.split("_", 1)[1]
             pane = self.active
             pane.set_photo_override(value)
@@ -6183,69 +6110,13 @@ class FilerWindow(QWidget):
             return "add"
         return None
 
-    # --- 写真の★(R のダイアログ・ボタン段・★の絞り込み・変更記録) ---
-    def photo_bar_items(self) -> list:
-        """写真のボタン段の [(表示名, 動作)]。photometa の menu_items から作り、名前は短く。"""
-        cfg = self.photo_config
-        levels = {lv["name"]: lv for lv in cfg.get("levels") or []}
-        keywords = cfg.get("keywords") or []
-        out = []
-        for item in photo_config.menu_items(cfg):
-            kind, value = item.action
-            if kind == "rating":
-                if value > 0:
-                    level = levels.get(item.label) or {"name": item.label}
-                    label = f"★{value} {photo_config.level_short(level)}"
-                elif value == 0:
-                    label = "★外す"
-                else:
-                    label = "❌ 削除候補"
-            elif kind == "keyword":
-                # ★の列と同じく、1つ目のキーワードは「済」で見せる
-                label = "済" if keywords and value == keywords[0]["name"] else value
-            elif kind == "filter_menu":
-                label = "絞り込み▾"
-            else:
-                continue
-            out.append((label, item.action))
-        return out
-
+    # --- 写真の★(R のダイアログ・変更記録) ---
     def _reload_photo_config(self) -> None:
-        """共通設定を読み直す。メニューの中身が変わっていたらボタン段も作り直す。"""
-        before = self.photo_bar_items()
+        """共通設定を読み直す(★の列の幅と★の範囲の段の目盛りも合わせる)。"""
         self.photo_config = photo_config.load_config()
-        if self.photo_bar_items() != before:
-            for pane in (self.left, self.right):
-                pane.build_photo_bar()
         for pane in (self.left, self.right):
             pane.update_rating_col_width()
             pane.update_rating_bar()
-
-    def press_photo_button(self, pane, action) -> None:
-        """写真のボタン段を押した(対象はその窓のマーク中のファイル、無ければカーソル位置)。
-        フォーカスはファイル窓に残す。"""
-        try:
-            if pane.side != self.active_side:
-                self.activate(pane.side, focus=False)
-            self.run_photo_action(action)
-            self.active.view.setFocus()
-        except Exception:  # noqa: BLE001
-            self.log(f"エラー: {_log_exception('photoButton')}")
-
-    def photo_targets(self):
-        """写真のボタン段で★を付ける対象。(写真のフルパスの一覧, 写真でないので飛ばした数,
-        断る理由)。
-
-        マーク中のファイル、無ければカーソル位置(pick_targets と同じ)。画像ビュア
-        (F3 のプレビュー)を出している間も同じ(マークが無ければ表示中の1枚)。
-        以前はビュア中はマークを見なかったが、ビュアで見ながら Space で選んでまとめて
-        付ける、というあっふの使い方で1枚にしか付かなかった(2026-11-01)。"""
-        pane = self.active
-        if pane.archive is not None:
-            return [], 0, ARCHIVE_READONLY
-        entries = pane.targets()
-        photos = [e for e in entries if pane.is_photo_entry(e)]
-        return [pane.entry_path(e) for e in photos], len(entries) - len(photos), None
 
     def _photo_metas_for(self, paths) -> list:
         """対象の今の★(読めていなければその場で読む。読めなければ None)。"""
@@ -6265,34 +6136,6 @@ class FilerWindow(QWidget):
     def _has_keyword(meta, name: str) -> bool:
         folded = name.casefold()
         return meta is not None and any(k.casefold() == folded for k in meta.keywords)
-
-    def run_photo_action(self, action, paths=None, skipped=0, metas=None) -> None:
-        """写真のボタン段の動作を実行する。paths を渡さなければ今の対象で。"""
-        kind, value = action
-        if kind == "filter_menu":
-            self.photo_filter_menu()
-            return
-        if kind not in ("rating", "keyword"):
-            return
-        if paths is None:
-            paths, skipped, refused = self.photo_targets()
-            if refused:
-                self.log(f"写真の★: {refused}")
-                return
-        if skipped:
-            self.log(f"写真の★: 写真ではないもの {skipped} 件を飛ばしました")
-        if not paths:
-            self.log("写真の★: 対象の写真がありません")
-            return
-        if metas is None:
-            metas = self._photo_metas_for(paths)
-        if kind == "rating":
-            op = ("rating", int(value))
-        else:
-            # 対象の全部に付いていれば外す、そうでなければ付ける
-            on = not all(self._has_keyword(m, value) for m in metas)
-            op = ("keyword", value, on)
-        self.photo_write(paths, op, metas)
 
     @staticmethod
     def _predict_meta(meta, op):
@@ -6335,8 +6178,6 @@ class FilerWindow(QWidget):
         pane = self.active
         if pane.marks:
             pane.marks.clear()          # model と同じ集合なので clear で解く
-            if pane.rating_node is not None:
-                pane.refilter()         # sel を使った式なら見え方が変わる
             pane.view.viewport().update()
             pane.update_footer()
             self.update_status_bar()
@@ -6467,124 +6308,13 @@ class FilerWindow(QWidget):
         key = rating_color_key(meta.rating)
         return text, self.colors[key], self.colors[f"{key}_bg"]
 
-    def _photo_filter_items(self):
-        """★で絞り込む小メニューの (見出し, 行)。行は build_menu の形。"""
-        pane = self.active
-        items = []
-        for item in photo_config.filter_menu_items(self.photo_config):
-            label = f"{item.label}  {item.detail}" if item.detail else item.label
-            items.append((item.key, label, item.action))
-        title = "★で絞り込む" + (f"（今: {pane.rating_filter}）" if pane.rating_filter else "")
-        return title, items
-
-    def photo_filter_menu(self) -> None:
-        """★で絞り込むメニューを単独で開く(写真のボタン段の「絞り込み▾」。段階・プリセット・
-        未選別・式を入力・解く)。Shift+Z のメニューからは小メニューで開く。"""
-        menu, chosen = self.build_menu(*self._photo_filter_items())
-        choice = self._exec_menu(menu, chosen)
-        if choice is not None:
-            self.run_photo_filter(choice)
-
-    def run_photo_filter(self, choice) -> None:
-        """★で絞り込む小メニューで選んだ項目を実行する。"""
-        pane = self.active
-        kind, value = choice
-        if kind == "filter":
-            self.apply_rating_filter(value)
-        elif kind == "filter_input":
-            text = self.ask_filter_expr(pane.rating_filter)
-            if text is not None:
-                self.apply_rating_filter(text)
-        elif kind == "filter_clear":
-            self.apply_rating_filter("")
-
-    def apply_rating_filter(self, expr: str, name: str = None) -> bool:
-        """今の窓に★の絞り込みを掛ける(空なら解く)。式が読めなければログに出して False。"""
-        pane = self.active
-        if pane.archive is not None:
-            self.log(f"★の絞り込み: {ARCHIVE_READONLY}")
-            return False
-        try:
-            pane.set_rating_filter(expr)
-        except photo_filter.FilterSyntaxError as e:
-            self.log(f"★の絞り込み: 式が読めません（{e.message}）")
-            return False
-        if pane.rating_filter:
-            shown = f"{name}（{pane.rating_filter}）" if name else pane.rating_filter
-            self.log(f"★の絞り込み: {shown}")
-        elif pane.rating_node is not None:
-            label = photo_config.range_label(*pane.rating_range, self.photo_config)
-            self.log(f"★の絞り込みの式を解きました（★の範囲「{label}」は残っています）")
-        else:
-            self.log("★の絞り込みを解きました")
-        return True
-
-    def apply_photo_preset(self, number: int) -> None:
-        """Alt+数字: 共通設定の presets の N 番目で絞り込む。"""
-        self._reload_photo_config()
-        presets = self.photo_config.get("presets") or []
-        if not 1 <= number <= len(presets):
-            self.log(f"★の絞り込み: プリセット {number} はありません"
-                     "（photo_ratings.json の presets）")
-            return
-        preset = presets[number - 1]
-        self.apply_rating_filter(preset["expr"], preset.get("name"))
-
-    @staticmethod
-    def filter_expr_error(text: str) -> str:
-        """式の構文エラー(「N文字目: 内容」)。読めれば空。"""
-        try:
-            photo_filter.parse(text)
-        except photo_filter.FilterSyntaxError as e:
-            return e.message
-        return ""
-
-    def ask_filter_expr(self, text: str = ""):
-        """★の絞り込みの式を入力する窓。構文エラーはその場で出し、直すまで OK を押せない。
-        決めた式(空なら解く)か、取消なら None。"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("★で絞り込む（式）")
-        layout = QVBoxLayout(dialog)
-        hint = QLabel("例: ★>=3 / ★=5 && !#みてね済 / reject / unrated / sel"
-                      "（! && || ( ) が使えます。空で解除）")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        edit = QLineEdit(text or "")
-        layout.addWidget(edit)
-        error = QLabel("")
-        error.setStyleSheet("color: #d03030;")
-        layout.addWidget(error)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        def check(value):
-            try:
-                message = self.filter_expr_error(value)
-                error.setText(message)
-                buttons.button(QDialogButtonBox.Ok).setEnabled(not message)
-            except Exception:  # noqa: BLE001
-                _log_exception("filterExprCheck")
-
-        edit.textChanged.connect(check)
-        check(edit.text())
-        edit.selectAll()
-        if self.exec_dialog(dialog) != QDialog.Accepted:
-            return None
-        return edit.text().strip()
-
-    def build_menu(self, title: str, items, parent=None):
+    def build_menu(self, title: str, items):
         """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
         items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
         項目はチェック付きで出す(Shift+Z の ON/OFF)。None は区切り線。先頭の項目を選んだ
-        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。
-
-        値が _SubMenu の項目は小メニュー(QMenu のサブメニュー)になり、その中の項目も
-        chosen に入る(exec は小メニューで選んだ項目も返す)。行の右の ▸ は Qt が描くので、
-        表示の末尾の ▸ は外す。"""
-        menu = _ChooserMenu(parent if parent is not None else self)
+        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。"""
+        menu = _ChooserMenu(self)
         menu.setTitle(title)
         menu.setStyleSheet(_menu_style_sheet(self.colors))
         chosen = {}
@@ -6593,13 +6323,6 @@ class FilerWindow(QWidget):
                 menu.addSeparator()
                 continue
             key, label, value = item[:3]
-            if isinstance(value, _SubMenu):
-                sub, sub_chosen = self.build_menu(value.title, value.items, parent=menu)
-                action = menu.addMenu(sub)
-                action.setText(f"&{key}:{label.rstrip(' ▸')}")
-                action.setProperty("filer_menu_key", key)
-                chosen.update(sub_chosen)
-                continue
             action = menu.addAction(f"&{key}:{label}")
             action.setProperty("filer_menu_key", key)
             if len(item) > 3:
@@ -6660,20 +6383,6 @@ class FilerWindow(QWidget):
         if dialog.exec() != QDialog.Accepted:
             return None
         return edit.text(), check.isChecked()
-
-
-def _photo_preset_command(number: int):
-    def command(self):
-        self.apply_photo_preset(number)
-    command.__name__ = f"cmd_photo_preset_{number}"
-    command.__doc__ = f"Alt+{number}: ★の絞り込みのプリセット {number} 番。"
-    return command
-
-
-# Alt+1〜9(photo_preset_1〜9)。9個並べて書く代わりにここで作る。
-for _number in range(1, 10):
-    setattr(FilerWindow, f"cmd_photo_preset_{_number}", _photo_preset_command(_number))
-del _number
 
 
 # ---------------------------------------------------------------

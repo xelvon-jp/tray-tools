@@ -2022,7 +2022,8 @@ XYplorer の Live Filter / yazi の filter に当たるものです。`/` で窓
 **鍵の置き場所と注意**
 
 - CA の鍵と証明書は `%LOCALAPPDATA%\traytools\phone_ca\`（リポジトリの外）にあり、フォルダと鍵は本人だけが読めるよう ACL を絞っています。**`ca_key.pem` はコピーしたり人に渡したりしないでください。** 漏れると、その CA を信頼した iPhone に対して LAN の中の偽サイトを作れてしまいます。iPhone に渡すのは公開部分（証明書）だけで、鍵はどこにも出しません
-- CA には名前制約（Name Constraints）を付け、プライベート IP（10/8・172.16/12・192.168/16）と `.local` にしか使えないようにしています。iOS で信頼設定がうまくいかないときは、`filer_phone.py` の `NAME_CONSTRAINTS` を `False` にして、下の手順で作り直してください
+- CA には名前制約（Name Constraints）を付け、プライベート IP（10/8・172.16/12・192.168/16）と `.local` にしか使えないようにしています。iOS で信頼設定がうまくいかないときは、`photometa/phone.py` の `NAME_CONSTRAINTS` を `False` にして、下の手順で作り直してください
+- サーバと CA の中身は共通モジュール `photometa/phone.py` にあり、PhotoCuller からも同じものを使います（CA の置き場所も共通なので、iPhone に入れた証明書は両方のアプリでそのまま使えます）。あっふ側の `filer_phone.py` は QR とダイアログだけです
 - **作り直したいとき**は `phone_ca` フォルダを消してください。次にダイアログを開いたときに作り直します。iPhone 側も、古いプロファイルを削除して（設定 → 一般 → VPN とデバイス管理）入れ直してください
 
 ### よく行くフォルダ（`Shift+H`）
@@ -2317,6 +2318,7 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 | `photometa/xmp.py` | ★とキーワードを**ExifTool を使わずに**読む（`read_meta(path)` → `PhotoMeta(rating, keywords)`、読めなければ `None`＝不明）。対象の判定は `is_photo(name)` |
 | `photometa/writer.py` | ExifTool を常駐させて書く（`ExifToolSession.set_rating` / `set_keyword` / `restore`）。変更記録の読み書き（`JournalReader`） |
 | `photometa/metacache.py` | ★の読み取り結果の永続キャッシュ（SQLite。`MetaCache.read_cached` / `read_metas`。下の「読み取りキャッシュ」） |
+| `photometa/phone.py` | スマホへ送るのサーバとローカル CA（`ShareServer` / `qr_matrix`。Qt に依存しない。画面は あっふ が `filer_phone.py`、PhotoCuller が自前で持つ。CA の置き場所 `phone_ca` は両アプリ共通） |
 | `photometa/config.py` | 共通設定の読み書き、写真メニュー（`menu_items`。PhotoCuller の `I`）・絞り込みの小メニュー（`filter_menu_items`。PhotoCuller の `I` → `/`）・書き出しの小メニュー（`export_menu_items`。PhotoCuller の `I` → `E`）の中身 |
 | `photometa/filter_expr.py` | 条件式（PhotoCuller の表示フィルタを拡張したもの。下の表） |
 | `photometa/export.py` | 書き出し（`collect` / `sync_frame` / `collect_mitene` / `finish_mitene`。PhotoCuller の `I` → `E` から使う。下の「書き出し」） |

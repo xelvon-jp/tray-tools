@@ -1573,6 +1573,55 @@ def test_metacache_read_metas_parallel():
 
 # ------------------------------------------------------------------ 実行器
 
+def test_phone_module_qt_free_and_server():
+    """スマホへ送る共通モジュール(photometa.phone): Qt を読み込まず、サーバが
+    127.0.0.1 でページを返し、表示名(app_name)がページに出る。"""
+    import sys
+    import urllib.request
+
+    from photometa import phone
+
+    assert "PySide6" not in sys.modules and "PyQt6" not in sys.modules
+    # あっふ側の filer_phone は薄い画面側で、共通の名前をそのまま出す
+    import filer_phone
+    assert filer_phone.ShareServer is phone.ShareServer
+    assert "PySide6" not in sys.modules
+
+    with tempfile.TemporaryDirectory() as tmp:
+        img = Path(tmp, "a.jpg")
+        img.write_bytes(b"\xff\xd8\xff" + b"x" * 50)
+        server = phone.ShareServer([str(img)], use_https=False,
+                                    host_ip="127.0.0.1", app_name="PhotoCuller")
+        server.start()
+        try:
+            page = urllib.request.urlopen(server.url, timeout=5).read().decode("utf-8")
+        finally:
+            server.stop()
+        assert "PhotoCuller から受け取る" in page
+        # CA の置き場所はモジュール定数で差し替えられる(環境変数は触らない)
+        old = phone.CA_DIR
+        try:
+            phone.CA_DIR = tmp
+            assert phone.default_ca_dir() == tmp
+        finally:
+            phone.CA_DIR = old
+
+
+def test_phone_qr_matrix():
+    """QR の行列: 正方形で、黒と白の両方がある。"""
+    try:
+        import segno  # noqa: F401
+    except ImportError:
+        print("  (segno が無いので飛ばす)")
+        return
+    from photometa import phone
+
+    matrix = phone.qr_matrix("https://example.invalid/k/token/")
+    assert matrix and all(len(row) == len(matrix) for row in matrix)
+    flat = [cell for row in matrix for cell in row]
+    assert any(flat) and not all(flat)
+
+
 def main():
     tests = [(n, f) for n, f in globals().items() if n.startswith("test_") and callable(f)]
     failed = 0

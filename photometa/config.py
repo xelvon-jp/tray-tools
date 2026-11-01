@@ -34,7 +34,7 @@ CONFIG_PATH = os.path.join(data_dir(), "photo_ratings.json")
 # 写真メニューで、段階が無い★に付ける行（★2・★1。頭の文字は★の数）
 MENU_PLAIN_RATINGS = (2, 1)
 # 写真メニュー・絞り込みメニューで固定の意味を持つキー（設定の段階・キーワードには使えない）
-MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E"} | {str(r) for r in MENU_PLAIN_RATINGS})
+MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E", "S"} | {str(r) for r in MENU_PLAIN_RATINGS})
 FILTER_FIXED_KEYS = frozenset({"U", "E", "A"})
 
 # ★の値の範囲（-1=削除候補 / 0=未選別 / 1〜5）

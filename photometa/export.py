@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 
 from . import config as _config
 from . import filter_expr as _fe
+from . import metacache as _metacache
 from .xmp import is_photo, is_raw, read_meta
 
 # 降りないフォルダ（大文字小文字は区別しない）。extract_ で始まるものも降りない
@@ -357,12 +358,30 @@ def photo_stamp(path: str) -> str:
 
 # ------------------------------------------------------------------ フレーム用 JPEG
 
-def build_frame_jpeg(src: str, out_path: str, settings: dict) -> str:
+def photo_edits(path: str):
+    """写真の補正（crs:）を読む（読み取りキャッシュ経由。読めなければ None）。"""
+    try:
+        meta = _metacache.read_meta_cached(path)
+    except Exception:  # noqa: BLE001  補正が読めなくても同期は続ける
+        return None
+    return meta.edits if meta else None
+
+
+def _sig_with_edits(sig: dict, edits) -> dict:
+    """台帳の署名に、その写真の補正を含めたもの。補正が無ければ sig のまま
+    （既存の台帳の記録と一致し続けるので、補正の無い写真は作り直しにならない）。"""
+    if edits is None:
+        return sig
+    return dict(sig, edits=edits.signature())
+
+
+def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None) -> str:
     """フレーム用の JPEG を out_path に作る。名前に使う撮影日時（YYYYMMDD_HHMMSS）を返す。
 
     長辺を max_long_edge 以下に縮小（拡大しない・LANCZOS）、quality で保存。EXIF の向きは
     画素を回して直し、向き情報は付けない。日時のタグは残し、GPS は strip_gps なら消す
     （ほかの EXIF は付けない）。色の ICC プロファイルは残す。読めなければ例外。
+    edits（補正）があれば、縮小の前に当てる（向き→傾き→切り抜き→明るさ）。
     """
     from PIL import Image, ImageOps
 
@@ -373,9 +392,13 @@ def build_frame_jpeg(src: str, out_path: str, settings: dict) -> str:
         exif = im.getexif()
         stamp = _stamp_from_exif(exif)
         icc = im.info.get("icc_profile")
-        img = ImageOps.exif_transpose(im)
-        if img is None:
-            img = im
+        if edits is not None and not edits.is_empty():
+            from . import render
+            img = render.apply_edits(im, edits)
+        else:
+            img = ImageOps.exif_transpose(im)
+            if img is None:
+                img = im
         img.load()
         if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
             rgba = img.convert("RGBA")
@@ -739,9 +762,11 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
             except OSError:
                 result.failed.append((src, "元の写真がありません"))
                 continue
+            edits = photo_edits(src)
+            sig_i = _sig_with_edits(sig, edits)
             plans = []
             for t in states:
-                action, name = _frame_action(t, key, st, sig)
+                action, name = _frame_action(t, key, st, sig_i)
                 if action == "kept":
                     result.kept.append((os.path.join(t.dir, name), "手で差し替えられています"))
                 elif action == "unchanged":
@@ -756,7 +781,7 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 continue
             built = os.path.join(work, f"{i}.jpg")
             try:
-                stamp = build_frame_jpeg(src, built, s)
+                stamp = build_frame_jpeg(src, built, s, edits=edits)
             except Exception as e:  # noqa: BLE001  1枚の失敗で止めない
                 result.failed.append((src, f"{type(e).__name__}: {e}"))
                 continue
@@ -782,7 +807,7 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                     result.failed.append((dest, f"書けません（{e}）"))
                     continue
                 t.ledger[name] = {"source": src, "mtime_ns": st.st_mtime_ns, "size": st.st_size,
-                                  "settings": sig, "out_size": out_size}
+                                  "settings": sig_i, "out_size": out_size}
                 t.by_source[key] = name
                 t.taken.add(name.casefold())
                 (result.updated if action == "update" else result.added).append((t.dir, name, src))
@@ -917,9 +942,10 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
         except OSError:
             plan.missing.append(src)
             continue
+        sig_i = _sig_with_edits(sig, photo_edits(src))
         todo = []
         for t, out in pairs:
-            action, name = _frame_action(t, key, st, sig)
+            action, name = _frame_action(t, key, st, sig_i)
             if action == "kept":
                 out.kept.append(name)
             elif action == "unchanged":

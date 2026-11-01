@@ -11,8 +11,9 @@ from photometa.phone import (  # noqa: F401  テスト・呼び出し側は file
     AUTO_CLOSE_SECONDS, CA_CERT_FILE, CA_DIR, CA_KEY_FILE, IMAGE_EXTS,
     NAME_CONSTRAINTS, PERMITTED_DNS, PERMITTED_NETWORKS, SERVER_VALID_DAYS,
     SHARE_ALL_MAX, CA_VALID_DAYS, SHARE_CHUNK, SHARE_TYPES, ShareServer,
-    ca_cert_der, default_ca_dir, ensure_ca, ip_permitted, is_image,
-    issue_server_cert, lan_ip, qr_matrix, server_ssl_context, share_type)
+    ca_cert_der, default_ca_dir, ensure_ca, frame_strip_gps, ip_permitted,
+    is_image, issue_server_cert, lan_ip, photo_edits, qr_matrix,
+    server_ssl_context, share_type)
 
 
 # ===============================================================
@@ -53,7 +54,8 @@ def show_share_dialog(parent, paths) -> int:
     from PySide6.QtWidgets import (QDialog, QLabel, QPushButton, QVBoxLayout,
                                    QWidget)
 
-    server = ShareServer(paths)
+    server = ShareServer(paths, edits_provider=photo_edits,
+                         strip_gps=frame_strip_gps())
     server.start()
     url = server.url
     downloads = 0

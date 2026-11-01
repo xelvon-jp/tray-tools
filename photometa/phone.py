@@ -388,9 +388,15 @@ class ShareServer:
     タイマーで覗いて表示を更新する(サーバのスレッドから Qt を触らない)。"""
 
     def __init__(self, paths, use_https: bool = True, ca_dir=None, host_ip=None,
-                 app_name: str = "あっふ"):
+                 app_name: str = "あっふ", edits_provider=None, strip_gps: bool = True):
         self.files = [p for p in paths if os.path.isfile(p)]
         self.app_name = app_name
+        # 補正（crs:）のある写真は、当てた JPEG を返すための入口。edits_provider は
+        # パス → Edits | None を返す関数（無ければ従来どおり元のファイルを返す）。
+        # 描画は photometa.render（品質 92、撮影日時は残す、GPS は strip_gps で消す）。
+        self._edits_provider = edits_provider
+        self._strip_gps = strip_gps
+        self._rendered: dict[int, bytes] = {}
         self.token = secrets.token_urlsafe(18)
         self.ca_token = secrets.token_urlsafe(18)
         self.ip = host_ip or lan_ip()     # 証明書の SAN と URL で同じものを使う
@@ -467,6 +473,25 @@ class ShareServer:
         with self._lock:
             events, self.events = self.events, []
         return events
+
+    def _rendered_bytes(self, index: int):
+        """補正のある写真なら、当てた JPEG のバイト列（作れたら覚える）。
+        補正が無い・描画できないときは None（元のファイルを返す）。"""
+        if self._edits_provider is None:
+            return None
+        if index in self._rendered:
+            return self._rendered[index]
+        try:
+            edits = self._edits_provider(self.files[index])
+            if edits is None or edits.is_empty():
+                return None
+            from . import render
+            data = render.render_bytes(self.files[index], edits, quality=92,
+                                       strip_gps=self._strip_gps)
+        except Exception:  # noqa: BLE001  描画できなければ元のファイルを返す
+            return None
+        self._rendered[index] = data
+        return data
 
     def _note(self, kind: str, name: str) -> None:
         with self._lock:
@@ -576,6 +601,22 @@ class ShareServer:
                     return
                 path = server.files[index]
                 name = os.path.basename(path)
+                rendered = server._rendered_bytes(index)
+                if rendered is not None:
+                    server._note("download" if download else "view", name)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(rendered)))
+                    self.send_header(
+                        "Content-Disposition",
+                        f"{'attachment' if download else 'inline'}; "
+                        f"filename*=UTF-8''{quote(name)}")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(rendered)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 try:
                     size = os.path.getsize(path)
                     stream = open(path, "rb")
@@ -758,6 +799,29 @@ _SHARE_JS = r"""
 })();
 """
 
+
+
+def photo_edits(path: str):
+    """写真の補正（crs:）を読む（読み取りキャッシュ経由。読めなければ None）。
+    ShareServer の edits_provider として渡すための既定の関数。"""
+    from . import metacache
+    try:
+        meta = metacache.read_meta_cached(path)
+    except Exception:  # noqa: BLE001
+        return None
+    return meta.edits if meta else None
+
+
+def frame_strip_gps() -> bool:
+    """補正を当てた JPEG から GPS を消すか（共通設定 frame.strip_gps。既定は消す）。
+    フォトフレーム同期と同じ設定に合わせる。"""
+    from . import config
+    try:
+        cfg = config.load_config()
+    except Exception:  # noqa: BLE001
+        return True
+    frame = cfg.get("frame") or {}
+    return bool(frame.get("strip_gps", True))
 
 
 def qr_matrix(text: str):

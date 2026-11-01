@@ -6717,7 +6717,10 @@ class FilerWindow(QWidget):
                     continue
                 kws = e.get("keywords")
                 kws = tuple(k for k in kws if isinstance(k, str)) if isinstance(kws, list) else ()
-                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws)
+                edits = None
+                if isinstance(e.get("edits"), dict):
+                    edits = photo_metacache._text_to_edits(json.dumps(e["edits"]))
+                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws, edits)
                 metas[photo_key(e["path"])] = meta
                 # 変更記録で分かった★は永続キャッシュにも反映する(書き込みは更新日時を
                 # 戻すので、stat の照合だけでは古い値のまま当たってしまう)

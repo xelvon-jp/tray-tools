@@ -1622,6 +1622,209 @@ def test_phone_qr_matrix():
     assert any(flat) and not all(flat)
 
 
+def _crs_packet(crop=None, angle=None, exposure=None, contrast=None, saturation=None):
+    """crs: 入りの XMP パケット（属性形式）。"""
+    attrs = ['xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"']
+    if crop is not None:
+        top, left, bottom, right = crop
+        attrs += ['crs:HasCrop="True"', f'crs:CropTop="{top}"', f'crs:CropLeft="{left}"',
+                  f'crs:CropBottom="{bottom}"', f'crs:CropRight="{right}"']
+    for name, val in (("CropAngle", angle), ("Exposure2012", exposure),
+                      ("Contrast2012", contrast), ("Saturation", saturation)):
+        if val is not None:
+            attrs.append(f'crs:{name}="{val}"')
+    return ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+            'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            f'<rdf:Description rdf:about="" {" ".join(attrs)}/>'
+            "</rdf:RDF></x:xmpmeta>").encode("utf-8")
+
+
+def test_edits_parse_and_cache():
+    """crs: の読み取り（属性・要素形式）と、読み取りキャッシュでの往復・旧DB移行。"""
+    from photometa import metacache as mc
+    from photometa import xmp as px
+
+    meta = px.parse_xmp(_crs_packet(crop=(0.1, 0.2, 0.9, 0.8), angle=1.5,
+                                    exposure=0.5, contrast=-20, saturation=10))
+    assert meta is not None and meta.edits is not None
+    assert meta.edits.crop == (0.1, 0.2, 0.9, 0.8)
+    assert meta.edits.angle == 1.5 and meta.edits.exposure == 0.5
+    assert meta.edits.contrast == -20 and meta.edits.saturation == 10
+    assert meta.edits.signature() == px.Edits(
+        (0.1, 0.2, 0.9, 0.8), 1.5, 0.5, -20, 10).signature()
+    # 要素形式
+    packet = ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+              'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+              '<rdf:Description rdf:about="" '
+              'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">'
+              "<crs:Exposure2012>+1.25</crs:Exposure2012>"
+              "</rdf:Description></rdf:RDF></x:xmpmeta>").encode("utf-8")
+    assert px.parse_xmp(packet).edits.exposure == 1.25
+    # 補正が無ければ None のまま
+    plain = px.parse_xmp(b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+                         b'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                         b'<rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta>')
+    assert plain.edits is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _exif_jpeg(Path(tmp, "a.jpg"), size=(400, 300),
+                         packet=_crs_packet(crop=(0.0, 0.0, 0.5, 0.5), exposure=1.0))
+        cache = mc.MetaCache(str(Path(tmp, "c.sqlite")))
+        got = cache.read_cached(src)
+        assert got is not None and got.edits is not None
+        assert got.edits.crop == (0.0, 0.0, 0.5, 0.5) and got.edits.exposure == 1.0
+        # 旧い形（edits 列の無い DB）でも開けて、列が足される
+        old_db = Path(tmp, "old.sqlite")
+        conn = __import__("sqlite3").connect(old_db)
+        conn.execute("CREATE TABLE meta (path TEXT PRIMARY KEY, size INTEGER NOT NULL,"
+                     " mtime_ns INTEGER NOT NULL, side_size INTEGER NOT NULL,"
+                     " side_mtime_ns INTEGER NOT NULL, rating INTEGER NOT NULL,"
+                     " keywords TEXT NOT NULL)")
+        conn.commit()
+        conn.close()
+        cache2 = mc.MetaCache(str(old_db))
+        assert cache2.read_cached(src).edits.crop == (0.0, 0.0, 0.5, 0.5)
+
+
+def test_render_apply_edits():
+    """補正を当てる: 切り抜きの大きさ・位置、明るさの向き、撮影日時が残ること。"""
+    from PIL import Image
+
+    from photometa import render
+    from photometa.xmp import Edits
+
+    img = Image.new("RGB", (200, 100), (100, 100, 100))
+    img.paste((200, 200, 200), (100, 0, 200, 100))     # 右半分が明るい
+    cropped = render.apply_edits(img, Edits(crop=(0.0, 0.5, 1.0, 1.0)))
+    assert cropped.size == (100, 100)
+    assert cropped.getpixel((50, 50)) == (200, 200, 200)   # 右半分だけ残る
+    bright = render.apply_edits(img, Edits(exposure=1.0))
+    dark = render.apply_edits(img, Edits(exposure=-1.0))
+    mean = lambda im: sum(im.convert("L").getdata()) / (im.size[0] * im.size[1])  # noqa: E731
+    assert mean(bright) > mean(img) > mean(dark)
+    # 撮影日時（DateTimeOriginal）が残り、GPS は消える
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _exif_jpeg(Path(tmp, "a.jpg"), size=(200, 100))
+        out = str(Path(tmp, "out.jpg"))
+        render.render_to_jpeg(src, out, Edits(exposure=0.5), strip_gps=True)
+        with Image.open(out) as im:
+            exif = im.getexif()
+            assert exif.get_ifd(0x8769).get(0x9003) == "2024:09:03 02:23:44"
+            assert not exif.get_ifd(0x8825)
+
+
+def test_suggest_crop_from_faces():
+    """顔からのおまかせ枠: 顔を含み、縦横比が合い、写真からはみ出さない。"""
+    from photometa import render
+
+    # 中央の顔1つ（比率）。4000x3000 の写真、16:10
+    face = (0.45, 0.30, 0.10, 0.13)
+    crop = render.suggest_crop(4000, 3000, [face], 16 / 10)
+    assert crop is not None
+    top, left, bottom, right = crop
+    assert left <= face[0] and top <= face[1]
+    assert right >= face[0] + face[2] and bottom >= face[1] + face[3]
+    w_px = (right - left) * 4000
+    h_px = (bottom - top) * 3000
+    assert abs(w_px / h_px - 1.6) < 0.02, (w_px, h_px)
+    assert 0 <= top < bottom <= 1 and 0 <= left < right <= 1
+    # 端の顔でもはみ出さない
+    crop = render.suggest_crop(4000, 3000, [(0.0, 0.0, 0.08, 0.1)], 16 / 10)
+    assert crop[0] == 0 and crop[1] == 0 and crop[2] <= 1 and crop[3] <= 1
+    # 顔が無ければ提案なし
+    assert render.suggest_crop(4000, 3000, [], 16 / 10) is None
+
+
+def test_frame_sync_applies_edits():
+    """補正を変えると plan が「更新」を数え、sync が作り直す。補正なしは作り直さない。"""
+    d, src, t1, _t2, ledger = _frame_setup("frame_edits")
+    a = _exif_jpeg(src / "a.jpg", size=(400, 300),
+                   packet=_crs_packet(crop=(0.0, 0.0, 0.5, 1.0)))
+    b = _exif_jpeg(src / "b.jpg", size=(400, 300))
+    res = pe.sync_frame([a, b], [str(t1)], {}, str(ledger))
+    assert len(res.added) == 2, res
+    made = {os.path.basename(p): p for _d, p, _s in
+            [(x[0], x[1], x[2]) for x in res.added]}
+    from PIL import Image
+    with Image.open(os.path.join(str(t1), res.added[0][1])) as im:
+        pass
+    # a は縦半分に切り抜かれている（300→150 の高さ。長辺 400 はそのまま）
+    a_out = [x for x in res.added if x[2] == a][0]
+    with Image.open(os.path.join(a_out[0], a_out[1])) as im:
+        assert im.size == (400, 150), im.size
+    # 変化なしなら更新ゼロ
+    plan = pe.plan_frame_sync([a, b], [str(t1)], {}, str(ledger))
+    assert sum(len(t.updated) for t in plan.targets) == 0, plan
+    # 補正を変える（XMP を書き換え＋更新日時を進める）
+    a2 = _exif_jpeg(src / "a.jpg", size=(400, 300),
+                    packet=_crs_packet(crop=(0.0, 0.0, 0.25, 1.0)))
+    st = os.stat(a2)
+    os.utime(a2, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    plan = pe.plan_frame_sync([a, b], [str(t1)], {}, str(ledger))
+    assert sum(len(t.updated) for t in plan.targets) == 1, plan
+    res = pe.sync_frame([a, b], [str(t1)], {}, str(ledger))
+    assert len(res.updated) == 1, res
+    with Image.open(os.path.join(res.updated[0][0], res.updated[0][1])) as im:
+        assert im.size == (400, 75), im.size
+
+
+def test_phone_share_renders_edits():
+    """スマホへ送る: 補正のある写真は当てた JPEG が返り、撮影日時が残る。"""
+    import urllib.request
+
+    from photometa import phone
+    from photometa.xmp import Edits
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = _exif_jpeg(Path(tmp, "a.jpg"), size=(200, 100))
+        plain = phone.ShareServer([src], use_https=False, host_ip="127.0.0.1")
+        plain.start()
+        try:
+            body = urllib.request.urlopen(plain.url + "f/0", timeout=5).read()
+            assert body == Path(src).read_bytes()      # 補正なしは元のまま
+        finally:
+            plain.stop()
+        server = phone.ShareServer(
+            [src], use_https=False, host_ip="127.0.0.1",
+            edits_provider=lambda p: Edits(exposure=1.0))
+        server.start()
+        try:
+            resp = urllib.request.urlopen(server.url + "f/0", timeout=5)
+            body = resp.read()
+            assert resp.headers["Content-Type"] == "image/jpeg"
+            assert body != Path(src).read_bytes()
+            from PIL import Image
+            with Image.open(io.BytesIO(body)) as im:
+                assert im.getexif().get_ifd(0x8769).get(0x9003) == "2024:09:03 02:23:44"
+        finally:
+            server.stop()
+
+
+def test_writer_edits_roundtrip():
+    """ExifTool で補正を書いて読み直す（ExifTool が無ければ飛ばす）。"""
+    from photometa import writer
+    from photometa.xmp import Edits, read_meta
+
+    session = writer.open_session()
+    if session is None:
+        print("  (ExifTool が無いので飛ばす)")
+        return
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = _exif_jpeg(Path(tmp, "a.jpg"), size=(100, 80))
+            edits = Edits(crop=(0.1, 0.1, 0.9, 0.9), angle=2.0, exposure=0.75,
+                          contrast=15, saturation=-5)
+            results = session.set_edits([src], edits)
+            assert results[0].ok, results
+            got = read_meta(src)
+            assert got is not None and got.edits == edits, got
+            results = session.set_edits([src], None)
+            assert results[0].ok
+            assert read_meta(src).edits is None
+    finally:
+        session.close()
+
+
 def main():
     tests = [(n, f) for n, f in globals().items() if n.startswith("test_") and callable(f)]
     failed = 0

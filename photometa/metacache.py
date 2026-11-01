@@ -29,7 +29,7 @@ import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from . import config as _config
-from .xmp import PhotoMeta, is_raw, read_meta, sidecar_path
+from .xmp import Edits, PhotoMeta, is_raw, read_meta, sidecar_path
 
 CACHE_PATH = os.path.join(_config.data_dir(), "photometa_cache.sqlite")
 READ_WORKERS = 8                 # キャッシュに無い写真を並行して読む本数
@@ -51,6 +51,34 @@ CREATE TABLE IF NOT EXISTS meta (
 def normalize_key(path) -> str:
     """キャッシュのキー（大文字小文字・区切りをそろえたフルパス。filer.photo_key と同じ）。"""
     return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+def _edits_to_text(edits: Edits | None) -> str | None:
+    """補正を覚える形（JSON）。無ければ None。"""
+    if edits is None:
+        return None
+    return json.dumps({
+        "crop": list(edits.crop) if edits.crop is not None else None,
+        "angle": edits.angle, "exposure": edits.exposure,
+        "contrast": edits.contrast, "saturation": edits.saturation,
+    }, ensure_ascii=False)
+
+
+def _text_to_edits(text) -> Edits | None:
+    if not text:
+        return None
+    try:
+        d = json.loads(text)
+        crop = d.get("crop")
+        edits = Edits(
+            crop=tuple(float(v) for v in crop) if crop else None,
+            angle=float(d.get("angle") or 0.0),
+            exposure=float(d.get("exposure") or 0.0),
+            contrast=float(d.get("contrast") or 0.0),
+            saturation=float(d.get("saturation") or 0.0))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return None if edits.is_empty() else edits
 
 
 def _stat_key(path: str):
@@ -100,6 +128,10 @@ class MetaCache:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute(_SCHEMA)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(meta)")}
+            if "edits" not in cols:
+                # 補正（crs:）も覚える（段階2で追加。既存のキャッシュには列を足す）
+                conn.execute("ALTER TABLE meta ADD COLUMN edits TEXT")
             conn.commit()
         except (OSError, sqlite3.Error):
             return None
@@ -129,8 +161,8 @@ class MetaCache:
                 return None
             try:
                 row = conn.execute(
-                    "SELECT size, mtime_ns, side_size, side_mtime_ns, rating, keywords"
-                    " FROM meta WHERE path = ?", (normalize_key(path),)).fetchone()
+                    "SELECT size, mtime_ns, side_size, side_mtime_ns, rating, keywords,"
+                    " edits FROM meta WHERE path = ?", (normalize_key(path),)).fetchone()
             except sqlite3.Error:
                 return None
         if row is None or tuple(row[:4]) != stat_key:
@@ -139,7 +171,8 @@ class MetaCache:
             keywords = tuple(k for k in json.loads(row[5]) if isinstance(k, str))
         except (ValueError, TypeError):
             keywords = ()
-        return PhotoMeta(int(row[4]), keywords)
+        return PhotoMeta(int(row[4]), keywords,
+                         _text_to_edits(row[6] if len(row) > 6 else None))
 
     def put(self, path, meta: PhotoMeta | None) -> None:
         """読み取り結果を覚える。meta が None（不明）なら覚えず、古い値があれば消す。"""
@@ -158,10 +191,11 @@ class MetaCache:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO meta"
-                    " (path, size, mtime_ns, side_size, side_mtime_ns, rating, keywords)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " (path, size, mtime_ns, side_size, side_mtime_ns, rating, keywords,"
+                    " edits) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (normalize_key(path), *stat_key, int(meta.rating),
-                     json.dumps(list(meta.keywords), ensure_ascii=False)))
+                     json.dumps(list(meta.keywords), ensure_ascii=False),
+                     _edits_to_text(meta.edits)))
                 conn.commit()
             except sqlite3.Error:
                 pass

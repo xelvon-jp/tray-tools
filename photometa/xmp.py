@@ -38,6 +38,7 @@ _JPEG_XMP_SIG = b"http://ns.adobe.com/xap/1.0/\x00"
 _NS_RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _NS_XMP = "http://ns.adobe.com/xap/1.0/"
 _NS_DC = "http://purl.org/dc/elements/1.1/"
+_NS_CRS = "http://ns.adobe.com/camera-raw-settings/1.0/"
 _RATING = f"{{{_NS_XMP}}}Rating"
 _SUBJECT = f"{{{_NS_DC}}}subject"
 _LI = f"{{{_NS_RDF}}}li"
@@ -45,9 +46,35 @@ _DESC = f"{{{_NS_RDF}}}Description"
 
 
 @dataclass(frozen=True)
+class Edits:
+    """写真の補正（非破壊編集）。XMP の crs:（Camera Raw）名前空間に持つ。
+
+    crop は (top, left, bottom, right) で、各 0〜1 の比率（crs:CropTop など。
+    bottom/right は下端・右端の位置）。傾き angle は度（crs:CropAngle）、
+    exposure は EV（crs:Exposure2012）、contrast / saturation は -100〜100
+    （crs:Contrast2012 / crs:Saturation）。"""
+    crop: tuple[float, float, float, float] | None = None
+    angle: float = 0.0
+    exposure: float = 0.0
+    contrast: float = 0.0
+    saturation: float = 0.0
+
+    def is_empty(self) -> bool:
+        return (self.crop is None and self.angle == 0 and self.exposure == 0
+                and self.contrast == 0 and self.saturation == 0)
+
+    def signature(self) -> str:
+        """台帳の「作り方の署名」に入れる安定した文字列。"""
+        crop = "" if self.crop is None else ",".join(f"{v:.4f}" for v in self.crop)
+        return (f"crop[{crop}]a{self.angle:.2f}e{self.exposure:.2f}"
+                f"c{self.contrast:.0f}s{self.saturation:.0f}")
+
+
+@dataclass(frozen=True)
 class PhotoMeta:
     rating: int = 0                       # -1（削除候補）〜 5。書かれていなければ 0
     keywords: tuple[str, ...] = ()        # dc:subject の並び（書かれている順）
+    edits: Edits | None = None            # 補正（crs:）。無ければ None
 
 
 class _Broken(Exception):
@@ -110,7 +137,42 @@ def parse_xmp(packet: bytes | str) -> PhotoMeta | None:
         except ValueError:
             return None
         rating = max(-1, min(5, rating))
-    return PhotoMeta(rating, tuple(keywords))
+    return PhotoMeta(rating, tuple(keywords), _parse_edits(root))
+
+
+def _parse_edits(root) -> Edits | None:
+    """crs: の補正を読む（属性形式・要素形式の両方）。壊れた値は無視して None 側に倒す。"""
+    values: dict[str, str] = {}
+    for el in root.iter():
+        if el.tag == _DESC:
+            for key, val in el.attrib.items():
+                if key.startswith(f"{{{_NS_CRS}}}"):
+                    values[key[len(_NS_CRS) + 2:]] = val
+        elif el.tag.startswith(f"{{{_NS_CRS}}}"):
+            name = el.tag[len(_NS_CRS) + 2:]
+            if name not in values and el.text:
+                values[name] = el.text
+    if not values:
+        return None
+
+    def num(name: str):
+        try:
+            return float(values[name])
+        except (KeyError, ValueError):
+            return None
+
+    crop = None
+    if (values.get("HasCrop", "").strip().lower() == "true"
+            or all(k in values for k in ("CropTop", "CropLeft", "CropBottom", "CropRight"))):
+        parts = [num(k) for k in ("CropTop", "CropLeft", "CropBottom", "CropRight")]
+        if all(v is not None for v in parts):
+            crop = tuple(max(0.0, min(1.0, v)) for v in parts)
+    edits = Edits(crop=crop,
+                  angle=num("CropAngle") or 0.0,
+                  exposure=num("Exposure2012") or 0.0,
+                  contrast=num("Contrast2012") or 0.0,
+                  saturation=num("Saturation") or 0.0)
+    return None if edits.is_empty() else edits
 
 
 def _cut(data: bytes, start: bytes, end: bytes) -> bytes | None:

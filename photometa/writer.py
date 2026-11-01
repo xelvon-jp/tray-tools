@@ -71,6 +71,36 @@ def keyword_tags(keyword: str, on: bool) -> list[str]:
     return tags
 
 
+def _num(v: float) -> str:
+    s = f"{v:.6f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"
+
+
+def edits_tags(edits) -> list[str]:
+    """補正（crs:）を書く ExifTool の引数。edits が None なら補正を全部消す。"""
+    tags: list[str] = []
+    if edits is not None and edits.crop is not None:
+        top, left, bottom, right = edits.crop
+        tags.append("-XMP-crs:HasCrop=True")
+        tags += [f"-XMP-crs:CropTop={_num(top)}", f"-XMP-crs:CropLeft={_num(left)}",
+                 f"-XMP-crs:CropBottom={_num(bottom)}", f"-XMP-crs:CropRight={_num(right)}",
+                 f"-XMP-crs:CropAngle={_num(edits.angle)}"]
+    elif edits is not None and edits.angle:
+        tags.append(f"-XMP-crs:CropAngle={_num(edits.angle)}")
+    else:
+        tags.append("-XMP-crs:HasCrop=False")
+        tags += [f"-XMP-crs:{name}=" for name in
+                 ("CropTop", "CropLeft", "CropBottom", "CropRight", "CropAngle")]
+    if edits is None:
+        tags += [f"-XMP-crs:{name}=" for name in
+                 ("Exposure2012", "Contrast2012", "Saturation")]
+    else:
+        tags += [f"-XMP-crs:Exposure2012={_num(edits.exposure)}",
+                 f"-XMP-crs:Contrast2012={_num(edits.contrast)}",
+                 f"-XMP-crs:Saturation={_num(edits.saturation)}"]
+    return tags
+
+
 @dataclass
 class WriteResult:
     path: str                      # 指定された写真のパス（RAW なら RAW 本体）
@@ -303,6 +333,15 @@ class ExifToolSession:
                                     lambda xmp_only: keyword_tags(keyword, on))
                     for p in paths]
 
+    def set_edits(self, paths, edits) -> list[WriteResult]:
+        """補正（crs:）を書く。edits が None なら補正を全部消す。"""
+        if edits is not None and edits.is_empty():
+            edits = None
+        with self._lock:
+            return [self._write_one(os.fspath(p), ("edits", edits),
+                                    lambda xmp_only: edits_tags(edits))
+                    for p in paths]
+
     def restore(self, results: list[WriteResult]) -> list[WriteResult]:
         """取り消し（Z）：set_rating / set_keyword の結果から、書く前の値に戻す。
 
@@ -319,9 +358,13 @@ class ExifToolSession:
                 kw = r.op[1]
                 had = any(k.casefold() == kw.casefold() for k in r.before.keywords)
                 groups.setdefault(("keyword", kw, had), []).append(r.path)
+            elif r.op[0] == "edits":
+                groups.setdefault(("edits", r.before.edits), []).append(r.path)
         for key, paths in groups.items():
             if key[0] == "rating":
                 out += self.set_rating(paths, key[1])
+            elif key[0] == "edits":
+                out += self.set_edits(paths, key[1])
             else:
                 out += self.set_keyword(paths, key[1], key[2])
         return out
@@ -332,19 +375,28 @@ class ExifToolSession:
         meta = r.after
         if meta is None:
             return
-        append_journal(r.path, meta.rating, meta.keywords, self.journal_path)
+        append_journal(r.path, meta.rating, meta.keywords, self.journal_path,
+                       edits=meta.edits)
 
 
-def append_journal(path: str, rating: int, keywords, journal_path: str | None = None) -> None:
+def append_journal(path: str, rating: int, keywords, journal_path: str | None = None,
+                   edits=None) -> None:
     """変更記録に1行足す（書けなくても止めない）。2MB を超えていたら .old に回してから書く。"""
     jp = journal_path or JOURNAL_PATH
-    line = json.dumps({
+    entry = {
         "path": os.path.abspath(path),
         "rating": rating,
         "keywords": list(keywords),
         "time": round(time.time(), 3),
         "pid": os.getpid(),
-    }, ensure_ascii=False) + "\n"
+    }
+    if edits is not None:
+        entry["edits"] = {
+            "crop": list(edits.crop) if edits.crop is not None else None,
+            "angle": edits.angle, "exposure": edits.exposure,
+            "contrast": edits.contrast, "saturation": edits.saturation,
+        }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
     try:
         os.makedirs(os.path.dirname(jp) or ".", exist_ok=True)
         try:

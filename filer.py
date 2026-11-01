@@ -4242,7 +4242,9 @@ class FilerWindow(QWidget):
                 return True
             # 名前の既定値はフォルダ名。ルート(C:\)は basename が空なのでパスそのもの。
             default_name = os.path.basename(path.rstrip("\\/")) or path
-            name = launcher._ask_name(self, default_name)
+            # 親はピッカー。窓(self)に付けると、最前面のピッカーの裏に隠れたまま入力を
+            # 塞いでしまい、あっふ全体が操作できなくなった(2026-11-01)
+            name = launcher._ask_name(picker, default_name)
             if name is None:
                 return
             if launcher.save_bookmark(current, self.settings_path, name, path):
@@ -4255,7 +4257,7 @@ class FilerWindow(QWidget):
             if kind != launcher.KIND_JUMP:
                 return
             if not self.confirm("フォルダブックマーク", f"{name} を削除しますか？",
-                                default_yes=False):
+                                default_yes=False, parent=picker):
                 return
             if launcher.delete_bookmark(current, self.settings_path, name, path):
                 picker.set_items(build_items())
@@ -5848,9 +5850,11 @@ class FilerWindow(QWidget):
                                         QLineEdit.Password)
         return text if ok else None
 
-    def confirm(self, title: str, text: str, default_yes: bool = True) -> bool:
+    def confirm(self, title: str, text: str, default_yes: bool = True, parent=None) -> bool:
+        """parent は、最前面のピッカーから聞くときにピッカーを渡す(窓に付けるとピッカーの裏に隠れる)。"""
         default = QMessageBox.Yes if default_yes else QMessageBox.No
-        answer = QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No, default)
+        answer = QMessageBox.question(parent or self, title, text,
+                                      QMessageBox.Yes | QMessageBox.No, default)
         return answer == QMessageBox.Yes
 
     def ask_sort(self, title: str, spec):

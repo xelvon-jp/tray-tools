@@ -36,6 +36,7 @@ _TEST_TEMP = tempfile.mkdtemp(prefix="photometa_test_tmp_")
 
 from photometa import config as pc  # noqa: E402
 from photometa import filter_expr as fe  # noqa: E402
+from photometa import metacache as mc  # noqa: E402
 from photometa import writer as pw  # noqa: E402
 from photometa import xmp as px  # noqa: E402
 
@@ -1426,6 +1427,148 @@ class _FakeKeywordSession:
                 after = PhotoMeta(before.rating, before.keywords + (keyword,))
                 out.append(pw.WriteResult(p, True, before=before, after=after))
         return out
+
+
+# ------------------------------------------------------------------ metacache
+
+def test_metacache_hit_does_not_read_file():
+    """ヒットしたら読み取り関数（＝ファイルを開く処理）を呼ばない。置き場所も差し替えられる。"""
+    d = _tmpdir("cache_hit")
+    path = _make_jpeg(d / "a.jpg", _packet(4, ["旅行"]))
+    db = d / "cache.sqlite"
+    cache = mc.MetaCache(str(db))
+    assert cache.db_path == str(db)                 # 置き場所を差し替えられる
+    calls = []
+
+    def reader(p):
+        calls.append(p)
+        return px.read_meta(p)
+
+    assert cache.read_cached(path, reader) == PhotoMeta(4, ("旅行",))
+    assert len(calls) == 1 and db.exists()          # DB は指定した場所にできる
+    assert cache.read_cached(path, reader) == PhotoMeta(4, ("旅行",))
+    assert len(calls) == 1                          # 2回目はファイルを開いていない
+    assert cache.get(path) == PhotoMeta(4, ("旅行",))
+    # 読めなかったもの（None）は覚えない
+    assert cache.read_cached(str(d / "none.jpg"), reader) is None
+    assert cache.get(str(d / "none.jpg")) is None
+
+
+def test_metacache_revalidates_on_change():
+    """サイズや更新日時が変わったら読み直す。"""
+    d = _tmpdir("cache_change")
+    path = _make_jpeg(d / "a.jpg", _packet(1))
+    cache = mc.MetaCache(str(d / "cache.sqlite"))
+    calls = []
+
+    def reader(p):
+        calls.append(p)
+        return px.read_meta(p)
+
+    assert cache.read_cached(path, reader).rating == 1
+    # 中身を書き換える（サイズも更新日時も変わる）
+    _make_jpeg(path, _packet(5, ["山"]))
+    assert cache.read_cached(path, reader) == PhotoMeta(5, ("山",))
+    assert len(calls) == 2
+    # 中身は同じでも更新日時だけ変えたら読み直す
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert cache.read_cached(path, reader).rating == 5
+    assert len(calls) == 3
+
+
+def test_metacache_raw_sidecar():
+    """RAW はサイドカーの変化でも読み直す（サイドカーが後から作られた場合も）。"""
+    d = _tmpdir("cache_raw")
+    raw = d / "r.ARW"
+    raw.write_bytes(b"II*\x00dummy raw")
+    cache = mc.MetaCache(str(d / "cache.sqlite"))
+    assert cache.read_cached(str(raw)) == PhotoMeta()
+    (d / "r.xmp").write_bytes(_packet(5))
+    assert cache.read_cached(str(raw)) == PhotoMeta(5, ())
+    (d / "r.xmp").write_bytes(_packet(3, ["海"]))
+    st = os.stat(d / "r.xmp")
+    os.utime(d / "r.xmp", ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert cache.read_cached(str(raw)) == PhotoMeta(3, ("海",))
+
+
+def test_metacache_update_overrides_stat_match():
+    """書き込み後（更新日時は元に戻る）の値は、update でキャッシュに反映される。"""
+    d = _tmpdir("cache_update")
+    path = _make_jpeg(d / "a.jpg", _packet(1))
+    cache = mc.MetaCache(str(d / "cache.sqlite"))
+    assert cache.read_cached(path).rating == 1
+    cache.update(path, PhotoMeta(5, ("みてね済",)))
+    assert cache.get(path) == PhotoMeta(5, ("みてね済",))
+    assert cache.read_cached(path) == PhotoMeta(5, ("みてね済",))   # ファイルは★1のまま
+    cache.update(path, None)                        # 読み直せなかったら古い値を消す
+    assert cache.get(path) is None
+
+
+def test_metacache_writer_session_updates():
+    """ExifToolSession（metacache 付き）で書くと、キャッシュも新しい値になる。"""
+    exe = _exiftool()
+    if not exe:
+        print("skip  test_metacache_writer_session_updates: ExifTool が見つかりません")
+        return
+    d = _tmpdir("cache_writer")
+    path = _make_jpeg(d / "a.jpg", _packet(1))
+    cache = mc.MetaCache(str(d / "cache.sqlite"))
+    assert cache.read_cached(path).rating == 1
+    jp = os.path.join(_TEST_TEMP, "cache_writer.jsonl")
+    with pw.ExifToolSession(exe, journal_path=jp, metacache=cache) as et:
+        res = et.set_rating([path], 4)
+    assert res[0].ok, res[0].error
+    # ファイルの更新日時は書き込み前のまま（writer が戻す）でも、キャッシュは★4
+    assert cache.get(path) == PhotoMeta(4, ())
+    assert cache.read_cached(path).rating == 4
+
+
+def test_metacache_two_connections():
+    """2つの接続（＝2プロセス相当）から同時に使っても壊れない。"""
+    import threading
+    d = _tmpdir("cache_two")
+    paths = [_make_jpeg(d / f"p{i}.jpg", _packet(i % 6)) for i in range(12)]
+    db = str(d / "cache.sqlite")
+    errors = []
+
+    def work(cache):
+        try:
+            for _ in range(10):
+                for p in paths:
+                    cache.read_cached(p)
+                    cache.put(p, PhotoMeta(2, ()))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    caches = [mc.MetaCache(db), mc.MetaCache(db)]
+    threads = [threading.Thread(target=work, args=(c,)) for c in caches]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert caches[0].get(paths[0]) == PhotoMeta(2, ())
+    assert caches[1].get(paths[3]) == PhotoMeta(2, ())
+
+
+def test_metacache_read_metas_parallel():
+    """read_metas: 並行して読んでも結果が正しく、2回目は全部キャッシュで済む。中止も効く。"""
+    import threading
+    d = _tmpdir("cache_parallel")
+    paths = [_make_jpeg(d / f"p{i}.jpg", _packet(i % 6)) for i in range(10)]
+    cache = mc.MetaCache(str(d / "cache.sqlite"))
+    results, hits, reads, cancelled = mc.read_metas(paths, cache=cache)
+    assert not cancelled and hits == 0 and reads == len(paths)
+    assert all(results[p] == PhotoMeta(i % 6, ()) for i, p in enumerate(paths))
+    results, hits, reads, cancelled = mc.read_metas(paths, cache=cache)
+    assert hits == len(paths) and reads == 0 and not cancelled
+    # 中止（最初から立っている）→ 何も読まない
+    cancel = threading.Event()
+    cancel.set()
+    results, hits, reads, cancelled = mc.read_metas(
+        paths, cache=mc.MetaCache(str(d / "other.sqlite")), cancel=cancel)
+    assert cancelled and reads == 0 and results == {}
 
 
 # ------------------------------------------------------------------ 実行器

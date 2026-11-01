@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import config as _config
+from . import metacache as _metacache
 from .xmp import PhotoMeta, is_photo, is_raw, read_meta, sidecar_path
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -101,10 +102,14 @@ class ExifToolSession:
     """
 
     def __init__(self, exe: str, timeout: float = 60.0, journal_path: str | None = None,
-                 popen=subprocess.Popen):
+                 popen=subprocess.Popen, metacache=None):
         self.exe = exe
         self.timeout = timeout
         self.journal_path = journal_path
+        # ★の読み取りキャッシュ（metacache.MetaCache）。書き込みは更新日時を元に戻すので、
+        # 成功したらキャッシュも新しい値に直す。None なら触らない（open_session は
+        # 既定のキャッシュを渡す。直接作るテスト等は実キャッシュを汚さない）。
+        self._metacache = metacache
         self._popen = popen
         self._proc = None
         self._out: queue.Queue | None = None
@@ -269,6 +274,11 @@ class ExifToolSession:
             except OSError:
                 pass
         after = read_meta(path) if ok else None
+        if ok and self._metacache is not None:
+            try:
+                self._metacache.update(path, after)
+            except Exception:  # noqa: BLE001  キャッシュを直せなくても書き込みは成功
+                pass
         result = WriteResult(path, ok, err, before=before, after=after, note=note, op=op)
         if ok:
             self._journal(result)
@@ -414,7 +424,14 @@ class JournalReader:
 
 
 def open_session(config: dict | None = None, **kwargs) -> ExifToolSession | None:
-    """設定（無ければ共通設定ファイル）から ExifTool を探してセッションを作る。見つからなければ None。"""
+    """設定（無ければ共通設定ファイル）から ExifTool を探してセッションを作る。見つからなければ None。
+
+    書き込みの成功時に★の読み取りキャッシュも直すよう、既定のキャッシュを渡す
+    （metacache=None を明示すれば無効にできる）。
+    """
     cfg = config if config is not None else _config.load_config()
     exe = _config.find_exiftool(cfg)
-    return ExifToolSession(exe, **kwargs) if exe else None
+    if not exe:
+        return None
+    kwargs.setdefault("metacache", _metacache.default_cache())
+    return ExifToolSession(exe, **kwargs)

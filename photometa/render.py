@@ -8,6 +8,8 @@
 # 計算は Lightroom と同じではない簡易なもの:
 #   明るさ   … Exposure2012 を EV として 2**EV 倍
 #   コントラスト・彩度 … (100 + 値) / 100 倍（-100〜100 → 0〜2 倍）
+#   色温度・色合い … チャンネルごとの利得（色温度 + で R を上げ B を下げる、
+#                    色合い + で G を下げる＝マゼンタ寄り）
 #   傾き     … CropAngle 度だけ反時計回りに回す（Pillow の rotate は反時計が正。
 #              Lightroom の CropAngle は「写真を時計回りに回して真っ直ぐにする」
 #              向きなので、符号を反転して渡す）。回した四隅の余白は切り落とさず
@@ -56,7 +58,31 @@ def apply_edits(image, edits: Edits | None):
         img = ImageEnhance.Contrast(img).enhance((100.0 + edits.contrast) / 100.0)
     if edits.saturation:
         img = ImageEnhance.Color(img).enhance((100.0 + edits.saturation) / 100.0)
+    if edits.temperature or edits.tint:
+        img = _white_balance(img, edits.temperature, edits.tint)
     return img
+
+
+def _white_balance(img, temperature: float, tint: float):
+    """色温度・色合い（各 -100〜100）をチャンネルの利得で当てる。
+
+    色被りの補正用。色温度 + で暖かく（R を上げ B を下げる）、
+    色合い + でマゼンタ寄り（G を下げる）、- で緑寄り。
+    """
+    from PIL import Image
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    tr = temperature / 100.0
+    ti = tint / 100.0
+    gains = (1.0 + 0.30 * tr + 0.08 * ti,
+             1.0 - 0.12 * ti,
+             1.0 - 0.38 * tr + 0.08 * ti)
+    out = []
+    for channel, gain in zip(img.split(), gains):
+        lut = [min(255, max(0, round(v * gain))) for v in range(256)]
+        out.append(channel.point(lut))
+    return Image.merge("RGB", out)
 
 
 def _kept_exif(im, strip_gps: bool):

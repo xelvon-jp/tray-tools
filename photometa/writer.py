@@ -93,11 +93,16 @@ def edits_tags(edits) -> list[str]:
                  ("CropTop", "CropLeft", "CropBottom", "CropRight", "CropAngle")]
     if edits is None:
         tags += [f"-XMP-crs:{name}=" for name in
-                 ("Exposure2012", "Contrast2012", "Saturation")]
+                 ("Exposure2012", "Contrast2012", "Saturation",
+                  "Temperature", "TemperatureUnit", "Tint")]
     else:
         tags += [f"-XMP-crs:Exposure2012={_num(edits.exposure)}",
                  f"-XMP-crs:Contrast2012={_num(edits.contrast)}",
-                 f"-XMP-crs:Saturation={_num(edits.saturation)}"]
+                 f"-XMP-crs:Saturation={_num(edits.saturation)}",
+                 # 色温度は相対値の形（TemperatureUnit=1）で書く
+                 "-XMP-crs:TemperatureUnit=1",
+                 f"-XMP-crs:Temperature={_num(edits.temperature)}",
+                 f"-XMP-crs:Tint={_num(edits.tint)}"]
     return tags
 
 
@@ -395,6 +400,7 @@ def append_journal(path: str, rating: int, keywords, journal_path: str | None = 
             "crop": list(edits.crop) if edits.crop is not None else None,
             "angle": edits.angle, "exposure": edits.exposure,
             "contrast": edits.contrast, "saturation": edits.saturation,
+            "temperature": edits.temperature, "tint": edits.tint,
         }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     try:

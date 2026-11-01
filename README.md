@@ -2321,7 +2321,7 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 | `photometa/writer.py` | ExifTool を常駐させて書く（`ExifToolSession.set_rating` / `set_keyword` / `restore`）。変更記録の読み書き（`JournalReader`） |
 | `photometa/metacache.py` | ★の読み取り結果の永続キャッシュ（SQLite。`MetaCache.read_cached` / `read_metas`。下の「読み取りキャッシュ」） |
 | `photometa/phone.py` | スマホへ送るのサーバとローカル CA（`ShareServer` / `qr_matrix`。Qt に依存しない。画面は あっふ が `filer_phone.py`、PhotoCuller が自前で持つ。CA の置き場所 `phone_ca` は両アプリ共通） |
-| `photometa/render.py` | 補正（XMP の `crs:`。トリミング・傾き・明るさ・コントラスト・彩度）を画素に当てる（`apply_edits` / `render_to_jpeg`。Qt に依存しない）。元の写真は書き換えず、フォトフレーム同期とスマホへ送るときにその場で当てる。計算は Lightroom と同じではない簡易なもの（明るさは EV の 2 のべき乗、コントラスト・彩度は (100+値)/100 倍）で、写りが完全には一致しません。補正の読み書きは `xmp.py`（`PhotoMeta.edits`）と `writer.py`（`set_edits`）、画面は PhotoCuller の `I` → `T` |
+| `photometa/render.py` | 補正（XMP の `crs:`。トリミング・傾き・明るさ・コントラスト・彩度・色温度・色合い）を画素に当てる（`apply_edits` / `render_to_jpeg`。Qt に依存しない）。元の写真は書き換えず、フォトフレーム同期とスマホへ送るときにその場で当てる。計算は Lightroom と同じではない簡易なもの（明るさは EV の 2 のべき乗、コントラスト・彩度は (100+値)/100 倍、色温度・色合いはチャンネルごとの利得）で、写りが完全には一致しません。補正の読み書きは `xmp.py`（`PhotoMeta.edits`）と `writer.py`（`set_edits`）、画面は PhotoCuller の `I` → `T` |
 | `photometa/config.py` | 共通設定の読み書き、写真メニュー（`menu_items`。PhotoCuller の `I`）・絞り込みの小メニュー（`filter_menu_items`。PhotoCuller の `I` → `/`）・書き出しの小メニュー（`export_menu_items`。PhotoCuller の `I` → `E`）の中身 |
 | `photometa/filter_expr.py` | 条件式（PhotoCuller の表示フィルタを拡張したもの。下の表） |
 | `photometa/export.py` | 書き出し（`collect` / `sync_frame` / `collect_mitene` / `finish_mitene`。PhotoCuller の `I` → `E` から使う。下の「書き出し」） |

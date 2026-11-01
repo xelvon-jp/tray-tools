@@ -1698,6 +1698,12 @@ def test_render_apply_edits():
     cropped = render.apply_edits(img, Edits(crop=(0.0, 0.5, 1.0, 1.0)))
     assert cropped.size == (100, 100)
     assert cropped.getpixel((50, 50)) == (200, 200, 200)   # 右半分だけ残る
+    # 色温度 + で R が増え B が減る（暖かく）。色合い + で G が減る（マゼンタ寄り）
+    warm = render.apply_edits(img, Edits(temperature=100))
+    r, g, b = warm.getpixel((10, 10))
+    assert r > 100 and b < 100, (r, g, b)
+    magenta = render.apply_edits(img, Edits(tint=100))
+    assert magenta.getpixel((10, 10))[1] < 100
     bright = render.apply_edits(img, Edits(exposure=1.0))
     dark = render.apply_edits(img, Edits(exposure=-1.0))
     mean = lambda im: sum(im.convert("L").getdata()) / (im.size[0] * im.size[1])  # noqa: E731
@@ -1850,7 +1856,7 @@ def test_writer_edits_roundtrip():
         with tempfile.TemporaryDirectory() as tmp:
             src = _exif_jpeg(Path(tmp, "a.jpg"), size=(100, 80))
             edits = Edits(crop=(0.1, 0.1, 0.9, 0.9), angle=2.0, exposure=0.75,
-                          contrast=15, saturation=-5)
+                          contrast=15, saturation=-5, temperature=30, tint=-10)
             results = session.set_edits([src], edits)
             assert results[0].ok, results
             got = read_meta(src)

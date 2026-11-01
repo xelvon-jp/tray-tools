@@ -61,6 +61,7 @@ def _edits_to_text(edits: Edits | None) -> str | None:
         "crop": list(edits.crop) if edits.crop is not None else None,
         "angle": edits.angle, "exposure": edits.exposure,
         "contrast": edits.contrast, "saturation": edits.saturation,
+        "temperature": edits.temperature, "tint": edits.tint,
     }, ensure_ascii=False)
 
 
@@ -75,7 +76,9 @@ def _text_to_edits(text) -> Edits | None:
             angle=float(d.get("angle") or 0.0),
             exposure=float(d.get("exposure") or 0.0),
             contrast=float(d.get("contrast") or 0.0),
-            saturation=float(d.get("saturation") or 0.0))
+            saturation=float(d.get("saturation") or 0.0),
+            temperature=float(d.get("temperature") or 0.0),
+            tint=float(d.get("tint") or 0.0))
     except (ValueError, TypeError, AttributeError):
         return None
     return None if edits.is_empty() else edits

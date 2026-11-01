@@ -52,22 +52,28 @@ class Edits:
     crop は (top, left, bottom, right) で、各 0〜1 の比率（crs:CropTop など。
     bottom/right は下端・右端の位置）。傾き angle は度（crs:CropAngle）、
     exposure は EV（crs:Exposure2012）、contrast / saturation は -100〜100
-    （crs:Contrast2012 / crs:Saturation）。"""
+    （crs:Contrast2012 / crs:Saturation）。temperature（色温度）と tint（色合い）は
+    色被りの補正で -100〜100（crs:Temperature（相対値。TemperatureUnit=1）/
+    crs:Tint）。"""
     crop: tuple[float, float, float, float] | None = None
     angle: float = 0.0
     exposure: float = 0.0
     contrast: float = 0.0
     saturation: float = 0.0
+    temperature: float = 0.0
+    tint: float = 0.0
 
     def is_empty(self) -> bool:
         return (self.crop is None and self.angle == 0 and self.exposure == 0
-                and self.contrast == 0 and self.saturation == 0)
+                and self.contrast == 0 and self.saturation == 0
+                and self.temperature == 0 and self.tint == 0)
 
     def signature(self) -> str:
         """台帳の「作り方の署名」に入れる安定した文字列。"""
         crop = "" if self.crop is None else ",".join(f"{v:.4f}" for v in self.crop)
         return (f"crop[{crop}]a{self.angle:.2f}e{self.exposure:.2f}"
-                f"c{self.contrast:.0f}s{self.saturation:.0f}")
+                f"c{self.contrast:.0f}s{self.saturation:.0f}"
+                f"t{self.temperature:.0f}u{self.tint:.0f}")
 
 
 @dataclass(frozen=True)
@@ -167,11 +173,18 @@ def _parse_edits(root) -> Edits | None:
         parts = [num(k) for k in ("CropTop", "CropLeft", "CropBottom", "CropRight")]
         if all(v is not None for v in parts):
             crop = tuple(max(0.0, min(1.0, v)) for v in parts)
+    # 色温度は相対値（TemperatureUnit=1。JPEG など非 RAW で Lightroom が使う形）の
+    # ときだけ読む。絶対値（ケルビン）のものは基準が分からないので読み替えない
+    temperature = 0.0
+    if (values.get("TemperatureUnit", "").strip() == "1"):
+        temperature = num("Temperature") or 0.0
     edits = Edits(crop=crop,
                   angle=num("CropAngle") or 0.0,
                   exposure=num("Exposure2012") or 0.0,
                   contrast=num("Contrast2012") or 0.0,
-                  saturation=num("Saturation") or 0.0)
+                  saturation=num("Saturation") or 0.0,
+                  temperature=temperature,
+                  tint=num("Tint") or 0.0)
     return None if edits.is_empty() else edits
 
 

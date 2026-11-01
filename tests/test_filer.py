@@ -5505,6 +5505,46 @@ def test_window_renemo_block_and_gutter():
         d.close()
 
 
+def test_window_renemo_maximize_and_drag_scroll():
+    """Renemo: 最大化ボタンがあること。矩形のドラッグが欄の下へ出たら送って伸ばすこと。"""
+    import filer_renemo as rm
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtGui import QFont
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    items = [{"folder": "C:\\x", "name": f"DSC{i:04}.jpg", "is_dir": False, "size": 1, "mtime": 0}
+             for i in range(200)]
+    existing = {"C:\\x": {i["name"] for i in items}}
+    d = rm.RenemoWindow(None, items, existing, font=QFont("Consolas", 14))
+    assert d.windowFlags() & Qt.WindowMaximizeButtonHint
+    d.resize(600, 400)
+    d.show()
+    try:
+        ed = d.editor
+        vp = ed.viewport()
+        bar = ed.verticalScrollBar()
+        assert bar.maximum() > 0 and bar.value() == 0
+        QTest.mousePress(vp, Qt.LeftButton, Qt.AltModifier, QPoint(80, 5))
+        QTest.mouseMove(vp, QPoint(80, vp.height() + 60))
+        for _ in range(5):
+            ed._auto_scroll()       # タイマーの代わりに直接回す
+        assert ed._scroll_timer.isActive()
+        assert bar.value() > 0
+        first, last = ed.block_rows()[0], ed.block_rows()[-1]
+        assert first == 0 and last > 10      # 見えていなかった行まで伸びた
+        QTest.mouseRelease(vp, Qt.LeftButton, Qt.AltModifier, QPoint(80, vp.height() + 60))
+        assert not ed._scroll_timer.isActive()
+        # 欄の中へ戻れば送るのをやめる
+        QTest.mousePress(vp, Qt.LeftButton, Qt.AltModifier, QPoint(80, 5))
+        QTest.mouseMove(vp, QPoint(80, vp.height() + 60))
+        QTest.mouseMove(vp, QPoint(80, 20))
+        assert not ed._scroll_timer.isActive()
+        QTest.mouseRelease(vp, Qt.LeftButton, Qt.AltModifier, QPoint(80, 20))
+    finally:
+        d.close()
+
+
 # ---------------------------------------------------------------
 # Ctrl+Enter の拡張子ごとのメニュー(filer_extmenu.py)
 # ---------------------------------------------------------------

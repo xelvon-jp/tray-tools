@@ -16,7 +16,7 @@
 import os
 import time
 
-from PySide6.QtCore import QEvent, QFileInfo, QRect, QSize, Qt
+from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -98,6 +98,12 @@ class RenameEdit(QPlainTextEdit):
         self._block = None
         self._block_drag = False
         self._row_selections = []   # 窓側の行ハイライト(編集済み・問題あり)
+        # 矩形のドラッグが欄の外へ出たら、出た向きへ少しずつ送る(離すまで続ける)。
+        # マウスを止めていても送れるよう、移動のイベントではなくタイマーで回す。
+        self._drag_pos = None
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(40)
+        self._scroll_timer.timeout.connect(self._auto_scroll)
 
     def gutter_width(self) -> int:
         digits = len(str(max(1, self.blockCount())))
@@ -298,10 +304,12 @@ class RenameEdit(QPlainTextEdit):
 
     def mouseMoveEvent(self, event):
         if self._block_drag:
-            cursor = self.cursorForPosition(event.pos())
-            self._block[2] = cursor.blockNumber()
-            self._block[3] = cursor.positionInBlock()
-            self._apply_selections()
+            self._drag_pos = event.pos()
+            self._extend_block(self._drag_pos)
+            if self.viewport().rect().contains(self._drag_pos):
+                self._scroll_timer.stop()
+            elif not self._scroll_timer.isActive():
+                self._scroll_timer.start()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -309,9 +317,44 @@ class RenameEdit(QPlainTextEdit):
     def mouseReleaseEvent(self, event):
         if self._block_drag:
             self._block_drag = False
+            self._scroll_timer.stop()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _extend_block(self, pos) -> None:
+        """矩形の端を pos(欄の座標)の文字へ。欄の外なら欄の縁で測る。"""
+        rect = self.viewport().rect()
+        inside = QPoint(min(max(pos.x(), rect.left()), rect.right()),
+                        min(max(pos.y(), rect.top()), rect.bottom()))
+        cursor = self.cursorForPosition(inside)
+        self._block[2] = cursor.blockNumber()
+        self._block[3] = cursor.positionInBlock()
+        self._apply_selections()
+
+    def _auto_scroll(self) -> None:
+        """矩形のドラッグ中にマウスが欄の外にあれば、その向きへ送って端を伸ばす。
+        離れているほど速く送る(縦は行、横はおよそ文字の幅の単位)。"""
+        if not self._block_drag or self._drag_pos is None or self._block is None:
+            self._scroll_timer.stop()
+            return
+        rect = self.viewport().rect()
+        pos = self._drag_pos
+        dy = (pos.y() - rect.bottom() if pos.y() > rect.bottom()
+              else pos.y() - rect.top() if pos.y() < rect.top() else 0)
+        dx = (pos.x() - rect.right() if pos.x() > rect.right()
+              else pos.x() - rect.left() if pos.x() < rect.left() else 0)
+        if not dx and not dy:
+            self._scroll_timer.stop()
+            return
+        if dy:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() + (1 + abs(dy) // 20) * (1 if dy > 0 else -1))
+        if dx:
+            bar = self.horizontalScrollBar()
+            step = QFontMetrics(self.font()).horizontalAdvance("0")
+            bar.setValue(bar.value() + step * (1 + abs(dx) // 20) * (1 if dx > 0 else -1))
+        self._extend_block(pos)
 
     def _block_key(self, event) -> bool:
         """矩形が生きている間のキー。処理したら True。
@@ -435,6 +478,9 @@ class RenemoWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("一括改名（Renemo風）")
         self.setObjectName("renemo")
+        # ファイルが多いと縦に足りないので、最大化できるようにする(QDialog は既定で
+        # 最大化ボタンを持たない)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         # Renemo と同じ白地の配色(この窓だけ。エディタとして読みやすさを優先)。
         self.setStyleSheet(
             "#renemo { background-color: #f0f0f0; }"

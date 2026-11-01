@@ -7025,19 +7025,50 @@ def test_photo_mode_window_and_rating_column():
             assert hh.sectionPosition(filer.COL_EXT) < hh.sectionPosition(filer.COL_RATING) \
                 < hh.sectionPosition(filer.COL_SIZE)
             texts = _rating_texts(L)
-            assert texts["a5.jpg"] == "★5" and texts["b4.jpg"] == "★4"
-            assert texts["c3.jpg"] == "★3済" and texts["d_reject.jpg"] == "✖"
+            assert texts["a5.jpg"] == "みてね用" and texts["b4.jpg"] == "フォトフレーム用"
+            assert texts["c3.jpg"] == "ベストショット 済" and texts["d_reject.jpg"] == "❌削除候補"
             assert texts["e_none.jpg"] == "" and texts["memo.txt"] == "" and texts["sub"] == ""
+            # 描くのは段階ごとの角丸バッジ(文字・色の種類・みてね済の ✓)。ツールチップは正式名
+            badges = {e.name: L.model.data(L.model.index(row, filer.COL_RATING), filer.BADGE_ROLE)
+                      for row, e in enumerate(L.entries)}
+            assert badges["a5.jpg"] == ("💌 みてね", "rating_5", False)
+            assert badges["b4.jpg"] == ("🖼️ フレーム", "rating_4", False)
+            assert badges["c3.jpg"] == ("⭐ ベスト", "rating_3", True)
+            assert badges["d_reject.jpg"] == ("❌ 削除", "rating_reject", False)
+            assert badges["e_none.jpg"] is None and badges["memo.txt"] is None
+            assert badges["sub"] is None and badges[".."] is None
+            tip = lambda n: L.model.data(  # noqa: E731
+                L.model.index(L._row_of(n), filer.COL_RATING), Qt.ToolTipRole)
+            assert tip("c3.jpg") == "ベストショット 済" and tip("e_none.jpg") is None
+            # 列の幅はバッジの字(RATING_BADGE_PX)で測る。正式名の幅より狭い
+            from PySide6.QtGui import QFontMetrics
+            assert L._col_widths[filer.COL_RATING] < QFontMetrics(L.pane_font).horizontalAdvance(
+                "フォトフレーム用 済")
+            assert filer.rating_badge_font(L.pane_font).pixelSize() == filer.RATING_BADGE_PX
+            # バッジは delegate が描く(落ちずに描けること)
+            L.view.viewport().repaint()
             # 段階ごとの色
             entry = lambda n: L.entries[L._row_of(n)]  # noqa: E731
             assert L.text_color(entry("a5.jpg"), filer.COL_RATING) == filer.DEFAULT_COLORS["rating_5"]
             assert L.text_color(entry("b4.jpg"), filer.COL_RATING) == filer.DEFAULT_COLORS["rating_4"]
             assert L.text_color(entry("d_reject.jpg"), filer.COL_RATING) \
                 == filer.DEFAULT_COLORS["rating_reject"]
+            # 未選別でみてね済だけなら ✓ だけ。★1・★2 は灰色のバッジ
+            from photometa import xmp as _xmp
+            key = filer.photo_key(L.entry_path(entry("e_none.jpg")))
+            saved = L.photo_meta[key]
+            try:
+                L.photo_meta[key] = _xmp.PhotoMeta(0, ("みてね済",))
+                assert L.rating_badge(entry("e_none.jpg")) == ("", "rating_other", True)
+                L.photo_meta[key] = _xmp.PhotoMeta(2, ())
+                assert L.rating_badge(entry("e_none.jpg")) == ("★2", "rating_other", False)
+                L.view.viewport().repaint()
+            finally:
+                L.photo_meta[key] = saved
             # 写真のボタン段(写真フォルダモードの窓だけ。フォーカスを取らない)
             assert L.photo_bar.isVisible() and not R.photo_bar.isVisible()
             assert [b.text() for b in L.photo_buttons] == [
-                "★5 みてね", "★4 フレーム", "★3 ベスト", "★外す", "✖ 削除候補", "済", "絞り込み▾"]
+                "★5 みてね", "★4 フレーム", "★3 ベスト", "★外す", "❌ 削除候補", "済", "絞り込み▾"]
             assert all(b.focusPolicy() == Qt.NoFocus for b in L.photo_buttons)
             # 窓が狭いときは ★ の列を拡張子より先に隠す(日時 → サイズ → ★ → 拡張子)
             name_min = L._name_min
@@ -7074,12 +7105,12 @@ def test_photo_mode_window_and_rating_column():
             w._exec_menu = lambda m, c: "photo_on"
             QTest.keyClick(L.view, Qt.Key_Z, Qt.ShiftModifier)
             assert L.photo_mode
-            _wait_until(lambda: _rating_texts(L).get("one.jpg") == "★5", what="sub の★")
+            _wait_until(lambda: _rating_texts(L).get("one.jpg") == "みてね用", what="sub の★")
             QTest.keyClick(L.view, Qt.Key_Backspace)
             _wait(w)
             assert core.same_dir(L.path, photos)
             assert L.photo_override == "auto" and L.photo_mode
-            _wait_until(lambda: _rating_texts(L).get("a5.jpg") == "★5", what="戻ったあとの★")
+            _wait_until(lambda: _rating_texts(L).get("a5.jpg") == "みてね用", what="戻ったあとの★")
         finally:
             w.close()
             w.deleteLater()
@@ -7111,7 +7142,7 @@ def test_photo_menu_targets_and_write():
             assert len(seen[-1][1]) == 1 and seen[-1][1][0].startswith("&5:")
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 4)
             _wait_until(lambda: "★4 を 1 枚に付けました" in log(), what="書き込みのログ")
-            assert _rating_texts(L)["a5.jpg"] == "★4"
+            assert _rating_texts(L)["a5.jpg"] == "フォトフレーム用"
 
             # マーク中のファイル(写真でないものは飛ばしてログに件数)。実行後はマークを解く
             L.marks.update({"b4.jpg", "c3.jpg", "memo.txt"})
@@ -7122,7 +7153,7 @@ def test_photo_menu_targets_and_write():
             assert "写真ではないもの 1 件を飛ばしました" in log()
             assert not L.marks
             _wait_until(lambda: "★5 を 2 枚に付けました" in log(), what="2枚のログ")
-            assert _rating_texts(L)["b4.jpg"] == "★5" and _rating_texts(L)["c3.jpg"] == "★5済"
+            assert _rating_texts(L)["b4.jpg"] == "みてね用" and _rating_texts(L)["c3.jpg"] == "みてね用 済"
 
             # 失敗したものは表示を戻して理由を出す
             L.marks.update({"d_reject.jpg", "e_none.jpg"})
@@ -7130,20 +7161,20 @@ def test_photo_menu_targets_and_write():
             QTest.keyClick(L.view, Qt.Key_I)
             _wait_until(lambda: "★3 を 1 枚に付けました（失敗 1：読み取り専用です）" in log(),
                         what="失敗のログ")
-            assert _rating_texts(L)["d_reject.jpg"] == "✖" and _rating_texts(L)["e_none.jpg"] == "★3"
+            assert _rating_texts(L)["d_reject.jpg"] == "❌削除候補" and _rating_texts(L)["e_none.jpg"] == "ベストショット"
 
             # K: 全部に付いていれば外す、そうでなければ付ける
             L.marks.update({"b4.jpg", "c3.jpg"})
             picks.append("&K:")
             QTest.keyClick(L.view, Qt.Key_I)
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", True)
-            _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "★5済", what="キーワードが付く")
+            _wait_until(lambda: _rating_texts(L)["b4.jpg"] == "みてね用 済", what="キーワードが付く")
             L.marks.update({"b4.jpg", "c3.jpg"})
             picks.append("&K:")
             QTest.keyClick(L.view, Qt.Key_I)
             assert any(t.startswith("&K:") for t in seen[-1][1])     # 全部に付いている印
             assert fake.calls[-1] == ("keyword", [path("b4.jpg"), path("c3.jpg")], "みてね済", False)
-            _wait_until(lambda: _rating_texts(L)["c3.jpg"] == "★5", what="キーワードが外れる")
+            _wait_until(lambda: _rating_texts(L)["c3.jpg"] == "みてね用", what="キーワードが外れる")
 
             # フォルダの上では対象なし(書かない)
             n = len(fake.calls)
@@ -7157,25 +7188,28 @@ def test_photo_menu_targets_and_write():
             L.set_cursor(L._row_of("e_none.jpg"))
             w.press_photo_button(L, ("rating", -1))
             assert fake.calls[-1] == ("rating", [path("e_none.jpg")], -1)
-            _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "✖", what="ボタンの書き込み")
+            _wait_until(lambda: _rating_texts(L)["e_none.jpg"] == "❌削除候補", what="ボタンの書き込み")
 
             # 画像ビュア(F3)の間: マークが無ければ表示中の1枚。隅に★
             L.set_cursor(L._row_of("a5.jpg"))
             w.run_command("preview_toggle")
             _wait_until(lambda: w.preview_widget is not None
-                        and w.preview_widget.rating.text() == "★4", what="ビュアの★")
+                        and w.preview_widget.rating.text() == "🖼️ フォトフレーム用", what="ビュアの★")
+            # 一覧のバッジと同じ色の角丸
+            sheet = w.preview_widget.rating.styleSheet()
+            assert filer.DEFAULT_COLORS["rating_4_bg"] in sheet and "border-radius" in sheet
             picks.append("&5:")
             QTest.keyClick(L.view, Qt.Key_I)
             assert seen[-1][0] == "写真の★（1枚）"
             assert fake.calls[-1] == ("rating", [path("a5.jpg")], 5)
-            _wait_until(lambda: w.preview_widget.rating.text() == "★5", what="ビュアの★の更新")
+            _wait_until(lambda: w.preview_widget.rating.text() == "💌 みてね用", what="ビュアの★の更新")
             # ビュアで見ながらマークしたら、マークした全部(ビュア中でもマーク優先)
             L.marks.update({"a5.jpg", "b4.jpg"})
             picks.append("&3:")
             QTest.keyClick(L.view, Qt.Key_I)
             assert seen[-1][0] == "写真の★（2枚）", seen[-1]
             assert fake.calls[-1] == ("rating", [path("a5.jpg"), path("b4.jpg")], 3)
-            _wait_until(lambda: w.preview_widget.rating.text() == "★3", what="ビュアの★の更新")
+            _wait_until(lambda: w.preview_widget.rating.text() == "⭐ ベストショット", what="ビュアの★の更新")
             w.preview_off()
 
             # ExifTool の書き込み途中の一時ファイル(名前_exiftool_tmp)は一覧に出さない
@@ -7285,6 +7319,166 @@ def test_photo_rating_filter_and_presets():
             w.deleteLater()
 
 
+def _drag_rating(slider, *values, release=True):
+    """★の範囲スライダーを、values[0] の目盛りで押して values[1:] へ順に動かす。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    y = slider.height() // 2
+    at = lambda v: QPoint(int(slider.x_of(v)), y)  # noqa: E731
+    QTest.mousePress(slider, Qt.LeftButton, Qt.NoModifier, at(values[0]))
+    for v in values[1:]:
+        QTest.mouseMove(slider, at(v))
+    if release:
+        QTest.mouseRelease(slider, Qt.LeftButton, Qt.NoModifier, at(values[-1]))
+
+
+def test_photo_rating_range_bar():
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = _photo_window(photos, other, settings_path)
+        L, R = w.left, w.right
+        bar = L.rating_bar
+        slider = bar.slider
+        log = lambda: w.log_view.toPlainText()  # noqa: E731
+        try:
+            # 段は窓ごとに一覧の真下。写真フォルダモードの窓(左)にだけ出る
+            assert bar is not R.rating_bar and not hasattr(w, "rating_bar")
+            assert bar.parent() is L and R.rating_bar.parent() is R
+            assert bar.isVisible() and not R.rating_bar.isVisible()
+            assert bar.geometry().top() >= L.view.geometry().bottom()
+            assert slider._ticks == ["❌", "未", "1", "2", "ベスト", "フレーム", "みてね"]
+            assert slider.values() == (-1, 5) and bar.range_label.text() == "すべて"
+            assert bar.filter_label.text() == "絞り込み: なし"
+            assert bar.count_label.text() == "表示 5 / 5枚"
+            assert not bar.clear_button.isEnabled()
+            # どの部品もフォーカスを取らない
+            assert slider.focusPolicy() == Qt.NoFocus
+            assert bar.clear_button.focusPolicy() == Qt.NoFocus
+
+            # 近い方のつまみが動く(1 は下限の方が近い)。離したらすぐ掛かる
+            _drag_rating(slider, 1, 2, 3)
+            assert L.rating_range == (3, 5) and slider.values() == (3, 5)
+            assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
+            assert bar.range_label.text() == "ベストショット以上"
+            assert bar.count_label.text() == "表示 3 / 5枚" and bar.clear_button.isEnabled()
+            # 文字の式には書き込まない。見出しには合わせた式を出す
+            assert L.rating_filter == "" and bar.filter_label.text() == "絞り込み: なし"
+            assert "★絞り込み: ★>=3" in L.header2.text()
+
+            # ドラッグ中は間引く(名前はすぐ、絞り込みは少し後)
+            _drag_rating(slider, 5, 4, release=False)
+            assert bar.range_label.text() == "ベストショット〜フォトフレーム用"
+            assert L.rating_range == (3, 5)
+            _wait_until(lambda: L.rating_range == (3, 4), what="ドラッグ中の絞り込み")
+            assert _names(L) == ["..", "sub", "b4.jpg", "c3.jpg"]
+            assert slider.values() == (3, 4)            # 掛け直してもつまみは戻らない
+            QTest.mouseRelease(slider, Qt.LeftButton, Qt.NoModifier)
+
+            # 文字の式と AND になる
+            w.apply_rating_filter("#みてね済")
+            assert L.rating_filter == "#みてね済" and L.rating_range == (3, 4)
+            assert L.rating_expr() == "(#みてね済) && ★>=3 && ★<=4"
+            assert _names(L) == ["..", "sub", "c3.jpg"]
+            assert bar.filter_label.text() == "絞り込み: #みてね済"
+            assert bar.count_label.text() == "表示 1 / 5枚"
+
+            # 2つを重ねると「〜だけ」。重なったつまみは動かした向きで下限か上限かを決める
+            _drag_rating(slider, 3, 4)
+            assert L.rating_range == (4, 4) and bar.range_label.text() == "フォトフレーム用だけ"
+            assert _names(L) == ["..", "sub"]
+            _drag_rating(slider, 4, 2)
+            assert L.rating_range == (2, 4) and bar.range_label.text() == "★2〜フォトフレーム用"
+            _drag_rating(slider, 4, 4)                  # 重なっていない上限を掴んで動かさない
+            assert L.rating_range == (2, 4)
+
+            # 式だけ解くと、★の範囲は残る(ログで分かるように)
+            w.apply_rating_filter("")
+            assert L.rating_filter == "" and L.rating_range == (2, 4)
+            assert _names(L) == ["..", "sub", "b4.jpg", "c3.jpg"]
+            assert "★の範囲「★2〜フォトフレーム用」は残っています" in log()
+
+            # ✕ は文字の式とスライダーを両方解く
+            w.apply_rating_filter("!reject")
+            QTest.mouseClick(bar.clear_button, Qt.LeftButton)
+            assert L.rating_filter == "" and L.rating_range == (-1, 5) and L.rating_node is None
+            assert "memo.txt" in _names(L) and "d_reject.jpg" in _names(L)
+            assert slider.values() == (-1, 5) and bar.range_label.text() == "すべて"
+            assert bar.filter_label.text() == "絞り込み: なし"
+            assert not bar.clear_button.isEnabled() and "★絞り込み" not in L.header2.text()
+
+            # 左右とも写真フォルダなら両方に出て、別々に表示・操作できる
+            _drag_rating(slider, 1, 3)
+            assert L.rating_range == (3, 5)
+            R.load(str(photos))
+            _wait(w)
+            _wait_until(lambda: len(R.photo_meta) >= 5 and not R._photo_requested,
+                        what="右の★の読み取り")
+            rbar = R.rating_bar
+            assert R.photo_mode and rbar.isVisible() and bar.isVisible()
+            assert rbar.slider.values() == (-1, 5) and rbar.range_label.text() == "すべて"
+            assert rbar.count_label.text() == "表示 5 / 5枚"
+            assert bar.count_label.text() == "表示 3 / 5枚"       # 左は左のまま
+            # アクティブでない窓の段も動かせる(押した窓がアクティブになる。ボタン段と同じ)
+            assert w.active is L
+            _drag_rating(rbar.slider, 5, 0)
+            assert w.active is R
+            assert R.rating_range == (-1, 0) and L.rating_range == (3, 5)
+            assert _names(R) == ["..", "sub", "d_reject.jpg", "e_none.jpg"]
+            assert rbar.range_label.text() == "未選別まで" and rbar.count_label.text() == "表示 2 / 5枚"
+            assert bar.range_label.text() == "ベストショット以上" and slider.values() == (3, 5)
+            assert _names(L) == ["..", "sub", "a5.jpg", "b4.jpg", "c3.jpg"]
+            # 間引きも窓ごと(左をドラッグ中に右を動かしても、左の値は左に掛かる)
+            _drag_rating(slider, 5, 4, release=False)
+            assert w.active is L
+            _drag_rating(rbar.slider, 0, 1)
+            _wait_until(lambda: L.rating_range == (3, 4), what="左の間引き")
+            QTest.mouseRelease(slider, Qt.LeftButton, Qt.NoModifier)
+            assert R.rating_range == (-1, 1) and L.rating_range == (3, 4)
+            # 式も窓ごと(アクティブな窓に掛かる)
+            w.apply_rating_filter("#みてね済")
+            assert rbar.filter_label.text() == "絞り込み: #みてね済"
+            assert bar.filter_label.text() == "絞り込み: なし"
+            # 右の ✕ は右だけを解く
+            w.activate("left")
+            QTest.mouseClick(rbar.clear_button, Qt.LeftButton)
+            assert w.active is R
+            assert R.rating_filter == "" and R.rating_range == (-1, 5)
+            assert L.rating_range == (3, 4) and bar.clear_button.isEnabled()
+
+            # プレビュー(F3)で窓が隠れれば、その窓の段も一緒に隠れる
+            w.activate("left")
+            w.run_command("preview_toggle")
+            assert not R.isVisible() and not rbar.isVisible() and bar.isVisible()
+            w.run_command("preview_toggle")
+            assert R.isVisible() and rbar.isVisible()
+
+            # 写真フォルダモードでない窓では隠れる(片方だけ)
+            R.load(str(other))
+            _wait(w)
+            assert not R.photo_mode and not rbar.isVisible() and bar.isVisible()
+            L.set_photo_override("off")
+            assert not bar.isVisible()
+            L.set_photo_override("auto")
+            assert bar.isVisible() and slider.values() == (3, 4)
+
+            # フォルダを移ったら(文字の式と同じく)解く
+            L.load(str(sub))
+            _wait(w)
+            assert L.rating_range == (-1, 5) and not bar.isVisible()   # sub は写真フォルダでない
+            L.load(str(photos))
+            _wait(w)
+            assert bar.isVisible() and slider.values() == (-1, 5)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_photo_journal_reflects_changes():
     import filer
     from photometa import writer
@@ -7309,7 +7503,7 @@ def test_photo_journal_reflects_changes():
                 f.write("{壊れた行\n")
             w._poll_photo_journal()
             texts = _rating_texts(L)
-            assert texts["e_none.jpg"] == "★5済" and texts["a5.jpg"] == "★5"
+            assert texts["e_none.jpg"] == "みてね用 済" and texts["a5.jpg"] == "みてね用"
             # タイマー(1秒ごと)でも拾う。絞り込み中なら掛け直す
             w.apply_rating_filter("★=2")
             assert _names(L) == ["..", "sub"]
@@ -7365,7 +7559,7 @@ def test_photo_write_with_exiftool():
                         timeout=30, what="ExifTool の書き込み")
             assert xmp.read_meta(target).rating == 4
             assert os.stat(target).st_mtime_ns == mtime          # 更新日時は変えない
-            assert _rating_texts(L)["e_none.jpg"] == "★4"
+            assert _rating_texts(L)["e_none.jpg"] == "フォトフレーム用"
         finally:
             w.close()
             w.deleteLater()
@@ -7435,7 +7629,7 @@ def test_photo_export_menu():
                         what="片付けの終わり")
             assert fake.calls[-1][0] == "keyword" and fake.calls[-1][2:] == ("みてね済", True)
             assert not [n for n in os.listdir(mitene) if n.endswith(".jpg")]
-            _wait_until(lambda: _rating_texts(L)["a5.jpg"] == "★5済", what="済の表示")
+            _wait_until(lambda: _rating_texts(L)["a5.jpg"] == "みてね用 済", what="済の表示")
 
             # 同期先が無ければ実行しない
             filer.photo_config.save_config(filer.photo_config.default_config())

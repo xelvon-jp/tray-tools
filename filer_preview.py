@@ -155,13 +155,15 @@ class PreviewWidget(QWidget):
         self.rating.hide()
         self.image.installEventFilter(self)
 
-    def set_rating_text(self, text: str, color: str = "#ffd400") -> None:
-        """隅に出す★の文字(★5 / ✖ / ☆ など)。空なら消す。"""
+    def set_rating_text(self, text: str, color: str = "#ffd400", background=None) -> None:
+        """隅に出す★(🖼️ フォトフレーム用 ✓ / ☆ など)。background を渡すと一覧の★の列と
+        同じ色の角丸バッジにする(無ければ半透明の黒地)。空なら消す。"""
         if not text:
             self.rating.hide()
             return
-        self.rating.setStyleSheet(f"color: {color}; background-color: rgba(0, 0, 0, 150);"
-                                  " padding: 2px 6px;")
+        self.rating.setStyleSheet(f"color: {color};"
+                                  f" background-color: {background or 'rgba(0, 0, 0, 150)'};"
+                                  " padding: 2px 8px; border-radius: 8px;")
         self.rating.setText(text)
         self.rating.adjustSize()
         self._place_rating()

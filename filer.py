@@ -35,6 +35,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QRect,
+    QRectF,
     Qt,
     QTimer,
     QUrl,
@@ -48,6 +49,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QLinearGradient,
+    QPainter,
 )
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -81,6 +83,7 @@ import filer_everything
 import filer_extmenu
 import filer_launch
 import filer_phone
+import filer_rating_bar
 import filer_shell
 import filer_update
 import settings as settings_module
@@ -132,13 +135,21 @@ DEFAULT_COLORS = {
     "fkey_background": "#f0f0f0",   # あふｗのファンクションキー段(明るい灰色に黒字)
     "fkey_text": "#000000",
     "fkey_border": "#808080",
-    # 写真フォルダモードの★の列(段階ごとに色を変える)。rating_other は ★1・★2 と、
-    # ★なしで「済」だけのもの。
-    "rating_5": "#ffd400",
-    "rating_4": "#ff9a3c",
-    "rating_3": "#7ee787",
-    "rating_reject": "#ff4060",
-    "rating_other": "#c0c0c0",
+    # 写真フォルダモードの★の列。段階ごとの角丸バッジで、rating_N が字、rating_N_bg が地。
+    # rating_other は ★1・★2(灰色のバッジ)。rating_done はみてね済の「✓」。
+    # rating_accent は★の範囲スライダーの選んだ範囲・つまみの色。
+    "rating_5": "#ffb0e8",
+    "rating_5_bg": "#5a2a50",
+    "rating_4": "#9cc8ff",
+    "rating_4_bg": "#203a5a",
+    "rating_3": "#ffcc66",
+    "rating_3_bg": "#4a3a10",
+    "rating_reject": "#ff8080",
+    "rating_reject_bg": "#4a1e1e",
+    "rating_other": "#bbbbbb",
+    "rating_other_bg": "#333333",
+    "rating_done": "#7ee787",
+    "rating_accent": "#ffd400",
 }
 
 # カーソルの下線の太さ(px)。アクティブ窓ははっきり、非アクティブ窓は控えめに。
@@ -291,6 +302,7 @@ def save_values(app_settings, settings_path, updates: dict) -> None:
 # ---------------------------------------------------------------
 ENTRY_ROLE = Qt.UserRole + 1
 MARK_ROLE = Qt.UserRole + 2
+BADGE_ROLE = Qt.UserRole + 3    # ★の列のバッジ(Pane.rating_badge の結果)
 
 # ★の列(COL_RATING)は拡張子の右。写真フォルダモードのときだけ見せる(fit_columns)。
 COL_NAME, COL_EXT, COL_RATING, COL_SIZE, COL_DATE = range(5)
@@ -302,11 +314,17 @@ _read_photo_meta = photo_xmp.read_meta
 PHOTO_READ_BATCH = 32
 PHOTO_READ_FLUSH_SECONDS = 0.15
 PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★)を読みに行く間隔
-# 写真のボタン段の表示名(段階名が既定のままのとき。設定に "short" があればそれを使う)。
-PHOTO_SHORT_NAMES = {"みてね用": "みてね", "フォトフレーム用": "フレーム",
-                     "ベストショット": "ベスト"}
+RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
+RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
+RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
 EXIFTOOL_NOT_FOUND = ("ExifTool が見つかりません。%LOCALAPPDATA%\\traytools\\photo_ratings.json の"
                       " exiftool に場所を書いてください")
+
+
+def rating_color_key(rating) -> str:
+    """★の色のキー(filer.colors。地の色は後ろに _bg)。★1・★2・未選別は rating_other。"""
+    return {5: "rating_5", 4: "rating_4", 3: "rating_3", -1: "rating_reject"}.get(
+        rating, "rating_other")
 
 
 def photo_key(path: str) -> str:
@@ -323,6 +341,7 @@ class FileModel(QAbstractTableModel):
         self.marks = set()
         # ★の列の文字(Pane が差し替える。写真フォルダモードでなければ空)。
         self.rating_text = lambda entry: ""
+        self.rating_badge = None
 
     def set_entries(self, entries, marks) -> None:
         self.beginResetModel()
@@ -344,6 +363,13 @@ class FileModel(QAbstractTableModel):
             return entry
         if role == MARK_ROLE:
             return entry.name in self.marks
+        if index.column() == COL_RATING and role in (BADGE_ROLE, Qt.ToolTipRole):
+            # ★の列はバッジで描く(RowDelegate)。DisplayRole の文字はツールチップと同じ正式名
+            if entry.is_parent:
+                return None
+            if role == BADGE_ROLE:
+                return self.rating_badge(entry) if self.rating_badge else None
+            return self.rating_text(entry) or None
         if role == Qt.DisplayRole:
             col = index.column()
             if entry.is_parent:
@@ -408,6 +434,9 @@ class RowDelegate(QStyledItemDelegate):
                 color = colors["cursor"] if active else colors["cursor_inactive"]
                 painter.fillRect(QRect(rect.left(), rect.bottom() - thick + 1,
                                        rect.width(), thick), QColor(color))
+            if index.column() == COL_RATING:
+                self._paint_badge(painter, rect, index.data(BADGE_ROLE))
+                return
             text = index.data(Qt.DisplayRole) or ""
             painter.setPen(QColor(fg))
             painter.setFont(option.font)
@@ -419,6 +448,45 @@ class RowDelegate(QStyledItemDelegate):
             painter.drawText(text_rect, align, text)
         finally:
             painter.restore()
+
+
+    def _paint_badge(self, painter, rect, badge) -> None:
+        """★の列: 段階ごとの色の角丸バッジ(「🖼️ フレーム」)と、みてね済なら右に緑の ✓。"""
+        if not badge:
+            return
+        label, kind, done = badge
+        colors = self.pane.colors
+        font = rating_badge_font(self.pane.pane_font)
+        fm = QFontMetrics(font)
+        painter.setClipRect(rect)
+        painter.setFont(font)
+        painter.setRenderHint(QPainter.Antialiasing)
+        x = rect.left() + 4
+        height = min(rect.height() - 2, fm.height() + 2)
+        top = rect.top() + (rect.height() - height) // 2
+        if label:
+            width = fm.horizontalAdvance(label) + 2 * RATING_BADGE_PAD
+            box = QRectF(x, top, width, height)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(colors.get(f"{kind}_bg") or colors["rating_other_bg"]))
+            painter.drawRoundedRect(box, height / 2.5, height / 2.5)
+            painter.setPen(QColor(colors.get(kind) or colors["rating_other"]))
+            painter.drawText(box, Qt.AlignCenter, label)
+            x += width + 2
+        if done:
+            painter.setPen(QColor(colors["rating_done"]))
+            painter.drawText(QRect(int(x), rect.top(), rect.right() - int(x), rect.height()),
+                             Qt.AlignVCenter | Qt.AlignLeft, RATING_DONE_MARK)
+
+
+def rating_badge_font(font):
+    """★の列のバッジの字。一覧の字の書体のまま、大きさは RATING_BADGE_PX。"""
+    small = QFont(font)
+    small.setPixelSize(RATING_BADGE_PX)
+    return small
+
+
+RATING_BADGE_PAD = 3            # バッジの左右の余白(px)
 
 
 class FileView(QTableView):
@@ -633,9 +701,16 @@ class Pane(QWidget):
         self._photo_scan_src = None     # 写真の数を数えた一覧(同じなら数え直さない)
         self._photo_auto = False
         self._photo_keys = {}           # photo_key → 名前(一覧にある写真)
-        # ★の絞り込み(I → / と Alt+数字)。式の文字列と解析済みの木。フォルダを移ったら解く。
+        # ★の絞り込み(I → / と Alt+数字)。rating_filter は文字の式、rating_range は下部の
+        # ★の範囲スライダー(lo, hi)。rating_node はその2つを AND した式の解析済みの木
+        # (どちらも無ければ None)。文字の式にスライダーの条件は書き込まない。
+        # どちらもフォルダを移ったら解く(保存しない)。
         self.rating_filter = ""
+        self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
         self.rating_node = None
+        # 写真の枚数(★の絞り込みを掛ける前 / 掛けた後)。下部の段の「表示 12 / 340枚」
+        self.photo_total = 0
+        self.photo_shown = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -678,6 +753,21 @@ class Pane(QWidget):
         header.hideSection(COL_RATING)
         layout.addWidget(self.view, 1)
 
+        # ★の範囲の段(写真フォルダモードのときだけ。一覧の真下)。この窓の文字の式・
+        # ★の範囲・枚数を出し、操作もこの窓にだけ掛かる。ドラッグ中は間引いて掛ける。
+        self.rating_bar = filer_rating_bar.RatingBar(window.colors, window.log_font, self)
+        self.rating_bar.pressed.connect(self._on_rating_bar_pressed)
+        self.rating_bar.range_changed.connect(self._on_rating_slider)
+        self.rating_bar.released.connect(self._flush_rating_slider)
+        self.rating_bar.clear_requested.connect(self._on_rating_clear)
+        self.rating_bar.hide()
+        layout.addWidget(self.rating_bar)
+        self._rating_pending = None     # まだ掛けていないスライダーの値 (lo, hi)
+        self._rating_timer = QTimer(self)
+        self._rating_timer.setSingleShot(True)
+        self._rating_timer.setInterval(RATING_SLIDER_MS)
+        self._rating_timer.timeout.connect(self._flush_rating_slider)
+
         # ライブ絞り込みの入力欄(/ で出る)。窓の下の行のすぐ上。
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("絞り込み（空白区切りで AND。Enter 確定 / Esc 解除）")
@@ -709,6 +799,7 @@ class Pane(QWidget):
         layout.addWidget(self.photo_bar)
         self.build_photo_bar()
         self.model.rating_text = self.rating_text
+        self.model.rating_badge = self.rating_badge
         # QLabel は既定だと文字列の幅を最小幅にする。深いパスを開くと窓がそれより狭く
         # できなくなり、左右の境界も動かせなくなるので、横幅は文字に合わせない。
         for label in (self.header, self.header2, self.footer):
@@ -737,7 +828,7 @@ class Pane(QWidget):
             col: fm.horizontalAdvance(sample) + 8
             for col, sample in ((COL_EXT, ".MMMMM"), (COL_SIZE, "9,999,999,999 "),
                                 (COL_DATE, "26/10/23 12:34:56 "))}
-        self._col_widths[COL_RATING] = max(fm.horizontalAdvance(t) for t in ("★5済", "✖済")) + 8
+        self._col_widths[COL_RATING] = self._rating_col_width(fm)
         small = QFontMetrics(self.window_.log_font)
         for button in getattr(self, "photo_buttons", []):
             button.setFont(self.window_.log_font)
@@ -770,6 +861,23 @@ class Pane(QWidget):
                     break
         if widths[COL_EXT] != need:
             widths[COL_EXT] = need
+            self.fit_columns()
+
+    def _rating_col_width(self, _fm=None) -> int:
+        """★の列の幅。一番長いバッジ(RATING_BADGE_PX の字で測る)と ✓ が入る幅。"""
+        cfg = self.window_.photo_config
+        small = QFontMetrics(rating_badge_font(self.pane_font))
+        labels = [" ".join(t for t in b if t) for b in (
+            photo_config.rating_badge(r, cfg)
+            for r in range(photo_config.RATING_MIN, photo_config.RATING_MAX + 1)) if b]
+        badge = max(small.horizontalAdvance(t) for t in labels) + 2 * RATING_BADGE_PAD
+        return 4 + badge + 2 + small.horizontalAdvance(RATING_DONE_MARK) + 6
+
+    def update_rating_col_width(self) -> None:
+        """設定を読み直したとき: ★の列の幅を測り直す。"""
+        widths = getattr(self, "_col_widths", None)
+        if widths:
+            widths[COL_RATING] = self._rating_col_width(QFontMetrics(self.pane_font))
             self.fit_columns()
 
     def fit_columns(self) -> None:
@@ -839,9 +947,7 @@ class Pane(QWidget):
         elif column == COL_RATING:
             meta = self.meta_of(entry)
             if meta is not None:
-                key = {5: "rating_5", 4: "rating_4", 3: "rating_3", -1: "rating_reject"}.get(
-                    meta.rating, "rating_other")
-                color = colors.get(key) or color
+                color = colors.get(rating_color_key(meta.rating)) or color
         return color
 
     def drive_root(self):
@@ -883,8 +989,8 @@ class Pane(QWidget):
         self.header.setText(text)
         # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)と★の絞り込み。
         text2 = self.window_.drive_label_text(self.drive_root())
-        if self.rating_filter:
-            text2 = (f"{text2}   " if text2 else "") + f"★絞り込み: {self.rating_filter}"
+        if self.rating_node is not None:
+            text2 = (f"{text2}   " if text2 else "") + f"★絞り込み: {self.rating_expr()}"
         self.header2.setText(text2)
 
     def update_footer(self) -> None:
@@ -1133,13 +1239,18 @@ class Pane(QWidget):
         visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
+        self.photo_total = sum(1 for e in visible if self.is_photo_entry(e))
         if self.rating_node is not None:
             visible = [e for e in visible if e.is_dir or self.rating_match(e)]
+            self.photo_shown = sum(1 for e in visible if self.is_photo_entry(e))
+        else:
+            self.photo_shown = self.photo_total
         parent = [] if (self.flat or self.stash or core.is_root(self.path)) else [core.PARENT_ENTRY]
         self.entries = parent + visible
         self.model.set_entries(self.entries, self.marks)
         self._fit_ext_column()
         self.update_photo_mode()
+        self.update_rating_bar()
 
     def _row_of(self, name):
         if not name:
@@ -1652,8 +1763,7 @@ class Pane(QWidget):
         self._photo_scan_src = None
         self._photo_keys = {}
         self.photo_override = "auto"
-        self.rating_filter = ""
-        self.rating_node = None
+        self.clear_rating(refresh=False)
 
     def entry_path(self, entry) -> str:
         """一覧の項目のフルパス(フラット表示・検索結果は相対パス、一時置き場はフルパスの名前)。"""
@@ -1670,13 +1780,30 @@ class Pane(QWidget):
         return self.photo_meta.get(photo_key(self.entry_path(entry)))
 
     def rating_text(self, entry) -> str:
-        """★の列の文字(★5 / ✖ / ★3済 など)。写真フォルダモードでなければ空。"""
+        """★の列の文字(みてね用 / ❌削除候補 / ベストショット 済 など)。写真フォルダモードでなければ空。"""
         if not self.photo_mode:
             return ""
         meta = self.meta_of(entry)
         if meta is None:
             return ""
         return photo_config.rating_display(meta.rating, meta.keywords, self.window_.photo_config)
+
+    def rating_badge(self, entry):
+        """★の列のバッジ (表示する文字, 色の種類, みてね済か)。何も出さないなら None。
+        文字は「🖼️ フレーム」(photometa.config.rating_badge)。未選別で済だけなら文字は空。"""
+        if not self.photo_mode:
+            return None
+        meta = self.meta_of(entry)
+        if meta is None:
+            return None
+        cfg = self.window_.photo_config
+        kws = cfg.get("keywords") or []
+        done = bool(kws) and kws[0]["name"] in meta.keywords
+        badge = photo_config.rating_badge(meta.rating, cfg)
+        if badge is None and not done:
+            return None
+        label = " ".join(t for t in badge if t) if badge else ""
+        return label, rating_color_key(meta.rating), done
 
     def rating_match(self, entry) -> bool:
         """★の絞り込みの式に合うか。読めていない写真・写真以外は「不明」で隠す。
@@ -1714,6 +1841,7 @@ class Pane(QWidget):
             self.photo_bar.setVisible(mode)
             self.fit_columns()
             self.update_header()
+            self.update_rating_bar()
         if self.needs_photo_meta():
             QTimer.singleShot(0, self._start_photo_read_safely)
 
@@ -1723,15 +1851,101 @@ class Pane(QWidget):
         self.update_header()
 
     def set_rating_filter(self, expr: str) -> None:
-        """★の絞り込みを掛ける(空なら解く)。式が書けていなければ FilterSyntaxError。"""
+        """★の絞り込みの文字の式を差し替える(空なら式だけ解く。★の範囲はそのまま)。
+        式が書けていなければ FilterSyntaxError。"""
         node = photo_filter.parse(expr)
         self.rating_filter = (expr or "").strip() if node is not None else ""
-        self.rating_node = node
+        self._apply_rating()
+
+    def set_rating_range(self, lo: int, hi: int) -> None:
+        """★の範囲スライダーの値を差し替える(-1〜5。両端なら★では絞り込まない)。"""
+        lo = min(max(int(lo), photo_config.RATING_MIN), photo_config.RATING_MAX)
+        hi = min(max(int(hi), photo_config.RATING_MIN), photo_config.RATING_MAX)
+        self.rating_range = (min(lo, hi), max(lo, hi))
+        self._apply_rating()
+
+    def clear_rating(self, refresh: bool = True) -> None:
+        """★の絞り込みを文字の式・★の範囲とも解く。"""
+        self.rating_filter = ""
+        self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
+        if refresh:
+            self._apply_rating()
+        else:
+            self.rating_node = None
+
+    def rating_expr(self) -> str:
+        """実際に掛ける★の絞り込みの式((文字の式) && ★の範囲)。無ければ空。"""
+        rng = photo_config.range_expr(*self.rating_range)
+        if self.rating_filter and rng:
+            return f"({self.rating_filter}) && {rng}"
+        return self.rating_filter or rng
+
+    def _apply_rating(self) -> None:
+        """文字の式と★の範囲から絞り込みの木を作り直し、一覧に掛け直す。"""
+        self.rating_node = photo_filter.parse(self.rating_expr())
         if self.path or self.stash:
             self.refilter()
             self.update_photo_mode()
         else:
             self.update_header()
+            self.update_rating_bar()
+
+    # --- ★の範囲の段 ---
+    def update_rating_bar(self) -> None:
+        """★の範囲の段をこの窓の状態に合わせる。写真フォルダモードでなければ隠す。"""
+        bar = getattr(self, "rating_bar", None)
+        if bar is None:
+            return  # 組み立ての途中
+        bar.setVisible(self.photo_mode)
+        if not self.photo_mode:
+            return
+        pending = self._rating_pending
+        lo, hi = pending if pending is not None else self.rating_range
+        # ドラッグ中で窓の側がまだ追い付いていないときは、つまみを戻さない
+        bar.show_state(lo, hi, self.rating_filter, self.photo_shown, self.photo_total,
+                       self.window_.photo_config, move_slider=pending is None)
+
+    def _on_rating_bar_pressed(self) -> None:
+        """段のスライダーか ✕ を押した: 写真のボタン段と同じく、この窓をアクティブにする
+        (フォーカスはファイル窓。段の部品はフォーカスを取らない)。"""
+        try:
+            if not self.is_active():
+                self.window_.activate(self.side)
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("ratingPress")
+
+    def _on_rating_slider(self, lo: int, hi: int) -> None:
+        """スライダーを動かした。名前はすぐ変え、絞り込みはドラッグ中なら間引いて掛ける。"""
+        try:
+            self._rating_pending = (lo, hi)
+            self.rating_bar.show_range(lo, hi, self.window_.photo_config)
+            if self.rating_bar.slider.dragging():
+                if not self._rating_timer.isActive():
+                    self._rating_timer.start()
+            else:
+                self._flush_rating_slider()
+        except Exception:  # noqa: BLE001
+            self.window_.log(f"エラー: {_log_exception('ratingSlider')}")
+
+    def _flush_rating_slider(self) -> None:
+        """間引いていたスライダーの値をこの窓に掛ける(タイマー・ボタンを離したとき)。"""
+        try:
+            self._rating_timer.stop()
+            pending, self._rating_pending = self._rating_pending, None
+            if pending is not None:
+                self.set_rating_range(*pending)
+        except Exception:  # noqa: BLE001
+            self.window_.log(f"エラー: {_log_exception('ratingSlider')}")
+
+    def _on_rating_clear(self) -> None:
+        """段の ✕: この窓の文字の式と★の範囲を両方解く。"""
+        try:
+            self._rating_timer.stop()
+            self._rating_pending = None
+            self.clear_rating()
+            self.window_.log("★の絞り込みを解きました")
+        except Exception:  # noqa: BLE001
+            self.window_.log(f"エラー: {_log_exception('ratingClear')}")
 
     def _start_photo_read_safely(self) -> None:
         try:
@@ -4080,8 +4294,7 @@ class FilerWindow(QWidget):
     def cmd_mask_clear(self):
         # : はマスクを *.* に戻す。ライブ絞り込みと★の絞り込みもいっしょに解く(「全部見せる」キー)。
         self.active.clear_live_filter(rebuild=False)
-        self.active.rating_filter = ""
-        self.active.rating_node = None
+        self.active.clear_rating(refresh=False)
         self.active.set_mask(core.DEFAULT_MASK)
 
     # --- プレビュー(F3) ---
@@ -5685,13 +5898,12 @@ class FilerWindow(QWidget):
             kind, value = item.action
             if kind == "rating":
                 if value > 0:
-                    level = levels.get(item.label) or {}
-                    short = level.get("short") or PHOTO_SHORT_NAMES.get(item.label) or item.label
-                    label = f"★{value} {short}"
+                    level = levels.get(item.label) or {"name": item.label}
+                    label = f"★{value} {photo_config.level_short(level)}"
                 elif value == 0:
                     label = "★外す"
                 else:
-                    label = "✖ 削除候補"
+                    label = "❌ 削除候補"
             elif kind == "keyword":
                 # ★の列と同じく、1つ目のキーワードは「済」で見せる
                 label = "済" if keywords and value == keywords[0]["name"] else value
@@ -5709,6 +5921,9 @@ class FilerWindow(QWidget):
         if self.photo_bar_items() != before:
             for pane in (self.left, self.right):
                 pane.build_photo_bar()
+        for pane in (self.left, self.right):
+            pane.update_rating_col_width()
+            pane.update_rating_bar()
 
     def press_photo_button(self, pane, action) -> None:
         """写真のボタン段を押した。I メニューで選んだのと同じ動作(対象はその窓の
@@ -5888,7 +6103,7 @@ class FilerWindow(QWidget):
                 return f"★{n} を {count} 枚に付けました"
             if n == 0:
                 return f"★を {count} 枚から外しました"
-            return f"削除候補（✖）を {count} 枚に付けました"
+            return f"削除候補（❌）を {count} 枚に付けました"
         if op[2]:
             return f"{op[1]} を {count} 枚に付けました"
         return f"{op[1]} を {count} 枚から外しました"
@@ -5957,7 +6172,7 @@ class FilerWindow(QWidget):
             return
         pane = self.active
         entry = pane.cursor_entry()
-        text, color = "", self.colors["rating_other"]
+        text, color, background = "", self.colors["rating_other"], None
         if pane.archive is None and pane.is_photo_entry(entry):
             path = pane.entry_path(entry)
             key = photo_key(path)
@@ -5968,10 +6183,25 @@ class FilerWindow(QWidget):
                     pane.photo_meta[key] = None
             meta = pane.photo_meta.get(key)
             if meta is not None:
-                text = photo_config.rating_display(meta.rating, meta.keywords,
-                                                   self.photo_config) or "☆"
-                color = pane.text_color(entry, COL_RATING)
-        widget.set_rating_text(text, color)
+                text, color, background = self.rating_viewer_text(meta)
+        widget.set_rating_text(text, color, background)
+
+    def rating_viewer_text(self, meta):
+        """ビュア右上の★: (文字, 字の色, 地の色)。一覧のバッジと同じ色で、文字は
+        絵文字＋正式名(「🖼️ フォトフレーム用 ✓」)。未選別なら ☆。"""
+        cfg = self.photo_config
+        kws = cfg.get("keywords") or []
+        done = bool(kws) and kws[0]["name"] in meta.keywords
+        badge = photo_config.rating_badge(meta.rating, cfg)
+        if badge is None:
+            text = "☆"
+        else:
+            name = "削除候補" if meta.rating == -1 else photo_config.rating_name(meta.rating, cfg)
+            text = f"{badge[0]} {name}".strip()
+        if done:
+            text += f" {RATING_DONE_MARK}"
+        key = rating_color_key(meta.rating)
+        return text, self.colors[key], self.colors[f"{key}_bg"]
 
     # --- 書き出し(I → E。フォトフレーム同期・みてね) ---
     def photo_export_menu(self) -> None:
@@ -6190,6 +6420,9 @@ class FilerWindow(QWidget):
         if pane.rating_filter:
             shown = f"{name}（{pane.rating_filter}）" if name else pane.rating_filter
             self.log(f"★の絞り込み: {shown}")
+        elif pane.rating_node is not None:
+            label = photo_config.range_label(*pane.rating_range, self.photo_config)
+            self.log(f"★の絞り込みの式を解きました（★の範囲「{label}」は残っています）")
         else:
             self.log("★の絞り込みを解きました")
         return True

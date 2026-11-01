@@ -34,13 +34,20 @@ CONFIG_PATH = os.path.join(data_dir(), "photo_ratings.json")
 MENU_FIXED_KEYS = frozenset({"0", "-", "/", "E"})
 FILTER_FIXED_KEYS = frozenset({"U", "E", "A"})
 
+# ★の値の範囲（-1=削除候補 / 0=未選別 / 1〜5）
+RATING_MIN, RATING_MAX = -1, 5
+
 # filter_key（段階の）と key（プリセットの）は §7 の既定に足した任意の項目。
 # 絞り込みの小メニュー（B/F/M/D/U/E/A）の頭の文字を決める。
+# short（段階の）は任意。★の範囲スライダーの目盛り・ボタン段・★列のバッジに出す短い名前。
+# icon（段階の）は任意。★列のバッジの頭に付ける絵文字。
 DEFAULT_CONFIG: dict = {
     "levels": [
-        {"key": "5", "name": "みてね用", "min": 5},
-        {"key": "4", "name": "フォトフレーム用", "min": 4, "filter_key": "F"},
-        {"key": "3", "name": "ベストショット", "min": 3, "filter_key": "B"},
+        {"key": "5", "name": "みてね用", "min": 5, "short": "みてね", "icon": "💌"},
+        {"key": "4", "name": "フォトフレーム用", "min": 4, "filter_key": "F", "short": "フレーム",
+         "icon": "🖼️"},
+        {"key": "3", "name": "ベストショット", "min": 3, "filter_key": "B", "short": "ベスト",
+         "icon": "⭐"},
     ],
     "keywords": [{"key": "K", "name": "みてね済"}],
     "presets": [
@@ -99,6 +106,12 @@ def _norm_levels(v) -> list | None:
             item.pop("filter_key", None)
         else:
             item["filter_key"] = fk
+        for opt in ("short", "icon"):
+            value = _str(e.get(opt))
+            if value is None:
+                item.pop(opt, None)
+            else:
+                item[opt] = value
         out.append(item)
         keys.add(key)
         names.add(name)
@@ -267,15 +280,117 @@ def level_for_rating(config: dict, rating: int) -> dict | None:
     return None
 
 
+def level_exact(config: dict | None, rating: int) -> dict | None:
+    """しきい値がちょうどその★の段階（★4 なら フォトフレーム用）。無ければ None。"""
+    for lv in (config or DEFAULT_CONFIG).get("levels") or []:
+        if lv.get("min") == rating:
+            return lv
+    return None
+
+
+_DEFAULT_SHORTS = {lv["name"]: lv["short"] for lv in DEFAULT_CONFIG["levels"]}
+_DEFAULT_ICONS = {lv["name"]: lv["icon"] for lv in DEFAULT_CONFIG["levels"]}
+
+
+def level_short(level: dict) -> str:
+    """段階の短い名前。short が無ければ、既定と同じ名前の段階なら既定の short、それも無ければ name。
+
+    （short を足す前に保存した photo_ratings.json にも短い名前が出るように）"""
+    return _str(level.get("short")) or _DEFAULT_SHORTS.get(level.get("name")) or level["name"]
+
+
+def level_icon(level: dict) -> str:
+    """段階の絵文字。icon が無ければ、既定と同じ名前の段階なら既定の icon、それも無ければ空。"""
+    return _str(level.get("icon")) or _DEFAULT_ICONS.get(level.get("name")) or ""
+
+
+# ------------------------------------------------------------------ ★の表示名
+
+def rating_name(rating: int, config: dict | None = None) -> str:
+    """★の名前（削除候補 / 未選別 / ベストショット / ★2 など）。"""
+    if rating == -1:
+        return "削除候補"
+    if rating == 0:
+        return "未選別"
+    lv = level_exact(config, rating)
+    return lv["name"] if lv else f"★{rating}"
+
+
+def rating_tag(rating: int, config: dict | None = None) -> str:
+    """一覧やビュアの★表示（❌削除候補 / 空欄 / ベストショット / ★2 など）。"""
+    if rating == -1:
+        return "❌削除候補"
+    if rating == 0:
+        return ""
+    return rating_name(rating, config)
+
+
+def rating_short(rating: int, config: dict | None = None) -> str:
+    """★の範囲スライダーの目盛りの文字（❌ / 未 / 1 / 2 / ベスト / フレーム / みてね）。"""
+    if rating == -1:
+        return "❌"
+    if rating == 0:
+        return "未"
+    lv = level_exact(config, rating)
+    return level_short(lv) if lv else str(rating)
+
+
+def rating_badge(rating: int | None, config: dict | None = None) -> tuple[str, str] | None:
+    """★列のバッジの (絵文字, 短い名前)。未選別・★を読めていないなら None。
+
+    -1 → ("❌", "削除")、段階のしきい値ちょうど → (icon, short)（★4 なら ("🖼️", "フレーム")）、
+    それ以外 → ("", "★2") のように絵文字なし。"""
+    if rating is None or rating == 0:
+        return None
+    if rating == -1:
+        return "❌", "削除"
+    lv = level_exact(config, rating)
+    if lv:
+        return level_icon(lv), level_short(lv)
+    return "", f"★{rating}"
+
+
+def is_full_range(lo: int, hi: int) -> bool:
+    """★の範囲が全部（-1〜5。★では絞り込まない）か。"""
+    return lo <= RATING_MIN and hi >= RATING_MAX
+
+
+def range_expr(lo: int, hi: int) -> str:
+    """★の範囲を絞り込みの式にする（「★>=3 && ★<=4」）。全部なら空。
+
+    端の側の比較は書かない（★>=-1 は「★を読めた」と同じで余計な条件になるため）。"""
+    parts = []
+    if lo > RATING_MIN:
+        parts.append(f"★>={lo}")
+    if hi < RATING_MAX:
+        parts.append(f"★<={hi}")
+    return " && ".join(parts)
+
+
+def range_label(lo: int, hi: int, config: dict | None = None) -> str:
+    """★の範囲の表記（すべて / ベストショットだけ / ベストショット以上 / 未選別まで / ★1〜★2）。"""
+    if is_full_range(lo, hi):
+        return "すべて"
+    if lo == hi:
+        return f"{rating_name(lo, config)}だけ"
+    if hi >= RATING_MAX:
+        return f"{rating_name(lo, config)}以上"
+    if lo <= RATING_MIN:
+        return f"{rating_name(hi, config)}まで"
+    return f"{rating_name(lo, config)}〜{rating_name(hi, config)}"
+
+
 def rating_display(rating: int | None, keywords=(), config: dict | None = None) -> str:
-    """一覧の★列の表示（★5 / ✖ / 空欄。キーワードの1つ目が付いていれば後ろに「済」）。"""
+    """一覧の★列の表示（rating_tag。キーワードの1つ目が付いていれば後ろに「 済」）。
+
+    未選別で済だけなら「済」。★を読めていなければ空。"""
     if rating is None:
         return ""
-    text = "✖" if rating == -1 else (f"★{rating}" if rating > 0 else "")
     cfg = config or DEFAULT_CONFIG
+    text = rating_tag(rating, cfg)
     kws = cfg.get("keywords") or []
     if kws and kws[0]["name"] in keywords:
-        text += "済"
+        text = f"{text} 済" if text else "済"
     return text
 
 

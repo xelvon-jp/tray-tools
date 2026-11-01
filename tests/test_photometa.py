@@ -293,9 +293,81 @@ def test_config_levels_lookup():
     assert pc.level_min(cfg, "無い") is None
     assert pc.level_for_rating(cfg, 4)["name"] == "フォトフレーム用"
     assert pc.level_for_rating(cfg, 2) is None
-    assert pc.rating_display(5, ("みてね済",), cfg) == "★5済"
-    assert pc.rating_display(-1) == "✖"
+    assert pc.rating_display(5, ("みてね済",), cfg) == "みてね用 済"
+    assert pc.rating_display(2, (), cfg) == "★2"
+    assert pc.rating_display(-1) == "❌削除候補"
+    assert pc.rating_display(-1, ("みてね済",)) == "❌削除候補 済"
+    assert pc.rating_display(0, ("みてね済",)) == "済"           # 未選別で済だけ
     assert pc.rating_display(0) == "" and pc.rating_display(None) == ""
+
+
+def test_rating_names():
+    cfg = pc.default_config()
+    assert (pc.RATING_MIN, pc.RATING_MAX) == (-1, 5)
+    assert [pc.rating_name(r, cfg) for r in range(-1, 6)] == [
+        "削除候補", "未選別", "★1", "★2", "ベストショット", "フォトフレーム用", "みてね用"]
+    assert [pc.rating_tag(r, cfg) for r in range(-1, 6)] == [
+        "❌削除候補", "", "★1", "★2", "ベストショット", "フォトフレーム用", "みてね用"]
+    assert [pc.rating_short(r, cfg) for r in range(-1, 6)] == [
+        "❌", "未", "1", "2", "ベスト", "フレーム", "みてね"]
+    assert pc.rating_name(4) == "フォトフレーム用"              # config を省くと既定
+    # 段階は「しきい値がちょうどその★」のときだけ名前になる
+    custom = pc.normalize({"levels": [{"key": "A", "name": "とっておき", "min": 2,
+                                       "short": " とっ "},
+                                      {"key": "B", "name": "まあまあ", "min": 1}]})
+    assert custom["levels"][0]["short"] == "とっ"               # 前後の空白は落とす
+    assert "short" not in custom["levels"][1]
+    assert [pc.rating_short(r, custom) for r in range(-1, 6)] == [
+        "❌", "未", "まあまあ", "とっ", "3", "4", "5"]              # short が無ければ name
+    assert pc.rating_name(3, custom) == "★3" and pc.rating_name(2, custom) == "とっておき"
+    # short の無い古い設定でも、既定と同じ名前の段階なら既定の短い名前
+    old = pc.normalize({"levels": [{"key": "5", "name": "みてね用", "min": 5},
+                                   {"key": "3", "name": "ベストショット", "min": 3,
+                                    "short": 12}]})
+    assert all("short" not in lv for lv in old["levels"])        # 文字列でない short は落とす
+    assert pc.rating_short(5, old) == "みてね" and pc.rating_short(3, old) == "ベスト"
+
+
+def test_rating_badge():
+    cfg = pc.default_config()
+    assert [lv["icon"] for lv in cfg["levels"]] == ["💌", "🖼️", "⭐"]
+    assert [pc.rating_badge(r, cfg) for r in range(-1, 6)] == [
+        ("❌", "削除"), None, ("", "★1"), ("", "★2"),
+        ("⭐", "ベスト"), ("🖼️", "フレーム"), ("💌", "みてね")]
+    assert pc.rating_badge(None) is None and pc.rating_badge(4) == ("🖼️", "フレーム")
+    # icon の無い段階: 既定と同じ名前なら既定の絵文字、それ以外は絵文字なし
+    custom = pc.normalize({"levels": [{"key": "5", "name": "みてね用", "min": 5},
+                                      {"key": "A", "name": "とっておき", "min": 2, "short": "とっ"},
+                                      {"key": "B", "name": "まあまあ", "min": 1, "icon": " 🙂 "},
+                                      {"key": "C", "name": "数字", "min": 3, "icon": 7}]})
+    assert all("icon" not in lv for lv in custom["levels"] if lv["name"] != "まあまあ")
+    assert pc.rating_badge(5, custom) == ("💌", "みてね")
+    assert pc.rating_badge(2, custom) == ("", "とっ")
+    assert pc.rating_badge(1, custom) == ("🙂", "まあまあ")
+    assert pc.rating_badge(3, custom) == ("", "数字")
+
+
+def test_rating_range():
+    cfg = pc.default_config()
+    assert pc.is_full_range(-1, 5) and not pc.is_full_range(0, 5)
+    assert not pc.is_full_range(-1, 4)
+    assert pc.range_expr(-1, 5) == ""
+    assert pc.range_expr(3, 5) == "★>=3"
+    assert pc.range_expr(-1, 0) == "★<=0"
+    assert pc.range_expr(1, 2) == "★>=1 && ★<=2"
+    assert pc.range_expr(4, 4) == "★>=4 && ★<=4"
+    assert pc.range_label(-1, 5, cfg) == "すべて"
+    assert pc.range_label(4, 4, cfg) == "フォトフレーム用だけ"
+    assert pc.range_label(-1, -1, cfg) == "削除候補だけ"
+    assert pc.range_label(3, 5, cfg) == "ベストショット以上"
+    assert pc.range_label(-1, 0, cfg) == "未選別まで"
+    assert pc.range_label(1, 2, cfg) == "★1〜★2"
+    assert pc.range_label(0, 4, cfg) == "未選別〜フォトフレーム用"
+    # 式は filter_expr でそのまま読める（★の原子として評価される）
+    node = fe.parse(f"(#みてね済) && {pc.range_expr(3, 4)}")
+    meta = px.PhotoMeta(4, ("みてね済",))
+    assert fe.evaluate(node, fe.meta_atom_fn(meta, cfg)) is True
+    assert fe.evaluate(node, fe.meta_atom_fn(px.PhotoMeta(5, ("みてね済",)), cfg)) is False
 
 
 def test_menu_items():

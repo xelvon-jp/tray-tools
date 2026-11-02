@@ -271,6 +271,35 @@ def save_config(cfg: dict, path: str | None = None) -> None:
     os.replace(tmp, path)
 
 
+# キーワードのキー(1文字)の候補。メニューの固定キー・段階のキー・他のキーワードと
+# 重ならないものから前順に選ぶ
+_KEYWORD_KEY_ORDER = "CLBNPYGUWDFAHJMOQVXZ"
+
+
+def add_keyword(config: dict, name: str) -> dict:
+    """キーワード(ラベル)を設定に足して、その項目 {"key", "name"} を返す。
+
+    名前は前後の空白を除く。空・同じ名前が既にあるものは ValueError。キーは
+    空いている文字から自動で選ぶ。config を書き換えるだけ(保存は呼び出し側)。"""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("ラベルの名前が空です")
+    keywords = config.setdefault("keywords", [])
+    if any(kw.get("name") == name for kw in keywords):
+        raise ValueError(f"ラベル「{name}」は既にあります")
+    used = set(MENU_FIXED_KEYS)
+    used |= {lv.get("key") for lv in config.get("levels") or []}
+    used |= {kw.get("key") for kw in keywords}
+    key = next((c for c in _KEYWORD_KEY_ORDER if c not in used), None)
+    if key is None:
+        key = next((c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if c not in used), None)
+    if key is None:
+        raise ValueError("空いているキーがありません")
+    entry = {"key": key, "name": name}
+    keywords.append(entry)
+    return entry
+
+
 def find_exiftool(config: dict | None = None) -> str | None:
     """ExifTool の場所。設定の "exiftool"（ファイルかフォルダ）→ PATH 上の exiftool.exe の順。
 

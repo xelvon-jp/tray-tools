@@ -6330,7 +6330,8 @@ class FilerWindow(QWidget):
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
         """Shift+Z: 各種設定の一時切替。隠し/システムファイルの表示と写真フォルダモード。
-        ★の絞り込みは置かない(窓の下の★の範囲の段だけ。2026-11-01)。"""
+        ★の絞り込みは置かない(窓の下の★の範囲の段だけ。2026-11-01)。
+        L の「新しいラベルを作る」だけは一時切替でなく、共通設定に保存する。"""
         override = self.active.photo_override
         menu, chosen = self.build_menu("各種設定一時切替", [
             ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
@@ -6340,6 +6341,8 @@ class FilerWindow(QWidget):
             ("A", "写真フォルダモード：自動", "photo_auto", override == "auto"),
             ("N", "写真フォルダモード：常にオン", "photo_on", override == "on"),
             ("F", "写真フォルダモード：常にオフ", "photo_off", override == "off"),
+            None,
+            ("L", "新しいラベルを作る", "label_new"),
         ])
         choice = self._exec_menu(menu, chosen)
         if choice in ("photo_auto", "photo_on", "photo_off"):
@@ -6348,8 +6351,30 @@ class FilerWindow(QWidget):
             pane.set_photo_override(value)
             label = {"auto": "自動", "on": "常にオン", "off": "常にオフ"}[value]
             self.log(f"設定: 写真フォルダモードを{label}にしました（この窓・このフォルダの間だけ）")
+        elif choice == "label_new":
+            self.create_keyword_label()
         elif choice is not None:
             self.toggle_attr_filter(choice)
+
+    def create_keyword_label(self) -> None:
+        """新しいラベル(キーワード)を共通設定に作る(Shift+Z → L)。
+
+        作ったラベルは ★の範囲の段のチップと R の「写真の★」の欄にすぐ出て、
+        PhotoCuller でも使える。キーは空いている文字から自動で付く。"""
+        name, ok = QInputDialog.getText(self, "新しいラベル",
+                                        "ラベルの名前（例: 2028年カレンダー向け）")
+        if not ok:
+            return
+        try:
+            entry = photo_config.add_keyword(self.photo_config, name)
+        except ValueError as e:
+            self.log(f"ラベル: {e}")
+            return
+        photo_config.save_config(self.photo_config)
+        for pane in (self.left, self.right):
+            pane.update_rating_bar()
+        self.log(f"ラベル: 「{entry['name']}」を作りました（キー {entry['key']}）。"
+                 "R の「写真の★」で付けられます")
 
     def toggle_attr_filter(self, which: str) -> None:
         """隠し/システムファイルの表示を切り替えて、両窓を並べ直す(カーソルは同じ項目に

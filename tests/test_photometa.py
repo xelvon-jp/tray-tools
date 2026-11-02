@@ -277,6 +277,26 @@ def test_config_normalize_bad_values():
     assert pc.normalize({"levels": []})["levels"] == pc.default_config()["levels"]
 
 
+def test_config_add_keyword():
+    import copy
+    cfg = copy.deepcopy(pc.default_config())
+    entry = pc.add_keyword(cfg, " 2028年カレンダー向け ")
+    assert entry == {"key": "C", "name": "2028年カレンダー向け"}   # 前後の空白は除く
+    assert cfg["keywords"][-1] == entry
+    # C が埋まったので次は候補の2番目
+    assert pc.add_keyword(cfg, "お気に入り")["key"] == "L"
+    for bad in ("", "   ", "2028年カレンダー向け", "みてね済"):
+        try:
+            pc.add_keyword(cfg, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    # 正規化を通しても残る
+    assert pc.normalize(cfg)["keywords"][-2:] == [
+        {"key": "C", "name": "2028年カレンダー向け"}, {"key": "L", "name": "お気に入り"}]
+
+
 def test_config_save_roundtrip_lf():
     cfg = pc.default_config()
     cfg["exiftool"] = r"X:\tools\exiftool.exe"

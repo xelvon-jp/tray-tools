@@ -6633,10 +6633,11 @@ class FilerWindow(QWidget):
     def _predict_meta(meta, op):
         base = meta if meta is not None else photo_xmp.PhotoMeta()
         if op[0] == "rating":
-            return photo_xmp.PhotoMeta(op[1], base.keywords)
+            return photo_xmp.PhotoMeta(op[1], base.keywords, base.edits, base.description)
         name, on = op[1], op[2]
         kws = tuple(k for k in base.keywords if k.casefold() != name.casefold())
-        return photo_xmp.PhotoMeta(base.rating, kws + ((name,) if on else ()))
+        return photo_xmp.PhotoMeta(base.rating, kws + ((name,) if on else ()),
+                                   base.edits, base.description)
 
     def _get_photo_session(self):
         if self._photo_session is None:
@@ -6760,7 +6761,12 @@ class FilerWindow(QWidget):
                 edits = None
                 if isinstance(e.get("edits"), dict):
                     edits = photo_metacache._text_to_edits(json.dumps(e["edits"]))
-                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws, edits)
+                desc = e.get("description")
+                if not isinstance(desc, str):
+                    # 旧形式の記録（メモ欄が無い）では、覚えているメモを消さない
+                    old = cache.get(e["path"])
+                    desc = old.description if old is not None else ""
+                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws, edits, desc)
                 metas[photo_key(e["path"])] = meta
                 # 変更記録で分かった★は永続キャッシュにも反映する(書き込みは更新日時を
                 # 戻すので、stat の照合だけでは古い値のまま当たってしまう)

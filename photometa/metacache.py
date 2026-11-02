@@ -148,6 +148,9 @@ class MetaCache:
             if "edits" not in cols:
                 # 補正（crs:）も覚える（段階2で追加。既存のキャッシュには列を足す）
                 conn.execute("ALTER TABLE meta ADD COLUMN edits TEXT")
+            if "description" not in cols:
+                # メモ（dc:description）も覚える（既存のキャッシュには列を足す）
+                conn.execute("ALTER TABLE meta ADD COLUMN description TEXT")
             conn.commit()
         except (OSError, sqlite3.Error):
             return None
@@ -187,7 +190,7 @@ class MetaCache:
             try:
                 row = conn.execute(
                     "SELECT size, mtime_ns, side_size, side_mtime_ns, rating, keywords,"
-                    " edits FROM meta WHERE path = ?", (normalize_key(path),)).fetchone()
+                    " edits, description FROM meta WHERE path = ?", (normalize_key(path),)).fetchone()
             except sqlite3.Error:
                 return None
         if row is None or tuple(row[:4]) != stat_key:
@@ -197,7 +200,8 @@ class MetaCache:
         except (ValueError, TypeError):
             keywords = ()
         return PhotoMeta(int(row[4]), keywords,
-                         _text_to_edits(row[6] if len(row) > 6 else None))
+                         _text_to_edits(row[6] if len(row) > 6 else None),
+                         (row[7] if len(row) > 7 and isinstance(row[7], str) else ""))
 
     def put(self, path, meta: PhotoMeta | None) -> None:
         """読み取り結果を覚える。meta が None（不明）なら覚えず、古い値があれば消す。"""
@@ -217,10 +221,10 @@ class MetaCache:
                 conn.execute(
                     "INSERT OR REPLACE INTO meta"
                     " (path, size, mtime_ns, side_size, side_mtime_ns, rating, keywords,"
-                    " edits) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " edits, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (normalize_key(path), *stat_key, int(meta.rating),
                      json.dumps(list(meta.keywords), ensure_ascii=False),
-                     _edits_to_text(meta.edits)))
+                     _edits_to_text(meta.edits), meta.description or ""))
                 conn.commit()
             except sqlite3.Error:
                 pass

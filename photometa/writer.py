@@ -71,6 +71,19 @@ def keyword_tags(keyword: str, on: bool) -> list[str]:
     return tags
 
 
+def normalize_description(text: str) -> str:
+    """メモ（dc:description）の正規化。ExifTool の常駐プロセスへは改行を含む引数を送れない
+    （execute が ValueError にする）ので、改行は空白に置き換える。前後の空白も落とす。"""
+    return " ".join((text or "").split())
+
+
+def description_tags(text: str) -> list[str]:
+    """メモを書く ExifTool の引数。空ならメモを消す。text は normalize_description 済みのこと。"""
+    if not text:
+        return ["-XMP-dc:Description="]
+    return [f"-XMP-dc:Description={text}"]
+
+
 def _num(v: float) -> str:
     s = f"{v:.6f}".rstrip("0").rstrip(".")
     return s if s not in ("", "-0") else "0"
@@ -347,6 +360,14 @@ class ExifToolSession:
                                     lambda xmp_only: edits_tags(edits))
                     for p in paths]
 
+    def set_description(self, paths, text: str) -> list[WriteResult]:
+        """メモ（dc:description）を書く。空文字ならメモを消す。改行は空白に置き換わる。"""
+        text = normalize_description(text)
+        with self._lock:
+            return [self._write_one(os.fspath(p), ("description", text),
+                                    lambda xmp_only: description_tags(text))
+                    for p in paths]
+
     def restore(self, results: list[WriteResult]) -> list[WriteResult]:
         """取り消し（Z）：set_rating / set_keyword の結果から、書く前の値に戻す。
 
@@ -365,11 +386,15 @@ class ExifToolSession:
                 groups.setdefault(("keyword", kw, had), []).append(r.path)
             elif r.op[0] == "edits":
                 groups.setdefault(("edits", r.before.edits), []).append(r.path)
+            elif r.op[0] == "description":
+                groups.setdefault(("description", r.before.description), []).append(r.path)
         for key, paths in groups.items():
             if key[0] == "rating":
                 out += self.set_rating(paths, key[1])
             elif key[0] == "edits":
                 out += self.set_edits(paths, key[1])
+            elif key[0] == "description":
+                out += self.set_description(paths, key[1])
             else:
                 out += self.set_keyword(paths, key[1], key[2])
         return out
@@ -381,11 +406,11 @@ class ExifToolSession:
         if meta is None:
             return
         append_journal(r.path, meta.rating, meta.keywords, self.journal_path,
-                       edits=meta.edits)
+                       edits=meta.edits, description=meta.description)
 
 
 def append_journal(path: str, rating: int, keywords, journal_path: str | None = None,
-                   edits=None) -> None:
+                   edits=None, description: str = "") -> None:
     """変更記録に1行足す（書けなくても止めない）。2MB を超えていたら .old に回してから書く。"""
     jp = journal_path or JOURNAL_PATH
     entry = {
@@ -394,6 +419,7 @@ def append_journal(path: str, rating: int, keywords, journal_path: str | None = 
         "keywords": list(keywords),
         "time": round(time.time(), 3),
         "pid": os.getpid(),
+        "description": description or "",
     }
     if edits is not None:
         entry["edits"] = {

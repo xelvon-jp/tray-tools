@@ -41,6 +41,8 @@ _NS_DC = "http://purl.org/dc/elements/1.1/"
 _NS_CRS = "http://ns.adobe.com/camera-raw-settings/1.0/"
 _RATING = f"{{{_NS_XMP}}}Rating"
 _SUBJECT = f"{{{_NS_DC}}}subject"
+_DESCRIPTION = f"{{{_NS_DC}}}description"
+_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 _LI = f"{{{_NS_RDF}}}li"
 _DESC = f"{{{_NS_RDF}}}Description"
 
@@ -116,6 +118,7 @@ class PhotoMeta:
     rating: int = 0                       # -1（削除候補）〜 5。書かれていなければ 0
     keywords: tuple[str, ...] = ()        # dc:subject の並び（書かれている順）
     edits: Edits | None = None            # 補正（crs:）。無ければ None
+    description: str = ""                 # メモ（dc:description。言語別は x-default 優先）
 
 
 class _Broken(Exception):
@@ -161,6 +164,7 @@ def parse_xmp(packet: bytes | str) -> PhotoMeta | None:
         return None
     rating_text = None
     keywords: list[str] = []
+    descriptions: list[tuple[str, str]] = []   # (xml:lang, 本文)
     for el in root.iter():
         if el.tag == _DESC and _RATING in el.attrib and rating_text is None:
             rating_text = el.attrib[_RATING]
@@ -171,6 +175,20 @@ def parse_xmp(packet: bytes | str) -> PhotoMeta | None:
                 kw = (li.text or "").strip()
                 if kw and kw not in keywords:
                     keywords.append(kw)
+        elif el.tag == _DESCRIPTION:
+            lis = list(el.iter(_LI))
+            if lis:
+                for li in lis:
+                    text = li.text or ""
+                    if text:
+                        descriptions.append((li.attrib.get(_LANG, ""), text))
+            elif el.text:
+                descriptions.append(("", el.text))
+    description = ""
+    if descriptions:
+        # 言語別の説明文（Lang Alt）は x-default を優先し、無ければ最初のもの
+        description = next((t for lang, t in descriptions if lang == "x-default"),
+                           descriptions[0][1])
     rating = 0
     if rating_text is not None and rating_text.strip():
         try:
@@ -178,7 +196,7 @@ def parse_xmp(packet: bytes | str) -> PhotoMeta | None:
         except ValueError:
             return None
         rating = max(-1, min(5, rating))
-    return PhotoMeta(rating, tuple(keywords), _parse_edits(root))
+    return PhotoMeta(rating, tuple(keywords), _parse_edits(root), description)
 
 
 def _parse_edits(root) -> Edits | None:

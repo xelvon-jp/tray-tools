@@ -2319,9 +2319,9 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 
 | モジュール | 役目 |
 |---|---|
-| `photometa/xmp.py` | ★とキーワードを**ExifTool を使わずに**読む（`read_meta(path)` → `PhotoMeta(rating, keywords)`、読めなければ `None`＝不明）。対象の判定は `is_photo(name)` |
-| `photometa/writer.py` | ExifTool を常駐させて書く（`ExifToolSession.set_rating` / `set_keyword` / `restore`）。変更記録の読み書き（`JournalReader`） |
-| `photometa/metacache.py` | ★の読み取り結果の永続キャッシュ（SQLite。`MetaCache.read_cached` / `read_metas`。下の「読み取りキャッシュ」） |
+| `photometa/xmp.py` | ★とキーワードとメモを**ExifTool を使わずに**読む（`read_meta(path)` → `PhotoMeta(rating, keywords, edits, description)`、読めなければ `None`＝不明）。対象の判定は `is_photo(name)` |
+| `photometa/writer.py` | ExifTool を常駐させて書く（`ExifToolSession.set_rating` / `set_keyword` / `set_edits` / `set_description` / `restore`）。変更記録の読み書き（`JournalReader`） |
+| `photometa/metacache.py` | ★の読み取り結果の永続キャッシュ（SQLite。`MetaCache.read_cached` / `read_metas`。メモも一緒に覚える。下の「読み取りキャッシュ」） |
 | `photometa/phone.py` | スマホへ送るのサーバとローカル CA（`ShareServer` / `qr_matrix`。Qt に依存しない。画面は あっふ が `filer_phone.py`、PhotoCuller が自前で持つ。CA の置き場所 `phone_ca` は両アプリ共通） |
 | `photometa/render.py` | 補正（XMP の `crs:`。トリミング・傾き・明るさ・コントラスト・彩度・色温度・色合い）を画素に当てる（`apply_edits` / `render_to_jpeg`。Qt に依存しない）。元の写真は書き換えず、フォトフレーム同期とスマホへ送るときにその場で当てる。計算は Lightroom と同じではない簡易なもの（明るさは EV の 2 のべき乗、コントラスト・彩度は (100+値)/100 倍、色温度・色合いはチャンネルごとの利得）で、写りが完全には一致しません。補正の読み書きは `xmp.py`（`PhotoMeta.edits`）と `writer.py`（`set_edits`）、画面は PhotoCuller の `I` → `T` |
 | `photometa/config.py` | 共通設定の読み書き、写真メニュー（`menu_items`。PhotoCuller の `I`）・絞り込みの小メニュー（`filter_menu_items`。PhotoCuller の `I` → `/`）・書き出しの小メニュー（`export_menu_items`。PhotoCuller の `I` → `E`）の中身 |
@@ -2336,6 +2336,7 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 |---|---|
 | 書くタグ | `XMP-xmp:Rating`（-1〜5。正本）、`XMP-microsoft:RatingPercent`・`EXIF:Rating`・`EXIF:RatingPercent`（★1=1 ★2=25 ★3=50 ★4=75 ★5=99。0 と -1 は 0）。エクスプローラーの「評価」にも同じ★が出ます。EXIF の Rating は符号なしなので、削除候補（-1）は EXIF では 0（エクスプローラーでは★なしに見える） |
 | キーワード | `XMP-dc:Subject` に足す／消すだけ（ほかのキーワードは触らない）。エクスプローラーの「タグ」列に出ます |
+| メモ | `XMP-dc:Description`（キャプション欄）に書く短いメモ。読み取りは言語別（Lang Alt）の `x-default` を優先。編集の画面は PhotoCuller の `I` → `M`（あっふに画面は無い）。ExifTool の常駐プロセスへ改行を含む引数を送れないため、改行は空白に置き換わります |
 | 形式 | JPEG / PNG / WebP / HEIC / TIFF はファイルの中。RAW（arw cr2 cr3 nef dng orf rw2 raf）は同名のサイドカー `名前.xmp`（無ければ作る。XMP のタグだけ） |
 | 更新日時 | **変えません**（`-P`）。ExifTool の `-P` でも 1µs ほどずれる（Perl の浮動小数を通るため）ので、書いた後に書く前の値へ 100ns 単位で戻しています。PhotoCuller のキャッシュが「パス＋更新日時」をキーにしているためです |
 | 控え | 作りません（`-overwrite_original`）。ExifTool は一時ファイルに書いてから置き換えます。読み取り専用のファイルは ExifTool に渡さずに断ります（渡すと置き換えに失敗して `名前_exiftool_tmp` を残すため） |
@@ -2345,7 +2346,7 @@ ExifTool は `-stay_open True -@ -` で1つだけ起こし、1枚ずつ送りま
 
 **読み取り**は、JPEG は APP1 の XMP セグメントをマーカーをたどって探し（画像データの始まりで打ち切る）、PNG は `iTXt`、WebP は `XMP ` チャンク、それ以外（HEIC / TIFF）は先頭 1MB から XMP パケットを探します。形式は拡張子ではなく先頭のバイト列で見分けます。
 
-**変更記録**（`%LOCALAPPDATA%\traytools\photometa_journal.jsonl`）: 書いた側が1行（パス・★・キーワード・時刻・pid）足し、もう一方のアプリが `JournalReader` で前回の位置から読んで、開いている一覧に反映します（更新日時を変えないので、日時では変更に気付けないため）。2MB を超えたら `.old` に回して新しく始めます。
+**変更記録**（`%LOCALAPPDATA%\traytools\photometa_journal.jsonl`）: 書いた側が1行（パス・★・キーワード・時刻・pid・メモ）足し、もう一方のアプリが `JournalReader` で前回の位置から読んで、開いている一覧に反映します（更新日時を変えないので、日時では変更に気付けないため）。2MB を超えたら `.old` に回して新しく始めます。
 
 **読み取りキャッシュ**（`photometa/metacache.py`）: ★の読み取り結果を `%LOCALAPPDATA%\traytools\photometa_cache.sqlite`（SQLite、WAL）に覚え、あっふと PhotoCuller で共用します。キーは正規化したフルパス、照合はファイルのサイズと更新日時（RAW はサイドカーのサイズと更新日時も）。一致すればファイルを開かずに返し、違えば読み直して書き換えます。書き込みは更新日時を元に戻すため、`open_session` で作った `ExifToolSession` が成功時にキャッシュも新しい値へ更新し、変更記録を読んで反映する側も同じ更新をします。キャッシュに無い写真は8本並行で読みます（`READ_WORKERS`）。作り直したいときは、このファイルを消せば次回に自動で作り直します。
 

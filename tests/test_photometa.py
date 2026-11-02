@@ -149,6 +149,33 @@ def test_jpeg_reject_and_none():
     assert px.read_meta(_make_jpeg(d / "d.jpg", _packet(9))).rating == 5
 
 
+def test_read_description():
+    d = _tmpdir("jpeg_desc")
+    alt = ("<dc:description><rdf:Alt>"
+           "<rdf:li xml:lang='en'>english</rdf:li>"
+           "<rdf:li xml:lang='x-default'>運動会の写真</rdf:li>"
+           "</rdf:Alt></dc:description>")
+    p = _make_jpeg(d / "a.jpg", _packet(2, ["x"], extra=alt))
+    # x-default を優先する
+    assert px.read_meta(p) == PhotoMeta(2, ("x",), None, "運動会の写真")
+    # x-default が無ければ最初の言語
+    alt2 = ("<dc:description><rdf:Alt>"
+            "<rdf:li xml:lang='ja'>最初</rdf:li>"
+            "<rdf:li xml:lang='en'>second</rdf:li>"
+            "</rdf:Alt></dc:description>")
+    p = _make_jpeg(d / "b.jpg", _packet(None, (), extra=alt2))
+    assert px.read_meta(p).description == "最初"
+    # メモが無ければ空
+    assert px.read_meta(_make_jpeg(d / "c.jpg", _packet(1))).description == ""
+
+
+def test_description_tags_and_normalize():
+    assert pw.normalize_description("  あい\nうえ\r\nお  ") == "あい うえ お"
+    assert pw.normalize_description("") == ""
+    assert pw.description_tags("") == ["-XMP-dc:Description="]
+    assert pw.description_tags("メモ") == ["-XMP-dc:Description=メモ"]
+
+
 def test_jpeg_after_sos_is_ignored():
     """SOS より後ろにある XMP らしき文字列は見ない(画像データの途中にたまたま出ても拾わない)。"""
     d = _tmpdir("jpeg_sos")
@@ -802,6 +829,14 @@ def test_writer_exiftool():
         et.restore(res)
         assert "みてね済" in px.read_meta(files[2]).keywords
 
+        # メモを書く（改行は空白になる）・消す・取り消す
+        res = et.set_description(files[:2], "運動会\n泣いていた")
+        assert all(r.ok for r in res)
+        assert [px.read_meta(f).description for f in files[:2]] == ["運動会 泣いていた"] * 2
+        back = et.restore(res)
+        assert all(r.ok for r in back)
+        assert [px.read_meta(f).description for f in files[:2]] == ["", ""]
+        assert all(r.ok for r in et.set_description(files[:1], ""))
         # ★を外す(0)
         assert all(r.ok for r in et.set_rating(files, 0))
         assert all(px.read_meta(f).rating == 0 for f in files)
@@ -1471,6 +1506,22 @@ def test_metacache_hit_does_not_read_file():
     assert cache.get(path) == PhotoMeta(4, ("旅行",))
     # 読めなかったもの（None）は覚えない
     assert cache.read_cached(str(d / "none.jpg"), reader) is None
+
+
+def test_metacache_description_roundtrip():
+    """メモ（dc:description）もキャッシュに残り、再接続後も読める。"""
+    d = _tmpdir("cache_desc")
+    alt = ("<dc:description><rdf:Alt>"
+           "<rdf:li xml:lang='x-default'>桜の前で</rdf:li>"
+           "</rdf:Alt></dc:description>")
+    path = _make_jpeg(d / "a.jpg", _packet(3, ["旅行"], extra=alt))
+    db = str(d / "cache.sqlite")
+    cache = mc.MetaCache(db)
+    assert cache.read_cached(path) == PhotoMeta(3, ("旅行",), None, "桜の前で")
+    cache.close()
+    cache2 = mc.MetaCache(db)
+    assert cache2.get(path) == PhotoMeta(3, ("旅行",), None, "桜の前で")
+    cache2.close()
     assert cache.get(str(d / "none.jpg")) is None
 
 

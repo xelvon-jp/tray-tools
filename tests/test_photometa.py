@@ -1818,6 +1818,40 @@ def test_frame_aspect_crop():
         assert im.size == (1200, 800), im.size
 
 
+def test_metacache_close_and_finalize():
+    """MetaCache: close は二重でも安全、with で閉じる、参照が無くなれば接続も閉じる。"""
+    import gc
+
+    from photometa.metacache import MetaCache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp, "c.sqlite"))
+        photo = str(_exif_jpeg(Path(tmp, "a.jpg")))
+        cache = MetaCache(db)
+        cache.put(photo, PhotoMeta(3, ()))
+        assert cache._conn is not None
+        cache.close()
+        assert cache._conn is None
+        cache.close()   # 二重でも安全
+        with MetaCache(db) as c2:
+            assert c2.get(photo) is not None
+        assert c2._conn is None
+        # 参照を手放したら finalizer が接続を閉じる
+        from photometa import metacache as mc_mod
+
+        closed = []
+        orig_close = mc_mod._close_connection
+        mc_mod._close_connection = lambda c: (closed.append(c), orig_close(c))
+        try:
+            cache = MetaCache(db)
+            cache.put(photo, PhotoMeta(4, ()))
+            del cache
+            gc.collect()
+        finally:
+            mc_mod._close_connection = orig_close
+        assert closed, "finalizer did not close"
+
+
 def test_edits_sanitized():
     """外から来た補正値の検査: 範囲で切りそろえ、駄目な枠は捨て、NaN は 0。"""
     from photometa import metacache

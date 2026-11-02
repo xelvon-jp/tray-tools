@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 import threading
+import weakref
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from . import config as _config
@@ -103,6 +104,18 @@ def _stat_key(path: str):
     return (st.st_size, st.st_mtime_ns, side_size, side_mtime_ns)
 
 
+def _close_connection(conn) -> None:
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _finalize_close(conn) -> None:
+    """finalize 用（_close_connection を呼ぶ時点で引き直す）。"""
+    _close_connection(conn)
+
+
 class MetaCache:
     """★の読み取り結果の永続キャッシュ（SQLite）。スレッドセーフ。
 
@@ -139,16 +152,25 @@ class MetaCache:
         except (OSError, sqlite3.Error):
             return None
         self._conn = conn
+        # 使い終わって参照が無くなったら、接続も閉じる（Windows では開いた
+        # ままの SQLite ファイルが消せなくなるため。close() 済みなら何もしない）
+        self._finalizer = weakref.finalize(self, _finalize_close, conn)
         return conn
 
     def close(self) -> None:
         with self._lock:
             conn, self._conn = self._conn, None
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
         if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
+            _close_connection(conn)
+
+    def __enter__(self) -> "MetaCache":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ------------------------------------------------------------ 読み書き
 

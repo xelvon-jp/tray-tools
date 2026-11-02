@@ -8253,7 +8253,10 @@ def test_photo_rating_slider_only():
             finally:
                 gate.set()
                 filer._read_photo_meta = original
+                cur = filer._photo_metacache
                 filer._photo_metacache = saved_cache
+                if cur is not None and cur is not saved_cache:
+                    cur.close()   # 開いたままだと一時ファイルが消せない（Windows）
             L.clear_rating()
         finally:
             w.close()
@@ -9184,7 +9187,11 @@ def test_photo_read_metacache_progress_online():
             finally:
                 filer._read_photo_meta = original
         finally:
+            cur = filer._photo_metacache
             filer._photo_metacache = saved_cache
+            if cur is not None and cur is not saved_cache:
+                cur.close()
+            cache.close()
 
 
 def test_photo_pick():
@@ -9349,7 +9356,13 @@ def test_photo_pick():
         finally:
             w.close()
             w.deleteLater()
+            cur = filer._photo_metacache
             filer._photo_metacache = saved_metacache
+            if cur is not None and cur is not saved_metacache:
+                cur.close()
+            pick_cache = locals().get("pick_cache")
+            if pick_cache is not None and pick_cache is not saved_metacache:
+                pick_cache.close()
 
 
 def main() -> int:

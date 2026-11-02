@@ -5,6 +5,9 @@
 #
 # - 範囲スライダーはつまみ2つ・7段(-1〜5)。目盛りは photometa.config.rating_short
 #   (❌ / 未 / 1 / 2 / ベスト / フレーム / みてね)。値は整数にスナップし、下限 <= 上限を保つ
+# - キーワードのチップ: 共通設定のキーワードごとにトグルのボタンを並べ、押したものが
+#   付いている写真だけに絞る(複数は AND)。状態(どのキーワードで絞っているか)は窓(Pane)
+#   が持ち、この段は表示とマウス操作だけ
 # - あっふで★で絞り込む入口はこの段だけ。状態(★の範囲)はその窓(Pane)が持つ。この段は
 #   表示とマウス操作だけで、式への変換と一覧の絞り込みは filer.py(Pane)が行う
 # - 窓の幅は左右の境界で決まるので、段は窓を押し広げない。入りきらないときは
@@ -171,12 +174,13 @@ class RatingRangeSlider(QWidget):
 
 
 class RatingBar(QWidget):
-    """★の範囲スライダー・範囲の名前・表示枚数・解除(✕)を並べた1段。"""
+    """★の範囲スライダー・範囲の名前・キーワードのチップ・表示枚数・解除(✕)を並べた1段。"""
 
-    pressed = Signal()                  # スライダーか ✕ を押した(窓をアクティブにする)
+    pressed = Signal()                  # スライダーか ✕・チップを押した(窓をアクティブにする)
     range_changed = Signal(int, int)    # スライダーを動かした(lo, hi)
     released = Signal()                 # スライダーのボタンを離した
     clear_requested = Signal()          # ✕
+    keyword_toggled = Signal(str, bool)  # キーワードのチップ(名前, 絞るなら True)
 
     def __init__(self, colors: dict, font, parent=None):
         super().__init__(parent)
@@ -208,6 +212,16 @@ class RatingBar(QWidget):
         self.slider.range_changed.connect(self.range_changed)
         self.slider.released.connect(self.released)
         self.range_label = label()
+        # キーワードのチップの並び(中身は set_keywords で差し替える)
+        self._colors = c
+        self._font = font
+        self.keyword_box = QWidget(self)
+        self.keyword_box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        kw_layout = QHBoxLayout(self.keyword_box)
+        kw_layout.setContentsMargins(0, 0, 0, 0)
+        kw_layout.setSpacing(4)
+        self.keyword_buttons: dict[str, QPushButton] = {}
+        self._any_keyword_on = False
         self.count_label = label()
         self.clear_button = QPushButton("✕", self)
         self.clear_button.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
@@ -224,6 +238,7 @@ class RatingBar(QWidget):
         layout.addWidget(star)
         layout.addWidget(self.slider)
         layout.addWidget(self.range_label)
+        layout.addWidget(self.keyword_box)
         layout.addStretch()     # 枚数と ✕ は右端に寄せる
         layout.addWidget(self.count_label)
         layout.addWidget(self.clear_button)
@@ -244,21 +259,72 @@ class RatingBar(QWidget):
             return max(w.sizeHint().width(), w.minimumWidth())
 
         room -= sum(width_of(w) + gap for w in (self.star, self.slider, self.clear_button)) - gap
-        for w in (self.count_label, self.range_label):
+        for w in (self.count_label, self.range_label, self.keyword_box):
+            if w is self.keyword_box and not self.keyword_buttons:
+                w.setVisible(False)
+                continue
             need = width_of(w) + gap
             w.setVisible(room >= need)
             if room >= need:
                 room -= need
 
+    # --- キーワードのチップ ---
+
+    def _make_chip(self, name: str) -> QPushButton:
+        c = self._colors
+        b = QPushButton(name, self.keyword_box)
+        b.setCheckable(True)
+        b.setFocusPolicy(Qt.NoFocus)   # ファイル窓からフォーカスを奪わない
+        b.setFont(self._font)
+        b.setToolTip(f"「{name}」が付いている写真だけ出す(もう一度押すと解除)")
+        b.setStyleSheet(
+            f"QPushButton {{ background-color: {c['status_background']}; color: {c['status_text']};"
+            f" border: 1px solid {c['fkey_border']}; border-radius: 8px; padding: 1px 8px; }}"
+            f" QPushButton:checked {{ background-color: {c['rating_accent']}; color: {c['background']};"
+            f" border: 1px solid {c['rating_accent']}; }}")
+        b.pressed.connect(self.pressed)
+        b.toggled.connect(lambda on, n=name: self.keyword_toggled.emit(n, on))
+        return b
+
+    def set_keywords(self, keywords) -> None:
+        """キーワードのチップを並べ直す。keywords は (名前, 絞り込み中か) の列。
+
+        名前の並びが変わったときだけボタンを作り直し、印だけなら付け直す
+        (信号は出さない)。"""
+        names = [name for name, _on in keywords]
+        if names != list(self.keyword_buttons):
+            layout = self.keyword_box.layout()
+            for b in self.keyword_buttons.values():
+                layout.removeWidget(b)
+                b.setParent(None)
+                b.deleteLater()
+            self.keyword_buttons = {}
+            for name in names:
+                b = self._make_chip(name)
+                self.keyword_buttons[name] = b
+                layout.addWidget(b)
+        self._any_keyword_on = False
+        for name, on in keywords:
+            self._any_keyword_on = self._any_keyword_on or bool(on)
+            b = self.keyword_buttons[name]
+            if b.isChecked() != bool(on):
+                b.blockSignals(True)
+                b.setChecked(bool(on))
+                b.blockSignals(False)
+        self.keyword_box.setVisible(bool(names))
+        self._fit_items()
+
     def show_state(self, lo: int, hi: int, shown: int, total: int,
-                   config: dict, move_slider: bool = True) -> None:
+                   config: dict, move_slider: bool = True, keywords=()) -> None:
         """表示を差し替える(range_changed は出さない)。move_slider=False ならつまみは
-        動かさない(ドラッグ中で、窓の側がまだ追い付いていないとき)。"""
+        動かさない(ドラッグ中で、窓の側がまだ追い付いていないとき)。
+        keywords は (名前, 絞り込み中か) の列で、チップの並びと印になる。"""
         self.slider.set_tick_texts(photo_config.rating_short(v, config)
                                    for v in range(RATING_MIN, RATING_MAX + 1))
         if move_slider:
             self.slider.set_values(lo, hi)
         self.count_label.setText(f"表示 {shown:,} / {total:,}枚")
+        self.set_keywords(keywords)
         self.show_range(lo, hi, config)
         self._fit_items()
 
@@ -268,4 +334,6 @@ class RatingBar(QWidget):
         if text != self.range_label.text():
             self.range_label.setText(text)
             self._fit_items()
-        self.clear_button.setEnabled(not photo_config.is_full_range(lo, hi))
+        # ✕ は★の範囲だけでなくキーワードの絞り込みも解くので、どちらか効いていれば押せる
+        self.clear_button.setEnabled(
+            not photo_config.is_full_range(lo, hi) or self._any_keyword_on)

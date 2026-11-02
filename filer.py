@@ -825,6 +825,7 @@ class Pane(QWidget):
         # 効かせないだけで、写真フォルダへ戻ればまた効く)。解くのは段の ✕ と :(マスク解除)。
         # 保存はしない(起動し直せば「すべて」)。
         self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
+        self.rating_keywords: set[str] = set()   # キーワードの絞り込み(段のチップ。AND)
         self.rating_node = None
         # 写真の枚数(★の絞り込みを掛ける前 / 掛けた後)。下部の段の「表示 12 / 340枚」
         self.photo_total = 0
@@ -881,6 +882,7 @@ class Pane(QWidget):
         self.rating_bar.range_changed.connect(self._on_rating_slider)
         self.rating_bar.released.connect(self._flush_rating_slider)
         self.rating_bar.clear_requested.connect(self._on_rating_clear)
+        self.rating_bar.keyword_toggled.connect(self._on_rating_keyword)
         self.rating_bar.hide()
         layout.addWidget(self.rating_bar)
         self._rating_pending = None     # まだ掛けていないスライダーの値 (lo, hi)
@@ -2143,16 +2145,29 @@ class Pane(QWidget):
         self._apply_rating()
 
     def clear_rating(self, refresh: bool = True) -> None:
-        """★の絞り込みを解く(★の範囲を「すべて」に戻す)。"""
+        """★の絞り込みを解く(★の範囲を「すべて」に戻し、キーワードの絞り込みも解く)。"""
         self.rating_range = (photo_config.RATING_MIN, photo_config.RATING_MAX)
+        self.rating_keywords = set()
         if refresh:
             self._apply_rating()
         else:
             self.rating_node = None
 
     def rating_expr(self) -> str:
-        """★の範囲を式にしたもの(「★>=3 && ★<=4」)。すべてなら空。"""
-        return photo_config.range_expr(*self.rating_range)
+        """★の範囲とキーワードを式にしたもの(「★>=3 && #みてね済」)。すべてなら空。
+
+        キーワードは共通設定にあるものだけ(設定から消えた名前は静かに落とす)。
+        並びは設定の順。"""
+        parts = []
+        expr = photo_config.range_expr(*self.rating_range)
+        if expr:
+            parts.append(expr)
+        names = [kw["name"] for kw in (self.window_.photo_config.get("keywords") or [])]
+        self.rating_keywords &= set(names)
+        for name in names:
+            if name in self.rating_keywords:
+                parts.append("#" + photo_filter.quote_name(name))
+        return " && ".join(parts)
 
     def _apply_rating(self) -> None:
         """★の範囲から絞り込みの木を作り直し、一覧に掛け直す。"""
@@ -2175,9 +2190,12 @@ class Pane(QWidget):
             return
         pending = self._rating_pending
         lo, hi = pending if pending is not None else self.rating_range
+        keywords = [(kw["name"], kw["name"] in self.rating_keywords)
+                    for kw in (self.window_.photo_config.get("keywords") or [])]
         # ドラッグ中で窓の側がまだ追い付いていないときは、つまみを戻さない
         bar.show_state(lo, hi, self.photo_shown, self.photo_total,
-                       self.window_.photo_config, move_slider=pending is None)
+                       self.window_.photo_config, move_slider=pending is None,
+                       keywords=keywords)
 
     def _on_rating_bar_pressed(self) -> None:
         """段のスライダーか ✕ を押した: この窓をアクティブにする(フォーカスはファイル窓。
@@ -2211,8 +2229,19 @@ class Pane(QWidget):
         except Exception:  # noqa: BLE001
             self.window_.log(f"エラー: {_log_exception('ratingSlider')}")
 
+    def _on_rating_keyword(self, name: str, on: bool) -> None:
+        """段のキーワードチップ: そのキーワードで絞る／解く(★の範囲とは AND)。"""
+        try:
+            if on:
+                self.rating_keywords.add(name)
+            else:
+                self.rating_keywords.discard(name)
+            self._apply_rating()
+        except Exception:  # noqa: BLE001
+            self.window_.log(f"エラー: {_log_exception('ratingKeyword')}")
+
     def _on_rating_clear(self) -> None:
-        """段の ✕: この窓の★の範囲を「すべて」に戻す。"""
+        """段の ✕: この窓の★の範囲を「すべて」に戻し、キーワードの絞り込みも解く。"""
         try:
             self._rating_timer.stop()
             self._rating_pending = None
@@ -5720,7 +5749,6 @@ class FilerWindow(QWidget):
             return "不明" if value is None else show(value)
 
         kws = cfg.get("keywords") or []
-        keyword = kws[0] if kws else None
         # ★のボタン(❌ 削除 / 未選別 / ★1 / ★2 / ⭐ ベスト / 🖼️ フレーム / 💌 みてね)。
         # 文字と色は★の列のバッジと同じ(rating_badge・rating_color_key)
         ratings = []
@@ -5740,11 +5768,13 @@ class FilerWindow(QWidget):
             "ratings": ratings,
             "rating_now": now((m.rating if m is not None else None for m in metas),
                               lambda r: photo_config.rating_name(r, cfg)),
-            "keyword": keyword["name"] if keyword else None,
-            "keyword_key": keyword["key"] if keyword else "",
-            "keyword_now": now(
-                (None if m is None else self._has_keyword(m, keyword["name"]) for m in metas),
-                lambda on: "付いている" if on else "付いていない") if keyword else "",
+            "keywords": [
+                {"name": kw["name"], "key": kw["key"],
+                 "now": now(
+                     (None if m is None else self._has_keyword(m, kw["name"])
+                      for m in metas),
+                     lambda on: "付いている" if on else "付いていない")}
+                for kw in kws],
         }
 
     def _apply_file_info_photo(self, pane, photos, renamed, changes) -> None:
@@ -5761,12 +5791,10 @@ class FilerWindow(QWidget):
                 if meta is not None:
                     pane.photo_meta[photo_key(new)] = meta
             paths.append(new)
-        keywords = self.photo_config.get("keywords") or []
         if "rating" in changes:
             self.photo_write(paths, ("rating", changes["rating"]), self._photo_metas_for(paths))
-        if "keyword" in changes and keywords:
-            op = ("keyword", keywords[0]["name"], changes["keyword"])
-            self.photo_write(paths, op, self._photo_metas_for(paths))
+        for name, on in (changes.get("keywords") or {}).items():
+            self.photo_write(paths, ("keyword", name, on), self._photo_metas_for(paths))
 
     # --- 設定(Z) ---
     def cmd_settings_dialog(self):

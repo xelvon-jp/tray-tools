@@ -101,9 +101,10 @@ class FileInfoDialog(QDialog):
                      (「⭐ ベスト」), "name": 正式名(「ベストショット」), "color": 字の色,
                      "background": 地の色}。「変えない」はどれも選んでいない状態
         rating_now   今の★の表示(「ベストショット」「いろいろ」など)
-        keyword      キーワードの名前(「みてね済」。無ければ None で行を出さない)
-        keyword_key  キーワードを Alt+この文字で切り替える(属性の頭文字と重なれば使わない)
-        keyword_now  今のキーワードの表示(「付いている」「付いていない」「いろいろ」)
+        keywords     キーワードの列 [{"name": 名前, "key": Alt+この文字で切り替える
+                     (属性の頭文字などと重なれば使わない), "now": 今の表示
+                     (「付いている」「付いていない」「いろいろ」)}]。キーワードごとに
+                     ボタン1つ(押すたびに 変えない → 付ける ✓ → 外す)。空なら出さない
 
     colors は "background" / "text"(ダイアログの地と字)と "cursor"(写真の★のボタンを
     選んだときの枠)。
@@ -246,10 +247,11 @@ class FileInfoDialog(QDialog):
         self.rating_buttons = {}        # ★の値 → ボタン
         self.rating_names = {}          # ★の値 → 正式名(「ベストショット」)
         self.rating_choice = None       # 選んだ★(None は「変えない」)
-        self.keyword = None
-        self.keyword_button = None
-        self.keyword_choice = None      # みてね済: None 変えない / True 付ける / False 外す
-        self.keyword_key = ""
+        self.keyword = None             # 1つ目のキーワードの名前(互換の参照用)
+        self.keyword_buttons: dict = {}  # キーワードの名前 → ボタン
+        self.keyword_choices: dict = {}  # キーワードの名前 → None 変えない / True 付ける / False 外す
+        self.keyword_keys: dict = {}     # キーワードの名前 → Alt+の文字(使えなければ "")
+        self.keyword_now_labels: dict = {}  # キーワードの名前 → 「今: …」の表示
         if photo:
             self._build_photo_box(layout, photo)
 
@@ -283,10 +285,30 @@ class FileInfoDialog(QDialog):
         (self.name_edit if not (self.bulk or self.photo_only) else self.ok_button).setFocus()
 
     # --- 写真の★ ---
+    # ---- 1つ目のキーワードへの互換の参照(従来は みてね済 1つだけだった) ----
+
+    @property
+    def keyword_button(self):
+        return self.keyword_buttons.get(self.keyword) if self.keyword else None
+
+    @property
+    def keyword_choice(self):
+        return self.keyword_choices.get(self.keyword) if self.keyword else None
+
+    @keyword_choice.setter
+    def keyword_choice(self, value):
+        if self.keyword:
+            self.keyword_choices[self.keyword] = value
+
+    @property
+    def keyword_key(self) -> str:
+        return self.keyword_keys.get(self.keyword, "") if self.keyword else ""
+
     def _build_photo_box(self, layout, photo: dict) -> None:
         """下部の「写真の★」の欄。★は★の列のバッジと同じ色のボタンを横に並べ、各ボタンの
         下に小さくキーの案内(Alt+-・Alt+0・Alt+1〜Alt+5)。既定は「変えない」(どれも選んで
-        いない)。みてね済は同じ形のボタン1つで、押すたびに 変えない → 付ける ✓ → 外す。"""
+        いない)。キーワードは同じ形のボタンをキーワードごとに1つ並べ、押すたびに
+        変えない → 付ける ✓ → 外す。"""
         box = QGroupBox(f"写真の★（画像 {photo.get('count', 0)} 件）")
         grid = QGridLayout(box)
         grid.setHorizontalSpacing(4)
@@ -306,45 +328,63 @@ class FileInfoDialog(QDialog):
             self.rating_buttons[value] = button
             self.rating_names[value] = item.get("name") or item["label"]
             col += 1
-        keyword = photo.get("keyword")
+        keywords = photo.get("keywords") or []
+        if not keywords and photo.get("keyword"):
+            # 従来の渡し方(1つだけ)も受ける
+            keywords = [{"name": photo["keyword"], "key": photo.get("keyword_key") or "",
+                         "now": photo.get("keyword_now") or ""}]
         self.keyword_now_label = None
-        if keyword:
-            self.keyword = keyword
-            key = (photo.get("keyword_key") or "").upper()
-            # 属性の Alt+頭文字と重なるなら使わない(属性を優先)
-            if len(key) == 1 and "A" <= key <= "Z" and key not in {a for _k, _l, a in ATTR_ROWS}:
-                self.keyword_key = key
+        if keywords:
             grid.setColumnMinimumWidth(col, 10)      # ★のボタンとの間を少し空ける
             col += 1
             fg = self.colors.get("text", "#ffffff")
-            self.keyword_button = self._photo_button("", fg, "#24244e", cursor)
-            self.keyword_button.setToolTip(f"{keyword}を付ける／外す（押すたびに切り替え）")
-            self.keyword_button.clicked.connect(self._on_keyword_button)
-            grid.addWidget(self.keyword_button, 0, col)
-            if self.keyword_key:
-                grid.addWidget(self._key_hint(f"Alt+{self.keyword_key}"), 1, col, Qt.AlignHCenter)
+            used_keys = {a for _k, _l, a in ATTR_ROWS}
+            for item in keywords:
+                name = item["name"]
+                if self.keyword is None:
+                    self.keyword = name
+                self.keyword_choices[name] = None
+                key = (item.get("key") or "").upper()
+                # 属性の Alt+頭文字・他のキーワードと重なるなら使わない(属性を優先)
+                if len(key) == 1 and "A" <= key <= "Z" and key not in used_keys:
+                    self.keyword_keys[name] = key
+                    used_keys.add(key)
+                else:
+                    self.keyword_keys[name] = ""
+                button = self._photo_button("", fg, "#24244e", cursor)
+                button.setToolTip(f"{name}を付ける／外す（押すたびに切り替え）")
+                button.clicked.connect(lambda _c=False, n=name: self._on_keyword_button(n))
+                self.keyword_buttons[name] = button
+                grid.addWidget(button, 0, col)
+                if self.keyword_keys[name]:
+                    grid.addWidget(self._key_hint(f"Alt+{self.keyword_keys[name]}"),
+                                   1, col, Qt.AlignHCenter)
+                now_label = QLabel(f"今: {item.get('now') or 'いろいろ'}")
+                now_label.setTextFormat(Qt.PlainText)
+                self.keyword_now_labels[name] = now_label
+                grid.addWidget(now_label, 2, col, 1, 1)
+                col += 1
+            col -= 1
+            self.keyword_now_label = next(iter(self.keyword_now_labels.values()), None)
         grid.setColumnStretch(col + 1, 1)
-        # 今の★・キーワード(選んだ結果は下の1行)
+        # 今の★(キーワードの「今」は各ボタンの下。選んだ結果は最下行)
         self.rating_now_label = QLabel(f"今: {photo.get('rating_now') or 'いろいろ'}")
         self.rating_now_label.setTextFormat(Qt.PlainText)
         grid.addWidget(self.rating_now_label, 2, 0, 1, max(len(self.rating_buttons), 1))
-        if keyword:
-            self.keyword_now_label = QLabel(f"今: {photo.get('keyword_now') or 'いろいろ'}")
-            self.keyword_now_label.setTextFormat(Qt.PlainText)
-            grid.addWidget(self.keyword_now_label, 2, col, 1, 2)
         self.rating_choice_label = QLabel()
         self.rating_choice_label.setTextFormat(Qt.PlainText)
         grid.addWidget(self.rating_choice_label, 3, 0, 1, col + 2)
         layout.addWidget(box)
         self.photo_box = box
-        # Alt+5/4/3/2/1/0/- で★を、Alt+(キーワードの頭文字)でみてね済を切り替える。
+        # Alt+5/4/3/2/1/0/- で★を、Alt+(キーワードの文字)で各キーワードを切り替える。
         # QShortcut なのでダイアログのどこにフォーカスがあっても効き、入力欄に字は入らない。
         for text, value in RATING_KEYS.items():
             shortcut = QShortcut(QKeySequence(f"Alt+{text}"), self)
             shortcut.activated.connect(lambda v=value: self._on_rating_key(v))
-        if self.keyword_key:
-            shortcut = QShortcut(QKeySequence(f"Alt+{self.keyword_key}"), self)
-            shortcut.activated.connect(self._on_keyword_button)
+        for name, key in self.keyword_keys.items():
+            if key:
+                shortcut = QShortcut(QKeySequence(f"Alt+{key}"), self)
+                shortcut.activated.connect(lambda n=name: self._on_keyword_button(n))
         self._show_photo_choice()
 
     def _photo_button(self, text: str, fg: str, bg: str, cursor: str) -> QPushButton:
@@ -374,12 +414,16 @@ class FileInfoDialog(QDialog):
         self.rating_choice = None if value == self.rating_choice else value
         self._show_photo_choice()
 
-    def cycle_keyword(self) -> None:
-        """みてね済を 変えない → 付ける → 外す → 変えない の順に切り替える。"""
-        if self.keyword_button is None:
+    def cycle_keyword(self, name=None) -> None:
+        """キーワードを 変えない → 付ける → 外す → 変えない の順に切り替える。
+
+        name を省くと1つ目(従来の みてね済)。"""
+        if name is None:
+            name = self.keyword
+        if name not in self.keyword_buttons:
             return
-        index = KEYWORD_CYCLE.index(self.keyword_choice)
-        self.keyword_choice = KEYWORD_CYCLE[(index + 1) % len(KEYWORD_CYCLE)]
+        index = KEYWORD_CYCLE.index(self.keyword_choices[name])
+        self.keyword_choices[name] = KEYWORD_CYCLE[(index + 1) % len(KEYWORD_CYCLE)]
         self._show_photo_choice()
 
     def _on_rating_button(self, value) -> None:
@@ -394,33 +438,41 @@ class FileInfoDialog(QDialog):
         except Exception:  # noqa: BLE001
             pass
 
-    def _on_keyword_button(self) -> None:
+    def _on_keyword_button(self, name=None) -> None:
         try:
-            self.cycle_keyword()
+            self.cycle_keyword(name)
         except Exception:  # noqa: BLE001
             pass
 
     def _show_photo_choice(self) -> None:
-        """ボタンの選んだ印・みてね済のボタンの文字・下の1行を、選んだ状態に合わせる。"""
+        """ボタンの選んだ印・キーワードのボタンの文字・下の1行を、選んだ状態に合わせる。"""
         for value, button in self.rating_buttons.items():
             button.setChecked(value == self.rating_choice)
-        if self.keyword_button is not None:
-            state = {None: "変えない", True: "付ける ✓", False: "外す"}[self.keyword_choice]
-            self.keyword_button.setText(f"{self.keyword}: {state}")
-            self.keyword_button.setChecked(self.keyword_choice is not None)
+        for name, button in self.keyword_buttons.items():
+            choice = self.keyword_choices[name]
+            state = {None: "変えない", True: "付ける ✓", False: "外す"}[choice]
+            button.setText(f"{name}: {state}")
+            button.setChecked(choice is not None)
         if self.rating_choice is None:
-            self.rating_choice_label.setText("★: 変えない")
+            text = "★: 変えない"
         else:
-            self.rating_choice_label.setText(f"★: {self.rating_names[self.rating_choice]}にする")
+            text = f"★: {self.rating_names[self.rating_choice]}にする"
+        picked = [f"{name}: {'付ける' if choice else '外す'}"
+                  for name, choice in self.keyword_choices.items() if choice is not None]
+        if picked:
+            text += "　／　" + "、".join(picked)
+        self.rating_choice_label.setText(text)
 
     def photo_changes(self) -> dict:
-        """写真の★の欄で変えるもの。{"rating": ★の値, "keyword": 付けるなら True / 外すなら
-        False}。「変えない」のものは入れない(欄が無ければ空)。"""
+        """写真の★の欄で変えるもの。{"rating": ★の値, "keywords": {名前: 付けるなら True /
+        外すなら False}}。「変えない」のものは入れない(欄が無ければ空)。"""
         changes = {}
         if self.rating_choice is not None:
             changes["rating"] = int(self.rating_choice)
-        if self.keyword_button is not None and self.keyword_choice is not None:
-            changes["keyword"] = bool(self.keyword_choice)
+        picked = {name: bool(choice) for name, choice in self.keyword_choices.items()
+                  if choice is not None}
+        if picked:
+            changes["keywords"] = picked
         return changes
 
     # --- 名前 ---

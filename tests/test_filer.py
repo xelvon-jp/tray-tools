@@ -8044,7 +8044,7 @@ def test_rename_photo_section():
                 QTest.mouseClick(kb, Qt.LeftButton)
                 QTest.mouseClick(kb, Qt.LeftButton)
                 assert d.keyword_choice is False
-                assert d.photo_changes() == {"rating": 1, "keyword": False}
+                assert d.photo_changes() == {"rating": 1, "keywords": {"みてね済": False}}
                 assert QApplication.focusWidget() is edit
                 return False
             steps.append(keys)
@@ -8073,7 +8073,7 @@ def test_rename_photo_section():
                 assert d.rating_now_label.text() == "今: ベストショット", d.rating_now_label.text()
                 _show_active(d)
                 QTest.keyClick(d, Qt.Key_K, Qt.AltModifier)
-                assert d.keyword_choice is True and d.photo_changes() == {"keyword": True}
+                assert d.keyword_choice is True and d.photo_changes() == {"keywords": {"みてね済": True}}
             steps.append(keyword_on)
             L.marks.update({"a5.jpg", "b4.jpg"})
             QTest.keyClick(L.view, Qt.Key_R)
@@ -8404,6 +8404,82 @@ def test_photo_rating_range_bar():
             w.deleteLater()
 
 
+def test_photo_keyword_chips_and_dialog():
+    """キーワードが複数あるとき: ★の範囲の段にチップが出て、押したキーワードで絞れる
+    (複数は AND、✕ で全部解ける)。R のダイアログではキーワードごとに付け外しできる。"""
+    import copy
+
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos = Path(tmp, "photos")
+        photos.mkdir()
+        _photo_jpeg(photos / "a.jpg", 5, ["カレンダー向け"])
+        _photo_jpeg(photos / "b.jpg", 4)
+        _photo_jpeg(photos / "c.jpg", 3, ["みてね済", "カレンダー向け"])
+        _photo_jpeg(photos / "d.jpg", 2)
+        _photo_jpeg(photos / "e.jpg", 1, ["みてね済"])
+        (photos / "memo.txt").write_text("x", encoding="utf-8")
+        other = Path(tmp, "other")
+        other.mkdir()
+        (other / "x.txt").write_text("x", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+
+        cfg = filer.photo_config.load_config()
+        cfg["keywords"] = list(cfg["keywords"]) + [{"key": "C", "name": "カレンダー向け"}]
+        original_load = filer.photo_config.load_config
+        filer.photo_config.load_config = lambda path=None: copy.deepcopy(cfg)
+        try:
+            w = _photo_window(photos, other, settings_path)
+            L = w.left
+            fake = _FakePhotoSession()
+            w._photo_session = fake
+            bar = L.rating_bar
+            try:
+                # チップは共通設定のキーワードの並びで出る
+                assert list(bar.keyword_buttons) == ["みてね済", "カレンダー向け"]
+                assert _names(L) == ["..", "a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "memo.txt"], _names(L)
+                # カレンダー向けで絞る
+                bar.keyword_buttons["カレンダー向け"].click()
+                _wait_until(lambda: _names(L) == ["..", "a.jpg", "c.jpg"],
+                            what="キーワードで絞り込み")
+                assert L.rating_keywords == {"カレンダー向け"}
+                # みてね済も押すと AND(両方付いている c.jpg だけ)
+                bar.keyword_buttons["みてね済"].click()
+                _wait_until(lambda: _names(L) == ["..", "c.jpg"], what="AND の絞り込み")
+                # ✕ で全部解ける
+                bar.clear_button.click()
+                _wait_until(lambda: _names(L) == ["..", "a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "memo.txt"],
+                            what="絞り込み解除")
+                assert L.rating_keywords == set() and not L.rating_node
+                assert not bar.keyword_buttons["カレンダー向け"].isChecked()
+
+                # R のダイアログ: キーワードごとにボタンがあり、Alt+文字も割り当たる
+                def step(d):
+                    assert list(d.keyword_buttons) == ["みてね済", "カレンダー向け"]
+                    assert d.keyword_keys == {"みてね済": "K", "カレンダー向け": "C"}
+                    d.cycle_keyword("カレンダー向け")
+                    assert d.photo_changes() == {"keywords": {"カレンダー向け": True}}
+                opened = _rename_dialog_runner(w, [step])
+                L.set_cursor(L._row_of("b.jpg"))
+                QTest.keyClick(L.view, Qt.Key_R)
+                assert opened, w.log_view.toPlainText()
+                path = lambda name: str(photos / name)  # noqa: E731
+                assert fake.calls[-1] == ("keyword", [path("b.jpg")], "カレンダー向け", True), \
+                    fake.calls
+                meta = L.photo_meta[filer.photo_key(path("b.jpg"))]
+                assert "カレンダー向け" in meta.keywords, meta
+            finally:
+                w.close()
+                w.deleteLater()
+        finally:
+            filer.photo_config.load_config = original_load
+
+
 def test_photo_journal_reflects_changes():
     import filer
     from photometa import writer
@@ -8535,12 +8611,15 @@ def test_photo_no_extra_entries():
                 assert not hasattr(w, name), name
             for name in ("PHOTO_EXPORT_KINDS", "PHOTO_FILTER_KINDS", "_SubMenu"):
                 assert not hasattr(filer, name), name
-            # ボタン段は無い。窓の中のボタンは★の範囲の段の ✕ だけ。文字の式の状態も無い
+            # ボタン段は無い。窓の中のボタンは★の範囲の段(✕ とキーワードのチップ)だけ。
+            # 文字の式の状態も無い
             for pane in (L, w.right):
                 for name in ("photo_bar", "photo_buttons", "build_photo_bar", "rating_filter",
                              "set_rating_filter"):
                     assert not hasattr(pane, name), name
-                assert pane.findChildren(QPushButton) == [pane.rating_bar.clear_button]
+                bar = pane.rating_bar
+                assert set(pane.findChildren(QPushButton)) == {
+                    bar.clear_button, *bar.keyword_buttons.values()}
             # Shift+Z: 隠し/システムファイルと写真フォルダモードだけ。★・絞り込み・書き出しの行や
             # 小メニューは無い
             rows = []

@@ -8480,10 +8480,11 @@ def test_photo_keyword_chips_and_dialog():
             filer.photo_config.load_config = original_load
 
 
-def test_photo_label_create():
-    """Shift+Z → L で新しいラベル(キーワード)を作る。共通設定に保存され、★の範囲の段の
-    チップにすぐ出る。同じ名前は作れない。"""
+def test_window_settings_label_tab():
+    """Z の設定ダイアログの「ラベル」タブ: 追加・削除(最初のラベルは消せない・同名は不可)。
+    決定で初めて共通設定に保存され、★の範囲の段のチップに出る。"""
     import filer
+    from PySide6.QtWidgets import QDialog
 
     _qapp()
     with tempfile.TemporaryDirectory() as tmp:
@@ -8493,37 +8494,56 @@ def test_photo_label_create():
         # 共通設定は一時ファイルに差し替える(本物には触らない)
         original_path = filer.photo_config.CONFIG_PATH
         filer.photo_config.CONFIG_PATH = str(Path(tmp, "photo_ratings.json"))
-
-        class _Input:
-            answer = "2028年カレンダー向け"
-
-            @staticmethod
-            def getText(*a, **k):
-                return _Input.answer, True
-
-        original_dialog = filer.QInputDialog
-        filer.QInputDialog = _Input
         try:
             w = _photo_window(photos, other, settings_path)
             L = w.left
+            state = {}
+
+            def drive(dialog):
+                if not hasattr(dialog, "label_list"):
+                    return QDialog.Rejected
+                try:
+                    names = lambda: [dialog.label_list.item(i).text()  # noqa: E731
+                                     for i in range(dialog.label_list.count())]
+                    assert names() == ["みてね済（キー K）"], names()
+                    errors = []
+                    dialog.label_error = errors.append
+                    dialog.ask_label_name = lambda: "2028年カレンダー向け"
+                    dialog.label_add()
+                    assert names() == ["みてね済（キー K）", "2028年カレンダー向け（キー C）"], names()
+                    dialog.label_add()       # 同じ名前は作れない
+                    assert errors == ["ラベル「2028年カレンダー向け」は既にあります"], errors
+                    assert len(names()) == 2
+                    dialog.ask_label_name = lambda: "お気に入り"
+                    dialog.label_add()
+                    assert names()[-1] == "お気に入り（キー L）", names()
+                    dialog.label_list.setCurrentRow(0)
+                    dialog.label_delete()    # 最初のラベルは消せない
+                    assert len(names()) == 3 and "最初のラベル" in errors[-1], errors
+                    dialog.label_confirm = lambda text: True
+                    dialog.label_list.setCurrentRow(2)
+                    dialog.label_delete()
+                    assert names() == ["みてね済（キー K）", "2028年カレンダー向け（キー C）"], names()
+                    # 決定前はファイルに書かれていない
+                    assert not Path(tmp, "photo_ratings.json").exists()
+                except BaseException as e:  # noqa: BLE001
+                    state["error"] = e
+                    return QDialog.Rejected
+                return QDialog.Accepted
+            w.exec_dialog = drive
             try:
-                assert list(L.rating_bar.keyword_buttons) == ["みてね済"]
-                w._exec_menu = lambda menu, chosen: "label_new"
-                w.cmd_settings_menu()
+                w.cmd_settings_dialog()
+                if "error" in state:
+                    raise state["error"]
                 saved = filer.photo_config.load_config()
-                assert saved["keywords"][-1]["name"] == "2028年カレンダー向け", saved["keywords"]
-                assert list(L.rating_bar.keyword_buttons) == \
-                    ["みてね済", "2028年カレンダー向け"]
-                assert "作りました" in w.log_view.toPlainText()
-                # 同じ名前は作れない(増えない)
-                w.cmd_settings_menu()
-                assert len(filer.photo_config.load_config()["keywords"]) == 2
-                assert "既にあります" in w.log_view.toPlainText()
+                assert saved["keywords"] == [{"key": "K", "name": "みてね済"},
+                                             {"key": "C", "name": "2028年カレンダー向け"}], saved
+                assert list(L.rating_bar.keyword_buttons) == ["みてね済", "2028年カレンダー向け"]
+                assert "ラベルを保存しました" in w.log_view.toPlainText()
             finally:
                 w.close()
                 w.deleteLater()
         finally:
-            filer.QInputDialog = original_dialog
             filer.photo_config.CONFIG_PATH = original_path
 
 
@@ -8678,7 +8698,7 @@ def test_photo_no_extra_entries():
                 return None
             w._exec_menu = look
             _press_settings_menu(w, L)
-            assert [t[:3] for t in rows] == ["&H:", "&S:", "&A:", "&N:", "&F:", "&L:"], rows
+            assert [t[:3] for t in rows] == ["&H:", "&S:", "&A:", "&N:", "&F:"], rows
             assert not any(("★" in t or "絞り込" in t or "書き出し" in t) for t in rows), rows
         finally:
             w.close()

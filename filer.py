@@ -5798,19 +5798,31 @@ class FilerWindow(QWidget):
 
     # --- 設定(Z) ---
     def cmd_settings_dialog(self):
-        """Z: 設定ダイアログ(あふｗの Z ＝設定プログラム起動)。いまは拡張子別表示色だけ。
-        決定で settings.json の filer.ext_colors だけを差し替え、両窓をその場で描き直す。"""
+        """Z: 設定ダイアログ(あふｗの Z ＝設定プログラム起動)。
+        決定で settings.json の filer.ext_colors を差し替えて両窓をその場で描き直し、
+        ラベル(キーワード)が変わっていれば共通設定(photo_ratings.json)にも保存する。"""
+        import copy
+
         import filer_settings  # 使うときに読む
 
+        self._reload_photo_config()
         editor = self.menu_editor()
         dialog = filer_settings.SettingsDialog(
             self, self.ext_rules, font=self.log_font, menu_editor=editor,
-            ask_tool=lambda kind, initial=None: self.ask_add_tool(kind, editor, initial))
+            ask_tool=lambda kind, initial=None: self.ask_add_tool(kind, editor, initial),
+            label_config=copy.deepcopy(self.photo_config))
         accepted = self.exec_dialog(dialog) == QDialog.Accepted
         rules = dialog.rules
+        new_keywords = dialog.label_config["keywords"] if dialog.label_config else None
         dialog.deleteLater()
         if not accepted:
             return
+        if new_keywords is not None and new_keywords != (self.photo_config.get("keywords") or []):
+            self.photo_config["keywords"] = new_keywords
+            photo_config.save_config(self.photo_config)
+            for pane in (self.left, self.right):
+                pane.update_rating_bar()
+            self.log(f"設定: ラベルを保存しました（{len(new_keywords)}件）")
         written = self.commit_menu_editor(editor)
         if written["local"] or written["shared"]:
             self.log("設定: 拡張子とツールを保存しました（"
@@ -6330,8 +6342,7 @@ class FilerWindow(QWidget):
     # --- 各種設定一時切替(Shift+Z。あふｗの S-Z) ---
     def cmd_settings_menu(self):
         """Shift+Z: 各種設定の一時切替。隠し/システムファイルの表示と写真フォルダモード。
-        ★の絞り込みは置かない(窓の下の★の範囲の段だけ。2026-11-01)。
-        L の「新しいラベルを作る」だけは一時切替でなく、共通設定に保存する。"""
+        ★の絞り込みは置かない(窓の下の★の範囲の段だけ。2026-11-01)。"""
         override = self.active.photo_override
         menu, chosen = self.build_menu("各種設定一時切替", [
             ("H", "隠しファイルを表示する", "hidden", self.show_hidden),
@@ -6341,8 +6352,6 @@ class FilerWindow(QWidget):
             ("A", "写真フォルダモード：自動", "photo_auto", override == "auto"),
             ("N", "写真フォルダモード：常にオン", "photo_on", override == "on"),
             ("F", "写真フォルダモード：常にオフ", "photo_off", override == "off"),
-            None,
-            ("L", "新しいラベルを作る", "label_new"),
         ])
         choice = self._exec_menu(menu, chosen)
         if choice in ("photo_auto", "photo_on", "photo_off"):
@@ -6351,30 +6360,8 @@ class FilerWindow(QWidget):
             pane.set_photo_override(value)
             label = {"auto": "自動", "on": "常にオン", "off": "常にオフ"}[value]
             self.log(f"設定: 写真フォルダモードを{label}にしました（この窓・このフォルダの間だけ）")
-        elif choice == "label_new":
-            self.create_keyword_label()
         elif choice is not None:
             self.toggle_attr_filter(choice)
-
-    def create_keyword_label(self) -> None:
-        """新しいラベル(キーワード)を共通設定に作る(Shift+Z → L)。
-
-        作ったラベルは ★の範囲の段のチップと R の「写真の★」の欄にすぐ出て、
-        PhotoCuller でも使える。キーは空いている文字から自動で付く。"""
-        name, ok = QInputDialog.getText(self, "新しいラベル",
-                                        "ラベルの名前（例: 2028年カレンダー向け）")
-        if not ok:
-            return
-        try:
-            entry = photo_config.add_keyword(self.photo_config, name)
-        except ValueError as e:
-            self.log(f"ラベル: {e}")
-            return
-        photo_config.save_config(self.photo_config)
-        for pane in (self.left, self.right):
-            pane.update_rating_bar()
-        self.log(f"ラベル: 「{entry['name']}」を作りました（キー {entry['key']}）。"
-                 "R の「写真の★」で付けられます")
 
     def toggle_attr_filter(self, which: str) -> None:
         """隠し/システムファイルの表示を切り替えて、両窓を並べ直す(カーソルは同じ項目に

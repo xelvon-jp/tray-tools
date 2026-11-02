@@ -2,7 +2,8 @@
 # あっふの Z「設定」ダイアログ(あふｗの設定画面に寄せたもの)。
 #
 # タブは「拡張子別表示色」と「拡張子とツール」(Ctrl+Enter の拡張子ごとのメニューの
-# この PC の分の編集。共有の分は読み取り専用で灰色に出す)。
+# この PC の分の編集。共有の分は読み取り専用で灰色に出す)と「ラベル」
+# (写真のキーワードの定義。共通設定 photo_ratings.json の写しを編集する)。
 # 配色は Windows 標準のまま(ファイラの濃紺には寄せない)。色の帯がそのままの色で
 # 見えることがいちばん大事な画面なので、地の色に引っ張られない白地の方が判断しやすい。
 #
@@ -42,16 +43,20 @@ from PySide6.QtWidgets import (
 
 import filer_core as core
 import filer_extmenu
+from photometa import config as photo_config
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent, ext_rules, font=None, menu_editor=None, ask_tool=None):
+    def __init__(self, parent, ext_rules, font=None, menu_editor=None, ask_tool=None,
+                 label_config=None):
         super().__init__(parent)
         self.setWindowTitle("あっふの設定")
         if font is not None:
             self.setFont(font)
         # 編集用の写し。決定までは呼び出し側の設定に触らない。
         self.rules = [dict(r, exts=list(r["exts"])) for r in ext_rules]
+        # ラベル(キーワード)の編集用の写し(共通設定そのものの写し。決定で呼び出し側が保存)
+        self.label_config = label_config
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -106,6 +111,8 @@ class SettingsDialog(QDialog):
         self.ask_tool_fn = ask_tool
         if menu_editor is not None:
             self.tabs.addTab(self._build_tool_page(), "拡張子とツール(&T)")
+        if label_config is not None:
+            self.tabs.addTab(self._build_label_page(), "ラベル(&L)")
 
         bottom = QHBoxLayout()
         self.reset_button = QPushButton("初期値(&R)")
@@ -431,6 +438,90 @@ class SettingsDialog(QDialog):
             return
         if self.menu_editor.move_local(kind, number, step):
             self.tool_refresh_items(number + step)
+
+    # ---------------------------------------------------------------
+    # 「ラベル」タブ(写真のキーワードの定義)
+    # ---------------------------------------------------------------
+    def _build_label_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        group = QGroupBox("ラベル（写真のキーワード）")
+        group_layout = QVBoxLayout(group)
+        self.label_list = QListWidget()
+        group_layout.addWidget(self.label_list)
+        note = QLabel("共通設定に保存され、あっふの ★の範囲の段のチップと R の「写真の★」の欄、"
+                      "PhotoCuller で使えます。キーは空いている文字から自動で付きます。")
+        note.setWordWrap(True)
+        group_layout.addWidget(note)
+        row_buttons = QHBoxLayout()
+        self.label_add_button = QPushButton("追加(&A)")
+        self.label_delete_button = QPushButton("削除(&D)")
+        self.label_add_button.setAutoDefault(False)
+        self.label_delete_button.setAutoDefault(False)
+        self.label_add_button.clicked.connect(self.label_add)
+        self.label_delete_button.clicked.connect(self.label_delete)
+        row_buttons.addWidget(self.label_add_button)
+        row_buttons.addWidget(self.label_delete_button)
+        row_buttons.addStretch(1)
+        group_layout.addLayout(row_buttons)
+        page_layout.addWidget(group)
+        self.label_refresh(0)
+        return page
+
+    def label_refresh(self, select: int = None) -> None:
+        self.label_list.clear()
+        keywords = (self.label_config or {}).get("keywords") or []
+        for kw in keywords:
+            self.label_list.addItem(f"{kw['name']}（キー {kw['key']}）")
+        if keywords:
+            row = 0 if select is None else max(0, min(select, len(keywords) - 1))
+            self.label_list.setCurrentRow(row)
+
+    def label_row(self) -> int:
+        return self.label_list.currentRow()
+
+    # --- 入力の口(テストではここを差し替える) ---
+    def ask_label_name(self):
+        value, ok = QInputDialog.getText(self, "新しいラベル",
+                                         "ラベルの名前（例: 2028年カレンダー向け）")
+        return value if ok else None
+
+    def label_error(self, text: str) -> None:
+        QMessageBox.warning(self, "ラベル", text)
+
+    def label_confirm(self, text: str) -> bool:
+        return QMessageBox.question(self, "ラベル", text,
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes
+
+    def label_add(self) -> None:
+        name = self.ask_label_name()
+        if name is None:
+            return
+        try:
+            entry = photo_config.add_keyword(self.label_config, name)
+        except ValueError as e:
+            self.label_error(str(e))
+            return
+        keywords = self.label_config["keywords"]
+        self.label_refresh(keywords.index(entry))
+
+    def label_delete(self) -> None:
+        row = self.label_row()
+        keywords = (self.label_config or {}).get("keywords") or []
+        if not (0 <= row < len(keywords)):
+            return
+        if row == 0:
+            # 1つ目は「みてね済」として ★の列の ✓ やフォトフレーム連携が使うので消せない
+            self.label_error("最初のラベルは「みてね済」として使われるので削除できません")
+            return
+        name = keywords[row]["name"]
+        if not self.label_confirm(f"ラベル「{name}」を削除しますか？\n"
+                                  "（写真に付いているキーワード自体は消えません。"
+                                  "絞り込みのチップや R の欄に出なくなります）"):
+            return
+        del keywords[row]
+        self.label_refresh(row)
 
 
 # ---------------------------------------------------------------

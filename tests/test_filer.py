@@ -4601,6 +4601,12 @@ def test_preview_esc_and_image_enter():
             assert not w.preview_on and w.preview_widget is None
         finally:
             w.close()
+            # pic2 の読み取りスレッドが残っていると、一時フォルダの後片付けで
+            # WinError 32 になる（Windows）。終わるまで待ってから閉じる
+            deadline = time.monotonic() + 5
+            while getattr(w, "_preview_worker_on", False) \
+                    and time.monotonic() < deadline:
+                QTest.qWait(20)
             w.deleteLater()
 
 

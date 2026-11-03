@@ -1755,6 +1755,9 @@ def test_edits_parse_and_cache():
         conn.close()
         cache2 = mc.MetaCache(str(old_db))
         assert cache2.read_cached(src).edits.crop == (0.0, 0.0, 0.5, 0.5)
+        # 閉じないと一時フォルダの後片付けで WinError 32 になる（Windows）
+        cache.close()
+        cache2.close()
 
 
 def test_render_apply_edits():

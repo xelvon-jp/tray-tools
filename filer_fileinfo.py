@@ -3,7 +3,7 @@
 #
 #   - 1件: ファイル名・大小の変換・更新日時・属性(Read Only / System / Hidden / Archive)
 #   - マークあり: 「ファイル情報の一括変更」。名前は直接は打たせず、変換(小文字 /
-#     入れ替え / 大文字)を全件に当てる。日時は「変更する」を付けたときだけ、属性は
+#     大文字。⇔ は変換しない)を全件に当てる。日時は「変更する」を付けたときだけ、属性は
 #     3つの状態(変えない / ON / OFF)で、ON/OFF にしたものだけ全件に当てる
 #   - 対象に画像があり★を書ける場所なら、下部に「写真の★」の欄(★とキーワード)。
 #     画像が無ければ欄は出さない(見た目は従来どおり)。あっふで★を付ける入口はここだけ。
@@ -58,7 +58,8 @@ CHECKBOX_STYLE = (
 
 ATTR_ROWS = (("readonly", "Read Only", "R"), ("system", "System", "S"),
              ("hidden", "Hidden", "H"), ("archive", "Archive", "A"))
-CASE_BUTTONS = (("lower", "小文字"), ("swap", "⇔"), ("upper", "大文字"))
+# ⇔ は「何もしない」(その部分は元のまま)。大小の入れ替えという変換は無い。
+CASE_BUTTONS = (("lower", "小文字"), ("none", "⇔"), ("upper", "大文字"))
 # 写真の★を選ぶキー(Alt+この文字 → ★の値)。5〜1 はその★、0 は未選別、- は削除候補。
 # ダイアログのどこにフォーカスがあっても効く(QShortcut。名前の欄に数字を打つのとは
 # ぶつからない: Alt なしの数字はそのまま欄に入る)。属性の Alt+R/S/H/A とも重ならない。
@@ -296,6 +297,13 @@ class FileInfoDialog(QDialog):
             self.setTabOrder(a, b)
         (self.name_edit if not (self.bulk or self.photo_only) else self.ok_button).setFocus()
 
+        # 変換の選択(1件のとき)。名前欄は「元の名前(_case_base)に選択を当てた結果」を
+        # 出す。手で編集したら、その内容が新しい元の名前になり、選択は解除される
+        self._case_base = first.name
+        self._case_sel = {"all": None, "ext": None}
+        if not self.bulk:
+            self.name_edit.textEdited.connect(self._on_name_edited)
+
         # ↑↓←→でのフォーカス移動(下の _focus_stop など)。部品の出来事を横取りして、
         # 値やチェックを変えずにフォーカスだけを動かす
         arrow_widgets = ([self.name_edit] + list(self.case_buttons.values())
@@ -520,6 +528,12 @@ class FileInfoDialog(QDialog):
 
     def _on_case(self, part: str, mode: str) -> None:
         if self.bulk:
+            if mode == "none":
+                # ⇔ は「その行は変換しない」。行のチェックを全部外す
+                for (p, _m), button in self.case_buttons.items():
+                    if p == part:
+                        button.setChecked(False)
+                return
             # 一括: 行ごとにどれか1つだけ(押し直すと外れる)。
             pressed = self.case_buttons[(part, mode)].isChecked()
             for (p, m), button in self.case_buttons.items():
@@ -527,10 +541,29 @@ class FileInfoDialog(QDialog):
                     button.setChecked(False)
             self.case_buttons[(part, mode)].setChecked(pressed)
             return
+        self._case_sel[part] = None if mode == "none" else mode
+        self._refresh_case_name()
+
+    def _refresh_case_name(self) -> None:
+        """変換の選択を、元の名前(_case_base)へ当て直して名前欄に出す。
+
+        今の表示へ重ねては当てない(小文字にした名前へ大文字を当て直す、などが
+        そのまま選択どおりの結果になる)。⇔(未選択)の部分は元のまま。
+        """
         entry = self.entries[0]
+        text = self._case_base
+        for part in ("all", "ext"):
+            mode = self._case_sel.get(part)
+            if mode:
+                text = core.convert_case(text, part, mode, entry.is_dir)
         position = self.name_edit.cursorPosition()
-        self.name_edit.setText(core.convert_case(self.name_edit.text(), part, mode, entry.is_dir))
-        self.name_edit.setCursorPosition(position)
+        self.name_edit.setText(text)
+        self.name_edit.setCursorPosition(min(position, len(text)))
+
+    def _on_name_edited(self, text: str) -> None:
+        """名前欄を手で直したら、その内容が新しい元の名前になり、変換の選択は解除。"""
+        self._case_base = text
+        self._case_sel = {"all": None, "ext": None}
 
     # --- ↑↓←→でのフォーカス移動(値・チェックは変えない) ---
     # 止まり先: 0 ファイル名 → 1 変換(全体) → 2 変換(拡張子) → 3 タイムスタンプ
@@ -559,9 +592,9 @@ class FileInfoDialog(QDialog):
             self.name_edit.setFocus()
         elif stop in (1, 2):
             part = "all" if stop == 1 else "ext"
-            # 着地は常に ⇔(両矢印)。⇔を起点に ← で小文字、→ で大文字、という
+            # 着地は常に ⇔(何もしない)。⇔を起点に ← で小文字、→ で大文字、という
             # 位置関係にする(当てた変換があっても、戻ってきたら ⇔ に着地する)
-            self.case_buttons[(part, "swap")].setFocus()
+            self.case_buttons[(part, "none")].setFocus()
         elif stop == 3:
             (self.stamp_check or self.stamp_edits[0]).setFocus()
         else:

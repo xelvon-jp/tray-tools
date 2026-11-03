@@ -1187,7 +1187,7 @@ def caret_position(name: str, is_dir: bool) -> int:
     return rename_selection_length(name, is_dir)
 
 
-CASE_MODES = ("lower", "swap", "upper")
+CASE_MODES = ("lower", "upper")
 
 
 def _convert(text: str, mode: str) -> str:
@@ -1195,14 +1195,12 @@ def _convert(text: str, mode: str) -> str:
         return text.lower()
     if mode == "upper":
         return text.upper()
-    if mode == "swap":
-        return text.swapcase()
     return text
 
 
 def convert_case(name: str, part: str, mode: str, is_dir: bool = False) -> str:
     """「変換」の枠。part は "all"(名前全体)か "ext"(拡張子だけ)、mode は
-    "lower" / "upper" / "swap"(大小の入れ替え)。フォルダの「拡張子」は変えない。"""
+    "lower" / "upper"。フォルダの「拡張子」は変えない。"""
     if part == "all":
         return _convert(name, mode)
     if is_dir:
@@ -1295,7 +1293,7 @@ def plan_bulk_info(entries, case_all=None, case_ext=None, stamp_fields=None,
                    attr_changes=None):
     """一括変更の計画。([1件ごとの変更], [(名前, 理由)])。
 
-    case_all / case_ext は変換("lower" / "upper" / "swap" か None)、stamp_fields は
+    case_all / case_ext は変換("lower" / "upper" か None)、stamp_fields は
     (年, 月, 日, 時, 分, 秒) か None(変えない)、attr_changes は変えるものだけの dict。
     年月日が 0/0/0 なら、それぞれのファイルの年月日のまま時分秒だけ変える(あふｗと同じ)。"""
     plans, problems = [], []

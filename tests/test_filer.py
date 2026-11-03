@@ -3603,7 +3603,7 @@ def test_file_info_logic():
     assert core.caret_position("dir.v2", True) == len("dir.v2")
     assert core.convert_case("Photo.WebP", "all", "lower") == "photo.webp"
     assert core.convert_case("Photo.WebP", "all", "upper") == "PHOTO.WEBP"
-    assert core.convert_case("Photo.WebP", "all", "swap") == "pHOTO.wEBp"
+    assert "swap" not in core.CASE_MODES   # 大小の入れ替えという変換は無い
     assert core.convert_case("Photo.WebP", "ext", "upper") == "Photo.WEBP"
     assert core.convert_case("Photo.WebP", "ext", "lower") == "Photo.webp"
     assert core.convert_case("Dir.Ext", "ext", "upper", is_dir=True) == "Dir.Ext"   # フォルダは不変
@@ -3728,9 +3728,9 @@ def test_file_info_arrow_key_focus():
             assert focus() is d.name_edit
             # ↓: 全体 → 拡張子 → タイムスタンプ → 属性 R へ
             down()
-            assert focus() is d.case_buttons[("all", "swap")]
+            assert focus() is d.case_buttons[("all", "none")]
             down()
-            assert focus() is d.case_buttons[("ext", "swap")]
+            assert focus() is d.case_buttons[("ext", "none")]
             down()
             assert focus() is d.stamp_edits[0]
             values = [b.value() for b in d.stamp_edits]
@@ -3739,7 +3739,7 @@ def test_file_info_arrow_key_focus():
             # タイムスタンプの中で ↑↓ しても値は変わらず、グループを出るだけ
             d.stamp_edits[2].setFocus()
             up()
-            assert focus() is d.case_buttons[("ext", "swap")]
+            assert focus() is d.case_buttons[("ext", "none")]
             down()
             assert focus() is d.stamp_edits[0]
             assert [b.value() for b in d.stamp_edits] == values
@@ -3758,16 +3758,22 @@ def test_file_info_arrow_key_focus():
             up()
             assert focus() is d.stamp_edits[0]
             up()
-            assert focus() is d.case_buttons[("ext", "swap")]
+            assert focus() is d.case_buttons[("ext", "none")]
             up()
-            assert focus() is d.case_buttons[("all", "swap")]
+            assert focus() is d.case_buttons[("all", "none")]
             up()
             assert focus() is d.name_edit
-            # ←→: 全体の行で移ると、その場で名前へ当たる(1件)。端では止まる
-            d.case_buttons[("all", "lower")].setFocus()
+            # ←→: 全体の行で移ると、その場で名前へ当たる(1件)。端では止まる。
+            # 変換は元の名前へ当て直すので、⇔(何もしない)に戻れば元の名前になる
+            d.case_buttons[("all", "none")].setFocus()
+            QTest.keyClick(focus(), Qt.Key_Left)
+            assert focus() is d.case_buttons[("all", "lower")]
+            assert d.name_edit.text() == "photo.jpg"
+            QTest.keyClick(focus(), Qt.Key_Left)
+            assert focus() is d.case_buttons[("all", "lower")]
             QTest.keyClick(focus(), Qt.Key_Right)
-            assert focus() is d.case_buttons[("all", "swap")]
-            assert d.name_edit.text() == "pHOTO.jpg"
+            assert focus() is d.case_buttons[("all", "none")]
+            assert d.name_edit.text() == "Photo.JPG"
             QTest.keyClick(focus(), Qt.Key_Right)
             assert focus() is d.case_buttons[("all", "upper")]
             assert d.name_edit.text() == "PHOTO.JPG"
@@ -3775,9 +3781,9 @@ def test_file_info_arrow_key_focus():
             assert focus() is d.case_buttons[("all", "upper")]
             # 行を離れて戻っても、着地は ⇔(当てた大文字には戻らない)
             down()
-            assert focus() is d.case_buttons[("ext", "swap")]
+            assert focus() is d.case_buttons[("ext", "none")]
             up()
-            assert focus() is d.case_buttons[("all", "swap")]
+            assert focus() is d.case_buttons[("all", "none")]
         finally:
             d.close()
 
@@ -3792,14 +3798,14 @@ def test_file_info_arrow_key_focus():
             assert bulk.chosen_case("all") == "upper"
             bulk.case_buttons[("ext", "lower")].setFocus()
             QTest.keyClick(bulk.case_buttons[("ext", "lower")], Qt.Key_Up)
-            assert QApplication.focusWidget() is bulk.case_buttons[("all", "swap")]
+            assert QApplication.focusWidget() is bulk.case_buttons[("all", "none")]
             QTest.keyClick(bulk.case_buttons[("all", "upper")], Qt.Key_Left)
-            assert QApplication.focusWidget() is bulk.case_buttons[("all", "swap")]
+            assert QApplication.focusWidget() is bulk.case_buttons[("all", "none")]
             assert bulk.chosen_case("all") == "upper"
             # ↓↓: 拡張子 → タイムスタンプの止まり先は「変更する」チェック
-            QTest.keyClick(bulk.case_buttons[("all", "swap")], Qt.Key_Down)
-            assert QApplication.focusWidget() is bulk.case_buttons[("ext", "swap")]
-            QTest.keyClick(bulk.case_buttons[("ext", "swap")], Qt.Key_Down)
+            QTest.keyClick(bulk.case_buttons[("all", "none")], Qt.Key_Down)
+            assert QApplication.focusWidget() is bulk.case_buttons[("ext", "none")]
+            QTest.keyClick(bulk.case_buttons[("ext", "none")], Qt.Key_Down)
             assert QApplication.focusWidget() is bulk.stamp_check
             values = [b.value() for b in bulk.stamp_edits]
             QTest.keyClick(bulk.stamp_check, Qt.Key_Down)
@@ -3846,8 +3852,8 @@ def test_window_file_info():
                 assert d.name_edit.text() == "image.webp"
                 d.case_buttons[("ext", "upper")].click()
                 assert d.name_edit.text() == "image.WEBP"
-                d.case_buttons[("all", "swap")].click()
-                assert d.name_edit.text() == "IMAGE.webp"
+                d.case_buttons[("all", "none")].click()
+                assert d.name_edit.text() == "Image.WEBP"
                 before = d.attr_checks["readonly"].isChecked()
                 QTest.keyClick(d, Qt.Key_R, Qt.AltModifier)
                 assert d.attr_checks["readonly"].isChecked() != before
@@ -3860,13 +3866,13 @@ def test_window_file_info():
             key(Qt.Key_R)
             _wait(w)
             assert steps["result"] == QDialog.Accepted
-            assert "IMAGE.webp" in os.listdir(left)
-            st = os.stat(left / "IMAGE.webp")
+            assert "Image.WEBP" in os.listdir(left)
+            st = os.stat(left / "Image.WEBP")
             assert time.localtime(st.st_mtime)[:6] == (2021, 2, 3, 4, 5, 6)
             assert st.st_file_attributes & 0x01 and st.st_file_attributes & 0x02
-            assert _cursor_name(L) == "IMAGE.webp"
-            assert "IMAGE.webp" in w.log_view.toPlainText()
-            _set_attrs(left / "IMAGE.webp", 0x80)
+            assert _cursor_name(L) == "Image.WEBP"
+            assert "Image.WEBP" in w.log_view.toPlainText()
+            _set_attrs(left / "Image.WEBP", 0x80)
 
             # 大文字小文字だけの改名
             def case_only(d):

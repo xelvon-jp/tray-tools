@@ -1797,7 +1797,13 @@ def test_frame_sync_applies_edits():
 
 
 def test_frame_aspect_crop():
-    """frame.crop_aspect: 縦位置を 16:10 に切り抜く。顔があれば顔基準、手動の切り抜きが優先。"""
+    """frame.crop_aspect は設定としては読めるが、同期では切り抜かない。
+
+    切り抜きは写真ごとの補正だけが当たる（2026-11-04 の仕様変更）。
+    crop_aspect は PhotoCuller の「顔でおまかせ一括」の既定として残るので、
+    normalize_frame の解釈は従来どおり。同期の署名にも入らない
+    （既定を変えても作り直しにならない）。
+    """
     from PIL import Image
 
     from photometa import config as pcfg
@@ -1812,26 +1818,11 @@ def test_frame_aspect_crop():
     res = pe.sync_frame([a], [str(t1)], settings, str(ledger))
     assert len(res.added) == 1, res
     with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
-        assert im.size == (1200, 750), im.size               # 幅いっぱい・16:10
-    # 顔が上端にあれば、枠も上端から（中央寄せと違う結果になる）
-    face = [(0.4, 0.02, 0.2, 0.1)]                            # (x, y, w, h) 比率
-    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
-                        faces_provider=lambda p: face)
-    assert len(res.updated) == 1, res   # 顔が付くと署名が変わり、作り直しになる
-    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
-                        faces_provider=lambda p: face)
-    assert len(res.updated) == 0 and len(res.unchanged) == 1, res   # 同じ顔ならそのまま
-    other = [(0.1, 0.5, 0.2, 0.1)]
-    res = pe.sync_frame([a], [str(t1)], settings, str(ledger),
-                        faces_provider=lambda p: other)
-    assert len(res.updated) == 1, res   # 顔が変わればまた作り直し
-    d2, src2, t3, _t4, ledger2 = _frame_setup("frame_aspect2")
-    a2 = _exif_jpeg(src2 / "a.jpg", size=(1200, 1600))
-    res = pe.sync_frame([a2], [str(t3)], settings, str(ledger2),
-                        faces_provider=lambda p: face)
-    with Image.open(os.path.join(res.added[0][0], res.added[0][1])) as im:
-        assert im.size[1] <= 750 and im.size[0] <= 1200, im.size
-    # 手動の切り抜きがある写真はそちらが優先（縦半分）
+        assert im.size == (1200, 1600), im.size              # 切り抜かず、そのままの比率
+    # crop_aspect を変えても作り直しにならない（署名に入っていない）
+    res = pe.sync_frame([a], [str(t1)], {"crop_aspect": "4:3"}, str(ledger))
+    assert len(res.updated) == 0 and len(res.unchanged) == 1, res
+    # 手動の切り抜きがある写真はそちらが当たる（縦半分）
     d3, src3, t5, _t6, ledger3 = _frame_setup("frame_aspect3")
     a3 = _exif_jpeg(src3 / "a.jpg", size=(1200, 1600),
                     packet=_crs_packet(crop=(0.0, 0.0, 0.5, 1.0)))

@@ -54,7 +54,7 @@ EXCLUDED_DIR_NAMES = frozenset({"print", "delete_candidates", "bestshot"})
 EXCLUDED_DIR_PREFIXES = ("extract_",)
 
 LEDGER_VERSION = 1
-FRAME_FORMAT = 1              # 作り方を変えたら上げる（全部作り直しになる）
+FRAME_FORMAT = 2              # 作り方を変えたら上げる（全部作り直しになる）。2: 同期時の自動切り抜き（crop_aspect）を廃止
 MANUAL_DELETE_FILE = "frame_manual_delete.json"
 MANUAL_DELETE_VERSION = 1
 
@@ -191,7 +191,12 @@ def default_ledger_dir() -> str:
 
 
 def frame_settings(settings) -> dict:
-    return _config.normalize_frame(settings)
+    s = _config.normalize_frame(settings)
+    # crop_aspect は同期では使わない（切り抜きは写真ごとの補正だけが当たる。
+    # 設定自体は PhotoCuller の「顔でおまかせ一括」の縦横比の既定として残る）。
+    # 署名にも入れない（既定を変えても同期先を作り直さないため）。
+    s.pop("crop_aspect", None)
+    return s
 
 
 # ------------------------------------------------------------------ 集める
@@ -367,14 +372,6 @@ def photo_edits(path: str):
     return meta.edits if meta else None
 
 
-def _faces_sig(faces) -> str:
-    """顔の並び（(x, y, w, h) の比率）を署名用の文字列にする。"""
-    try:
-        return ";".join(",".join(f"{float(v):.3f}" for v in box) for box in faces)
-    except (TypeError, ValueError):
-        return ""
-
-
 def _sig_with_edits(sig: dict, edits) -> dict:
     """台帳の署名に、その写真の補正を含めたもの。補正が無ければ sig のまま
     （既存の台帳の記録と一致し続けるので、補正の無い写真は作り直しにならない）。"""
@@ -383,16 +380,14 @@ def _sig_with_edits(sig: dict, edits) -> dict:
     return dict(sig, edits=edits.signature())
 
 
-def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None,
-                     faces=None) -> str:
+def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None) -> str:
     """フレーム用の JPEG を out_path に作る。名前に使う撮影日時（YYYYMMDD_HHMMSS）を返す。
 
     長辺を max_long_edge 以下に縮小（拡大しない・LANCZOS）、quality で保存。EXIF の向きは
     画素を回して直し、向き情報は付けない。日時のタグは残し、GPS は strip_gps なら消す
     （ほかの EXIF は付けない）。色の ICC プロファイルは残す。読めなければ例外。
     edits（補正）があれば、縮小の前に当てる（向き→傾き→切り抜き→明るさ）。
-    設定 crop_aspect があれば、手動の切り抜きが無い写真をその縦横比に切り抜く
-    （faces があれば顔基準、無ければ中央。render.aspect_crop）。
+    切り抜きは補正にあるものだけ（同期が勝手に縦横比で切り抜くことはしない）。
     """
     from PIL import Image, ImageOps
 
@@ -411,15 +406,6 @@ def build_frame_jpeg(src: str, out_path: str, settings: dict, edits=None,
             if img is None:
                 img = im
         img.load()
-        if s.get("crop_aspect") and not (edits is not None and edits.crop is not None):
-            from . import render
-            crop = render.aspect_crop(img.size[0], img.size[1], s["crop_aspect"],
-                                      faces=faces)
-            if crop is not None:
-                top, left, bottom, right = crop
-                w, h = img.size
-                img = img.crop((round(left * w), round(top * h),
-                                round(right * w), round(bottom * h)))
         if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
             rgba = img.convert("RGBA")
             base = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -733,7 +719,7 @@ def _stale_entries(t: _Target, seen: set, scope_keys, keep_keys) -> list:
 
 
 def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progress=None,
-               scope=None, keep=(), manual_delete=(), faces_provider=None) -> SyncResult:
+               scope=None, keep=(), manual_delete=()) -> SyncResult:
     """フォトフレーム同期。sources（写真のパス）を、縮小した JPEG にして targets の各フォルダへ。
 
     台帳は ledger_dir に同期先ごと。scope（フォルダの並び）を渡したら、その下の写真だけを
@@ -783,18 +769,7 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 result.failed.append((src, "元の写真がありません"))
                 continue
             edits = photo_edits(src)
-            # 顔基準の切り抜きが効くときだけ、顔も署名に入れる（顔の解析が
-            # 変わったら作り直しになる。手動の切り抜きがある写真では顔は無関係）
-            faces = None
-            if (faces_provider is not None and s.get("crop_aspect")
-                    and not (edits is not None and edits.crop is not None)):
-                try:
-                    faces = faces_provider(src)
-                except Exception:  # noqa: BLE001  顔が取れなくても中央で切り抜く
-                    faces = None
             sig_i = _sig_with_edits(sig, edits)
-            if faces:
-                sig_i = dict(sig_i, faces=_faces_sig(faces))
             plans = []
             for t in states:
                 action, name = _frame_action(t, key, st, sig_i)
@@ -812,7 +787,7 @@ def sync_frame(sources, targets, settings, ledger_dir: str, cancel=None, progres
                 continue
             built = os.path.join(work, f"{i}.jpg")
             try:
-                stamp = build_frame_jpeg(src, built, s, edits=edits, faces=faces)
+                stamp = build_frame_jpeg(src, built, s, edits=edits)
             except Exception as e:  # noqa: BLE001  1枚の失敗で止めない
                 result.failed.append((src, f"{type(e).__name__}: {e}"))
                 continue
@@ -940,8 +915,7 @@ class FramePlan:
 
 
 def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, scope=None,
-                    keep=(), manual_delete=(), cancel=None, progress=None,
-                    faces_provider=None) -> FramePlan:
+                    keep=(), manual_delete=(), cancel=None, progress=None) -> FramePlan:
     """sync_frame の予行。同じ引数で、同期先ごとに追加・更新・削除・そのままを数える。
 
     判定は sync_frame と同じ部品（_frame_action / _cannot_build / _stale_entries）で行い、
@@ -985,16 +959,7 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
             plan.missing.append(src)
             continue
         edits = photo_edits(src)
-        faces = None
-        if (faces_provider is not None and frame_settings(settings).get("crop_aspect")
-                and not (edits is not None and edits.crop is not None)):
-            try:
-                faces = faces_provider(src)
-            except Exception:  # noqa: BLE001
-                faces = None
         sig_i = _sig_with_edits(sig, edits)
-        if faces:
-            sig_i = dict(sig_i, faces=_faces_sig(faces))
         todo = []
         for t, out in pairs:
             action, name = _frame_action(t, key, st, sig_i)

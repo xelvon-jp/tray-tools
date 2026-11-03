@@ -17,7 +17,8 @@
 # 「何をどう変えるか」(photo_changes)を返すだけ。書くのは呼び出し側(閉じた後)。
 #
 # フォーカスは ↑↓ でも移る: ファイル名 → 変換(全体) → 変換(拡張子) → タイムスタンプ
-# → 属性(R / S / H / A)。変換の行の中は ←→(1件では移った先の変換をその場で当てる)。
+# → 属性(R / S / H / A)。変換の行への着地は常に ⇔(両矢印)で、行の中は ←→
+# (1件では移った先の変換をその場で当てる)。
 # ↑↓ では値もチェックも変えない(スピンボックスの増減は横取りして止める)。
 import os
 import time
@@ -297,7 +298,6 @@ class FileInfoDialog(QDialog):
 
         # ↑↓←→でのフォーカス移動(下の _focus_stop など)。部品の出来事を横取りして、
         # 値やチェックを変えずにフォーカスだけを動かす
-        self._case_applied = {}          # 1件のとき、変換の行ごとに最後に当てた変換
         arrow_widgets = ([self.name_edit] + list(self.case_buttons.values())
                          + ([self.stamp_check] if self.stamp_check else [])
                          + self.stamp_edits
@@ -527,7 +527,6 @@ class FileInfoDialog(QDialog):
                     button.setChecked(False)
             self.case_buttons[(part, mode)].setChecked(pressed)
             return
-        self._case_applied[part] = mode     # ↑↓で戻ってきたときに当てる先
         entry = self.entries[0]
         position = self.name_edit.cursorPosition()
         self.name_edit.setText(core.convert_case(self.name_edit.text(), part, mode, entry.is_dir))
@@ -560,10 +559,9 @@ class FileInfoDialog(QDialog):
             self.name_edit.setFocus()
         elif stop in (1, 2):
             part = "all" if stop == 1 else "ext"
-            # その行で選ばれている(当てた)ボタンへ。無ければ先頭のボタン
-            mode = self.chosen_case(part) if self.bulk else self._case_applied.get(part)
-            button = self.case_buttons.get((part, mode)) if mode else None
-            (button or self.case_buttons[(part, CASE_BUTTONS[0][0])]).setFocus()
+            # 着地は常に ⇔(両矢印)。⇔を起点に ← で小文字、→ で大文字、という
+            # 位置関係にする(当てた変換があっても、戻ってきたら ⇔ に着地する)
+            self.case_buttons[(part, "swap")].setFocus()
         elif stop == 3:
             (self.stamp_check or self.stamp_edits[0]).setFocus()
         else:

@@ -3728,9 +3728,9 @@ def test_file_info_arrow_key_focus():
             assert focus() is d.name_edit
             # ↓: 全体 → 拡張子 → タイムスタンプ → 属性 R へ
             down()
-            assert focus() is d.case_buttons[("all", "lower")]
+            assert focus() is d.case_buttons[("all", "swap")]
             down()
-            assert focus() is d.case_buttons[("ext", "lower")]
+            assert focus() is d.case_buttons[("ext", "swap")]
             down()
             assert focus() is d.stamp_edits[0]
             values = [b.value() for b in d.stamp_edits]
@@ -3739,7 +3739,7 @@ def test_file_info_arrow_key_focus():
             # タイムスタンプの中で ↑↓ しても値は変わらず、グループを出るだけ
             d.stamp_edits[2].setFocus()
             up()
-            assert focus() is d.case_buttons[("ext", "lower")]
+            assert focus() is d.case_buttons[("ext", "swap")]
             down()
             assert focus() is d.stamp_edits[0]
             assert [b.value() for b in d.stamp_edits] == values
@@ -3758,9 +3758,9 @@ def test_file_info_arrow_key_focus():
             up()
             assert focus() is d.stamp_edits[0]
             up()
-            assert focus() is d.case_buttons[("ext", "lower")]
+            assert focus() is d.case_buttons[("ext", "swap")]
             up()
-            assert focus() is d.case_buttons[("all", "lower")]
+            assert focus() is d.case_buttons[("all", "swap")]
             up()
             assert focus() is d.name_edit
             # ←→: 全体の行で移ると、その場で名前へ当たる(1件)。端では止まる
@@ -3773,15 +3773,15 @@ def test_file_info_arrow_key_focus():
             assert d.name_edit.text() == "PHOTO.JPG"
             QTest.keyClick(focus(), Qt.Key_Right)
             assert focus() is d.case_buttons[("all", "upper")]
-            # 行を離れて戻ると、当てたボタン(大文字)に着地する
+            # 行を離れて戻っても、着地は ⇔(当てた大文字には戻らない)
             down()
-            assert focus() is d.case_buttons[("ext", "lower")]
+            assert focus() is d.case_buttons[("ext", "swap")]
             up()
-            assert focus() is d.case_buttons[("all", "upper")]
+            assert focus() is d.case_buttons[("all", "swap")]
         finally:
             d.close()
 
-        # 一括: ←→ はフォーカスだけ(チェックは変わらない)。着地は選ばれているボタン
+        # 一括: ←→ はフォーカスだけ(チェックは変わらない)。着地は ⇔
         other = core.Entry("b.txt", False, 1, time.time(), 0x20)
         Path(tmp, "b.txt").write_bytes(b"x")
         bulk = filer_fileinfo.FileInfoDialog(None, tmp, [entry, other])
@@ -3792,14 +3792,14 @@ def test_file_info_arrow_key_focus():
             assert bulk.chosen_case("all") == "upper"
             bulk.case_buttons[("ext", "lower")].setFocus()
             QTest.keyClick(bulk.case_buttons[("ext", "lower")], Qt.Key_Up)
-            assert QApplication.focusWidget() is bulk.case_buttons[("all", "upper")]
+            assert QApplication.focusWidget() is bulk.case_buttons[("all", "swap")]
             QTest.keyClick(bulk.case_buttons[("all", "upper")], Qt.Key_Left)
             assert QApplication.focusWidget() is bulk.case_buttons[("all", "swap")]
             assert bulk.chosen_case("all") == "upper"
             # ↓↓: 拡張子 → タイムスタンプの止まり先は「変更する」チェック
             QTest.keyClick(bulk.case_buttons[("all", "swap")], Qt.Key_Down)
-            assert QApplication.focusWidget() is bulk.case_buttons[("ext", "lower")]
-            QTest.keyClick(bulk.case_buttons[("ext", "lower")], Qt.Key_Down)
+            assert QApplication.focusWidget() is bulk.case_buttons[("ext", "swap")]
+            QTest.keyClick(bulk.case_buttons[("ext", "swap")], Qt.Key_Down)
             assert QApplication.focusWidget() is bulk.stamp_check
             values = [b.value() for b in bulk.stamp_edits]
             QTest.keyClick(bulk.stamp_check, Qt.Key_Down)

@@ -3713,6 +3713,9 @@ def test_file_info_arrow_key_focus():
         Path(tmp, "Photo.JPG").write_bytes(b"x")
         entry = core.Entry("Photo.JPG", False, 1, time.time(), 0x20)
         d = filer_fileinfo.FileInfoDialog(None, tmp, [entry])
+        # フォーカスのあるボタンが目で見て分かる枠を持つ(スタイルシート側の保証)
+        assert "QPushButton:focus" in d.styleSheet()
+        assert "#ffd400" in d.styleSheet()
         d.show()
         QTest.qWait(50)
         try:

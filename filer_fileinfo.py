@@ -145,6 +145,13 @@ class FileInfoDialog(QDialog):
             f" #fileInfo QPushButton {{ background-color: #24244e; color: {fg};"
             f" border: 1px solid #50508a; padding: 1px 6px; }}"
             f" #fileInfo QPushButton:checked {{ background-color: #1a3a8a; }}"
+            # ↑↓で移るフォーカスが、どのボタンにあるか見て分かるようにする
+            # (スタイルシートを当てると Windows 既定のフォーカス枠が出ない)。
+            # 枠を太くする分、padding を減らしてボタンの大きさは変えない。
+            f" #fileInfo QPushButton:focus {{ background-color: #3a3a6e;"
+            f" border: 2px solid #ffd400; padding: 0px 5px; }}"
+            f" #fileInfo QLineEdit:focus, #fileInfo QSpinBox:focus"
+            f" {{ border: 1px solid #ffd400; }}"
             + CHECKBOX_STYLE.replace("SCOPE", "#fileInfo"))
 
         first = self.entries[0]

@@ -960,9 +960,8 @@ def test_export_config_and_menu():
                                   {"key": "3", "name": "y", "min": 3}]})["levels"]
     assert [x["key"] for x in lv] == ["3"]
     items = pc.export_menu_items(cfg)
-    assert [m.key for m in items] == ["F", "M", "D", "L"]
-    assert [m.action[0] for m in items] == ["frame_sync", "mitene_collect", "mitene_finish",
-                                            "frame_manual_list"]
+    assert [m.key for m in items] == ["F", "L"]
+    assert [m.action[0] for m in items] == ["frame_sync", "frame_manual_list"]
     assert items[-1].label == "手で消す写真の一覧（0枚）"
     # 式
     assert pe.frame_expr(cfg) == "★>=4"
@@ -1377,6 +1376,36 @@ def test_plan_frame_sync():
     assert [len(pt.added) for pt in plan.targets] == [1]
 
 
+def test_plan_frame_sync_collisions():
+    """予行の collisions: 本来の名前（{撮影日時}_{元名}.jpg）が既に使われていて
+    _2 のような名前になる追加を数える。実際の同期で _2 が付く数と一致する。"""
+    d, src, t1, _t2, ledger = _frame_setup("frame_plan_collision")
+    sub = src / "sub"
+    sub.mkdir()
+    when = "2024:05:01 10:00:00"
+    a = _exif_jpeg(src / "DSC0001.jpg", size=(400, 300), when=when)
+    b = _exif_jpeg(sub / "DSC0001.jpg", size=(500, 300), when=when)  # 同じ日時・同じ名前
+    c = _exif_jpeg(src / "DSC0002.jpg", size=(400, 300), when=when)
+    # 同期先に、本来の名前と同じ手で入れたファイルがある
+    (t1 / "20240501_100000_DSC0002.jpg").write_bytes(b"manual")
+
+    plan = pe.plan_frame_sync([a, b, c], [str(t1)], {}, str(ledger))
+    pt = plan.targets[0]
+    # b は a と、c は手で入れた物とぶつかる
+    assert len(pt.added) == 3 and pt.collisions == 2, pt
+
+    res = pe.sync_frame([a, b, c], [str(t1)], {}, str(ledger))
+    assert not res.failed and not res.error, res
+    names = sorted(n for _t, n, _s in res.added)
+    assert names == ["20240501_100000_DSC0001.jpg", "20240501_100000_DSC0001_2.jpg",
+                     "20240501_100000_DSC0002_2.jpg"], names
+    assert (t1 / "20240501_100000_DSC0002.jpg").read_bytes() == b"manual"
+
+    # 同期済みなら追加は無く、ぶつかりも無い
+    plan = pe.plan_frame_sync([a, b, c], [str(t1)], {}, str(ledger))
+    assert plan.targets[0].collisions == 0 and not plan.changed
+
+
 def test_sync_frame_heic_raw_and_formats():
     from PIL import Image
     d, src, t1, _t2, ledger = _frame_setup("frame_formats")
@@ -1401,87 +1430,6 @@ def test_sync_frame_heic_raw_and_formats():
     assert out.name.endswith("_p.jpg")
     with Image.open(out) as im:
         assert im.mode == "RGB" and im.getpixel((5, 5))[1] > 200   # 透明は白で埋める
-
-
-def test_mitene_collect_and_finish():
-    d = _tmpdir("mitene")
-    root = d / "root"
-    root.mkdir()
-    dest = d / "みてね用"
-    a = _rated(root / "a.jpg", 5, when="2024:05:05 05:05:05")
-    b = _rated(root / "b.jpg", 5, when=None)
-    c = _rated(root / "c.jpg", 5)
-    _rated(root / "done.jpg", 5, ["みてね済"])
-    _rated(root / "four.jpg", 4)
-    old = time.mktime((2022, 2, 2, 2, 2, 2, 0, 0, -1))
-    os.utime(b, (old, old))
-    cfg = pc.default_config()
-    cfg["mitene_dir"] = str(dest)
-    found = pe.collect(root, pe.mitene_expr(cfg), cfg)
-    assert [os.path.basename(p) for p in found.paths] == ["a.jpg", "b.jpg", "c.jpg"]
-    res = pe.collect_mitene(found.paths, dest)
-    names = sorted(n for n, _s in res.copied)
-    assert names == sorted(["20240505_050505_a.jpg", "20220202_020202_b.jpg",
-                            "20240903_022344_c.jpg"]), names
-    # そのままコピー(縮小しない)
-    assert (dest / "20240505_050505_a.jpg").read_bytes() == Path(a).read_bytes()
-    man = pe.load_manifest(str(dest))
-    assert sorted(it["source"] for it in man) == sorted([a, b, c])
-    # 2回目は飛ばす
-    res = pe.collect_mitene(found.paths, dest)
-    assert not res.copied and len(res.already) == 3
-    # 上げないことにした1枚を集めた先から消しておく
-    os.remove(dest / "20240903_022344_c.jpg")
-
-    exe = _exiftool()
-    if exe:
-        session = pw.ExifToolSession(exe, journal_path=os.path.join(_TEST_TEMP, "mitene.jsonl"))
-    else:
-        print("      test_mitene_collect_and_finish: ExifTool が無いのでフェイクで書きます")
-        session = _FakeKeywordSession(fail={"b.jpg"})
-    try:
-        if exe:
-            os.chmod(b, 0o444)        # 読み取り専用で1枚失敗させる
-        try:
-            fin = pe.finish_mitene(str(dest), session, "みてね済")
-        finally:
-            os.chmod(b, 0o666)
-    finally:
-        if exe:
-            session.close()
-    assert fin.marked == [a], fin
-    assert fin.missing == [c]
-    assert [p for p, _r in fin.failed] == [b]
-    assert not (dest / "20240505_050505_a.jpg").exists()
-    assert (dest / "20220202_020202_b.jpg").exists()      # 失敗したものは残る
-    assert [it["source"] for it in pe.load_manifest(str(dest))] == [b]
-    if exe:
-        assert "みてね済" in px.read_meta(a).keywords
-        assert "みてね済" not in px.read_meta(c).keywords
-        assert px.read_meta(a).rating == 5
-    # 残りを片付けると一覧ファイルも消える
-    fin = pe.finish_mitene(str(dest), _FakeKeywordSession(), "みてね済")
-    assert fin.marked == [b] and not pe.load_manifest(str(dest))
-    assert not (dest / pe.MITENE_MANIFEST).exists()
-    assert pe.finish_mitene(str(dest), _FakeKeywordSession(), "").error
-
-
-class _FakeKeywordSession:
-    def __init__(self, fail=()):
-        self.fail = set(fail)
-        self.calls = []
-
-    def set_keyword(self, paths, keyword, on):
-        out = []
-        for p in paths:
-            self.calls.append((p, keyword, on))
-            before = px.read_meta(p)
-            if os.path.basename(p) in self.fail:
-                out.append(pw.WriteResult(p, False, "読み取り専用のファイルです", before=before))
-            else:
-                after = PhotoMeta(before.rating, before.keywords + (keyword,))
-                out.append(pw.WriteResult(p, True, before=before, after=after))
-        return out
 
 
 # ------------------------------------------------------------------ metacache

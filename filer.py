@@ -341,6 +341,8 @@ def _read_photo_metas_parallel(paths, cancel=None, progress=None, on_result=None
 PHOTO_READ_BATCH = 32
 PHOTO_READ_FLUSH_SECONDS = 0.15
 PHOTO_JOURNAL_MS = 1000         # 変更記録(PhotoCuller などが書いた★)を読みに行く間隔
+# ★の読み取りの進み具合に出す注意書き(読んだ分は永続キャッシュに残るので、中止しても無駄にならない)
+PICK_READ_NOTE = "※中止しても、読んだ分はキャッシュに残り、次回の処理はその分高速化されます"
 RATING_SLIDER_MS = 150          # ★の範囲スライダーをドラッグ中、絞り込みを掛け直す間隔
 RATING_BADGE_PX = 8             # ★の列のバッジの字(絵文字も)の大きさ(px)。列の幅もこれで測る
 RATING_DONE_MARK = "✓"          # みてね済(キーワードの1つ目)のしるし。バッジの右に添える
@@ -1117,7 +1119,8 @@ class Pane(QWidget):
                 text += f"   Mark {count} ({total:,})"
         elif self.pick_loading:
             if self.pick_phase == "read":
-                text = f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（Esc で中止）"
+                text = (f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（Esc で中止）"
+                        f"　{PICK_READ_NOTE}")
             else:
                 text = f"写真を探しています… {self.pick_count:,}枚（Esc で中止）"
         elif self.pick_root is not None:
@@ -1882,7 +1885,12 @@ class Pane(QWidget):
             return
         picked, metas, mtimes, offline, status, cache_hits, disk_reads = result
         if status == "cancel":
-            self.window_.log("★写真抽出: 中止しました")
+            # 完了時と同じ内訳(キャッシュ/読み取り)を出す。読み終わった分は永続
+            # キャッシュに残っているので、中止しても次回はその分速くなる
+            self.window_.log(
+                f"★写真抽出: 中止しました（★を読んだ写真 {cache_hits + disk_reads:,} 枚"
+                f"／キャッシュ {cache_hits:,} / 読み取り {disk_reads:,}）。"
+                "読んだ分はキャッシュに残り、次回の処理はその分高速化されます")
             self._stop_pick()
             self.reload()
             return
@@ -2270,7 +2278,8 @@ class Pane(QWidget):
         if self.pick_phase == "read" and self.pick_total > 0:
             pct = int(self.pick_read * 100 / self.pick_total)
             self._show_read_progress(
-                f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（{pct}%）　Esc で中止",
+                f"★を読んでいます… {self.pick_read:,} / {self.pick_total:,}（{pct}%）　Esc で中止"
+                f"\n{PICK_READ_NOTE}",
                 self.pick_read, self.pick_total)
         else:
             self._show_read_progress(f"写真を探しています… {self.pick_count:,}枚　Esc で中止")
@@ -2709,6 +2718,8 @@ class FilerWindow(QWidget):
         self._photo_journal_timer.setInterval(PHOTO_JOURNAL_MS)
         self._photo_journal_timer.timeout.connect(self._poll_photo_journal)
         self._photo_journal_timer.start()
+        # 起動時のなめ読み(閉じている間に付いた★を永続キャッシュへ反映する)。窓が出てから1回だけ
+        QTimer.singleShot(0, self._replay_photo_journal)
         self._watch_checking = False
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(WATCH_INTERVAL_MS)
@@ -6749,35 +6760,67 @@ class FilerWindow(QWidget):
     def _poll_photo_journal(self) -> None:
         """変更記録(PhotoCuller などが付けた★)を読み、一覧に出ている写真なら描き直す。"""
         try:
-            entries = self._photo_journal.read_new(exclude_pid=os.getpid())
-            metas = {}
-            cache = _get_photo_metacache()
-            for e in entries:
-                rating = e.get("rating")
-                if isinstance(rating, bool) or not isinstance(rating, int):
-                    continue
-                kws = e.get("keywords")
-                kws = tuple(k for k in kws if isinstance(k, str)) if isinstance(kws, list) else ()
-                edits = None
-                if isinstance(e.get("edits"), dict):
-                    edits = photo_metacache._text_to_edits(json.dumps(e["edits"]))
-                desc = e.get("description")
-                if not isinstance(desc, str):
-                    # 旧形式の記録（メモ欄が無い）では、覚えているメモを消さない
-                    old = cache.get(e["path"])
-                    desc = old.description if old is not None else ""
-                meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws, edits, desc)
-                metas[photo_key(e["path"])] = meta
-                # 変更記録で分かった★は永続キャッシュにも反映する(書き込みは更新日時を
-                # 戻すので、stat の照合だけでは古い値のまま当たってしまう)
-                try:
-                    cache.update(e["path"], meta)
-                except Exception:  # noqa: BLE001  キャッシュは付属。失敗しても反映は続ける
-                    pass
-            if metas:
-                self._apply_photo_metas_all(metas)
+            self._apply_photo_journal_entries(
+                self._photo_journal.read_new(exclude_pid=os.getpid()))
         except Exception:  # noqa: BLE001  タイマーから呼ぶ
             _log_exception("photoJournal")
+
+    def _replay_photo_journal(self) -> None:
+        """起動時のなめ読み: 変更記録を先頭から読み直し、閉じている間に付いた★を反映する。
+
+        通常の読み取りは今の末尾からなので、あっふを閉じている間に PhotoCuller などが
+        付けた★は取りこぼす。書き込みは更新日時を元に戻すため、stat の照合でも
+        気付けず、永続キャッシュに古い★が残ってしまう。そこで起動時に1回だけ、
+        .old に回った分も含めて先頭から読み、写真ごとに最後の記録を当てる
+        （件数が多いと重いので、写真ごとに最後の1件へ畳んでから反映する）。
+        以後は通常の1秒ごとの読み取りが続く。"""
+        try:
+            base = self._photo_journal.path
+            entries = []
+            for path in (base + ".old", base):
+                reader = photo_writer.JournalReader(path, from_start=True)
+                entries += reader.read_new(exclude_pid=os.getpid())
+            latest: dict = {}
+            for e in entries:
+                prev = latest.get(e["path"])
+                if (prev is not None and not isinstance(e.get("description"), str)
+                        and isinstance(prev.get("description"), str)):
+                    # 旧形式の記録（メモ欄が無い）が新しいときは、直前のメモを引き継ぐ
+                    e = {**e, "description": prev["description"]}
+                latest[e["path"]] = e
+            if latest:
+                self._apply_photo_journal_entries(list(latest.values()))
+        except Exception:  # noqa: BLE001  起動時の付属処理。失敗しても本体は続ける
+            _log_exception("photoJournalReplay")
+
+    def _apply_photo_journal_entries(self, entries) -> None:
+        """変更記録の行を、一覧（出ている写真）と永続キャッシュへ反映する。"""
+        metas = {}
+        cache = _get_photo_metacache()
+        for e in entries:
+            rating = e.get("rating")
+            if isinstance(rating, bool) or not isinstance(rating, int):
+                continue
+            kws = e.get("keywords")
+            kws = tuple(k for k in kws if isinstance(k, str)) if isinstance(kws, list) else ()
+            edits = None
+            if isinstance(e.get("edits"), dict):
+                edits = photo_metacache._text_to_edits(json.dumps(e["edits"]))
+            desc = e.get("description")
+            if not isinstance(desc, str):
+                # 旧形式の記録（メモ欄が無い）では、覚えているメモを消さない
+                old = cache.get(e["path"])
+                desc = old.description if old is not None else ""
+            meta = photo_xmp.PhotoMeta(max(-1, min(5, rating)), kws, edits, desc)
+            metas[photo_key(e["path"])] = meta
+            # 変更記録で分かった★は永続キャッシュにも反映する(書き込みは更新日時を
+            # 戻すので、stat の照合だけでは古い値のまま当たってしまう)
+            try:
+                cache.update(e["path"], meta)
+            except Exception:  # noqa: BLE001  キャッシュは付属。失敗しても反映は続ける
+                pass
+        if metas:
+            self._apply_photo_metas_all(metas)
 
     def _update_preview_rating(self) -> None:
         """画像ビュア(F3)の隅の★を、表示中の1枚に合わせる。"""

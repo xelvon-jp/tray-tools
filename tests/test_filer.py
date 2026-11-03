@@ -3699,6 +3699,113 @@ def test_file_info_focus_and_checkbox_look():
         bulk.close()
 
 
+def test_file_info_arrow_key_focus():
+    """R ダイアログの ↑↓←→: 名前 → 変換(全体) → 変換(拡張子) → タイムスタンプ →
+    属性(R/S/H/A) とフォーカスが移り、値やチェックは変わらない。変換の行の ←→ は
+    1件ではその場で変換を当て、一括ではフォーカスだけ移る。"""
+    import filer_fileinfo
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "Photo.JPG").write_bytes(b"x")
+        entry = core.Entry("Photo.JPG", False, 1, time.time(), 0x20)
+        d = filer_fileinfo.FileInfoDialog(None, tmp, [entry])
+        d.show()
+        QTest.qWait(50)
+        try:
+            focus = lambda: QApplication.focusWidget()  # noqa: E731
+            down = lambda: QTest.keyClick(focus(), Qt.Key_Down)  # noqa: E731
+            up = lambda: QTest.keyClick(focus(), Qt.Key_Up)  # noqa: E731
+            # 始点は名前欄。先頭で ↑ は何もしない
+            assert focus() is d.name_edit
+            up()
+            assert focus() is d.name_edit
+            # ↓: 全体 → 拡張子 → タイムスタンプ → 属性 R へ
+            down()
+            assert focus() is d.case_buttons[("all", "lower")]
+            down()
+            assert focus() is d.case_buttons[("ext", "lower")]
+            down()
+            assert focus() is d.stamp_edits[0]
+            values = [b.value() for b in d.stamp_edits]
+            down()
+            assert focus() is d.attr_checks["readonly"]
+            # タイムスタンプの中で ↑↓ しても値は変わらず、グループを出るだけ
+            d.stamp_edits[2].setFocus()
+            up()
+            assert focus() is d.case_buttons[("ext", "lower")]
+            down()
+            assert focus() is d.stamp_edits[0]
+            assert [b.value() for b in d.stamp_edits] == values
+            # 属性を ↓ で最後まで(末尾の A で ↓ は何もしない)。チェックは変わらない
+            down()
+            for key in ("readonly", "system", "hidden", "archive"):
+                assert focus() is d.attr_checks[key], key
+                down()
+            assert focus() is d.attr_checks["archive"]
+            assert d.attr_checks["archive"].isChecked()
+            assert not d.attr_checks["readonly"].isChecked()
+            # ↑ で名前まで戻る(属性 → タイムスタンプ → 拡張子 → 全体 → 名前)
+            up()
+            up()
+            up()
+            up()
+            assert focus() is d.stamp_edits[0]
+            up()
+            assert focus() is d.case_buttons[("ext", "lower")]
+            up()
+            assert focus() is d.case_buttons[("all", "lower")]
+            up()
+            assert focus() is d.name_edit
+            # ←→: 全体の行で移ると、その場で名前へ当たる(1件)。端では止まる
+            d.case_buttons[("all", "lower")].setFocus()
+            QTest.keyClick(focus(), Qt.Key_Right)
+            assert focus() is d.case_buttons[("all", "swap")]
+            assert d.name_edit.text() == "pHOTO.jpg"
+            QTest.keyClick(focus(), Qt.Key_Right)
+            assert focus() is d.case_buttons[("all", "upper")]
+            assert d.name_edit.text() == "PHOTO.JPG"
+            QTest.keyClick(focus(), Qt.Key_Right)
+            assert focus() is d.case_buttons[("all", "upper")]
+            # 行を離れて戻ると、当てたボタン(大文字)に着地する
+            down()
+            assert focus() is d.case_buttons[("ext", "lower")]
+            up()
+            assert focus() is d.case_buttons[("all", "upper")]
+        finally:
+            d.close()
+
+        # 一括: ←→ はフォーカスだけ(チェックは変わらない)。着地は選ばれているボタン
+        other = core.Entry("b.txt", False, 1, time.time(), 0x20)
+        Path(tmp, "b.txt").write_bytes(b"x")
+        bulk = filer_fileinfo.FileInfoDialog(None, tmp, [entry, other])
+        bulk.show()
+        QTest.qWait(30)
+        try:
+            bulk.case_buttons[("all", "upper")].click()
+            assert bulk.chosen_case("all") == "upper"
+            bulk.case_buttons[("ext", "lower")].setFocus()
+            QTest.keyClick(bulk.case_buttons[("ext", "lower")], Qt.Key_Up)
+            assert QApplication.focusWidget() is bulk.case_buttons[("all", "upper")]
+            QTest.keyClick(bulk.case_buttons[("all", "upper")], Qt.Key_Left)
+            assert QApplication.focusWidget() is bulk.case_buttons[("all", "swap")]
+            assert bulk.chosen_case("all") == "upper"
+            # ↓↓: 拡張子 → タイムスタンプの止まり先は「変更する」チェック
+            QTest.keyClick(bulk.case_buttons[("all", "swap")], Qt.Key_Down)
+            assert QApplication.focusWidget() is bulk.case_buttons[("ext", "lower")]
+            QTest.keyClick(bulk.case_buttons[("ext", "lower")], Qt.Key_Down)
+            assert QApplication.focusWidget() is bulk.stamp_check
+            values = [b.value() for b in bulk.stamp_edits]
+            QTest.keyClick(bulk.stamp_check, Qt.Key_Down)
+            assert QApplication.focusWidget() is bulk.attr_checks["readonly"]
+            assert [b.value() for b in bulk.stamp_edits] == values
+        finally:
+            bulk.close()
+
+
 def test_window_file_info():
     import filer
     from PySide6.QtCore import Qt
@@ -8601,6 +8708,50 @@ def test_photo_journal_reflects_changes():
             w.deleteLater()
 
 
+def test_photo_journal_replay_on_startup():
+    """起動時のなめ読み: 閉じている間に書かれた変更記録を先頭から読み直し、
+    永続キャッシュと一覧へ反映する(末尾から読む通常の読み取りでは取りこぼす分)。"""
+    import filer
+    from photometa import writer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        photos, sub, other = _make_photo_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        journal = Path(tmp, "journal.jsonl")
+        line = lambda p, r, k=(), pid=1: json.dumps(  # noqa: E731
+            {"path": str(p), "rating": r, "keywords": list(k), "time": 0, "pid": pid},
+            ensure_ascii=False) + "\n"
+        # 閉じている間に書かれた、という想定で先に記録を用意しておく
+        with open(journal, "w", encoding="utf-8") as f:
+            f.write(line(photos / "e_none.jpg", 5, ["みてね済"]))
+            f.write(line(photos / "e_none.jpg", 2))      # 同じ写真は最後の記録が勝つ
+            f.write(line(photos / "b4.jpg", 5))
+        cache = filer.photo_metacache.MetaCache(str(Path(tmp, "cache.sqlite")))
+        saved_cache = filer._photo_metacache
+        filer._photo_metacache = cache
+        w = _photo_window(photos, other, settings_path)
+        # 通常の読み取りは末尾から(上の記録は全部「過去の」分になる)
+        w._photo_journal = writer.JournalReader(str(journal))
+        L = w.left
+        try:
+            w._poll_photo_journal()
+            got = cache.get(str(photos / "b4.jpg"))
+            assert got is not None and got.rating == 4     # ファイルの値のまま
+            w._replay_photo_journal()
+            texts = _rating_texts(L)
+            assert texts["b4.jpg"] == "みてね用" and texts["e_none.jpg"] == "★2", texts
+            # 永続キャッシュにも入っている(次に開いたときの読み取りで効く)
+            assert cache.get(str(photos / "b4.jpg")).rating == 5
+            assert cache.get(str(photos / "e_none.jpg")).rating == 2
+        finally:
+            w.close()
+            w.deleteLater()
+            filer._photo_metacache = saved_cache
+            cache.close()
+
+
 def test_photo_write_with_exiftool():
     """実際に ExifTool で書く(環境変数 PHOTOMETA_EXIFTOOL があるときだけ。一時フォルダのコピーに1件)。"""
     exe_setting = os.environ.get("PHOTOMETA_EXIFTOOL")
@@ -9484,6 +9635,9 @@ def test_photo_pick():
                 # 読み取り中は一覧の中央にも進み具合が出る
                 assert L.read_progress.isVisible()
                 assert "★を読んでいます…" in L.read_progress.label.text()
+                # 進み具合には、中止しても読んだ分はキャッシュに残る旨の注意書きが出る
+                assert filer.PICK_READ_NOTE in L.read_progress.label.text()
+                assert filer.PICK_READ_NOTE in L.footer.text()
                 key(Qt.Key_Escape)
                 gate.set()
                 _wait(w, timeout=10)
@@ -9493,6 +9647,9 @@ def test_photo_pick():
                 filer._photo_metacache = pick_cache
             assert not L.read_progress.isVisible()      # 終われば中央表示は消える
             assert "★写真抽出: 中止しました" in log()
+            # 中止のログにも完了時と同じ内訳(キャッシュ/読み取り)と、残る旨が出る
+            assert "★写真抽出: 中止しました（★を読んだ写真" in log()
+            assert "読んだ分はキャッシュに残り、次回の処理はその分高速化されます" in log()
             assert not L.pick_loading and L.pick_root is None and not L.flat
             assert sorted(_names(L)) == before and w.isVisible()
 

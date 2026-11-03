@@ -15,6 +15,10 @@
 # だけ。実際のファイルに当てるのは呼び出し側(on_apply)で、失敗したらその理由を
 # このダイアログに出して閉じない(打った内容を失わない)。写真の★も同じで、ここは
 # 「何をどう変えるか」(photo_changes)を返すだけ。書くのは呼び出し側(閉じた後)。
+#
+# フォーカスは ↑↓ でも移る: ファイル名 → 変換(全体) → 変換(拡張子) → タイムスタンプ
+# → 属性(R / S / H / A)。変換の行の中は ←→(1件では移った先の変換をその場で当てる)。
+# ↑↓ では値もチェックも変えない(スピンボックスの増減は横取りして止める)。
 import os
 import time
 
@@ -284,6 +288,16 @@ class FileInfoDialog(QDialog):
             self.setTabOrder(a, b)
         (self.name_edit if not (self.bulk or self.photo_only) else self.ok_button).setFocus()
 
+        # ↑↓←→でのフォーカス移動(下の _focus_stop など)。部品の出来事を横取りして、
+        # 値やチェックを変えずにフォーカスだけを動かす
+        self._case_applied = {}          # 1件のとき、変換の行ごとに最後に当てた変換
+        arrow_widgets = ([self.name_edit] + list(self.case_buttons.values())
+                         + ([self.stamp_check] if self.stamp_check else [])
+                         + self.stamp_edits
+                         + [self.attr_checks[k] for k, _l, _a in ATTR_ROWS])
+        for widget in arrow_widgets:
+            widget.installEventFilter(self)
+
     # --- 写真の★ ---
     # ---- 1つ目のキーワードへの互換の参照(従来は みてね済 1つだけだった) ----
 
@@ -506,10 +520,86 @@ class FileInfoDialog(QDialog):
                     button.setChecked(False)
             self.case_buttons[(part, mode)].setChecked(pressed)
             return
+        self._case_applied[part] = mode     # ↑↓で戻ってきたときに当てる先
         entry = self.entries[0]
         position = self.name_edit.cursorPosition()
         self.name_edit.setText(core.convert_case(self.name_edit.text(), part, mode, entry.is_dir))
         self.name_edit.setCursorPosition(position)
+
+    # --- ↑↓←→でのフォーカス移動(値・チェックは変えない) ---
+    # 止まり先: 0 ファイル名 → 1 変換(全体) → 2 変換(拡張子) → 3 タイムスタンプ
+    # → 4〜7 属性(R / S / H / A)。変換の行の中は ←→ でボタンを移る(1件では移った
+    # 先の変換をその場で当てる。クリックと同じ)。タイムスタンプの中は Tab で移り、
+    # ↑↓ はグループを出る(QSpinBox の値の増減はさせない)。
+
+    def _focus_stop(self, widget):
+        """widget が属する止まり先の番号。属さなければ None(一括では名前欄は使えない)。"""
+        if widget is self.name_edit:
+            return None if self.bulk else 0
+        for part, stop in (("all", 1), ("ext", 2)):
+            if any(widget is self.case_buttons[(part, m)] for m, _t in CASE_BUTTONS):
+                return stop
+        stamp_widgets = ([self.stamp_check] if self.stamp_check else []) + self.stamp_edits
+        if any(widget is w for w in stamp_widgets):
+            return 3
+        for index, (key, _label, _letter) in enumerate(ATTR_ROWS):
+            if widget is self.attr_checks[key]:
+                return 4 + index
+        return None
+
+    def _land_on_stop(self, stop) -> None:
+        """止まり先へフォーカスを当てる(押したり値を変えたりはしない)。"""
+        if stop == 0:
+            self.name_edit.setFocus()
+        elif stop in (1, 2):
+            part = "all" if stop == 1 else "ext"
+            # その行で選ばれている(当てた)ボタンへ。無ければ先頭のボタン
+            mode = self.chosen_case(part) if self.bulk else self._case_applied.get(part)
+            button = self.case_buttons.get((part, mode)) if mode else None
+            (button or self.case_buttons[(part, CASE_BUTTONS[0][0])]).setFocus()
+        elif stop == 3:
+            (self.stamp_check or self.stamp_edits[0]).setFocus()
+        else:
+            self.attr_checks[ATTR_ROWS[stop - 4][0]].setFocus()
+
+    def _move_case_focus(self, part: str, obj, delta: int) -> None:
+        """変換の行の中で ←→。端では止まる。一括ではフォーカスだけ、1件では
+        移った先の変換をクリックと同じくその場で当てる。"""
+        modes = [m for m, _t in CASE_BUTTONS]
+        current = next(m for m in modes if self.case_buttons[(part, m)] is obj)
+        index = min(max(modes.index(current) + delta, 0), len(modes) - 1)
+        mode = modes[index]
+        self.case_buttons[(part, mode)].setFocus()
+        if not self.bulk:
+            self._on_case(part, mode)
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.KeyPress and not self.photo_only:
+                key = event.key()
+                if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+                    stop = self._focus_stop(obj)
+                    mods = event.modifiers()
+                    if (stop is not None
+                            and not mods & (Qt.AltModifier | Qt.ControlModifier
+                                            | Qt.MetaModifier)
+                            and not (mods & Qt.ShiftModifier and stop == 0)):
+                        if key == Qt.Key_Up:
+                            first = 1 if self.bulk else 0
+                            if stop > first:
+                                self._land_on_stop(stop - 1)
+                            return True     # 先頭では何もしない(スピンの増減もさせない)
+                        if key == Qt.Key_Down:
+                            if stop < 4 + len(ATTR_ROWS) - 1:
+                                self._land_on_stop(stop + 1)
+                            return True     # 末尾では何もしない
+                        if stop in (1, 2):  # ←→ は変換の行の中だけ
+                            self._move_case_focus("all" if stop == 1 else "ext", obj,
+                                                  -1 if key == Qt.Key_Left else 1)
+                            return True
+        except Exception:  # noqa: BLE001  フィルタで投げ切ると落ちる
+            return True
+        return super().eventFilter(obj, event)
 
     def chosen_case(self, part: str):
         for (p, m), button in self.case_buttons.items():

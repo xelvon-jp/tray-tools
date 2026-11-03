@@ -510,20 +510,15 @@ def export_menu_items(config: dict) -> list[MenuItem]:
     """書き出しの小メニュー（PhotoCuller の I → E）の行。動作は次のどれか：
 
     ("frame_sync", None)     … フォトフレームへ同期（photometa.export.sync_frame）
-    ("mitene_collect", None) … みてね用に集める（photometa.export.collect_mitene）
-    ("mitene_finish", None)  … みてね済にして片付ける（photometa.export.finish_mitene）
     ("frame_manual_list", None) … 手で消す写真の一覧（photometa.export.pending_manual_deletes）
                                   知らない動作の行は、古いアプリが飛ばす
+    みてねはスマホへ送る経路に一本化した（フォルダへ集める経路は廃止）。
     """
     from . import export as ex
 
-    kws = config.get("keywords") or []
-    done = kws[0]["name"] if kws else "みてね済"
     pending = len(ex.pending_manual_deletes())
     return [
         MenuItem("F", "フォトフレームへ同期", ex.frame_expr(config), ("frame_sync", None)),
-        MenuItem("M", "みてね用に集める", ex.mitene_expr(config), ("mitene_collect", None)),
-        MenuItem("D", f"{done}にして片付ける", "", ("mitene_finish", None)),
         MenuItem("L", f"手で消す写真の一覧（{pending}枚）", "", ("frame_manual_list", None)),
     ]
 

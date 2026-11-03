@@ -3,9 +3,10 @@
 #
 #   collect(root, 式, 設定)          … root 配下を再帰で歩いて、式に合う写真を集める
 #   sync_frame(写真, 同期先, ...)    … フォトフレーム用に縮小した JPEG を同期先へ足し引きする
-#   plan_frame_sync(写真, 同期先, ...) … sync_frame の予行（何も書かずに、足す・消す数を数える）
-#   collect_mitene(写真, 集める先)   … みてね用に、そのままコピーして集める
-#   finish_mitene(集める先, session) … 集めた元の写真に「みてね済」を付け、集めた先から消す
+#   plan_frame_sync(写真, 同期先, ...) … sync_frame の予行（何も書かずに、足す・消す数と名前のぶつかりを数える）
+#
+# みてね用の式（mitene_expr）と済キーワード（mitene_keyword）は、スマホへ送る
+# （photometa.phone）からの対象選びに使う。フォルダへコピーして集める経路は廃止した。
 #
 # どれも時間がかかるので、呼ぶ側は裏のスレッドから呼ぶ。中止は cancel（threading.Event）、
 # 進み具合は progress(済んだ数, 全体の数, 名前)（全体が分からないときは 0）。
@@ -54,7 +55,6 @@ EXCLUDED_DIR_PREFIXES = ("extract_",)
 
 LEDGER_VERSION = 1
 FRAME_FORMAT = 1              # 作り方を変えたら上げる（全部作り直しになる）
-MITENE_MANIFEST = "photometa_mitene.json"
 MANUAL_DELETE_FILE = "frame_manual_delete.json"
 MANUAL_DELETE_VERSION = 1
 
@@ -901,6 +901,9 @@ class FramePlanTarget:
     unchanged: list = field(default_factory=list)  # (同期先の名前, 元の写真)
     kept: list = field(default_factory=list)       # 同期先の名前。手で差し替えられていて触らない
     manual: bool = False                           # 削除がクラウドへ反映されない同期先か
+    # 追加のうち、本来の名前（{撮影日時}_{元名}.jpg）が既に使われていて _2 のような
+    # 名前になるものの数（同期先の既存ファイル・台帳の名前・この予行で先に足す分と照らす）
+    collisions: int = 0
 
     @property
     def manual_delete(self) -> list:
@@ -945,6 +948,10 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
     ファイルには一切書かない（同期先のフォルダも作らない。台帳・手で消す写真の一覧も変えない）。
     ledger_dir を省くと default_ledger_dir()。中止したら cancelled（削除の数は数えない）。
     実際の同期では、JPEG を作れなかった写真・書けなかった同期先の分だけ数が減ることがある。
+
+    追加については、本来の名前（{撮影日時}_{元名}.jpg）が既に使われていて _2 のような
+    名前になる件数も collisions に数える（名前は photo_stamp で見積もる。同期先の既存
+    ファイル・台帳の名前・この予行で先に足す分と照らす）。
     """
     plan = FramePlan()
     targets = _clean_targets(targets)
@@ -959,6 +966,9 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
     states = [_Target(t, load_ledger(ledger_dir, t)) for t in targets]
     plan.targets = [FramePlanTarget(t.dir, manual=_key(t.dir) in manual_keys) for t in states]
     pairs = list(zip(states, plan.targets))
+    # 名前の見積もり用（同期先ごとに、使われている名前の写し。追加が決まるたびに
+    # sync_frame と同じ順で名前を消費していく）
+    taken_map = {id(t): set(t.taken) for t in states}
     scope_keys = None if scope is None else [_key(p) for p in scope]
     keep_keys = [_key(p) for p in keep]
     heif_cache: list = []
@@ -993,18 +1003,29 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
             elif action == "unchanged":
                 out.unchanged.append((name, src))
             else:
-                todo.append((out, name, action))
+                todo.append((t, out, name, action))
         if not todo:
             continue
         skip = _cannot_build(src, heif_cache)
         if skip is not None:
             (plan.skipped_raw if skip == "raw" else plan.skipped_heic).append(src)
             continue
-        for out, name, action in todo:
+        stamp = None
+        for t, out, name, action in todo:
             if action == "update":
                 out.updated.append((name, src))
             else:
                 out.added.append(src)
+                if name is None:
+                    # 新規の追加は名前をこれから決める。本来の名前が使われていたら
+                    # _2 のような名前になる（sync_frame の _unique_name と同じ判定）
+                    if stamp is None:
+                        stamp = photo_stamp(src)
+                    natural = f"{stamp}_{os.path.splitext(os.path.basename(src))[0]}.jpg"
+                    taken = taken_map[id(t)]
+                    if natural.casefold() in taken:
+                        out.collisions += 1
+                    taken.add(_unique_name(natural, taken).casefold())
     if _cancelled(cancel):
         plan.cancelled = True
         return plan
@@ -1017,155 +1038,3 @@ def plan_frame_sync(sources, targets, settings, ledger_dir: str | None = None, s
                 out.kept.append(name)
     return plan
 
-
-# ------------------------------------------------------------------ みてね
-
-@dataclass
-class MiteneResult:
-    copied: list = field(default_factory=list)     # (集めた先の名前, 元の写真)
-    already: list = field(default_factory=list)    # もう集めてあった元の写真
-    failed: list = field(default_factory=list)     # (パス, 理由)
-    cancelled: bool = False
-    dest: str = ""
-
-
-@dataclass
-class FinishResult:
-    marked: list = field(default_factory=list)     # 「みてね済」を付けた元の写真
-    removed: list = field(default_factory=list)    # 集めた先から消したコピー
-    missing: list = field(default_factory=list)    # 集めた先から消されていた（付けない）元の写真
-    failed: list = field(default_factory=list)     # (パス, 理由)
-    results: list = field(default_factory=list)    # writer.WriteResult（表示の反映用）
-    cancelled: bool = False
-    error: str | None = None
-
-
-def manifest_path(dest: str) -> str:
-    return os.path.join(dest, MITENE_MANIFEST)
-
-
-def load_manifest(dest: str) -> list:
-    """集めた先の一覧（[{"name", "source", "size", "mtime_ns"}]）。無ければ空。"""
-    data = _read_json(manifest_path(dest))
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
-    return [it for it in items if isinstance(it, dict) and isinstance(it.get("name"), str)
-            and isinstance(it.get("source"), str)]
-
-
-def save_manifest(dest: str, items: list) -> None:
-    path = manifest_path(dest)
-    if not items:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        return
-    _write_json(path, {"version": 1, "items": items})
-
-
-def collect_mitene(sources, dest: str, cancel=None, progress=None) -> MiteneResult:
-    """sources（式で選んだ写真）を dest にそのままコピーする（縮小しない）。
-
-    名前は「撮影日時_元の名前」（ぶつかったら連番）。dest に集めた元のパスの一覧
-    （MITENE_MANIFEST）を置く。もう集めてあって、コピーが残っているものは飛ばす。
-    """
-    dest = os.path.abspath(dest)
-    result = MiteneResult(dest=dest)
-    os.makedirs(dest, exist_ok=True)
-    items = load_manifest(dest)
-    have = {}
-    for it in items:
-        if os.path.exists(os.path.join(dest, it["name"])):
-            have[_key(it["source"])] = it
-    items = list(have.values())          # コピーが消えていた記録は捨てる（集め直す）
-    try:
-        taken = {n.casefold() for n in os.listdir(dest)}
-    except OSError:
-        taken = set()
-    sources = [os.path.abspath(os.fspath(p)) for p in sources]
-    try:
-        for i, src in enumerate(sources):
-            if _cancelled(cancel):
-                result.cancelled = True
-                break
-            _notify(progress, i, len(sources), os.path.basename(src))
-            key = _key(src)
-            if key in have:
-                result.already.append(src)
-                continue
-            try:
-                st = os.stat(src)
-            except OSError:
-                result.failed.append((src, "元の写真がありません"))
-                continue
-            name = _unique_name(f"{photo_stamp(src)}_{os.path.basename(src)}", taken)
-            try:
-                _copy_replace(src, os.path.join(dest, name))
-            except OSError as e:
-                result.failed.append((src, f"コピーできません（{e}）"))
-                continue
-            taken.add(name.casefold())
-            it = {"name": name, "source": src, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
-            items.append(it)
-            have[key] = it
-            result.copied.append((name, src))
-    finally:
-        save_manifest(dest, items)
-    return result
-
-
-def finish_mitene(dest: str, session, keyword: str, cancel=None, progress=None) -> FinishResult:
-    """dest の一覧にある元の写真へ keyword（みてね済）を付け、成功したものだけ dest から消す。
-
-    集めた先からコピーが消されていた写真には付けない（上げないことにしたもの）。
-    session は writer.ExifToolSession（set_keyword を持つもの）。
-    """
-    dest = os.path.abspath(dest)
-    result = FinishResult()
-    if not keyword:
-        result.error = "みてね済に当たるキーワードがありません（photo_ratings.json の keywords）"
-        return result
-    items = load_manifest(dest)
-    remaining = []
-    try:
-        for i, it in enumerate(items):
-            if _cancelled(cancel):
-                result.cancelled = True
-                remaining.extend(items[i:])
-                break
-            _notify(progress, i, len(items), it["name"])
-            copy = os.path.join(dest, it["name"])
-            src = it["source"]
-            if not os.path.exists(copy):
-                result.missing.append(src)
-                continue
-            if not os.path.isfile(src):
-                result.failed.append((src, "元の写真がありません"))
-                remaining.append(it)
-                continue
-            try:
-                r = session.set_keyword([src], keyword, True)[0]
-            except Exception as e:  # noqa: BLE001  ExifTool が落ちたなど
-                result.failed.append((src, f"{type(e).__name__}: {e}"))
-                remaining.append(it)
-                continue
-            result.results.append(r)
-            if not r.ok:
-                result.failed.append((src, r.error or "書けませんでした"))
-                remaining.append(it)
-                continue
-            result.marked.append(src)
-            try:
-                os.remove(copy)
-                result.removed.append(copy)
-            except OSError as e:
-                result.failed.append((copy, f"集めた先から消せません（{e}）"))
-                remaining.append(it)       # 付け直しても害はないので、次の片付けで消す
-    finally:
-        try:
-            save_manifest(dest, remaining)
-        except OSError as e:
-            result.failed.append((manifest_path(dest), f"一覧を書けません（{e}）"))
-    return result

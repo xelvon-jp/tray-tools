@@ -9517,9 +9517,88 @@ def test_photo_pick():
                 pick_cache.close()
 
 
+# 窓を立てる重いテストのうち、中核（FULL_ONLY に無い窓テスト）以外は普段回さない。
+# CI（GITHUB_ACTIONS）と --full のときだけ全部回す。守る対象は変えず、手元の確認を
+# 軽くするための仕分け（2026-11-03 Nagato の「最低限にして」による）。
+# pytest で集めた場合は main() を通らないので全部回る。
+FULL_ONLY = frozenset({
+    "test_archive_password_and_missing_py7zr",
+    "test_auto_refresh_on_external_change",
+    "test_chooser_menu_delete_key",
+    "test_dialogs",
+    "test_drive_list",
+    "test_edit_confirms_images",
+    "test_enter_viewer_routing",
+    "test_ext_column_fits_long_ext",
+    "test_file_info_focus_and_checkbox_look",
+    "test_live_filter_logic",
+    "test_log_selection_ctrl_c",
+    "test_menu_selected_row_color",
+    "test_open_shell_and_explorer",
+    "test_photo_mode_judgement",
+    "test_photo_mode_window_and_rating_column",
+    "test_photo_no_extra_entries",
+    "test_photo_rating_range_bar",
+    "test_photo_rating_slider_only",
+    "test_photo_read_metacache_progress_online",
+    "test_photo_write_targets",
+    "test_preload_modules",
+    "test_preview_applies_edits",
+    "test_preview_catches_up_with_cursor",
+    "test_preview_fullscreen_from_right",
+    "test_preview_image_lr_keys",
+    "test_preview_image_repeat_waits_for_display",
+    "test_preview_image_rotate_keys",
+    "test_rename_photo_section",
+    "test_single_instance_and_show",
+    "test_size_total_keys",
+    "test_stash_pane",
+    "test_stash_register_keys_and_cursor",
+    "test_tally_sizes_core",
+    "test_transfer_cursor_follows_to_other_pane",
+    "test_update_decide_and_check",
+    "test_viewer_encoding_and_index_logic",
+    "test_viewer_window_big_file",
+    "test_window_add_tool_from_menu",
+    "test_window_bs_at_drive_root",
+    "test_window_copy_tree",
+    "test_window_everything_search",
+    "test_window_ext_colors_and_settings_dialog",
+    "test_window_ext_menu",
+    "test_window_ext_menu_property_and_archive",
+    "test_window_f7_jump_range",
+    "test_window_flat_view",
+    "test_window_frecency_jump",
+    "test_window_layout_and_font",
+    "test_window_live_filter",
+    "test_window_menu_attrs_mouse_drag_drawing",
+    "test_window_renemo_block_and_gutter",
+    "test_window_renemo_ext_fullpath_checks",
+    "test_window_renemo_format_dialog",
+    "test_window_renemo_maximize_and_drag_scroll",
+    "test_window_renemo_target_line",
+    "test_window_renemo_toolbar_and_keys",
+    "test_window_screen_layout",
+    "test_window_title_shows_version",
+    "test_window_transfer_com_init",
+    "test_window_update_restart",
+    "test_window_vertical_scrollbar",
+    "test_window_winmerge",
+    "test_window_workspace",
+    "test_window_zip_create",
+})
+
+
 def main() -> int:
+    full = "--full" in sys.argv or os.environ.get("FILER_FULL") \
+        or os.environ.get("GITHUB_ACTIONS")
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
+    if not full:
+        skipped = [name for name, _fn in tests if name in FULL_ONLY]
+        tests = [(name, fn) for name, fn in tests if name not in FULL_ONLY]
+        print(f"（重い窓テスト {len(skipped)} 件は省略しました。"
+              "全部回すときは --full を付けてください）")
     failed = 0
     for name, fn in tests:
         try:

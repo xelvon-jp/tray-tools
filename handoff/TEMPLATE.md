@@ -13,13 +13,16 @@ author: Claude（陽太の依頼で作成）
 <!--
 使い方（Claude 向けのメモ。依頼書には残してよい）:
 1. このファイルを handoff/<id>.md にコピーして埋め、main にコミット・push する
-2. そのコミットの sha を base_sha に書く（書いてからもう一度コミットする必要はない。
+2. **同じコミットから作業ブランチも Claude が先に作る**：git push origin HEAD:refs/heads/muse/<id>
+   Muse がブランチを作ると承認カードが1回増える（ブランチ作成＋push で2回）。先に作っておけば push の1回で済む
+3. そのコミットの sha を base_sha に書く（書いてからもう一度コミットする必要はない。
    依頼の1行に base を書けば Muse はそちらを読む）
-3. muse_post.py post --message-file で依頼の1行を投稿する。1行の例:
+4. muse_post.py post --message-file で依頼の1行を投稿する。1行の例:
    [Claude依頼] tray-tools <id> ／ xelvon-jp/tray-tools の handoff/<id>.md
    （branch: main, base: <base_sha>）を読んで、書いてあるとおりに作業してください。
-   結果はブランチ muse/<id> に 1コミットで push してください。
-4. muse_post.py wait --repo <repo> --branch muse/<id> で push を待つ
+   ブランチ muse/<id> は作成済みです（新しく作らないでください）。結果はそこに 1コミットで push してください。
+5. muse_post.py wait --repo <repo> --branch muse/<id> --path handoff/<id>.result.md で結果を待つ
+   （ブランチは最初からあるので、--path なしだと即座に終わってしまう）
 -->
 
 # [Claude依頼] <一言でいうと何をしてほしいか>
@@ -46,6 +49,7 @@ implement のとき：
 
 ## 守ること
 - **`main` には何も push しない**。push するのはブランチ `muse/YYYYMMDD-NN-slug` だけ
+- **ブランチ `muse/YYYYMMDD-NN-slug` は Claude が作成済み**（依頼書と同じコミットを指している）。新しく作らず、そこへ push する（承認カードを1回で済ませるため）
 - 触ってよいパス：
   - `handoff/YYYYMMDD-NN-slug.result.md`（新規。必ず作る）
   - <implement / draft のときだけ、ほかのパスをここに列挙する>
@@ -59,7 +63,7 @@ implement のとき：
 着手したとき、main の HEAD が base_sha より先に進んでいることがある（Claude 側が並行して作業しているため）。
 
 - **調べ物・判断は base_sha 時点の内容で行う。** 依頼書はその時点を前提に書いてある
-- **ブランチは現在の main から切ってよい。** GitHub コネクタはブランチ名からしか切れず、base_sha ぴったりからは切れないため
+- **ブランチは作成済みで、base_sha を指している。** そのまま使う（現在の main に合わせ直さない）
 - base_sha と現在の main とで、**この依頼の対象ファイル（読むもの・変えるもの）が違っていたら**、結果ファイルにそう書く（どのファイルが、どう違ったか。blob の SHA で確かめた、など）
 - implement で、変えるファイル自体が main 側で変わっていて衝突しそうなら、無理に合わせず status: blocked で止めて理由を書く
 

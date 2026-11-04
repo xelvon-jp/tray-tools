@@ -47,6 +47,7 @@ from capture_grab import new_session_stem, save_image
 from capture_overlay import CountdownOverlay, FrozenSelectionOverlay
 from keep_awake import hibernate_available, set_keep_awake, suspend
 import action_log
+import rapture_timing
 from sleep_countdown import SleepCountdown
 from qt_image import pil_to_qicon
 from toast import show_toast
@@ -798,11 +799,15 @@ class ScreenFeature:
         self.overlay = None
 
     def _on_selection_made(self, rect_global: QRect):
+        # 所要時間の計測(rapture_timing.log)。選んだ時刻を付箋側へも渡し、付箋が描き終わる
+        # までを通しで測る。「数秒かかることがある」の原因を見分けるため(2026-11-04)
+        timing = {"t0_ms": rapture_timing.now_ms()}
         # 撮り直さず凍結画像から切り出す。参照を捨てる前に取り出しておく。
         image = self.overlay.crop(rect_global)
         self.overlay.close()
         self.overlay.deleteLater()
         self.overlay = None
+        timing["cropped_ms"] = rapture_timing.now_ms()
 
         # 付箋1枚が1つの連番セッション。撮影直後の自動保存がそのセッションの1枚目になるよう、
         # 先にファイル名の頭を決めてから付箋へ引き継ぐ(rapture_20260823_140919-001.png)。
@@ -811,12 +816,34 @@ class ScreenFeature:
         saved = save_image(  # 素の画像を自動保存
             image, self.app_settings.get("capture", {}), stem=session_stem, index=1
         )
+        timing["saved_ms"] = rapture_timing.now_ms()
         self._open_capture_window(
             image,
             rect_global.topLeft(),
             session_stem=session_stem,
             session_index=1 if saved else 0,
+            timing=timing,
         )
+        try:
+            self._write_capture_timing(image, session_stem, saved, timing)
+        except Exception:  # noqa: BLE001  計測の失敗でキャプチャを止めない
+            pass
+
+    @staticmethod
+    def _write_capture_timing(image, session_stem, saved, timing: dict) -> None:
+        """本体側の所要時間を rapture_timing.log へ1行。付箋側の行とは session_stem で対応する。"""
+        t0 = timing["t0_ms"]
+        size = image.size()
+        rapture_timing.write("本体", session_stem, {
+            "経路": timing.get("route", "?"),
+            "画像": f"{size.width()}x{size.height()}",
+            "切出": rapture_timing.span(t0, timing.get("cropped_ms")),
+            "保存": rapture_timing.span(timing.get("cropped_ms"), timing.get("saved_ms")),
+            "受渡PNG": rapture_timing.span(timing.get("png_start_ms"), timing.get("png_done_ms")),
+            "送信": rapture_timing.span(timing.get("png_done_ms"), timing.get("sent_ms")),
+            "本体合計": rapture_timing.span(t0, timing.get("sent_ms")),
+            "保存先": str(saved.parent) if saved else "失敗",
+        })
 
     def _prewarm_enabled(self) -> bool:
         """待機役を飼うかどうか。既定は有効。
@@ -839,7 +866,7 @@ class ScreenFeature:
             print(f"[rapture] 待機役を起こせません: {e}", file=sys.stderr)
 
     def _open_capture_window(self, image, global_pos, close_on_escape=False,
-                             session_stem=None, session_index=0):
+                             session_stem=None, session_index=0, timing=None):
         """付箋を1枚開く。実体はこのプロセスではなく別プロセス(capture_process.py)。
 
         本体と同じプロセスに置くと、本体が落ちたときはもちろん、機能追加のたびの
@@ -865,6 +892,7 @@ class ScreenFeature:
                     session_stem=session_stem,
                     session_index=session_index,
                     capture_hotkey=capture_hotkey,
+                    timing=timing,
                 )
             except OSError as e:
                 # 受け渡し用PNGを書けなかった場合。spawn も同じ書き出しをするので
@@ -876,6 +904,8 @@ class ScreenFeature:
             # ここでプロセスを起こすぶん(10〜15ms)は表示を遅らせない。
             QTimer.singleShot(0, self._ensure_prewarmed)
             if used is not None:
+                if timing is not None:
+                    timing["route"] = "warm"
                 return
 
         try:
@@ -889,7 +919,10 @@ class ScreenFeature:
                 # 連番キャプチャのキーをタイトルバーに出させる。設定で変えられる値なので
                 # 付箋側にハードコードさせず、ここで実値を渡す。
                 capture_hotkey=capture_hotkey,
+                timing=timing,
             )
+            if timing is not None:
+                timing["route"] = "spawn" if self._prewarm_enabled() else "spawn(prewarm無効)"
         except OSError as e:
             # 撮ったのに何も出ないと、キャプチャ自体が失敗したように見える。
             # 自動保存だけは済んでいるので、そのことが分かる言い方で知らせる。

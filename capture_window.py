@@ -5,6 +5,7 @@
 # (rapture-py/capture_window.py から移設。不具合1〜5を修正)
 import os
 import threading
+import time
 
 from PySide6.QtCore import (
     QBuffer,
@@ -299,6 +300,18 @@ class CaptureWindow(QWidget):
         # base_image と actions_history からしか絵を作らないため、これで保存画像には混ざらない。
         painter.resetTransform()
         self._draw_session_badge(painter)
+
+        # 付箋プロセスが仕込む「最初に描き終わったら1回だけ呼ぶ」計測(rapture_timing.log)。
+        # 描画を遅らせないよう、時刻だけ取って書き込みは次のイベントループへ回す。
+        # 計測の失敗で描画を止めない(paintEvent の例外はプロセスごと落としうる)。
+        callback = getattr(self, "_after_first_paint", None)
+        if callback is not None:
+            self._after_first_paint = None
+            try:
+                painted_ms = time.time() * 1000.0
+                QTimer.singleShot(0, lambda: callback(painted_ms))
+            except Exception:  # noqa: BLE001
+                pass
 
     def _draw_session_badge(self, painter: QPainter):
         """左上の隅に「このセッションで何枚目か」を小さく出す。撮ったつもりで撮れていない、

@@ -51,6 +51,12 @@
 # keyboard は絶対に使わないこと。初回の add_hotkey が COM を触り、GC と衝突すると
 # プロセスごと落ちる(hotkeys.init_keyboard のコメント参照)。ホットキーは本体が
 # 持ち、ここへは上記の IPC で伝える、という役割分担にしてある。
+import time as _time
+
+# 所要時間の計測(rapture_timing.log)用。import より前に取る: spawn の道では
+# 「Python と Qt の読み込み」がいちばん時間を食いうるので、そこを見えるようにする。
+_PROC_START_MS = _time.time() * 1000.0
+
 import argparse
 import ctypes
 import json
@@ -70,6 +76,7 @@ from PySide6.QtWidgets import QApplication
 
 import settings as settings_module
 import capture_grab
+import rapture_timing
 from capture_window import CaptureWindow
 from toast import show_toast
 # 窓の出ない実行ファイルの割り出しと、親から切り離して起動するフラグ。本体の再起動
@@ -80,6 +87,9 @@ from traytools_send import (
     DETACHED_PROCESS,
     pythonw_executable,
 )
+
+# import(Python と Qt の読み込み)を終えた時刻。spawn の道の計測用(_PROC_START_MS と対)。
+_IMPORTED_MS = rapture_timing.now_ms()
 
 SCRIPT_PATH = Path(__file__).resolve()
 ERROR_LOG_PATH = SCRIPT_PATH.parent / "error.log"
@@ -300,7 +310,7 @@ def _sweep_stale_handoffs() -> None:
 
 def spawn(image: QImage, global_pos: QPoint, settings_path=None,
           close_on_escape: bool = False, session_stem=None, session_index: int = 0,
-          capture_hotkey=None) -> int:
+          capture_hotkey=None, timing=None) -> int:
     """付箋を1枚、別プロセスとして起こす。起こせなければ OSError を投げる。
 
     pythonw.exe で起こすのはコンソール窓を出さないため、DETACHED_PROCESS を付けるのは
@@ -321,13 +331,19 @@ def spawn(image: QImage, global_pos: QPoint, settings_path=None,
       - メモリ: 待機役1人あたり専有27MB前後(ワーキングセットは56MBだが、大半は本体と
         共有しているQtのDLL)。常時1人だけ飼う作りにした。
       - 立て直し: 待機役が死んでいると show_via_warm が None を返すので、呼び出し側
-        (feature_screen._open_capture_window)がここへ落ちる。付箋が出ないことは無い。"""
+        (feature_screen._open_capture_window)がここへ落ちる。付箋が出ないことは無い。
+
+    timing(dict)を渡すと、受け渡しPNGの書き出しと起動の時刻を書き込む(rapture_timing)。"""
+    if timing is not None:
+        timing["png_start_ms"] = rapture_timing.now_ms()
     _sweep_stale_handoffs()
     HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
     # 同じミリ秒に2枚開いても衝突しないよう pid と ns を混ぜる。
     handoff = HANDOFF_DIR / f"handoff_{os.getpid()}_{time.time_ns()}.png"
     if not image.save(str(handoff), "PNG"):
         raise OSError(f"受け渡し用の画像を書き出せませんでした: {handoff}")
+    if timing is not None:
+        timing["png_done_ms"] = rapture_timing.now_ms()
 
     argv = [
         pythonw_executable(),
@@ -346,6 +362,8 @@ def spawn(image: QImage, global_pos: QPoint, settings_path=None,
         argv += ["--capture-hotkey", str(capture_hotkey)]
     if close_on_escape:
         argv += ["--close-on-escape"]
+    if timing is not None and timing.get("t0_ms"):
+        argv += ["--t0-ms", f"{timing['t0_ms']:.0f}"]
 
     try:
         proc = subprocess.Popen(
@@ -360,6 +378,8 @@ def spawn(image: QImage, global_pos: QPoint, settings_path=None,
         except OSError:
             pass
         raise
+    if timing is not None:
+        timing["sent_ms"] = rapture_timing.now_ms()
     return proc.pid
 
 
@@ -420,7 +440,7 @@ def _forget_dead_consumed_warm() -> None:
 
 def show_via_warm(image: QImage, global_pos: QPoint, settings_path=None,
                   close_on_escape: bool = False, session_stem=None,
-                  session_index: int = 0, capture_hotkey=None):
+                  session_index: int = 0, capture_hotkey=None, timing=None):
     """待機役へ画像と表示位置を送り、付箋になってもらう。
 
     送れた待機役の待ち受け名を返す。待機役が1人も居ない/全員に届かなかったときは
@@ -438,11 +458,15 @@ def show_via_warm(image: QImage, global_pos: QPoint, settings_path=None,
     if not names:
         return None
 
+    if timing is not None:
+        timing["png_start_ms"] = rapture_timing.now_ms()
     _sweep_stale_handoffs()
     HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
     handoff = HANDOFF_DIR / f"handoff_{os.getpid()}_{time.time_ns()}.png"
     if not image.save(str(handoff), "PNG"):
         raise OSError(f"受け渡し用の画像を書き出せませんでした: {handoff}")
+    if timing is not None:
+        timing["png_done_ms"] = rapture_timing.now_ms()
 
     payload = {
         "image": str(handoff),
@@ -454,11 +478,15 @@ def show_via_warm(image: QImage, global_pos: QPoint, settings_path=None,
         "capture_hotkey": capture_hotkey,
         "close_on_escape": bool(close_on_escape),
         "settings_path": str(settings_path) if settings_path else None,
+        # 範囲を選んだ時刻(rapture_timing)。付箋側が「選んでから描き終わるまで」を出す
+        "t0_ms": (timing or {}).get("t0_ms"),
     }
 
     for name in names:
         try:
             send(name, SHOW_STICKY_COMMAND, [payload])
+            if timing is not None:
+                timing["sent_ms"] = rapture_timing.now_ms()
             # この待機役はもう付箋。一覧から消えるまでの間、居ないものとして扱う。
             _consumed_warm.add(name)
             # 使えたということは、頼んでおいたぶんは立ち上がり切っている。すぐ後に来る
@@ -543,10 +571,53 @@ def _parse_args(argv: list):
                         help="タイトルバーに出す連番キャプチャのキー")
     parser.add_argument("--close-on-escape", action="store_true",
                         help="Esc で閉じられるようにする")
+    parser.add_argument("--t0-ms", type=float, default=None,
+                        help="範囲を選んだ時刻(エポック ms。rapture_timing.log の計測用)")
     args = parser.parse_args(argv)
     if not args.prewarm and (args.image is None or args.pos is None):
         parser.error("--prewarm でないときは画像と --pos が要ります")
     return args
+
+
+def _log_sticky_timing(window, route: str, session_stem, marks: dict) -> None:
+    """付箋が最初に描き終わったら、付箋側の所要時間を rapture_timing.log へ1行書く。
+
+    marks は時刻(エポック ms)の dict: t0(範囲を選んだ時刻。本体から), start(この
+    プロセスの起動 or 待機役が受け取った時刻), imported(spawn のみ。import を終えた),
+    loaded_from/loaded(画像を読み始めた/読み終えた), shown(show を呼ぶ直前)。
+    idle_min があれば待機役が待っていた分数。初回描画の時刻は CaptureWindow の
+    paintEvent が _after_first_paint を呼んだ時点で取る。
+
+    「枠が出てから絵が出るまで遅い」は 表示→描画 が長いときの形。計測の失敗で付箋を
+    止めないよう、全部握りつぶす。"""
+    def done(painted=None):
+        try:
+            painted = painted or rapture_timing.now_ms()
+            t0 = marks.get("t0")
+            fields = {"経路": route}
+            if marks.get("idle_min") is not None:
+                fields["待機"] = f"{marks['idle_min']:.0f}分"
+            fields["届くまで" if route == "warm" else "起動まで"] = rapture_timing.span(
+                t0, marks.get("start"))
+            if route != "warm":
+                fields["import"] = rapture_timing.span(marks.get("start"),
+                                                       marks.get("imported"))
+                # import の後、画像を読み始めるまで(QApplication の作成など)
+                fields["準備"] = rapture_timing.span(marks.get("imported"),
+                                                   marks.get("loaded_from"))
+            fields["画像読込"] = rapture_timing.span(marks.get("loaded_from"),
+                                                    marks.get("loaded"))
+            fields["表示まで"] = rapture_timing.span(marks.get("loaded"), marks.get("shown"))
+            fields["表示→描画"] = rapture_timing.span(marks.get("shown"), painted)
+            fields["選択→描画"] = rapture_timing.span(t0, painted)
+            rapture_timing.write("付箋", session_stem, fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        window._after_first_paint = done
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _take_handoff_image(path: str, dpr: float):
@@ -721,6 +792,9 @@ class _WarmHost:
             settings_path=settings_path,
         )
         _prerender_offscreen(self.window)
+        # 待機に入った時刻(rapture_timing の「待機 N分」)。長く待った後だけ遅いなら、
+        # メモリから追い出されていた疑いが強い。
+        self.ready_ms = rapture_timing.now_ms()
 
         self.warm_name = warm_pipe_basename(int(time.time() * 1000), os.getpid())
         # 待ち受けは QLocalServer 1つを最後まで使い回す(_listen_as のコメント参照)。
@@ -774,6 +848,7 @@ class _WarmHost:
             show_toast(f"Rapture\n待機役でエラーが起きました\n{summary}")
 
     def _accept(self) -> None:
+        self._received_ms = rapture_timing.now_ms()
         socket = self.server.nextPendingConnection()
         if socket is None:
             return
@@ -800,7 +875,9 @@ class _WarmHost:
 
     def _become_sticky(self, payload: dict) -> None:
         """画像を受け取って普通の付箋になる。ここから先は本体の生死と無関係に生きる。"""
+        received = getattr(self, "_received_ms", None) or rapture_timing.now_ms()
         image = _take_handoff_image(payload.get("image") or "", payload.get("dpr") or 1.0)
+        loaded = rapture_timing.now_ms()
         if image is None:
             # 出すものが無い。ここで終わると本体は「送れた」と思っているのに何も出ず、
             # おまけに待機役まで居なくなる。待機役のまま次を待つ。
@@ -838,6 +915,11 @@ class _WarmHost:
         # 表示の直前に張るのは spawn 側と同じ理由(本体から見た「付箋が使えるようになった
         # 時刻」を表示と揃えたい)。
         self._listen_as(pipe_basename(int(time.time() * 1000), os.getpid()))
+        _log_sticky_timing(window, "warm", payload.get("session_stem"), {
+            "t0": payload.get("t0_ms"), "start": received, "loaded_from": received,
+            "loaded": loaded, "shown": rapture_timing.now_ms(),
+            "idle_min": (received - self.ready_ms) / 60000.0,
+        })
         window.show()
         # 待機役は「古いプロセス」なので、show() だけでは前面に来ないことがある。
         # 最前面固定(WindowStaysOnTopHint)のおかげで見えなくなりはしないが、
@@ -877,9 +959,11 @@ def _run_prewarmed(app, args) -> int:
 
 def _run_sticky(app, args) -> int:
     """付箋1枚として立ち上がる(従来どおりの道)。"""
+    load_from = rapture_timing.now_ms()
     image = _take_handoff_image(args.image, args.dpr)
     if image is None:
         return 1
+    loaded = rapture_timing.now_ms()
 
     app_settings = settings_module.load_settings(args.settings_path)
     settings_path = args.settings_path or str(settings_module.SETTINGS_PATH)
@@ -902,6 +986,10 @@ def _run_sticky(app, args) -> int:
     # 表示とほぼ揃えたい(起動待ちの計測もこの時刻を目印にしている)。
     # 参照を捨てるとGCで待ち受けごと消えるため、ローカル変数で持ち続ける。
     server = _listen(window)  # noqa: F841
+    _log_sticky_timing(window, "spawn", args.session_stem, {
+        "t0": args.t0_ms, "start": _PROC_START_MS, "imported": _IMPORTED_MS,
+        "loaded_from": load_from, "loaded": loaded, "shown": rapture_timing.now_ms(),
+    })
     window.show()
     # 画面取得(mss の実体)を先に作っておく。初回の連番キャプチャで生成コストを
     # 払うと、撮れるまでが目に見えて遅れるため(待機役と同じ対策)。

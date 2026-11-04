@@ -194,6 +194,50 @@ def test_app_session_title():
             cs.APP_SESSIONS_DIR = old
 
 
+def test_background_work_after_reply():
+    """応答を終えても裏の処理が残っていれば「裏で作業中」。起こされて動けば実行中に戻る。"""
+    text = "\n".join([
+        '{"toolUseResult":{"backgroundTaskId":"aaa1"}}',
+        '{"toolUseResult":{"backgroundTaskId":"bbb2"}}',
+        '{"toolUseResult":{"backgroundTaskId":"ccc3"}}',
+        '{"content":"<task-notification>\\n<task-id>aaa1</task-id>\\n<status>completed"}',
+        '{"name":"TaskStop","input":{"task_id":"ccc3"}}',
+    ])
+    assert cs.pending_background(text) == ["bbb2"]
+    assert cs.pending_background("") == [] and cs.pending_background_in("Z:/nope.jsonl") == []
+
+    import claude_hook as hook
+    hook.send = lambda command, args: True
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.STATUS_DIR = Path(tmp, "status")
+        hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")
+        transcript = Path(tmp, "t.jsonl")
+        transcript.write_text(text, encoding="utf-8")
+        config = dict(hook.DEFAULTS, min_seconds=0)
+        event = {"session_id": "bg", "cwd": "R:/x", "transcript_path": str(transcript)}
+        hook.on_start(config, event)
+        hook.on_stop(config, event)
+        data = cs.read("bg")
+        assert data["state"] == cs.DONE and data["background"] == 1
+        assert cs.background_count(data) == 1
+        assert "裏で作業中" in cs.menu_label(data) and "裏で作業中" in cs.describe(data)[0]
+        assert cs.background_count(data, data["ended"] + cs.BACKGROUND_TTL + 1) == 0
+        # 完了より前に起こされたフック(遅れて届いた最後のツールの分)では戻さない
+        hook.HOOK_STARTED = data["ended"] - 1
+        hook.on_tool(config, dict(event, tool_name="Bash", tool_input={}))
+        assert cs.read("bg")["state"] == cs.DONE
+        # 裏の処理が終わって起こされ、ツールが走った → 実行中に戻り、「裏で作業中」は消える
+        hook.HOOK_STARTED = data["ended"] + 5
+        hook.on_tool(config, dict(event, tool_name="Bash", tool_input={}))
+        data = cs.read("bg")
+        assert data["state"] == cs.RUNNING and data["background"] == 0 and data["ended"] is None
+        # 次の終わりで、もう残りが無ければ普通の完了
+        transcript.write_text(text + '\n{"content":"<task-id>bbb2</task-id>"}', encoding="utf-8")
+        hook.on_stop(config, event)
+        assert cs.read("bg")["background"] == 0
+
+
 def test_remove_one_session():
     with tempfile.TemporaryDirectory() as tmp:
         cs.write("s1", {"state": cs.DONE, "updated": time.time()}, tmp)

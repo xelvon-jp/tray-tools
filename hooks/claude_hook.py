@@ -61,6 +61,11 @@ import traytools_send  # noqa: E402  (標準ライブラリだけ)
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
+# このフックが起こされた時刻。PostToolUse は async で走るので、最後のツールの分が
+# 応答の終わり(Stop)より後に書き込むことがある。「完了」を「実行中」に戻すのは、
+# 完了より後に起こされたフックだけにする(遅れて届いた分で戻さない)。
+HOOK_STARTED = time.time()
+
 # 呼ばれるたびに1行残す。フックは目に見えないところで走るので、記録が無いと
 # 「鳴らなかった」のが「呼ばれていない」のか「短くて見送った」のか「送ったが
 # 聞こえなかった」のか切り分けられない。実際その3つで詰まった。
@@ -369,7 +374,8 @@ def on_start(config: dict, event: dict) -> None:
     # 新しいターン。前のターンの計画・完了時刻は持ち越さない(計画は最初のツール呼び出しで来る)。
     # 送ったメッセージの書き出しを名前に添える(同じフォルダのセッションを見分けるため)。
     # 書き出しは手元の %TEMP% に置くだけで、どこへも送らない。
-    fields = {"started": time.time(), "ended": None, "asked": None, "plan": []}
+    fields = {"started": time.time(), "ended": None, "asked": None, "plan": [],
+              "background": 0}
     title = claude_status.prompt_title(event.get("prompt"))[:80]
     if title:
         fields["title"] = title
@@ -390,9 +396,16 @@ def on_tool(config: dict, event: dict) -> None:
         fields["plan"] = claude_status.apply_plan(data.get("plan"), tool_name,
                                                   event.get("tool_input"))
     resumed = data.get("state") == claude_status.ASK
+    # 応答を終えたあと、裏の処理が終わって起こされ、続きを始めた(新しいメッセージは
+    # 来ていないので UserPromptSubmit は来ない)。完了より後に起こされたフックだけで戻す。
+    revived = (data.get("state") in (claude_status.DONE, claude_status.FAIL)
+               and HOOK_STARTED > (data.get("ended") or 0))
+    if revived:
+        fields.update(started=HOOK_STARTED, ended=None, background=0)
     if not fields and not resumed:
         return
-    update_status(config, event, claude_status.RUNNING if resumed else None,
+    update_status(config, event,
+                  claude_status.RUNNING if (resumed or revived) else None,
                   **({"asked": None} if resumed else {}), **fields)
 
 
@@ -401,7 +414,11 @@ def on_tool(config: dict, event: dict) -> None:
 # ---------------------------------------------------------------------------
 def on_stop(config: dict, event: dict) -> None:
     elapsed = take_elapsed(event)
-    update_status(config, event, claude_status.DONE, ended=time.time())
+    # 裏で走らせたまま終わっていない処理(終わるとアプリが Claude を起こして続きをさせる)。
+    background = len(claude_status.pending_background_in(event.get("transcript_path")))
+    update_status(config, event, claude_status.DONE, ended=time.time(), background=background)
+    if background:
+        _record("stop", f"裏で {background}件 動いたまま応答を終えました")
     if elapsed is None:
         _record("stop", "開始の控えが無いので見送り（フック導入直後 / 再開したセッション）")
         return

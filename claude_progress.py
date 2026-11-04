@@ -259,6 +259,8 @@ class ClaudeProgressPanel(QWidget):
             tail = f"確認待ち {cs.format_duration(now - (entry.get('asked') or now))}"
         elif state in (cs.DONE, cs.FAIL):
             tail = cs.LABELS.get(state, "")
+            if cs.background_count(entry, now):
+                tail += "・裏で作業中"
         else:
             tail = cs.format_duration(now - (entry.get("started") or now))
         p.setFont(self._name_font)
@@ -297,7 +299,10 @@ class ClaudeProgressPanel(QWidget):
         p.setFont(self._sub_font)
         sub_fm = QFontMetrics(self._sub_font)
         plan = cs.plan_text(entry.get("plan"))
-        if state == cs.DONE:
+        background = cs.background_count(entry, now)
+        if state == cs.DONE and background:
+            sub = f"応答は終わりました。裏で {background}件 動いています（終わると続きを始めます）"
+        elif state == cs.DONE:
             sub = "終わりました"
         elif state == cs.FAIL:
             sub = "止まりました"
@@ -319,6 +324,8 @@ class ClaudeProgressPanel(QWidget):
         fm = QFontMetrics(self._sub_font)
         ended = entry.get("ended") or entry.get("updated") or time.time()
         tail = time.strftime("%H:%M", time.localtime(ended))
+        if cs.background_count(entry):
+            tail = "裏で作業中 " + tail
         if entry.get("state") == cs.FAIL:
             tail = "失敗 " + tail
         tail_w = fm.horizontalAdvance(tail)

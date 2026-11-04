@@ -306,6 +306,8 @@ def describe(entry: dict, now=None) -> list:
         took = (entry.get("ended") or now) - (entry.get("started") or entry.get("ended") or now)
         head = (f"{name}　{format_duration(took)}で完了"
                 f"（{time.strftime('%H:%M', time.localtime(entry.get('ended') or now))}）")
+        if background_count(entry, now):
+            head += "・裏で作業中"
     else:
         head = f"{name}　失敗しました"
     lines = [head]
@@ -326,7 +328,10 @@ def menu_label(entry: dict, now=None) -> str:
         tail = format_duration(now - (entry.get("asked") or now))
     else:
         tail = format_duration(now - (entry.get("started") or now))
-    return f"{LABELS.get(state, state)}　{name}　{tail}"
+    label = LABELS.get(state, state)
+    if background_count(entry, now):
+        label += "（裏で作業中）"
+    return f"{label}　{name}　{tail}"
 
 
 def remove(entry: dict, directory=None) -> bool:
@@ -342,6 +347,58 @@ def remove(entry: dict, directory=None) -> bool:
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 裏で動いている作業(応答は終わったが、裏で走らせた処理がまだ終わっていない)
+# ---------------------------------------------------------------------------
+# 応答を終えた後も裏の処理が残っていると、終わったときにアプリが Claude を起こして続きを
+# させる。その間は Claude が何もしていないのでフックには何も来ない。そこで応答の終わり
+# (Stop)に会話の記録(transcript_path)を見て、走らせたまま終わっていない処理を数える。
+#   走らせた: ツール結果の "backgroundTaskId":"…"
+#   終わった: 終わりの知らせ <task-id>…</task-id> か、TaskStop で止めたもの
+# 「完了」の補足として出すだけ(輪の色・トーストは変えない)。起こされないまま終わった
+# ときに残り続けないよう BACKGROUND_TTL で外す。
+BACKGROUND_TTL = 15 * 60
+_BG_STARTED = re.compile(r'"backgroundTaskId":"([A-Za-z0-9_-]+)"')
+_BG_NOTIFIED = re.compile(r"<task-id>([A-Za-z0-9_-]+)</task-id>")
+_BG_STOPPED = re.compile(r'"name":"TaskStop","input":\{"task_id":"([A-Za-z0-9_-]+)"')
+
+
+def pending_background(transcript_text: str) -> list:
+    """記録の中で、走らせたまま終わりの知らせが来ていない処理の ID。"""
+    started = _BG_STARTED.findall(transcript_text or "")
+    finished = set(_BG_NOTIFIED.findall(transcript_text or ""))
+    finished |= set(_BG_STOPPED.findall(transcript_text or ""))
+    seen, pending = set(), []
+    for task in started:
+        if task not in finished and task not in seen:
+            seen.add(task)
+            pending.append(task)
+    return pending
+
+
+def pending_background_in(transcript_path) -> list:
+    """会話の記録ファイルから数える。読めなければ空(「裏の作業なし」に倒す)。"""
+    if not transcript_path:
+        return []
+    try:
+        data = Path(transcript_path).read_bytes()
+    except OSError:
+        return []
+    return pending_background(data.decode("utf-8", errors="replace"))
+
+
+def background_count(entry: dict, now=None) -> int:
+    """「完了（裏で作業中）」として見せる数。完了でない・古いものは 0。"""
+    now = time.time() if now is None else now
+    if (entry or {}).get("state") != DONE:
+        return 0
+    count = entry.get("background") or 0
+    ended = entry.get("ended") or entry.get("updated") or 0
+    if not isinstance(count, int) or count <= 0 or now - ended > BACKGROUND_TTL:
+        return 0
+    return count
 
 
 def clear_finished(directory=None) -> int:

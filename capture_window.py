@@ -52,6 +52,7 @@ from capture_grab import (
 )
 import bg_remove_launch
 import ocr_win
+import sticky_measure
 from toast import dismiss, show_toast
 
 
@@ -171,6 +172,15 @@ class CaptureWindow(QWidget):
         self._ocr_selecting = False
         self._ocr_drag_start = None
         self._ocr_drag_current = None
+        # スポイト/定規(sticky_measure)。_measure_mode は None / "color" / "ruler"。
+        # モードは Esc か、メニューでもう一度選ぶまで続く(色をいくつも拾うため)。
+        # _measure_hover はカーソル位置のプレビュー、_ruler_start は定規を引き始めた画素。
+        # measure_in_output は「測った結果も保存・コピーに入れる」(付箋1枚ごと、既定で入れる)。
+        self._measure_mode = None
+        self._measure_hover = None
+        self._measure_shift = False   # 定規を Shift で水平/垂直に揃えるか(最後に見た修飾キー)
+        self._ruler_start = None
+        self.measure_in_output = True
         # キャプチャ＆保存の実行中フラグ。hide() → 待つ → 撮る、の非同期処理なので、
         # 待っている間に(連打やホットキー経由で)もう一度入られると hide()/show() の
         # 順序が乱れ、同じ絵を二重に保存してしまう。ScreenFeature.start_capture() が
@@ -230,6 +240,13 @@ class CaptureWindow(QWidget):
         self._ocr_selecting = False
         self._ocr_drag_start = None
         self._ocr_drag_current = None
+        self._measure_mode = None
+        self._measure_hover = None
+        self._measure_shift = False
+        self._ruler_start = None
+        self.measure_in_output = True
+        # 前の1枚を OCR やスポイトの途中で閉じていると十字カーソルが残っている。
+        self.unsetCursor()
 
         self.pen_color = QColor(self.capture_settings.get("pen_color", "#ff0000"))
         self.pen_width = self.capture_settings.get("pen_width", 3)
@@ -296,6 +313,11 @@ class CaptureWindow(QWidget):
             painter.setBrush(QColor(0, 120, 215, 40))
             painter.drawRect(rect)
 
+        # スポイト/定規のプレビュー(まだ actions_history に入っていない1件)。
+        preview = self._measure_preview()
+        if preview is not None:
+            draw_action(painter, preview)
+
         # バッジはウィジェットへの直接描画で済ませる。保存/コピーが使う render_annotated() は
         # base_image と actions_history からしか絵を作らないため、これで保存画像には混ざらない。
         painter.resetTransform()
@@ -350,6 +372,11 @@ class CaptureWindow(QWidget):
             self._ocr_drag_current = self._ocr_drag_start
             self.update()
             return
+        # スポイト/定規のモード中は、Ctrl なしの左ボタンが測定になる(Ctrl+ドラッグのペンは生かす)。
+        if (self._measure_mode is not None and event.button() == Qt.LeftButton
+                and not event.modifiers() & Qt.ControlModifier):
+            self._measure_press(event)
+            return
         # 画像部分の左ドラッグでウインドウを動かす機能は廃止した。描き込もうとして
         # (Ctrlを押し損ねて)付箋ごと動かしてしまう事故が多かったため。この付箋は
         # FramelessWindowHint を使っておらずOS標準のタイトルバーがあるので、移動手段は
@@ -374,6 +401,11 @@ class CaptureWindow(QWidget):
             self._ocr_drag_current = self._to_image_coords(event.position())
             self.update()
             return
+        if self._measure_mode is not None and not self._drawing:
+            self._measure_hover = self._to_image_coords(event.position())
+            self._measure_shift = bool(event.modifiers() & Qt.ShiftModifier)
+            self.update()
+            return
         if self._drawing and self._current_stroke is not None:
             self._current_stroke["points"].append(self._to_image_coords(event.position()))
             self.update()
@@ -383,6 +415,10 @@ class CaptureWindow(QWidget):
                 and self._ocr_drag_start is not None):
             self._ocr_drag_current = self._to_image_coords(event.position())
             self._finish_ocr_selection()
+            return
+        if (self._measure_mode is not None and event.button() == Qt.LeftButton
+                and not self._drawing):
+            self._measure_release(event)
             return
         if event.button() == Qt.LeftButton:
             if self._drawing and self._current_stroke is not None:
@@ -429,6 +465,9 @@ class CaptureWindow(QWidget):
             self._cancel_ocr_selection()
             show_toast("Rapture\nOCR を中止しました")
             return
+        if event.key() == Qt.Key_Escape and self._measure_mode is not None:
+            self._end_measure_mode()
+            return
         # 修飾キーは & ではなく == で見る。& だと「Ctrlが含まれていれば真」なので、
         # 連番キャプチャのホットキー(既定 Ctrl+Alt+S)を付箋にフォーカスがある状態で
         # 押したときに Ctrl+S とも解釈され、同じ絵が単発の名前と連番の名前の両方で
@@ -453,8 +492,15 @@ class CaptureWindow(QWidget):
     # ---------------------------------------------------------------
     # 保存・コピー(不具合2対策): 元画像 + actions_history を焼き込んで永続化する
     # ---------------------------------------------------------------
+    def _export_actions(self) -> list:
+        """保存・コピー・背景透過へ渡す描き込み。「測った結果も保存・コピーに入れる」を
+        外していれば、スポイト/定規の結果だけを除く(画面上には残る)。"""
+        if self.measure_in_output:
+            return self.actions_history
+        return [a for a in self.actions_history if not sticky_measure.is_measurement(a)]
+
     def _save(self):
-        rendered = render_annotated(self.base_image, self.actions_history)
+        rendered = render_annotated(self.base_image, self._export_actions())
         save_image(rendered, self.capture_settings)
 
     def capture_and_save(self):
@@ -538,12 +584,132 @@ class CaptureWindow(QWidget):
             show_toast(f"Rapture\n保存先を開けませんでした\n{folder}\n{e}")
 
     def _copy(self):
-        rendered = render_annotated(self.base_image, self.actions_history)
+        rendered = render_annotated(self.base_image, self._export_actions())
         QGuiApplication.clipboard().setImage(rendered)
+
+    # ---------------------------------------------------------------
+    # スポイト / 定規(sticky_measure)。色・距離は元画像の画素で出す。
+    # ---------------------------------------------------------------
+    def _begin_measure_mode(self, mode: str):
+        if self._ocr_selecting:
+            self._cancel_ocr_selection()
+        self._measure_mode = mode
+        self._measure_hover = None
+        self._ruler_start = None
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()
+        if mode == "color":
+            show_toast("Rapture\nスポイト：クリックした色を残してコピーします（Escで終了）")
+        else:
+            show_toast("Rapture\n画面定規：ドラッグで測ります。Shiftで水平/垂直（Escで終了）")
+        self.update()
+
+    def _end_measure_mode(self):
+        self._measure_mode = None
+        self._measure_hover = None
+        self._ruler_start = None
+        self.unsetCursor()
+        self.update()
+
+    def _image_px_size(self):
+        return self.base_image.width(), self.base_image.height()
+
+    def _image_bounds(self) -> QRectF:
+        dpr = self.base_image.devicePixelRatio() or 1.0
+        return QRectF(0, 0, self.base_image.width() / dpr, self.base_image.height() / dpr)
+
+    def _snap(self, logical: QPointF):
+        width, height = self._image_px_size()
+        return sticky_measure.snap_to_pixel(
+            logical, self.base_image.devicePixelRatio() or 1.0, width, height
+        )
+
+    def _color_action(self, logical: QPointF):
+        px, py, center = self._snap(logical)
+        return {
+            "type": "color",
+            "pos": center,
+            "pixel": (px, py),
+            "color": self.base_image.pixelColor(px, py),
+            "bounds": self._image_bounds(),
+        }
+
+    def _ruler_action(self, start, logical: QPointF, constrain: bool):
+        """start は _snap() の結果。終点を画素に寄せ、Shift なら水平/垂直に揃える。"""
+        sx, sy, start_center = start
+        ex, ey, _ = self._snap(logical)
+        if constrain:
+            ex, ey = sticky_measure.constrain_axis((sx, sy), (ex, ey))
+        dpr = self.base_image.devicePixelRatio() or 1.0
+        return {
+            "type": "ruler",
+            "start": start_center,
+            "end": QPointF((ex + 0.5) / dpr, (ey + 0.5) / dpr),
+            "start_px": (sx, sy),
+            "end_px": (ex, ey),
+            "metrics": sticky_measure.ruler_metrics((sx, sy), (ex, ey)),
+            "bounds": self._image_bounds(),
+        }
+
+    def _measure_preview(self):
+        """paintEvent 用。カーソル位置の仮の1件。描画を止めないよう例外は握りつぶす。"""
+        if self._measure_mode is None or self._measure_hover is None:
+            return None
+        try:
+            if self._measure_mode == "color":
+                return self._color_action(self._measure_hover)
+            if self._ruler_start is not None:
+                return self._ruler_action(self._ruler_start, self._measure_hover,
+                                          self._measure_shift)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _measure_press(self, event):
+        try:
+            if self._measure_mode == "ruler":
+                self._ruler_start = self._snap(self._to_image_coords(event.position()))
+                self._measure_hover = self._to_image_coords(event.position())
+                self.update()
+        except Exception as e:
+            # 付箋プロセスで投げ切ると、貼ってある中身ごとプロセスが消える。
+            show_toast(f"Rapture\n測定に失敗しました\n{e}")
+
+    def _measure_release(self, event):
+        try:
+            pos = self._to_image_coords(event.position())
+            if self._measure_mode == "color":
+                action = self._color_action(pos)
+                self.actions_history.append(action)
+                self._copy_color_text(action["color"].name().upper())
+            elif self._measure_mode == "ruler" and self._ruler_start is not None:
+                action = self._ruler_action(
+                    self._ruler_start, pos, bool(event.modifiers() & Qt.ShiftModifier)
+                )
+                self._ruler_start = None
+                # その場のクリック(同じ画素)は測ったことにしない。1x1 の札が増えるだけなので。
+                if action["start_px"] != action["end_px"]:
+                    self.actions_history.append(action)
+            self.update()
+        except Exception as e:
+            show_toast(f"Rapture\n測定に失敗しました\n{e}")
+
+    def _copy_color_text(self, hex_color: str):
+        QGuiApplication.clipboard().setText(hex_color)
+        show_toast(f"Rapture\n{hex_color} をコピーしました")
+
+    def leaveEvent(self, event):
+        # 付箋の外へ出たらプレビューの札を消す(端に残ると、測った結果と見分けにくい)。
+        super().leaveEvent(event)
+        if self._measure_mode is not None and self._ruler_start is None:
+            self._measure_hover = None
+            self.update()
 
     def _begin_ocr(self):
         """OCR の範囲指定を始める。付箋の上でドラッグした矩形だけを読む。
         その場のクリック(ドラッグなし)なら全体、Esc で中止。"""
+        if self._measure_mode is not None:
+            self._end_measure_mode()
         self._ocr_selecting = True
         self._ocr_drag_start = None
         self._ocr_drag_current = None
@@ -640,7 +806,7 @@ class CaptureWindow(QWidget):
         クリップボードを経由しないのは、ユーザーがいま載せている中身を勝手に
         書き換えないため。一時PNGで渡し、向こうが読み終えたら消す。"""
         try:
-            rendered = render_annotated(self.base_image, self.actions_history)
+            rendered = render_annotated(self.base_image, self._export_actions())
             # 高DPIの付箋は devicePixelRatio を持つが、背景透過は画素を扱うだけなので
             # そのまま渡してよい(PNG には倍率が残らず、画素数は撮ったときのまま)。
             bg_remove_launch.spawn_with_image(rendered)
@@ -664,6 +830,18 @@ class CaptureWindow(QWidget):
         act_ocr = None
         if ocr_win.available():
             act_ocr = menu.addAction("文字を読み取る（OCR）")
+        menu.addSeparator()
+
+        # スポイト/定規。チェックは「いまそのモード中か」。もう一度選ぶと終わる。
+        act_eyedropper = menu.addAction("スポイト")
+        act_eyedropper.setCheckable(True)
+        act_eyedropper.setChecked(self._measure_mode == "color")
+        act_ruler = menu.addAction("画面定規")
+        act_ruler.setCheckable(True)
+        act_ruler.setChecked(self._measure_mode == "ruler")
+        act_measure_output = menu.addAction("測った結果も保存・コピーに入れる")
+        act_measure_output.setCheckable(True)
+        act_measure_output.setChecked(self.measure_in_output)
         menu.addSeparator()
 
         act_color = menu.addAction("色...")
@@ -698,7 +876,19 @@ class CaptureWindow(QWidget):
         if chosen is None:
             return
 
-        if chosen == act_color:
+        if chosen == act_eyedropper:
+            if act_eyedropper.isChecked():
+                self._begin_measure_mode("color")
+            else:
+                self._end_measure_mode()
+        elif chosen == act_ruler:
+            if act_ruler.isChecked():
+                self._begin_measure_mode("ruler")
+            else:
+                self._end_measure_mode()
+        elif chosen == act_measure_output:
+            self.measure_in_output = act_measure_output.isChecked()
+        elif chosen == act_color:
             self._choose_color()
         elif chosen in width_actions:
             self.pen_width = width_actions[chosen]

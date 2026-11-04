@@ -10,6 +10,8 @@ import mss
 from PySide6.QtCore import Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
 
+import sticky_measure
+
 
 # mss のインスタンスは使い回す。生成のたびに ctypes で GDI の関数を引き直すため
 # 安くはなく、それ以上に「生成中にGCが走ると落ちる」問題がある。
@@ -196,7 +198,7 @@ def draw_stroke(painter: QPainter, stroke: dict) -> None:
 
 
 def draw_action(painter: QPainter, action: dict) -> None:
-    """actions_history の1件(ストローク or テキスト)を描画する。
+    """actions_history の1件(ストローク・テキスト・スポイト/定規の結果)を描画する。
     付箋ウインドウのライブ描画と、保存/コピー時の焼き込みレンダリングの両方から使う共通処理。"""
     if action["type"] == "stroke":
         draw_stroke(painter, action)
@@ -204,6 +206,8 @@ def draw_action(painter: QPainter, action: dict) -> None:
         painter.setPen(action["color"])
         painter.setFont(QFont("Meiryo", 14))
         painter.drawText(action["pos"], action["text"])
+    elif sticky_measure.is_measurement(action):
+        sticky_measure.draw_measurement(painter, action)
 
 
 def render_annotated(base_image: QImage, actions_history: list) -> QImage:

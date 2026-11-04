@@ -27,6 +27,7 @@ import bg_remove_launch
 import capture_process
 import color_picker
 import explorer_nav
+import claude_status
 import filer_launch
 import filer_update
 import launcher
@@ -73,6 +74,21 @@ BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
 # 見に行くのはメニューを開いたときと、この間隔ごと(ツールチップはメニューを開かずに見るため)。
 DISK_NEWER_TEXT = "ファイルは新しい版です（再起動で反映）"
 VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000
+
+# Claude Code の状態表示(claude_status)。輪の色は状態ごと。確認待ちはスリープ抑止の
+# 橙と見分けられるよう桃色にする(止まって待っているのが、いちばん見落としたくない)。
+CLAUDE_MENU_TITLE = "💬 Claude"
+CLAUDE_STATUS_INTERVAL_MS = 3000
+CLAUDE_RING_COLORS = {
+    claude_status.ASK: (236, 72, 153, 255),       # 桃
+    claude_status.FAIL: (231, 76, 60, 255),       # 赤
+    claude_status.RUNNING: (55, 138, 221, 255),   # 青
+    claude_status.DONE: (99, 153, 34, 255),       # 緑
+}
+# Windows の通知領域のツールチップは 127 文字まで(超えた分は切れる)。
+TOOLTIP_MAX_CHARS = 127
+CLAUDE_TOOLTIP_SESSIONS = 2
+CLAUDE_PLAN_CHARS = 18
 
 # スリープ抑止中の目印。通知領域のアイコンは実質16px相当で、隅の小さなバッジは潰れて
 # 見えない。アイコン全周に太いリングを描き、縮小しても輪郭の変化で判別できるようにする。
@@ -128,6 +144,26 @@ def _format_minutes(minutes: int) -> str:
     if minutes >= 60 and minutes % 60 == 0:
         return f"{minutes // 60}時間"
     return f"{minutes}分"
+
+
+def _join_state(head: str, state: str) -> str:
+    """「Rapture（スリープ抑止中）」に状態を1つ足す。無ければ「Rapture（…）」にする。"""
+    if head.endswith("）"):
+        return head[:-1] + "・" + state + "）"
+    return f"{head}（{state}）"
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
+def _fit_tooltip(lines) -> str:
+    """Windows の上限(127文字)に収める。収まらなければ後ろの行から落とす
+    (切れ目の分からない途中切れより、行ごと落とすほうが読める)。"""
+    lines = list(lines)
+    while len(lines) > 1 and len("\n".join(lines)) > TOOLTIP_MAX_CHARS:
+        lines.pop()
+    return _clip("\n".join(lines), TOOLTIP_MAX_CHARS)
 
 
 def _read_disk_version() -> dict:
@@ -379,6 +415,14 @@ class ScreenFeature:
         self._version_timer.timeout.connect(self._check_disk_version)
         self._version_timer.start(VERSION_CHECK_INTERVAL_MS)
 
+        # Claude Code のセッションの状態。フックが書いたファイルを数秒ごとに読む
+        # (フックから常駐へ知らせる口は増やさない。CLAUDE.md「外から叩ける口」)。
+        self._claude_entries = []
+        self._claude_icons = {}
+        self._claude_timer = QTimer()
+        self._claude_timer.timeout.connect(self._poll_claude_status)
+        self._claude_timer.start(CLAUDE_STATUS_INTERVAL_MS)
+
         hotkey_config = app_settings.get("hotkeys", {})
         screen_settings = app_settings.get("screen", {})
         self._awake_choices = screen_settings.get("keep_awake_minutes", [30, 120])
@@ -587,6 +631,10 @@ class ScreenFeature:
         )
         # 初期状態を反映
         self._refresh_agent_loop_menu()
+
+        # Claude Code の各セッションの状態(hooks/claude_hook.py が書く)。中身は開くたびに作る。
+        self._claude_menu = self.menu.addMenu(CLAUDE_MENU_TITLE)
+        self._claude_menu.aboutToShow.connect(self._rebuild_claude_menu)
 
         self.menu.addSeparator()
         # 電源まわりをひとつの傘に。狙いが近い(席を外す・寝かせる・寝させない)ので、
@@ -1776,8 +1824,23 @@ class ScreenFeature:
             self.mirror_status(),
             self.sticky_status(),
             self.jiggler_status(),
+            self.claude_status_text(),
             self.version_status(),
         ])
+
+    def claude_status_text(self) -> str:
+        """Claude Code の各セッション(トレイの輪・ツールチップと同じ中身)。"""
+        entries = claude_status.list_sessions()
+        if not entries:
+            return "Claude: なし"
+        parts = []
+        for entry in entries:
+            text = claude_status.menu_label(entry)
+            plan = claude_status.plan_text(entry.get("plan"))
+            if plan and entry.get("state") in (claude_status.RUNNING, claude_status.ASK):
+                text += f"（{plan}）"
+            parts.append(text)
+        return "Claude: " + " / ".join(parts)
 
     def version_status(self) -> str:
         """起動時の版と、ディスクの方が新しいか(トレイのツールチップと同じ判定)。"""
@@ -1939,6 +2002,77 @@ class ScreenFeature:
             traceback.print_exc()
             print("[tray-tools] マウスジグラー: 実行に失敗したため停止しました", file=sys.stderr)
 
+    def _update_tooltip(self):
+        """ツールチップを組み直す。Claude の経過時間は刻々と変わるので、状態が変わらなくても
+        _poll_claude_status から数秒ごとにここだけ呼ぶ(アイコンは触らない)。"""
+        lines = [getattr(self, "_states_text", "Rapture")]
+        entries = getattr(self, "_claude_entries", [])
+        if entries:
+            lines[0] = _join_state(lines[0], "Claude " + claude_status.LABELS.get(
+                entries[0].get("state"), ""))
+            for entry in entries[:CLAUDE_TOOLTIP_SESSIONS]:
+                described = claude_status.describe(entry)
+                lines.append(described[0])
+                if len(described) > 1:
+                    lines.append(_clip(described[1], CLAUDE_PLAN_CHARS + 4))
+            if len(entries) > CLAUDE_TOOLTIP_SESSIONS:
+                lines.append(f"ほか {len(entries) - CLAUDE_TOOLTIP_SESSIONS}件（メニューの Claude）")
+        if getattr(self, "_disk_newer", False):
+            lines.append(DISK_NEWER_TEXT)
+        self.tray_icon.setToolTip(_fit_tooltip(lines))
+
+    def _claude_ring_icon(self, state):
+        icon = self._claude_icons.get(state)
+        if icon is None and ICON_PATH.exists() and state in CLAUDE_RING_COLORS:
+            icon = pil_to_qicon(_make_ring_icon_image(
+                CLAUDE_RING_COLORS[state], AGENT_LOOP_RING_WIDTH))
+            self._claude_icons[state] = icon
+        return icon
+
+    def _poll_claude_status(self):
+        """フックが書いた状態を読み、輪の色が変わるときだけアイコンまで更新する。
+        タイマーのスロットなので例外は受け止める(投げ切ると常駐ごと落ちる)。"""
+        try:
+            before = claude_status.overall_state(self._claude_entries)
+            had_any = bool(self._claude_entries)
+            self._claude_entries = claude_status.list_sessions()
+            if claude_status.overall_state(self._claude_entries) != before:
+                self._refresh_state()
+            elif self._claude_entries or had_any:
+                self._update_tooltip()
+        except Exception:  # noqa: BLE001  表示が出ないだけ
+            traceback.print_exc()
+
+    def _rebuild_claude_menu(self):
+        try:
+            self._claude_entries = claude_status.list_sessions()
+            menu = self._claude_menu
+            menu.clear()
+            if not self._claude_entries:
+                action = menu.addAction("（動いているセッションはありません）")
+                action.setEnabled(False)
+            for entry in self._claude_entries:
+                menu.addAction(claude_status.menu_label(entry))
+                plan = claude_status.plan_text(entry.get("plan"))
+                if plan and entry.get("state") in (claude_status.RUNNING, claude_status.ASK):
+                    detail = menu.addAction("　　" + _clip(plan, 40))
+                    detail.setEnabled(False)
+            if any(e.get("state") in (claude_status.DONE, claude_status.FAIL)
+                   for e in self._claude_entries):
+                menu.addSeparator()
+                menu.addAction("完了した行を消す", self._clear_finished_claude)
+            self._refresh_state()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _clear_finished_claude(self):
+        try:
+            claude_status.clear_finished()
+            self._claude_entries = claude_status.list_sessions()
+            self._refresh_state()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
     def _check_disk_version(self):
         """ディスクの版が起動時より新しければ、ツールチップと 🔄 の項目に出す。
         メニューの aboutToShow とタイマーから呼ばれるスロットなので、例外は受け止める。"""
@@ -1974,7 +2108,12 @@ class ScreenFeature:
         大きいから(裏で Copilot とやり取りしていて実行までしている状態)。"""
         icon = self._normal_icon
         state = self._agent_loop_state
-        if state == "busy":
+        # Claude の確認待ちだけは監視モードより上に置く(人が承認するまで進まない)。
+        # それ以外の Claude の状態は監視モードとスリープ抑止の間。
+        claude_state = claude_status.overall_state(getattr(self, "_claude_entries", []))
+        if claude_state == claude_status.ASK:
+            icon = self._claude_ring_icon(claude_state) or icon
+        elif state == "busy":
             if self._agent_loop_busy_icon is None and ICON_PATH.exists():
                 self._agent_loop_busy_icon = pil_to_qicon(_make_ring_icon_image(
                     AGENT_LOOP_BUSY_COLOR, AGENT_LOOP_RING_WIDTH))
@@ -1989,6 +2128,8 @@ class ScreenFeature:
                 self._agent_loop_ring_icon = pil_to_qicon(_make_ring_icon_image(
                     AGENT_LOOP_RING_COLOR, AGENT_LOOP_RING_WIDTH))
             icon = self._agent_loop_ring_icon or icon
+        elif claude_state is not None:
+            icon = self._claude_ring_icon(claude_state) or icon
         elif self._awake_active:
             if self._awake_icon is None and ICON_PATH.exists():
                 self._awake_icon = pil_to_qicon(_make_awake_icon_image())
@@ -2007,10 +2148,8 @@ class ScreenFeature:
             states.append("スリープ抑止中")
         if self._jiggle_active:
             states.append("マウスジグラー動作中")
-        tooltip = f"Rapture（{'・'.join(states)}）" if states else "Rapture"
-        if getattr(self, "_disk_newer", False):
-            tooltip += "\n" + DISK_NEWER_TEXT
-        self.tray_icon.setToolTip(tooltip)
+        self._states_text = f"Rapture（{'・'.join(states)}）" if states else "Rapture"
+        self._update_tooltip()
         self._refresh_awake_menu()
         self._refresh_jiggle_menu()
         self._refresh_agent_loop_menu()

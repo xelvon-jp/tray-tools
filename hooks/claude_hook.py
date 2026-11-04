@@ -15,6 +15,11 @@
 #   python claude_hook.py stop    … Stop。掛かった時間が閾値を超えたときだけ鳴らす
 #   python claude_hook.py fail    … StopFailure。失敗は時間に関わらず鳴らす
 #   python claude_hook.py ask     … Notification(permission_prompt)。確認待ちを知らせる
+#   python claude_hook.py tool    … PostToolUse(全ツール、async)。確認待ちが解けたことと、
+#                                   計画(update_plan / TodoWrite)の進み具合を状態に書く
+#
+# どのイベントでも、セッションの状態(実行中/確認待ち/完了/失敗)を claude_status の
+# ファイルに書く。トレイはそれを読んで輪の色・ツールチップ・メニューに出す。
 #
 # フックの標準入力には JSON が1つ来る(session_id, cwd, last_assistant_message など)。
 # 来なくても・壊れていても動くようにしてある。
@@ -50,6 +55,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import claude_status  # noqa: E402  (標準ライブラリだけ。トレイの状態表示と共有)
 import mouse_jiggler  # noqa: E402  (ctypes だけ。副作用なし)
 import traytools_send  # noqa: E402  (標準ライブラリだけ)
 
@@ -105,6 +111,12 @@ DEFAULTS = {
     # 繰り返すときの間隔(秒)。MessageBeep は鳴り終わるのを待たずに戻るので、
     # 間を空けないと2回目が重なって1回に聞こえる。
     "ask_repeat_interval": 0.35,
+    # トレイの状態表示(claude_status)のためにセッションの状態を書くか。
+    "status_enabled": True,
+    # 画面右下の自前トーストも出すか(音と同じ条件。完了は min_seconds を超えたときだけ)。
+    "toast_on_done": True,
+    "toast_on_error": True,
+    "toast_on_ask": True,
 }
 
 # ファイル名に使ってよい文字。session_id は UUID のはずだが、外から来る値なので
@@ -308,11 +320,71 @@ def maybe_pushover(config: dict, event: dict, title: str, body: str, elapsed=Non
     send("pushover", [body, "--title", title])
 
 
+def toast(config: dict, key: str, event: dict, body: str) -> None:
+    """常駐の自前トースト(notify)。1行目にどのプロジェクトかを出す。"""
+    if config.get(key):
+        send("notify", [f"Claude（{_project_name(event)}）\n{body}"])
+
+
+# ---------------------------------------------------------------------------
+# トレイの状態表示(claude_status)。書けなくても音・通知は止めない。
+# ---------------------------------------------------------------------------
+def update_status(config: dict, event: dict, state=None, **fields) -> None:
+    """このセッションの状態ファイルを読み直して、変わったところだけ書き戻す。"""
+    if not config.get("status_enabled"):
+        return
+    session_id = event.get("session_id")
+    if not session_id:
+        return
+    try:
+        now = time.time()
+        data = claude_status.read(session_id)
+        data.setdefault("session_id", session_id)
+        if event.get("cwd"):
+            data["cwd"] = event["cwd"]
+            data["project"] = claude_status.project_name(event["cwd"])
+        if state is not None:
+            data["state"] = state
+        data.update(fields)
+        data["updated"] = now
+        claude_status.write(session_id, data)
+    except Exception as e:  # noqa: BLE001
+        _log(f"状態を書けません: {e}")
+
+
+def on_start(config: dict, event: dict) -> None:
+    mark_start(event)
+    # 新しいターン。前のターンの計画・完了時刻は持ち越さない(計画は最初のツール呼び出しで来る)。
+    update_status(config, event, claude_status.RUNNING, started=time.time(),
+                  ended=None, asked=None, plan=[])
+    claude_status.sweep()
+
+
+def on_tool(config: dict, event: dict) -> None:
+    """PostToolUse(全ツール)。ツールが走った＝確認待ちは解けた。計画のツールなら計画も更新。
+
+    ツール呼び出しのたびに走るので、何も変わらないときは書かずに戻る(読むだけ)。"""
+    if not config.get("status_enabled") or not event.get("session_id"):
+        return
+    tool_name = event.get("tool_name") or ""
+    data = claude_status.read(event["session_id"])
+    fields = {}
+    if tool_name in claude_status.PLAN_TOOLS:
+        fields["plan"] = claude_status.apply_plan(data.get("plan"), tool_name,
+                                                  event.get("tool_input"))
+    resumed = data.get("state") == claude_status.ASK
+    if not fields and not resumed:
+        return
+    update_status(config, event, claude_status.RUNNING if resumed else None,
+                  **({"asked": None} if resumed else {}), **fields)
+
+
 # ---------------------------------------------------------------------------
 # 各イベント
 # ---------------------------------------------------------------------------
 def on_stop(config: dict, event: dict) -> None:
     elapsed = take_elapsed(event)
+    update_status(config, event, claude_status.DONE, ended=time.time())
     if elapsed is None:
         _record("stop", "開始の控えが無いので見送り（フック導入直後 / 再開したセッション）")
         return
@@ -322,6 +394,7 @@ def on_stop(config: dict, event: dict) -> None:
     _record("stop", f"経過 {elapsed:.1f}秒 → {config['sound_done']} を鳴らす")
     if config["beep_on_done"]:
         beep(config, "sound_done")
+    toast(config, "toast_on_done", event, f"応答が終わりました（{_format_minutes(elapsed)}）")
     maybe_pushover(
         config,
         event,
@@ -334,6 +407,7 @@ def on_stop(config: dict, event: dict) -> None:
 def on_fail(config: dict, event: dict) -> None:
     # 失敗は時間で絞らない。短く終わったということは、たいてい早々に落ちたということ。
     elapsed = take_elapsed(event)
+    update_status(config, event, claude_status.FAIL, ended=time.time())
     if config["beep_on_error"]:
         beep(config, "sound_error")
     _record("fail", f"経過 {_format_minutes(elapsed)} → {config['sound_error']} を鳴らす")
@@ -341,22 +415,26 @@ def on_fail(config: dict, event: dict) -> None:
     body = f"止まりました（{_format_minutes(elapsed)}）"
     if reason:
         body += f"\n{reason[:80]}"
+    toast(config, "toast_on_error", event, body)
     maybe_pushover(config, event, _project_name(event), body)
 
 
 def on_ask(config: dict, event: dict) -> None:
     # 確認待ちは、放っておくといつまでも進まない。経過時間では絞らない。
+    update_status(config, event, claude_status.ASK, asked=time.time())
     _record("ask", f"{config['sound_ask']} を {config['ask_repeat']} 回鳴らす")
     if config["beep_on_ask"]:
         beep(config, "sound_ask", config["ask_repeat"], config["ask_repeat_interval"])
+    toast(config, "toast_on_ask", event, "確認待ちで止まっています")
     maybe_pushover(config, event, _project_name(event), "確認待ちで止まっています")
 
 
 ACTIONS = {
-    "start": lambda _config, event: mark_start(event),
+    "start": on_start,
     "stop": on_stop,
     "fail": on_fail,
     "ask": on_ask,
+    "tool": on_tool,
 }
 
 

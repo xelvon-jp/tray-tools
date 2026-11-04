@@ -21,9 +21,30 @@ Claude Code のフックから tray-tools を鳴らし、**画面を見ていな
 | フックイベント | 渡す引数 | 動き |
 |---|---|---|
 | `UserPromptSubmit` | `start` | 開始時刻を控えるだけ。**音は鳴らない** |
-| `Stop` | `stop` | 掛かった時間が `min_seconds` を超えたときだけ `beep done` |
-| `StopFailure` | `fail` | 時間に関わらず `beep error` |
-| `Notification`（matcher `permission_prompt`） | `ask` | `beep ask` |
+| `Stop` | `stop` | 掛かった時間が `min_seconds` を超えたときだけ `beep done` ＋トースト |
+| `StopFailure` | `fail` | 時間に関わらず `beep error` ＋トースト |
+| `Notification`（matcher `permission_prompt`） | `ask` | `beep ask` ＋トースト |
+| `PostToolUse`（matcher なし＝全ツール、**`"async": true`**） | `tool` | 確認待ちが解けたことと、計画（`update_plan` / `TodoWrite`）の進み具合を状態に書く。音は鳴らない |
+
+**どのイベントでも、セッションの状態をトレイの表示用に書きます**（`claude_status.py`。`%TEMP%\tray-tools-hooks\status\<session_id>.json`）。状態は 実行中／確認待ち／完了／失敗 の4つで、常駐が3秒ごとに読み、画面アイコンの輪の色（確認待ち=桃・失敗=赤・実行中=青・完了=緑）、ツールチップ、トレイの「💬 Claude」メニュー、`traytools_send.py status` の `Claude:` 行に出します。完了・失敗は30分で一覧から外れます（Claude Code は応答の後は何も知らせてこないため）。実行中のまま6時間何も起きないもの（アプリごと閉じた等）も外します。フックから常駐へ知らせる口は増やしていません（ファイルを置くだけ）。クラウドセッションは別のマシンで動くので対象外です。
+
+`PostToolUse` はツール呼び出しのたびに走ります。venv の Python の起動だけで1回約0.12秒かかるので、**`"async": true` で裏で走らせて Claude を待たせない**ようにしています。何も変わらないとき（確認待ちでもなく、計画のツールでもない）は読むだけで書きません。
+
+```json
+"PostToolUse": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "C:\\Users\\yotan\\.venvs\\tray-tools\\Scripts\\python.exe",
+        "args": ["R:\\claude\\tray-tools\\hooks\\claude_hook.py", "tool"],
+        "async": true,
+        "timeout": 10
+      }
+    ]
+  }
+]
+```
 
 呼ぶ Python は **venv のもの**（`C:\Users\yotan\.venvs\tray-tools\Scripts\python.exe`）にしてください。理由は下の「踏みやすい罠」に書いてあります。
 
@@ -44,6 +65,8 @@ Claude Code のフックから tray-tools を鳴らし、**画面を見ていな
 | `sound_done` / `sound_error` / `sound_ask` | `done` / `error` / `warn` | 鳴らす音（`beep.py` の名前: `ok` `done` `warn` `error` `ask`） |
 | `ask_repeat` | `2` | 確認待ちを何回鳴らすか |
 | `ask_repeat_interval` | `0.35` | 繰り返すときの間隔（秒） |
+| `status_enabled` | `true` | トレイの状態表示のために状態を書くか |
+| `toast_on_done` / `toast_on_error` / `toast_on_ask` | `true` | 画面右下の自前トーストも出すか（音と同じ条件。完了は `min_seconds` を超えたときだけ） |
 
 ### 確認待ちに `ask` を使っていない理由
 

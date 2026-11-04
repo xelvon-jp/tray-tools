@@ -1,0 +1,251 @@
+# claude_status.py
+# Claude Code の各セッションが「いまどうなっているか」を、フックと常駐の間で受け渡す。
+#
+# 書くのは hooks/claude_hook.py(フック。毎ターン・ツール呼び出しごとに走る)、
+# 読むのは feature_screen.py(トレイの輪・ツールチップ・メニュー)。どちらからも読むので
+# 標準ライブラリだけで書く(フックは PySide6 を読まない。CLAUDE.md)。
+#
+# 置き場所はセッションごとに1ファイル(%TEMP%\tray-tools-hooks\status\<session_id>.json)。
+# 開始時刻の控え(hooks の STATE_DIR 直下)とは分ける。あちらは stop で消すが、こちらは
+# 「完了」を見せるために残す。
+#
+# 状態は4つ: running(実行中) / ask(確認待ち) / done(完了) / fail(失敗)。
+# Claude Code は応答が終わった後は何も知らせてこないので、完了・失敗は一定時間で
+# 一覧から外す(DONE_TTL)。走っているはずが長く音沙汰が無いもの(アプリごと閉じた等)も外す。
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+STATUS_DIR = (Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".")
+              / "tray-tools-hooks" / "status")
+
+RUNNING, ASK, DONE, FAIL = "running", "ask", "done", "fail"
+
+# 完了・失敗を一覧に残す時間(秒)。
+DONE_TTL = 30 * 60
+# 実行中・確認待ちのまま、これだけ何も起きなければ見えなくする(秒)。
+# 1ターンがこれより長いことはまず無く、あってもフックが途中で何度か書く。
+STALE_TTL = 6 * 60 * 60
+# ファイルそのものを消す時間(秒)。
+FILE_MAX_AGE = 24 * 60 * 60
+
+LABELS = {RUNNING: "実行中", ASK: "確認待ち", DONE: "完了", FAIL: "失敗"}
+# トレイの輪に出す優先順(大きいほど強い)。止まって待っているのがいちばん見落としたくない。
+PRIORITY = {ASK: 4, FAIL: 3, RUNNING: 2, DONE: 1}
+
+# 計画を書くツール。デスクトップアプリの右のタスク一覧と、CLI の TodoWrite。
+PLAN_TOOLS = ("mcp__ccd_turn__update_plan", "TodoWrite")
+
+# session_id は外から来る値なので、そのままパスに混ぜない(hooks の _SAFE_NAME と同じ)。
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def status_path(session_id, directory=None):
+    name = _SAFE_NAME.sub("_", str(session_id or "").strip())[:80]
+    if not name:
+        return None
+    return Path(directory or STATUS_DIR) / f"{name}.json"
+
+
+def read(session_id, directory=None) -> dict:
+    path = status_path(session_id, directory)
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write(session_id, data: dict, directory=None) -> bool:
+    """一時ファイルに書いてから置き換える(常駐が書きかけを読まないように)。"""
+    path = status_path(session_id, directory)
+    if path is None:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def project_name(cwd) -> str:
+    cwd = str(cwd or "").strip().rstrip("\\/")
+    return Path(cwd).name if cwd else "Claude Code"
+
+
+# ---------------------------------------------------------------------------
+# 計画(タスク一覧)
+# ---------------------------------------------------------------------------
+def apply_plan(plan, tool_name: str, tool_input) -> list:
+    """計画ツールの呼び出し1回を、手元の計画([{content, status}])に当てる。
+
+    update_plan は毎回全体を送るとは限らない({"advance": true} や
+    {"done": [2], "start": 4} だけのこともある)ので、前の計画に差分を当てて保つ。"""
+    plan = [dict(item) for item in (plan or []) if isinstance(item, dict)]
+    data = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name == "TodoWrite":
+        todos = data.get("todos")
+        if isinstance(todos, list):
+            return [{"content": str(t.get("content") or ""), "status": str(t.get("status") or "")}
+                    for t in todos if isinstance(t, dict)]
+        return plan
+    items = data.get("items")
+    if isinstance(items, list):
+        plan = [{"content": str(t.get("content") or ""), "status": str(t.get("status") or "")}
+                for t in items if isinstance(t, dict)]
+    if data.get("advance"):
+        current = next((i for i, t in enumerate(plan) if t["status"] == "in_progress"), None)
+        if current is not None:
+            plan[current]["status"] = "completed"
+            following = next((i for i in range(current + 1, len(plan))
+                              if plan[i]["status"] == "pending"), None)
+            if following is not None:
+                plan[following]["status"] = "in_progress"
+    for number in data.get("done") or []:
+        if isinstance(number, int) and 1 <= number <= len(plan):
+            plan[number - 1]["status"] = "completed"
+    start = data.get("start")
+    if isinstance(start, int) and 1 <= start <= len(plan):
+        for item in plan:
+            if item["status"] == "in_progress":
+                item["status"] = "pending"
+        plan[start - 1]["status"] = "in_progress"
+    return plan
+
+
+def plan_text(plan) -> str:
+    """「3/6 テストと実常駐で確認」。進行中が無ければ「4/6 済」。計画が無ければ空。"""
+    plan = [t for t in (plan or []) if isinstance(t, dict)]
+    if not plan:
+        return ""
+    for index, item in enumerate(plan, 1):
+        if item.get("status") == "in_progress":
+            return f"{index}/{len(plan)} {item.get('content') or ''}".strip()
+    finished = sum(1 for t in plan if t.get("status") == "completed")
+    return f"{finished}/{len(plan)} 済"
+
+
+# ---------------------------------------------------------------------------
+# 一覧(トレイ側)
+# ---------------------------------------------------------------------------
+def visible(entry: dict, now: float) -> bool:
+    state = entry.get("state")
+    updated = entry.get("updated") or 0
+    if state in (DONE, FAIL):
+        return now - (entry.get("ended") or updated) < DONE_TTL
+    if state in (RUNNING, ASK):
+        return now - updated < STALE_TTL
+    return False
+
+
+def list_sessions(directory=None, now=None) -> list:
+    """見せるセッションを、強い状態から(同じなら新しい順に)並べて返す。"""
+    now = time.time() if now is None else now
+    directory = Path(directory or STATUS_DIR)
+    entries = []
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and visible(data, now):
+            data["_path"] = str(path)
+            entries.append(data)
+    entries.sort(key=lambda e: (-PRIORITY.get(e.get("state"), 0), -(e.get("updated") or 0)))
+    return entries
+
+
+def overall_state(entries):
+    """トレイの輪に出す状態(いちばん強いもの)。何も無ければ None。"""
+    return entries[0].get("state") if entries else None
+
+
+def format_duration(seconds) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        return f"{seconds // 60}分{seconds % 60:02d}秒" if seconds < 600 else f"{seconds // 60}分"
+    return f"{seconds // 3600}時間{(seconds % 3600) // 60}分"
+
+
+def describe(entry: dict, now=None) -> list:
+    """ツールチップ用の行。[1行目(プロジェクトと状態の詳細), 2行目(計画、あれば)]。"""
+    now = time.time() if now is None else now
+    name = entry.get("project") or "Claude Code"
+    state = entry.get("state")
+    if state == RUNNING:
+        head = f"{name}　{format_duration(now - (entry.get('started') or now))}"
+    elif state == ASK:
+        head = f"{name}　承認を待っています（{format_duration(now - (entry.get('asked') or now))}）"
+    elif state == DONE:
+        took = (entry.get("ended") or now) - (entry.get("started") or entry.get("ended") or now)
+        head = (f"{name}　{format_duration(took)}で完了"
+                f"（{time.strftime('%H:%M', time.localtime(entry.get('ended') or now))}）")
+    else:
+        head = f"{name}　失敗しました"
+    lines = [head]
+    plan = plan_text(entry.get("plan"))
+    if plan and state in (RUNNING, ASK):
+        lines.append(plan)
+    return lines
+
+
+def menu_label(entry: dict, now=None) -> str:
+    """メニューの1行。「確認待ち　tray-tools　2分」。"""
+    now = time.time() if now is None else now
+    state = entry.get("state")
+    name = entry.get("project") or "Claude Code"
+    if state in (DONE, FAIL):
+        tail = time.strftime("%H:%M", time.localtime(entry.get("ended") or now))
+    elif state == ASK:
+        tail = format_duration(now - (entry.get("asked") or now))
+    else:
+        tail = format_duration(now - (entry.get("started") or now))
+    return f"{LABELS.get(state, state)}　{name}　{tail}"
+
+
+def clear_finished(directory=None) -> int:
+    """完了・失敗のファイルを消す(メニューの「完了した行を消す」)。消した数。"""
+    count = 0
+    directory = Path(directory or STATUS_DIR)
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return 0
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("state") in (DONE, FAIL):
+                path.unlink()
+                count += 1
+        except (OSError, ValueError):
+            continue
+    return count
+
+
+def sweep(directory=None, now=None) -> None:
+    """一日以上前のファイルを消す(フックの start のたびに呼ぶ)。"""
+    now = time.time() if now is None else now
+    directory = Path(directory or STATUS_DIR)
+    try:
+        paths = list(directory.glob("*.json")) + list(directory.glob("*.tmp"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            if now - path.stat().st_mtime > FILE_MAX_AGE:
+                path.unlink()
+        except OSError:
+            continue

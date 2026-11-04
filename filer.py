@@ -4530,8 +4530,7 @@ class FilerWindow(QWidget):
                     self.log("更新: 依存パッケージの更新に失敗しました"
                              f"（{pip.get('message')}）。"
                              "python setup.py を実行してください")
-            if filer_update.resident_files(result.get("files")):
-                self.log("常駐側も更新されました。トレイの 🔄 で再起動してください")
+            self._offer_resident_restart(result.get("files"))
             if not self.restart_filer():
                 self.log("更新は取り込みました。あとで Shift+F5 か閉じて開き直すと反映されます")
         except Exception:  # noqa: BLE001
@@ -4546,12 +4545,41 @@ class FilerWindow(QWidget):
                 self.log("更新: " + (result.get("message") or "失敗しました"))
                 return
             self.log(f"更新: {result.get('message')}（{info.get('behind')}件）")
-            if filer_update.resident_files(info.get("files")):
-                self.log("常駐側も更新されました。トレイの 🔄 で再起動してください")
+            self._offer_resident_restart(info.get("files"))
             if not self.restart_filer():
                 self.log("更新は取り込みました。あとで Shift+F5 か閉じて開き直すと反映されます")
         except Exception:  # noqa: BLE001
             self.log(f"エラー: {_log_exception('updatePulled')}")
+
+    def restart_resident(self):
+        """常駐に再起動を頼む((再起動したか, 一言))。テストでは差し替える。"""
+        return filer_update.restart_resident()
+
+    def _offer_resident_restart(self, files) -> None:
+        """取り込んだ変更に常駐(トレイ)が読むファイルがあれば、常駐も再起動するか聞く。
+
+        以前は「トレイの 🔄 で再起動してください」と書くだけで、2手間かかっていた。
+        常駐を落とすかの判断は常駐自身(restart --check)に任せ、断られたら理由を
+        そのまま見せる(このあとあっふが再起動してログが流れるので、窓で見せる)。"""
+        resident = filer_update.resident_files(files)
+        if not resident:
+            return
+        names = "\n".join(resident[:8]) + ("\n…" if len(resident) > 8 else "")
+        if not self.confirm("あっふの更新",
+                            "常駐（トレイ）が読み込むファイルも変わりました。\n\n"
+                            f"{names}\n\n常駐も再起動しますか？", default_yes=True):
+            self.log("常駐側も更新されました。あとでトレイの 🔄 で再起動してください")
+            return
+        try:
+            ok, message = self.restart_resident()
+        except Exception as e:  # noqa: BLE001  スロットの中なので落とさない
+            ok, message = False, f"常駐の再起動を頼めませんでした: {e}"
+        self.log(f"常駐: {message}")
+        if not ok:
+            self.inform("常駐の再起動", message)
+
+    def inform(self, title: str, text: str) -> None:
+        QMessageBox.information(self, title, text)
 
     def restart_filer(self) -> bool:
         """あっふだけを再起動する。状態を保存 → 単一起動の権利を手放す → 後継を起こす →

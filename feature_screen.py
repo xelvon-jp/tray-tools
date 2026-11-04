@@ -28,6 +28,7 @@ import capture_process
 import color_picker
 import explorer_nav
 import filer_launch
+import filer_update
 import launcher
 import mouse_jiggler
 import presenter_overlay
@@ -67,6 +68,11 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
 # 壁は消える。それが web_presenter.py で、あちらは presenter.html を無改造のまま使う。
 # 画面へ重ねる側(presenter_overlay.py)も残す(対象を選ばないのはあちらの取り柄)。
 BUNDLED_PRESENTER = Path(__file__).resolve().parent / "presenter.html"
+
+# 起動後にファイルが更新された(pull・ZIP 更新・この PC でのコミット)ことの知らせ。
+# 見に行くのはメニューを開いたときと、この間隔ごと(ツールチップはメニューを開かずに見るため)。
+DISK_NEWER_TEXT = "ファイルは新しい版です（再起動で反映）"
+VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000
 
 # スリープ抑止中の目印。通知領域のアイコンは実質16px相当で、隅の小さなバッジは潰れて
 # 見えない。アイコン全周に太いリングを描き、縮小しても輪郭の変化で判別できるようにする。
@@ -122,6 +128,14 @@ def _format_minutes(minutes: int) -> str:
     if minutes >= 60 and minutes % 60 == 0:
         return f"{minutes // 60}時間"
     return f"{minutes}分"
+
+
+def _read_disk_version() -> dict:
+    """いまディスクにある版(filer_update.quick_version)。読めなければ空(表示が出ないだけ)。"""
+    try:
+        return filer_update.quick_version()
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _remaining_minutes(deadline):
@@ -355,6 +369,15 @@ class ScreenFeature:
         # 一時スレッドから始めても回らないのでここで持つ)。
         self._jiggle_timer = QTimer()
         self._jiggle_timer.timeout.connect(self._on_jiggle_tick)
+
+        # 「ファイルの方が新しい」表示(あっふのタイトルと同じ考え方)。起動したときの版を
+        # 覚えておき、メニューを開いたときと数分ごとに、ディスクの版と比べる。
+        # quick_version は .git を数ファイル読むだけ(git コマンドは叩かない)なので軽い。
+        self._boot_version = _read_disk_version()
+        self._disk_newer = False
+        self._version_timer = QTimer()
+        self._version_timer.timeout.connect(self._check_disk_version)
+        self._version_timer.start(VERSION_CHECK_INTERVAL_MS)
 
         hotkey_config = app_settings.get("hotkeys", {})
         screen_settings = app_settings.get("screen", {})
@@ -685,10 +708,11 @@ class ScreenFeature:
         # データを持ち出せないので、スマホで読み取ってもらうためのもの。まれにしか
         # 使わないのでホットキーは付けない。
         self.menu.addAction("🩺 診断…", self.open_diagnostics)
-        self.menu.addAction("🔄 再起動", self._restart)
+        self._restart_action = self.menu.addAction("🔄 再起動", self._restart)
         self.menu.addAction("✖ 終了", QApplication.instance().quit)
 
         # 残り時間は開くたびに変わるので、表示直前に作り直す
+        self.menu.aboutToShow.connect(self._check_disk_version)
         self.menu.aboutToShow.connect(self._refresh_awake_menu)
         self.menu.aboutToShow.connect(self._refresh_jiggle_menu)
         self.menu.aboutToShow.connect(self._refresh_taskbar_menu)
@@ -1752,7 +1776,17 @@ class ScreenFeature:
             self.mirror_status(),
             self.sticky_status(),
             self.jiggler_status(),
+            self.version_status(),
         ])
+
+    def version_status(self) -> str:
+        """起動時の版と、ディスクの方が新しいか(トレイのツールチップと同じ判定)。"""
+        self._check_disk_version()   # 聞かれたついでに見直す(.git を読むだけで軽い)
+        running = filer_update.describe_version(self._boot_version)
+        if self._disk_newer:
+            disk = filer_update.describe_version(_read_disk_version())
+            return f"版: {running}（{DISK_NEWER_TEXT}: {disk}）"
+        return f"版: {running}"
 
     def jiggler_status(self) -> str:
         if not self._jiggle_active:
@@ -1905,6 +1939,19 @@ class ScreenFeature:
             traceback.print_exc()
             print("[tray-tools] マウスジグラー: 実行に失敗したため停止しました", file=sys.stderr)
 
+    def _check_disk_version(self):
+        """ディスクの版が起動時より新しければ、ツールチップと 🔄 の項目に出す。
+        メニューの aboutToShow とタイマーから呼ばれるスロットなので、例外は受け止める。"""
+        try:
+            newer = filer_update.disk_is_newer(self._boot_version, _read_disk_version())
+            self._restart_action.setText(
+                f"🔄 再起動（{DISK_NEWER_TEXT}）" if newer else "🔄 再起動")
+            if newer != self._disk_newer:
+                self._disk_newer = newer
+                self._refresh_state()
+        except Exception:  # noqa: BLE001  表示が出ないだけ
+            traceback.print_exc()
+
     def _refresh_jiggle_menu(self):
         for key, action in self._jiggle_actions.items():
             action.setChecked(self._jiggle_active and key == self._jiggle_minutes)
@@ -1960,7 +2007,10 @@ class ScreenFeature:
             states.append("スリープ抑止中")
         if self._jiggle_active:
             states.append("マウスジグラー動作中")
-        self.tray_icon.setToolTip(f"Rapture（{'・'.join(states)}）" if states else "Rapture")
+        tooltip = f"Rapture（{'・'.join(states)}）" if states else "Rapture"
+        if getattr(self, "_disk_newer", False):
+            tooltip += "\n" + DISK_NEWER_TEXT
+        self.tray_icon.setToolTip(tooltip)
         self._refresh_awake_menu()
         self._refresh_jiggle_menu()
         self._refresh_agent_loop_menu()

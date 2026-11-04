@@ -6671,6 +6671,41 @@ def test_update_decide_and_check():
     assert u.resident_files(["filer.py", "filer_menus/a.txt", "main.py", "tests/test_x.py",
                              "README.md", "feature_screen.py", "tools/x.py"]) == [
         "main.py", "feature_screen.py"]
+    # 起動時の版よりディスクの版が新しいか(常駐のトレイ表示)
+    assert u.disk_is_newer({"sha": "a" * 40, "label": "20261104"},
+                           {"sha": "b" * 40, "label": "20261104"})
+    assert not u.disk_is_newer({"sha": "a" * 40}, {"sha": "a" * 40, "label": "x"})
+    # ZIP 展開は同じ日付でも、一番新しい .py の時刻で見分ける
+    assert u.disk_is_newer({"label": "ZIP 20261104", "stamp": 100.0},
+                           {"label": "ZIP 20261104", "stamp": 200.0})
+    assert not u.disk_is_newer({"label": "ZIP 20261104", "stamp": 200.0},
+                               {"label": "ZIP 20261104", "stamp": 200.0})
+    assert not u.disk_is_newer({}, {"sha": "b" * 40}) and not u.disk_is_newer({"label": "x"}, {})
+    # 常駐の再起動: --check で差し支えないと言われたときだけ restart を送る
+    sent = []
+
+    def exchange_with(check_answer, restart_answer="OK 再起動します（数秒で戻ります）"):
+        def exchange(command, args):
+            sent.append((command, list(args)))
+            return check_answer if args else restart_answer
+        return exchange
+    ok, message = u.restart_resident(exchange_with("OK いま再起動して差し支えありません"))
+    assert ok and message == "再起動します（数秒で戻ります）"
+    assert sent == [("restart", ["--check"]), ("restart", [])], sent
+    sent.clear()
+    ok, message = u.restart_resident(exchange_with("OK 再起動は見送るべきです: 付箋 2枚・画面ミラー"))
+    assert not ok and "付箋 2枚・画面ミラー" in message and sent == [("restart", ["--check"])]
+    sent.clear()
+    ok, message = u.restart_resident(exchange_with(
+        "OK いま再起動して差し支えありません", "ERR 起動し直せませんでした（このまま動き続けます）"))
+    assert not ok and message.startswith("起動し直せませんでした")
+    ok, message = u.restart_resident(exchange_with(None))
+    assert not ok and "返事がありません" in message
+
+    def not_running(command, args):
+        raise FileNotFoundError
+    ok, message = u.restart_resident(not_running)
+    assert not ok and "起動していない" in message
     with tempfile.TemporaryDirectory() as tmp:
         assert u.check_updates(tmp, run=_fake_git({}))["state"] == "nogit"
         Path(tmp, ".git").mkdir()
@@ -7227,24 +7262,61 @@ def test_window_update_restart():
             answers[:] = [False]
             press()
             assert "最新です" in asked[-1] and order == []
-            # 新しいコミットあり → 一覧を見せて OK → pull → 再起動。常駐側の変更も知らせる
+            # 新しいコミットあり → 一覧を見せて OK → pull → 常駐のファイルがあれば
+            # 「常駐も再起動しますか？」(断ればログで案内) → あっふを再起動
             order.clear()
+            resident_calls = []
+            informed = []
+            w.restart_resident = lambda: (resident_calls.append(1),
+                                          (True, "再起動します（数秒で戻ります）"))[1]
+            w.inform = lambda title, text: informed.append(text)
             w.check_updates = lambda repo_dir: {
                 "state": "behind", "behind": 2, "ahead": 0, "dirty": [],
                 "commits": ["abc1234 あっふ: 直す", "def5678 常駐: 足す"],
                 "files": ["filer.py", "main.py"]}
+            answers[:] = [True, False]
+            press()
+            _wait_until(lambda: order)
+            assert "abc1234 あっふ: 直す" in asked[-2] and "2件" in asked[-2], asked[-2]
+            assert "常駐も再起動しますか" in asked[-1] and "main.py" in asked[-1], asked[-1]
+            assert "filer.py" not in asked[-1]
+            assert pulls == [repo] and order == ["save", "release", "spawn", "exit"], order
+            assert resident_calls == [] and "常駐側も更新されました" in w.log_view.toPlainText()
+            w._restarting = False
+            # 「はい」なら常駐へ頼んでから、あっふを再起動する
+            order.clear()
+            answers[:] = [True, True]
+            press()
+            _wait_until(lambda: order)
+            assert resident_calls == [1] and informed == []
+            assert "常駐: 再起動します" in w.log_view.toPlainText()
+            assert order == ["save", "release", "spawn", "exit"], order
+            w._restarting = False
+            # 常駐に断られたら、その理由を窓で見せる(あっふの再起動は続ける)
+            order.clear()
+            w.restart_resident = lambda: (False, "常駐は再起動しませんでした（再起動は見送る"
+                                                 "べきです: 付箋 1枚）。トレイの 🔄 から行ってください")
+            answers[:] = [True, True]
+            press()
+            _wait_until(lambda: order)
+            assert informed and "付箋 1枚" in informed[-1], informed
+            assert order == ["save", "release", "spawn", "exit"], order
+            w._restarting = False
+            # 常駐のファイルが無ければ聞かない
+            order.clear()
+            w.check_updates = lambda repo_dir: {
+                "state": "behind", "behind": 1, "ahead": 0, "dirty": [],
+                "commits": ["abc1234 あっふ: 直す"], "files": ["filer.py", "README.md"]}
             answers[:] = [True]
             press()
             _wait_until(lambda: order)
-            assert "abc1234 あっふ: 直す" in asked[-1] and "2件" in asked[-1], asked[-1]
-            assert pulls == [repo] and order == ["save", "release", "spawn", "exit"], order
-            assert "常駐側も更新されました" in w.log_view.toPlainText()
+            assert "常駐も再起動" not in asked[-1] and len(informed) == 1
             w._restarting = False
             # 取り込みを断れば何もしない
             order.clear()
             answers[:] = [False]
             press()
-            assert order == [] and len(pulls) == 1
+            assert order == [] and len(pulls) == 4   # 上の4回ぶん。断った分は増えない
             # 早送りできない → 何もせず理由を出す(確認も出さない)
             asked.clear()
             w.check_updates = lambda repo_dir: {"state": "diverged", "ahead": 1, "behind": 2,
@@ -7287,10 +7359,11 @@ def test_window_update_restart():
             w.zip_apply = lambda prepared: (applied.append(prepared), {
                 "ok": True, "added": 1, "overwritten": 0, "deleted": 0,
                 "backup": "", "pip": None, "files": ["new.py"]})[1]
-            answers[:] = [True]
+            answers[:] = [True, False]   # new.py は常駐が読むファイル → 常駐の再起動は断る
             press()
             _wait_until(lambda: len(order) >= 4)
-            assert applied and "ZIP 20261104" in asked[-1] and "追加 1件" in asked[-1], asked
+            assert "常駐も再起動しますか" in asked[-1] and "new.py" in asked[-1], asked[-1]
+            assert applied and "ZIP 20261104" in asked[-2] and "追加 1件" in asked[-2], asked
             assert order == ["save", "release", "spawn", "exit"], order
             assert "ZIP で更新しました" in w.log_view.toPlainText()
             w._restarting = False

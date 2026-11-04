@@ -67,7 +67,8 @@ def quick_version(repo_dir=REPO_DIR, read_git=None, newest=None) -> dict:
         except Exception:  # noqa: BLE001
             found = None
         if found:
-            return {"label": f"ZIP {found[1]:%Y%m%d}", "sha": "", "source": "zip"}
+            return {"label": f"ZIP {found[1]:%Y%m%d}", "sha": "", "source": "zip",
+                    "stamp": found[1].timestamp()}
     # .git が壊れていて読めない(業務PCで ZIP を古い展開先へ上書きした場合など)ときも、
     # .py の一番新しい日付で版を出す(空にして「あっふ」だけにはしない)
     try:
@@ -75,7 +76,8 @@ def quick_version(repo_dir=REPO_DIR, read_git=None, newest=None) -> dict:
     except Exception:  # noqa: BLE001
         found = None
     if found:
-        return {"label": f"{found[1]:%Y%m%d}", "sha": "", "source": "file"}
+        return {"label": f"{found[1]:%Y%m%d}", "sha": "", "source": "file",
+                "stamp": found[1].timestamp()}
     return {"label": "", "sha": "", "source": ""}
 
 
@@ -154,6 +156,24 @@ def same_version(a: dict, b: dict) -> bool:
     if sha_a and sha_b:
         return sha_a == sha_b
     return ((a or {}).get("label") or "") == ((b or {}).get("label") or "")
+
+
+def disk_is_newer(running: dict, disk: dict) -> bool:
+    """起動したときの版(running)より、いまディスクにある版(disk)が新しいか。
+    常駐のトレイの「ファイルは新しい版です」に使う(どちらも quick_version の結果)。
+
+    ハッシュがあればハッシュの違いで。ZIP 展開の PC は表記が日付だけで、同じ日に
+    2回更新すると表記では見分けられないので、一番新しい .py の更新時刻(stamp)で比べる。
+    どちらかが読めなければ「新しくない」(読めないだけで、更新を促す理由は無い)。"""
+    running, disk = running or {}, disk or {}
+    sha_a, sha_b = running.get("sha") or "", disk.get("sha") or ""
+    if sha_a and sha_b:
+        return sha_a != sha_b
+    stamp_a, stamp_b = running.get("stamp"), disk.get("stamp")
+    if stamp_a and stamp_b:
+        return stamp_b > stamp_a
+    label_a, label_b = running.get("label") or "", disk.get("label") or ""
+    return bool(label_a and label_b and label_a != label_b)
 
 
 def _head_file_time(repo_dir: Path):
@@ -277,6 +297,48 @@ def resident_files(files) -> list:
             continue
         result.append(path)
     return result
+
+
+def _strip_status(answer: str) -> str:
+    for prefix in ("OK ", "ERR "):
+        if answer.startswith(prefix):
+            return answer[len(prefix):]
+    return answer
+
+
+def restart_resident(exchange=None) -> tuple:
+    """常駐(main.py)に再起動を頼む。(再起動したか, 一言)。
+
+    自前では落とさない。traytools_send と同じ口で、まず restart --check で巻き添え
+    (付箋・ミラー・エージェントループ・スリープ予約など)が無いかを常駐自身に答えさせ、
+    差し支えないと言われたときだけ restart を送る。断られたら常駐の言葉をそのまま返す。
+    常駐が居なければ起こさない(意図して終了していたのを押し返さない。CLAUDE.md)。
+    exchange(command, args) は応答の1行か None を返す(テストで差し替える)。"""
+    if exchange is None:
+        import traytools_send
+
+        def exchange(command, args):
+            return traytools_send._exchange(command, args, traytools_send.RESPONSE_TIMEOUT)
+    try:
+        answer = exchange("restart", ["--check"])
+    except FileNotFoundError:
+        return False, "常駐（tray-tools）が起動していないので、再起動しませんでした"
+    except OSError as e:
+        return False, f"常駐に繋がりません: {e}"
+    if not answer:
+        return False, "常駐から返事がありませんでした（古い版の常駐かもしれません）。トレイの 🔄 から行ってください"
+    # 「差し支えありません」と言われたときだけ進む。言い回しが変わって読めなくなったら
+    # 安全側(再起動しない)に倒し、常駐の言葉をそのまま見せる。
+    if not answer.startswith("OK") or "差し支え" not in answer:
+        return False, (f"常駐は再起動しませんでした（{_strip_status(answer)}）。"
+                       "トレイの 🔄 から行ってください")
+    try:
+        answer = exchange("restart", [])
+    except OSError as e:
+        return False, f"常駐に繋がりません: {e}"
+    if not answer:
+        return True, "常駐へ再起動を頼みました（返事はありませんでした）"
+    return answer.startswith("OK"), _strip_status(answer)
 
 
 def check_updates(repo_dir=REPO_DIR, run=None) -> dict:

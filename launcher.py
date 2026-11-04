@@ -23,7 +23,8 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtWidgets import QInputDialog, QMessageBox
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialog, QInputDialog, QMessageBox
 
 import explorer_nav
 import settings as settings_module
@@ -378,10 +379,17 @@ def tab_text(_name: str, data):
 
 def _ask_name(parent, default_name: str):
     """登録する名前を尋ねる。キャンセルなら None を返す。"""
-    name, ok = QInputDialog.getText(
-        parent, "フォルダブックマーク", "登録する名前", text=default_name
-    )
-    name = name.strip() if ok else None
+    dialog = QInputDialog(parent)
+    dialog.setWindowTitle("フォルダブックマーク")
+    dialog.setLabelText("登録する名前")
+    dialog.setTextValue(default_name)
+    # 親のピッカーは最前面(WindowStaysOnTopHint)の窓。子ダイアログはその帯に
+    # 入らないので、ピッカーの裏に隠れてしまう(親をピッカーにしても起きた)。
+    # こちらも最前面にして、ピッカーより上に出す
+    dialog.setWindowFlags(dialog.windowFlags() | Qt.WindowStaysOnTopHint)
+    if dialog.exec() != QDialog.Accepted:
+        return None
+    name = dialog.textValue().strip()
     return name or None
 
 

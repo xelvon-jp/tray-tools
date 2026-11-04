@@ -68,6 +68,14 @@ def quick_version(repo_dir=REPO_DIR, read_git=None, newest=None) -> dict:
             found = None
         if found:
             return {"label": f"ZIP {found[1]:%Y%m%d}", "sha": "", "source": "zip"}
+    # .git が壊れていて読めない(業務PCで ZIP を古い展開先へ上書きした場合など)ときも、
+    # .py の一番新しい日付で版を出す(空にして「あっふ」だけにはしない)
+    try:
+        found = newest(repo_dir)
+    except Exception:  # noqa: BLE001
+        found = None
+    if found:
+        return {"label": f"{found[1]:%Y%m%d}", "sha": "", "source": "file"}
     return {"label": "", "sha": "", "source": ""}
 
 

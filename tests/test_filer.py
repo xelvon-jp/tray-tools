@@ -6286,10 +6286,71 @@ def test_version_label_reads_git_and_zip():
         assert u.version_label(tmp, run=lambda a, t: called.append(a)) == "ZIP 20261028"
         assert not u.has_git(tmp) and not called    # .git が無ければ git は呼ばない
         assert u.quick_version(tmp)["sha"] == ""
+    with tempfile.TemporaryDirectory() as tmp:      # .git が壊れている(読めない)
+        Path(tmp, ".git").mkdir()
+        Path(tmp, ".git", "HEAD").write_text("ref: refs/heads/gone\n", encoding="utf-8")
+        py = Path(tmp, "a.py")
+        py.write_text("x = 1\n", encoding="utf-8")
+        stamp = time.mktime((2026, 10, 27, 9, 0, 0, 0, 0, -1))
+        os.utime(py, (stamp, stamp))
+        # 空にはせず、.py の日付で版を出す
+        assert u.version_label(tmp, run=_no_git) == "20261027"
+        assert u.quick_version(tmp)["source"] == "file"
     with tempfile.TemporaryDirectory() as tmp:
         assert u.version_label(tmp) == ""           # どちらも取れない
     assert u.window_title("C:\\x", "20261031-02") == "C:\\x - あっふ 20261031-02"
     assert u.window_title("", "") == "あっふ" and u.window_title("C:\\x", "") == "C:\\x - あっふ"
+
+
+def test_ask_name_dialog_stays_on_top():
+    """J の「ここを登録」の名前入力: 親のピッカー(最前面)の裏に隠れないよう、
+    ダイアログ自身も最前面(WindowStaysOnTopHint)で出す。"""
+    try:
+        import launcher
+    except ImportError:
+        # VM(Windows 専用の comtypes が無い)では explorer_nav を差し替えて読む
+        import types as _types
+        sys.modules.setdefault("explorer_nav", _types.ModuleType("explorer_nav"))
+        import launcher
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDialog
+
+    made = {}
+
+    class FakeDialog:
+        def __init__(self, parent):
+            made["flags"] = Qt.WindowFlags()
+            made["parent"] = parent
+
+        def setWindowTitle(self, t):
+            made["title"] = t
+
+        def setLabelText(self, t):
+            made["label"] = t
+
+        def setTextValue(self, t):
+            made["value"] = t
+
+        def windowFlags(self):
+            return made["flags"]
+
+        def setWindowFlags(self, flags):
+            made["flags"] = flags
+
+        def exec(self):
+            return QDialog.Accepted
+
+        def textValue(self):
+            return "  なまえ  "
+
+    original = launcher.QInputDialog
+    launcher.QInputDialog = FakeDialog
+    try:
+        assert launcher._ask_name(object(), "既定") == "なまえ"
+    finally:
+        launcher.QInputDialog = original
+    assert made["flags"] & Qt.WindowStaysOnTopHint
+    assert made["value"] == "既定"
 
 
 def test_version_sequence_label():

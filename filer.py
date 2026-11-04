@@ -6575,9 +6575,14 @@ class FilerWindow(QWidget):
     def confirm(self, title: str, text: str, default_yes: bool = True, parent=None) -> bool:
         """parent は、最前面のピッカーから聞くときにピッカーを渡す(窓に付けるとピッカーの裏に隠れる)。"""
         default = QMessageBox.Yes if default_yes else QMessageBox.No
-        answer = QMessageBox.question(parent or self, title, text,
-                                      QMessageBox.Yes | QMessageBox.No, default)
-        return answer == QMessageBox.Yes
+        box = QMessageBox(QMessageBox.Question, title, text,
+                          QMessageBox.Yes | QMessageBox.No, parent or self)
+        box.setDefaultButton(default)
+        if parent is not None:
+            # ピッカーは最前面(WindowStaysOnTopHint)の窓で、子ダイアログはその帯に
+            # 入らず裏に隠れることがある。こちらも最前面にして上に出す
+            box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
+        return box.exec() == QMessageBox.Yes
 
     def ask_sort(self, title: str, spec):
         """ソートのダイアログ。決めた並べ方か、取消なら None。"""

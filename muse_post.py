@@ -5,10 +5,15 @@
 #   python muse_post.py status
 #   python muse_post.py post --message "..." [--current-chat] [--dry-run]
 #   python muse_post.py post --message-file handoff\xxx.txt
-#   python muse_post.py wait --repo R:\claude\tray-tools --branch muse/xxx
+#   python muse_post.py wait --repo R:\claude\tray-tools --branch muse/xxx --path handoff\xxx.result.md
 #
 # 出力は標準出力に JSON 1つ。終了コード 0=成功 / 1=中止(安全確認で止めた・
 # 見つからない・タイムアウト) / 2=引数の誤り。
+#
+# 判断ロジック(純関数)と Muse アプリの見え方の定義は muse_post_logic.py にある
+# (20261105-01 #11)。あちらは comtypes・copilot_loop を読まないので、判断の
+# テストは UIA の無い環境(Linux など)でも回る。ここに残るのは UIA の実操作と
+# サブコマンドの進行だけ。
 #
 # 【なぜ常駐(main.py)でも MCP でもなく単独スクリプトなのか】
 # CLAUDE.md「外から叩ける口」: 足してよいのは常駐でなければできないことだけ。
@@ -29,307 +34,46 @@
 # 確かめる(作ると書きかけの下書きごと画面が切り替わる)。
 #
 # 【Muse の画面が変わったら】
-# 窓の探し方もボタン名も MUSE_PROFILE にまとめてある。直すのはそこだけ。
-# 調べ直すには tools/uia_probe.py が使える。
+# 窓の探し方もボタン名も MUSE_PROFILE(muse_post_logic.py)にまとめてある。
+# 直すのはそこだけ。調べ直すには tools/uia_probe.py が使える。
 import argparse
-import datetime
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 
-import comtypes
-import comtypes.client
-
-import copilot_loop
-from copilot_loop import (
-    INVOKE_PATTERN, MIN_AWAKE_DESCENDANTS, OBJID_CLIENT, SMTO_ABORTIFHUNG,
-    VALUE_PATTERN, WM_GETOBJECT, _ensure_uia, find_window,
+from muse_post_logic import (
+    AWAKE_TIMEOUT, CLEAR_TIMEOUT, CONTROL_BUTTON, CONTROL_EDIT, GIT_TIMEOUT,
+    MUSE_PROFILE, NEW_CHAT_TIMEOUT, OPEN_LIST_TIMEOUT, POLL_SEC,
+    SEND_APPEAR_TIMEOUT, TITLE_TIMEOUT, _names, _same_text,
+    check_before_invoke, check_before_set, check_initial, check_new_chat_ready,
+    is_blank, message_error, now_iso, parse_ls_remote, public_summary, redact,
+    summarize, title_settled, view_signature,
 )
 
-VERSION = "20261104-01"
+# UIA 依存はここでまとめて読む。読めない環境(Linux の VM など)でも、判断の
+# テストや wait のために import だけは通るようにする(#11)。実際に窓を扱う
+# Muse の生成では、読めなかった理由を添えて止まる。
+try:
+    import comtypes
+    import comtypes.client
 
-# --- Muse アプリの見え方(2026-11-04 実測) ----------------------------------
-# 名前はすべてリスト。copilot_loop の BUILTIN_PROFILES と同じ理由で、1つの完全一致に
-# 賭けると文言が少し変わっただけで「見つからない」になり、理由も分からないため。
-MUSE_PROFILE = {
-    "name": "muse",
-    # 実体は Edge の PWA。exe とクラスだけでは普通の Edge の窓と区別がつかない。
-    "process_name": "msedge.exe",
-    "window_class": "Chrome_WidgetWin_1",
-    # タイトルは「Muse - Chat — Muse」。"Muse" だけで探すと、Obsidian の窓
-    # (ノート名に Muse が入っていることがある)に当たる。em dash(U+2014)付きの
-    # 末尾で探し、さらに exe で絞る。find_window は大文字小文字を区別しない部分一致。
-    "window_title_contains": "\u2014 Muse",
-    "render_class": "Chrome_RenderWidgetHostHWND",
-    # 投稿欄。AutomationId が無いので Name で探す。Name「検索」の Edit も居るので
-    # Name の一致は必須(Edit というだけで拾うと検索欄に書いてしまう)。
-    "input_name": ["メッセージ"],
-    # 入力欄が空のときは存在しない。文字が入ると出る。
-    "send_button": ["送信"],
-    # 作業中に投稿欄の横に出る。
-    "busy_button": ["停止"],
-    # サイドバーのチャット一覧が開いているときだけ見える。
-    "new_chat_button": ["新しいサイドチャット"],
-    # 一覧を開くボタン。Name は「<チャット名> [未読のチャット] チャットとサイドチャットを開く」。
-    # 末尾一致で探し、前の部分からチャット名を取る。
-    "open_list_suffix": ["チャットとサイドチャットを開く"],
-    "unread_marker": ["未読のチャット"],
-    # 会話のメッセージに付くボタン。作りたての空のチャットには1つも無い。
-    "message_buttons": ["返信", "リアクションする"],
-    # サイドチャットの名前は最初の投稿から Muse が付ける。付く前の仮の名前は
-    # 未実測なので空。分かったら足す(足すとチャット名の待ちがそれを読み飛ばす)。
-    "placeholder_titles": [],
-}
+    import copilot_loop
+    from copilot_loop import (
+        INVOKE_PATTERN, MIN_AWAKE_DESCENDANTS, OBJID_CLIENT, SMTO_ABORTIFHUNG,
+        VALUE_PATTERN, WM_GETOBJECT, _ensure_uia, find_window,
+    )
+    _UIA_IMPORT_ERROR = None
+except ImportError as _e:  # ModuleNotFoundError を含む
+    comtypes = None
+    copilot_loop = None
+    INVOKE_PATTERN = MIN_AWAKE_DESCENDANTS = OBJID_CLIENT = None
+    SMTO_ABORTIFHUNG = VALUE_PATTERN = WM_GETOBJECT = None
+    _ensure_uia = find_window = None
+    _UIA_IMPORT_ERROR = _e
 
-CONTROL_BUTTON, CONTROL_EDIT = 50000, 50004
-
-# --- 待ち時間(すべてポーリング。上限だけをここで決める) ---------------------
-POLL_SEC = 0.25
-AWAKE_TIMEOUT = 6.0        # 木が組み上がるまで(実測は1秒未満)
-OPEN_LIST_TIMEOUT = 4.0    # 一覧を開いてから「新しいサイドチャット」が出るまで
-NEW_CHAT_TIMEOUT = 6.0     # 新しいサイドチャットが空の状態で表示されるまで
-SEND_APPEAR_TIMEOUT = 4.0  # SetValue してから「送信」が出るまで
-CLEAR_TIMEOUT = 6.0        # 送信してから投稿欄が空に戻るまで
-TITLE_TIMEOUT = 20.0       # 送信してから Muse がチャット名を付けるまで
-
-# wait サブコマンドの git 1回ぶんの上限。認証待ちで固まらないよう短めに切る。
-GIT_TIMEOUT = 60
-
-# 空とみなす文字。React のエディタは空でも幅ゼロの文字を抱えていることがある。
-_BLANK_CHARS = "\u200b\ufeff"
-
-
-# =========================================================================
-# 判断ロジック(純関数。UIA 無しでテストできるようにここに集める)
-# =========================================================================
-def _names(profile, key):
-    """プロファイルの項目を必ずリストで返す(文字列1つでも書けるように)。"""
-    value = profile.get(key) or []
-    return [value] if isinstance(value, str) else list(value)
-
-
-def is_blank(value):
-    """投稿欄の中身が「空」か。読めなかった(None)ものは空とみなさない。
-
-    空白だけ・幅ゼロ文字だけは空とする。上書きして困るものではないし、
-    React が空の欄に残す文字で「入力中」と誤判定して止まるのを避けるため。"""
-    if value is None:
-        return False
-    return value.strip().strip(_BLANK_CHARS).strip() == ""
-
-
-def chat_title_from_names(button_names, profile=MUSE_PROFILE):
-    """「…チャットとサイドチャットを開く」ボタンの Name から、表示中のチャット名を取る。
-
-    例: 'Tray-tools ルール調査の試運転 未読のチャット チャットとサイドチャットを開く'
-        → 'Tray-tools ルール調査の試運転'
-    ボタンが無い(メインチャット表示中・一覧が開いている)、または名前部分が空なら None。"""
-    for raw in button_names:
-        name = (raw or "").strip()
-        for suffix in _names(profile, "open_list_suffix"):
-            if not name.endswith(suffix):
-                continue
-            title = name[: -len(suffix)].strip()
-            for marker in _names(profile, "unread_marker"):
-                if title.endswith(marker):
-                    title = title[: -len(marker)].strip()
-            return title or None
-    return None
-
-
-def summarize(items, input_values, profile=MUSE_PROFILE):
-    """木を1回歩いた結果を、判断に要る数だけに畳む。
-
-    items        [(ControlType, Name), ...] 子孫ぜんぶ
-    input_values 投稿欄(Name 一致の Edit)それぞれの値。読めなかったものは None
-    """
-    send = set(_names(profile, "send_button"))
-    busy = set(_names(profile, "busy_button"))
-    new_chat = set(_names(profile, "new_chat_button"))
-    msg = set(_names(profile, "message_buttons"))
-    suffixes = _names(profile, "open_list_suffix")
-    inputs = set(_names(profile, "input_name"))
-
-    counts = {"inputs": 0, "send": 0, "busy": 0, "new_chat": 0,
-              "open_list": 0, "message_buttons": 0}
-    button_names = []
-    for ctype, name in items:
-        name = (name or "").strip()
-        if ctype == CONTROL_EDIT and name in inputs:
-            counts["inputs"] += 1
-        if ctype != CONTROL_BUTTON:
-            continue
-        button_names.append(name)
-        if name in send:
-            counts["send"] += 1
-        if name in busy:
-            counts["busy"] += 1
-        if name in new_chat:
-            counts["new_chat"] += 1
-        if name in msg:
-            counts["message_buttons"] += 1
-        if any(name.endswith(s) for s in suffixes):
-            counts["open_list"] += 1
-
-    value = input_values[0] if len(input_values) == 1 else None
-    return {
-        "descendants": len(items),
-        "inputs": counts["inputs"],
-        "input_value": value,
-        "input_empty": is_blank(value) if len(input_values) == 1 and value is not None else None,
-        "send": counts["send"],
-        "busy": counts["busy"] > 0,
-        "new_chat": counts["new_chat"],
-        "open_list": counts["open_list"],
-        "message_buttons": counts["message_buttons"],
-        "chat_title": chat_title_from_names(button_names, profile),
-    }
-
-
-def public_summary(s):
-    """出力用。投稿欄の中身(書きかけの下書きかもしれない)は出さず、長さだけ出す。"""
-    out = {k: v for k, v in s.items() if k != "input_value"}
-    value = s.get("input_value")
-    out["input_length"] = None if value is None else len(value)
-    return out
-
-
-def _input_reason(s):
-    """投稿欄まわりの共通の確認。問題が無ければ None。"""
-    if s["descendants"] < MIN_AWAKE_DESCENDANTS:
-        return f"アクセシビリティツリーが起きていない(子孫 {s['descendants']} 個)"
-    if s["inputs"] == 0:
-        return "投稿欄(Name='メッセージ' の Edit)が見つからない"
-    if s["inputs"] > 1:
-        return f"投稿欄が {s['inputs']} 個ある(どれに書くか決められない)"
-    if s["input_value"] is None:
-        return "投稿欄の中身を読めない(ValuePattern が無い)"
-    if not s["input_empty"]:
-        return "投稿欄が空でない(入力中かもしれないので上書きしない)"
-    return None
-
-
-def check_initial(s, current_chat):
-    """着手してよいか。よければ None、だめなら理由。何も押す前に呼ぶ。
-
-    新しいチャットを作る場合でも投稿欄が空であることを求める。作ると画面が
-    切り替わり、書きかけの下書きが見えなくなる(消えるかもしれない)ため。
-    busy は、表示中のチャットに投稿するときだけ止める。新しいチャットは別物なので
-    作ってから確かめ直す(check_new_chat_ready)。"""
-    reason = _input_reason(s)
-    if reason:
-        return reason
-    if current_chat:
-        if s["busy"]:
-            return "表示中のチャットは作業中(『停止』がある)"
-        return None
-    if s["new_chat"] == 0 and s["open_list"] == 0:
-        return "新しいサイドチャットを作れない(ボタンも一覧を開くボタンも無い)"
-    if s["new_chat"] > 1:
-        return f"『新しいサイドチャット』が {s['new_chat']} 個ある"
-    if s["new_chat"] == 0 and s["open_list"] > 1:
-        return f"一覧を開くボタンが {s['open_list']} 個ある"
-    return None
-
-
-def is_new_chat_empty(s):
-    """作りたてのサイドチャットか(会話のメッセージに付くボタンが1つも無いか)。"""
-    return s["message_buttons"] == 0
-
-
-def check_new_chat_ready(s):
-    """新しいサイドチャットを作った直後、投稿してよいか。よければ None。"""
-    if not is_new_chat_empty(s):
-        return f"新しいチャットが空になっていない(返信等のボタンが {s['message_buttons']} 個)"
-    if s["busy"]:
-        return "新しいチャットが作業中になっている(『停止』がある)"
-    return _input_reason(s)
-
-
-def check_before_set(s):
-    """SetValue の直前。よければ None。"""
-    if s["busy"]:
-        return "作業中(『停止』がある)"
-    return _input_reason(s)
-
-
-def _same_text(a, b):
-    if a is None or b is None:
-        return False
-    return a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
-
-
-def check_before_invoke(s, message):
-    """送信ボタンを押す直前。よければ None。
-
-    読み戻した値が送った文字列と一致することを求める。React が SetValue を
-    取りこぼしたり、陽太さんが同時に打鍵して混ざったりしたときに、意図と違う
-    文面を送らないため。"""
-    if s["inputs"] != 1:
-        return "投稿欄を見失った"
-    if not _same_text(s["input_value"], message):
-        return "投稿欄の中身が送るはずの文字列と一致しない"
-    if s["send"] == 0:
-        return "『送信』ボタンが出ない"
-    if s["send"] > 1:
-        return f"『送信』ボタンが {s['send']} 個ある"
-    return None
-
-
-def title_settled(before, now, new_chat, placeholders=(), message=None):
-    """チャット名が決まったとみなしてよいか。
-
-    新しいチャットでは、投稿前に見えていた名前(まだ付いていない仮の名前)から
-    変わるのを待つ。表示中のチャットへの投稿では名前は変わらないので、取れれば足りる。
-
-    投稿文そのものと同じ名前も「まだ」とみなす。2026-11-04 の実測で、投稿直後の
-    サイドチャットの名前が依頼文の全文になっていた(要約した名前に置き換わるのかは
-    未確認)。置き換わらなければ上限まで待って、その名前を settled=false で返す。"""
-    if not now or now in placeholders:
-        return False
-    if message and now.strip() == message.strip():
-        return False
-    if new_chat:
-        return now != before
-    return True
-
-
-def message_error(message, allow_multiline):
-    """投稿文として受け付けられないなら理由を返す(終了コード 2 にする)。"""
-    if message is None or not message.strip():
-        return "投稿文が空"
-    if ("\n" in message or "\r" in message) and not allow_multiline:
-        return ("投稿文に改行が入っている。改行入りの送信は未検証なので、"
-                "送るなら --allow-multiline を付ける")
-    return None
-
-
-def parse_ls_remote(output, branch):
-    """`git ls-remote --heads origin NAME` の出力から、そのブランチの sha を取る。
-
-    ls-remote のパターンは末尾一致なので、NAME が 'x' なら 'refs/heads/foo/x' も
-    返ってくる。refs/heads/NAME と完全に一致する行だけを採る。"""
-    want = "refs/heads/" + branch
-    for line in (output or "").splitlines():
-        parts = line.strip().split()
-        if len(parts) == 2 and parts[1] == want and re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
-            return parts[0]
-    return None
-
-
-def redact(text):
-    """git のエラーには remote URL(認証情報入りのことがある)が混ざる。URL を伏せる。"""
-    text = re.sub(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+", "<url>", text or "")
-    text = re.sub(r"\S+@[\w.-]+:\S+", "<url>", text)  # git@github.com:owner/repo 形式
-    return text.strip()[-300:]
-
-
-def now_iso():
-    """ローカル時刻(JST)の ISO 8601。"""
-    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+VERSION = "20261105-01"
 
 
 # =========================================================================
@@ -349,6 +93,9 @@ class Muse:
     使い終わったら close() で、掴んだのと同じスレッドで手放すこと。"""
 
     def __init__(self, profile=MUSE_PROFILE):
+        if _UIA_IMPORT_ERROR is not None:
+            raise MuseNotFound(
+                f"UIA 依存(comtypes / copilot_loop)を読み込めない: {_UIA_IMPORT_ERROR}")
         self.profile = profile
         main, render = find_window(profile)
         if not main:
@@ -519,8 +266,8 @@ def _dry_run_plan(s, current_chat, message):
             plan.append("一覧を開くボタン(…チャットとサイドチャットを開く)を Invoke する")
             plan.append(f"『新しいサイドチャット』が出るのを最大 {OPEN_LIST_TIMEOUT:g} 秒待つ")
         plan.append("『新しいサイドチャット』を Invoke する")
-        plan.append(f"返信/リアクションのボタンが0個になるのを最大 {NEW_CHAT_TIMEOUT:g} 秒待つ"
-                    "(ならなければ中止)")
+        plan.append(f"画面が Invoke 前と変わり、返信/リアクションのボタンが0個になるのを"
+                    f"最大 {NEW_CHAT_TIMEOUT:g} 秒待つ(ならなければ中止)")
     plan.append("投稿欄が空であることを確かめ直す")
     plan.append(f"投稿欄に SetValue する({len(message)} 文字)")
     plan.append(f"『送信』が出て、読み戻した値が一致するのを最大 {SEND_APPEAR_TIMEOUT:g} 秒待つ")
@@ -537,7 +284,7 @@ def _restore_input(muse, refs, message):
     ただし中身が自分の書いたものと一致するときだけ消す(その間に人が打った分は
     消さない)。戻せたか(bool)を返す。"""
     try:
-        if len(refs["input"]) != 1:
+        if not refs or len(refs["input"]) != 1:
             return False
         el = refs["input"][0]
         if not _same_text(muse.read_value(el), message):
@@ -548,16 +295,25 @@ def _restore_input(muse, refs, message):
         return False
 
 
-def cmd_post(args, message):
+def cmd_post(args, message, muse_factory=None):
+    """投稿の進行。muse_factory はテスト用の差し替え口(偽の Muse を渡せる)。"""
     result = {"ok": False, "posted_at": None, "chat_title": None,
               "new_chat": not args.current_chat, "reason": None,
               "dry_run": bool(args.dry_run), "steps": []}
     steps = result["steps"]
     try:
-        muse = Muse()
+        muse = (muse_factory or Muse)()
     except MuseNotFound as e:
         result["reason"] = str(e)
         return 1, result
+    s, refs = None, None
+    wrote = False           # SetValue で自分の文面を書いた後か
+    send_attempted = False  # 送信 Invoke に入った後か(例外でも送れたか不明になる)
+    leftovers = []          # 取り消せない UI 側の副作用(#6)。理由に明示する
+
+    def note_suffix():
+        return f"({'・'.join(leftovers)}が残っている)" if leftovers else ""
+
     try:
         if not muse.wait_awake():
             steps.append("木が組み上がらないまま進む(下の確認で止まるはず)")
@@ -580,44 +336,74 @@ def cmd_post(args, message):
             if s["new_chat"] == 0:
                 muse.invoke(refs["open_list"][0])
                 steps.append("一覧を開いた")
+                leftovers.append("開いた一覧")
                 s, refs, ok = muse.poll(lambda x: x["new_chat"] >= 1, OPEN_LIST_TIMEOUT)
                 if not ok:
-                    result["reason"] = "一覧を開いたが『新しいサイドチャット』が出ない"
+                    result["reason"] = "一覧を開いたが『新しいサイドチャット』が出ない" + note_suffix()
                     return 1, result
                 if s["new_chat"] != 1:
-                    result["reason"] = f"『新しいサイドチャット』が {s['new_chat']} 個ある"
+                    result["reason"] = f"『新しいサイドチャット』が {s['new_chat']} 個ある" + note_suffix()
                     return 1, result
+            # 「新しいサイドチャット」を押す直前の画面を覚え、切り替わりを待つ(#1)
+            sig_before_new = view_signature(s)
             muse.invoke(refs["new_chat"][0])
             steps.append("新しいサイドチャットを作った")
-            s, refs, ok = muse.poll(lambda x: check_new_chat_ready(x) is None, NEW_CHAT_TIMEOUT)
+            leftovers.append("作った空のサイドチャット")
+            s, refs, ok = muse.poll(
+                lambda x: check_new_chat_ready(x, sig_before_new) is None, NEW_CHAT_TIMEOUT)
             if not ok:
-                result["reason"] = check_new_chat_ready(s) or "新しいチャットの準備を確かめられない"
+                result["reason"] = (check_new_chat_ready(s, sig_before_new)
+                                    or "新しいチャットの準備を確かめられない") + note_suffix()
                 return 1, result
 
         title_before = s["chat_title"]
         reason = check_before_set(s)
         if reason:
-            result["reason"] = reason
+            result["reason"] = reason + note_suffix()
+            return 1, result
+
+        # SetValue の直前に、同じ要素を読み直して空を確かめる(#2)。
+        # scan から SetValue までの間に人が打ち始めたら上書きになるため。
+        if not is_blank(muse.read_value(refs["input"][0])):
+            result["reason"] = ("SetValue の直前に投稿欄が空でなくなった"
+                                "(入力中かもしれないので上書きしない)") + note_suffix()
             return 1, result
 
         muse.set_value(refs["input"][0], message)
+        wrote = True
         steps.append("投稿欄に書いた")
         s, refs, ok = muse.poll(lambda x: check_before_invoke(x, message) is None,
                                 SEND_APPEAR_TIMEOUT)
         if not ok:
-            result["reason"] = check_before_invoke(s, message) or "送信の準備を確かめられない"
+            result["reason"] = (check_before_invoke(s, message)
+                                or "送信の準備を確かめられない") + note_suffix()
             if _restore_input(muse, refs, message):
                 steps.append("送らずに投稿欄を空に戻した")
             return 1, result
 
-        muse.invoke(refs["send"][0])
+        # 送信 Invoke の直前にも、同じ要素を読み直して一致を確かめる(#2)
+        if not _same_text(muse.read_value(refs["input"][0]), message):
+            result["reason"] = ("送信の直前に投稿欄の中身が送るはずの文字列と"
+                                "一致しなくなった") + note_suffix()
+            if _restore_input(muse, refs, message):
+                steps.append("送らずに投稿欄を空に戻した")
+            return 1, result
+
+        send_attempted = True
+        try:
+            muse.invoke(refs["send"][0])
+        except Exception as e:  # noqa: BLE001  押せたかどうか自体が分からない
+            result["reason"] = (f"送信ボタンを押す際に例外: {type(e).__name__}: {e}"
+                                "(送れたか不明。二重投稿に注意)") + note_suffix()
+            return 1, result
         result["posted_at"] = now_iso()
         steps.append("送信を押した")
 
         s, refs, ok = muse.poll(lambda x: x["inputs"] == 1 and x["input_empty"] is True,
                                 CLEAR_TIMEOUT)
         if not ok:
-            result["reason"] = "送信を押したが投稿欄が空に戻らない(送れたか不明。二重投稿に注意)"
+            result["reason"] = ("送信を押したが投稿欄が空に戻らない"
+                                "(送れたか不明。二重投稿に注意)") + note_suffix()
             result["chat_title"] = s["chat_title"]
             return 1, result
 
@@ -632,14 +418,38 @@ def cmd_post(args, message):
         result["ok"] = True
         return 0, result
     except Exception as e:  # noqa: BLE001  ここまでに何を押したか(steps)を残して返す
-        result["reason"] = f"例外: {type(e).__name__}: {e}"
+        reason = f"例外: {type(e).__name__}: {e}"
+        if send_attempted:
+            reason += "(送信を押した後なので送れたか不明。二重投稿に注意)"
+        elif wrote:
+            # 書いたが送っていない。自分の文面だけを消して戻す(#5)
+            if _restore_input(muse, refs, message):
+                steps.append("例外のため送らずに投稿欄を空に戻した")
+            else:
+                steps.append("例外のため投稿欄を空に戻そうとしたが戻せなかった")
+                reason += "(投稿欄に書いた文字が残っているかもしれない)"
+        result["reason"] = reason + note_suffix()
         return 1, result
     finally:
         muse.close()
 
 
+def _git_timeout(start, total_timeout, first=False):
+    """この1回の git 呼び出しに使える秒数(#8)。
+
+    全体の残り時間と GIT_TIMEOUT の小さい方。残りが無いのに最初の1回だけは
+    GIT_TIMEOUT で試す(--timeout 0 でも1回は確かめる、従来の挙動)。"""
+    remaining = total_timeout - (time.time() - start)
+    if remaining <= 0:
+        return GIT_TIMEOUT if first else None
+    return min(GIT_TIMEOUT, remaining)
+
+
 def cmd_wait(args):
-    """ブランチが remote に現れるまで待つ。UIA は使わない(git だけ)。"""
+    """ブランチが remote に現れ、--path のファイルが載るまで待つ。UIA は使わない。
+
+    --path 無しでは完了を判定できない(ブランチは作業前に作られることがある)ので、
+    ブランチが現れただけなら ok:false / appeared:true で返す(#7)。"""
     if not os.path.isdir(args.repo):
         return 2, {"ok": False, "reason": f"リポジトリが無い: {args.repo}"}
     if args.interval <= 0 or args.timeout < 0:
@@ -648,50 +458,76 @@ def cmd_wait(args):
     env["GIT_TERMINAL_PROMPT"] = "0"  # 認証を対話で聞かれて固まらないように
     start = time.time()
     last_error = None
+
+    def timeout_result():
+        out = {"ok": False, "reason": "timeout",
+               "waited_sec": round(time.time() - start, 1), "branch": args.branch}
+        if last_error:
+            out["last_error"] = last_error
+        return 1, out
+
+    def run_git(argv, first=False):
+        """全体の制限時間を守って git を1回呼ぶ。時間が尽きていれば
+        TimeoutExpired を投げて、呼び出し側の timeout 処理に寄せる。"""
+        budget = _git_timeout(start, args.timeout, first=first)
+        if budget is None:
+            raise subprocess.TimeoutExpired(argv, 0)
+        return subprocess.run(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=budget, env=env)
+
+    first_call = True
     while True:
         try:
-            proc = subprocess.run(
-                ["git", "-C", args.repo, "ls-remote", "--heads", "origin", args.branch],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=GIT_TIMEOUT, env=env)
+            proc = run_git(["git", "-C", args.repo, "ls-remote", "--heads",
+                            "origin", args.branch], first=first_call)
+            first_call = False
             if proc.returncode == 0:
                 sha = parse_ls_remote(proc.stdout, args.branch)
                 last_error = None
-                # ブランチが現れただけでは終わっていない。Muse はブランチを main の先頭から
-                # 先に作り(承認1回目)、結果は後から push する(承認2回目)。2026-11-04 の
-                # 2回目の試運転で、ブランチ出現時は main と同じコミットで中身が空だった。
-                # --path があれば、そのファイルがブランチに載るまで待ち続ける。
+                if sha and not args.path:
+                    # ブランチが現れただけでは終わっていない。Muse はブランチを
+                    # 先に作り、結果は後から push する。完了は --path でしか言えない。
+                    return 1, {"ok": False, "appeared": True,
+                               "reason": "ブランチは現れたが完了は未確認"
+                                         "(--path を付けてください)",
+                               "appeared_after_sec": round(time.time() - start, 1),
+                               "sha": sha, "branch": args.branch}
                 if sha and args.path:
-                    fetched = subprocess.run(
+                    fetched = run_git(
                         ["git", "-C", args.repo, "fetch", "-q", "origin",
-                         f"+refs/heads/{args.branch}:refs/remotes/origin/{args.branch}"],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=GIT_TIMEOUT, env=env)
+                         f"+refs/heads/{args.branch}:refs/remotes/origin/{args.branch}"])
                     if fetched.returncode != 0:
                         last_error = (f"git fetch の終了コード {fetched.returncode}: "
                                       f"{redact(fetched.stderr)}")
                         sha = None
                     else:
-                        has = subprocess.run(
-                            ["git", "-C", args.repo, "cat-file", "-e",
-                             f"refs/remotes/origin/{args.branch}:{args.path}"],
-                            capture_output=True, timeout=GIT_TIMEOUT, env=env)
-                        if has.returncode != 0:
-                            sha = None  # ブランチはあるが結果ファイルがまだ
-                if sha:
-                    return 0, {"ok": True, "appeared_after_sec": round(time.time() - start, 1),
-                               "sha": sha, "branch": args.branch, "path": args.path}
+                        # 成功として返す sha は fetch 後の先端で取り直す(#9)。
+                        # ls-remote の sha と、その間に push された先端がずれうるため。
+                        head = run_git(["git", "-C", args.repo, "rev-parse",
+                                        f"refs/remotes/origin/{args.branch}"])
+                        fetched_sha = (head.stdout or "").strip()
+                        if head.returncode != 0 or not fetched_sha:
+                            last_error = (f"git rev-parse の終了コード "
+                                          f"{head.returncode}: {redact(head.stderr)}")
+                            sha = None
+                        else:
+                            has = run_git(["git", "-C", args.repo, "cat-file", "-e",
+                                           f"{fetched_sha}:{args.path}"])
+                            if has.returncode != 0:
+                                sha = None  # ブランチはあるが結果ファイルがまだ
+                            else:
+                                return 0, {"ok": True,
+                                           "appeared_after_sec": round(time.time() - start, 1),
+                                           "sha": fetched_sha, "branch": args.branch,
+                                           "path": args.path}
             else:
                 last_error = f"git の終了コード {proc.returncode}: {redact(proc.stderr)}"
         except subprocess.TimeoutExpired:
-            last_error = f"git が {GIT_TIMEOUT} 秒で返らない"
+            last_error = "git が制限時間内に返らない"
         elapsed = time.time() - start
         if elapsed >= args.timeout:
-            out = {"ok": False, "reason": "timeout", "waited_sec": round(elapsed, 1),
-                   "branch": args.branch}
-            if last_error:
-                out["last_error"] = last_error
-            return 1, out
+            return timeout_result()
         time.sleep(min(args.interval, max(0.0, args.timeout - elapsed)))
 
 
@@ -725,7 +561,7 @@ def build_parser():
     post.add_argument("--dry-run", action="store_true", help="UI を一切変えずに計画だけ返す")
     post.add_argument("--allow-multiline", action="store_true",
                       help="改行入りの投稿文を許す(送信の挙動は未検証)")
-    wait = sub.add_parser("wait", help="remote にブランチが現れるまで待つ")
+    wait = sub.add_parser("wait", help="remote にブランチと結果ファイルが現れるまで待つ")
     wait.add_argument("--repo", required=True)
     wait.add_argument("--branch", required=True)
     wait.add_argument("--timeout", type=float, default=3000)

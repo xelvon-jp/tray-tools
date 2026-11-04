@@ -17,7 +17,10 @@ MEASURE_TYPES = ("color", "ruler")
 
 LABEL_FONT_PX = 12
 LABEL_PADDING = 4
-LABEL_GAP = 10
+# 印と札の間を空け、引出線でつなぐ。札が画像の端で押し戻されたり、札同士が重なったり
+# しても、どの印の札かを線で辿れるようにする(◯と札の対応が分かりにくいという声から)。
+LABEL_GAP = 22
+LEADER_DOT_RADIUS = 2
 LABEL_BG = QColor(20, 20, 20, 225)
 LABEL_TEXT = QColor(255, 255, 255)
 SWATCH_PX = 12
@@ -82,8 +85,35 @@ def _label_font() -> QFont:
     return font
 
 
-def _draw_label(painter, anchor: QPointF, text: str, bounds: QRectF, swatch: QColor = None):
-    """anchor の右下に札を出す。画像の外へはみ出すときは反対側へ寄せる。"""
+def _leader_end(rect: QRectF, anchor: QPointF) -> QPointF:
+    """札の縁のうち anchor にいちばん近い点。引出線はここで札に届く。"""
+    return QPointF(min(max(anchor.x(), rect.left()), rect.right()),
+                   min(max(anchor.y(), rect.top()), rect.bottom()))
+
+
+def _draw_leader(painter, anchor: QPointF, rect: QRectF, start_offset: float):
+    """anchor(印の中心)から札までの引出線。印の輪の外側から引き始める。
+
+    地の色を選ばないよう、印と同じく黒の縁に白の芯を重ねる。札が印に重なって
+    しまう(画像が札より小さい)ときは線を引かない。"""
+    end = _leader_end(rect, anchor)
+    dx, dy = end.x() - anchor.x(), end.y() - anchor.y()
+    length = math.hypot(dx, dy)
+    if length <= start_offset + 1:
+        return
+    start = QPointF(anchor.x() + dx / length * start_offset,
+                    anchor.y() + dy / length * start_offset)
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QPen(QColor(0, 0, 0, 200), 3, Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(start, end)
+    painter.setPen(QPen(QColor(255, 255, 255), 1.2, Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(start, end)
+
+
+def _draw_label(painter, anchor: QPointF, text: str, bounds: QRectF, swatch: QColor = None,
+                leader_offset: float = 0.0):
+    """anchor の右下に札を出し、anchor から引出線を引く。画像の外へはみ出すときは
+    反対側へ寄せる。leader_offset は引出線を anchor からどれだけ離して始めるか(印の半径)。"""
     painter.setFont(_label_font())
     metrics = painter.fontMetrics()
     swatch_w = (SWATCH_PX + LABEL_PADDING) if swatch is not None else 0
@@ -101,6 +131,8 @@ def _draw_label(painter, anchor: QPointF, text: str, bounds: QRectF, swatch: QCo
         y = max(bounds.top(), y)
     rect = QRectF(x, y, width, height)
 
+    # 線を先に引き、札で線の端を覆う(札の角に線が刺さって見えないように)。
+    _draw_leader(painter, anchor, rect, leader_offset)
     painter.setPen(Qt.NoPen)
     painter.setBrush(LABEL_BG)
     painter.drawRoundedRect(rect, 4, 4)
@@ -125,7 +157,7 @@ def _draw_color(painter, action: dict):
     painter.setPen(QPen(QColor(255, 255, 255), 1.5))
     painter.drawEllipse(pos, MARKER_RADIUS, MARKER_RADIUS)
     _draw_label(painter, pos, color_text(action["color"]), action.get("bounds"),
-                swatch=action["color"])
+                swatch=action["color"], leader_offset=MARKER_RADIUS + 1)
 
 
 def _draw_ruler(painter, action: dict):
@@ -146,6 +178,10 @@ def _draw_ruler(painter, action: dict):
     painter.strokePath(path, QPen(RULER_COLOR, 1.5, Qt.SolidLine, Qt.RoundCap))
     middle = QPointF((start.x() + end.x()) / 2, (start.y() + end.y()) / 2)
     _draw_label(painter, middle, ruler_text(action["metrics"]), action.get("bounds"))
+    # 引出線の根元(線の中点)に小さな点を打ち、どの線の札かを示す。
+    painter.setPen(QPen(QColor(255, 255, 255), 1))
+    painter.setBrush(RULER_COLOR)
+    painter.drawEllipse(middle, LEADER_DOT_RADIUS + 0.5, LEADER_DOT_RADIUS + 0.5)
 
 
 def draw_measurement(painter, action: dict) -> None:

@@ -93,6 +93,12 @@ def test_pure_helpers():
     assert sticky_measure.color_text(QColor("#1e90ff")) == "#1E90FF  RGB(30,144,255)"
     assert sticky_measure.constrain_axis((10, 10), (50, 20)) == (50, 10)
     assert sticky_measure.constrain_axis((10, 10), (12, 40)) == (10, 40)
+    # 引出線は札の縁のうち印にいちばん近い点に届く(右下の札なら左上の角)
+    from PySide6.QtCore import QRectF
+    end = sticky_measure._leader_end(QRectF(30, 40, 100, 20), QPointF(10, 10))
+    assert (end.x(), end.y()) == (30, 40)
+    end = sticky_measure._leader_end(QRectF(30, 40, 100, 20), QPointF(50, 10))
+    assert (end.x(), end.y()) == (50, 40)
     # 画像の外は端の画素に留める
     px, py, _ = sticky_measure.snap_to_pixel(QPointF(-5, 999), DPR, W_PX, H_PX)
     assert (px, py) == (0, H_PX - 1)

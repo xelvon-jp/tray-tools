@@ -2012,7 +2012,9 @@ class ScreenFeature:
         _poll_claude_status から数秒ごとにここだけ呼ぶ(アイコンは触らない)。"""
         lines = [getattr(self, "_states_text", "Rapture")]
         entries = getattr(self, "_claude_entries", [])
-        if entries:
+        # 進捗パネルを出しているなら、Claude の中身はパネルに任せて重ねて出さない
+        # (本人の声: 内容が被る)。パネルを切っているときだけ、ここに出す。
+        if entries and not getattr(self, "_claude_progress_enabled", False):
             lines[0] = _join_state(lines[0], "Claude " + claude_status.LABELS.get(
                 entries[0].get("state"), ""))
             for entry in entries[:CLAUDE_TOOLTIP_SESSIONS]:
@@ -2084,6 +2086,7 @@ class ScreenFeature:
             self._claude_progress_enabled = bool(checked)
             claude_progress.save_state({"enabled": self._claude_progress_enabled})
             self._update_claude_progress()
+            self._update_tooltip()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
@@ -2101,10 +2104,12 @@ class ScreenFeature:
             self._claude_entries = claude_status.list_sessions()
             menu = self._claude_menu
             menu.clear()
-            if not self._claude_entries:
+            # 一覧は進捗パネルと被るので、パネルを切っているときだけ出す(ツールチップと同じ)。
+            listed = [] if self._claude_progress_enabled else self._claude_entries
+            if not self._claude_progress_enabled and not listed:
                 action = menu.addAction("（動いているセッションはありません）")
                 action.setEnabled(False)
-            for entry in self._claude_entries:
+            for entry in listed:
                 # 押すとそのセッションをアプリで開く。開けないもの(ターミナル)は押せなくする。
                 action = menu.addAction(
                     claude_status.menu_label(entry),
@@ -2116,9 +2121,12 @@ class ScreenFeature:
                     detail.setEnabled(False)
             if any(e.get("state") in (claude_status.DONE, claude_status.FAIL)
                    for e in self._claude_entries):
-                menu.addSeparator()
+                if listed:
+                    menu.addSeparator()
                 menu.addAction("完了した行を消す", self._clear_finished_claude)
-            menu.addSeparator()
+                menu.addSeparator()
+            elif listed:
+                menu.addSeparator()
             panel = menu.addAction("📊 進捗パネルを表示")
             panel.setCheckable(True)
             panel.setChecked(self._claude_progress_enabled)

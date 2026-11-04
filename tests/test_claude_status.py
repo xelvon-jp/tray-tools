@@ -393,6 +393,19 @@ def test_tray_tooltip_helpers():
     text = fs._fit_tooltip(long_lines)
     assert len(text) <= fs.TOOLTIP_MAX_CHARS and text.startswith("Rapture（Claude 実行中）")
     assert text.count("\n") == 2   # 収まらない行は後ろから落とす
+    # 進捗パネルを出しているときは、ツールチップに Claude の中身を重ねない
+    from types import SimpleNamespace
+    shown = []
+    stub = SimpleNamespace(
+        _states_text="Rapture", _disk_newer=False,
+        _claude_entries=[{"state": cs.RUNNING, "started": time.time(), "project": "x"}],
+        _claude_progress_enabled=True,
+        tray_icon=SimpleNamespace(setToolTip=shown.append))
+    fs.ScreenFeature._update_tooltip(stub)
+    assert shown[-1] == "Rapture"
+    stub._claude_progress_enabled = False
+    fs.ScreenFeature._update_tooltip(stub)
+    assert shown[-1].startswith("Rapture（Claude 実行中）\nx　")
 
 
 def main():

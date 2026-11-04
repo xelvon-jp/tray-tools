@@ -6924,6 +6924,12 @@ class FilerWindow(QWidget):
             text = f"写真の★: {self._photo_done_text(op, ok)}"
             if failed:
                 text += f"（失敗 {len(failed)}：{failed[0].error or '理由が分かりません'}）"
+            # 書けたはずなのに読み直すと違う(ExifTool が黙って捨てたタグなど)。表示は読み直した
+            # 実際の値になっているので、気づけるよう理由を添える
+            mismatched = [r for r in results if r.ok and getattr(r, "mismatch", None)]
+            if mismatched:
+                text += (f"（⚠ 読み直すと違う {len(mismatched)}枚："
+                         f"{Path(mismatched[0].path).name} {mismatched[0].mismatch}）")
             self.log(text)
         except Exception:  # noqa: BLE001
             self.log(f"エラー: {_log_exception('photoWritten')}")

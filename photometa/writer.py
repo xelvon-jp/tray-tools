@@ -132,6 +132,58 @@ class WriteResult:
     after: PhotoMeta | None = None    # 書いた後に読み直した値
     note: str | None = None        # 補足（「EXIF は書けず XMP だけ書いた」など）
     op: tuple = field(default=())  # ("rating", 3) / ("keyword", "みてね済", True)
+    # 書いたあと読み直した値が、書こうとした値と違ったときの説明（違わなければ None）。
+    # ok は True のまま（ファイルは書き換わっているので、取り消しも効くようにする）。
+    # ExifTool は知らないタグを -m のせいで警告だけで捨てるので、これが無いと
+    # 「書いたつもりで書けていない」に気づけない（色温度が一度も保存されていなかった。2026-11-04）
+    mismatch: str | None = None
+
+
+# 補正の項目の表示名（verify_written の説明に使う）と、読み直しで許すずれ
+_EDIT_FIELDS = (("angle", "傾き"), ("exposure", "明るさ"), ("contrast", "コントラスト"),
+                ("saturation", "彩度"), ("temperature", "色温度"), ("tint", "色合い"))
+_EDIT_TOLERANCE = 1e-3
+
+
+def verify_written(op: tuple, after) -> str | None:
+    """書いた後に読み直した値(after)が、op で書こうとした値と合っているか。
+
+    合っていれば None、違えばその説明。読み直せなかった(after が None)ときは確かめ
+    ようがないので None（読めない形式に書くことはあり得るので、それを失敗扱いにしない）。"""
+    if after is None or not op:
+        return None
+    kind = op[0]
+    if kind == "rating":
+        if after.rating != op[1]:
+            return f"★{op[1]} を書いたのに、読み直すと ★{after.rating} でした"
+    elif kind == "keyword":
+        keyword, on = op[1], op[2]
+        has = any(k.casefold() == keyword.casefold() for k in after.keywords)
+        if has != on:
+            state = "付いていません" if on else "外れていません"
+            return f"キーワード「{keyword}」が{state}"
+    elif kind == "description":
+        if (after.description or "").strip() != (op[1] or "").strip():
+            return "メモが書いた内容と違います"
+    elif kind == "edits":
+        want, got = op[1], after.edits
+        if want is None or want.is_empty():
+            if got is not None and not got.is_empty():
+                return "補正を消したのに残っています"
+            return None
+        if got is None:
+            return "補正が書かれていません"
+        names = []
+        if (want.crop is None) != (got.crop is None) or (
+                want.crop is not None and any(abs(a - b) > _EDIT_TOLERANCE
+                                              for a, b in zip(want.crop, got.crop))):
+            names.append("切り抜き")
+        for attr, label in _EDIT_FIELDS:
+            if abs(float(getattr(want, attr)) - float(getattr(got, attr))) > _EDIT_TOLERANCE:
+                names.append(label)
+        if names:
+            return f"補正の「{'・'.join(names)}」が書いた値と違います"
+    return None
 
 
 def _parse_output(out: str) -> tuple[bool, str | None]:
@@ -331,7 +383,8 @@ class ExifToolSession:
                 self._metacache.update(path, after)
             except Exception:  # noqa: BLE001  キャッシュを直せなくても書き込みは成功
                 pass
-        result = WriteResult(path, ok, err, before=before, after=after, note=note, op=op)
+        result = WriteResult(path, ok, err, before=before, after=after, note=note, op=op,
+                             mismatch=verify_written(op, after) if ok else None)
         if ok:
             self._journal(result)
         return result

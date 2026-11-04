@@ -1947,6 +1947,35 @@ def test_phone_share_renders_edits():
             server.stop()
 
 
+def test_writer_verify_written():
+    """書いた後の読み直しが、書こうとした値と違えば説明を返す（ExifTool 不要）。"""
+    from photometa import writer
+    from photometa.xmp import Edits, PhotoMeta
+
+    v = writer.verify_written
+    assert v(("rating", 4), PhotoMeta(rating=4)) is None
+    assert "★4" in v(("rating", 4), PhotoMeta(rating=0))
+    assert v(("keyword", "家族", True), PhotoMeta(keywords=("家族",))) is None
+    assert v(("keyword", "家族", True), PhotoMeta(keywords=("カゾク",))) is not None
+    assert v(("keyword", "Kazoku", False), PhotoMeta(keywords=("kazoku",))) is not None
+    assert v(("description", "メモ"), PhotoMeta(description="メモ")) is None
+    assert v(("description", "メモ"), PhotoMeta(description="")) is not None
+    want = Edits(crop=(0.1, 0.1, 0.9, 0.9), exposure=0.75, temperature=30, tint=-10)
+    assert v(("edits", want), PhotoMeta(edits=want)) is None
+    # 2026-11-04 の不具合の形: 色温度だけ黙って捨てられていた
+    got = Edits(crop=(0.1, 0.1, 0.9, 0.9), exposure=0.75, temperature=0, tint=-10)
+    message = v(("edits", want), PhotoMeta(edits=got))
+    assert message is not None and "色温度" in message and "色合い" not in message, message
+    # 書式のまるめ程度のずれは同じとみなす
+    near = Edits(crop=(0.1000004, 0.1, 0.9, 0.9), exposure=0.7500001, temperature=30, tint=-10)
+    assert v(("edits", want), PhotoMeta(edits=near)) is None
+    assert v(("edits", None), PhotoMeta(edits=None)) is None
+    assert v(("edits", None), PhotoMeta(edits=want)) is not None
+    assert v(("edits", want), PhotoMeta(edits=None)) is not None
+    # 読み直せなかったときは確かめようがないので、失敗扱いにしない
+    assert v(("rating", 4), None) is None
+
+
 def test_writer_edits_roundtrip():
     """ExifTool で補正を書いて読み直す（ExifTool が無ければ飛ばす）。"""
     from photometa import writer

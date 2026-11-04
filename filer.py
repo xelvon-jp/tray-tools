@@ -4235,9 +4235,12 @@ class FilerWindow(QWidget):
     def pull_updates(self, repo_dir):
         return filer_update.pull(repo_dir)
 
+    def find_update_zip(self):
+        """ダウンロードフォルダの tray-tools-main*.zip のうち一番新しいもの。"""
+        return filer_zipupdate.find_downloaded_zip()
+
     def zip_check(self, zip_path):
-        """ZIP 更新の確認(別スレッドから呼ぶ。テストでは差し替える)。
-        zip_path が None なら GitHub からダウンロードして調べる。"""
+        """ZIP 更新の確認(別スレッドから呼ぶ。テストでは差し替える)。"""
         return filer_zipupdate.check(self.repo_dir, zip_path)
 
     def zip_apply(self, prepared):
@@ -4293,8 +4296,8 @@ class FilerWindow(QWidget):
             self.log("更新: 確認の途中です")
             return
         if not filer_update.has_git(self.repo_dir):
-            # ZIP 展開の PC は GitHub の ZIP から更新する
-            self._start_zip_check(None)
+            # ZIP 展開の PC は、ダウンロードフォルダの ZIP から更新する
+            self._start_zip_update()
             return
         self._update_busy = True
         self.set_status_state("更新を確認中")
@@ -4323,7 +4326,7 @@ class FilerWindow(QWidget):
             self.set_status_state("Ready.")
             state = info.get("state")
             if state == "nogit":
-                self._start_zip_check(None)
+                self._start_zip_update()
                 return
             if state == "error":
                 self.log("更新: " + (info.get("message") or "失敗しました"))
@@ -4379,15 +4382,34 @@ class FilerWindow(QWidget):
             self.log(f"エラー: {_log_exception('updateChecked')}")
 
     # --- Shift+F5 の ZIP 更新(ZIP 展開の PC 向け) ---
+    def _start_zip_update(self) -> None:
+        """ダウンロードフォルダの tray-tools-main*.zip(最新のもの)から更新する。
+
+        取得は Edge で行う前提(職場のプロキシではあっふ自身はダウンロードできない)。
+        見つからなければ案内を出し、ファイル選択でも更新できるようにする。"""
+        found = self.find_update_zip()
+        if found is not None:
+            self._start_zip_check(found)
+            return
+        if self.confirm("あっふの更新",
+                        "ダウンロードフォルダに tray-tools-main*.zip が"
+                        "見つかりませんでした。\n"
+                        "Edge で GitHub からダウンロードしてから、"
+                        "もう一度 Shift+F5 してください。\n\n"
+                        "代わりに、ZIP ファイルを選んで更新しますか？",
+                        default_yes=True):
+            self._pick_zip_file()
+        elif self.confirm("あっふの更新", "再起動だけしますか？", default_yes=False):
+            self.restart_filer()
+
     def _start_zip_check(self, zip_path) -> None:
-        """ZIP を見て計画する。zip_path が None なら GitHub からダウンロード。"""
+        """ZIP を見て計画する。"""
         if self._update_busy:
             self.log("更新: 確認の途中です")
             return
         self._update_busy = True
         self.set_status_state("更新を確認中")
-        self.log("更新: GitHub から ZIP を取得して確かめています…"
-                 if zip_path is None else "更新: ZIP を確かめています…")
+        self.log("更新: ZIP を確かめています…")
         bridge = self.bridge
 
         def worker():
@@ -4395,7 +4417,7 @@ class FilerWindow(QWidget):
                 info = self.zip_check(zip_path)
             except Exception as e:  # noqa: BLE001
                 info = {"state": "error", "message": f"更新を確かめられません: {e}",
-                        "can_pick_file": zip_path is None, "zip_path": ""}
+                        "zip_path": str(zip_path)}
             try:
                 bridge.zip_checked.emit(info)
             except RuntimeError:
@@ -4410,9 +4432,9 @@ class FilerWindow(QWidget):
             state = info.get("state")
             if state == "error":
                 self.log("更新: " + (info.get("message") or "失敗しました"))
-                if info.get("can_pick_file") and self.confirm(
-                        "あっふの更新", (info.get("message") or "取得に失敗しました")
-                        + "\n\n代わりに、手元の ZIP ファイルを選んで更新しますか？",
+                if self.confirm(
+                        "あっふの更新", (info.get("message") or "ZIP を読めませんでした")
+                        + "\n\n別の ZIP ファイルを選んで更新しますか？",
                         default_yes=True):
                     self._pick_zip_file()
                 elif self.confirm("あっふの更新", "更新はできませんでした。\n"
@@ -4420,7 +4442,6 @@ class FilerWindow(QWidget):
                     self.restart_filer()
                 return
             if state == "uptodate":
-                filer_zipupdate.discard(info.get("zip_path"))
                 disk = filer_update.quick_version(self.repo_dir)
                 running = self.version or ""
                 if disk.get("label") and running \
@@ -4439,7 +4460,8 @@ class FilerWindow(QWidget):
                 return
             plan = info.get("plan") or {}
             current = filer_update.quick_version(self.repo_dir).get("label") or "?"
-            lines = [f"この PC は ZIP 展開です。GitHub の ZIP で更新します。",
+            zip_name = Path(info.get("zip_path") or "").name or "ZIP"
+            lines = [f"この PC は ZIP 展開です。{zip_name} で更新します。",
                      f"{current} → {info.get('label') or '新しい版'}",
                      f"追加 {len(plan.get('add') or [])}件"
                      f"・上書き {len(plan.get('overwrite') or [])}件"
@@ -4455,7 +4477,6 @@ class FilerWindow(QWidget):
             lines.append("\n更新して再起動しますか？")
             if not self.confirm("あっふの更新", "\n".join(lines), default_yes=True):
                 self.log("更新: 取りやめました")
-                filer_zipupdate.discard(info.get("zip_path"))
                 return
             self._update_busy = True
             self.set_status_state("更新中")
@@ -4489,7 +4510,6 @@ class FilerWindow(QWidget):
             self._update_busy = False
             self.set_status_state("Ready.")
             info, result = payload
-            filer_zipupdate.discard(info.get("zip_path"))
             if not result.get("ok"):
                 self.log("更新: " + (result.get("message") or "失敗しました"))
                 return

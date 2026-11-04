@@ -1,7 +1,9 @@
 # filer_zipupdate.py
 # ZIP 展開で入れた PC のための、GitHub の ZIP からの更新(Qt に依存しない部分)。
 #
-# 流れ: GitHub から main の ZIP をダウンロード(だめなら手元の ZIP ファイルでも可)
+# 流れ: ダウンロードフォルダの tray-tools-main*.zip のうち一番新しいものを拾う
+#   (職場のプロキシではあっふ自身はダウンロードできないので、取得は Edge で行い、
+#   あっふはフォルダを見るだけ。見つからなければファイルを選んでもらう)
 #   → 中身を検証 → 今のフォルダとの差分(追加・上書き・削除)を計画
 #   → 控えを取ってから適用 → 依存(requirements.txt)が変わっていれば pip install
 #   → 入れたファイルの一覧(manifest)を覚える。
@@ -15,19 +17,15 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
-import urllib.error
-import urllib.request
 import zipfile
 import zlib
 from datetime import datetime
 from pathlib import Path
 
-ARCHIVE_URL = "https://github.com/xelvon-jp/tray-tools/archive/refs/heads/main.zip"
+DOWNLOAD_GLOB = "tray-tools-main*.zip"   # Edge で落とした GitHub の ZIP の名前
 MARKERS = ("main.py", "filer.py", "requirements.txt")
 MANIFEST_NAME = "zip_install.json"
 BACKUP_DIR_NAME = "update_backup"
-DOWNLOAD_TIMEOUT = 30
 PIP_TIMEOUT = 600
 MAX_TOTAL_SIZE = 512 * 1024 * 1024     # 展開後の合計の上限(異常な ZIP を弾く)
 CREATE_NO_WINDOW = 0x08000000
@@ -38,34 +36,21 @@ class ZipUpdateError(Exception):
 
 
 # ---------------------------------------------------------------
-# ダウンロード
+# ダウンロードフォルダから探す
 # ---------------------------------------------------------------
-def _fetch_bytes(url, timeout):
-    request = urllib.request.Request(url, headers={"User-Agent": "tray-tools-affx"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+def find_downloaded_zip(downloads=None):
+    """ダウンロードフォルダの tray-tools-main*.zip のうち更新日時が一番新しいもの。
 
-
-def download_archive(url=ARCHIVE_URL, fetch=None, timeout=DOWNLOAD_TIMEOUT) -> Path:
-    """GitHub の ZIP を一時ファイルへ落とす。失敗は ZipUpdateError(理由つき)。"""
-    fetch = fetch or _fetch_bytes
+    Edge で何度か落とすと tray-tools-main (1).zip のような名前になるので、
+    名前ではなく更新日時で一番新しいものを選ぶ。無ければ None。"""
+    folder = Path(downloads) if downloads is not None else Path.home() / "Downloads"
     try:
-        data = fetch(url, timeout)
-    except urllib.error.HTTPError as e:
-        raise ZipUpdateError(f"ダウンロードに失敗しました（HTTP {e.code}）") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        reason = getattr(e, "reason", e)
-        raise ZipUpdateError(f"ダウンロードに失敗しました（{reason}）。"
-                             "ネットワークを確かめてください") from e
-    if not data:
-        raise ZipUpdateError("ダウンロードした ZIP が空でした")
-    handle, name = tempfile.mkstemp(prefix="affx_update_", suffix=".zip")
-    try:
-        with os.fdopen(handle, "wb") as f:
-            f.write(data)
-    except OSError as e:
-        raise ZipUpdateError(f"ダウンロードした ZIP を保存できません: {e}") from e
-    return Path(name)
+        candidates = [path for path in folder.glob(DOWNLOAD_GLOB) if path.is_file()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
 
 
 # ---------------------------------------------------------------
@@ -315,19 +300,15 @@ def _decode(data) -> str:
 # ---------------------------------------------------------------
 # 呼ぶ側(あっふ)の入口: 確認と適用
 # ---------------------------------------------------------------
-def check(repo_dir, zip_path=None, fetch=None, store_dir=None) -> dict:
-    """ダウンロード(または手元の ZIP)を見て、計画まで作る。
+def check(repo_dir, zip_path, store_dir=None) -> dict:
+    """ZIP を見て、計画まで作る。
 
-    {"state": "ready"|"uptodate"|"error", "message", "can_pick_file",
+    {"state": "ready"|"uptodate"|"error", "message",
      "zip_path", "archive", "plan", "label"}"""
-    downloaded = zip_path is None
     try:
-        if downloaded:
-            zip_path = download_archive(fetch=fetch)
         info = inspect_archive(zip_path)
     except ZipUpdateError as e:
-        return {"state": "error", "message": str(e), "can_pick_file": downloaded,
-                "zip_path": str(zip_path) if zip_path else ""}
+        return {"state": "error", "message": str(e), "zip_path": str(zip_path)}
     manifest = load_manifest(store_dir)
     plan = plan_update(info, repo_dir, manifest["files"])
     return {"state": "uptodate" if plan_is_empty(plan) else "ready",
@@ -351,13 +332,3 @@ def apply(prepared: dict, repo_dir, store_dir=None, run=None) -> dict:
         pip = pip_install_requirements(Path(repo_dir) / "requirements.txt", run=run)
     return {"ok": True, **result, "pip": pip,
             "files": plan["add"] + plan["overwrite"] + plan["delete"]}
-
-
-def discard(zip_path) -> None:
-    """ダウンロードした一時 ZIP の後片付け(失敗しても何も言わない)。"""
-    if not zip_path:
-        return
-    try:
-        Path(zip_path).unlink(missing_ok=True)
-    except OSError:
-        pass

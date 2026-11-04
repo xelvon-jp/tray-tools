@@ -2486,19 +2486,19 @@ def test_zip_update_logic():
         assert backup.read("photometa/__init__.py") == b""
         assert zu.check(repo, v2, store_dir=store)["state"] == "uptodate"
 
-        # ダウンロード経路: fetch を差し替えれば check(repo, None) で完結する
-        data = Path(v2).read_bytes()
-        prepared = zu.check(repo, None, fetch=lambda url, timeout: data, store_dir=store)
-        assert prepared["state"] == "uptodate"
-        zu.discard(prepared["zip_path"])
-
-        import urllib.error
-
-        def broken_fetch(url, timeout):
-            raise urllib.error.URLError("no route")
-
-        failed = zu.check(repo, None, fetch=broken_fetch, store_dir=store)
-        assert failed["state"] == "error" and failed["can_pick_file"]
+        # ダウンロードフォルダから探す: 名前ではなく更新日時が一番新しいもの
+        downloads = Path(tmp, "Downloads")
+        downloads.mkdir()
+        assert zu.find_downloaded_zip(downloads) is None
+        older = downloads / "tray-tools-main.zip"
+        older.write_bytes(b"x")
+        os.utime(older, (1_700_000_000, 1_700_000_000))
+        newer = downloads / "tray-tools-main (1).zip"
+        newer.write_bytes(b"y")
+        os.utime(newer, (1_800_000_000, 1_800_000_000))
+        (downloads / "tray-tools-main.txt").write_bytes(b"z")
+        (downloads / "other.zip").write_bytes(b"z")
+        assert zu.find_downloaded_zip(downloads) == newer
 
         # pip が失敗しても適用自体は成功として返り、pip の失敗が載る
         v3 = make_zip(Path(tmp, "v3.zip"), {
@@ -7172,16 +7172,22 @@ def test_window_update_restart():
             w.check_updates = lambda repo_dir: 1 / 0
             press()
             assert order == [] and "更新を確かめられません" in w.log_view.toPlainText()
-            # ZIP 展開(.git 無し) → ZIP 更新の確認へ。取得に失敗したらファイル選択を
-            # 案内し、再起動だけの案内も断れば何もしない
+            # ZIP 展開(.git 無し) → ダウンロードフォルダの ZIP で更新する。
+            # 見つからなければ案内(ファイル選択→再起動だけ、両方断れば何もしない)
             w.repo_dir = Path(tmp, "zip")
             w.repo_dir.mkdir()
-            w.zip_check = lambda zip_path: {"state": "error", "can_pick_file": True,
-                                            "zip_path": "",
-                                            "message": "ダウンロードに失敗しました"}
+            w.find_update_zip = lambda: None
+            answers[:] = [False, False]
+            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            assert "見つかりませんでした" in asked[-2] and "再起動だけ" in asked[-1], asked
+            assert order == []
+            # ZIP が読めない場合も、別のファイルを選ぶ案内→再起動だけ、で何もしない
+            w.find_update_zip = lambda: Path(tmp, "update.zip")
+            w.zip_check = lambda zip_path: {"state": "error", "zip_path": str(zip_path),
+                                            "message": "tray-tools の ZIP ではありません"}
             answers[:] = [False, False]
             press()
-            assert "ZIP ファイルを選んで" in asked[-2] and "再起動だけ" in asked[-1], asked
+            assert "別の ZIP ファイルを選んで" in asked[-2] and "再起動だけ" in asked[-1], asked
             assert order == []
             # ZIP に差分あり → 件数を見せて OK → 適用 → 再起動
             w.zip_check = lambda zip_path: {

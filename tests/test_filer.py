@@ -2401,6 +2401,116 @@ def test_ask_overwrite_defaults():
     assert decision == filer.OVERWRITE
 
 
+def test_zip_update_logic():
+    """ZIP 更新: 検証・計画(manifest 方式の削除)・控え・適用・pip の要否。"""
+    import filer_zipupdate as zu
+
+    def make_zip(path, files, top="tray-tools-main", when=(2026, 11, 4, 10, 0, 0)):
+        with zipfile.ZipFile(path, "w") as zf:
+            for rel, data in files.items():
+                zf.writestr(zipfile.ZipInfo(f"{top}/{rel}", date_time=when), data)
+        return path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp, "repo")
+        repo.mkdir()
+        store = Path(tmp, "store")
+        (repo / "settings.json").write_text("mine", encoding="utf-8")
+        (repo / "my_tool.py").write_text("user file", encoding="utf-8")
+        (repo / "filer.py").write_text("old filer", encoding="utf-8")
+
+        v1 = make_zip(Path(tmp, "v1.zip"), {
+            "main.py": "main", "filer.py": "filer v1",
+            "requirements.txt": "req1", "photometa/__init__.py": ""})
+        info = zu.inspect_archive(v1)
+        assert info["label"] == "ZIP 20261104" and info["top"] == "tray-tools-main"
+        assert set(info["entries"]) == {"main.py", "filer.py", "requirements.txt",
+                                        "photometa/__init__.py"}
+        # 検証: 目印が無い ZIP / 外へ出るエントリ / 最上位が2つ は弾く
+        for bad_files in ({"main.py": "x", "requirements.txt": "y"},
+                          {"../evil.py": "x", "main.py": "m", "filer.py": "f",
+                           "requirements.txt": "r"}):
+            bad = make_zip(Path(tmp, "bad.zip"), bad_files)
+            try:
+                zu.inspect_archive(bad)
+                raise AssertionError("弾くはず")
+            except zu.ZipUpdateError:
+                pass
+        two_tops = Path(tmp, "two.zip")
+        with zipfile.ZipFile(two_tops, "w") as zf:
+            zf.writestr("a/main.py", "x")
+            zf.writestr("b/filer.py", "y")
+        try:
+            zu.inspect_archive(two_tops)
+            raise AssertionError("弾くはず")
+        except zu.ZipUpdateError:
+            pass
+
+        # 初回: manifest が無いので削除なし。requirements は追加なので pip 対象
+        prepared = zu.check(repo, v1, store_dir=store)
+        assert prepared["state"] == "ready" and not prepared["manifest_present"]
+        plan = prepared["plan"]
+        assert plan["add"] == ["main.py", "photometa/__init__.py", "requirements.txt"]
+        assert plan["overwrite"] == ["filer.py"] and plan["delete"] == []
+        assert plan["requirements_changed"]
+        pip_calls = []
+        result = zu.apply(prepared, repo, store_dir=store,
+                          run=lambda args, timeout: (pip_calls.append(args), (0, "", ""))[1])
+        assert result["ok"] and len(pip_calls) == 1
+        assert (repo / "filer.py").read_text(encoding="utf-8") == "filer v1"
+        assert (repo / "settings.json").read_text(encoding="utf-8") == "mine"
+        assert (repo / "my_tool.py").read_text(encoding="utf-8") == "user file"
+        # 上書きされた filer.py の控えが取れている
+        assert result["backup"] and zipfile.ZipFile(result["backup"]).read(
+            "filer.py") == b"old filer"
+        assert zu.load_manifest(store)["files"] == sorted(info["entries"])
+        # 同じ ZIP では最新
+        assert zu.check(repo, v1, store_dir=store)["state"] == "uptodate"
+
+        # v2: filer.py 変更・newmod.py 追加・photometa/__init__.py 削除(上流で消えた)
+        v2 = make_zip(Path(tmp, "v2.zip"), {
+            "main.py": "main", "filer.py": "filer v2",
+            "requirements.txt": "req1", "newmod.py": "new"})
+        prepared = zu.check(repo, v2, store_dir=store)
+        plan = prepared["plan"]
+        assert plan["add"] == ["newmod.py"] and plan["overwrite"] == ["filer.py"]
+        assert plan["delete"] == ["photometa/__init__.py"]
+        assert not plan["requirements_changed"]
+        result = zu.apply(prepared, repo, store_dir=store,
+                          run=lambda args, timeout: (pip_calls.append(args), (0, "", ""))[1])
+        assert result["ok"] and len(pip_calls) == 1     # pip は増えない
+        assert not (repo / "photometa").exists()        # 空になったフォルダも消える
+        assert (repo / "newmod.py").read_text(encoding="utf-8") == "new"
+        backup = zipfile.ZipFile(result["backup"])
+        assert backup.read("filer.py") == b"filer v1"
+        assert backup.read("photometa/__init__.py") == b""
+        assert zu.check(repo, v2, store_dir=store)["state"] == "uptodate"
+
+        # ダウンロード経路: fetch を差し替えれば check(repo, None) で完結する
+        data = Path(v2).read_bytes()
+        prepared = zu.check(repo, None, fetch=lambda url, timeout: data, store_dir=store)
+        assert prepared["state"] == "uptodate"
+        zu.discard(prepared["zip_path"])
+
+        import urllib.error
+
+        def broken_fetch(url, timeout):
+            raise urllib.error.URLError("no route")
+
+        failed = zu.check(repo, None, fetch=broken_fetch, store_dir=store)
+        assert failed["state"] == "error" and failed["can_pick_file"]
+
+        # pip が失敗しても適用自体は成功として返り、pip の失敗が載る
+        v3 = make_zip(Path(tmp, "v3.zip"), {
+            "main.py": "main", "filer.py": "filer v2",
+            "requirements.txt": "req2", "newmod.py": "new"})
+        prepared = zu.check(repo, v3, store_dir=store)
+        assert prepared["plan"]["requirements_changed"]
+        result = zu.apply(prepared, repo, store_dir=store,
+                          run=lambda args, timeout: (1, "", "boom"))
+        assert result["ok"] and result["pip"]["ok"] is False
+
+
 def test_collapsed_pane_is_never_active():
     """境界を端まで寄せて畳んだ窓はアクティブにしない(2026-10-29 本人と相談)。
 
@@ -7062,22 +7172,50 @@ def test_window_update_restart():
             w.check_updates = lambda repo_dir: 1 / 0
             press()
             assert order == [] and "更新を確かめられません" in w.log_view.toPlainText()
-            # ZIP 展開(.git 無し) → 自動更新できない旨。断れば何もしない
+            # ZIP 展開(.git 無し) → ZIP 更新の確認へ。取得に失敗したらファイル選択を
+            # 案内し、再起動だけの案内も断れば何もしない
             w.repo_dir = Path(tmp, "zip")
             w.repo_dir.mkdir()
-            answers[:] = [False]
-            QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
-            assert "ZIP 展開" in asked[-1] and order == []
+            w.zip_check = lambda zip_path: {"state": "error", "can_pick_file": True,
+                                            "zip_path": "",
+                                            "message": "ダウンロードに失敗しました"}
+            answers[:] = [False, False]
+            press()
+            assert "ZIP ファイルを選んで" in asked[-2] and "再起動だけ" in asked[-1], asked
+            assert order == []
+            # ZIP に差分あり → 件数を見せて OK → 適用 → 再起動
+            w.zip_check = lambda zip_path: {
+                "state": "ready", "zip_path": "", "label": "ZIP 20261104",
+                "archive": {"entries": {"new.py": {}}, "label": "ZIP 20261104"},
+                "plan": {"add": ["new.py"], "overwrite": [], "delete": [],
+                         "unchanged": 3, "requirements_changed": False},
+                "manifest_present": True}
+            applied = []
+            w.zip_apply = lambda prepared: (applied.append(prepared), {
+                "ok": True, "added": 1, "overwritten": 0, "deleted": 0,
+                "backup": "", "pip": None, "files": ["new.py"]})[1]
+            answers[:] = [True]
+            press()
+            _wait_until(lambda: len(order) >= 4)
+            assert applied and "ZIP 20261104" in asked[-1] and "追加 1件" in asked[-1], asked
+            assert order == ["save", "release", "spawn", "exit"], order
+            assert "ZIP で更新しました" in w.log_view.toPlainText()
+            w._restarting = False
+            # 以後のケース(転送の残り・起こす失敗)は「最新」の応答で進める
+            order.clear()
+            w.zip_check = lambda zip_path: {"state": "uptodate", "zip_path": ""}
             # 転送が残っていれば確かめる(断れば再起動しない)
             w._op_queue = [object()]
             answers[:] = [True, False]
             QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
-            assert "ファイル転送が残っています" in asked[-1] and order == [], order
+            _wait_until(lambda: asked and "ファイル転送が残っています" in asked[-1])
+            assert order == [], order
             w._op_queue = []
             # 起こせなければ取り戻して残る
             w.spawn_successor = lambda: (order.append("spawn"), (_ for _ in ()).throw(OSError("x")))
             answers[:] = [True]
             QTest.keyClick(w.active.view, Qt.Key_F5, Qt.ShiftModifier)
+            _wait_until(lambda: "reacquire" in order)
             assert order == ["save", "release", "spawn", "reacquire"], order
             assert not w._restarting
         finally:

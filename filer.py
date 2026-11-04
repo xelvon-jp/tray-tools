@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -87,6 +88,7 @@ import filer_phone
 import filer_rating_bar
 import filer_shell
 import filer_update
+import filer_zipupdate
 import settings as settings_module
 from photometa import config as photo_config
 from photometa import filter_expr as photo_filter
@@ -716,6 +718,9 @@ class ListBridge(QObject):
     # Shift+F5 の更新: fetch して調べた結果 / pull の結果。
     update_checked = Signal(object)
     update_pulled = Signal(object)
+    # Shift+F5 の ZIP 更新: ZIP を見て計画した結果 / 適用した結果。
+    zip_checked = Signal(object)
+    zip_applied = Signal(object)
     # 版の連番(git log)が数え終わったとき。filer_update.git_version の結果 or None。
     version_ready = Signal(object)
     # 写真の★が読めたとき (side, 世代, [(photo_key, PhotoMeta or None)])。
@@ -2709,6 +2714,8 @@ class FilerWindow(QWidget):
         self.bridge.folder_watch.connect(self._on_folder_watch)
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.update_pulled.connect(self._on_update_pulled)
+        self.bridge.zip_checked.connect(self._on_zip_checked)
+        self.bridge.zip_applied.connect(self._on_zip_applied)
         self.bridge.version_ready.connect(self._on_version_ready)
         self.bridge.photo_meta.connect(self._on_photo_meta)
         self.bridge.photo_written.connect(self._on_photo_written)
@@ -4228,6 +4235,15 @@ class FilerWindow(QWidget):
     def pull_updates(self, repo_dir):
         return filer_update.pull(repo_dir)
 
+    def zip_check(self, zip_path):
+        """ZIP 更新の確認(別スレッドから呼ぶ。テストでは差し替える)。
+        zip_path が None なら GitHub からダウンロードして調べる。"""
+        return filer_zipupdate.check(self.repo_dir, zip_path)
+
+    def zip_apply(self, prepared):
+        """ZIP 更新の適用(別スレッドから呼ぶ。テストでは差し替える)。"""
+        return filer_zipupdate.apply(prepared, self.repo_dir)
+
     def disk_version(self, repo_dir):
         """ディスク上の版({"label", "sha"})。起動時の self.version_info と比べる。"""
         return filer_update.version_info(repo_dir)
@@ -4277,9 +4293,8 @@ class FilerWindow(QWidget):
             self.log("更新: 確認の途中です")
             return
         if not filer_update.has_git(self.repo_dir):
-            if self.confirm("あっふの更新", "この PC は ZIP 展開なので自動更新できません。\n"
-                            "再起動だけしますか？", default_yes=False):
-                self.restart_filer()
+            # ZIP 展開の PC は GitHub の ZIP から更新する
+            self._start_zip_check(None)
             return
         self._update_busy = True
         self.set_status_state("更新を確認中")
@@ -4308,9 +4323,7 @@ class FilerWindow(QWidget):
             self.set_status_state("Ready.")
             state = info.get("state")
             if state == "nogit":
-                if self.confirm("あっふの更新", "この PC は ZIP 展開なので自動更新できません。\n"
-                                "再起動だけしますか？", default_yes=False):
-                    self.restart_filer()
+                self._start_zip_check(None)
                 return
             if state == "error":
                 self.log("更新: " + (info.get("message") or "失敗しました"))
@@ -4364,6 +4377,141 @@ class FilerWindow(QWidget):
             threading.Thread(target=worker, daemon=True, name="filer-update-pull").start()
         except Exception:  # noqa: BLE001  スロットの中の例外で落とさない
             self.log(f"エラー: {_log_exception('updateChecked')}")
+
+    # --- Shift+F5 の ZIP 更新(ZIP 展開の PC 向け) ---
+    def _start_zip_check(self, zip_path) -> None:
+        """ZIP を見て計画する。zip_path が None なら GitHub からダウンロード。"""
+        if self._update_busy:
+            self.log("更新: 確認の途中です")
+            return
+        self._update_busy = True
+        self.set_status_state("更新を確認中")
+        self.log("更新: GitHub から ZIP を取得して確かめています…"
+                 if zip_path is None else "更新: ZIP を確かめています…")
+        bridge = self.bridge
+
+        def worker():
+            try:
+                info = self.zip_check(zip_path)
+            except Exception as e:  # noqa: BLE001
+                info = {"state": "error", "message": f"更新を確かめられません: {e}",
+                        "can_pick_file": zip_path is None, "zip_path": ""}
+            try:
+                bridge.zip_checked.emit(info)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="filer-zip-check").start()
+
+    def _on_zip_checked(self, info) -> None:
+        try:
+            self._update_busy = False
+            self.set_status_state("Ready.")
+            state = info.get("state")
+            if state == "error":
+                self.log("更新: " + (info.get("message") or "失敗しました"))
+                if info.get("can_pick_file") and self.confirm(
+                        "あっふの更新", (info.get("message") or "取得に失敗しました")
+                        + "\n\n代わりに、手元の ZIP ファイルを選んで更新しますか？",
+                        default_yes=True):
+                    self._pick_zip_file()
+                elif self.confirm("あっふの更新", "更新はできませんでした。\n"
+                                  "再起動だけしますか？", default_yes=False):
+                    self.restart_filer()
+                return
+            if state == "uptodate":
+                filer_zipupdate.discard(info.get("zip_path"))
+                disk = filer_update.quick_version(self.repo_dir)
+                running = self.version or ""
+                if disk.get("label") and running \
+                        and not filer_update.same_version(disk, {"label": running}):
+                    self.log(f"更新: ファイルは {disk['label']}、動いているのは {running}")
+                    if self.confirm("あっふの更新",
+                                    f"このPCのファイルは最新版（{disk['label']}）になっていますが、\n"
+                                    f"いま動いているのは前の版（{running}）です。\n\n"
+                                    "再起動して最新版にしますか？", default_yes=True):
+                        self.restart_filer()
+                    return
+                self.log("更新: 最新です")
+                if self.confirm("あっふの更新", "最新です。再起動だけしますか？",
+                                default_yes=False):
+                    self.restart_filer()
+                return
+            plan = info.get("plan") or {}
+            current = filer_update.quick_version(self.repo_dir).get("label") or "?"
+            lines = [f"この PC は ZIP 展開です。GitHub の ZIP で更新します。",
+                     f"{current} → {info.get('label') or '新しい版'}",
+                     f"追加 {len(plan.get('add') or [])}件"
+                     f"・上書き {len(plan.get('overwrite') or [])}件"
+                     f"・削除 {len(plan.get('delete') or [])}件"]
+            deleted = plan.get("delete") or []
+            if deleted:
+                lines.append("削除: " + "、".join(deleted[:5])
+                             + ("…" if len(deleted) > 5 else ""))
+            if not info.get("manifest_present"):
+                lines.append("（初回なので、削除はしません）")
+            if plan.get("requirements_changed"):
+                lines.append("依存パッケージも更新します（pip install）")
+            lines.append("\n更新して再起動しますか？")
+            if not self.confirm("あっふの更新", "\n".join(lines), default_yes=True):
+                self.log("更新: 取りやめました")
+                filer_zipupdate.discard(info.get("zip_path"))
+                return
+            self._update_busy = True
+            self.set_status_state("更新中")
+            bridge = self.bridge
+
+            def worker():
+                try:
+                    result = self.zip_apply(info)
+                except Exception as e:  # noqa: BLE001
+                    result = {"ok": False, "message": f"更新に失敗: {e}"}
+                try:
+                    bridge.zip_applied.emit((info, result))
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True, name="filer-zip-apply").start()
+        except Exception:  # noqa: BLE001  スロットの中の例外で落とさない
+            self.log(f"エラー: {_log_exception('zipChecked')}")
+
+    def _pick_zip_file(self) -> None:
+        start = Path.home() / "Downloads"
+        if not start.is_dir():
+            start = Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, "更新に使う ZIP ファイル",
+                                              str(start), "ZIP ファイル (*.zip)")
+        if path:
+            self._start_zip_check(path)
+
+    def _on_zip_applied(self, payload) -> None:
+        try:
+            self._update_busy = False
+            self.set_status_state("Ready.")
+            info, result = payload
+            filer_zipupdate.discard(info.get("zip_path"))
+            if not result.get("ok"):
+                self.log("更新: " + (result.get("message") or "失敗しました"))
+                return
+            self.log(f"更新: ZIP で更新しました（追加 {result.get('added', 0)}件"
+                     f"・上書き {result.get('overwritten', 0)}件"
+                     f"・削除 {result.get('deleted', 0)}件）")
+            if result.get("backup"):
+                self.log(f"更新: 上書き・削除したファイルの控え: {result['backup']}")
+            pip = result.get("pip")
+            if pip:
+                if pip.get("ok"):
+                    self.log("更新: 依存パッケージを更新しました")
+                else:
+                    self.log("更新: 依存パッケージの更新に失敗しました"
+                             f"（{pip.get('message')}）。"
+                             "python setup.py を実行してください")
+            if filer_update.resident_files(result.get("files")):
+                self.log("常駐側も更新されました。トレイの 🔄 で再起動してください")
+            if not self.restart_filer():
+                self.log("更新は取り込みました。あとで Shift+F5 か閉じて開き直すと反映されます")
+        except Exception:  # noqa: BLE001
+            self.log(f"エラー: {_log_exception('zipApplied')}")
 
     def _on_update_pulled(self, payload) -> None:
         try:

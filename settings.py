@@ -423,6 +423,22 @@ DEFAULT_SETTINGS = {
         "monitor": "",
         "fps": 60,
     },
+    # フォルダ監視移動(folder_watch.py)。特定フォルダを定期的に見て、入ってきた
+    # ファイルを別のフォルダへ移動する。トレイの「📥 フォルダ監視移動」から使う。
+    #   rules … [{"source": 元フォルダ, "dest": 先フォルダ,
+    #             "interval_seconds": 動作間隔(秒。最小5),
+    #             "exclude_extensions": 除外する拡張子(点なし・小文字),
+    #             "exclude_patterns": 除外する名前パターン(ワイルドカード),
+    #             "enabled": 有効か}] の並び。ダイアログから編集するのが本線で、
+    #             手で書いてもよい(壊れた値は folder_watch.normalize_* が既定へ落とす)
+    #   exclude_extensions の初期値(crdownload 等)はダウンロード中のファイルを
+    #     対象外にするためのもの。ルールにキーが無いときだけ folder_watch 側が
+    #     補うので、空リストにすれば「拡張子では除外しない」になる。
+    # このほか、サイズと更新時刻が前回のチェックから変わっていないファイルだけを
+    # 移動する(書き込み途中のファイルを掴まないための安定判定。folder_watch.py 冒頭)。
+    "folder_watch": {
+        "rules": [],
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",

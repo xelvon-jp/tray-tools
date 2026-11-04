@@ -31,6 +31,7 @@ import claude_progress
 import claude_status
 import filer_launch
 import filer_update
+import folder_watch
 import launcher
 import mouse_jiggler
 import presenter_overlay
@@ -428,6 +429,16 @@ class ScreenFeature:
         self._claude_timer.timeout.connect(self._poll_claude_status)
         self._claude_timer.start(CLAUDE_STATUS_INTERVAL_MS)
 
+        # フォルダ監視移動(folder_watch.py)。ルールごとに QTimer を1本持つ。
+        # FolderWatcher(安定判定のための前回署名)は「元→先」の鍵で使い回す:
+        # 間隔や除外条件を編集したときに作り直すと「初見」の記録が消えて、
+        # 移動が1周期ぶん遅れるだけだが、編集のたびに起きるのは避けたい。
+        # タイマーの組み立てはメニューが出来てから _rebuild_folder_watch で行う。
+        self._folder_watch_timers = []
+        self._folder_watchers = {}
+        self._folder_watch_warned = set()
+        self._folder_watch_dialog = None
+
         hotkey_config = app_settings.get("hotkeys", {})
         screen_settings = app_settings.get("screen", {})
         self._awake_choices = screen_settings.get("keep_awake_minutes", [30, 120])
@@ -583,6 +594,18 @@ class ScreenFeature:
         self._slideshow_screen_actions = []
         self._slideshow_dialog = None
         self._slideshow_menu.aboutToShow.connect(self._refresh_slideshow_menu)
+
+        # フォルダ監視移動(folder_watch.py)。常駐のタイマーで特定フォルダを見て、
+        # 入ってきたファイルを別のフォルダへ移す。アイコンは増やさず、状態は
+        # メニューの見出し(有効ルール数)と status で示す。
+        self._folder_watch_menu = self.menu.addMenu("📥 フォルダ監視移動")
+        self._folder_watch_menu.addAction("▶ 今すぐチェック", self.check_folder_watch_now)
+        self._folder_watch_rules_menu = self._folder_watch_menu.addMenu("📋 ルール（有効／無効）")
+        self._folder_watch_rule_actions = []
+        self._folder_watch_menu.addSeparator()
+        self._folder_watch_menu.addAction(
+            "⚙ ルールの追加・編集…", self.open_folder_watch_settings)
+        self._folder_watch_menu.aboutToShow.connect(self._refresh_folder_watch_menu)
 
         # Copilot まわりのメニュー。中身は性質の違う2つで、区切り線で分けてある。
         #   上: 状態監視バー   … 見るだけ。Copilot の手番を画面に出す
@@ -791,6 +814,9 @@ class ScreenFeature:
         # (GDI 関数の解決とモニタ列挙)を払うと、押してから撮れるまでが目に見えて
         # 遅れる。待機役を起こすのと同じだけ遅らせて、起動直後の混雑を避ける。
         QTimer.singleShot(PREWARM_STARTUP_DELAY_MS, capture_grab.prewarm_sct)
+
+        # フォルダ監視移動のタイマーを組み立てる(enabled なルールだけ自動で始まる)。
+        self._rebuild_folder_watch()
 
     def hotkeys(self) -> dict:
         return {
@@ -1219,6 +1245,149 @@ class ScreenFeature:
         except Exception as e:
             # ホットキーからも呼ばれる。投げ切ると常駐ごと落ちるので必ず受ける。
             self._notify("あっふ", f"起動できませんでした\n{e}")
+
+    # ---------------------------------------------------------------
+    # フォルダ監視移動(folder_watch.py)
+    # ---------------------------------------------------------------
+    def _folder_watch_rules(self) -> list:
+        """いまの設定のルール(正規化済み)。壊れた値は folder_watch 側が落とす。"""
+        return folder_watch.normalize_config(
+            self.app_settings.get(folder_watch.SECTION))["rules"]
+
+    def _rebuild_folder_watch(self) -> None:
+        """設定からタイマーを組み直す。起動時と、設定が書かれたあとに呼ぶ。
+
+        無効なルール(元=先など)はタイマーを作らず、理由を1回だけ知らせる
+        (組み直しのたびに鳴ると、設定を開くたびにトーストが出るため)。"""
+        try:
+            for timer in self._folder_watch_timers:
+                timer.stop()
+            self._folder_watch_timers = []
+            for rule in self._folder_watch_rules():
+                if not rule["enabled"]:
+                    continue
+                problem = folder_watch.validate_rule(rule)
+                key = folder_watch.folder_key(rule["source"]) + "->" + folder_watch.folder_key(rule["dest"])
+                if problem:
+                    if key not in self._folder_watch_warned:
+                        self._folder_watch_warned.add(key)
+                        self._notify("フォルダ監視移動",
+                                     f"ルールを止めています\n{rule['source']}\n{problem}")
+                    continue
+                self._folder_watch_warned.discard(key)
+                watcher = self._folder_watchers.get(key)
+                if watcher is None:
+                    watcher = self._folder_watchers[key] = folder_watch.FolderWatcher(rule)
+                else:
+                    watcher.rule = rule
+                timer = QTimer()
+                timer.timeout.connect(lambda k=key: self._run_folder_watch(k))
+                timer.start(rule["interval_seconds"] * 1000)
+                self._folder_watch_timers.append(timer)
+        except Exception:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動の組み立て")
+
+    def _run_folder_watch(self, key: str, source: str = "timer") -> None:
+        """1ルールぶんスキャンする。移動したら記録と、まとめて1枚の通知。
+
+        PySide6 はスロット内で例外を投げ切るとプロセスごと終わる。ここは常駐中
+        ずっと回り続ける場所なので、必ず受けて常駐を続ける(ジグラーの tick と同じ)。"""
+        try:
+            watcher = self._folder_watchers.get(key)
+            if watcher is None:
+                return
+            result = watcher.scan_once()
+            if result["error"]:
+                if key not in self._folder_watch_warned:
+                    self._folder_watch_warned.add(key)
+                    self._notify("フォルダ監視移動", result["error"])
+                return
+            self._folder_watch_warned.discard(key)
+            for src, dst in result["moved"]:
+                action_log.record("フォルダ監視移動", f"{src} → {dst}", source)
+            if result["moved"]:
+                self._notify("フォルダ監視移動", f"{len(result['moved'])}件移動しました")
+        except Exception:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動のスキャン")
+
+    def check_folder_watch_now(self) -> None:
+        """全ルールをいますぐ1回スキャンする(安定判定はそのまま効く)。"""
+        try:
+            for rule in self._folder_watch_rules():
+                if not rule["enabled"]:
+                    continue
+                key = (folder_watch.folder_key(rule["source"]) + "->"
+                       + folder_watch.folder_key(rule["dest"]))
+                if key not in self._folder_watchers:
+                    self._folder_watchers[key] = folder_watch.FolderWatcher(rule)
+                self._run_folder_watch(key, source="menu")
+        except Exception:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動の手動チェック")
+
+    def folder_watch_status(self) -> str:
+        try:
+            rules = self._folder_watch_rules()
+            enabled = sum(1 for rule in rules if rule["enabled"])
+            return f"フォルダ監視移動: ルール{len(rules)}件（有効{enabled}件）"
+        except Exception:  # noqa: BLE001
+            return "フォルダ監視移動: 不明"
+
+    def _refresh_folder_watch_menu(self) -> None:
+        """開く直前にルールの有効／無効の一覧を作り直す。"""
+        try:
+            rules = self._folder_watch_rules()
+            enabled = sum(1 for rule in rules if rule["enabled"])
+            self._folder_watch_menu.setTitle(
+                "📥 フォルダ監視移動" if not enabled
+                else f"📥 フォルダ監視移動（{enabled}件有効）")
+            menu = self._folder_watch_rules_menu
+            menu.clear()
+            self._folder_watch_rule_actions = []
+            if not rules:
+                action = menu.addAction("（ルールがありません）")
+                action.setEnabled(False)
+                self._folder_watch_rule_actions.append(action)
+            for index, rule in enumerate(rules):
+                action = menu.addAction(
+                    f"{rule['source']} → {rule['dest']}（{rule['interval_seconds']}秒）")
+                action.setCheckable(True)
+                action.setChecked(rule["enabled"])
+                action.triggered.connect(
+                    lambda checked, i=index: self._set_folder_watch_enabled(i, checked))
+                self._folder_watch_rule_actions.append(action)
+        except Exception:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動のメニューの更新")
+
+    def _set_folder_watch_enabled(self, index: int, enabled: bool) -> None:
+        """ルールの有効／無効を settings.json へ書いて、タイマーを組み直す。"""
+        try:
+            rules = self._folder_watch_rules()
+            if not 0 <= index < len(rules):
+                return
+            rules[index]["enabled"] = bool(enabled)
+            folder_watch.save_config(
+                self.settings_path, {"rules": rules}, self.app_settings)
+            self._rebuild_folder_watch()
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動の有効／無効の切り替え")
+            self._notify("フォルダ監視移動", f"切り替えを保存できませんでした\n{e}")
+
+    def open_folder_watch_settings(self) -> None:
+        """ルールの追加・編集ダイアログ。開いていれば前に出すだけ。"""
+        try:
+            dialog = self._folder_watch_dialog
+            if dialog is not None and dialog.isVisible():
+                dialog.raise_()
+                dialog.activateWindow()
+                return
+            import folder_watch_settings
+            dialog = folder_watch_settings.open_dialog(
+                self.app_settings, self.settings_path)
+            dialog.accepted.connect(self._rebuild_folder_watch)
+            self._folder_watch_dialog = dialog
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("フォルダ監視移動の設定を開くの")
+            self._notify("フォルダ監視移動", f"設定を開けませんでした\n{e}")
 
     # ---------------------------------------------------------------
     # Teams の一人会議(teams_meeting.py。UIA の実処理は子プロセス)
@@ -1831,6 +2000,7 @@ class ScreenFeature:
             self.jiggler_status(),
             self.claude_status_text(),
             self.version_status(),
+            self.folder_watch_status(),
         ])
 
     def claude_status_text(self) -> str:
@@ -2594,6 +2764,9 @@ class ScreenFeature:
         # 止め忘れると、終了処理の途中でタイマーが回って入力を送りに行く。
         self._jiggle_timer.stop()
         self._jiggle_expire_timer.stop()
+        # フォルダ監視移動のタイマーも止める(終了処理の途中でファイルを動かさない)。
+        for timer in self._folder_watch_timers:
+            timer.stop()
         self.topmost.release_all()
         # 枠なし・最前面の窓を残したままイベントループを畳むと、画面に貼り付いたまま
         # 消えないことがある。タイマーもここで止まる(hideEvent 参照)。

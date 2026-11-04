@@ -2375,6 +2375,32 @@ def test_window_archive():
         w2.deleteLater()
 
 
+def test_ask_overwrite_defaults():
+    """展開の上書き確認: 既定ボタンは「上書き」、「残りも同じ」は最初から ON。"""
+    import filer
+    from PySide6.QtWidgets import QMessageBox
+
+    _qapp()
+    seen = {}
+    original_exec = QMessageBox.exec
+
+    def fake_exec(box):
+        check = box.checkBox()
+        seen["checked"] = check.isChecked() if check is not None else None
+        seen["default"] = box.defaultButton().text()
+        box.defaultButton().click()
+        return box.result()
+
+    QMessageBox.exec = fake_exec
+    try:
+        decision, same = filer.FilerWindow.ask_overwrite(None, "a.txt", 3)
+    finally:
+        QMessageBox.exec = original_exec
+    assert seen["default"].startswith("上書き"), seen
+    assert seen["checked"] is True and same is True
+    assert decision == filer.OVERWRITE
+
+
 def test_collapsed_pane_is_never_active():
     """境界を端まで寄せて畳んだ窓はアクティブにしない(2026-10-29 本人と相談)。
 

@@ -6555,11 +6555,13 @@ class FilerWindow(QWidget):
         overwrite = box.addButton("上書き(&O)", QMessageBox.AcceptRole)
         skip = box.addButton("スキップ(&S)", QMessageBox.RejectRole)
         cancel = box.addButton("取消", QMessageBox.DestructiveRole)
-        box.setDefaultButton(skip)
+        # 既定は上書き(展開では全部上書きしたい場面がほとんど。2026-11-04 Nagato)
+        box.setDefaultButton(overwrite)
         box.setEscapeButton(cancel)
         check = None
         if remaining > 0:
             check = QCheckBox(f"残り {remaining}件にも同じ扱いをする")
+            check.setChecked(True)   # 既定で残りにも同じ扱い(毎回付ける手間を無くす)
             box.setCheckBox(check)
         box.exec()
         clicked = box.clickedButton()

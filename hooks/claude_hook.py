@@ -350,6 +350,11 @@ def update_status(config: dict, event: dict, state=None, **fields) -> None:
         if event.get("cwd"):
             data["cwd"] = event["cwd"]
             data["project"] = claude_status.project_name(event["cwd"])
+        # デスクトップアプリのセッションなら、アプリ側の ID(local_…)が環境変数で来る。
+        # トレイからそのセッションへ飛ぶ(claude://code/continue?session=…)のに使う。
+        host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+        if claude_status.valid_host_session(host):
+            data["host_session_id"] = host
         if state is not None:
             data["state"] = state
         data.update(fields)

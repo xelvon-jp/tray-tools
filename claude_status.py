@@ -67,12 +67,57 @@ def write(session_id, data: dict, directory=None) -> bool:
         return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        # 一時ファイル名にプロセス番号を入れる。PostToolUse は async で並んで走ることが
+        # あり、同じ名前だと互いの書きかけを置き換え合う。
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
         return True
     except OSError:
         return False
+
+
+# デスクトップアプリのセッション ID。アプリ本体の受け口(claude://code/continue)が
+# 受け付ける形(local_ に英数字とハイフン)と同じ条件で確かめる。外から来る値なので、
+# この形でなければリンクに混ぜない。
+_HOST_SESSION = re.compile(r"^local_[A-Za-z0-9-]{1,64}$")
+
+
+def valid_host_session(value) -> bool:
+    return bool(_HOST_SESSION.match(str(value or "")))
+
+
+def jump_url(entry: dict) -> str:
+    """そのセッションをデスクトップアプリで開くリンク。アプリのセッションでなければ空。"""
+    host = (entry or {}).get("host_session_id") or ""
+    if not valid_host_session(host):
+        return ""
+    return f"claude://code/continue?session={host}"
+
+
+def open_in_app(entry: dict) -> bool:
+    """デスクトップアプリでそのセッションを開く。開けなければ False。"""
+    url = jump_url(entry)
+    if not url:
+        return False
+    try:
+        os.startfile(url)
+        return True
+    except OSError:
+        return False
+
+
+def plan_fraction(plan):
+    """バーの長さ(0〜1)。計画が無ければ None(長さを出せない＝流れる帯にする)。
+
+    進行中の手順は半分済んだものとして数える(3/6 の最中なら 2.5/6)。始めたばかりで
+    0 のまま止まって見えるのを避けるため。"""
+    plan = [t for t in (plan or []) if isinstance(t, dict)]
+    if not plan:
+        return None
+    done = sum(1 for t in plan if t.get("status") == "completed")
+    doing = sum(1 for t in plan if t.get("status") == "in_progress")
+    return min(1.0, (done + 0.5 * doing) / len(plan))
 
 
 # 同じフォルダで複数のセッションを開くと名前だけでは見分けられないので、

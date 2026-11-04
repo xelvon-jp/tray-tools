@@ -27,6 +27,7 @@ import bg_remove_launch
 import capture_process
 import color_picker
 import explorer_nav
+import claude_progress
 import claude_status
 import filer_launch
 import filer_update
@@ -419,6 +420,10 @@ class ScreenFeature:
         # (フックから常駐へ知らせる口は増やさない。CLAUDE.md「外から叩ける口」)。
         self._claude_entries = []
         self._claude_icons = {}
+        # 処理中のセッションを並べる進捗パネル(claude_progress)。出すときに作る。
+        self._claude_progress = None
+        self._claude_progress_enabled = bool(
+            claude_progress.load_state().get("enabled", True))
         self._claude_timer = QTimer()
         self._claude_timer.timeout.connect(self._poll_claude_status)
         self._claude_timer.start(CLAUDE_STATUS_INTERVAL_MS)
@@ -2040,7 +2045,46 @@ class ScreenFeature:
                 self._refresh_state()
             elif self._claude_entries or had_any:
                 self._update_tooltip()
+            self._update_claude_progress()
         except Exception:  # noqa: BLE001  表示が出ないだけ
+            traceback.print_exc()
+
+    def _update_claude_progress(self):
+        if not self._claude_progress_enabled:
+            if self._claude_progress is not None:
+                self._claude_progress.set_entries([])
+            return
+        if self._claude_progress is None:
+            if not self._claude_entries:
+                return   # 出すものが無いうちは窓を作らない
+            self._claude_progress = claude_progress.ClaudeProgressPanel(
+                on_open=self._open_claude_session)
+        self._claude_progress.set_entries(self._claude_entries)
+
+    def _open_claude_session(self, entry):
+        """そのセッションをデスクトップアプリで開く(メニューとパネルの行から)。"""
+        try:
+            if not claude_status.open_in_app(entry):
+                show_toast("Claude\nこのセッションはアプリで開けません"
+                           "（ターミナルの Claude Code か、記録が古い）")
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _toggle_claude_progress(self, checked):
+        try:
+            self._claude_progress_enabled = bool(checked)
+            claude_progress.save_state({"enabled": self._claude_progress_enabled})
+            self._update_claude_progress()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _reset_claude_progress_position(self):
+        try:
+            if self._claude_progress is not None:
+                self._claude_progress.reset_position()
+            else:
+                claude_progress.save_state({"pos": None})
+        except Exception:  # noqa: BLE001
             traceback.print_exc()
 
     def _rebuild_claude_menu(self):
@@ -2052,7 +2096,11 @@ class ScreenFeature:
                 action = menu.addAction("（動いているセッションはありません）")
                 action.setEnabled(False)
             for entry in self._claude_entries:
-                menu.addAction(claude_status.menu_label(entry))
+                # 押すとそのセッションをアプリで開く。開けないもの(ターミナル)は押せなくする。
+                action = menu.addAction(
+                    claude_status.menu_label(entry),
+                    lambda _checked=False, e=entry: self._open_claude_session(e))
+                action.setEnabled(bool(claude_status.jump_url(entry)))
                 plan = claude_status.plan_text(entry.get("plan"))
                 if plan and entry.get("state") in (claude_status.RUNNING, claude_status.ASK):
                     detail = menu.addAction("　　" + _clip(plan, 40))
@@ -2061,6 +2109,13 @@ class ScreenFeature:
                    for e in self._claude_entries):
                 menu.addSeparator()
                 menu.addAction("完了した行を消す", self._clear_finished_claude)
+            menu.addSeparator()
+            panel = menu.addAction("📊 進捗パネルを表示")
+            panel.setCheckable(True)
+            panel.setChecked(self._claude_progress_enabled)
+            # addAction(文字, 関数) だと checked が渡らないので triggered で受ける。
+            panel.triggered.connect(self._toggle_claude_progress)
+            menu.addAction("↘ パネルの位置を右下に戻す", self._reset_claude_progress_position)
             self._refresh_state()
         except Exception:  # noqa: BLE001
             traceback.print_exc()

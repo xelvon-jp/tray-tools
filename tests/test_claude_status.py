@@ -152,6 +152,100 @@ def test_resident_change_ignores_hooks_and_tests():
         assert u.changed_files("", "b" * 40, tmp, run=run) is None
 
 
+def test_jump_url_and_fraction():
+    assert cs.jump_url({"host_session_id": "local_271781ac-b747-46d1-9974-448b994962c3"}) == \
+        "claude://code/continue?session=local_271781ac-b747-46d1-9974-448b994962c3"
+    for bad in ("", "local_", "local_a&b=1", "session_x", "local_" + "a" * 65, None):
+        assert cs.jump_url({"host_session_id": bad}) == "", bad
+    assert cs.open_in_app({}) is False
+    assert cs.plan_fraction([]) is None
+    plan = [{"status": "completed"}, {"status": "in_progress"}, {"status": "pending"},
+            {"status": "pending"}]
+    assert cs.plan_fraction(plan) == 1.5 / 4
+
+
+def test_hook_records_host_session():
+    import claude_hook as hook
+    hook.send = lambda command, args: True
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.STATUS_DIR = Path(tmp, "status")
+        hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")
+        old = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+        try:
+            os.environ["CLAUDE_CODE_HOST_SESSION_ID"] = "local_abc-123"
+            hook.on_start(dict(hook.DEFAULTS), {"session_id": "h1", "cwd": "R:/x"})
+            assert cs.read("h1")["host_session_id"] == "local_abc-123"
+            os.environ["CLAUDE_CODE_HOST_SESSION_ID"] = "../../evil"
+            hook.on_start(dict(hook.DEFAULTS), {"session_id": "h2", "cwd": "R:/x"})
+            assert "host_session_id" not in cs.read("h2")
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_CODE_HOST_SESSION_ID"] = old
+
+
+def test_progress_panel_rows_and_grab():
+    import claude_progress as cp
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    now = time.time()
+    seen = {}
+    running = {"session_id": "a", "state": cs.RUNNING, "started": now - 252, "project": "tray-tools",
+               "title": "メニューの項目押したとき", "host_session_id": "local_a",
+               "plan": [{"content": "読む", "status": "completed"},
+                        {"content": "書く", "status": "completed"},
+                        {"content": "テストと実常駐で確認", "status": "in_progress"},
+                        {"content": "x", "status": "pending"}, {"content": "y", "status": "pending"},
+                        {"content": "z", "status": "pending"}]}
+    asking = {"session_id": "b", "state": cs.ASK, "asked": now - 120, "project": "obsidian",
+              "title": "週報まとめて", "plan": [{"content": "ノートを読む", "status": "in_progress"},
+                                               {"content": "b", "status": "pending"}]}
+    noplan = {"session_id": "c", "state": cs.RUNNING, "started": now - 38, "project": "claude",
+              "title": "入れるだけ試して", "plan": []}
+    done = {"session_id": "d", "state": cs.DONE, "started": now - 90, "ended": now - 1,
+            "project": "beads"}
+    rows = cp.rows_to_show([asking, running, noplan, done], now, seen)
+    assert [r["session_id"] for r in rows] == ["b", "a", "c", "d"]
+    # 終わったものは、最初に見てから LINGER_SECONDS 経つと消える
+    assert [r["session_id"] for r in cp.rows_to_show([done], now + cp.LINGER_SECONDS + 1, seen)] == []
+    with tempfile.TemporaryDirectory() as tmp:
+        opened = []
+        panel = cp.ClaudeProgressPanel(on_open=opened.append, state_path=Path(tmp, "s.json"))
+        panel.set_entries([asking, running, noplan])
+        assert panel.isVisible() and panel.height() == cp.PAD_Y * 2 + cp.ROW_HEIGHT * 3
+        # 行のクリックで、その行のセッションを開く
+        point = QPointF(panel._row_rect(1).center())
+        panel.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, point, point, Qt_left(),
+                                          Qt_left(), no_mod()))
+        assert opened and opened[0]["session_id"] == "a"
+        out = os.environ.get("PROGRESS_GRAB_DIR")
+        if out:
+            Path(out).mkdir(parents=True, exist_ok=True)
+            panel.grab().save(str(Path(out) / "progress_panel.png"))
+        # 処理中が無くなればパネルごと隠す
+        panel.set_entries([])
+        assert not panel.isVisible()
+        # 位置の保存は該当キーだけ差し替える
+        cp.save_state({"enabled": False}, Path(tmp, "s.json"))
+        cp.save_state({"pos": [10, 20]}, Path(tmp, "s.json"))
+        assert cp.load_state(Path(tmp, "s.json")) == {"enabled": False, "pos": [10, 20]}
+        panel.close()
+
+
+def Qt_left():
+    from PySide6.QtCore import Qt
+    return Qt.LeftButton
+
+
+def no_mod():
+    from PySide6.QtCore import Qt
+    return Qt.NoModifier
+
+
 def test_hook_reads_utf8_stdin():
     """フックの標準入力は UTF-8。Windows の既定(cp932)で解くと日本語が化ける。"""
     import subprocess

@@ -107,15 +107,19 @@ def edits_tags(edits) -> list[str]:
     if edits is None:
         tags += [f"-XMP-crs:{name}=" for name in
                  ("Exposure2012", "Contrast2012", "Saturation",
-                  "Temperature", "TemperatureUnit", "Tint")]
+                  "IncrementalTemperature", "IncrementalTint")]
     else:
         tags += [f"-XMP-crs:Exposure2012={_num(edits.exposure)}",
                  f"-XMP-crs:Contrast2012={_num(edits.contrast)}",
                  f"-XMP-crs:Saturation={_num(edits.saturation)}",
-                 # 色温度は相対値の形（TemperatureUnit=1）で書く
-                 "-XMP-crs:TemperatureUnit=1",
-                 f"-XMP-crs:Temperature={_num(edits.temperature)}",
-                 f"-XMP-crs:Tint={_num(edits.tint)}"]
+                 # 色温度・色合いは相対値の形（Lightroom が JPEG などに使うもの）で書く。
+                 # 以前の "Temperature"/"TemperatureUnit" は ExifTool に無い名前で、
+                 # -m のせいで警告だけで捨てられていた（2026-11-04）
+                 f"-XMP-crs:IncrementalTemperature={_num(edits.temperature)}",
+                 f"-XMP-crs:IncrementalTint={_num(edits.tint)}"]
+    # 以前の版が色合いを書いていた crs:Tint は、読み取りの予備になるので消しておく
+    # （残すと、補正を消した・0 にしたあとも古い色合いが読まれる）
+    tags.append("-XMP-crs:Tint=")
     return tags
 
 

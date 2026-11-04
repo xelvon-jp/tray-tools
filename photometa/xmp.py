@@ -55,8 +55,8 @@ class Edits:
     bottom/right は下端・右端の位置）。傾き angle は度（crs:CropAngle）、
     exposure は EV（crs:Exposure2012）、contrast / saturation は -100〜100
     （crs:Contrast2012 / crs:Saturation）。temperature（色温度）と tint（色合い）は
-    色被りの補正で -100〜100（crs:Temperature（相対値。TemperatureUnit=1）/
-    crs:Tint）。"""
+    色被りの補正で -100〜100（crs:IncrementalTemperature / crs:IncrementalTint。
+    Lightroom が JPEG など非 RAW の相対値に使う形）。"""
     crop: tuple[float, float, float, float] | None = None
     angle: float = 0.0
     exposure: float = 0.0
@@ -226,18 +226,21 @@ def _parse_edits(root) -> Edits | None:
         parts = [num(k) for k in ("CropTop", "CropLeft", "CropBottom", "CropRight")]
         if all(v is not None for v in parts):
             crop = tuple(max(0.0, min(1.0, v)) for v in parts)
-    # 色温度は相対値（TemperatureUnit=1。JPEG など非 RAW で Lightroom が使う形）の
-    # ときだけ読む。絶対値（ケルビン）のものは基準が分からないので読み替えない
-    temperature = 0.0
-    if (values.get("TemperatureUnit", "").strip() == "1"):
-        temperature = num("Temperature") or 0.0
+    # 色温度・色合いは相対値の crs:IncrementalTemperature / crs:IncrementalTint を読む。
+    # crs:Temperature は絶対値（ケルビン）で基準が分からないので読み替えない。
+    # 2026-11-04 までの版は色合いを crs:Tint に書いていたので、Incremental が無ければそれを読む
+    # （同じ版は色温度を存在しないタグに書いていて、ExifTool に捨てられていた）
+    temperature = num("IncrementalTemperature") or 0.0
+    tint = num("IncrementalTint")
+    if tint is None:
+        tint = num("Tint")
     edits = Edits(crop=crop,
                   angle=num("CropAngle") or 0.0,
                   exposure=num("Exposure2012") or 0.0,
                   contrast=num("Contrast2012") or 0.0,
                   saturation=num("Saturation") or 0.0,
                   temperature=temperature,
-                  tint=num("Tint") or 0.0)
+                  tint=tint or 0.0)
     return None if edits.is_empty() else edits
 
 

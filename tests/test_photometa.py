@@ -1685,6 +1685,38 @@ def test_edits_parse_and_cache():
                          b'<rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta>')
     assert plain.edits is None
 
+    def crs_elements(body: str) -> bytes:
+        return ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+                'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                '<rdf:Description rdf:about="" '
+                'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">'
+                + body + "</rdf:Description></rdf:RDF></x:xmpmeta>").encode("utf-8")
+
+    # 色温度・色合いは相対値の Incremental* を読む
+    got = px.parse_xmp(crs_elements(
+        "<crs:IncrementalTemperature>30</crs:IncrementalTemperature>"
+        "<crs:IncrementalTint>-10</crs:IncrementalTint>")).edits
+    assert got.temperature == 30 and got.tint == -10, got
+    # 旧版が書いた crs:Tint も読める（Incremental があればそちらが勝つ）
+    assert px.parse_xmp(crs_elements("<crs:Tint>-7</crs:Tint>")).edits.tint == -7
+    assert px.parse_xmp(crs_elements(
+        "<crs:Tint>-7</crs:Tint><crs:IncrementalTint>4</crs:IncrementalTint>")).edits.tint == 4
+    # 絶対値（ケルビン）の crs:Temperature は読み替えない
+    # （それしか無ければ補正なし扱い）
+    assert px.parse_xmp(crs_elements(
+        "<crs:Exposure2012>0.5</crs:Exposure2012><crs:Temperature>5000</crs:Temperature>")
+    ).edits.temperature == 0
+    assert px.parse_xmp(crs_elements("<crs:Temperature>5000</crs:Temperature>")).edits is None
+
+    # 書く引数は ExifTool にある名前だけ（以前は存在しない TemperatureUnit・書けない
+    # Temperature を渡していて、-m のせいで警告だけで黙って捨てられていた）
+    from photometa import writer
+    tags = writer.edits_tags(px.Edits(temperature=30, tint=-10))
+    assert "-XMP-crs:IncrementalTemperature=30" in tags
+    assert "-XMP-crs:IncrementalTint=-10" in tags
+    assert not any(t.startswith(("-XMP-crs:Temperature", "-XMP-crs:TemperatureUnit"))
+                   for t in tags + writer.edits_tags(None)), tags
+
     with tempfile.TemporaryDirectory() as tmp:
         src = _exif_jpeg(Path(tmp, "a.jpg"), size=(400, 300),
                          packet=_crs_packet(crop=(0.0, 0.0, 0.5, 0.5), exposure=1.0))

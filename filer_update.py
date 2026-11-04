@@ -292,11 +292,26 @@ def resident_files(files) -> list:
         base = path.rsplit("/", 1)[-1]
         if not path.endswith(".py"):
             continue
+        # hooks/ は Claude Code が毎回新しく起こすスクリプトで、常駐は読み込まない。
         if base.startswith("filer") or path.startswith(("filer_menus/", "tests/", "tools/",
-                                                        "docs/", ".github/")):
+                                                        "docs/", ".github/", "hooks/")):
             continue
         result.append(path)
     return result
+
+
+def changed_files(old_sha: str, new_sha: str, repo_dir=REPO_DIR, run=None):
+    """2つのコミットの間で変わったファイル。調べられなければ None(呼ぶ側は「変わった」扱い)。"""
+    if not old_sha or not new_sha or not has_git(repo_dir):
+        return None
+    run = run or (lambda args, timeout: run_git(args, repo_dir, timeout))
+    try:
+        code, out, _err = run(["diff", "--name-only", old_sha, new_sha], VERSION_TIMEOUT)
+    except Exception:  # noqa: BLE001  git が無い・時間切れ
+        return None
+    if code != 0:
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def _strip_status(answer: str) -> str:

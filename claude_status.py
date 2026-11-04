@@ -75,6 +75,30 @@ def write(session_id, data: dict, directory=None) -> bool:
         return False
 
 
+# 同じフォルダで複数のセッションを開くと名前だけでは見分けられないので、
+# 最後に送ったメッセージの書き出しを添える(「claude「私の方でなにか…」」)。
+TITLE_CHARS = 10
+MENU_TITLE_CHARS = 24
+_TAG = re.compile(r"<[^>]*>")
+_SPACE = re.compile(r"\s+")
+
+
+def prompt_title(prompt) -> str:
+    """送ったメッセージから、見分けるための短い書き出しを作る。タグ(貼り付けの囲みなど)は除く。"""
+    text = _SPACE.sub(" ", _TAG.sub(" ", str(prompt or ""))).strip()
+    return text
+
+
+def display_name(entry: dict, limit: int = TITLE_CHARS) -> str:
+    name = entry.get("project") or "Claude Code"
+    title = str(entry.get("title") or "").strip()
+    if not title:
+        return name
+    if len(title) > limit:
+        title = title[: max(1, limit - 1)] + "…"
+    return f"{name}「{title}」"
+
+
 def project_name(cwd) -> str:
     cwd = str(cwd or "").strip().rstrip("\\/")
     return Path(cwd).name if cwd else "Claude Code"
@@ -183,7 +207,7 @@ def format_duration(seconds) -> str:
 def describe(entry: dict, now=None) -> list:
     """ツールチップ用の行。[1行目(プロジェクトと状態の詳細), 2行目(計画、あれば)]。"""
     now = time.time() if now is None else now
-    name = entry.get("project") or "Claude Code"
+    name = display_name(entry)
     state = entry.get("state")
     if state == RUNNING:
         head = f"{name}　{format_duration(now - (entry.get('started') or now))}"
@@ -206,7 +230,7 @@ def menu_label(entry: dict, now=None) -> str:
     """メニューの1行。「確認待ち　tray-tools　2分」。"""
     now = time.time() if now is None else now
     state = entry.get("state")
-    name = entry.get("project") or "Claude Code"
+    name = display_name(entry, MENU_TITLE_CHARS)
     if state in (DONE, FAIL):
         tail = time.strftime("%H:%M", time.localtime(entry.get("ended") or now))
     elif state == ASK:

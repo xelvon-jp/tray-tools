@@ -362,8 +362,13 @@ def update_status(config: dict, event: dict, state=None, **fields) -> None:
 def on_start(config: dict, event: dict) -> None:
     mark_start(event)
     # 新しいターン。前のターンの計画・完了時刻は持ち越さない(計画は最初のツール呼び出しで来る)。
-    update_status(config, event, claude_status.RUNNING, started=time.time(),
-                  ended=None, asked=None, plan=[])
+    # 送ったメッセージの書き出しを名前に添える(同じフォルダのセッションを見分けるため)。
+    # 書き出しは手元の %TEMP% に置くだけで、どこへも送らない。
+    fields = {"started": time.time(), "ended": None, "asked": None, "plan": []}
+    title = claude_status.prompt_title(event.get("prompt"))[:80]
+    if title:
+        fields["title"] = title
+    update_status(config, event, claude_status.RUNNING, **fields)
     claude_status.sweep()
 
 

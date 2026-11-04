@@ -2073,11 +2073,31 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
+    def _resident_files_changed(self, disk: dict) -> bool:
+        """起動時から今のコミットまでに、常駐が読むファイルが変わったか。
+
+        ハッシュが違っても、変わったのがフック・テスト・あっふだけなら再起動は要らない
+        (あっふの「常駐も再起動しますか？」と同じ resident_files で判定する)。git で
+        調べられない(ZIP 展開・git が無い)ときは「変わった」に倒す。結果はコミットごとに
+        覚えておき、同じコミットで git を何度も叩かない。"""
+        old_sha = (self._boot_version or {}).get("sha") or ""
+        new_sha = (disk or {}).get("sha") or ""
+        cache = getattr(self, "_resident_change_cache", None)
+        if cache and cache[0] == new_sha:
+            return cache[1]
+        files = filer_update.changed_files(old_sha, new_sha)
+        changed = True if files is None else bool(filer_update.resident_files(files))
+        self._resident_change_cache = (new_sha, changed)
+        return changed
+
     def _check_disk_version(self):
         """ディスクの版が起動時より新しければ、ツールチップと 🔄 の項目に出す。
         メニューの aboutToShow とタイマーから呼ばれるスロットなので、例外は受け止める。"""
         try:
-            newer = filer_update.disk_is_newer(self._boot_version, _read_disk_version())
+            disk = _read_disk_version()
+            newer = filer_update.disk_is_newer(self._boot_version, disk)
+            if newer:
+                newer = self._resident_files_changed(disk)
             self._restart_action.setText(
                 f"🔄 再起動（{DISK_NEWER_TEXT}）" if newer else "🔄 再起動")
             if newer != self._disk_newer:

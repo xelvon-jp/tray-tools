@@ -123,6 +123,35 @@ def test_hook_writes_status_through_a_turn():
         assert cs.read("s-1")["state"] == cs.FAIL
 
 
+def test_title_tells_sessions_apart():
+    assert cs.prompt_title("<pasted_content id=x>\n長い\n貼り付け</pasted_content>  修正して") == \
+        "長い 貼り付け 修正して"
+    entry = {"project": "claude", "title": "私の方でなにかすることある？", "state": cs.DONE,
+             "started": 100.0, "ended": 155.0, "updated": 155.0}
+    assert cs.display_name(entry) == "claude「私の方でなにかする…」"
+    assert cs.describe(entry, 200.0)[0].startswith("claude「私の方でなにかする…」　55秒で完了")
+    assert cs.display_name({"project": "claude"}) == "claude"
+    assert "「私の方でなにかすることある？」" in cs.menu_label(entry, 200.0)
+
+
+def test_resident_change_ignores_hooks_and_tests():
+    import filer_update as u
+    assert u.resident_files(["hooks/claude_hook.py", "tests/test_x.py", "filer.py"]) == []
+    assert u.resident_files(["hooks/claude_hook.py", "claude_status.py"]) == ["claude_status.py"]
+    calls = []
+
+    def run(args, timeout):
+        calls.append(args)
+        return 0, "hooks/claude_hook.py\ntests/test_claude_status.py\n", ""
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, ".git").mkdir()
+        assert u.changed_files("a" * 40, "b" * 40, tmp, run=run) == [
+            "hooks/claude_hook.py", "tests/test_claude_status.py"]
+        assert calls == [["diff", "--name-only", "a" * 40, "b" * 40]]
+        assert u.changed_files("a" * 40, "b" * 40, tmp, run=lambda a, t: (128, "", "bad")) is None
+        assert u.changed_files("", "b" * 40, tmp, run=run) is None
+
+
 def test_hook_reads_utf8_stdin():
     """フックの標準入力は UTF-8。Windows の既定(cp932)で解くと日本語が化ける。"""
     import subprocess

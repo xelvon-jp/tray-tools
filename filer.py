@@ -6225,19 +6225,30 @@ class FilerWindow(QWidget):
             return
         skip = set()
         apply_all = None
-        conflicts = filer_archive.find_conflicts(plan, dest)
-        for number, rel in enumerate(conflicts):
+        # 大きさと日時が同じもの(前に同じ書庫から展開したもの)は尋ねずに飛ばす。
+        # 既定が「上書き・残りも同じ」なので、尋ねるのは本当に違うものだけにしておき、
+        # そのうち今あるもののほうが新しい件数も見せる(Enter 1回で新しいものを消さないように)
+        all_conflicts = filer_archive.describe_conflicts(index, plan, dest)
+        same = [c.rel for c in all_conflicts if c.same]
+        if same:
+            skip.update(same)
+            self.log(f"展開: 中身が同じ {len(same)}件は飛ばします（大きさと日時が同じ）")
+        conflicts = [c for c in all_conflicts if not c.same]
+        for number, conflict in enumerate(conflicts):
+            rest = conflicts[number + 1:]
             if apply_all is not None:
                 decision = apply_all
             else:
-                decision, same_for_rest = self.ask_overwrite(rel, len(conflicts) - number - 1)
+                decision, same_for_rest = self.ask_overwrite(
+                    conflict.rel, len(rest), conflict=conflict,
+                    rest_newer=sum(1 for c in rest if c.existing_newer))
                 if same_for_rest:
                     apply_all = decision
             if decision == CANCEL:
                 self.log("展開: 取り消しました")
                 return
             if decision == SKIP:
-                skip.add(rel)
+                skip.add(conflict.rel)
         password = None
         if filer_archive.needs_password(index, plan):
             password = self.ask_password(os.path.basename(index.path))
@@ -6719,11 +6730,19 @@ class FilerWindow(QWidget):
             return None
         return dialog.textValue()
 
-    def ask_overwrite(self, rel: str, remaining: int):
-        """展開先に同じ名前があるとき。(OVERWRITE|SKIP|CANCEL, 残りも同じにするか)。"""
+    def ask_overwrite(self, rel: str, remaining: int, conflict=None, rest_newer: int = 0):
+        """展開先に同じ名前があるとき。(OVERWRITE|SKIP|CANCEL, 残りも同じにするか)。
+
+        conflict(filer_archive.Conflict)があれば、書庫の中と今あるものの日時・大きさを
+        並べ、新しいほうに印を付ける。rest_newer は残りのうち今あるもののほうが新しい件数。"""
         box = QMessageBox(self)
         box.setWindowTitle("展開")
-        box.setText(f"同じ名前があります。上書きしますか？\n\n{rel}")
+        text = f"同じ名前があります。上書きしますか？\n\n{rel}"
+        if conflict is not None:
+            text += "\n\n" + conflict.describe()
+            if conflict.existing_newer:
+                text += "\n\n⚠ 今あるもののほうが新しいです（上書きすると古いもので置き換わります）"
+        box.setText(text)
         overwrite = box.addButton("上書き(&O)", QMessageBox.AcceptRole)
         skip = box.addButton("スキップ(&S)", QMessageBox.RejectRole)
         cancel = box.addButton("取消", QMessageBox.DestructiveRole)
@@ -6732,7 +6751,10 @@ class FilerWindow(QWidget):
         box.setEscapeButton(cancel)
         check = None
         if remaining > 0:
-            check = QCheckBox(f"残り {remaining}件にも同じ扱いをする")
+            label = f"残り {remaining}件にも同じ扱いをする"
+            if rest_newer:
+                label += f"（うち {rest_newer}件は今あるもののほうが新しい）"
+            check = QCheckBox(label)
             check.setChecked(True)   # 既定で残りにも同じ扱い(毎回付ける手間を無くす)
             box.setCheckBox(check)
         box.exec()

@@ -325,6 +325,66 @@ def find_conflicts(plan, dest: str) -> list:
     return found
 
 
+# 「中身が同じ」とみなす更新日時のずれ(秒)。ZIP の日時は2秒刻みなので、それ以下は同じ。
+SAME_MTIME_SLACK = 2.0
+
+
+@dataclass
+class Conflict:
+    """展開先に既にあるファイル1件の、書庫の中のものとの比べ(上書き確認に出す)。"""
+    rel: str
+    archive_size: int
+    archive_mtime: float          # 0 は不明
+    existing_size: int
+    existing_mtime: float
+
+    @property
+    def same(self) -> bool:
+        """大きさと更新日時が同じ(＝前に同じ書庫から展開したもの)。尋ねずに飛ばしてよい。
+        日時が分からないものは同じと言い切れないので False。"""
+        return (bool(self.archive_mtime) and self.archive_size == self.existing_size
+                and abs(self.archive_mtime - self.existing_mtime) <= SAME_MTIME_SLACK)
+
+    @property
+    def existing_newer(self) -> bool:
+        """今あるもののほうが新しい(上書きすると新しいものが古いもので消える)。"""
+        return (bool(self.archive_mtime)
+                and self.existing_mtime > self.archive_mtime + SAME_MTIME_SLACK)
+
+    def describe(self) -> str:
+        """上書き確認に出す2行(書庫の中／今あるもの。新しいほうに印)。"""
+        archive_time = core.format_mtime(self.archive_mtime) or "日時不明"
+        existing_time = core.format_mtime(self.existing_mtime) or "日時不明"
+        newer_mark = "  ← こちらが新しい"
+        archive_newer = bool(self.archive_mtime) and \
+            self.archive_mtime > self.existing_mtime + SAME_MTIME_SLACK
+        return (f"書庫の中:　{archive_time}　{self.archive_size:,} バイト"
+                f"{newer_mark if archive_newer else ''}\n"
+                f"今あるもの: {existing_time}　{self.existing_size:,} バイト"
+                f"{newer_mark if self.existing_newer else ''}")
+
+
+def describe_conflicts(index: ArchiveIndex, plan, dest: str) -> list:
+    """find_conflicts の各件を、書庫の中と今あるものの大きさ・日時で比べた Conflict の並び。
+    今あるものが読めなければ(フォルダが同名で居るなど)日時0・大きさ-1 として必ず尋ねる側に。"""
+    out = []
+    by_rel = {item.rel: item for item in plan if not item.is_dir}
+    for rel in find_conflicts(plan, dest):
+        member = index.members.get(by_rel[rel].inner) if rel in by_rel else None
+        target = os.path.join(dest, rel.replace("/", os.sep))
+        try:
+            st = os.stat(target)
+            existing_size = st.st_size if os.path.isfile(target) else -1
+            existing_mtime = st.st_mtime
+        except OSError:
+            existing_size, existing_mtime = -1, 0.0
+        out.append(Conflict(rel,
+                            member.size if member is not None else -1,
+                            member.mtime if member is not None else 0.0,
+                            existing_size, existing_mtime))
+    return out
+
+
 def needs_password(index: ArchiveIndex, plan) -> bool:
     if index.kind == "7z":
         return index.needs_password and any(not p.is_dir for p in plan)

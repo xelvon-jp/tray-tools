@@ -2281,7 +2281,7 @@ def test_window_archive():
 
         # Alt+C: 反対窓へ展開。上書きは尋ねる(スキップ)、フォルダは中身ごと
         asked = []
-        w.ask_overwrite = lambda rel, remaining: (asked.append(rel), (filer.SKIP, False))[1]
+        w.ask_overwrite = lambda rel, remaining, **_: (asked.append(rel), (filer.SKIP, False))[1]
         L.marks.update({"readme.txt", "docs"})
         key(Qt.Key_C, Qt.AltModifier)
         _wait_extract(w)
@@ -2292,7 +2292,7 @@ def test_window_archive():
         assert "展開: 2件" in w.log_view.toPlainText()
         # 上書き＋「残りも同じ」
         asked.clear()
-        w.ask_overwrite = lambda rel, remaining: (asked.append(rel), (filer.OVERWRITE, True))[1]
+        w.ask_overwrite = lambda rel, remaining, **_: (asked.append(rel), (filer.OVERWRITE, True))[1]
         L.marks.update({"readme.txt", "docs"})
         key(Qt.Key_C, Qt.AltModifier)
         _wait_extract(w)
@@ -2300,7 +2300,7 @@ def test_window_archive():
         assert len(asked) == 1 and Path(right, "readme.txt").read_bytes() == b"hello"
         # 取消なら何もしない
         Path(right, "readme.txt").write_bytes(b"old")
-        w.ask_overwrite = lambda rel, remaining: (filer.CANCEL, False)
+        w.ask_overwrite = lambda rel, remaining, **_: (filer.CANCEL, False)
         L.set_cursor(L._row_of("readme.txt"))
         key(Qt.Key_C, Qt.AltModifier)
         assert w._extracting is None and Path(right, "readme.txt").read_bytes() == b"old"
@@ -2399,6 +2399,62 @@ def test_ask_overwrite_defaults():
     assert seen["default"].startswith("上書き"), seen
     assert seen["checked"] is True and same is True
     assert decision == filer.OVERWRITE
+
+
+def test_extract_conflicts_compare():
+    """展開の上書き確認: 大きさと日時が同じものは尋ねずに飛ばし、違うものは日時・大きさを
+    並べて新しいほうに印を付ける。残りのうち今あるもののほうが新しい件数も出す。"""
+    import filer
+    import filer_archive as fa
+    from PySide6.QtWidgets import QMessageBox
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zpath = Path(tmp, "a.zip")
+        with zipfile.ZipFile(zpath, "w") as z:
+            for name, data in (("same.txt", b"same"), ("newer.txt", b"zip"),
+                               ("older.txt", b"zip-older"), ("size.txt", b"12345")):
+                info = zipfile.ZipInfo(name, date_time=(2026, 11, 1, 12, 0, 0))
+                z.writestr(info, data)
+        index = fa.get_index(str(zpath))
+        plan = fa.plan_extract(index, "", ["same.txt", "newer.txt", "older.txt", "size.txt"])
+        out = Path(tmp, "out")
+        out.mkdir()
+        stamp = index.members["same.txt"].mtime
+        for name, data, mtime in (("same.txt", b"same", stamp + 1),     # 2秒以内は同じ
+                                  ("newer.txt", b"local", stamp + 86400),
+                                  ("older.txt", b"zip-older", stamp - 86400),
+                                  ("size.txt", b"1234", stamp)):
+            Path(out, name).write_bytes(data)
+            os.utime(Path(out, name), (mtime, mtime))
+        got = {c.rel: c for c in fa.describe_conflicts(index, plan, str(out))}
+        assert set(got) == {"same.txt", "newer.txt", "older.txt", "size.txt"}
+        assert got["same.txt"].same and not got["same.txt"].existing_newer
+        assert not got["newer.txt"].same and got["newer.txt"].existing_newer
+        assert not got["older.txt"].same and not got["older.txt"].existing_newer
+        assert not got["size.txt"].same          # 日時が同じでも大きさが違えば尋ねる
+        text = got["newer.txt"].describe()
+        assert "今あるもの" in text.splitlines()[1] and "こちらが新しい" in text.splitlines()[1]
+        assert "こちらが新しい" in got["older.txt"].describe().splitlines()[0]
+
+        # ダイアログ: 日時・大きさと警告、残りの「新しい」件数が出る
+        _qapp()
+        seen = {}
+        original_exec = QMessageBox.exec
+
+        def fake_exec(box):
+            seen["text"] = box.text()
+            seen["check"] = box.checkBox().text()
+            box.defaultButton().click()
+            return box.result()
+
+        QMessageBox.exec = fake_exec
+        try:
+            filer.FilerWindow.ask_overwrite(None, "newer.txt", 2, conflict=got["newer.txt"],
+                                            rest_newer=1)
+        finally:
+            QMessageBox.exec = original_exec
+        assert "今あるもののほうが新しい" in seen["text"], seen
+        assert "うち 1件は今あるもののほうが新しい" in seen["check"], seen
 
 
 def test_zip_update_logic():

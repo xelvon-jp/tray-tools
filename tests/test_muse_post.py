@@ -1,8 +1,12 @@
 # tests/test_muse_post.py
-# muse_post.py の判断ロジック(純関数)を確かめる。Muse アプリが無くても通る。
-# UIA には触らない(Muse の窓を探しもしない)。
+# muse_post の判断ロジックと進行を確かめる。Muse アプリが無くても通る。
+#
+# 純関数は muse_post_logic( UIA 依存なし)を、進行(cmd_post / cmd_wait)は
+# 偽の Muse と一時リポジトリを使って確かめるので、Linux でも回る
+# (20261105-01 #11〜#13)。UIA の実操作だけはここでは触らない。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_muse_post.py
+#   python3 tests/test_muse_post.py    (Linux でも可)
 #
 # pytest が無くても動くように、素の assert と自前の小さな実行器で書いてある
 # (tests/test_claude_status.py と同じ形)。
@@ -19,7 +23,8 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-import muse_post as mp  # noqa: E402
+import muse_post as mpost  # noqa: E402
+import muse_post_logic as mp  # noqa: E402  既存テストの mp. はこちらを指す
 
 B, E, T = mp.CONTROL_BUTTON, mp.CONTROL_EDIT, 50020
 OPEN = "チャットとサイドチャットを開く"
@@ -83,6 +88,20 @@ def test_new_chat_empty():
     assert "作業中" in mp.check_new_chat_ready(_summary("停止"))
 
 
+def test_new_chat_ready_needs_transition():
+    # #1: Invoke 前と同じ画面の間は、空の作りたてでも「まだ切り替わっていない」
+    before = _summary()
+    sig = mp.view_signature(before)
+    r = mp.check_new_chat_ready(_summary(), sig)
+    assert r and "切り替わっていない" in r, r
+    # 画面が変われば(子孫数が変わるなど)通る
+    after = _summary(extra=41)
+    assert mp.view_signature(after) != sig
+    assert mp.check_new_chat_ready(after, sig) is None
+    # before_sig を渡さなければ従来どおり状態だけで判定する
+    assert mp.check_new_chat_ready(_summary()) is None
+
+
 # ---------------------------------------------------------------
 # 安全確認
 # ---------------------------------------------------------------
@@ -143,6 +162,13 @@ def test_before_invoke():
     assert "見失った" in mp.check_before_invoke(_summary("送信", value=msg, inputs=0), msg)
 
 
+def test_before_invoke_busy():
+    # #3: SetValue の待ちの間に作業中になったら、文面が一致していても押さない
+    msg = "依頼です"
+    r = mp.check_before_invoke(_summary("送信", "停止", value=msg), msg)
+    assert r and "作業中" in r, r
+
+
 def test_title_settled():
     assert mp.title_settled(None, "話題", new_chat=True)
     assert not mp.title_settled("話題", "話題", new_chat=True)  # まだ名前が付いていない
@@ -171,7 +197,7 @@ def test_multiline_exits_2():
     from contextlib import redirect_stdout
     buf = io.StringIO()
     with redirect_stdout(buf):
-        code = mp.main(["post", "--message", "a\nb", "--dry-run"])
+        code = mpost.main(["post", "--message", "a\nb", "--dry-run"])
     assert code == 2, code
     assert "改行" in buf.getvalue()
 
@@ -183,7 +209,7 @@ def test_bad_args_exit_2_with_json():
     buf = io.StringIO()
     try:
         with redirect_stdout(buf):
-            mp.main(["post"])  # --message も --message-file も無い
+            mpost.main(["post"])  # --message も --message-file も無い
         raise AssertionError("SystemExit にならなかった")
     except SystemExit as e:
         assert e.code == 2
@@ -197,8 +223,38 @@ def test_version():
     from contextlib import redirect_stdout
     buf = io.StringIO()
     with redirect_stdout(buf):
-        assert mp.main(["--version"]) == 0
+        assert mpost.main(["--version"]) == 0
     assert re.fullmatch(r"\d{8}-\d{2}", json.loads(buf.getvalue())["version"])
+
+
+def test_read_message_file():
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "msg.txt"
+        p.write_bytes("﻿依頼です\n".encode("utf-8"))  # BOM + 末尾の改行
+        args = SimpleNamespace(message=None, message_file=str(p))
+        assert mpost.read_message(args) == "依頼です"
+        # 読めないファイルは main が終了コード 2 で返す
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = mpost.main(["post", "--message-file", str(Path(d) / "none.txt")])
+        assert code == 2, code
+
+
+def test_logic_module_has_no_uia_imports():
+    # #11: 判断モジュールが comtypes / copilot_loop を読んでいないことを見張る
+    import ast
+    tree = ast.parse((ROOT / "muse_post_logic.py").read_text(encoding="utf-8"))
+    mods = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            mods.append(node.module or "")
+    assert not any(m.startswith("comtypes") or m.startswith("copilot_loop") for m in mods), mods
 
 
 # ---------------------------------------------------------------
@@ -221,6 +277,219 @@ def test_redact_hides_urls():
     r = mp.redact(msg)
     assert "tok" not in r and "github.com" not in r and "<url>" in r
     assert "github.com" not in mp.redact("git@github.com:o/r.git: denied")
+
+
+def test_git_timeout_budget():
+    # #8: 1回の git の制限は全体の残り時間と GIT_TIMEOUT の小さい方
+    import time
+    start = time.time()
+    t = mpost._git_timeout(start, 30)
+    assert t is not None and 0 < t <= 30
+    assert mpost._git_timeout(start, 10 ** 9) == mp.GIT_TIMEOUT
+    # 残りが尽きたら None(最初の1回だけは試す)
+    assert mpost._git_timeout(start - 100, 10) is None
+    assert mpost._git_timeout(start - 100, 10, first=True) == mp.GIT_TIMEOUT
+
+
+# ---------------------------------------------------------------
+# cmd_wait を一時リポジトリで確かめる(#13)
+# ---------------------------------------------------------------
+def _run_git(cwd, *argv):
+    import subprocess
+    proc = subprocess.run(["git", "-C", str(cwd), *argv],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (argv, proc.stderr)
+    return proc.stdout.strip()
+
+
+def _make_wait_repos(d):
+    """src(投稿先のつもり)に muse/done ブランチを作り、dst に clone する。"""
+    src = Path(d) / "src"
+    src.mkdir()
+    _run_git(src, "init", "-b", "main")
+    (src / "handoff").mkdir()
+    (src / "handoff" / "result.md").write_text("結果\n", encoding="utf-8")
+    _run_git(src, "add", ".")
+    _run_git(src, "-c", "user.name=test", "-c", "user.email=test@example.com",
+             "commit", "-m", "test")
+    _run_git(src, "branch", "muse/done")
+    sha = _run_git(src, "rev-parse", "muse/done")
+    dst = Path(d) / "dst"
+    import subprocess
+    proc = subprocess.run(["git", "clone", "-q", str(src), str(dst)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return dst, sha
+
+
+def test_wait_with_path_succeeds():
+    import tempfile
+    from types import SimpleNamespace
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        dst, sha = _make_wait_repos(d)
+        args = SimpleNamespace(repo=str(dst), branch="muse/done",
+                               path="handoff/result.md", timeout=30, interval=0.05)
+        code, out = mpost.cmd_wait(args)
+        assert code == 0 and out["ok"] is True, out
+        # #9: 返す sha は fetch 後の先端(= ブランチの先端)と一致する
+        assert out["sha"] == sha, out
+
+
+def test_wait_without_path_reports_appeared_only():
+    # #7: --path 無しでは「現れた」までしか言わない(ok にはしない)
+    import tempfile
+    from types import SimpleNamespace
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        dst, sha = _make_wait_repos(d)
+        args = SimpleNamespace(repo=str(dst), branch="muse/done",
+                               path=None, timeout=30, interval=0.05)
+        code, out = mpost.cmd_wait(args)
+        assert code == 1 and out["ok"] is False and out["appeared"] is True, out
+        assert out["sha"] == sha
+
+
+def test_wait_times_out_when_path_missing():
+    import tempfile
+    from types import SimpleNamespace
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        dst, _sha = _make_wait_repos(d)
+        args = SimpleNamespace(repo=str(dst), branch="muse/done",
+                               path="handoff/absent.md", timeout=0.6, interval=0.05)
+        code, out = mpost.cmd_wait(args)
+        assert code == 1 and out["reason"] == "timeout", out
+        args2 = SimpleNamespace(repo=str(dst), branch="muse/absent",
+                                path="handoff/result.md", timeout=0.6, interval=0.05)
+        code2, out2 = mpost.cmd_wait(args2)
+        assert code2 == 1 and out2["reason"] == "timeout", out2
+
+
+def _git_available():
+    import shutil
+    return shutil.which("git") is not None
+
+
+# ---------------------------------------------------------------
+# cmd_post の進行を偽の Muse で確かめる(#12)
+# ---------------------------------------------------------------
+class _FakeMuse:
+    """UIA の代わりの偽物。scan / poll / read_value / set_value / invoke だけ。
+
+    poll は1回だけ scan して判定する(実物の繰り返し待ちはしない)。
+    invoke('new') を受けたら after_new の要約に切り替わる。"""
+
+    def __init__(self, value="", after_new=None, fail_poll_after_write=False):
+        self.profile = mp.MUSE_PROFILE
+        self.value = value
+        self.after_new = after_new
+        self.fail_poll_after_write = fail_poll_after_write
+        self.switched = False
+        self.set_calls = []
+        self.invoke_calls = []
+        self.closed = False
+
+    def wait_awake(self):
+        return True
+
+    def _summary(self):
+        s = {"descendants": 100, "inputs": 1, "input_value": self.value,
+             "input_empty": mp.is_blank(self.value) if self.value is not None else None,
+             "send": 1 if self.value else 0, "busy": False, "new_chat": 1,
+             "open_list": 0, "message_buttons": 2, "chat_title": "話題"}
+        if self.switched and self.after_new:
+            s.update(self.after_new)
+        return s
+
+    def scan(self):
+        refs = {"input": ["in"], "send": ["send"], "new_chat": ["new"], "open_list": []}
+        return self._summary(), refs
+
+    def poll(self, predicate, timeout):
+        if self.fail_poll_after_write and self.set_calls:
+            raise RuntimeError("scan が落ちた(偽)")
+        s, refs = self.scan()
+        return s, refs, bool(predicate(s))
+
+    def read_value(self, el):
+        return self.value
+
+    def set_value(self, el, text):
+        self.set_calls.append(text)
+        self.value = text
+
+    def invoke(self, el):
+        self.invoke_calls.append(el)
+        if el == "new":
+            self.switched = True
+        if el == "send":
+            self.value = ""  # 送信されると投稿欄は空に戻る
+
+    def close(self):
+        self.closed = True
+
+
+def _post_args(current_chat=True, dry_run=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(current_chat=current_chat, dry_run=dry_run)
+
+
+def test_cmd_post_current_chat_happy():
+    fake = _FakeMuse()
+    code, out = mpost.cmd_post(_post_args(), "依頼です", muse_factory=lambda: fake)
+    assert code == 0 and out["ok"] is True, out
+    assert fake.set_calls == ["依頼です"] and fake.invoke_calls == ["send"]
+    assert fake.closed
+
+
+def test_cmd_post_dry_run_touches_nothing():
+    fake = _FakeMuse()
+    code, out = mpost.cmd_post(_post_args(dry_run=True), "依頼です", muse_factory=lambda: fake)
+    assert code == 0 and out["ok"] is True and out["plan"], out
+    assert fake.set_calls == [] and fake.invoke_calls == []
+
+
+def test_cmd_post_refuses_non_empty_input():
+    fake = _FakeMuse(value="書きかけ")
+    code, out = mpost.cmd_post(_post_args(), "依頼です", muse_factory=lambda: fake)
+    assert code == 1 and "空でない" in out["reason"], out
+    assert fake.set_calls == [] and fake.invoke_calls == []
+
+
+def test_cmd_post_restores_on_exception_after_write():
+    # #5: 書いた後に例外が起きたら、送らずに自分の文面だけを消して戻す
+    fake = _FakeMuse(fail_poll_after_write=True)
+    code, out = mpost.cmd_post(_post_args(), "依頼です", muse_factory=lambda: fake)
+    assert code == 1 and out["ok"] is False, out
+    assert fake.value == "", fake.set_calls
+    assert any("空に戻した" in st for st in out["steps"]), out["steps"]
+
+
+def test_cmd_post_new_chat_leftover_is_reported():
+    # #6: 新規チャットの途中で止まったら、残ったものを理由に明示する
+    after = {"descendants": 101, "message_buttons": 3, "chat_title": None}
+    fake = _FakeMuse(after_new=after)
+    code, out = mpost.cmd_post(_post_args(current_chat=False), "依頼です",
+                               muse_factory=lambda: fake)
+    assert code == 1, out
+    assert "空になっていない" in out["reason"], out
+    assert "空のサイドチャットが残っている" in out["reason"], out
+    assert fake.set_calls == []  # 投稿はしていない
+
+
+def test_restore_input_only_own_text():
+    fake = _FakeMuse(value="依頼です")
+    refs = {"input": ["in"]}
+    assert mpost._restore_input(fake, refs, "依頼です") is True
+    assert fake.value == ""
+    # 人が打った分は消さない
+    fake2 = _FakeMuse(value="人が打った分")
+    assert mpost._restore_input(fake2, refs, "依頼です") is False
+    assert fake2.value == "人が打った分"
 
 
 def main():

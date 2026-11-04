@@ -234,11 +234,14 @@ def test_rule_edit_dialog_validation():
     import folder_watch_settings as fws
     with tempfile.TemporaryDirectory() as tmp:
         dialog = fws.RuleEditDialog({}, choose_folder=lambda: "")
-        dialog.source.setText(str(tmp))
-        dialog.dest.setText(str(Path(tmp, "sub")))   # 先が元の中
+        source = Path(tmp, "src")
+        dialog.source.setText(str(source))
+        dialog.dest.setText(str(source / "sub"))   # 先が元の中
         # 警告ダイアログは offscreen では閉じられないので、accept は叩かず
         # 「この値では検証に落ちる」ことだけ確かめる(検証そのものは上のテストで担保)
         assert fw.validate_rule(dialog.values()) is not None
+        # 先は元の「外」にする。以前は元＝tmp・先＝tmp/elsewhere で、先が元の中のまま
+        # accept を叩いていたため、警告ダイアログ(モーダル)が出てテストが止まっていた
         dialog.dest.setText(str(Path(tmp, "elsewhere")))
         dialog.accept()
         assert dialog.result() == 1                  # QDialog.Accepted == 1

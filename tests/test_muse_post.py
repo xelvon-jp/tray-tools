@@ -406,7 +406,8 @@ class _FakeMuse:
         return s
 
     def scan(self):
-        refs = {"input": ["in"], "send": ["send"], "new_chat": ["new"], "open_list": []}
+        refs = {"input": ["in"], "send": ["send"], "new_chat": ["new"], "open_list": [],
+                "buttons": [], "texts": [], "items": []}
         return self._summary(), refs
 
     def poll(self, predicate, timeout):
@@ -490,6 +491,363 @@ def test_restore_input_only_own_text():
     fake2 = _FakeMuse(value="人が打った分")
     assert mpost._restore_input(fake2, refs, "依頼です") is False
     assert fake2.value == "人が打った分"
+
+# ---------------------------------------------------------------
+# 承認カードの解析と判定(20261105-02。実機の実例がフィクスチャ)
+# ---------------------------------------------------------------
+G, D = 50026, 50007
+
+
+def _card_items(files=("muse_post.py", "muse_post_logic.py"),
+                action="Push files to GitHub",
+                branch="muse/20261105-01-muse-post-fixes",
+                owner="xelvon-jp", repo="tray-tools", extra_texts=()):
+    items = [(G, "GitHubの承認リクエスト")]
+    items += [(T, "Action"), (T, action),
+              (T, "Branch or ref"), (T, branch),
+              (T, "Repository owner"), (T, owner),
+              (T, "Repository"), (T, repo)]
+    for i, f in enumerate(files, 1):
+        items += [(T, f"Files · {i} · File path"), (T, f),
+                  (T, f"Files · {i} · Content"), (T, f"内容{i}の先頭")]
+    items += [(T, "Additional request details are not shown."),
+              (T, "プレビューは省略されています")]
+    items += [(D, "Action"), (D, action)]  # DataItem の重複は無視される
+    items += list(extra_texts)
+    items += [(B, "許可する"), (B, "許可しない")]
+    return items
+
+
+def _expect(**kw):
+    e = {"owner": "xelvon-jp", "repo": "tray-tools",
+         "branch": "muse/20261105-01-muse-post-fixes",
+         "allow_paths": ["muse_post.py", "muse_post_logic.py",
+                         "tests/test_muse_post.py"]}
+    e.update(kw)
+    return e
+
+
+def test_parse_approval_card():
+    card = mp.parse_approval_card(_card_items())
+    assert card["action"] == "Push files to GitHub"
+    assert card["branch"] == "muse/20261105-01-muse-post-fixes"
+    assert card["owner"] == "xelvon-jp" and card["repo"] == "tray-tools"
+    assert card["files"] == ["muse_post.py", "muse_post_logic.py"]
+    assert card["unknown"] == [] and card["duplicates"] == []
+    assert card["approve_buttons"] == 1 and card["deny_buttons"] == 1
+    assert card["files_complete"] is True
+    # 窓全体の並びからでも、カードの外は切り捨てて1枚として読める
+    items = [(T, "t0"), (B, "送信")] + _card_items() + [(B, "返信")]
+    cards = mp.split_approval_cards(items)
+    assert len(cards) == 1
+    assert mp.parse_approval_card(cards[0])["files"] == card["files"]
+
+
+def test_approval_decision_ok():
+    card = mp.parse_approval_card(_card_items())
+    assert mp.approval_decision(card, _expect()) is None
+
+
+def test_approval_decision_refusals():
+    # 許可されていないパス
+    card = mp.parse_approval_card(_card_items(files=("muse_post.py", "settings.json")))
+    r = mp.approval_decision(card, _expect())
+    assert r and "許可されていないパス" in r, r
+    # Action 違い
+    card = mp.parse_approval_card(_card_items(action="Delete files from GitHub"))
+    r = mp.approval_decision(card, _expect())
+    assert r and "Action" in r, r
+    # ファイル0件
+    card = mp.parse_approval_card(_card_items(files=()))
+    r = mp.approval_decision(card, _expect())
+    assert r and "1件も無い" in r, r
+    # 未知のラベル
+    card = mp.parse_approval_card(_card_items(extra_texts=[(T, "謎のラベル"), (T, "値")]))
+    r = mp.approval_decision(card, _expect())
+    assert r and "未知" in r, r
+    # ブランチ不一致と、muse/ で始まらないブランチ
+    card = mp.parse_approval_card(_card_items(branch="muse/other"))
+    r = mp.approval_decision(card, _expect())
+    assert r and "一致しない" in r, r
+    card = mp.parse_approval_card(_card_items(branch="main"))
+    r = mp.approval_decision(card, _expect(branch="main"))
+    assert r and "muse/" in r, r
+
+
+# ---------------------------------------------------------------
+# approve / watch を偽の Muse で確かめる
+# ---------------------------------------------------------------
+class _FakeApproveMuse:
+    """承認カードのある窓の偽物。『許可する』を押されるとカードが消える。"""
+
+    def __init__(self, card_items=None, banner=False, on_approve=None):
+        self.profile = mp.MUSE_PROFILE
+        self.card_items = card_items
+        self.banner = banner
+        self.on_approve = on_approve
+        self.invoke_calls = []
+        self.closed = False
+
+    def wait_awake(self):
+        return True
+
+    def _items(self):
+        items = [(T, f"t{i}") for i in range(40)] + [(E, "検索"), (E, "メッセージ")]
+        if self.banner:
+            items.append((B, "Muse、承認が必要です"))
+        if self.card_items:
+            items += self.card_items
+        return items
+
+    def scan(self):
+        items = self._items()
+        s = mp.summarize(items, [""])
+        refs = {"input": ["in"], "send": [], "new_chat": [], "open_list": [],
+                "buttons": [(n, n) for c, n in items if c == B],
+                "texts": [n for c, n in items if c == T], "items": items}
+        return s, refs
+
+    def poll(self, predicate, timeout):
+        s, refs = self.scan()
+        return s, refs, bool(predicate(s))
+
+    def invoke(self, el):
+        self.invoke_calls.append(el)
+        if el == "許可する":
+            self.card_items = None
+            if self.on_approve:
+                self.on_approve()
+
+    def close(self):
+        self.closed = True
+
+
+def _approve_args(**kw):
+    from types import SimpleNamespace
+    a = {"owner": "xelvon-jp", "repo": "tray-tools",
+         "branch": "muse/20261105-01-muse-post-fixes",
+         "allow_path": ["muse_post.py", "muse_post_logic.py"], "dry_run": False}
+    a.update(kw)
+    return SimpleNamespace(**a)
+
+
+def test_cmd_approve_happy_and_dry_run():
+    fake = _FakeApproveMuse(card_items=_card_items())
+    code, out = mpost.cmd_approve(_approve_args(), muse_factory=lambda: fake)
+    assert code == 0 and out["approved"] is True, out
+    assert fake.invoke_calls == ["許可する"]
+    fake2 = _FakeApproveMuse(card_items=_card_items())
+    code, out = mpost.cmd_approve(_approve_args(dry_run=True), muse_factory=lambda: fake2)
+    assert code == 0 and out["would_approve"] is True, out
+    assert fake2.invoke_calls == []
+
+
+def test_cmd_approve_refusals_do_not_press():
+    # 許可外のパス: 許可する も 許可しない も押さない
+    fake = _FakeApproveMuse(card_items=_card_items(files=("settings.json",)))
+    code, out = mpost.cmd_approve(_approve_args(), muse_factory=lambda: fake)
+    assert code == 1 and "許可されていないパス" in out["reason"], out
+    assert fake.invoke_calls == []
+    # カード2枚
+    fake = _FakeApproveMuse(card_items=_card_items() + _card_items())
+    code, out = mpost.cmd_approve(_approve_args(), muse_factory=lambda: fake)
+    assert code == 1 and "2 枚" in out["reason"], out
+    assert fake.invoke_calls == []
+    # main ブランチは引数の時点で拒否
+    fake = _FakeApproveMuse(card_items=_card_items(branch="main"))
+    code, out = mpost.cmd_approve(_approve_args(branch="main"), muse_factory=lambda: fake)
+    assert code == 2, out
+    assert fake.invoke_calls == []
+    # カードが無い
+    fake = _FakeApproveMuse()
+    code, out = mpost.cmd_approve(_approve_args(), muse_factory=lambda: fake)
+    assert code == 1 and "見つからない" in out["reason"], out
+
+
+def _make_repos_no_result(d):
+    """結果ファイルの無い muse/done ブランチを持つ src と、その clone。"""
+    src = Path(d) / "src2"
+    src.mkdir()
+    _run_git(src, "init", "-b", "main")
+    (src / "README.md").write_text("x\n", encoding="utf-8")
+    _run_git(src, "add", ".")
+    _run_git(src, "-c", "user.name=test", "-c", "user.email=test@example.com",
+             "commit", "-m", "test")
+    _run_git(src, "branch", "muse/done")
+    dst = Path(d) / "dst2"
+    import subprocess
+    proc = subprocess.run(["git", "clone", "-q", str(src), str(dst)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return src, dst
+
+
+def _watch_args(dst, **kw):
+    from types import SimpleNamespace
+    a = {"repo_dir": str(dst), "owner": "xelvon-jp", "repo": "tray-tools",
+         "branch": "muse/done", "path": "handoff/result.md",
+         "allow_path": ["muse_post.py", "muse_post_logic.py"],
+         "timeout": 30, "interval": 0.05}
+    a.update(kw)
+    return SimpleNamespace(**a)
+
+
+def test_watch_done_without_card():
+    import tempfile
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        dst, _sha = _make_wait_repos(d)  # muse/done に結果ファイルがある
+        fake = _FakeApproveMuse()
+        code, out = mpost.cmd_watch(_watch_args(dst), muse_factory=lambda: fake)
+        assert code == 0 and out["status"] == "done" and out["approved"] == [], out
+
+
+def test_watch_needs_human_on_refused_card():
+    import tempfile
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        _src, dst = _make_repos_no_result(d)
+        fake = _FakeApproveMuse(card_items=_card_items(
+            branch="muse/done", files=("settings.json",)))
+        code, out = mpost.cmd_watch(_watch_args(dst), muse_factory=lambda: fake)
+        assert code == 1 and out["status"] == "needs_human", out
+        assert fake.invoke_calls == []
+
+
+def test_watch_needs_human_on_banner_only():
+    import tempfile
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        _src, dst = _make_repos_no_result(d)
+        fake = _FakeApproveMuse(banner=True)
+        code, out = mpost.cmd_watch(_watch_args(dst), muse_factory=lambda: fake)
+        assert code == 1 and out["status"] == "needs_human", out
+        assert "見えない" in out["reason"], out
+
+
+def test_watch_approves_then_done():
+    import tempfile
+    if not _git_available():
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = _make_repos_no_result(d)
+
+        def _deliver_result():
+            _run_git(src, "checkout", "muse/done")
+            (src / "handoff").mkdir(exist_ok=True)
+            (src / "handoff" / "result.md").write_text("結果\n", encoding="utf-8")
+            _run_git(src, "add", ".")
+            _run_git(src, "-c", "user.name=test", "-c", "user.email=test@example.com",
+                     "commit", "-m", "result")
+            _run_git(src, "checkout", "main")
+
+        fake = _FakeApproveMuse(
+            card_items=_card_items(branch="muse/done"), on_approve=_deliver_result)
+        code, out = mpost.cmd_watch(_watch_args(dst), muse_factory=lambda: fake)
+        assert code == 0 and out["status"] == "done", out
+        assert len(out["approved"]) == 1, out
+        assert out["approved"][0]["files"] == ["muse_post.py", "muse_post_logic.py"]
+        assert fake.invoke_calls == ["許可する"]
+
+
+# ---------------------------------------------------------------
+# post --chat(既存チャットへの投稿)
+# ---------------------------------------------------------------
+def test_match_chat_buttons():
+    names = ["対象チャット", "対象チャット 未読のチャット",
+             "対象チャット 未読のアップデート", "対象チャット2", "別"]
+    assert mp.match_chat_buttons(names, "対象チャット") == names[:3]
+    assert mp.match_chat_buttons(names, "無い名前") == []
+
+
+class _FakeChatMuse(_FakeMuse):
+    """一覧→チャット切り替えの偽物。stage で画面が変わる。"""
+
+    def __init__(self, target="対象チャット", with_expect=True):
+        super().__init__()
+        self.target = target
+        self.with_expect = with_expect
+        self.stage = "closed"
+
+    def scan(self):
+        s, refs = super().scan()
+        if self.stage == "closed":
+            s["open_list"] = 1
+            s["chat_title"] = "旧話題"
+            refs["open_list"] = ["openlist"]
+        elif self.stage == "list":
+            s["open_list"] = 0
+            s["chat_title"] = None
+            refs["buttons"] = [(self.target + " 未読のチャット", "chatbtn")]
+        else:
+            s["open_list"] = 1
+            s["chat_title"] = self.target
+            refs["texts"] = (["前の依頼 20261105-02 の続き"] if self.with_expect
+                             else ["関係ない話"])
+        return s, refs
+
+    def invoke(self, el):
+        if el == "openlist":
+            self.invoke_calls.append(el)
+            self.stage = "list"
+            return
+        if el == "chatbtn":
+            self.invoke_calls.append(el)
+            self.stage = "chat"
+            return
+        super().invoke(el)
+
+
+def _chat_args(**kw):
+    from types import SimpleNamespace
+    a = {"current_chat": False, "dry_run": False,
+         "chat": "対象チャット", "expect_text": "20261105-02"}
+    a.update(kw)
+    return SimpleNamespace(**a)
+
+
+def _with_fast_timeouts(fn):
+    old = (mpost.OPEN_LIST_TIMEOUT, mpost.CHAT_SWITCH_TIMEOUT, mpost.POLL_SEC)
+    mpost.OPEN_LIST_TIMEOUT = mpost.CHAT_SWITCH_TIMEOUT = 0.3
+    mpost.POLL_SEC = 0.01
+    try:
+        fn()
+    finally:
+        mpost.OPEN_LIST_TIMEOUT, mpost.CHAT_SWITCH_TIMEOUT, mpost.POLL_SEC = old
+
+
+def test_cmd_post_chat_happy():
+    def run():
+        fake = _FakeChatMuse()
+        code, out = mpost.cmd_post(_chat_args(), "続きの依頼です",
+                                   muse_factory=lambda: fake)
+        assert code == 0 and out["ok"] is True, out
+        assert fake.invoke_calls == ["openlist", "chatbtn", "send"], fake.invoke_calls
+        assert fake.set_calls == ["続きの依頼です"]
+    _with_fast_timeouts(run)
+
+
+def test_cmd_post_chat_expect_text_missing():
+    def run():
+        fake = _FakeChatMuse(with_expect=False)
+        code, out = mpost.cmd_post(_chat_args(), "続きの依頼です",
+                                   muse_factory=lambda: fake)
+        assert code == 1 and "見つからない" in out["reason"], out
+        assert fake.set_calls == []  # 投稿していない
+    _with_fast_timeouts(run)
+
+
+def test_cmd_post_chat_not_found():
+    def run():
+        fake = _FakeChatMuse(target="別のチャット")
+        code, out = mpost.cmd_post(_chat_args(), "続きの依頼です",
+                                   muse_factory=lambda: fake)
+        assert code == 1 and "見つからない" in out["reason"], out
+        assert fake.set_calls == []
+    _with_fast_timeouts(run)
 
 
 def main():

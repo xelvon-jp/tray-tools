@@ -44,6 +44,7 @@ MUSE_PROFILE = {
 }
 
 CONTROL_BUTTON, CONTROL_EDIT = 50000, 50004
+CONTROL_TEXT, CONTROL_DATA_ITEM, CONTROL_GROUP = 50020, 50007, 50026
 
 # --- 待ち時間(すべてポーリング。上限だけをここで決める) ---------------------
 POLL_SEC = 0.25
@@ -118,12 +119,15 @@ def summarize(items, input_values, profile=MUSE_PROFILE):
     inputs = set(_names(profile, "input_name"))
 
     counts = {"inputs": 0, "send": 0, "busy": 0, "new_chat": 0,
-              "open_list": 0, "message_buttons": 0}
+              "open_list": 0, "message_buttons": 0,
+              "approval_cards": 0, "approval_banner": 0}
     button_names = []
     for ctype, name in items:
         name = (name or "").strip()
         if ctype == CONTROL_EDIT and name in inputs:
             counts["inputs"] += 1
+        if ctype == CONTROL_GROUP and name == APPROVAL_CARD_NAME:
+            counts["approval_cards"] += 1
         if ctype != CONTROL_BUTTON:
             continue
         button_names.append(name)
@@ -131,6 +135,8 @@ def summarize(items, input_values, profile=MUSE_PROFILE):
             counts["send"] += 1
         if name in busy:
             counts["busy"] += 1
+        if name == APPROVAL_BANNER:
+            counts["approval_banner"] += 1
         if name in new_chat:
             counts["new_chat"] += 1
         if name in msg:
@@ -150,6 +156,8 @@ def summarize(items, input_values, profile=MUSE_PROFILE):
         "open_list": counts["open_list"],
         "message_buttons": counts["message_buttons"],
         "chat_title": chat_title_from_names(button_names, profile),
+        "approval_cards": counts["approval_cards"],
+        "approval_banner": counts["approval_banner"] > 0,
     }
 
 
@@ -315,3 +323,171 @@ def redact(text):
 def now_iso():
     """ローカル時刻(JST)の ISO 8601。"""
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# =========================================================================
+# 承認カードの解析と判定(20261105-02。実機で測った形に基づく)
+# =========================================================================
+# カードは表示中のチャットの中に Group(Name が下記)として出て、その子孫に
+# 「ラベル → 値」の順で Text が並ぶ。同じラベルが DataItem としても重複して
+# 出るが、そちらは見ない(Text だけを見る)。
+APPROVAL_CARD_NAME = "GitHubの承認リクエスト"
+APPROVAL_ACTION = "Push files to GitHub"
+APPROVE_BUTTON = "許可する"
+DENY_BUTTON = "許可しない"
+# 承認待ちの間、窓の上部に出るボタン。カードが別チャットにある目印。
+APPROVAL_BANNER = "Muse、承認が必要です"
+APPROVE_TIMEOUT = 6.0        # 許可する を押してからカードが消えるまで
+CHAT_SWITCH_TIMEOUT = 6.0    # 一覧で選んでからそのチャットが表示されるまで
+
+# ラベルとして知っているもの。これ以外が来たら「未知」として押さない側に倒す。
+_APPROVAL_SCALAR_LABELS = ("Action", "Branch or ref", "Repository owner", "Repository")
+_APPROVAL_FILES_LABEL = re.compile(r"Files · (\d+) · (File path|Content)")
+# ラベルではなく単独で出る、知っている注記。
+_APPROVAL_NOTES = ("Additional request details are not shown.",
+                   "プレビューは省略されています")
+
+
+def split_approval_cards(items):
+    """窓の子孫の並びから、承認カードごとの部分並びを切り出す。
+
+    カードの Group が現れた所から、次のカードの Group の手前までが1枚ぶん。
+    カードの外の要素は捨てる。"""
+    cards = []
+    current = None
+    for ctype, name in items:
+        name = (name or "").strip()
+        if ctype == CONTROL_GROUP and name == APPROVAL_CARD_NAME:
+            current = [(ctype, name)]
+            cards.append(current)
+            continue
+        if current is not None:
+            current.append((ctype, name))
+    return cards
+
+
+def parse_approval_card(items):
+    """承認カード1枚ぶんの (ControlType, Name) の並びを辞書にする。
+
+    Text の並びを「ラベル → 値」として読む。知らないラベル・余った文字列は
+    unknown に集める(判定で押さない理由になる)。DataItem は重複なので無視。"""
+    card = {"action": None, "branch": None, "owner": None, "repo": None,
+            "files": [], "contents": [], "notes": [], "unknown": [],
+            "duplicates": [], "approve_buttons": 0, "deny_buttons": 0,
+            "files_complete": True}
+    scalar_keys = {"Action": "action", "Branch or ref": "branch",
+                   "Repository owner": "owner", "Repository": "repo"}
+    file_paths = {}
+    file_contents = {}
+    pending = None  # 次の Text を値として受けるラベル(文字列 or ("files", 番号, 種類))
+
+    def take_value(value):
+        nonlocal pending
+        label, pending = pending, None
+        if isinstance(label, str):
+            key = scalar_keys[label]
+            if card[key] is not None and card[key] != value:
+                card["duplicates"].append(label)
+            card[key] = value
+            return
+        _tag, idx, kind = label
+        target = file_paths if kind == "File path" else file_contents
+        if idx in target and target[idx] != value:
+            card["duplicates"].append(f"Files · {idx} · {kind}")
+        target[idx] = value
+
+    for ctype, name in items:
+        name = (name or "").strip()
+        if ctype == CONTROL_GROUP and name == APPROVAL_CARD_NAME:
+            continue
+        if ctype == CONTROL_BUTTON:
+            if name == APPROVE_BUTTON:
+                card["approve_buttons"] += 1
+            elif name == DENY_BUTTON:
+                card["deny_buttons"] += 1
+            continue
+        if ctype != CONTROL_TEXT:
+            continue  # DataItem の重複などは見ない
+        if pending is None and name in _APPROVAL_SCALAR_LABELS:
+            pending = name
+            continue
+        m = _APPROVAL_FILES_LABEL.fullmatch(name) if pending is None else None
+        if m:
+            pending = ("files", int(m.group(1)), m.group(2))
+            continue
+        if pending is None and name in _APPROVAL_NOTES:
+            card["notes"].append(name)
+            continue
+        if pending is not None:
+            take_value(name)
+            continue
+        card["unknown"].append(name)
+    if pending is not None:
+        card["unknown"].append(f"{pending}(値が無い)")
+    indices = sorted(file_paths)
+    card["files"] = [file_paths[i] for i in indices]
+    card["contents"] = [file_contents[i] for i in sorted(file_contents)]
+    card["files_complete"] = indices == list(range(1, len(indices) + 1))
+    return card
+
+
+def approval_decision(card, expect):
+    """このカードの『許可する』を押してよいか。よければ None、だめなら理由。
+
+    expect は {"owner", "repo", "branch", "allow_paths"}。
+    迷う要素が1つでもあれば押さない(『許可しない』も押さない。人に残す)。"""
+    branch = expect.get("branch") or ""
+    if not branch.startswith("muse/"):
+        return "--branch は muse/ で始まらなければならない"
+    if card["unknown"]:
+        return f"未知の項目がある: {card['unknown'][0]}"
+    if card["duplicates"]:
+        return f"同じ項目が複数ある: {card['duplicates'][0]}"
+    for key, label in (("action", "Action"), ("branch", "Branch or ref"),
+                       ("owner", "Repository owner"), ("repo", "Repository")):
+        if card[key] is None:
+            return f"{label} が読めない"
+    if card["action"] != APPROVAL_ACTION:
+        return f"Action が想定と違う: {card['action']}"
+    if card["branch"] != branch:
+        return f"Branch or ref が一致しない: {card['branch']}"
+    if card["owner"] != expect.get("owner"):
+        return f"Repository owner が一致しない: {card['owner']}"
+    if card["repo"] != expect.get("repo"):
+        return f"Repository が一致しない: {card['repo']}"
+    if not card["files"]:
+        return "ファイルが1件も無い"
+    if not card["files_complete"]:
+        return "ファイルの一覧が揃っていない(番号の抜けがある)"
+    allow = set(expect.get("allow_paths") or [])
+    for f in card["files"]:
+        if f not in allow:
+            return f"許可されていないパスが含まれている: {f}"
+    if card["approve_buttons"] != 1 or card["deny_buttons"] != 1:
+        return ("『許可する』『許可しない』の数が想定と違う"
+                f"(許可する {card['approve_buttons']} / 許可しない {card['deny_buttons']})")
+    return None
+
+
+def public_card(card):
+    """出力用。ファイルの内容(先頭)は出さず、パスと件数だけにする。"""
+    return {"action": card["action"], "branch": card["branch"],
+            "owner": card["owner"], "repo": card["repo"],
+            "files": card["files"], "contents_count": len(card["contents"])}
+
+
+# =========================================================================
+# チャット一覧での名前の一致(20261105-02、post --chat 用)
+# =========================================================================
+# 一覧の Button の Name はチャット名そのもの。未読があると後ろに印が付く。
+CHAT_UNREAD_SUFFIXES = (" 未読のアップデート", " 未読のチャット")
+
+
+def match_chat_buttons(button_names, title):
+    """Name がチャット名と完全一致、または未読の印付きのものを集める。"""
+    out = []
+    for raw in button_names:
+        name = (raw or "").strip()
+        if name == title or any(name == title + s for s in CHAT_UNREAD_SUFFIXES):
+            out.append(name)
+    return out

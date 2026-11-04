@@ -4,11 +4,18 @@
 #
 #   python muse_post.py status
 #   python muse_post.py post --message "..." [--current-chat] [--dry-run]
+#   python muse_post.py post --message "..." --chat "チャット名" [--expect-text "依頼id"]
 #   python muse_post.py post --message-file handoff\xxx.txt
+#   python muse_post.py approve --owner X --repo Y --branch muse/xxx --allow-path muse_post.py [--dry-run]
+#   python muse_post.py watch --repo-dir R:\claude\tray-tools --owner X --repo Y --branch muse/xxx --path handoff\xxx.result.md --allow-path muse_post.py
 #   python muse_post.py wait --repo R:\claude\tray-tools --branch muse/xxx --path handoff\xxx.result.md
 #
 # 出力は標準出力に JSON 1つ。終了コード 0=成功 / 1=中止(安全確認で止めた・
-# 見つからない・タイムアウト) / 2=引数の誤り。
+# 見つからない・タイムアウト・人に残す) / 2=引数の誤り。
+#
+# approve は承認カードの内容が指定とすべて一致するときだけ『許可する』を押す。
+# watch は結果ファイルの到着と承認カードをスクリプトのループで見張り、Claude が
+# ポーリングで起き続けないようにするもの。判定は muse_post_logic.py の純関数。
 #
 # 判断ロジック(純関数)と Muse アプリの見え方の定義は muse_post_logic.py にある
 # (20261105-01 #11)。あちらは comtypes・copilot_loop を読まないので、判断の
@@ -44,11 +51,13 @@ import sys
 import time
 
 from muse_post_logic import (
-    AWAKE_TIMEOUT, CLEAR_TIMEOUT, CONTROL_BUTTON, CONTROL_EDIT, GIT_TIMEOUT,
+    APPROVE_BUTTON, APPROVE_TIMEOUT, AWAKE_TIMEOUT, CHAT_SWITCH_TIMEOUT,
+    CLEAR_TIMEOUT, CONTROL_BUTTON, CONTROL_EDIT, CONTROL_TEXT, GIT_TIMEOUT,
     MUSE_PROFILE, NEW_CHAT_TIMEOUT, OPEN_LIST_TIMEOUT, POLL_SEC,
-    SEND_APPEAR_TIMEOUT, TITLE_TIMEOUT, _names, _same_text,
+    SEND_APPEAR_TIMEOUT, TITLE_TIMEOUT, _names, _same_text, approval_decision,
     check_before_invoke, check_before_set, check_initial, check_new_chat_ready,
-    is_blank, message_error, now_iso, parse_ls_remote, public_summary, redact,
+    is_blank, match_chat_buttons, message_error, now_iso, parse_approval_card,
+    parse_ls_remote, public_card, public_summary, redact, split_approval_cards,
     summarize, title_settled, view_signature,
 )
 
@@ -73,7 +82,7 @@ except ImportError as _e:  # ModuleNotFoundError を含む
     _ensure_uia = find_window = None
     _UIA_IMPORT_ERROR = _e
 
-VERSION = "20261105-01"
+VERSION = "20261105-02"
 
 
 # =========================================================================
@@ -150,14 +159,17 @@ class Muse:
     def scan(self):
         """木を1回歩いて (要約, 要素) を返す。
 
-        要素は役目ごとのリスト {'input', 'send', 'new_chat', 'open_list'}。
-        押す・書くのは、この直後に、この要素に対してだけ行う(古い要素は無効)。"""
+        要素は役目ごとのリスト {'input', 'send', 'new_chat', 'open_list'} に、
+        全 Button の (Name, 要素) を 'buttons'、全 Text の Name を 'texts'、
+        子孫の (ControlType, Name) の並びそのものを 'items' に足してある
+        (承認カードの解析と、チャット一覧での選択に使う)。"""
         profile = self.profile
         inputs = set(_names(profile, "input_name"))
         send = set(_names(profile, "send_button"))
         new_chat = set(_names(profile, "new_chat_button"))
         suffixes = _names(profile, "open_list_suffix")
-        refs = {"input": [], "send": [], "new_chat": [], "open_list": []}
+        refs = {"input": [], "send": [], "new_chat": [], "open_list": [],
+                "buttons": [], "texts": [], "items": []}
         items = []
         _root, desc = self._descendants()
         for i in range(desc.Length):
@@ -171,12 +183,16 @@ class Muse:
             if ctype == CONTROL_EDIT and name in inputs:
                 refs["input"].append(el)
             elif ctype == CONTROL_BUTTON:
+                refs["buttons"].append((name, el))
                 if name in send:
                     refs["send"].append(el)
                 elif name in new_chat:
                     refs["new_chat"].append(el)
                 elif any(name.endswith(s) for s in suffixes):
                     refs["open_list"].append(el)
+            elif ctype == CONTROL_TEXT:
+                refs["texts"].append(name)
+        refs["items"] = items
         values = [self.read_value(el) for el in refs["input"]]
         return summarize(items, values, profile), refs
 
@@ -229,6 +245,26 @@ class Muse:
         invoke.Invoke()
 
 
+def _poll_scan(muse, predicate, timeout):
+    """predicate(要約, 要素) が真になるまで scan を繰り返す。Muse.poll と同じ作法。
+
+    要素(ボタン一覧など)も見て判定したいときに使う(post --chat の切り替え)。"""
+    deadline = time.time() + max(0.0, timeout)
+    s, refs = None, None
+    while True:
+        try:
+            s, refs = muse.scan()
+            if predicate(s, refs):
+                return s, refs, True
+        except Exception:  # noqa: BLE001
+            pass
+        if time.time() >= deadline:
+            if s is None:
+                s, refs = muse.scan()
+            return s, refs, False
+        time.sleep(POLL_SEC)
+
+
 # =========================================================================
 # サブコマンド
 # =========================================================================
@@ -250,16 +286,24 @@ def cmd_status(_args):
             "descendants": s["descendants"],
             "awake": awake,
             "window_title": muse.window_title(),
+            "approval_cards": s["approval_cards"],
+            "approval_banner": s["approval_banner"],
             "detail": public_summary(s),
         }
     finally:
         muse.close()
 
 
-def _dry_run_plan(s, current_chat, message):
+def _dry_run_plan(s, current_chat, message, chat=None, expect_text=None):
     """--dry-run のときに「実行したら何をするか」を並べる。UI には触らない。"""
     plan = []
-    if current_chat:
+    if chat:
+        plan.append("チャット一覧を開く")
+        plan.append(f"『{chat}』と完全一致(未読の印つきを含む)のボタンをちょうど1つ見つけて Invoke する")
+        if expect_text:
+            plan.append(f"切り替え後の画面に『{expect_text}』を含む Text があることを確かめる")
+        plan.append(f"表示中のチャット『{chat}』に投稿する")
+    elif current_chat:
         plan.append(f"表示中のチャット『{s['chat_title'] or '(名前不明)'}』に投稿する")
     else:
         if s["new_chat"] == 0:
@@ -297,9 +341,14 @@ def _restore_input(muse, refs, message):
 
 def cmd_post(args, message, muse_factory=None):
     """投稿の進行。muse_factory はテスト用の差し替え口(偽の Muse を渡せる)。"""
+    chat_arg = getattr(args, "chat", None)
+    expect_text = getattr(args, "expect_text", None)
+    to_current = bool(args.current_chat or chat_arg)
     result = {"ok": False, "posted_at": None, "chat_title": None,
-              "new_chat": not args.current_chat, "reason": None,
+              "new_chat": not to_current, "reason": None,
               "dry_run": bool(args.dry_run), "steps": []}
+    if chat_arg:
+        result["chat"] = chat_arg
     steps = result["steps"]
     try:
         muse = (muse_factory or Muse)()
@@ -319,10 +368,12 @@ def cmd_post(args, message, muse_factory=None):
             steps.append("木が組み上がらないまま進む(下の確認で止まるはず)")
         s, refs = muse.scan()
         result["found"] = public_summary(s)
-        reason = check_initial(s, args.current_chat)
+        # --chat でも、切り替え前に表示中のチャットの下書きを守る(同じ確認を使う)
+        reason = check_initial(s, True) if chat_arg else check_initial(s, args.current_chat)
 
         if args.dry_run:
-            result["plan"] = [] if reason else _dry_run_plan(s, args.current_chat, message)
+            result["plan"] = [] if reason else _dry_run_plan(
+                s, args.current_chat, message, chat=chat_arg, expect_text=expect_text)
             result["ok"] = reason is None
             result["reason"] = reason
             result["chat_title"] = s["chat_title"]
@@ -332,7 +383,51 @@ def cmd_post(args, message, muse_factory=None):
             result["reason"] = reason
             return 1, result
 
-        if not args.current_chat:
+        if chat_arg:
+            # 一覧を開き、名前の合うチャットをちょうど1つ選んで切り替える
+            if s["open_list"] > 1:
+                result["reason"] = f"一覧を開くボタンが {s['open_list']} 個ある"
+                return 1, result
+            if s["open_list"] == 1:
+                muse.invoke(refs["open_list"][0])
+                steps.append("一覧を開いた")
+                leftovers.append("開いた一覧")
+
+            def _found(_s, r):
+                names = [n for n, _el in (r.get("buttons") or [])]
+                return len(match_chat_buttons(names, chat_arg)) >= 1
+
+            s, refs, ok = _poll_scan(muse, _found, OPEN_LIST_TIMEOUT)
+            matched = [(n, el) for n, el in (refs.get("buttons") or [])
+                       if n in match_chat_buttons([n], chat_arg)]
+            if not ok:
+                result["reason"] = f"チャット『{chat_arg}』が一覧に見つからない" + note_suffix()
+                return 1, result
+            if len(matched) != 1:
+                result["reason"] = (f"チャット『{chat_arg}』に合うボタンが "
+                                     f"{len(matched)} 個ある") + note_suffix()
+                return 1, result
+            muse.invoke(matched[0][1])
+            steps.append(f"チャット『{chat_arg}』を開いた")
+
+            def _switched(s2, r2):
+                if s2["chat_title"] != chat_arg:
+                    return False
+                if expect_text and not any(expect_text in t for t in (r2.get("texts") or [])):
+                    return False
+                return True
+
+            s, refs, ok = _poll_scan(muse, _switched, CHAT_SWITCH_TIMEOUT)
+            if not ok:
+                if s["chat_title"] != chat_arg:
+                    result["reason"] = (f"チャット『{chat_arg}』に切り替わらなかった"
+                                         f"(表示中: {s['chat_title']})") + note_suffix()
+                else:
+                    result["reason"] = (f"切り替え後の画面に『{expect_text}』が見つからない"
+                                         "(別のチャットの可能性があるので投稿しない)") + note_suffix()
+                return 1, result
+
+        if not to_current:
             if s["new_chat"] == 0:
                 muse.invoke(refs["open_list"][0])
                 steps.append("一覧を開いた")
@@ -408,9 +503,8 @@ def cmd_post(args, message, muse_factory=None):
             return 1, result
 
         placeholders = _names(muse.profile, "placeholder_titles")
-        new_chat = not args.current_chat
         s, refs, settled = muse.poll(
-            lambda x: title_settled(title_before, x["chat_title"], new_chat, placeholders,
+            lambda x: title_settled(title_before, x["chat_title"], not to_current, placeholders,
                                     message),
             TITLE_TIMEOUT)
         result["chat_title"] = s["chat_title"]
@@ -432,6 +526,176 @@ def cmd_post(args, message, muse_factory=None):
         return 1, result
     finally:
         muse.close()
+
+
+# =========================================================================
+# 承認カード(approve / watch)
+# =========================================================================
+def _expect_from_args(args):
+    return {"owner": args.owner, "repo": args.repo, "branch": args.branch,
+            "allow_paths": list(args.allow_path or [])}
+
+
+def _check_approval(muse, expect, dry_run=False):
+    """今見えている承認カードを1回見て、必要なら押す。
+
+    戻り値は {"status": "none"|"approved"|"would_approve"|"refused", ...}。
+    none のときは banner(承認が必要です が出ているか)も入れる。"""
+    s, refs = muse.scan()
+    segments = split_approval_cards(refs.get("items") or [])
+    if not segments:
+        return {"status": "none", "banner": bool(s["approval_banner"])}
+    if len(segments) > 1:
+        return {"status": "refused", "reason": f"承認カードが {len(segments)} 枚ある"}
+    card = parse_approval_card(segments[0])
+    reason = approval_decision(card, expect)
+    if reason:
+        return {"status": "refused", "reason": reason, "card": card}
+    if dry_run:
+        return {"status": "would_approve", "card": card}
+    buttons = [el for name, el in (refs.get("buttons") or []) if name == APPROVE_BUTTON]
+    if len(buttons) != 1:
+        return {"status": "refused", "card": card,
+                "reason": f"『許可する』ボタンが {len(buttons)} 個ある"}
+    muse.invoke(buttons[0])
+    _s2, _refs2, ok = muse.poll(lambda x: x["approval_cards"] == 0, APPROVE_TIMEOUT)
+    if not ok:
+        return {"status": "refused", "card": card,
+                "reason": "『許可する』を押したがカードが消えない(押せたか不明)"}
+    return {"status": "approved", "card": card}
+
+
+def cmd_approve(args, muse_factory=None):
+    expect = _expect_from_args(args)
+    if not expect["branch"].startswith("muse/"):
+        return 2, {"ok": False, "reason": "--branch は muse/ で始まらなければならない"}
+    if not expect["allow_paths"]:
+        return 2, {"ok": False, "reason": "--allow-path が1つ以上必要"}
+    try:
+        muse = (muse_factory or Muse)()
+    except MuseNotFound as e:
+        return 1, {"ok": False, "reason": str(e)}
+    try:
+        if not muse.wait_awake():
+            pass  # 木が起きていなければ下の scan で「見つからない」になる
+        chk = _check_approval(muse, expect, dry_run=bool(args.dry_run))
+        if chk["status"] == "none":
+            reason = "承認カードが見つからない"
+            if chk.get("banner"):
+                reason = ("『Muse、承認が必要です』が出ているが、承認カードが"
+                          "表示中のチャットに見えない")
+            return 1, {"ok": False, "reason": reason}
+        if chk["status"] == "refused":
+            out = {"ok": False, "reason": chk["reason"]}
+            if chk.get("card"):
+                out["card"] = public_card(chk["card"])
+            return 1, out
+        if chk["status"] == "would_approve":
+            return 0, {"ok": True, "dry_run": True, "would_approve": True,
+                       "card": public_card(chk["card"])}
+        return 0, {"ok": True, "approved": True, "approved_at": now_iso(),
+                   "card": public_card(chk["card"])}
+    finally:
+        muse.close()
+
+
+def _branch_result_sha(repo_dir, branch, path):
+    """結果ファイルがブランチに載っていれば、その先端の sha。無ければ None。
+
+    watch のループから毎回呼ぶ軽い確認。失敗はすべて「まだ無い」として扱う
+    (理由の切り分けは wait 側の仕事)。"""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_dir, "ls-remote", "--heads", "origin", branch],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=GIT_TIMEOUT, env=env)
+        if proc.returncode != 0 or not parse_ls_remote(proc.stdout, branch):
+            return None
+        fetched = subprocess.run(
+            ["git", "-C", repo_dir, "fetch", "-q", "origin",
+             f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=GIT_TIMEOUT, env=env)
+        if fetched.returncode != 0:
+            return None
+        head = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", f"refs/remotes/origin/{branch}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=GIT_TIMEOUT, env=env)
+        sha = (head.stdout or "").strip()
+        if head.returncode != 0 or not sha:
+            return None
+        has = subprocess.run(["git", "-C", repo_dir, "cat-file", "-e", f"{sha}:{path}"],
+                             capture_output=True, timeout=GIT_TIMEOUT, env=env)
+        return sha if has.returncode == 0 else None
+    except Exception:  # noqa: BLE001  ループを止めない
+        return None
+
+
+def cmd_watch(args, muse_factory=None):
+    """結果ファイルの到着と承認カードを、スクリプトのループで見張る。
+
+    Claude はこのコマンドを1回呼んで結果だけ読めばよい(トークンを食わない)。"""
+    expect = _expect_from_args(args)
+    if not expect["branch"].startswith("muse/"):
+        return 2, {"ok": False, "status": "error",
+                   "reason": "--branch は muse/ で始まらなければならない"}
+    if not expect["allow_paths"]:
+        return 2, {"ok": False, "status": "error", "reason": "--allow-path が1つ以上必要"}
+    if not os.path.isdir(args.repo_dir):
+        return 2, {"ok": False, "status": "error", "reason": f"リポジトリが無い: {args.repo_dir}"}
+    if args.interval <= 0 or args.timeout < 0:
+        return 2, {"ok": False, "status": "error", "reason": "--interval は正、--timeout は0以上"}
+    try:
+        muse = (muse_factory or Muse)()
+        muse_note = None
+    except MuseNotFound as e:
+        muse = None
+        muse_note = f"Muse アプリが見えないため承認の監視はしていない: {e}"
+    approved = []
+    start = time.time()
+    try:
+        while True:
+            sha = _branch_result_sha(args.repo_dir, args.branch, args.path)
+            if sha:
+                out = {"ok": True, "status": "done", "sha": sha, "branch": args.branch,
+                       "path": args.path, "approved": approved,
+                       "waited_sec": round(time.time() - start, 1)}
+                if muse_note:
+                    out["note"] = muse_note
+                return 0, out
+            if muse is not None:
+                try:
+                    chk = _check_approval(muse, expect)
+                except Exception as e:  # noqa: BLE001  画面の切り替わり中などは次周へ
+                    chk = {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+                if chk["status"] == "approved":
+                    approved.append({"at": now_iso(),
+                                     "files": chk["card"]["files"]})
+                    continue  # 押したら結果の確認をすぐやり直す
+                if chk["status"] == "refused":
+                    return 1, {"ok": False, "status": "needs_human",
+                               "reason": chk["reason"], "approved": approved,
+                               "waited_sec": round(time.time() - start, 1)}
+                if chk["status"] == "none" and chk.get("banner"):
+                    return 1, {"ok": False, "status": "needs_human",
+                               "reason": ("『Muse、承認が必要です』が出ているが、承認カードが"
+                                          "表示中のチャットに見えない(別のチャットにある可能性)"),
+                               "approved": approved,
+                               "waited_sec": round(time.time() - start, 1)}
+            elapsed = time.time() - start
+            if elapsed >= args.timeout:
+                out = {"ok": False, "status": "timeout", "approved": approved,
+                       "waited_sec": round(elapsed, 1), "branch": args.branch}
+                if muse_note:
+                    out["note"] = muse_note
+                return 1, out
+            time.sleep(min(args.interval, max(0.0, args.timeout - elapsed)))
+    finally:
+        if muse is not None:
+            muse.close()
 
 
 def _git_timeout(start, total_timeout, first=False):
@@ -558,9 +822,29 @@ def build_parser():
     src.add_argument("--message-file")
     post.add_argument("--current-chat", action="store_true",
                       help="新しいサイドチャットを作らず、表示中のチャットに投稿する")
+    post.add_argument("--chat", help="この名前の既存チャットを開いて投稿する")
+    post.add_argument("--expect-text",
+                      help="--chat で切り替えた画面にこの文字列があることを確かめる")
     post.add_argument("--dry-run", action="store_true", help="UI を一切変えずに計画だけ返す")
     post.add_argument("--allow-multiline", action="store_true",
                       help="改行入りの投稿文を許す(送信の挙動は未検証)")
+    approve = sub.add_parser("approve", help="承認カードが指定と一致するときだけ許可する")
+    approve.add_argument("--owner", required=True)
+    approve.add_argument("--repo", required=True)
+    approve.add_argument("--branch", required=True)
+    approve.add_argument("--allow-path", action="append", required=True,
+                         help="許可してよいファイルパス(複数指定可)")
+    approve.add_argument("--dry-run", action="store_true", help="押さずに判定だけ返す")
+    watch = sub.add_parser("watch", help="結果ファイルの到着と承認カードを見張る")
+    watch.add_argument("--repo-dir", required=True)
+    watch.add_argument("--owner", required=True)
+    watch.add_argument("--repo", required=True)
+    watch.add_argument("--branch", required=True)
+    watch.add_argument("--path", required=True, help="結果ファイルのパス")
+    watch.add_argument("--allow-path", action="append", required=True,
+                       help="許可してよいファイルパス(複数指定可)")
+    watch.add_argument("--timeout", type=float, default=3600)
+    watch.add_argument("--interval", type=float, default=15)
     wait = sub.add_parser("wait", help="remote にブランチと結果ファイルが現れるまで待つ")
     wait.add_argument("--repo", required=True)
     wait.add_argument("--branch", required=True)
@@ -589,12 +873,18 @@ def main(argv=None):
         _emit({"version": VERSION})
         return 0
     if not args.cmd:
-        _emit({"ok": False, "reason": "サブコマンド(status / post / wait)を指定する"})
+        _emit({"ok": False, "reason": "サブコマンド(status / post / approve / watch / wait)を指定する"})
         return 2
     try:
         if args.cmd == "status":
             code, out = cmd_status(args)
         elif args.cmd == "post":
+            if args.chat and args.current_chat:
+                _emit({"ok": False, "reason": "引数の誤り: --chat と --current-chat は同時に使えない"})
+                return 2
+            if args.expect_text and not args.chat:
+                _emit({"ok": False, "reason": "引数の誤り: --expect-text は --chat と一緒に使う"})
+                return 2
             try:
                 message = read_message(args)
             except OSError as e:
@@ -605,6 +895,10 @@ def main(argv=None):
                 _emit({"ok": False, "reason": err})
                 return 2
             code, out = cmd_post(args, message)
+        elif args.cmd == "approve":
+            code, out = cmd_approve(args)
+        elif args.cmd == "watch":
+            code, out = cmd_watch(args)
         else:
             code, out = cmd_wait(args)
     except Exception as e:  # noqa: BLE001  COMError は OSError でないので広く受ける

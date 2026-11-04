@@ -605,7 +605,15 @@ class _FakeApproveMuse:
         refs = {"input": ["in"], "send": [], "new_chat": [], "open_list": [],
                 "buttons": [(n, n) for c, n in items if c == B],
                 "texts": [n for c, n in items if c == T], "items": items}
+        # 本物の scan と同じく、カードの Group 要素を cards に入れる(カードごとの切り出しは
+        # card_contents が Group の子孫だけから行う)
+        segments = mp.split_approval_cards(items)
+        if segments:
+            refs["cards"] = segments
         return s, refs
+
+    def card_contents(self, segment):
+        return segment, [(n, n) for c, n in segment if c == B]
 
     def poll(self, predicate, timeout):
         s, refs = self.scan()
@@ -848,6 +856,28 @@ def test_cmd_post_chat_not_found():
         assert code == 1 and "見つからない" in out["reason"], out
         assert fake.set_calls == []
     _with_fast_timeouts(run)
+
+
+def test_parse_card_real_quirks():
+    """実機(2026-11-05)のカードに出た3つ: 方向制御文字入りの問いかけ・空の Text・
+    番号の付かない Content(コミットメッセージ)。どれも未知扱いにしない。"""
+    items = [(G, "GitHubの承認リクエスト"),
+             (T, "Museに⁨GitHubアカウントでこのアクションを実行⁩を許可しますか？"),
+             (T, ""),
+             (T, "Action"), (T, "Push files to GitHub"),
+             (T, "Branch or ref"), (T, "muse/x"),
+             (T, "Repository owner"), (T, "xelvon-jp"),
+             (T, "Repository"), (T, "tray-tools"),
+             (T, "Files · 1 · File path"), (T, "README.md"),
+             (T, "Files · 1 · Content"), (T, "# 中身"),
+             (T, "Content"), (T, "README に節を足す"),
+             (B, "許可する"), (B, "許可しない")]
+    card = mp.parse_approval_card(items)
+    assert card["unknown"] == [], card["unknown"]
+    assert card["commit_message"] == "README に節を足す"
+    expect = {"owner": "xelvon-jp", "repo": "tray-tools", "branch": "muse/x",
+              "allow_paths": ["README.md"]}
+    assert mp.approval_decision(card, expect) is None
 
 
 def main():

@@ -52,7 +52,8 @@ import time
 
 from muse_post_logic import (
     APPROVE_BUTTON, APPROVE_TIMEOUT, AWAKE_TIMEOUT, CHAT_SWITCH_TIMEOUT,
-    CLEAR_TIMEOUT, CONTROL_BUTTON, CONTROL_EDIT, CONTROL_TEXT, GIT_TIMEOUT,
+    APPROVAL_CARD_NAME, CLEAR_TIMEOUT, CONTROL_BUTTON, CONTROL_EDIT, CONTROL_GROUP,
+    CONTROL_TEXT, GIT_TIMEOUT,
     MUSE_PROFILE, NEW_CHAT_TIMEOUT, OPEN_LIST_TIMEOUT, POLL_SEC,
     SEND_APPEAR_TIMEOUT, TITLE_TIMEOUT, _names, _same_text, approval_decision,
     check_before_invoke, check_before_set, check_initial, check_new_chat_ready,
@@ -192,9 +193,28 @@ class Muse:
                     refs["open_list"].append(el)
             elif ctype == CONTROL_TEXT:
                 refs["texts"].append(name)
+            elif ctype == CONTROL_GROUP and name == APPROVAL_CARD_NAME:
+                refs.setdefault("cards", []).append(el)
         refs["items"] = items
         values = [self.read_value(el) for el in refs["input"]]
         return summarize(items, values, profile), refs
+
+    def card_contents(self, card_el):
+        """承認カードの Group の子孫だけを歩き、((ControlType, Name) の並び, [(Name, Button)]) を返す。"""
+        items = [(CONTROL_GROUP, APPROVAL_CARD_NAME)]
+        buttons = []
+        desc = card_el.FindAll(copilot_loop.UIA.TreeScope_Descendants, self.true_cond)
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                ctype = el.CurrentControlType
+                name = (el.CurrentName or "").strip()
+            except Exception:  # noqa: BLE001  COMError は OSError でない
+                continue
+            items.append((ctype, name))
+            if ctype == CONTROL_BUTTON:
+                buttons.append((name, el))
+        return items, buttons
 
     def poll(self, predicate, timeout, poll=POLL_SEC):
         """predicate(要約) が真になるまで scan を繰り返す。(要約, 要素, 成否) を返す。
@@ -549,18 +569,22 @@ def _check_approval(muse, expect, dry_run=False):
     戻り値は {"status": "none"|"approved"|"would_approve"|"refused", ...}。
     none のときは banner(承認が必要です が出ているか)も入れる。"""
     s, refs = muse.scan()
-    segments = split_approval_cards(refs.get("items") or [])
-    if not segments:
+    card_els = refs.get("cards") or []
+    if not card_els:
         return {"status": "none", "banner": bool(s["approval_banner"])}
-    if len(segments) > 1:
-        return {"status": "refused", "reason": f"承認カードが {len(segments)} 枚ある"}
-    card = parse_approval_card(segments[0])
+    if len(card_els) > 1:
+        return {"status": "refused", "reason": f"承認カードが {len(card_els)} 枚ある"}
+    # カードの中身は、カードの Group 要素の子孫だけから取る。窓全体の並びから
+    # 「カードの Group 以降」を切り出す方式(split_approval_cards)だと、カードの後ろに
+    # 並ぶ別ペインの要素(実機では 'Chat — Muse' の文書)まで混ざり、未知扱いで止まっていた。
+    card_items, card_buttons = muse.card_contents(card_els[0])
+    card = parse_approval_card(card_items)
     reason = approval_decision(card, expect)
     if reason:
         return {"status": "refused", "reason": reason, "card": card}
     if dry_run:
         return {"status": "would_approve", "card": card}
-    buttons = [el for name, el in (refs.get("buttons") or []) if name == APPROVE_BUTTON]
+    buttons = [el for name, el in card_buttons if name == APPROVE_BUTTON]
     if len(buttons) != 1:
         return {"status": "refused", "card": card,
                 "reason": f"『許可する』ボタンが {len(buttons)} 個ある"}

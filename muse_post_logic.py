@@ -346,6 +346,13 @@ _APPROVAL_FILES_LABEL = re.compile(r"Files · (\d+) · (File path|Content)")
 # ラベルではなく単独で出る、知っている注記。
 _APPROVAL_NOTES = ("Additional request details are not shown.",
                    "プレビューは省略されています")
+# カード冒頭の問いかけ。実機(2026-11-05)では「Museに⁨GitHubアカウントでこのアクションを実行⁩を
+# 許可しますか？」で、⁨⁩(U+2068/U+2069 の方向制御文字)が挟まる。中身は固定の定型文なので、
+# 制御文字を除いた全文の一致で注記扱いにする(これが未知扱いで watch が毎回止まっていた)。
+_APPROVAL_HEADER = "MuseにGitHubアカウントでこのアクションを実行を許可しますか？"
+_BIDI_MARKS = dict.fromkeys(map(ord, "⁦⁧⁨⁩‎‏"), None)
+# ラベル「Content」の次の Text はコミットメッセージ(ファイル番号の付かない Content)。
+_APPROVAL_COMMIT_LABEL = "Content"
 
 
 def split_approval_cards(items):
@@ -408,6 +415,8 @@ def parse_approval_card(items):
             continue
         if ctype != CONTROL_TEXT:
             continue  # DataItem の重複などは見ない
+        if not name and pending is None:
+            continue  # 中身の無い Text(実機で1つ出た)。情報が無いので判定に使わない
         if pending is None and name in _APPROVAL_SCALAR_LABELS:
             pending = name
             continue
@@ -415,8 +424,16 @@ def parse_approval_card(items):
         if m:
             pending = ("files", int(m.group(1)), m.group(2))
             continue
-        if pending is None and name in _APPROVAL_NOTES:
+        if pending is None and (name in _APPROVAL_NOTES
+                                or name.translate(_BIDI_MARKS) == _APPROVAL_HEADER):
             card["notes"].append(name)
+            continue
+        if pending is None and name == _APPROVAL_COMMIT_LABEL:
+            pending = "commit"
+            continue
+        if pending == "commit":
+            pending = None
+            card["commit_message"] = name
             continue
         if pending is not None:
             take_value(name)

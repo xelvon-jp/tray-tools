@@ -194,6 +194,17 @@ def test_app_session_title():
             cs.APP_SESSIONS_DIR = old
 
 
+def test_remove_one_session():
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.write("s1", {"state": cs.DONE, "updated": time.time()}, tmp)
+        outside = Path(tmp).parent / "keep_me.json"
+        assert cs.remove({"session_id": "s1"}, tmp) is True
+        assert not cs.status_path("s1", tmp).exists()
+        assert cs.remove({"session_id": "s1"}, tmp) is False      # もう無い
+        assert cs.remove({"session_id": "../keep_me", "_path": str(outside)}, tmp) is False
+        assert cs.remove({}, tmp) is False
+
+
 def test_hook_records_host_session():
     import claude_hook as hook
     hook.send = lambda command, args: True
@@ -281,6 +292,15 @@ def test_progress_panel_rows_and_grab():
         panel.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, point, point, Qt_left(),
                                           Qt_left(), no_mod()))
         assert opened and opened[0]["session_id"] == "a"
+        # ✕ でその行だけ消える(開きはしない)。消す本体は呼んだ側に任せる
+        removed = []
+        panel._on_remove = removed.append
+        opened.clear()
+        point = QPointF(panel._close_rect(1).center())
+        panel.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, point, point, Qt_left(),
+                                          Qt_left(), no_mod()))
+        assert [r["session_id"] for r in removed] == ["d"] and opened == []
+        assert [r["session_id"] for r in panel._rows] == ["c", "a"]
         # 何も無くなればパネルごと隠す
         panel.set_entries([])
         assert not panel.isVisible()

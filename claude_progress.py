@@ -12,6 +12,7 @@
 #     claude_status の DONE_TTL(30分)で消え、何も無くなればパネルごと隠す
 #
 # 操作: 行をクリック = そのセッションをデスクトップアプリで開く(claude://code/continue)。
+#       行の右端の ✕ = その行を消す(状態ファイルを消す。そのセッションが次に動けばまた出る)。
 #       Ctrl+ドラッグ = 移動(場所を覚える)。Copilot の状態監視バーと同じ作法で、
 #       ただのドラッグでは動かさない(押したつもりで動いてしまう事故を避ける)。
 # フォーカスは奪わない(WindowDoesNotAcceptFocus + WA_ShowWithoutActivating)。打っている
@@ -37,6 +38,10 @@ COMPACT_HEIGHT = 24
 MAX_COMPACT = 5
 TRACK_HEIGHT = 6
 SCREEN_MARGIN = 12
+# 行の右端の ✕(その行を消す)。邪魔にならないよう小さく薄く、指したときだけ明るくする。
+CLOSE_SIZE = 12
+CLOSE_GAP = 6
+CLOSE_HOVER = QColor(255, 255, 255, 40)
 # 完了・失敗をバーのまま残しておく時間(秒)。終わったことが目に入る程度。過ぎたら折りたたむ。
 LINGER_SECONDS = 8
 # 計画の無いセッションの帯を動かす間隔(ms)。経過時間の表示もこの間隔で進む。
@@ -111,7 +116,7 @@ def panel_height(rows) -> int:
 
 
 class ClaudeProgressPanel(QWidget):
-    def __init__(self, on_open=None, state_path=None):
+    def __init__(self, on_open=None, state_path=None, on_remove=None):
         super().__init__()
         self.setWindowTitle("Claude の進み具合")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
@@ -120,6 +125,8 @@ class ClaudeProgressPanel(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self._on_open = on_open
+        self._on_remove = on_remove
+        self._hover_close = -1
         self._state_path = state_path
         self._entries = []
         self._rows = []
@@ -208,6 +215,32 @@ class ClaudeProgressPanel(QWidget):
         now = time.time()
         for index, entry in enumerate(self._rows):
             self._paint_row(p, entry, self._row_rect(index), now, index == self._hover)
+            self._paint_close(p, index)
+
+    def _close_rect(self, index) -> QRect:
+        """その行の ✕ の場所。バーの行は1行目(名前の行)の高さに、折りたたんだ行は真ん中に。"""
+        rect = self._row_rect(index)
+        right = rect.right() - PAD_X // 2
+        if self._rows[index].get("_compact"):
+            top = rect.center().y() - CLOSE_SIZE // 2 + 1
+        else:
+            line = QFontMetrics(self._name_font).height()
+            top = rect.top() + 4 + (line - CLOSE_SIZE) // 2
+        return QRect(right - CLOSE_SIZE + 1, top, CLOSE_SIZE, CLOSE_SIZE)
+
+    def _paint_close(self, p, index):
+        box = QRectF(self._close_rect(index))
+        hot = index == self._hover_close
+        if hot:
+            p.setPen(Qt.NoPen)
+            p.setBrush(CLOSE_HOVER)
+            p.drawEllipse(box.adjusted(-2, -2, 2, 2))
+        pen = QPen(TEXT if hot else SUBTEXT, 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        inset = 3.0
+        p.drawLine(box.left() + inset, box.top() + inset, box.right() - inset, box.bottom() - inset)
+        p.drawLine(box.right() - inset, box.top() + inset, box.left() + inset, box.bottom() - inset)
 
     def _paint_row(self, p, entry, rect, now, hover):
         if hover and cs.jump_url(entry):
@@ -231,12 +264,13 @@ class ClaudeProgressPanel(QWidget):
         p.setFont(self._name_font)
         fm = QFontMetrics(self._name_font)
         tail_w = fm.horizontalAdvance(tail)
-        head = QRect(inner.left(), inner.top(), inner.width(), fm.height())
+        head = QRect(inner.left(), inner.top(), inner.width() - CLOSE_SIZE - CLOSE_GAP,
+                     fm.height())
         p.setPen(color if state != cs.RUNNING else SUBTEXT)
         p.drawText(head, Qt.AlignRight | Qt.AlignVCenter, tail)
         p.setPen(TEXT)
         name = fm.elidedText(cs.display_name(entry, cs.MENU_TITLE_CHARS), Qt.ElideRight,
-                             max(0, inner.width() - tail_w - 8))
+                             max(0, head.width() - tail_w - 8))
         p.drawText(head, Qt.AlignLeft | Qt.AlignVCenter, name)
 
         # バー
@@ -288,7 +322,7 @@ class ClaudeProgressPanel(QWidget):
         if entry.get("state") == cs.FAIL:
             tail = "失敗 " + tail
         tail_w = fm.horizontalAdvance(tail)
-        text_rect = inner.adjusted(dot + 6, 0, 0, 0)
+        text_rect = inner.adjusted(dot + 6, 0, -CLOSE_SIZE - CLOSE_GAP, 0)
         p.setPen(SUBTEXT)
         p.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, tail)
         p.setPen(TEXT if cs.jump_url(entry) else SUBTEXT)
@@ -307,16 +341,20 @@ class ClaudeProgressPanel(QWidget):
         if self._drag_origin is not None:
             self.move(event.globalPosition().toPoint() - self._drag_origin)
             return
-        hover = self._row_at(event.position().toPoint())
-        if hover != self._hover:
-            self._hover = hover
+        pos = event.position().toPoint()
+        hover = self._row_at(pos)
+        hover_close = hover if hover >= 0 and self._close_rect(hover).adjusted(
+            -3, -3, 3, 3).contains(pos) else -1
+        if hover != self._hover or hover_close != self._hover_close:
+            self._hover, self._hover_close = hover, hover_close
             jumpable = 0 <= hover < len(self._rows) and cs.jump_url(self._rows[hover])
-            self.setCursor(Qt.PointingHandCursor if jumpable else Qt.ArrowCursor)
+            self.setCursor(Qt.PointingHandCursor if jumpable or hover_close >= 0
+                           else Qt.ArrowCursor)
             self.update()
 
     def leaveEvent(self, _event):
-        if self._hover != -1:
-            self._hover = -1
+        if self._hover != -1 or self._hover_close != -1:
+            self._hover = self._hover_close = -1
             self.update()
 
     def mousePressEvent(self, event):
@@ -326,13 +364,34 @@ class ClaudeProgressPanel(QWidget):
             self._drag_origin = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self.setCursor(Qt.SizeAllCursor)
             return
-        index = self._row_at(event.position().toPoint())
+        pos = event.position().toPoint()
+        index = self._row_at(pos)
+        # ✕ は少し広めに当たりを取る(小さいので押し損ねると、その行を開いてしまう)
+        if 0 <= index < len(self._rows) and self._close_rect(index).adjusted(
+                -3, -3, 3, 3).contains(pos):
+            self._remove_row(index)
+            return
         if 0 <= index < len(self._rows) and self._on_open is not None:
             try:
                 self._on_open(self._rows[index])
             except Exception:  # noqa: BLE001  スロットの中で投げ切らない
                 import traceback
                 traceback.print_exc()
+
+    def _remove_row(self, index):
+        """その行を消す。手元の一覧からもすぐ外して描き直す(次の読み込みを待たない)。"""
+        entry = self._rows[index]
+        key = entry.get("session_id") or entry.get("_path")
+        try:
+            if self._on_remove is not None:
+                self._on_remove(entry)
+        except Exception:  # noqa: BLE001  スロットの中で投げ切らない
+            import traceback
+            traceback.print_exc()
+        self._entries = [e for e in self._entries
+                         if (e.get("session_id") or e.get("_path")) != key]
+        self._hover = self._hover_close = -1
+        self._tick()
 
     def mouseReleaseEvent(self, _event):
         if self._drag_origin is None:

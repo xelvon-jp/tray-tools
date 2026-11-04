@@ -329,6 +329,21 @@ def menu_label(entry: dict, now=None) -> str:
     return f"{LABELS.get(state, state)}　{name}　{tail}"
 
 
+def remove(entry: dict, directory=None) -> bool:
+    """1つのセッションの状態ファイルを消す(進捗パネルの ✕)。
+
+    パスは一覧が付けた _path ではなく session_id から作り直す(外から来た値で
+    任意のファイルを消さないように)。そのセッションが次に動けば、フックがまた書く。"""
+    path = status_path((entry or {}).get("session_id"), directory)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def clear_finished(directory=None) -> int:
     """完了・失敗のファイルを消す(メニューの「完了した行を消す」)。消した数。"""
     count = 0

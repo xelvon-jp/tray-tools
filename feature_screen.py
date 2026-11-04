@@ -2058,7 +2058,7 @@ class ScreenFeature:
             if not self._claude_entries:
                 return   # 出すものが無いうちは窓を作らない
             self._claude_progress = claude_progress.ClaudeProgressPanel(
-                on_open=self._open_claude_session)
+                on_open=self._open_claude_session, on_remove=self._remove_claude_session)
         self._claude_progress.set_entries(self._claude_entries)
 
     def _open_claude_session(self, entry):
@@ -2067,6 +2067,15 @@ class ScreenFeature:
             if not claude_status.open_in_app(entry):
                 show_toast("Claude\nこのセッションはアプリで開けません"
                            "（ターミナルの Claude Code か、記録が古い）")
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _remove_claude_session(self, entry):
+        """進捗パネルの ✕。そのセッションを一覧から消し、輪とツールチップもすぐ直す。"""
+        try:
+            claude_status.remove(entry)
+            self._claude_entries = claude_status.list_sessions()
+            self._refresh_state()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 

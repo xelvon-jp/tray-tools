@@ -240,8 +240,17 @@ def test_progress_panel_rows_and_grab():
             "project": "beads"}
     rows = cp.rows_to_show([asking, running, noplan, done], now, seen)
     assert [r["session_id"] for r in rows] == ["b", "a", "c", "d"]
-    # 終わったものは、最初に見てから LINGER_SECONDS 経つと消える
-    assert [r["session_id"] for r in cp.rows_to_show([done], now + cp.LINGER_SECONDS + 1, seen)] == []
+    assert not any(r["_compact"] for r in rows)
+    # 終わったものは、最初に見てから LINGER_SECONDS 経つと1行に折りたたむ(消さない)
+    later = cp.rows_to_show([running, done], now + cp.LINGER_SECONDS + 1, seen)
+    assert [(r["session_id"], r["_compact"]) for r in later] == [("a", False), ("d", True)]
+    # 折りたたんだ行は終わった新しい順に MAX_COMPACT まで
+    many = [dict(done, session_id=f"d{i}", ended=now - 100 + i) for i in range(8)]
+    seen_many = {}
+    cp.rows_to_show(many, now, seen_many)            # ここで「終わった」と初めて見る
+    folded = cp.rows_to_show(many, now + 1000, seen_many)
+    assert [r["session_id"] for r in folded] == ["d7", "d6", "d5", "d4", "d3"]
+    assert cp.panel_height(later) == cp.PAD_Y * 2 + cp.ROW_HEIGHT + cp.COMPACT_HEIGHT
     with tempfile.TemporaryDirectory() as tmp:
         opened = []
         panel = cp.ClaudeProgressPanel(on_open=opened.append, state_path=Path(tmp, "s.json"))
@@ -256,7 +265,23 @@ def test_progress_panel_rows_and_grab():
         if out:
             Path(out).mkdir(parents=True, exist_ok=True)
             panel.grab().save(str(Path(out) / "progress_panel.png"))
-        # 処理中が無くなればパネルごと隠す
+        # 終わったものだけになっても、折りたたんだ行で残り、押せばそのセッションを開く
+        finished = dict(running, state=cs.DONE, ended=now - 60)
+        panel._first_seen_done["a"] = now - cp.LINGER_SECONDS - 1
+        panel._first_seen_done["d"] = now - cp.LINGER_SECONDS - 2
+        panel.set_entries([noplan, finished, dict(done, host_session_id="local_d")])
+        assert panel.isVisible() and [r["_compact"] for r in panel._rows] == [False, True, True]
+        assert panel.height() == cp.PAD_Y * 2 + cp.ROW_HEIGHT + cp.COMPACT_HEIGHT * 2
+        if out:
+            panel.grab().save(str(Path(out) / "progress_panel_folded.png"))
+        opened.clear()
+        # 折りたたんだ行は終わった新しい順(d が後に終わった)
+        assert [r["session_id"] for r in panel._rows] == ["c", "d", "a"]
+        point = QPointF(panel._row_rect(2).center())
+        panel.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, point, point, Qt_left(),
+                                          Qt_left(), no_mod()))
+        assert opened and opened[0]["session_id"] == "a"
+        # 何も無くなればパネルごと隠す
         panel.set_entries([])
         assert not panel.isVisible()
         # 位置の保存は該当キーだけ差し替える

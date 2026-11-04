@@ -7,7 +7,9 @@
 #   - バーの長さは計画の進み具合(claude_status.plan_fraction)。計画が無いセッションは
 #     長さを出せないので、流れる帯で「動いている」ことだけ示す
 #   - 色はトレイの輪と同じ(実行中=青・確認待ち=桃)
-#   - 完了・失敗したものは数秒だけ残して消し、処理中が無くなればパネルごと隠す
+#   - 完了・失敗したものは数秒だけバーのまま残し、そのあとは1行に折りたたんで残す
+#     (少し前にやり取りしていたセッションへ飛びたいことが多いため)。折りたたんだ行は
+#     claude_status の DONE_TTL(30分)で消え、何も無くなればパネルごと隠す
 #
 # 操作: 行をクリック = そのセッションをデスクトップアプリで開く(claude://code/continue)。
 #       Ctrl+ドラッグ = 移動(場所を覚える)。Copilot の状態監視バーと同じ作法で、
@@ -29,9 +31,13 @@ PANEL_WIDTH = 300
 PAD_X = 12
 PAD_Y = 8
 ROW_HEIGHT = 48
+# 折りたたんだ行(終わったセッション)の高さ。名前と終わった時刻だけ。
+COMPACT_HEIGHT = 24
+# 折りたたんだ行は新しいものからこの数まで(全部はメニューの「💬 Claude」にある)。
+MAX_COMPACT = 5
 TRACK_HEIGHT = 6
 SCREEN_MARGIN = 12
-# 完了・失敗を残しておく時間(秒)。終わったことが目に入る程度。
+# 完了・失敗をバーのまま残しておく時間(秒)。終わったことが目に入る程度。過ぎたら折りたたむ。
 LINGER_SECONDS = 8
 # 計画の無いセッションの帯を動かす間隔(ms)。経過時間の表示もこの間隔で進む。
 ANIMATION_MS = 80
@@ -75,22 +81,33 @@ def save_state(update: dict, path=None) -> None:
 
 
 def rows_to_show(entries, now, first_seen_done: dict) -> list:
-    """パネルに出す行。処理中(実行中・確認待ち)と、終わって LINGER_SECONDS 以内のもの。
+    """パネルに出す行(entry の写しに "_compact" を付けたもの)。
+
+    処理中(実行中・確認待ち)と、終わって LINGER_SECONDS 以内のものはバーの行。
+    それより前に終わったもの(entries に残っている＝DONE_TTL 以内)は折りたたんだ1行で、
+    バーの行の下に、終わった新しい順に MAX_COMPACT まで並べる。
 
     first_seen_done は「終わったのを最初に見た時刻」の控え(セッション ID ごと)。ファイルの
     ended はフックが書いた時刻だが、常駐が読むまでに数秒ずれるので、見えた時刻から数える。"""
-    rows = []
+    full, compact = [], []
     for entry in entries:
         state = entry.get("state")
         key = entry.get("session_id") or entry.get("_path")
         if state in (cs.RUNNING, cs.ASK):
             first_seen_done.pop(key, None)
-            rows.append(entry)
+            full.append(dict(entry, _compact=False))
         elif state in (cs.DONE, cs.FAIL):
             seen = first_seen_done.setdefault(key, now)
             if now - seen < LINGER_SECONDS:
-                rows.append(entry)
-    return rows
+                full.append(dict(entry, _compact=False))
+            else:
+                compact.append(dict(entry, _compact=True))
+    compact.sort(key=lambda e: -(e.get("ended") or e.get("updated") or 0))
+    return full + compact[:MAX_COMPACT]
+
+
+def panel_height(rows) -> int:
+    return PAD_Y * 2 + sum(COMPACT_HEIGHT if r.get("_compact") else ROW_HEIGHT for r in rows)
 
 
 class ClaudeProgressPanel(QWidget):
@@ -135,15 +152,21 @@ class ClaudeProgressPanel(QWidget):
                 self._timer.stop()
                 self.hide()
                 return
-            resize = len(rows) != len(self._rows)
+            height = panel_height(rows)
+            resize = height != self.height()
             self._rows = rows
             if resize or not self.isVisible():
-                self.resize(PANEL_WIDTH, PAD_Y * 2 + ROW_HEIGHT * len(rows))
+                self.resize(PANEL_WIDTH, height)
                 self._place()
             if not self.isVisible():
                 self.show()
-            if not self._timer.isActive():
-                self._timer.start(ANIMATION_MS)
+            # 動くもの(経過時間・流れる帯・バーの行が折りたたまれる時刻)があるときだけ回す。
+            # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
+            if any(not r.get("_compact") for r in rows):
+                if not self._timer.isActive():
+                    self._timer.start(ANIMATION_MS)
+            else:
+                self._timer.stop()
             self.update()
         except Exception:  # noqa: BLE001  タイマーのスロット。投げ切ると常駐ごと落ちる
             import traceback
@@ -169,7 +192,11 @@ class ClaudeProgressPanel(QWidget):
 
     # -- 描画 ------------------------------------------------------------
     def _row_rect(self, index) -> QRect:
-        return QRect(PAD_X // 2, PAD_Y + ROW_HEIGHT * index, self.width() - PAD_X, ROW_HEIGHT)
+        top = PAD_Y
+        for row in self._rows[:index]:
+            top += COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
+        height = COMPACT_HEIGHT if self._rows[index].get("_compact") else ROW_HEIGHT
+        return QRect(PAD_X // 2, top, self.width() - PAD_X, height)
 
     def paintEvent(self, _event):
         # QWidget の setStyleSheet では背景が描かれない(CLAUDE.md の罠)ので自分で描く。
@@ -189,6 +216,9 @@ class ClaudeProgressPanel(QWidget):
             p.drawRoundedRect(QRectF(rect), 6, 6)
         state = entry.get("state")
         color = STATE_COLORS.get(state, STATE_COLORS[cs.RUNNING])
+        if entry.get("_compact"):
+            self._paint_compact(p, entry, rect, color)
+            return
         inner = rect.adjusted(PAD_X // 2, 4, -PAD_X // 2, -4)
 
         # 1行目: 名前(切り詰め)と、右に経過/状態
@@ -243,6 +273,28 @@ class ClaudeProgressPanel(QWidget):
         sub_rect = QRect(inner.left(), int(track.bottom()) + 2, inner.width(), sub_fm.height())
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
+
+    def _paint_compact(self, p, entry, rect, color):
+        """折りたたんだ行: 状態の色の点・名前・終わった時刻だけ。バーの行より控えめに。"""
+        inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        dot = 6
+        p.drawEllipse(QRectF(inner.left(), inner.center().y() - dot / 2 + 1, dot, dot))
+        p.setFont(self._sub_font)
+        fm = QFontMetrics(self._sub_font)
+        ended = entry.get("ended") or entry.get("updated") or time.time()
+        tail = time.strftime("%H:%M", time.localtime(ended))
+        if entry.get("state") == cs.FAIL:
+            tail = "失敗 " + tail
+        tail_w = fm.horizontalAdvance(tail)
+        text_rect = inner.adjusted(dot + 6, 0, 0, 0)
+        p.setPen(SUBTEXT)
+        p.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, tail)
+        p.setPen(TEXT if cs.jump_url(entry) else SUBTEXT)
+        name = fm.elidedText(cs.display_name(entry, cs.MENU_TITLE_CHARS), Qt.ElideRight,
+                             max(0, text_rect.width() - tail_w - 8))
+        p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, name)
 
     # -- マウス ----------------------------------------------------------
     def _row_at(self, pos) -> int:

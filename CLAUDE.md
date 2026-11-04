@@ -180,6 +180,13 @@ PCごとの違いは `settings.json` の `copilot_profiles` で上書きでき�
 
 `settings.json` を丸ごと書き戻さない。**ファイルを読み直して該当キーだけ差し替える**（丸ごと書くと未設定の既定値まで焼き込まれ、ファイルの姿が変わる）。`snippets.push_recent` / `launcher.save_bookmark` / `clipboard_preview._save_size` が同じ作法。
 
+## photometa は PhotoCuller からも使われている
+
+`photometa/` は別アプリ PhotoCuller（private リポジトリ photo-culler）が、PC 上のこのフォルダから直接 import している。**tray-tools を pull しただけで、PhotoCuller 側を何も変えなくても PhotoCuller が壊れる。**
+
+- **関数・クラス・引数を消す、名前を変えるときは、photo-culler 側の呼び出しを検索して確かめる。** 必要なら両方を同時に直す（2026-11-03、`collect_mitene` / `finish_mitene` / `load_manifest` の削除で実際に壊れた）
+- このリポジトリの CI は PhotoCuller のテストを回さないので、壊しても CI は緑のまま
+
 ## git
 
 - コミットメッセージは**日本語**。1行目に要約、本文に「なぜそうしたか」。

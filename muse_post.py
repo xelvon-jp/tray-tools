@@ -411,6 +411,13 @@ def cmd_post(args, message, muse_factory=None):
             steps.append(f"チャット『{chat_arg}』を開いた")
 
             def _switched(s2, r2):
+                # 実機(2026-11-05)では、一覧からチャットを開いても一覧は開いたままで、
+                # チャット名の取り出し元(…を開くボタン)が消えて chat_title は None になる。
+                # そのときは --expect-text の一致だけを切り替わりの証拠にする
+                # (expect_text が無ければ証拠が無いので止まる側に倒す)。
+                if s2["chat_title"] is None:
+                    return bool(expect_text) and any(
+                        expect_text in t for t in (r2.get("texts") or []))
                 if s2["chat_title"] != chat_arg:
                     return False
                 if expect_text and not any(expect_text in t for t in (r2.get("texts") or [])):

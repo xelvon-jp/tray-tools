@@ -173,8 +173,15 @@ def read_event() -> dict:
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return {}
-        raw = sys.stdin.read()
-    except (OSError, ValueError):
+        # バイトのまま読んで UTF-8 で解く。Claude Code は UTF-8 で送ってくるが、テキストの
+        # まま読むと Windows では cp932 で解かれ、計画の日本語やパスが化ける(実際に
+        # 状態ファイルが書けなくなった)。
+        data = sys.stdin.buffer.read()
+        try:
+            raw = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raw = data.decode("cp932", errors="replace")
+    except (OSError, ValueError, AttributeError):
         return {}
     if not (raw or "").strip():
         return {}

@@ -85,6 +85,7 @@ def test_hook_writes_status_through_a_turn():
     with tempfile.TemporaryDirectory() as tmp:
         cs.STATUS_DIR = Path(tmp, "status")
         hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")   # 本物の hook.log を汚さない
         config = dict(hook.DEFAULTS, min_seconds=0)
         event = {"session_id": "s-1", "cwd": r"R:\claude\tray-tools"}
         hook.on_start(config, event)
@@ -120,6 +121,25 @@ def test_hook_writes_status_through_a_turn():
         assert cs.read("s-1")["state"] == cs.RUNNING
         hook.on_fail(config, event)
         assert cs.read("s-1")["state"] == cs.FAIL
+
+
+def test_hook_reads_utf8_stdin():
+    """フックの標準入力は UTF-8。Windows の既定(cp932)で解くと日本語が化ける。"""
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, TEMP=tmp, TMP=tmp)
+        env.pop("PYTHONUTF8", None)
+        payload = {"session_id": "u8", "cwd": "R:/claude/日本語の作業",
+                   "tool_name": "mcp__ccd_turn__update_plan",
+                   "tool_input": {"items": [{"content": "テストと確認", "status": "in_progress"}]}}
+        import json
+        for action in ("start", "tool"):
+            subprocess.run([sys.executable, str(ROOT / "hooks" / "claude_hook.py"), action],
+                           input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                           env=env, capture_output=True, timeout=30)
+        data = cs.read("u8", Path(tmp, "tray-tools-hooks", "status"))
+        assert data.get("project") == "日本語の作業", data
+        assert cs.plan_text(data.get("plan")) == "1/1 テストと確認", data
 
 
 def test_tray_tooltip_helpers():

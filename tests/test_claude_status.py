@@ -164,6 +164,36 @@ def test_jump_url_and_fraction():
     assert cs.plan_fraction(plan) == 1.5 / 4
 
 
+def test_app_session_title():
+    """アプリが保存しているセッション名を出す。取れなければ「フォルダ名「書き出し」」。"""
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp, "acct", "org")
+        folder.mkdir(parents=True)
+        path = folder / "local_t1.json"
+        path.write_text(json.dumps({"sessionId": "local_t1", "title": "Tray-Tools_1104(ローカル)"},
+                                   ensure_ascii=False), encoding="utf-8")
+        old = cs.APP_SESSIONS_DIR
+        cs.APP_SESSIONS_DIR = Path(tmp)
+        try:
+            entry = {"project": "claude", "title": "書き出し", "host_session_id": "local_t1"}
+            assert cs.display_name(entry) == "Tray-Tools_1104(ローカル)"
+            assert cs.display_name(entry, 5) == "Tray-Tools_1104(ロー…"   # 5+14=19 文字に切る
+            # アプリで名前を変えたら付いてくる(更新時刻が変われば読み直す)
+            path.write_text(json.dumps({"title": "新しい名前"}, ensure_ascii=False),
+                            encoding="utf-8")
+            os.utime(path, (time.time() + 5, time.time() + 5))
+            assert cs.display_name(entry) == "新しい名前"
+            # 名前が無い・ファイルが無い・形が違う ID なら今までの表示
+            path.write_text("{}", encoding="utf-8")
+            os.utime(path, (time.time() + 10, time.time() + 10))
+            assert cs.display_name(entry) == "claude「書き出し」"
+            assert cs.display_name(dict(entry, host_session_id="local_none")) == "claude「書き出し」"
+            assert cs.app_session_title("../x") == ""
+        finally:
+            cs.APP_SESSIONS_DIR = old
+
+
 def test_hook_records_host_session():
     import claude_hook as hook
     hook.send = lambda command, args: True

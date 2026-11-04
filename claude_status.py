@@ -134,14 +134,58 @@ def prompt_title(prompt) -> str:
     return text
 
 
+# デスクトップアプリが保存しているセッションの情報。サイドバーに出ている名前(title)が
+# 入っている。アプリ内部の保存形式で公開された仕様ではないので、場所や項目が変わったら
+# 名前が出ないだけにする(フォルダ名「書き出し」の表示に戻る)。
+APP_SESSIONS_DIR = (Path(os.environ.get("APPDATA") or Path.home())
+                    / "Claude" / "claude-code-sessions")
+# アプリの名前は書き出しより長めに見せる(陽太さんが付けた名前を途中で切りすぎない)。
+APP_NAME_EXTRA = 14
+_app_paths = {}     # local_… → ファイルの場所
+_app_titles = {}    # 場所 → (更新時刻, 名前)。更新されたときだけ読み直す(1つ40KBほど)
+
+
+def app_session_title(host_session_id, directory=None) -> str:
+    """デスクトップアプリでのセッション名。取れなければ空。"""
+    if not valid_host_session(host_session_id):
+        return ""
+    root = Path(directory or APP_SESSIONS_DIR)
+    key = (str(root), host_session_id)
+    path = _app_paths.get(key)
+    try:
+        if path is None or not path.exists():
+            # <アカウント>/<組織>/local_….json。ID は確かめ済みなのでパターンに混ぜてよい。
+            found = next(iter(root.glob(f"*/*/{host_session_id}.json")), None)
+            if found is None:
+                return ""
+            path = _app_paths[key] = found
+        mtime = path.stat().st_mtime
+        cached = _app_titles.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        title = str(data.get("title") or "").strip() if isinstance(data, dict) else ""
+        title = _SPACE.sub(" ", title)
+        _app_titles[path] = (mtime, title)
+        return title
+    except (OSError, ValueError):
+        return ""
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
 def display_name(entry: dict, limit: int = TITLE_CHARS) -> str:
+    """見せる名前。アプリのセッション名があればそれ、無ければ「フォルダ名「書き出し」」。"""
+    app_title = app_session_title(entry.get("host_session_id"))
+    if app_title:
+        return _clip(app_title, limit + APP_NAME_EXTRA)
     name = entry.get("project") or "Claude Code"
     title = str(entry.get("title") or "").strip()
     if not title:
         return name
-    if len(title) > limit:
-        title = title[: max(1, limit - 1)] + "…"
-    return f"{name}「{title}」"
+    return f"{name}「{_clip(title, limit)}」"
 
 
 def project_name(cwd) -> str:

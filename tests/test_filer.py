@@ -2500,6 +2500,37 @@ def test_zip_update_logic():
         (downloads / "other.zip").write_bytes(b"z")
         assert zu.find_downloaded_zip(downloads) == newer
 
+        # 大文字小文字だけ違う名前は同じファイルとして扱い、削除で消さない
+        # (一覧に NewMod.py、新しい ZIP に newmod.py があるケース)
+        case_zip = make_zip(Path(tmp, "case.zip"), {
+            "main.py": "main", "filer.py": "filer v2",
+            "requirements.txt": "req1", "newmod.py": "new"})
+        case_plan = zu.plan_update(zu.inspect_archive(case_zip), repo, ["NewMod.py"])
+        assert case_plan["delete"] == []
+        # ドライブ名を含むエントリは弾く
+        drive_zip = make_zip(Path(tmp, "drive.zip"), {
+            "main.py": "m", "filer.py": "f", "requirements.txt": "r",
+            "C:/evil.py": "x"})
+        try:
+            zu.inspect_archive(drive_zip)
+            raise AssertionError("弾くはず")
+        except zu.ZipUpdateError:
+            pass
+        # 版の新旧: 古い ZIP はダウングレード扱い
+        assert zu.is_downgrade("ZIP 20261104", "ZIP 20261031")
+        assert not zu.is_downgrade("ZIP 20261031", "ZIP 20261104")
+        assert not zu.is_downgrade("ZIP 20261104", "ZIP 20261104")
+        assert not zu.is_downgrade("", "ZIP 20261104")
+        # 控えは新しい順に5件だけ残る
+        backups = Path(tmp, "backups")
+        backups.mkdir()
+        for i in range(7):
+            old = backups / f"update_backup_2026010{i}_000000.zip"
+            old.write_bytes(b"x")
+            os.utime(old, (1_700_000_000 + i, 1_700_000_000 + i))
+        zu._prune_backups(backups)
+        assert len(list(backups.glob("*.zip"))) == zu.BACKUP_KEEP == 5
+
         # pip が失敗しても適用自体は成功として返り、pip の失敗が載る
         v3 = make_zip(Path(tmp, "v3.zip"), {
             "main.py": "main", "filer.py": "filer v2",

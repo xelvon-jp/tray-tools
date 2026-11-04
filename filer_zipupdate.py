@@ -77,7 +77,10 @@ def inspect_archive(zip_path) -> dict:
         for info in files:
             name = info.filename.replace("\\", "/")
             parts = [part for part in name.split("/") if part not in ("", ".")]
-            if len(parts) < 2 or any(part == ".." for part in parts):
+            # ".." で外へ出るものと、"C:" のようなドライブ名・代替ストリーム
+            # (コロンを含む部分)があるものを弾く。後者は Windows ではフォルダの
+            # 外への書き出しになりうる
+            if len(parts) < 2 or any(part == ".." or ":" in part for part in parts):
                 raise ZipUpdateError(f"想定外のエントリがあります: {info.filename}")
             tops.add(parts[0])
             rel = "/".join(parts[1:])
@@ -179,9 +182,13 @@ def plan_update(info: dict, repo_dir, manifest_files) -> dict:
             pass
         overwrite.append(rel)
     delete = []
+    entry_keys = {rel.lower() for rel in entries}
     for rel in manifest_files or []:
         rel = str(rel).replace("\\", "/")
-        if rel in entries or _protected(rel):
+        # 大文字小文字だけ違う名前は Windows では同じファイル。新しい ZIP に
+        # foo.py があり一覧に Foo.py があるとき、Foo.py を消すと今書いた
+        # foo.py まで消えてしまうので、削除の対象から外す
+        if rel in entries or rel.lower() in entry_keys or _protected(rel):
             continue
         if (repo / rel).is_file():
             delete.append(rel)
@@ -193,6 +200,22 @@ def plan_update(info: dict, repo_dir, manifest_files) -> dict:
 
 def plan_is_empty(plan: dict) -> bool:
     return not (plan["add"] or plan["overwrite"] or plan["delete"])
+
+
+def label_date(label) -> int:
+    """版表記("ZIP 20261104" / "20261104" / "20261104-02")から日付部分 YYYYMMDD。
+    取れなければ 0。"""
+    import re
+
+    match = re.search(r"\d{8}", str(label or ""))
+    return int(match.group()) if match else 0
+
+
+def is_downgrade(current_label, new_label) -> bool:
+    """新しい ZIP の版が今の版より古いか(ダウンロードフォルダに古い ZIP が
+    残っていると、更新で版が戻ってしまう)。日付が両方取れるときだけ比べる。"""
+    current, new = label_date(current_label), label_date(new_label)
+    return bool(current and new and new < current)
 
 
 # ---------------------------------------------------------------
@@ -214,7 +237,25 @@ def _make_backup(plan: dict, repo: Path, backup_root: Path, now: datetime) -> st
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
         for rel in targets:
             out.write(repo / rel, rel)
+    _prune_backups(backup_root)
     return str(path)
+
+
+BACKUP_KEEP = 5
+
+
+def _prune_backups(backup_root: Path) -> None:
+    """控えは新しい順に BACKUP_KEEP 件だけ残す(更新のたびに増え続けないように)。"""
+    try:
+        files = sorted(backup_root.glob("update_backup_*.zip"),
+                       key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in files[BACKUP_KEEP:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def apply_files(zip_path, info: dict, plan: dict, repo_dir, backup_root=None,

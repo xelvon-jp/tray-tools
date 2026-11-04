@@ -2366,7 +2366,7 @@ ExifTool は `-stay_open True -@ -` で1つだけ起こし、1枚ずつ送りま
 | `presets` | ベスト `★>=3` / みてね未 `★=5 && !#みてね済` / 削除候補 `reject` | `{"name", "expr"}`。任意で `key`・`label`（PhotoCuller の絞り込みの小メニュー用。あっふは使わない） |
 | `frame_targets` | `[]` | フォトフレーム同期の置き先（フォルダの並び） |
 | `frame_manual_delete` | `[]` | `frame_targets` のうち、**削除がクラウドへ反映されない同期先**（フォルダの並び）。下の「手で消す写真の一覧」 |
-| `frame` | `{"max_long_edge": 2560, "quality": 85, "strip_gps": true, "crop_aspect": null}` | フォトフレーム用 JPEG の作り方（長辺の上限 256〜20000・JPEG 品質 1〜100・GPS を消すか）と、PhotoCuller の「顔でおまかせ一括」の縦横比の既定 `"16:10"`（同期時の切り抜きには使わない） |
+| `frame` | `{"max_long_edge": 2560, "quality": 85, "strip_gps": true, "crop_aspect": null}` | フォトフレーム用 JPEG の作り方（長辺の上限 256〜20000・JPEG 品質 1〜100・GPS を消すか）と、PhotoCuller の「顔でおまかせ一括」の縦横比の既定（未設定なら元画像の比率。同期時の切り抜きには使わない） |
 | `mitene_dir` | `""` | 旧「みてね用に集める」先（経路は廃止）。`collect` の降りない先と、書き出し候補からの除外に使う。空なら `%TEMP%\みてね用` |
 | `exiftool` | `""` | ExifTool の場所（ファイルかフォルダ）。空なら PATH から探す |
 

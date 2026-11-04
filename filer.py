@@ -4474,8 +4474,12 @@ class FilerWindow(QWidget):
                 lines.append("（初回なので、削除はしません）")
             if plan.get("requirements_changed"):
                 lines.append("依存パッケージも更新します（pip install）")
+            downgrade = filer_zipupdate.is_downgrade(current, info.get("label"))
+            if downgrade:
+                lines.append("⚠ この ZIP は今の版より古いです（更新すると版が戻ります）")
             lines.append("\n更新して再起動しますか？")
-            if not self.confirm("あっふの更新", "\n".join(lines), default_yes=True):
+            if not self.confirm("あっふの更新", "\n".join(lines),
+                                default_yes=not downgrade):
                 self.log("更新: 取りやめました")
                 return
             self._update_busy = True

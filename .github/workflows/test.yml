@@ -55,3 +55,8 @@ jobs:
         # 実際に書くテストは skip と表示して成功扱いになる(読み取り・設定・式は全部回る)。
         shell: cmd
         run: python -X faulthandler -u tests/test_photometa.py
+
+      - name: フォルダ監視移動のテスト
+        # 純ロジックとルール編集ダイアログ(ダイアログだけ offscreen の Qt)。自分で終了コードを返す。
+        shell: cmd
+        run: python -X faulthandler -u tests/test_folder_watch.py

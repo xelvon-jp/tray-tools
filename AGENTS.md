@@ -1,0 +1,256 @@
+# tray-tools 作業ルール
+
+Windows 常駐トレイアプリ（Python 3.10 以上 + PySide6）。トレイアイコンから画面キャプチャ・音声出力切替・画面ミラーなどをまとめて扱う。Python の下限は `setup.py` の実際のチェック内容（`MIN_PYTHON = (3, 10)` で 3.10 以上を確認する）に合わせる。
+
+詳しい仕様は `README.md`（このリポジトリのいちばん厚い文書）にある。**ここに書くのは、読まずに触ると壊すところだけ。**
+
+**このファイルが、Claude Code と Muse に共通する作業ルールの正本である。** Claude（Claude Code）固有のことは `CLAUDE.md` に分けてあり、`CLAUDE.md` の冒頭の `@AGENTS.md` からこのファイルを読み込む。
+
+## 改行コード
+
+**全ファイル LF。** `.gitattributes` は無く `core.autocrlf=false`。
+
+- 確認は `git ls-files --eol`（`i/lf w/lf` なら LF）と `git diff --stat`。
+- **「既存は CRLF」という報告を信じないこと。** 実際に何度も誤報告があった。必ず上のコマンドで確かめる。
+- **Python で書き戻すと CRLF になる。** `open(path, 'w')` は既定 `newline=None` で `\n` → `\r\n` に変換する。書き戻すときは `newline=''` を指定するか、`'rb'` / `'wb'` でバイト列のまま扱う。
+
+## 環境・セットアップ
+
+- **仮想環境（venv）はこのフォルダの中ではなく `%USERPROFILE%\.venvs\tray-tools` にあります。**
+- グローバルの `python` ではなく必ず上記 venv の `python.exe` を使ってください。
+- `settings.json`・`*.lnk`・venv は PC 固有で、コミットしません（`settings.json` はデバイスIDや保存先パスが PC 固有のため、リポジトリには含まれません。`*.lnk` は絶対パスを埋め込むため `setup.py` が各 PC で作り直します。venv は各 PC で作り直します）。
+
+## Feature の規約
+
+**Feature = トレイアイコンを1つ所有するもの。**
+
+- `feature_*.py` に「`self.tray_icon` を持つ」「`hotkeys()` を返す」クラスを書き、`main.py` の `FEATURE_CLASSES` に足す。
+- **抽象基底クラスは意図的に作っていない。** 2つしかないものに継承を被せる利点が無い。
+- **アイコンを持たない能力は、普通のモジュールにする**（`snippets.py` / `clipboard_format.py` / `screen_ruler.py` など）。開閉の管理は `feature_screen.py` 側が持つ。
+
+**通知領域のアイコンは2つに固定する方針。** 新しいトレイアイコンを増やさないこと。状態表示が要るならタスクバーウィジェット側へ。
+
+## 落ちる書き方（すべて実際に踏んだもの）
+
+- **COM オブジェクトを関数の外に出さない。** 親を変数に受けずに子だけ返すと即座に解放され、`0xC0000005` でプロセス即死する。例外ではないので `error.log` にも何も残らず、しかも落ちたり落ちなかったりする。
+- **`mss.MSS()` を都度作らない。** `capture_grab._sct()` の使い回しを必ず通す。毎フレーム作ると COM/GC 衝突で落ちる（2026-08-28 に8回）。
+- **`finally` の中の例外は捕まえられない。** `finally` で Qt オブジェクトを触るなら必ず `try` で囲む。
+- **PySide6 はスロット内で例外が投げ切られるとプロセスごと終了する。** 外部から叩かれる入口（`_handle_connection` など）は必ず `try` で受ける。通常起動は `pythonw.exe` なので標準エラーもどこにも出ず、理由が何も残らない。
+- **`comtypes.COMError` は `OSError` のサブクラスではない。** まとめて捕まえたつもりで抜ける。
+- **`ctypes` は `argtypes` / `restype` を必ず指定する。** 64bit でハンドルが int に切り詰められてアクセス違反になる（`GetClipboardData` で実際に踏んだ）。
+- **COM ポインタを `ctypes.cast` で型変換しない。`QueryInterface` を使う。** `cast` は AddRef しないので Release が1回多くなる。しかも元のポインタを自分の `_objects` に抱えさせる循環を作るので、元のポインタは循環 GC が来たときにだけ解放される。cast の結果が先に Release して COM オブジェクトが消え、あとから GC が残りを Release して解放済みメモリを触る。crash.log の「`Garbage-collecting` → `unknwn.py Release` → `__del__` ←（毎回違う処理）」の正体はこれだった（`mic_control` の旧 `_endpoint_volume`。2026-10-21 に突き止めた）。GC を呼び込んだ側（segno・psutil・mss・`_make_methods` など）は引き金にすぎない。`tests/test_com_gc.py` が、COM を使うモジュールに `cast(` の呼び出しが無いことを見張っている。
+- **COM ポインタを循環参照の中に置かない。** 循環に入った COM ポインタは、いつ・どのスレッドで GC が来るかで解放のされ方が変わる（ハーネスでは、作ったのと別のスレッドで GC されたものが半分以上あった）。確かめるには `tools/com_gc_harness.py --probe`（常駐の外で COM の読み取り経路を叩く）か、調査モード（`settings.json` の `"debug": {"com_gc_probe": true}`、または環境変数 `TRAYTOOLS_COM_GC_PROBE=1`）を使う。`com_gc_probe.log` に、循環 GC に回ってきた COM ポインタの型・作った場所とスレッド・抱えていたものが出る。**調査モードは GC 中の Release を止め、`gc.garbage` も解放しない（意図的なリーク）。終わったら必ず無効に戻すこと。** なお `gc.DEBUG_SAVEALL` だけでは落ちるのは止まらない（CPython は garbage に残す前に `__del__` を呼ぶ）。
+
+## 外から叩ける口（`main.py` の `_build_command_handlers`）
+
+増やすほど誤操作の被害が広がる。**足してよいのは「常駐しているこのプロセスでなければできないこと」だけ。**
+
+アプリの起動・ファイル操作のたぐいは足さない。呼ぶ側が直接できるので、わざわざ常駐を経由させる利点が無く、口を通る危険だけが増える。
+
+`traytools_send.py` と `hooks/claude_hook.py` は **PySide6 を import しない。** Qt の import だけで1秒近くかかり、ホットキーやフックの体感がそのぶん遅くなる。
+
+### MCP サーバーの実装上の約束（共通部分）
+
+- **MCP の SDK を使いません。** stdio 上の JSON-RPC は数十行で足りるうえ、venv に依存を増やさずに済みます
+- **`stdout` には MCP のメッセージ以外を一切書きません。** 診断は `stderr` へ。メッセージは1行1件で、**中に改行を含めません**（`separators=(",", ":")` で潰しています）
+- **常駐が起きていなければ、起こしに行かず「起きていない」と返します。** `traytools_send.send()` は未起動なら本体を起動して6秒待ちますが、それはあふｗから呼ぶときの作法です
+- **引数の不正はプロトコルのエラーにせず、`isError` を立てた結果として返します。** そのほうが Claude 側が読んで対処できます（プロトコルのエラーは会話に載りません）
+
+Claude Code への登録先や annotations など、Claude 固有の事情は `CLAUDE.md` にある。
+
+## 単一起動の判定
+
+**名前付きミューテックス（`CreateMutexW`）で決める。`QLocalServer` では決まらない。**
+
+- **Windows の名前付きパイプは、同じ名前で複数のサーバインスタンスを作れる。** 実測で、別プロセスが待ち受けている名前に対して `listen()` が `True` を返した。**「立てられたから自分が先着」という判定が原理的に成り立たない**
+- 「調べてから立てる」形は、検査と確保の間に隙間がある（同時に起動した2つが両方「誰も居ない」と判断しうる）
+- `CreateMutexW` は作成と「既にあったか」の判定が1回のシステムコールで済むので隙間が無い。プロセスが死ねば OS が必ず手放すので、**クラッシュ後に起動できなくなる問題も起きない**
+
+`QLocalServer`（`SINGLE_INSTANCE_KEY`）は**外部コマンドを受ける口としてだけ**使う。判定には使わない。
+
+**再起動（`_restart`）では、後継を起こす前にミューテックスを手放すこと。** 手放さないと新しい方が「すでに起動しています」と判断して引き返す。
+
+## プロセス一覧では常に2つに見える（二重起動ではない）
+
+**`%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe` / `pythonw.exe` は起動用のスタブで、本物のインタプリタを子プロセスとして起こす。** 親も生き続けるので、タスクマネージャや `Get-CimInstance Win32_Process` では**同じコマンドラインが必ず2行並ぶ**。
+
+```
+10908 親37244  pythonw.exe R:\claude\tray-tools\main.py
+48844 親10908  pythonw.exe R:\claude\tray-tools\main.py     ← 10908 の子。同じ1インスタンス
+```
+
+**これを二重起動と読み違えないこと。** 実際に一度読み違えて、存在しない不具合を追いかけた。見分け方は次のとおり。
+
+- **親子関係を見る**（`ParentProcessId`）。片方がもう片方の親なら1インスタンス
+- 起動時刻の差が**十数ミリ秒**なら、まず間違いなくこれ
+- `capture_process.py` でも `mcp_server.py` でも同じように2つ並ぶ。**MCP サーバーは自分で子を作らない**ので、そこで2つ見えたら原因はスタブだと分かる
+- 決定的な確かめ方: `%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe -c "import time; time.sleep(4)"` を1つ動かして数える。**2つ見えれば環境の性質**
+
+本当に二重起動しているかは、ミューテックスが取れるかで確かめる。
+
+```
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe -c "import main; print(main._acquire_single_instance())"
+```
+
+常駐が正しく1つ動いていれば `False`（＝既に誰かが握っている）が返る。
+
+## 起動・再起動
+
+**避ける理由は「危ないから」ではなく「巻き添えが出るから」。** 動いている常駐を落とすと、貼ったままの付箋や見ている最中のミラーが道連れになる。付箋の中身は開き直しても戻らない。トレイの「🔄 再起動」は本人が押すので巻き添えを承知で押せるが、外から叩く口にはその判断が無い。
+
+**だから、巻き添えが無いことを確かめてからならエージェントが再起動してよい。** 修正や機能追加のあと、反映とテストまで通してよい。
+
+```
+traytools_send.py restart --check    落としてよいかだけ答える（何もしない）
+traytools_send.py restart            安全なときだけ再起動する
+```
+
+`restart` は次のどれかが生きていたら `ERR` を返して**何もしない**。そのときはトレイの 🔄 を押してもらうこと。
+
+| 断る理由 | なぜ |
+|---|---|
+| 付箋 | 貼ったままの中身が消える。開き直しても戻らない |
+| 画面ミラー | 見ている最中かもしれない |
+| エージェントループ | 走っている作業が途中で切れる |
+| スリープ予約 | 再起動で消える。寝るつもりで寝ないのは気づきにくい |
+
+状態が読めないものは「あるかもしれない」側に倒す（数え落とすより数え過ぎるほうが安全）。判定は `ScreenFeature.restart_blockers()` に集めてある。**巻き添えの種類が増えたらここに足すこと。** 足し忘れると、黙って消えるものが増える。
+
+**アプリの「起動」は引き続きエージェントがやらない。** 落ちている常駐を勝手に立ち上げると、意図して終了していた場合に押し返すことになる。
+
+検証は `QT_QPA_PLATFORM=offscreen` で。窓を実画面に出さず、`QWidget.grab()` で PNG に落として確かめられる。
+
+- **offscreen で `setMimeData()` を使うと終了時にセグメンテーション違反（139）が出る。** 実機とは無関係（`README.md` に理由あり）。
+- offscreen では日本語フォントが解決されず豆腐になることがある。レイアウトの確認には使えるが、字が出ないことを不具合と読み違えないこと。
+
+## テスト
+
+- テストはモジュールごとに `tests/test_*.py` があります。実行はグローバルの `python` ではなく、必ず venv の `python.exe` で行います。基本形は `%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_<モジュール>.py` です
+- ファイラは普段の実行では、窓を立てる重いテスト（`FULL_ONLY`）は省略されます。全部回すときは `--full`（`%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_filer.py --full`）で、CI では常に全部回ります
+- ExifTool の実書きテストは環境に無ければ skip されます。skip は「通った」こととは違うので、結果を書くときは区別すること
+
+## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py` / `agent_loop_viewer.py`）
+
+Copilot アプリを相手に「プロンプト送信 → 応答受信 → コード実行 → 結果貼り戻し」を自動で回す仕組み。
+
+- **UIA だけを使う。キー送信もマウス操作もしない。** フォーカスを奪わないので、他の作業と並行しても事故が起きない
+- **既定は dry-run。** `--auto` を明示しない限り PowerShell を実行せず、コードをログに残して止まる。初めての題材はまずここで安全に確かめる
+- **危険パターン検知**（`copilot_loop.risky_lines`）でヒットしたら自動実行しない。人の判断を待って止まる。Copilot に理由を返して終わる
+- **3層のタイムアウト**（PowerShell 単発 / 応答待ち / ループ全体）で無限ループを防ぐ
+- **キャンセルはファイル方式**（`.copilot_loop_cancel`）。実行スレッドが詰まっていても次の周の頭で拾って止まる
+
+### 3つのモード
+
+| モード | 送信 | 実行 | 用途 |
+|---|---|---|---|
+| 通常 dry-run | tray-tools が送信 | 実行しない | 目視確認 |
+| 通常 auto（`--auto`） | tray-tools が送信 | 実行 | Claude Code / CLI から起動 |
+| 監視モード（`--watch`） | **人が Copilot に手で投稿** | 実行 | 業務PC など Claude Code の無い環境 |
+
+**監視モードは1周目の送信をスキップする**。それだけの違い。`run_loop(watch=True, initial_prompt=None)`。busy 判定も skip する（人が送った直後で busy なのが普通）。2周目以降は通常モードと同じ。
+
+### イベント配信で「PowerShell の窓」を作らない
+
+トレイメニューの「監視モード開始」から起動すると、`agent_loop_viewer.LogViewer`（Qt の QPlainTextEdit）が開いて、応答受信・スニペット抽出・PowerShell 実行の内容を色分けで流す。Start-Process で新しい PowerShell 窓を開かない理由:
+
+- 周ごとに窓が増える／監視モード終了で自動的に閉じられない
+- 1つに集約したいが、cmd/pwsh 窓を1つに集約するのは面倒（stdin にコマンドを流し込む必要があり、標準出力を吸うのも面倒）
+- Qt 窓なら開閉を tray-tools が管理でき、周が増えても1枚に集約、ログもスクロール・選択がそのまま使える
+
+`agent_loop.run_loop(on_event=...)` にコールバックを渡すことで、ワーカースレッド → メインスレッド（Qt シグナル `QueuedConnection`）→ LogViewer の順に流す。**ワーカースレッドから Qt を直接触ると壊れる**ので `_AgentLoopBridge`（`Signal(dict)`）を必ず経由する（`_PushoverBridge` と同じ流儀）。
+
+### アイコン状態表示
+
+`_refresh_state` で優先順位 監視モード > スリープ抑止 > 通常。監視モードはさらに待機（緑）／実行中（青）／エラー（赤）で色を変える。**新しいトレイアイコンは追加しない**（`_normal_icon` を差し替える）ので、「アイコン2つ固定」の方針は維持。既存の `_make_awake_icon_image` を一般化した `_make_ring_icon_image(color, width)` を使う。
+
+### 応答テキストの取り方に決着済みの罠
+
+`copilot_loop.Copilot.document_text` の docstring に詳しいが要点を再掲。3案を実測して「**`FindAll` の並びのまま `Text` 要素の名前を繋ぐ**」だけが正解だった。
+
+- Text を座標順に並べる → 構文強調でトークンが割れ、コードが原形を失う
+- `TextPattern.DocumentRange` → 一部のトークン境界で改行が入る（`@{` が `@` と `{` に割れる、`-Encoding UTF8` が2行になる）
+- `FindAll` の返り順（DOM 順）は保たれるので、**並べ替えないこと**が肝
+
+### wait_until_idle は「busy を見てから idle 復帰」に依存しない
+
+前実装は「busy を見た後に idle に戻ったら完了」で作っていたが、生成が短すぎたり poll の隙間で busy を見逃すと**永久に idle 待ちになった**（301秒タイムアウトの実例あり）。いまは「送信後 grace → idle が settle_seconds 連続で完了 / busy を見たらタイマーをリセット」。busy を見逃しても止まる。
+
+### new_response は送信直前の全文長から切り出す
+
+`rsplit("Copilot の発言", 1)[1]` は会話が長くなると誤爆する。応答内に見出しとして同じマーカーが混ざったり、古いターンの断片が最後尾になったりして、27文字などの短片が返る。**送信直前の `snapshot_length()` を渡して、それより後ろだけを扱う**。
+
+### 業務PC（M365 Copilot）への移植
+
+`copilot_loop.BUILTIN_PROFILES` にアプリごとのプロファイルを並べてあり、実行時に「動いている窓に合うもの」を選ぶ。手元PCと業務PCで同じコードが動く。実測値：
+
+| | 手元PC | 業務PC |
+|---|---|---|
+| exe | `mscopilot.exe` | `M365Copilot.exe` |
+| class | `Chrome_WidgetWin_1` | `Microsoft 365 Copilot Host` |
+| 入力欄 aid | `userInput` | `m365chat-editor-target-element` |
+| 送信 | `メッセージの送信` | `送信` |
+| 回答中 | `メッセージの割り込み` | `生成を停止する` |
+
+**窓の照合は exe 名を第一の手掛かりにする**。タイトルは表示言語や開いている会話で変わり、class も `Chrome_WidgetWin_1` には Claude も Chrome も居るので単独では足りない。**ボタン名はリストで持ち「どれかに当てはまれば」で判定する**。1つの完全一致に賭けると、文言が少し違うだけで「ずっと idle」に見えて理由も画面に出ない。
+
+PCごとの違いは `settings.json` の `copilot_profiles` で上書きできる（同じ `name` なら設定側が勝つ）。業務PCへはコードを配りにくいので、そちらで直せる道を残してある。
+
+**調べる候補は `tools/uia_probe.py` が出してくれる**。`--survey` で対象を見つけ、`--exe <名前> --watch 30` で1往復させながら遷移を眺める。出力の最後に「ここから下だけ読み上げれば足ります」のまとめが出る（業務PCからデータを持ち出せず、画面を読み上げるしかないため）。
+
+**M365 の発言マーカーは未特定**。`あなたの発言` に相当する Text を出しておらず、プローブの上位に出たのは会話本文だった。プロファイルでは空にしてある。状態表示（`copilot_watchdog`）はマーカーを使わないので空でも動くが、`agent_loop` の応答切り出しはここが埋まるまで業務PCでは正しく効かない。
+
+## 設定ファイル
+
+`settings.json` を丸ごと書き戻さない。**ファイルを読み直して該当キーだけ差し替える**（丸ごと書くと未設定の既定値まで焼き込まれ、ファイルの姿が変わる）。`snippets.push_recent` / `launcher.save_bookmark` / `clipboard_preview._save_size` が同じ作法。
+
+## photometa は PhotoCuller からも使われている
+
+`photometa/` は別アプリ PhotoCuller（private リポジトリ photo-culler）が、PC 上のこのフォルダから直接 import している。**tray-tools を pull しただけで、PhotoCuller 側を何も変えなくても PhotoCuller が壊れる。**
+
+- **関数・クラス・引数を消す、名前を変えるときは、photo-culler 側の呼び出しを検索して確かめる。** 必要なら両方を同時に直す（2026-11-03、`collect_mitene` / `finish_mitene` / `load_manifest` の削除で実際に壊れた）
+- このリポジトリの CI は PhotoCuller のテストを回さないので、壊しても CI は緑のまま
+
+## git
+
+- コミットメッセージは**日本語**。1行目に要約、本文に「なぜそうしたか」。
+- **このリポジトリは public。** 個人的な除外は `.gitignore` ではなく `.git/info/exclude` へ（`.gitignore` は共有されるので「何を隠したか」が公開される）。
+
+### push
+
+**push の確認は実行者で違います。Claude Code は通常の push は確認なしでよい。Muse は push 可ですが、GitHub コネクタは書き込みごとに承認カードが出るため、そのカードが確認の代わりになります。1 push = 1 コミットにまとめて、カードの回数を減らすこと。** 単一PC・単独操作で、GitHub Actions も他の書き手もいないため競合しない（`threads-auto-post` で git を禁止しているのは Actions と `index.lock` が競合するからで、ここにその事情は無い）。
+
+**ただし public なので、push の直前に必ずこれを通すこと。** 一度出せば取り消しは事実上効かない（キャッシュ・フォーク・検索）。危ないのは push ではなく**コミットの時点**なので、push を止めても守りにはならない。だから止める代わりに、毎回見る。
+
+```bash
+git diff --stat origin/main..HEAD
+git ls-files --error-unmatch settings.json hooks/hook.log action.log crash.log error.log copilot_loop.log
+git diff origin/main..HEAD | grep -inE "token|api[_-]?key|password|secret|bearer|[a-f0-9]{32,}"
+git log origin/main..HEAD --format="%an <%ae>" | sort -u
+```
+
+- `settings.json` と各種 `*.log` が**追跡対象になっていないこと**（`--error-unmatch` が全部失敗すれば正しい）
+- 追加行に秘密情報らしき文字列が無いこと
+- 著者が noreply で統一されていること
+
+**引っかかったら push せずに報告する。**
+
+Muse がコネクタで push する場合は、手元の git にその HEAD が無い構成があり、上の git コマンド群をそのままでは実行できないことがあります。その場合は、ローカルクローンを `git fetch` してから、同じ観点（変更ファイルの一覧・秘密情報らしき文字列・著者・追跡対象になっていないこと）で確かめる代替手順でよいです。
+
+### 確認が要るもの（自動でやらない）
+
+- **履歴を書き換える操作** … `push --force` / `rebase` / `reset --hard`
+- **public ↔ private の切り替え**
+- **新しいリポジトリを公開すること**
+
+## 実行環境ごとの違い
+
+上のルールは共通ですが、実行環境によってはそのまま守れない・意味がないものがあります。守れない場合は、やらなかったことにせず、代替の範囲までやって残りを切り分けて書くこと。
+
+- **Windows 実機が前提の確認・操作**：常駐の再起動（`restart --check` を含む）、実画面での目視、UIA で Copilot アプリを回すエージェントループ、Teams・Everything・WinMerge・ExifTool の実書き、`SHFileOperationW` の実動作テストなどは、ユーザーの PC 上の常駐や実画面が前提です。Muse の VM は Linux で、ユーザーの PC で動いている常駐プロセスにも触れません
+  - 代替案：Muse 側は純関数テスト・静的チェック・offscreen で回る範囲までを行い、実機でしか確かめられない項目は結果ファイルに「未実施・実機確認待ち」として切り分けて書きます。実機確認は Nagato 本人か PC 側の担当に回します
+- **`CLAUDE.md` の「通常の push は確認なしでよい」**：Muse の GitHub コネクタは書き込みごとに承認カードが出るため、そのままでは守れません
+  - 代替案：上の「push」の節のとおり書き分けます。「Claude Code は確認なしで push 可。Muse は push 可だが、コネクタの承認カードが確認の代わりになる。1 push = 1 コミットにまとめてカードの回数を減らすこと」
+- **push 前チェックの git コマンド群**（`git diff origin/main..HEAD` など）：コネクタ経由の push では手元の git にその HEAD が無い構成があり、そのままでは実行できないことがあります
+  - 代替案：上の「push」の節のとおり、ローカルクローンを `git fetch` してから、同じ観点（変更ファイルの一覧・秘密情報のパターン・著者・追跡対象になっていないこと）で確かめる代替手順を併記してあるので、そちらを使います
+- **改行コードのうち「Python の `open(path, 'w')` が `\n` を `\r\n` に変換する」という警告**：Windows 版 Python の話で、Linux VM では再現しません（LF を維持すること自体は共通ルールとして有効です）
+- **プロセス一覧が2つに見える件と、ミューテックス取得の確認コマンド**（`%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe -c "import main; print(main._acquire_single_instance())"`）：知識としては共通ですが、確認の実行先はユーザーの PC の常駐であり、Muse からは実行できません

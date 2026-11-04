@@ -348,6 +348,7 @@ traytools_send.py sleep cancel           予約を取り消す
 | `pushover` | `message`（必須）, `title`, `priority`, `sound` | `openWorldHint` |
 | `capture` | `screen` | |
 | `bookmark` | `path` | |
+| `agent_loop` | `action`（必須）, `prompt_file`, `watch`, `auto`, `max_rounds`, `finish_word` | **`destructiveHint`** |
 
 `annotations` はクライアントが承認の重さを決める材料です。読むだけのものに `readOnlyHint` を付けてあるので、都度確認せずに使う設定にしやすくなっています。逆に `sleep_pc` には `destructiveHint` を付けてあります —— **作業中に寝られるのがいちばん困る**ためです。
 
@@ -442,8 +443,6 @@ Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`a
 
 ### 安全機構
 
-### 安全機構
-
 - **既定は dry-run**（`--auto` を明示するまで実行しない）。Copilot が返したコードは `copilot_loop.log` に残るので、目視で確かめてから `--auto` を付ける
 - **危険パターン検知**（`Remove-Item` / `Stop-Process` / `Invoke-WebRequest` / `git push` / `-Force` など）にヒットしたら実行せず停止。Copilot に理由を返して人の判断を待つ
 - **3層のタイムアウト**: PowerShell 1回（既定60秒）／応答待ち（180秒）／ループ全体（30分）
@@ -468,6 +467,8 @@ Claude Code から MCP 経由でも呼べます（ツール名 `agent_loop`、`a
 ### 業務PC（M365 Copilot）への移植
 
 `copilot_loop.BUILTIN_PROFILES` にアプリごとのプロファイルが並んでいて、実行時に「動いている窓に合うもの」が選ばれます。手元PCの Copilot（`mscopilot.exe`）と業務PCの M365 Copilot（`M365Copilot.exe`）の両方が入っているので、同じコードがどちらでも動きます。
+
+**ただし M365 の発言マーカーは未特定です**。`あなたの発言` に相当する Text を出しておらず、プロファイルでは空にしてあります。状態表示（`copilot_watchdog`）はマーカーを使わないので空でも動きますが、`agent_loop` の応答切り出しはここが埋まるまで業務PCでは正しく効きません。
 
 PCごとに値が違うときは、コードを触らず `settings.json` の `copilot_profiles` で上書きできます（同じ `name` なら設定側が勝ちます）。
 
@@ -1001,10 +1002,10 @@ SVG の `d` は、相対命令・H/V・S・Q（3次ベジエへ正確に上げ�
 ### テスト
 
 ```
-python tests\test_bg_remove.py               # 純関数（推定・精密モード・アルファ・残す色・ムラ追従・自動の許容量・AI補正・色かぶり除去・切り詰め・アイコン分割・GVML・ベクタ化）と配色のコントラスト比
-python tests\check_bg_remove_clipboard.py    # 実画面で "PNG" 形式が載るか
-python tests\check_bg_remove_gvml.py         # アイコンに分けて載せ、見えない Excel に貼って図の数・型・位置・アルファを確かめる
-python tests\check_bg_remove_vector_gvml.py  # ベクタ化して載せ、見えない Excel に貼ってグループの数・Freeform・色を確かめる(vtracer が要る)
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_bg_remove.py               # 純関数（推定・精密モード・アルファ・残す色・ムラ追従・自動の許容量・AI補正・色かぶり除去・切り詰め・アイコン分割・GVML・ベクタ化）と配色のコントラスト比
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\check_bg_remove_clipboard.py    # 実画面で "PNG" 形式が載るか
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\check_bg_remove_gvml.py         # アイコンに分けて載せ、見えない Excel に貼って図の数・型・位置・アルファを確かめる
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\check_bg_remove_vector_gvml.py  # ベクタ化して載せ、見えない Excel に貼ってグループの数・Freeform・色を確かめる(vtracer が要る)
 ```
 
 ベクタ化のテストは合成画像だけで書いてあります（vtracer が無ければ、子プロセスで実際に走らせるものだけ飛ばす）。手元の実画像での目視の確認には、リポジトリの外に置いた画像を使ってください（公開リポジトリに入れない）。
@@ -2250,10 +2251,10 @@ Renemo の画面に寄せた一括改名の窓です（`filer_renemo.py`。改�
 ### テスト
 
 ```
-python tests\test_filer.py
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_filer.py
 ```
 
-普段の実行では、窓を立てる重いテスト（`FULL_ONLY` の64件）は省略されます。全部回すときは `python tests\test_filer.py --full`（CI では常に全部回ります）。
+普段の実行では、窓を立てる重いテスト（`FULL_ONLY` の64件）は省略されます。全部回すときは `%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_filer.py --full`（CI では常に全部回ります）。
 
 純関数（キー表・パス・マスク・並べ方・マーク・履歴・名前・比較マーク・窓の配分）と、offscreen の窓へのキー送信（移動・マーク・親移動・左右切替・O/Alt+O・履歴・マスク・K/R・W・S・V・コピー/移動/削除・Esc で閉じないこと・Alt+矢印・字の拡大縮小・メニューの初期選択と選んでいる行の色・Shift+Z・マウスが効かないこと・ドラッグで渡すもの・カーソル行の描画（背景を塗らず下線だけ）・F7 で子プロセスへ渡す引数・頭文字ジャンプの巡回・範囲マーク・Enter の拡張子判別・P で反対窓に ZIP・Alt+W で WinMerge に渡す引数・上の2行と下の行の文字（容量の読み取りは差し替え）・ステータスバーがカーソルで変わる・Fキーの段の表示と Shift での切り替え・区画のクリックでコマンドが走る・深いパスでも窓の最小幅が広がらない・R のダイアログ（キャレット位置・変換・Alt+頭文字・名前/日時/属性が実際に変わる・大文字小文字だけの改名・読み込み専用・存在しない日付・名前の重なり・一括変更）・F5・合計ファイルサイズ（`I` / `Shift+I`。件数とバイト数・クラスタでの切り上げ・マークあり/なし・`..`・`Esc` で中止・読めないフォルダ・書庫の中）・`E` / `V` で画像を含むときだけの確認・拡張子別表示色が拡張子の列だけに付くこと・Z の設定ダイアログの新規/変更/削除/上下/色/初期値と決定・中止・R のフォーカスで全選択しないこととチェックの四角の見え方・ライブ絞り込み・よく行くフォルダ・フラット表示（中止・上限・ジャンクションをたどらない）・プレビュー（テキスト・画像の縮小・フォルダ・書庫）・一括改名（変換・置換・書式で付け直す（よく使う形・見本・誤りで OK を押せない・`{ext}`・以前の連番/マスクと同じ結果）・メニューバーが無くツールバーの並びとキー・対象の行・並べ替え・拡張子/フルパスのチェック・入れ替え・衝突・巻き戻し・履歴・Esc）。ダイアログの中で外れた assert も、コマンドの例外の受け止めに飲まれずテストに伝わるようにしてある）、ファイル情報と拡張子別表示色の純関数、画面の書式（`475.69 GB ( 100.38 GB)` などあふｗと同じ書式・属性の文字・Fキーの表示名と修飾ごとの割り当て）、簡易テキストビュア（50万行のファイルを開いてすぐ描ける・末尾/行ジャンプ・別スレッドの検索・文字コードの判定と切り替え・BOM・空のファイル）、ZIP 圧縮（中身・UTF-8 の印・更新日時・自分自身を入れない・中止と失敗で残さない）、WinMerge の探し方と左右の決め方、F7 の子プロセスの診断モード（メニューの項目が取れ、gc.collect を挟んだ繰り返しでも落ちないこと。画面には出さない）、属性（隠し/システムの絞り込み・表示色の種類・ZIP の DOS 属性）、書庫（cp932 の名前・ディレクトリのエントリ無し・zip slip の除外・入る/出る・展開と上書き確認・書き込み系の拒否・7z・パスワード付き 7z・py7zr が無い場合）、`SHFileOperationW` の実動作（コピー・移動・完全削除。ごみ箱は `FILER_TEST_TRASH=1` のときだけ）、ミューテックスと「前面に出して」の受け渡しを確かめます。触るのは一時フォルダだけです。**ファイラを開いたままだと、単一起動のテストは飛ばします**（本物に「前面に出して」を送ってしまうため）。環境変数 `FILER_SHOT` に PNG のパスを入れると窓の絵を書き出します。
 

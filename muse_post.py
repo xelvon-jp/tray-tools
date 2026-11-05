@@ -85,7 +85,7 @@ except ImportError as _e:  # ModuleNotFoundError を含む
     _ensure_uia = find_window = None
     _UIA_IMPORT_ERROR = _e
 
-VERSION = "20261105-03"
+VERSION = "20261105-04"
 
 
 # =========================================================================
@@ -681,16 +681,29 @@ def cmd_watch(args, muse_factory=None):
         return 2, {"ok": False, "status": "error", "reason": f"リポジトリが無い: {args.repo_dir}"}
     if args.interval <= 0 or args.timeout < 0:
         return 2, {"ok": False, "status": "error", "reason": "--interval は正、--timeout は0以上"}
-    try:
-        muse = (muse_factory or Muse)()
-        muse_note = None
-    except MuseNotFound as e:
-        muse = None
-        muse_note = f"Muse アプリが見えないため承認の監視はしていない: {e}"
+    # Muse の窓は毎周つかみ直せるようにする。投稿の直後は窓が一瞬見つからない
+    # ことがあり(2026-11-05 に2回、最初の1回で諦めて承認を監視しないまま待ち続け、
+    # 承認カードが放置された)、窓が作り直されると古い参照は使えなくなるため。
+    factory = muse_factory or Muse
+    muse = None
+    muse_note = None
+
+    def _acquire():
+        nonlocal muse, muse_note
+        if muse is not None:
+            return
+        try:
+            muse = factory()
+            muse_note = None
+        except MuseNotFound as e:
+            muse = None
+            muse_note = f"Muse アプリが見えないあいだは承認を監視できない: {e}"
+
     approved = []
     start = time.time()
     try:
         while True:
+            _acquire()
             sha = _branch_result_sha(args.repo_dir, args.branch, args.path)
             if sha:
                 out = {"ok": True, "status": "done", "sha": sha, "branch": args.branch,
@@ -704,6 +717,12 @@ def cmd_watch(args, muse_factory=None):
                     chk = _check_approval(muse, expect)
                 except Exception as e:  # noqa: BLE001  画面の切り替わり中などは次周へ
                     chk = {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+                    # 窓が作り直されたかもしれないので、次周でつかみ直す
+                    try:
+                        muse.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    muse = None
                 if chk["status"] == "approved":
                     approved.append({"at": now_iso(),
                                      "files": chk["card"]["files"]})

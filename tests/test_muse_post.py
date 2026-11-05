@@ -1018,6 +1018,37 @@ def test_desk_bad_args_exit_2():
         assert code == 2 and _json.loads(buf.getvalue())["ok"] is False, argv
 
 
+def test_watch_reacquires_muse_after_not_found():
+    # 最初の周で窓が見つからなくても、次の周でつかみ直して承認する(2026-11-05 の放置対策)
+    import tempfile
+    from types import SimpleNamespace
+    state = {"made": 0, "delivered": False}
+
+    def deliver():
+        state["delivered"] = True
+
+    fake = _FakeApproveMuse(card_items=_card_items(branch="muse/done"), on_approve=deliver)
+
+    def factory():
+        state["made"] += 1
+        if state["made"] == 1:
+            raise mpost.MuseNotFound("まだ無い(偽)")
+        return fake
+
+    orig = mpost._branch_result_sha
+    mpost._branch_result_sha = lambda *_a: "abc" if state["delivered"] else None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(owner="xelvon-jp", repo="tray-tools", branch="muse/done",
+                                   allow_path=["muse_post.py", "muse_post_logic.py"],
+                                   repo_dir=d, path="r.md", timeout=5, interval=0.01)
+            code, out = mpost.cmd_watch(args, muse_factory=factory)
+    finally:
+        mpost._branch_result_sha = orig
+    assert state["made"] == 2, state
+    assert code == 0 and out["status"] == "done" and len(out["approved"]) == 1, out
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

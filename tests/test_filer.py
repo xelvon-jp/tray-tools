@@ -2610,7 +2610,8 @@ def test_window_archive():
 
         # Ctrl+Enter のメニューの「関連付けで開く」(&OPEN) / E は一時フォルダへ取り出して開く
         opened = []
-        w._startfile = lambda path: opened.append(path)
+        # 書庫から取り出して開くものは履歴に残さない(record=False)ので、その引数も受ける
+        w._startfile = lambda path, **_kw: opened.append(path)
         w._exec_menu = _pick_menu("&O:")
         L.set_cursor(L._row_of(JP_NAME))
         key(Qt.Key_Return, Qt.ControlModifier)
@@ -9938,7 +9939,9 @@ def test_photo_no_extra_entries():
                              "set_rating_filter"):
                     assert not hasattr(pane, name), name
                 bar = pane.rating_bar
-                assert set(pane.findChildren(QPushButton)) == {
+                # 履歴ビュー(Shift+H)のフィルタの段の ✕ とチップは別の段なので除いて数える
+                history = set(pane.history_bar.findChildren(QPushButton))
+                assert set(pane.findChildren(QPushButton)) - history == {
                     bar.clear_button, *bar.keyword_buttons.values()}
             # Shift+Z: 隠し/システムファイルと写真フォルダモードだけ。★・絞り込み・書き出しの行や
             # 小メニューは無い

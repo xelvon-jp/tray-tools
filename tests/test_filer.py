@@ -835,6 +835,30 @@ def test_window_copy_renamed():
             w2.deleteLater()
 
 
+def test_picker_auto_width_and_elide():
+    """ピッカー: 長い項目に合わせて幅が広がり(上限は画面の9割)、
+    一覧の省略は中央(先頭と末尾が見える形)になる。"""
+    from picker import PickerWindow, WINDOW_WIDTH
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication
+
+    _qapp()
+    short = PickerWindow("短い", [("a", "a"), ("bb", "bb")], lambda n, d: None)
+    try:
+        assert short.width() == WINDOW_WIDTH
+        assert short.list.textElideMode() == Qt.ElideMiddle
+    finally:
+        short.close()
+    long_path = "C:\\" + "あ" * 60 + "\\写真\\2026"
+    wide = PickerWindow("フォルダ履歴", [(long_path, long_path)], lambda n, d: None)
+    try:
+        assert wide.width() > WINDOW_WIDTH, wide.width()
+        screen_w = QGuiApplication.primaryScreen().availableGeometry().width()
+        assert wide.width() <= int(screen_w * 0.9) + 1, wide.width()
+    finally:
+        wide.close()
+
+
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
     そのまま表示され、ダウンロードは attachment で届く。"""

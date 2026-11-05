@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# 幅の下限。実際の幅は _fit_to_items が中身に合わせて広げる(上限は画面幅の
+# MAX_WIDTH_RATIO)。短い一覧ではこの幅のまま。
 WINDOW_WIDTH = 420
 
 # プレビューを出すときは横も広げる。展開後の本文を折り返しだらけで見せても
@@ -53,6 +55,9 @@ PREVIEW_HEIGHT_MAX = 600
 
 # 画面の作業領域に対して、ウインドウが占めてよい高さの上限。
 MAX_SCREEN_RATIO = 0.8
+
+# 幅の上限(画面の作業領域に対する割合)。中身に合わせて広げるときの頭打ち。
+MAX_WIDTH_RATIO = 0.9
 
 # 中央より少し上に出す。ちょうど中央だと視線移動が大きく、下端が画面の下寄りになる。
 VERTICAL_OFFSET = -200
@@ -167,6 +172,9 @@ class PickerWindow(QWidget):
 
         self.list = QListWidget()
         self.list.setFont(font)
+        # 省略は中央で。パスは末尾のフォルダ名がいちばん大事なので、既定の
+        # 末尾省略(先頭しか見えない)ではなく、先頭と末尾を残す形にする。
+        self.list.setTextElideMode(Qt.ElideMiddle)
         # 項目間の隙間を殺す。padding(スタイルシート)と別に効くので両方詰める。
         self.list.setSpacing(0)
         # 全項目が同じ高さだと Qt が高さ計算を省ける。行高を測る _fit_to_items とも相性がよい。
@@ -269,6 +277,18 @@ class PickerWindow(QWidget):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         height = min(height, int(screen.availableGeometry().height() * MAX_SCREEN_RATIO))
         width = WINDOW_WIDTH if self.preview is None else PREVIEW_WINDOW_WIDTH
+        # 幅は中身に合わせる: いちばん長い項目が省略なしで収まる幅までは広げる。
+        # 下限は従来の固定幅(短い一覧では広げない)、上限は画面幅の MAX_WIDTH_RATIO
+        # で、それでも収まらない分は一覧の中央省略が末尾を見せる。
+        metrics = self.list.fontMetrics()
+        longest = max((metrics.horizontalAdvance(name) for name, _data in self._items),
+                      default=0)
+        needed = (longest + ITEM_PADDING_H * 2 + self.list.frameWidth() * 2
+                  + margins.left() + margins.right())
+        if len(self._items) > rows:
+            needed += self.list.verticalScrollBar().sizeHint().width()
+        limit = int(screen.availableGeometry().width() * MAX_WIDTH_RATIO)
+        width = max(width, min(needed, limit))
         self.resize(width, height)
 
     def _move_to_center(self):

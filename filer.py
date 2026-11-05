@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -80,6 +81,7 @@ from PySide6.QtWidgets import (
 
 import affx_icon
 import filer_archive
+import filer_box
 import filer_core as core
 import filer_everything
 import filer_extmenu
@@ -3199,6 +3201,7 @@ class FilerWindow(QWidget):
             # 書庫の中から開いたファイルの一時フォルダ。開いたままのものは消えずに残り、
             # 次の起動で片付く。
             filer_archive.cleanup_temp()
+            filer_box.discard_cache()   # Box の sync.db のコピー(一時フォルダ)
         except Exception:  # noqa: BLE001  閉じられなくなるのが最悪
             _log_exception("close")
         super().closeEvent(event)
@@ -5566,6 +5569,8 @@ class FilerWindow(QWidget):
         if self.phone_enabled:
             # 環境1のときだけ出す(無効な PC では項目自体を見せない)
             items.append(("S", "スマホへ送る（QR）", "phone"))
+        if self._box_menu_ok():
+            items.append(("L", "Box の共有用テキスト", "box"))
         items.append(("Q", "キャンセル", None))
         choice = self.choose_menu("複写", items)
         if choice == "copy":
@@ -5580,6 +5585,8 @@ class FilerWindow(QWidget):
             self._copy_renamed(to_other=False, rename=False)
         elif choice == "phone":
             self.cmd_phone_send()
+        elif choice == "box":
+            self._copy_box_share()
         elif choice in ("path", "name"):
             paths = self.active.target_paths()
             QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=choice == "name"))
@@ -5588,6 +5595,103 @@ class FilerWindow(QWidget):
             self._copy_hash()
         elif choice == "tree":
             self._copy_tree()
+
+    def _box_menu_ok(self) -> bool:
+        """C メニューに「Box の共有用テキスト」を出すか。対象がすべて Box Drive の中にあり、
+        Box Drive の記録(sync.db)があるときだけ。ほかの PC・ほかの場所では項目自体を見せない。"""
+        try:
+            if self.active.archive is not None:
+                return False
+            return filer_box.all_inside(self.active.target_paths()) and filer_box.available()
+        except Exception:  # noqa: BLE001  メニューが開けなくなるのが最悪
+            return False
+
+    def _copy_box_share(self):
+        """C→L: 対象の Box 上の ID を引き、共有用テキストをクリップボードへ入れる。
+
+        共有リンクの鍵が祖先に登録済みなら /s/<鍵>/folder/<ID> の形(ログイン不要で開ける)。
+        未登録なら、登録先とリンクを1回だけ聞く(案件フォルダごとに1回で、設定に残る)。"""
+        paths = self.active.target_paths()
+        cache_dir = os.path.join(filer_archive.TEMP_ROOT, "box_db")
+        try:
+            items, missing = filer_box.resolve_many(paths, cache_dir)
+        except filer_box.BoxDbError:
+            self.log("Box: Box Drive の記録が読めません")
+            return
+        for name in missing:
+            self.log(f"Box: 同期の記録に見つかりません: {name}（アップロード前かも）")
+        if not items:
+            return
+        links = filer_box.valid_links(_section(self.app_settings).get("box_links"))
+        plain = False
+        for item in items:
+            if plain or filer_box.find_link(item, links) is not None:
+                continue
+            decision = self.ask_box_link(item)
+            if decision is None:
+                return
+            if decision[0] == "plain":
+                plain = True        # 今回だけ登録せずに出す(残りの未登録分も同じ)
+                continue
+            _kind, folder_id, path, host, token = decision
+            links = filer_box.with_link(links, filer_box.make_link(folder_id, path, host, token))
+            save_values(self.app_settings, self.settings_path, {"box_links": links})
+        QGuiApplication.clipboard().setText(filer_box.build_share_text(items, links))
+        self.log(f"Box: {len(items)}件をクリップボードへ")
+
+    def ask_box_link(self, item):
+        """共有リンクの登録ダイアログ(テストではここを差し替える)。
+
+        ("register", folder_id, path, host, token) / ("plain",) / 取消なら None。"""
+        candidates = filer_box.candidate_folders(item)
+        if not candidates:
+            # Box の根の直下には鍵を付けられない。聞かずに通常の形で出す
+            return ("plain",)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Box の共有リンクを登録")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("共有リンクを、どのフォルダ(とその下すべて)に登録しますか？"))
+        combo = QComboBox()
+        for shown, _folder_id, _path in candidates:
+            combo.addItem(shown)
+        combo.setCurrentIndex(0)    # 既定は一番上(案件の根)
+        layout.addWidget(combo)
+        layout.addWidget(QLabel("共有リンク（https://…/s/… の形。Box の「共有リンク」からコピー）"))
+        edit = QLineEdit()
+        layout.addWidget(edit)
+        error = QLabel("")
+        error.setStyleSheet("color: #c0392b;")
+        layout.addWidget(error)
+        row = QHBoxLayout()
+        register = QPushButton("登録(&R)")
+        plain = QPushButton("登録しない（招待メンバー用のリンクで出す）(&N)")
+        cancel = QPushButton("中止")
+        for button in (register, plain, cancel):
+            row.addWidget(button)
+        layout.addLayout(row)
+        result = {}
+
+        def on_register():
+            parsed = filer_box.parse_shared_link(edit.text())
+            if parsed is None:
+                error.setText("共有リンクの形ではありません（https://<ホスト>/s/<鍵> の形で貼ってください）")
+                return
+            _shown, folder_id, path = candidates[combo.currentIndex()]
+            result["value"] = ("register", folder_id, path, parsed[0], parsed[1])
+            dialog.accept()
+
+        def on_plain():
+            result["value"] = ("plain",)
+            dialog.accept()
+
+        register.clicked.connect(on_register)
+        plain.clicked.connect(on_plain)
+        cancel.clicked.connect(dialog.reject)
+        edit.returnPressed.connect(on_register)
+        edit.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return result.get("value")
 
     def cmd_phone_send(self):
         """C→S(環境1のときだけ): 対象ファイルをスマホへ QR で渡す。

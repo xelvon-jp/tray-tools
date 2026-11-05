@@ -8127,6 +8127,132 @@ def test_window_copy_tree():
             w.deleteLater()
 
 
+def test_window_copy_box_share():
+    """C→L: 対象がすべて Box Drive の中のときだけ項目が出る。登録済みの鍵があればその形で、
+    未登録なら聞いて(登録/登録しない/中止)、結果がクリップボードへ入る。
+    Box の根と sync.db は一時フォルダに作った偽物(本物の Box Drive には触れない)。"""
+    import sqlite3
+    import filer
+    import filer_box
+    from PySide6.QtGui import QGuiApplication
+
+    _qapp()
+    token = "abcdefghij1234567890"          # 作り物の鍵
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)       # Box の外(通常のフォルダ)
+        box_root = Path(tmp, "home", "Box")
+        folder = box_root / "ProjA" / "資料"
+        folder.mkdir(parents=True)
+        for name in ("見積書.xlsx", "memo.txt", "notsynced.txt"):
+            (folder / name).write_bytes(b"x")
+        db = Path(tmp, "local", "sync.db")
+        db.parent.mkdir()
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE local_item (local_id INTEGER NOT NULL, native_item_type INTEGER,"
+                     " parent_item_id INTEGER, name VARCHAR COLLATE NOCASE, PRIMARY KEY (local_id))")
+        conn.execute("CREATE TABLE item_mapping_between_fs (id INTEGER, local_id INTEGER,"
+                     " box_id VARCHAR, box_item_type INTEGER, PRIMARY KEY (id), UNIQUE (local_id))")
+        rows = [(0, 1, None, "", "0", 1), (100, 1, 0, "ProjA", "9100", 1),
+                (101, 1, 100, "資料", "9101", 1), (102, 0, 101, "見積書.xlsx", "9102", 0),
+                (103, 0, 101, "memo.txt", "9103", 0)]
+        for i, (lid, typ, parent, name, box_id, box_type) in enumerate(rows):
+            conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, typ, parent, name))
+            conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
+                         (i, lid, box_id, box_type))
+        conn.commit()
+        conn.close()
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        app_settings = {"filer": {"left_path": str(left), "right_path": str(right)}}
+        seen = {}
+
+        def capture(title, items):
+            seen["items"] = items
+            return None
+
+        filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
+        filer_box.discard_cache()
+        w = filer.FilerWindow(app_settings, str(settings_path))
+        try:
+            w.show()
+            w.start()
+            _wait(w)
+            w.choose_menu = capture
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            w.cmd_copy_menu()
+            assert "box" not in [i[2] for i in seen["items"]]
+
+            # Box の中に入ると出る
+            w.left.load(str(folder))
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("見積書.xlsx"))
+            w.cmd_copy_menu()
+            assert ("L", "Box の共有用テキスト", "box") in seen["items"]
+            # 記録(sync.db)が無い PC では出ない
+            filer_box.DB_OVERRIDE = str(db) + ".none"
+            w.cmd_copy_menu()
+            assert "box" not in [i[2] for i in seen["items"]]
+            filer_box.DB_OVERRIDE = str(db)
+
+            w.choose_menu = lambda title, items: "box"
+            asked = []
+
+            def ask(item):
+                asked.append(item)
+                return ("register", "9100", "Box/ProjA", "app.box.com", token)
+
+            w.ask_box_link = ask
+            clip = QGuiApplication.clipboard()
+            w.left.set_cursor(w.left._row_of("見積書.xlsx"))
+            w.cmd_copy_menu()
+            expected = ("/Box/ProjA/資料/\r\n"
+                        f"　https://app.box.com/s/{token}/folder/9101\r\n"
+                        "　　見積書.xlsx")
+            assert clip.text() == expected, repr(clip.text())
+            assert len(asked) == 1
+            assert "Box: 1件をクリップボードへ" in w.log_view.toPlainText()
+            # 登録は settings.json にだけ残り、次からは聞かれない
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert saved["filer"]["box_links"] == [
+                {"folder_id": "9100", "path": "Box/ProjA", "host": "app.box.com", "token": token}]
+
+            def no_ask(item):
+                raise AssertionError("登録済みなのに聞かれた")
+
+            w.ask_box_link = no_ask
+            clip.setText("")
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+            w.cmd_copy_menu()
+            assert clip.text().endswith("　　memo.txt"), clip.text()
+            assert f"/s/{token}/folder/9101" in clip.text()
+
+            # 同期の記録に無いものは飛ばしてログに出す。全部だめなら何もしない
+            clip.setText("keep")
+            w.left.set_cursor(w.left._row_of("notsynced.txt"))
+            w.cmd_copy_menu()
+            assert clip.text() == "keep"
+            assert "Box: 同期の記録に見つかりません: notsynced.txt" in w.log_view.toPlainText()
+
+            # 未登録: 「登録しない」は通常の形で出して保存しない / 中止は何もしない
+            w.ask_box_link = lambda item: ("plain",)
+            app_settings["filer"]["box_links"] = []
+            filer.save_values(app_settings, str(settings_path), {"box_links": []})
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+            w.cmd_copy_menu()
+            assert clip.text() == ("/Box/ProjA/資料/\r\n"
+                                   "　https://app.box.com/folder/9101\r\n"
+                                   "　　memo.txt"), repr(clip.text())
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == []
+            clip.setText("keep")
+            w.ask_box_link = lambda item: None
+            w.cmd_copy_menu()
+            assert clip.text() == "keep"
+        finally:
+            filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
+            w.close()
+            w.deleteLater()
+
+
 def test_workspace_store():
     """ワークスペースの保存先はデータ置き場(テストでは一時フォルダ。本物の
     %LOCALAPPDATA% には書かない)。一時ファイル→置き換えで書く。"""

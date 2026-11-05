@@ -10146,6 +10146,28 @@ FULL_ONLY = frozenset({
 })
 
 
+def test_update_zip_folder_setting():
+    """Shift+F5 の ZIP 確認フォルダ: 未設定なら Downloads、保存すると filer の他のキーを残して差し替わる。"""
+    import types
+    import filer
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "settings.json")
+        path.write_text('{"filer": {"left_path": "x"}, "other": 1}', encoding="utf-8")
+        logs = []
+        obj = types.SimpleNamespace(app_settings={"filer": {}}, settings_path=str(path),
+                                    log=logs.append)
+        assert filer.FilerWindow.update_zip_folder(obj) == Path.home() / "Downloads"
+        obj.app_settings["filer"]["update_zip_folder"] = "   "   # 空白だけは未設定扱い
+        assert filer.FilerWindow.update_zip_folder(obj) == Path.home() / "Downloads"
+        target = Path(tmp, "dl")
+        filer.FilerWindow.save_update_zip_folder(obj, target)
+        assert filer.FilerWindow.update_zip_folder(obj) == target
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored == {"filer": {"left_path": "x", "update_zip_folder": str(target)},
+                          "other": 1}, stored
+        assert logs == []
+
+
 def main() -> int:
     full = "--full" in sys.argv or os.environ.get("FILER_FULL") \
         or os.environ.get("GITHUB_ACTIONS")

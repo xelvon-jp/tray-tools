@@ -4235,9 +4235,46 @@ class FilerWindow(QWidget):
     def pull_updates(self, repo_dir):
         return filer_update.pull(repo_dir)
 
+    def update_zip_folder(self) -> Path:
+        """Shift+F5 の ZIP 更新で tray-tools-main*.zip を探すフォルダ。
+
+        settings.json の filer.update_zip_folder。空・未設定なら %USERPROFILE%\\Downloads
+        (Windows 側でダウンロード先を OneDrive などへ移していると、既定の場所には
+        来ないため、変えられるようにした)。"""
+        section = self.app_settings.get(SETTINGS_SECTION) if isinstance(
+            self.app_settings, dict) else None
+        value = section.get("update_zip_folder") if isinstance(section, dict) else None
+        if isinstance(value, str) and value.strip():
+            return Path(os.path.expandvars(value.strip()))
+        return Path.home() / "Downloads"
+
+    def save_update_zip_folder(self, folder) -> None:
+        """filer.update_zip_folder だけを差し替えて保存する(ほかのキーは触らない)。"""
+        value = str(folder)
+        if isinstance(self.app_settings, dict):
+            section = self.app_settings.setdefault(SETTINGS_SECTION, {})
+            if isinstance(section, dict):
+                section["update_zip_folder"] = value
+        if not self.settings_path:
+            return
+        try:
+            stored = {}
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            if not isinstance(stored, dict):
+                stored = {}
+            filer_section = stored.get(SETTINGS_SECTION)
+            if not isinstance(filer_section, dict):
+                filer_section = stored[SETTINGS_SECTION] = {}
+            filer_section["update_zip_folder"] = value
+            settings_module.save_settings(stored, self.settings_path)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"settings.json に書けません: {e}")
+
     def find_update_zip(self):
-        """ダウンロードフォルダの tray-tools-main*.zip のうち一番新しいもの。"""
-        return filer_zipupdate.find_downloaded_zip()
+        """確認フォルダ(update_zip_folder)の tray-tools-main*.zip のうち一番新しいもの。"""
+        return filer_zipupdate.find_downloaded_zip(self.update_zip_folder())
 
     def zip_check(self, zip_path):
         """ZIP 更新の確認(別スレッドから呼ぶ。テストでは差し替える)。"""
@@ -4392,11 +4429,12 @@ class FilerWindow(QWidget):
             self._start_zip_check(found)
             return
         if self.confirm("あっふの更新",
-                        "ダウンロードフォルダに tray-tools-main*.zip が"
+                        f"{self.update_zip_folder()} に tray-tools-main*.zip が"
                         "見つかりませんでした。\n"
                         "Edge で GitHub からダウンロードしてから、"
                         "もう一度 Shift+F5 してください。\n\n"
-                        "代わりに、ZIP ファイルを選んで更新しますか？",
+                        "代わりに、ZIP ファイルを選んで更新しますか？\n"
+                        "（別のフォルダの ZIP を選ぶと、次回からそのフォルダを見るか尋ねます）",
                         default_yes=True):
             self._pick_zip_file()
         elif self.confirm("あっふの更新", "再起動だけしますか？", default_yes=False):
@@ -4501,13 +4539,31 @@ class FilerWindow(QWidget):
             self.log(f"エラー: {_log_exception('zipChecked')}")
 
     def _pick_zip_file(self) -> None:
-        start = Path.home() / "Downloads"
+        start = self.update_zip_folder()
         if not start.is_dir():
             start = Path.home()
         path, _ = QFileDialog.getOpenFileName(self, "更新に使う ZIP ファイル",
                                               str(start), "ZIP ファイル (*.zip)")
         if path:
+            self._remember_zip_folder(Path(path).parent)
             self._start_zip_check(path)
+
+    def _remember_zip_folder(self, folder: Path) -> None:
+        """選んだ ZIP のフォルダが確認フォルダと違えば、次回からそこを見るか尋ねる。"""
+        current = self.update_zip_folder()
+        try:
+            same = os.path.normcase(os.path.abspath(folder)) == os.path.normcase(
+                os.path.abspath(current))
+        except (OSError, ValueError):
+            same = False
+        if same:
+            return
+        if self.confirm("あっふの更新",
+                        f"次回の Shift+F5 から、このフォルダの ZIP を確認しますか？\n\n{folder}\n\n"
+                        f"（いまの確認フォルダ: {current}）",
+                        default_yes=True):
+            self.save_update_zip_folder(folder)
+            self.log(f"ZIP 更新の確認フォルダを変えました: {folder}")
 
     def _on_zip_applied(self, payload) -> None:
         try:

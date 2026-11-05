@@ -79,7 +79,7 @@ VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000
 
 # Claude Code の状態表示(claude_status)。輪の色は状態ごと。確認待ちはスリープ抑止の
 # 橙と見分けられるよう桃色にする(止まって待っているのが、いちばん見落としたくない)。
-CLAUDE_MENU_TITLE = "💬 Claude"
+CLAUDE_MENU_TITLE = "💬 AI状態監視"
 CLAUDE_STATUS_INTERVAL_MS = 3000
 CLAUDE_RING_COLORS = {
     claude_status.ASK: (236, 72, 153, 255),       # 桃
@@ -2309,13 +2309,7 @@ class ScreenFeature:
                 if plan and entry.get("state") in (claude_status.RUNNING, claude_status.ASK):
                     detail = menu.addAction("　　" + _clip(plan, 40))
                     detail.setEnabled(False)
-            if any(e.get("state") in (claude_status.DONE, claude_status.FAIL)
-                   for e in self._claude_entries):
-                if listed:
-                    menu.addSeparator()
-                menu.addAction("完了した行を消す", self._clear_finished_claude)
-                menu.addSeparator()
-            elif listed:
+            if listed:
                 menu.addSeparator()
             panel = menu.addAction("📊 進捗パネルを表示")
             panel.setCheckable(True)
@@ -2323,14 +2317,6 @@ class ScreenFeature:
             # addAction(文字, 関数) だと checked が渡らないので triggered で受ける。
             panel.triggered.connect(self._toggle_claude_progress)
             menu.addAction("↘ パネルの位置を右下に戻す", self._reset_claude_progress_position)
-            self._refresh_state()
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
-
-    def _clear_finished_claude(self):
-        try:
-            claude_status.clear_finished()
-            self._claude_entries = claude_status.list_sessions()
             self._refresh_state()
         except Exception:  # noqa: BLE001
             traceback.print_exc()

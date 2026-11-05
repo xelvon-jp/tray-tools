@@ -121,6 +121,13 @@ DEFAULT_THRESHOLDS = {
     "waiting_user": 120,  # 返ってきたのに読んでいない
 }
 
+# 応答待ち(waiting_ai)の経過則(秒)。入力中→空idle は「送信した」と「全削除した」
+# の区別がつかないので、まず応答待ちに倒す。だが送信したのなら、この秒数までに
+# は応答中(停止ボタン)が出ているはず。出ないままなら削除だったとみなして
+# 応答済(waiting_user)に倒し直す(_poll)。応答開始が本当に遅いときは、応答中が
+# 出た時点でそちらへ直る。取り直し間隔(1.5秒)の4回分。
+WAITING_AI_DECAY_SECONDS = 6
+
 # 手で動かした位置とピン留めを覚えておくファイル。
 #
 # 【なぜ settings.json に書かないか】
@@ -1176,6 +1183,17 @@ class StatusWatcher:
             self._elapsed_ticked_at = None
             # 前の待ちで断った「再開しますか」も、状況が変わったので忘れる。
             self._resume_declined = False
+        elif (state == "waiting_ai" and self._state_since is not None
+              and time.time() - self._state_since >= WAITING_AI_DECAY_SECONDS):
+            # 応答待ちのまま、応答中を一度も見ていない。送信したのなら
+            # とっくに停止ボタンが出ているはずなので、「送った」のではなく
+            # 「全削除した」とみなして応答済に倒し直す(_classify の決め打ちの
+            # 補正)。手番が変わった扱いで、経過秒も数え直す。
+            self._state = "waiting_user"
+            self._state_since = time.time()
+            self._last_decisive = "waiting_user"
+            self._elapsed_accum = 0.0
+            self._elapsed_ticked_at = None
 
         window = _to_logical(snapshot.get("window_rect"))
         inp = _to_logical(snapshot.get("input_rect"))
@@ -1365,6 +1383,9 @@ class StatusWatcher:
         空の idle は、直前に何を見たかで意味が変わる:
           入力中 → 空idle : 送信した直後 → 応答待ち
           応答中 → 空idle : 喋り終わった → 入力待ち
+        ただし「入力中 → 空idle」には全削除も混ざる(観測では送信と区別が
+        つかない)。応答中を一度も見ないままなら、_poll の経過則
+        (WAITING_AI_DECAY_SECONDS)で応答済に倒し直す。
         判断がつかない(起動した直後など)ときは入力待ち扱いにする。どちらも点滅する
         状態なので実害は小さく、「応答待ち」と言い切って Copilot が遅いように
         見せるより誤解が少ない。"""

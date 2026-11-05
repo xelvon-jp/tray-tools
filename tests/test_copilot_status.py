@@ -167,6 +167,55 @@ def test_publish_turn_writes_on_change_and_heartbeats():
             csp.TURN_STATUS_FILE = old
 
 
+def test_classify_delete_all_decays_to_waiting_user():
+    # 入力→全削除は監視からは送信と区別がつかない。まず応答待ちに倒れるが、
+    # 応答中(busy)を一度も見ないまま経過則を過ぎたら応答済に倒し直すこと。
+    import copilot_status_process as csp
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "turn.json"
+        old = csp.TURN_STATUS_FILE
+        csp.TURN_STATUS_FILE = str(target)
+        try:
+            stub = object.__new__(csp.StatusWatcher)
+            stub._paused = False
+            stub._state = None
+            stub._state_since = None
+            stub._last_decisive = None
+            stub._elapsed_accum = 0.0
+            stub._elapsed_ticked_at = None
+            stub._resume_declined = False
+            stub._thresholds = dict(csp.DEFAULT_THRESHOLDS)
+            stub._turn_published = None
+            stub._turn_written_at = 0.0
+            stub._copilot = None
+            stub._refresh_bar_setting = lambda: None
+            snap = {"state": "idle", "input_text": "こんにちは",
+                    "window_rect": None, "input_rect": None}
+            stub._read_snapshot = lambda: snap
+            stub._poll()
+            assert stub._state == "typing"
+            # 全削除 → 空idle。まず応答待ち(送信と区別がつかない)
+            snap = {**snap, "input_text": ""}
+            stub._read_snapshot = lambda: snap
+            stub._poll()
+            assert stub._state == "waiting_ai"
+            # 経過則を過ぎても応答中が出なければ、応答済に倒し直す
+            stub._state_since = time.time() - csp.WAITING_AI_DECAY_SECONDS - 1
+            stub._poll()
+            assert stub._state == "waiting_user"
+            # 本物の送信は busy が出るので応答中になり、倒し直しの対象外
+            snap = {**snap, "input_text": "質問"}
+            stub._read_snapshot = lambda: snap
+            stub._poll()
+            assert stub._state == "typing"
+            snap = {**snap, "input_text": "", "state": "busy"}
+            stub._read_snapshot = lambda: snap
+            stub._poll()
+            assert stub._state == "responding"
+        finally:
+            csp.TURN_STATUS_FILE = old
+
+
 # -- パネルの Copilot 行 ----------------------------------------------------
 
 def test_copilot_row_shape():

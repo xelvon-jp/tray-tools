@@ -402,7 +402,10 @@ def background_count(entry: dict, now=None) -> int:
 
 
 def clear_finished(directory=None) -> int:
-    """完了・失敗のファイルを消す(メニューの「完了した行を消す」)。消した数。"""
+    """完了・失敗のファイルを消す。消した数。
+
+    以前はトレイのメニュー項目から呼んでいたが、パネルの行の ✕ で足りる
+    ので項目は外した(2026-11-05)。関数自体は一括消去の道具として残す。"""
     count = 0
     directory = Path(directory or STATUS_DIR)
     try:

@@ -40,7 +40,7 @@ PAD_Y = 8
 ROW_HEIGHT = 48
 # 折りたたんだ行(終わったセッション)の高さ。名前と終わった時刻だけ。
 COMPACT_HEIGHT = 24
-# 折りたたんだ行は新しいものからこの数まで(全部はメニューの「💬 Claude」にある)。
+# 折りたたんだ行は新しいものからこの数まで(全部はメニューの「💬 AI状態監視」にある)。
 MAX_COMPACT = 5
 # Copilot の状態 → (絵文字, 文言, バーの色)。文言と色は状態監視バー
 # (copilot_status_process.STATE_STYLES)と同じ。あちらは UIA ごと別プロセスで、
@@ -162,7 +162,7 @@ class ClaudeProgressPanel(QWidget):
     def __init__(self, on_open=None, state_path=None, on_remove=None,
                  on_open_copilot=None):
         super().__init__()
-        self.setWindowTitle("Claude の進み具合")
+        self.setWindowTitle("進み具合")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                             | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)

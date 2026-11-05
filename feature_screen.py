@@ -40,6 +40,7 @@ from datetime import datetime
 
 import pushover
 import screen_mirror
+import window_layout
 import screen_ruler
 import snippets
 import teams_meeting
@@ -596,6 +597,18 @@ class ScreenFeature:
         self._slideshow_screen_actions = []
         self._slideshow_dialog = None
         self._slideshow_menu.aboutToShow.connect(self._refresh_slideshow_menu)
+
+        # 窓の配置(window_layout.py)。モニタの入力を他 PC へ切り替えたときに
+        # 見えない画面へ残った窓を、カーソルのある画面へ集める。配置プリセットは
+        # 選んだ窓の位置と大きさを手動で出し入れする(自動適用はしない)。
+        self._gather_undo = []
+        self._window_layout_menu = self.menu.addMenu("🪟 窓の配置")
+        self._window_layout_menu.addAction("🎯 この画面に集める", self.gather_windows_here)
+        self._undo_gather_action = self._window_layout_menu.addAction(
+            "↩ 集めた窓を元に戻す", self.undo_gathered_windows)
+        self._presets_menu = self._window_layout_menu.addMenu("📐 配置プリセット")
+        self._presets_menu.aboutToShow.connect(self._refresh_presets_menu)
+        self._window_layout_menu.aboutToShow.connect(self._refresh_window_layout_menu)
 
         # フォルダ監視移動(folder_watch.py)。常駐のタイマーで特定フォルダを見て、
         # 入ってきたファイルを別のフォルダへ移す。アイコンは増やさず、状態は
@@ -1238,6 +1251,182 @@ class ScreenFeature:
                 self._slideshow_screen_actions.append(action)
         except Exception:  # noqa: BLE001
             self._log_failure("スライドショーのメニューの更新")
+
+    # --- 窓の配置(集める・元に戻す・配置プリセット) ---
+    def _layout_presets(self) -> list:
+        section = self.app_settings.get(window_layout.SECTION)
+        return window_layout.normalize_presets(
+            section.get("presets") if isinstance(section, dict) else None)
+
+    def _save_layout_presets(self, presets) -> None:
+        window_layout.save_config(self.settings_path, {"presets": presets},
+                                  self.app_settings)
+
+    def _refresh_window_layout_menu(self) -> None:
+        try:
+            self._undo_gather_action.setEnabled(bool(self._gather_undo))
+        except Exception:  # noqa: BLE001
+            self._log_failure("窓の配置のメニューの更新")
+
+    def gather_windows_here(self) -> None:
+        """他のモニタの窓を、マウスカーソルのあるモニタへ全部集める。
+
+        入力を他 PC へ切り替えたモニタは PC 側には接続されたままに見えるので
+        Windows の自動再配置が働かず、窓だけが見えない画面に残る。その回収用。
+        集約先に元からある窓は触らない。元に戻すのは直前の1回分だけ。"""
+        try:
+            import window_tools
+
+            monitors = window_tools.list_monitor_work_areas()
+            if len(monitors) < 2:
+                self._notify("窓の配置", "モニタが1つしかないため、集める先がありません")
+                return
+            windows = window_layout.list_layout_windows()
+            moves, _target = window_layout.plan_gather(
+                windows, monitors, window_tools.get_cursor_pos())
+            if not moves:
+                self._notify("窓の配置", "他の画面に窓はありませんでした")
+                return
+            undo = window_layout.undo_moves(windows, moves)
+            ok, failed = window_layout.apply_moves(moves)
+            self._gather_undo = undo if ok else []
+            message = f"{ok}件の窓をこの画面に集めました"
+            if failed:
+                message += f"\n{len(failed)}件は動かせませんでした（管理者の窓など）"
+            self._notify("窓の配置", message)
+        except Exception:  # noqa: BLE001
+            self._log_failure("窓を集める")
+            self._notify("窓の配置", "窓を集められませんでした")
+
+    def undo_gathered_windows(self) -> None:
+        """直前の「集める」で動かした窓を、元のモニタ・位置へ戻す。"""
+        try:
+            if not self._gather_undo:
+                self._notify("窓の配置", "戻せる記録がありません")
+                return
+            ok, failed = window_layout.apply_moves(self._gather_undo)
+            self._gather_undo = []
+            message = f"{ok}件の窓を元の画面へ戻しました"
+            if failed:
+                message += f"\n{len(failed)}件は戻せませんでした（閉じた窓など）"
+            self._notify("窓の配置", message)
+        except Exception:  # noqa: BLE001
+            self._log_failure("集めた窓を元に戻す")
+            self._notify("窓の配置", "窓を戻せませんでした")
+
+    def _refresh_presets_menu(self) -> None:
+        try:
+            menu = self._presets_menu
+            menu.clear()
+            presets = self._layout_presets()
+            for preset in presets:
+                action = menu.addAction(f"▶ {preset['name']}")
+                action.triggered.connect(
+                    lambda _checked, n=preset["name"]: self.apply_layout_preset(n))
+            if presets:
+                menu.addSeparator()
+                delete_menu = menu.addMenu("🗑 プリセットを削除")
+                for preset in presets:
+                    action = delete_menu.addAction(preset["name"])
+                    action.triggered.connect(
+                        lambda _checked, n=preset["name"]: self.delete_layout_preset(n))
+                menu.addSeparator()
+            menu.addAction("💾 今の窓から保存…", self.save_layout_preset)
+        except Exception:  # noqa: BLE001
+            self._log_failure("配置プリセットのメニューの更新")
+
+    def apply_layout_preset(self, name: str) -> None:
+        """保存した配置へ、対象の窓を一括で戻す。開いていない窓は飛ばす。"""
+        try:
+            preset = next((p for p in self._layout_presets() if p["name"] == name), None)
+            if preset is None:
+                return
+            windows = window_layout.list_layout_windows()
+            moves, missing = window_layout.match_preset(windows, preset["items"])
+            if not moves:
+                self._notify("配置プリセット", f"「{name}」の窓は開いていませんでした")
+                return
+            ok, failed = window_layout.apply_moves(moves)
+            message = f"「{name}」: {ok}件の窓を配置しました"
+            notes = []
+            if missing:
+                notes.append(f"開いていない窓 {missing}件")
+            if failed:
+                notes.append(f"動かせなかった窓 {len(failed)}件")
+            if notes:
+                message += "\n（" + "・".join(notes) + "）"
+            self._notify("配置プリセット", message)
+        except Exception:  # noqa: BLE001
+            self._log_failure("配置プリセットの適用")
+            self._notify("配置プリセット", "配置を適用できませんでした")
+
+    def delete_layout_preset(self, name: str) -> None:
+        try:
+            presets = [p for p in self._layout_presets() if p["name"] != name]
+            self._save_layout_presets(presets)
+            self._notify("配置プリセット", f"「{name}」を削除しました")
+        except Exception:  # noqa: BLE001
+            self._log_failure("配置プリセットの削除")
+            self._notify("配置プリセット", "プリセットを削除できませんでした")
+
+    def save_layout_preset(self) -> None:
+        """今見えている窓の一覧から、チェックした窓だけを名前付きで保存する。"""
+        try:
+            from PySide6.QtWidgets import (
+                QDialog, QDialogButtonBox, QLabel, QListWidget, QListWidgetItem,
+                QVBoxLayout,
+            )
+
+            windows = [w for w in window_layout.list_layout_windows() if w["title"]]
+            if not windows:
+                self._notify("配置プリセット", "保存できる窓がありませんでした")
+                return
+            dialog = QDialog()
+            dialog.setWindowTitle("配置プリセットに保存")
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel("保存する窓を選んでください（位置と大きさを覚えます）"))
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("プリセットの名前")
+            layout.addWidget(name_edit)
+            listing = QListWidget()
+            for window in windows:
+                exe = os.path.basename(window["exe"]) if window["exe"] else "?"
+                item = QListWidgetItem(f"{window['title']}  （{exe}）")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                listing.addItem(item)
+            layout.addWidget(listing)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            name = name_edit.text().strip()
+            chosen = [window_layout.preset_item(windows[i])
+                      for i in range(listing.count())
+                      if listing.item(i).checkState() == Qt.Checked]
+            if not name:
+                self._notify("配置プリセット", "名前が空なので保存しませんでした")
+                return
+            if not chosen:
+                self._notify("配置プリセット", "窓が選ばれていないので保存しませんでした")
+                return
+            presets = self._layout_presets()
+            existing = next((p for p in presets if p["name"] == name), None)
+            if existing is not None:
+                answer = QMessageBox.question(
+                    None, "配置プリセット",
+                    f"「{name}」はすでにあります。上書きしますか？")
+                if answer != QMessageBox.Yes:
+                    return
+                presets = [p for p in presets if p["name"] != name]
+            presets.append({"name": name, "items": chosen})
+            self._save_layout_presets(presets)
+            self._notify("配置プリセット", f"「{name}」に{len(chosen)}件の窓を保存しました")
+        except Exception:  # noqa: BLE001
+            self._log_failure("配置プリセットの保存")
+            self._notify("配置プリセット", "プリセットを保存できませんでした")
 
     def start_filer(self):
         """あっふを開く。既に開いていれば前面に出すだけ(判定は filer_launch が

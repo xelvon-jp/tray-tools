@@ -101,7 +101,7 @@ DEFAULT_KEYMAP = {
     "1083": "sort_reverse",       # Shift+S 昇順/降順の反転(AFXW.key 1083 &SORT !)
     "1090": "settings_menu",      # Shift+Z 各種設定一時切替(隠し/システムファイルの表示・
                                   # 写真フォルダモード)
-    "1072": "frecency_jump",      # Shift+H よく行くフォルダへ(zoxide 風)
+    "1072": "frecency_jump",      # Shift+H フォルダ/ファイル履歴
     "4066": "flat_view",          # Alt+B フラット表示(Total Commander の Ctrl+B)
     "0114": "preview_toggle",     # F3 プレビュー(反対窓の位置に出す)
     "1082": "batch_rename",       # Shift+R 一括改名(Renemo 風)
@@ -1002,7 +1002,7 @@ COMMAND_SHORT_NAMES = {
     "desktop": "Desktop",
     "drive": "Drive",
     "live_filter": "Filter",
-    "frecency_jump": "Frequent",
+    "frecency_jump": "History",
     "flat_view": "Flat",
     "preview_toggle": "Preview",
     "batch_rename": "Renemo",
@@ -2742,6 +2742,295 @@ def frecency_query(data: dict, text: str, now: float) -> list:
         found.append((not in_tail, -frecency_score(count, last, now), path))
     found.sort()
     return [path for _a, _b, path in found]
+
+
+# ---------------------------------------------------------------
+# フォルダ/ファイル履歴(Shift+H。よく行くフォルダと最近のファイルを1つの一覧に)
+# ---------------------------------------------------------------
+# Shift+H は「フォルダ/ファイル履歴」。行は2種類。
+#   - フォルダ行: frecency の記録(表示したフォルダ)から。時刻は最後に表示した時刻
+#   - ファイル行: あっふから関連付けで開いたファイルの記録(開いた時刻が基準。
+#     ファイル自体のタイムスタンプは見ない)と、走査対象フォルダの中の新しい
+#     ファイル(作成・更新の新しい方が基準)を混ぜる。同じファイルは「開いた」が勝つ
+# 走査対象フォルダは、直近 HISTORY_FOLDER_DAYS 日にあっふで表示したフォルダ
+# (frecency の最終訪問)+ ダウンロード + 手動で足したフォルダ
+# (settings.json の filer.history_folders)。F3 プレビューは記録しない(「ちょっと
+# 見る」が多くて履歴が膨らむため)。Outlook の添付一時フォルダは対象にしない
+# (今はファイル共有が SharePoint/Box/Gmail 中心で、個人のダウンロードは
+# ダウンロードフォルダ経由で拾えるため)。
+FILE_HISTORY_STORE = "filer_file_history.json"
+FILE_HISTORY_LIMIT = 500          # 開いたファイルの記録の上限(件数)
+FILE_HISTORY_KEEP_DAYS = 30       # 開いたファイルの記録を持つ期間
+HISTORY_FOLDER_DAYS = 3           # 表示したフォルダを走査対象にする期間
+HISTORY_FILE_DAYS = 3             # 走査で拾うファイルの新しさ
+HISTORY_LIMIT = 200               # 一覧に出すファイル行の上限(フォルダ行は別枠)
+HISTORY_FOLDER_LIMIT = 100        # 一覧に出すフォルダ行の上限
+HISTORY_SCAN_BUDGET = 1.5         # 走査の時間予算(秒)。超えたら打ち切って一部表示
+HISTORY_SKIP_EXTS = frozenset({".crdownload", ".part", ".tmp", ".download", ".partial"})
+
+
+def history_key(path: str) -> str:
+    """履歴まわりでパスを同一視するためのキー。Windows のパスは大小文字を
+    区別しないので、normcase に casefold を重ねる(他の環境でも同じ判定になる)。"""
+    return os.path.normcase(path).casefold()
+
+
+def file_history_add(data: dict, path: str, now: float,
+                     limit: int = FILE_HISTORY_LIMIT,
+                     keep_days: int = FILE_HISTORY_KEEP_DAYS) -> dict:
+    """ファイルを関連付けで開いたことを記録する。data は {パス: 開いた時刻}。
+
+    大文字小文字だけ違うパスは同じものとして扱う。古い記録(keep_days を過ぎた
+    もの)は捨て、件数が limit を超えたら古いものから間引く。"""
+    folded = history_key(path)
+    for key in [k for k in data if history_key(k) == folded]:
+        del data[key]
+    data[path] = now
+    return file_history_prune(data, now, keep_days, limit)
+
+
+def file_history_prune(data: dict, now: float,
+                       keep_days: int = FILE_HISTORY_KEEP_DAYS,
+                       limit: int = FILE_HISTORY_LIMIT) -> dict:
+    """古すぎる記録を捨て、上限を超えたら古いものから間引く(その場で書き換える)。"""
+    cutoff = now - keep_days * 86400
+    for key in [k for k, ts in data.items() if not isinstance(ts, (int, float)) or ts < cutoff]:
+        del data[key]
+    if len(data) > limit:
+        for key, _ts in sorted(data.items(), key=lambda kv: kv[1])[:len(data) - limit]:
+            del data[key]
+    return data
+
+
+def history_folder_rows(frecency: dict, now: float,
+                        keep_days: int = FILE_HISTORY_KEEP_DAYS,
+                        limit: int = HISTORY_FOLDER_LIMIT) -> list:
+    """フォルダ行を作る。{kind, path, ts} の並び(並び順は呼び出し側の統合で決める)。
+
+    最後に表示してから keep_days を過ぎたものは出さない。多いときは frecency の
+    スコアが高いもの(よく行く・最近行ったもの)を残す。"""
+    rows = [{"kind": "folder", "path": path, "ts": float(last)}
+            for path, (count, last) in frecency.items()
+            if now - float(last) <= keep_days * 86400]
+    if len(rows) > limit:
+        score = {r["path"]: frecency_score(frecency[r["path"]][0], r["ts"], now)
+                 for r in rows}
+        rows.sort(key=lambda r: score[r["path"]], reverse=True)
+        rows = rows[:limit]
+    return rows
+
+
+def history_scan_roots(frecency: dict, now: float, downloads: str, extra,
+                       days: int = HISTORY_FOLDER_DAYS) -> list:
+    """走査対象フォルダの (フォルダ, 1階層下まで見るか) の並び。
+
+    直近 days 日に表示したフォルダ + ダウンロード(ここだけ1階層下まで)
+    + 手動で足したフォルダ。重複は大文字小文字を無視して除く。"""
+    roots = []
+    seen = set()
+
+    def add(path, deep):
+        if not path or not isinstance(path, str):
+            return
+        path = normalize_dir(path)
+        key = history_key(path)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append((path, deep))
+
+    for path, (_count, last) in frecency.items():
+        if now - float(last) <= days * 86400:
+            add(path, False)
+    add(downloads, True)
+    for path in extra or []:
+        add(path, False)
+    return roots
+
+
+def file_time_basis(st) -> float:
+    """ファイルの新しさの基準時刻。作成時刻と更新時刻の新しい方。
+
+    Windows では st_ctime が作成時刻。st_birthtime がある環境(macOS 等)では
+    そちらが作成時刻なので優先する。"""
+    created = getattr(st, "st_birthtime", None)
+    if created is None:
+        created = getattr(st, "st_ctime", 0.0)
+    return max(float(created or 0.0), float(getattr(st, "st_mtime", 0.0) or 0.0))
+
+
+def collect_history_files(roots, now: float, days: int = HISTORY_FILE_DAYS,
+                          cancel=None, progress=None,
+                          budget: float = HISTORY_SCAN_BUDGET,
+                          clock=None) -> tuple:
+    """走査対象フォルダから新しいファイルを集める。(行の並び, 打ち切ったか) を返す。
+
+    行は {kind, path, ts, size, attrs, origin}。origin は拾ったフォルダ。
+    フォルダが読めない・ファイルが消えた等の失敗はその項目だけ飛ばす(履歴の
+    走査で本体を止めない)。時間予算を超えたら打ち切って partial=True。
+    ダウンロード中のファイル(拡張子)と ExifTool の一時ファイルは出さない。"""
+    if clock is None:
+        clock = time.monotonic
+    started = clock()
+    cutoff = now - days * 86400
+    rows = []
+    seen = set()
+    partial = False
+    count = 0
+
+    def overdue() -> bool:
+        return clock() - started > budget
+
+    def visit(folder: str, origin: str, depth: int) -> None:
+        nonlocal partial, count
+        try:
+            with os.scandir(folder) as it:
+                entries = list(it)
+        except OSError:
+            return
+        for entry in entries:
+            if cancel is not None and cancel.is_set():
+                partial = True
+                return
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if depth > 0:
+                        visit(entry.path, origin, depth - 1)
+                    continue
+            except OSError:
+                continue
+            name = entry.name
+            if os.path.splitext(name)[1].casefold() in HISTORY_SKIP_EXTS:
+                continue
+            if name.lower().endswith(EXIFTOOL_TEMP_SUFFIX):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            basis = file_time_basis(st)
+            if basis < cutoff:
+                continue
+            key = history_key(entry.path)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"kind": "file", "path": entry.path, "ts": basis,
+                         "size": st.st_size,
+                         "attrs": getattr(st, "st_file_attributes", 0),
+                         "origin": origin})
+            count += 1
+            if progress is not None and count % 200 == 0:
+                progress(count)
+            if count % 200 == 0 and overdue():
+                partial = True
+                return
+
+    for root, deep in roots:
+        if partial:
+            break
+        if overdue():
+            partial = True
+            break
+        visit(root, root, 1 if deep else 0)
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows, partial
+
+
+def opened_file_rows(data: dict, now: float,
+                     keep_days: int = FILE_HISTORY_KEEP_DAYS) -> list:
+    """開いたファイルの記録から行を作る。実在確認と stat は呼び出し側(窓)が行う
+    ので、size/attrs は持たない(None)。"""
+    return [{"kind": "file", "path": path, "ts": float(ts), "size": None,
+             "attrs": None, "origin": "開いた"}
+            for path, ts in data.items()
+            if isinstance(ts, (int, float)) and now - float(ts) <= keep_days * 86400]
+
+
+def merge_history_rows(folder_rows, opened_rows, scanned_rows,
+                       limit: int = HISTORY_LIMIT) -> list:
+    """3種の行を1つにまとめる。ファイル行は新しい順に limit 件まで。
+
+    同じファイルが開いた記録と走査の両方にあれば「開いた」が勝つ(開いた時刻で
+    並ぶ)。全体の並びは時刻の新しい順(フォルダ行も最後に表示した時刻で混ざる)。"""
+    files = {}
+    for row in scanned_rows:
+        files[history_key(row["path"])] = row
+    for row in opened_rows:      # 開いた記録が後勝ち
+        files[history_key(row["path"])] = row
+    picked = sorted(files.values(), key=lambda r: r["ts"], reverse=True)[:limit]
+    rows = list(folder_rows) + picked
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows
+
+
+def history_row_match(row, kind: str, period_days, now: float) -> bool:
+    """履歴ビューの絞り込み(段のチップ)に合うか。row は行の辞書(無ければ False)。
+
+    kind は "all" / "folder" / "file"。period_days は日数(None なら期間で絞らない)。"""
+    if row is None:
+        return False
+    if kind in ("folder", "file") and row.get("kind") != kind:
+        return False
+    if period_days is not None and now - float(row.get("ts") or 0) > period_days * 86400:
+        return False
+    return True
+
+
+def history_age_text(ts: float, now: float) -> str:
+    """履歴の行に出す経過の文字。「たった今」「3分前」「2時間前」「昨日 15:20」
+    「11/3 09:12」「2025/11/3 09:12」の形。"""
+    import datetime
+
+    age = now - ts
+    if age < 60:
+        return "たった今"
+    if age < 3600:
+        return f"{int(age // 60)}分前"
+    moment = datetime.datetime.fromtimestamp(ts)
+    today = datetime.datetime.fromtimestamp(now).date()
+    if age < 86400 and moment.date() == today:
+        return f"{int(age // 3600)}時間前"
+    if moment.date() == today - datetime.timedelta(days=1):
+        return f"昨日 {moment:%H:%M}"
+    if moment.year == today.year:
+        return f"{moment:%m/%d %H:%M}"
+    return f"{moment:%Y/%m/%d %H:%M}"
+
+
+def downloads_folder() -> str:
+    """ダウンロードフォルダ。Known Folder(FOLDERID_Downloads)で実体を解決し、
+    取れなければ %USERPROFILE%\\Downloads。"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+            folder_id = GUID(0x374DE290, 0x123F, 0x4565,
+                             (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4,
+                                                  0x92, 0xE4, 0x67, 0x5A))
+            path_ptr = ctypes.c_wchar_p()
+            shell32 = ctypes.windll.shell32
+            ole32 = ctypes.windll.ole32
+            shell32.SHGetKnownFolderPath.argtypes = [
+                ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_wchar_p)]
+            shell32.SHGetKnownFolderPath.restype = ctypes.c_long  # HRESULT
+            ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ole32.CoTaskMemFree.restype = None
+            if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None,
+                                            ctypes.byref(path_ptr)) == 0 and path_ptr.value:
+                try:
+                    return path_ptr.value
+                finally:
+                    ole32.CoTaskMemFree(path_ptr)
+        except (OSError, AttributeError, ValueError):
+            pass
+    return str(os.path.join(os.path.expanduser("~"), "Downloads"))
 
 
 # ---------------------------------------------------------------

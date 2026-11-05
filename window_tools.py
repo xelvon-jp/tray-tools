@@ -387,3 +387,143 @@ class TopmostTracker:
         for hwnd in list(self._hwnds):
             set_topmost(hwnd, False)
         self._hwnds.clear()
+
+
+# ---------------------------------------------------------------
+# 窓の配置(窓を集める・配置プリセット。window_layout.py から使う)
+# ---------------------------------------------------------------
+_user32.IsZoomed.argtypes = [ctypes.c_void_p]
+_user32.IsZoomed.restype = ctypes.c_bool
+
+_kernel32 = ctypes.windll.kernel32
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+_kernel32.OpenProcess.restype = ctypes.c_void_p
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+_kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.CloseHandle.restype = ctypes.c_bool
+
+
+def is_zoomed(hwnd) -> bool:
+    """最大化されているか。"""
+    return bool(_user32.IsZoomed(hwnd))
+
+
+def get_window_exe(hwnd) -> str:
+    """ウィンドウの持ち主の実行ファイルのフルパス。取れなければ空文字。
+
+    窓の照合(配置プリセット)はタイトルだけでは足りない(同じタイトルの別アプリが
+    ありうる)ので、exe を第一の手掛かりにする。"""
+    pid = ctypes.c_ulong()
+    if not _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
+        return ""
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(1024)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if _kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+        return ""
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+_MONITOR_ENUM_PROC = ctypes.WINFUNCTYPE(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_void_p)
+_user32.EnumDisplayMonitors.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, _MONITOR_ENUM_PROC, ctypes.c_void_p]
+_user32.EnumDisplayMonitors.restype = ctypes.c_bool
+_user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+_user32.GetMonitorInfoW.restype = ctypes.c_bool
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+_user32.GetCursorPos.restype = ctypes.c_bool
+
+
+def list_monitor_work_areas() -> list:
+    """モニタごとの作業領域 (left, top, right, bottom) の並び(物理ピクセル)。
+
+    作業領域はタスクバーを除いた範囲。窓を集める・寄せる先はモニタ全体では
+    なくこちら(タスクバーの下に隠れる置き方をしないため)。"""
+    areas = []
+
+    def on_monitor(hmonitor, _hdc, _rect, _lparam):
+        try:
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(_MONITORINFO)
+            if _user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                r = info.rcWork
+                areas.append((r.left, r.top, r.right, r.bottom))
+        except OSError:
+            pass
+        return True
+
+    callback = _MONITOR_ENUM_PROC(on_monitor)
+    try:
+        _user32.EnumDisplayMonitors(None, None, callback, None)
+    except OSError:
+        pass
+    return areas
+
+
+def get_cursor_pos():
+    """マウスカーソルの位置 (x, y)(物理ピクセル)。取れなければ None。"""
+    point = _POINT()
+    if _user32.GetCursorPos(ctypes.byref(point)):
+        return point.x, point.y
+    return None
+
+
+SW_SHOWNORMAL = 1
+SW_MAXIMIZE = 3
+
+
+class _WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                ("showCmd", ctypes.c_uint), ("ptMinPosition", _POINT),
+                ("ptMaxPosition", _POINT), ("rcNormalPosition", RECT)]
+
+
+_user32.SetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
+_user32.SetWindowPlacement.restype = ctypes.c_bool
+_user32.GetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
+_user32.GetWindowPlacement.restype = ctypes.c_bool
+
+
+def get_placement(hwnd):
+    """(通常時の矩形, 最大化か)。取れなければ None。
+
+    最大化中の窓の GetWindowRect はモニタ全体を返すので、元の大きさに戻す話は
+    こちらの「通常時の矩形」でないとできない。"""
+    placement = _WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(_WINDOWPLACEMENT)
+    if not _user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+        return None
+    r = placement.rcNormalPosition
+    return (r.left, r.top, r.right, r.bottom), placement.showCmd == SW_MAXIMIZE
+
+
+def set_placement(hwnd, rect, zoomed: bool = False) -> bool:
+    """窓を指定の矩形へ移す。zoomed なら移した先で最大化する。
+
+    SetWindowPos と違い、最大化中の窓もそのまま扱える(最大化を解いて矩形を
+    当て、必要なら移した先で最大化し直す、までが1回の呼び出しで済む)。
+    フォーカスは移さない(呼び出しは配置の都合で、操作の対象を変えない)。"""
+    placement = _WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(_WINDOWPLACEMENT)
+    placement.flags = 0
+    placement.showCmd = SW_MAXIMIZE if zoomed else SW_SHOWNORMAL
+    placement.rcNormalPosition = RECT(*rect)
+    return bool(_user32.SetWindowPlacement(hwnd, ctypes.byref(placement)))

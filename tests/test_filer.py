@@ -4816,6 +4816,83 @@ def test_frecency_logic():
     assert core.DEFAULT_KEYMAP["1072"] == "frecency_jump"
 
 
+def test_history_logic():
+    now = 1_000_000_000.0
+    # 開いたファイルの記録: 同じパスは1件(大小違いも同じ)、古いものは間引く
+    data = {}
+    core.file_history_add(data, "C:\\x\\a.txt", now)
+    core.file_history_add(data, "c:\\X\\A.txt", now + 10)
+    assert list(data) == ["c:\\X\\A.txt"] and data["c:\\X\\A.txt"] == now + 10
+    core.file_history_add(data, "C:\\x\\b.txt", now + 20)
+    assert "C:\\x\\a.txt" not in data and len(data) == 2
+    pruned = {"C:\\old.txt": now - 40 * 86400, "C:\\new.txt": now}
+    core.file_history_prune(pruned, now)
+    assert list(pruned) == ["C:\\new.txt"]
+    # フォルダ行: 30日より前の訪問は出さない
+    frec = {"C:\\Work": [3, now - 60], "C:\\Old": [1, now - 40 * 86400]}
+    rows = core.history_folder_rows(frec, now)
+    assert [r["path"] for r in rows] == ["C:\\Work"] and rows[0]["kind"] == "folder"
+    # 走査対象: 直近3日の表示フォルダ + ダウンロード(深さ1) + 手動追加。重複は除く
+    roots = core.history_scan_roots(
+        {"C:\\Work": [3, now - 60], "C:\\Gone": [1, now - 9 * 86400],
+         "c:\\work": [1, now - 30]},
+        now, "C:\\DL", ["C:\\Extra", "c:\\dl"])
+    assert roots == [("C:\\Work", False), ("C:\\DL", True), ("C:\\Extra", False)], roots
+    # 統合: 同じファイルは「開いた」が勝ち、全体は時刻の新しい順。ファイルは上限まで
+    opened = [{"kind": "file", "path": "C:\\DL\\f.txt", "ts": now, "size": None,
+               "attrs": None, "origin": "開いた"}]
+    scanned = [{"kind": "file", "path": "c:\\dl\\F.txt", "ts": now - 100, "size": 5,
+                "attrs": 0, "origin": "C:\\DL"},
+               {"kind": "file", "path": "C:\\DL\\g.txt", "ts": now - 50, "size": 5,
+                "attrs": 0, "origin": "C:\\DL"}]
+    merged = core.merge_history_rows(rows, opened, scanned)
+    files = [r for r in merged if r["kind"] == "file"]
+    assert [r["path"] for r in files] == ["C:\\DL\\f.txt", "C:\\DL\\g.txt"], merged
+    assert files[0]["origin"] == "開いた"
+    many = [{"kind": "file", "path": f"C:\\DL\\{i}.txt", "ts": now - i, "size": 1,
+             "attrs": 0, "origin": "C:\\DL"} for i in range(10)]
+    assert len([r for r in core.merge_history_rows([], [], many, limit=3)
+                if r["kind"] == "file"]) == 3
+    # 絞り込み(段のチップ)
+    assert core.history_row_match(files[0], "all", 30, now)
+    assert not core.history_row_match(files[0], "folder", 30, now)
+    assert core.history_row_match(files[0], "file", 30, now)
+    assert not core.history_row_match(files[1], "file", 0, now)  # 期間0日では過去は出ない
+    old_row = {"kind": "file", "path": "C:\\x", "ts": now - 5 * 86400}
+    assert not core.history_row_match(old_row, "all", 3, now)
+    assert core.history_row_match(old_row, "all", 30, now)
+    assert not core.history_row_match(None, "all", 30, now)
+    # 経過の文字
+    assert core.history_age_text(now - 30, now) == "たった今"
+    assert core.history_age_text(now - 300, now) == "5分前"
+    assert core.history_age_text(now - 3 * 3600, now).endswith("時間前")
+
+
+def test_history_collect():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "sub").mkdir()
+        (root / "new.txt").write_bytes(b"x")
+        (root / "sub" / "deep.txt").write_bytes(b"y")
+        (root / "dl.crdownload").write_bytes(b"z")          # ダウンロード中は出さない
+        rows, partial = core.collect_history_files([(str(root), True)], now + 5)
+        paths = {r["path"] for r in rows}
+        assert str(root / "new.txt") in paths and str(root / "sub" / "deep.txt") in paths, paths
+        assert str(root / "dl.crdownload") not in paths
+        assert not partial
+        # 期間を0日にすれば、作られたばかりのものも含めて全部が対象から外れる
+        rows0, _ = core.collect_history_files([(str(root), True)], now + 5, days=0)
+        assert rows0 == []
+        # 深さ0ではサブフォルダの中は見ない
+        rows2, _ = core.collect_history_files([(str(root), False)], now + 5)
+        assert all(r["path"] != str(root / "sub" / "deep.txt") for r in rows2)
+        # 予算0なら打ち切りになる
+        _rows3, partial3 = core.collect_history_files(
+            [(str(root), True)], now + 5, budget=-1)
+        assert partial3
+
+
 def test_window_frecency_jump():
     import filer
     from PySide6.QtCore import Qt
@@ -4856,30 +4933,95 @@ def test_window_frecency_jump():
             L.load(str(zpath))
             _wait(w)
             assert not any(p.casefold().endswith("pack.zip") for p in w.frecency)
-            # Shift+H: 語で絞ってスコア順。Enter でそこへ
+            # Shift+H: 履歴ビューがアクティブ窓に出る。フォルダ行の Enter でそこへ
             key(Qt.Key_H, Qt.ShiftModifier)
-            picker = w._picker
-            assert picker is not None
-            picker.search.setText("sub")
-            rows = [picker.list.item(i).text() for i in range(picker.list.count())]
-            assert rows[0].casefold() == str(left / "sub1").casefold(), rows
-            picker._commit()
             _wait(w)
-            assert core.same_dir(L.path, left / "sub1")
-            # 無くなったフォルダは候補から外し、記録からも消す
+            assert L.hist
+            names = [e.name for e in L.entries]
+            assert str(left / "sub1") in names, names
+            L.set_cursor(L._row_of(str(left / "sub1")))
+            key(Qt.Key_Return)
+            _wait(w)
+            assert not L.hist and core.same_dir(L.path, left / "sub1")
+            # 無くなったフォルダは行に出ず、記録からも消える(開くときの掃除)
+            L.load(str(left))
+            _wait(w)
             shutil.rmtree(left / "sub1" / "deep")
             key(Qt.Key_H, Qt.ShiftModifier)
-            picker = w._picker
-            rows = [picker.list.item(i).text() for i in range(picker.list.count())]
-            assert not any(r.casefold().endswith("deep") for r in rows), rows
-            picker.close()
+            _wait(w)
+            assert L.hist
+            names = [e.name for e in L.entries]
+            assert not any(n.casefold().endswith("deep") for n in names), names
             assert not any(p.casefold().endswith("deep") for p in w.frecency)
+            key(Qt.Key_H, Qt.ShiftModifier)   # もう一度押すと閉じる
+            _wait(w)
+            assert not L.hist
         finally:
             w.close()
             w.deleteLater()
 
 
 # ---------------------------------------------------------------
+def test_window_history_view():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        for store_name in (core.FRECENCY_STORE, core.FILE_HISTORY_STORE):
+            store = Path(core.data_dir(), store_name)
+            if store.exists():
+                store.unlink()
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(L.view, k, mods)  # noqa: E731
+        try:
+            L.load(str(left / "sub1"))
+            _wait(w)
+            L.load(str(left))
+            _wait(w)
+            # 関連付けで開いた記録(開いた時刻が基準)
+            w.record_opened_file(str(left / "alpha.txt"))
+            assert str(left / "alpha.txt") in w.file_history
+            key(Qt.Key_H, Qt.ShiftModifier)
+            _wait(w)
+            assert L.hist and L.history_bar.isVisible()
+            names = [e.name for e in L.entries]
+            assert str(left / "sub1") in names, names            # フォルダ行
+            assert str(left / "alpha.txt") in names, names       # 開いたファイル行
+            assert str(right / "r.txt") in names, names          # 表示したフォルダの走査
+            assert names[0] == str(left / "alpha.txt"), names    # 開いたものが先頭(最新)
+            # 段のチップ: 種別で絞る
+            L._on_history_filter("file", 30)
+            assert L.entries and all(not e.is_dir for e in L.entries)
+            L._on_history_filter("folder", 30)
+            assert L.entries and all(e.is_dir for e in L.entries)
+            L._on_history_filter("all", 30)
+            # フォルダ行の Enter で移動し、履歴は閉じる
+            L.set_cursor(L._row_of(str(left / "sub1")))
+            key(Qt.Key_Return)
+            _wait(w)
+            assert not L.hist and core.same_dir(L.path, left / "sub1")
+            # BS で開く前にいたフォルダへ戻る
+            key(Qt.Key_H, Qt.ShiftModifier)
+            _wait(w)
+            assert L.hist
+            key(Qt.Key_Backspace)
+            _wait(w)
+            assert not L.hist and core.same_dir(L.path, left / "sub1")
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 # C. フラット表示(Alt+B)
 # ---------------------------------------------------------------
 def _make_flat_tree(root):
@@ -10680,6 +10822,7 @@ FULL_ONLY = frozenset({
     "test_window_f7_jump_range",
     "test_window_flat_view",
     "test_window_frecency_jump",
+    "test_window_history_view",
     "test_window_layout_and_font",
     "test_window_live_filter",
     "test_window_menu_attrs_mouse_drag_drawing",

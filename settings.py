@@ -439,6 +439,14 @@ DEFAULT_SETTINGS = {
     "folder_watch": {
         "rules": [],
     },
+    # 窓の配置(window_layout.py)。画面アイコンの「🪟 窓の配置」から使う。
+    #   presets … [{name, items: [{exe, title, rect: [l, t, r, b], zoomed}]}]
+    #             選んだ窓の位置と大きさを名前付きで覚えたもの。適用は手動だけ
+    #             (モニタ構成の検知・自動適用はしない)。座標は物理ピクセルで、
+    #             PC ごとにモニタ構成が違うので共有せず PC ごとに持つ。
+    "window_layout": {
+        "presets": [],
+    },
     # Copilot 状態監視(copilot_watchdog.py / copilot_status_process.py)。
     # 監視そのものに入切は無い(バーか進捗パネルのどちらかが出る間だけ子が動く)。
     #   bar     … Copilot の窓に出す状態監視バーを出すか。トレイの

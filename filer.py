@@ -87,6 +87,7 @@ import filer_everything
 import filer_extmenu
 import filer_launch
 import filer_phone
+import filer_history_bar
 import filer_rating_bar
 import filer_shell
 import filer_update
@@ -771,6 +772,19 @@ class Pane(QWidget):
         # 置き場を開く前にいたフォルダ(T でもう一度押すと戻る)。
         self.stash = False
         self.stash_from = None
+        # フォルダ/ファイル履歴(Shift+H)。よく行くフォルダ(frecency)と最近の
+        # ファイルを1つの一覧に出す。項目の名前は一時置き場と同じくフルパス。
+        # hist_rows は絞り込み前の行(core.merge_history_rows の結果)、hist_meta は
+        # {パス(normcase): 行}。並びは時刻の新しい順で固定(窓の並べ方は効かせない)。
+        self.hist = False
+        self.hist_from = None
+        self.hist_rows = []
+        self.hist_meta = {}
+        self.hist_kind = "all"     # all / folder / file(段のチップ)
+        self.hist_period = 30      # 期間の日数(段のチップ)
+        self.hist_partial = False  # 走査が時間予算で打ち切られた
+        self.hist_loading = False
+        self.hist_cancel = None
         # フラット表示(Alt+B)。いまのフォルダ以下のファイルを1つの一覧に。
         self.flat = False
         self.flat_loading = False
@@ -898,6 +912,13 @@ class Pane(QWidget):
         self.rating_bar.keyword_toggled.connect(self._on_rating_keyword)
         self.rating_bar.hide()
         layout.addWidget(self.rating_bar)
+        # 履歴の絞り込みの段(Shift+H の履歴表示のときだけ。一覧の真下)。
+        self.history_bar = filer_history_bar.HistoryBar(window.colors, window.log_font, self)
+        self.history_bar.pressed.connect(self._on_history_bar_pressed)
+        self.history_bar.filter_changed.connect(self._on_history_filter)
+        self.history_bar.close_requested.connect(self._on_history_close)
+        self.history_bar.hide()
+        layout.addWidget(self.history_bar)
         self._rating_pending = None     # まだ掛けていないスライダーの値 (lo, hi)
         self._rating_timer = QTimer(self)
         self._rating_timer.setSingleShot(True)
@@ -1083,7 +1104,11 @@ class Pane(QWidget):
         if not hasattr(self, "header2"):
             return
         # 1行目: "C:\Program Files\ *.*"(あふｗと同じく、パスの末尾に \ と空白とマスク)。
-        if self.stash:
+        if self.hist:
+            text = f"フォルダ/ファイル履歴 {self.mask_text}"
+            if self.hist_partial:
+                text += "   [走査を打ち切ったため一部のみ]"
+        elif self.stash:
             text = f"一時置き場 {self.mask_text}"
         elif self.path:
             text = self.path if self.path.endswith("\\") else self.path + "\\"
@@ -1123,7 +1148,16 @@ class Pane(QWidget):
             return  # 組み立ての途中(ビューを作った時点で currentChanged が飛ぶ)
         dirs, files = core.count_dirs_files(self.entries)
         count, total = core.marks_summary(self.entries, self.marks)
-        if self.stash:
+        if self.hist:
+            if self.hist_loading:
+                text = "履歴を集めています…"
+            else:
+                text = f"履歴 {dirs + files}件（フォルダ {dirs}・ファイル {files}）"
+                if self.hist_partial:
+                    text += "   ※走査を打ち切ったため一部のみ表示"
+                if count:
+                    text += f"   Mark {count} ({total:,})"
+        elif self.stash:
             size = sum(e.size for e in self.entries if not e.is_dir)
             text = f"一時置き場 {dirs + files}件   {size:,} bytes"
             if count:
@@ -1239,12 +1273,14 @@ class Pane(QWidget):
 
         history … "visit"(履歴に積む) / None(積まない。再読込) / ("back"|"forward", 直前のパス)
         on_fail … 読めなかったときに呼ぶ(起動時の復元で、次の候補へ回すため)。"""
-        # ふつうの読み込みはフラット表示・検索結果・一時置き場を終える
+        # ふつうの読み込みはフラット表示・検索結果・一時置き場・履歴を終える
         # (フォルダを移る・BS・O など)。
         self._stop_flat()
         self._stop_grep()
         self._stop_es()
         self._stop_pick()
+        self._stop_hist()
+        self.hist_from = None
         was_stash = self.stash
         self.stash = False
         self.stash_from = None
@@ -1371,6 +1407,24 @@ class Pane(QWidget):
         コピーしたりするのは事故の元なので、安全な側に倒した。"""
         win = self.window_
         shown = core.filter_attrs(self.all_entries, win.show_hidden, win.show_system)
+        if self.hist:
+            # 履歴は「時刻の新しい順」が並びそのものなので、窓の並べ方とマスクは
+            # 効かせない(マスクはフォルダを眺めるためのもの)。ライブ絞り込みと
+            # 段のチップ(種別・期間)だけを掛ける。
+            now = time.time()
+            visible = [e for e in core.live_filter_entries(shown, self.live_words)
+                       if core.history_row_match(
+                           self.hist_meta.get(core.history_key(e.name)),
+                           self.hist_kind, self.hist_period, now)]
+            self.photo_total = 0
+            self.photo_shown = 0
+            self.entries = visible
+            self.model.set_entries(self.entries, self.marks)
+            self._fit_ext_column()
+            self.update_photo_mode()
+            self.update_rating_bar()
+            self.update_history_bar()
+            return
         masked = core.filter_entries(shown, self.patterns)
         visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
         names = {e.name for e in self.all_entries}
@@ -1391,6 +1445,7 @@ class Pane(QWidget):
         self._fit_ext_column()
         self.update_photo_mode()
         self.update_rating_bar()
+        self.update_history_bar()
 
     def _row_of(self, name):
         if not name:
@@ -1402,6 +1457,9 @@ class Pane(QWidget):
         return None
 
     def reload(self, keep_marks=False, focus=None) -> None:
+        if self.hist:
+            self.show_history()
+            return
         if self.stash:
             self.show_stash()
             return
@@ -1464,6 +1522,174 @@ class Pane(QWidget):
             self.stash_from = None
             self.apply_style()
 
+    # --- フォルダ/ファイル履歴(Shift+H) ---
+    def _stop_hist(self) -> None:
+        if self.hist_cancel is not None:
+            self.hist_cancel.set()
+        self.hist_cancel = None
+        self.hist = False
+        self.hist_loading = False
+
+    def show_history(self) -> None:
+        """履歴をこの窓に出す。フォルダ行(frecency)と開いたファイルの記録は
+        その場で並べ、走査対象フォルダの新しいファイルは別スレッドで集めて
+        後から差し込む(先に出せる行だけでもすぐ見せるため)。項目の名前は
+        フルパス(一時置き場と同じで、既存の操作がそのまま動く)。"""
+        win = self.window_
+        if not self.hist:
+            self.hist_from = self.real_dir() if self.archive else self.path
+        self._stop_flat()
+        self._stop_grep()
+        self._stop_es()
+        self._stop_pick()
+        if self.stash:
+            self.stash = False
+            self.stash_from = None
+            self.apply_style()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.hist_cancel = cancel
+        self.hist = True
+        self.hist_loading = True
+        self.loading = True
+        self.hist_partial = False
+        self.path = ""
+        now = time.time()
+        folder_rows = core.history_folder_rows(win.frecency, now)
+        opened_rows = core.opened_file_rows(win.file_history, now)
+        self._set_history_rows(core.merge_history_rows(folder_rows, opened_rows, []))
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            win.update_status_bar()
+        roots = core.history_scan_roots(win.frecency, now, core.downloads_folder(),
+                                        win.history_folders)
+        bridge = win.bridge
+
+        def worker():
+            try:
+                scanned, partial = core.collect_history_files(roots, now, cancel=cancel)
+                payload = (self.side, request, True,
+                           (scanned, partial, folder_rows, opened_rows),
+                           dict(path="", hist=True))
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}",
+                           dict(path="", hist=True))
+            try:
+                bridge.finished.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name=f"filer-hist-{self.side}").start()
+        self._flat_timer.start(200)
+
+    def _set_history_rows(self, rows) -> None:
+        """行の並びから一覧の項目を作る。開いたファイルの行(size が無いもの)は
+        ここで stat し直し、消えていたものは記録からも外す(窓へ通知)。
+        フォルダ行は実在しないものを出さないだけ(記録の掃除は frecency 側)。"""
+        entries = []
+        meta = {}
+        missing_opened = []
+        for row in rows:
+            path = row["path"]
+            if row["kind"] == "folder":
+                if not os.path.isdir(path):
+                    continue
+                entry = core.Entry(path, True, 0, row["ts"], 0)
+            else:
+                size, attrs = row.get("size"), row.get("attrs")
+                if size is None:
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        missing_opened.append(path)
+                        continue
+                    size, attrs = st.st_size, getattr(st, "st_file_attributes", 0)
+                entry = core.Entry(path, False, size, row["ts"], attrs)
+            entries.append(entry)
+            meta[core.history_key(path)] = row
+        if missing_opened:
+            self.window_.forget_opened_files(missing_opened)
+        self.hist_rows = rows
+        self.hist_meta = meta
+        self.all_entries = entries
+        self.marks = set()
+        self._rebuild()
+
+    def on_history_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id or not self.hist:
+            return
+        self.loading = False
+        self.hist_loading = False
+        self.hist_cancel = None
+        self._flat_timer.stop()
+        if not ok:
+            self.window_.log(f"履歴: 走査できません ({result})")
+            self.update_header()
+            self.update_footer()
+            return
+        scanned, partial, folder_rows, opened_rows = result
+        self.hist_partial = partial
+        current = self.cursor_entry()
+        cursor_path = current.name if current is not None else None
+        self._set_history_rows(core.merge_history_rows(folder_rows, opened_rows, scanned))
+        if cursor_path:
+            row = self._row_of(cursor_path)
+            if row is not None:
+                self.set_cursor(row)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
+
+    def cancel_history(self) -> None:
+        """履歴の走査を止める。すでに出ている行(フォルダ・開いた記録)は残す。"""
+        if self.hist_loading and self.hist_cancel is not None:
+            self.hist_cancel.set()
+            self.request_id += 1   # 走査結果の到着を無効化する
+            self.hist_loading = False
+            self.loading = False
+            self.hist_partial = True
+            self.update_header()
+            self.update_footer()
+
+    def close_history(self) -> None:
+        """履歴を閉じて、開く前にいたフォルダへ戻る。"""
+        back = self.hist_from
+        if back:
+            # 後始末(フラグを落とす)は load 側に任せる(close_stash と同じ理由)。
+            self.load(back, history=None)
+        else:
+            self._stop_hist()
+            self.hist_from = None
+
+    def update_history_bar(self) -> None:
+        """履歴の段をこの窓の状態に合わせる。履歴表示でなければ隠す。"""
+        bar = getattr(self, "history_bar", None)
+        if bar is None:
+            return  # 組み立ての途中
+        bar.setVisible(self.hist)
+        if self.hist:
+            bar.show_state(self.hist_kind, self.hist_period,
+                           len(self.entries), len(self.hist_rows))
+
+    def _on_history_bar_pressed(self) -> None:
+        try:
+            if not self.is_active():
+                self.window_.activate(self.side)
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("historyPress")
+
+    def _on_history_filter(self, kind: str, period_days: int) -> None:
+        self.hist_kind = kind
+        self.hist_period = period_days
+        self.refilter()
+
+    def _on_history_close(self) -> None:
+        self.close_history()
+
     # --- フラット表示(Alt+B) ---
     def _stop_flat(self) -> None:
         if self.flat_cancel is not None:
@@ -1518,7 +1744,8 @@ class Pane(QWidget):
 
     def _tick_flat(self) -> None:
         try:
-            if self.flat_loading or self.grep_loading or self.es_loading or self.pick_loading:
+            if (self.flat_loading or self.grep_loading or self.es_loading
+                    or self.pick_loading or self.hist_loading):
                 self.update_footer()
                 if self.pick_loading:
                     self._update_pick_progress()
@@ -1935,7 +2162,7 @@ class Pane(QWidget):
     def refilter(self) -> None:
         """表示の絞り込み(Shift+Z)が変わったときに並べ直す。カーソルは同じ項目に付いて
         いき、その項目が消えたら同じ行の辺りに留まる。マークは見えているものだけ残る。"""
-        if not self.path:
+        if not self.path and not self.hist:
             self.update_header()
             return
         entry = self.cursor_entry()
@@ -2579,6 +2806,14 @@ class FilerWindow(QWidget):
         stored = core.load_store(core.FRECENCY_STORE, {})
         self.frecency = {p: v for p, v in stored.items()
                          if isinstance(p, str) and isinstance(v, list) and len(v) == 2}
+        # 開いたファイルの記録(履歴 Shift+H 用。リポジトリの外。形の違う行は捨てる)。
+        stored_files = core.load_store(core.FILE_HISTORY_STORE, {})
+        self.file_history = {p: v for p, v in stored_files.items()
+                             if isinstance(p, str) and isinstance(v, (int, float))}
+        # 履歴の走査へ手動で足すフォルダ(settings の filer.history_folders)。
+        extra = section.get("history_folders")
+        self.history_folders = ([p for p in extra if isinstance(p, str)]
+                                if isinstance(extra, list) else [])
         # ドライブのラベルと容量(窓の2行目と下の行)。読み取りは別スレッドで、結果を
         # ドライブの根ごとに覚える。ラベルはドライブが変わったときだけ、容量は読み直しの
         # たびに読む。読めないうちは空のまま(固まらない方を取る)。
@@ -3293,29 +3528,18 @@ class FilerWindow(QWidget):
                 pass
 
     def cmd_frecency_jump(self):
-        """Shift+H: よく行くフォルダへ(zoxide 風)。打った語をすべて含むパスを、
-        回数と最近さのスコア順に出す。最後の語がフォルダ名に入るものが先。"""
-        self._prune_missing_frecency()
-        if not self.frecency:
-            self.log("よく行くフォルダの記録がまだありません")
+        """Shift+H: フォルダ/ファイル履歴をアクティブ窓に出す。
+
+        旧「よく行くフォルダ」の選択窓はこの一覧に置き換えた(よく行くフォルダ
+        ≒ 最近行ったフォルダで、同じ履歴として出す方が探しやすいため)。
+        フォルダ行は frecency の記録、ファイル行は開いた記録と走査から。
+        もう一度押すと開く前にいたフォルダへ戻る。"""
+        pane = self.active
+        if pane.hist:
+            pane.close_history()
             return
-
-        def candidates(text):
-            return [(path, path) for path in core.frecency_query(self.frecency, text, time.time())]
-
-        def go(path):
-            def failed(path=path):
-                core.frecency_remove(self.frecency, path)
-                try:
-                    core.save_store(core.FRECENCY_STORE, self.frecency)
-                except OSError:
-                    pass
-                self.log(f"よく行くフォルダ: 開けないので記録から消しました: {path}")
-            self.active.load(path, on_fail=failed)
-
-        self._open_picker("よく行くフォルダ", [], go,
-                          placeholder="語を空白区切りで（最後の語はフォルダ名に）",
-                          dynamic_items=candidates)
+        self._prune_missing_frecency()
+        pane.show_history()
 
     # --- ドライブのラベルと容量(別スレッドで読んで覚える) ---
     def drive_label_text(self, root) -> str:
@@ -3452,6 +3676,8 @@ class FilerWindow(QWidget):
                 self.pane(side).on_grep_loaded(request, ok, result, args)
             elif args.get("flat"):
                 self.pane(side).on_flat_loaded(request, ok, result, args)
+            elif args.get("hist"):
+                self.pane(side).on_history_loaded(request, ok, result, args)
             else:
                 self.pane(side).on_loaded(request, ok, result, args)
         except Exception:  # noqa: BLE001
@@ -3534,6 +3760,9 @@ class FilerWindow(QWidget):
             return
         if event.key() == Qt.Key_Escape and self.active.pick_loading:
             self.active.cancel_pick()   # Esc は「処理の中止」: ★写真抽出を止める
+            return
+        if event.key() == Qt.Key_Escape and self.active.hist_loading:
+            self.active.cancel_history()   # Esc は「処理の中止」: 履歴の走査を止める
             return
         if event.key() == Qt.Key_Escape and self._size_job is not None:
             self.cancel_size_total()    # Esc は「処理の中止」: 合計ファイルサイズを止める
@@ -3692,6 +3921,10 @@ class FilerWindow(QWidget):
 
     def cmd_parent(self):
         pane = self.active
+        if pane.hist:
+            # 履歴での BS は「開く前にいたフォルダへ戻る」(一時置き場と同じ作法)。
+            pane.close_history()
+            return
         if pane.stash:
             # 置き場での BS は「開く前にいたフォルダへ戻る」(フラット表示と同じ作法)。
             pane.close_stash()
@@ -3795,16 +4028,49 @@ class FilerWindow(QWidget):
         pane = self.active
         if pane.archive is not None:
             # 書庫の中のファイルは一時フォルダへ取り出してから開く。
-            self._extract_to_temp([entry], lambda paths: self._startfile(paths[0]))
+            self._extract_to_temp([entry],
+                                  lambda paths: self._startfile(paths[0], record=False))
             return
         self._startfile(os.path.join(pane.path, entry.name))
 
-    def _startfile(self, path: str) -> None:
+    def _startfile(self, path: str, record: bool = True) -> None:
         try:
             os.startfile(path)
             self.log(f"開く: {path}")
         except OSError as e:
             self.log(f"開けません: {path}  ({e})")
+            return
+        if record:
+            self.record_opened_file(path)
+
+    # --- 開いたファイルの記録(履歴 Shift+H) ---
+    def record_opened_file(self, path: str) -> None:
+        """関連付けでファイルを開いたことを記録する(履歴のファイル行の材料)。
+
+        フォルダは記録しない。書庫の中身は呼び出し側(_startfile の record=False)
+        で除いてある。書けなくても操作は止めない(frecency の記録と同じ)。"""
+        try:
+            if not os.path.isfile(path):
+                return
+            core.file_history_add(self.file_history, path, time.time())
+            core.save_store(core.FILE_HISTORY_STORE, self.file_history)
+        except (OSError, ValueError, TypeError) as e:
+            print(f"[filer] 開いたファイルを記録できません: {e}", file=sys.stderr)
+
+    def forget_opened_files(self, paths) -> None:
+        """消えていた開いたファイルを記録から外す(履歴を出したときに呼ばれる)。"""
+        changed = False
+        for path in paths:
+            key = next((k for k in self.file_history
+                        if core.history_key(k) == core.history_key(path)), None)
+            if key is not None:
+                del self.file_history[key]
+                changed = True
+        if changed:
+            try:
+                core.save_store(core.FILE_HISTORY_STORE, self.file_history)
+            except OSError:
+                pass
 
     def cmd_open_in_other(self):
         """Shift+Enter: カーソルのフォルダを反対窓で開く。ファイルならエディタで開く。

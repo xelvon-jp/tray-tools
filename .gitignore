@@ -49,6 +49,12 @@ copilot_status_state.json
 # エージェントループの周回数を状態監視バーへ知らせるファイル。実行中だけ存在する。
 copilot_loop_status.json
 
+# 状態監視の子が「いまの手番」を常駐(進捗パネル)へ知らせるファイル。窓のハンドルを含むので公開しない。
+copilot_turn_status.json
+
+# ↑の書きかけ。os.replace で差し替える前の一時ファイル。
+copilot_turn_status.json.tmp
+
 # 「続けてよいか」への返事を子プロセスへ渡すファイル。聞いている間だけ存在する。
 .copilot_loop_decision
 

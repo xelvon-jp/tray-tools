@@ -959,8 +959,24 @@ class StatusWatcher:
         self._thresholds = load_thresholds(app_settings)
         # バー(札)を出すか。settings.json の copilot_status.bar。false でも
         # 監視と手番の知らせ(TURN_STATUS_FILE)は続ける(右下パネルで見るため)。
-        _section = (app_settings or {}).get("copilot_status") or {}
-        self._bar_enabled = bool(_section.get("bar", True))
+        #
+        # 【判定は親と共通・生ファイルで】app_settings は DEFAULT_SETTINGS と
+        # マージ済みなので、そちらで判定すると旧 enabled へ引き継げない。
+        # copilot_watchdog の共通判定を、settings.json を直接読んだ生の節に
+        # 対して使う(あちらは UIA / comtypes を読まないので安全に import
+        # できる)。ファイルが読めないときだけ、渡された節で判定する。
+        import copilot_watchdog as _cw
+        _raw = None
+        try:
+            import settings as _settings_module
+            _raw = _cw.read_raw_copilot_section(_settings_module.SETTINGS_PATH)
+        except Exception:  # noqa: BLE001  読めなければ渡された節で判定する
+            _raw = None
+        if _raw is not None:
+            self._bar_enabled = _cw.bar_enabled_from_section(_raw)
+        else:
+            self._bar_enabled = _cw.bar_enabled_from_section(
+                (app_settings or {}).get("copilot_status"))
         # 最後に書いた手番の知らせ(updated を除いた写し)と書いた時刻。
         self._turn_published = None
         self._turn_written_at = 0.0
@@ -1210,12 +1226,17 @@ class StatusWatcher:
 
         トレイ側で切り替えたときに、子を再起動せず反映するための読み直し。
         閾値やプロファイルは起動時のまま(変える頻度が違う)。読めなければ
-        前の値のままにする。"""
+        前の値のままにする。
+
+        判定は初期化と同じ共通関数(copilot_watchdog)で、生ファイルに対して
+        行う(マージ済みの load_settings で判定すると旧 enabled へ引き継げ
+        ない。親と子の答えがずれないよう、必ず同じ関数を通す)。"""
         try:
             import settings as settings_module
-            data = settings_module.load_settings(settings_module.SETTINGS_PATH)
-            section = data.get("copilot_status") or {}
-            self._bar_enabled = bool(section.get("bar", True))
+            import copilot_watchdog as cw
+            raw = cw.read_raw_copilot_section(settings_module.SETTINGS_PATH)
+            if raw is not None:
+                self._bar_enabled = cw.bar_enabled_from_section(raw)
         except Exception:  # noqa: BLE001  読めなければ前の値で続ける
             pass
 

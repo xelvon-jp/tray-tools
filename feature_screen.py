@@ -2723,19 +2723,39 @@ class ScreenFeature:
 
         子プロセスが知らせに書いた hwnd へ ctypes の user32 だけで触る
         (UIA/COM は常駐に入れない。copilot_watchdog 冒頭の実測どおり)。
-        最小化されていたら戻してから前面へ。"""
+        最小化されていたら戻してから前面へ。
+
+        【ctypes の型は専用の WinDLL で指定する】
+        リポジトリの決まり(AGENTS.md: argtypes / restype を必ず指定する)。
+        ctypes.windll.user32 の関数オブジェクトへ直接書き込むと、同じ
+        オブジェクトを使う他のモジュールにも影響が広がるので、専用の
+        WinDLL をここで作ってそちらにだけ型を書く。hwnd は知らせ(JSON)から
+        来る int なので wintypes.HWND で渡す(値が大きいと型なしでは変換で
+        例外になり、押しても何も起きなくなる)。
+        WinDLL は呼ばれたときにだけ作る(import 時に作ると、WinDLL の無い
+        Linux ではテストの import で落ちる)。"""
         try:
             turn = self._read_copilot_turn()
             hwnd = (turn or {}).get("hwnd")
             if not hwnd:
                 return
             import ctypes
-            user32 = ctypes.windll.user32
-            if not user32.IsWindow(hwnd):
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsIconic.argtypes = [wintypes.HWND]
+            user32.IsIconic.restype = wintypes.BOOL
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.ShowWindow.restype = wintypes.BOOL
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            handle = wintypes.HWND(hwnd)
+            if not user32.IsWindow(handle):
                 return
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
+            if user32.IsIconic(handle):
+                user32.ShowWindow(handle, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(handle)
         except Exception:  # noqa: BLE001  表示側の操作。失敗しても落とさない
             traceback.print_exc()
 

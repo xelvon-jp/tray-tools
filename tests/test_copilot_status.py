@@ -111,9 +111,69 @@ def test_watchdog_bar_defaults():
 
 
 def test_settings_defaults_have_copilot_status():
+    # bar / enabled の既定値は DEFAULT_SETTINGS に置かない。置くと
+    # load_settings の深いマージで bar が常に入り、旧 enabled への引き継ぎが
+    # 働かなくなる。既定の判定は copilot_watchdog が生ファイルに対して行う。
     with tempfile.TemporaryDirectory() as d:
         loaded = settings_module.load_settings(Path(d) / "settings.json")
-        assert loaded["copilot_status"] == {"enabled": False, "bar": True}
+        assert loaded["copilot_status"] == {}
+
+
+def test_bar_enabled_from_section_cases():
+    # copilot_status が無い → True(初めて使う PC)
+    assert cw.bar_enabled_from_section(None) is True
+    assert cw.bar_enabled_from_section({}) is True
+    # {"enabled": false} だけ → False(旧仕様で OFF にしていた PC)
+    assert cw.bar_enabled_from_section({"enabled": False}) is False
+    assert cw.bar_enabled_from_section({"enabled": True}) is True
+    # bar があれば bar が勝つ
+    assert cw.bar_enabled_from_section(
+        {"enabled": False, "bar": True}) is True
+    assert cw.bar_enabled_from_section(
+        {"enabled": True, "bar": False}) is False
+
+
+def test_bar_enabled_from_raw_file_and_child_agrees():
+    # 親(CopilotWatchdog)と子(StatusWatcher の読み直し)が、生ファイルに
+    # 対して同じ答えを返すこと(同じ共通関数を通る)。
+    # 子のモジュールは ctypes.windll 前提で Linux では import できないため、
+    # 子の確認は import できた環境(Windows)でのみ行う。
+    try:
+        import copilot_status_process as csp
+    except Exception:  # noqa: BLE001  Linux VM では import 自体ができない
+        csp = None
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    cases = [
+        ({"capture": {"save_folder": "X"}}, True),          # 節が無い
+        ({"copilot_status": {"enabled": False}}, False),    # 旧 OFF の PC
+        ({"copilot_status": {"enabled": False, "bar": True}}, True),
+        ({"copilot_status": {"bar": False}}, False),
+    ]
+    old_settings_path = settings_module.SETTINGS_PATH
+    try:
+        for payload, expected in cases:
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "settings.json"
+                path.write_text(json.dumps(payload, ensure_ascii=False),
+                                encoding="utf-8")
+                assert cw.resolve_bar_enabled(settings_path=path) is expected
+                wd = cw.CopilotWatchdog(
+                    app_settings=settings_module.load_settings(path),
+                    settings_path=path)
+                try:
+                    assert wd.bar_enabled() is expected
+                finally:
+                    wd.close()
+                # 子の読み直し(SETTINGS_PATH 経由)も同じ答え
+                if csp is not None:
+                    settings_module.SETTINGS_PATH = path
+                    stub = object.__new__(csp.StatusWatcher)
+                    stub._bar_enabled = None
+                    stub._refresh_bar_setting()
+                    assert stub._bar_enabled is expected
+    finally:
+        settings_module.SETTINGS_PATH = old_settings_path
 
 
 # -- 子プロセス側の手番の書き出し -------------------------------------------

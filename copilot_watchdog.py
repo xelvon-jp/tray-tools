@@ -89,6 +89,61 @@ TURN_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 TURN_STALE_SECONDS = 20
 
 
+def bar_enabled_from_section(section):
+    """「バーを出すか」を、生の copilot_status 節(settings.json を直接読んだ
+    中身)から決める。親(CopilotWatchdog)と子(StatusWatcher)の共通の判定。
+
+    優先順: bar があればそれ → 無く enabled(旧仕様)があればそれ → どちらも
+    無ければ True(この機能を初めて使う PC)。
+
+    【マージ済みの設定で判定してはいけない】
+    settings.load_settings() の結果は DEFAULT_SETTINGS と深くマージ済みで、
+    既定値に bar が入っていると「bar が無い PC」が原理的にありえなくなり、
+    旧 enabled への引き継ぎが働かなくなる(実際に働いていなかった)。
+    だから判定は必ずファイルの中身そのものに対して行い、DEFAULT_SETTINGS の
+    copilot_status には bar / enabled の既定値を置かない(settings.py 参照)。
+    このモジュールは UIA / comtypes を読まないので、常駐からも子プロセス
+    からも安全に import できる。"""
+    if not isinstance(section, dict):
+        return True
+    if "bar" in section:
+        return bool(section.get("bar"))
+    if "enabled" in section:
+        return bool(section.get("enabled"))
+    return True
+
+
+def read_raw_copilot_section(settings_path):
+    """settings.json を直接読み、copilot_status 節を返す(マージ前)。
+
+    ファイルが無い・壊れている・読めないときは None(節が無い・節が辞書で
+    ないときは {})。None と {} の区別は「前の値を保つ」判断に要る
+    (読み直しに失敗しただけで表示が変わってはいけない)。"""
+    import json
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    section = data.get("copilot_status")
+    return section if isinstance(section, dict) else {}
+
+
+def resolve_bar_enabled(settings_path=None, section=None):
+    """「バーを出すか」の入口。section が与えられればそれを生の節として
+    判定し、無ければ settings_path のファイルを直接読んで判定する。
+    ファイルが読めなければ True(初めて使う PC と同じ扱い)。"""
+    if section is not None:
+        return bar_enabled_from_section(section)
+    raw = (read_raw_copilot_section(settings_path)
+           if settings_path else None)
+    if raw is None:
+        return True
+    return bar_enabled_from_section(raw)
+
+
 def read_turn_status(path=None):
     """手番の知らせを読む。新しいものが無ければ None。
 
@@ -141,13 +196,22 @@ class CopilotWatchdog:
         # set_enabled で伝える(Claude のフックに開始ボタンが無いのと同じ思想)。
         # bar キーが無い PC では、旧仕様(ff0f81f)の enabled を初期値にする
         # (OFF にしていた PC で勝手にバーが出始めないように)。
-        section = (app_settings or {}).get("copilot_status") or {}
-        if "bar" in section:
-            self._bar_enabled = bool(section.get("bar"))
-        elif "enabled" in section:
-            self._bar_enabled = bool(section.get("enabled"))
+        #
+        # 【判定はマージ前のファイルで】app_settings は DEFAULT_SETTINGS と
+        # マージ済みで、そちらで判定すると bar が常に入っていて enabled へ
+        # 引き継げない。settings_path があればファイルを直接読む
+        # (bar_enabled_from_section)。パスが無いとき(テスト等)だけ、渡された
+        # app_settings の節を生の節として判定する。
+        if settings_path:
+            raw = read_raw_copilot_section(settings_path)
+            if raw is not None:
+                self._bar_enabled = bar_enabled_from_section(raw)
+            else:
+                self._bar_enabled = bar_enabled_from_section(
+                    (app_settings or {}).get("copilot_status"))
         else:
-            self._bar_enabled = True
+            self._bar_enabled = bar_enabled_from_section(
+                (app_settings or {}).get("copilot_status"))
         self._enabled = False
         self._proc = None
 

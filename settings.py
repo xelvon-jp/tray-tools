@@ -446,10 +446,15 @@ DEFAULT_SETTINGS = {
     #             状態は右下の進捗パネル(Claude と相乗り)に出る。
     #   enabled … 旧仕様の名残り。もう書かない。bar が無い PC では初期値として
     #             だけ読む(OFF にしていた PC で勝手にバーが出ないように)。
-    "copilot_status": {
-        "enabled": False,
-        "bar": True,
-    },
+    #
+    # 【bar / enabled の既定値をここに置かない理由】
+    # load_settings はこの既定値と深くマージする。ここに bar の既定値を置くと
+    # 読み込んだ設定には bar が必ず入ることになり、「bar が無い PC では
+    # enabled を初期値にする」という引き継ぎが原理的に働かなくなる(実際に
+    # 働いていなかった)。バーを出すかの既定(bar → enabled → True)は
+    # copilot_watchdog.bar_enabled_from_section が、settings.json を直接
+    # 読んだ生の節に対して決める。ここは空の節だけ置く。
+    "copilot_status": {},
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",

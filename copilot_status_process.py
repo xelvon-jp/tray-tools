@@ -55,6 +55,7 @@
 # 入力ボックスがどれだけ大きくても必ずその下に出る。横位置だけ入力欄の右端に合わせる。
 import argparse
 import ctypes
+import json
 import os
 import sys
 import time
@@ -148,6 +149,16 @@ LOOP_STATUS_POLL_SECONDS = 1.0
 # Copilot がなかなか返してこないだけの周で印が一度消えて、返ってきたらまた出る、
 # というちらつきになる。回っているのに消えるのが、いちばん困る誤りかた。
 LOOP_STATUS_STALE_SECONDS = 300
+
+# いまの手番を常駐へ知らせるファイル。常駐(feature_screen)が読んで、右下の
+# 進捗パネル(Claude と相乗り)に出す。Copilot が背面・最小化でも状態が見える
+# ようにするためのもので、札(バー)とは別の出口。場所の取り決めは
+# copilot_watchdog 側(TURN_STATUS_FILE)。書き方は LOOP_STATUS_FILE の逆向き。
+TURN_STATUS_FILE = os.path.join(_HERE, "copilot_turn_status.json")
+
+# 手番が変わらなくても、生存の印として updated を進め直す間隔(秒)。
+# 常駐側の捨て時(TURN_STALE_SECONDS = 20)より十分短くすること。
+TURN_HEARTBEAT_SECONDS = 10
 
 # ループが回っている間の絵文字。状態の絵文字と置き換える(札の幅に両方は入らない)。
 # 色は状態のまま残るので、何を待っているのかは色と文言で分かる。
@@ -939,6 +950,13 @@ class StatusWatcher:
         self._app_settings = app_settings
         # 状態ごとの閾値。ここに無い状態(応答中)はそもそも点滅させない。
         self._thresholds = load_thresholds(app_settings)
+        # バー(札)を出すか。settings.json の copilot_status.bar。false でも
+        # 監視と手番の知らせ(TURN_STATUS_FILE)は続ける(右下パネルで見るため)。
+        _section = (app_settings or {}).get("copilot_status") or {}
+        self._bar_enabled = bool(_section.get("bar", True))
+        # 最後に書いた手番の知らせ(updated を除いた写し)と書いた時刻。
+        self._turn_published = None
+        self._turn_written_at = 0.0
 
         self._state = None
         self._state_since = None
@@ -1106,6 +1124,9 @@ class StatusWatcher:
             self._follow_timer.stop()
             self._hide_all()
             self._release()
+            # 手番の知らせも一緒に消す(残すと常駐のパネルに最大で捨て時まで
+            # 残る。消し忘れても古くなれば消えるが、終わるときは畳む)。
+            os.remove(TURN_STATUS_FILE)
         except Exception:  # noqa: BLE001
             pass
         QApplication.instance().exit(0)
@@ -1134,6 +1155,8 @@ class StatusWatcher:
             cp = self._copilot
             if cp is not None and not copilot_loop.user32.IsWindow(cp.hwnd_main):
                 self._release()
+            # 一時停止中であることも知らせておく(常駐のパネルは出さない側に倒す)。
+            self._publish_turn()
             return
 
         snapshot = self._read_snapshot()
@@ -1161,6 +1184,46 @@ class StatusWatcher:
             if 0 <= inset < window.width() // 2:
                 self._right_inset = inset
 
+        self._publish_turn()
+
+    def _publish_turn(self):
+        """いまの手番を TURN_STATUS_FILE へ書く(常駐の右下パネル用)。
+
+        中身が変わったときだけ書く。ただし生存の印として TURN_HEARTBEAT_SECONDS
+        ごとに updated だけは進める(常駐側は古い知らせを捨てる作り)。
+        Copilot を読めていない間は呼ばない(古い手番を延命しない。知らせは
+        古くなって消える側に倒す)。書けなくても監視そのものは続ける。"""
+        now = time.time()
+        payload = {
+            "state": self._state,
+            "app": ((self._copilot.profile.get("name") or "")
+                    if self._copilot is not None else ""),
+            "since": self._state_since,
+            "paused": bool(self._paused),
+            "alert": self._turn_alert(),
+            "updated": now,
+        }
+        comparable = {k: v for k, v in payload.items() if k != "updated"}
+        if (comparable == self._turn_published
+                and now - self._turn_written_at < TURN_HEARTBEAT_SECONDS):
+            return
+        self._turn_published = comparable
+        self._turn_written_at = now
+        try:
+            tmp = TURN_STATUS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, TURN_STATUS_FILE)
+        except OSError:
+            pass
+
+    def _turn_alert(self) -> bool:
+        """パネル用の「待たせすぎ」印。札は操作していない時間だけで数えるが、
+        こちらは壁時計で近似する(パネルは遠目に見るものなので、その程度で足りる)。"""
+        if self._paused or self._state_since is None:
+            return False
+        return (time.time() - self._state_since) >= self._alert_after()
+
     # -- 窓を追う(軽い。150msごと) ---------------------------------------
     def _on_follow(self):
         try:
@@ -1169,6 +1232,12 @@ class StatusWatcher:
             print(f"[copilot-status] 追従に失敗: {e}")
 
     def _follow(self):
+        if not self._bar_enabled:
+            # バーを出さない設定。出ている札があれば一度だけ畳む。手番の
+            # 知らせ(_poll 側)はこの設定と関係なく続ける。
+            if self._pill.isVisible():
+                self._hide_all()
+            return
         if self._state is None and not self._paused and not self._pinned:
             self._hide_all()
             return

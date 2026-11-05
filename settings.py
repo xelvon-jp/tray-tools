@@ -439,6 +439,15 @@ DEFAULT_SETTINGS = {
     "folder_watch": {
         "rules": [],
     },
+    # Copilot 状態監視(copilot_watchdog.py / copilot_status_process.py)。
+    #   enabled … 前回 ON だったかを覚える。true の PC では常駐の起動時に監視を
+    #             自動で始める(既定は false。ON にした PC だけの意思表示)。
+    #   bar     … Copilot の窓に出す状態監視バー。false にするとバーは出さないが
+    #             監視は続け、状態は右下の進捗パネル(Claude と相乗り)に出る。
+    "copilot_status": {
+        "enabled": False,
+        "bar": True,
+    },
     # 空文字にすると、そのホットキーは登録されない(無効化できる)。
     "hotkeys": {
         "audio_toggle": "ctrl+alt+h",

@@ -77,6 +77,43 @@ EXIT_BY_USER = 0
 LOOP_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "copilot_loop_status.json")
 
+# 状態監視の子プロセスが「いまの手番」を知らせるファイル。書くのは子
+# (copilot_status_process)、読むのは常駐(feature_screen が右下の進捗パネルへ
+# 出す)。方向が LOOP_STATUS_FILE と逆なだけで、置き場所の理由は同じ
+# (常駐が copilot_status_process を import すると UIA が入り込んで即死する)。
+TURN_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "copilot_turn_status.json")
+
+# 手番の知らせがこれより古ければ、子が止まった・Copilot が居ないとみなす(秒)。
+# 子の取り直しは1.5秒ごとで、生存の印は10秒ごとに更新される前提。
+TURN_STALE_SECONDS = 20
+
+
+def read_turn_status(path=None):
+    """手番の知らせを読む。新しいものが無ければ None。
+
+    戻り値は {"state", "app", "since", "alert"} 。一時停止中・古い・壊れている
+    ときは None(パネルに出さない)。"""
+    import json
+    import time
+    try:
+        with open(path or TURN_STATUS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("paused"):
+        return None
+    updated = data.get("updated")
+    if not isinstance(updated, (int, float)):
+        return None
+    if time.time() - updated > TURN_STALE_SECONDS:
+        return None
+    if data.get("state") not in ("typing", "waiting_ai", "responding",
+                                 "waiting_user"):
+        return None
+    return {"state": data["state"], "app": data.get("app") or "",
+            "since": data.get("since"), "alert": bool(data.get("alert"))}
+
 
 def _pythonw():
     """コンソール窓を出さないインタプリタ。capture_process と同じ流儀。"""
@@ -97,10 +134,13 @@ class CopilotWatchdog:
         # 子が自分から終わったときに、メニューのチェックを外してもらう連絡口。
         self._on_child_exit = on_child_exit
 
-        # **起動時は必ず OFF。** 前回 ON のまま終わっても、次に立ち上げたときに
-        # 勝手に札が出ないようにする。常駐の起動は「PC を使い始めるとき」なので、
-        # そこで前回の続きを再開されても困ることのほうが多い。
-        self._enabled = False
+        # 起動時の入切は settings.json の copilot_status.enabled を引き継ぐ。
+        # 【以前は「起動時は必ず OFF」だった】前回の続きを勝手に再開しないための
+        # 決まりだったが、右下パネルへの相乗りで「Copilot が居なければ何も出ない」
+        # 形になったのと、職場PCでは監視が主用途で毎回手で入れる手間が勝ったため、
+        # ON にした PC では自動で始める形に変えた(2026-11-05)。既定は OFF のまま。
+        section = (app_settings or {}).get("copilot_status") or {}
+        self._enabled = bool(section.get("enabled"))
         self._proc = None
 
         # 子が落ちていたら起こし直す。
@@ -117,14 +157,52 @@ class CopilotWatchdog:
         self._watch_timer.timeout.connect(self._on_watch)
 
     # -- 外部から呼ばれる操作 --------------------------------------------
+    def restore(self) -> None:
+        """保存された入切で起動する(feature_screen が生成直後に1回呼ぶ)。"""
+        if self._enabled:
+            self._start_child()
+            self._watch_timer.start()
+
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
+        self._save_enabled()
         if self._enabled:
             self._start_child()
             self._watch_timer.start()
         else:
             self._watch_timer.stop()
             self._stop_child()
+
+    def _save_enabled(self) -> None:
+        """入切を settings.json の copilot_status.enabled だけ差し替えて覚える。
+
+        丸ごと書き戻さない(settings.json の作法)。メモリ側(app_settings)も
+        合わせておく。書けなくても入切そのものは続ける。"""
+        try:
+            if self._app_settings is not None:
+                section = self._app_settings.get("copilot_status")
+                if not isinstance(section, dict):
+                    section = self._app_settings["copilot_status"] = {}
+                section["enabled"] = self._enabled
+            if not self._settings_path:
+                return
+            import json
+            from pathlib import Path
+            path = Path(self._settings_path)
+            raw = {}
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            section = raw.get("copilot_status")
+            if not isinstance(section, dict):
+                section = raw["copilot_status"] = {}
+            section["enabled"] = self._enabled
+            path.write_text(json.dumps(raw, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except (OSError, ValueError) as e:
+            print(f"[copilot-status] 入切を保存できませんでした: {e}",
+                  file=sys.stderr)
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -206,6 +284,7 @@ class CopilotWatchdog:
                 # 札の上で終了された。機能ごと OFF にして、メニューのチェックも外す。
                 self._proc = None
                 self._enabled = False
+                self._save_enabled()
                 self._watch_timer.stop()
                 if self._on_child_exit is not None:
                     self._on_child_exit()

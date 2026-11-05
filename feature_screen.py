@@ -379,6 +379,8 @@ class ScreenFeature:
             # 札の右クリックで終了されたら、メニューのチェックも外す。
             on_child_exit=self._on_copilot_watchdog_exited,
         )
+        # 前回 ON のままだったら、監視を自動で始める(copilot_status.enabled)。
+        self._copilot_watchdog.restore()
         self._copilot_watchdog_action = None  # メニュー項目(後で作る)
 
         # Teams の一人会議の立ち上げ(teams_meeting.py)。UIA は常駐の中で使えないので
@@ -2221,17 +2223,31 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001  表示が出ないだけ
             traceback.print_exc()
 
+    def _read_copilot_turn(self):
+        """Copilot の手番の知らせ(子プロセスが書いたファイル)を読む。
+
+        監視が ON のときだけ読む。UIA には触らない(ファイルを読むだけ)。
+        読めない・古い・一時停止中なら None(パネルには出さない)。"""
+        try:
+            if not self._copilot_watchdog.is_enabled():
+                return None
+            import copilot_watchdog as cw
+            return cw.read_turn_status()
+        except Exception:  # noqa: BLE001  表示が出ないだけ
+            return None
+
     def _update_claude_progress(self):
+        copilot = self._read_copilot_turn()
         if not self._claude_progress_enabled:
             if self._claude_progress is not None:
-                self._claude_progress.set_entries([])
+                self._claude_progress.set_entries([], None)
             return
         if self._claude_progress is None:
-            if not self._claude_entries:
+            if not self._claude_entries and copilot is None:
                 return   # 出すものが無いうちは窓を作らない
             self._claude_progress = claude_progress.ClaudeProgressPanel(
                 on_open=self._open_claude_session, on_remove=self._remove_claude_session)
-        self._claude_progress.set_entries(self._claude_entries)
+        self._claude_progress.set_entries(self._claude_entries, copilot)
 
     def _open_claude_session(self, entry):
         """そのセッションをデスクトップアプリで開く(メニューとパネルの行から)。"""

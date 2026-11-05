@@ -4,6 +4,9 @@
 #
 # 中身は claude_status.list_sessions() の結果をそのまま受け取る(feature_screen が
 # 3秒ごとに読んでいるものを渡すだけ。こちらでファイルは読まない)。
+# Copilot の手番も相乗りする: feature_screen が copilot_watchdog.read_turn_status()
+# の結果を一緒に渡し、先頭に1行だけ出す。Copilot の窓に付くバー(状態監視バー)と
+# 違い、背面・最小化でも見えるのが役目。行に操作は無い(✕もクリックも無し)。
 #   - バーの長さは計画の進み具合(claude_status.plan_fraction)。計画が無いセッションは
 #     長さを出せないので、流れる帯で「動いている」ことだけ示す
 #   - 色はトレイの輪と同じ(実行中=青・確認待ち=桃)
@@ -36,6 +39,19 @@ ROW_HEIGHT = 48
 COMPACT_HEIGHT = 24
 # 折りたたんだ行は新しいものからこの数まで(全部はメニューの「💬 Claude」にある)。
 MAX_COMPACT = 5
+# Copilot の手番の行(相乗り)の高さ。名前と状態だけの1行。
+COPILOT_ROW_HEIGHT = 30
+# Copilot の状態 → (絵文字, 文言, 点の色)。文言と色は状態監視バー
+# (copilot_status_process.STATE_STYLES)と同じ。あちらは UIA ごと別プロセスで、
+# 常駐からは import できないので、表示に要る分だけをここに写してある。
+COPILOT_STATES = {
+    "typing": ("✏", "ユーザ入力中", QColor(168, 95, 0)),
+    "waiting_ai": ("⏳", "応答待ち", QColor(179, 40, 40)),
+    "responding": ("💬", "応答中", QColor(31, 107, 176)),
+    "waiting_user": ("🙂", "応答済（入力待ち）", QColor(31, 138, 76)),
+}
+# 「待たせすぎ」のときの文言の色(バーの点滅に相当する印)。
+COPILOT_ALERT_COLOR = QColor(240, 90, 90)
 TRACK_HEIGHT = 6
 SCREEN_MARGIN = 12
 # 行の右端の ✕(その行を消す)。邪魔にならないよう小さく薄く、指したときだけ明るくする。
@@ -111,8 +127,27 @@ def rows_to_show(entries, now, first_seen_done: dict) -> list:
     return full + compact[:MAX_COMPACT]
 
 
+def copilot_row(copilot) -> dict | None:
+    """Copilot の手番(copilot_watchdog.read_turn_status の戻り)をパネルの行にする。
+
+    形が合わない・状態が未知なら None(行を出さない)。"""
+    if not isinstance(copilot, dict):
+        return None
+    if copilot.get("state") not in COPILOT_STATES:
+        return None
+    return {"_copilot": True, "state": copilot["state"],
+            "app": copilot.get("app") or "",
+            "since": copilot.get("since"), "alert": bool(copilot.get("alert"))}
+
+
+def row_height(row) -> int:
+    if row.get("_copilot"):
+        return COPILOT_ROW_HEIGHT
+    return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
+
+
 def panel_height(rows) -> int:
-    return PAD_Y * 2 + sum(COMPACT_HEIGHT if r.get("_compact") else ROW_HEIGHT for r in rows)
+    return PAD_Y * 2 + sum(row_height(r) for r in rows)
 
 
 class ClaudeProgressPanel(QWidget):
@@ -129,6 +164,7 @@ class ClaudeProgressPanel(QWidget):
         self._hover_close = -1
         self._state_path = state_path
         self._entries = []
+        self._copilot = None
         self._rows = []
         self._first_seen_done = {}
         self._hover = -1
@@ -146,14 +182,20 @@ class ClaudeProgressPanel(QWidget):
         self._timer.timeout.connect(self._tick)
 
     # -- 中身 ------------------------------------------------------------
-    def set_entries(self, entries) -> None:
-        """feature_screen から、読んだばかりの一覧を受け取る。"""
+    def set_entries(self, entries, copilot=None) -> None:
+        """feature_screen から、読んだばかりの一覧を受け取る。
+
+        copilot は Copilot の手番(read_turn_status の戻り)。あれば先頭に
+        1行だけ相乗りさせる(背面・最小化でも見えるようにするのが目的)。"""
         self._entries = list(entries or [])
+        self._copilot = copilot
         self._tick()
 
     def _tick(self):
         try:
-            rows = rows_to_show(self._entries, time.time(), self._first_seen_done)
+            head = copilot_row(self._copilot)
+            rows = ([head] if head else []) + rows_to_show(
+                self._entries, time.time(), self._first_seen_done)
             if not rows:
                 self._rows = []
                 self._timer.stop()
@@ -169,7 +211,8 @@ class ClaudeProgressPanel(QWidget):
                 self.show()
             # 動くもの(経過時間・流れる帯・バーの行が折りたたまれる時刻)があるときだけ回す。
             # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
-            if any(not r.get("_compact") for r in rows):
+            # Copilot の行も同じ(経過は3秒ごとの受け取りで進めば足りる)。
+            if any(not r.get("_compact") and not r.get("_copilot") for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
             else:
@@ -201,9 +244,9 @@ class ClaudeProgressPanel(QWidget):
     def _row_rect(self, index) -> QRect:
         top = PAD_Y
         for row in self._rows[:index]:
-            top += COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
-        height = COMPACT_HEIGHT if self._rows[index].get("_compact") else ROW_HEIGHT
-        return QRect(PAD_X // 2, top, self.width() - PAD_X, height)
+            top += row_height(row)
+        return QRect(PAD_X // 2, top, self.width() - PAD_X,
+                     row_height(self._rows[index]))
 
     def paintEvent(self, _event):
         # QWidget の setStyleSheet では背景が描かれない(CLAUDE.md の罠)ので自分で描く。
@@ -229,6 +272,8 @@ class ClaudeProgressPanel(QWidget):
         return QRect(right - CLOSE_SIZE + 1, top, CLOSE_SIZE, CLOSE_SIZE)
 
     def _paint_close(self, p, index):
+        if self._rows[index].get("_copilot"):
+            return   # Copilot の行は消すものではない(監視を止める操作はトレイ側)
         box = QRectF(self._close_rect(index))
         hot = index == self._hover_close
         if hot:
@@ -243,6 +288,9 @@ class ClaudeProgressPanel(QWidget):
         p.drawLine(box.right() - inset, box.top() + inset, box.left() + inset, box.bottom() - inset)
 
     def _paint_row(self, p, entry, rect, now, hover):
+        if entry.get("_copilot"):
+            self._paint_copilot(p, entry, rect, now)
+            return
         if hover and cs.jump_url(entry):
             p.setPen(Qt.NoPen)
             p.setBrush(HOVER)
@@ -313,6 +361,32 @@ class ClaudeProgressPanel(QWidget):
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
 
+    def _paint_copilot(self, p, entry, rect, now):
+        """Copilot の行: 状態の色の点・対象の名前・状態と経過だけの1行。
+
+        バー(札)が Copilot の窓に付くのに対し、こちらは背面・最小化でも
+        見えることが役目。クリックで開く・✕で消すといった操作は付けない。"""
+        emoji, label, color = COPILOT_STATES[entry["state"]]
+        inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        dot = 6
+        p.drawEllipse(QRectF(inner.left(), inner.center().y() - dot / 2 + 1, dot, dot))
+        tail = f"{emoji} {label}"
+        # 待ちの2状態だけ経過を足す(バーの札と同じ方針)。
+        if entry["state"] in ("waiting_ai", "waiting_user") and entry.get("since"):
+            tail += " " + cs.format_duration(now - entry["since"])
+        p.setFont(self._name_font)
+        fm = QFontMetrics(self._name_font)
+        tail_w = fm.horizontalAdvance(tail)
+        text_rect = inner.adjusted(dot + 6, 0, 0, 0)
+        p.setPen(COPILOT_ALERT_COLOR if entry.get("alert") else SUBTEXT)
+        p.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, tail)
+        p.setPen(TEXT)
+        name = fm.elidedText(entry.get("app") or "Copilot", Qt.ElideRight,
+                             max(0, text_rect.width() - tail_w - 8))
+        p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, name)
+
     def _paint_compact(self, p, entry, rect, color):
         """折りたたんだ行: 状態の色の点・名前・終わった時刻だけ。バーの行より控えめに。"""
         inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
@@ -350,8 +424,8 @@ class ClaudeProgressPanel(QWidget):
             return
         pos = event.position().toPoint()
         hover = self._row_at(pos)
-        hover_close = hover if hover >= 0 and self._close_rect(hover).adjusted(
-            -3, -3, 3, 3).contains(pos) else -1
+        hover_close = hover if hover >= 0 and not self._rows[hover].get("_copilot") \
+            and self._close_rect(hover).adjusted(-3, -3, 3, 3).contains(pos) else -1
         if hover != self._hover or hover_close != self._hover_close:
             self._hover, self._hover_close = hover, hover_close
             jumpable = 0 <= hover < len(self._rows) and cs.jump_url(self._rows[hover])
@@ -373,6 +447,8 @@ class ClaudeProgressPanel(QWidget):
             return
         pos = event.position().toPoint()
         index = self._row_at(pos)
+        if 0 <= index < len(self._rows) and self._rows[index].get("_copilot"):
+            return   # Copilot の行にクリックの操作は無い
         # ✕ は少し広めに当たりを取る(小さいので押し損ねると、その行を開いてしまう)
         if 0 <= index < len(self._rows) and self._close_rect(index).adjusted(
                 -3, -3, 3, 3).contains(pos):

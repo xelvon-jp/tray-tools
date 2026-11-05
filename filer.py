@@ -103,6 +103,10 @@ SETTINGS_SECTION = "filer"
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "filer_error.log"
 # F7 のコンテキストメニューを出す子プロセス(COM を使うのはそちらだけ)。
 CONTEXT_MENU_SCRIPT = Path(__file__).resolve().parent / "filer_contextmenu.py"
+# C→L で Box の「共有リンクをコピー」を子に実行させるときの待ち時間。子の終わりを待つ上限と、
+# 終わってからクリップボードにリンクが入るのを待つ上限(実測では合わせて約3秒で入る)。
+BOX_FETCH_CHILD_SECONDS = 15.0
+BOX_FETCH_CLIPBOARD_SECONDS = 5.0
 
 # 既定の配色は、ユーザーのあふｗの「表示色」設定から拾った値(濃紺の地に白、カーソルは
 # シアンの下線、マークは灰色のグラデーション)。settings.json の filer.colors に同じ名前で
@@ -5610,7 +5614,8 @@ class FilerWindow(QWidget):
         """C→L: 対象の Box 上の ID を引き、共有用テキストをクリップボードへ入れる。
 
         共有リンクの鍵が祖先に登録済みなら /s/<鍵>/folder/<ID> の形(ログイン不要で開ける)。
-        未登録なら、登録先とリンクを1回だけ聞く(案件フォルダごとに1回で、設定に残る)。"""
+        未登録なら、登録先を1回だけ聞いて Box からリンクを取る(案件フォルダごとに1回で、
+        設定に残る)。取ったときに Box が入れたリンクは、最後に共有用テキストで上書きされる。"""
         paths = self.active.target_paths()
         cache_dir = os.path.join(filer_archive.TEMP_ROOT, "box_db")
         try:
@@ -5642,7 +5647,11 @@ class FilerWindow(QWidget):
     def ask_box_link(self, item):
         """共有リンクの登録ダイアログ(テストではここを差し替える)。
 
-        ("register", folder_id, path, host, token) / ("plain",) / 取消なら None。"""
+        ("register", folder_id, path, host, token) / ("plain",) / 取消なら None。
+
+        登録を押すと、選んだフォルダで Box Drive の「共有リンクをコピー」を実行して
+        リンクを取る(fetch_box_link)。取れなければダイアログは開いたまま、手で貼る欄を出す
+        (メニューの表示名が違う PC・Box Drive の古い版などでも登録できるように)。"""
         candidates = filer_box.candidate_folders(item)
         if not candidates:
             # Box の根の直下には鍵を付けられない。聞かずに通常の形で出す
@@ -5652,33 +5661,90 @@ class FilerWindow(QWidget):
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("共有リンクを、どのフォルダ(とその下すべて)に登録しますか？"))
         combo = QComboBox()
+        combo.setObjectName("boxFolder")
         for shown, _folder_id, _path in candidates:
             combo.addItem(shown)
         combo.setCurrentIndex(0)    # 既定は一番上(案件の根)
         layout.addWidget(combo)
-        layout.addWidget(QLabel("共有リンク（https://…/s/… の形。Box の「共有リンク」からコピー）"))
-        edit = QLineEdit()
-        layout.addWidget(edit)
-        error = QLabel("")
-        error.setStyleSheet("color: #c0392b;")
-        layout.addWidget(error)
+        note = QLabel("登録すると、そのフォルダで Box の「共有リンクをコピー」を実行してリンクを"
+                      "取ります（まだ共有リンクが無いフォルダでは、Box が新しく作ります。"
+                      "アクセスできる人は Box の既定の設定です）")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        status = QLabel("")
+        status.setObjectName("boxStatus")
+        status.setWordWrap(True)
+        layout.addWidget(status)
+        # 取れなかったときだけ出す、手で貼る欄(以前の入力のしかた)
+        manual_label = QLabel("共有リンク（https://…/s/… の形。Box の「共有リンク」からコピー）")
+        manual = QLineEdit()
+        manual.setObjectName("boxManual")
+        manual_label.hide()
+        manual.hide()
+        layout.addWidget(manual_label)
+        layout.addWidget(manual)
         row = QHBoxLayout()
         register = QPushButton("登録(&R)")
+        register.setObjectName("boxRegister")
         plain = QPushButton("登録しない（招待メンバー用のリンクで出す）(&N)")
+        plain.setObjectName("boxPlain")
         cancel = QPushButton("中止")
+        cancel.setObjectName("boxCancel")
         for button in (register, plain, cancel):
             row.addWidget(button)
         layout.addLayout(row)
+        register.setDefault(True)
         result = {}
+        closed = []     # 空でなければ閉じられた(取っている間に Esc で閉じることがある)
+        dialog.finished.connect(lambda _code: closed.append(True))
+
+        def show_error(text):
+            status.setStyleSheet("color: #c0392b;")
+            status.setText(text)
+
+        def accept(host, token):
+            _shown, folder_id, path = candidates[combo.currentIndex()]
+            result["value"] = ("register", folder_id, path, host, token)
+            dialog.accept()
 
         def on_register():
-            parsed = filer_box.parse_shared_link(edit.text())
-            if parsed is None:
-                error.setText("共有リンクの形ではありません（https://<ホスト>/s/<鍵> の形で貼ってください）")
-                return
-            _shown, folder_id, path = candidates[combo.currentIndex()]
-            result["value"] = ("register", folder_id, path, parsed[0], parsed[1])
-            dialog.accept()
+            # スロットの中で例外を投げ切るとプロセスごと落ちる(CLAUDE.md)。必ず受ける。
+            try:
+                if not manual.isHidden() and manual.text().strip():
+                    parsed = filer_box.parse_shared_link(manual.text())
+                    if parsed is None:
+                        show_error("共有リンクの形ではありません"
+                                   "（https://<ホスト>/s/<鍵> の形で貼ってください）")
+                        return
+                    accept(*parsed)
+                    return
+                shown = candidates[combo.currentIndex()][0]
+                status.setStyleSheet("")
+                status.setText("Box から共有リンクを取っています…")
+                buttons = (register, plain, cancel, combo)
+                for widget in buttons:
+                    widget.setEnabled(False)
+                try:
+                    parsed = self.fetch_box_link(filer_box.local_folder(shown))
+                finally:
+                    for widget in buttons:
+                        try:
+                            widget.setEnabled(True)
+                        except RuntimeError:
+                            pass
+                if closed:
+                    return      # 取っている間に Esc や × で閉じられた。取れても登録しない
+                if parsed is None:
+                    show_error("共有リンクを取れませんでした。手で貼ってください")
+                    manual_label.show()
+                    manual.show()
+                    manual.setFocus()
+                    return
+                accept(*parsed)
+            except Exception:  # noqa: BLE001
+                show_error("共有リンクを取れませんでした  (" + _log_exception("box link") + ")")
+                manual_label.show()
+                manual.show()
 
         def on_plain():
             result["value"] = ("plain",)
@@ -5687,11 +5753,76 @@ class FilerWindow(QWidget):
         register.clicked.connect(on_register)
         plain.clicked.connect(on_plain)
         cancel.clicked.connect(dialog.reject)
-        edit.returnPressed.connect(on_register)
-        edit.setFocus()
-        if dialog.exec() != QDialog.Accepted:
+        combo.setFocus()
+        if self.exec_dialog(dialog) != QDialog.Accepted:
             return None
         return result.get("value")
+
+    def fetch_box_link(self, folder_path: str):
+        """folder_path で Box Drive の右クリックメニュー「共有リンクをコピー」を実行し、
+        クリップボードに載った共有リンクを (host, 鍵) で返す。取れなければ None。
+        (テストではここを差し替える。本物は Box 上に共有リンクを作ることがある)
+
+        メニューは COM でしか触れないので、F7 と同じ子プロセス(filer_contextmenu.py
+        --item)に実行させる。メニューは画面に出さない。リンクは Box Drive が少し遅れて
+        クリップボードへ入れるので、子の終わりを待ってからもしばらく見張る。
+        前から入っていた中身は、取れなかったときに戻す(テキストだけ)。"""
+        clip = QGuiApplication.clipboard()
+        before = clip.text()
+        clip.clear()        # 前に入っていたリンクを、今回取れたものと読み違えないように
+        args = core.context_menu_args([folder_path], 0, 0, self._hwnd(),
+                                      items=filer_box.COPY_LINK_ITEMS)
+        parsed = None
+        reason = ""
+        if args is None:
+            reason = "パスが長すぎます"
+        else:
+            argv = [pythonw_executable(), str(CONTEXT_MENU_SCRIPT)] + args
+            filer_launch._allow_foreground()   # Box が窓や通知を出すとき前面を取れるように
+            try:
+                proc = subprocess.Popen(argv, close_fds=True)
+            except OSError as e:
+                proc = None
+                reason = str(e)
+            if proc is not None:
+                deadline = time.monotonic() + BOX_FETCH_CHILD_SECONDS
+                code = None
+                while True:
+                    parsed = filer_box.extract_shared_link(clip.text())
+                    if parsed is not None:
+                        break
+                    code = proc.poll()
+                    if code is not None:
+                        break
+                    if time.monotonic() > deadline:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        reason = "時間切れ"
+                        break
+                    QApplication.processEvents()
+                    time.sleep(0.05)
+                if parsed is None and code == 0:
+                    deadline = time.monotonic() + BOX_FETCH_CLIPBOARD_SECONDS
+                    while parsed is None and time.monotonic() < deadline:
+                        QApplication.processEvents()
+                        time.sleep(0.05)
+                        parsed = filer_box.extract_shared_link(clip.text())
+                    if parsed is None:
+                        reason = "クリップボードにリンクが入りませんでした"
+                elif parsed is None and code is not None:
+                    reason = ("メニューに「共有リンクをコピー」が見つかりません" if code == 3
+                              else f"終了コード {code}")
+                if proc.poll() is None:
+                    # リンクは先に取れたが子はまだ後始末中。終わりは裏で待つ。
+                    threading.Thread(target=proc.wait, daemon=True,
+                                     name="filer-boxlink").start()
+        if parsed is None:
+            self.log(f"Box: 共有リンクを取れませんでした（{reason}）")
+            if before and not clip.text():
+                clip.setText(before)
+        return parsed
 
     def cmd_phone_send(self):
         """C→S(環境1のときだけ): 対象ファイルをスマホへ QR で渡す。

@@ -1857,14 +1857,19 @@ def to_native_point(x: float, y: float, origin_x: int, origin_y: int, dpr: float
             int(round(origin_y + (y - origin_y) * dpr)))
 
 
-def context_menu_args(paths, x: int, y: int, owner: int = 0, verb: str = None):
+def context_menu_args(paths, x: int, y: int, owner: int = 0, verb: str = None,
+                      items=None):
     """子プロセスへ渡す引数。長すぎるなら None(呼ぶ側が一時 JSON で渡す)。
 
     パスは "--" の後ろに並べる("-" で始まる名前を指定と取り違えないように)。
-    verb(properties など)を渡すと、子はメニューを出さずにその動詞を実行する。"""
+    verb(properties など)を渡すと、子はメニューを出さずにその動詞を実行する。
+    items(項目の表示名の並び)を渡すと、子はメニューを出さずに、その名前の項目を
+    探して実行する(どれか1つに当たればよい。言語ごとの綴りを並べる)。"""
     args = ["--x", str(int(x)), "--y", str(int(y)), "--owner", str(int(owner or 0))]
     if verb:
         args += ["--verb", str(verb)]
+    for text in items or ():
+        args += ["--item", str(text)]
     args.append("--")
     args += [str(p) for p in paths]
     if sum(len(a) + 3 for a in args) > CONTEXT_ARGS_MAX:
@@ -1872,21 +1877,28 @@ def context_menu_args(paths, x: int, y: int, owner: int = 0, verb: str = None):
     return args
 
 
-def context_menu_payload(paths, x: int, y: int, owner: int = 0, verb: str = None) -> dict:
+def context_menu_payload(paths, x: int, y: int, owner: int = 0, verb: str = None,
+                         items=None) -> dict:
     """一時 JSON で渡すときの中身(context_menu_args と同じ情報)。"""
     payload = {"paths": [str(p) for p in paths], "x": int(x), "y": int(y),
                "owner": int(owner or 0)}
     if verb:
         payload["verb"] = str(verb)
+    if items:
+        payload["items"] = [str(t) for t in items]
     return payload
 
 
 def parse_context_args(argv) -> dict:
-    """子プロセス側の引数の読み取り。{"paths", "x", "y", "owner", "list", "repeat", "json", "verb"}。
+    """子プロセス側の引数の読み取り。
+    {"paths", "x", "y", "owner", "list", "repeat", "json", "verb", "items"}。
 
     --verb があれば、メニューを出さずにその動詞(properties など)を直接実行する。
+    --item は何度でも書ける(言語ごとの綴りなど、どれか1つに当たればよい候補)。あれば
+    メニューを出さずに、表示名がそれに当たる項目を探して実行する。items は無ければ []。
 
-    --json があればそのファイルから paths/x/y/owner を読む(読んだら消すのは呼ぶ側)。"""
+    --json があればそのファイルから paths/x/y/owner(と verb・items)を読む
+    (読んだら消すのは呼ぶ側)。"""
     import argparse
 
     parser = argparse.ArgumentParser(prog="filer_contextmenu.py", add_help=False)
@@ -1896,12 +1908,13 @@ def parse_context_args(argv) -> dict:
     parser.add_argument("--json")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--verb")
+    parser.add_argument("--item", action="append", default=[])
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("paths", nargs="*")
     ns = parser.parse_args(list(argv))
     result = {"paths": list(ns.paths), "x": ns.x, "y": ns.y, "owner": ns.owner,
               "list": ns.list, "repeat": max(1, ns.repeat), "json": ns.json,
-              "verb": ns.verb}
+              "verb": ns.verb, "items": list(ns.item)}
     if ns.json:
         import json
 
@@ -1912,7 +1925,37 @@ def parse_context_args(argv) -> dict:
                       owner=int(data.get("owner", 0)))
         if data.get("verb"):
             result["verb"] = str(data["verb"])
+        if isinstance(data.get("items"), list):
+            result["items"] = [str(t) for t in data["items"]]
     return result
+
+
+def plain_menu_label(text: str) -> str:
+    """メニューの表示名から、アクセラレータ(& と末尾の "(&X)")とタブ以降のショートカット
+    表記を除いたもの。"&&" は文字としての "&"。"""
+    text = str(text or "").split("\t", 1)[0]
+    text = re.sub(r"\(&[^)]\)\s*$", "", text)
+    text = re.sub(r"&(&?)", r"\1", text)   # "&&" は "&" に、ほかの "&" は消す
+    return text.strip()
+
+
+def find_menu_item(items, texts):
+    """[(深さ, ID, 表示名)] から、一番上の階層(深さ 0)で表示名が texts のどれかに当たる
+    項目を1つだけ探す。(ID, None) か、見つからない・2つ以上あるなら (None, 理由)。
+
+    & を除くのはメニュー側の表示名だけ(texts は見えているとおりの綴りで渡す)。"""
+    wanted = {str(t).strip() for t in texts if str(t).strip()}
+    if not wanted:
+        return None, "探す項目の名前がありません"
+    # サブメニューの見出しは ID が -1、区切り線は 0。実行できるのは 1 以上だけ。
+    found = [item_id for depth, item_id, label in items
+             if depth == 0 and isinstance(item_id, int) and item_id > 0
+             and plain_menu_label(label) in wanted]
+    if not found:
+        return None, "項目が見つかりません: " + " / ".join(sorted(wanted))
+    if len(found) > 1:
+        return None, f"同じ名前の項目が {len(found)} 個あります: " + " / ".join(sorted(wanted))
+    return found[0], None
 
 
 # ---------------------------------------------------------------

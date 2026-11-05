@@ -3302,6 +3302,30 @@ def test_context_targets_and_args():
     assert parsed["paths"] == paths and (parsed["x"], parsed["y"], parsed["owner"]) == (10, -20, 1234)
     assert parsed["list"] is False and parsed["repeat"] == 1
     assert core.parse_context_args(["--list", "--repeat", "3", "--", "C:\\a"])["repeat"] == 3
+    assert parsed["items"] == []
+    # --item は何度でも(Box の「共有リンクをコピー」を言語ごとの綴りで探す)
+    parsed = core.parse_context_args(["--owner", "9", "--item", "共有リンクをコピー",
+                                      "--item", "Copy Shared Link", "--", "C:\\Box\\-p"])
+    assert parsed["items"] == ["共有リンクをコピー", "Copy Shared Link"]
+    assert parsed["paths"] == ["C:\\Box\\-p"] and parsed["owner"] == 9 and parsed["verb"] is None
+    args = core.context_menu_args(["C:\\Box\\a"], 0, 0, 5, items=("甲", "B c"))
+    assert args == ["--x", "0", "--y", "0", "--owner", "5", "--item", "甲", "--item", "B c",
+                    "--", "C:\\Box\\a"], args
+    assert core.parse_context_args(args)["items"] == ["甲", "B c"]
+    # 名前で項目を探す(一番上の階層だけ・& を除いて比べる・ちょうど1つのときだけ)
+    menu = [(0, 10, "開く(&O)"), (0, 0, ""), (0, -1, "Box"), (1, 20, "共有リンクをコピー"),
+            (0, 30, "共有リンクを&コピー"), (0, 40, "Copy &Shared Link\tCtrl+L"),
+            (0, 50, "A && B")]
+    find = core.find_menu_item
+    assert find(menu, ["共有リンクをコピー"]) == (30, None)
+    assert find(menu, ["Copy Shared Link"]) == (40, None)
+    assert find(menu, ["開く"]) == (10, None)
+    assert find(menu, ["A & B"]) == (50, None)
+    assert find(menu, ["共有リンクをコピー", "Copy Shared Link"])[0] is None   # 2つ当たる
+    assert "2 個" in find(menu, ["共有リンクをコピー", "Copy Shared Link"])[1]
+    assert find(menu, ["Box"])[0] is None              # サブメニューの見出しは実行できない
+    assert find(menu, ["無い"])[0] is None and find(menu, [])[0] is None
+    assert core.plain_menu_label("コピー(&C)") == "コピー"
     many = [f"C:\\folder\\{'x' * 100}_{i}.txt" for i in range(200)]
     assert core.context_menu_args(many, 0, 0) is None                    # 長すぎれば JSON で
     with tempfile.TemporaryDirectory() as tmp:
@@ -3310,6 +3334,10 @@ def test_context_targets_and_args():
             json.dump(core.context_menu_payload(many, 5, 6, 7), f)
         parsed = core.parse_context_args(["--json", jpath])
         assert parsed["paths"] == many and (parsed["x"], parsed["y"], parsed["owner"]) == (5, 6, 7)
+        assert parsed["items"] == []
+        with open(jpath, "w", encoding="utf-8") as f:
+            json.dump(core.context_menu_payload(many, 0, 0, 7, items=["甲"]), f)
+        assert core.parse_context_args(["--json", jpath])["items"] == ["甲"]
 
 
 def test_contextmenu_child_list_mode():
@@ -8247,6 +8275,104 @@ def test_window_copy_box_share():
             w.ask_box_link = lambda item: None
             w.cmd_copy_menu()
             assert clip.text() == "keep"
+
+            # 本物の登録ダイアログ(exec と Box からの取得は差し替え。窓は出さない)
+            from PySide6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton
+            del w.ask_box_link
+            fetched = []
+
+            def fetch_ok(path):
+                fetched.append(path)
+                return ("acme.app.box.com", token)
+
+            def drive(*steps):
+                def run(dialog):
+                    for step in steps:
+                        step(dialog)
+                    return dialog.result()
+                return run
+
+            def check_initial(dialog):
+                combo = dialog.findChild(QComboBox, "boxFolder")
+                assert [combo.itemText(i) for i in range(combo.count())] == [
+                    "Box/ProjA", "Box/ProjA/資料"]
+                assert combo.currentIndex() == 0          # 既定は一番上(案件の根)
+                assert dialog.findChild(QLineEdit, "boxManual").isHidden()   # 手で貼る欄は隠す
+                texts = [l.text() for l in dialog.findChildren(QLabel)]
+                assert "共有リンクを、どのフォルダ(とその下すべて)に登録しますか？" in texts
+                assert any("「共有リンクをコピー」" in t and "新しく作ります" in t for t in texts)
+
+            def click(name):
+                return lambda dialog: dialog.findChild(QPushButton, name).click()
+
+            def reset_links():
+                app_settings["filer"]["box_links"] = []
+                filer.save_values(app_settings, str(settings_path), {"box_links": []})
+
+            # 登録 → Box から取れた: 案件の根に登録し、共有用テキストで上書きする
+            reset_links()
+            w.fetch_box_link = fetch_ok
+            w.exec_dialog = drive(check_initial, click("boxRegister"))
+            clip.setText("keep")
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+            w.cmd_copy_menu()
+            assert fetched == [str(box_root / "ProjA")], fetched
+            assert clip.text() == ("/Box/ProjA/資料/\r\n"
+                                   f"　https://acme.app.box.com/s/{token}/folder/9101\r\n"
+                                   "　　memo.txt"), repr(clip.text())
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == [
+                {"folder_id": "9100", "path": "Box/ProjA", "host": "acme.app.box.com",
+                 "token": token}]
+
+            # 下の階層を選べば、そのフォルダで取ってそこに登録する
+            reset_links()
+            fetched.clear()
+
+            def pick_lower(dialog):
+                dialog.findChild(QComboBox, "boxFolder").setCurrentIndex(1)
+            w.exec_dialog = drive(pick_lower, click("boxRegister"))
+            w.cmd_copy_menu()
+            assert fetched == [str(box_root / "ProjA" / "資料")], fetched
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"][0][
+                "folder_id"] == "9101"
+
+            # 取れなかった: 開いたまま、エラーと手で貼る欄を出す。貼れば登録できる
+            reset_links()
+            fetched.clear()
+            w.fetch_box_link = lambda path: fetched.append(path) or None
+            seen_dialog = {}
+
+            def after_fail(dialog):
+                assert dialog.result() != filer.QDialog.Accepted      # まだ閉じない
+                status = dialog.findChild(QLabel, "boxStatus")
+                assert status.text() == "共有リンクを取れませんでした。手で貼ってください", status.text()
+                manual = dialog.findChild(QLineEdit, "boxManual")
+                assert not manual.isHidden()
+                manual.setText("https://app.box.com/folder/1")       # 形が違う
+                dialog.findChild(QPushButton, "boxRegister").click()
+                assert "共有リンクの形ではありません" in status.text()
+                assert len(fetched) == 1          # 貼る欄に字があれば取りに行かない
+                manual.setText(f" https://app.box.com/s/{token}x ")
+                seen_dialog["ok"] = True
+            w.exec_dialog = drive(click("boxRegister"), after_fail, click("boxRegister"))
+            w.cmd_copy_menu()
+            assert seen_dialog.get("ok") and len(fetched) == 1
+            assert f"https://app.box.com/s/{token}x/folder/9101" in clip.text(), clip.text()
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"][0][
+                "token"] == token + "x"
+
+            # 登録しない / 中止 は前と同じ(取りには行かない)
+            reset_links()
+            fetched.clear()
+            w.exec_dialog = drive(click("boxPlain"))
+            w.cmd_copy_menu()
+            assert clip.text().startswith("/Box/ProjA/資料/\r\n　https://app.box.com/folder/9101")
+            assert fetched == []
+            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == []
+            clip.setText("keep")
+            w.exec_dialog = drive(click("boxCancel"))
+            w.cmd_copy_menu()
+            assert clip.text() == "keep" and fetched == []
         finally:
             filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
             w.close()

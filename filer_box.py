@@ -25,6 +25,10 @@ NEWLINE = "\r\n"           # core.clip_text と同じ(クリップボードの�
 FILE = "file"
 FOLDER = "folder"
 
+# Box Drive がエクスプローラの右クリックメニューに足す「共有リンクをコピー」の表示名。
+# 表示言語で綴りが変わるので候補を並べる(filer_contextmenu.py --item に渡す)。
+COPY_LINK_ITEMS = ("共有リンクをコピー", "Copy Shared Link")
+
 # テストから差し替える口(None なら本物の場所)
 ROOT_OVERRIDE = None
 DB_OVERRIDE = None
@@ -264,6 +268,30 @@ def parse_shared_link(url: str):
     if not _TOKEN_RE.match(token):
         return None
     return host, token
+
+
+# URL に使える ASCII の字だけを続けて取る(日本語の文に続けて書かれていても切れるように)
+_URL_RE = re.compile(r"https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+", re.I)
+
+
+def extract_shared_link(text: str):
+    """任意の文字列(クリップボードの中身など)から、parse_shared_link が受ける最初の
+    共有リンクを探して (host, 鍵) を返す。無ければ None。"""
+    if not isinstance(text, str):
+        return None
+    for match in _URL_RE.finditer(text):
+        parsed = parse_shared_link(match.group(0).rstrip(".,;:!"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def local_folder(shown: str) -> str:
+    """candidate_folders の表示("Box/案件/資料")→ 手元の同期フォルダの中の実際のパス。"""
+    parts = [p for p in str(shown).split("/") if p]
+    if parts and parts[0] == ROOT_NAME:
+        parts = parts[1:]
+    return os.path.join(box_root(), *parts)
 
 
 def make_link(folder_id: str, path: str, host: str, token: str) -> dict:

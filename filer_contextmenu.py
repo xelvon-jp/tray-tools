@@ -15,6 +15,11 @@
 #   pythonw filer_contextmenu.py --verb properties --owner ファイラのHWND -- パス...
 #       メニューを出さずに動詞を直接実行する(あっふの Ctrl+Enter の &PROPERTY。プロパティ窓は
 #       このプロセスで出るので、窓が閉じるまで待ってから終わる)。
+#   pythonw filer_contextmenu.py --item 共有リンクをコピー --item "Copy Shared Link" --owner HWND -- パス
+#       メニューを出さずに、一番上の階層で表示名(& を除いたもの)が --item のどれかに当たる
+#       項目を1つだけ探して実行する(あっふの C→L で Box Drive の「共有リンクをコピー」)。
+#       --item は言語ごとの綴りなど、何度でも書ける。見つからない・2つ以上当たるときは
+#       何もせず、理由を標準エラーに出して終了コード 3 で終わる。
 #   python  filer_contextmenu.py --list [--repeat N] -- パス...
 #       診断用。メニューを組み立てて項目を標準出力に出して終わる(画面には何も出さない)。
 #       --repeat で同じことを N 回、毎回 gc.collect を挟んで繰り返す(COM の寿命の確かめ)。
@@ -221,6 +226,11 @@ CMIC_MASK_UNICODE = 0x00004000
 CMIC_MASK_PTINVOKE = 0x20000000
 ID_FIRST = 1
 ID_LAST = 0x7FFF
+EXIT_ITEM_NOT_FOUND = 3   # --item の項目が無い・2つ以上ある
+
+
+class ItemNotFound(Exception):
+    """--item で探した項目が、メニューの一番上の階層にちょうど1つ見つからない。"""
 
 # InvokeCommand の後、シェル拡張は別スレッドで窓を出して処理を続けることがある
 # (プロパティ、削除の確認や進捗など)。プロセスを終えるとそれも消えるので、
@@ -338,10 +348,12 @@ def _wait_for_shell_windows(owner_hwnd) -> None:
 
 
 def show_menu(paths, x: int, y: int, list_only: bool = False, filer_hwnd: int = 0,
-              verb: str = None):
+              verb: str = None, item_texts=None):
     """paths のコンテキストメニューを出す(list_only なら項目を返すだけ)。
 
     verb を渡すとメニューは出さず、その動詞(properties など)を InvokeCommand で直接実行する。
+    item_texts(表示名の候補の並び)を渡すとメニューは出さず、一番上の階層でそのどれかに
+    当たる項目を1つだけ探して実行する。ちょうど1つでなければ ItemNotFound。
 
     COM のオブジェクトはこの関数の中だけで作って使い、出る前に手放す。"""
     global _menu_handler
@@ -420,6 +432,24 @@ def show_menu(paths, x: int, y: int, list_only: bool = False, filer_hwnd: int = 
             del verb_a, verb_w
             return verb
 
+        if item_texts:
+            # 名前で探して、TrackPopupMenuEx で選ばれたときと同じく番号で実行する。
+            # メニューは画面に出さない(前面も取らない)。
+            command, reason = core.find_menu_item(_menu_items(hmenu), item_texts)
+            if command is None:
+                raise ItemNotFound(reason)
+            info = CMINVOKECOMMANDINFOEX()
+            info.cbSize = sizeof(CMINVOKECOMMANDINFOEX)
+            info.fMask = CMIC_MASK_UNICODE
+            info.hwnd = owner
+            info.lpVerb = command - ID_FIRST        # MAKEINTRESOURCE(番号)
+            info.lpVerbW = command - ID_FIRST
+            info.lpDirectoryW = os.path.dirname(os.path.normpath(paths[0]))
+            info.nShow = SW_SHOWNORMAL
+            menu.InvokeCommand(byref(info))
+            _wait_for_shell_windows(owner)
+            return command
+
         # 前面を取っておかないと、Esc や外側のクリックでメニューが閉じなくなる。
         # 取る権利はファイラが起こす前に譲ってくれている(AllowSetForegroundWindow)。
         SetForegroundWindow(owner)
@@ -487,7 +517,8 @@ def main(argv=None) -> int:
         for round_ in range(args["repeat"]):
             items = show_menu(args["paths"], args["x"], args["y"],
                               list_only=args["list"], filer_hwnd=args["owner"],
-                              verb=None if args["list"] else args.get("verb"))
+                              verb=None if args["list"] else args.get("verb"),
+                              item_texts=None if args["list"] else args.get("items"))
             if args["list"]:
                 for depth, item_id, label in items:
                     print(f"{round_}\t{depth}\t{item_id}\t{label}")
@@ -495,6 +526,9 @@ def main(argv=None) -> int:
         # 「切り取り」「コピー」でクリップボードに載せたデータは、このプロセスが持っている。
         # 終わる前に実体にしておかないと、プロセスと一緒にクリップボードから消える。
         OleFlushClipboard()
+    except ItemNotFound as e:
+        print(f"error: {e}", file=sys.stderr)
+        code = EXIT_ITEM_NOT_FOUND
     except (OSError, COMError) as e:
         print(f"error: {e}", file=sys.stderr)
         code = 1

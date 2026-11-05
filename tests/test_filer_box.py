@@ -251,6 +251,29 @@ def test_candidate_folders():
         assert [c[0] for c in fb.candidate_folders(item(env, "ProjA", "資料"))] == [
             "Box/ProjA", "Box/ProjA/資料"]
         assert fb.candidate_folders(item(env, "top.txt")) == []
+        # 表示("Box/…")→ 手元の同期フォルダの中の実際のパス(右クリックメニューを出す先)
+        assert fb.local_folder("Box/ProjA/資料") == env.p("ProjA", "資料")
+        assert fb.local_folder("Box/ProjA") == env.p("ProjA")
+
+
+def test_copy_link_items_and_extract_shared_link():
+    assert "共有リンクをコピー" in fb.COPY_LINK_ITEMS
+    assert "Copy Shared Link" in fb.COPY_LINK_ITEMS
+    ex = fb.extract_shared_link
+    # Box の「共有リンクをコピー」が入れるのはリンクだけ
+    assert ex(f"https://app.box.com/s/{TOKEN}") == ("app.box.com", TOKEN)
+    assert ex(f"https://app.box.com/s/{TOKEN}\r\n") == ("app.box.com", TOKEN)
+    # 文の中・前後に別の URL があっても、受けられる最初の共有リンクを拾う
+    assert ex(f"リンク: https://acme.app.box.com/s/{TOKEN} です") == ("acme.app.box.com", TOKEN)
+    assert ex(f"https://example.com/s/{TOKEN} https://app.box.com/folder/1 "
+              f"https://app.box.com/s/{TOKEN}2。") == ("app.box.com", TOKEN + "2")
+    assert ex(f"(https://app.box.com/s/{TOKEN})") == ("app.box.com", TOKEN)
+    assert ex(f"「https://app.box.com/s/{TOKEN}」") == ("app.box.com", TOKEN)
+    assert ex(f"共有リンクはhttps://app.box.com/s/{TOKEN}です") == ("app.box.com", TOKEN)
+    assert ex(f"'https://app.box.com/s/{TOKEN}'") == ("app.box.com", TOKEN)
+    for bad in ("", None, 5, "abc", "https://app.box.com/folder/12345",
+                f"http://app.box.com/s/{TOKEN}", f"https://evilbox.com/s/{TOKEN}"):
+        assert ex(bad) is None, bad
 
 
 def test_copy_cache_reuse_and_refresh():

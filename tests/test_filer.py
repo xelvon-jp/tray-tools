@@ -885,6 +885,72 @@ def test_window_mkdir_stamp():
             w.deleteLater()
 
 
+def test_window_newtext_stamp():
+    """Shift+E: 空のテキストを作ってエディタで開く。拡張子なしなら .txt、あれば維持、
+    日時だけなら末尾の "_" は落ちる。同名は作らず、キャンセルなら何もしない。"""
+    import filer
+
+    _qapp()
+    assert core.DEFAULT_KEYMAP["1069"] == "newtext"
+    assert core.DEFAULT_KEYMAP["0069"] == "edit"  # E は従来どおり
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        seen = {}
+        answers = []
+        opened = []
+
+        def ask(title, label, text="", select=None):
+            seen.update(text=text, select=select)
+            return answers.pop(0)
+
+        w.ask_text = ask
+        w._open_in_editor = lambda paths: opened.append(list(paths))
+        try:
+            before = set(os.listdir(left))
+            # 拡張子なし → .txt
+            answers.append("メモ")
+            w.cmd_newtext()
+            prefix = seen["text"]
+            assert prefix.endswith("_") and len(prefix) == len("20261105_1548_"), prefix
+            assert seen["select"] == len(prefix)
+            p = left / "メモ.txt"
+            assert p.is_file() and p.read_bytes() == b""
+            assert opened == [[str(p)]], opened
+            # 拡張子あり → そのまま
+            answers.append("memo.md")
+            w.cmd_newtext()
+            assert (left / "memo.md").is_file() and not (left / "memo.md.txt").exists()
+            assert opened[-1] == [str(left / "memo.md")]
+            # 日時だけ → 末尾の _ なし
+            answers.append(prefix)
+            w.cmd_newtext()
+            assert (left / (prefix[:-1] + ".txt")).is_file()
+            assert not (left / (prefix + ".txt")).exists()
+            # 同名 → 上書きしない・エディタも開かない
+            p.write_text("keep", encoding="utf-8")
+            n = len(opened)
+            answers.append("メモ")
+            w.cmd_newtext()
+            assert p.read_text(encoding="utf-8") == "keep" and len(opened) == n
+            # キャンセル → 何もしない
+            files = set(os.listdir(left))
+            answers.append(None)
+            w.cmd_newtext()
+            assert set(os.listdir(left)) == files and len(opened) == n
+            assert files - before == {"メモ.txt", "memo.md", prefix[:-1] + ".txt"}
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_picker_auto_width_and_elide():
     """ピッカー: 長い項目に合わせて幅が広がり(上限は画面の9割)、
     一覧の省略は中央(先頭と末尾が見える形)になる。"""

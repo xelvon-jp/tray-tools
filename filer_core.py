@@ -136,6 +136,7 @@ DEFAULT_KEYMAP = {
     "1068": "delete_permanent",   # Shift+D 完全削除
     "1046": "delete_permanent",   # Shift+Del
     "0075": "mkdir",              # K
+    "1069": "newtext",            # Shift+E 空のテキストファイルを作ってエディタで開く
     "0082": "rename",             # R ファイル情報の編集(画像を含むと下部に★の欄)
     "2045": "clip_copy",          # Ctrl+Ins
     "2046": "clip_cut",           # Ctrl+Del
@@ -976,6 +977,7 @@ COMMAND_SHORT_NAMES = {
     "delete": "Delete",
     "delete_permanent": "Del!",
     "mkdir": "MkDir",
+    "newtext": "NewTxt",
     "rename": "Rename",
     "isearch": "Search",
     "grep": "Grep",

@@ -6018,6 +6018,43 @@ class FilerWindow(QWidget):
         self.log(f"フォルダ作成: {path}")
         pane.reload(focus=name)
 
+    def cmd_newtext(self):
+        """Shift+E: 空のテキストファイルを作って、そのまま filer.editor で開く。
+        K(フォルダ作成)と同じく日時プレフィックスを選択状態で入れる(打てば置き換わり、
+        → で確定すれば日時付き)。拡張子が無ければ .txt を付ける。中身は空(BOM なし)。"""
+        pane = self.active
+        if self._refuse_stash("テキスト作成"):
+            return
+        if not pane.path or self._refuse_archive("テキスト作成") or self._refuse_flat("テキスト作成"):
+            return
+        prefix = core.stamp_prefix(datetime.now())
+        name = self.ask_text("テキスト作成", "新しいテキストファイルの名前", prefix,
+                             select=len(prefix))
+        if name is None:
+            return
+        name = name.strip()
+        if name == prefix:
+            name = prefix[:-1]  # 日時だけで作るなら末尾の "_" は落とす
+        if name and os.path.splitext(name)[1] == "":
+            name += ".txt"
+        problem = core.validate_name(name)
+        if problem:
+            self.log(f"テキスト作成: {problem}")
+            return
+        if core.name_conflicts([e.name for e in pane.all_entries], name):
+            self.log(f"テキスト作成: 同じ名前があります: {name}")
+            return
+        path = os.path.join(pane.path, name)
+        try:
+            with open(path, "x", encoding="utf-8"):
+                pass  # 排他的に作る(既存を上書きしない)。空のまま
+        except OSError as e:
+            self.log(f"テキスト作成: できません: {path}  ({e})")
+            return
+        self.log(f"テキスト作成: {path}")
+        pane.reload(focus=name)
+        self._open_in_editor([path])
+
     def cmd_rename(self):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更
         (あふｗと同じ)。対象はマーク、無ければカーソル行。".." は対象外。

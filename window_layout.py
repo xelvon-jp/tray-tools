@@ -20,6 +20,30 @@ SECTION = "window_layout"
 CASCADE_STEP = 30     # 集めた窓をずらす間隔(px)
 CASCADE_WRAP = 10     # 何段ずらしたら左上へ戻るか
 
+# 動かしてはいけないシェルの窓。2026-11-06 の実機で、2画面目のタスクバー
+# (Shell_SecondaryTrayWnd)が「集める」の対象になって1画面目へ動いてしまった
+# (ディスプレイの切り替えを何度かするまで戻らなかった)。
+SHELL_CLASSES = frozenset({
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW",
+    "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
+    "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow",
+})
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+
+
+def is_layout_target(class_name: str, ex_style: int, title: str) -> bool:
+    """配置(集める・プリセット)で動かしてよいアプリの窓か(純関数)。
+
+    タスクバーなどのシェルの窓、ツール窓(タスクバーに出ない浮き窓)、
+    前面にならない窓、タイトルの無い窓は除く。タスクバーに出る普通の
+    アプリの窓だけを相手にする。"""
+    if class_name in SHELL_CLASSES:
+        return False
+    if ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE):
+        return False
+    return bool((title or "").strip())
+
 
 # ---------------------------------------------------------------
 # 矩形の計算(純関数)。矩形は (left, top, right, bottom)、right/bottom は排他
@@ -191,6 +215,9 @@ def list_layout_windows() -> list:
     windows = []
     for hwnd, title, bounds in window_tools.list_windows():
         if window_tools.is_own_window(hwnd):
+            continue
+        if not is_layout_target(window_tools.get_window_class(hwnd),
+                                window_tools.get_ex_style(hwnd), title):
             continue
         placement = window_tools.get_placement(hwnd)
         normal, zoomed = placement if placement else (bounds, window_tools.is_zoomed(hwnd))

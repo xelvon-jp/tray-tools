@@ -488,6 +488,16 @@ def get_cursor_pos():
 
 SW_SHOWNORMAL = 1
 SW_MAXIMIZE = 3
+SW_SHOWNOACTIVATE = 4
+
+GWL_EXSTYLE = -20
+_user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+
+def get_ex_style(hwnd) -> int:
+    """拡張スタイル(WS_EX_*)。取れなければ 0。"""
+    return int(_user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & 0xFFFFFFFF
 
 
 class _WINDOWPLACEMENT(ctypes.Structure):
@@ -524,6 +534,15 @@ def set_placement(hwnd, rect, zoomed: bool = False) -> bool:
     placement = _WINDOWPLACEMENT()
     placement.length = ctypes.sizeof(_WINDOWPLACEMENT)
     placement.flags = 0
-    placement.showCmd = SW_MAXIMIZE if zoomed else SW_SHOWNORMAL
     placement.rcNormalPosition = RECT(*rect)
+    if not zoomed:
+        placement.showCmd = SW_SHOWNORMAL
+        return bool(_user32.SetWindowPlacement(hwnd, ctypes.byref(placement)))
+    # 最大化中の窓へいきなり SW_MAXIMIZE を当てても、窓は今のモニタで最大化された
+    # まま動かず、通常時の矩形だけが書き換わる(2026-11-06 実機)。一度通常表示で
+    # 移した先へ置いてから(前面にはしない)、そこで最大化し直す。
+    placement.showCmd = SW_SHOWNOACTIVATE
+    if not _user32.SetWindowPlacement(hwnd, ctypes.byref(placement)):
+        return False
+    placement.showCmd = SW_MAXIMIZE
     return bool(_user32.SetWindowPlacement(hwnd, ctypes.byref(placement)))

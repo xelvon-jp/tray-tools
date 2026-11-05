@@ -119,6 +119,19 @@ def test_presets_normalize_and_match():
                     "zoomed": True}
 
 
+def test_layout_target_excludes_shell_and_tool_windows():
+    # 2026-11-06 実機: 2画面目のタスクバーが「集める」で動いてしまった
+    assert not wl.is_layout_target("Shell_SecondaryTrayWnd", 0, "")
+    assert not wl.is_layout_target("Shell_SecondaryTrayWnd", 0, "タスクバー")
+    assert not wl.is_layout_target("Shell_TrayWnd", 0, "")
+    assert not wl.is_layout_target("Progman", 0, "Program Manager")
+    assert not wl.is_layout_target("Chrome_WidgetWin_1", wl.WS_EX_TOOLWINDOW, "浮き窓")
+    assert not wl.is_layout_target("Chrome_WidgetWin_1", wl.WS_EX_NOACTIVATE, "通知")
+    assert not wl.is_layout_target("Notepad", 0, "   ")
+    assert wl.is_layout_target("Notepad", 0, "メモ - メモ帳")
+    assert wl.is_layout_target("Chrome_WidgetWin_1", 0x100, "Edge")  # WS_EX_WINDOWEDGE は可
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

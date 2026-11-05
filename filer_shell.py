@@ -47,6 +47,7 @@ FO_MOVE = 0x0001
 FO_COPY = 0x0002
 FO_DELETE = 0x0003
 
+FOF_MULTIDESTFILES = 0x0001
 FOF_SILENT = 0x0004
 FOF_RENAMEONCOLLISION = 0x0008
 FOF_NOCONFIRMATION = 0x0010
@@ -89,17 +90,25 @@ def _wide_buffer(text: str):
     return buf
 
 
-def file_operation(func: int, sources, dest: str = None, hwnd: int = 0, flags: int = 0):
+def file_operation(func: int, sources, dest: str = None, hwnd: int = 0, flags: int = 0,
+                   dests=None):
     """SHFileOperationW を呼ぶ。(戻り値, ユーザーが中断したか) を返す。
 
     戻り値 0 が成功。0 以外は SHFileOperation 固有のエラーコード(DE_*)のことが多く、
     GetLastError とは別物なので、呼ぶ側では数値をそのまま見せる。
-    sources は絶対パスの並び(相対パスは SHFileOperation がカレントで解決してしまう)。"""
+    sources は絶対パスの並び(相対パスは SHFileOperation がカレントで解決してしまう)。
+    dests を渡すと FOF_MULTIDESTFILES: sources と1対1の宛先フルパスの並びで、
+    名前を変えた複写ができる(dest より優先)。"""
     sources = [os.path.abspath(p) for p in sources]
     if not sources:
         return 0, False
     src_buf = _wide_buffer(filer_core.double_null_join(sources))
-    dst_buf = _wide_buffer(filer_core.double_null_join([os.path.abspath(dest)])) if dest else None
+    if dests is not None:
+        dst_buf = _wide_buffer(filer_core.double_null_join(
+            [os.path.abspath(d) for d in dests]))
+        flags |= FOF_MULTIDESTFILES
+    else:
+        dst_buf = _wide_buffer(filer_core.double_null_join([os.path.abspath(dest)])) if dest else None
     op = SHFILEOPSTRUCTW()
     op.hwnd = wintypes.HWND(hwnd or 0)
     op.wFunc = func
@@ -114,6 +123,14 @@ def copy_files(sources, dest: str, hwnd: int = 0, extra_flags: int = 0):
     """コピー。上書きの確認は Windows 標準のダイアログに任せる(FOF_NOCONFIRMATION を付けない)。"""
     return file_operation(FO_COPY, sources, dest, hwnd,
                           FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR | extra_flags)
+
+
+def copy_files_named(sources, dests, hwnd: int = 0, extra_flags: int = 0):
+    """名前を変えたコピー。dests は sources と1対1の宛先フルパス。
+    衝突時の扱いは copy_files と同じく Windows 標準のダイアログに任せる。"""
+    return file_operation(FO_COPY, sources, hwnd=hwnd,
+                          flags=FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR | extra_flags,
+                          dests=dests)
 
 
 def move_files(sources, dest: str, hwnd: int = 0, extra_flags: int = 0):

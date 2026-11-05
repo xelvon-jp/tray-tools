@@ -5385,6 +5385,62 @@ class FilerWindow(QWidget):
         paths = src.target_paths()
         self._enqueue_transfer(move, paths, src, dst)
 
+    def _copy_renamed(self, to_other: bool, rename: bool) -> None:
+        """C の名前を変える複写4種(リネーム入力 / _cp 付与 × 反対窓 / ここ)。
+
+        宛先の名前を先に全部決めてから、通常の複写と同じキューに
+        (元パス, 先フルパス) の組で積む。実行はシェルの複数宛先コピー。"""
+        src = self.active
+        label = "複写"
+        if self._refuse_archive(label, dest_pane=self.other if to_other else None):
+            return
+        if self._refuse_stash(label):
+            return
+        if to_other:
+            dst = self.other
+            if dst.stash:
+                self.log(f"{label}: 反対窓が一時置き場のときは使えません")
+                return
+            if not dst.path or core.same_dir(src.path, dst.path):
+                self.log(f"{label}: 反対窓が同じフォルダです")
+                return
+            dest_dir, dst_pane = dst.path, dst
+        else:
+            dest_dir, dst_pane = src.path, src
+        targets = src.targets()
+        if not targets:
+            return
+        if rename and (src.flat or src.pick_root is not None):
+            # 名前が相対パスになる表示では、付け替えた名前の置き場所が定まらない
+            self.log(f"{label}: フラット表示・検索結果では使えません（Alt+B で通常の表示へ）")
+            return
+        pairs = []
+        for entry in targets:
+            leaf = os.path.basename(entry.name)
+            if rename:
+                new_leaf = self.ask_text(
+                    label, f"コピー先の名前（{leaf}）", text=leaf,
+                    select=core.rename_selection_length(leaf, entry.is_dir))
+                if new_leaf is None:
+                    break  # キャンセル: 残りは複写しない(決めた分は下で実行)
+                new_leaf = new_leaf.strip()
+                if not new_leaf or any(c in new_leaf for c in '\\/:*?"<>|'):
+                    self.log(f"{label}: 名前が使えないため飛ばしました: {leaf}")
+                    continue
+                if not to_other and new_leaf == leaf:
+                    self.log(f"{label}: 同じ名前のため飛ばしました: {leaf}")
+                    continue
+            elif entry.is_dir:
+                new_leaf = leaf + "_cp"
+            else:
+                new_leaf = core.cp_name(leaf)
+            pairs.append((os.path.join(src.path, entry.name),
+                          os.path.join(dest_dir, os.path.dirname(entry.name),
+                                       new_leaf)))
+        if not pairs:
+            return
+        self._enqueue_named_copy(pairs, dst_pane)
+
     # --- ファイル転送のキュー ---
     # キューの管理だけ自前で、実行そのものは今までどおりシェルの転送
     # (SHFileOperation。進捗の窓・ごみ箱の「元に戻す」は Windows 標準のまま)。
@@ -5400,6 +5456,18 @@ class FilerWindow(QWidget):
         self._pump_op_queue()
         waiting = f"（待ち {len(self._op_queue)}件）" if self._op_queue else ""
         self.log(f"キューに追加: {op['label']} {len(paths)}件 → {dst.path}{waiting}")
+
+    def _enqueue_named_copy(self, pairs, dst_pane) -> None:
+        """名前を変える複写をキューへ。(元パス, 先フルパス) の組で実行する。"""
+        op = {"move": False, "label": "複写", "pairs": list(pairs),
+              "paths": [s for s, _ in pairs],
+              "dest": os.path.dirname(pairs[0][1]), "dst_pane": dst_pane,
+              "from_stash": False,
+              "focus": os.path.basename(pairs[0][1])}
+        self._op_queue.append(op)
+        self._pump_op_queue()
+        waiting = f"（待ち {len(self._op_queue)}件）" if self._op_queue else ""
+        self.log(f"キューに追加: 複写 {len(pairs)}件 → {op['dest']}{waiting}")
 
     def _pump_op_queue(self) -> None:
         if self._op_running is not None or not self._op_queue:
@@ -5418,7 +5486,12 @@ class FilerWindow(QWidget):
             # 絡むときに効く)。
             com_ready = _thread_com_init()
             try:
-                result = func(op["paths"], op["dest"], hwnd, flags)
+                if op.get("pairs"):
+                    result = filer_shell.copy_files_named(
+                        [s for s, _ in op["pairs"]],
+                        [d for _, d in op["pairs"]], hwnd, flags)
+                else:
+                    result = func(op["paths"], op["dest"], hwnd, flags)
             except Exception:  # noqa: BLE001  結果として戻し、窓は落とさない
                 _log_exception("transfer worker")
                 result = (0x80004005, False)  # E_FAIL として失敗の形に寄せる
@@ -5479,6 +5552,10 @@ class FilerWindow(QWidget):
             return
         items = [
             ("O", "反対窓にコピー", "copy"),
+            ("R", "反対窓にリネームしてコピー", "rename_other"),
+            ("B", "反対窓にコピー（_cpを付与）", "suffix_other"),
+            ("T", "ここにリネームしてコピー", "rename_here"),
+            ("D", "ここにコピー（_cpを付与）", "suffix_here"),
             ("P", "フルパスをクリップボードへ（改行区切り）", "path"),
             ("N", "ファイル名のみクリップボードへ", "name"),
             ("H", "ハッシュ(SHA-256)をクリップボードへ", "hash"),
@@ -5491,6 +5568,14 @@ class FilerWindow(QWidget):
         choice = self.choose_menu("複写", items)
         if choice == "copy":
             self._transfer(move=False)
+        elif choice == "rename_other":
+            self._copy_renamed(to_other=True, rename=True)
+        elif choice == "suffix_other":
+            self._copy_renamed(to_other=True, rename=False)
+        elif choice == "rename_here":
+            self._copy_renamed(to_other=False, rename=True)
+        elif choice == "suffix_here":
+            self._copy_renamed(to_other=False, rename=False)
         elif choice == "phone":
             self.cmd_phone_send()
         elif choice in ("path", "name"):

@@ -693,6 +693,111 @@ def test_window_transfer_queue():
         w.deleteLater()
 
 
+def test_window_copy_renamed():
+    """C の名前を変える複写4種: _cp 付与とリネーム入力が、キュー経由で
+    (元, 先フルパス) の組としてシェルへ渡り、宛先に新しい名前で届く。"""
+    import filer
+    import filer_shell as sh
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        calls = []
+        orig_named = sh.copy_files_named
+
+        def fake_named(sources, dests, hwnd, flags):
+            calls.append((list(sources), list(dests)))
+            for s, d in zip(sources, dests):
+                if os.path.isdir(s):
+                    shutil.copytree(s, d)
+                else:
+                    shutil.copy2(s, d)
+            return (0, False)
+
+        def drain():
+            for _ in range(100):
+                QTest.qWait(20)
+                if w._op_running is None and not w._op_queue:
+                    break
+            assert w._op_running is None and not w._op_queue
+
+        menu_items = []
+        state = {"choice": None, "answer": None}
+
+        def choose(title, items):
+            menu_items.extend(items)
+            return state["choice"]
+
+        w.choose_menu = choose
+        w.ask_text = lambda title, label, text="", select=None: state["answer"]
+        sh.copy_files_named = fake_named
+        try:
+            # D: ここにコピー(_cp) — ファイルは拡張子の前
+            L.set_cursor(_names(L).index("alpha.txt"))
+            state["choice"] = "suffix_here"
+            w.cmd_copy_menu()
+            drain()
+            assert calls[-1] == ([str(left / "alpha.txt")],
+                                 [str(left / "alpha_cp.txt")]), calls
+            assert (left / "alpha_cp.txt").exists()
+            # B: 反対窓にコピー(_cp)
+            L.set_cursor(_names(L).index("beta.md"))
+            state["choice"] = "suffix_other"
+            w.cmd_copy_menu()
+            drain()
+            assert calls[-1] == ([str(left / "beta.md")],
+                                 [str(right / "beta_cp.md")]), calls
+            assert (right / "beta_cp.md").exists()
+            # D: ここにコピー(_cp) — フォルダは末尾に付く
+            L.set_cursor(_names(L).index("sub1"))
+            state["choice"] = "suffix_here"
+            w.cmd_copy_menu()
+            drain()
+            assert calls[-1][1] == [str(left / "sub1_cp")], calls
+            assert (left / "sub1_cp" / "deep").is_dir()
+            # R: 反対窓にリネームしてコピー
+            L.set_cursor(_names(L).index("gamma.txt"))
+            state["choice"] = "rename_other"
+            state["answer"] = "renamed.txt"
+            w.cmd_copy_menu()
+            drain()
+            assert calls[-1] == ([str(left / "gamma.txt")],
+                                 [str(right / "renamed.txt")]), calls
+            assert (right / "renamed.txt").exists()
+            # T: ここにリネームで同名 → 飛ばして何も積まない
+            before = len(calls)
+            L.set_cursor(_names(L).index("gamma.txt"))
+            state["choice"] = "rename_here"
+            state["answer"] = "gamma.txt"
+            w.cmd_copy_menu()
+            drain()
+            assert len(calls) == before
+            assert "同じ名前のため飛ばしました" in w.log_view.toPlainText()
+            # T: 入力をキャンセル → 何も積まない
+            state["answer"] = None
+            w.cmd_copy_menu()
+            drain()
+            assert len(calls) == before
+            # メニューに4項目が並ぶ
+            values = [item[2] for item in menu_items]
+            for v in ("rename_other", "suffix_other", "rename_here", "suffix_here"):
+                assert v in values, values
+        finally:
+            sh.copy_files_named = orig_named
+            w.close()
+            w.deleteLater()
+
+
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
     そのまま表示され、ダウンロードは attachment で届く。"""
@@ -1140,6 +1245,15 @@ def test_folder_signature():
             pass
 
 
+def test_cp_name():
+    """_cp 付与の名前: 拡張子の前に差し込む。無ければ末尾。"""
+    assert core.cp_name("alpha.txt") == "alpha_cp.txt"
+    assert core.cp_name("beta") == "beta_cp"
+    assert core.cp_name("a.b.txt") == "a.b_cp.txt"
+    assert core.cp_name(".gitignore") == ".gitignore_cp"
+    assert core.cp_name("alpha_cp.txt") == "alpha_cp_cp.txt"
+
+
 def test_hash_helpers():
     """ハッシュ計算とクリップボード用テキスト(表示なしで確かめられる部分)。"""
     import hashlib
@@ -1200,6 +1314,10 @@ def test_shell_copy_move_delete():
         assert (src / "a.txt").exists()
         assert sh.move_files([str(src / "a.txt")], str(dst / "d"), 0, _quiet_flags()) == (0, False)
         assert (dst / "d" / "a.txt").exists() and not (src / "a.txt").exists()
+        # 名前を変えたコピー(FOF_MULTIDESTFILES)。元は残る
+        assert sh.copy_files_named([str(src / "日本語 b.txt")], [str(dst / "renamed b.txt")],
+                                   0, _quiet_flags()) == (0, False)
+        assert (dst / "renamed b.txt").exists() and (src / "日本語 b.txt").exists()
         # ごみ箱へ。本物のごみ箱に1件入り、回すたびに溜まっていくので、
         # 環境変数 FILER_TEST_TRASH=1 のときだけ確かめる。
         if os.environ.get("FILER_TEST_TRASH") == "1":

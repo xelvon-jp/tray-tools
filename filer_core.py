@@ -1170,6 +1170,13 @@ def unique_name(existing, base: str) -> str:
         number += 1
 
 
+def cp_name(name: str) -> str:
+    """複写の別名: 拡張子の前に "_cp" を差し込む("a.txt" → "a_cp.txt")。
+    拡張子が無ければ末尾に付ける。フォルダ名には使わない(呼び出し側で末尾に付ける)。"""
+    stem, ext = os.path.splitext(name)
+    return f"{stem}_cp{ext}"
+
+
 def rename_selection_length(name: str, is_dir: bool) -> int:
     """改名の入力欄で最初に選んでおく文字数。拡張子の手前まで(エクスプローラと同じ)。"""
     if is_dir:

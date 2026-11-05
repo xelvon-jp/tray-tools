@@ -883,12 +883,15 @@ def test_parse_card_real_quirks():
 # ---------------------------------------------------------------
 # 窓口チャット(--desk)
 def test_desk_plan():
-    assert mpost.desk_plan({}, "tray-tools") == (None, None)
+    assert mpost.desk_plan({}, "tray-tools") == ("new", None, None)
     desks = {"tray-tools": {"chat": "窓口", "last_id": "20261105-04"}}
-    assert mpost.desk_plan(desks, "tray-tools") == ("窓口", "20261105-04")
-    assert mpost.desk_plan(desks, "tray-tools", new_desk=True) == (None, None)
-    assert mpost.desk_plan(desks, "other") == (None, None)
-    assert mpost.desk_plan({"tray-tools": "壊れた値"}, "tray-tools") == (None, None)
+    assert mpost.desk_plan(desks, "tray-tools") == ("chat", "窓口", "20261105-04")
+    assert mpost.desk_plan(desks, "tray-tools", new_desk=True) == ("new", None, None)
+    assert mpost.desk_plan(desks, "other") == ("new", None, None)
+    assert mpost.desk_plan({"tray-tools": "壊れた値"}, "tray-tools") == ("new", None, None)
+    # 名前は未登録でも前回の id があれば「表示中なら投稿」
+    assert mpost.desk_plan({"r": {"chat": None, "last_id": "id1"}}, "r") == ("here", None, "id1")
+    assert mpost.desk_plan({"r": {"chat": None, "last_id": None}}, "r") == ("new", None, None)
 
 
 def test_desk_record_counts_and_keeps_since():
@@ -976,7 +979,7 @@ def test_cmd_post_desk_creates_and_records_new_chat():
         assert e["chat"] == "窓口になる話題" and e["last_id"] == "20261105-05" and e["posts"] == 1
 
 
-def test_cmd_post_desk_unsettled_title_not_recorded():
+def test_cmd_post_desk_unsettled_title_keeps_id_only():
     import tempfile
     old = mpost.TITLE_TIMEOUT
     mpost.TITLE_TIMEOUT = 0.05
@@ -987,9 +990,67 @@ def test_cmd_post_desk_unsettled_title_not_recorded():
             code, out = mpost.cmd_post_desk(_desk_args(), "新しい依頼です",
                                             muse_factory=lambda: fake, desk_path=path)
             assert code == 0 and "desk_note" in out, out
-            assert mpost.load_desks(path) == {}
+            e = mpost.load_desks(path)["tray-tools"]
+            assert e["chat"] is None and e["last_id"] == "20261105-05", e
     finally:
         mpost.TITLE_TIMEOUT = old
+
+
+class _FakeHereMuse(_FakeMuse):
+    """表示中のチャットにある文字列が見えている偽物(一覧は開けない)。"""
+
+    def __init__(self, texts, title=None):
+        super().__init__()
+        self.texts = texts
+        self.title = title
+
+    def scan(self):
+        s, refs = super().scan()
+        s["chat_title"] = self.title
+        s["open_list"] = 0
+        refs["texts"] = list(self.texts)
+        return s, refs
+
+
+def test_cmd_post_desk_here_posts_when_id_visible():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = _tmp_desk(d, {"tray-tools": {"chat": None, "last_id": "20261105-05"}})
+        fake = _FakeHereMuse(["[Claude依頼] tray-tools 20261105-05 ／ ..."], title="読めた名前")
+        code, out = mpost.cmd_post_desk(_desk_args(request_id="20261105-06"), "次の依頼です",
+                                        muse_factory=lambda: fake, desk_path=path)
+        assert code == 0 and out["desk_mode"] == "here", out
+        assert fake.invoke_calls == ["send"]  # 新しいチャットも一覧も触らない
+        e = mpost.load_desks(path)["tray-tools"]
+        assert e["last_id"] == "20261105-06" and e["chat"] == "読めた名前", e
+
+
+def test_cmd_post_desk_here_refuses_without_id():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = _tmp_desk(d, {"tray-tools": {"chat": None, "last_id": "20261105-05"}})
+        fake = _FakeHereMuse(["関係ない話"])
+        code, out = mpost.cmd_post_desk(_desk_args(request_id="20261105-06"), "次の依頼です",
+                                        muse_factory=lambda: fake, desk_path=path)
+        assert code == 1 and "見つからない" in out["reason"], out
+        assert fake.invoke_calls == [] and fake.set_calls == []
+        assert mpost.load_desks(path)["tray-tools"]["last_id"] == "20261105-05"
+
+
+def test_cmd_post_chat_skips_switch_when_already_shown():
+    def run():
+        fake = _FakeChatMuse()
+        fake_scan = fake.scan
+
+        def scan():
+            s, refs = fake_scan()
+            refs["texts"] = ["前の依頼 20261105-02 の続き"]
+            return s, refs
+        fake.scan = scan
+        code, out = mpost.cmd_post(_chat_args(), "続きの依頼です", muse_factory=lambda: fake)
+        assert code == 0, out
+        assert fake.invoke_calls == ["send"], fake.invoke_calls
+    _with_fast_timeouts(run)
 
 
 def test_cmd_desk_set_and_list():

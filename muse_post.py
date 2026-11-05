@@ -85,7 +85,7 @@ except ImportError as _e:  # ModuleNotFoundError を含む
     _ensure_uia = find_window = None
     _UIA_IMPORT_ERROR = _e
 
-VERSION = "20261105-04"
+VERSION = "20261105-05"
 
 
 # =========================================================================
@@ -405,7 +405,18 @@ def cmd_post(args, message, muse_factory=None):
             result["reason"] = reason
             return 1, result
 
-        if chat_arg:
+        # 表示中のチャットに前回の依頼 id が見えていれば、それが目的のチャット。
+        # 一覧を開かずにそのまま投稿する(窓口チャットは Muse の作業後もそのまま
+        # 表示されていることが多く、名前が読めなくても続けられるようにするため)。
+        here = bool(expect_text) and any(
+            expect_text in t for t in (refs.get("texts") or []))
+        if args.current_chat and expect_text and not here:
+            result["reason"] = (f"表示中のチャットに『{expect_text}』が見つからない"
+                                "(別のチャットの可能性があるので投稿しない)")
+            return 1, result
+        if chat_arg and here:
+            steps.append(f"表示中のチャットに『{expect_text}』があるので切り替えない")
+        elif chat_arg:
             # 一覧を開き、名前の合うチャットをちょうど1つ選んで切り替える
             if s["open_list"] > 1:
                 result["reason"] = f"一覧を開くボタンが {s['open_list']} 個ある"
@@ -901,12 +912,21 @@ def save_desks(desks, path=None):
 
 
 def desk_plan(desks, name, new_desk=False):
-    """窓口への投稿先を決める。(chat, expect_text) を返す。
-    (None, None) は「新しいサイドチャットを作る」。"""
+    """窓口への投稿の仕方を決める。(mode, chat, expect_text) を返す。
+
+    mode: "new"  = 新しいサイドチャットを作る(控えが無い・--new-desk)
+          "chat" = 名前の分かっている窓口チャット(表示中なら切り替えない)
+          "here" = 名前は未登録だが前回の id は分かっている。表示中のチャットに
+                   その id が見えるときだけ投稿する"""
     entry = desks.get(name) if isinstance(desks, dict) else None
-    if new_desk or not isinstance(entry, dict) or not entry.get("chat"):
-        return None, None
-    return entry["chat"], entry.get("last_id") or None
+    if new_desk or not isinstance(entry, dict):
+        return "new", None, None
+    last_id = entry.get("last_id") or None
+    if entry.get("chat"):
+        return "chat", entry["chat"], last_id
+    if last_id:
+        return "here", None, last_id
+    return "new", None, None
 
 
 def desk_record(desks, name, chat, request_id, when, new_chat):
@@ -923,33 +943,42 @@ def desk_record(desks, name, chat, request_id, when, new_chat):
 def cmd_post_desk(args, message, muse_factory=None, desk_path=None):
     """--desk: 窓口チャットを引いて cmd_post に渡し、投稿できたら控えを更新する。"""
     desks = load_desks(desk_path)
-    chat, expect = desk_plan(desks, args.desk, args.new_desk)
+    mode, chat, expect = desk_plan(desks, args.desk, args.new_desk)
     args.chat = chat
     args.expect_text = expect
-    args.current_chat = False
+    args.current_chat = mode == "here"
     code, out = cmd_post(args, message, muse_factory=muse_factory)
     out["desk"] = args.desk
-    if chat is None:
-        out["desk_action"] = "新しい窓口チャットを作った" if code == 0 and not args.dry_run else "新しい窓口チャットを作る(予定)"
+    out["desk_mode"] = mode
+    finished = code == 0 and not args.dry_run
+    target = {"new": "新しい窓口チャット", "chat": f"窓口チャット『{chat}』",
+              "here": "表示中の窓口チャット"}[mode]
+    if mode == "new":
+        verb = "を作った" if finished else "を作る(予定)"
     else:
-        out["desk_action"] = (f"窓口チャット『{chat}』に投稿した" if code == 0 and not args.dry_run
-                              else f"窓口チャット『{chat}』に投稿する(予定)")
+        verb = "に投稿した" if finished else "に投稿する(予定)"
+    out["desk_action"] = target + verb
     if code != 0:
-        if chat is not None and "見つからない" in (out.get("reason") or ""):
+        if mode == "chat" and "見つからない" in (out.get("reason") or ""):
             out["reason"] += ("(窓口チャットがアーカイブされたか名前が変わったかもしれない。"
                               "確かめてから --new-desk で作り直す)")
+        if mode == "here":
+            out["reason"] += ("(窓口チャットの名前が未登録。Muse でそのチャットを表示すれば"
+                              "続けられる。名前が分かれば desk --set で控える)")
         return code, out
     if args.dry_run:
         return code, out
-    title = chat if chat is not None else out.get("chat_title")
-    if chat is None and not out.get("chat_title_settled"):
-        # 名前が決まる前に読んだ値かもしれない。控えに入れると次回に別のチャットを開きうる
-        out["desk_note"] = ("新しいチャットの名前が定まらなかったので控えに入れていない。"
-                            "status で名前を確かめて desk --set で控える")
-        return code, out
+    title = chat
+    if title is None and out.get("chat_title"):
+        # 新しいチャットでは名前が定まったときだけ、表示中への投稿では読めれば採る
+        if mode == "here" or out.get("chat_title_settled"):
+            title = out["chat_title"]
+    if title is None:
+        out["desk_note"] = ("窓口チャットの名前は読めなかった。前回の id だけ控えたので、"
+                            "次回は表示中のチャットにその id があれば続けて投稿する")
     try:
         save_desks(desk_record(desks, args.desk, title, args.request_id, now_iso(),
-                               chat is None), desk_path)
+                               mode == "new"), desk_path)
         out["desk_chat"] = title
     except OSError as e:
         out["desk_note"] = f"控え(muse_desks.json)を書けなかった: {e}"

@@ -376,11 +376,11 @@ class ScreenFeature:
         self._copilot_watchdog = _cw.CopilotWatchdog(
             app_settings=app_settings,
             settings_path=settings_path,
-            # 札の右クリックで終了されたら、メニューのチェックも外す。
+            # 札の右クリックで終了されたら、バーを消したものとして扱う。
             on_child_exit=self._on_copilot_watchdog_exited,
         )
-        # 前回 ON のままだったら、監視を自動で始める(copilot_status.enabled)。
-        self._copilot_watchdog.restore()
+        # 子の起こし直しは、メニュー項目を作る場所で _sync_copilot_watchdog が
+        # 行う(パネルの入切も材料になるので、そちらが揃ってから)。
         self._copilot_watchdog_action = None  # メニュー項目(後で作る)
 
         # Teams の一人会議の立ち上げ(teams_meeting.py)。UIA は常駐の中で使えないので
@@ -627,15 +627,16 @@ class ScreenFeature:
             lambda: self.start_teams_meeting("menu"),
         )
         self._agent_loop_menu = self.menu.addMenu(AGENT_LOOP_MENU_TITLE)
-        # 状態監視バー(独立機能。エージェントループが動いている間は休む)。
-        # チェック項目にして、いま ON/OFF どちらかがひと目で分かるようにする。
+        # 状態監視バーを出すかどうか。表示だけの入切で、監視は止めない
+        # (監視の生死は _sync_copilot_watchdog がバー/パネルの表示から決める)。
         self._copilot_watchdog_action = self._agent_loop_menu.addAction(
             "🏷 状態監視バーを表示"
         )
         self._copilot_watchdog_action.setCheckable(True)
-        self._copilot_watchdog_action.setChecked(self._copilot_watchdog.is_enabled())
+        self._copilot_watchdog_action.setChecked(self._copilot_watchdog.bar_enabled())
         # addAction(テキスト, 関数) だと checked が渡らないので triggered.connect で受ける。
-        self._copilot_watchdog_action.triggered.connect(self._toggle_copilot_watchdog)
+        self._copilot_watchdog_action.triggered.connect(self._toggle_copilot_bar)
+        self._sync_copilot_watchdog()
 
         self._agent_loop_menu.addSeparator()
         # ここから下は「tray-tools が自分でコードを実行する」側。押すと何が起きるかを
@@ -2246,7 +2247,8 @@ class ScreenFeature:
             if not self._claude_entries and copilot is None:
                 return   # 出すものが無いうちは窓を作らない
             self._claude_progress = claude_progress.ClaudeProgressPanel(
-                on_open=self._open_claude_session, on_remove=self._remove_claude_session)
+                on_open=self._open_claude_session, on_remove=self._remove_claude_session,
+                on_open_copilot=self._activate_copilot)
         self._claude_progress.set_entries(self._claude_entries, copilot)
 
     def _open_claude_session(self, entry):
@@ -2273,6 +2275,8 @@ class ScreenFeature:
             claude_progress.save_state({"enabled": self._claude_progress_enabled})
             self._update_claude_progress()
             self._update_tooltip()
+            # パネルが Copilot 監視の子の要否にも関わるので、そちらも合わせる。
+            self._sync_copilot_watchdog()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
@@ -2665,30 +2669,46 @@ class ScreenFeature:
             except OSError:
                 pass
 
-    def _on_copilot_watchdog_exited(self) -> None:
-        """状態監視バーが自分から終わったときに呼ばれる。メニューの表示を合わせる。
+    def _sync_copilot_watchdog(self) -> None:
+        """監視の子を、表示(バー/パネル)の状態に合わせて起こす/止める。
 
-        チェックが入ったままだと、次に押したときに「切る」操作になってしまい、
-        出したいのに出せない(もう一度押す羽目になる)。"""
+        監視そのものに入切は無い。バーか進捗パネルのどちらかが出る設定の
+        間だけ子が要る(Claude のフックに開始ボタンが無いのと同じ思想)。
+        両方オフなら子も止まる。"""
         try:
+            want = (self._copilot_watchdog.bar_enabled()
+                    or self._claude_progress_enabled)
+            if want != self._copilot_watchdog.is_enabled():
+                self._copilot_watchdog.set_enabled(want)
+        except Exception as e:  # noqa: BLE001
+            print(f"[copilot-watchdog] 同期に失敗: {e}", file=sys.stderr)
+
+    def _on_copilot_watchdog_exited(self) -> None:
+        """札の右クリックで「終了」されたときに呼ばれる。バーを消したものとして扱う。
+
+        監視そのものは止めない: パネルが出る設定なら、バー無しで子を起こし直す
+        (_sync_copilot_watchdog)。チェックを外しておかないと、次に押したときに
+        「出す」操作が逆になってしまう。"""
+        try:
+            self._copilot_watchdog.set_bar_enabled(False)
             if self._copilot_watchdog_action is not None:
                 self._copilot_watchdog_action.setChecked(False)
+            self._sync_copilot_watchdog()
         except Exception as e:  # noqa: BLE001
             print(f"[copilot-status] メニューの更新に失敗: {e}", file=sys.stderr)
 
     def copilot_bar_command(self, args) -> str:
         """外から状態監視バーを入切する。on / off / status。
 
-        【なぜ口を足したか】
-        入切がトレイのメニューにしか無かったので、再起動するたびに人に押してもらう
-        必要があった。**起動時は必ず OFF** という決まり(copilot_watchdog 冒頭)は
-        そのままにしたいので、代わりにメニュー以外からも入れられるようにする。
+        入切するのはバーの表示だけ(監視はバー/パネルの表示状態に従う)。
         メニューのチェックも合わせて動かす。片方だけ変わると、次に押したときに
         逆の操作になってしまう。"""
         mode = (str(args[0]).strip().lower() if args else "status")
         if mode == "status":
             return ("OK 状態監視バー: "
-                    + ("表示中" if self._copilot_watchdog.is_enabled() else "停止中"))
+                    + ("表示中" if self._copilot_watchdog.bar_enabled() else "非表示")
+                    + ("（監視中）" if self._copilot_watchdog.is_enabled()
+                       else "（監視なし）"))
         if mode in ("on", "1", "true", "start", "show"):
             want = True
         elif mode in ("off", "0", "false", "stop", "hide"):
@@ -2696,19 +2716,42 @@ class ScreenFeature:
         else:
             return f"ERR 不明な指示: {mode}（on / off / status）"
         try:
-            self._copilot_watchdog.set_enabled(want)
+            self._copilot_watchdog.set_bar_enabled(want)
             if self._copilot_watchdog_action is not None:
                 self._copilot_watchdog_action.setChecked(want)
+            self._sync_copilot_watchdog()
         except Exception as e:  # noqa: BLE001
             return f"ERR 切り替えられませんでした: {e}"
-        return "OK 状態監視バー: " + ("表示中" if want else "停止中")
+        return "OK 状態監視バー: " + ("表示中" if want else "非表示")
 
-    def _toggle_copilot_watchdog(self, checked: bool) -> None:
-        """状態監視バーの入切をメニューから切り替える。設定は自動保存。"""
+    def _toggle_copilot_bar(self, checked: bool) -> None:
+        """状態監視バーを出す/消す。監視は止めない(パネル用に続くことがある)。"""
         try:
-            self._copilot_watchdog.set_enabled(bool(checked))
+            self._copilot_watchdog.set_bar_enabled(bool(checked))
+            self._sync_copilot_watchdog()
         except Exception as e:  # noqa: BLE001
             print(f"[copilot-watchdog] 切替失敗: {e}", file=sys.stderr)
+
+    def _activate_copilot(self, _entry=None):
+        """進捗パネルの Copilot 行クリック: Copilot の窓を前面に出す。
+
+        子プロセスが知らせに書いた hwnd へ ctypes の user32 だけで触る
+        (UIA/COM は常駐に入れない。copilot_watchdog 冒頭の実測どおり)。
+        最小化されていたら戻してから前面へ。"""
+        try:
+            turn = self._read_copilot_turn()
+            hwnd = (turn or {}).get("hwnd")
+            if not hwnd:
+                return
+            import ctypes
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                return
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+        except Exception:  # noqa: BLE001  表示側の操作。失敗しても落とさない
+            traceback.print_exc()
 
     def _ensure_agent_loop_viewer(self):
         """ログ窓を1つだけ作って使い回す。

@@ -1,5 +1,5 @@
 # tests/test_copilot_status.py
-# Copilot 状態監視の「手番の知らせ」と入切の保存・復元、右下パネルへの相乗りを確かめる。
+# Copilot 状態監視の「手番の知らせ」とバー表示の保存、右下パネルへの相乗りを確かめる。
 # UIA には触らない(手番ファイルの読み書きと純粋な組み立てだけ)。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_copilot_status.py
@@ -29,7 +29,7 @@ import settings as settings_module  # noqa: E402
 
 
 def _write_turn(path, **overrides):
-    payload = {"state": "responding", "app": "M365 Copilot",
+    payload = {"state": "responding", "app": "M365 Copilot", "hwnd": 12345,
                "since": time.time() - 5, "paused": False, "alert": False,
                "updated": time.time()}
     payload.update(overrides)
@@ -48,6 +48,7 @@ def test_read_turn_status_fresh():
         assert got["state"] == "responding"
         assert got["app"] == "M365 Copilot"
         assert got["alert"] is False
+        assert got["hwnd"] == 12345
 
 
 def test_read_turn_status_stale_is_none():
@@ -69,9 +70,9 @@ def test_read_turn_status_paused_and_unknown_and_broken():
         assert cw.read_turn_status(Path(d) / "無い.json") is None
 
 
-# -- 入切の保存と復元 ------------------------------------------------------
+# -- バー表示の保存 --------------------------------------------------------
 
-def test_watchdog_restores_enabled_and_saves_partially():
+def test_watchdog_bar_flag_and_partial_save():
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
     with tempfile.TemporaryDirectory() as d:
@@ -82,22 +83,29 @@ def test_watchdog_restores_enabled_and_saves_partially():
             ensure_ascii=False), encoding="utf-8")
         app_settings = settings_module.load_settings(path)
         wd = cw.CopilotWatchdog(app_settings=app_settings, settings_path=path)
-        # 起動時は必ず OFF ではなく、保存された ON を引き継ぐ(子はまだ起こさない)
-        assert wd.is_enabled() is True
-        wd._enabled = False
-        wd._save_enabled()
+        # bar キーが優先。子は生成しただけでは起きない(起こすのは feature_screen)
+        assert wd.bar_enabled() is False
+        assert wd.is_enabled() is False
+        wd.set_bar_enabled(True)
         raw = json.loads(path.read_text(encoding="utf-8"))
-        assert raw["copilot_status"]["enabled"] is False
-        # 該当キーだけの差し替え: 他の節と bar はそのまま残る
-        assert raw["copilot_status"]["bar"] is False
+        assert raw["copilot_status"]["bar"] is True
+        # 該当キーだけの差し替え: 他の節と旧キーはそのまま残る
+        assert raw["copilot_status"]["enabled"] is True
         assert raw["capture"]["save_folder"] == "X"
         wd.close()
 
 
-def test_watchdog_default_is_off():
+def test_watchdog_bar_defaults():
     from PySide6.QtWidgets import QApplication
     QApplication.instance() or QApplication([])
+    # bar が無ければ旧キー enabled を初期値にする(OFF にしていた PC のため)
+    wd = cw.CopilotWatchdog(app_settings={"copilot_status": {"enabled": False}},
+                            settings_path=None)
+    assert wd.bar_enabled() is False
+    wd.close()
+    # どちらも無ければ表示する(従来の既定)
     wd = cw.CopilotWatchdog(app_settings={}, settings_path=None)
+    assert wd.bar_enabled() is True
     assert wd.is_enabled() is False
     wd.close()
 
@@ -127,12 +135,14 @@ def test_publish_turn_writes_on_change_and_heartbeats():
 
             class _Cp:
                 profile = {"name": "M365 Copilot"}
+                hwnd_main = 777
             stub._copilot = _Cp()
 
             stub._publish_turn()
             first = json.loads(target.read_text(encoding="utf-8"))
             assert first["state"] == "waiting_ai"
             assert first["app"] == "M365 Copilot"
+            assert first["hwnd"] == 777
             assert first["alert"] is False
 
             # 変わらなければ書き直さない(updated が進まない)
@@ -166,8 +176,9 @@ def test_copilot_row_shape():
                           "since": 123.0, "alert": True})
     assert row["_copilot"] is True and row["state"] == "waiting_user"
     assert row["app"] == "M365 Copilot" and row["alert"] is True
-    assert cp.row_height(row) == cp.COPILOT_ROW_HEIGHT
-    assert cp.panel_height([row]) == cp.PAD_Y * 2 + cp.COPILOT_ROW_HEIGHT
+    # Copilot 行は Claude の行と同じ高さ(2段組み)
+    assert cp.row_height(row) == cp.ROW_HEIGHT
+    assert cp.panel_height([row]) == cp.PAD_Y * 2 + cp.ROW_HEIGHT
 
 
 def test_panel_shows_copilot_row_alone():
@@ -182,6 +193,26 @@ def test_panel_shows_copilot_row_alone():
         assert panel.height() == cp.panel_height(panel._rows)
         panel.set_entries([], None)
         assert not panel.isVisible()
+        panel.close()
+
+
+def test_panel_copilot_dismiss_until_turn_changes():
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as d:
+        panel = cp.ClaudeProgressPanel(state_path=Path(d) / "panel.json")
+        turn = {"state": "waiting_user", "app": "M365 Copilot",
+                "since": 1000.0, "alert": False}
+        panel.set_entries([], turn)
+        assert panel.isVisible()
+        panel._remove_row(0)   # ✕
+        assert not panel.isVisible()
+        # 同じ手番が届き直しても出ない
+        panel.set_entries([], turn)
+        assert not panel.isVisible()
+        # 手番が変われば(開始時刻が変われば)また出る
+        panel.set_entries([], {**turn, "since": 2000.0})
+        assert panel.isVisible()
         panel.close()
 
 

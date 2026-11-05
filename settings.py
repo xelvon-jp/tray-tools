@@ -440,10 +440,12 @@ DEFAULT_SETTINGS = {
         "rules": [],
     },
     # Copilot 状態監視(copilot_watchdog.py / copilot_status_process.py)。
-    #   enabled … 前回 ON だったかを覚える。true の PC では常駐の起動時に監視を
-    #             自動で始める(既定は false。ON にした PC だけの意思表示)。
-    #   bar     … Copilot の窓に出す状態監視バー。false にするとバーは出さないが
-    #             監視は続け、状態は右下の進捗パネル(Claude と相乗り)に出る。
+    # 監視そのものに入切は無い(バーか進捗パネルのどちらかが出る間だけ子が動く)。
+    #   bar     … Copilot の窓に出す状態監視バーを出すか。トレイの
+    #             「🏷 状態監視バーを表示」と連動する。false でも監視は続き、
+    #             状態は右下の進捗パネル(Claude と相乗り)に出る。
+    #   enabled … 旧仕様の名残り。もう書かない。bar が無い PC では初期値として
+    #             だけ読む(OFF にしていた PC で勝手にバーが出ないように)。
     "copilot_status": {
         "enabled": False,
         "bar": True,

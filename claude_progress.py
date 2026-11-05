@@ -6,7 +6,10 @@
 # 3秒ごとに読んでいるものを渡すだけ。こちらでファイルは読まない)。
 # Copilot の手番も相乗りする: feature_screen が copilot_watchdog.read_turn_status()
 # の結果を一緒に渡し、先頭に1行だけ出す。Copilot の窓に付くバー(状態監視バー)と
-# 違い、背面・最小化でも見えるのが役目。行に操作は無い(✕もクリックも無し)。
+# 違い、背面・最小化でも見えるのが役目。行の作りは Claude の行と同じ
+# (名前と状態 / バーと補足の2段組み)。クリック = Copilot の窓を前面へ
+# (feature_screen 側の on_open_copilot)、✕ = その手番の間だけ閉じる
+# (手番が変わればまた出る。監視は止めない)。
 #   - バーの長さは計画の進み具合(claude_status.plan_fraction)。計画が無いセッションは
 #     長さを出せないので、流れる帯で「動いている」ことだけ示す
 #   - 色はトレイの輪と同じ(実行中=青・確認待ち=桃)
@@ -39,9 +42,7 @@ ROW_HEIGHT = 48
 COMPACT_HEIGHT = 24
 # 折りたたんだ行は新しいものからこの数まで(全部はメニューの「💬 Claude」にある)。
 MAX_COMPACT = 5
-# Copilot の手番の行(相乗り)の高さ。名前と状態だけの1行。
-COPILOT_ROW_HEIGHT = 30
-# Copilot の状態 → (絵文字, 文言, 点の色)。文言と色は状態監視バー
+# Copilot の状態 → (絵文字, 文言, バーの色)。文言と色は状態監視バー
 # (copilot_status_process.STATE_STYLES)と同じ。あちらは UIA ごと別プロセスで、
 # 常駐からは import できないので、表示に要る分だけをここに写してある。
 COPILOT_STATES = {
@@ -49,6 +50,13 @@ COPILOT_STATES = {
     "waiting_ai": ("⏳", "応答待ち", QColor(179, 40, 40)),
     "responding": ("💬", "応答中", QColor(31, 107, 176)),
     "waiting_user": ("🙂", "応答済（入力待ち）", QColor(31, 138, 76)),
+}
+# Copilot 行の2段目に出す補足。
+COPILOT_SUBS = {
+    "typing": "入力欄に未送信の文章があります",
+    "waiting_ai": "Copilot の応答を待っています",
+    "responding": "Copilot が回答を生成しています",
+    "waiting_user": "応答が返っています",
 }
 # 「待たせすぎ」のときの文言の色(バーの点滅に相当する印)。
 COPILOT_ALERT_COLOR = QColor(240, 90, 90)
@@ -142,7 +150,7 @@ def copilot_row(copilot) -> dict | None:
 
 def row_height(row) -> int:
     if row.get("_copilot"):
-        return COPILOT_ROW_HEIGHT
+        return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
 
 
@@ -151,7 +159,8 @@ def panel_height(rows) -> int:
 
 
 class ClaudeProgressPanel(QWidget):
-    def __init__(self, on_open=None, state_path=None, on_remove=None):
+    def __init__(self, on_open=None, state_path=None, on_remove=None,
+                 on_open_copilot=None):
         super().__init__()
         self.setWindowTitle("Claude の進み具合")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
@@ -161,10 +170,13 @@ class ClaudeProgressPanel(QWidget):
         self.setMouseTracking(True)
         self._on_open = on_open
         self._on_remove = on_remove
+        self._on_open_copilot = on_open_copilot
         self._hover_close = -1
         self._state_path = state_path
         self._entries = []
         self._copilot = None
+        # ✕で閉じた Copilot の手番(状態, 開始時刻)。同じ手番の間は出さない。
+        self._copilot_dismissed = None
         self._rows = []
         self._first_seen_done = {}
         self._hover = -1
@@ -194,6 +206,9 @@ class ClaudeProgressPanel(QWidget):
     def _tick(self):
         try:
             head = copilot_row(self._copilot)
+            if (head is not None
+                    and (head["state"], head.get("since")) == self._copilot_dismissed):
+                head = None   # ✕で閉じた手番は、その手番の間は出さない
             rows = ([head] if head else []) + rows_to_show(
                 self._entries, time.time(), self._first_seen_done)
             if not rows:
@@ -211,8 +226,12 @@ class ClaudeProgressPanel(QWidget):
                 self.show()
             # 動くもの(経過時間・流れる帯・バーの行が折りたたまれる時刻)があるときだけ回す。
             # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
-            # Copilot の行も同じ(経過は3秒ごとの受け取りで進めば足りる)。
-            if any(not r.get("_compact") and not r.get("_copilot") for r in rows):
+            # Copilot の行は、帯が流れる応答待ち・応答中だけ回す(他の状態の
+            # 経過表示は3秒ごとの受け取りで進めば足りる)。
+            if any((not r.get("_compact") and not r.get("_copilot"))
+                   or (r.get("_copilot")
+                       and r["state"] in ("responding", "waiting_ai"))
+                   for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
             else:
@@ -272,8 +291,6 @@ class ClaudeProgressPanel(QWidget):
         return QRect(right - CLOSE_SIZE + 1, top, CLOSE_SIZE, CLOSE_SIZE)
 
     def _paint_close(self, p, index):
-        if self._rows[index].get("_copilot"):
-            return   # Copilot の行は消すものではない(監視を止める操作はトレイ側)
         box = QRectF(self._close_rect(index))
         hot = index == self._hover_close
         if hot:
@@ -289,7 +306,7 @@ class ClaudeProgressPanel(QWidget):
 
     def _paint_row(self, p, entry, rect, now, hover):
         if entry.get("_copilot"):
-            self._paint_copilot(p, entry, rect, now)
+            self._paint_copilot(p, entry, rect, now, hover)
             return
         if hover and cs.jump_url(entry):
             p.setPen(Qt.NoPen)
@@ -361,31 +378,64 @@ class ClaudeProgressPanel(QWidget):
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
 
-    def _paint_copilot(self, p, entry, rect, now):
-        """Copilot の行: 状態の色の点・対象の名前・状態と経過だけの1行。
+    def _paint_copilot(self, p, entry, rect, now, hover):
+        """Copilot の行: Claude の行と同じ2段組み(名前と状態 / バーと補足)。
 
-        バー(札)が Copilot の窓に付くのに対し、こちらは背面・最小化でも
-        見えることが役目。クリックで開く・✕で消すといった操作は付けない。"""
-        emoji, label, color = COPILOT_STATES[entry["state"]]
-        inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
-        p.setPen(Qt.NoPen)
-        p.setBrush(color)
-        dot = 6
-        p.drawEllipse(QRectF(inner.left(), inner.center().y() - dot / 2 + 1, dot, dot))
-        tail = f"{emoji} {label}"
-        # 待ちの2状態だけ経過を足す(バーの札と同じ方針)。
-        if entry["state"] in ("waiting_ai", "waiting_user") and entry.get("since"):
+        バーは進み具合が分からないので、応答待ち・応答中は流れる帯
+        (計画の無い Claude の行と同じ)、応答済は満タン、入力中は空
+        (まだ何も始まっていない)。"""
+        if hover and self._on_open_copilot is not None:
+            p.setPen(Qt.NoPen)
+            p.setBrush(HOVER)
+            p.drawRoundedRect(QRectF(rect), 6, 6)
+        _emoji, label, color = COPILOT_STATES[entry["state"]]
+        state = entry["state"]
+        inner = rect.adjusted(PAD_X // 2, 4, -PAD_X // 2, -4)
+
+        # 1段目: 名前と、右に状態(入力中以外は経過つき)
+        tail = f"{_emoji} {label}"
+        if state != "typing" and entry.get("since"):
             tail += " " + cs.format_duration(now - entry["since"])
         p.setFont(self._name_font)
         fm = QFontMetrics(self._name_font)
         tail_w = fm.horizontalAdvance(tail)
-        text_rect = inner.adjusted(dot + 6, 0, 0, 0)
+        head = QRect(inner.left(), inner.top(), inner.width() - CLOSE_SIZE - CLOSE_GAP,
+                     fm.height())
         p.setPen(COPILOT_ALERT_COLOR if entry.get("alert") else SUBTEXT)
-        p.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, tail)
+        p.drawText(head, Qt.AlignRight | Qt.AlignVCenter, tail)
         p.setPen(TEXT)
         name = fm.elidedText(entry.get("app") or "Copilot", Qt.ElideRight,
-                             max(0, text_rect.width() - tail_w - 8))
-        p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, name)
+                             max(0, head.width() - tail_w - 8))
+        p.drawText(head, Qt.AlignLeft | Qt.AlignVCenter, name)
+
+        # バー
+        track = QRectF(inner.left(), head.bottom() + 4, inner.width(), TRACK_HEIGHT)
+        p.setPen(Qt.NoPen)
+        p.setBrush(TRACK)
+        p.drawRoundedRect(track, 3, 3)
+        p.setBrush(color)
+        if state in ("responding", "waiting_ai"):
+            # 進み具合は分からない: 帯を左から右へ流す(長さは意味を持たない)
+            phase = (now % SLIDE_SECONDS) / SLIDE_SECONDS
+            width = track.width() * SLIDE_RATIO
+            left = track.left() - width + (track.width() + width) * phase
+            band = QRectF(left, track.top(), width, track.height()).intersected(track)
+            if band.width() > 0:
+                p.drawRoundedRect(band, 3, 3)
+        elif state == "waiting_user":
+            p.drawRoundedRect(track, 3, 3)
+
+        # 2段目: 補足(待たせすぎは赤字。入力中の文言は札の差し替えに合わせる)
+        sub = COPILOT_SUBS[state]
+        if entry.get("alert") and state == "typing":
+            sub = "送信していません"
+        p.setFont(self._sub_font)
+        sub_fm = QFontMetrics(self._sub_font)
+        p.setPen(COPILOT_ALERT_COLOR if entry.get("alert") else SUBTEXT)
+        sub_rect = QRect(inner.left(), int(track.bottom()) + 2, inner.width(),
+                         sub_fm.height())
+        p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
 
     def _paint_compact(self, p, entry, rect, color):
         """折りたたんだ行: 状態の色の点・名前・終わった時刻だけ。バーの行より控えめに。"""
@@ -424,11 +474,13 @@ class ClaudeProgressPanel(QWidget):
             return
         pos = event.position().toPoint()
         hover = self._row_at(pos)
-        hover_close = hover if hover >= 0 and not self._rows[hover].get("_copilot") \
-            and self._close_rect(hover).adjusted(-3, -3, 3, 3).contains(pos) else -1
+        hover_close = hover if hover >= 0 and self._close_rect(hover).adjusted(
+            -3, -3, 3, 3).contains(pos) else -1
         if hover != self._hover or hover_close != self._hover_close:
             self._hover, self._hover_close = hover, hover_close
-            jumpable = 0 <= hover < len(self._rows) and cs.jump_url(self._rows[hover])
+            row = self._rows[hover] if 0 <= hover < len(self._rows) else {}
+            jumpable = cs.jump_url(row) or (
+                row.get("_copilot") and self._on_open_copilot is not None)
             self.setCursor(Qt.PointingHandCursor if jumpable or hover_close >= 0
                            else Qt.ArrowCursor)
             self.update()
@@ -447,12 +499,18 @@ class ClaudeProgressPanel(QWidget):
             return
         pos = event.position().toPoint()
         index = self._row_at(pos)
-        if 0 <= index < len(self._rows) and self._rows[index].get("_copilot"):
-            return   # Copilot の行にクリックの操作は無い
         # ✕ は少し広めに当たりを取る(小さいので押し損ねると、その行を開いてしまう)
         if 0 <= index < len(self._rows) and self._close_rect(index).adjusted(
                 -3, -3, 3, 3).contains(pos):
             self._remove_row(index)
+            return
+        if 0 <= index < len(self._rows) and self._rows[index].get("_copilot"):
+            if self._on_open_copilot is not None:
+                try:
+                    self._on_open_copilot(self._rows[index])
+                except Exception:  # noqa: BLE001  スロットの中で投げ切らない
+                    import traceback
+                    traceback.print_exc()
             return
         if 0 <= index < len(self._rows) and self._on_open is not None:
             try:
@@ -464,6 +522,14 @@ class ClaudeProgressPanel(QWidget):
     def _remove_row(self, index):
         """その行を消す。手元の一覧からもすぐ外して描き直す(次の読み込みを待たない)。"""
         entry = self._rows[index]
+        if entry.get("_copilot"):
+            # Copilot の行の ✕: その手番の間だけ閉じる。手番が変われば
+            # (状態か開始時刻が変われば)また出る。監視は止めない。
+            self._copilot_dismissed = (entry["state"], entry.get("since"))
+            self._copilot = None
+            self._hover = self._hover_close = -1
+            self._tick()
+            return
         key = entry.get("session_id") or entry.get("_path")
         try:
             if self._on_remove is not None:

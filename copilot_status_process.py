@@ -1145,6 +1145,7 @@ class StatusWatcher:
             print(f"[copilot-status] 状態の取得に失敗: {e}")
 
     def _poll(self):
+        self._refresh_bar_setting()
         if self._paused:
             # 止めている間も、Copilot が動き出したかどうかだけは見る。
             # 一時停止は「いまは邪魔しないで」であって「もう知らない」ではない。
@@ -1186,6 +1187,20 @@ class StatusWatcher:
 
         self._publish_turn()
 
+    def _refresh_bar_setting(self):
+        """バーを出すか(settings.json の copilot_status.bar)を読み直す。
+
+        トレイ側で切り替えたときに、子を再起動せず反映するための読み直し。
+        閾値やプロファイルは起動時のまま(変える頻度が違う)。読めなければ
+        前の値のままにする。"""
+        try:
+            import settings as settings_module
+            data = settings_module.load_settings(settings_module.SETTINGS_PATH)
+            section = data.get("copilot_status") or {}
+            self._bar_enabled = bool(section.get("bar", True))
+        except Exception:  # noqa: BLE001  読めなければ前の値で続ける
+            pass
+
     def _publish_turn(self):
         """いまの手番を TURN_STATUS_FILE へ書く(常駐の右下パネル用)。
 
@@ -1198,6 +1213,10 @@ class StatusWatcher:
             "state": self._state,
             "app": ((self._copilot.profile.get("name") or "")
                     if self._copilot is not None else ""),
+            # 常駐がパネルの行クリックで窓を前面に出すための控え(user32 だけ
+            # で触る。UIA のハンドルではない)。
+            "hwnd": (self._copilot.hwnd_main
+                     if self._copilot is not None else None),
             "since": self._state_since,
             "paused": bool(self._paused),
             "alert": self._turn_alert(),

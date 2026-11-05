@@ -112,7 +112,8 @@ def read_turn_status(path=None):
                                  "waiting_user"):
         return None
     return {"state": data["state"], "app": data.get("app") or "",
-            "since": data.get("since"), "alert": bool(data.get("alert"))}
+            "since": data.get("since"), "alert": bool(data.get("alert")),
+            "hwnd": data.get("hwnd")}
 
 
 def _pythonw():
@@ -122,7 +123,7 @@ def _pythonw():
 
 
 class CopilotWatchdog:
-    """状態監視バーの入切。実処理は子プロセス。
+    """状態監視の子の世話と、バーを出すかの保持。実処理は子プロセス。
 
     公開している名前(set_enabled / is_enabled / close など)は、1プロセスで
     動かしていた頃と同じにしてある。feature_screen 側を書き換えずに済ませるため。"""
@@ -134,13 +135,20 @@ class CopilotWatchdog:
         # 子が自分から終わったときに、メニューのチェックを外してもらう連絡口。
         self._on_child_exit = on_child_exit
 
-        # 起動時の入切は settings.json の copilot_status.enabled を引き継ぐ。
-        # 【以前は「起動時は必ず OFF」だった】前回の続きを勝手に再開しないための
-        # 決まりだったが、右下パネルへの相乗りで「Copilot が居なければ何も出ない」
-        # 形になったのと、職場PCでは監視が主用途で毎回手で入れる手間が勝ったため、
-        # ON にした PC では自動で始める形に変えた(2026-11-05)。既定は OFF のまま。
+        # バーを出すか(settings.json の copilot_status.bar)。監視そのものの
+        # 入切は持たない: 子は「バーかパネルのどちらかが出る間」だけ要るので、
+        # 起こす/止めるの判断は feature_screen が表示の状態から決めて
+        # set_enabled で伝える(Claude のフックに開始ボタンが無いのと同じ思想)。
+        # bar キーが無い PC では、旧仕様(ff0f81f)の enabled を初期値にする
+        # (OFF にしていた PC で勝手にバーが出始めないように)。
         section = (app_settings or {}).get("copilot_status") or {}
-        self._enabled = bool(section.get("enabled"))
+        if "bar" in section:
+            self._bar_enabled = bool(section.get("bar"))
+        elif "enabled" in section:
+            self._bar_enabled = bool(section.get("enabled"))
+        else:
+            self._bar_enabled = True
+        self._enabled = False
         self._proc = None
 
         # 子が落ちていたら起こし直す。
@@ -157,15 +165,12 @@ class CopilotWatchdog:
         self._watch_timer.timeout.connect(self._on_watch)
 
     # -- 外部から呼ばれる操作 --------------------------------------------
-    def restore(self) -> None:
-        """保存された入切で起動する(feature_screen が生成直後に1回呼ぶ)。"""
-        if self._enabled:
-            self._start_child()
-            self._watch_timer.start()
-
     def set_enabled(self, enabled: bool) -> None:
+        """子を起こす/止める。それだけをする(設定は書かない)。
+
+        「起こすかどうか」は表示(バー/パネル)の状態から feature_screen が
+        決める。ここで設定まで書くと、表示の入切と監視の生死が絡んでしまう。"""
         self._enabled = bool(enabled)
-        self._save_enabled()
         if self._enabled:
             self._start_child()
             self._watch_timer.start()
@@ -173,17 +178,28 @@ class CopilotWatchdog:
             self._watch_timer.stop()
             self._stop_child()
 
-    def _save_enabled(self) -> None:
-        """入切を settings.json の copilot_status.enabled だけ差し替えて覚える。
+    def bar_enabled(self) -> bool:
+        return self._bar_enabled
+
+    def set_bar_enabled(self, visible: bool) -> None:
+        """バーを出すかどうかを覚える(copilot_status.bar だけ差し替える)。
+
+        子は取り直しのたびに settings.json を読み直すので、再起動なしで
+        反映される。監視の生死は変えない(feature_screen が別に決める)。"""
+        self._bar_enabled = bool(visible)
+        self._save_section({"bar": self._bar_enabled})
+
+    def _save_section(self, updates: dict) -> None:
+        """settings.json の copilot_status 節の該当キーだけ差し替えて覚える。
 
         丸ごと書き戻さない(settings.json の作法)。メモリ側(app_settings)も
-        合わせておく。書けなくても入切そのものは続ける。"""
+        合わせておく。書けなくても操作そのものは続ける。"""
         try:
             if self._app_settings is not None:
                 section = self._app_settings.get("copilot_status")
                 if not isinstance(section, dict):
                     section = self._app_settings["copilot_status"] = {}
-                section["enabled"] = self._enabled
+                section.update(updates)
             if not self._settings_path:
                 return
             import json
@@ -197,11 +213,11 @@ class CopilotWatchdog:
             section = raw.get("copilot_status")
             if not isinstance(section, dict):
                 section = raw["copilot_status"] = {}
-            section["enabled"] = self._enabled
+            section.update(updates)
             path.write_text(json.dumps(raw, ensure_ascii=False, indent=2),
                             encoding="utf-8")
         except (OSError, ValueError) as e:
-            print(f"[copilot-status] 入切を保存できませんでした: {e}",
+            print(f"[copilot-status] 設定を保存できませんでした: {e}",
                   file=sys.stderr)
 
     def is_enabled(self) -> bool:
@@ -281,10 +297,10 @@ class CopilotWatchdog:
                 return
             code = self._proc.poll() if self._proc is not None else None
             if code == EXIT_BY_USER:
-                # 札の上で終了された。機能ごと OFF にして、メニューのチェックも外す。
+                # 札の上で終了された。子は止めるが、意味づけは feature_screen
+                # 側(バーを消したものとして扱い、パネル用なら起こし直す)。
                 self._proc = None
                 self._enabled = False
-                self._save_enabled()
                 self._watch_timer.stop()
                 if self._on_child_exit is not None:
                     self._on_child_exit()

@@ -835,6 +835,56 @@ def test_window_copy_renamed():
             w2.deleteLater()
 
 
+def test_window_mkdir_stamp():
+    """K: 入力欄に日時プレフィックスが選択状態で入る。そのまま Enter なら
+    日時だけ(末尾の "_" は落ちる)、続きを打てば日時付き、打ち替えれば通常名。"""
+    import filer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        seen = {}
+        answers = []
+
+        def ask(title, label, text="", select=None):
+            seen.update(text=text, select=select)
+            return answers.pop(0)
+
+        w.ask_text = ask
+        try:
+            # そのまま Enter(スタブは入力欄の初期値をそのまま返す)
+            def ask_echo(title, label, text="", select=None):
+                seen.update(text=text, select=select)
+                return text
+            w.ask_text = ask_echo
+            w.cmd_mkdir()
+            prefix = seen["text"]
+            assert prefix.endswith("_") and len(prefix) == len("20261105_1548_"), prefix
+            assert seen["select"] == len(prefix)
+            assert (left / prefix[:-1]).is_dir()          # 日時だけ・"_" なし
+            assert not (left / prefix).exists()
+            # 続きを打った形
+            w.ask_text = ask
+            answers.append(prefix + "写真")
+            w.cmd_mkdir()
+            assert (left / (prefix + "写真")).is_dir()
+            # 打ち替えた形(通常名)
+            answers.append("ふつうの名前")
+            w.cmd_mkdir()
+            assert (left / "ふつうの名前").is_dir()
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_picker_auto_width_and_elide():
     """ピッカー: 長い項目に合わせて幅が広がり(上限は画面の9割)、
     一覧の省略は中央(先頭と末尾が見える形)になる。"""
@@ -1304,6 +1354,13 @@ def test_folder_signature():
             raise AssertionError("無いフォルダは例外のはず")
         except OSError:
             pass
+
+
+def test_stamp_prefix():
+    """フォルダ作成の日時プレフィックス: YYYYMMDD_hhmm_ の形。"""
+    from datetime import datetime
+    assert core.stamp_prefix(datetime(2026, 11, 5, 15, 48)) == "20261105_1548_"
+    assert core.stamp_prefix(datetime(2026, 1, 2, 3, 4)) == "20260102_0304_"
 
 
 def test_cp_name():

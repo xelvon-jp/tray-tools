@@ -1170,6 +1170,11 @@ def unique_name(existing, base: str) -> str:
         number += 1
 
 
+def stamp_prefix(moment) -> str:
+    """フォルダ作成の日時プレフィックス。"20261105_1548_" の形(秒は入れない)。"""
+    return moment.strftime("%Y%m%d_%H%M_")
+
+
 def cp_name(name: str) -> str:
     """複写の別名: 拡張子の前に "_cp" を差し込む("a.txt" → "a_cp.txt")。
     拡張子が無ければ末尾に付ける。フォルダ名には使わない(呼び出し側で末尾に付ける)。"""

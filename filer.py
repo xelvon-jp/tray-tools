@@ -5992,10 +5992,16 @@ class FilerWindow(QWidget):
             return
         if not pane.path or self._refuse_archive("フォルダ作成") or self._refuse_flat("フォルダ作成"):
             return
-        name = self.ask_text("フォルダ作成", "新しいフォルダの名前", "")
+        # 日時プレフィックスを選択状態で入れて開く。そのまま打ち始めれば消えて
+        # 通常の名前になり、→ で確定すれば日時付きになる(付けることが多いため)。
+        prefix = core.stamp_prefix(datetime.now())
+        name = self.ask_text("フォルダ作成", "新しいフォルダの名前", prefix,
+                             select=len(prefix))
         if name is None:
             return
         name = name.strip()
+        if name == prefix:
+            name = prefix[:-1]  # 日時だけで作るなら末尾の "_" は落とす
         problem = core.validate_name(name)
         if problem:
             self.log(f"フォルダ作成: {problem}")

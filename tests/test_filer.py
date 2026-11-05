@@ -797,6 +797,43 @@ def test_window_copy_renamed():
             w.close()
             w.deleteLater()
 
+        # 左右が同じフォルダでも、名前を変える複写はできる
+        w2 = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(left),
+                                          "editor": "x"}},
+                               str(settings_path))
+        w2.show()
+        w2.start()
+        _wait(w2)
+        calls.clear()
+        w2.choose_menu = choose
+        w2.ask_text = lambda title, label, text="", select=None: state["answer"]
+        sh.copy_files_named = fake_named
+        try:
+            L2 = w2.left
+            # B: _cp 付与なら同フォルダでも届く
+            L2.set_cursor(_names(L2).index("beta.md"))
+            state["choice"] = "suffix_other"
+            w2.cmd_copy_menu()
+            for _ in range(100):
+                QTest.qWait(20)
+                if w2._op_running is None and not w2._op_queue:
+                    break
+            assert calls[-1] == ([str(left / "beta.md")],
+                                 [str(left / "beta_cp.md")]), calls
+            assert (left / "beta_cp.md").exists()
+            # R: 同フォルダでリネーム入力が同名 → 飛ばして何も積まない
+            before = len(calls)
+            L2.set_cursor(_names(L2).index("beta.md"))
+            state["choice"] = "rename_other"
+            state["answer"] = "beta.md"
+            w2.cmd_copy_menu()
+            assert len(calls) == before
+            assert "同じ名前のため飛ばしました" in w2.log_view.toPlainText()
+        finally:
+            sh.copy_files_named = orig_named
+            w2.close()
+            w2.deleteLater()
+
 
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに

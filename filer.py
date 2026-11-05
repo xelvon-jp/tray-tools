@@ -5401,9 +5401,11 @@ class FilerWindow(QWidget):
             if dst.stash:
                 self.log(f"{label}: 反対窓が一時置き場のときは使えません")
                 return
-            if not dst.path or core.same_dir(src.path, dst.path):
-                self.log(f"{label}: 反対窓が同じフォルダです")
+            if not dst.path:
+                self.log(f"{label}: 反対窓にフォルダがありません")
                 return
+            # 左右が同じフォルダでも、名前が変わるので複写できる
+            # (通常の反対窓コピーは同名になるため _transfer 側で断る)
             dest_dir, dst_pane = dst.path, dst
         else:
             dest_dir, dst_pane = src.path, src
@@ -5427,7 +5429,7 @@ class FilerWindow(QWidget):
                 if not new_leaf or any(c in new_leaf for c in '\\/:*?"<>|'):
                     self.log(f"{label}: 名前が使えないため飛ばしました: {leaf}")
                     continue
-                if not to_other and new_leaf == leaf:
+                if new_leaf == leaf and core.same_dir(dest_dir, src.path):
                     self.log(f"{label}: 同じ名前のため飛ばしました: {leaf}")
                     continue
             elif entry.is_dir:

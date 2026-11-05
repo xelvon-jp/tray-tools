@@ -393,6 +393,14 @@ def cmd_post(args, message, muse_factory=None):
         # --chat でも、切り替え前に表示中のチャットの下書きを守る(同じ確認を使う)
         reason = check_initial(s, True) if chat_arg else check_initial(s, args.current_chat)
 
+        # 表示中のチャットに前回の依頼 id が見えていれば、それが目的のチャット。
+        # 一覧を開かずにそのまま投稿する(窓口チャットは Muse の作業後もそのまま
+        # 表示されていることが多く、名前が読めなくても続けられるようにするため)。
+        here = bool(expect_text) and any(
+            expect_text in t for t in (refs.get("texts") or []))
+        if not reason and args.current_chat and expect_text and not here:
+            reason = (f"表示中のチャットに『{expect_text}』が見つからない"
+                      "(別のチャットの可能性があるので投稿しない)")
         if args.dry_run:
             result["plan"] = [] if reason else _dry_run_plan(
                 s, args.current_chat, message, chat=chat_arg, expect_text=expect_text)
@@ -405,15 +413,6 @@ def cmd_post(args, message, muse_factory=None):
             result["reason"] = reason
             return 1, result
 
-        # 表示中のチャットに前回の依頼 id が見えていれば、それが目的のチャット。
-        # 一覧を開かずにそのまま投稿する(窓口チャットは Muse の作業後もそのまま
-        # 表示されていることが多く、名前が読めなくても続けられるようにするため)。
-        here = bool(expect_text) and any(
-            expect_text in t for t in (refs.get("texts") or []))
-        if args.current_chat and expect_text and not here:
-            result["reason"] = (f"表示中のチャットに『{expect_text}』が見つからない"
-                                "(別のチャットの可能性があるので投稿しない)")
-            return 1, result
         if chat_arg and here:
             steps.append(f"表示中のチャットに『{expect_text}』があるので切り替えない")
         elif chat_arg:

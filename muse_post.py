@@ -911,9 +911,10 @@ def cmd_post_desk(args, message, muse_factory=None, desk_path=None):
     code, out = cmd_post(args, message, muse_factory=muse_factory)
     out["desk"] = args.desk
     if chat is None:
-        out["desk_action"] = "新しい窓口チャットを作る" if args.dry_run else "新しい窓口チャットを作った"
+        out["desk_action"] = "新しい窓口チャットを作った" if code == 0 and not args.dry_run else "新しい窓口チャットを作る(予定)"
     else:
-        out["desk_action"] = f"窓口チャット『{chat}』に投稿する" if args.dry_run else f"窓口チャット『{chat}』に投稿した"
+        out["desk_action"] = (f"窓口チャット『{chat}』に投稿した" if code == 0 and not args.dry_run
+                              else f"窓口チャット『{chat}』に投稿する(予定)")
     if code != 0:
         if chat is not None and "見つからない" in (out.get("reason") or ""):
             out["reason"] += ("(窓口チャットがアーカイブされたか名前が変わったかもしれない。"

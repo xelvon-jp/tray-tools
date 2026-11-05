@@ -880,6 +880,144 @@ def test_parse_card_real_quirks():
     assert mp.approval_decision(card, expect) is None
 
 
+# ---------------------------------------------------------------
+# 窓口チャット(--desk)
+def test_desk_plan():
+    assert mpost.desk_plan({}, "tray-tools") == (None, None)
+    desks = {"tray-tools": {"chat": "窓口", "last_id": "20261105-04"}}
+    assert mpost.desk_plan(desks, "tray-tools") == ("窓口", "20261105-04")
+    assert mpost.desk_plan(desks, "tray-tools", new_desk=True) == (None, None)
+    assert mpost.desk_plan(desks, "other") == (None, None)
+    assert mpost.desk_plan({"tray-tools": "壊れた値"}, "tray-tools") == (None, None)
+
+
+def test_desk_record_counts_and_keeps_since():
+    d1 = mpost.desk_record({}, "r", "窓口", "id1", "T1", new_chat=True)
+    assert d1["r"] == {"chat": "窓口", "last_id": "id1", "updated": "T1",
+                       "since": "T1", "posts": 1}
+    d2 = mpost.desk_record(d1, "r", "窓口", "id2", "T2", new_chat=False)
+    assert d2["r"]["since"] == "T1" and d2["r"]["posts"] == 2 and d2["r"]["last_id"] == "id2"
+    assert d1["r"]["posts"] == 1  # 元は変えない
+
+
+def _desk_args(**kw):
+    from types import SimpleNamespace
+    a = {"desk": "tray-tools", "request_id": "20261105-05", "new_desk": False,
+         "dry_run": False, "chat": None, "expect_text": None, "current_chat": False}
+    a.update(kw)
+    return SimpleNamespace(**a)
+
+
+def _tmp_desk(tmpdir, desks=None):
+    path = os.path.join(tmpdir, "muse_desks.json")
+    if desks is not None:
+        mpost.save_desks(desks, path)
+    return path
+
+
+def test_cmd_post_desk_uses_existing_chat_and_updates():
+    import tempfile
+
+    def run():
+        with tempfile.TemporaryDirectory() as d:
+            path = _tmp_desk(d, {"tray-tools": {"chat": "対象チャット",
+                                                "last_id": "20261105-02", "posts": 3,
+                                                "since": "S"}})
+            fake = _FakeChatMuse()
+            code, out = mpost.cmd_post_desk(_desk_args(), "続きの依頼です",
+                                            muse_factory=lambda: fake, desk_path=path)
+            assert code == 0, out
+            assert fake.invoke_calls == ["openlist", "chatbtn", "send"]
+            e = mpost.load_desks(path)["tray-tools"]
+            assert e["last_id"] == "20261105-05" and e["posts"] == 4 and e["since"] == "S", e
+    _with_fast_timeouts(run)
+
+
+def test_cmd_post_desk_missing_chat_stops_without_new_chat():
+    import tempfile
+
+    def run():
+        with tempfile.TemporaryDirectory() as d:
+            path = _tmp_desk(d, {"tray-tools": {"chat": "アーカイブ済み",
+                                                "last_id": "20261105-02"}})
+            fake = _FakeChatMuse(target="別のチャット")
+            code, out = mpost.cmd_post_desk(_desk_args(), "続きの依頼です",
+                                            muse_factory=lambda: fake, desk_path=path)
+            assert code == 1 and "--new-desk" in out["reason"], out
+            assert "new" not in fake.invoke_calls and fake.set_calls == []
+            assert mpost.load_desks(path)["tray-tools"]["last_id"] == "20261105-02"
+    _with_fast_timeouts(run)
+
+
+class _FakeNewDeskMuse(_FakeMuse):
+    """新しいチャットを作り、送信後に名前が付く偽物。"""
+
+    def __init__(self, final_title="窓口になる話題"):
+        super().__init__(after_new={"descendants": 60, "message_buttons": 0,
+                                    "chat_title": "新しいチャット"})
+        self.final_title = final_title
+
+    def invoke(self, el):
+        super().invoke(el)
+        if el == "send" and self.final_title:
+            self.after_new = dict(self.after_new, chat_title=self.final_title)
+
+
+def test_cmd_post_desk_creates_and_records_new_chat():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = _tmp_desk(d)
+        fake = _FakeNewDeskMuse()
+        code, out = mpost.cmd_post_desk(_desk_args(), "新しい依頼です",
+                                        muse_factory=lambda: fake, desk_path=path)
+        assert code == 0, out
+        assert "new" in fake.invoke_calls
+        e = mpost.load_desks(path)["tray-tools"]
+        assert e["chat"] == "窓口になる話題" and e["last_id"] == "20261105-05" and e["posts"] == 1
+
+
+def test_cmd_post_desk_unsettled_title_not_recorded():
+    import tempfile
+    old = mpost.TITLE_TIMEOUT
+    mpost.TITLE_TIMEOUT = 0.05
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = _tmp_desk(d)
+            fake = _FakeNewDeskMuse(final_title=None)
+            code, out = mpost.cmd_post_desk(_desk_args(), "新しい依頼です",
+                                            muse_factory=lambda: fake, desk_path=path)
+            assert code == 0 and "desk_note" in out, out
+            assert mpost.load_desks(path) == {}
+    finally:
+        mpost.TITLE_TIMEOUT = old
+
+
+def test_cmd_desk_set_and_list():
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        path = _tmp_desk(d)
+        code, out = mpost.cmd_desk(SimpleNamespace(set="r", chat="窓口", last_id="id9"), path)
+        assert code == 0 and out["entry"]["chat"] == "窓口"
+        code, out = mpost.cmd_desk(SimpleNamespace(set=None, chat=None, last_id=None), path)
+        assert out["desks"]["r"]["last_id"] == "id9"
+        code, out = mpost.cmd_desk(SimpleNamespace(set="r", chat=None, last_id=None), path)
+        assert code == 2
+
+
+def test_desk_bad_args_exit_2():
+    import contextlib
+    import io
+    import json as _json
+    for argv in (["post", "--message", "x", "--desk", "r"],
+                 ["post", "--message", "x", "--desk", "r", "--request-id", "i", "--chat", "c"],
+                 ["post", "--message", "x", "--new-desk"]):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = mpost.main(argv)
+        assert code == 2 and _json.loads(buf.getvalue())["ok"] is False, argv
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

@@ -5,6 +5,8 @@
 #   python muse_post.py status
 #   python muse_post.py post --message "..." [--current-chat] [--dry-run]
 #   python muse_post.py post --message "..." --chat "チャット名" [--expect-text "依頼id"]
+#   python muse_post.py post --message "..." --desk tray-tools --request-id 依頼id [--new-desk]
+#   python muse_post.py desk [--set tray-tools --chat "チャット名" --last-id 依頼id]
 #   python muse_post.py post --message-file handoff\xxx.txt
 #   python muse_post.py approve --owner X --repo Y --branch muse/xxx --allow-path muse_post.py [--dry-run]
 #   python muse_post.py watch --repo-dir R:\claude\tray-tools --owner X --repo Y --branch muse/xxx --path handoff\xxx.result.md --allow-path muse_post.py
@@ -83,7 +85,7 @@ except ImportError as _e:  # ModuleNotFoundError を含む
     _ensure_uia = find_window = None
     _UIA_IMPORT_ERROR = _e
 
-VERSION = "20261105-02"
+VERSION = "20261105-03"
 
 
 # =========================================================================
@@ -837,6 +839,121 @@ class _JsonArgParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
+# =========================================================================
+# 窓口チャット(--desk)
+# =========================================================================
+# 【なぜ窓口チャットなのか】
+# 依頼のたびに新しいサイドチャットを作ると、チャットが増えてアーカイブの手間も
+# 増える(陽太さんの要望で 20261105 に変更)。依頼の中身はすべて GitHub の依頼書に
+# あり、Muse は毎回それを読むので、会話の流れに頼る必要はない。そこでリポジトリ
+# ごとに「窓口」のチャットを1つ決め、毎回そこに投稿する。
+#
+# 窓口のチャット名と、最後に投稿した依頼 id を DESK_FILE に控える。次の投稿では
+# その名前のチャットを開き、前回の id が画面にあることを確かめてから書く
+# (--chat --expect-text と同じ確かめ方。一覧が開いたままだとチャット名を
+# 読めないので、id が唯一の証拠になる)。
+# チャット名は個人の作業内容なので、public リポジトリには置かない。
+#
+# 窓口が控えに無い(初回)か --new-desk のときは、新しいサイドチャットを作り、
+# Muse が付けた名前を新しい窓口として控える。控えにあるのに一覧で見つからない
+# ときは、勝手に作り直さず止まる(陽太さんがアーカイブした・名前が変わった、
+# などを人が見て --new-desk を付け直す)。
+DESK_FILE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                         "traytools", "muse_desks.json")
+
+
+def load_desks(path=None):
+    path = path or DESK_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_desks(desks, path=None):
+    path = path or DESK_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(desks, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def desk_plan(desks, name, new_desk=False):
+    """窓口への投稿先を決める。(chat, expect_text) を返す。
+    (None, None) は「新しいサイドチャットを作る」。"""
+    entry = desks.get(name) if isinstance(desks, dict) else None
+    if new_desk or not isinstance(entry, dict) or not entry.get("chat"):
+        return None, None
+    return entry["chat"], entry.get("last_id") or None
+
+
+def desk_record(desks, name, chat, request_id, when, new_chat):
+    """投稿できたあとの控えを作る(元の dict は変えない)。"""
+    out = dict(desks) if isinstance(desks, dict) else {}
+    old = out.get(name) if isinstance(out.get(name), dict) else {}
+    entry = {"chat": chat, "last_id": request_id, "updated": when}
+    entry["since"] = when if new_chat else old.get("since", when)
+    entry["posts"] = 1 if new_chat else int(old.get("posts", 0) or 0) + 1
+    out[name] = entry
+    return out
+
+
+def cmd_post_desk(args, message, muse_factory=None, desk_path=None):
+    """--desk: 窓口チャットを引いて cmd_post に渡し、投稿できたら控えを更新する。"""
+    desks = load_desks(desk_path)
+    chat, expect = desk_plan(desks, args.desk, args.new_desk)
+    args.chat = chat
+    args.expect_text = expect
+    args.current_chat = False
+    code, out = cmd_post(args, message, muse_factory=muse_factory)
+    out["desk"] = args.desk
+    if chat is None:
+        out["desk_action"] = "新しい窓口チャットを作る" if args.dry_run else "新しい窓口チャットを作った"
+    else:
+        out["desk_action"] = f"窓口チャット『{chat}』に投稿する" if args.dry_run else f"窓口チャット『{chat}』に投稿した"
+    if code != 0:
+        if chat is not None and "見つからない" in (out.get("reason") or ""):
+            out["reason"] += ("(窓口チャットがアーカイブされたか名前が変わったかもしれない。"
+                              "確かめてから --new-desk で作り直す)")
+        return code, out
+    if args.dry_run:
+        return code, out
+    title = chat if chat is not None else out.get("chat_title")
+    if chat is None and not out.get("chat_title_settled"):
+        # 名前が決まる前に読んだ値かもしれない。控えに入れると次回に別のチャットを開きうる
+        out["desk_note"] = ("新しいチャットの名前が定まらなかったので控えに入れていない。"
+                            "status で名前を確かめて desk --set で控える")
+        return code, out
+    try:
+        save_desks(desk_record(desks, args.desk, title, args.request_id, now_iso(),
+                               chat is None), desk_path)
+        out["desk_chat"] = title
+    except OSError as e:
+        out["desk_note"] = f"控え(muse_desks.json)を書けなかった: {e}"
+    return code, out
+
+
+def cmd_desk(args, desk_path=None):
+    """窓口の控えを見る / 手で直す(名前が定まらなかったとき、名前が変わったとき)。"""
+    desks = load_desks(desk_path)
+    if not args.set:
+        return 0, {"ok": True, "desks": desks, "path": desk_path or DESK_FILE}
+    if not args.chat:
+        return 2, {"ok": False, "reason": "引数の誤り: --set には --chat が要る"}
+    old = desks.get(args.set) if isinstance(desks.get(args.set), dict) else {}
+    when = now_iso()
+    desks = dict(desks)
+    desks[args.set] = {"chat": args.chat,
+                       "last_id": args.last_id or old.get("last_id"),
+                       "updated": when, "since": old.get("since", when),
+                       "posts": int(old.get("posts", 0) or 0)}
+    save_desks(desks, desk_path)
+    return 0, {"ok": True, "desk": args.set, "entry": desks[args.set]}
+
+
 def _emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -856,9 +973,17 @@ def build_parser():
     post.add_argument("--chat", help="この名前の既存チャットを開いて投稿する")
     post.add_argument("--expect-text",
                       help="--chat で切り替えた画面にこの文字列があることを確かめる")
+    post.add_argument("--desk", help="このリポジトリの窓口チャットに投稿する(例: tray-tools)")
+    post.add_argument("--request-id", help="--desk で、今回の依頼 id(次回の確かめに使う)")
+    post.add_argument("--new-desk", action="store_true",
+                      help="--desk で、新しいサイドチャットを作って窓口を切り替える")
     post.add_argument("--dry-run", action="store_true", help="UI を一切変えずに計画だけ返す")
     post.add_argument("--allow-multiline", action="store_true",
                       help="改行入りの投稿文を許す(送信の挙動は未検証)")
+    desk = sub.add_parser("desk", help="窓口チャットの控えを見る / 直す")
+    desk.add_argument("--set", help="この窓口(例: tray-tools)の控えを書き換える")
+    desk.add_argument("--chat", help="--set で、窓口にするチャット名")
+    desk.add_argument("--last-id", help="--set で、そのチャットに最後に投稿した依頼 id")
     approve = sub.add_parser("approve", help="承認カードが指定と一致するときだけ許可する")
     approve.add_argument("--owner", required=True)
     approve.add_argument("--repo", required=True)
@@ -904,7 +1029,7 @@ def main(argv=None):
         _emit({"version": VERSION})
         return 0
     if not args.cmd:
-        _emit({"ok": False, "reason": "サブコマンド(status / post / approve / watch / wait)を指定する"})
+        _emit({"ok": False, "reason": "サブコマンド(status / post / desk / approve / watch / wait)を指定する"})
         return 2
     try:
         if args.cmd == "status":
@@ -916,6 +1041,16 @@ def main(argv=None):
             if args.expect_text and not args.chat:
                 _emit({"ok": False, "reason": "引数の誤り: --expect-text は --chat と一緒に使う"})
                 return 2
+            if args.desk and (args.chat or args.current_chat or args.expect_text):
+                _emit({"ok": False, "reason": "引数の誤り: --desk は --chat / --current-chat / "
+                                              "--expect-text と同時に使えない"})
+                return 2
+            if args.desk and not args.request_id:
+                _emit({"ok": False, "reason": "引数の誤り: --desk には --request-id が要る"})
+                return 2
+            if (args.new_desk or args.request_id) and not args.desk:
+                _emit({"ok": False, "reason": "引数の誤り: --new-desk / --request-id は --desk と一緒に使う"})
+                return 2
             try:
                 message = read_message(args)
             except OSError as e:
@@ -925,7 +1060,12 @@ def main(argv=None):
             if err:
                 _emit({"ok": False, "reason": err})
                 return 2
-            code, out = cmd_post(args, message)
+            if args.desk:
+                code, out = cmd_post_desk(args, message)
+            else:
+                code, out = cmd_post(args, message)
+        elif args.cmd == "desk":
+            code, out = cmd_desk(args)
         elif args.cmd == "approve":
             code, out = cmd_approve(args)
         elif args.cmd == "watch":

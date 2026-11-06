@@ -23,7 +23,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 import filer_box as fb  # noqa: E402
 
-TOKEN = "abcdefghij1234567890"          # 作り物の鍵
 IN = "\u3000"
 
 
@@ -46,10 +45,15 @@ def make_db(path):
         (111, 0, 110, "b.txt", "9111", 0),
         (120, 0, 0, "top.txt", "9120", 0),
     ]
+    conn.execute("CREATE TABLE box_item (box_id VARCHAR, item_type INTEGER,"
+                 " parent_item_id VARCHAR, name VARCHAR COLLATE NOCASE)")
+    box_of = {lid: box_id for lid, _t, _p, _n, box_id, _bt in rows}
     for i, (lid, typ, parent, name, box_id, box_type) in enumerate(rows):
         conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, typ, parent, name))
         conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
                      (i, lid, box_id, box_type))
+        conn.execute("INSERT INTO box_item VALUES (?,?,?,?)",
+                     (box_id, box_type, None if parent is None else box_of[parent], name))
     conn.commit()
     conn.close()
 
@@ -135,145 +139,61 @@ def test_broken_db():
             pass
 
 
-def test_parse_shared_link():
-    ok = fb.parse_shared_link
-    assert ok(f"https://app.box.com/s/{TOKEN}") == ("app.box.com", TOKEN)
-    assert ok(f"https://app.box.com/s/{TOKEN}/") == ("app.box.com", TOKEN)
-    assert ok(f"  https://app.box.com/s/{TOKEN}?x=1#y ") == ("app.box.com", TOKEN)
-    assert ok(f"https://app.box.com/s/{TOKEN}/folder/12345") == ("app.box.com", TOKEN)
-    assert ok(f"https://acme.app.box.com/s/{TOKEN}") == ("acme.app.box.com", TOKEN)
-    assert ok(f"https://ACME.app.box.com/s/{TOKEN}") == ("acme.app.box.com", TOKEN)
-    for bad in ("", "abc", None, 5,
-                f"http://app.box.com/s/{TOKEN}",              # https のみ
-                f"https://example.com/s/{TOKEN}",             # box.com 以外
-                f"https://evilbox.com/s/{TOKEN}",
-                f"https://app.box.com.evil.com/s/{TOKEN}",
-                "https://app.box.com/s/",                     # 鍵が無い
-                "https://app.box.com/s/short",                # 短すぎる
-                "https://app.box.com/folder/12345",
-                f"https://app.box.com/file/{TOKEN}"):
-        assert ok(bad) is None, bad
-
-
 def test_build_share_text_single_file_and_folder():
     with Env() as env:
-        links = [fb.make_link("9100", "Box/ProjA", "app.box.com", TOKEN)]
         f = item(env, "ProjA", "資料", "見積書.xlsx")
-        assert fb.build_share_text([f], links) == (
+        assert fb.build_share_text([f]) == (
             "/Box/ProjA/資料/\r\n"
-            f"{IN}https://app.box.com/s/{TOKEN}/folder/9101\r\n"
+            f"{IN}https://app.box.com/folder/9101\r\n"
             f"{IN}{IN}見積書.xlsx")
         d = item(env, "ProjA", "資料")
-        assert fb.build_share_text([d], links) == (
+        assert fb.build_share_text([d]) == (
             "/Box/ProjA/資料/\r\n"
-            f"{IN}https://app.box.com/s/{TOKEN}/folder/9101")
+            f"{IN}https://app.box.com/folder/9101")
         # 案件フォルダ自身
-        assert fb.build_share_text([item(env, "ProjA")], links) == (
-            "/Box/ProjA/\r\n" f"{IN}https://app.box.com/s/{TOKEN}/folder/9100")
+        assert fb.build_share_text([item(env, "ProjA")]) == (
+            "/Box/ProjA/\r\n" f"{IN}https://app.box.com/folder/9100")
+        # 共有リンク(/s/<鍵>)の形は出さない
+        assert "/s/" not in fb.build_share_text([f, d])
+        assert fb.folder_url("9101") == "https://app.box.com/folder/9101"
 
 
 def test_build_share_text_multiple():
     with Env() as env:
-        links = [fb.make_link("9100", "Box/ProjA", "acme.app.box.com", TOKEN)]
         a = item(env, "ProjA", "資料", "見積書.xlsx")
         b = item(env, "ProjA", "資料", "memo.txt")
         c = item(env, "ProjA", "top_a.txt")
         # 同じフォルダの複数ファイルは1つの見出しにまとまる
-        assert fb.build_share_text([a, b], links) == (
+        assert fb.build_share_text([a, b]) == (
             "/Box/ProjA/資料/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9101\r\n"
+            f"{IN}https://app.box.com/folder/9101\r\n"
             f"{IN}{IN}見積書.xlsx\r\n{IN}{IN}memo.txt")
         # 別フォルダは初めて出た順に、空行で区切る。間に別フォルダが挟まっても束ねる
-        assert fb.build_share_text([a, c, b], links) == (
+        assert fb.build_share_text([a, c, b]) == (
             "/Box/ProjA/資料/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9101\r\n"
+            f"{IN}https://app.box.com/folder/9101\r\n"
             f"{IN}{IN}見積書.xlsx\r\n{IN}{IN}memo.txt\r\n\r\n"
             "/Box/ProjA/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9100\r\n"
+            f"{IN}https://app.box.com/folder/9100\r\n"
             f"{IN}{IN}top_a.txt")
         # フォルダ対象は1つずつ自分の塊(ファイルの塊とも、ほかのフォルダとも空行で分ける)
         d1, d2 = item(env, "ProjA", "資料"), item(env, "ProjA")
-        assert fb.build_share_text([a, d1, d2], links) == (
-            "/Box/ProjA/資料/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9101\r\n"
-            f"{IN}{IN}見積書.xlsx\r\n\r\n"
-            "/Box/ProjA/資料/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9101\r\n\r\n"
-            "/Box/ProjA/\r\n"
-            f"{IN}https://acme.app.box.com/s/{TOKEN}/folder/9100")
-        assert fb.build_share_text([], links) == ""
-
-
-def test_build_share_text_unregistered_plain():
-    with Env() as env:
-        a = item(env, "ProjA", "資料", "見積書.xlsx")
-        assert fb.build_share_text([a], []) == (
+        assert fb.build_share_text([a, d1, d2]) == (
             "/Box/ProjA/資料/\r\n"
             f"{IN}https://app.box.com/folder/9101\r\n"
-            f"{IN}{IN}見積書.xlsx")
-        # 登録が別の案件にあるだけなら通常の形のまま
-        other = [fb.make_link("9110", "Box/ProjB", "app.box.com", TOKEN)]
-        assert "/s/" not in fb.build_share_text([a], other)
+            f"{IN}{IN}見積書.xlsx\r\n\r\n"
+            "/Box/ProjA/資料/\r\n"
+            f"{IN}https://app.box.com/folder/9101\r\n\r\n"
+            "/Box/ProjA/\r\n"
+            f"{IN}https://app.box.com/folder/9100")
+        assert fb.build_share_text([]) == ""
+
+
+def test_build_share_text_root_file():
+    with Env() as env:
         # 根直下のファイルは根(ID 0)の見出し
-        assert fb.build_share_text([item(env, "top.txt")], other) == (
+        assert fb.build_share_text([item(env, "top.txt")]) == (
             "/Box/\r\n" f"{IN}https://app.box.com/folder/0\r\n" f"{IN}{IN}top.txt")
-        # 壊れた登録は無視する
-        assert "/s/" not in fb.build_share_text([a], [{"folder_id": "9100"}, "x", None])
-
-
-def test_find_link_nearest_by_id():
-    with Env() as env:
-        far = fb.make_link("9100", "Box/ProjA", "app.box.com", "farfarfarfar")
-        near = fb.make_link("9101", "Box/ProjA/資料", "app.box.com", "nearnearnear")
-        f = item(env, "ProjA", "資料", "見積書.xlsx")
-        assert fb.find_link(f, [far, near])["token"] == "nearnearnear"
-        assert fb.find_link(f, [far])["token"] == "farfarfarfar"
-        # フォルダ自身の登録も効く。登録は子孫にだけ効き、兄弟・親には効かない
-        assert fb.find_link(item(env, "ProjA", "資料"), [near])["token"] == "nearnearnear"
-        assert fb.find_link(item(env, "ProjA"), [near]) is None
-        assert fb.find_link(item(env, "ProjA", "top_a.txt"), [near]) is None
-        assert fb.find_link(item(env, "ProjB", "b.txt"), [far, near]) is None
-        # 登録に残っている path が古くても(改名後でも)ID で当たる
-        stale = fb.make_link("9100", "Box/旧名", "app.box.com", "stalestalestale")
-        assert fb.find_link(f, [stale])["token"] == "stalestalestale"
-        # 同じフォルダを登録し直すと置き換わる
-        new = fb.make_link("9101", "Box/ProjA/資料", "h.box.com", "newnewnewnew")
-        links = fb.with_link([far, near], new)
-        assert [l["folder_id"] for l in links] == ["9100", "9101"]
-        assert links[1]["token"] == "newnewnewnew"
-
-
-def test_candidate_folders():
-    with Env() as env:
-        f = item(env, "ProjA", "資料", "見積書.xlsx")
-        assert fb.candidate_folders(f) == [("Box/ProjA", "9100", "Box/ProjA"),
-                                           ("Box/ProjA/資料", "9101", "Box/ProjA/資料")]
-        assert [c[0] for c in fb.candidate_folders(item(env, "ProjA", "資料"))] == [
-            "Box/ProjA", "Box/ProjA/資料"]
-        assert fb.candidate_folders(item(env, "top.txt")) == []
-        # 表示("Box/…")→ 手元の同期フォルダの中の実際のパス(右クリックメニューを出す先)
-        assert fb.local_folder("Box/ProjA/資料") == env.p("ProjA", "資料")
-        assert fb.local_folder("Box/ProjA") == env.p("ProjA")
-
-
-def test_copy_link_items_and_extract_shared_link():
-    assert "共有リンクをコピー" in fb.COPY_LINK_ITEMS
-    assert "Copy Shared Link" in fb.COPY_LINK_ITEMS
-    ex = fb.extract_shared_link
-    # Box の「共有リンクをコピー」が入れるのはリンクだけ
-    assert ex(f"https://app.box.com/s/{TOKEN}") == ("app.box.com", TOKEN)
-    assert ex(f"https://app.box.com/s/{TOKEN}\r\n") == ("app.box.com", TOKEN)
-    # 文の中・前後に別の URL があっても、受けられる最初の共有リンクを拾う
-    assert ex(f"リンク: https://acme.app.box.com/s/{TOKEN} です") == ("acme.app.box.com", TOKEN)
-    assert ex(f"https://example.com/s/{TOKEN} https://app.box.com/folder/1 "
-              f"https://app.box.com/s/{TOKEN}2。") == ("app.box.com", TOKEN + "2")
-    assert ex(f"(https://app.box.com/s/{TOKEN})") == ("app.box.com", TOKEN)
-    assert ex(f"「https://app.box.com/s/{TOKEN}」") == ("app.box.com", TOKEN)
-    assert ex(f"共有リンクはhttps://app.box.com/s/{TOKEN}です") == ("app.box.com", TOKEN)
-    assert ex(f"'https://app.box.com/s/{TOKEN}'") == ("app.box.com", TOKEN)
-    for bad in ("", None, 5, "abc", "https://app.box.com/folder/12345",
-                f"http://app.box.com/s/{TOKEN}", f"https://evilbox.com/s/{TOKEN}"):
-        assert ex(bad) is None, bad
 
 
 def test_copy_cache_reuse_and_refresh():
@@ -286,6 +206,7 @@ def test_copy_cache_reuse_and_refresh():
         conn = sqlite3.connect(str(env.db))
         conn.execute("INSERT INTO local_item VALUES (130, 0, 101, 'new.txt')")
         conn.execute("INSERT INTO item_mapping_between_fs VALUES (99, 130, '9130', 0)")
+        conn.execute("INSERT INTO box_item VALUES ('9130', 0, '9101', 'new.txt')")
         conn.commit()
         conn.close()
         second = fb.copy_db(env.cache)
@@ -300,6 +221,193 @@ def test_copy_cache_reuse_and_refresh():
         assert not os.path.exists(os.path.dirname(third))
         # 掃除などで消されても、次の呼び出しで作り直す
         assert os.path.isfile(fb.copy_db(env.cache))
+
+
+def _add_rows(env, rows, box_side=True):
+    """env の sync.db に行を足す。rows = [(local_id, parent, name, box_id または None, 種別)]。
+    box_id が None なら対応表には入れない(Box 側と結び付いていない古い行)。"""
+    conn = sqlite3.connect(str(env.db))
+    n = 1000
+    for lid, parent, name, box_id, box_type in rows:
+        conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, 1, parent, name))
+        if box_id is not None:
+            n += 1
+            conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
+                         (n, lid, box_id, box_type))
+            if box_side and parent is not None:
+                parent_box = conn.execute(
+                    "SELECT box_id FROM item_mapping_between_fs WHERE local_id=?",
+                    (parent,)).fetchone()[0]
+                conn.execute("INSERT INTO box_item VALUES (?,?,?,?)",
+                             (box_id, box_type, parent_box, name))
+    conn.commit()
+    conn.close()
+    fb.discard_cache()
+
+
+def test_ambiguous_same_name_both_mapped():
+    with Env() as env:
+        # 資料(101) と同じ親・同じ名前の行がもう1つ(削除→作り直しの残りなど)
+        _add_rows(env, [(201, 100, "資料", "9201", 1)])
+        for path in (("ProjA", "資料"), ("ProjA", "資料", "memo.txt")):
+            try:
+                item(env, *path)
+            except fb.Ambiguous as e:
+                assert str(e) == "資料", str(e)
+            else:
+                raise AssertionError("決められないのに通った")
+        # Ambiguous は NotSynced の一種(区別しない呼び出し側では「見つからない」扱い)
+        assert issubclass(fb.Ambiguous, fb.NotSynced)
+        # resolve_many: ambiguous を渡せばそちらへ、渡さなければ missing へ
+        paths = [env.p("ProjA", "資料"), env.p("ProjB", "b.txt")]
+        amb = []
+        items, missing = fb.resolve_many(paths, env.cache, amb)
+        assert [i.name for i in items] == ["b.txt"] and missing == [] and amb == ["資料"]
+        items, missing = fb.resolve_many(paths, env.cache)
+        assert [i.name for i in items] == ["b.txt"] and missing == ["資料"]
+
+
+def test_ambiguous_case_only_difference_picks_exact():
+    with Env() as env:
+        # 大文字小文字だけ違う行(NOCASE なので同じ name 検索に掛かる)。綴りが一致する方を採る
+        _add_rows(env, [(202, 100, "PROJC", "9202", 1), (203, 100, "projc", "9203", 1)])
+        assert item(env, "ProjA", "PROJC").box_id == "9202"
+        assert item(env, "ProjA", "projc").box_id == "9203"
+        # どちらとも綴りが違えば決められない
+        try:
+            item(env, "ProjA", "ProjC")
+        except fb.Ambiguous:
+            pass
+        else:
+            raise AssertionError("綴りが合わないのに通った")
+
+
+def test_duplicate_one_unmapped_picks_mapped():
+    with Env() as env:
+        # 同名の行が2つあっても、対応表に載っているのが1つだけならそれを使う
+        _add_rows(env, [(204, 100, "資料", None, 1)])
+        got = item(env, "ProjA", "資料", "memo.txt")
+        assert got.ids == ("9100", "9101", "9103")
+        # 対応の付いた行が1つも無ければ従来どおり NotSynced(Ambiguous ではない)
+        _add_rows(env, [(205, 100, "stale", None, 1), (206, 100, "stale", None, 1)])
+        try:
+            item(env, "ProjA", "stale")
+        except fb.Ambiguous:
+            raise AssertionError("対応が無いのに Ambiguous")
+        except fb.NotSynced:
+            pass
+
+
+def test_ambiguous_two_roots():
+    with Env() as env:
+        _add_rows(env, [(300, None, "", "0", 1)])
+        try:
+            item(env, "ProjA")
+        except fb.Ambiguous:
+            pass
+        else:
+            raise AssertionError("根が2つなのに通った")
+
+
+def test_share_blocks():
+    with Env() as env:
+        a = item(env, "ProjA", "資料", "見積書.xlsx")
+        b = item(env, "ProjA", "資料", "memo.txt")
+        c = item(env, "ProjA", "top_a.txt")
+        u1 = "https://app.box.com/folder/9101"
+        u0 = "https://app.box.com/folder/9100"
+        assert fb.share_blocks([a]) == [("/Box/ProjA/資料/", u1)]
+        assert fb.share_blocks([a, c, b]) == [("/Box/ProjA/資料/", u1), ("/Box/ProjA/", u0)]
+        d1, d2 = item(env, "ProjA", "資料"), item(env, "ProjA")
+        assert fb.share_blocks([d1]) == [("/Box/ProjA/資料/", u1)]
+        assert fb.share_blocks([a, d1, d2]) == [
+            ("/Box/ProjA/資料/", u1), ("/Box/ProjA/資料/", u1), ("/Box/ProjA/", u0)]
+        # 根直下のファイルは根(ID 0)
+        assert fb.share_blocks([item(env, "top.txt")]) == [
+            ("/Box/", "https://app.box.com/folder/0")]
+        assert fb.share_blocks([]) == []
+        # build_share_text と塊の数・見出し・URL が食い違わない
+        for items in ([a], [a, c, b], [a, d1, d2]):
+            text = fb.build_share_text(items)
+            blocks = fb.share_blocks(items)
+            parts = text.split("\r\n\r\n")
+            assert len(parts) == len(blocks)
+            for part, (shown, url) in zip(parts, blocks):
+                lines = part.split("\r\n")
+                assert lines[0] == shown and lines[1] == IN + url
+
+
+def test_mismatch_and_box_side_checks():
+    with Env() as env:
+        # 一致していれば通る(各階層の ID が Box 側の木と同じ)
+        assert item(env, "ProjA", "資料", "memo.txt").ids == ("9100", "9101", "9103")
+    # 手元の対応が古くて別の box_id を指している → Mismatch(食い違った階層の名前を含む)
+    with Env() as env:
+        conn = sqlite3.connect(str(env.db))
+        conn.execute("UPDATE item_mapping_between_fs SET box_id='9999' WHERE local_id=101")
+        conn.commit()
+        conn.close()
+        fb.discard_cache()
+        for path in (("ProjA", "資料", "memo.txt"), ("ProjA", "資料")):
+            try:
+                item(env, *path)
+            except fb.Mismatch as e:
+                assert e.part == "資料" and "資料" in str(e) and "9999" in str(e), str(e)
+            else:
+                raise AssertionError("食い違いを見逃した")
+        # 祖先が食い違えば、最後の階層が一致していても拒否する(全階層を見る)
+        paths = [env.p("ProjA", "資料", "memo.txt"), env.p("ProjB", "b.txt")]
+        mism = []
+        items, missing = fb.resolve_many(paths, env.cache, [], mism)
+        assert [i.name for i in items] == ["b.txt"] and missing == [] and mism == ["memo.txt"]
+        items, missing = fb.resolve_many(paths, env.cache)
+        assert missing == ["memo.txt"]
+    # Box 側の木に無い → 拒否
+    with Env() as env:
+        conn = sqlite3.connect(str(env.db))
+        conn.execute("DELETE FROM box_item WHERE box_id='9103'")
+        conn.commit()
+        conn.close()
+        fb.discard_cache()
+        try:
+            item(env, "ProjA", "資料", "memo.txt")
+        except fb.Mismatch as e:
+            assert e.part == "memo.txt"
+        else:
+            raise AssertionError("Box 側に無いのに通った")
+    # Box 側で同じ名前が複数 → Ambiguous(綴りが完全一致する1つがあればそれを使う)
+    with Env() as env:
+        conn = sqlite3.connect(str(env.db))
+        conn.execute("INSERT INTO box_item VALUES ('9555', 0, '9101', 'MEMO.txt')")
+        conn.commit()
+        conn.close()
+        fb.discard_cache()
+        assert item(env, "ProjA", "資料", "memo.txt").box_id == "9103"      # 綴りが一致する方
+    with Env() as env:
+        conn = sqlite3.connect(str(env.db))
+        conn.execute("INSERT INTO box_item VALUES ('9556', 0, '9101', 'memo.txt')")
+        conn.commit()
+        conn.close()
+        fb.discard_cache()
+        try:
+            item(env, "ProjA", "資料", "memo.txt")
+        except fb.Ambiguous as e:
+            assert not isinstance(e, fb.Mismatch)
+        else:
+            raise AssertionError("Box 側が曖昧なのに通った")
+    # box_item の表が無い記録は読めない扱い
+    with Env() as env:
+        conn = sqlite3.connect(str(env.db))
+        conn.execute("DROP TABLE box_item")
+        conn.commit()
+        conn.close()
+        fb.discard_cache()
+        try:
+            item(env, "ProjA")
+        except fb.BoxDbError:
+            pass
+        else:
+            raise AssertionError("box_item が無いのに通った")
 
 
 def main():

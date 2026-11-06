@@ -8310,17 +8310,31 @@ def test_window_copy_tree():
             w.deleteLater()
 
 
+def _add_box_item_table(conn, rows):
+    """Box 側の木(box_item)を、(local_id, 種別, 親の local_id, 名前, box_id, box 種別) の
+    並びから作る(親は親の box_id で指す。根の box_id は "0")。"""
+    conn.execute("CREATE TABLE box_item (box_id VARCHAR, item_type INTEGER,"
+                 " parent_item_id VARCHAR, name VARCHAR COLLATE NOCASE)")
+    box_of = {lid: box_id for lid, _t, _p, _n, box_id, _bt in rows}
+    for lid, _typ, parent, name, box_id, box_type in rows:
+        conn.execute("INSERT INTO box_item VALUES (?,?,?,?)",
+                     (box_id, box_type, None if parent is None else box_of[parent], name))
+
+
 def test_window_copy_box_share():
-    """C→L: 対象がすべて Box Drive の中のときだけ項目が出る。登録済みの鍵があればその形で、
-    未登録なら聞いて(登録/登録しない/中止)、結果がクリップボードへ入る。
+    """C→L: 対象がすべて Box Drive の中のときだけ項目が出る。URL は常に
+    https://app.box.com/folder/<ID> の形(共有リンクは作らない・聞かない)。コピーしたあとは確認窓
+    (ブラウザで開いて確かめる)。同じ名前の記録が複数あって決められないものは作らない。
     Box の根と sync.db は一時フォルダに作った偽物(本物の Box Drive には触れない)。"""
     import sqlite3
     import filer
     import filer_box
+    from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel, QPushButton
 
     _qapp()
-    token = "abcdefghij1234567890"          # 作り物の鍵
     with tempfile.TemporaryDirectory() as tmp:
         left, right = _make_tree(tmp)       # Box の外(通常のフォルダ)
         box_root = Path(tmp, "home", "Box")
@@ -8342,11 +8356,16 @@ def test_window_copy_box_share():
             conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, typ, parent, name))
             conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
                          (i, lid, box_id, box_type))
+        _add_box_item_table(conn, rows)
         conn.commit()
         conn.close()
         settings_path = Path(tmp, "settings.json")
         settings_path.write_text("{}", encoding="utf-8")
-        app_settings = {"filer": {"left_path": str(left), "right_path": str(right)}}
+        # 昔の版が残した box_links は読まない・触らない
+        old_links = [{"folder_id": "9100", "path": "Box/ProjA", "host": "app.box.com",
+                      "token": "abcdefghij1234567890"}]
+        app_settings = {"filer": {"left_path": str(left), "right_path": str(right),
+                                  "box_links": old_links}}
         seen = {}
 
         def capture(title, items):
@@ -8356,6 +8375,8 @@ def test_window_copy_box_share():
         filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
         filer_box.discard_cache()
         w = filer.FilerWindow(app_settings, str(settings_path))
+        shown_blocks = []
+        w.show_box_copied = lambda blocks: shown_blocks.append(blocks)    # 確認窓は出さない
         try:
             w.show()
             w.start()
@@ -8377,158 +8398,224 @@ def test_window_copy_box_share():
             assert "box" not in [i[2] for i in seen["items"]]
             filer_box.DB_OVERRIDE = str(db)
 
+            # 常に /folder/<ID> の形。登録を聞くことも、共有リンクを取りに行くこともない
+            assert not hasattr(w, "ask_box_link") and not hasattr(w, "fetch_box_link")
             w.choose_menu = lambda title, items: "box"
-            asked = []
-
-            def ask(item):
-                asked.append(item)
-                return ("register", "9100", "Box/ProjA", "app.box.com", token)
-
-            w.ask_box_link = ask
             clip = QGuiApplication.clipboard()
             w.left.set_cursor(w.left._row_of("見積書.xlsx"))
             w.cmd_copy_menu()
             expected = ("/Box/ProjA/資料/\r\n"
-                        f"　https://app.box.com/s/{token}/folder/9101\r\n"
+                        "　https://app.box.com/folder/9101\r\n"
                         "　　見積書.xlsx")
             assert clip.text() == expected, repr(clip.text())
-            assert len(asked) == 1
             assert "Box: 1件をクリップボードへ" in w.log_view.toPlainText()
-            # 登録は settings.json にだけ残り、次からは聞かれない
-            saved = json.loads(settings_path.read_text(encoding="utf-8"))
-            assert saved["filer"]["box_links"] == [
-                {"folder_id": "9100", "path": "Box/ProjA", "host": "app.box.com", "token": token}]
+            # コピーしたあと、確認窓に出す塊(見出しと URL)を渡す
+            assert shown_blocks == [[("/Box/ProjA/資料/", "https://app.box.com/folder/9101")]], \
+                shown_blocks
+            # 古い box_links は読まず、書き換えもしない
+            assert "/s/" not in clip.text()
+            assert app_settings["filer"]["box_links"] == old_links
+            assert json.loads(settings_path.read_text(encoding="utf-8")) == {}
 
-            def no_ask(item):
-                raise AssertionError("登録済みなのに聞かれた")
-
-            w.ask_box_link = no_ask
             clip.setText("")
             w.left.set_cursor(w.left._row_of("memo.txt"))
             w.cmd_copy_menu()
             assert clip.text().endswith("　　memo.txt"), clip.text()
-            assert f"/s/{token}/folder/9101" in clip.text()
 
             # 同期の記録に無いものは飛ばしてログに出す。全部だめなら何もしない
             clip.setText("keep")
+            n_blocks = len(shown_blocks)
             w.left.set_cursor(w.left._row_of("notsynced.txt"))
             w.cmd_copy_menu()
-            assert clip.text() == "keep"
+            assert clip.text() == "keep" and len(shown_blocks) == n_blocks
             assert "Box: 同期の記録に見つかりません: notsynced.txt" in w.log_view.toPlainText()
 
-            # 未登録: 「登録しない」は通常の形で出して保存しない / 中止は何もしない
-            w.ask_box_link = lambda item: ("plain",)
-            app_settings["filer"]["box_links"] = []
-            filer.save_values(app_settings, str(settings_path), {"box_links": []})
-            w.left.set_cursor(w.left._row_of("memo.txt"))
-            w.cmd_copy_menu()
-            assert clip.text() == ("/Box/ProjA/資料/\r\n"
-                                   "　https://app.box.com/folder/9101\r\n"
-                                   "　　memo.txt"), repr(clip.text())
-            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == []
-            clip.setText("keep")
-            w.ask_box_link = lambda item: None
-            w.cmd_copy_menu()
-            assert clip.text() == "keep"
+            # --- コピー後の確認窓(本物。exec とブラウザは差し替え。窓は出さない) ---
+            del w.show_box_copied
+            opened = []
+            w.open_url = lambda url: opened.append(url)
+            url = "https://app.box.com/folder/9101"
+            seen_dialog = {}
 
-            # 本物の登録ダイアログ(exec と Box からの取得は差し替え。窓は出さない)
-            from PySide6.QtWidgets import QComboBox, QLabel, QLineEdit, QPushButton
-            del w.ask_box_link
-            fetched = []
-
-            def fetch_ok(path):
-                fetched.append(path)
-                return ("acme.app.box.com", token)
-
-            def drive(*steps):
+            def drive_confirm(key):
                 def run(dialog):
-                    for step in steps:
-                        step(dialog)
+                    seen_dialog["title"] = dialog.windowTitle()
+                    seen_dialog["labels"] = [l.text() for l in dialog.findChildren(QLabel)]
+                    buttons = {b.objectName(): b for b in dialog.findChildren(QPushButton)}
+                    seen_dialog["texts"] = [b.text() for b in dialog.findChildren(QPushButton)]
+                    assert buttons["boxCopiedClose"].isDefault()
+                    buttons["boxCopiedOpen1"].click()
+                    assert opened == [url], opened
+                    assert dialog.result() != filer.QDialog.Accepted      # 開いても閉じない
+                    buttons["boxCopiedOpen1"].click()                     # 続けて何度でも
+                    assert opened == [url, url]
+                    dialog.show()
+                    QTest.keyClick(dialog, key)
+                    seen_dialog["result"] = dialog.result()
                     return dialog.result()
                 return run
 
-            def check_initial(dialog):
-                combo = dialog.findChild(QComboBox, "boxFolder")
-                assert [combo.itemText(i) for i in range(combo.count())] == [
-                    "Box/ProjA", "Box/ProjA/資料"]
-                assert combo.currentIndex() == 0          # 既定は一番上(案件の根)
-                assert dialog.findChild(QLineEdit, "boxManual").isHidden()   # 手で貼る欄は隠す
-                texts = [l.text() for l in dialog.findChildren(QLabel)]
-                assert "共有リンクを、どのフォルダ(とその下すべて)に登録しますか？" in texts
-                assert any("「共有リンクをコピー」" in t and "新しく作ります" in t for t in texts)
+            w.exec_dialog = drive_confirm(Qt.Key_Return)
+            clip.setText("")
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+            w.cmd_copy_menu()
+            assert seen_dialog["title"] == "Box の共有用テキストをコピーしました"
+            assert "/Box/ProjA/資料/" in seen_dialog["labels"], seen_dialog
+            assert seen_dialog["texts"] == ["ブラウザで開いて確かめる(&O)", "閉じる"], seen_dialog
+            assert seen_dialog["result"] == filer.QDialog.Accepted        # Enter(既定の「閉じる」)
+            assert clip.text().endswith("　　memo.txt")                   # 閉じてもコピーは残る
+            # Esc でも閉じる
+            seen_dialog.clear()
+            opened.clear()
+            w.exec_dialog = drive_confirm(Qt.Key_Escape)
+            w.cmd_copy_menu()
+            assert seen_dialog["result"] == filer.QDialog.Rejected and opened == [url, url]
+            # 開く処理が例外を投げても、窓もプロセスも落ちない(ログに残る)
+            filer.ERROR_LOG_PATH = os.path.join(tmp, "filer_error.log")
 
-            def click(name):
-                return lambda dialog: dialog.findChild(QPushButton, name).click()
+            def boom(_url):
+                raise RuntimeError("boom")
+            w.open_url = boom
 
-            def reset_links():
-                app_settings["filer"]["box_links"] = []
-                filer.save_values(app_settings, str(settings_path), {"box_links": []})
+            def drive_boom(dialog):
+                dialog.findChild(QPushButton, "boxCopiedOpen1").click()
+                seen_dialog["alive"] = True
+                return dialog.result()
+            w.exec_dialog = drive_boom
+            w.cmd_copy_menu()
+            assert seen_dialog.get("alive") and "boom" in w.log_view.toPlainText()
 
-            # 登録 → Box から取れた: 案件の根に登録し、共有用テキストで上書きする
-            reset_links()
-            w.fetch_box_link = fetch_ok
-            w.exec_dialog = drive(check_initial, click("boxRegister"))
+            # --- 同じ名前の記録が複数ある(古い行の残りなど)と、リンクを作らない ---
+            del w.exec_dialog
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (190, 0, 101, "memo.txt"))
+            conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
+                         (90, 190, "9190", 0))
+            conn.commit()
+            conn.close()
+            filer_box.discard_cache()
+
+            def never(blocks):
+                raise AssertionError("決められないのに確認窓が出た")
+            w.show_box_copied = never
             clip.setText("keep")
             w.left.set_cursor(w.left._row_of("memo.txt"))
             w.cmd_copy_menu()
-            assert fetched == [str(box_root / "ProjA")], fetched
-            assert clip.text() == ("/Box/ProjA/資料/\r\n"
-                                   f"　https://acme.app.box.com/s/{token}/folder/9101\r\n"
-                                   "　　memo.txt"), repr(clip.text())
-            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == [
-                {"folder_id": "9100", "path": "Box/ProjA", "host": "acme.app.box.com",
-                 "token": token}]
+            assert clip.text() == "keep"
+            assert ("Box: 同じ名前の記録が複数あるため特定できません: memo.txt"
+                    "（リンクは作りません）") in w.log_view.toPlainText()
+            assert "同期の記録に見つかりません: memo.txt" not in w.log_view.toPlainText()
 
-            # 下の階層を選べば、そのフォルダで取ってそこに登録する
-            reset_links()
-            fetched.clear()
-
-            def pick_lower(dialog):
-                dialog.findChild(QComboBox, "boxFolder").setCurrentIndex(1)
-            w.exec_dialog = drive(pick_lower, click("boxRegister"))
-            w.cmd_copy_menu()
-            assert fetched == [str(box_root / "ProjA" / "資料")], fetched
-            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"][0][
-                "folder_id"] == "9101"
-
-            # 取れなかった: 開いたまま、エラーと手で貼る欄を出す。貼れば登録できる
-            reset_links()
-            fetched.clear()
-            w.fetch_box_link = lambda path: fetched.append(path) or None
-            seen_dialog = {}
-
-            def after_fail(dialog):
-                assert dialog.result() != filer.QDialog.Accepted      # まだ閉じない
-                status = dialog.findChild(QLabel, "boxStatus")
-                assert status.text() == "共有リンクを取れませんでした。手で貼ってください", status.text()
-                manual = dialog.findChild(QLineEdit, "boxManual")
-                assert not manual.isHidden()
-                manual.setText("https://app.box.com/folder/1")       # 形が違う
-                dialog.findChild(QPushButton, "boxRegister").click()
-                assert "共有リンクの形ではありません" in status.text()
-                assert len(fetched) == 1          # 貼る欄に字があれば取りに行かない
-                manual.setText(f" https://app.box.com/s/{token}x ")
-                seen_dialog["ok"] = True
-            w.exec_dialog = drive(click("boxRegister"), after_fail, click("boxRegister"))
-            w.cmd_copy_menu()
-            assert seen_dialog.get("ok") and len(fetched) == 1
-            assert f"https://app.box.com/s/{token}x/folder/9101" in clip.text(), clip.text()
-            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"][0][
-                "token"] == token + "x"
-
-            # 登録しない / 中止 は前と同じ(取りには行かない)
-            reset_links()
-            fetched.clear()
-            w.exec_dialog = drive(click("boxPlain"))
-            w.cmd_copy_menu()
-            assert clip.text().startswith("/Box/ProjA/資料/\r\n　https://app.box.com/folder/9101")
-            assert fetched == []
-            assert json.loads(settings_path.read_text(encoding="utf-8"))["filer"]["box_links"] == []
+            # --- 手元の記録が Box 側の木と食い違う(古い対応が別の ID を指す)と、作らない ---
+            conn = sqlite3.connect(str(db))
+            conn.execute("DELETE FROM item_mapping_between_fs WHERE local_id=190")
+            conn.execute("DELETE FROM local_item WHERE local_id=190")
+            conn.execute("UPDATE item_mapping_between_fs SET box_id='9777' WHERE local_id=103")
+            conn.commit()
+            conn.close()
+            filer_box.discard_cache()
             clip.setText("keep")
-            w.exec_dialog = drive(click("boxCancel"))
             w.cmd_copy_menu()
-            assert clip.text() == "keep" and fetched == []
+            assert clip.text() == "keep"
+            assert ("Box: Box 側の記録と一致しないため、リンクを作りません: memo.txt"
+                    in w.log_view.toPlainText())
         finally:
+            filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
+            w.close()
+            w.deleteLater()
+
+
+def test_window_ext_menu_box_open():
+    """Ctrl+Enter に「Box.comで開く」が出るのは、対象が Box Drive の中のときだけ。選ぶと
+    Box 自身の右クリック項目「Box.comで表示」を子プロセス(filer_contextmenu.py --item)で
+    実行する(Popen は差し替え。ブラウザは開かない)。"""
+    import filer
+    import filer_box
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        box_root = Path(tmp, "home", "Box")
+        folder = box_root / "ProjA"
+        (folder / "資料").mkdir(parents=True)
+        (folder / "memo.txt").write_bytes(b"x")
+        db = Path(tmp, "local", "sync.db")
+        db.parent.mkdir()
+        db.write_bytes(b"")         # 項目を出す条件(記録のファイルがある)だけ見る
+        shared = Path(tmp, "shared")
+        shared.mkdir()
+        (shared / "folder.txt").write_text('"B:ひとつ目" &NOP\n', encoding="utf-8")
+        (shared / "txt.txt").write_text('"W:別の項目" &NOP\n', encoding="utf-8")
+        app_settings = {"filer": {"left_path": str(left), "right_path": str(right)}}
+        filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
+        filer_box.discard_cache()
+        w = filer.FilerWindow(app_settings, None)
+        w.menu_shared_dir = shared
+        w.menu_local_dir = os.path.join(tmp, "localmenus")
+        launched = []
+
+        class FakeProc:
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, *a, **kw):
+            launched.append(argv)
+            return FakeProc()
+
+        original_popen = filer.subprocess.Popen
+        original_allow = filer.filer_launch._allow_foreground
+        seen = {}
+
+        def pick(title, items):
+            seen["items"] = items
+            return seen.get("choice")
+
+        try:
+            w.show()
+            w.start()
+            _wait(w)
+            w.choose_menu = pick
+            filer.subprocess.Popen = fake_popen
+            filer.filer_launch._allow_foreground = lambda: None
+
+            # Box の外: 出ない
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            w.cmd_ext_menu()
+            assert "Box.comで開く" not in [i[1] for i in seen["items"] if i], seen["items"]
+
+            # Box の中のフォルダ: 出る。既存の項目(B)と衝突しない文字になる
+            w.left.load(str(folder))
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("資料"))
+            w.cmd_ext_menu()
+            entry = [i for i in seen["items"] if i and i[1] == "Box.comで開く"]
+            assert len(entry) == 1 and entry[0][2] == ("box_open",), seen["items"]
+            keys = [i[0] for i in seen["items"] if i]
+            assert keys.count(entry[0][0]) == 1 and entry[0][0] != "B", keys
+            # ファイル(txt のメニュー)でも出て、W とは衝突しない
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+            w.cmd_ext_menu()
+            entry = [i for i in seen["items"] if i and i[1] == "Box.comで開く"]
+            assert len(entry) == 1 and entry[0][0] != "W", seen["items"]
+
+            # 選ぶと、Box の項目を実行する子プロセスを起こす
+            seen["choice"] = ("box_open",)
+            w.left.set_cursor(w.left._row_of("資料"))
+            w.cmd_ext_menu()
+            target = str(folder / "資料")
+            assert launched == [[filer.pythonw_executable(), str(filer.CONTEXT_MENU_SCRIPT),
+                                 "--x", "0", "--y", "0", "--owner", str(w._hwnd()),
+                                 "--item", "Box.comで表示", "--item", "View on Box.com",
+                                 "--", target]], launched
+            assert f"Box.comで開く: {target}" in w.log_view.toPlainText()
+            # 子の終了コード 3 = 右クリックに項目が無い
+            w._on_box_open_done((target, 3))
+            assert "Box: 右クリックに「Box.comで表示」が見つかりません" in w.log_view.toPlainText()
+            w._on_box_open_done((target, 1))
+            assert "終了コード 1" in w.log_view.toPlainText()
+        finally:
+            filer.subprocess.Popen = original_popen
+            filer.filer_launch._allow_foreground = original_allow
             filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
             w.close()
             w.deleteLater()
@@ -8544,8 +8631,6 @@ def test_window_copy_path_box_dialog():
     from PySide6.QtGui import QGuiApplication
 
     _qapp()
-    assert filer.BOX_FETCH_CLIPBOARD_SECONDS >= 20.0   # 職場で約10秒かかる実測に合わせた見張り
-    token = "Ab3dEf6hIjKlMnOp"
     with tempfile.TemporaryDirectory() as tmp:
         left, right = _make_tree(tmp)       # Box の外(通常のフォルダ)
         box_root = Path(tmp, "home", "Box")
@@ -8565,16 +8650,17 @@ def test_window_copy_path_box_dialog():
             conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, typ, parent, name))
             conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
                          (i, lid, box_id, box_type))
+        _add_box_item_table(conn, rows)
         conn.commit()
         conn.close()
         settings_path = Path(tmp, "settings.json")
         settings_path.write_text("{}", encoding="utf-8")
-        link = {"folder_id": "9100", "path": "Box/ProjA", "host": "app.box.com", "token": token}
-        app_settings = {"filer": {"left_path": str(left), "right_path": str(right),
-                                  "box_links": [link]}}
+        app_settings = {"filer": {"left_path": str(left), "right_path": str(right)}}
         filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
         filer_box.discard_cache()
         w = filer.FilerWindow(app_settings, str(settings_path))
+        shown_blocks = []
+        w.show_box_copied = lambda blocks: shown_blocks.append(blocks)    # 確認窓は出さない
         try:
             w.show()
             w.start()
@@ -8582,7 +8668,7 @@ def test_window_copy_path_box_dialog():
             clip = QGuiApplication.clipboard()
             full = str(folder / "memo.txt")
             share = ("/Box/ProjA/資料/\r\n"
-                     f"　https://app.box.com/s/{token}/folder/9101\r\n"
+                     "　https://app.box.com/folder/9101\r\n"
                      "　　memo.txt")
             w.choose_menu = lambda title, items: "path"
             w.left.load(str(folder))
@@ -8599,12 +8685,20 @@ def test_window_copy_path_box_dialog():
             w.ask_copy_kind = lambda count: "box"
             w.cmd_copy_menu()
             assert clip.text() == share, repr(clip.text())
+            blocks = [("/Box/ProjA/資料/", "https://app.box.com/folder/9101")]
+            assert shown_blocks == [blocks], shown_blocks
 
             # 両方: フルパス → 空行 → 共有用テキスト
             w.ask_copy_kind = lambda count: "both"
             w.cmd_copy_menu()
             assert clip.text() == full + "\r\n\r\n" + share, repr(clip.text())
             assert "フルパス 1件＋Box の共有用テキスト 1件" in w.log_view.toPlainText()
+            assert shown_blocks == [blocks, blocks], shown_blocks
+            # フルパスだけのときは確認窓を出さない
+            w.ask_copy_kind = lambda count: "path"
+            w.cmd_copy_menu()
+            assert len(shown_blocks) == 2
+            w.ask_copy_kind = lambda count: "both"
 
             # キャンセル: 何も入らない
             w.ask_copy_kind = lambda count: None
@@ -8612,20 +8706,19 @@ def test_window_copy_path_box_dialog():
             w.cmd_copy_menu()
             assert clip.text() == "keep"
 
-            # 両方で登録を中止したら、フルパスだけ入る
-            app_settings["filer"]["box_links"] = []
-            filer.save_values(app_settings, str(settings_path), {"box_links": []})
+            # 両方で共有用テキストが作れなかった(決められない・記録が読めない等)ら、フルパスだけ入る
+            real_share = w._box_share_text
+            w._box_share_text = lambda: None
             w.ask_copy_kind = lambda count: "both"
-            w.ask_box_link = lambda item: None
+            n_blocks = len(shown_blocks)
             clip.setText("")
             w.cmd_copy_menu()
             assert clip.text() == full, repr(clip.text())
-            del w.ask_box_link
+            assert len(shown_blocks) == n_blocks
+            w._box_share_text = real_share
 
             # 本物の選択ダイアログ: ボタンの並びと、「両方」を押した結果
             from PySide6.QtWidgets import QPushButton
-            app_settings["filer"]["box_links"] = [link]
-            filer.save_values(app_settings, str(settings_path), {"box_links": [link]})
             seen_dialog = {}
 
             def drive(dialog):

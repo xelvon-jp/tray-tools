@@ -1,21 +1,20 @@
 """あっふ(filer.py)の C→L「Box の共有用テキスト」の、Qt に依存しない部分。
 
 Box Drive が手元に持つ同期の記録(sync.db)から、ファイル・フォルダの Box 上の ID を引き、
-「/Box/案件/資料/」「共有リンク付きの URL」「ファイル名」の3行をまとめた文字列を作る。
+「/Box/案件/資料/」「フォルダの URL(https://app.box.com/folder/<ID>)」「ファイル名」の
+3行をまとめた文字列を作る。
 
 - Box Drive は sync.db を掴んで離さない(mode=ro でも "database is locked")。
   そのため **本体ではなくコピーを開く**。コピーは元の更新日時・大きさが変わらない間は使い回す。
-- 共有リンクの鍵(トークン)は、祖先フォルダのものが子孫すべてに効く。案件フォルダに
-  1回だけ登録しておけば、その下のファイルは同じ鍵で開ける(ログイン不要)。
-- 設定(box_links)の読み書きや画面は filer.py の側。ここは純関数と DB の読み取りだけ。
+- 共有リンク(/s/<鍵>)は作らないし使わない。フォルダのメンバーとして招待された人は
+  /folder/<ID> の URL で開ける(共有リンクを新しく作ると、Box 上の公開範囲を変えてしまう)。
+- 画面は filer.py の側。ここは純関数と DB の読み取りだけ。
 """
 import os
-import re
 import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from urllib.parse import urlsplit
 
 DEFAULT_HOST = "app.box.com"
 ROOT_NAME = "Box"          # 1行目の先頭に付ける固定の見出し(実フォルダ名ではない)
@@ -25,9 +24,10 @@ NEWLINE = "\r\n"           # core.clip_text と同じ(クリップボードの�
 FILE = "file"
 FOLDER = "folder"
 
-# Box Drive がエクスプローラの右クリックメニューに足す「共有リンクをコピー」の表示名。
+# Box Drive がエクスプローラの右クリックメニューに足す「Box.com で表示」の表示名。
 # 表示言語で綴りが変わるので候補を並べる(filer_contextmenu.py --item に渡す)。
-COPY_LINK_ITEMS = ("共有リンクをコピー", "Copy Shared Link")
+# Box 自身の項目なので、こちらで組み立てた URL とは別の、確かな開き方になる。
+VIEW_ON_BOX_ITEMS = ("Box.comで表示", "View on Box.com")
 
 # テストから差し替える口(None なら本物の場所)
 ROOT_OVERRIDE = None
@@ -40,6 +40,22 @@ class BoxDbError(Exception):
 
 class NotSynced(Exception):
     """同期の記録に見つからない(アップロード前のことがある)。"""
+
+
+class Ambiguous(NotSynced):
+    """同じ名前の記録が複数あり、どれか1つに決められない(古い行・改名の残り・
+    大文字小文字だけ違う行・競合コピーなど)。間違ったフォルダのリンクを作るくらいなら作らない。
+    NotSynced の子にしてあるので、区別しない呼び出し側では「見つからない」と同じに扱われる。"""
+
+
+class Mismatch(NotSynced):
+    """手元の記録(local_item と対応表)と、Box 側の木(box_item)で、同じパスが同じ ID に
+    ならない、または Box 側の木に無い。どちらが正しいか分からないのでリンクを作らない。
+    part は食い違った階層の名前。"""
+
+    def __init__(self, part, detail=""):
+        super().__init__(f"{part}: {detail}" if detail else part)
+        self.part = part
 
 
 def box_root() -> str:
@@ -142,6 +158,7 @@ def open_db(cache_dir: str = None) -> sqlite3.Connection:
         conn = sqlite3.connect(path)
         conn.execute("SELECT 1 FROM local_item LIMIT 1")
         conn.execute("SELECT 1 FROM item_mapping_between_fs LIMIT 1")
+        conn.execute("SELECT 1 FROM box_item LIMIT 1")
         return conn
     except sqlite3.Error as e:
         if conn is not None:
@@ -183,6 +200,27 @@ def _box_id_of(conn, local_id):
     return row
 
 
+def _box_side_ids(conn, parts) -> list:
+    """Box 側の木(box_item。根の box_id は "0"、parent_item_id は親の box_id)を、
+    手元の記録とは無関係に名前でたどって、各階層の box_id を返す。見つからなければ Mismatch、
+    同じ名前が複数あって決められなければ Ambiguous(同じ規則: 綴りが完全一致する1つがあればそれ)。"""
+    parent = "0"
+    ids = []
+    for part in parts:
+        rows = conn.execute("SELECT box_id, name FROM box_item WHERE parent_item_id=? AND name=?",
+                            (parent, part)).fetchall()
+        if not rows:
+            raise Mismatch(part, "Box 側の記録に見つかりません")
+        if len(rows) > 1:
+            exact = [r for r in rows if r[1] == part]
+            if len(exact) != 1:
+                raise Ambiguous(part)
+            rows = exact
+        parent = str(rows[0][0])
+        ids.append(parent)
+    return ids
+
+
 def resolve(path: str, conn: sqlite3.Connection = None, cache_dir: str = None):
     """(box_id, kind, rel_parts)。見つからなければ NotSynced、読めなければ BoxDbError。"""
     item = resolve_item(path, conn, cache_dir)
@@ -197,25 +235,42 @@ def resolve_item(path: str, conn: sqlite3.Connection = None, cache_dir: str = No
     if own:
         conn = open_db(cache_dir)
     try:
-        row = conn.execute("SELECT local_id FROM local_item WHERE parent_item_id IS NULL"
-                           ).fetchone()
-        if row is None:
+        roots = conn.execute("SELECT local_id FROM local_item WHERE parent_item_id IS NULL"
+                             ).fetchall()
+        if not roots:
             raise BoxDbError("根の行がありません")
-        local_id = row[0]
+        if len(roots) > 1:
+            raise Ambiguous("Box の根")
+        local_id = roots[0][0]
         names, ids, kind = [], [], FOLDER
         for part in parts:
-            row = conn.execute(
+            # name は大文字小文字を区別しない照合なので、綴りの違う行も一緒に拾う
+            rows = conn.execute(
                 "SELECT local_id, name FROM local_item WHERE parent_item_id=? AND name=?",
-                (local_id, part)).fetchone()
-            if row is None:
+                (local_id, part)).fetchall()
+            found = []          # (行, 対応表の行)。Box 側との対応が付いているものだけ
+            for row in rows:
+                mapped = _box_id_of(conn, row[0])
+                if mapped is not None:
+                    found.append((row, mapped))
+            if not found:
                 raise NotSynced(part)
+            if len(found) > 1:
+                exact = [f for f in found if f[0][1] == part]
+                if len(exact) != 1:
+                    raise Ambiguous(part)
+                found = exact
+            row, mapped = found[0]
             local_id = row[0]
-            mapped = _box_id_of(conn, local_id)
-            if mapped is None:
-                raise NotSynced(part)
             names.append(row[1] or part)
             ids.append(str(mapped[0]))
             kind = FOLDER if mapped[1] == 1 else FILE
+        # 手元の記録とは別に、Box 側の木を同じパスでたどり、すべての階層で同じ ID になることを
+        # 確かめる(古い対応が残っていて別のフォルダを指している、を防ぐ)
+        box_ids = _box_side_ids(conn, parts)
+        for part, mine, theirs in zip(parts, ids, box_ids):
+            if mine != theirs:
+                raise Mismatch(part, f"手元の記録の ID({mine})と Box 側の ID({theirs})が違います")
         return BoxItem(kind, tuple(names), tuple(ids))
     except sqlite3.Error as e:
         raise BoxDbError(str(e)) from e
@@ -224,14 +279,23 @@ def resolve_item(path: str, conn: sqlite3.Connection = None, cache_dir: str = No
             conn.close()
 
 
-def resolve_many(paths, cache_dir: str = None):
-    """(items, 見つからなかった名前の一覧)。記録が読めなければ BoxDbError。"""
+def resolve_many(paths, cache_dir: str = None, ambiguous: list = None, mismatched: list = None):
+    """(items, 見つからなかった名前の一覧)。記録が読めなければ BoxDbError。
+
+    ambiguous にリストを渡すと、同じ名前の記録が複数あって決められなかったもの(Ambiguous)の
+    名前はそちらへ入れる(渡さなければ「見つからなかった名前」の一覧に混ぜる)。mismatched も同じ
+    作法で、手元の記録と Box 側の記録が食い違った(Mismatch)ものの名前(対象の名前)を受ける。"""
     conn = open_db(cache_dir)
     items, missing = [], []
     try:
         for path in paths:
             try:
                 items.append(resolve_item(path, conn))
+            except Mismatch:
+                name = os.path.basename(path.rstrip("\\/")) or path
+                (mismatched if mismatched is not None else missing).append(name)
+            except Ambiguous as e:
+                (ambiguous if ambiguous is not None else missing).append(str(e))
             except NotSynced as e:
                 missing.append(str(e))
     finally:
@@ -240,143 +304,59 @@ def resolve_many(paths, cache_dir: str = None):
 
 
 # ---------------------------------------------------------------
-# 共有リンクの登録
-# ---------------------------------------------------------------
-_HOST_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.box\.com$", re.I)
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,}$")
-
-
-def parse_shared_link(url: str):
-    """共有リンク https://<host>/s/<鍵>(末尾の / ・クエリ・/folder/.. が付いても可)
-    → (host, 鍵)。それ以外は None。host は *.box.com だけ受ける(会社の Box は
-    <company>.app.box.com)。"""
-    if not isinstance(url, str):
-        return None
-    try:
-        split = urlsplit(url.strip())
-    except ValueError:
-        return None
-    if split.scheme.lower() != "https" or not split.hostname:
-        return None
-    host = split.hostname.lower()
-    if not _HOST_RE.match(host):
-        return None
-    segments = [s for s in split.path.split("/") if s]
-    if len(segments) < 2 or segments[0] != "s":
-        return None
-    token = segments[1]
-    if not _TOKEN_RE.match(token):
-        return None
-    return host, token
-
-
-# URL に使える ASCII の字だけを続けて取る(日本語の文に続けて書かれていても切れるように)
-_URL_RE = re.compile(r"https://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+", re.I)
-
-
-def extract_shared_link(text: str):
-    """任意の文字列(クリップボードの中身など)から、parse_shared_link が受ける最初の
-    共有リンクを探して (host, 鍵) を返す。無ければ None。"""
-    if not isinstance(text, str):
-        return None
-    for match in _URL_RE.finditer(text):
-        parsed = parse_shared_link(match.group(0).rstrip(".,;:!"))
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def local_folder(shown: str) -> str:
-    """candidate_folders の表示("Box/案件/資料")→ 手元の同期フォルダの中の実際のパス。"""
-    parts = [p for p in str(shown).split("/") if p]
-    if parts and parts[0] == ROOT_NAME:
-        parts = parts[1:]
-    return os.path.join(box_root(), *parts)
-
-
-def make_link(folder_id: str, path: str, host: str, token: str) -> dict:
-    return {"folder_id": str(folder_id), "path": path, "host": host, "token": token}
-
-
-def valid_links(links) -> list:
-    """設定から読んだ box_links のうち、形の合うものだけ。"""
-    out = []
-    for link in links if isinstance(links, list) else []:
-        if (isinstance(link, dict)
-                and all(isinstance(link.get(k), str) and link.get(k)
-                        for k in ("folder_id", "host", "token"))):
-            out.append(link)
-    return out
-
-
-def with_link(links, new_link: dict) -> list:
-    """同じフォルダの登録があれば置き換え、無ければ足す(新しい一覧を返す)。"""
-    kept = [l for l in valid_links(links) if l["folder_id"] != new_link["folder_id"]]
-    kept.append(new_link)
-    return kept
-
-
-def find_link(item: BoxItem, links):
-    """item を含むフォルダ(フォルダ自身も)のうち、登録のある一番近いものの登録。
-    パスの文字列ではなく Box の ID で照合するので、改名・移動をしても外れない。"""
-    by_id = {l["folder_id"]: l for l in valid_links(links)}
-    for folder_id in reversed(item.folder_ids):
-        if folder_id in by_id:
-            return by_id[folder_id]
-    return None
-
-
-def candidate_folders(item: BoxItem):
-    """登録先の候補。[(Box/案件 のような表示, folder_id, 保存用の path)]、浅い方(案件の根)から。
-    Box の根自身は含めない。"""
-    out = []
-    for depth in range(1, len(item.folder_parts) + 1):
-        shown = "/".join((ROOT_NAME,) + item.folder_parts[:depth])
-        out.append((shown, item.folder_ids[depth - 1], shown))
-    return out
-
-
-# ---------------------------------------------------------------
 # 共有用テキスト
 # ---------------------------------------------------------------
-def folder_url(folder_id: str, link=None) -> str:
-    if link:
-        return f"https://{link['host']}/s/{link['token']}/folder/{folder_id}"
+def folder_url(folder_id: str) -> str:
     return f"https://{DEFAULT_HOST}/folder/{folder_id}"
 
 
-def _header(parts, folder_id, link) -> list:
+def _header(parts, folder_id) -> list:
     shown = "/" + "/".join((ROOT_NAME,) + tuple(parts)) + "/"
-    return [shown, INDENT + folder_url(folder_id, link)]
+    return [shown, INDENT + folder_url(folder_id)]
 
 
-def build_share_text(items, links) -> str:
-    """BoxItem の並び → クリップボード用テキスト(CRLF)。
-
-    ファイルは入っているフォルダごとに束ね(初めて出た順)、フォルダの見出しの下に
-    名前を並べる。フォルダを対象にしたものは、1つずつそれ自身の見出しだけの塊にする。
-    塊と塊の間は空行。登録が無ければ /folder/<ID> の形(招待メンバー用)。"""
-    blocks = []          # [(キー, 行の並び)]
+def _blocks(items) -> list:
+    """塊の並び。[(行の並び, 見出しのパス "/Box/案件/", URL)]。build_share_text と
+    share_blocks が同じ並び・同じ束ね方を使うための元。"""
+    blocks = []          # [キー, 行の並び, 見出し, URL]
     index = {}
     for item in items:
         if item.kind == FOLDER:
             # フォルダはそれぞれ別の塊にする(見出しが空行なしで続くと、どの URL が
             # どのフォルダのものか読みにくいため)
             key = ("folder", item.box_id)
-            lines = _header(item.rel_parts, item.box_id, find_link(item, links))
+            lines = _header(item.rel_parts, item.box_id)
         else:
             key = ("files", item.folder_ids[-1] if item.folder_ids else "0")
             lines = None
         if key not in index:
             index[key] = len(blocks)
-            blocks.append([key, []])
-        block = blocks[index[key]][1]
+            blocks.append([key, [], "", ""])
+        entry = blocks[index[key]]
+        block = entry[1]
         if item.kind == FOLDER:
             block.extend(lines)
         else:
             if not block:
                 parent_id = item.folder_ids[-1] if item.folder_ids else "0"
-                # 根直下のファイルは根の ID "0" を使う(鍵は付けられない)
-                block.extend(_header(item.folder_parts, parent_id, find_link(item, links)))
+                # 根直下のファイルは根の ID "0" を使う
+                block.extend(_header(item.folder_parts, parent_id))
             block.append(INDENT * 2 + item.name)
-    return (NEWLINE * 2).join(NEWLINE.join(lines) for _key, lines in blocks if lines)
+        if not entry[2] and len(block) >= 2:
+            entry[2], entry[3] = block[0], block[1][len(INDENT):]
+    return [(lines, shown, url) for _key, lines, shown, url in blocks if lines]
+
+
+def build_share_text(items) -> str:
+    """BoxItem の並び → クリップボード用テキスト(CRLF)。
+
+    ファイルは入っているフォルダごとに束ね(初めて出た順)、フォルダの見出しの下に
+    名前を並べる。フォルダを対象にしたものは、1つずつそれ自身の見出しだけの塊にする。
+    塊と塊の間は空行。URL は /folder/<ID> の形(招待されたメンバー用)。"""
+    return (NEWLINE * 2).join(NEWLINE.join(lines) for lines, _shown, _url in _blocks(items))
+
+
+def share_blocks(items) -> list:
+    """build_share_text の塊ごとの [(見出しのパス "/Box/ProjA/資料/", URL)]。同じ並び・同じ束ね方。
+    画面が「この URL をブラウザで開いて確かめる」ボタンを塊ごとに出すのに使う。"""
+    return [(shown, url) for _lines, shown, url in _blocks(items)]

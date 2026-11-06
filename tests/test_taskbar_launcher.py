@@ -21,6 +21,14 @@ def test_resolve_items_calendar():
     assert launcher.resolve_items({}) == launcher.DEFAULT_ITEMS
     assert "calendar" in launcher.DEFAULT_ITEMS
     assert launcher.DEFAULT_ITEMS[-1] == "calculator"
+    # 先頭はコマンドパレット。呼び先が feature_screen 側に実在すること
+    assert launcher.DEFAULT_ITEMS[0] == "palette"
+    assert launcher.ITEMS["palette"]["method"] == "show_palette"
+    import ast
+    import pathlib
+    tree = ast.parse(pathlib.Path("feature_screen.py").read_text(encoding="utf-8"))
+    methods = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "show_palette" in methods
     # 設定を書かなかった場合の受け取り方(知らない名前は飛ばす・重複は1つ)
     keys = launcher.resolve_items({"launcher_items": ["calendar", "calendar", "nope"]})
     assert keys == ["calendar"], keys

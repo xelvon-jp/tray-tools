@@ -11,6 +11,7 @@
 import json
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -28,9 +29,11 @@ import calendar_popup
 import calculator
 import capture_process
 import color_picker
+import command_palette
 import explorer_nav
 import claude_progress
 import claude_status
+import filer_everything
 import filer_launch
 import filer_update
 import folder_watch
@@ -42,6 +45,7 @@ from datetime import datetime
 
 import pushover
 import screen_mirror
+import taskbar_launcher
 import window_layout
 import screen_ruler
 import snippets
@@ -261,6 +265,9 @@ class ScreenFeature:
         self.snippet_picker = None
         self.calendar_popup = None
         self.calculator_window = None
+        self.palette_window = None
+        self._palette_apps_cache = None
+        self._palette_es_cache = None
         self.launcher_picker = None
         # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
@@ -848,6 +855,7 @@ class ScreenFeature:
             "bg_remove": self.start_bg_remove,
             "launcher": lambda: self.start_launcher(),
             "filer": self.start_filer,
+            "command_palette": self.show_palette,
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
             "presenter_laser": lambda: self.toggle_presenter_overlay("laser"),
@@ -1192,6 +1200,99 @@ class ScreenFeature:
         self.calculator_window = None
         window.close()
         window.deleteLater()
+
+    # ---------------------------------------------------------------
+    # コマンドパレット(縦ランチャの項目・ホットキー。command_palette.py)
+    # ---------------------------------------------------------------
+    def show_palette(self):
+        """統合パレットを出す。出ているときに呼ばれたら閉じる(トグル)。"""
+        if self.palette_window is not None:
+            self._close_palette()
+            return
+        window = command_palette.create_window(
+            self._palette_static_candidates(), self._palette_file_search)
+        window.chosen.connect(self._on_palette_chosen)
+        window.closed.connect(self._close_palette)
+        self.palette_window = window
+        window.show_at_cursor_screen()
+
+    def _close_palette(self):
+        if self.palette_window is None:
+            return
+        window = self.palette_window
+        self.palette_window = None
+        window.close()
+        window.deleteLater()
+
+    def _palette_static_candidates(self):
+        """打たなくても並ぶ候補: 機能(縦ランチャの全項目)・フォルダ
+        ブックマーク・アプリ(スタートメニューのショートカット)。"""
+        candidates = []
+        for key, item in taskbar_launcher.ITEMS.items():
+            candidates.append(command_palette.Candidate(
+                "feature", item["label"], "縦ランチャの項目",
+                {"item_key": key}, keywords=key))
+        for entry in launcher.load_bookmarks(self.app_settings):
+            path = entry.get("path") or ""
+            if not path:
+                continue
+            name = entry.get("name") or os.path.basename(path.rstrip("\\/")) or path
+            candidates.append(command_palette.Candidate(
+                "folder", name, path, {"path": path}, keywords=path))
+        if self._palette_apps_cache is None:
+            self._palette_apps_cache = command_palette.scan_app_candidates()
+        candidates.extend(self._palette_apps_cache)
+        return candidates
+
+    def _palette_es_argv(self):
+        """ファイル検索用の es.exe の引数列。探すのは初回だけ(結果は保持)。"""
+        if self._palette_es_cache is None:
+            argv = filer_everything.find_es(None)
+            if argv is None:
+                found = shutil.which("es.exe")
+                argv = [found] if found else False
+            self._palette_es_cache = argv
+        return self._palette_es_cache or None
+
+    def _palette_file_search(self, query: str):
+        """Everything でファイルを探して file 候補にする(別スレッドから呼ばれる)。
+
+        es.exe が無い・Everything が起きていないときは空を返す(候補が出ないだけ)。"""
+        argv = self._palette_es_argv()
+        if argv is None:
+            return []
+        result = filer_everything.run_search(argv, query, None, limit=8, timeout=3.0)
+        if result.status not in ("done", "limit"):
+            return []
+        return [
+            command_palette.Candidate(
+                "file", os.path.basename(path) or path, path,
+                {"path": path}, keywords=path)
+            for path in result.paths
+        ]
+
+    def _on_palette_chosen(self, cand):
+        """選ばれた候補を実行する。入口なので例外は必ず受ける(常駐を落とさない)。"""
+        try:
+            if cand.kind == "feature":
+                item = taskbar_launcher.ITEMS.get(cand.payload.get("item_key") or "")
+                if item is None:
+                    return
+                target = self._audio_feature if item.get("feature") == "audio" else self
+                method = (getattr(target, item.get("method", ""), None)
+                          if target is not None else None)
+                if callable(method):
+                    method(*item.get("args", ()))
+                else:
+                    show_toast(f"コマンドパレット\n{item.get('label')}を呼び出せません")
+            elif cand.kind == "calc":
+                QApplication.clipboard().setText(cand.payload.get("value", ""))
+            elif cand.kind in ("folder", "file", "app"):
+                path = cand.payload.get("path") or ""
+                if path:
+                    os.startfile(path)  # noqa: S606  本人が選んだ候補を開くだけ
+        except Exception:
+            traceback.print_exc()
 
     # ---------------------------------------------------------------
     # 背景を透過(bg_remove.py。窓は別プロセス)

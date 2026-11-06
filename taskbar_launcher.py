@@ -178,6 +178,12 @@ def _draw_spotlight(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.ellipse((22, 20, 46, 44), fill="white")
 
 
+def _draw_palette(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """虫めがね。輪と柄だけの単純な形にする(探す窓なので)。"""
+    draw.ellipse((10, 8, 40, 38), outline="white", width=5)
+    draw.line((36, 34, 54, 52), fill="white", width=7)
+
+
 def _draw_calendar(draw: ImageDraw.ImageDraw, color: str) -> None:
     """カレンダー。綴じ具の付いた月めくりのページ。日付は背景色の四角で抜く。"""
     draw.rounded_rectangle((21, 12, 25, 21), radius=2, fill="white")
@@ -237,6 +243,7 @@ _GLYPHS = {
     "blank": _draw_blank,
     "calendar": _draw_calendar,
     "calculator": _draw_calculator,
+    "palette": _draw_palette,
 }
 
 
@@ -294,6 +301,14 @@ def _item_pixmap(key: str) -> QPixmap:
 # なく実行時に落ちる。名前で引けば「無ければ通知して何もしない」に落とせる。
 # ---------------------------------------------------------------
 ITEMS = {
+    "palette": {
+        "label": "コマンドパレット",
+        "feature": "screen",
+        "method": "show_palette",
+        "args": (),
+        "icon": "palette",
+        "color": "#7c3aed",
+    },
     "capture": {
         "label": "キャプチャ",
         "feature": "screen",
@@ -433,7 +448,7 @@ ITEMS = {
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
-DEFAULT_ITEMS = ["capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator"]
+DEFAULT_ITEMS = ["palette", "capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator"]
 
 # settings.json に書かれがちな別名を正規のキーへ寄せる。hotkeys セクションでは同じ機能が
 # capture_now / audio_toggle / snippet_picker / launcher という名前で並んでおり、そちらを

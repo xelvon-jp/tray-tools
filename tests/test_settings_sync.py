@@ -64,7 +64,12 @@ def test_sync_end_to_end():
         assert "taskbar_widget.launcher_items += calendar" in changes, changes
         saved = json.loads(path.read_text(encoding="utf-8"))
         widget = saved["taskbar_widget"]
-        assert widget["launcher_items"] == DEFAULT_ITEMS, widget["launcher_items"]
+        # 新しい項目は利用者の並びの後ろへ足す(既定の順へ並べ替えはしない)。
+        # 既定の先頭に palette が増えたので、capture/audio の後ろに付く形になる
+        expected = ["capture", "audio"] + [
+            n for n in DEFAULT_ITEMS if n not in ("capture", "audio")
+        ]
+        assert widget["launcher_items"] == expected, widget["launcher_items"]
         assert widget["launcher_defaults_applied"] == DEFAULT_ITEMS
         assert saved["environment"] == 1  # 既存の値はそのまま
         backups = list(tmp.glob("settings.json.bak_*"))

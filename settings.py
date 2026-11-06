@@ -269,7 +269,7 @@ DEFAULT_SETTINGS = {
     # (taskbar_launcher.py)。本体は時計に化ける都合で幅が59px前後しかなく、Rapture と
     # 音声の2つで埋まる。それ以外の機能へ通知領域まで戻らずに届くようにするためのもの。
     # launcher_items は上から下へ並ぶ順で、書ける名前は
-    # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
+    # palette(コマンドパレット) / capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
     # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
     # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
     # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー) / calendar(カレンダー) /
@@ -295,6 +295,7 @@ DEFAULT_SETTINGS = {
         "clock_format_bottom": "%H:%M:%S",
         "launcher_enabled": True,
         "launcher_items": [
+            "palette",
             "capture",
             "audio",
             "ruler",
@@ -483,6 +484,9 @@ DEFAULT_SETTINGS = {
         "snippet_picker": "ctrl+alt+v",
         # あふｗ側でも同じ機能を J に割り当てているので、単独で呼ぶときも同じ指に置く。
         "launcher": "win+j",
+        # 統合コマンドパレット。既定は未割り当て(空文字=登録しない)。使う人が
+        # 縦ランチャの項目以外からも開きたいときに割り当てる。
+        "command_palette": "",
         # 画面に重ねるプレゼン支援(presenter_overlay.py)。レーザーとスポットライトは
         # マウスを透過する＝自分ではキーもマウスも受け取れないので、ここが唯一の
         # 「畳む手段」になる(トレイメニューからも切れるが、発表中に通知領域まで

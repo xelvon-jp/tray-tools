@@ -1079,8 +1079,9 @@ class Pane(QWidget):
 
     def text_color(self, entry, column: int, marked: bool = False) -> str:
         """1つの欄の字の色。ファイルの種類(フォルダ/システム/隠し/読み込み専用/通常)で
-        決まり、拡張子の列だけは拡張子別表示色(filer.ext_colors)を重ねる。名前の列は
-        種類の色のまま。属性色の行(隠し等)やフォルダには拡張子の色を付けない。
+        決まり、拡張子の列だけは拡張子別表示色(filer.ext_colors)を重ねる。属性色の行
+        (隠し等)やフォルダには拡張子の色を付けない。行の色分けルール
+        (filer.row_color_rules)に一致すれば、拡張子と★以外の列はその色が勝つ。
         マーク行でも変えない(filer.colors の mark_text を書いたときだけそれにする)。"""
         colors = self.colors
         if marked and colors.get("mark_text"):
@@ -1093,6 +1094,13 @@ class Pane(QWidget):
             meta = self.meta_of(entry)
             if meta is not None:
                 color = colors.get(rating_color_key(meta.rating)) or color
+        else:
+            # 行の色分けルール(filer.row_color_rules)。種類の色より優先する
+            # (本人が条件を書いて指定した色なので)。拡張子の列は拡張子別
+            # 表示色、★の列は★の色がそれぞれ専門なので、そちらに譲る
+            ruled = core.row_color_for(entry, self.window_.row_color_rules)
+            if ruled:
+                color = ruled
         return color
 
     def drive_root(self):
@@ -2801,6 +2809,10 @@ class FilerWindow(QWidget):
         # 拡張子別表示色(Z の設定ダイアログで変えられる)。
         self.ext_rules = core.normalize_ext_colors(section.get("ext_colors"))
         self.ext_color_map = core.ext_color_map(self.ext_rules)
+        # 行の色分けルール(settings.json の filer.row_color_rules。ダイアログは
+        # 無く、手で書く。起動時に読む)
+        self.row_color_rules = core.normalize_row_color_rules(
+            section.get("row_color_rules"))
         # よく行くフォルダの記録(リポジトリの外。形の違う行は捨てる)。
         stored = core.load_store(core.FRECENCY_STORE, {})
         self.frecency = {p: v for p, v in stored.items()

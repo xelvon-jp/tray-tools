@@ -1679,6 +1679,8 @@ python traytools_send.py pushover "変換が終わりました" --title 変換 -
 
 **拡張子別表示色**（あふｗの「各種登録 > 拡張子別表示色」）: **色が付くのは拡張子の列だけ**で、名前は種類の色のままです。隠し・システム・読み込み専用の行は行全体の属性色を優先し（`desktop.ini` が行全体灰色になるのと同じ）、フォルダにも付けません。既定はあふｗの設定画面から拾った色で、上の行が勝ちます。`Z` の設定ダイアログで変えられ、`filer.ext_colors` に保存されます。
 
+**行の色分けルール**（`filer.row_color_rules`）: 条件に合う行に、行全体（名前・大きさ・日時の列）へ色を付けます。条件は名前のパターン（`name`、`*.log` のような fnmatch）／拡張子（`exts`）／大きさ（`min_size`・`max_size`、バイト）／新しさ（`newer_days`・`older_days`）／属性（`attrs` に `h`・`s`・`r`）／フォルダかどうか（`folder`）で、書いた条件が全部成り立つときに一致し、上の行が勝ちます。種類の色より優先しますが、拡張子の列（拡張子別表示色）と★の列には譲ります。ダイアログは無く、`settings.json` に手で書きます（例: `[{"color": "#ff8800", "name": "backup_*"}, {"color": "#888888", "older_days": 365}]`）。書かなければ何も変わりません。
+
 | 色 | 拡張子 |
 |---|---|
 | 青 `#0000ff` | zip 7z rar lzh cab tar gz tgz bz2 xz zst iso |
@@ -2920,6 +2922,7 @@ QR には `segno` を使います（`requirements.txt` に入っているので 
 | `filer.editor` / `.list_timeout_seconds` / `.archive_timeout_seconds` / `.time_tolerance_sec` / `.keys` / `.colors` / `.font_families` | あっふのエディタ（既定 `notepad.exe`）・一覧の読み取りを見切る秒数（既定 `5`）・書庫の中の一覧を見切る秒数（既定 `30`）・比較マークの時刻の許容誤差（秒・既定 `2`）・キーの上書き・色の上書き・一覧の字（既定 MS Gothic） |
 | `filer.viewer_extensions` / `.winmerge` / `.viewer_geometry` | `Enter` で簡易テキストビュアに回す拡張子（配列。点なし）・`Alt+W` で使う `WinMergeU.exe`（空なら自動で探す）・ビュアの窓の位置と大きさ（**アプリが自動で書き込みます**） |
 | `filer.ext_colors` | 拡張子別表示色。`[{"color": "#RRGGBB", "exts": ["zip", "7z"]}, ...]` の並びで上の行が勝つ。書かれていなければ既定（あふｗから拾った色）。`Z` の設定ダイアログで変えると書き換わります |
+| `filer.row_color_rules` | 行の色分けルール。`[{"color": "#RRGGBB", 条件...}, ...]` の並びで、条件（`name` / `exts` / `min_size`・`max_size` / `newer_days`・`older_days` / `attrs` / `folder`）が全部成り立つ行に色を行全体へ付ける。上の行が勝つ。書かなければ無し |
 | `filer.tools` | `Ctrl+Enter` のメニューで `{tool:名前}` と書いたツールの、この PC での場所。`{"名前": "コマンド 引数"}` か `{"名前": {"command": [exe, 引数…], "cwd": 作業フォルダ}}`。無い名前は App Paths と PATH から探す。「ツールを追加」で書き足される（あっふの「拡張子ごとのメニュー」） |
 | `filer.everything_limit` / `.everything_timeout_seconds` / `.tree_depth` / `.tree_lines` | `Shift+F`（Everything 検索）の件数の上限（既定 `1000`）と es.exe を待つ秒数（既定 `10`）・`C`→`I`（フォルダ構成をコピー）の深さ（既定 `5`）と行数（既定 `2000`）の上限。es.exe の場所は `filer.tools` の `"es"` |
 | `filer.show_fkey_bar` / `.fkey_labels` | ファンクションキーの段を出すか（既定 `true`）・その段の表示名だけの上書き（`{"F7": "右クリ", "Shift+F10": "再読込"}`。あふｗの4桁 `"0118"` でも書ける） |

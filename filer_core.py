@@ -2604,6 +2604,104 @@ def ext_colors_to_settings(rules) -> list:
 
 
 # ---------------------------------------------------------------
+# 行の色分けルール(名前・大きさ・新しさ・属性で行に色を付ける)
+# ---------------------------------------------------------------
+# 拡張子別表示色が「拡張子の列だけ」なのに対して、こちらは行全体(名前・
+# 大きさ・日時の列)に付ける。settings の filer.row_color_rules に
+# [{"color": "#RRGGBB", 条件...}] の並びで書く。条件は書いたもの全部が
+# 成り立つときだけ一致し、先に一致した行が勝つ(拡張子別表示色と同じ)。
+#   name       名前のパターン(fnmatch。"*.log" "backup_*" など)
+#   exts       拡張子(ファイルだけ)
+#   min_size / max_size  大きさ(バイト。ファイルだけ)
+#   newer_days / older_days  更新日時からの日数(以内 / 以上)
+#   attrs      "h"(隠し) "s"(システム) "r"(読み込み専用) のうち要るもの全部
+#   folder     true ならフォルダだけ、false ならファイルだけ
+# 既定は無し(書かなければ何も変わらない)。色だけの行(全部に一致してしまう)
+# は事故のもとなので捨てる。
+_ROW_ATTR_BITS = {
+    "h": stat.FILE_ATTRIBUTE_HIDDEN,
+    "s": stat.FILE_ATTRIBUTE_SYSTEM,
+    "r": stat.FILE_ATTRIBUTE_READONLY,
+}
+
+
+def normalize_row_color_rules(value) -> list:
+    """settings.json の filer.row_color_rules を検証済みの並びに揃える。
+
+    色の書式が違う行・条件が1つも無い行は黙って捨てる。配列でなければ空。"""
+    if not isinstance(value, list):
+        return []
+    rules = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        color = str(row.get("color", "")).strip()
+        if not _COLOR_RE.match(color):
+            continue
+        rule = {"color": color.lower()}
+        name = row.get("name")
+        if isinstance(name, str) and name.strip():
+            rule["name"] = name.strip()
+        exts = normalize_exts(row.get("exts"))
+        if exts:
+            rule["exts"] = exts
+        for key in ("min_size", "max_size"):
+            v = row.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+                rule[key] = int(v)
+        for key in ("newer_days", "older_days"):
+            v = row.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+                rule[key] = float(v)
+        attrs = row.get("attrs")
+        if isinstance(attrs, str):
+            picked = "".join(ch for ch in "hsr" if ch in attrs.lower())
+            if picked:
+                rule["attrs"] = picked
+        if isinstance(row.get("folder"), bool):
+            rule["folder"] = row["folder"]
+        if len(rule) > 1:
+            rules.append(rule)
+    return rules
+
+
+def row_color_for(entry, rules, now=None):
+    """行に付ける色。付けないなら None。"""
+    if entry is None or entry.is_parent or not rules:
+        return None
+    now = time.time() if now is None else now
+    for rule in rules:
+        if "folder" in rule and entry.is_dir != rule["folder"]:
+            continue
+        if "name" in rule and not fnmatch.fnmatchcase(
+                entry.name.casefold(), rule["name"].casefold()):
+            continue
+        if "exts" in rule:
+            if entry.is_dir:
+                continue
+            ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+            if ext not in rule["exts"]:
+                continue
+        if "min_size" in rule and (entry.is_dir or entry.size < rule["min_size"]):
+            continue
+        if "max_size" in rule and (entry.is_dir or entry.size > rule["max_size"]):
+            continue
+        if "newer_days" in rule or "older_days" in rule:
+            if not entry.mtime:
+                continue
+            age_days = (now - entry.mtime) / 86400.0
+            if "newer_days" in rule and age_days > rule["newer_days"]:
+                continue
+            if "older_days" in rule and age_days < rule["older_days"]:
+                continue
+        if "attrs" in rule and any(
+                not (entry.attrs & _ROW_ATTR_BITS[ch]) for ch in rule["attrs"]):
+            continue
+        return rule["color"]
+    return None
+
+
+# ---------------------------------------------------------------
 # 使った記録の置き場所(よく行くフォルダ・一括改名の履歴)
 # ---------------------------------------------------------------
 # リポジトリの外(%LOCALAPPDATA%\traytools)に置く。このリポジトリは公開なので、

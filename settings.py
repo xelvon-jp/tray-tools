@@ -380,6 +380,10 @@ DEFAULT_SETTINGS = {
     #     上の行が勝つ。色が付くのは一覧の拡張子の列だけ。書かれていなければ
     #     filer_core.DEFAULT_EXT_COLORS(あふｗの設定から拾った色)。Z の設定ダイアログで
     #     変えるとここが書き換わる
+    #   row_color_rules … 行の色分けルール。[{"color": "#RRGGBB", 条件...}, ...] の並びで、
+    #     条件(名前のパターン name / exts / min_size・max_size / newer_days・older_days /
+    #     attrs "hsr" / folder true|false)が全部成り立つ行に、その色を行全体(名前・
+    #     大きさ・日時の列)へ付ける。上の行が勝つ。書かなければ無し。ダイアログは無い
     #   show_fkey_bar … 窓の下にファンクションキーの段(F1〜F12。押せる)を出すか
     #   fkey_labels … その段の表示名だけの上書き。{"F7": "右クリ", "Shift+F10": "再読込"}
     #     (あふｗの4桁 "0118" でも書ける)。割り当てそのものは keys で変える

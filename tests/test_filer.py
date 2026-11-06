@@ -4618,6 +4618,51 @@ def test_ext_color_logic():
     assert core.DEFAULT_KEYMAP["0090"] == "settings_dialog"
 
 
+def test_row_color_rules():
+    now = 1_800_000_000.0
+    day = 86400.0
+    # 検証: 色だけの行・壊れた行は捨てる。条件の形が揃う
+    rules = core.normalize_row_color_rules([
+        {"color": "#FF8800", "name": "*.log"},
+        {"color": "red", "name": "*.tmp"},
+        {"color": "#00ff00"},
+        {"color": "#0000ff", "min_size": 1024, "folder": False},
+        "garbage",
+    ])
+    assert rules == [
+        {"color": "#ff8800", "name": "*.log"},
+        {"color": "#0000ff", "min_size": 1024, "folder": False},
+    ], rules
+    assert core.normalize_row_color_rules(None) == []
+    assert core.normalize_row_color_rules("x") == []
+
+    rules = core.normalize_row_color_rules([
+        {"color": "#111111", "name": "backup_*"},
+        {"color": "#222222", "exts": ["log"]},
+        {"color": "#333333", "min_size": 1000},
+        {"color": "#444444", "newer_days": 1},
+        {"color": "#555555", "older_days": 30},
+        {"color": "#666666", "attrs": "h"},
+        {"color": "#777777", "folder": True},
+    ])
+    # 先に一致した行が勝つ・条件ごとに効く
+    assert core.row_color_for(F("backup_2026.zip", 10, now), rules, now) == "#111111"
+    assert core.row_color_for(F("a.LOG", 10, now), rules, now) == "#222222"
+    assert core.row_color_for(F("big.bin", 5000, now - 10 * day), rules, now) == "#333333"
+    assert core.row_color_for(F("new.txt", 1, now - 3600), rules, now) == "#444444"
+    assert core.row_color_for(F("old.txt", 1, now - 40 * day), rules, now) == "#555555"
+    assert core.row_color_for(F("hid.txt", 1, now - 10 * day, attrs=HIDDEN), rules, now) == "#666666"
+    assert core.row_color_for(F("dir", 0, now - 10 * day, is_dir=True), rules, now) == "#777777"
+    # どれにも合わない・親・ルール無しは None
+    assert core.row_color_for(F("plain.txt", 1, now - 10 * day), rules, now) is None
+    assert core.row_color_for(core.PARENT_ENTRY, rules, now) is None
+    assert core.row_color_for(F("a.log"), [], now) is None
+    # 大きさと拡張子の条件はフォルダに付けない(日数の条件はフォルダにも効く)
+    assert core.row_color_for(F("x.log", 0, now - 10 * day, is_dir=True), rules, now) == "#777777"
+    assert core.row_color_for(F("fresh", 0, now, is_dir=True), rules, now) == "#444444"
+    assert core.DEFAULT_KEYMAP["4068"] == "diff_view"
+
+
 def test_window_ext_colors_and_settings_dialog():
     import filer
     from PySide6.QtCore import Qt

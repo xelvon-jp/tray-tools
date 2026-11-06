@@ -243,6 +243,18 @@ DEFAULT_SETTINGS = {
         "afxw_path": r"C:\soft\afxw\AFXW.EXE",
         "bookmarks": [],
     },
+    # コマンドパレットの横断検索。web_searches は {name, url} の配列で、url に
+    # {query} を含む。パレットに文字を打つと「(名前) で『…』を検索」の行が
+    # 接頭辞なしで出て、選ぶとブラウザで開く。社内サイトも同じ形で足せる
+    # (SharePoint 単体の例: https://<テナント>.sharepoint.com/search/Pages/results.aspx?k={query})。
+    # 既定の Microsoft 365 は SharePoint・OneDrive・Teams・OneNote を横断する
+    # 検索。社内環境での動作は未検証(テナント側の設定で結果は変わる)。
+    "command_palette": {
+        "web_searches": [
+            {"name": "Microsoft 365", "url": "https://www.office.com/search?q={query}"},
+            {"name": "Box", "url": "https://app.box.com/search?query={query}"},
+        ],
+    },
     # 定型文。recent は最近コピーしたテンプレート名(新しいものが先頭・上限20件)で、
     # ピッカーの並び順に使う。アプリが自分で書き足す値なので手で編集する必要はない。
     "snippets": {

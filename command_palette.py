@@ -2,6 +2,10 @@
 # 統合コマンドパレット。1つの入力窓から、機能・フォルダ・ファイル・アプリを
 # 横断で探してその場で開く/実行する。入力が計算式なら、その場で答えも出す。
 #
+# 横断検索 v2: settings の command_palette.web_searches にある URL
+# テンプレート({query} を含む)ごとに「そのサービスで検索」の行も出す。
+# 接頭辞は付けない(打ち分ける手間を無くすため)。選ぶとブラウザで開く。
+#
 # 入口は縦ランチャの項目とホットキー(既定は未割り当て)で、開閉の管理は
 # feature_screen.show_palette が持つ。候補の収集(何を対象にするか)と実行
 # (選ばれたら何をするか)も feature_screen 側。ここは「探す・並べる・窓」の係。
@@ -19,6 +23,7 @@ import math
 import os
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +39,7 @@ _KIND_LABELS = {
     "file": "ファイル",
     "app": "アプリ",
     "calc": "計算",
+    "web": "Web検索",
 }
 
 # ファイル検索の入力待ち(ms)。打つたびに es.exe を叩かないための猶予。
@@ -140,7 +146,48 @@ def candidate_key(cand):
     if cand.kind in ("folder", "file", "app"):
         path = cand.payload.get("path")
         return f"{cand.kind}:{os.path.normcase(path)}" if path else None
+    if cand.kind == "web":
+        # Web 検索はクエリごとに URL が変わるので、サービス名で数える
+        service = cand.payload.get("service")
+        return f"web:{service}" if service else None
     return None
+
+
+def normalize_web_searches(value) -> list:
+    """settings の web_searches を [{name, url}] の並びに整える。
+
+    手で編集される値なので、name が空・{query} を含まない URL の要素は捨てる
+    (壊れた1件でパレット全体が開かなくなる方が困る。launcher.load_bookmarks
+    と同じ考え方)。"""
+    if not isinstance(value, list):
+        return []
+    found = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        if name and "{query}" in url:
+            found.append({"name": name, "url": url})
+    return found
+
+
+def build_web_candidates(searches, query: str) -> list:
+    """打った文字を各サービスの検索 URL に差し込んだ候補を作る。
+
+    クエリが空なら出さない(打つ前から検索行が並ぶのは邪魔なだけ)。"""
+    text = (query or "").strip()
+    if not text:
+        return []
+    encoded = urllib.parse.quote(text, safe="")
+    return [
+        Candidate("web", f"{entry['name']} で「{text}」を検索",
+                  entry["url"].replace("{query}", encoded),
+                  {"url": entry["url"].replace("{query}", encoded),
+                   "service": entry["name"]},
+                  keywords=entry["name"])
+        for entry in searches
+    ]
 
 
 def frecency_boost(entry, now: float) -> float:
@@ -408,7 +455,8 @@ class PaletteWindow(QWidget):
     chosen = Signal(object)   # Candidate
     closed = Signal()
 
-    def __init__(self, static_candidates, file_search=None, history=None):
+    def __init__(self, static_candidates, file_search=None, history=None,
+                 web_searches=None):
         super().__init__()
         self.setWindowTitle("コマンドパレット")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -416,6 +464,7 @@ class PaletteWindow(QWidget):
         self._static = list(static_candidates)
         self._file_search = file_search
         self._history = history or {}
+        self._web_searches = normalize_web_searches(web_searches or [])
         self._generation = 0
         self._file_results = []
         self._shown = []
@@ -470,6 +519,7 @@ class PaletteWindow(QWidget):
         if calc is not None:
             rows.append(calc)
         rows.extend(filter_candidates(text, self._static, _MAX_ROWS, self._history))
+        rows.extend(build_web_candidates(self._web_searches, text))
         seen_paths = {
             c.payload.get("path") for c in rows if c.payload.get("path")
         }
@@ -560,5 +610,6 @@ class PaletteWindow(QWidget):
         super().closeEvent(event)
 
 
-def create_window(static_candidates, file_search=None, history=None) -> PaletteWindow:
-    return PaletteWindow(static_candidates, file_search, history)
+def create_window(static_candidates, file_search=None, history=None,
+                  web_searches=None) -> PaletteWindow:
+    return PaletteWindow(static_candidates, file_search, history, web_searches)

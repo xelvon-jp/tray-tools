@@ -1228,7 +1228,8 @@ class ScreenFeature:
             self._palette_history_cache = command_palette.load_history()
         window = command_palette.create_window(
             self._palette_static_candidates(), self._palette_file_search,
-            self._palette_history_cache)
+            self._palette_history_cache,
+            (self.app_settings.get("command_palette") or {}).get("web_searches"))
         window.chosen.connect(self._on_palette_chosen)
         window.closed.connect(self._close_palette)
         self.palette_window = window
@@ -1317,6 +1318,10 @@ class ScreenFeature:
                     show_toast(f"コマンドパレット\n{item.get('label')}を呼び出せません")
             elif cand.kind == "calc":
                 QApplication.clipboard().setText(cand.payload.get("value", ""))
+            elif cand.kind == "web":
+                url = cand.payload.get("url") or ""
+                if url:
+                    os.startfile(url)  # noqa: S606  本人が選んだ検索先を開くだけ
             elif cand.kind in ("folder", "file", "app"):
                 path = cand.payload.get("path") or ""
                 if path:

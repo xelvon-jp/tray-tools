@@ -786,6 +786,7 @@ Windows 11 のタスクバー時計に合わせて2行（上に時刻、下に�
 - ファイル候補は `es.exe` が見つかり、Everything が起動しているときだけ出ます。無ければ他の候補だけで動きます
 - `Esc`／フォーカスを外すと閉じます
 - **frecency 学習**: 選んだ候補は数えて覚えます（`%LOCALAPPDATA%\traytools\palette_history.json`。PC ごとの状態なので `settings.json` には入れません）。よく使うものほど（頻度×近さで）並びが前に寄り、検索語が空のときは使う順に出ます。文字列の合い具合が主で、押し上げは近いスコアをひっくり返す程度に抑えてあります
+- **Web サービスの横断検索**: 文字を打つと、`settings.json` の `command_palette.web_searches` にあるサービスごとに「（サービス名）で『…』を検索」の行が出て、選ぶとブラウザでそのサービスの検索結果を開きます。**接頭辞は不要**です。既定は Microsoft 365（SharePoint・OneDrive・Teams・OneNote を横断する検索）と Box です。社内サイトも `{query}` を含む URL テンプレートを足すだけで加えられます（SharePoint 単体なら `https://<テナント>.sharepoint.com/search/Pages/results.aspx?k={query}` の形）。社内環境での結果はテナント側の設定に依存するため未検証です
 
 ### 電卓（ランチャの項目）
 

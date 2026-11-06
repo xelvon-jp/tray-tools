@@ -173,6 +173,46 @@ def test_history_file_roundtrip():
         assert cp.load_history(path) == {}
 
 
+def test_web_searches():
+    searches = cp.normalize_web_searches([
+        {"name": "Box", "url": "https://app.box.com/search?query={query}"},
+        {"name": "", "url": "https://x.example/?q={query}"},       # 名前なしは捨てる
+        {"name": "壊れ", "url": "https://x.example/"},              # {query} 無しは捨てる
+        "not-a-dict",
+    ])
+    assert [s["name"] for s in searches] == ["Box"]
+    assert cp.normalize_web_searches(None) == []
+    # 空クエリでは出さない
+    assert cp.build_web_candidates(searches, "  ") == []
+    rows = cp.build_web_candidates(searches, "議事録 テスト&1")
+    assert len(rows) == 1
+    cand = rows[0]
+    assert cand.kind == "web"
+    assert cand.payload["service"] == "Box"
+    # クエリは URL エンコードされて差し込まれる
+    assert cand.payload["url"] == (
+        "https://app.box.com/search?query="
+        "%E8%AD%B0%E4%BA%8B%E9%8C%B2%20%E3%83%86%E3%82%B9%E3%83%88%261")
+    # frecency のキーはサービス単位
+    assert cp.candidate_key(cand) == "web:Box"
+
+
+def test_palette_window_web_rows():
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    searches = [{"name": "Box", "url": "https://app.box.com/search?query={query}"}]
+    window = cp.PaletteWindow([], None, {}, searches)
+    try:
+        # 打つ前は Web 行は無い
+        assert all(c.kind != "web" for c in window._shown)
+        window._refresh("議事録")
+        web = [c for c in window._shown if c.kind == "web"]
+        assert len(web) == 1 and web[0].payload["service"] == "Box"
+    finally:
+        window.close()
+        app.processEvents()
+
+
 ALL_TESTS = [
     test_score_match,
     test_filter_candidates,
@@ -182,6 +222,8 @@ ALL_TESTS = [
     test_palette_window_offscreen,
     test_frecency,
     test_history_file_roundtrip,
+    test_web_searches,
+    test_palette_window_web_rows,
 ]
 
 

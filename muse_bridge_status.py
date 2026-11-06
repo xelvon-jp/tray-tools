@@ -29,9 +29,9 @@ FORGET_SEC = 6 * 3600
 
 LABELS = {
     "waiting": "返事待ち",
-    "busy": "Muse作業中",
+    "busy": "作業中",
     "settling": "返事の確定待ち",
-    "idle": "Muse待機",
+    "idle": "待機中",
     "claude": "Claude確認中",
 }
 

@@ -24,7 +24,7 @@ def test_waiting_reply_with_busy_muse():
     data = {"state": "busy", "since": NOW - 65, "waiting_since": NOW - 252,
             "poll_sec": 15, "last_poll": NOW - 8, "approved": 2}
     assert mbs.describe(data, NOW) == [
-        "Muse返事待ち 4分12秒（Muse作業中 1分05秒）",
+        "Muse返事待ち 4分12秒（作業中 1分05秒）",
         "監視 15秒毎・次7秒・自動承認2件",
     ]
 
@@ -44,7 +44,7 @@ def test_settling_shows_count():
 def test_idle_without_waiting():
     data = {"state": "idle", "since": NOW - 600, "waiting_since": None,
             "poll_sec": 15, "last_poll": NOW - 3}
-    assert mbs.describe(data, NOW)[0] == "Muse Muse待機 10分00秒"
+    assert mbs.describe(data, NOW)[0] == "Muse 待機中 10分00秒"
 
 
 def test_stale_and_forgotten():

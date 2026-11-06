@@ -2058,6 +2058,41 @@ def opens_in_viewer(name: str, extensions) -> bool:
 
 
 # ---------------------------------------------------------------
+# 拡張子ごとの既定アプリ(settings の filer.default_apps)
+# ---------------------------------------------------------------
+# Windows の関連付けとは別に、あっふの中で「この拡張子はこのアプリで開く」を
+# 持つ。{"pdf": "C:\\...\\SumatraPDF.exe"} のような {拡張子: コマンド文字列} で、
+# Enter の通常開き・Ctrl+Enter のどちらでも、関連付けの代わりにそのアプリへ
+# ファイルのパスを渡して開く。画像・テキストビュアなど内部で開く種類には
+# 効かない(あちらは Ctrl+Enter でも関連付け=この表が先)。コマンドの分け方は
+# filer_extmenu.split_command(ツールと同じ Windows の書き方)。
+
+
+def normalize_default_apps(value) -> dict:
+    """settings.json の filer.default_apps を {拡張子: コマンド} に揃える。
+
+    辞書でなければ空。キーは normalize_exts と同じ揃え方(点や * を除いた小文字)、
+    コマンドが空の行は捨てる。"""
+    if not isinstance(value, dict):
+        return {}
+    apps = {}
+    for key, command in value.items():
+        exts = normalize_exts([key])
+        command = str(command).strip() if command is not None else ""
+        if exts and command:
+            apps[exts[0]] = command
+    return apps
+
+
+def default_app_for(name: str, apps: dict):
+    """その名前のファイルを開く既定アプリのコマンド。無ければ None。"""
+    if not apps:
+        return None
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    return apps.get(ext) if ext else None
+
+
+# ---------------------------------------------------------------
 # プレビュー(F3)
 # ---------------------------------------------------------------
 PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico".split())

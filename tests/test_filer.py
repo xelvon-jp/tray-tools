@@ -4618,6 +4618,22 @@ def test_ext_color_logic():
     assert core.DEFAULT_KEYMAP["0090"] == "settings_dialog"
 
 
+def test_default_apps():
+    apps = core.normalize_default_apps({
+        ".PDF": "C:/apps/SumatraPDF.exe",
+        "*.log": "notepad++",
+        "txt": "",
+        "": "x.exe",
+    })
+    assert apps == {"pdf": "C:/apps/SumatraPDF.exe", "log": "notepad++"}, apps
+    assert core.normalize_default_apps(None) == {}
+    assert core.normalize_default_apps(["pdf"]) == {}
+    assert core.default_app_for("a.PDF", apps) == "C:/apps/SumatraPDF.exe"
+    assert core.default_app_for("a.txt", apps) is None
+    assert core.default_app_for("noext", apps) is None
+    assert core.default_app_for("a.pdf", {}) is None
+
+
 def test_row_color_rules():
     now = 1_800_000_000.0
     day = 86400.0

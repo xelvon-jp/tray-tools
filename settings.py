@@ -374,6 +374,10 @@ DEFAULT_SETTINGS = {
     #   font_families … 一覧の字(既定は MS Gothic)
     #   viewer_extensions … Enter で簡易テキストビュアに回す拡張子(点なし。ここに無いものは
     #     従来どおり関連付けで開く。Ctrl+Enter は常に関連付け)
+    #   default_apps … 拡張子ごとの既定アプリ。{"pdf": "C:\\...\\SumatraPDF.exe"} のような
+    #     {拡張子: コマンド文字列} で、Enter の通常開き・Ctrl+Enter のどちらでも関連付けの
+    #     代わりにそのアプリで開く(ファイルのパスが最後の引数に付く)。画像・テキスト
+    #     ビュアなど内部で開く種類には効かない。書かなければ無し
     #   winmerge … Alt+W で使う WinMergeU.exe。空ならレジストリの App Paths と
     #     Program Files / LOCALAPPDATA の既定の場所を探す
     #   ext_colors … 拡張子別表示色。[{"color": "#RRGGBB", "exts": ["zip", "7z"]}, ...] の並びで、

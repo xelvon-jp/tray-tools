@@ -2781,6 +2781,9 @@ class FilerWindow(QWidget):
         self.viewer_extensions = core.normalize_viewer_extensions(
             section.get("viewer_extensions"))
         self._viewers = []
+        # 拡張子ごとの既定アプリ(settings の filer.default_apps。関連付けの代わりに
+        # あっふの中で開くアプリを差し替える)
+        self.default_apps = core.normalize_default_apps(section.get("default_apps"))
         # Alt+W の WinMerge。空なら App Paths と既定の場所を探す。
         self.winmerge_setting = section.get("winmerge") or ""
         # フラット表示で集める上限(テストでは小さくする)。
@@ -4041,9 +4044,30 @@ class FilerWindow(QWidget):
         if pane.archive is not None:
             # 書庫の中のファイルは一時フォルダへ取り出してから開く。
             self._extract_to_temp([entry],
-                                  lambda paths: self._startfile(paths[0], record=False))
+                                  lambda paths: self._open_path(paths[0], record=False))
             return
-        self._startfile(os.path.join(pane.path, entry.name))
+        self._open_path(os.path.join(pane.path, entry.name))
+
+    def _open_path(self, path: str, record: bool = True) -> None:
+        """ファイルを開く。拡張子ごとの既定アプリ(filer.default_apps)に登録が
+        あれば関連付けでなくそのアプリで開く。起動に失敗したら関連付けで開く。"""
+        command = None if os.path.isdir(path) else core.default_app_for(
+            path, self.default_apps)
+        if command:
+            import filer_extmenu  # コマンドの分け方はツールと同じものを使う
+
+            argv = filer_extmenu.split_command(command) + [path]
+            try:
+                subprocess.Popen(argv, close_fds=True)
+                self.log(f"開く: {path}（{command}）")
+            except OSError as e:
+                self.log(f"開けません: {path}（{command}: {e}）。関連付けで開きます")
+                self._startfile(path, record=record)
+                return
+            if record:
+                self.record_opened_file(path)
+            return
+        self._startfile(path, record=record)
 
     def _startfile(self, path: str, record: bool = True) -> None:
         try:
@@ -4447,7 +4471,7 @@ class FilerWindow(QWidget):
                         self._open_file(entry)
                 return
             for path in paths:
-                self._startfile(path)
+                self._open_path(path)
             return
 
     def start_slideshow(self, paths) -> None:

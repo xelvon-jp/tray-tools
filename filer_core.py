@@ -120,6 +120,7 @@ DEFAULT_KEYMAP = {
     # 減らすために外した(2026-11-01)。filer.keys に古い上書きが残っていても、知らない
     # コマンドとして build_keymap が捨てる。Alt+I・Alt+1〜9 は空き。
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
+    "4068": "diff_view",          # Alt+D 内蔵の差分ビューア(対象の選び方は Alt+W と同じ)
     "0080": "zip_create",         # P 圧縮(反対窓に ZIP / 7z で作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
@@ -994,6 +995,7 @@ COMMAND_SHORT_NAMES = {
     "sync_copy": "Sync",
     "queue_clear": "QueueClear",
     "winmerge": "WinMerge",
+    "diff_view": "Diff",
     "zip_create": "Press",
     "mask_input": "Mask",
     "mask_clear": "Mask*.*",
@@ -2059,6 +2061,9 @@ def opens_in_viewer(name: str, extensions) -> bool:
 # プレビュー(F3)
 # ---------------------------------------------------------------
 PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico".split())
+PREVIEW_PDF_EXTS = frozenset("pdf".split())
+PREVIEW_HTML_EXTS = frozenset("html htm xhtml".split())
+PREVIEW_MARKDOWN_EXTS = frozenset("md markdown".split())
 PREVIEW_TEXT_LINES = 200
 PREVIEW_TEXT_BYTES = 256 * 1024
 PREVIEW_ARCHIVE_MAX = 4 * 1024 * 1024     # 書庫の中はこれ以下だけ取り出して見せる
@@ -2066,8 +2071,10 @@ PREVIEW_FOLDER_NAMES = 40
 
 
 def preview_kind(entry, text_extensions) -> str:
-    """プレビューで何を出すか。"none"(何も無い・"..")/ "folder" / "text" / "image" / "info"。
-    テキストかどうかはビュアと同じ拡張子の表(filer.viewer_extensions)で決める。"""
+    """プレビューで何を出すか。"none"(何も無い・"..")/ "folder" / "text" / "image" /
+    "pdf" / "html" / "markdown" / "info"。
+    テキストかどうかはビュアと同じ拡張子の表(filer.viewer_extensions)で決める。
+    PDF・HTML・Markdown はテキストの表に載っていても整形して出すので先に見る。"""
     if entry is None or entry.is_parent:
         return "none"
     if entry.is_dir:
@@ -2075,6 +2082,12 @@ def preview_kind(entry, text_extensions) -> str:
     ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
     if ext in PREVIEW_IMAGE_EXTS:
         return "image"
+    if ext in PREVIEW_PDF_EXTS:
+        return "pdf"
+    if ext in PREVIEW_HTML_EXTS:
+        return "html"
+    if ext in PREVIEW_MARKDOWN_EXTS:
+        return "markdown"
     if ext and ext in text_extensions:
         return "text"
     return "info"

@@ -5261,10 +5261,45 @@ def test_preview_logic():
     assert core.preview_kind(F("a.LOG"), exts) == "text"
     assert core.preview_kind(F("p.JPEG"), exts) == "image"
     assert core.preview_kind(F("x.bin"), exts) == "info"
+    # PDF・HTML・Markdown は整形して出す(テキストの表に載っていてもそちらが先)
+    assert core.preview_kind(F("doc.PDF"), exts) == "pdf"
+    assert core.preview_kind(F("page.html"), exts) == "html"
+    assert core.preview_kind(F("note.md"), exts) == "markdown"
     assert core.fit_size(4000, 3000, 400, 400) == (400, 300)
     assert core.fit_size(100, 50, 400, 400) == (100, 50)               # 拡大はしない
     assert core.fit_size(0, 0, 10, 10) == (0, 0)
     assert core.info_lines("x.bin", F("x.bin", size=1234))[2].startswith("サイズ  1,234")
+
+
+def test_preview_rich_and_pdf():
+    """プレビューの整形表示(HTML / Markdown)と PDF の1ページ目。"""
+    import filer_preview
+    with tempfile.TemporaryDirectory() as tmp:
+        md = Path(tmp, "note.md")
+        md.write_text("# 見出し\n\n本文です\n", encoding="utf-8")
+        result = filer_preview.load_preview(str(md), "markdown", F("note.md"))
+        assert result["rich"] is not None and result["rich"][0] == "markdown"
+        assert "見出し" in result["rich"][1]
+
+        html = Path(tmp, "page.html")
+        html.write_text("<h1>題</h1><p>中身</p>", encoding="utf-8")
+        result = filer_preview.load_preview(str(html), "html", F("page.html"))
+        assert result["rich"] is not None and result["rich"][0] == "html"
+
+        pdf = Path(tmp, "doc.pdf")
+        pdf.write_bytes(
+            b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n"
+            b"trailer<</Root 1 0 R>>\n%%EOF")
+        result = filer_preview.load_preview(str(pdf), "pdf", F("doc.pdf"), box=(200, 200))
+        assert result["image"] is not None and not result["image"].isNull()
+        assert "1ページ目" in (result.get("note") or "")
+
+        # 書庫の中の PDF は中身を出さない
+        result = filer_preview.load_preview(str(pdf), "pdf", F("doc.pdf"),
+                                            archive=(str(pdf), ""))
+        assert result["kind"] == "info" and result["image"] is None
 
 
 def test_preview_image_orientation():

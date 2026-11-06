@@ -7428,6 +7428,66 @@ class FilerWindow(QWidget):
         except OSError as e:
             self.log(f"比較: WinMerge を起動できません（{e}）")
 
+    # --- 内蔵の差分ビューア(Alt+D) ---
+    def cmd_diff_view(self):
+        """対象の選び方は WinMerge(Alt+W)と同じ。フォルダ同士は WinMerge に任せる。"""
+        pair = core.winmerge_pair(self._marked_entries(self.left),
+                                  self._marked_entries(self.right))
+        if pair is None:
+            self.log(f"差分: {core.WINMERGE_HINT}")
+            return
+        items = [(self.pane(side), entry) for side, entry in pair]
+        if any(entry.is_dir for _pane, entry in items):
+            self.log("差分: フォルダは内蔵ビューアでは比べられません（WinMerge は Alt+W）")
+            return
+        displays = [os.path.join(pane.path, entry.name) for pane, entry in items]
+        resolved = [None, None]
+
+        def step(i):
+            # 書庫の中のものは一時フォルダへ取り出してから読む(WinMerge と同じ)
+            if i == len(items):
+                self._show_diff(displays, resolved)
+                return
+            pane, entry = items[i]
+            if pane.archive is None:
+                resolved[i] = displays[i]
+                step(i + 1)
+                return
+
+            def got(paths, i=i):
+                resolved[i] = paths[0]
+                step(i + 1)
+
+            self._extract_to_temp([entry], got, pane)
+
+        step(0)
+
+    def _show_diff(self, displays, paths) -> None:
+        import filer_diff  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        try:
+            a_lines, a_label, a_cut = filer_diff.read_text_lines(paths[0])
+            b_lines, b_label, b_cut = filer_diff.read_text_lines(paths[1])
+        except OSError as e:
+            self.log(f"差分: 読めません（{e}）")
+            return
+        rows = filer_diff.diff_rows(a_lines, b_lines)
+        added, removed = filer_diff.diff_counts(rows)
+        summary = (f"{displays[0]} ⇔ {displays[1]}　追加 {added} 行 / 削除 {removed} 行"
+                   f"（{a_label} / {b_label}）")
+        if a_cut or b_cut:
+            summary += "　※大きいので先頭だけ比べています"
+        window = filer_diff.DiffWindow(self, displays[0], displays[1], rows,
+                                       self.log_font, self.colors, summary)
+        windows = getattr(self, "_diff_windows", None)
+        if windows is None:
+            windows = self._diff_windows = []
+        windows.append(window)
+        window.destroyed.connect(lambda _obj=None: windows.remove(window)
+                                 if window in windows else None)
+        window.show()
+        self.log(f"差分: {displays[0]} ⇔ {displays[1]}（追加 {added} / 削除 {removed}）")
+
     # --- 閉じる ---
     def cmd_quit(self):
         self.close()

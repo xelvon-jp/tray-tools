@@ -8,19 +8,23 @@
 #     (JPEG / TIFF は Qt、Qt が読まない PNG / WebP は自前。読み込みはスライドショーと
 #     共通の image_load)。手動の回転・反転(R / L / H / V。状態は filer_core.ImageTurn)
 #     は表示のときに PreviewWidget が当てる
+#   - PDF: 1ページ目を絵にして出す(PySide6 の QtPdf。無ければ情報だけ)
+#   - HTML / Markdown: QTextBrowser で整形して出す(相対パスの画像も読む。
+#     リンクは辿らない)。読む範囲はテキストと同じ先頭 200 行まで
 #   - フォルダ: 中のフォルダ・ファイルの数と、先頭の名前
 #   - そのほか: 名前・サイズ・日時・属性
 # 読み込みは load_preview を読み取りスレッドで呼ぶ(ネットワーク越しでも窓は止まらない)。
 # QImage はスレッドをまたいで渡してよい(QPixmap にするのは UI スレッドで)。
 import os
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QUrl, Qt
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QSizePolicy,
     QStackedWidget,
+    QTextBrowser,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
@@ -41,6 +45,40 @@ def _read_text(path: str):
     lines = text.splitlines()[:core.PREVIEW_TEXT_LINES]
     label = filer_viewer.ENCODING_LABELS.get(encoding, encoding)
     return lines, label
+
+
+def _read_rich(path: str):
+    """HTML / Markdown 用に、テキストと同じ範囲を1つの文字列で読む。"""
+    lines, label = _read_text(path)
+    return "\n".join(lines), label
+
+
+def _read_pdf(path: str, box):
+    """PDF の1ページ目を絵にする。(QImage, ページ数)。
+
+    PySide6 の QtPdf を使う(追加の依存なし)。ドキュメントはこのスレッドの中で
+    作って捨てる(スレッドをまたいで持たない)。QtPdf が無い環境では RuntimeError。"""
+    try:
+        from PySide6.QtPdf import QPdfDocument
+    except ImportError as e:
+        raise RuntimeError("PDF を表示できません（PySide6 の QtPdf がありません）") from e
+    from PySide6.QtCore import QSize
+
+    doc = QPdfDocument()
+    error = doc.load(path)
+    if error != QPdfDocument.Error.None_:
+        raise RuntimeError(f"PDF を開けません（{error}）")
+    pages = doc.pageCount()
+    if pages <= 0:
+        raise RuntimeError("PDF にページがありません")
+    point = doc.pagePointSize(0)
+    bw, bh = max(box[0], 16), max(box[1], 16)
+    scale = min(bw / max(point.width(), 1.0), bh / max(point.height(), 1.0))
+    size = QSize(max(1, int(point.width() * scale)), max(1, int(point.height() * scale)))
+    image = doc.render(0, size)
+    if image.isNull():
+        raise RuntimeError("PDF の1ページ目を描けませんでした")
+    return image, pages
 
 
 # 画像の読み込み(縮小・EXIF の向き)はスライドショーと共通の image_load にある。
@@ -112,9 +150,14 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
 
     archive は (書庫ファイル, 中のフォルダ) で、書庫の中のファイルのとき。小さいものだけ
     一時フォルダへ取り出して読み、大きいものは情報だけにする。"""
-    result = {"kind": kind, "title": entry.name if entry else "", "lines": [], "image": None}
+    result = {"kind": kind, "title": entry.name if entry else "", "lines": [],
+              "image": None, "rich": None, "path": path}
     try:
-        if archive is not None and kind in ("text", "image"):
+        if archive is not None and kind == "pdf":
+            result.update(kind="info", lines=core.info_lines(entry.name, entry)
+                          + ["", "（書庫の中の PDF は中身を出しません）"])
+            return result
+        if archive is not None and kind in ("text", "image", "html", "markdown"):
             if entry.size > core.PREVIEW_ARCHIVE_MAX:
                 result.update(kind="info", lines=core.info_lines(entry.name, entry)
                               + ["", "（書庫の中の大きなファイルは中身を出しません）"])
@@ -130,9 +173,16 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             if outcome.errors:
                 raise OSError(outcome.errors[0])
             path = os.path.join(dest, entry.name)
+            result["path"] = path
         if kind == "text":
             lines, label = _read_text(path)
             result.update(lines=lines, note=label)
+        elif kind == "pdf":
+            image, pages = _read_pdf(path, box)
+            result.update(image=image, note=f"PDF {pages}ページ・1ページ目")
+        elif kind in ("html", "markdown"):
+            text, label = _read_rich(path)
+            result.update(rich=(kind, text), note=label)
         elif kind == "image":
             edited = None
             orig_image = None
@@ -204,8 +254,17 @@ class PreviewWidget(QWidget):
         # 絵の大きさで窓側の寸法が決まらないようにする(寸法は窓が決める)
         self.image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.image.setStyleSheet(f"background-color: {colors['background']};")
+        # HTML / Markdown の整形表示。リンクは辿らない(見本なので)
+        self.rich = QTextBrowser()
+        self.rich.setReadOnly(True)
+        self.rich.setFocusPolicy(Qt.NoFocus)
+        self.rich.setOpenLinks(False)
+        self.rich.setOpenExternalLinks(False)
+        self.rich.setStyleSheet(f"background-color: {colors['background']};"
+                                f" color: {colors['text']}; border: none;")
         self.stack.addWidget(self.text)
         self.stack.addWidget(self.image)
+        self.stack.addWidget(self.rich)
         layout.addWidget(self.stack, 1)
         self.last = None
         self.turn = core.TURN_IDENTITY      # 手動の回転・反転(R / L / H / V)
@@ -303,6 +362,19 @@ class PreviewWidget(QWidget):
             self.orig_btn.setEnabled(self._orig_pixmap is not None)
             self.image.setPixmap(pixmap)
             self.stack.setCurrentWidget(self.image)
+        elif result.get("rich") is not None:
+            self._disp_pixmap = None
+            self._orig_pixmap = None
+            self.orig_btn.setEnabled(False)
+            kind, text = result["rich"]
+            base = result.get("path") or ""
+            self.rich.document().setBaseUrl(
+                QUrl.fromLocalFile(os.path.dirname(base) + os.sep) if base else QUrl())
+            if kind == "html":
+                self.rich.setHtml(text)
+            else:
+                self.rich.setMarkdown(text)
+            self.stack.setCurrentWidget(self.rich)
         else:
             self._disp_pixmap = None
             self._orig_pixmap = None

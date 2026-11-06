@@ -354,39 +354,20 @@ def _build_devices(detected: list) -> list:
 
 
 def _fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:
-    """defaults にあって current に無いキーだけを current へ足す。既存の値は触らない。
+    """settings.fill_missing への委譲。本体は settings.py にあり、起動時の自動同期
+    (settings.sync_settings_file)と共用する(二重管理にしない)。"""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import settings as settings_module
 
-    バージョンが上がって設定項目が増えても、既存の settings.json には入らないままになる。
-    load_settings 側の deep merge で既定値は効くので動作はするが、ファイルを開いても
-    「今どんな設定があるのか」が分からない。ここで実体を書き足して見えるようにする。
-
-    足したキーのパス一覧を返す(何が増えたのかを画面に出すため)。"""
-    added = []
-    for key, value in defaults.items():
-        path = f"{prefix}{key}"
-        if key not in current:
-            current[key] = json.loads(json.dumps(value))  # 既定値を汚さないよう複製して渡す
-            added.append((path, current[key]))
-        elif isinstance(value, dict) and isinstance(current[key], dict):
-            added.extend(_fill_missing(value, current[key], f"{path}."))
-    return added
+    return settings_module.fill_missing(defaults, current, prefix)
 
 
 def _new_launcher_items(default_items, current_items, applied_items) -> list:
-    """縦ランチャへ足すべき項目。既定にあって、前回の setup 実行時点の既定には
-    無くて、今のリストにも無いもの(既定の並び順で返す)。
+    """settings.new_launcher_items への委譲(本体は settings.py、理由は _fill_missing と同じ)。"""
+    sys.path.insert(0, str(PROJECT_DIR))
+    import settings as settings_module
 
-    applied_items(前回の既定)を挟むのは、利用者が自分で消した項目を「既定にある」
-    というだけで復活させないため。_fill_missing はキーの有無しか見ないので、
-    既にあるリストの中身を増やす話はここで受ける。"""
-    added = []
-    for name in default_items:
-        if not isinstance(name, str):
-            continue
-        if name in applied_items or name in current_items or name in added:
-            continue
-        added.append(name)
-    return added
+    return settings_module.new_launcher_items(default_items, current_items, applied_items)
 
 
 def _backup_settings() -> Path:
@@ -445,7 +426,8 @@ def _update_existing_settings(detected: list, redetect, env=None) -> None:
     # 1.25. 縦ランチャの項目。既定に増えた分だけを、既存リストの末尾へ足す。
     # 過去に自分で消した項目まで復活させないよう、前回の実行時点の既定を
     # launcher_defaults_applied に記録して「今回の既定 − 前回の既定」を対象にする
-    # (記録は setup.py だけが読み書きする。アプリ側は知らない)。
+    # (この部分は起動時の自動同期 settings.sync_settings_file と同じ動きで、
+    # 本体は settings.py 側にある。ここでは setup.py を流したときにも効く)。
     widget_cfg = current.get("taskbar_widget")
     if isinstance(widget_cfg, dict):
         default_items = (

@@ -2,7 +2,9 @@
 # settings.json の読み書きを行う。存在しない場合は自動生成し、壊れている場合は
 # デフォルトにフォールバックする(rapture-py/settings.py の挙動を踏襲)。
 import json
+import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 # 既定の保存先。ドライブ直下(C:\bak 等)は権限の無いPCでは作成に失敗しうるので、
@@ -276,9 +278,10 @@ DEFAULT_SETTINGS = {
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
     # 移る途中には必ず「どちらにも乗っていない」瞬間があるので、0にすると項目へ届く前に
     # 閉じる。
-    # launcher_defaults_applied は既定には無いキーで、setup.py だけが読み書きする記録
-    # (前回の setup 実行時点の launcher_items の既定)。既定に増えた項目を既存リストへ
-    # 足すときに、自分で消した項目を復活させないためのもの。アプリ側は知らない。
+    # launcher_defaults_applied は既定には無いキーで、setup.py と起動時の自動同期
+    # (settings.sync_settings_file)が読み書きする記録(前回そろえた時点の
+    # launcher_items の既定)。既定に増えた項目を既存リストへ足すときに、自分で消した
+    # 項目を復活させないためのもの。
     "taskbar_widget": {
         "enabled": False,
         "all_displays": True,
@@ -566,6 +569,98 @@ def save_settings(settings_dict: dict, path=None) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(settings_dict, f, ensure_ascii=False, indent=2)
+
+
+def fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:
+    """defaults にあって current に無いキーだけを current へ足す。既存の値は触らない。
+
+    バージョンが上がって設定項目が増えても、既存の settings.json には入らないままに
+    なる。load_settings の deep merge で既定値は効くので動作はするが、ファイルを開いても
+    「今どんな設定があるのか」が分からない。ここで実体を書き足して見えるようにする。
+
+    足したキーの (パス, 値) の一覧を返す(何が増えたのかを画面に出すため)。
+    setup.py の設定更新と、起動時の自動同期(sync_settings_file)で共用する。"""
+    added = []
+    for key, value in defaults.items():
+        path = f"{prefix}{key}"
+        if key not in current:
+            current[key] = json.loads(json.dumps(value))  # 既定値を汚さないよう複製して渡す
+            added.append((path, current[key]))
+        elif isinstance(value, dict) and isinstance(current[key], dict):
+            added.extend(fill_missing(value, current[key], f"{path}."))
+    return added
+
+
+def new_launcher_items(default_items, current_items, applied_items) -> list:
+    """縦ランチャへ足すべき項目。既定にあって、前回そろえた時点の既定には無くて、
+    今のリストにも無いもの(既定の並び順で返す)。
+
+    applied_items(前回そろえた既定)を挟むのは、利用者が自分で消した項目を「既定に
+    ある」というだけで復活させないため。fill_missing はキーの有無しか見ないので、
+    既にあるリストの中身を増やす話はここで受ける。"""
+    added = []
+    for name in default_items:
+        if not isinstance(name, str):
+            continue
+        if name in applied_items or name in current_items or name in added:
+            continue
+        added.append(name)
+    return added
+
+
+def sync_settings_file(path=None) -> list:
+    """settings.json を今の版に追いつかせる(起動時の自動同期)。
+
+    setup.py の設定更新のうち、対話の要らない部分だけを行う: 不足キーを足すことと、
+    縦ランチャの新項目を足すこと。値の変更や環境・音声デバイスの確認はしない
+    (それらは setup.py の役目のまま)。
+
+    変更があるときだけ、控え(settings.json.bak_YYYYMMDD_HHMMSS、setup.py と同じ
+    名前)を取ってから書き込む。足した項目の説明の一覧を返す(呼び出し側が知らせる)。
+    ファイルが無いときは何もしない(load_settings が既定で作る)。読めない・書けない
+    ときも例外を投げずに空の一覧を返し、起動を止めない。"""
+    target_path = Path(path) if path else SETTINGS_PATH
+    try:
+        if not target_path.exists():
+            return []
+        with open(target_path, "r", encoding="utf-8") as f:
+            current = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(current, dict):
+        return []
+
+    before = json.dumps(current, ensure_ascii=False, sort_keys=True)
+    changes = [p for p, _value in fill_missing(DEFAULT_SETTINGS, current)]
+
+    widget_cfg = current.get("taskbar_widget")
+    if isinstance(widget_cfg, dict):
+        default_items = DEFAULT_SETTINGS.get("taskbar_widget", {}).get("launcher_items") or []
+        current_items = widget_cfg.get("launcher_items")
+        if isinstance(current_items, list) and all(
+            isinstance(x, str) for x in current_items
+        ):
+            applied = widget_cfg.get("launcher_defaults_applied")
+            if not isinstance(applied, list):
+                applied = []
+            for name in new_launcher_items(default_items, current_items, applied):
+                current_items.append(name)
+                changes.append(f"taskbar_widget.launcher_items += {name}")
+            # 記録だけの更新では changes に載せない(利用者から見える変化ではない)が、
+            # ファイルは書き換わるので、下の比較で書き込みは行われる。
+            widget_cfg["launcher_defaults_applied"] = list(default_items)
+
+    if json.dumps(current, ensure_ascii=False, sort_keys=True) == before:
+        return changes
+    try:
+        backup = target_path.with_name(
+            f"{target_path.name}.bak_{datetime.now():%Y%m%d_%H%M%S}"
+        )
+        shutil.copy2(target_path, backup)
+        save_settings(current, target_path)
+    except OSError:
+        return []
+    return changes
 
 
 def cleanup_old_captures(capture_settings: dict) -> None:

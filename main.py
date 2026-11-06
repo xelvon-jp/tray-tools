@@ -949,6 +949,14 @@ def main():
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
+    # 設定ファイルを今の版へ追いつかせる(不足キーと縦ランチャの新項目だけ)。
+    # setup.py を手で流さなくても、更新後の再起動だけで済むようにするためのもの。
+    # 単一起動の確認が済んだ後・Feature を組み立てる前に置く(書き換えるのはここだけに
+    # する)。失敗しても起動は止めない(sync_settings_file 側で握りつぶしてある)。
+    _synced = settings_module.sync_settings_file()
+    if _synced:
+        action_log.record("設定の自動同期", " / ".join(_synced), "startup")
+
     app_settings = settings_module.load_settings()
     settings_module.cleanup_old_captures(app_settings.get("capture", {}))
 

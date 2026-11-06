@@ -106,3 +106,29 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+def test_sync_unexpected_exception_swallowed():
+    """処理の途中で予期しない例外が出ても、投げずに空の一覧を返す(起動を止めない)。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "settings.json"
+        path.write_text(json.dumps({"environment": 1}), encoding="utf-8")
+        original = settings_module.fill_missing
+
+        def boom(defaults, current, prefix=""):
+            raise RuntimeError("boom")
+
+        settings_module.fill_missing = boom
+        try:
+            assert settings_module.sync_settings_file(path) == []
+        finally:
+            settings_module.fill_missing = original
+
+
+def test_save_settings_trailing_newline():
+    """setup.py の _save_settings と同じく末尾に改行を入れる(書き合いの diff ノイズ防止)。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "settings.json"
+        settings_module.save_settings({"environment": 1}, path)
+        text = path.read_text(encoding="utf-8")
+        assert text.endswith("\n")
+        assert json.loads(text) == {"environment": 1}

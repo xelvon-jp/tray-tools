@@ -569,6 +569,7 @@ def save_settings(settings_dict: dict, path=None) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(settings_dict, f, ensure_ascii=False, indent=2)
+        f.write("\n")  # setup.py の _save_settings と末尾改行を揃える
 
 
 def fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:
@@ -618,50 +619,51 @@ def sync_settings_file(path=None) -> list:
     変更があるときだけ、控え(settings.json.bak_YYYYMMDD_HHMMSS、setup.py と同じ
     名前)を取ってから書き込む。足した項目の説明の一覧を返す(呼び出し側が知らせる)。
     ファイルが無いときは何もしない(load_settings が既定で作る)。読めない・書けない
-    ときも例外を投げずに空の一覧を返し、起動を止めない。"""
+    ときも、途中で予期しない例外が出たときも、例外を投げずに空の一覧を返し、
+    起動を止めない(関数全体を try で包んである)。
+    """
     target_path = Path(path) if path else SETTINGS_PATH
     try:
         if not target_path.exists():
             return []
         with open(target_path, "r", encoding="utf-8") as f:
             current = json.load(f)
-    except (OSError, ValueError):
-        return []
-    if not isinstance(current, dict):
-        return []
+        if not isinstance(current, dict):
+            return []
 
-    before = json.dumps(current, ensure_ascii=False, sort_keys=True)
-    changes = [p for p, _value in fill_missing(DEFAULT_SETTINGS, current)]
+        before = json.dumps(current, ensure_ascii=False, sort_keys=True)
+        changes = [p for p, _value in fill_missing(DEFAULT_SETTINGS, current)]
 
-    widget_cfg = current.get("taskbar_widget")
-    if isinstance(widget_cfg, dict):
-        default_items = DEFAULT_SETTINGS.get("taskbar_widget", {}).get("launcher_items") or []
-        current_items = widget_cfg.get("launcher_items")
-        if isinstance(current_items, list) and all(
-            isinstance(x, str) for x in current_items
-        ):
-            applied = widget_cfg.get("launcher_defaults_applied")
-            if not isinstance(applied, list):
-                applied = []
-            for name in new_launcher_items(default_items, current_items, applied):
-                current_items.append(name)
-                changes.append(f"taskbar_widget.launcher_items += {name}")
-            # 記録だけの更新では changes に載せない(利用者から見える変化ではない)が、
-            # ファイルは書き換わるので、下の比較で書き込みは行われる。
-            widget_cfg["launcher_defaults_applied"] = list(default_items)
+        widget_cfg = current.get("taskbar_widget")
+        if isinstance(widget_cfg, dict):
+            default_items = DEFAULT_SETTINGS.get("taskbar_widget", {}).get("launcher_items") or []
+            current_items = widget_cfg.get("launcher_items")
+            if isinstance(current_items, list) and all(
+                isinstance(x, str) for x in current_items
+            ):
+                applied = widget_cfg.get("launcher_defaults_applied")
+                if not isinstance(applied, list):
+                    applied = []
+                for name in new_launcher_items(default_items, current_items, applied):
+                    current_items.append(name)
+                    changes.append(f"taskbar_widget.launcher_items += {name}")
+                # 記録だけの更新では changes に載せない(利用者から見える変化ではない)が、
+                # ファイルは書き換わるので、下の比較で書き込みは行われる。
+                widget_cfg["launcher_defaults_applied"] = list(default_items)
 
-    if json.dumps(current, ensure_ascii=False, sort_keys=True) == before:
-        return changes
-    try:
+        if json.dumps(current, ensure_ascii=False, sort_keys=True) == before:
+            return changes
         backup = target_path.with_name(
             f"{target_path.name}.bak_{datetime.now():%Y%m%d_%H%M%S}"
         )
         shutil.copy2(target_path, backup)
         save_settings(current, target_path)
-    except OSError:
+        return changes
+    except (OSError, ValueError):
         return []
-    return changes
-
+    except Exception:
+        # 予期しない例外でも起動は止めない(この関数の約束)。
+        return []
 
 def cleanup_old_captures(capture_settings: dict) -> None:
     """history_days > 0 のとき、保存フォルダ内のN日以上前のキャプチャファイルを削除する。

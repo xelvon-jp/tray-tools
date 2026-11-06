@@ -2,6 +2,11 @@
 # フォルダブックマークと、選んだフォルダへの移動指示。トレイアイコンは持たない
 # 部品で、開閉の管理は feature_screen 側が行う(snippets.py と同じ形)。
 #
+# ブックマークの path にはフォルダのほかに Web ページの URL(http/https)も
+# 入れられる。URL の行は既定のブラウザで開く。Edge / Chrome のお気に入りは
+# ピッカーの「ブラウザのお気に入りを取り込む」から一括で取り込める
+# (import_browser_bookmarks)。
+#
 # 移動先は二画面ファイラ「あふｗ」と、Windowsのエクスプローラの2つ(settings.json の
 # launcher.target で選ぶ。既定の auto は、ブックマークを開いた時に前面だったウインドウが
 # エクスプローラならそこを移動させ、それ以外ならあふｗへ送る)。エクスプローラ側の操作は
@@ -84,6 +89,25 @@ DRIVE_REMOTE = 4
 # 項目データの種別。picker には (表示名, データ) の形で渡す。
 KIND_JUMP = "jump"
 KIND_ADD = "add"
+KIND_IMPORT = "import"
+
+# URL のブックマークの表示名の頭。フォルダの行と見分けるための印。
+URL_ITEM_PREFIX = "🌐 "
+
+# ブラウザのお気に入りを取り込む項目。ADD_ITEM_PREFIX と同じく全角の ＋ で
+# 始める(絞り込みで英字を打った時点で候補から外れる)。
+IMPORT_ITEM_LABEL = "＋ ブラウザのお気に入りを取り込む"
+
+# 取り込みの上限。お気に入りが数千件ある環境で settings.json が膨らみ、
+# ピッカーも実用にならなくなるのを防ぐ。
+IMPORT_LIMIT = 500
+
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def is_url(path) -> bool:
+    """ブックマークの path が Web ページの URL か。"""
+    return bool(_URL_RE.match(str(path or "").strip()))
 
 
 def afxw_path(app_settings: dict) -> str:
@@ -202,6 +226,93 @@ def save_bookmark(app_settings: dict, settings_path, name: str, path: str) -> bo
     return _rewrite_stored_bookmarks(settings_path, lambda bookmarks: bookmarks + [entry])
 
 
+# ---------------------------------------------------------------
+# ブラウザのお気に入りの取り込み
+# ---------------------------------------------------------------
+def browser_bookmark_files() -> list:
+    """Edge / Chrome のお気に入りファイル(Bookmarks)の候補。実在するものだけ。
+
+    どちらのブラウザも Chromium 系で、プロファイルごとに Bookmarks(JSON)を
+    持つ。Default と Profile * を見る。"""
+    base = os.environ.get("LOCALAPPDATA") or ""
+    user_data_dirs = [
+        os.path.join(base, "Microsoft", "Edge", "User Data"),
+        os.path.join(base, "Google", "Chrome", "User Data"),
+    ]
+    found = []
+    for user_data in user_data_dirs:
+        try:
+            profiles = sorted(os.listdir(user_data))
+        except OSError:
+            continue
+        for profile in profiles:
+            if profile == "Default" or profile.startswith("Profile "):
+                path = os.path.join(user_data, profile, "Bookmarks")
+                if os.path.isfile(path):
+                    found.append(path)
+    return found
+
+
+def parse_browser_bookmarks(data) -> list:
+    """Bookmarks(JSON を dict にしたもの)から {name, path} の並びを作る。
+
+    フォルダはたどるだけで、URL の項目だけを集める(ブックマークバー →
+    その他の順はファイルの並びどおり)。"""
+    found = []
+
+    def walk(node) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "url":
+            url = str(node.get("url") or "").strip()
+            if is_url(url):
+                name = str(node.get("name") or "").strip() or url
+                found.append({"name": name, "path": url})
+            return
+        children = node.get("children")
+        if isinstance(children, list):
+            for child in children:
+                walk(child)
+
+    roots = data.get("roots") if isinstance(data, dict) else None
+    if isinstance(roots, dict):
+        for root in roots.values():
+            walk(root)
+    return found
+
+
+def import_browser_bookmarks(app_settings: dict, settings_path, files=None):
+    """ブラウザのお気に入りをブックマークへ取り込む。(取り込んだ分, 見つけた総数)。
+
+    既に同じ URL が登録されているもの・取り込み同士の重複は入れない。
+    上限(IMPORT_LIMIT)を超えた分は切る。保存は save_bookmark と同じく
+    メモリ側は常に行い、ファイル側はベストエフォート。"""
+    if files is None:
+        files = browser_bookmark_files()
+    discovered = []
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                discovered.extend(parse_browser_bookmarks(json.load(f)))
+        except (OSError, ValueError):
+            continue
+    seen = {str(e.get("path") or "").strip().casefold().rstrip("/")
+            for e in load_bookmarks(app_settings) if is_url(e.get("path"))}
+    added = []
+    for entry in discovered:
+        key = entry["path"].strip().casefold().rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        added.append(entry)
+        if len(added) >= IMPORT_LIMIT:
+            break
+    if added:
+        _rewrite_memory_bookmarks(app_settings, lambda b: b + added)
+        _rewrite_stored_bookmarks(settings_path, lambda b: b + added)
+    return added, len(discovered)
+
+
 def _log_deleted(name: str, path: str, index: int) -> None:
     """消したブックマークを1行1件で控える(DELETED_LOG_PATH)。
 
@@ -278,6 +389,13 @@ def jump(path: str, exe_path: str = None, target: str = TARGET_AFXW, hwnd: int =
 
     hwnd は「ブックマークを開いた時点で前面だったウインドウ」。auto の判定と、
     エクスプローラを移動させる対象の指定に使う。"""
+    if is_url(path):
+        # Web ページのブックマークは既定のブラウザで開く(フォルダの移動先へは送らない)
+        try:
+            os.startfile(path)  # noqa: S606  本人が選んだブックマークを開くだけ
+            return True
+        except OSError:
+            return False
     if target == TARGET_AUTO:
         # hwnd を掴んだのはピッカーを開く前だが、エクスプローラかどうかを見るのは今
         # (選ばれた瞬間)。開いている間にその窓が閉じられていれば is_explorer が False に
@@ -372,7 +490,7 @@ def tab_text(_name: str, data):
     効く**。分けていないのは意図してのこと。ブックマークを選んで Tab でその中へ掘れる方が、
     いったん移動してから探すより早い。"""
     kind, path = data
-    if kind != KIND_JUMP:
+    if kind != KIND_JUMP or is_url(path):
         return None
     return path.rstrip("\\/") + "\\"
 
@@ -570,11 +688,13 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
         「ここを登録」の行も毎回付け直す。ここを分けて書くと、組み直したときにだけ
         その行が消える、といった食い違いになる。"""
         found = [
-            (entry["name"], (KIND_JUMP, entry["path"]))
+            (f"{URL_ITEM_PREFIX}{entry['name']}" if is_url(entry["path"])
+             else entry["name"], (KIND_JUMP, entry["path"]))
             for entry in load_bookmarks(app_settings)
         ]
         if add_path:
             found.append((f"{ADD_ITEM_PREFIX}   {add_path}", (KIND_ADD, add_path)))
+        found.append((IMPORT_ITEM_LABEL, (KIND_IMPORT, "")))
         return found
 
     items = _build_items()
@@ -589,6 +709,16 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
         if kind == KIND_JUMP:
             jump(path, exe, target=target, hwnd=hwnd)
             return
+        if kind == KIND_IMPORT:
+            added, discovered = import_browser_bookmarks(app_settings, settings_path)
+            if added:
+                show_toast(f"フォルダブックマーク\nお気に入りを {len(added)} 件取り込みました")
+            elif discovered:
+                show_toast("フォルダブックマーク\n新しいお気に入りはありませんでした")
+            else:
+                show_toast("フォルダブックマーク\nブラウザのお気に入りが見つかりませんでした")
+            picker.set_items(_build_items())
+            return True
         # 登録済みのフォルダなら増やさない。知らせて、その行を選んだまま窓を開けておく
         # (そのまま Enter で飛べる)。
         existing = find_bookmark_by_path(app_settings, path)
@@ -613,13 +743,16 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
         if kind != KIND_JUMP:
             # 「ここを登録」の行。消せる実体が無い(キーは picker 側が食べている)。
             return
+        # URL の行は表示名に印(🌐)が付いている。保存側の名前は印なしで探す
+        real_name = name[len(URL_ITEM_PREFIX):] \
+            if is_url(path) and name.startswith(URL_ITEM_PREFIX) else name
         answer = QMessageBox.question(
             picker, "フォルダブックマーク", f"{name} を削除しますか？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
-        if delete_bookmark(app_settings, settings_path, name, path):
+        if delete_bookmark(app_settings, settings_path, real_name, path):
             picker.set_items(_build_items())
             # 「控えがある」ことを出すのは、消してすぐ気づいたときに探す先が分かるように。
             show_toast(f"フォルダブックマーク\n削除しました\n{name}\n（控え: {DELETED_LOG_NAME}）")
@@ -631,7 +764,9 @@ def create_picker(app_settings: dict, settings_path=None, current_path: str = No
         kind, path = data
         if kind != KIND_JUMP:
             return
-        if move_bookmark(app_settings, settings_path, name, path, step):
+        real_name = name[len(URL_ITEM_PREFIX):] \
+            if is_url(path) and name.startswith(URL_ITEM_PREFIX) else name
+        if move_bookmark(app_settings, settings_path, real_name, path, step):
             picker.set_items(_build_items())
 
     picker = PickerWindow(

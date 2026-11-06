@@ -48,8 +48,10 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QGuiApplication,
+    QKeySequence,
     QLinearGradient,
     QPainter,
+    QShortcut,
 )
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -105,9 +107,12 @@ ERROR_LOG_PATH = Path(__file__).resolve().parent / "filer_error.log"
 # F7 のコンテキストメニューを出す子プロセス(COM を使うのはそちらだけ)。
 CONTEXT_MENU_SCRIPT = Path(__file__).resolve().parent / "filer_contextmenu.py"
 # C→L で Box の「共有リンクをコピー」を子に実行させるときの待ち時間。子の終わりを待つ上限と、
-# 終わってからクリップボードにリンクが入るのを待つ上限(実測では合わせて約3秒で入る)。
+# 終わってからクリップボードにリンクが入るのを待つ上限。手元では合わせて約3秒で入るが、
+# 職場では子の終了のあとに Box Drive の画面が出て、リンクが入るまで約10秒かかることがある
+# (子の役目はメニュー実行までで、Box 側の画面表示やコピーは待たない)。リンクが入った時点で
+# 終わるので、見張りは長めに取る。
 BOX_FETCH_CHILD_SECONDS = 15.0
-BOX_FETCH_CLIPBOARD_SECONDS = 5.0
+BOX_FETCH_CLIPBOARD_SECONDS = 20.0
 
 # 既定の配色は、ユーザーのあふｗの「表示色」設定から拾った値(濃紺の地に白、カーソルは
 # シアンの下線、マークは灰色のグラデーション)。settings.json の filer.colors に同じ名前で
@@ -5857,10 +5862,12 @@ class FilerWindow(QWidget):
             self.cmd_phone_send()
         elif choice == "box":
             self._copy_box_share()
-        elif choice in ("path", "name"):
+        elif choice == "name":
             paths = self.active.target_paths()
-            QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=choice == "name"))
-            self.log(f"クリップボード: {len(paths)}件の{'フルパス' if choice == 'path' else '名前'}")
+            QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=True))
+            self.log(f"クリップボード: {len(paths)}件の名前")
+        elif choice == "path":
+            self._copy_paths()
         elif choice == "hash":
             self._copy_hash()
         elif choice == "tree":
@@ -5876,23 +5883,24 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001  メニューが開けなくなるのが最悪
             return False
 
-    def _copy_box_share(self):
-        """C→L: 対象の Box 上の ID を引き、共有用テキストをクリップボードへ入れる。
+    def _box_share_text(self):
+        """対象の共有用テキストを作り、(テキスト, 件数) で返す。中止・失敗・対象が
+        無ければ None(クリップボードへは入れない。入れる先は呼び出し側が決める)。
 
         共有リンクの鍵が祖先に登録済みなら /s/<鍵>/folder/<ID> の形(ログイン不要で開ける)。
         未登録なら、登録先を1回だけ聞いて Box からリンクを取る(案件フォルダごとに1回で、
-        設定に残る)。取ったときに Box が入れたリンクは、最後に共有用テキストで上書きされる。"""
+        設定に残る)。"""
         paths = self.active.target_paths()
         cache_dir = os.path.join(filer_archive.TEMP_ROOT, "box_db")
         try:
             items, missing = filer_box.resolve_many(paths, cache_dir)
         except filer_box.BoxDbError:
             self.log("Box: Box Drive の記録が読めません")
-            return
+            return None
         for name in missing:
             self.log(f"Box: 同期の記録に見つかりません: {name}（アップロード前かも）")
         if not items:
-            return
+            return None
         links = filer_box.valid_links(_section(self.app_settings).get("box_links"))
         plain = False
         for item in items:
@@ -5900,15 +5908,92 @@ class FilerWindow(QWidget):
                 continue
             decision = self.ask_box_link(item)
             if decision is None:
-                return
+                return None
             if decision[0] == "plain":
                 plain = True        # 今回だけ登録せずに出す(残りの未登録分も同じ)
                 continue
             _kind, folder_id, path, host, token = decision
             links = filer_box.with_link(links, filer_box.make_link(folder_id, path, host, token))
             save_values(self.app_settings, self.settings_path, {"box_links": links})
-        QGuiApplication.clipboard().setText(filer_box.build_share_text(items, links))
-        self.log(f"Box: {len(items)}件をクリップボードへ")
+        return filer_box.build_share_text(items, links), len(items)
+
+    def _copy_box_share(self):
+        """C→L: 共有用テキストをクリップボードへ入れる(取ったときに Box が入れた
+        リンクは、最後に共有用テキストで上書きされる)。"""
+        got = self._box_share_text()
+        if got is None:
+            return
+        text, count = got
+        QGuiApplication.clipboard().setText(text)
+        self.log(f"Box: {count}件をクリップボードへ")
+
+    def _copy_paths(self):
+        """C→P: フルパスをクリップボードへ入れる。対象がすべて Box の中で共有リンクが
+        取得できるなら(C→L が出る条件と同じ)、先に何をコピーするか聞く
+        (フルパス/共有用テキスト/両方)。"""
+        paths = self.active.target_paths()
+        full = core.clip_text(paths)
+        if not self._box_menu_ok():
+            QGuiApplication.clipboard().setText(full)
+            self.log(f"クリップボード: {len(paths)}件のフルパス")
+            return
+        kind = self.ask_copy_kind(len(paths))
+        if kind is None:
+            return
+        if kind == "path":
+            QGuiApplication.clipboard().setText(full)
+            self.log(f"クリップボード: {len(paths)}件のフルパス")
+        elif kind == "box":
+            self._copy_box_share()
+        else:  # both: 共有分が取れなかった(中止・失敗)ときはフルパスだけ入れる
+            got = self._box_share_text()
+            if got is None:
+                QGuiApplication.clipboard().setText(full)
+                self.log(f"クリップボード: {len(paths)}件のフルパス（共有用テキストは含めず）")
+            else:
+                text, count = got
+                QGuiApplication.clipboard().setText(full + "\r\n\r\n" + text)
+                self.log(f"クリップボード: フルパス {len(paths)}件＋Box の共有用テキスト {count}件")
+
+    def ask_copy_kind(self, count):
+        """C→P で Box の共有リンクも取得できるとき、何をコピーするか聞く。
+        "path" / "box" / "both" / None(キャンセル)を返す。(テストではここを差し替える)
+
+        既定はフルパス(最初のボタンにフォーカス)。P / L / B のキーでも選べて、
+        その場で実行する(この小さい窓だけの特例)。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("何をコピーしますか？")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Box の共有リンクも取得できます（{count}件）"))
+        result = {}
+
+        def pick(kind):
+            result["kind"] = kind
+            dialog.accept()
+
+        first = None
+        for kind, label, name in (
+                ("path", "フルパス（通常）", "copyKindPath"),
+                ("box", "共有用テキスト", "copyKindBox"),
+                ("both", "両方", "copyKindBoth")):
+            button = QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(lambda _checked=False, k=kind: pick(k))
+            layout.addWidget(button)
+            if first is None:
+                first = button
+        cancel = QPushButton("キャンセル")
+        cancel.setObjectName("copyKindCancel")
+        cancel.clicked.connect(dialog.reject)
+        layout.addWidget(cancel)
+        for key, kind in (("P", "path"), ("L", "box"), ("B", "both")):
+            shortcut = QShortcut(QKeySequence(key), dialog)
+            shortcut.activated.connect(lambda k=kind: pick(k))
+        if first is not None:
+            first.setFocus()
+        if self.exec_dialog(dialog) != QDialog.Accepted:
+            return None
+        return result.get("kind")
 
     def ask_box_link(self, item):
         """共有リンクの登録ダイアログ(テストではここを差し替える)。

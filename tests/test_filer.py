@@ -8522,6 +8522,132 @@ def test_window_copy_box_share():
             w.deleteLater()
 
 
+def test_window_copy_path_box_dialog():
+    """C→P: 対象がすべて Box の中なら、先に何をコピーするか聞く(フルパス/
+    共有用テキスト/両方)。両方で共有分が取れなければフルパスだけ入れる。
+    Box の外では聞かずに従来どおり即フルパス。"""
+    import sqlite3
+    import filer
+    import filer_box
+    from PySide6.QtGui import QGuiApplication
+
+    _qapp()
+    assert filer.BOX_FETCH_CLIPBOARD_SECONDS >= 20.0   # 職場で約10秒かかる実測に合わせた見張り
+    token = "Ab3dEf6hIjKlMnOp"
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)       # Box の外(通常のフォルダ)
+        box_root = Path(tmp, "home", "Box")
+        folder = box_root / "ProjA" / "資料"
+        folder.mkdir(parents=True)
+        (folder / "memo.txt").write_bytes(b"x")
+        db = Path(tmp, "local", "sync.db")
+        db.parent.mkdir()
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE local_item (local_id INTEGER NOT NULL, native_item_type INTEGER,"
+                     " parent_item_id INTEGER, name VARCHAR COLLATE NOCASE, PRIMARY KEY (local_id))")
+        conn.execute("CREATE TABLE item_mapping_between_fs (id INTEGER, local_id INTEGER,"
+                     " box_id VARCHAR, box_item_type INTEGER, PRIMARY KEY (id), UNIQUE (local_id))")
+        rows = [(0, 1, None, "", "0", 1), (100, 1, 0, "ProjA", "9100", 1),
+                (101, 1, 100, "資料", "9101", 1), (102, 0, 101, "memo.txt", "9103", 0)]
+        for i, (lid, typ, parent, name, box_id, box_type) in enumerate(rows):
+            conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (lid, typ, parent, name))
+            conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
+                         (i, lid, box_id, box_type))
+        conn.commit()
+        conn.close()
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        link = {"folder_id": "9100", "path": "Box/ProjA", "host": "app.box.com", "token": token}
+        app_settings = {"filer": {"left_path": str(left), "right_path": str(right),
+                                  "box_links": [link]}}
+        filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
+        filer_box.discard_cache()
+        w = filer.FilerWindow(app_settings, str(settings_path))
+        try:
+            w.show()
+            w.start()
+            _wait(w)
+            clip = QGuiApplication.clipboard()
+            full = str(folder / "memo.txt")
+            share = ("/Box/ProjA/資料/\r\n"
+                     f"　https://app.box.com/s/{token}/folder/9101\r\n"
+                     "　　memo.txt")
+            w.choose_menu = lambda title, items: "path"
+            w.left.load(str(folder))
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("memo.txt"))
+
+            # フルパス(通常)
+            w.ask_copy_kind = lambda count: "path"
+            clip.setText("")
+            w.cmd_copy_menu()
+            assert clip.text() == full, repr(clip.text())
+
+            # 共有用テキスト(C→L と同じ)
+            w.ask_copy_kind = lambda count: "box"
+            w.cmd_copy_menu()
+            assert clip.text() == share, repr(clip.text())
+
+            # 両方: フルパス → 空行 → 共有用テキスト
+            w.ask_copy_kind = lambda count: "both"
+            w.cmd_copy_menu()
+            assert clip.text() == full + "\r\n\r\n" + share, repr(clip.text())
+            assert "フルパス 1件＋Box の共有用テキスト 1件" in w.log_view.toPlainText()
+
+            # キャンセル: 何も入らない
+            w.ask_copy_kind = lambda count: None
+            clip.setText("keep")
+            w.cmd_copy_menu()
+            assert clip.text() == "keep"
+
+            # 両方で登録を中止したら、フルパスだけ入る
+            app_settings["filer"]["box_links"] = []
+            filer.save_values(app_settings, str(settings_path), {"box_links": []})
+            w.ask_copy_kind = lambda count: "both"
+            w.ask_box_link = lambda item: None
+            clip.setText("")
+            w.cmd_copy_menu()
+            assert clip.text() == full, repr(clip.text())
+            del w.ask_box_link
+
+            # 本物の選択ダイアログ: ボタンの並びと、「両方」を押した結果
+            from PySide6.QtWidgets import QPushButton
+            app_settings["filer"]["box_links"] = [link]
+            filer.save_values(app_settings, str(settings_path), {"box_links": [link]})
+            seen_dialog = {}
+
+            def drive(dialog):
+                seen_dialog["names"] = [b.objectName()
+                                        for b in dialog.findChildren(QPushButton)]
+                dialog.findChild(QPushButton, "copyKindBoth").click()
+                return dialog.result()
+
+            del w.ask_copy_kind
+            w.exec_dialog = drive
+            clip.setText("")
+            w.cmd_copy_menu()
+            assert seen_dialog["names"] == ["copyKindPath", "copyKindBox",
+                                            "copyKindBoth", "copyKindCancel"], seen_dialog
+            assert clip.text() == full + "\r\n\r\n" + share, repr(clip.text())
+            del w.exec_dialog
+
+            # Box の外では聞かない
+            def no_ask(count):
+                raise AssertionError("Box の外で聞かれた")
+
+            w.ask_copy_kind = no_ask
+            w.left.load(str(left))
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            clip.setText("")
+            w.cmd_copy_menu()
+            assert clip.text() == str(left / "alpha.txt"), repr(clip.text())
+        finally:
+            filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
+            w.close()
+            w.deleteLater()
+
+
 def test_workspace_store():
     """ワークスペースの保存先はデータ置き場(テストでは一時フォルダ。本物の
     %LOCALAPPDATA% には書かない)。一時ファイル→置き換えで書く。"""

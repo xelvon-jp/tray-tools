@@ -121,6 +121,7 @@ DEFAULT_KEYMAP = {
     # コマンドとして build_keymap が捨てる。Alt+I・Alt+1〜9 は空き。
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
     "4068": "diff_view",          # Alt+D 内蔵の差分ビューア(対象の選び方は Alt+W と同じ)
+    "4083": "sftp_open",          # Alt+S WinSCP で SFTP 接続先を開く(filer.sftp の設定)
     "0080": "zip_create",         # P 圧縮(反対窓に ZIP / 7z で作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
@@ -1125,6 +1126,7 @@ COMMAND_SHORT_NAMES = {
     "queue_clear": "QueueClear",
     "winmerge": "WinMerge",
     "diff_view": "Diff",
+    "sftp_open": "SFTP",
     "zip_create": "Press",
     "mask_input": "Mask",
     "mask_clear": "Mask*.*",

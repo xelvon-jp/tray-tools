@@ -90,6 +90,8 @@ import filer_everything
 import filer_extmenu
 import filer_launch
 import filer_phone
+import filer_sftp
+import filer_weblinks
 import filer_history_bar
 import filer_rating_bar
 import filer_shell
@@ -2818,6 +2820,11 @@ class FilerWindow(QWidget):
         # 無く、手で書く。起動時に読む)
         self.row_color_rules = core.normalize_row_color_rules(
             section.get("row_color_rules"))
+        # Web リンク(C→W。同期フォルダ→SharePoint 等の URL)と、SFTP 接続先
+        # (Alt+S で WinSCP を起こす)。どちらも filer 側の手書き設定で、起動時に読む
+        self.web_link_bases = filer_weblinks.normalize_web_link_bases(
+            section.get("web_link_bases"))
+        self.sftp_config = filer_sftp.normalize_sftp_config(section.get("sftp"))
         # よく行くフォルダの記録(リポジトリの外。形の違う行は捨てる)。
         stored = core.load_store(core.FRECENCY_STORE, {})
         self.frecency = {p: v for p, v in stored.items()
@@ -5933,6 +5940,8 @@ class FilerWindow(QWidget):
             items.append(("S", "スマホへ送る（QR）", "phone"))
         if self._box_menu_ok():
             items.append(("L", "Box の共有用テキスト", "box"))
+        if self._web_link_menu_ok():
+            items.append(("W", "Web リンクをコピー（SharePoint 等）", "weblink"))
         items.append(("Q", "キャンセル", None))
         choice = self.choose_menu("複写", items)
         if choice == "copy":
@@ -5949,6 +5958,8 @@ class FilerWindow(QWidget):
             self.cmd_phone_send()
         elif choice == "box":
             self._copy_box_share()
+        elif choice == "weblink":
+            self._copy_web_links()
         elif choice == "name":
             paths = self.active.target_paths()
             QGuiApplication.clipboard().setText(core.clip_text(paths, names_only=True))
@@ -5959,6 +5970,32 @@ class FilerWindow(QWidget):
             self._copy_hash()
         elif choice == "tree":
             self._copy_tree()
+
+    def _web_link_menu_ok(self) -> bool:
+        """C メニューに「Web リンクをコピー」を出すか。対象がすべて設定済みの
+        同期フォルダ(filer.web_link_bases)の中にあるときだけ(Box と同じ出し方)。"""
+        try:
+            if self.active.archive is not None or not self.web_link_bases:
+                return False
+            return all(filer_weblinks.web_link_for(p, self.web_link_bases)
+                       for p in self.active.target_paths())
+        except Exception:  # noqa: BLE001  メニューが開けなくなるのが最悪
+            return False
+
+    def _copy_web_links(self):
+        """C→W: 対象の Web リンク(SharePoint 等)をクリップボードへ入れる。
+        Teams / Slack へは貼るだけで共有できる。"""
+        links = []
+        for path in self.active.target_paths():
+            found = filer_weblinks.web_link_for(path, self.web_link_bases)
+            if found:
+                links.append(found)
+        if not links:
+            self.log("Web リンク: 対象が同期フォルダの外でした")
+            return
+        QGuiApplication.clipboard().setText(
+            "\n".join(url for _name, url in links))
+        self.log(f"クリップボード: Web リンク {len(links)}件（{links[0][0]}）")
 
     def _box_menu_ok(self) -> bool:
         """C メニューに「Box の共有用テキスト」を出すか。対象がすべて Box Drive の中にあり、
@@ -7467,6 +7504,31 @@ class FilerWindow(QWidget):
             self.log(f"比較: WinMerge を起動できません（{e}）")
 
     # --- 内蔵の差分ビューア(Alt+D) ---
+    def cmd_sftp_open(self):
+        """Alt+S: 設定済みの SFTP 接続先を WinSCP で開く。
+
+        あっふ自体は SFTP を持たず、接続は WinSCP に渡す(filer_sftp の頭書き)。
+        接続先が1つだけなら選ばせず直接開く。"""
+        sites = self.sftp_config["sites"]
+        if not sites:
+            self.log("SFTP: 接続先が未設定です（settings.json の filer.sftp.sites）")
+            return
+        if len(sites) == 1:
+            target = sites[0]["target"]
+        else:
+            items = [(str(i + 1), site["name"], site["target"])
+                     for i, site in enumerate(sites[:9])]
+            items.append(("Q", "キャンセル", None))
+            target = self.choose_menu("SFTP", items)
+            if not target:
+                return
+        command = filer_sftp.build_command(self.sftp_config["winscp_path"], target)
+        try:
+            subprocess.Popen(command)
+            self.log(f"SFTP: WinSCP で開きました（{target}）")
+        except OSError as e:
+            self.log(f"SFTP: WinSCP を起動できませんでした（{e}）")
+
     def cmd_diff_view(self):
         """対象の選び方は WinMerge(Alt+W)と同じ。フォルダ同士は WinMerge に任せる。"""
         pair = core.winmerge_pair(self._marked_entries(self.left),

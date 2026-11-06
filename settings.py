@@ -404,6 +404,14 @@ DEFAULT_SETTINGS = {
     #     条件(名前のパターン name / exts / min_size・max_size / newer_days・older_days /
     #     attrs "hsr" / folder true|false)が全部成り立つ行に、その色を行全体(名前・
     #     大きさ・日時の列)へ付ける。上の行が勝つ。書かなければ無し。ダイアログは無い
+    #   web_link_bases … Web リンク(C→W)。[{"name": 名前, "root": ローカルの同期
+    #     フォルダ, "url_base": 対応する Web の場所}, ...] の並びで、root の中にある
+    #     ファイルの URL を url_base + 相対パスで組み立ててコピーする(SharePoint /
+    #     OneDrive 等)。対象が全部いずれかの root の中のときだけ C メニューに出る。
+    #     書かなければ無し
+    #   sftp … SFTP 接続先(Alt+S)。{"winscp_path": "WinSCP.exe",
+    #     "sites": [{"name": 名前, "target": WinSCP のセッション名か sftp:// の URL}]}
+    #     の形で、選ぶと WinSCP で開く(あっふ自体は SFTP を持たない)。書かなければ無し
     #   show_fkey_bar … 窓の下にファンクションキーの段(F1〜F12。押せる)を出すか
     #   fkey_labels … その段の表示名だけの上書き。{"F7": "右クリ", "Shift+F10": "再読込"}
     #     (あふｗの4桁 "0118" でも書ける)。割り当てそのものは keys で変える

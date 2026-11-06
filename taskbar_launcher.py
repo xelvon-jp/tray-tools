@@ -189,6 +189,15 @@ def _draw_calendar(draw: ImageDraw.ImageDraw, color: str) -> None:
             draw.rectangle((x, y, x + 4, y + 4), fill=color)
 
 
+def _draw_calculator(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """電卓。白い本体に、表示部とキーの並びを色で抜く。"""
+    draw.rounded_rectangle((16, 8, 48, 56), radius=4, fill="white")
+    draw.rectangle((21, 13, 43, 23), fill=color)
+    for y in (29, 39, 49):
+        for x in (21, 29, 37):
+            draw.rectangle((x, y, x + 6, y + 5), fill=color)
+
+
 def _draw_blank(draw: ImageDraw.ImageDraw, color: str) -> None:
     """黒画面/白画面。覆われた画面そのもの。黒と白は丸の色で描き分けるので、
     絵は共通のものを1つだけ持つ。"""
@@ -227,6 +236,7 @@ _GLYPHS = {
     "spotlight": _draw_spotlight,
     "blank": _draw_blank,
     "calendar": _draw_calendar,
+    "calculator": _draw_calculator,
 }
 
 
@@ -411,10 +421,19 @@ ITEMS = {
         "icon": "calendar",
         "color": "#e11d48",
     },
+    # 電卓(旧 Mac 風の小窓、calculator.py)。カレンダーと同じくトグルで開閉する。
+    "calculator": {
+        "label": "電卓",
+        "feature": "screen",
+        "method": "show_calculator",
+        "args": (),
+        "icon": "calculator",
+        "color": "#0f766e",
+    },
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
-DEFAULT_ITEMS = ["capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar"]
+DEFAULT_ITEMS = ["capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator"]
 
 # settings.json に書かれがちな別名を正規のキーへ寄せる。hotkeys セクションでは同じ機能が
 # capture_now / audio_toggle / snippet_picker / launcher という名前で並んでおり、そちらを

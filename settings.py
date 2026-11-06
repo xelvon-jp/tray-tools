@@ -272,7 +272,8 @@ DEFAULT_SETTINGS = {
     # capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
     # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
     # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
-    # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー) / calendar(カレンダー)。
+    # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー) / calendar(カレンダー) /
+    # calculator(電卓)。
     # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
@@ -302,6 +303,7 @@ DEFAULT_SETTINGS = {
             "bookmarks",
             "presenter",
             "calendar",
+            "calculator",
         ],
         "launcher_item_size": 36,
         "launcher_close_delay_ms": 300,

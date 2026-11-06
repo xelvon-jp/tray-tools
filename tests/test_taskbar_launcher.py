@@ -17,9 +17,10 @@ def _qapp():
 
 
 def test_resolve_items_calendar():
-    """既定の並びの最後にカレンダーが入り、設定の既定値にも入っている。"""
+    """既定の並びにカレンダーが入り、設定の既定値にも入っている(末尾は電卓)。"""
     assert launcher.resolve_items({}) == launcher.DEFAULT_ITEMS
-    assert launcher.DEFAULT_ITEMS[-1] == "calendar"
+    assert "calendar" in launcher.DEFAULT_ITEMS
+    assert launcher.DEFAULT_ITEMS[-1] == "calculator"
     # 設定を書かなかった場合の受け取り方(知らない名前は飛ばす・重複は1つ)
     keys = launcher.resolve_items({"launcher_items": ["calendar", "calendar", "nope"]})
     assert keys == ["calendar"], keys
@@ -28,7 +29,8 @@ def test_resolve_items_calendar():
     import settings
 
     section = settings.DEFAULT_SETTINGS["taskbar_widget"]
-    assert launcher.resolve_items(section)[-1] == "calendar"
+    assert "calendar" in launcher.resolve_items(section)
+    assert launcher.resolve_items(section)[-1] == "calculator"
 
 
 def test_calendar_item_wiring():

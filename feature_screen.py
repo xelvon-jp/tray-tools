@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 import bg_remove_launch
+import calendar_popup
 import capture_process
 import color_picker
 import explorer_nav
@@ -257,6 +258,7 @@ class ScreenFeature:
         self.picker = None
         self.ruler = None
         self.snippet_picker = None
+        self.calendar_popup = None
         self.launcher_picker = None
         # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
@@ -1146,6 +1148,27 @@ class ScreenFeature:
         self.snippet_picker = None
         picker.close()
         picker.deleteLater()
+
+    # ---------------------------------------------------------------
+    # カレンダー(縦ランチャの項目。見る専用の小窓)
+    # ---------------------------------------------------------------
+    def show_calendar(self):
+        """カレンダーの小窓を出す。出ているときに呼ばれたら閉じる(トグル)。"""
+        if self.calendar_popup is not None:
+            self._close_calendar()
+            return
+        popup = calendar_popup.create_popup()
+        popup.closed.connect(self._close_calendar)
+        self.calendar_popup = popup
+        popup.show_at_cursor_screen()
+
+    def _close_calendar(self):
+        if self.calendar_popup is None:
+            return
+        popup = self.calendar_popup
+        self.calendar_popup = None
+        popup.close()
+        popup.deleteLater()
 
     # ---------------------------------------------------------------
     # 背景を透過(bg_remove.py。窓は別プロセス)

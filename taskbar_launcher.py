@@ -178,6 +178,17 @@ def _draw_spotlight(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.ellipse((22, 20, 46, 44), fill="white")
 
 
+def _draw_calendar(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """カレンダー。綴じ具の付いた月めくりのページ。日付は背景色の四角で抜く。"""
+    draw.rounded_rectangle((21, 12, 25, 21), radius=2, fill="white")
+    draw.rounded_rectangle((39, 12, 43, 21), radius=2, fill="white")
+    draw.rounded_rectangle((15, 17, 49, 53), radius=4, fill="white")
+    draw.line((17, 28, 47, 28), fill=color, width=3)
+    for y in (35, 43):
+        for x in (22, 30, 38):
+            draw.rectangle((x, y, x + 4, y + 4), fill=color)
+
+
 def _draw_blank(draw: ImageDraw.ImageDraw, color: str) -> None:
     """黒画面/白画面。覆われた画面そのもの。黒と白は丸の色で描き分けるので、
     絵は共通のものを1つだけ持つ。"""
@@ -215,6 +226,7 @@ _GLYPHS = {
     "laser": _draw_laser,
     "spotlight": _draw_spotlight,
     "blank": _draw_blank,
+    "calendar": _draw_calendar,
 }
 
 
@@ -388,10 +400,21 @@ ITEMS = {
         "icon": "mirror",
         "color": "#2563eb",
     },
+    # カレンダー(見る専用の小窓、calendar_popup.py)。時計のフライアウトの代わり。
+    # サブ画面ではウィジェット自身が時計に化けていて本物のフライアウトが無いので、
+    # Windows 標準ではなく自前で出す。押すたびに出す/閉じるが入れ替わる。
+    "calendar": {
+        "label": "カレンダー",
+        "feature": "screen",
+        "method": "show_calendar",
+        "args": (),
+        "icon": "calendar",
+        "color": "#e11d48",
+    },
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
-DEFAULT_ITEMS = ["capture", "audio", "ruler", "color_picker", "snippets", "bookmarks"]
+DEFAULT_ITEMS = ["capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar"]
 
 # settings.json に書かれがちな別名を正規のキーへ寄せる。hotkeys セクションでは同じ機能が
 # capture_now / audio_toggle / snippet_picker / launcher という名前で並んでおり、そちらを

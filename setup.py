@@ -372,6 +372,23 @@ def _fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:
     return added
 
 
+def _new_launcher_items(default_items, current_items, applied_items) -> list:
+    """縦ランチャへ足すべき項目。既定にあって、前回の setup 実行時点の既定には
+    無くて、今のリストにも無いもの(既定の並び順で返す)。
+
+    applied_items(前回の既定)を挟むのは、利用者が自分で消した項目を「既定にある」
+    というだけで復活させないため。_fill_missing はキーの有無しか見ないので、
+    既にあるリストの中身を増やす話はここで受ける。"""
+    added = []
+    for name in default_items:
+        if not isinstance(name, str):
+            continue
+        if name in applied_items or name in current_items or name in added:
+            continue
+        added.append(name)
+    return added
+
+
 def _backup_settings() -> Path:
     """書き換える前に控えを取る。settings.json.bak* は .gitignore 済み。"""
     backup = SETTINGS_PATH.with_name(
@@ -424,6 +441,31 @@ def _update_existing_settings(detected: list, redetect, env=None) -> None:
             print(f"    {path} = {shown}")
     else:
         print("  設定項目は最新の状態です")
+
+    # 1.25. 縦ランチャの項目。既定に増えた分だけを、既存リストの末尾へ足す。
+    # 過去に自分で消した項目まで復活させないよう、前回の実行時点の既定を
+    # launcher_defaults_applied に記録して「今回の既定 − 前回の既定」を対象にする
+    # (記録は setup.py だけが読み書きする。アプリ側は知らない)。
+    widget_cfg = current.get("taskbar_widget")
+    if isinstance(widget_cfg, dict):
+        default_items = (
+            settings_module.DEFAULT_SETTINGS.get("taskbar_widget", {}).get("launcher_items")
+            or []
+        )
+        current_items = widget_cfg.get("launcher_items")
+        if isinstance(current_items, list) and all(
+            isinstance(x, str) for x in current_items
+        ):
+            applied = widget_cfg.get("launcher_defaults_applied")
+            if not isinstance(applied, list):
+                applied = []
+            new_items = _new_launcher_items(default_items, current_items, applied)
+            if new_items:
+                current_items.extend(new_items)
+                print("  縦ランチャに新しい項目を足します:")
+                for name in new_items:
+                    print(f"    launcher_items += {name}")
+            widget_cfg["launcher_defaults_applied"] = list(default_items)
 
     # 1.5. 環境(1/2/3)。未設定か --env の指定があるときだけ決め直す
     env_value = _resolve_environment(current.get("environment"), env)

@@ -276,6 +276,9 @@ DEFAULT_SETTINGS = {
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
     # 移る途中には必ず「どちらにも乗っていない」瞬間があるので、0にすると項目へ届く前に
     # 閉じる。
+    # launcher_defaults_applied は既定には無いキーで、setup.py だけが読み書きする記録
+    # (前回の setup 実行時点の launcher_items の既定)。既定に増えた項目を既存リストへ
+    # 足すときに、自分で消した項目を復活させないためのもの。アプリ側は知らない。
     "taskbar_widget": {
         "enabled": False,
         "all_displays": True,

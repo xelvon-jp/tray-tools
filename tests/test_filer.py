@@ -299,6 +299,18 @@ def test_dialogs():
     assert r["strip_ext"] and r["unmark"]
     assert compare((Qt.Key_Escape, N)) is None
 
+    # 見た目: 選択肢は〔〕でなく色の帯、チェックは ☑/☐、枠線の色がある
+    d = filer.CompareDialog(None, "同名ファイル比較マーク(左)", True, colors, font)
+    size_text = d.rows[0].text()
+    assert "<span" in size_text and "〔" not in size_text, size_text
+    assert "同じ" in size_text
+    assert d.rows[2].text().startswith("☑"), d.rows[2].text()
+    assert "dialog_border" in colors
+    d2 = filer.SortDialog(None, "ソート(右)", None, colors, font)
+    assert "<span" in d2.order_label.text(), d2.order_label.text()
+    assert d2.check_labels[0].text().startswith("☑")   # 既定はフォルダを上に集める
+    assert d2.check_labels[1].text().startswith("☑")   # 既定は大文字小文字区別無し
+
     def sort(spec, *keys):
         d = filer.SortDialog(None, "ソート(右)", spec, colors, font)
         for k in keys:

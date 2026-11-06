@@ -127,6 +127,8 @@ DEFAULT_COLORS = {
     "mark_cursor": "",            # 前の版の名残(今はマーク背景＋下線で示すので使わない)
     "dialog_cursor": "#1a3a8a",   # ソート・比較マークのダイアログと、C / M / Shift+Z などの
                                   # メニューで選んでいる行(メニューは左端に cursor の色の縦線も)
+    "dialog_border": "#4a5a8a",   # キーダイアログ(_KeyDialog)の枠線。地(#00001c)と
+                                  # 見分けが付く程度の、落ち着いた青灰
     "header_active": "#00001c",   # アクティブ窓のパス表示の地と枠(あふｗと同じく
                                   # 帯は付けず地のまま。区別は字の色とカーソルで)
     "header_active_text": "#ffffff",
@@ -7975,34 +7977,62 @@ class _KeyDialog(QDialog):
         self.colors = colors
         self.result_value = None
         self.setObjectName("filerDialog")
-        self.setStyleSheet(f"#filerDialog {{ background-color: {colors['background']}; }}")
+        border = colors.get("dialog_border", "#4a5a8a")
+        self.setStyleSheet(
+            f"#filerDialog {{ background-color: {colors['background']};"
+            f" border: 1px solid {border}; }}")
         self._font = font
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(8, 8, 8, 8)
-        self._layout.setSpacing(2)
+        self._layout.setContentsMargins(10, 10, 10, 10)
+        self._layout.setSpacing(3)
         self.row = 0
 
-    def add_label(self, text="", hint=False) -> QLabel:
+    def add_label(self, text="", hint=False, rich=False) -> QLabel:
         label = QLabel(text)
         label.setFont(self._font)
-        label.setTextFormat(Qt.PlainText)
+        label.setTextFormat(Qt.RichText if rich else Qt.PlainText)
         color = self.colors["footer_text"] if hint else self.colors["text"]
-        label.setStyleSheet(f"color: {color}; padding: 2px 8px;")
+        label.setStyleSheet(f"color: {color}; padding: 3px 8px;")
         self._layout.addWidget(label)
         return label
 
     def paint_rows(self, rows, framed=None) -> None:
-        """rows は [(QLabel, 文字列)]。カーソル行は背景色、framed の行は枠で示す
-        (あふｗのソートで「いまの種類」に枠が付くのと同じ)。"""
+        """rows は [(QLabel, 文字列)]。カーソル行は背景色と左端の縦線、framed の行は
+        枠で示す(あふｗのソートで「いまの種類」に枠が付くのと同じ)。"""
         c = self.colors
         for index, (label, text) in enumerate(rows):
             label.setText(text)
-            style = f"color: {c['text']}; padding: 2px 8px;"
+            style = f"color: {c['text']}; padding: 3px 8px;"
             if index == self.row:
                 style += f" background-color: {c['dialog_cursor']};"
             border = c["header_active"] if index == framed else "transparent"
             style += f" border: 1px solid {border};"
+            if index == self.row:
+                style += f" border-left: 3px solid {c.get('cursor', '#00ffff')};"
             label.setStyleSheet(style)
+
+    def options_html(self, labels, chosen) -> str:
+        """選択肢の並び(リッチテキスト)。選んでいるものに色の帯を付ける。
+
+        〔〕で囲う書き方だと、等幅でないフォントでは選択を動かすたびに幅が
+        ずれて行が揺れる。帯なら幅が変わらない。"""
+        import html as _html
+
+        parts = []
+        for i, label in enumerate(labels):
+            text = _html.escape(str(label))
+            if i == chosen:
+                parts.append(
+                    f'<span style="background-color: {self.colors["dialog_cursor"]};'
+                    f' color: {self.colors["text"]}">&nbsp;{text}&nbsp;</span>')
+            else:
+                parts.append(f"&nbsp;{text}&nbsp;")
+        return " ".join(parts)
+
+    @staticmethod
+    def check_mark(on) -> str:
+        """チェックの印。ASCII の [x] / [ ] より一目で分かる字を使う。"""
+        return "☑" if on else "☐"
 
     def event(self, event):
         if event.type() == QEvent.KeyPress:
@@ -8030,7 +8060,7 @@ class SortDialog(_KeyDialog):
         super().__init__(parent, title, colors, font)
         self.spec = core.normalize_sort(spec)
         self.kind_labels = [self.add_label() for _ in core.SORT_KINDS]
-        self.order_label = self.add_label()
+        self.order_label = self.add_label(rich=True)
         self.check_labels = [self.add_label(), self.add_label()]
         self.add_label("↑↓:選択  ←→/Tab:昇降  Enter:決定  Esc:取消", hint=True)
         self.row = core.SORT_KINDS.index(self.spec["kind"])
@@ -8041,14 +8071,12 @@ class SortDialog(_KeyDialog):
         rows = [(label, f"{letters[kind]}: {core.SORT_LABELS[kind]}")
                 for label, kind in zip(self.kind_labels, core.SORT_KINDS)]
         self.paint_rows(rows, framed=core.SORT_KINDS.index(self.spec["kind"]))
-        if self.spec["descending"]:
-            order = " 昇順 / 〔降順〕"
-        else:
-            order = "〔昇順〕/  降順"
+        order = self.options_html(["昇順", "降順"], 1 if self.spec["descending"] else 0)
         self.order_label.setText(f"順序:  {order}")
-        mark = lambda on: "[x]" if on else "[ ]"  # noqa: E731
-        self.check_labels[0].setText(f"{mark(self.spec['dirs_first'])} G: フォルダを上に集める")
-        self.check_labels[1].setText(f"{mark(self.spec['ignore_case'])} C: 大文字小文字区別無し")
+        self.check_labels[0].setText(
+            f"{self.check_mark(self.spec['dirs_first'])} G: フォルダを上に集める")
+        self.check_labels[1].setText(
+            f"{self.check_mark(self.spec['ignore_case'])} C: 大文字小文字区別無し")
 
     def _decide(self, kind) -> None:
         self.spec["kind"] = kind
@@ -8093,19 +8121,17 @@ class CompareDialog(_KeyDialog):
         self.time_index = core.TIME_CHOICES.index("any")
         self.include_dirs = bool(include_dirs)
         self.add_label("E:除拡  A:全同  N:全異  S:大同  T:時同", hint=True)
-        self.rows = [self.add_label() for _ in range(4)]
+        # 先頭2行は選択肢を色の帯で示すのでリッチテキスト(空白は全角で揃える)
+        self.rows = [self.add_label(rich=True), self.add_label(rich=True),
+                     self.add_label(), self.add_label()]
         self.add_label("Shift を押しながら決定するとマークを外す", hint=True)
         self.refresh()
 
-    @staticmethod
-    def _options(labels, chosen) -> str:
-        return " ".join(f"〔{t}〕" if i == chosen else f" {t} " for i, t in enumerate(labels))
-
     def refresh(self) -> None:
         texts = [
-            "サイズ         " + self._options(core.SIZE_LABELS, self.size_index),
-            "タイムスタンプ " + self._options(core.TIME_LABELS, self.time_index),
-            f"{'[x]' if self.include_dirs else '[ ]'} フォルダ同士も同名があればマーク",
+            "サイズ　　　　　" + self.options_html(core.SIZE_LABELS, self.size_index),
+            "タイムスタンプ　" + self.options_html(core.TIME_LABELS, self.time_index),
+            f"{self.check_mark(self.include_dirs)} フォルダ同士も同名があればマーク",
             "除：拡張子（[大時]比較無効）",
         ]
         self.paint_rows(list(zip(self.rows, texts)))
@@ -8164,22 +8190,21 @@ class SyncDialog(_KeyDialog):
         # plans は [(送るエントリ, 合計バイト, フォルダ件数)] × 2(0=左→右、1=右→左)
         self.plans = plans
         self.index = 1 if initial else 0
-        self.rows = [self.add_label(), self.add_label()]
+        # 方向の行は選択肢を色の帯で示すのでリッチテキスト
+        self.rows = [self.add_label(rich=True), self.add_label()]
         self.add_label("削除はしません。両方にあるフォルダの中身は対象外です", hint=True)
         self.add_label("Enter: コピー実行  Esc: 取消", hint=True)
         self.refresh()
 
     def refresh(self) -> None:
         entries, total, dirs = self.plans[self.index]
-        options = " ".join(
-            f"〔{label}〕" if i == self.index else f" {label} "
-            for i, label in enumerate(self.LABELS))
+        options = self.options_html(self.LABELS, self.index)
         if entries:
             detail = (f"送るもの     {len(entries)}件"
                       f"（合計 {core.format_bytes(total)}、うちフォルダ {dirs}件）")
         else:
             detail = "送るもの     ありません（差分なし）"
-        self.paint_rows([(self.rows[0], "方向         " + options),
+        self.paint_rows([(self.rows[0], "方向　　　　　　" + options),
                          (self.rows[1], detail)])
 
     def on_key(self, event) -> None:

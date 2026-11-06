@@ -6,16 +6,21 @@
 # feature_screen.show_palette が持つ。候補の収集(何を対象にするか)と実行
 # (選ばれたら何をするか)も feature_screen 側。ここは「探す・並べる・窓」の係。
 #
-# 検索は部分一致+あいまい(部分列)スコア。frecency のような学習は持たない
-# (並びはスコアのみ。以後の課題)。
+# 検索は部分一致+あいまい(部分列)スコアに、frecency(使う頻度×近さ)の
+# 押し上げを足したもの。履歴は %LOCALAPPDATA%\traytools\palette_history.json
+# (PC ごとの状態なので settings.json には入れない。claude_progress の状態
+# ファイルと同じ置き方)。
 #
 # ファイル候補は Everything(es.exe)任せで、呼び出しは feature_screen から
 # 関数で渡される。ここは Qt のスレッドプールで受けて、古い結果は捨てる。
 import ast
+import json
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent, QObject, QRunnable, QThreadPool, QTimer, Qt, Signal,
@@ -84,11 +89,22 @@ def score_match(query: str, text: str):
     return 100 + score - len(t) // 8
 
 
-def filter_candidates(query: str, candidates, limit: int = _MAX_ROWS):
-    """静的な候補を query で絞って並べる。空の query なら渡された順のまま。"""
+def filter_candidates(query: str, candidates, limit: int = _MAX_ROWS,
+                      history=None, now=None):
+    """候補を query で絞って並べる。
+
+    history(候補キー → {"count","last"})を渡すと frecency の押し上げが効く:
+    空の query では使う順(押し上げの大きい順)。query があるときは文字列の
+    合い具合が主で、押し上げは近さをひっくり返す程度に抑えてある。"""
     q = (query or "").strip()
     if not q:
-        return list(candidates)[:limit]
+        if not history:
+            return list(candidates)[:limit]
+        now = time.time() if now is None else now
+        ranked = sorted(
+            candidates,
+            key=lambda c: -frecency_boost(history.get(candidate_key(c) or ""), now))
+        return ranked[:limit]
     scored = []
     for cand in candidates:
         best = score_match(q, cand.title)
@@ -97,9 +113,87 @@ def filter_candidates(query: str, candidates, limit: int = _MAX_ROWS):
             if other is not None:
                 best = other + 50 if best is None else max(best, other + 50)
         if best is not None:
+            if history:
+                now = time.time() if now is None else now
+                best += frecency_boost(history.get(candidate_key(cand) or ""), now)
             scored.append((best, cand))
     scored.sort(key=lambda pair: -pair[0])
     return [cand for _score, cand in scored[:limit]]
+
+
+# ---------------------------------------------------------------
+# frecency(使う頻度×近さ)の履歴
+# ---------------------------------------------------------------
+HISTORY_PATH = (Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                / "traytools" / "palette_history.json")
+_HISTORY_MAX_KEYS = 200
+# 押し上げの上限。文字列スコア(前方一致1000・部分一致600・部分列100〜)の
+# 格を崩さない範囲に抑える。
+_BOOST_CAP = 160.0
+
+
+def candidate_key(cand):
+    """履歴のキー。計算は一過性なので記録しない(None)。"""
+    if cand.kind == "feature":
+        item_key = cand.payload.get("item_key")
+        return f"feature:{item_key}" if item_key else None
+    if cand.kind in ("folder", "file", "app"):
+        path = cand.payload.get("path")
+        return f"{cand.kind}:{os.path.normcase(path)}" if path else None
+    return None
+
+
+def frecency_boost(entry, now: float) -> float:
+    """履歴1件の押し上げ量。回数×近さ(1時間以内×4 / 1日×2 / 1週間×1 / それ以前×0.5)。"""
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        count = float(entry.get("count") or 0)
+        last = float(entry.get("last") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if count <= 0 or last <= 0:
+        return 0.0
+    age = max(0.0, now - last)
+    weight = 4.0 if age < 3600 else 2.0 if age < 86400 else 1.0 if age < 604800 else 0.5
+    return min(_BOOST_CAP, min(count, 20.0) * weight * 4.0)
+
+
+def record_use(history: dict, key: str, now: float) -> dict:
+    """使った記録を1件足した履歴を返す(元の辞書は書き換えない)。"""
+    updated = dict(history or {})
+    entry = dict(updated.get(key) or {})
+    try:
+        count = int(entry.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    entry["count"] = count + 1
+    entry["last"] = now
+    updated[key] = entry
+    if len(updated) > _HISTORY_MAX_KEYS:
+        newest = sorted(updated.items(),
+                        key=lambda kv: -(kv[1].get("last") or 0))[:_HISTORY_MAX_KEYS]
+        updated = dict(newest)
+    return updated
+
+
+def load_history(path=None) -> dict:
+    """履歴ファイルを読む。無い・壊れているなら空(学習が無いだけ)。"""
+    try:
+        data = json.loads(Path(path or HISTORY_PATH).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_history(history: dict, path=None) -> None:
+    """履歴を書く(読み直しはしない丸ごとの状態ファイル。書けなくても諦める)。"""
+    path = Path(path or HISTORY_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------
@@ -314,13 +408,14 @@ class PaletteWindow(QWidget):
     chosen = Signal(object)   # Candidate
     closed = Signal()
 
-    def __init__(self, static_candidates, file_search=None):
+    def __init__(self, static_candidates, file_search=None, history=None):
         super().__init__()
         self.setWindowTitle("コマンドパレット")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setFixedWidth(580)
         self._static = list(static_candidates)
         self._file_search = file_search
+        self._history = history or {}
         self._generation = 0
         self._file_results = []
         self._shown = []
@@ -374,11 +469,16 @@ class PaletteWindow(QWidget):
         calc = evaluate_query(text)
         if calc is not None:
             rows.append(calc)
-        rows.extend(filter_candidates(text, self._static, _MAX_ROWS))
+        rows.extend(filter_candidates(text, self._static, _MAX_ROWS, self._history))
         seen_paths = {
             c.payload.get("path") for c in rows if c.payload.get("path")
         }
-        for cand in self._file_results:
+        # ファイル候補は Everything の順を土台に、よく開くものを前へ寄せる
+        now = time.time()
+        file_rows = sorted(
+            self._file_results,
+            key=lambda c: -frecency_boost(self._history.get(candidate_key(c) or ""), now))
+        for cand in file_rows:
             if cand.payload.get("path") in seen_paths:
                 continue
             rows.append(cand)
@@ -460,5 +560,5 @@ class PaletteWindow(QWidget):
         super().closeEvent(event)
 
 
-def create_window(static_candidates, file_search=None) -> PaletteWindow:
-    return PaletteWindow(static_candidates, file_search)
+def create_window(static_candidates, file_search=None, history=None) -> PaletteWindow:
+    return PaletteWindow(static_candidates, file_search, history)

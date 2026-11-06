@@ -120,6 +120,59 @@ def test_palette_window_offscreen():
     window.deleteLater()
 
 
+def test_frecency():
+    import time as _time
+
+    now = _time.time()
+    feature = cp.Candidate("feature", "電卓", "", {"item_key": "calculator"})
+    folder = cp.Candidate("folder", "仕事", "", {"path": "C:\\Work"})
+    calc = cp.Candidate("calc", "= 3", "", {"value": "3"})
+    assert cp.candidate_key(feature) == "feature:calculator"
+    # normcase は Windows で小文字化する(VM の Linux ではそのまま)
+    assert cp.candidate_key(folder) == "folder:" + os.path.normcase("C:\\Work")
+    assert cp.candidate_key(calc) is None
+
+    # 押し上げ: 回数×近さ。上限で頭打ち、壊れた記録は 0
+    assert cp.frecency_boost({"count": 1, "last": now}, now) == 16.0
+    assert cp.frecency_boost({"count": 5, "last": now - 2 * 86400}, now) == 20.0
+    assert cp.frecency_boost({"count": 100, "last": now}, now) == 160.0
+    assert cp.frecency_boost({"count": 0, "last": now}, now) == 0.0
+    assert cp.frecency_boost({"count": "x"}, now) == 0.0
+    assert cp.frecency_boost(None, now) == 0.0
+
+    # 記録: 元の辞書は書き換えず、回数と最終時刻が進む
+    history = {}
+    history2 = cp.record_use(history, "feature:calculator", now)
+    assert history == {} and history2["feature:calculator"] == {"count": 1, "last": now}
+    history3 = cp.record_use(history2, "feature:calculator", now + 5)
+    assert history3["feature:calculator"]["count"] == 2
+
+    # 並び: 空の検索語では使う順、検索語があるときは近いスコアをひっくり返せる
+    items = [
+        cp.Candidate("feature", "電卓", "", {"item_key": "calculator"}),
+        cp.Candidate("feature", "電卓メモ", "", {"item_key": "memo"}),
+        cp.Candidate("feature", "カレンダー", "", {"item_key": "calendar"}),
+    ]
+    hist = {"feature:memo": {"count": 10, "last": now},
+            "feature:calendar": {"count": 3, "last": now}}
+    assert [c.title for c in cp.filter_candidates("", items, history=hist, now=now)] == [
+        "電卓メモ", "カレンダー", "電卓"]
+    assert [c.title for c in cp.filter_candidates("電卓", items, history=hist, now=now)][0] == "電卓メモ"
+    # 合わない候補は押し上げでも戻らない
+    assert cp.filter_candidates("zzz", items, history=hist, now=now) == []
+
+
+def test_history_file_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "palette_history.json"
+        assert cp.load_history(path) == {}
+        history = {"feature:calculator": {"count": 2, "last": 123.0}}
+        cp.save_history(history, path)
+        assert cp.load_history(path) == history
+        path.write_text("{broken", encoding="utf-8")
+        assert cp.load_history(path) == {}
+
+
 ALL_TESTS = [
     test_score_match,
     test_filter_candidates,
@@ -127,6 +180,8 @@ ALL_TESTS = [
     test_evaluate_units,
     test_scan_app_candidates,
     test_palette_window_offscreen,
+    test_frecency,
+    test_history_file_roundtrip,
 ]
 
 

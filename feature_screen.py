@@ -269,6 +269,7 @@ class ScreenFeature:
         self.palette_window = None
         self._palette_apps_cache = None
         self._palette_es_cache = None
+        self._palette_history_cache = None
         self.launcher_picker = None
         # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
@@ -1210,8 +1211,11 @@ class ScreenFeature:
         if self.palette_window is not None:
             self._close_palette()
             return
+        if self._palette_history_cache is None:
+            self._palette_history_cache = command_palette.load_history()
         window = command_palette.create_window(
-            self._palette_static_candidates(), self._palette_file_search)
+            self._palette_static_candidates(), self._palette_file_search,
+            self._palette_history_cache)
         window.chosen.connect(self._on_palette_chosen)
         window.closed.connect(self._close_palette)
         self.palette_window = window
@@ -1274,6 +1278,18 @@ class ScreenFeature:
 
     def _on_palette_chosen(self, cand):
         """選ばれた候補を実行する。入口なので例外は必ず受ける(常駐を落とさない)。"""
+        try:
+            key = command_palette.candidate_key(cand)
+            if key is not None:
+                # frecency の学習: 選んだものを数える(実行の成否は問わない。
+                # 開こうとした時点で「使うもの」なのは確かなため)
+                if self._palette_history_cache is None:
+                    self._palette_history_cache = command_palette.load_history()
+                self._palette_history_cache = command_palette.record_use(
+                    self._palette_history_cache, key, time.time())
+                command_palette.save_history(self._palette_history_cache)
+        except Exception:  # noqa: BLE001  学習は添え物。失敗しても実行は続ける
+            traceback.print_exc()
         try:
             if cand.kind == "feature":
                 item = taskbar_launcher.ITEMS.get(cand.payload.get("item_key") or "")

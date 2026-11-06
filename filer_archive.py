@@ -648,3 +648,59 @@ def create_zip(folder: str, names, dest: str, progress=None,
         _remove_quietly(part)
         result.error = f"{type(e).__name__}: {e}"
     return result
+
+
+def create_7z(folder: str, names, dest: str, progress=None,
+              cancel: threading.Event = None) -> ZipResult:
+    """folder の names(フォルダは中身ごと)を dest に 7z で作る。create_zip の 7z 版。
+
+    - py7zr の既定(LZMA2)で圧縮する。読み取りスレッドで呼ぶ
+    - ZIP と同じく隣の .filer-part に書いてから置き換える(中止・失敗のときに
+      作りかけは残さない)。作ろうとしている書庫自身は入れない
+    - 計画(core.zip_plan)の順に1件ずつ書く。フォルダは空のときだけ実エントリを
+      持ち、中身のあるフォルダは中のファイルのパスから辿れるので数だけ数える
+      (7z ではフォルダの実エントリは必須ではない。あっふの読み取りも合成で補う)
+    - 読めないファイル(使用中など)は飛ばして続け、skipped に残す"""
+    result = ZipResult()
+    cancel = cancel or threading.Event()
+    part = dest + ".filer-part"
+    try:
+        py7zr = _import_py7zr()
+        plan = core.zip_plan(folder, names, exclude=dest)
+        total = len(plan)
+        with py7zr.SevenZipFile(part, "w") as zf:
+            for done, (path, arc, is_dir) in enumerate(plan):
+                if cancel.is_set():
+                    result.cancelled = True
+                    break
+                if progress:
+                    progress(done, total, arc)
+                if is_dir:
+                    result.folders += 1
+                    try:
+                        if not os.listdir(path):
+                            zf.writeall(path, arc.rstrip("/"))
+                    except OSError as e:
+                        result.skipped.append(f"{arc}: {e}")
+                    continue
+                try:
+                    zf.writeall(path, arc)
+                except OSError as e:
+                    result.skipped.append(f"{arc}: {e}")
+                    continue
+                result.files += 1
+                try:
+                    result.source_bytes += os.path.getsize(path)
+                except OSError:
+                    pass
+        if result.cancelled:
+            _remove_quietly(part)
+            return result
+        os.replace(part, dest)
+        result.zip_bytes = os.path.getsize(dest)
+        if progress:
+            progress(total, total, "")
+    except Exception as e:  # noqa: BLE001  py7zr が無い・ディスクが一杯など。作りかけは残さない
+        _remove_quietly(part)
+        result.error = f"{type(e).__name__}: {e}"
+    return result

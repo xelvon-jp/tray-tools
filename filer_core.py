@@ -120,7 +120,7 @@ DEFAULT_KEYMAP = {
     # 減らすために外した(2026-11-01)。filer.keys に古い上書きが残っていても、知らない
     # コマンドとして build_keymap が捨てる。Alt+I・Alt+1〜9 は空き。
     "4087": "winmerge",           # Alt+W WinMerge で比較(AFXW.key 4087 &MENU hikaku.txt の代わり)
-    "0080": "zip_create",         # P ZIP 圧縮(反対窓に作る。AFXW.key 0080 &MENU press.txt の代わり)
+    "0080": "zip_create",         # P 圧縮(反対窓に ZIP / 7z で作る。AFXW.key 0080 &MENU press.txt の代わり)
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
     "1186": "mask_input",         # Shift+: (AFXW.key 1186 &MASK)
@@ -994,7 +994,7 @@ COMMAND_SHORT_NAMES = {
     "sync_copy": "Sync",
     "queue_clear": "QueueClear",
     "winmerge": "WinMerge",
-    "zip_create": "Zip",
+    "zip_create": "Press",
     "mask_input": "Mask",
     "mask_clear": "Mask*.*",
     "history_jump": "History",
@@ -2355,16 +2355,21 @@ def info_lines(name: str, entry) -> list:
 # ZIP 圧縮(P)
 # ---------------------------------------------------------------
 def default_zip_name(folder: str, targets) -> str:
-    """作る ZIP の名前の既定。対象が1件ならその名前(拡張子を除く)、複数ならいまの
-    フォルダ名。ドライブ直下(C:\\)なら "C"。"""
+    """作る ZIP の名前の既定。default_archive_name の .zip 版。"""
+    return default_archive_name(folder, targets, ".zip")
+
+
+def default_archive_name(folder: str, targets, ext: str) -> str:
+    """作る書庫の名前の既定。対象が1件ならその名前(拡張子を除く)、複数ならいまの
+    フォルダ名。ドライブ直下(C:\\)なら "C"。ext は ".zip" のような拡張子。"""
     if len(targets) == 1:
         entry = targets[0]
         stem = entry.name if entry.is_dir else os.path.splitext(entry.name)[0]
-        return f"{stem or entry.name}.zip"
+        return f"{stem or entry.name}{ext}"
     base = os.path.basename(normalize_dir(folder).rstrip("\\/"))
     if not base:
         base = os.path.splitdrive(folder)[0].rstrip(":") or "archive"
-    return f"{base}.zip"
+    return f"{base}{ext}"
 
 
 def zip_plan(folder: str, names, exclude=None, walk=os.walk) -> list:

@@ -3825,6 +3825,56 @@ def test_zip_plan_and_create():
         _set_attrs(hidden, 0x80)
 
 
+def test_create_7z():
+    """P の 7z 版(create_7z)。作って、自分自身の読み取りで中身と展開を確かめる。"""
+    import filer_archive as fa
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp, "src")
+        (src / "dir" / "empty").mkdir(parents=True)
+        (src / "dir" / "中.txt").write_bytes(b"naka")
+        (src / "a.txt").write_bytes(b"a" * 1000)
+        dest = src / "out.7z"
+
+        assert core.default_archive_name(
+            str(src), [core.Entry("a.txt", False)], ".7z") == "a.7z"
+        assert core.default_archive_name(
+            str(src), [core.Entry("a", False), core.Entry("b", False)], ".7z") == "src.7z"
+        # 既存の .zip 版の名前は変わらない
+        assert core.default_zip_name(str(src), [core.Entry("a.txt", False)]) == "a.zip"
+
+        result = fa.create_7z(str(src), ["a.txt", "dir"], str(dest))
+        assert not result.error and not result.cancelled, result.error
+        assert result.files == 2 and result.folders == 2
+        assert result.source_bytes == 1000 + 4 and result.zip_bytes == dest.stat().st_size
+        assert not Path(str(dest) + ".filer-part").exists()
+
+        index = fa.get_index(str(dest))
+        assert sorted(e.name for e in index.list_dir("")) == ["a.txt", "dir"]
+        assert sorted(e.name for e in index.list_dir("dir")) == ["empty", "中.txt"]
+        out = Path(tmp, "out")
+        out.mkdir()
+        result = fa.extract(index, fa.plan_extract(index, "", ["a.txt", "dir"]), str(out))
+        assert result.written == 2 and not result.errors, result.errors
+        assert (out / "dir" / "中.txt").read_bytes() == b"naka"
+
+        # 自分自身(作る 7z)をいまのフォルダの対象に含めても入らない
+        result = fa.create_7z(str(src), ["a.txt", "out.7z"], str(dest))
+        assert not result.error
+        index = fa.get_index(str(dest))
+        assert [e.name for e in index.list_dir("")] == ["a.txt"]
+
+        # 中止: 作りかけを残さない
+        cancel = threading.Event()
+        cancel.set()
+        dest2 = src / "cancel.7z"
+        result = fa.create_7z(str(src), ["a.txt"], str(dest2), cancel=cancel)
+        assert result.cancelled and not dest2.exists() and not Path(str(dest2) + ".filer-part").exists()
+        # 失敗(書けない場所): 何も残さない
+        bad = Path(tmp, "nope", "x.7z")
+        result = fa.create_7z(str(src), ["a.txt"], str(bad))
+        assert result.error and not bad.exists()
+
+
 def test_auto_refresh_on_external_change():
     """表示中のフォルダが外部で変わったら、監視が検めて自動で再読込する。"""
     import time as _time

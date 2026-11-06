@@ -7323,8 +7323,17 @@ class FilerWindow(QWidget):
         if self._extracting is not None:
             self.log("圧縮: ほかの処理が終わるまで待ってください")
             return
-        name = self.ask_text("圧縮", f"反対窓（{dst.path}）に作る ZIP の名前",
-                             core.default_zip_name(src.path, targets))
+        kind = self.choose_menu("圧縮", [
+            ("Z", "ZIP で圧縮", "zip"),
+            ("S", "7z で圧縮", "7z"),
+            ("Q", "キャンセル", None),
+        ])
+        if kind is None:
+            return
+        ext = ".7z" if kind == "7z" else ".zip"
+        label = "7z" if kind == "7z" else "ZIP"
+        name = self.ask_text("圧縮", f"反対窓（{dst.path}）に作る {label} の名前",
+                             core.default_archive_name(src.path, targets, ext))
         if name is None:
             return
         name = name.strip()
@@ -7344,6 +7353,8 @@ class FilerWindow(QWidget):
         names = [e.name for e in targets]
 
         def run(progress, cancel):
+            if kind == "7z":
+                return filer_archive.create_7z(folder, names, dest, progress, cancel)
             return filer_archive.create_zip(folder, names, dest, progress, cancel)
 
         def done(result):
@@ -7357,10 +7368,10 @@ class FilerWindow(QWidget):
             self.log(f"圧縮: 失敗しました（{type(result).__name__}: {result}）")
             return
         if result.cancelled:
-            self.log("圧縮: 中止しました（作りかけの ZIP は残していません）")
+            self.log("圧縮: 中止しました（作りかけの書庫は残していません）")
             return
         if result.error:
-            self.log(f"圧縮: 失敗しました（{result.error}。作りかけの ZIP は残していません）")
+            self.log(f"圧縮: 失敗しました（{result.error}。作りかけの書庫は残していません）")
             return
         self.log(f"圧縮: {result.files}ファイル {result.folders}フォルダ"
                  f"（{core.format_bytes(result.source_bytes)}）→ {os.path.basename(dest)}"

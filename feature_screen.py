@@ -30,6 +30,7 @@ import color_picker
 import explorer_nav
 import claude_progress
 import claude_status
+import muse_bridge_status
 import filer_launch
 import filer_update
 import folder_watch
@@ -2411,6 +2412,9 @@ class ScreenFeature:
                 lines.append(f"ほか {len(entries) - CLAUDE_TOOLTIP_SESSIONS}件（メニューの Claude）")
         if getattr(self, "_disk_newer", False):
             lines.append(DISK_NEWER_TEXT)
+        # Muse 見張りの状態は1行目の直後に置く(上限超えで後ろの行から落ちるため、
+        # 待ち時間という本人がいちばん見たい行を先に落とさない)。
+        lines[1:1] = getattr(self, "_muse_bridge_lines", [])
         self.tray_icon.setToolTip(_fit_tooltip(lines))
 
     def _claude_ring_icon(self, state):
@@ -2428,9 +2432,12 @@ class ScreenFeature:
             before = claude_status.overall_state(self._claude_entries)
             had_any = bool(self._claude_entries)
             self._claude_entries = claude_status.list_sessions()
+            # Muse 見張りの待ち時間も刻々と変わるので、同じ周期で読み直す(ファイルを読むだけ)。
+            had_bridge = bool(getattr(self, "_muse_bridge_lines", []))
+            self._muse_bridge_lines = muse_bridge_status.describe(muse_bridge_status.read())
             if claude_status.overall_state(self._claude_entries) != before:
                 self._refresh_state()
-            elif self._claude_entries or had_any:
+            elif self._claude_entries or had_any or self._muse_bridge_lines or had_bridge:
                 self._update_tooltip()
             self._update_claude_progress()
         except Exception:  # noqa: BLE001  表示が出ないだけ

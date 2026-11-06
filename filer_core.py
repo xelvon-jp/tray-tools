@@ -455,7 +455,10 @@ def existing_ancestor(path: str, isdir=os.path.isdir):
                 return current
         except OSError:
             pass
-        current = parent_of(current)
+        parent = parent_of(current)
+        if parent == current:
+            break       # 親が変わらない形では打ち切る(環境差で起こりうる。無限に回らない保証)
+        current = parent
     return None
 
 

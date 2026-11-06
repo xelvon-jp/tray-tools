@@ -138,6 +138,18 @@ def test_existing_ancestor():
     assert core.existing_ancestor("", isdir) is None
 
 
+def test_existing_ancestor_stuck_parent():
+    """親が自分と変わらない形(parent_of の不動点)でも、無限に回らず None で終わる。
+    Windows 以外の os.path では実際に起こる(Linux の VM で検証が止まった)。"""
+    original = core.parent_of
+    core.parent_of = lambda p: p  # noqa: E731
+    try:
+        assert core.existing_ancestor("C:\\a\\b", lambda p: False) is None
+        assert core.existing_ancestor("C:\\a\\b", lambda p: True) == "C:\\a\\b"
+    finally:
+        core.parent_of = original
+
+
 def test_expand_typed_path():
     os.environ["FILER_TEST_DIR"] = "C:\\tmp"
     assert core.expand_typed_path('"%FILER_TEST_DIR%\\x"') == "C:\\tmp\\x"

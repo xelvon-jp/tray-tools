@@ -273,7 +273,7 @@ DEFAULT_SETTINGS = {
     # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
     # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
     # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー) / calendar(カレンダー) /
-    # calculator(電卓)。
+    # calculator(電卓) / cursor(カーソルを探す)。
     # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
@@ -305,6 +305,7 @@ DEFAULT_SETTINGS = {
             "presenter",
             "calendar",
             "calculator",
+            "cursor",
         ],
         "launcher_item_size": 36,
         "launcher_close_delay_ms": 300,
@@ -495,6 +496,8 @@ DEFAULT_SETTINGS = {
         # 統合コマンドパレット。既定は未割り当て(空文字=登録しない)。使う人が
         # 縦ランチャの項目以外からも開きたいときに割り当てる。
         "command_palette": "",
+        # カーソルファインダー(カーソルの位置に波紋を出す)。既定は未割り当て。
+        "cursor_finder": "",
         # 画面に重ねるプレゼン支援(presenter_overlay.py)。レーザーとスポットライトは
         # マウスを透過する＝自分ではキーもマウスも受け取れないので、ここが唯一の
         # 「畳む手段」になる(トレイメニューからも切れるが、発表中に通知領域まで

@@ -204,6 +204,12 @@ def _draw_calculator(draw: ImageDraw.ImageDraw, color: str) -> None:
             draw.rectangle((x, y, x + 6, y + 5), fill=color)
 
 
+def _draw_cursor_finder(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """カーソルファインダー。波紋の輪と中心の点(カーソルはここ、の目印)。"""
+    draw.ellipse((8, 8, 56, 56), outline="white", width=5)
+    draw.ellipse((24, 24, 40, 40), fill=color)
+
+
 def _draw_blank(draw: ImageDraw.ImageDraw, color: str) -> None:
     """黒画面/白画面。覆われた画面そのもの。黒と白は丸の色で描き分けるので、
     絵は共通のものを1つだけ持つ。"""
@@ -244,6 +250,7 @@ _GLYPHS = {
     "calendar": _draw_calendar,
     "calculator": _draw_calculator,
     "palette": _draw_palette,
+    "cursor": _draw_cursor_finder,
 }
 
 
@@ -445,10 +452,18 @@ ITEMS = {
         "icon": "calculator",
         "color": "#0f766e",
     },
+    "cursor": {
+        "label": "カーソルを探す",
+        "feature": "screen",
+        "method": "find_cursor",
+        "args": (),
+        "icon": "cursor",
+        "color": "#ea580c",
+    },
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
-DEFAULT_ITEMS = ["palette", "capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator"]
+DEFAULT_ITEMS = ["palette", "capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator", "cursor"]
 
 # settings.json に書かれがちな別名を正規のキーへ寄せる。hotkeys セクションでは同じ機能が
 # capture_now / audio_toggle / snippet_picker / launcher という名前で並んでおり、そちらを

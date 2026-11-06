@@ -30,6 +30,7 @@ import calculator
 import capture_process
 import color_picker
 import command_palette
+import cursor_finder
 import explorer_nav
 import claude_progress
 import claude_status
@@ -266,6 +267,7 @@ class ScreenFeature:
         self.snippet_picker = None
         self.calendar_popup = None
         self.calculator_window = None
+        self.cursor_finder = None
         self.palette_window = None
         self._palette_apps_cache = None
         self._palette_es_cache = None
@@ -858,6 +860,7 @@ class ScreenFeature:
             "launcher": lambda: self.start_launcher(),
             "filer": self.start_filer,
             "command_palette": self.show_palette,
+            "cursor_finder": self.find_cursor,
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
             "presenter_laser": lambda: self.toggle_presenter_overlay("laser"),
@@ -1202,6 +1205,16 @@ class ScreenFeature:
         self.calculator_window = None
         window.close()
         window.deleteLater()
+
+    # ---------------------------------------------------------------
+    # カーソルファインダー(縦ランチャの項目・ホットキー。cursor_finder.py)
+    # ---------------------------------------------------------------
+    def find_cursor(self):
+        """カーソルの位置に波紋の輪を出す。窓は使い回し、呼ばれるたびに
+        アニメーションを出し直す(隠すのは窓まかせ)。"""
+        if self.cursor_finder is None:
+            self.cursor_finder = cursor_finder.CursorFinderOverlay()
+        self.cursor_finder.start()
 
     # ---------------------------------------------------------------
     # コマンドパレット(縦ランチャの項目・ホットキー。command_palette.py)

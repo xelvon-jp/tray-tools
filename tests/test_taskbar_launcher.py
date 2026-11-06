@@ -17,18 +17,20 @@ def _qapp():
 
 
 def test_resolve_items_calendar():
-    """既定の並びにカレンダーが入り、設定の既定値にも入っている(末尾は電卓)。"""
+    """既定の並びにカレンダーが入り、設定の既定値にも入っている(末尾はカーソル)。"""
     assert launcher.resolve_items({}) == launcher.DEFAULT_ITEMS
     assert "calendar" in launcher.DEFAULT_ITEMS
-    assert launcher.DEFAULT_ITEMS[-1] == "calculator"
+    assert launcher.DEFAULT_ITEMS[-1] == "cursor"
     # 先頭はコマンドパレット。呼び先が feature_screen 側に実在すること
     assert launcher.DEFAULT_ITEMS[0] == "palette"
     assert launcher.ITEMS["palette"]["method"] == "show_palette"
+    assert launcher.ITEMS["cursor"]["method"] == "find_cursor"
     import ast
     import pathlib
     tree = ast.parse(pathlib.Path("feature_screen.py").read_text(encoding="utf-8"))
     methods = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
     assert "show_palette" in methods
+    assert "find_cursor" in methods
     # 設定を書かなかった場合の受け取り方(知らない名前は飛ばす・重複は1つ)
     keys = launcher.resolve_items({"launcher_items": ["calendar", "calendar", "nope"]})
     assert keys == ["calendar"], keys
@@ -38,7 +40,7 @@ def test_resolve_items_calendar():
 
     section = settings.DEFAULT_SETTINGS["taskbar_widget"]
     assert "calendar" in launcher.resolve_items(section)
-    assert launcher.resolve_items(section)[-1] == "calculator"
+    assert launcher.resolve_items(section)[-1] == "cursor"
 
 
 def test_calendar_item_wiring():

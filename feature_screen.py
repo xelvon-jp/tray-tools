@@ -39,6 +39,7 @@ import filer_update
 import folder_watch
 import launcher
 import mouse_jiggler
+import muse_bridge_status
 import presenter_overlay
 import threading
 from datetime import datetime
@@ -2573,19 +2574,29 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001  表示が出ないだけ
             return None
 
+    def _read_muse_bridge(self):
+        """Muse 見張りの状態ファイルを読む。無ければ None(パネルに出さない)。
+
+        ツールチップ側の表示と同じファイル(muse_bridge_status)。読むだけ。"""
+        try:
+            return muse_bridge_status.read()
+        except Exception:  # noqa: BLE001  表示が出ないだけ
+            return None
+
     def _update_claude_progress(self):
         copilot = self._read_copilot_turn()
+        muse = self._read_muse_bridge()
         if not self._claude_progress_enabled:
             if self._claude_progress is not None:
-                self._claude_progress.set_entries([], None)
+                self._claude_progress.set_entries([], None, None)
             return
         if self._claude_progress is None:
-            if not self._claude_entries and copilot is None:
+            if not self._claude_entries and copilot is None and muse is None:
                 return   # 出すものが無いうちは窓を作らない
             self._claude_progress = claude_progress.ClaudeProgressPanel(
                 on_open=self._open_claude_session, on_remove=self._remove_claude_session,
                 on_open_copilot=self._activate_copilot)
-        self._claude_progress.set_entries(self._claude_entries, copilot)
+        self._claude_progress.set_entries(self._claude_entries, copilot, muse)
 
     def _open_claude_session(self, entry):
         """そのセッションをデスクトップアプリで開く(メニューとパネルの行から)。"""

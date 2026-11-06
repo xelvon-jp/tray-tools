@@ -68,3 +68,48 @@ def test_read():
         assert mbs.read(p) is None
         p.write_text(json.dumps({"state": "idle"}), encoding="utf-8")
         assert mbs.read(p) == {"state": "idle"}
+
+
+def test_panel_view_waiting():
+    data = {"state": "waiting", "since": NOW - 30, "waiting_since": NOW - 252,
+            "poll_sec": 15, "last_poll": NOW - 8, "approved": 2}
+    view = mbs.panel_view(data, NOW)
+    assert view["label"] == "返事待ち" and not view["stopped"]
+    assert view["elapsed"] == 30 and view["waiting"] == 252
+    assert view["approved"] == 2
+    # 次の読み取りは 7 秒後(15 - 8)。割合は残り/間隔
+    assert view["poll_next_sec"] == 7
+    assert abs(view["poll_fraction"] - 7 / 15) < 1e-9
+    assert view["settle_fraction"] is None and view["settle_text"] is None
+
+
+def test_panel_view_settling():
+    data = {"state": "settling", "since": NOW - 20, "waiting_since": NOW - 100,
+            "settle": 2, "settle_need": 4, "poll_sec": 15, "last_poll": NOW}
+    view = mbs.panel_view(data, NOW)
+    assert view["settle_fraction"] == 0.5 and view["settle_text"] == "2/4"
+    assert view["poll_fraction"] == 1.0   # 読んだばかりは満タン
+
+
+def test_panel_view_poll_overdue_clamps():
+    data = {"state": "busy", "since": NOW - 65, "waiting_since": None,
+            "poll_sec": 15, "last_poll": NOW - 20}   # 次の読み取りを過ぎている
+    view = mbs.panel_view(data, NOW)
+    assert view["poll_fraction"] == 0.0 and view["poll_next_sec"] == 0
+    assert view["waiting"] is None and view["approved"] == 0
+
+
+def test_panel_view_stopped_and_forgotten():
+    data = {"state": "claude", "since": NOW - 200, "poll_sec": 15,
+            "last_poll": NOW - 180}
+    view = mbs.panel_view(data, NOW)
+    assert view["stopped"] and view["stale_sec"] == 180
+    assert view["poll_fraction"] is None and view["label"] == "Claude確認中"
+    data["last_poll"] = NOW - mbs.FORGET_SEC - 1
+    assert mbs.panel_view(data, NOW) is None
+
+
+def test_panel_view_bad_input_is_quiet():
+    assert mbs.panel_view(None, NOW) is None
+    assert mbs.panel_view({}, NOW) is None
+    assert mbs.panel_view({"state": "busy", "last_poll": "x"}, NOW) is None

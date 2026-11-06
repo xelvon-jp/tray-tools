@@ -10,6 +10,13 @@
 # (名前と状態 / バーと補足の2段組み)。クリック = Copilot の窓を前面へ
 # (feature_screen 側の on_open_copilot)、✕ = その手番の間だけ閉じる
 # (手番が変わればまた出る。監視は止めない)。
+# Muse 見張り(Claude が Muse の画面を見張る役)の行も相乗りする:
+# feature_screen が muse_bridge_status.read() の結果を渡し、Copilot の次の行に
+# 出す。バーは本物で、確定待ちなら settle の段階、それ以外は次に画面を読む
+# までの残り。値の計算は muse_bridge_status.panel_view(純関数)に寄せ、描く
+# ときに now で計算し直す。ファイルが無ければ行は出ない。last_poll が90秒
+# より古ければ灰色の「監視停止」、6時間で行ごと消える。クリックで開く先は
+# 無い(見るだけ)。✕ はその状態の間だけ閉じる。
 #   - バーの長さは計画の進み具合(claude_status.plan_fraction)。計画が無いセッションは
 #     長さを出せないので、流れる帯で「動いている」ことだけ示す
 #   - 色はトレイの輪と同じ(実行中=青・確認待ち=桃)
@@ -33,6 +40,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import QWidget
 
 import claude_status as cs
+import muse_bridge_status as mbs
 
 PANEL_WIDTH = 300
 PAD_X = 12
@@ -60,6 +68,16 @@ COPILOT_SUBS = {
 }
 # 「待たせすぎ」のときの文言の色(バーの点滅に相当する印)。
 COPILOT_ALERT_COLOR = QColor(240, 90, 90)
+# Muse 見張りの状態 → バーの色。返事待ちは Claude の確認待ちと同じ桃、
+# 作業中は実行中の青。止まっているときは状態によらず灰色。
+MUSE_STATE_COLORS = {
+    "waiting": QColor(212, 83, 126),
+    "busy": QColor(55, 138, 221),
+    "settling": QColor(214, 156, 32),
+    "idle": QColor(99, 153, 34),
+    "claude": QColor(38, 148, 160),
+}
+MUSE_STOPPED_COLOR = QColor(140, 140, 135)
 TRACK_HEIGHT = 6
 SCREEN_MARGIN = 12
 # 行の右端の ✕(その行を消す)。邪魔にならないよう小さく薄く、指したときだけ明るくする。
@@ -148,8 +166,19 @@ def copilot_row(copilot) -> dict | None:
             "since": copilot.get("since"), "alert": bool(copilot.get("alert"))}
 
 
+def muse_row(data, now=None) -> dict | None:
+    """Muse 見張りの状態(muse_bridge_status.read の戻り)をパネルの行にする。
+
+    出すかどうかの判定だけ panel_view で行い、割合は描くときに計算し直す
+    (3秒ごとの受け取りの間もバーと経過が進むように、生のデータを抱える)。"""
+    if mbs.panel_view(data, now) is None:
+        return None
+    return {"_muse": True, "data": data,
+            "state": data.get("state"), "since": data.get("since")}
+
+
 def row_height(row) -> int:
-    if row.get("_copilot"):
+    if row.get("_copilot") or row.get("_muse"):
         return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
 
@@ -175,8 +204,11 @@ class ClaudeProgressPanel(QWidget):
         self._state_path = state_path
         self._entries = []
         self._copilot = None
+        self._muse = None
         # ✕で閉じた Copilot の手番(状態, 開始時刻)。同じ手番の間は出さない。
         self._copilot_dismissed = None
+        # ✕で閉じた Muse 見張りの状態(状態, 開始時刻)。同じ状態の間は出さない。
+        self._muse_dismissed = None
         self._rows = []
         self._first_seen_done = {}
         self._hover = -1
@@ -194,23 +226,32 @@ class ClaudeProgressPanel(QWidget):
         self._timer.timeout.connect(self._tick)
 
     # -- 中身 ------------------------------------------------------------
-    def set_entries(self, entries, copilot=None) -> None:
+    def set_entries(self, entries, copilot=None, muse=None) -> None:
         """feature_screen から、読んだばかりの一覧を受け取る。
 
         copilot は Copilot の手番(read_turn_status の戻り)。あれば先頭に
-        1行だけ相乗りさせる(背面・最小化でも見えるようにするのが目的)。"""
+        1行だけ相乗りさせる(背面・最小化でも見えるようにするのが目的)。
+        muse は Muse 見張りの状態(muse_bridge_status.read の戻り)。
+        あれば Copilot の次に1行だけ相乗りさせる。"""
         self._entries = list(entries or [])
         self._copilot = copilot
+        self._muse = muse
         self._tick()
 
     def _tick(self):
         try:
+            now = time.time()
             head = copilot_row(self._copilot)
             if (head is not None
                     and (head["state"], head.get("since")) == self._copilot_dismissed):
                 head = None   # ✕で閉じた手番は、その手番の間は出さない
-            rows = ([head] if head else []) + rows_to_show(
-                self._entries, time.time(), self._first_seen_done)
+            muse = muse_row(self._muse, now)
+            if (muse is not None
+                    and (muse["state"], muse.get("since")) == self._muse_dismissed):
+                muse = None   # ✕で閉じた状態は、その状態の間は出さない
+            muse_view = mbs.panel_view(self._muse, now) if muse is not None else None
+            rows = (([head] if head else []) + ([muse] if muse else [])
+                    + rows_to_show(self._entries, now, self._first_seen_done))
             if not rows:
                 self._rows = []
                 self._timer.stop()
@@ -228,9 +269,13 @@ class ClaudeProgressPanel(QWidget):
             # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
             # Copilot の行は、帯が流れる応答待ち・応答中だけ回す(他の状態の
             # 経過表示は3秒ごとの受け取りで進めば足りる)。
-            if any((not r.get("_compact") and not r.get("_copilot"))
+            # Muse 見張りの行は、止まっていない間はバー(次の読み取りまでの
+            # 残り)と経過が進むので回す。止まっていれば静止画で足りる。
+            if any((not r.get("_compact") and not r.get("_copilot") and not r.get("_muse"))
                    or (r.get("_copilot")
                        and r["state"] in ("responding", "waiting_ai"))
+                   or (r.get("_muse") and muse_view is not None
+                       and not muse_view["stopped"])
                    for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
@@ -307,6 +352,9 @@ class ClaudeProgressPanel(QWidget):
     def _paint_row(self, p, entry, rect, now, hover):
         if entry.get("_copilot"):
             self._paint_copilot(p, entry, rect, now, hover)
+            return
+        if entry.get("_muse"):
+            self._paint_muse(p, entry, rect, now, hover)
             return
         if hover and cs.jump_url(entry):
             p.setPen(Qt.NoPen)
@@ -437,6 +485,71 @@ class ClaudeProgressPanel(QWidget):
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
 
+    def _paint_muse(self, p, entry, rect, now, hover):
+        """Muse 見張りの行: Claude の行と同じ2段組み(名前と状態 / バーと補足)。
+
+        バーは本物で、確定待ちなら settle の段階、それ以外は次に画面を読む
+        までの残り(満タンから減っていく)。割合は panel_view が now で計算する。
+        止まっているときは状態によらず灰色で、バーは空。"""
+        view = mbs.panel_view(entry["data"], now)
+        if view is None:
+            return
+        stopped = view["stopped"]
+        color = (MUSE_STOPPED_COLOR if stopped
+                 else MUSE_STATE_COLORS.get(view["state"], SUBTEXT))
+        inner = rect.adjusted(PAD_X // 2, 4, -PAD_X // 2, -4)
+
+        # 1段目: 名前と、右に状態＋経過(止まっていれば「監視停止」だけ)
+        tail = "監視停止" if stopped else view["label"]
+        if not stopped and view["elapsed"] is not None:
+            tail += " " + cs.format_duration(view["elapsed"])
+        p.setFont(self._name_font)
+        fm = QFontMetrics(self._name_font)
+        tail_w = fm.horizontalAdvance(tail)
+        head = QRect(inner.left(), inner.top(), inner.width() - CLOSE_SIZE - CLOSE_GAP,
+                     fm.height())
+        p.setPen(MUSE_STOPPED_COLOR if stopped else SUBTEXT)
+        p.drawText(head, Qt.AlignRight | Qt.AlignVCenter, tail)
+        p.setPen(MUSE_STOPPED_COLOR if stopped else TEXT)
+        name = fm.elidedText("Muse 見張り", Qt.ElideRight,
+                             max(0, head.width() - tail_w - 8))
+        p.drawText(head, Qt.AlignLeft | Qt.AlignVCenter, name)
+
+        # バー
+        track = QRectF(inner.left(), head.bottom() + 4, inner.width(), TRACK_HEIGHT)
+        p.setPen(Qt.NoPen)
+        p.setBrush(TRACK)
+        p.drawRoundedRect(track, 3, 3)
+        fraction = (view["settle_fraction"] if view["settle_fraction"] is not None
+                    else view["poll_fraction"])
+        if fraction is not None and fraction > 0:
+            p.setBrush(color)
+            p.drawRoundedRect(QRectF(track.left(), track.top(),
+                                     max(track.height(), track.width() * fraction),
+                                     track.height()), 3, 3)
+
+        # 2段目: 補足(返事待ちの総時間・確定の段階・次の読み取り・自動承認)
+        if stopped:
+            sub = f"最後の確認は {cs.format_duration(view['stale_sec'])}前"
+        else:
+            parts = []
+            if view["waiting"] is not None:
+                parts.append(f"返事待ち {cs.format_duration(view['waiting'])}")
+            if view["settle_text"]:
+                parts.append(f"確定 {view['settle_text']}")
+            if view["poll_next_sec"] is not None:
+                parts.append(f"次に読むまで {view['poll_next_sec']}秒")
+            if view["approved"]:
+                parts.append(f"自動承認 {view['approved']}件")
+            sub = "・".join(parts)
+        p.setFont(self._sub_font)
+        sub_fm = QFontMetrics(self._sub_font)
+        p.setPen(MUSE_STOPPED_COLOR if stopped else SUBTEXT)
+        sub_rect = QRect(inner.left(), int(track.bottom()) + 2, inner.width(),
+                         sub_fm.height())
+        p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
+
     def _paint_compact(self, p, entry, rect, color):
         """折りたたんだ行: 状態の色の点・名前・終わった時刻だけ。バーの行より控えめに。"""
         inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
@@ -512,6 +625,8 @@ class ClaudeProgressPanel(QWidget):
                     import traceback
                     traceback.print_exc()
             return
+        if 0 <= index < len(self._rows) and self._rows[index].get("_muse"):
+            return   # Muse 見張りの行は開く先が無い(見るだけ)
         if 0 <= index < len(self._rows) and self._on_open is not None:
             try:
                 self._on_open(self._rows[index])
@@ -527,6 +642,13 @@ class ClaudeProgressPanel(QWidget):
             # (状態か開始時刻が変われば)また出る。監視は止めない。
             self._copilot_dismissed = (entry["state"], entry.get("since"))
             self._copilot = None
+            self._hover = self._hover_close = -1
+            self._tick()
+            return
+        if entry.get("_muse"):
+            # Muse 見張りの行の ✕: その状態の間だけ閉じる(Copilot と同じ作法)。
+            self._muse_dismissed = (entry["state"], entry.get("since"))
+            self._muse = None
             self._hover = self._hover_close = -1
             self._tick()
             return

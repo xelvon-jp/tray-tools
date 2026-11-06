@@ -14,6 +14,9 @@
 #   last_poll     最後に画面を読んだ時刻(epoch 秒)
 #   settle, settle_need  返事が落ち着いたと見なすまでの回数(いま/必要)
 #   approved      自動で押した承認カードの数
+#
+# 使い道は2つ: ツールチップの行(describe)と、進捗パネルの Muse 見張り行
+# (panel_view。バーの割合まで含めてここで計算し、描画は claude_progress が担う)。
 import json
 import os
 import time
@@ -106,3 +109,47 @@ def describe(data, now=None) -> list:
     if parts:
         lines.append("監視 " + "・".join(parts))
     return lines
+
+
+def panel_view(data, now=None):
+    """進捗パネルの Muse 見張り行に出す値(now 基準)。行を出さないなら None。
+
+    - データが無い・last_poll が無い/ FORGET_SEC(6時間)より古い → None
+    - last_poll が STALE_SEC(90秒)より古い → stopped(灰色の「監視停止」行)
+    バーの割合: poll_fraction は次に画面を読むまでの残り(1→0)、
+    settle_fraction は確定待ちの段階(返事の確定待ちのときだけ)。"""
+    if not data:
+        return None
+    now = time.time() if now is None else now
+    last_poll = _num(data, "last_poll")
+    if last_poll is None or now - last_poll > FORGET_SEC:
+        return None
+    state = data.get("state")
+    since = _num(data, "since")
+    waiting_since = _num(data, "waiting_since")
+    poll_sec = _num(data, "poll_sec")
+    stopped = now - last_poll > STALE_SEC
+    view = {
+        "state": state,
+        "label": LABELS.get(state, str(state or "?")),
+        "stopped": stopped,
+        "elapsed": max(0.0, now - since) if since is not None else None,
+        "waiting": (max(0.0, now - waiting_since)
+                    if waiting_since is not None else None),
+        "approved": int(_num(data, "approved") or 0),
+        "poll_fraction": None,
+        "poll_next_sec": None,
+        "settle_fraction": None,
+        "settle_text": None,
+        "stale_sec": max(0.0, now - last_poll) if stopped else None,
+    }
+    if not stopped and poll_sec:
+        remain = last_poll + poll_sec - now
+        view["poll_next_sec"] = max(0, int(round(remain)))
+        view["poll_fraction"] = min(1.0, max(0.0, remain / poll_sec))
+    if state == "settling":
+        settle, need = _num(data, "settle"), _num(data, "settle_need")
+        if settle is not None and need:
+            view["settle_fraction"] = min(1.0, max(0.0, settle / need))
+            view["settle_text"] = f"{int(settle)}/{int(need)}"
+    return view

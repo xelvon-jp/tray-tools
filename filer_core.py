@@ -661,7 +661,9 @@ def flat_footer_text(files: int, total: int, mark_count: int = 0, mark_bytes: in
 # 文字列検索(Grep。G キー)
 # ---------------------------------------------------------------
 GREP_LIMIT = 2_000            # ヒット件数の上限(結果が一覧にならない量は実用でないため)
-GREP_FILE_MAX = 32 * 1024 * 1024   # これより大きいファイルは中身を見ない
+GREP_FILE_MAX = 32 * 1024 * 1024   # これより大きいファイルは grep_file_large で
+                                   # チャンク読みに切り替える(丸ごとは読まない)
+GREP_CHUNK = 8 * 1024 * 1024       # 巨大ファイル検索の1回に読む量
 GREP_LINE_MAX = 200           # ログに出すヒット行の長さ
 
 def _decode_text(data: bytes):
@@ -702,6 +704,131 @@ def grep_in_bytes(data: bytes, needle: str, case_sensitive: bool = False):
         if any((n if case_sensitive else n.lower()) in hay for n in needles):
             count += 1
     return (count, "") if count else None
+
+
+def _grep_line_hit(line_bytes: bytes, needle: str, case_sensitive: bool):
+    """1行分のバイト列がヒットか。(ヒットか, 表示用の行文字列)。
+
+    テキストとして読めたら文字列で比べる(grep_in_bytes と同じ)。読めなければ
+    バイト列のまま比べ、表示用の行は空(バイナリ扱い)。"""
+    text = _decode_text(line_bytes)
+    if text is not None:
+        line = text.rstrip("\r\n")
+        hay = line if case_sensitive else line.casefold()
+        probe = needle if case_sensitive else needle.casefold()
+        return (probe in hay), (line.strip()[:GREP_LINE_MAX] if probe in hay else "")
+    needles = {needle.encode("utf-8"), needle.encode("cp932", "ignore")}
+    needles.discard(b"")
+    hay = line_bytes if case_sensitive else line_bytes.lower()
+    hit = any((n if case_sensitive else n.lower()) in hay for n in needles)
+    return hit, ""
+
+
+def grep_file_large(path: str, needle: str, case_sensitive: bool = False,
+                    cancel=None, chunk_size: int = GREP_CHUNK):
+    """巨大ファイルを少しずつ読んで探す。(ヒット行数, 最初のヒット行) か None。
+
+    丸ごと読むとメモリを食うので、chunk_size ずつ読み進める。まずバイト列で
+    候補を探し(UTF-8 と cp932 の両方の符号化で。大小無区別はバイト単位の
+    lower で、両側に同じ変換をかけるので取りこぼしは無い)、候補のある行だけ
+    抜き出して文字列で確かめる(候補違いを落とす)。行の区切りは \\n で数える
+    (grep_in_bytes の splitlines とは、特殊な区切り字のときだけ数え方が違う)。"""
+    raw_needles = {needle.encode("utf-8"), needle.encode("cp932", "ignore")}
+    raw_needles.discard(b"")
+    if not raw_needles:
+        return None
+    needles = [n if case_sensitive else n.lower() for n in raw_needles]
+    overlap = max(len(n) for n in needles) - 1
+    counted = set()          # ヒットと確定した行(行頭の直前の \\n の位置で識別)
+    rejected = set()         # 候補はあったが文字列では一致しなかった行
+    count = 0
+    first = ""
+    have_first = False
+    last_nl = -1             # 最後に見た \\n の絶対位置
+    nl_cursor = 0            # \\n を探し終えた絶対位置(候補の処理順に進む)
+    boundary = 0             # 候補を処理済みの絶対位置(これ未満は見ない)
+    base = 0                 # buffer の先頭の絶対位置
+    buffer = b""
+    eof = False
+    with open(path, "rb") as f:
+        while True:
+            if cancel is not None and cancel.is_set():
+                return None
+            chunk = f.read(chunk_size) if not eof else b""
+            if chunk:
+                buffer += chunk
+            else:
+                eof = True
+            buffer_end = base + len(buffer)
+            hay = buffer if case_sensitive else buffer.lower()
+            # この buffer で処理できる候補(針が最後まで入っているもの)を集める
+            limit_pos = buffer_end if eof else buffer_end - overlap
+            candidates = []
+            for n in needles:
+                start = boundary
+                while True:
+                    at = hay.find(n, start - base)
+                    if at < 0:
+                        break
+                    absolute = base + at
+                    if absolute >= limit_pos:
+                        break
+                    candidates.append(absolute)
+                    start = absolute + 1
+            candidates.sort()
+            for absolute in candidates:
+                # 行の識別: 候補より前にある最後の \\n の位置
+                seg_from = max(nl_cursor, base)
+                if absolute > seg_from:
+                    at = hay.rfind(b"\n", seg_from - base, absolute - base)
+                    if at >= 0:
+                        last_nl = base + at
+                nl_cursor = max(nl_cursor, absolute)
+                line_key = last_nl
+                if line_key in counted or line_key in rejected:
+                    continue
+                # 行を取り出す(buffer の中だけ。行頭が buffer より前なら切れる
+                # 末尾は次の \\n まで、無ければ buffer 末尾)
+                line_start = line_key + 1
+                nl_at = buffer.find(b"\n", max(absolute - base, 0))
+                line_end = base + nl_at if nl_at >= 0 else buffer_end
+                line_bytes = buffer[max(line_start - base, 0):line_end - base]
+                if line_start < base or (nl_at < 0 and not eof):
+                    # 行頭が buffer より前にある、または行が buffer の先まで
+                    # 続いている。行頭から読み直して行を取り直す(表示と照合が
+                    # buffer の切れ目で短くならないように)
+                    try:
+                        with open(path, "rb") as extra:
+                            extra.seek(line_start)
+                            piece = extra.read(min(absolute - line_start + 4096,
+                                                   4 * 1024 * 1024))
+                        cut = piece.find(b"\n")
+                        line_bytes = piece[:cut] if cut >= 0 else piece
+                    except OSError:
+                        pass
+                hit, shown = _grep_line_hit(line_bytes, needle, case_sensitive)
+                if hit:
+                    counted.add(line_key)
+                    count += 1
+                    if not have_first:
+                        first = shown
+                        have_first = True
+                else:
+                    rejected.add(line_key)
+            if eof:
+                break
+            # 次の buffer は overlap 分を残して進める。捨てる範囲にある最後の
+            # \\n は last_nl に残す(行の識別が継ぎ目でずれないように)
+            keep_from = buffer_end - overlap
+            if keep_from > base:
+                at = buffer.rfind(b"\n", 0, keep_from - base)
+                if at >= 0:
+                    last_nl = base + at
+                nl_cursor = max(nl_cursor, keep_from)
+                buffer = buffer[keep_from - base:]
+                base = keep_from
+            boundary = max(boundary, limit_pos)
+    return (count, first) if count else None
 
 
 def grep_files(root: str, needle: str, case_sensitive: bool = False,
@@ -745,14 +872,16 @@ def grep_files(root: str, needle: str, case_sensitive: bool = False,
                     subdirs.append(entry.path)
                 continue
             scanned += 1
-            if st.st_size > GREP_FILE_MAX:
-                continue
             try:
-                with open(entry.path, "rb") as f:
-                    data = f.read()
+                if st.st_size > GREP_FILE_MAX:
+                    # 巨大なファイルは丸ごと読まず、少しずつ読んで探す
+                    hit = grep_file_large(entry.path, needle, case_sensitive, cancel)
+                else:
+                    with open(entry.path, "rb") as f:
+                        data = f.read()
+                    hit = grep_in_bytes(data, needle, case_sensitive)
             except OSError:
                 continue
-            hit = grep_in_bytes(data, needle, case_sensitive)
             if hit is None:
                 continue
             rel = os.path.relpath(entry.path, root)

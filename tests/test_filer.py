@@ -2118,6 +2118,51 @@ def test_log_selection_ctrl_c():
             w.deleteLater()
 
 
+def test_grep_file_large():
+    """巨大ファイル用のチャンク読み検索。小さい chunk_size で継ぎ目を踏ませ、
+    grep_in_bytes と同じ数え方になることを確かめる。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "big.log")
+
+        def run(data: bytes, needle: str, case_sensitive=False, chunk=16):
+            path.write_bytes(data)
+            return core.grep_file_large(str(path), needle, case_sensitive,
+                                        chunk_size=chunk)
+
+        data = b"Hello World\nsecond HELLO line\nnothing here\nlast hello\n"
+        expect = core.grep_in_bytes(data, "hello")
+        assert run(data, "hello") == expect == (3, "Hello World")
+        assert run(data, "HELLO", case_sensitive=True) == \
+            core.grep_in_bytes(data, "HELLO", True) == (1, "second HELLO line")
+        assert run(data, "absent") is None
+        # 同じ行に2回出ても1行
+        assert run(b"hello hello\n", "hello") == (1, "hello hello")
+        # 針がチャンクの継ぎ目をまたぐ(13 バイト目から始めて 16 の境界を越える)
+        seam = b"x" * 13 + b"NEEDLE\n" + b"y" * 40 + b"\nneedle again\n"
+        assert run(seam, "needle") == (2, "x" * 13 + "NEEDLE")
+        # 行がチャンクより長い
+        long_line = b"a" * 100 + b" hello " + b"b" * 100 + b"\nshort hello\n"
+        assert run(long_line, "hello") == (2, long_line.split(b"\n")[0].decode()[:200])
+        # CRLF の行でも数える
+        assert run(b"one hello\r\ntwo\r\nthree hello\r\n", "hello") == (2, "one hello")
+        # cp932 の日本語(大小区別なし・あり)
+        jp = "テスト HELLO\n次のテスト\n".encode("cp932")
+        assert run(jp, "テスト") == core.grep_in_bytes(jp, "テスト") == (2, "テスト HELLO")
+        assert run(jp, "hello") == (1, "テスト HELLO")
+        # バイナリ(どちらの文字コードでも読めない)はバイト列で数える
+        binary = b"\xff\xfe hello \x80\x81\n\xff hello\n"
+        assert run(binary, "hello") == (2, "")
+        # 末尾に改行が無い行
+        assert run(b"tail hello", "hello") == (1, "tail hello")
+        # 中止したら None(結果なし)
+        import threading
+        cancel = threading.Event()
+        cancel.set()
+        path.write_bytes(b"hello\n" * 100)
+        assert core.grep_file_large(str(path), "hello", cancel=cancel,
+                                    chunk_size=16) is None
+
+
 def test_grep_search():
     """G: 文字列検索。core の照合(UTF-8/cp932・大小区別・中止)と、窓側で
     結果がフラット表示の形(相対パス)で並び、通常表示へ戻れること。"""

@@ -389,22 +389,6 @@ def test_show_bridge_expands():
     panel.deleteLater()
 
 
-ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
-             test_muse_kind_row_and_dismiss_key, test_coop_row,
-             test_panel_coop_all_tones_paint, test_panel_coop_cannot_be_dismissed,
-             test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint,
-             test_item_position, test_rows_to_show_prunes_first_seen,
-             test_paint_survives_row_exception, test_pulse_alpha,
-             test_pause_rect_left_of_toggle, test_panel_watch_pause_toggle,
-             test_show_bridge_expands]
-
-
-if __name__ == "__main__":
-    for test in ALL_TESTS:
-        test()
-        print(f"PASS {test.__name__}")
-
-
 def test_bridge_size_state():
     """大きさの保存と読み戻し。知らない値は large に倒す。"""
     path = _state_path()
@@ -458,3 +442,20 @@ def test_panel_stealth_and_sizes():
     assert panel._rows[0]["_size"] == "medium"
     assert panel.height() == cp.panel_height(panel._rows)
     panel.hide()
+
+
+ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
+             test_muse_kind_row_and_dismiss_key, test_coop_row,
+             test_panel_coop_all_tones_paint, test_panel_coop_cannot_be_dismissed,
+             test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint,
+             test_item_position, test_rows_to_show_prunes_first_seen,
+             test_paint_survives_row_exception, test_pulse_alpha,
+             test_pause_rect_left_of_toggle, test_panel_watch_pause_toggle,
+             test_show_bridge_expands, test_bridge_size_state,
+             test_coop_height_sizes, test_panel_stealth_and_sizes]
+
+
+if __name__ == "__main__":
+    for test in ALL_TESTS:
+        test()
+        print(f"PASS {test.__name__}")

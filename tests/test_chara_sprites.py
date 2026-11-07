@@ -18,10 +18,10 @@ def test_frame_sizes():
     assert set(sp.MUSE_FRAMES) == {"idle", "blink", "work-a", "work-b", "wait", "alert",
                                    "happy", "sleep", "look-l", "look-r"}
     for name, rows in sp.MUSE_FRAMES.items():
-        assert len(rows) == 10 and all(len(r) == 12 for r in rows), name
-        assert set("".join(rows)) <= set(".BPES"), name
-        r2 = sp.muse_rows(name)
-        assert len(r2) == 10 and all(len(r) == 12 for r in r2), name
+        assert len(rows) == 15 and all(len(r) == 13 for r in rows), name
+        assert set("".join(rows)) <= set(".BFEPS"), name
+        assert sp.muse_rows(name) is rows
+    assert len(sp.MUSE_PALETTE) == 5 and set(sp.MUSE_PALETTE) == set("BFEPS")
 
 
 def test_clawd_shape():
@@ -33,11 +33,9 @@ def test_clawd_shape():
 
 
 def test_muse_sleep_z_is_light_blue():
+    # v2 では最初から水色(S)で描かれている。特別処理は無い
     rows = sp.muse_rows("sleep")
-    assert "E" not in "".join(r[9:] for r in rows[:3])
-    assert "S" in "".join(r[9:] for r in rows[:3])
-    assert rows[5] == sp.MUSE_FRAMES["sleep"][5]            # 目の E は残る
-    assert sp.MUSE_FRAMES["sleep"][0].endswith("EE")        # 元データは書き換えない
+    assert "S" in "".join(rows[:2]) and "E" not in "".join(r[9:] for r in rows[:3])
 
 
 def test_clawd_frame_cycles():

@@ -17,6 +17,7 @@ PAD = 8
 GAP = 6
 COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + CARDS_H + PAD
 CELL = 5                      # キャラの1マス(px)。Claw'd は 60x40、Muse は 60x50
+MUSE_CELL = 4                 # Muse の1マス(px)。v2 は 13x15 なので 52x60
 ITEM_CELL = 2                 # 手紙・受領・火花の1マス(px)
 ITEM_LEFT = 72                # 手紙の出発点(ステージ左端から)
 CLOSE_ROOM = 20               # 右上の ✕ のために空けておく幅
@@ -219,8 +220,11 @@ def _paint_stage(p, dpr, view, st, accent, t):
     # Muse(左)と Claw'd(右)
     mdx, mdy = sp.move_offset(sp.MUSE_MOVE.get(view["muse_anim"], ""), t)
     mname = sp.muse_frame(view["muse_anim"], t)
-    _sprite(p, dpr, ("muse", mname), sp.muse_rows(mname), sp.MUSE_PALETTE,
-            ox + 8 + mdx, feet - 10 * CELL + mdy)
+    mrows = sp.muse_rows(mname)
+    mw, mh = len(mrows[0]) * MUSE_CELL, len(mrows) * MUSE_CELL
+    mtop = feet - mh                          # Claw'd と足元(feet)を揃える
+    _sprite(p, dpr, ("muse", mname), mrows, sp.MUSE_PALETTE,
+            ox + 8 + mdx, mtop + mdy, MUSE_CELL)
     cdx, cdy = sp.move_offset(sp.CLAWD_MOVE.get(view["clawd_anim"], ""), t)
     cname = sp.clawd_frame(view["clawd_anim"], t)
     cx, cy = ox + W - 70 + cdx, feet - 8 * CELL + cdy
@@ -234,7 +238,7 @@ def _paint_stage(p, dpr, view, st, accent, t):
     p.setFont(tag_font)
     p.setPen(accent)
     th = QFontMetrics(tag_font).height()
-    p.drawText(QRect(ox + 6, feet + 2, 64, th), Qt.AlignCenter, "MUSE")
+    p.drawText(QRect(ox + 8 + mw // 2 - 32, feet + 2, 64, th), Qt.AlignCenter, "MUSE")
     p.drawText(QRect(ox + W - 72, feet + 2, 68, th), Qt.AlignCenter, "CLAW'D")
 
     # 手紙・受領のチェック(座標で飛ばす)
@@ -257,7 +261,7 @@ def _paint_stage(p, dpr, view, st, accent, t):
     if "spark" in props:
         p.setOpacity(1.0 if t % 500 < 250 else 0.15)
         _sprite(p, dpr, ("item", "spark"), ITEM_GRIDS["spark"], ITEM_PALETTE,
-                ox + 33, oy + H - 92, ITEM_CELL)
+                ox + 8 + (mw - 18) // 2, mtop - 16, ITEM_CELL)
         p.setOpacity(1.0)
     # Claw'd の頭の上と体まわり
     if "dots" in props:

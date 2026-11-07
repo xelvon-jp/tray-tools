@@ -64,7 +64,21 @@
 
   .piece { position: absolute; cursor: grab; touch-action: none; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,.18); }
   .piece .cells { display: grid; gap: 2px; }
-  .piece .cell { width: 24px; height: 24px; border-radius: 3px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.15), inset 0 2px 0 rgba(255,255,255,.3); }
+  .piece .cell { border-radius: 3px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.15), inset 0 2px 0 rgba(255,255,255,.3); }
+  .piece.exhibit { cursor: pointer; }
+  .piece.winnerglow { animation: glowpulse .45s ease-in-out 3; }
+  @keyframes glowpulse {
+    0%, 100% { box-shadow: 0 2px 5px rgba(0,0,0,.18); }
+    50% { box-shadow: 0 0 0 5px #ffb703, 0 0 28px 8px rgba(255,183,3,.75); }
+  }
+  #partsbox.droptarget { background: #ffd9d9; }
+  #carrytoast {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    font-size: 34px; font-weight: bold; color: #1463a3; background: #ffffff;
+    border: 3px solid #f5c542; border-radius: 999px; padding: 8px 26px;
+    display: none; z-index: 60; pointer-events: none; white-space: nowrap;
+    box-shadow: 0 3px 8px rgba(0,0,0,.18);
+  }
   .piece.pop { animation: pop .25s ease-out; }
   @keyframes pop { 0% { transform: scale(.6); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
   .piece.wiggle { animation: wiggle .3s ease-in-out; }
@@ -129,7 +143,7 @@
     </div>
     <div id="totaldisp">いま 0.00</div>
   </div>
-  <div id="stage"></div>
+  <div id="stage"><div id="carrytoast"></div></div>
   <div id="partsbox">
     <div id="partslabel">ぶひんばこ</div>
   </div>
@@ -150,7 +164,8 @@ const recipeEl = document.getElementById("recipe");
 const nextBtn = document.getElementById("nextbtn");
 const undoBtn = document.getElementById("undobtn");
 
-// kinds: value in hundredths, grid shape in cells (cell = 24px, gap = 2px)
+// kinds: value in hundredths, grid shape in cells (cell size is
+// computed from the stage size by computeCell below)
 // "one" is a 10x10 plate, "tenth" a 1x10 stick, "hundredth" a single square,
 // so ten of a kind tile the next unit exactly (area is conserved visually)
 const KINDS = {
@@ -159,7 +174,17 @@ const KINDS = {
   hundredth: { value: 1,   cols: 1,  rows: 1,  color: "#e67e22", next: "tenth" }
 };
 const KIND_ORDER = ["one", "tenth", "hundredth"];
-const CELL = 24, GAP = 2, PITCH = CELL + GAP;
+const GAP = 2;
+let CELL = 20, PITCH = CELL + GAP;
+// pieces are sized from the stage: a plate is about 200px square
+// (one cell about 20px), shrinking only when the stage is too small
+function computeCell() {
+  const w = stage.clientWidth || 1024, h = stage.clientHeight || 500;
+  let c = 20;
+  const fit = Math.floor(Math.min((h * 0.55 - 18) / 10, (w * 0.34 - 18) / 10));
+  if (fit < c) c = Math.max(12, fit);
+  CELL = c; PITCH = CELL + GAP;
+}
 
 function pieceSize(kind) {
   const k = KINDS[kind];
@@ -298,10 +323,20 @@ function overlapsAny(x, y, w, h, pad, ignoreId) {
 }
 function findSpawnPos(kind) {
   const size = pieceSize(kind);
-  const maxX = Math.max(0, stage.clientWidth - size.w);
-  const maxY = Math.max(0, stage.clientHeight - size.h);
-  for (const o of blocks.values()) {
-    if (o.kind !== kind) continue;
+  const W = stage.clientWidth, H = stage.clientHeight;
+  const maxX = Math.max(0, W - size.w);
+  const maxY = Math.max(0, H - size.h);
+  const cx = W / 2, cy = H / 2;
+  // 1) tiling next to a same-kind piece (keeps the cluster the carry
+  //    needs), starting from the piece closest to the stage centre
+  const same = Array.from(blocks.values()).filter((p) => p.kind === kind);
+  same.sort((a, b) => {
+    const sa = pieceSize(a.kind), sb = pieceSize(b.kind);
+    const da = (a.x + sa.w / 2 - cx) ** 2 + (a.y + sa.h / 2 - cy) ** 2;
+    const db = (b.x + sb.w / 2 - cx) ** 2 + (b.y + sb.h / 2 - cy) ** 2;
+    return da - db;
+  });
+  for (const o of same) {
     const os = pieceSize(o.kind);
     const cand = [
       { x: o.x + os.w + 4, y: o.y }, { x: o.x, y: o.y + os.h + 4 },
@@ -312,16 +347,17 @@ function findSpawnPos(kind) {
       if (!overlapsAny(c.x, c.y, size.w, size.h, 2, -1)) return c;
     }
   }
+  // 2) free space, biased to the centre of the stage
   for (let i = 0; i < 40; i++) {
-    const x = Math.random() * maxX;
-    const y = Math.random() * Math.min(maxY, 220);
+    const x = Math.min(maxX, Math.max(0, cx + (Math.random() + Math.random() - 1) * maxX * 0.42 - size.w / 2));
+    const y = Math.min(maxY, Math.max(0, cy + (Math.random() + Math.random() - 1) * maxY * 0.42 - size.h / 2));
     if (!overlapsAny(x, y, size.w, size.h, 10, -1)) return { x, y };
   }
-  for (let y = 8; y <= maxY; y += 26) {
-    for (let x = 8; x <= maxX; x += 26) {
-      if (!overlapsAny(x, y, size.w, size.h, 10, -1)) return { x, y };
-    }
-  }
+  // 3) grid points, centre first
+  const pts = [];
+  for (let y = 8; y <= maxY; y += 26) for (let x = 8; x <= maxX; x += 26) pts.push({ x, y });
+  pts.sort((a, b) => ((a.x - cx) ** 2 + (a.y - cy) ** 2) - ((b.x - cx) ** 2 + (b.y - cy) ** 2));
+  for (const c of pts) if (!overlapsAny(c.x, c.y, size.w, size.h, 10, -1)) return c;
   const k = blocks.size;
   return { x: (30 + k * 37) % Math.max(1, maxX), y: (20 + k * 53) % Math.max(1, maxY) };
 }
@@ -346,6 +382,15 @@ function clusterOf(start) {
   const cx = start.x, cy = start.y;
   out.sort((p, q) => ((p.x - cx) ** 2 + (p.y - cy) ** 2) - ((q.x - cx) ** 2 + (q.y - cy) ** 2));
   return out;
+}
+// short toast so the child can see what the carry just did
+const carryToast = document.getElementById("carrytoast");
+let toastTimer = null;
+function showCarryToast(nextKind) {
+  carryToast.textContent = nextKind === "one" ? "10ぽんで 1まい！" : "10こで 1ぽん！";
+  carryToast.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { carryToast.style.display = "none"; }, 900);
 }
 function convertTen(ten, kind) {
   const nextKind = KINDS[kind].next;
@@ -375,6 +420,7 @@ function convertTen(ten, kind) {
   placePiece(np, cx - ns.w / 2, cy - ns.h / 2);
   np.el.classList.add("pop");
   sndCarry();
+  showCarryToast(nextKind);
   return np;
 }
 // after a piece arrives, convert any full cluster of 10 it belongs to;
@@ -404,12 +450,17 @@ function breakApart(p) {
   snapshot();
   const x = p.x, y = p.y;
   removePiece(p);
+  // shift the whole row/column so all ten children stay on the stage
+  // instead of piling up against an edge
+  const span = 10 * PITCH - GAP;
+  const startX = Math.min(x, Math.max(0, stage.clientWidth - span));
+  const startY = Math.min(y, Math.max(0, stage.clientHeight - span));
   for (let i = 0; i < 10; i++) {
     const c = makePiece(childKind);
     blocks.set(c.id, c);
     renderPiece(c);
-    if (childKind === "tenth") placePiece(c, x + i * PITCH, y);
-    else placePiece(c, x, y + i * PITCH);
+    if (childKind === "tenth") placePiece(c, startX + i * PITCH, y);
+    else placePiece(c, x, startY + i * PITCH);
     c.el.classList.add("pop");
   }
   sndBreak();
@@ -419,6 +470,16 @@ function breakApart(p) {
 // ---------- drag / long-press ----------
 let drag = null;
 function attachPointer(p) {
+  if (p.exhibit) { // compare-mode group: a tap answers, no dragging
+    p.el.classList.add("exhibit");
+    p.el.dataset.side = p.side || "";
+    p.el.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ensureAudio();
+      chooseSide(p.side);
+    });
+    return;
+  }
   p.el.addEventListener("pointerdown", (ev) => {
     ensureAudio();
     if (!blocks.has(p.id)) return;
@@ -447,6 +508,8 @@ function attachPointer(p) {
       clearTimeout(drag.timer);
     }
     placePiece(p, ev.clientX - srect.left - drag.dx, ev.clientY - srect.top - drag.dy);
+    const pb = partsBox.getBoundingClientRect();
+    partsBox.classList.toggle("droptarget", ev.clientY >= pb.top - 14);
   });
   const finish = (ev) => {
     if (!drag || drag.piece !== p) return;
@@ -454,7 +517,22 @@ function attachPointer(p) {
     const wasBroke = drag.broke;
     drag = null;
     p.el.style.zIndex = "";
-    if (!wasBroke) { carryFrom(p); refreshInfo(); checkChallenge(); }
+    partsBox.classList.remove("droptarget");
+    if (wasBroke) return;
+    // dropped on the parts box: the piece goes back (this is how
+    // subtraction takes pieces away). The test uses the pointer, not
+    // the piece centre: pieces are clamped inside the stage, so a
+    // tall stick's centre can never reach the box.
+    const pb = partsBox.getBoundingClientRect();
+    if (ev.clientX >= pb.left - 6 && ev.clientX <= pb.right + 6 && ev.clientY >= pb.top - 14) {
+      snapshot();
+      removePiece(p);
+      tone(392, 0, 0.12);
+      refreshInfo();
+      checkChallenge();
+      return;
+    }
+    carryFrom(p); refreshInfo(); checkChallenge();
   };
   p.el.addEventListener("pointerup", finish);
   p.el.addEventListener("pointercancel", finish);
@@ -477,6 +555,7 @@ for (const kind of KIND_ORDER) {
   btn.appendChild(label);
   btn.addEventListener("click", () => {
     if (suppressClick) { suppressClick = false; return; }
+    if (mode === "compare") return;
     ensureAudio();
     snapshot();
     const p = makePiece(kind);
@@ -492,6 +571,7 @@ for (const kind of KIND_ORDER) {
   });
   let partDrag = null;
   btn.addEventListener("pointerdown", (ev) => {
+    if (mode === "compare") return;
     ensureAudio();
     partDrag = { kind, pid: ev.pointerId, startX: ev.clientX, startY: ev.clientY, piece: null };
     btn.setPointerCapture(ev.pointerId);
@@ -529,28 +609,157 @@ for (const kind of KIND_ORDER) {
   partsBox.appendChild(btn);
 }
 
-// ---------- total + challenge ----------
-let target = null; // in hundredths
+// ---------- total + challenges ----------
+// modes cycle: build a target, add, build, subtract, build, compare...
+const MODE_CYCLE = ["make", "add", "make", "sub", "make", "compare"];
+let modeIdx = 0;
+let mode = "make";
+let target = null; // goal total in hundredths (not used by compare)
+let curA = 0, curB = 0; // operands of the current add/sub problem
+let compareState = null; // { left, right, answered }
 let celebrating = false;
 function refreshInfo() {
   const total = totalHundredths();
   totalDisp.textContent = "いま " + fmt2(total);
-  if (celebrating || target === null) return;
+  if (celebrating) return;
+  if (mode === "compare") { challengeSub.textContent = ""; return; }
+  if (mode === "sub") {
+    challengeSub.textContent = total === curA ? "いらない ぶんは ぶひんばこに もどしてね" : "";
+    return;
+  }
+  if (target === null) { challengeSub.textContent = ""; return; }
   challengeSub.textContent = total < target ? "あと " + fmtTrim(target - total) : "";
 }
+// canonical pieces for an amount: plates, then sticks, then squares
+function composeKinds(h) {
+  const kinds = [];
+  for (let i = 0; i < Math.floor(h / 100); i++) kinds.push("one");
+  for (let i = 0; i < Math.floor((h % 100) / 10); i++) kinds.push("tenth");
+  for (let i = 0; i < h % 10; i++) kinds.push("hundredth");
+  return kinds;
+}
+// lay pieces out in one row, centred at cx; returns the created pieces
+function placeGroupAt(kinds, cx, topY, opts) {
+  opts = opts || {};
+  let totalW = 0;
+  for (const k of kinds) totalW += pieceSize(k).w + 6;
+  totalW -= 6;
+  let x = Math.min(Math.max(4, cx - totalW / 2), Math.max(4, stage.clientWidth - totalW - 4));
+  const made = [];
+  for (const k of kinds) {
+    const p = makePiece(k);
+    if (opts.exhibit) { p.exhibit = true; p.side = opts.side; }
+    blocks.set(p.id, p);
+    renderPiece(p);
+    placePiece(p, x, topY);
+    x += pieceSize(k).w + 6;
+    made.push(p);
+  }
+  return made;
+}
 function newChallenge() {
-  let t;
-  do { t = 5 + Math.floor(Math.random() * 95); } while (t === target); // 0.05..0.99
-  target = t;
-  challengeText.textContent = fmtTrim(target) + "を つくって！";
+  mode = MODE_CYCLE[modeIdx % MODE_CYCLE.length];
+  modeIdx++;
+  compareState = null;
   doneMsg.style.display = "none";
   reviewEl.style.display = "none";
+  nextBtn.style.display = "none";
   challengeInfo.style.display = "block";
+  if (mode === "compare") { setupCompare(); return; }
   totalDisp.style.display = "block";
+  if (mode === "make") {
+    let t;
+    do { t = 5 + Math.floor(Math.random() * 95); } while (t === target); // 0.05..0.99
+    target = t;
+    challengeText.textContent = fmtTrim(target) + "を つくって！";
+  } else if (mode === "add") {
+    const pr = pickAdd();
+    curA = pr.a; curB = pr.b; target = pr.a + pr.b;
+    challengeText.textContent = fmtTrim(curA) + " ＋ " + fmtTrim(curB) + " は？";
+  } else { // sub: the starting amount is dealt onto the stage
+    const pr = pickSubtraction();
+    curA = pr.a; curB = pr.b; target = pr.a - pr.b;
+    challengeText.textContent = fmtTrim(curA) + " − " + fmtTrim(curB) + " は？";
+    history.length = 0;
+    syncUndoBtn();
+    placeGroupAt(composeKinds(curA), stage.clientWidth / 2, Math.max(4, stage.clientHeight / 2 - 130), {});
+  }
   refreshInfo();
 }
+function pickAdd() {
+  for (let i = 0; i < 60; i++) {
+    const a = (1 + Math.floor(Math.random() * 9)) * 10;
+    const b = (1 + Math.floor(Math.random() * 9)) * 10;
+    if (a + b > 180) continue;
+    if (Math.random() < 0.7 && a + b < 110) continue; // mostly sums that carry
+    return { a, b };
+  }
+  return { a: 60, b: 70 };
+}
+function pickSubtraction() {
+  if (Math.random() < 0.7) { // borrow: 1.x - 0.y with y > x, so a plate must be broken
+    const x = 1 + Math.floor(Math.random() * 8);
+    const y = x + 1 + Math.floor(Math.random() * (9 - x));
+    return { a: 100 + x * 10, b: y * 10 };
+  }
+  const aT = 3 + Math.floor(Math.random() * 16);
+  const bT = 1 + Math.floor(Math.random() * (aT - 1));
+  return { a: aT * 10, b: bT * 10 };
+}
+function setupCompare() {
+  target = null;
+  history.length = 0;
+  syncUndoBtn();
+  const pr = pickCompare();
+  const leftFirst = Math.random() < 0.5;
+  const leftVal = leftFirst ? pr.a : pr.b;
+  const rightVal = leftFirst ? pr.b : pr.a;
+  compareState = { left: leftVal, right: rightVal, answered: false };
+  challengeText.textContent = fmtTrim(leftVal) + " と " + fmtTrim(rightVal) + " どっちが おおきい？";
+  challengeSub.textContent = "";
+  totalDisp.style.display = "none";
+  const topY = Math.max(4, stage.clientHeight * 0.16);
+  placeGroupAt(composeKinds(leftVal), stage.clientWidth * 0.26, topY, { exhibit: true, side: "left" });
+  placeGroupAt(composeKinds(rightVal), stage.clientWidth * 0.74, topY, { exhibit: true, side: "right" });
+}
+function pickCompare() {
+  if (Math.random() < 0.5) { // trap pair: 0.5 vs 0.45 style
+    const base = (2 + Math.floor(Math.random() * 8)) * 10;
+    const off = 1 + Math.floor(Math.random() * 9);
+    return Math.random() < 0.5 ? { a: base, b: base - off } : { a: base, b: base + off };
+  }
+  for (let i = 0; i < 60; i++) {
+    const a = 5 + Math.floor(Math.random() * 146);
+    const b = 5 + Math.floor(Math.random() * 146);
+    if (a !== b && Math.abs(a - b) >= 3) return { a, b };
+  }
+  return { a: 50, b: 45 };
+}
+// tapping a compare group: the bigger side glows (colour only, no
+// words); the smaller side just wiggles and can be re-tried
+function chooseSide(side) {
+  if (mode !== "compare" || !compareState || compareState.answered) return;
+  const mine = side === "left" ? compareState.left : compareState.right;
+  const other = side === "left" ? compareState.right : compareState.left;
+  const minePieces = Array.from(blocks.values()).filter((p) => p.exhibit && p.side === side);
+  if (mine > other) {
+    compareState.answered = true;
+    for (const p of minePieces) p.el.classList.add("winnerglow");
+    tone(659, 0, 0.15); tone(988, 0.1, 0.22);
+    setTimeout(showNextOnly, 700);
+  } else {
+    for (const p of minePieces) { p.el.classList.remove("wiggle"); void p.el.offsetWidth; p.el.classList.add("wiggle"); }
+  }
+}
+function showNextOnly() {
+  recipeEl.innerHTML = "";
+  doneMsg.style.display = "none";
+  challengeInfo.style.display = "none";
+  nextBtn.style.display = "inline-block";
+  reviewEl.style.display = "flex";
+}
 function checkChallenge() {
-  if (celebrating || target === null) return;
+  if (celebrating || target === null || mode === "compare") return;
   if (totalHundredths() === target) celebrate();
 }
 function celebrate() {
@@ -576,6 +785,18 @@ function celebrate() {
 function showReview() {
   doneMsg.style.display = "none";
   recipeEl.innerHTML = "";
+  if (mode === "sub") {
+    // subtraction reviews as the equation itself
+    const eqLine = document.createElement("div");
+    eqLine.className = "result";
+    eqLine.style.fontSize = "40px";
+    eqLine.textContent = fmtTrim(curA) + " − " + fmtTrim(curB) + " ＝ " + fmtTrim(target);
+    recipeEl.appendChild(eqLine);
+    nextBtn.style.display = "none";
+    reviewEl.style.display = "flex";
+    setTimeout(() => { nextBtn.style.display = "inline-block"; }, 2500);
+    return;
+  }
   let first = true;
   for (const kind of KIND_ORDER) {
     const c = countKind(kind);
@@ -612,9 +833,14 @@ nextBtn.addEventListener("click", () => {
   ensureAudio();
   reviewEl.style.display = "none";
   celebrating = false;
-  // the next challenge starts from an empty stage; the clear is one
-  // undoable step, so the pieces can be brought back with "modosu"
-  if (blocks.size > 0) {
+  if (mode === "compare") {
+    // exhibits leave with the challenge and stay out of the undo history
+    for (const p of Array.from(blocks.values())) removePiece(p);
+    history.length = 0;
+    syncUndoBtn();
+  } else if (blocks.size > 0) {
+    // the next challenge starts from an empty stage; the clear is one
+    // undoable step, so the pieces can be brought back with "modosu"
     snapshot();
     for (const p of Array.from(blocks.values())) removePiece(p);
   }
@@ -625,6 +851,7 @@ nextBtn.addEventListener("click", () => {
 // ---------- top bar buttons ----------
 document.getElementById("clearbtn").addEventListener("click", () => {
   ensureAudio();
+  if (mode === "compare") return;
   if (blocks.size === 0) return;
   snapshot();
   for (const p of Array.from(blocks.values())) removePiece(p);
@@ -641,6 +868,22 @@ document.getElementById("mutebtn").addEventListener("click", (ev) => {
 document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
 document.addEventListener("gesturestart", (e) => e.preventDefault());
 
+computeCell();
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const before = CELL;
+    computeCell();
+    if (CELL === before) return;
+    for (const p of Array.from(blocks.values())) {
+      const x = p.x, y = p.y;
+      p.el.remove();
+      renderPiece(p);
+      placePiece(p, x, y);
+    }
+  }, 200);
+});
 syncUndoBtn();
 newChallenge();
 </script>

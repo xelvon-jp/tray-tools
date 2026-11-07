@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAN Drop ビューアー</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; overflow: hidden;
+               font: 14px/1.5 "Yu Gothic UI", "Hiragino Sans", sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage img, #stage video { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #caption { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px; display: flex; gap: 12px;
+             background: linear-gradient(transparent, rgba(0,0,0,.7)); transition: opacity .4s; }
+  #caption .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.idle #caption { opacity: 0; }
+  #waiting { text-align: center; color: #888; line-height: 2; }
+  #conn { position: fixed; top: 8px; right: 12px; font-size: 12px; color: #c66; }
+  #hint { position: fixed; top: 8px; left: 12px; font-size: 12px; color: #888; transition: opacity .4s; }
+  body.idle #hint { opacity: 0; }
+  #paused { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+            justify-content: center; gap: 8px; background: rgba(0,0,0,.82); cursor: pointer; text-align: center; }
+  #paused b { font-size: 20px; color: #fff; font-weight: 500; }
+  #paused span { color: #aaa; }
+  #flash { position: fixed; left: 50%; top: 16px; transform: translateX(-50%); background: rgba(0,0,0,.8);
+           color: #fff; padding: 8px 16px; border-radius: 8px; transition: opacity .3s; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="waiting">iPhone の LAN Drop で、送った写真をタップすると<br>ここに表示されます</div>
+</div>
+<div id="caption" hidden><span class="name" id="name"></span><span id="pos"></span></div>
+<div id="hint">← → で前後 ／ Delete でごみ箱へ ／ ダブルクリックで全画面</div>
+<div id="flash" hidden></div>
+<div id="paused" hidden>
+  <b>別のウィンドウで表示中</b>
+  <span>クリックすると、こちらに表示を切り替えます</span>
+</div>
+<div id="conn" hidden>PCのサーバーに接続できません（再接続中）</div>
+<script src="/vendor/sweetalert2.all.min.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const stage = $("stage");
+
+  let shownId = null;
+
+  function onState(s) {
+    // 確認を出している間に表示が変わったら、確認は取り消す（別のファイルを消さないように）
+    if (confirmId && s.id !== confirmId) { confirmId = null; Swal.close(); }
+    $("paused").hidden = s.active;
+    if (!s.active) {
+      // 別のビューアーが有効になった。動画は止めて、切り替え待ちの表示にする
+      stage.querySelectorAll("video").forEach((v) => v.pause());
+      document.title = "（停止中）LAN Drop ビューアー";
+      return;
+    }
+    if (!s.id) {
+      // 最後の1枚を削除した等で、映すものが無くなった
+      shownId = null;
+      stage.innerHTML = '<div id="waiting">表示するものがありません。<br>iPhone の LAN Drop で写真をタップしてください</div>';
+      $("caption").hidden = true;
+      document.title = "LAN Drop ビューアー";
+      return;
+    }
+    $("pos").textContent = s.total > 1 ? `${s.pos} / ${s.total}` : "";
+    // 有効に戻っただけで中身が同じなら描き直さない（動画が頭から再生し直しにならないように）
+    if (s.id !== shownId) show(s);
+    else document.title = `${s.name} - LAN Drop`;
+  }
+
+  function show(s) {
+    shownId = s.id;
+    stage.replaceChildren();
+    let el;
+    if (s.kind === "image") {
+      el = new Image();
+      el.src = s.url;
+    } else if (s.kind === "video") {
+      el = document.createElement("video");
+      el.src = s.url;
+      el.controls = true;
+      el.playsInline = true;
+      // 音声付きの自動再生はブラウザに止められることがあるので、そのときは消音で再生する
+      el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
+    } else {
+      el = document.createElement("div");
+      el.id = "waiting";
+      el.textContent = `${s.name} はここでは表示できません`;
+    }
+    stage.appendChild(el);
+    $("name").textContent = s.name;
+    $("caption").hidden = false;
+    document.title = `${s.name} - LAN Drop`;
+    poke();
+  }
+
+  // しばらく操作が無ければファイル名などを隠す
+  let idleTimer;
+  function poke() {
+    document.body.classList.remove("idle");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => document.body.classList.add("idle"), 3000);
+  }
+  addEventListener("mousemove", poke);
+
+  // ---- キー操作：←→ で前後、Delete でごみ箱へ（確認つき） ----
+  const post = (url) => fetch(url, { method: "POST" });
+  let flashTimer;
+  function flash(text) {
+    const f = $("flash"); f.textContent = text; f.hidden = false;
+    clearTimeout(flashTimer); flashTimer = setTimeout(() => (f.hidden = true), 2500);
+  }
+
+  // 削除の確認は SweetAlert2（←→ でボタン移動・Enter で決定・Esc でやめる、が標準で効く）
+  let confirmId = null;
+  async function confirmDelete() {
+    if (!shownId || !$("paused").hidden || Swal.isVisible()) return;
+    confirmId = shownId;
+    stage.querySelectorAll("video").forEach((v) => v.pause());
+    const res = await Swal.fire({
+      title: "ごみ箱に移しますか？",
+      text: $("name").textContent,
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonText: "ごみ箱へ移す",
+      cancelButtonText: "やめる",
+      confirmButtonColor: "#c0392b",
+      reverseButtons: true,   // 右が「ごみ箱へ移す」
+      focusConfirm: true,     // Enter でそのまま移せる（←で「やめる」へ）
+      returnFocus: false,
+    });
+    const id = confirmId;
+    confirmId = null;
+    if (!res.isConfirmed || !id) return;
+    try {
+      const r = await post(`/viewer/delete?id=${encodeURIComponent(id)}`);
+      const j = await r.json().catch(() => ({}));
+      flash(r.ok ? `ごみ箱へ移しました：${j.deleted}` : (j.detail || "削除できませんでした"));
+    } catch { flash("削除できませんでした（サーバーに届きません）"); }
+  }
+
+  // capture で先に受ける（動画にフォーカスがあると ←→ が早送り・巻き戻しに取られるため）。
+  // ただし確認ダイアログが出ている間は何もしない（ダイアログ自身のキー操作に任せる）
+  addEventListener("keydown", (e) => {
+    if (Swal.isVisible() || !$("paused").hidden) return;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      post(`/viewer/step?delta=${e.key === "ArrowRight" ? 1 : -1}`)
+        .then((r) => r.json()).then((j) => { if (!j.ok) flash(e.key === "ArrowRight" ? "最後です" : "最初です"); })
+        .catch(() => {});
+      poke();
+    } else if (e.key === "Delete") {
+      e.preventDefault();
+      confirmDelete();
+    }
+  }, true);
+
+  addEventListener("dblclick", () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  });
+
+  // 画面に見えているかをサーバーに伝える。裏に隠れたタブや最小化した窓しか無ければ、
+  // iPhone でタップしたときに新しいビューアーを開いてもらうため
+  const cid = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
+  const visible = () => (document.visibilityState === "visible" ? 1 : 0);
+  document.addEventListener("visibilitychange", () => {
+    fetch(`/viewer/visibility?cid=${cid}&visible=${visible()}`, { method: "POST" }).catch(() => {});
+  });
+
+  // EventSource は切れても自動で繋ぎ直す（繋ぎ直すときもこの URL のまま。visible は最初の値なので、
+  // 再接続後に一度送り直す）
+  const es = new EventSource(`/viewer/events?cid=${cid}&visible=${visible()}`);
+  es.addEventListener("open", () => {
+    fetch(`/viewer/visibility?cid=${cid}&visible=${visible()}`, { method: "POST" }).catch(() => {});
+  });
+  es.onmessage = (e) => { $("conn").hidden = true; onState(JSON.parse(e.data)); };
+  $("paused").addEventListener("click", () => {
+    fetch(`/viewer/activate?cid=${cid}`, { method: "POST" }).catch(() => {});
+  });
+  es.onopen = () => { $("conn").hidden = true; };
+  es.onerror = () => { $("conn").hidden = false; };
+  poke();
+})();
+</script>
+</body>
+</html>

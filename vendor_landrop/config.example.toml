@@ -1,0 +1,50 @@
+# LAN Drop 設定ファイル（初回起動時に自動生成）
+# token は iPhone 側に渡す合言葉。漏れたら "" (空) にして再起動すると作り直される。
+token = ""
+
+# 受信ファイルの保存先
+save_dir = '~/Downloads/LanDrop'
+
+host = "0.0.0.0"
+port = 8000
+
+# 1ファイルあたりの上限（MB）
+max_file_mb = 1024
+
+# QRコード・案内に載せるPCのアドレス。
+#   ""   … PC名.local（IPが変わっても使える。既定）
+#   "ip" … 現在のIPアドレス（.local で届かない環境向け）
+#   それ以外 … その値をそのまま使う
+advertise_host = ""
+
+# 受信したファイルは「保存先/2026-10-17」のような日付フォルダに入れる。
+# 直近2回分の受信は別に覚えていて、iPhone の「PCで表示」で「直近」「一つ前」として選べる。
+# session_gap_sec 秒あいたら、次の受信は別の回になる
+date_folders = true
+session_gap_sec = 60
+
+# 受信が一段落したら、そのフォルダを Explorer で開く（同じフォルダは1回だけ）
+open_folder = true
+
+# 画像が1枚だけ届いたとき（トレイメニューのチェックでも切り替えられる）
+single_image_clipboard = true   # クリップボードにも入れる（そのまま Ctrl+V で貼れる）
+single_image_open = false       # フォルダの代わりに画像そのものを開く
+
+# テキスト共有
+text_popup = true           # iPhone から届いたテキストを PC の画面右下の窓でプレビュー（「クリップボードにコピー」で明示的にコピー）
+text_to_clipboard = false   # true にすると、届いたテキストを PC のクリップボードへ自動で入れる
+share_pc_clipboard = true   # iPhone のページ・ショートカットから PC のクリップボードの文字を取れる
+
+# 受信したらWindowsの通知を出す（クリックで受信フォルダが開く）
+notify = true
+
+# HEIC/HEIF を JPEG に変換する。元の HEIC は heic_keep_original = true なら保存先の _heic フォルダへ
+heic_to_jpeg = true
+heic_keep_original = true
+jpeg_quality = 92
+
+# ---- 将来機能（まだ動きません） ----
+https = false
+cert_file = ""
+key_file = ""
+mdns = false

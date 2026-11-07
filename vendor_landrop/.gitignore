@@ -1,0 +1,16 @@
+# トークンを含む設定（config.example.toml を参照）
+config.toml
+config.dev.toml
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 動作確認用の受信フォルダ
+_inbox*/
+*.part
+
+# 常駐モードのログ
+landrop.log*
+config.*.log*

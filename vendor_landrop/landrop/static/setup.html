@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAN Drop セットアップ</title>
+<style>
+  :root { --bg: #f5f6f8; --card: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e5e8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111214; --card: #1c1d20; --fg: #f2f2f2; --muted: #9a9aa0; --line: #2c2d31; }
+  }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
+         font: 15px/1.6 "Yu Gothic UI", "Hiragino Sans", sans-serif; }
+  main { max-width: 720px; margin: 0 auto; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .qr { background: #fff; padding: 12px; border-radius: 10px; width: 260px; }
+  .qr svg { width: 100%; height: auto; display: block; }
+  code { background: var(--bg); padding: 2px 6px; border-radius: 6px; word-break: break-all; font-size: 14px; }
+  dt { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  dd { margin: 2px 0 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LAN Drop セットアップ</h1>
+  <div class="card">
+    <p>iPhoneのカメラでQRコードを読み、Safariで開いてください。トークンは自動で保存されます。<br>
+       開いたら共有ボタン →「ホーム画面に追加」しておくと次から1タップです。</p>
+    <div class="qr">{{QR_SVG}}</div>
+    <p class="muted">{{URL}}<br>
+       開けないとき（名前で届かないとき）は IP で：{{IP_URL}}</p>
+  </div>
+  <div class="card">
+    <h2>iOSショートカット用</h2>
+    <dl>
+      <dt>URL（フォーム送信）</dt><dd><code>{{BASE}}/api/upload</code></dd>
+      <dt>URL（ファイル本文送信）</dt><dd><code>{{BASE}}/api/upload/raw</code></dd>
+      <dt>ヘッダー名</dt><dd><code>X-LanDrop-Token</code></dd>
+      <dt>ヘッダー値（トークン）</dt><dd><code>{{TOKEN}}</code></dd>
+    </dl>
+    <p class="muted">組み方は README の「iOSショートカット」を参照。</p>
+  </div>
+  <div class="card">
+    <dl>
+      <dt>保存先</dt><dd><code>{{SAVE_DIR}}</code></dd>
+    </dl>
+    <p class="muted">このページはPC本体（localhost）からしか開けません。</p>
+  </div>
+</main>
+</body>
+</html>

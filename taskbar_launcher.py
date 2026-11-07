@@ -27,7 +27,7 @@ from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPixmap, QPolygon,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 import window_tools
 from qt_image import pil_to_qpixmap
@@ -227,6 +227,24 @@ def _draw_globe(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.ellipse((23, 10, 41, 54), outline=color, width=4)
 
 
+def _draw_filer(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """あっふ。枠が左右に2つ並んだ2ペイン。各枠の上部を色で抜いて、フォルダの
+    タブっぽく見せる。フォルダブックマーク(フォルダ1つ)と並んでも見分けが付く
+    よう、必ず2枚描く(画面ミラーと同じ理由)。"""
+    draw.rounded_rectangle((8, 16, 30, 48), radius=3, fill="white")
+    draw.rectangle((12, 21, 26, 30), fill=color)
+    draw.rounded_rectangle((34, 16, 56, 48), radius=3, fill="white")
+    draw.rectangle((38, 21, 52, 30), fill=color)
+
+
+def _draw_transparency(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """背景を透過。透明を表す市松模様。白い四角の対角だけを色で抜くと、
+    24px相当まで縮めても「市松」と分かる。"""
+    draw.rounded_rectangle((12, 12, 52, 52), radius=4, fill="white")
+    draw.rectangle((14, 14, 32, 32), fill=color)
+    draw.rectangle((32, 32, 50, 50), fill=color)
+
+
 def _draw_mirror(draw: ImageDraw.ImageDraw, color: str) -> None:
     """画面ミラー。小さい画面から大きい画面へ映している形。左に小さな枠、右に大きな枠、
     間に矢印。「発表者ツール」の1枚の画面と見分けが付くよう、必ず2枚描く。"""
@@ -251,6 +269,8 @@ _GLYPHS = {
     "calculator": _draw_calculator,
     "palette": _draw_palette,
     "cursor": _draw_cursor_finder,
+    "filer": _draw_filer,
+    "checker": _draw_transparency,
 }
 
 
@@ -347,6 +367,15 @@ ITEMS = {
         "icon": "dropper",
         "color": "#a855f7",
     },
+    # クリップボードの画像を背景透過の窓で開く。画像が無ければ feature 側が知らせる。
+    "bg_remove": {
+        "label": "背景を透過",
+        "feature": "screen",
+        "method": "start_bg_remove",
+        "args": (),
+        "icon": "checker",
+        "color": "#db2777",
+    },
     "snippets": {
         "label": "定型文",
         "feature": "screen",
@@ -362,6 +391,15 @@ ITEMS = {
         "args": (),
         "icon": "folder",
         "color": "#f59e0b",
+    },
+    # あっふ(2ペインのファイラ)を開く。既に開いていれば前面に出るだけ。
+    "filer": {
+        "label": "あっふ",
+        "feature": "screen",
+        "method": "start_filer",
+        "args": (),
+        "icon": "filer",
+        "color": "#0369a1",
     },
     # 同梱の presenter.html を既定のブラウザで開く(設定 tools.presenter で差し替え可)。
     "presenter": {
@@ -547,6 +585,20 @@ def resolve_items(config: dict) -> list:
             continue
         keys.append(key)
     return keys
+
+
+def toggle_item_key(keys, key: str) -> list:
+    """並べる項目の付け外し。入っていれば外し、無ければ末尾に足した新しいリストを返す。
+
+    パネルの右クリックメニューから使う。順番の入れ替えはここではしない(並びは
+    settings.json の記述順のまま。GUI で並べ替えまでやると、ドラッグ中の見た目と
+    保存のタイミングの面倒が増える割に、並べ替えは滅多にしない)。"""
+    result = list(keys)
+    if key in result:
+        result.remove(key)
+    else:
+        result.append(key)
+    return result
 
 
 def _brightness(color: QColor) -> float:
@@ -878,7 +930,8 @@ class LauncherPanel(QWidget):
 
     WA_TranslucentBackground は使わない(本体と同じ流儀)。背景は必ず不透明に塗る。"""
 
-    def __init__(self, widget, screen_feature, audio_feature, config: dict):
+    def __init__(self, widget, screen_feature, audio_feature, config: dict,
+                 items_saver=None):
         super().__init__()
         # 本体のウィジェット。位置の基準・色・「閉じたときの表示の戻し」で参照する。
         # 親子(setParent)にはしない。子にすると本体の矩形へクリップされ、タスクバーの
@@ -886,6 +939,13 @@ class LauncherPanel(QWidget):
         self._widget = widget
         self._screen = screen_feature
         self._audio = audio_feature
+        # 右クリックメニューで項目を付け外ししたときの保存先(キーのリストを受け取る
+        # 呼び出し可能オブジェクト)。本体(taskbar_widget)が settings.json への
+        # 書き戻しを持つので、そこへ委ねる。無い場合はメモリ上の設定だけ変える。
+        self._items_saver = items_saver
+        # 付け外しメニューを出している間は True。閉じる判定を止めるために使う
+        # (メニューはパネルの外に広がるので、座標だけ見ると「離れた」になる)。
+        self._menu_open = False
         # taskbar_widget と同じ辞書(app_settings["taskbar_widget"])をそのまま持つ。
         # 開くたびに読み直すので、settings.json を直して再起動すれば並びが変わる。
         self._config = config
@@ -985,6 +1045,10 @@ class LauncherPanel(QWidget):
 
     def _on_close_tick(self):
         try:
+            if self._menu_open:
+                # 付け外しメニューの操作中。閉じるのはメニューが閉じてから判断する。
+                self._close_timer.start(self._close_delay())
+                return
             if self._cursor_on_widget_or_panel():
                 # まだどちらかに乗っている。leaveEvent が飛んで来ない経路(別の窓が上に
                 # 出た拍子など)で開きっぱなしにならないよう、次の周期でもう一度見る。
@@ -1258,6 +1322,75 @@ class LauncherPanel(QWidget):
             show_toast(f"タスクバーのランチャ\n{item.get('label')}を呼び出せません")
             return
         method(*item.get("args", ()))
+
+    # ---------------------------------------------------------------
+    # 項目の付け外し(右クリック)
+    # ---------------------------------------------------------------
+    def contextMenuEvent(self, event):
+        """右クリックで「並べる項目」のチェックリストを出す。
+
+        付け外しのたびにメニューを出し直す(選ぶ→閉じる→また右クリック、を
+        繰り返させない)。外をクリックするか Esc で終わる。変更はその場で
+        パネルに反映し、settings.json の launcher_items に保存する。"""
+        try:
+            pos = event.globalPos()
+            while True:
+                current = resolve_items(self._config)
+                menu = QMenu(self)
+                header = menu.addAction("並べる項目")
+                header.setEnabled(False)
+                actions = {}
+                for key, item in ITEMS.items():
+                    action = menu.addAction(item.get("label") or key)
+                    action.setCheckable(True)
+                    action.setChecked(key in current)
+                    actions[action] = key
+                self._menu_open = True
+                self._close_timer.stop()
+                try:
+                    chosen = menu.exec(pos)
+                finally:
+                    self._menu_open = False
+                    menu.deleteLater()
+                if chosen is None or chosen not in actions:
+                    break
+                self._apply_items(toggle_item_key(current, actions[chosen]))
+                if not self.isVisible():
+                    break   # 全部外れてパネルが畳まれたら終わる
+            # メニューが終わったあと、カーソルが本体・パネル・音量バーの外なら
+            # 通常の猶予つきで閉じる(中なら開いたまま)。
+            if self.isVisible() and not self._cursor_on_widget_or_panel():
+                self._close_timer.start(self._close_delay())
+        except Exception:
+            _guard("項目の付け外しメニュー")
+
+    def _apply_items(self, keys) -> None:
+        """並べる項目を差し替える。メモリ上の設定→保存→パネルの並び直しの順。
+
+        保存は本体側の items_saver に委ねる(settings.json の読み直し・該当キー
+        だけの書き戻しは向こうの作法)。失敗してもメモリ上の並びは変えておく
+        (次の保存のときに揃う)。"""
+        self._config["launcher_items"] = list(keys)
+        if self._items_saver is not None:
+            try:
+                self._items_saver(list(keys))
+            except Exception:
+                _guard("項目の保存", notify=False)
+        if not self.isVisible():
+            return
+        resolved = resolve_items(self._config)
+        if not resolved:
+            self.close_panel()
+            return
+        self._keys = resolved
+        self._hover_index = -1
+        self._label.hide()
+        width = self._item_size + PANEL_PADDING * 2
+        height = self._item_size * len(resolved) + PANEL_PADDING * 2
+        rect = self._place(width, height)
+        self.setGeometry(rect)
+        self._show_volume(rect)
+        self.update()
 
 
 def _screen_bounds(rect: QRect) -> QRect:

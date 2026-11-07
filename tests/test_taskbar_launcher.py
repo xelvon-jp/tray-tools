@@ -123,3 +123,24 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_toggle_item_key():
+    """右クリックメニューの付け外し: 入っていれば外す、無ければ末尾に足す。"""
+    keys = ["palette", "capture"]
+    assert launcher.toggle_item_key(keys, "capture") == ["palette"]
+    assert launcher.toggle_item_key(keys, "calendar") == ["palette", "capture", "calendar"]
+    assert keys == ["palette", "capture"]   # 元のリストは変えない
+    assert launcher.toggle_item_key([], "filer") == ["filer"]
+
+
+def test_new_items_filer_and_bg_remove():
+    """あっふ・背景を透過のボタンが用意され、呼び先が実在し、設定でも書ける。"""
+    for key, method in (("filer", "start_filer"), ("bg_remove", "start_bg_remove")):
+        item = launcher.ITEMS[key]
+        assert item["method"] == method
+        assert launcher._GLYPHS.get(item["icon"]) is not None
+        assert launcher.resolve_items({"launcher_items": [key]}) == [key]
+    tree = ast.parse(Path("feature_screen.py").read_text(encoding="utf-8"))
+    methods = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "start_filer" in methods and "start_bg_remove" in methods

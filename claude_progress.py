@@ -46,7 +46,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 import bridge_control as bctl
 import claude_status as cs
@@ -145,6 +145,22 @@ def save_state(update: dict, path=None) -> None:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+
+# ブリッジの大きさ。large=現状(最大) / medium・small=絵を 1/2・1/4 にして
+# カードを落とした背の低い形 / stealth=幅20pxの帯だけを画面の右端に出す形。
+# 描画パラメータは coop_stage.SIZES、保存キーは bridge_size(状態ファイル)。
+BRIDGE_SIZES = ("large", "medium", "small", "stealth")
+BRIDGE_SIZE_LABELS = {"large": "大", "medium": "中", "small": "小",
+                      "stealth": "ステルス"}
+STEALTH_SHOW_SEC = 10       # 状態変化で帯から広げたとき、広げておく秒数
+STEALTH_HIDE_DELAY_SEC = 3  # マウスが離れてから帯に戻るまでの秒数
+
+
+def load_bridge_size(state_path=None) -> str:
+    """保存済みのブリッジの大きさ。無い・知らない値なら large。"""
+    size = load_state(state_path).get("bridge_size")
+    return size if size in BRIDGE_SIZES else "large"
 
 
 def rows_to_show(entries, now, first_seen_done: dict) -> list:
@@ -247,7 +263,7 @@ def coop_row(muse, entries, now=None) -> dict | None:
 def row_height(row) -> int:
     if row.get("_coop"):
         return (coop_stage.COOP_COLLAPSED_HEIGHT if row.get("_collapsed")
-                else coop_stage.COOP_HEIGHT)
+                else coop_stage.coop_height(row.get("_size") or "large"))
     if row.get("_copilot") or row.get("_muse"):
         return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
@@ -282,6 +298,14 @@ class ClaudeProgressPanel(QWidget):
         self._muse_dismissed = None
         # 連携ステージ行をたたんでいるか(再起動しても保つ。既定は広げた状態)
         self._coop_collapsed = bool(load_state(state_path).get("coop_collapsed"))
+        # ブリッジの大きさ(再起動しても保つ)。stealth のときは帯だけの姿が
+        # 既定で、マウスオーバーか状態変化(tone の変化)で large に広がる。
+        self._bridge_size = load_bridge_size(state_path)
+        self._stealth_mode = False    # いま帯だけの姿か
+        self._stealth_hover = False   # 帯・パネルにマウスが乗っているか
+        self._stealth_until = 0.0     # この時刻までは広げておく(epoch 秒)
+        self._stealth_tone = None     # 直近に見た tone(変化の検出用)
+        self._stealth_view = None     # 帯を描くための直近の view
         self._rows = []
         self._first_seen_done = {}
         self._hover = -1
@@ -320,8 +344,28 @@ class ClaudeProgressPanel(QWidget):
                 head = None   # ✕で閉じた手番は、その手番の間は出さない
             # 連携ステージ行は ✕ で閉じられない(たたむだけ)ので、_muse_dismissed は見ない
             muse = coop_row(self._muse, self._entries, now)
+            self._stealth_mode = False
             if muse is not None:
                 muse["_collapsed"] = self._coop_collapsed
+                # stealth で広げたときの姿は large(元の大きさ)。それ以外は選んだ大きさ。
+                muse["_size"] = ("large" if self._bridge_size == "stealth"
+                                 else self._bridge_size)
+                view_now = cv.coop_view(self._muse, self._entries, now,
+                                        paused=bool(muse.get("paused")))
+                self._stealth_view = view_now
+                tone_now = view_now["tone"] if view_now else None
+                if tone_now is not None:
+                    if (self._bridge_size == "stealth"
+                            and self._stealth_tone is not None
+                            and tone_now != self._stealth_tone):
+                        # 状態が変わった。しばらく広げて知らせる。
+                        self._stealth_until = max(self._stealth_until,
+                                                  now + STEALTH_SHOW_SEC)
+                    self._stealth_tone = tone_now
+                self._stealth_mode = (
+                    self._bridge_size == "stealth"
+                    and not self._stealth_hover
+                    and now >= self._stealth_until)
             rows = (([head] if head else []) + ([muse] if muse else [])
                     + rows_to_show(self._entries, now, self._first_seen_done))
             if not rows:
@@ -329,8 +373,23 @@ class ClaudeProgressPanel(QWidget):
                 self._timer.stop()
                 self.hide()
                 return
+            if self._stealth_mode:
+                # 帯だけの姿。他の行も含めて全部隠し、帯だけを右端に出す。
+                # 帯の明滅と tone 変化の検出のためにタイマーは回し続ける。
+                self._rows = rows
+                if (self.width(), self.height()) != (coop_stage.STEALTH_W,
+                                                     coop_stage.STEALTH_H) \
+                        or not self.isVisible():
+                    self.resize(coop_stage.STEALTH_W, coop_stage.STEALTH_H)
+                    self._place()
+                if not self.isVisible():
+                    self.show()
+                if not self._timer.isActive():
+                    self._timer.start(ANIMATION_MS)
+                self.update()
+                return
             height = panel_height(rows)
-            resize = height != self.height()
+            resize = height != self.height() or self.width() != PANEL_WIDTH
             self._rows = rows
             if resize or not self.isVisible():
                 self.resize(PANEL_WIDTH, height)
@@ -360,6 +419,16 @@ class ClaudeProgressPanel(QWidget):
     def _place(self):
         """覚えた場所(左上。画面内に収める)か、既定はプライマリ画面の右下(下端を基準に
         上へ伸びる。行が増えても画面の外へはみ出さない)。"""
+        if self._stealth_mode:
+            # 帯は画面の右端に密着させる(隠れるのが役目)。縦は通常の居場所の
+            # 下端にそろえる。覚えた場所があっても帯だけは右端を優先する。
+            screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            self.move(area.right() - self.width() + 1,
+                      area.bottom() - self.height() - SCREEN_MARGIN)
+            return
         if self._manual_pos is not None:
             screen = QGuiApplication.screenAt(self._manual_pos + QPoint(10, 10))
             if screen is not None:
@@ -386,6 +455,16 @@ class ClaudeProgressPanel(QWidget):
     def paintEvent(self, _event):
         # QWidget の setStyleSheet では背景が描かれない(CLAUDE.md の罠)ので自分で描く。
         p = QPainter(self)
+        if self._stealth_mode:
+            # 帯だけの姿。行は描かず、帯(色で状態を知らせる)だけにする。
+            try:
+                coop_stage.paint_stealth(p, self.rect(), self._stealth_view,
+                                         time.time())
+            except Exception:  # noqa: BLE001  paintEvent で投げ切ると常駐ごと落ちる
+                import traceback
+                traceback.print_exc()
+            p.end()
+            return
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setPen(Qt.NoPen)
         p.setBrush(BG)
@@ -446,7 +525,8 @@ class ClaudeProgressPanel(QWidget):
                     p, rect, view, now, self.devicePixelRatioF(), self._sub_font,
                     collapsed=bool(entry.get("_collapsed")),
                     hot=self._rows.index(entry) == self._hover_close,
-                    hot_pause=self._rows.index(entry) == self._hover_pause)
+                    hot_pause=self._rows.index(entry) == self._hover_pause,
+                    size=entry.get("_size") or "large")
             return
         if entry.get("_copilot"):
             self._paint_copilot(p, entry, rect, now, hover)
@@ -736,12 +816,63 @@ class ClaudeProgressPanel(QWidget):
                 self.setToolTip("")
             self.update()
 
+    def enterEvent(self, _event):
+        # 帯にマウスが乗ったら広げる(ステルス時)。広がったあとは通常の行の
+        # ホバー処理(mouseMoveEvent)に任せる。
+        if self._bridge_size == "stealth" and not self._stealth_hover:
+            self._stealth_hover = True
+            self._tick()
+
     def leaveEvent(self, _event):
+        if self._stealth_hover:
+            # 離れたら少し置いて帯に戻る。その間に状態変化があれば _tick 側が
+            # 広げ直す(こちらは「いつまで広げるか」の下限を置くだけ)。
+            self._stealth_hover = False
+            self._stealth_until = max(self._stealth_until,
+                                      time.time() + STEALTH_HIDE_DELAY_SEC)
+            self._tick()
         if self._hover != -1 or self._hover_close != -1 or self._hover_pause != -1:
             self._hover = self._hover_close = self._hover_pause = -1
             self.update()
 
+    def contextMenuEvent(self, event):
+        """ブリッジの大きさの切り替え(右クリック)。トレイの💬メニューにも
+        同じものがある。ブリッジの行が無いときは何もしない。"""
+        if not any(r.get("_coop") for r in self._rows):
+            return
+        menu = QMenu(self)
+        header = menu.addAction("ブリッジの大きさ")
+        header.setEnabled(False)
+        for key in BRIDGE_SIZES:
+            action = menu.addAction(BRIDGE_SIZE_LABELS[key])
+            action.setCheckable(True)
+            action.setChecked(key == self._bridge_size)
+            action.triggered.connect(
+                lambda _checked=False, k=key: self.set_bridge_size(k))
+        menu.exec(event.globalPos())
+
+    def bridge_size(self) -> str:
+        return self._bridge_size
+
+    def set_bridge_size(self, size) -> None:
+        """大きさを切り替えて保存する(トレイメニューと右クリックの共通入口)。"""
+        if size not in BRIDGE_SIZES or size == self._bridge_size:
+            return
+        self._bridge_size = size
+        save_state({"bridge_size": size}, self._state_path)
+        if size == "stealth":
+            # 切り替えた直後は一度広げて見せる(帯だけだと「消えた」ように見える)。
+            self._stealth_until = max(self._stealth_until,
+                                      time.time() + STEALTH_SHOW_SEC)
+        self._tick()
+
     def mousePressEvent(self, event):
+        if self._stealth_mode:
+            # 帯のクリックでも広げる(ホバーが効かない環境向けの保険)。
+            self._stealth_until = max(self._stealth_until,
+                                      time.time() + STEALTH_SHOW_SEC)
+            self._tick()
+            return
         if event.button() != Qt.LeftButton:
             return
         if event.modifiers() & Qt.ControlModifier:
@@ -837,6 +968,9 @@ class ClaudeProgressPanel(QWidget):
 
         行が無い(見張りが動いていない等)ときは _tick が畳むので何も出ない
         (出すものが無いうちは窓を出さない、という既存の作法どおり)。"""
+        if self._bridge_size == "stealth":
+            self._stealth_until = max(self._stealth_until,
+                                      time.time() + STEALTH_SHOW_SEC)
         if self._coop_collapsed:
             self._coop_collapsed = False
             save_state({"coop_collapsed": False}, self._state_path)

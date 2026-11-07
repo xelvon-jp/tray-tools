@@ -511,7 +511,8 @@ class TaskbarWidget(QWidget):
         # ランチャを使わない設定でも作っておいて構わない(出すかどうかは
         # taskbar_launcher.resolve_items が設定を見て決める)。
         self._launcher = taskbar_launcher.LauncherPanel(
-            self, screen_feature, audio_feature, self._config
+            self, screen_feature, audio_feature, self._config,
+            items_saver=self._save_launcher_items,
         )
 
         self._background = QColor(FALLBACK_BACKGROUND)
@@ -965,6 +966,14 @@ class TaskbarWidget(QWidget):
             self.update()
         except Exception:
             _guard("時計表示への切り替え")
+
+    def _save_launcher_items(self, keys) -> None:
+        """ランチャの並べる項目の保存(パネルの右クリックメニューから呼ばれる)。
+
+        settings.json は読み直して taskbar_widget.launcher_items だけ差し替える
+        (save_config の作法)。書けなくてもメモリ上の設定は向こうで差し替え
+        済みなので、動作は続ける。"""
+        save_config(self.app_settings, self.settings_path, launcher_items=list(keys))
 
     def on_launcher_closed(self) -> None:
         """ランチャのパネルが閉じたときに、本体の見た目を現実に合わせ直す。

@@ -2611,7 +2611,13 @@ class ScreenFeature:
     def _read_muse_bridge(self):
         """Muse 見張りの状態ファイルを読む。無ければ None(パネルに出さない)。
 
-        ツールチップ側の表示と同じファイル(muse_bridge_status)。読むだけ。"""
+        ツールチップ側の表示と同じファイル(muse_bridge_status)。読むだけ。
+
+        環境2・3ではブリッジ自体を出さない(Claude も Muse も使えない環境の
+        ため。環境は setup で指定する settings.json の environment。あっふの
+        スマホ送信(QR)が環境1だけ有効なのと同じ作法で、未設定は環境1扱い)。"""
+        if self.app_settings.get("environment") in (2, 3):
+            return None
         try:
             data = muse_bridge_status.read()
         except Exception:  # noqa: BLE001  表示が出ないだけ
@@ -2689,6 +2695,17 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
+    def _set_bridge_size(self, size):
+        """ブリッジの大きさの切り替え(💬メニューから)。パネルがまだ無ければ
+        状態ファイルにだけ書いておく(作られたときに読む)。"""
+        try:
+            if self._claude_progress is not None:
+                self._claude_progress.set_bridge_size(size)
+            else:
+                claude_progress.save_state({"bridge_size": size})
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
     def _rebuild_claude_menu(self):
         try:
             self._claude_entries = claude_status.list_sessions()
@@ -2717,6 +2734,16 @@ class ScreenFeature:
             # addAction(文字, 関数) だと checked が渡らないので triggered で受ける。
             panel.triggered.connect(self._toggle_claude_progress)
             menu.addAction("🌉 ブリッジを開く", self._show_bridge)
+            size_menu = menu.addMenu("🌉 ブリッジの大きさ")
+            current_size = (self._claude_progress.bridge_size()
+                            if self._claude_progress is not None
+                            else claude_progress.load_bridge_size())
+            for key in claude_progress.BRIDGE_SIZES:
+                action = size_menu.addAction(claude_progress.BRIDGE_SIZE_LABELS[key])
+                action.setCheckable(True)
+                action.setChecked(key == current_size)
+                action.triggered.connect(
+                    lambda _checked=False, k=key: self._set_bridge_size(k))
             menu.addAction("↘ パネルの位置を右下に戻す", self._reset_claude_progress_position)
             self._refresh_state()
         except Exception:  # noqa: BLE001

@@ -19,6 +19,33 @@ PAD = 8
 GAP = 6
 COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + CARDS_H + PAD
 COOP_COLLAPSED_HEIGHT = 56    # たたんだとき: バナーだけ(上下に余白)
+# ブリッジの大きさ(muse/launcher-bridge-size)。stage_h はステージ部分の高さ、
+# muse_cell / cell / item_cell は各ドット絵の1マス(px)。絵は格子データから
+# 描き直すので、1/2・1/4 の縮小でも格子の情報は欠けない(画像のリサンプルでは
+# ない)。cards は下のカード3枚を出すか。中・小ではカードを落として背を低く
+# する。名前(MUSE / CLAW'D の文字)はどの大きさでも描かない(陽太さんの指定)。
+SIZES = {
+    "large": {"stage_h": 116, "muse_cell": 4, "cell": 5, "item_cell": 2, "cards": True},
+    "medium": {"stage_h": 74, "muse_cell": 2, "cell": 2.5, "item_cell": 1, "cards": False},
+    "small": {"stage_h": 50, "muse_cell": 1, "cell": 1.25, "item_cell": 1, "cards": False},
+}
+DEFAULT_SIZE = "large"
+STEALTH_W = 20      # ステルス時の帯の幅(px)
+STEALTH_H = 96      # ステルス時の帯の高さ(px)
+
+
+def size_spec(size) -> dict:
+    """大きさの指定から描画パラメータを引く。知らない指定は large に倒す。"""
+    return SIZES.get(size) or SIZES[DEFAULT_SIZE]
+
+
+def coop_height(size) -> int:
+    """その大きさで広げたときの連携ステージ行の高さ(たたんだときは別)。"""
+    spec = size_spec(size)
+    height = PAD + BANNER_H + GAP + spec["stage_h"] + PAD
+    if spec["cards"]:
+        height += GAP + CARDS_H
+    return height
 TOGGLE_SIZE = 20              # 「たたむ／ひろげる」ボタンの当たり(px)
 PAUSE_GAP = 4                 # 休止ボタンとたたむボタンの間(px)
 # 全員待機中(all_idle)の明滅。ゆっくり一呼吸ぶん周期で、枠の明るさが上下する。
@@ -85,23 +112,27 @@ def grid_pixmap(key, rows, palette, cell, dpr) -> QPixmap:
     return pm
 
 
-def item_position(kind, item, t_ms, stage_w):
+def item_position(kind, item, t_ms, stage_w, left=None, right=None):
     """手紙(letter)・受領(ack)の (x, 不透明度)。x はステージ左端から。出さないなら None。
-    デモの CSS(fly / flyback / bob / shake)と同じ動き。"""
-    right = stage_w - 100
+    デモの CSS(fly / flyback / bob / shake)と同じ動き。left / right は飛行の両端で、
+    大きさごとにキャラの居場所が変わるので呼び出し側が渡す(省略時は従来の位置)。"""
+    if left is None:
+        left = ITEM_LEFT
+    if right is None:
+        right = stage_w - 100
     if kind == "fly":
         if item == "letter":
-            p, a, b = (t_ms % 3000) / 3000.0, ITEM_LEFT, right
+            p, a, b = (t_ms % 3000) / 3000.0, left, right
         else:   # 受領は1.5秒遅れて逆向きに飛ぶ
-            p, a, b = ((t_ms - 1500) % 3000) / 3000.0, right, ITEM_LEFT
+            p, a, b = ((t_ms - 1500) % 3000) / 3000.0, right, left
         if p < 0.85:
             return (a + (b - a) * p / 0.85, 1.0)
         return (b, 1.0 - (p - 0.85) / 0.15)
     if kind == "back" and item == "ack":
         p = (t_ms % 2400) / 2400.0
         if p < 0.85:
-            return (right + (ITEM_LEFT - right) * p / 0.85, 1.0)
-        return (ITEM_LEFT, 1.0 - (p - 0.85) / 0.15)
+            return (right + (left - right) * p / 0.85, 1.0)
+        return (left, 1.0 - (p - 0.85) / 0.15)
     if kind == "parked" and item == "letter":
         return (right, 1.0)
     if kind == "wobble" and item == "letter":
@@ -166,7 +197,10 @@ def _paint_pause(p, rect, paused, hot):
 
 
 def _banner_top_offset(height) -> int:
-    return PAD if height >= COOP_HEIGHT else (height - BANNER_H) // 2
+    # 広げた状態(どの大きさでも)は上詰め、たたんだ状態だけ上下中央。
+    # 大きさが増えたので「最大の高さと比べる」判定は使えない(中・小が
+    # たたんだ扱いになってしまう)。たたんだ高さは固定なので、それ以下かで分ける。
+    return PAD if height > COOP_COLLAPSED_HEIGHT else (height - BANNER_H) // 2
 
 
 def _paint_toggle(p, rect, collapsed, hot):
@@ -188,11 +222,13 @@ def _paint_toggle(p, rect, collapsed, hot):
 
 
 def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
-               hot_pause=False):
+               hot_pause=False, size=DEFAULT_SIZE):
     """連携ステージの行を rect に描く。view は coop_view.coop_view の戻り、now は epoch 秒。
-    collapsed ならバナーだけ(ステージとカードは描かない)。hot / hot_pause は各ボタンに
+    collapsed ならバナーだけ(ステージとカードは描かない)。size は大きさ
+    (large / medium / small。SIZES 参照)。hot / hot_pause は各ボタンに
     マウスが乗っているか。全員待機中(view の all_idle)なら、枠をゆっくり明滅させる
     (二人とも陽太さん待ちなのが、離れていても目に入るように)。"""
+    spec = size_spec(size)
     accent = TONES.get(view["tone"], TONES["sleep"])
     t = now * 1000.0
     # 枠(ごく小さな丸みの長方形)
@@ -248,7 +284,7 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
         _paint_toggle(p, rect, True, hot)
         return
     # ステージ
-    st = QRect(inner.left(), ban.bottom() + 1 + GAP, inner.width(), STAGE_H)
+    st = QRect(inner.left(), ban.bottom() + 1 + GAP, inner.width(), spec["stage_h"])
     grad = QLinearGradient(0, st.top(), 0, st.bottom())
     grad.setColorAt(0, QColor("#08121a"))
     grad.setColorAt(1, BG)
@@ -259,9 +295,15 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
     p.save()
     try:
         p.setClipRect(st.adjusted(1, 1, -1, -1))
-        _paint_stage(p, dpr, view, st, accent, t)
+        _paint_stage(p, dpr, view, st, accent, t, spec)
     finally:
         p.restore()
+
+    if not spec["cards"]:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        _paint_pause(p, rect, bool(view.get("paused")), hot_pause)
+        _paint_toggle(p, rect, False, hot)
+        return
 
     # カード3枚
     top = st.bottom() + 1 + GAP
@@ -291,15 +333,21 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
     _paint_toggle(p, rect, False, hot)
 
 
-def _paint_stage(p, dpr, view, st, accent, t):
-    """ステージの中身。st は枠の矩形、t は ms。キャラ・手紙・点・「!」などを動かす。"""
+def _paint_stage(p, dpr, view, st, accent, t, spec):
+    """ステージの中身。st は枠の矩形、t は ms。キャラ・手紙・点・「!」などを動かす。
+
+    配置は全部「足元」と「キャラの大きさ」から組み立てる(大きさごとに変わる)。
+    名札(MUSE / CLAW'D の文字)は描かないので、足元は地面のすぐ上まで使える。"""
     W, H = st.width(), st.height()
     ox, oy = st.left(), st.top()
-    feet = oy + H - 31                       # 足元(この下に名札、さらに下に地面)
+    muse_cell = spec["muse_cell"]
+    cell = spec["cell"]
+    item_cell = spec["item_cell"]
+    feet = oy + H - 8                        # 足元(地面の少し上)
     pen = QPen(EDGE, 1)
     pen.setDashPattern([6, 6])
     p.setPen(pen)
-    gy = oy + H - 18
+    gy = oy + H - 5
     p.drawLine(ox, gy, ox + W, gy)
     props = view["props"]
 
@@ -307,71 +355,71 @@ def _paint_stage(p, dpr, view, st, accent, t):
     mdx, mdy = sp.move_offset(sp.MUSE_MOVE.get(view["muse_anim"], ""), t)
     mname = sp.muse_frame(view["muse_anim"], t)
     mrows = sp.muse_rows(mname)
-    mw, mh = len(mrows[0]) * MUSE_CELL, len(mrows) * MUSE_CELL
+    mw, mh = len(mrows[0]) * muse_cell, len(mrows) * muse_cell
     mtop = feet - mh                          # Claw'd と足元(feet)を揃える
     _sprite(p, dpr, ("muse", mname), mrows, sp.MUSE_PALETTE,
-            ox + 8 + mdx, mtop + mdy, MUSE_CELL)
+            ox + 8 + mdx, mtop + mdy, muse_cell)
     cdx, cdy = sp.move_offset(sp.CLAWD_MOVE.get(view["clawd_anim"], ""), t)
     cname = sp.clawd_frame(view["clawd_anim"], t)
-    cx, cy = ox + W - 70 + cdx, feet - 8 * CELL + cdy
-    _sprite(p, dpr, ("clawd", cname), sp.CLAWD_FRAMES[cname], sp.CLAWD_PALETTE, cx, cy)
+    cw = 12 * cell
+    cx, cy = ox + W - 10 - cw + cdx, feet - 8 * cell + cdy
+    _sprite(p, dpr, ("clawd", cname), sp.CLAWD_FRAMES[cname], sp.CLAWD_PALETTE,
+            cx, cy, cell)
     if "hat" in props:
-        _sprite(p, dpr, ("hat",), sp.HAT, sp.CLAWD_PALETTE, cx, cy - 6 * CELL)
+        _sprite(p, dpr, ("hat",), sp.HAT, sp.CLAWD_PALETTE, cx, cy - 6 * cell, cell)
 
-    # 名札
-    tag_font = QFont("Consolas", 7)
-    tag_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
-    p.setFont(tag_font)
-    p.setPen(accent)
-    th = QFontMetrics(tag_font).height()
-    p.drawText(QRect(ox + 8 + mw // 2 - 32, feet + 2, 64, th), Qt.AlignCenter, "MUSE")
-    p.drawText(QRect(ox + W - 72, feet + 2, 68, th), Qt.AlignCenter, "CLAW'D")
-
-    # 手紙・受領のチェック(座標で飛ばす)
+    # 手紙・受領のチェック(座標で飛ばす)。高さは Muse の胸のあたり。
+    item_top = feet - max(6, round(mh * 0.72))
+    fly_left = 8 + mw + 6
+    fly_right = W - 10 - cw - 10 * item_cell - 4
     kind = view["item"]
     if kind:
         for name in ("letter", "ack"):
-            pos = item_position(kind, name, t, W)
+            pos = item_position(kind, name, t, W, fly_left, fly_right)
             if pos is None:
                 continue
             p.setOpacity(max(0.0, min(1.0, pos[1])))
             dy = 0 if name == "ack" else 4 + (-2 if kind == "parked" and t % 1000 >= 500 else 0)
             _sprite(p, dpr, ("item", name), ITEM_GRIDS[name], ITEM_PALETTE,
-                    ox + pos[0] + 1, oy + H - 74 + dy, ITEM_CELL)
+                    ox + pos[0] + 1, item_top + dy, item_cell)
             p.setOpacity(1.0)
     if kind in ("parked", "wobble"):
-        _blink_text(p, "?", QRect(ox + W // 2 - 10, oy + H - 94, 20, 20), accent, 16,
+        _blink_text(p, "?", QRect(ox + W // 2 - 10, item_top - 22, 20, 20), accent, 16,
                     t % 800 < 400)
 
     # 火花(Muse の頭の上)
     if "spark" in props:
         p.setOpacity(1.0 if t % 500 < 250 else 0.15)
         _sprite(p, dpr, ("item", "spark"), ITEM_GRIDS["spark"], ITEM_PALETTE,
-                ox + 8 + (mw - 18) // 2, mtop - 16, ITEM_CELL)
+                ox + 8 + (mw - 18) // 2, mtop - 7 * item_cell - 2, item_cell)
         p.setOpacity(1.0)
-    # Claw'd の頭の上と体まわり
+    # Claw'd の頭の上と体まわり。オフセットは Claw'd の大きさ(CELL 比)で縮める。
+    f = cell / CELL
     if "dots" in props:
+        dot = max(2, round(4 * f))
         for i in range(3):
             phase = ((t - i * 250) % 1000) / 1000.0
-            p.fillRect(cx + 20 + i * 8, cy - 10, 4, 4,
+            p.fillRect(int(cx + (20 + i * 8) * f), int(cy - 10 * f), dot, dot,
                        QColor(79, 224, 255, 255 if phase >= 0.3 else 38))
     if "bang" in props:
-        _blink_text(p, "!", QRect(cx + 27, cy - 26, 14, 20), QColor("#ff5a5f"), 20,
+        _blink_text(p, "!", QRect(int(cx + 27 * f), int(cy - 26 * f), 14, 20),
+                    QColor("#ff5a5f"), max(11, round(20 * f)),
                     t % 500 < 250)
     if "sweat" in props:
         k = int((t % 1200) / 1200.0 * 4) / 4.0
         p.setOpacity(1.0 - k)
-        p.fillRect(cx + 52, int(cy + 10 * k), 4, 6, QColor("#6ec8ff"))
+        p.fillRect(int(cx + 52 * f), int(cy + 10 * k * f),
+                   max(2, round(4 * f)), max(3, round(6 * f)), QColor("#6ec8ff"))
         p.setOpacity(1.0)
     if "zz" in props:
         k = int((t % 2400) / 2400.0 * 6) / 6.0
         alpha = k / 0.15 if k < 0.15 else 1.0 - (k - 0.15) / 0.85
         p.setOpacity(max(0.0, min(1.0, alpha)))
-        font = QFont("Consolas", 9)
+        font = QFont("Consolas", max(7, round(9 * f)))
         font.setBold(True)
         p.setFont(font)
         p.setPen(QColor("#8fb4c2"))
-        p.drawText(QRect(int(cx + 48 + 10 * k), int(cy - 16 - 22 * k), 40, 16),
+        p.drawText(QRect(int(cx + 48 * f + 10 * k * f), int(cy - 16 * f - 22 * k * f), 40, 16),
                    Qt.AlignLeft | Qt.AlignVCenter, "z z Z")
         p.setOpacity(1.0)
     if "confetti" in props:
@@ -384,3 +432,35 @@ def _paint_stage(p, dpr, view, st, accent, t):
             p.fillRect(-2, -2, 4, 4, QColor(color))
             p.restore()
         p.setRenderHint(QPainter.Antialiasing, False)
+
+
+def paint_stealth(p, rect, view, now):
+    """ステルス時の帯(幅 STEALTH_W)を描く。
+
+    残すのはバナーの左端にある太線だけ。色は「いま誰待ちか」(tone)で、
+    全員待機中は枠と同じ呼吸で明滅し、異常のときは点滅して知らせる。
+    休止中は帯の真ん中に小さな休止印(橙の縦棒2本)を足す。view が無ければ
+    待機色の帯だけにする。"""
+    accent = TONES.get(view["tone"], TONES["sleep"]) if view else TONES["sleep"]
+    t = now * 1000.0
+    box = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setPen(QPen(EDGE, 1))
+    p.setBrush(BG)
+    p.drawRoundedRect(box, 3, 3)
+    alpha = 255
+    if view and view.get("all_idle"):
+        alpha = min(255, pulse_alpha(t) + 70)   # 帯は細いので下限を持ち上げる
+    elif view and view["tone"] == "alert":
+        alpha = 255 if t % 1000 < 550 else 110
+    bar = QColor(accent)
+    bar.setAlpha(alpha)
+    p.setPen(Qt.NoPen)
+    p.setBrush(bar)
+    p.drawRoundedRect(QRectF(rect.left() + 6, rect.top() + 8, 3,
+                             rect.height() - 16), 1.5, 1.5)
+    if view and view.get("paused"):
+        p.setBrush(QColor("#f0b04a"))
+        cy = rect.center().y()
+        for dx in (-3.0, 1.0):
+            p.drawRect(QRectF(rect.center().x() + dx, cy - 5, 2.2, 10))

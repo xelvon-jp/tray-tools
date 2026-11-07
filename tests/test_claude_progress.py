@@ -403,3 +403,58 @@ if __name__ == "__main__":
     for test in ALL_TESTS:
         test()
         print(f"PASS {test.__name__}")
+
+
+def test_bridge_size_state():
+    """大きさの保存と読み戻し。知らない値は large に倒す。"""
+    path = _state_path()
+    assert cp.load_bridge_size(path) == "large"
+    cp.save_state({"bridge_size": "stealth"}, path)
+    assert cp.load_bridge_size(path) == "stealth"
+    cp.save_state({"bridge_size": "huge"}, path)
+    assert cp.load_bridge_size(path) == "large"
+
+
+def test_coop_height_sizes():
+    """大きさごとの行の高さ: large が現状(COOP_HEIGHT)と一致し、中・小は低い。"""
+    stage = cp.coop_stage
+    assert stage.coop_height("large") == stage.COOP_HEIGHT
+    assert stage.coop_height("medium") < stage.coop_height("large")
+    assert stage.coop_height("small") < stage.coop_height("medium")
+    assert stage.coop_height("nonsense") == stage.COOP_HEIGHT
+    row = {"_coop": True, "_size": "small"}
+    assert cp.row_height(row) == stage.coop_height("small")
+    row["_collapsed"] = True
+    assert cp.row_height(row) == stage.COOP_COLLAPSED_HEIGHT
+
+
+def test_panel_stealth_and_sizes():
+    """stealth では帯だけ(幅 STEALTH_W)になり、広げる条件で large の姿に戻る。
+    medium では行の高さが medium のものになる。"""
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    path = _state_path()
+    cp.save_state({"bridge_size": "stealth"}, path)
+    panel = _new_panel(path)
+    now = time.time()
+    muse, entries = _tone_inputs(now)["approval"]
+    panel.set_entries(entries, None, muse)
+    app.processEvents()
+    assert panel._stealth_mode
+    assert panel.width() == cp.coop_stage.STEALTH_W
+    assert panel.isVisible()
+    # 状態変化で広げる: until を未来に置くと large の姿になる
+    panel._stealth_until = time.time() + 60
+    panel._tick()
+    app.processEvents()
+    assert not panel._stealth_mode
+    assert panel.width() == cp.PANEL_WIDTH
+    assert panel._rows[0]["_size"] == "large"
+    # medium に切り替えると保存され、行の高さも medium になる
+    panel.set_bridge_size("medium")
+    app.processEvents()
+    assert cp.load_bridge_size(path) == "medium"
+    assert panel._rows[0]["_size"] == "medium"
+    assert panel.height() == cp.panel_height(panel._rows)
+    panel.hide()

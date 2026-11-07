@@ -285,11 +285,15 @@ DEFAULT_SETTINGS = {
     # 音声の2つで埋まる。それ以外の機能へ通知領域まで戻らずに届くようにするためのもの。
     # launcher_items は上から下へ並ぶ順で、書ける名前は
     # palette(コマンドパレット) / capture(キャプチャ) / audio(音声出力切替) / ruler(画面定規) /
-    # color_picker(カラーピッカー) / snippets(定型文) / bookmarks(フォルダブックマーク) /
-    # presenter(発表者ツール) / laser(レーザーポインタ) / spotlight(スポットライト) /
-    # blackout(黒画面) / whiteout(白画面) / screen_mirror(画面ミラー) / calendar(カレンダー) /
+    # color_picker(カラーピッカー) / bg_remove(背景を透過) / snippets(定型文) /
+    # bookmarks(フォルダブックマーク) / filer(あっふ) / presenter(発表者ツール) /
+    # web_presenter(サイトを取り込んで開く) / laser(レーザーポインタ) /
+    # spotlight(スポットライト) / blackout(黒画面) / whiteout(白画面) /
+    # screen_mirror(画面ミラー) / calendar(カレンダー) /
     # calculator(電卓) / cursor(カーソルを探す)。
-    # 減らしても増やしても順を入れ替えてもよい。[] にするか launcher_enabled を False に
+    # 減らしても増やしても順を入れ替えてもよい。付け外しはパネルの右クリック
+    # メニューからもできる(順番の入れ替えはこのファイルで)。[] にするか
+    # launcher_enabled を False に
     # すると、マウスを乗せても従来どおり本体だけになる。
     # launcher_close_delay_ms は、カーソルが離れてから畳むまでの猶予。本体からパネルへ
     # 移る途中には必ず「どちらにも乗っていない」瞬間があるので、0にすると項目へ届く前に

@@ -372,6 +372,34 @@ function findSpawnPos(kind) {
   return { x: (30 + k * 37) % Math.max(1, maxX), y: (20 + k * 53) % Math.max(1, maxY) };
 }
 
+// pieces never rest on top of each other: when a piece is let go (or
+// a carry creates one) in a spot that overlaps another piece, it
+// slides to the nearest free spot instead
+function slideTo(p, nx, ny) {
+  if (!p.el) { p.x = nx; p.y = ny; return; }
+  p.el.style.transition = "left .18s ease-out, top .18s ease-out";
+  placePiece(p, nx, ny);
+  setTimeout(() => { if (p.el) p.el.style.transition = ""; }, 200);
+}
+function resolveOverlap(p) {
+  const s = pieceSize(p.kind);
+  if (!overlapsAny(p.x, p.y, s.w, s.h, 0, p.id)) return;
+  const ox = p.x, oy = p.y;
+  const maxX = Math.max(0, stage.clientWidth - s.w);
+  const maxY = Math.max(0, stage.clientHeight - s.h);
+  for (let r = 1; r <= 14; r++) {
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dy = -r; dy <= r; dy++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = ox + dx * PITCH, ny = oy + dy * PITCH;
+        if (nx < 0 || ny < 0 || nx > maxX || ny > maxY) continue;
+        if (!overlapsAny(nx, ny, s.w, s.h, 0, p.id)) { slideTo(p, nx, ny); return; }
+      }
+    }
+  }
+  // nowhere free nearby: stay where it was dropped
+}
+
 // ---------- carry-up: 10 of a kind gathered together become the next unit ----------
 function rectNear(a, b, pad) {
   const sa = pieceSize(a.kind), sb = pieceSize(b.kind);
@@ -432,6 +460,7 @@ function convertTen(ten, kind) {
   renderPiece(np);
   const ns = pieceSize(nextKind);
   placePiece(np, cx - ns.w / 2, cy - ns.h / 2);
+  resolveOverlap(np);
   np.el.classList.add("pop");
   sndCarry();
   showCarryToast(nextKind);
@@ -546,6 +575,7 @@ function attachPointer(p) {
       checkChallenge();
       return;
     }
+    resolveOverlap(p);
     carryFrom(p); refreshInfo(); checkChallenge();
   };
   p.el.addEventListener("pointerup", finish);
@@ -612,6 +642,7 @@ for (const kind of KIND_ORDER) {
     if (!p) return; // a plain tap: the click handler spawns as before
     suppressClick = true;
     p.el.style.zIndex = "";
+    resolveOverlap(p);
     p.el.classList.add("pop");
     sndPop();
     carryFrom(p);

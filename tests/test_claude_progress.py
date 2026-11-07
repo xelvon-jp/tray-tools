@@ -77,8 +77,89 @@ def test_muse_kind_row_and_dismiss_key():
     panel.deleteLater()
 
 
+def _tone_inputs(now):
+    """6つの tone それぞれになる (muse, entries)。"""
+    base = {"last_poll": now - 2, "poll_sec": 15, "state": "idle", "kind": "idle",
+            "kind_since": now - 300, "cards": 0, "mailbox_fail": 0}
+    return {
+        "work": (dict(base, kind="processing", kind_since=now - 80, header="実装中"), []),
+        "claude": (base, [{"state": "running", "started": now - 125, "session_id": "a"}]),
+        "approval": (dict(base, kind="approval", kind_since=now - 8, cards=1), []),
+        "alert": (dict(base, last_poll=now - 200), []),
+        "done": (dict(base, prev_kind="processing", kind_since=now - 2), []),
+        "sleep": (base, []),
+    }
+
+
+def test_coop_row():
+    now = time.time()
+    muse, entries = _tone_inputs(now)["approval"]
+    row = cp.coop_row(muse, entries, now)
+    assert row["_coop"] and row["_muse"] and row["key"] == ("approval", muse["kind_since"])
+    assert cp.row_height(row) == cp.coop_stage.COOP_HEIGHT
+    assert 190 <= cp.row_height(row) <= 215
+    assert cp.coop_row(None, entries, now) is None
+    assert cp.coop_row(dict(muse, last_poll=now - 7 * 3600), entries, now) is None
+    # kind が無い古いファイルは since 基準のキー
+    old = {"state": "busy", "since": now - 5, "last_poll": now}
+    assert cp.coop_row(old, [], now)["key"][1] == old["since"]
+
+
+def test_panel_coop_all_tones_paint():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    for tone, (muse, entries) in _tone_inputs(now).items():
+        panel = cp.ClaudeProgressPanel()
+        panel.set_entries(entries, None, muse)
+        app.processEvents()
+        assert panel._rows[0]["_coop"], tone
+        row = panel._rows[0]
+        assert cp.cv.coop_view(row["muse"], row["entries"], time.time())["tone"] == tone
+        assert panel.height() >= cp.coop_stage.COOP_HEIGHT
+        assert panel._timer.isActive()           # 連携ステージがある間は回す
+        pm = panel.grab()                        # 描画で例外が出ないこと
+        assert not pm.isNull()
+        # 時刻をずらしても(アニメの各コマで)通る
+        real = time.time
+        try:
+            for dt in (0.1, 0.37, 1.3, 2.9, 4.4):
+                time.time = lambda dt=dt: real() + dt   # paintEvent は time.time() を使う
+                panel.grab()
+        finally:
+            time.time = real
+        panel.close()
+        panel.deleteLater()
+
+
+def test_panel_coop_dismiss_by_tone():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    inputs = _tone_inputs(now)
+    panel = cp.ClaudeProgressPanel()
+    muse, entries = inputs["sleep"]
+    panel.set_entries(entries, None, muse)
+    app.processEvents()
+    panel._remove_row(0)
+    assert panel._rows == []
+    panel.set_entries(entries, None, muse)
+    assert panel._rows == []                     # 同じ tone の間は出ない
+    muse2, entries2 = inputs["claude"]
+    panel.set_entries(entries2, None, muse2)
+    assert panel._rows[0]["_coop"]               # tone が変われば戻る
+    # 状態ファイルが無くなれば、Claude の行だけが残る(連携ステージは出ない)
+    panel.set_entries(entries2, None, None)
+    assert [bool(r.get("_coop")) for r in panel._rows] == [False]
+    panel.close()
+    panel.deleteLater()
+
+
 ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
-             test_muse_kind_row_and_dismiss_key]
+             test_muse_kind_row_and_dismiss_key, test_coop_row,
+             test_panel_coop_all_tones_paint, test_panel_coop_dismiss_by_tone]
 
 
 if __name__ == "__main__":

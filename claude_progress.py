@@ -24,6 +24,12 @@
 #     (少し前にやり取りしていたセッションへ飛びたいことが多いため)。折りたたんだ行は
 #     claude_status の DONE_TTL(30分)で消え、何も無くなればパネルごと隠す
 #
+# 【連携ステージ】Muse 見張りの行は、いまは「連携ステージ」(coop_row / coop_stage.py)で
+# 置き換えている: 「いま誰待ちか」のバナー + Muse と Claw'd のドット絵 + カード3枚
+# (約200px)。何を出すかは coop_view(純関数)、絵は chara_sprites。ファイルが無い・
+# 古すぎる(6時間)ときは行を出さない。✕ はその tone(と kind_since)の間だけ閉じる。
+# 旧 muse_row / _paint_muse は使わなくなったが残してある(上の説明は旧仕様)。
+#
 # 操作: 行をクリック = そのセッションをデスクトップアプリで開く(claude://code/continue)。
 #       行の右端の ✕ = その行を消す(状態ファイルを消す。そのセッションが次に動けばまた出る)。
 #       Ctrl+ドラッグ = 移動(場所を覚える)。Copilot の状態監視バーと同じ作法で、
@@ -40,6 +46,8 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import QWidget
 
 import claude_status as cs
+import coop_stage
+import coop_view as cv
 import muse_bridge_status as mbs
 
 PANEL_WIDTH = 300
@@ -208,7 +216,26 @@ def muse_row(data, now=None) -> dict | None:
                     data.get("kind_since") if kind else data.get("since"))}
 
 
+def coop_row(muse, entries, now=None) -> dict | None:
+    """連携ステージの行(Muse 見張りの行の置き換え)。Muse 見張りの状態が無い・古すぎる
+    ときは None(行を出さない)。
+
+    表示内容は描くときに now で計算し直す(3秒ごとの受け取りの間も経過が進むよう、
+    生のデータを抱える)。_muse も立てるのは、✕ で閉じる・開く先が無い、という
+    Muse 見張りの行の作法をそのまま引き継ぐため。"""
+    view = cv.coop_view(muse, entries, now)
+    if view is None:
+        return None
+    has_kind = isinstance(muse.get("kind"), str) and bool(muse.get("kind"))
+    return {"_coop": True, "_muse": True, "muse": muse, "entries": list(entries or []),
+            "state": muse.get("state"), "since": muse.get("since"),
+            # ✕で閉じた判定のキー: tone と、その状態になった時刻(kind があれば kind_since)
+            "key": (view["tone"], muse.get("kind_since") if has_kind else muse.get("since"))}
+
+
 def row_height(row) -> int:
+    if row.get("_coop"):
+        return coop_stage.COOP_HEIGHT
     if row.get("_copilot") or row.get("_muse"):
         return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
@@ -276,11 +303,10 @@ class ClaudeProgressPanel(QWidget):
             if (head is not None
                     and (head["state"], head.get("since")) == self._copilot_dismissed):
                 head = None   # ✕で閉じた手番は、その手番の間は出さない
-            muse = muse_row(self._muse, now)
+            muse = coop_row(self._muse, self._entries, now)
             if (muse is not None
                     and muse["key"] == self._muse_dismissed):
                 muse = None   # ✕で閉じた状態は、その状態の間は出さない
-            muse_view = mbs.panel_view(self._muse, now) if muse is not None else None
             rows = (([head] if head else []) + ([muse] if muse else [])
                     + rows_to_show(self._entries, now, self._first_seen_done))
             if not rows:
@@ -300,13 +326,11 @@ class ClaudeProgressPanel(QWidget):
             # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
             # Copilot の行は、帯が流れる応答待ち・応答中だけ回す(他の状態の
             # 経過表示は3秒ごとの受け取りで進めば足りる)。
-            # Muse 見張りの行は、止まっていない間はバー(次の読み取りまでの
-            # 残り)と経過が進むので回す。止まっていれば静止画で足りる。
+            # 連携ステージの行は、どの tone でもキャラが動く(寝息・点滅など)ので常に回す。
             if any((not r.get("_compact") and not r.get("_copilot") and not r.get("_muse"))
                    or (r.get("_copilot")
                        and r["state"] in ("responding", "waiting_ai"))
-                   or (r.get("_muse") and muse_view is not None
-                       and not muse_view["stopped"])
+                   or r.get("_coop")
                    for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
@@ -354,6 +378,7 @@ class ClaudeProgressPanel(QWidget):
         for index, entry in enumerate(self._rows):
             self._paint_row(p, entry, self._row_rect(index), now, index == self._hover)
             self._paint_close(p, index)
+        p.end()
 
     def _close_rect(self, index) -> QRect:
         """その行の ✕ の場所。バーの行は1行目(名前の行)の高さに、折りたたんだ行は真ん中に。"""
@@ -381,6 +406,12 @@ class ClaudeProgressPanel(QWidget):
         p.drawLine(box.right() - inset, box.top() + inset, box.left() + inset, box.bottom() - inset)
 
     def _paint_row(self, p, entry, rect, now, hover):
+        if entry.get("_coop"):
+            view = cv.coop_view(entry["muse"], entry["entries"], now)
+            if view is not None:
+                coop_stage.paint_coop(p, rect, view, now, self.devicePixelRatioF(),
+                                      self._sub_font)
+            return
         if entry.get("_copilot"):
             self._paint_copilot(p, entry, rect, now, hover)
             return

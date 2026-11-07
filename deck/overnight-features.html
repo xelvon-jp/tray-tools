@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>昨晩の改善14件 — tray-tools</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#ffffff; --ink:#22303a; --sub:#5c7185;
+    --line:#d8e2ec; --accent:#2f6fb5; --chip:#eef3f9; --warn:#a34d00;
+    --warnbg:#fff3e0; --fig:#f7fafc; --band1:#123a5c; --band2:#2f6fb5;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#10161d; --card:#1a232e; --ink:#e8eef4; --sub:#9db1c4;
+      --line:#2c3a49; --accent:#7ab3e8; --chip:#243242; --warn:#ffb26b;
+      --warnbg:#3a2a16; --fig:#141d27; --band1:#0c2237; --band2:#1d4e79;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Hiragino Sans","Noto Sans JP","Yu Gothic",sans-serif;line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 16px 48px}
+  header.cover{margin:0 -16px;padding:40px 24px 30px;color:#fff;
+    background:linear-gradient(135deg,var(--band1),var(--band2))}
+  header.cover h1{margin:0 0 6px;font-size:34px;letter-spacing:.02em}
+  header.cover p{margin:2px 0;color:#cfe2f2;font-size:15px}
+  h2.sec{margin:34px 0 12px;font-size:21px;border-left:5px solid var(--accent);padding-left:10px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 16px 12px}
+  .card h3{margin:0 0 4px;font-size:18px}
+  .num{display:inline-block;min-width:28px;text-align:center;background:var(--accent);color:#fff;
+    border-radius:8px;padding:0 6px;margin-right:8px;font-weight:bold}
+  .fig{background:var(--fig);border:1px solid var(--line);border-radius:10px;
+    padding:8px;text-align:center;margin:8px 0 4px}
+  .figcap{font-size:11px;color:var(--sub);text-align:right;margin:0 0 6px}
+  .lab{font-size:12px;font-weight:bold;color:var(--accent);margin:10px 0 2px}
+  .card p{margin:2px 0;font-size:14.5px}
+  ol.flow{margin:2px 0;padding-left:20px;font-size:14.5px}
+  .chip{display:inline-block;background:var(--chip);border:1px solid var(--line);
+    border-radius:999px;padding:1px 10px;font-size:12px;margin:2px 4px 2px 0}
+  .chip.warn{background:var(--warnbg);color:var(--warn);border-color:var(--warn)}
+  .note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+  .note li{font-size:14.5px;margin:4px 0}
+  .chartbox{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px;overflow-x:auto}
+  footer{margin-top:36px;color:var(--sub);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="cover">
+  <h1>昨晩の改善14件</h1>
+  <p>tray-tools（あっふ・ランチャ・パレット）— 2026-11-07 03:00〜05:25 に実装・push した分</p>
+  <p>Muse が実装し、Claude の見張りと承認の仕組みで main へ入りました。この資料は紹介用で、外部通信なし・単体で開けます。</p>
+</header>
+
+<h2 class="sec">先に、正直な注意書き</h2>
+<div class="note">
+<ul>
+  <li>14件すべて、VM での検証（テスト・画面確認）は済んでいますが、<b>実機での目視確認はまだ</b>です。まとめて確認をお願いする分として残っています。</li>
+  <li>#13・#14 の<b>社内環境が要る部分は未検証</b>です（M365/Box の実検索、SharePoint リンク、WinSCP への受け渡し）。</li>
+  <li>#2 圧縮の VM テストには、変更前でも同じように失敗する1件（環境要因）があり、実機確認で最終判断します。</li>
+  <li><b>新しく増えたホットキーは既定では空</b>です。パレットやカーソルファインダーの呼び出しは、設定でキーを割り当てて使います（あっふ内の Alt+D、Alt+S、C→W などは、あっふの操作として追加されたものです）。</li>
+  <li>各カードの絵はすべて<b>イメージ図</b>です。実物のスクリーンショットではありません。</li>
+</ul>
+</div>
+
+<h2 class="sec">14件の紹介</h2>
+<div class="grid">
+
+<article class="card">
+  <h3><span class="num">1</span>旧Mac風電卓</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="38" y="4" width="44" height="56" rx="7" fill="#dfe9f2" stroke="#7a8ca0"/><rect x="44" y="9" width="32" height="11" rx="2" fill="#fff" stroke="#7a8ca0"/><g fill="#b9c9d9"><circle cx="50" cy="29" r="3.4"/><circle cx="60" cy="29" r="3.4"/><circle cx="70" cy="29" r="3.4"/><circle cx="50" cy="40" r="3.4"/><circle cx="60" cy="40" r="3.4"/><circle cx="70" cy="40" r="3.4"/><circle cx="50" cy="51" r="3.4"/><circle cx="60" cy="51" r="3.4"/><circle cx="70" cy="51" r="3.4"/></g></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>縦ランチャから開く小さな電卓。昔の Mac のような見た目で、四則計算を押した順に連鎖計算します（優先順位なし）。0 で割ると Error。フォーカスが外れても閉じないので、数字を見ながら作業できます。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>ランチャから電卓を開く</li><li>数字と演算子を押す</li><li>「=」で結果（続けて押せば連鎖）</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>アプリを切り替えずに、ちょっとした計算がその場で終わります。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">2</span>あっふ ZIP・7z圧縮</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><path d="M28 18 h22 l6 8 h36 v30 h-64 z" fill="#ffe1a8" stroke="#7a8ca0"/><line x1="60" y1="26" x2="60" y2="56" stroke="#7a8ca0" stroke-width="2" stroke-dasharray="3 3"/><text x="86" y="22" font-size="12" fill="#5c7185">7z</text></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>あっふの圧縮（P）で、ZIP に加えて 7z も作れるようになりました。形式はキーで選びます（Z=ZIP、S=7z）。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>ファイルを選ぶ</li><li>P を押す</li><li>Z か S で形式を選ぶと、同じフォルダに圧縮ファイルができる</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>渡す相手や用途に合わせて形式を選べて、別のツールを起動しなくて済みます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">3</span>統合パレット＋その場計算</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="14" y="8" width="92" height="48" rx="8" fill="#fff" stroke="#7a8ca0"/><rect x="20" y="14" width="80" height="13" rx="4" fill="#eef3f9" stroke="#7a8ca0"/><text x="26" y="24" font-size="9" fill="#5c7185">1200 * 1.1</text><line x1="22" y1="36" x2="86" y2="36" stroke="#b9c9d9" stroke-width="3"/><text x="22" y="50" font-size="10" fill="#2f6fb5">= 1320</text></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>機能・フォルダ・ファイル・アプリを1つの入力欄から曖昧検索。式を打つとその場で計算（単位換算つき）。Everything と連携して PC 内のファイルも探します（最大8件）。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>パレットを開く（キーは設定で割り当て）</li><li>文字を打つ</li><li>候補から選んで Enter。式なら結果そのものが候補に出る</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>「あれ、どこだっけ」の横断検索と電卓が、1か所にまとまります。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">4</span>パレットの frecency 学習</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><g fill="#7ab3e8"><rect x="24" y="40" width="12" height="16"/><rect x="44" y="30" width="12" height="26"/><rect x="64" y="20" width="12" height="36"/></g><path d="M92 12 l2.6 5.6 6 .7 -4.4 4.1 1.2 5.9 -5.4 -3 -5.4 3 1.2 -5.9 -4.4 -4.1 6 -.7 z" fill="#f0b04a"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>パレットの候補順が「よく使う × 最近使う」で学習されます。履歴は端末内（%LOCALAPPDATA%\traytools）に保存され、外には出ません。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>いつも通りパレットで選ぶだけ</li><li>次回から、よく使うものが上位に出る</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>使うほど、自分の手癖に合った順番になってきます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">5</span>あっふ プレビュー群＋差分</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="30" y="8" width="38" height="48" rx="3" fill="#fff" stroke="#7a8ca0"/><line x1="36" y1="18" x2="62" y2="18" stroke="#b9c9d9" stroke-width="3"/><line x1="36" y1="27" x2="62" y2="27" stroke="#b9c9d9" stroke-width="3"/><line x1="36" y1="36" x2="54" y2="36" stroke="#ff9a9c" stroke-width="3"/><path d="M76 32 c6 -8 16 -8 22 0 c-6 8 -16 8 -22 0z" fill="none" stroke="#7a8ca0"/><circle cx="87" cy="32" r="3.4" fill="#7a8ca0"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>プレビューで PDF・HTML・Markdown・テキストを表示できるようになりました。2ファイルの違いは Alt+D の内蔵差分ビューアで見られます。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>プレビューを開くと、種類に応じて自動で描画</li><li>差分は2つ選んで Alt+D</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>外部ビューアを開かなくても、中身と違いがその場で分かります。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">6</span>あっふ 行の色分けルール</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><g><rect x="18" y="10" width="84" height="10" fill="#ffe1a8"/><rect x="18" y="26" width="84" height="10" fill="#cdeac0"/><rect x="18" y="42" width="84" height="10" fill="#f6c6d9"/></g></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>settings.json の filer.row_color_rules（手編集）で、名前や拡張子の条件に合う行に色を付けられます。最初に一致したルールが優先で、マークの色が最優先です。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>settings にルールを書く</li><li>あっふを開くと、条件に合う行に色が付く</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>大事なファイルを、一覧の中で見落としにくくなります。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span><span class="chip">設定は手編集</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">7</span>あっふ 拡張子ごとの既定アプリ</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="16" y="16" width="30" height="34" rx="3" fill="#fff" stroke="#7a8ca0"/><text x="22" y="38" font-size="10" fill="#5c7185">.md</text><path d="M50 33 h22 m0 0 l-6 -6 m6 6 l-6 6" stroke="#2f6fb5" stroke-width="2.4" fill="none"/><rect x="78" y="16" width="30" height="34" rx="6" fill="#7ab3e8"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>settings.json の filer.default_apps（手編集）で、拡張子ごとに「開くアプリ」を指定できます。内蔵ビューアで開く Enter は対象外で、関連付けで開く Ctrl+Enter が対象です。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>settings に拡張子とアプリを書く</li><li>Ctrl+Enter で指定アプリが開く</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>ファイルの種類ごとに、好みのアプリへ直行できます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span><span class="chip">設定は手編集</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">8</span>カーソルファインダー</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><circle cx="60" cy="32" r="10" fill="none" stroke="#7ab3e8" stroke-width="2"/><circle cx="60" cy="32" r="18" fill="none" stroke="#7ab3e8" stroke-width="2" opacity=".65"/><circle cx="60" cy="32" r="26" fill="none" stroke="#7ab3e8" stroke-width="2" opacity=".35"/><path d="M56 26 l12 6 -5 1.6 -2 5 z" fill="#22303a"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>カーソルの位置に波紋の輪（3重・約1秒）が出て、見失ったカーソルを一目で示します。複数モニタの広い画面で特に効きます。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>割り当てたキーで呼び出す（既定は空）</li><li>輪の中心がカーソルの場所</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>広い画面でも、カーソルを探して目を走らせなくて済みます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">9</span>AI依頼テンプレート集</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><path d="M24 10 h72 v30 h-46 l-12 12 v-12 h-14 z" fill="#eef3f9" stroke="#7a8ca0"/><line x1="32" y1="20" x2="88" y2="20" stroke="#b9c9d9" stroke-width="3"/><line x1="32" y1="29" x2="76" y2="29" stroke="#b9c9d9" stroke-width="3"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>定型文（スニペット）に、AI への依頼文を6件追加。{clipboard} や {input:ラベル} の埋め込みで、コピーした内容やその場の入力が差し込まれます。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>定型文から依頼を選ぶ</li><li>必要なら入力欄に補足を書く</li><li>貼り付けて使う</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>よく使う依頼文を、毎回いちから書かなくて済みます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">10</span>キーダイアログの見た目改善</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="26" y="12" width="68" height="40" rx="6" fill="#141d27" stroke="#4a5a8a" stroke-width="3"/><text x="52" y="40" font-size="16" fill="#e8eef4">W</text></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>あっふの W・S・Shift+W ダイアログに枠の色（settings の dialog_border）が付いて、暗い背景と混ざらず見やすくなりました。挙動は変わりません。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>いつも通りダイアログを開くだけ</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>ダイアログの境界がはっきりして、操作に迷いません。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">11</span>巨大ファイルの高速検索</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><rect x="24" y="6" width="48" height="52" rx="3" fill="#fff" stroke="#7a8ca0"/><line x1="31" y1="16" x2="65" y2="16" stroke="#b9c9d9" stroke-width="3"/><line x1="31" y1="25" x2="65" y2="25" stroke="#b9c9d9" stroke-width="3"/><line x1="31" y1="34" x2="56" y2="34" stroke="#b9c9d9" stroke-width="3"/><circle cx="80" cy="40" r="11" fill="none" stroke="#2f6fb5" stroke-width="3"/><line x1="88" y1="48" x2="98" y2="58" stroke="#2f6fb5" stroke-width="3"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>あっふの文字列検索（G）が、32MB を超えるファイルでも 8MB ずつ読みながら探せるようになりました。文字コードは UTF-8 と cp932 の両方を候補にします。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>大きなファイルで G を開く</li><li>文字を入れて検索（操作は従来と同じ）</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>ログやダンプなど巨大なファイルでも、検索が止まりません。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">12</span>フォルダブックマーク拡張</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><circle cx="42" cy="30" r="15" fill="none" stroke="#7a8ca0" stroke-width="2"/><path d="M30 30 a12 12 0 0 1 24 0 a12 12 0 0 1 -24 0 M42 18 v24 M31 25 h22 M31 35 h22" stroke="#7a8ca0" fill="none"/><path d="M76 10 h16 v40 l-8 -7 -8 7 z" fill="#f0b04a"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>ランチャのフォルダショートカットに、Web ページ（URL）も登録できるようになりました。Edge・Chrome のお気に入りをまとめて取り込めます（重複は除き、上限500件）。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>ブラウザのお気に入りを取り込む</li><li>ランチャから選ぶと、フォルダはエクスプローラ、URL はブラウザで開く</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>フォルダもサイトも、同じ一覧から開けます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">13</span>横断検索 v2（Webサービス）</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><g fill="#cfe0f0" stroke="#7a8ca0"><rect x="16" y="18" width="18" height="18" rx="4"/><rect x="40" y="18" width="18" height="18" rx="4"/><rect x="64" y="18" width="18" height="18" rx="4"/></g><circle cx="88" cy="38" r="11" fill="none" stroke="#2f6fb5" stroke-width="3"/><line x1="96" y1="46" x2="106" y2="56" stroke="#2f6fb5" stroke-width="3"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>パレットから、Microsoft 365 や Box など Web サービスの中身も検索の候補に出ます（settings の command_palette.web_searches。接頭辞なしで自然に出る形です）。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>パレットを開く</li><li>文字を打つ</li><li>Web 検索の候補を選ぶと、ブラウザで結果が開く</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>ローカルとクラウドを、同じ入口で探せます。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span><span class="chip warn">社内環境での確認は未検証</span></p>
+</article>
+
+<article class="card">
+  <h3><span class="num">14</span>Webリンク＋SFTP受け渡し</h3>
+  <div class="fig"><svg width="120" height="64" viewBox="0 0 120 64"><path d="M38 40 a9 9 0 0 1 0 -13 l8 -8 a9 9 0 1 1 13 13 l-4 4" fill="none" stroke="#2f6fb5" stroke-width="3"/><path d="M82 24 a9 9 0 0 1 0 13 l-8 8 a9 9 0 1 1 -13 -13 l4 -4" fill="none" stroke="#2f6fb5" stroke-width="3"/><path d="M92 12 l10 6 -10 6 z" fill="#f0b04a"/></svg></div>
+  <p class="figcap">イメージ図</p>
+  <p class="lab">何ができるか</p>
+  <p>ファイルから Teams・Slack・SharePoint の Web リンクを作れます（C メニューの W。全ての対象が解決できたときだけ出ます）。SFTP は、あっふ自身はクライアントにならず、Alt+S で WinSCP に受け渡します。</p>
+  <p class="lab">使い方の流れ</p>
+  <ol class="flow"><li>ファイルを選んで C → W でリンクをコピー</li><li>SFTP の場所は Alt+S で WinSCP が開く</li></ol>
+  <p class="lab">嬉しさ</p>
+  <p>リンクのパスを手で組み立てなくて済み、あっふ自体は軽いままです。</p>
+  <p class="lab">状態</p>
+  <p><span class="chip">VM検証済み</span><span class="chip warn">実機の目視は未検証</span><span class="chip warn">社内環境・WinSCP連携は未検証</span></p>
+</article>
+
+
+</div>
+
+<h2 class="sec">その夜の時間配分</h2>
+<div class="chartbox">
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 900 340" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
+  <rect width="900" height="340" fill="#ffffff"/>
+  <text x="40" y="30" font-size="19" font-weight="bold" fill="#22303a">夜間 03:00〜05:25（145分）の時間配分 — 推定</text>
+  <text x="40" y="52" font-size="12" fill="#66788a">根拠・前提・誤差の幅は overnight-time-analysis.md に。点推定は「最も確からしい読み」。</text>
+  <!-- 帯グラフ -->
+  <rect x="40" y="66" width="458.1" height="46" fill="#2fa383"/>
+  <rect x="498.1" y="66" width="17" height="46" fill="#f0b04a"/>
+  <rect x="515" y="66" width="322.3" height="46" fill="#ff5a5f"/>
+  <rect x="837.4" y="66" width="22.6" height="46" fill="#8fa3b0"/>
+  <text x="60" y="95" font-size="16" font-weight="bold" fill="#ffffff">作業中 56%（約81分）</text>
+  <text x="676" y="95" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle">カードが出ず停止 39%（約57分）</text>
+  <line x1="506" y1="112" x2="506" y2="122" stroke="#b07d2a" stroke-width="1.5"/>
+  <text x="506" y="138" font-size="12.5" fill="#8a6414" text-anchor="middle">承認待ち（通常）2%（約3分）</text>
+  <line x1="849" y1="112" x2="849" y2="122" stroke="#66788a" stroke-width="1.5"/>
+  <text x="856" y="138" font-size="12.5" fill="#66788a" text-anchor="end">その他 3%（約4分）</text>
+  <!-- 時刻軸 -->
+  <text x="40" y="156" font-size="13" font-weight="bold" fill="#22303a">時刻軸: 赤い帯 = 承認で止まっていた区間(push 呼び出しの中) / 短い縦線 = コミット</text>
+  <text x="232" y="176" font-size="11.5" fill="#c0392b" text-anchor="middle">03:30〜03:38</text>
+  <text x="612" y="176" font-size="11.5" fill="#c0392b" text-anchor="middle">#12 約25分</text>
+  <text x="700" y="176" font-size="11.5" fill="#c0392b">#13 約5分</text>
+  <text x="796" y="176" font-size="11.5" fill="#c0392b" text-anchor="middle">#14 約20分</text>
+  <rect x="209.7" y="182" width="45.2" height="18" fill="#ff5a5f" opacity="0.85"/>
+  <rect x="541.6" y="182" width="141.4" height="18" fill="#ff5a5f" opacity="0.85"/>
+  <rect x="693.7" y="182" width="28.3" height="18" fill="#ff5a5f" opacity="0.85"/>
+  <rect x="740.1" y="182" width="113.1" height="18" fill="#ff5a5f" opacity="0.85"/>
+  <line x1="40" y1="206" x2="860" y2="206" stroke="#9fb2c0" stroke-width="1.5"/>
+  <g stroke="#5a7185" stroke-width="2">
+    <line x1="44.8" y1="206" x2="44.8" y2="214"/><line x1="58.1" y1="206" x2="58.1" y2="214"/>
+    <line x1="154.8" y1="206" x2="154.8" y2="214"/><line x1="208" y1="206" x2="208" y2="214"/>
+    <line x1="258.9" y1="206" x2="258.9" y2="214"/><line x1="290.6" y1="206" x2="290.6" y2="214"/>
+    <line x1="342.1" y1="206" x2="342.1" y2="214"/><line x1="370.4" y1="206" x2="370.4" y2="214"/>
+    <line x1="381.1" y1="206" x2="381.1" y2="214"/><line x1="397.5" y1="206" x2="397.5" y2="214"/>
+    <line x1="464.3" y1="206" x2="464.3" y2="214"/><line x1="506.2" y1="206" x2="506.2" y2="214"/>
+    <line x1="527.1" y1="206" x2="527.1" y2="214"/><line x1="683.3" y1="206" x2="683.3" y2="214"/>
+    <line x1="722.3" y1="206" x2="722.3" y2="214"/><line x1="853.6" y1="206" x2="853.6" y2="214"/>
+  </g>
+  <g font-size="11.5" fill="#66788a">
+    <text x="40" y="230">03:00</text>
+    <text x="209.7" y="230" text-anchor="middle">03:30</text>
+    <text x="379.3" y="230" text-anchor="middle">04:00</text>
+    <text x="549" y="230" text-anchor="middle">04:30</text>
+    <text x="718.6" y="230" text-anchor="middle">05:00</text>
+    <text x="860" y="230" text-anchor="end">05:25</text>
+  </g>
+  <!-- 幅 -->
+  <g font-size="13" fill="#22303a">
+    <text x="40" y="262">作業中 約81分（56%）／ 幅 77〜99分（53〜68%）</text>
+    <text x="40" y="284">承認待ち（通常） 約3分（2%）／ 幅 1〜4分（1〜3%）</text>
+    <text x="470" y="262">カードが出ず停止 約57分（39%）／ 幅 45〜60分（31〜41%）</text>
+    <text x="470" y="284">その他の待機 約4分（3%）／ 幅 0〜8分（0〜6%）</text>
+  </g>
+  <text x="40" y="316" font-size="11.5" fill="#66788a">「承認待ち（通常）」はカードが出てから押されるまで。通常分と停止分を合わせた『承認まわりで止まった時間』は約60分（約41%）。</text>
+</svg>
+
+</div>
+<p>結論: 作業中 約56% / 承認待ち（通常）約2% / カードが出ず停止 約39% / その他 約3%。
+「承認待ちがかなりの割合」という感覚は、カードが出ずに止まった約57分まで含めると実態に合っています（合計 約41%）。
+計算の過程・前提・誤差は <b>overnight-time-analysis.md</b> にあります。</p>
+
+<footer>
+  <p>資料: deck/overnight-features.html（このファイル）/ deck/overnight-time-analysis.md / deck/overnight-time-chart.svg — branch muse/overnight-deck</p>
+  <p>対象コミットは main の 2026-11-07 03:00〜05:23 の14件（＋途中の修正2件）。</p>
+</footer>
+</div>
+</body>
+</html>

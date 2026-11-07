@@ -88,9 +88,27 @@
     width: 68px; height: 68px; border: none; border-radius: 14px; cursor: pointer;
     font-size: 32px; font-weight: bold; color: #fff;
     text-shadow: 0 2px 0 rgba(0,0,0,.3); box-shadow: 0 3px 0 rgba(0,0,0,.2);
-    touch-action: manipulation;
+    touch-action: none;
   }
   .partbtn:active { transform: translateY(3px); box-shadow: none; }
+
+  /* split chooser (opens on long-press of a fused block) */
+  #splitpanel {
+    position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 40;
+    background: #ffffff; border: 3px solid #9fd3f5; border-radius: 16px;
+    padding: 10px 12px; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+  }
+  #splittitle { font-size: 24px; font-weight: bold; color: #1463a3; text-align: center; margin-bottom: 8px; }
+  #splitbtns { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-height: 168px; overflow-y: auto; }
+  .splitbtn {
+    font-size: 24px; font-weight: bold; border: none; border-radius: 12px;
+    padding: 12px 16px; min-height: 56px; cursor: pointer;
+    background: #eaf6ff; color: #1463a3; box-shadow: 0 2px 0 rgba(0,0,0,.12);
+    touch-action: manipulation;
+  }
+  .splitbtn:active { transform: translateY(2px); box-shadow: none; }
+  .splitbtn.orig { background: #ffe9b8; color: #8a5a00; }
+  .splitbtn.cancelbtn { background: #ffd9d9; color: #a33; }
 
   /* celebration stars */
   .star {
@@ -135,7 +153,12 @@
       <button class="bigbtn" id="nextbtn">つぎの おだい</button>
     </div>
   </div>
-  <div id="stage"></div>
+  <div id="stage">
+    <div id="splitpanel">
+      <div id="splittitle">どう わける？</div>
+      <div id="splitbtns"></div>
+    </div>
+  </div>
   <div id="partsbox">
     <div id="partslabel">ぶひんばこ</div>
   </div>
@@ -155,6 +178,8 @@ const reviewEl = document.getElementById("review");
 const recipeEl = document.getElementById("recipe");
 const nextBtn = document.getElementById("nextbtn");
 const undoBtn = document.getElementById("undobtn");
+const splitPanel = document.getElementById("splitpanel");
+const splitBtns = document.getElementById("splitbtns");
 
 const COLORS = {
   1: "#e74c3c", 2: "#e67e22", 3: "#f2b705", 4: "#2ecc71", 5: "#1abc9c",
@@ -302,6 +327,7 @@ function syncUndoBtn() { undoBtn.disabled = history.length === 0; }
 undoBtn.addEventListener("click", () => {
   ensureAudio();
   if (drag || history.length === 0) return;
+  closeSplitChooser();
   const snap = history.pop();
   for (const b of Array.from(blocks.values())) removeBlock(b);
   for (const s of snap) {
@@ -385,21 +411,58 @@ function trySplit(d) {
     return;
   }
   d.splitDone = true;
+  openSplitChooser(b);
+  // the drag is over (the finger may still be down, but its pointerup must
+  // not fuse anything); close it here like the old instant split did
+  if (drag === d) drag = null;
+}
+
+// ---------- split chooser: pick any two numbers, or the original pair ----------
+let splitTarget = null;
+function openSplitChooser(b) {
+  splitTarget = b;
+  splitBtns.innerHTML = "";
+  const n = totalOf(b);
+  const origA = Math.min(totalOf(b.left), totalOf(b.right));
+  for (let a = 1; a <= Math.floor(n / 2); a++) {
+    const btn = document.createElement("button");
+    btn.className = "splitbtn" + (a === origA ? " orig" : "");
+    btn.textContent = a + " と " + (n - a) + (a === origA ? "（もと）" : "");
+    const isOrig = a === origA;
+    btn.addEventListener("click", () => chooseSplit(a, isOrig));
+    splitBtns.appendChild(btn);
+  }
+  const cancel = document.createElement("button");
+  cancel.className = "splitbtn cancelbtn";
+  cancel.textContent = "やめる";
+  cancel.addEventListener("click", closeSplitChooser);
+  splitBtns.appendChild(cancel);
+  splitPanel.style.display = "block";
+  sndPop();
+}
+function closeSplitChooser() {
+  splitPanel.style.display = "none";
+  splitTarget = null;
+}
+function chooseSplit(a, isOrig) {
+  const b = splitTarget;
+  if (!b || !blocks.has(b.id)) { closeSplitChooser(); return; }
+  const n = totalOf(b);
   snapshot();
-  const a = b.left, c = b.right;
-  const sizeA = blockSize(totalOf(a)), sizeC = blockSize(totalOf(c));
+  let A, B;
+  if (isOrig) { A = b.left; B = b.right; }
+  else { A = makeLeaf(a); B = makeLeaf(n - a); }
+  const sizeA = blockSize(totalOf(A)), sizeB = blockSize(totalOf(B));
   const x = b.x, y = b.y;
   removeBlock(b);
-  blocks.set(a.id, a); blocks.set(c.id, c);
-  renderBlock(a); renderBlock(c);
-  placeBlock(a, x - sizeA.w / 2 - 6, y);
-  placeBlock(c, x + sizeC.w / 2 + 6, y);
-  a.el.classList.add("pop"); c.el.classList.add("pop");
+  blocks.set(A.id, A); blocks.set(B.id, B);
+  renderBlock(A); renderBlock(B);
+  placeBlock(A, x - sizeA.w / 2 - 6, y);
+  placeBlock(B, x + sizeB.w / 2 + 6, y);
+  A.el.classList.add("pop"); B.el.classList.add("pop");
+  closeSplitChooser();
   sndSplit();
   updateChallengeInfo();
-  // the dragged element is gone now, so the coming pointerup lands elsewhere
-  // and this drag would never finish; close it here
-  if (drag === d) drag = null;
 }
 
 function rectsNear(b1, b2, pad) {
@@ -408,7 +471,7 @@ function rectsNear(b1, b2, pad) {
            b1.y + s1.h + pad < b2.y || b2.y + s2.h + pad < b1.y);
 }
 
-function tryFuse(b) {
+function tryFuse(b, skipSnapshot) {
   let best = null, bestDist = Infinity;
   for (const other of blocks.values()) {
     if (other === b) continue;
@@ -418,7 +481,8 @@ function tryFuse(b) {
     if (d < bestDist) { bestDist = d; best = other; }
   }
   if (!best) { updateChallengeInfo(); return; }
-  snapshot();
+  if (!skipSnapshot) snapshot();
+  closeSplitChooser();
   const merged = makeFused(b, best);
   const nx = Math.round((b.x + best.x) / 2), ny = Math.round((b.y + best.y) / 2);
   removeBlock(b); removeBlock(best);
@@ -431,14 +495,16 @@ function tryFuse(b) {
   checkChallenge();
 }
 
-// ---------- parts box ----------
+// ---------- parts box (tap to spawn, or drag out to a chosen spot) ----------
 const partsBox = document.getElementById("partsbox");
+let suppressClick = false;
 for (let n = 1; n <= 10; n++) {
   const btn = document.createElement("button");
   btn.className = "partbtn";
   btn.textContent = n;
   btn.style.background = colorOf(n);
   btn.addEventListener("click", () => {
+    if (suppressClick) { suppressClick = false; return; }
     ensureAudio();
     snapshot();
     const b = makeLeaf(n);
@@ -452,6 +518,44 @@ for (let n = 1; n <= 10; n++) {
     updateChallengeInfo();
     checkChallenge();
   });
+  // drag-out: moving the finger 10px+ starts carrying a block that follows
+  // the finger and drops where released (may fuse, like a normal drop)
+  let partDrag = null;
+  btn.addEventListener("pointerdown", (ev) => {
+    ensureAudio();
+    partDrag = { value: n, pid: ev.pointerId, startX: ev.clientX, startY: ev.clientY, block: null };
+    btn.setPointerCapture(ev.pointerId);
+  });
+  btn.addEventListener("pointermove", (ev) => {
+    if (!partDrag || ev.pointerId !== partDrag.pid) return;
+    if (!partDrag.block) {
+      if (Math.abs(ev.clientX - partDrag.startX) < 10 && Math.abs(ev.clientY - partDrag.startY) < 10) return;
+      snapshot();
+      const b = makeLeaf(partDrag.value);
+      blocks.set(b.id, b);
+      renderBlock(b);
+      b.el.style.zIndex = 10;
+      partDrag.block = b;
+    }
+    const srect = stage.getBoundingClientRect();
+    const size = blockSize(partDrag.value);
+    placeBlock(partDrag.block, ev.clientX - srect.left - size.w / 2, ev.clientY - srect.top - size.h / 2);
+  });
+  const endPartDrag = (ev) => {
+    if (!partDrag || ev.pointerId !== partDrag.pid) return;
+    const b = partDrag.block;
+    partDrag = null;
+    if (!b) return; // a plain tap: the click handler spawns as before
+    suppressClick = true;
+    b.el.style.zIndex = "";
+    b.el.classList.add("pop");
+    sndPop();
+    updateChallengeInfo();
+    tryFuse(b, true); // this gesture already took its snapshot at drag start
+    checkChallenge();
+  };
+  btn.addEventListener("pointerup", endPartDrag);
+  btn.addEventListener("pointercancel", endPartDrag);
   partsBox.appendChild(btn);
 }
 
@@ -465,14 +569,29 @@ function biggestTotal() {
   return m;
 }
 function updateChallengeInfo() {
-  if (celebrating || target === null) return;
+  if (celebrating) return;
   const big = biggestTotal();
+  if (target === null) { // free play: show only the biggest number so far
+    challengeSub.textContent = big > 0 ? "いま いちばん おおきいのは " + big : "";
+    return;
+  }
   if (big === 0) { challengeSub.textContent = ""; return; }
   let s = "いま いちばん おおきいのは " + big;
   if (big < target) s += " ・ あと " + (target - big);
   challengeSub.textContent = s;
 }
 function newChallenge() {
+  doneMsg.style.display = "none";
+  reviewEl.style.display = "none";
+  challengeInfo.style.display = "block";
+  if (cap >= 30) { // cap maxed out: free play, no target
+    target = null;
+    challengeText.textContent = "すきな かずを つくって！";
+    ghostEl.style.display = "none";
+    ghostEl.innerHTML = "";
+    updateChallengeInfo();
+    return;
+  }
   let t;
   do { t = 5 + Math.floor(Math.random() * (cap - 4)); } while (t === target); // 5..cap
   target = t;
@@ -485,9 +604,6 @@ function newChallenge() {
     c.className = "gcell";
     ghostEl.appendChild(c);
   }
-  doneMsg.style.display = "none";
-  reviewEl.style.display = "none";
-  challengeInfo.style.display = "block";
   ghostEl.style.display = "grid";
   updateChallengeInfo();
 }
@@ -563,6 +679,12 @@ nextBtn.addEventListener("click", () => {
   ensureAudio();
   reviewEl.style.display = "none";
   celebrating = false;
+  // start the next challenge from an empty stage; the clear is one
+  // undoable step, so the blocks can be brought back with "modosu"
+  if (blocks.size > 0) {
+    snapshot();
+    for (const b of Array.from(blocks.values())) removeBlock(b);
+  }
   sndPop();
   newChallenge();
 });
@@ -571,6 +693,7 @@ nextBtn.addEventListener("click", () => {
 document.getElementById("clearbtn").addEventListener("click", () => {
   ensureAudio();
   if (blocks.size === 0) return;
+  closeSplitChooser();
   snapshot();
   for (const b of Array.from(blocks.values())) removeBlock(b);
   sndSplit();

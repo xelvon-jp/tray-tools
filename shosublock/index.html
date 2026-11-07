@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#fff7e6">
+<meta name="apple-mobile-web-app-title" content="しょうすう">
+<link rel="apple-touch-icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAACnUlEQVR42u3dsS40URiA4dnJdquW6KgVKp24B4neVSi4AApXoZe4B9GpFGoqEjVRUkyz2Ww2M3OOb3fmPE/1JyyZM++ew/r4J78/7xUsU1sCxIE4EAfiQByIA3EgDsSBOEAciANxIA7EgTgQB+JAHIgDxIE4EAfiQByIA3EgDsZmmvFjHd5+r3jr5fF284+rh8/2H3MDH/V0Nsu4aAcvN23e7Xn/fKhxrM5iZJqLTU+kZRbz7xycSK2MtVx1pzISH7W2OMosI/HaU+5xZB+1MoJXIP3uhvVRK8Pe6VvZjZDrSR+zedSeLjYPOwfiQByIA3EgDsSBOBAHxZr0+y817l9n1m7eyV6rF0nvvt5yfcbTrV07B44VRnOs9PhR02hmSJdqOTWY8aepASODdg7EgTgQB+JAHIgDcSAOxIE4QByIA3Hwn0yC5WESDMcKpBwrJsEWmATDsQLiQByIA3EgDsSBOBAH4kAciAPEQUcmwfIwCYZjBVKOFZNgC0yC4VgBcSAOxIE4EAfiQByIA3EgDsQB4qAjk2B5mATDsQIpx4pJsAUmwXCsgDgQB+JAHIgDcSAOCoqj5QuChRjratg5QuV6zTvgtfOkOGweo1+H2roEr0D6kz5m28hwrJTcR+9rT7m7YWXk+ZqjzD4Sr7rfPY4so6qqacaV6jHkUfIXGc2dbjnhEZxFo+ewDyXwrSziQByIA3EgDsSBOBAH4qBcU0uwFh/XR/0euHPxaOdQRv7HimPMZQT3IY6BlRHZhzgQB+JAHIgDcSAOxIE4EAfiAHEgDsSBOBAH4kAciIMOcs2Ox8ygi2N4fYT9doI4BtZH5O+t+Jtg2DkQB+JAHIgDcSAOxIE4EAeIA3EgDsSBOBAH4kAciANxgDgQBwn+ABGp79pYxunyAAAAAElFTkSuQmCC">
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAACnUlEQVR42u3dsS40URiA4dnJdquW6KgVKp24B4neVSi4AApXoZe4B9GpFGoqEjVRUkyz2Ww2M3OOb3fmPE/1JyyZM++ew/r4J78/7xUsU1sCxIE4EAfiQByIA3EgDsSBOEAciANxIA7EgTgQB+JAHIgDxIE4EAfiQByIA3EgDsZmmvFjHd5+r3jr5fF284+rh8/2H3MDH/V0Nsu4aAcvN23e7Xn/fKhxrM5iZJqLTU+kZRbz7xycSK2MtVx1pzISH7W2OMosI/HaU+5xZB+1MoJXIP3uhvVRK8Pe6VvZjZDrSR+zedSeLjYPOwfiQByIA3EgDsSBOBAHxZr0+y817l9n1m7eyV6rF0nvvt5yfcbTrV07B44VRnOs9PhR02hmSJdqOTWY8aepASODdg7EgTgQB+JAHIgDcSAOxIE4QByIA3Hwn0yC5WESDMcKpBwrJsEWmATDsQLiQByIA3EgDsSBOBAH4kAciAPEQUcmwfIwCYZjBVKOFZNgC0yC4VgBcSAOxIE4EAfiQByIA3EgDsQB4qAjk2B5mATDsQIpx4pJsAUmwXCsgDgQB+JAHIgDcSAOCoqj5QuChRjratg5QuV6zTvgtfOkOGweo1+H2roEr0D6kz5m28hwrJTcR+9rT7m7YWXk+ZqjzD4Sr7rfPY4so6qqacaV6jHkUfIXGc2dbjnhEZxFo+ewDyXwrSziQByIA3EgDsSBOBAH4qBcU0uwFh/XR/0euHPxaOdQRv7HimPMZQT3IY6BlRHZhzgQB+JAHIgDcSAOxIE4EAfiAHEgDsSBOBAH4kAciIMOcs2Ox8ygi2N4fYT9doI4BtZH5O+t+Jtg2DkQB+JAHIgDcSAOxIE4EAeIA3EgDsSBOBAH4kAciANxgDgQBwn+ABGp79pYxunyAAAAAElFTkSuQmCC">
+<title>しょうすう ブロック</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%; overflow: hidden; position: fixed; width: 100%;
+    touch-action: manipulation; overscroll-behavior: none;
+    font-family: "Hiragino Maru Gothic ProN", "Hiragino Sans", sans-serif;
+    background: #fff7e6; color: #333; user-select: none; -webkit-user-select: none;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  /* top bar */
+  #topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; background: #ffe9b8; border-bottom: 3px solid #f5c542;
+  }
+  #title { font-size: 26px; font-weight: bold; color: #8a5a00; }
+  .spacer { flex: 1; }
+  .bigbtn {
+    font-size: 22px; font-weight: bold; border: none; border-radius: 14px;
+    padding: 12px 18px; min-height: 56px; min-width: 56px; cursor: pointer;
+    background: #ffffff; color: #555; box-shadow: 0 2px 0 rgba(0,0,0,.15);
+    touch-action: manipulation;
+  }
+  .bigbtn:active { transform: translateY(2px); box-shadow: none; }
+  .bigbtn:disabled { opacity: .4; }
+  #clearbtn { background: #ffd9d9; color: #a33; }
+
+  /* challenge bar with the always-on total */
+  #challengebar {
+    display: flex; align-items: center; justify-content: center; gap: 22px;
+    padding: 10px 16px; background: #eaf6ff; border-bottom: 3px solid #9fd3f5;
+    min-height: 96px;
+  }
+  #challengetext { font-size: 34px; font-weight: bold; color: #1463a3; }
+  #challengesub { font-size: 22px; font-weight: bold; color: #5b8db8; margin-top: 4px; }
+  #totaldisp { font-size: 44px; font-weight: bold; color: #333; background: #fff; border: 3px solid #9fd3f5; border-radius: 14px; padding: 4px 18px; }
+  #donemsg { font-size: 38px; font-weight: bold; color: #e67e22; display: none; }
+
+  /* recipe review */
+  #review { display: none; align-items: center; gap: 12px; }
+  #recipe { display: flex; align-items: center; gap: 10px; }
+  #recipe .op { font-size: 34px; font-weight: bold; color: #1463a3; }
+  #recipe .result { font-size: 44px; font-weight: bold; color: #e67e22; margin-left: 2px; }
+  #recipe .term { display: flex; align-items: center; gap: 7px; }
+  #recipe .termval { font-size: 32px; font-weight: bold; color: #333; }
+  .mini { position: relative; }
+  .mini .cells { display: grid; gap: 1px; }
+  .mini .cell { border-radius: 1px; }
+  #nextbtn { background: #c8f2c8; color: #27632a; display: none; }
+
+  /* play stage */
+  #stage { position: relative; flex: 1; touch-action: none; overflow: hidden; }
+
+  .piece { position: absolute; cursor: grab; touch-action: none; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,.18); }
+  .piece .cells { display: grid; gap: 2px; }
+  .piece .cell { width: 24px; height: 24px; border-radius: 3px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.15), inset 0 2px 0 rgba(255,255,255,.3); }
+  .piece.pop { animation: pop .25s ease-out; }
+  @keyframes pop { 0% { transform: scale(.6); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
+  .piece.wiggle { animation: wiggle .3s ease-in-out; }
+  @keyframes wiggle { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-2.5deg); } 75% { transform: rotate(2.5deg); } }
+
+  /* parts box */
+  #partsbox {
+    display: flex; align-items: center; gap: 14px; justify-content: center;
+    padding: 10px 12px; background: #ffe9b8; border-top: 3px solid #f5c542;
+  }
+  #partslabel { font-size: 20px; font-weight: bold; color: #8a5a00; margin-right: 2px; }
+  .partbtn {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    width: 128px; height: 96px; border: none; border-radius: 14px; cursor: pointer;
+    background: #ffffff; box-shadow: 0 3px 0 rgba(0,0,0,.2); touch-action: none;
+  }
+  .partbtn:active { transform: translateY(3px); box-shadow: none; }
+  .partbtn .pnum { font-size: 26px; font-weight: bold; color: #333; }
+  .partbtn .mini .cell { box-shadow: none; border-radius: 1px; }
+
+  /* celebration stars */
+  .star {
+    position: absolute; font-size: 44px; pointer-events: none; z-index: 50;
+    animation: starfly 1.6s ease-out forwards;
+  }
+  @keyframes starfly {
+    0% { transform: translateY(0) scale(.5) rotate(0deg); opacity: 1; }
+    100% { transform: translateY(-280px) scale(1.3) rotate(160deg); opacity: 0; }
+  }
+
+  /* portrait: shrink so everything stays on screen */
+  @media (orientation: portrait) {
+    #partsbox { flex-wrap: wrap; }
+    .partbtn { width: 104px; height: 84px; }
+    #title { font-size: 21px; }
+    #challengetext { font-size: 27px; }
+    #challengesub { font-size: 18px; }
+    #totaldisp { font-size: 34px; }
+    .bigbtn { font-size: 19px; padding: 10px 12px; }
+    #undolong { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <div id="title">しょうすう ブロック</div>
+    <div class="spacer"></div>
+    <button class="bigbtn" id="undobtn">↩️ <span id="undolong">ひとつ </span>もどす</button>
+    <button class="bigbtn" id="mutebtn">🔊</button>
+    <button class="bigbtn" id="clearbtn">ぜんぶ けす</button>
+  </div>
+  <div id="challengebar">
+    <div id="challengeinfo">
+      <div id="challengetext">おだい</div>
+      <div id="challengesub"></div>
+    </div>
+    <div id="donemsg">できた！🎉</div>
+    <div id="review">
+      <div id="recipe"></div>
+      <button class="bigbtn" id="nextbtn">つぎの おだい</button>
+    </div>
+    <div id="totaldisp">いま 0.00</div>
+  </div>
+  <div id="stage"></div>
+  <div id="partsbox">
+    <div id="partslabel">ぶひんばこ</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---------- basics ----------
+const stage = document.getElementById("stage");
+const challengeBar = document.getElementById("challengebar");
+const challengeInfo = document.getElementById("challengeinfo");
+const challengeText = document.getElementById("challengetext");
+const challengeSub = document.getElementById("challengesub");
+const totalDisp = document.getElementById("totaldisp");
+const doneMsg = document.getElementById("donemsg");
+const reviewEl = document.getElementById("review");
+const recipeEl = document.getElementById("recipe");
+const nextBtn = document.getElementById("nextbtn");
+const undoBtn = document.getElementById("undobtn");
+
+// kinds: value in hundredths, grid shape in cells (cell = 24px, gap = 2px)
+// "one" is a 10x10 plate, "tenth" a 1x10 stick, "hundredth" a single square,
+// so ten of a kind tile the next unit exactly (area is conserved visually)
+const KINDS = {
+  one:       { value: 100, cols: 10, rows: 10, color: "#3498db", next: null },
+  tenth:     { value: 10,  cols: 1,  rows: 10, color: "#2ecc71", next: "one" },
+  hundredth: { value: 1,   cols: 1,  rows: 1,  color: "#e67e22", next: "tenth" }
+};
+const KIND_ORDER = ["one", "tenth", "hundredth"];
+const CELL = 24, GAP = 2, PITCH = CELL + GAP;
+
+function pieceSize(kind) {
+  const k = KINDS[kind];
+  return { w: k.cols * CELL + (k.cols - 1) * GAP, h: k.rows * CELL + (k.rows - 1) * GAP };
+}
+// amounts are integer hundredths everywhere (no float errors)
+function fmt2(h) { return Math.floor(h / 100) + "." + String(h % 100).padStart(2, "0"); }
+function fmtTrim(h) {
+  const w = Math.floor(h / 100), f = h % 100;
+  if (f === 0) return String(w);
+  if (f % 10 === 0) return w + "." + (f / 10);
+  return w + "." + String(f).padStart(2, "0");
+}
+
+// ---------- sound (WebAudio, quiet, mutable) ----------
+let audioCtx = null, masterGain = null, muted = false;
+function ensureAudio() {
+  if (audioCtx) { if (audioCtx.state === "suspended") audioCtx.resume(); return; }
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.12;
+    masterGain.connect(audioCtx.destination);
+  } catch (e) { audioCtx = null; }
+}
+function tone(freq, startIn, dur) {
+  if (!audioCtx || muted) return;
+  const t0 = audioCtx.currentTime + startIn;
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = "sine"; osc.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(1, t0 + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(masterGain);
+  osc.start(t0); osc.stop(t0 + dur + 0.05);
+}
+const sndPop = () => tone(520, 0, 0.12);
+const sndCarry = () => { tone(659, 0, 0.13); tone(988, 0.08, 0.2); };
+const sndBreak = () => { tone(784, 0, 0.12); tone(523, 0.07, 0.18); };
+const sndDone = () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, i * 0.11, 0.25)); };
+
+// ---------- piece model ----------
+// piece = { id, kind, x, y, el }
+let nextId = 1;
+const blocks = new Map();
+function makePiece(kind) { return { id: nextId++, kind, x: 0, y: 0, el: null }; }
+function totalHundredths() {
+  let s = 0;
+  for (const p of blocks.values()) s += KINDS[p.kind].value;
+  return s;
+}
+function countKind(kind) {
+  let c = 0;
+  for (const p of blocks.values()) if (p.kind === kind) c++;
+  return c;
+}
+
+// build the cell grid for a kind at any cell size (stage pieces and minis)
+function buildCellsEl(kind, cell, gap) {
+  const k = KINDS[kind];
+  const cells = document.createElement("div");
+  cells.className = "cells";
+  cells.style.display = "grid";
+  cells.style.gap = gap + "px";
+  cells.style.gridTemplateColumns = "repeat(" + k.cols + ", " + cell + "px)";
+  const n = k.cols * k.rows;
+  for (let i = 0; i < n; i++) {
+    const c = document.createElement("div");
+    c.className = "cell";
+    c.style.width = cell + "px"; c.style.height = cell + "px";
+    c.style.background = k.color;
+    cells.appendChild(c);
+  }
+  return cells;
+}
+
+function renderPiece(p) {
+  const el = document.createElement("div");
+  el.className = "piece piece-" + p.kind;
+  el.dataset.kind = p.kind;
+  el.style.left = p.x + "px"; el.style.top = p.y + "px";
+  el.appendChild(buildCellsEl(p.kind, CELL, GAP));
+  p.el = el;
+  stage.appendChild(el);
+  attachPointer(p);
+  return el;
+}
+function removePiece(p) {
+  if (p.el) p.el.remove();
+  blocks.delete(p.id);
+}
+function placePiece(p, x, y) {
+  const size = pieceSize(p.kind);
+  const maxX = Math.max(0, stage.clientWidth - size.w);
+  const maxY = Math.max(0, stage.clientHeight - size.h);
+  p.x = Math.min(Math.max(0, x), maxX);
+  p.y = Math.min(Math.max(0, y), maxY);
+  if (p.el) { p.el.style.left = p.x + "px"; p.el.style.top = p.y + "px"; }
+}
+
+// ---------- undo (snapshots of all pieces, max 20) ----------
+const history = [];
+function snapshot() {
+  history.push(Array.from(blocks.values(), (p) => ({ k: p.kind, x: Math.round(p.x), y: Math.round(p.y) })));
+  if (history.length > 20) history.shift();
+  syncUndoBtn();
+}
+function syncUndoBtn() { undoBtn.disabled = history.length === 0; }
+undoBtn.addEventListener("click", () => {
+  ensureAudio();
+  if (drag || history.length === 0) return;
+  const snap = history.pop();
+  for (const p of Array.from(blocks.values())) removePiece(p);
+  for (const s of snap) {
+    const p = makePiece(s.k);
+    blocks.set(p.id, p);
+    renderPiece(p);
+    placePiece(p, s.x, s.y);
+  }
+  syncUndoBtn();
+  refreshInfo();
+  sndBreak();
+});
+
+// ---------- spawn positions ----------
+// prefer a spot tiling right next to a same-kind piece, so tap-spawned
+// pieces gather into one cluster (which is what makes the carry fire)
+function overlapsAny(x, y, w, h, pad, ignoreId) {
+  for (const o of blocks.values()) {
+    if (o.id === ignoreId) continue;
+    const s = pieceSize(o.kind);
+    if (!(x + w + pad < o.x || o.x + s.w + pad < x || y + h + pad < o.y || o.y + s.h + pad < y)) return true;
+  }
+  return false;
+}
+function findSpawnPos(kind) {
+  const size = pieceSize(kind);
+  const maxX = Math.max(0, stage.clientWidth - size.w);
+  const maxY = Math.max(0, stage.clientHeight - size.h);
+  for (const o of blocks.values()) {
+    if (o.kind !== kind) continue;
+    const os = pieceSize(o.kind);
+    const cand = [
+      { x: o.x + os.w + 4, y: o.y }, { x: o.x, y: o.y + os.h + 4 },
+      { x: o.x - size.w - 4, y: o.y }, { x: o.x, y: o.y - size.h - 4 }
+    ];
+    for (const c of cand) {
+      if (c.x < 0 || c.y < 0 || c.x > maxX || c.y > maxY) continue;
+      if (!overlapsAny(c.x, c.y, size.w, size.h, 2, -1)) return c;
+    }
+  }
+  for (let i = 0; i < 40; i++) {
+    const x = Math.random() * maxX;
+    const y = Math.random() * Math.min(maxY, 220);
+    if (!overlapsAny(x, y, size.w, size.h, 10, -1)) return { x, y };
+  }
+  for (let y = 8; y <= maxY; y += 26) {
+    for (let x = 8; x <= maxX; x += 26) {
+      if (!overlapsAny(x, y, size.w, size.h, 10, -1)) return { x, y };
+    }
+  }
+  const k = blocks.size;
+  return { x: (30 + k * 37) % Math.max(1, maxX), y: (20 + k * 53) % Math.max(1, maxY) };
+}
+
+// ---------- carry-up: 10 of a kind gathered together become the next unit ----------
+function rectNear(a, b, pad) {
+  const sa = pieceSize(a.kind), sb = pieceSize(b.kind);
+  return !(a.x + sa.w + pad < b.x || b.x + sb.w + pad < a.x ||
+           a.y + sa.h + pad < b.y || b.y + sb.h + pad < a.y);
+}
+function clusterOf(start) {
+  const seen = new Set([start.id]);
+  const queue = [start];
+  const out = [start];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const o of blocks.values()) {
+      if (o.kind !== start.kind || seen.has(o.id)) continue;
+      if (rectNear(cur, o, 12)) { seen.add(o.id); queue.push(o); out.push(o); }
+    }
+  }
+  const cx = start.x, cy = start.y;
+  out.sort((p, q) => ((p.x - cx) ** 2 + (p.y - cy) ** 2) - ((q.x - cx) ** 2 + (q.y - cy) ** 2));
+  return out;
+}
+function convertTen(ten, kind) {
+  const nextKind = KINDS[kind].next;
+  let cx = 0, cy = 0;
+  for (const p of ten) { const s = pieceSize(p.kind); cx += p.x + s.w / 2; cy += p.y + s.h / 2; }
+  cx /= ten.length; cy /= ten.length;
+  for (const p of ten) {
+    blocks.delete(p.id);
+    const el = p.el, s = pieceSize(p.kind);
+    const dx = cx - (p.x + s.w / 2), dy = cy - (p.y + s.h / 2);
+    el.classList.add("dying");
+    el.style.pointerEvents = "none";
+    el.style.zIndex = 30;
+    if (el.animate) {
+      el.animate([
+        { transform: "translate(0px, 0px) scale(1)", opacity: 1 },
+        { transform: "translate(" + dx + "px, " + dy + "px) scale(0.15)", opacity: 0.3 }
+      ], { duration: 260, easing: "ease-in" });
+    }
+    const dying = el;
+    setTimeout(() => dying.remove(), 300);
+  }
+  const np = makePiece(nextKind);
+  blocks.set(np.id, np);
+  renderPiece(np);
+  const ns = pieceSize(nextKind);
+  placePiece(np, cx - ns.w / 2, cy - ns.h / 2);
+  np.el.classList.add("pop");
+  sndCarry();
+  return np;
+}
+// after a piece arrives, convert any full cluster of 10 it belongs to;
+// a conversion can complete the next kind's cluster too (chain), and the
+// whole cascade is a single undo step
+function carryFrom(start) {
+  if (!start || !KINDS[start.kind].next) return;
+  let pivot = start, snapshotted = false;
+  while (pivot && blocks.has(pivot.id) && KINDS[pivot.kind].next) {
+    const cluster = clusterOf(pivot);
+    if (cluster.length < 10) break;
+    if (!snapshotted) { snapshot(); snapshotted = true; }
+    pivot = convertTen(cluster.slice(0, 10), pivot.kind);
+  }
+  if (snapshotted) refreshInfo();
+}
+
+// ---------- break apart (long-press): 1 -> ten 0.1, 0.1 -> ten 0.01 ----------
+// the ten children tile the parent's exact footprint, so the area is
+// visibly the same before and after
+function breakApart(p) {
+  const childKind = p.kind === "one" ? "tenth" : p.kind === "tenth" ? "hundredth" : null;
+  if (!childKind) { // a single square cannot break; just wiggle
+    p.el.classList.remove("wiggle"); void p.el.offsetWidth; p.el.classList.add("wiggle");
+    return;
+  }
+  snapshot();
+  const x = p.x, y = p.y;
+  removePiece(p);
+  for (let i = 0; i < 10; i++) {
+    const c = makePiece(childKind);
+    blocks.set(c.id, c);
+    renderPiece(c);
+    if (childKind === "tenth") placePiece(c, x + i * PITCH, y);
+    else placePiece(c, x, y + i * PITCH);
+    c.el.classList.add("pop");
+  }
+  sndBreak();
+  refreshInfo();
+}
+
+// ---------- drag / long-press ----------
+let drag = null;
+function attachPointer(p) {
+  p.el.addEventListener("pointerdown", (ev) => {
+    ensureAudio();
+    if (!blocks.has(p.id)) return;
+    ev.preventDefault();
+    const rect = p.el.getBoundingClientRect();
+    drag = {
+      piece: p, dx: ev.clientX - rect.left, dy: ev.clientY - rect.top,
+      startX: ev.clientX, startY: ev.clientY, moved: false, broke: false,
+      timer: setTimeout(() => {
+        if (!drag || drag.piece !== p || drag.moved) return;
+        drag.broke = true;
+        breakApart(p);
+        // the dragged element may be gone now, so this drag never gets its
+        // pointerup; close it here (same lesson as kazublock)
+        if (drag && drag.piece === p) drag = null;
+      }, 600)
+    };
+    p.el.setPointerCapture(ev.pointerId);
+    p.el.style.zIndex = 10;
+  });
+  p.el.addEventListener("pointermove", (ev) => {
+    if (!drag || drag.piece !== p || drag.broke) return;
+    const srect = stage.getBoundingClientRect();
+    if (Math.abs(ev.clientX - drag.startX) > 12 || Math.abs(ev.clientY - drag.startY) > 12) {
+      drag.moved = true;
+      clearTimeout(drag.timer);
+    }
+    placePiece(p, ev.clientX - srect.left - drag.dx, ev.clientY - srect.top - drag.dy);
+  });
+  const finish = (ev) => {
+    if (!drag || drag.piece !== p) return;
+    clearTimeout(drag.timer);
+    const wasBroke = drag.broke;
+    drag = null;
+    p.el.style.zIndex = "";
+    if (!wasBroke) { carryFrom(p); refreshInfo(); checkChallenge(); }
+  };
+  p.el.addEventListener("pointerup", finish);
+  p.el.addEventListener("pointercancel", finish);
+}
+
+// ---------- parts box (tap to spawn, or drag out to a chosen spot) ----------
+const partsBox = document.getElementById("partsbox");
+let suppressClick = false;
+for (const kind of KIND_ORDER) {
+  const btn = document.createElement("button");
+  btn.className = "partbtn";
+  btn.dataset.kind = kind;
+  const mini = document.createElement("div");
+  mini.className = "mini";
+  mini.appendChild(buildCellsEl(kind, 4, 1));
+  const label = document.createElement("div");
+  label.className = "pnum";
+  label.textContent = fmtTrim(KINDS[kind].value);
+  btn.appendChild(mini);
+  btn.appendChild(label);
+  btn.addEventListener("click", () => {
+    if (suppressClick) { suppressClick = false; return; }
+    ensureAudio();
+    snapshot();
+    const p = makePiece(kind);
+    blocks.set(p.id, p);
+    renderPiece(p);
+    const pos = findSpawnPos(kind);
+    placePiece(p, pos.x, pos.y);
+    p.el.classList.add("pop");
+    sndPop();
+    carryFrom(p);
+    refreshInfo();
+    checkChallenge();
+  });
+  let partDrag = null;
+  btn.addEventListener("pointerdown", (ev) => {
+    ensureAudio();
+    partDrag = { kind, pid: ev.pointerId, startX: ev.clientX, startY: ev.clientY, piece: null };
+    btn.setPointerCapture(ev.pointerId);
+  });
+  btn.addEventListener("pointermove", (ev) => {
+    if (!partDrag || ev.pointerId !== partDrag.pid) return;
+    if (!partDrag.piece) {
+      if (Math.abs(ev.clientX - partDrag.startX) < 10 && Math.abs(ev.clientY - partDrag.startY) < 10) return;
+      snapshot();
+      const p = makePiece(partDrag.kind);
+      blocks.set(p.id, p);
+      renderPiece(p);
+      p.el.style.zIndex = 10;
+      partDrag.piece = p;
+    }
+    const srect = stage.getBoundingClientRect();
+    const size = pieceSize(partDrag.kind);
+    placePiece(partDrag.piece, ev.clientX - srect.left - size.w / 2, ev.clientY - srect.top - size.h / 2);
+  });
+  const endPartDrag = (ev) => {
+    if (!partDrag || ev.pointerId !== partDrag.pid) return;
+    const p = partDrag.piece;
+    partDrag = null;
+    if (!p) return; // a plain tap: the click handler spawns as before
+    suppressClick = true;
+    p.el.style.zIndex = "";
+    p.el.classList.add("pop");
+    sndPop();
+    carryFrom(p);
+    refreshInfo();
+    checkChallenge();
+  };
+  btn.addEventListener("pointerup", endPartDrag);
+  btn.addEventListener("pointercancel", endPartDrag);
+  partsBox.appendChild(btn);
+}
+
+// ---------- total + challenge ----------
+let target = null; // in hundredths
+let celebrating = false;
+function refreshInfo() {
+  const total = totalHundredths();
+  totalDisp.textContent = "いま " + fmt2(total);
+  if (celebrating || target === null) return;
+  challengeSub.textContent = total < target ? "あと " + fmtTrim(target - total) : "";
+}
+function newChallenge() {
+  let t;
+  do { t = 5 + Math.floor(Math.random() * 95); } while (t === target); // 0.05..0.99
+  target = t;
+  challengeText.textContent = fmtTrim(target) + "を つくって！";
+  doneMsg.style.display = "none";
+  reviewEl.style.display = "none";
+  challengeInfo.style.display = "block";
+  totalDisp.style.display = "block";
+  refreshInfo();
+}
+function checkChallenge() {
+  if (celebrating || target === null) return;
+  if (totalHundredths() === target) celebrate();
+}
+function celebrate() {
+  celebrating = true;
+  sndDone();
+  doneMsg.style.display = "block";
+  challengeInfo.style.display = "none";
+  const marks = ["⭐", "🎈", "✨", "🌟", "🎉"];
+  for (let i = 0; i < 14; i++) {
+    const s = document.createElement("div");
+    s.className = "star";
+    s.textContent = marks[i % marks.length];
+    s.style.left = (8 + Math.random() * 84) + "%";
+    s.style.top = (55 + Math.random() * 30) + "%";
+    s.style.animationDelay = (Math.random() * 0.4) + "s";
+    stage.appendChild(s);
+    setTimeout(() => s.remove(), 2400);
+  }
+  setTimeout(showReview, 1900);
+}
+// recipe: one term per kind present, e.g. "0.3 + 0.07 = 0.37",
+// each term drawn as that kind's piece next to its value
+function showReview() {
+  doneMsg.style.display = "none";
+  recipeEl.innerHTML = "";
+  let first = true;
+  for (const kind of KIND_ORDER) {
+    const c = countKind(kind);
+    if (c === 0) continue;
+    if (!first) {
+      const op = document.createElement("div");
+      op.className = "op"; op.textContent = "＋";
+      recipeEl.appendChild(op);
+    }
+    first = false;
+    const term = document.createElement("div");
+    term.className = "term";
+    const mini = document.createElement("div");
+    mini.className = "mini";
+    mini.appendChild(buildCellsEl(kind, 3, 1));
+    const val = document.createElement("div");
+    val.className = "termval";
+    val.textContent = fmtTrim(c * KINDS[kind].value);
+    term.appendChild(mini);
+    term.appendChild(val);
+    recipeEl.appendChild(term);
+  }
+  const eq = document.createElement("div");
+  eq.className = "op"; eq.textContent = "＝";
+  recipeEl.appendChild(eq);
+  const res = document.createElement("div");
+  res.className = "result"; res.textContent = fmtTrim(target);
+  recipeEl.appendChild(res);
+  nextBtn.style.display = "none";
+  reviewEl.style.display = "flex";
+  setTimeout(() => { nextBtn.style.display = "inline-block"; }, 2500);
+}
+nextBtn.addEventListener("click", () => {
+  ensureAudio();
+  reviewEl.style.display = "none";
+  celebrating = false;
+  // the next challenge starts from an empty stage; the clear is one
+  // undoable step, so the pieces can be brought back with "modosu"
+  if (blocks.size > 0) {
+    snapshot();
+    for (const p of Array.from(blocks.values())) removePiece(p);
+  }
+  sndPop();
+  newChallenge();
+});
+
+// ---------- top bar buttons ----------
+document.getElementById("clearbtn").addEventListener("click", () => {
+  ensureAudio();
+  if (blocks.size === 0) return;
+  snapshot();
+  for (const p of Array.from(blocks.values())) removePiece(p);
+  sndBreak();
+  refreshInfo();
+});
+document.getElementById("mutebtn").addEventListener("click", (ev) => {
+  ensureAudio();
+  muted = !muted;
+  ev.currentTarget.textContent = muted ? "🔇" : "🔊";
+});
+
+// keep the stage free of scroll/zoom gestures
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+document.addEventListener("gesturestart", (e) => e.preventDefault());
+
+syncUndoBtn();
+newChallenge();
+</script>
+</body>
+</html>

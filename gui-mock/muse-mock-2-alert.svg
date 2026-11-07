@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
+<rect x="4" y="4" width="892" height="552" rx="18" fill="#171c26" stroke="#7a4a2f" stroke-width="2"/>
+<text x="28" y="42" font-size="17" fill="#c9a184">連携パネル（イメージ）異常時</text>
+<text x="872" y="42" font-size="17" fill="#c9a184" text-anchor="end">15:21</text>
+
+<!-- banner: who waits -->
+<rect x="24" y="58" width="852" height="86" rx="12" fill="#4a2417" stroke="#c96a2f" stroke-width="2"/>
+<text x="48" y="100" font-size="31" font-weight="bold" fill="#ffe3cf">いま：承認待ち ― カードが PC に出ていません</text>
+<text x="48" y="130" font-size="17" fill="#e8b98f">38秒経過。Muse は承認を待って止まっています</text>
+
+<!-- Muse row -->
+<circle cx="52" cy="186" r="11" fill="#f0a13c"/>
+<text x="78" y="195" font-size="23" font-weight="bold" fill="#eef2f8">Muse</text>
+<rect x="168" y="168" width="104" height="34" rx="17" fill="#5c3a1e"/>
+<text x="220" y="191" font-size="17" fill="#ffd9a8" text-anchor="middle">承認待ち</text>
+<text x="288" y="195" font-size="17" fill="#c7d2e4">tray-tools / main（3ファイル）</text>
+<text x="876" y="195" font-size="17" fill="#c9a184" text-anchor="end">経過 00:38</text>
+
+<!-- flow arrow (blocked) -->
+<line x1="52" y1="216" x2="52" y2="252" stroke="#e05252" stroke-width="4" stroke-dasharray="6 6"/>
+<line x1="42" y1="238" x2="62" y2="258" stroke="#e05252" stroke-width="5"/>
+<line x1="62" y1="238" x2="42" y2="258" stroke="#e05252" stroke-width="5"/>
+<text x="78" y="246" font-size="17" fill="#f0b1b1">流れ：止まっています（カード未表示）</text>
+
+<!-- Claude row -->
+<circle cx="52" cy="292" r="11" fill="#f0a13c"/>
+<text x="78" y="301" font-size="23" font-weight="bold" fill="#eef2f8">Claude</text>
+<rect x="180" y="274" width="110" height="34" rx="17" fill="#23405c"/>
+<text x="235" y="297" font-size="17" fill="#bcd8f5" text-anchor="middle">監視中</text>
+<text x="306" y="297" font-size="17" fill="#f0b1b1">カード表示：なし</text>
+<text x="876" y="301" font-size="17" fill="#8fa1bd" text-anchor="end">生存確認 5秒前</text>
+
+<!-- widgets -->
+<rect x="24" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#7a4a2f"/>
+<circle cx="76" cy="382" r="30" fill="none" stroke="#2c3648" stroke-width="9"/>
+<circle cx="76" cy="382" r="30" fill="none" stroke="#e05252" stroke-width="9" stroke-dasharray="188 188" transform="rotate(-90 76 382)" stroke-linecap="round"/>
+<text x="122" y="376" font-size="17" fill="#c7d2e4">承認ストップウォッチ</text>
+<text x="122" y="404" font-size="21" font-weight="bold" fill="#f0b1b1">38秒（目標10秒）</text>
+
+<rect x="314" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#39445c"/>
+<text x="338" y="368" font-size="17" fill="#c7d2e4">郵便受け</text>
+<text x="338" y="398" font-size="21" font-weight="bold" fill="#f0a13c">未ack 1件</text>
+<text x="338" y="426" font-size="15" fill="#8fa1bd">最古 3分</text>
+
+<rect x="604" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#39445c"/>
+<text x="628" y="368" font-size="17" fill="#c7d2e4">考えられる対処</text>
+<text x="628" y="398" font-size="18" font-weight="bold" fill="#eef2f8">チャット欄への入力で</text>
+<text x="628" y="424" font-size="18" font-weight="bold" fill="#eef2f8">カードが出る場合があります</text>
+
+<!-- history tape -->
+<rect x="24" y="464" width="852" height="72" rx="12" fill="#12161f"/>
+<text x="44" y="492" font-size="15" fill="#8fa1bd">15:20　合図を受信</text>
+<text x="44" y="518" font-size="15" fill="#8fa1bd">15:20　カード待ち開始　／　15:21　つつき送信（入力で表示を促す）</text>
+</svg>

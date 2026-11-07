@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
+  <rect x="4" y="4" width="892" height="552" rx="18" fill="#171c26" stroke="#39445c" stroke-width="2"/>
+  <text x="28" y="42" font-size="17" fill="#8fa1bd">連携パネル（イメージ）平常時</text>
+  <text x="872" y="42" font-size="17" fill="#8fa1bd" text-anchor="end">15:12</text>
+
+  <!-- banner: who waits -->
+  <rect x="24" y="58" width="852" height="86" rx="12" fill="#1d3a2a" stroke="#2f7a4d" stroke-width="2"/>
+  <text x="48" y="100" font-size="31" font-weight="bold" fill="#d9f5e3">いま：Muse が作業中</text>
+  <text x="48" y="130" font-size="17" fill="#a9cbb6">しょうすうブロックの検証テストを実行しています（経過 2分31秒）</text>
+
+  <!-- Muse row -->
+  <circle cx="52" cy="186" r="11" fill="#3fce7c"/>
+  <text x="78" y="195" font-size="23" font-weight="bold" fill="#eef2f8">Muse</text>
+  <rect x="168" y="168" width="86" height="34" rx="17" fill="#23405c"/>
+  <text x="211" y="191" font-size="17" fill="#bcd8f5" text-anchor="middle">処理中</text>
+  <text x="876" y="195" font-size="17" fill="#8fa1bd" text-anchor="end">最終活動 12秒前</text>
+
+  <!-- flow arrow -->
+  <line x1="52" y1="216" x2="52" y2="252" stroke="#3fce7c" stroke-width="4"/>
+  <polygon points="52,264 44,248 60,248" fill="#3fce7c"/>
+  <text x="78" y="246" font-size="17" fill="#a9cbb6">流れ：なし（通常）</text>
+
+  <!-- Claude row -->
+  <circle cx="52" cy="292" r="11" fill="#3fce7c"/>
+  <text x="78" y="301" font-size="23" font-weight="bold" fill="#eef2f8">Claude</text>
+  <rect x="180" y="274" width="110" height="34" rx="17" fill="#23405c"/>
+  <text x="235" y="297" font-size="17" fill="#bcd8f5" text-anchor="middle">監視中</text>
+  <text x="306" y="297" font-size="17" fill="#c7d2e4">自動承認：有効</text>
+  <text x="876" y="301" font-size="17" fill="#8fa1bd" text-anchor="end">生存確認 8秒前</text>
+
+  <!-- widgets -->
+  <rect x="24" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#39445c"/>
+  <circle cx="76" cy="382" r="30" fill="none" stroke="#2c3648" stroke-width="9"/>
+  <circle cx="76" cy="382" r="30" fill="none" stroke="#3fce7c" stroke-width="9" stroke-dasharray="113 188" transform="rotate(-90 76 382)" stroke-linecap="round"/>
+  <text x="122" y="376" font-size="17" fill="#c7d2e4">直近の承認</text>
+  <text x="122" y="404" font-size="21" font-weight="bold" fill="#eef2f8">6.2秒（目標10秒）</text>
+
+  <rect x="314" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#39445c"/>
+  <text x="338" y="368" font-size="17" fill="#c7d2e4">郵便受け</text>
+  <text x="338" y="398" font-size="21" font-weight="bold" fill="#3fce7c">未ack 0件</text>
+  <text x="338" y="426" font-size="15" fill="#8fa1bd">最終ack 15:12（0.8秒）</text>
+
+  <rect x="604" y="330" width="272" height="118" rx="12" fill="#1d2432" stroke="#39445c"/>
+  <text x="628" y="368" font-size="17" fill="#c7d2e4">誰が誰を待っているか</text>
+  <text x="628" y="398" font-size="21" font-weight="bold" fill="#eef2f8">待ち：なし</text>
+  <text x="628" y="426" font-size="15" fill="#8fa1bd">両方とも動けます</text>
+
+  <!-- history tape -->
+  <rect x="24" y="464" width="852" height="72" rx="12" fill="#12161f"/>
+  <text x="44" y="492" font-size="15" fill="#8fa1bd">15:12　ack mb-…-02（0.8秒）</text>
+  <text x="44" y="518" font-size="15" fill="#8fa1bd">14:58　push を自動承認（5.5秒）　／　14:41　郵便受けに request 着信</text>
+</svg>

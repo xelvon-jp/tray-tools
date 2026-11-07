@@ -55,7 +55,7 @@
   #recipe .result { font-size: 44px; font-weight: bold; color: #e67e22; margin-left: 2px; }
   .mini { position: relative; }
   .mini .cells { display: grid; gap: 2px; }
-  .mini .cell { border-radius: 3px; box-shadow: inset 0 -2px 0 rgba(0,0,0,.18), inset 0 2px 0 rgba(255,255,255,.35); }
+  .mini .cell { border-radius: 5px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.18), inset 0 2px 0 rgba(255,255,255,.35); }
   .mini .num {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     font-weight: bold; color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,.35); pointer-events: none;
@@ -110,6 +110,7 @@
     #challengetext { font-size: 27px; }
     #challengesub { font-size: 18px; }
     .bigbtn { font-size: 19px; padding: 10px 12px; }
+    #undolong { display: none; }
   }
 </style>
 </head>
@@ -118,7 +119,7 @@
   <div id="topbar">
     <div id="title">かずブロック けんきゅうじょ</div>
     <div class="spacer"></div>
-    <button class="bigbtn" id="undobtn">↩️ ひとつ もどす</button>
+    <button class="bigbtn" id="undobtn">↩️ <span id="undolong">ひとつ </span>もどす</button>
     <button class="bigbtn" id="mutebtn">🔊</button>
     <button class="bigbtn" id="clearbtn">ぜんぶ けす</button>
   </div>
@@ -144,6 +145,7 @@
 "use strict";
 // ---------- basics ----------
 const stage = document.getElementById("stage");
+const challengeBar = document.getElementById("challengebar");
 const ghostEl = document.getElementById("ghost");
 const challengeInfo = document.getElementById("challengeinfo");
 const challengeText = document.getElementById("challengetext");
@@ -395,6 +397,9 @@ function trySplit(d) {
   a.el.classList.add("pop"); c.el.classList.add("pop");
   sndSplit();
   updateChallengeInfo();
+  // the dragged element is gone now, so the coming pointerup lands elsewhere
+  // and this drag would never finish; close it here
+  if (drag === d) drag = null;
 }
 
 function rectsNear(b1, b2, pad) {
@@ -482,8 +487,8 @@ function newChallenge() {
   }
   doneMsg.style.display = "none";
   reviewEl.style.display = "none";
-  challengeInfo.style.display = "";
-  ghostEl.style.display = "";
+  challengeInfo.style.display = "block";
+  ghostEl.style.display = "grid";
   updateChallengeInfo();
 }
 let celebrating = false;
@@ -498,7 +503,7 @@ function celebrate(winBlock) {
   streak++;
   if (streak % 3 === 0 && cap < 30) cap += 3;
   sndDone();
-  doneMsg.style.display = "";
+  doneMsg.style.display = "block";
   challengeInfo.style.display = "none";
   ghostEl.style.display = "none";
   const marks = ["⭐", "🎈", "✨", "🌟", "🎉"];
@@ -515,19 +520,32 @@ function celebrate(winBlock) {
   setTimeout(() => showReview(winBlock), 1900);
 }
 
+// recipe cell size: about 28px, shrunk only when the parts cannot fit
+function recipeCell(parts) {
+  const avail = Math.max(200, challengeBar.clientWidth - 430);
+  let colsSum = 0, gapSum = 0;
+  for (const p of parts) {
+    const c = colsFor(totalOf(p));
+    colsSum += c; gapSum += (c - 1) * 2;
+  }
+  const cell = Math.floor((avail - gapSum) / Math.max(1, colsSum));
+  return Math.max(14, Math.min(28, cell));
+}
+
 // show how the winning block was built: "5 + 7 = 12" in block pictures,
 // no evaluative words; the next-challenge button appears a few seconds later
 function showReview(winBlock) {
   doneMsg.style.display = "none";
   recipeEl.innerHTML = "";
   const parts = winBlock.leaf !== null ? [winBlock] : [winBlock.left, winBlock.right];
+  const cell = recipeCell(parts);
   parts.forEach((p, i) => {
     if (i > 0) {
       const op = document.createElement("div");
       op.className = "op"; op.textContent = "＋";
       recipeEl.appendChild(op);
     }
-    const mini = buildBlockEl(p, 16, 2);
+    const mini = buildBlockEl(p, cell, 2);
     mini.className = "mini";
     recipeEl.appendChild(mini);
   });
@@ -539,7 +557,7 @@ function showReview(winBlock) {
   recipeEl.appendChild(res);
   nextBtn.style.display = "none";
   reviewEl.style.display = "flex";
-  setTimeout(() => { nextBtn.style.display = ""; }, 2500);
+  setTimeout(() => { nextBtn.style.display = "inline-block"; }, 2500);
 }
 nextBtn.addEventListener("click", () => {
   ensureAudio();

@@ -21,16 +21,16 @@
 
   /* top bar */
   #topbar {
-    display: flex; align-items: center; gap: 12px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
     padding: 8px 14px; background: #ffe9b8; border-bottom: 3px solid #f5c542;
   }
-  #title { font-size: 26px; font-weight: bold; color: #8a5a00; }
+  #title { font-size: 26px; font-weight: bold; color: #8a5a00; white-space: nowrap; }
   .spacer { flex: 1; }
   .bigbtn {
     font-size: 22px; font-weight: bold; border: none; border-radius: 14px;
     padding: 12px 18px; min-height: 56px; min-width: 56px; cursor: pointer;
     background: #ffffff; color: #555; box-shadow: 0 2px 0 rgba(0,0,0,.15);
-    touch-action: manipulation;
+    touch-action: manipulation; white-space: nowrap; flex: none;
   }
   .bigbtn:active { transform: translateY(2px); box-shadow: none; }
   .bigbtn:disabled { opacity: .4; }
@@ -38,18 +38,20 @@
 
   /* challenge bar with the always-on total */
   #challengebar {
-    display: flex; align-items: center; justify-content: center; gap: 22px;
+    display: flex; align-items: center; justify-content: center; gap: 14px 22px;
+    flex-wrap: wrap;
     padding: 10px 16px; background: #eaf6ff; border-bottom: 3px solid #9fd3f5;
     min-height: 96px;
   }
   #challengetext { font-size: 34px; font-weight: bold; color: #1463a3; }
   #challengesub { font-size: 22px; font-weight: bold; color: #5b8db8; margin-top: 4px; }
-  #totaldisp { font-size: 44px; font-weight: bold; color: #333; background: #fff; border: 3px solid #9fd3f5; border-radius: 14px; padding: 4px 18px; }
+  #totaldisp { font-size: 44px; font-weight: bold; color: #333; background: #fff; border: 3px solid #9fd3f5; border-radius: 14px; padding: 4px 18px; flex: none; white-space: nowrap; }
   #donemsg { font-size: 38px; font-weight: bold; color: #e67e22; display: none; }
 
   /* recipe review */
-  #review { display: none; align-items: center; gap: 12px; }
-  #recipe { display: flex; align-items: center; gap: 10px; }
+  #review { display: none; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; max-width: 100%; }
+  #recipe { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  #recipe .eqline { font-size: 40px; }
   #recipe .op { font-size: 34px; font-weight: bold; color: #1463a3; }
   #recipe .result { font-size: 44px; font-weight: bold; color: #e67e22; margin-left: 2px; }
   #recipe .term { display: flex; align-items: center; gap: 7px; }
@@ -110,16 +112,23 @@
     100% { transform: translateY(-280px) scale(1.3) rotate(160deg); opacity: 0; }
   }
 
-  /* portrait: shrink so everything stays on screen */
+  /* portrait: shrink and wrap so everything stays on screen */
   @media (orientation: portrait) {
     #partsbox { flex-wrap: wrap; }
     .partbtn { width: 104px; height: 84px; }
-    #title { font-size: 21px; }
-    #challengetext { font-size: 27px; }
-    #challengesub { font-size: 18px; }
-    #totaldisp { font-size: 34px; }
-    .bigbtn { font-size: 19px; padding: 10px 12px; }
+    #title { font-size: 20px; }
+    #challengetext { font-size: 26px; }
+    #challengesub { font-size: 17px; }
+    #totaldisp { font-size: 30px; padding: 2px 12px; }
+    #donemsg { font-size: 30px; }
+    #recipe .result { font-size: 32px; }
+    #recipe .eqline { font-size: 29px; }
+    #recipe .termval { font-size: 24px; }
+    #recipe .op { font-size: 24px; }
+    #recipe .carrynote { font-size: 16px; }
+    .bigbtn { font-size: 17px; padding: 8px 10px; min-height: 48px; min-width: 48px; }
     #undolong { display: none; }
+    #carrytoast { font-size: 24px; padding: 6px 18px; }
   }
 </style>
 </head>
@@ -801,8 +810,7 @@ function showReview() {
     const wrap = document.createElement("div");
     wrap.style.textAlign = "center";
     const eqLine = document.createElement("div");
-    eqLine.className = "result";
-    eqLine.style.fontSize = "40px";
+    eqLine.className = "result eqline";
     eqLine.textContent = fmtTrim(curA) + " ＋ " + fmtTrim(curB) + " ＝ " + fmtTrim(target);
     wrap.appendChild(eqLine);
     const notes = [];
@@ -823,8 +831,7 @@ function showReview() {
   if (mode === "sub") {
     // subtraction reviews as the equation itself
     const eqLine = document.createElement("div");
-    eqLine.className = "result";
-    eqLine.style.fontSize = "40px";
+    eqLine.className = "result eqline";
     eqLine.textContent = fmtTrim(curA) + " − " + fmtTrim(curB) + " ＝ " + fmtTrim(target);
     recipeEl.appendChild(eqLine);
     nextBtn.style.display = "none";
@@ -913,11 +920,11 @@ window.addEventListener("resize", () => {
   resizeTimer = setTimeout(() => {
     const before = CELL;
     computeCell();
-    if (CELL === before) return;
     for (const p of Array.from(blocks.values())) {
       const x = p.x, y = p.y;
-      p.el.remove();
-      renderPiece(p);
+      if (CELL !== before) { p.el.remove(); renderPiece(p); }
+      // always re-clamp: a rotation can leave pieces outside a
+      // narrower stage even when the cell size did not change
       placePiece(p, x, y);
     }
   }, 200);

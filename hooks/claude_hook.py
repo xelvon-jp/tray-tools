@@ -44,6 +44,7 @@
 # フックは毎ターン走る。Qt の import だけで1秒近くかかるので、そのぶん全ターンが
 # 遅くなる。traytools_send.py と mouse_jiggler.py はどちらも標準ライブラリ(ctypes)
 # だけで動くので、この2つまでは読んでよい。
+import contextlib
 import json
 import os
 import re
@@ -72,6 +73,13 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 # 応答の終わり(Stop)より後に書き込むことがある。「完了」を「実行中」に戻すのは、
 # 完了より後に起こされたフックだけにする(遅れて届いた分で戻さない)。
 HOOK_STARTED = time.time()
+# 完了済みセッションの「復活」と認めるまでの最小の間隔(秒)。ターンの最後の
+# ツールの PostToolUse プロセスが OS の都合で遅れて起動すると、Stop が
+# ended を書いた後に HOOK_STARTED が来てしまう。その遅れは通常この間隔より
+# ずっと短いので、間隔未満のものは「遅れて届いた分」として復活させない。
+# 本物の復活(裏の処理が終わって起こされた続き)の最初のツールがたまたま
+# この間隔に収まっても、その次のツール(さらに後に起動する)で復活する。
+REVIVE_MIN_GAP_SEC = 3.0
 
 # 呼ばれるたびに1行残す。フックは目に見えないところで走るので、記録が無いと
 # 「鳴らなかった」のが「呼ばれていない」のか「短くて見送った」のか「送ったが
@@ -348,6 +356,50 @@ def toast(config: dict, key: str, event: dict, body: str) -> None:
 # ---------------------------------------------------------------------------
 # トレイの状態表示(claude_status)。書けなくても音・通知は止めない。
 # ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _status_lock(session_id):
+    """同じセッションの状態の「読み直し→書き戻し」を、フックのプロセス間で
+    直列にする簡易ロック(O_EXCL で作るロックファイル)。
+
+    並行ツール実行では pretool と posttool のフックが同時に走り、両方が
+    古い読みを基に書くと、後から書いた方に無い項目(plan や phase)が消える
+    (レビュー指摘 #4)。ロックは最大1秒まで待つ。持ち主が落ちたままの
+    ロック(10秒以上古い)は壊して取り直す。取れなければロック無しで進む
+    (状態は表示用なので、音や通知の経路をここで止めない)。"""
+    path = claude_status.status_path(session_id)
+    if path is None:
+        yield
+        return
+    lock_path = path.with_suffix(".lock")
+    fd = None
+    deadline = time.time() + 1.0
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 10:
+                    lock_path.unlink()   # 持ち主が落ちたまま。壊して取り直す
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.01)
+        except OSError:
+            break
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+
 def update_status(config: dict, event: dict, state=None, **fields) -> None:
     """このセッションの状態ファイルを読み直して、変わったところだけ書き戻す。"""
     if not config.get("status_enabled"):
@@ -356,22 +408,23 @@ def update_status(config: dict, event: dict, state=None, **fields) -> None:
     if not session_id:
         return
     try:
-        now = time.time()
-        data = claude_status.read(session_id)
-        data.setdefault("session_id", session_id)
-        if event.get("cwd"):
-            data["cwd"] = event["cwd"]
-            data["project"] = claude_status.project_name(event["cwd"])
-        # デスクトップアプリのセッションなら、アプリ側の ID(local_…)が環境変数で来る。
-        # トレイからそのセッションへ飛ぶ(claude://code/continue?session=…)のに使う。
-        host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
-        if claude_status.valid_host_session(host):
-            data["host_session_id"] = host
-        if state is not None:
-            data["state"] = state
-        data.update(fields)
-        data["updated"] = now
-        claude_status.write(session_id, data)
+        with _status_lock(session_id):
+            now = time.time()
+            data = claude_status.read(session_id)
+            data.setdefault("session_id", session_id)
+            if event.get("cwd"):
+                data["cwd"] = event["cwd"]
+                data["project"] = claude_status.project_name(event["cwd"])
+            # デスクトップアプリのセッションなら、アプリ側の ID(local_…)が環境変数で来る。
+            # トレイからそのセッションへ飛ぶ(claude://code/continue?session=…)のに使う。
+            host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+            if claude_status.valid_host_session(host):
+                data["host_session_id"] = host
+            if state is not None:
+                data["state"] = state
+            data.update(fields)
+            data["updated"] = now
+            claude_status.write(session_id, data)
     except Exception as e:  # noqa: BLE001
         _log(f"状態を書けません: {e}")
 
@@ -406,7 +459,7 @@ def on_tool(config: dict, event: dict) -> None:
     # 応答を終えたあと、裏の処理が終わって起こされ、続きを始めた(新しいメッセージは
     # 来ていないので UserPromptSubmit は来ない)。完了より後に起こされたフックだけで戻す。
     revived = (data.get("state") in (claude_status.DONE, claude_status.FAIL)
-               and HOOK_STARTED > (data.get("ended") or 0))
+               and HOOK_STARTED - (data.get("ended") or 0) >= REVIVE_MIN_GAP_SEC)
     if revived:
         fields.update(started=HOOK_STARTED, ended=None, background=0)
     # ツールが終わった＝次はモデルが考えている(応答中)。処理中(tool)のときだけ戻す。

@@ -476,6 +476,111 @@ def test_tray_tooltip_helpers():
     assert shown[-1].startswith("Rapture（Claude 実行中）\nx　")
 
 
+def test_delayed_posttool_does_not_revive():
+    """レビュー指摘 #3: ターン最後のツールの PostToolUse プロセスが OS の都合で
+    遅れて起動し、Stop が ended を書いた「直後」に始まった場合、それは裏の処理に
+    起こされた復活ではない。完了済みセッションを RUNNING に戻してはいけない。
+    十分に時間が経ってからのツールは、正規の復活として RUNNING に戻す。"""
+    import claude_hook as hook
+    hook.send = lambda command, args: True
+    hook.is_away = lambda config: False
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.STATUS_DIR = Path(tmp, "status")
+        hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")
+        transcript = Path(tmp, "t.jsonl")
+        transcript.write_text(
+            '{"toolUseResult":{"backgroundTaskId":"bbb2"}}', encoding="utf-8")
+        config = dict(hook.DEFAULTS, min_seconds=0)
+        event = {"session_id": "late", "cwd": "R:/x",
+                 "transcript_path": str(transcript)}
+        try:
+            hook.on_start(config, event)
+            hook.on_stop(config, event)
+            data = cs.read("late")
+            assert data["state"] == cs.DONE and data["background"] == 1
+            # 終了の1秒後に「起動した」PostToolUse = 遅れて届いた最後のツールの分
+            hook.HOOK_STARTED = data["ended"] + 1
+            hook.on_tool(config, dict(event, tool_name="Bash", tool_input={}))
+            assert cs.read("late")["state"] == cs.DONE, cs.read("late")
+            # 終了から十分経ってのツール = 裏の処理が終わって起こされた復活
+            hook.HOOK_STARTED = data["ended"] + 30
+            hook.on_tool(config, dict(event, tool_name="Bash", tool_input={}))
+            revived = cs.read("late")
+            assert revived["state"] == cs.RUNNING and revived["ended"] is None
+        finally:
+            hook.HOOK_STARTED = time.time()
+
+
+def test_concurrent_update_status_keeps_both_fields():
+    """レビュー指摘 #4: pretool と posttool のフックが並行に走り、読み→書きの
+    間に割り込まれても、互いの項目(plan と phase)を落とさない。
+
+    割り込みを決定的に作るため、最初の write を途中で止めて、その間に
+    もう1つの update_status を最後まで走らせる。"""
+    import threading
+
+    import claude_hook as hook
+    hook.send = lambda command, args: True
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.STATUS_DIR = Path(tmp, "status")
+        hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")
+        config = dict(hook.DEFAULTS, min_seconds=0)
+        event = {"session_id": "race", "cwd": "R:/x"}
+        cs.write("race", {"session_id": "race", "state": cs.RUNNING,
+                          "plan": [], "phase": "responding"})
+        real_write = cs.write
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_first_write(session_id, data, directory=None):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=5)
+            return real_write(session_id, data, directory)
+
+        cs.write = slow_first_write
+        errors = []
+
+        def run_a():
+            try:
+                hook.update_status(config, event, None,
+                                   plan=[{"content": "a", "status": "in_progress"}])
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        def run_b():
+            try:
+                hook.update_status(config, event, None, phase="tool",
+                                   tool_name="Bash")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        thread_a = threading.Thread(target=run_a)
+        thread_b = threading.Thread(target=run_b)
+        try:
+            thread_a.start()
+            assert entered.wait(timeout=5), "最初の書き込みに届いていない"
+            # A が読み終えて書きかけの間に、B が phase を書きに来る。
+            # 直しが効いていれば B は A の書き終わりまで待たされ、A の plan を
+            # 読んでから自分の phase を足す。効いていなければ B が先に書いて、
+            # A の古い読みに上書きされて phase が消える。
+            thread_b.start()
+            time.sleep(0.3)
+        finally:
+            release.set()
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+            cs.write = real_write
+        assert not errors, errors
+        data = cs.read("race")
+        assert cs.plan_text(data.get("plan")) == "1/1 a", data
+        assert data.get("phase") == "tool" and data.get("tool_name") == "Bash", data
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

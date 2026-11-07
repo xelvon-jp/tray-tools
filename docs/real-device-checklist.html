@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>実機確認チェックリスト</title>
+<style>
+:root { color-scheme: light dark;}
+* { box-sizing: border-box;}
+body { margin: 0; font-family: -apple-system, "Hiragino Sans", "Yu Gothic UI", sans-serif;
+line-height: 1.55; background: #f4f6f8; color: #1c2733;}
+@media (prefers-color-scheme: dark) { body { background: #12181f; color: #dbe6ee;}}
+header { position: sticky; top: 0; padding: 10px 14px; background: inherit;
+border-bottom: 1px solid #8aa0b440; backdrop-filter: blur(6px); z-index: 2;}
+h1 { font-size: 17px; margin: 0 0 6px;}
+.bar { height: 8px; border-radius: 4px; background: #8aa0b433; overflow: hidden;}
+.bar > div { height: 100%; width: 0; background: #2f9e6e; transition: width.2s;}
+.meta { font-size: 12.5px; opacity:.75; margin-top: 4px;}
+main { max-width: 760px; margin: 0 auto; padding: 10px 12px 40px;}
+.item { background: #ffffff; border: 1px solid #8aa0b42e; border-radius: 10px;
+padding: 10px 12px; margin: 10px 0;}
+@media (prefers-color-scheme: dark) {.item { background: #1a232e;}}
+.item.done { opacity:.62;}
+.head { display: flex; gap: 10px; align-items: flex-start;}
+.head input { width: 22px; height: 22px; margin-top: 2px; flex: none;}
+.title { font-weight: 700; font-size: 15px;}
+.where { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: #3f7fbf22;
+border: 1px solid #3f7fbf55; white-space: nowrap;}
+dl { margin: 8px 0 0 32px; font-size: 13.5px;}
+dt { font-weight: 700; opacity:.8; margin-top: 5px;}
+dd { margin: 0;}
+button { font-size: 14px; padding: 8px 14px; border-radius: 8px; border: 1px solid #8aa0b466;
+background: #2f9e6e; color: #fff;}
+button.sub { background: transparent; color: inherit;}
+.row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;}
+p.note { font-size: 12.5px; opacity:.75;}
+</style>
+</head>
+<body>
+<header>
+<h1>実機確認チェックリスト</h1>
+<div class="bar"><div id="fill"></div></div>
+<div class="meta"><span id="count">0 / 0</span> 済み ・ チェックはこのブラウザに保存されます ・ 重要度順</div>
+<div class="row">
+<button id="copy">結果をまとめてコピー</button>
+<button id="reset" class="sub">チェックを全部外す</button>
+</div>
+</header>
+<main id="list"></main>
+<script>
+"use strict";
+const ITEMS = [
+{ id:"launcher-gui", title:"ランチャのボタンの付け外し（右クリック）", where:"自宅PC",
+how:"タスクバーウィジェットにマウスを乗せて帯を出し、帯の上で右クリック。項目のチェックを外す・付けるを何度か繰り返す。「あっふ」と「背景を透過」も押してみる（背景を透過は先に画像をコピーしてから）。終わったら tray-tools を再起動する。",
+pass:"チェックの付け外しがその場で並びに反映される。再起動後も並びが保持されている。「あっふ」が開く／前面に出る。画像をコピーした状態で「背景を透過」を押すと透過の窓が開く。",
+fail:"メニューが出ない／選んでも何も変わらない／再起動で戻ってしまう／押しても開かない、のどれかと、そのときの画面の様子。"},
+{ id:"bridge-sizes", title:"ブリッジの大きさ（中・小・ステルス）と名札なし", where:"自宅PC",
+how:"トレイの💬メニュー「ブリッジの大きさ」で 中→小→ステルス と切り替える（ブリッジの右クリックでも切り替えられる）。ステルスではマウスを帯に乗せる／離す、も試す。",
+pass:"中は絵が半分・カードなし、小は絵が1/4でさらに低い。どの大きさでも MUSE・CLAW'D の文字が出ていない。ステルスは画面右端に幅20pxほどの色の帯だけになり、マウスを乗せると元の大きさに広がり、離れて数秒で帯に戻る。状態が変わったとき（作業開始など）も帯から広がって知らせる。",
+fail:"大きさが変わらない／絵が崩れる・はみ出す／帯が出ない・戻らない／広がったまま戻らない、のどれかと、どの大きさで起きたか。"},
+{ id:"bridge-3", title:"ブリッジの3件（明滅・休止ボタン・ブリッジを開く）", where:"自宅PC",
+how:"Muse も Claude も待機の状態でブリッジを見る。次にバナー右の休止ボタン（縦棒2本）を押し、しばらく置いてから再開する。最後に💬メニューの「ブリッジを開く」を押す（たたんである状態で）。",
+pass:"全員待機中は枠がゆっくり明滅する。休止中はバナーとカードに「休止」と出て、見張りのつつき・自動承認が実際に止まる（Claude 側の対応済み）。再開で元に戻る。「ブリッジを開く」で、たたんであっても広がって出る。",
+fail:"明滅しない／休止しても見張りが動き続ける／開くで出ない、のどれか。"},
+{ id:"env-bridge-off", title:"環境2・3でブリッジが出ないこと", where:"職場PC",
+how:"職場PC（環境2か3）で tray-tools を起動し、右下にブリッジ（キャラのいるパネル）が出ないことを見る。あわせて、あっふのメニューに「スマホへ送る(QR)」が出ないことも（従来どおりのはず）。",
+pass:"ブリッジが出ない。進捗パネルの他の表示や通常の動作に支障がない。QR送信も出ない。",
+fail:"ブリッジが出てしまう／パネルや常駐の動作がおかしい、のどちらかと画面の様子。"},
+{ id:"famchat", title:"かぞくチャット v6.11 / v6.12（送信と届き方）", where:"iPhone 3台",
+how:"3台それぞれからメッセージを送り合う。特に息子さんの電話から何回か続けて送る。半日ほど普通に使って、通信量・電池の減りが前より荒くないかも見る。",
+pass:"全員の送信が相手に届く（息子さんの電話からの送信が消えない）。送ったつもりが残り続ける（未送信のまま固まる）ことがない。",
+fail:"届かない送信があった（どの電話から・いつ頃か）／未送信表示が消えない／電池の減りが明らかに早い、など。"},
+{ id:"rapture-rotate", title:"Rapture の待機役の入れ替え（表示の速さ）", where:"自宅PC",
+how:"PCを数時間放置したあと、ホットキーでキャプチャする。数回繰り返す。",
+pass:"長時間放置した直後でも、キャプチャの表示がすぐ（体感で待たされない）出る。",
+fail:"放置後の最初のキャプチャだけ2秒くらい待たされる、などの体感と、だいたいの放置時間。"},
+{ id:"fourteen", title:"昨晩の改善14件（ひととおり）", where:"自宅PC",
+how:"触れる範囲で順に： 電卓を開く／あっふでファイルを選んで Z（ZIP化）と S（7z化）／統合パレットを開いて計算（例 12*8）と単位変換を打つ／あっふで PDF・HTML・Markdown をプレビュー／カーソルを探す／定型文の「AI依頼」テンプレート／あっふの比較ダイアログ（W）の枠の色／大きいテキストファイルを検索／ブラウザのブックマーク取り込み。",
+pass:"それぞれ開いて動く。エラーや固まりがない。",
+fail:"動かなかった項目の名前と、押したキー・出た表示。"},
+{ id:"m3-history", title:"M3 さっきのファイル（履歴ビュー）の見え方", where:"自宅PC",
+how:"あっふで Shift+H を押し、種別・期間のチップを切り替えて、最近開いたファイルを探す。",
+pass:"履歴が出て、チップで絞れる。普通に使える見た目・並びになっている。",
+fail:"出ない／絞れない／見た目で気になるところ（具体的に）。"},
+{ id:"m1-presets", title:"M1 窓の配置プリセットの実地", where:"自宅PC",
+how:"「🪟 窓の配置」で今の配置をプリセットとして保存し、窓を崩してからプリセットを適用する。（集める／元に戻す は確認済みなので不要）",
+pass:"保存したプリセットで、窓の配置がだいたい元に戻る。",
+fail:"戻らない窓がある／保存・適用でエラー、など。"},
+{ id:"box-folder", title:"Box のフォルダリンク（/folder/ 形式）", where:"自宅PC",
+how:"あっふで Box のフォルダを選び C→P でパスをコピーする（種類ダイアログで「共有用テキスト」）。コピー直後の確認窓で O（ブラウザで開く）と、Ctrl+Enter の「Box.comで開く」も試す。",
+pass:"コピーされる URL が https://app.box.com/folder/… の形で、正しいフォルダが開く。",
+fail:"URL の形が違う／別のフォルダが開く／ID が作られなかった、など（どのフォルダか）。"},
+{ id:"rename-copy", title:"Cメニューの名前を変える複写4種（R/B/T/D）", where:"自宅PC",
+how:"あっふでファイルを選んで C メニューから R（反対窓にリネームしてコピー）・B（反対窓にコピー）・T・D を試す。両ペインが同じフォルダのときの R/B も試す。",
+pass:"コピー先に _cp 付き（リネーム時は指定名）で複写される。同じフォルダでも R/B が動く。通常のコピー（O）・移動は同じフォルダでは従来どおり止まる。",
+fail:"動かないキー／名前の付き方が違う、など。"},
+{ id:"kazublock", title:"かずブロック（iPad）", where:"iPad",
+how:"かずブロックを開いて、ブロックをくっつける・割る・「もどす」を触る。もくひょう（お手本）に合わせる遊びも試す。",
+pass:"タッチで狙ったブロックが動く。くっつけると数が合う。割ると元の形に戻る。引っかかりや誤動作がない。",
+fail:"触っても反応しない場所がある／数が合わない／固まる、などの場面。"},
+{ id:"shosublock", title:"しょうすうブロック（わく版・iPad）", where:"iPad",
+how:"しょうすうブロックを開いて、1 の板・0.1 の棒・0.01 のコマをわくの中に置く。0.1 を10本集めて繰り上がり、1 を割って 0.1 にする操作も試す。",
+pass:"置いた分だけ合計が合う。10集まると繰り上がる。割ると小さい方になる。タッチで置きにくさがない。",
+fail:"合計が合わない／繰り上がらない／置けない場所がある、などの場面。"},
+{ id:"park-sakuranbo", title:"こうえん・さくらんぼ Stage 1・すきなかず（Numberblocks）", where:"iPad / スマホ",
+how:"こうえんでシーソー（小数も乗せる）とすべり台（次の数を当てる）を遊ぶ。さくらんぼの部屋で借りる引き算を触って確かめる。「すきなかず」の引き算も1回。",
+pass:"遊びとして成立している。数の表示・動きが合っている。息子さんが迷わず触れる。",
+fail:"数が合わない／動きがおかしい／分かりにくかったところ。"},
+{ id:"fourteen-work", title:"改善13・14（社内環境の分）", where:"職場PC",
+how:"統合パレットで横断検索（M365・Box の検索が開くか）。あっふで社内ファイルを選んで Alt+S（WinSCP が開くか）と、Cメニューの W（Teams/Slack/SharePoint のリンクが作れるか）。",
+pass:"検索・WinSCP・リンクのどれも、設定した向き先で開く／作れる。",
+fail:"開かない・作れない項目と、出た表示。"},
+{ id:"zip-update-work", title:"あっふ ZIP更新の初回（職場PC）", where:"職場PC",
+how:"職場PCでは初回だけ手動： Edge で tray-tools-main の ZIP をダウンロードし直し、あっふで Shift+F5。案内に従って進める。",
+pass:"差分が出て、適用と再起動の案内まで進み、更新後に動く。",
+fail:"ZIP が見つからない／検証で止まる／適用に失敗する、などの段階と表示。"},
+{ id:"story-chapters", title:"はんぶん ストーリー 章4〜8（保留中の確認だけ）", where:"iPad / スマホ",
+how:"ストーリーモードは保留中なので、気が向いたときにだけ。章4（きすう・ぐうすう）以降とフィナーレを一通り遊ぶ。",
+pass:"最後まで遊べる。数の扱い（ミラー・ダブル等）が息子さんの理解に合っている。",
+fail:"止まる場面／数が合わない場面。"},
+];
+const KEY = "real-device-checklist-v1";
+let state = {};
+try { state = JSON.parse(localStorage.getItem(KEY) || "{}");} catch (e) { state = {};}
+const list = document.getElementById("list");
+function render() {
+list.innerHTML = "";
+let done = 0;
+for (const it of ITEMS) {
+const checked =!!state[it.id];
+if (checked) done++;
+const div = document.createElement("div");
+div.className = "item" + (checked? " done": "");
+div.innerHTML =
+'<div class="head"><input type="checkbox">' +
+'<div class="title"></div><span class="where"></span></div>' +
+"<dl><dt>操作</dt><dd class='how'></dd>" +
+"<dt>合格</dt><dd class='pass'></dd>" +
+"<dt>だめなとき</dt><dd class='fail'></dd></dl>";
+div.querySelector(".title").textContent = it.title;
+div.querySelector(".where").textContent = it.where;
+div.querySelector(".how").textContent = it.how;
+div.querySelector(".pass").textContent = it.pass;
+div.querySelector(".fail").textContent = it.fail;
+const box = div.querySelector("input");
+box.checked = checked;
+box.addEventListener("change", () => {
+state[it.id] = box.checked;
+localStorage.setItem(KEY, JSON.stringify(state));
+render();
+});
+list.appendChild(div);
+}
+document.getElementById("count").textContent = done + " / " + ITEMS.length;
+document.getElementById("fill").style.width =
+(ITEMS.length? (100 * done / ITEMS.length): 0) + "%";
+}
+document.getElementById("reset").addEventListener("click", () => {
+state = {};
+localStorage.setItem(KEY, "{}");
+render();
+});
+document.getElementById("copy").addEventListener("click", async () => {
+const lines = ["実機確認の結果:"];
+for (const it of ITEMS) lines.push((state[it.id]? "✓ ": "・ ") + it.title);
+const text = lines.join("\n");
+try { await navigator.clipboard.writeText(text); alert("コピーしました");}
+catch (e) { prompt("コピーできませんでした。手でコピーしてください", text);}
+});
+render();
+</script>
+</body>
+</html>

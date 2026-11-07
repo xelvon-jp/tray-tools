@@ -156,10 +156,33 @@ def test_cards():
     assert view(muse())["cards"][2] == ("見張り", "正常")
 
 
+def test_state_claude_overrides_stale_kind():
+    # (a) 見張りが Claude を起こして終了: kind が approval / cards==0 のまま残っていても異常にしない
+    m = muse(state="claude", since=NOW - 30, kind="approval", cards=0, kind_since=NOW - 120)
+    v = view(m)
+    assert v["tone"] == "claude" and v["banner_title"] == "Claude が確認中"
+    assert v["banner_sub"] == "Muse の見張りが起こしました" and v["banner_time"] == "30秒"
+    assert v["muse_anim"] == "claude" and v["clawd_anim"] == "work"
+    assert v["item"] is None and v["props"] == {"dots"} and len(v["cards"]) == 3
+    # since が無ければ kind_since からの経過
+    m2 = dict(m)
+    del m2["since"]
+    assert view(m2)["banner_time"] == "2分00秒"
+    # mailbox_fail など 2) 以降より先
+    assert view(dict(m, mailbox_fail=20))["tone"] == "claude"
+    # (b) stale が先
+    v = view(dict(m, last_poll=NOW - 91))
+    assert v["tone"] == "alert" and v["banner_title"] == "見張りが止まっています"
+    # (c) state が claude 以外なら従来どおり
+    v = view(dict(m, state="Museは指示待ち"))
+    assert v["banner_title"] == "承認カードが見えません" and v["tone"] == "alert"
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
-             test_done_window, test_sleep_default, test_cards]
+             test_done_window, test_sleep_default, test_cards,
+             test_state_claude_overrides_stale_kind]
 
 
 if __name__ == "__main__":

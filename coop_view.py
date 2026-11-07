@@ -86,6 +86,15 @@ def coop_view(muse, claude_entries, now=None):
         tone, title = "alert", "見張りが止まっています"
         sub = f"最後の確認 {mbs.fmt_dur(now - last_poll)}前"
         elapsed = now - last_poll
+    elif muse.get("state") == "claude":
+        # 見張りが Claude を起こして終了した。kind / cards は直前のまま残っているので
+        # (approval で cards==0 など)、以降の判定は見ずに「Claude が確認中」とする。
+        tone, title = "claude", "Claude が確認中"
+        sub = "Muse の見張りが起こしました"
+        since = _num(muse, "since")
+        if since is None:
+            since = kind_since
+        elapsed = max(0.0, now - since) if since is not None else None
     elif fail >= MAILBOX_FAIL_LIMIT:
         tone, title = "alert", "郵便受けにつながりません"
         sub = "メールの取得に失敗しています"

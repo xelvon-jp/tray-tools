@@ -78,6 +78,58 @@ def dynamic_role(index: int) -> int:
     return -(index + 1)
 
 
+def name_matches(name: str, keyword: str) -> bool:
+    """絞り込みの判定そのもの(前方一致)。keyword は strip + lower 済みの前提。
+
+    _refresh_list の絞り込みと、候補を数える filter_names で同じ関数を使う
+    (判定を二重に持たない。work-board#15 の決定事項)。"""
+    return not keyword or name.lower().startswith(keyword)
+
+
+def filter_names(names, text: str) -> list:
+    """text で絞り込んだときに残る表示名。_refresh_list と同じ判定。"""
+    keyword = text.strip().lower()
+    return [name for name in names if name_matches(name, keyword)]
+
+
+def is_deletion(old: str, new: str) -> bool:
+    """new が old から連続した範囲を消しただけ(純粋な削除)なら True。
+
+    BackSpace / Delete は「いつでも効く」ものなので、候補の数によらず
+    通すための判定。選択範囲を消す操作も、消す範囲が連続していれば
+    ここに含まれる。"""
+    if len(new) >= len(old):
+        return False
+    removed = len(old) - len(new)
+    return any(new == old[:i] + old[i + removed:]
+               for i in range(len(new) + 1))
+
+
+def accepts_input(old_text: str, new_text: str,
+                  old_count: int, new_count: int) -> bool:
+    """入力欄の変更を受け付けるか。候補が0件になる編集だけを止める。
+
+    old_count / new_count は、それぞれの入力のときに実際に一覧へ出る行数
+    (動的項目を含む)。判定の考え方:
+    - 変更なし・純粋な削除はいつでも応じる
+    - 今の入力ですでに候補が0件なら止めない(何も打っていない状態で
+      候補が0件のときに、打つこと自体を封じて詰まらせないため)
+    - それ以外は、新しい入力で候補が1件以上残るときだけ応じる"""
+    if new_text == old_text:
+        return True
+    if is_deletion(old_text, new_text):
+        return True
+    if old_count <= 0:
+        return True
+    return new_count > 0
+
+
+# 候補が0件になる入力を無効にしたときの合図。入力欄を一瞬だけこの色にする
+# (音は出さない。work-board#15 の決定事項)。色を戻すまでの時間もここで持つ。
+REJECT_FLASH_MS = 180
+REJECT_FLASH_STYLE = "QLineEdit { background-color: #6e2434; }"
+
+
 class PickerWindow(QWidget):
     """枠なしの小さな選択ウインドウ。上の入力欄で絞り込み、下のリストから1つ決める。
 
@@ -241,6 +293,50 @@ class PickerWindow(QWidget):
         self._refresh_list("")
         self._fit_to_items()
         self._move_to_center()
+
+        # 入力ガード(work-board#15): 候補が0件になる編集を無効にして、
+        # 入力を直前の状態に戻す。初期状態は「空の入力で全件出ている」。
+        # textChanged への接続は _refresh_list の後にする(先に一覧が
+        # 組み直り、行数が新しい入力への候補数になるように)。
+        self._accepted_text = ""
+        self._accepted_count = self.list.count()
+        self._rejecting = False
+        self.search.textChanged.connect(self._guard_search_text)
+
+    def _guard_search_text(self, text: str) -> None:
+        """候補が0件になる入力を無効にする。textChanged の時点で
+        _refresh_list は済んでいて、一覧の行数が新しい入力への候補数
+        そのもの(動的項目を含む。判定は accepts_input に寄せる)。
+
+        貼り付けは text の差し替えとして一度に来るので、結果が0件なら
+        貼り付け全体が戻る。IME の変換中は text() 自体が変わらない
+        (未確定文字列は textChanged を出さない)ので判定は走らず、
+        確定した時点で確定分がまとめて判定される。"""
+        if self._rejecting:
+            return
+        if accepts_input(self._accepted_text, text,
+                         self._accepted_count, self.list.count()):
+            self._accepted_text = text
+            self._accepted_count = self.list.count()
+            return
+        self._rejecting = True
+        try:
+            self.search.setText(self._accepted_text)
+            self.search.setCursorPosition(len(self._accepted_text))
+        finally:
+            self._rejecting = False
+        self._flash_search_rejected()
+
+    def _flash_search_rejected(self) -> None:
+        """無効にした合図。入力欄を一瞬だけ色づける(音は出さない)。"""
+        self.search.setStyleSheet(REJECT_FLASH_STYLE)
+        QTimer.singleShot(REJECT_FLASH_MS, self._clear_search_flash)
+
+    def _clear_search_flash(self) -> None:
+        try:
+            self.search.setStyleSheet("")
+        except RuntimeError:
+            pass   # 色が戻る前に窓が閉じた。合図は済んでいるので問題ない
 
     def _fit_to_items(self):
         """項目数に合わせて高さを決める。
@@ -567,7 +663,7 @@ class PickerWindow(QWidget):
             item.setData(Qt.UserRole, dynamic_role(dynamic_index))
             self.list.addItem(item)
         for index, (name, _data) in enumerate(self._items):
-            if keyword and not name.lower().startswith(keyword):
+            if not name_matches(name, keyword):
                 continue
             item = QListWidgetItem(name)
             # データそのものではなく元リストの添字を持たせる。Qtの項目データは
@@ -594,6 +690,11 @@ class PickerWindow(QWidget):
 
         self._items = list(items)
         self._refresh_list(self.search.text())
+        # 項目の差し替えは打ち込みではないので、入力ガードの基準も
+        # 今の入力と行数に合わせ直す(古い行数のままだと、次の打鍵の
+        # 判定がずれる)。
+        self._accepted_text = self.search.text()
+        self._accepted_count = self.list.count()
 
         count = self.list.count()
         if count == 0:

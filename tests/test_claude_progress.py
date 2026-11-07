@@ -108,7 +108,8 @@ def test_coop_row():
     row = cp.coop_row(muse, entries, now)
     assert row["_coop"] and row["_muse"] and row["key"] == ("approval", muse["kind_since"])
     assert cp.row_height(row) == cp.coop_stage.COOP_HEIGHT
-    assert 190 <= cp.row_height(row) <= 215
+    # 履歴テープ(4行)ぶん増えたので上限は 280(work-board#8)
+    assert 190 <= cp.row_height(row) <= 280
     assert cp.coop_row(None, entries, now) is None
     assert cp.coop_row(dict(muse, last_poll=now - 7 * 3600), entries, now) is None
     # kind が無い古いファイルは since 基準のキー

@@ -58,7 +58,11 @@ def test_update_settings_end_to_end():
         }
         saved = _run_update(tmp, payload)
         widget = saved["taskbar_widget"]
-        assert widget["launcher_items"] == DEFAULT_ITEMS, widget["launcher_items"]
+        # 既存の並びは壊さず、足りない既定を末尾へ既定の順で足す(利用者の並びを尊重)
+        expected = ["capture", "audio"] + [
+            name for name in DEFAULT_ITEMS if name not in ("capture", "audio")
+        ]
+        assert widget["launcher_items"] == expected, widget["launcher_items"]
         assert widget["launcher_defaults_applied"] == DEFAULT_ITEMS
         assert list(tmp.glob("settings.json.bak_*")), "書き換え前の控えが無い"
 

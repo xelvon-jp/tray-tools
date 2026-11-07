@@ -50,7 +50,35 @@ def test_panel_shows_muse_row():
     panel.deleteLater()
 
 
-ALL_TESTS = [test_muse_row, test_panel_shows_muse_row]
+def test_muse_kind_row_and_dismiss_key():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    panel = cp.ClaudeProgressPanel()
+    now = time.time()
+    data = {"kind": "approval", "kind_since": now - 100, "header": None,
+            "state": "idle", "since": now - 500, "waiting_since": None,
+            "poll_sec": 15, "last_poll": now - 2}
+    row = cp.muse_row(data, now)
+    assert row["key"] == ("approval", now - 100)
+    # kind が無ければ (state, since) 基準
+    assert cp.muse_row(dict(data, kind=None), now)["key"] == ("idle", now - 500)
+    panel.set_entries([], None, data)
+    app.processEvents()
+    panel.grab()   # kind 経路の描画で例外が出ないこと
+    panel._remove_row(0)
+    panel.set_entries([], None, data)
+    assert panel._rows == []
+    # kind が変われば(kind_since も変わる)また出る
+    panel.set_entries([], None, dict(data, kind="idle", kind_since=now))
+    assert [bool(r.get("_muse")) for r in panel._rows] == [True]
+    panel.grab()
+    panel.close()
+    panel.deleteLater()
+
+
+ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
+             test_muse_kind_row_and_dismiss_key]
 
 
 if __name__ == "__main__":

@@ -14,6 +14,12 @@
 #   last_poll     最後に画面を読んだ時刻(epoch 秒)
 #   settle, settle_need  返事が落ち着いたと見なすまでの回数(いま/必要)
 #   approved      自動で押した承認カードの数
+#   kind          Muse の画面から見た状態。"idle"(待機) | "responding"(応答中) |
+#                 "processing"(処理中) | "approval"(承認待ち) | "no_reply"(Claude の
+#                 発言に未返答) | "unknown"(判定不能)。古いファイルには無い
+#   kind_since    いまの kind になった時刻(epoch 秒)
+#   header        Muse の画面の見出し(「実装中」など。自由文で null のこともある)
+# kind があればラベルと経過時間はそちらを基準にする。無ければ state / since で従来どおり。
 #
 # 使い道は2つ: ツールチップの行(describe)と、進捗パネルの Muse 見張り行
 # (panel_view。バーの割合まで含めてここで計算し、描画は claude_progress が担う)。
@@ -37,6 +43,24 @@ LABELS = {
     "idle": "待機中",
     "claude": "Claude確認中",
 }
+
+# kind → ラベル(短く)。processing だけ見出しを括弧で添える(_kind_label)。
+KIND_LABELS = {
+    "idle": "Muse 待機（指示待ち）",
+    "responding": "Muse 応答中",
+    "processing": "Muse 処理中",
+    "approval": "Muse 承認待ち",
+    "no_reply": "Muse 未応答",
+    "unknown": "Muse 状態不明",
+}
+# 見出しがこれ(または空)のときは括弧で添えない。
+HEADER_PLAIN = ("リンク済み", "")
+HEADER_MAX = 12
+# tone の切り替え秒数。
+WARN_APPROVAL_SEC = 60
+ALERT_APPROVAL_SEC = 180
+ALERT_NO_REPLY_SEC = 60
+ALERT_UNKNOWN_SEC = 60
 
 
 def read(path=None):
@@ -66,6 +90,47 @@ def _num(data, key):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _kind_label(kind, header) -> str:
+    label = KIND_LABELS.get(kind, KIND_LABELS["unknown"])
+    if kind == "processing" and isinstance(header, str):
+        header = header.strip()
+        if header not in HEADER_PLAIN:
+            if len(header) > HEADER_MAX:
+                header = header[:HEADER_MAX] + "…"
+            label += f"（{header}）"
+    return label
+
+
+def _tone(kind, elapsed) -> str:
+    """calm(落ち着き) / active(動いている) / warn(そろそろ) / alert(要対応)。"""
+    e = elapsed or 0
+    if kind in ("responding", "processing"):
+        return "active"
+    if kind == "approval":
+        if e >= ALERT_APPROVAL_SEC:
+            return "alert"
+        return "warn" if e >= WARN_APPROVAL_SEC else "calm"
+    if kind == "no_reply":
+        return "alert" if e >= ALERT_NO_REPLY_SEC else "warn"
+    if kind == "unknown":
+        return "alert" if e >= ALERT_UNKNOWN_SEC else "calm"
+    return "calm"
+
+
+def _kind_info(data, now):
+    """(kind, kind_label, kind_elapsed, tone)。kind が無い古いファイルは全部 None / calm。
+
+    kind が文字列でも知らない値なら unknown として扱う。"""
+    kind = data.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return None, None, None, "calm"
+    if kind not in KIND_LABELS:
+        kind = "unknown"
+    since = _num(data, "kind_since")
+    elapsed = max(0.0, now - since) if since is not None else None
+    return kind, _kind_label(kind, data.get("header")), elapsed, _tone(kind, elapsed)
+
+
 def describe(data, now=None) -> list:
     """ツールチップに足す行(0〜2行)を返す。
 
@@ -86,14 +151,17 @@ def describe(data, now=None) -> list:
             return []
         return [f"Muse監視 停止中（{fmt_dur(now - last_poll)}前・最後は{label}）"]
 
+    kind, kind_label, kind_elapsed, _tone_name = _kind_info(data, now)
     in_state = f" {fmt_dur(now - since)}" if since is not None else ""
-    if waiting_since is not None and state != "waiting":
+    if kind is not None:
+        head = kind_label + (f" {fmt_dur(kind_elapsed)}" if kind_elapsed is not None else "")
+    elif waiting_since is not None and state != "waiting":
         head = f"Muse返事待ち {fmt_dur(now - waiting_since)}（{label}{in_state}）"
     elif waiting_since is not None:
         head = f"Muse返事待ち {fmt_dur(now - waiting_since)}"
     else:
         head = f"Muse {label}{in_state}"
-    if state == "settling":
+    if state == "settling" and kind is None:
         settle, need = _num(data, "settle"), _num(data, "settle_need")
         if settle is not None and need:
             head += f" {int(settle)}/{int(need)}"
@@ -117,7 +185,10 @@ def panel_view(data, now=None):
     - データが無い・last_poll が無い/ FORGET_SEC(6時間)より古い → None
     - last_poll が STALE_SEC(90秒)より古い → stopped(灰色の「監視停止」行)
     バーの割合: poll_fraction は次に画面を読むまでの残り(1→0)、
-    settle_fraction は確定待ちの段階(返事の確定待ちのときだけ)。"""
+    settle_fraction は確定待ちの段階(返事の確定待ちのときだけ)。
+    kind / kind_label / kind_elapsed / tone は kind があるときの表示用(無ければ
+    None / None / None / "calm"。描く側は label / elapsed に戻る)。stopped が
+    True のときは描く側が tone より灰色を優先する。"""
     if not data:
         return None
     now = time.time() if now is None else now
@@ -129,7 +200,12 @@ def panel_view(data, now=None):
     waiting_since = _num(data, "waiting_since")
     poll_sec = _num(data, "poll_sec")
     stopped = now - last_poll > STALE_SEC
+    kind, kind_label, kind_elapsed, tone = _kind_info(data, now)
     view = {
+        "kind": kind,
+        "kind_label": kind_label,
+        "kind_elapsed": kind_elapsed,
+        "tone": tone,
         "state": state,
         "label": LABELS.get(state, str(state or "?")),
         "stopped": stopped,

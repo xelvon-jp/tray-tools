@@ -113,3 +113,77 @@ def test_panel_view_bad_input_is_quiet():
     assert mbs.panel_view(None, NOW) is None
     assert mbs.panel_view({}, NOW) is None
     assert mbs.panel_view({"state": "busy", "last_poll": "x"}, NOW) is None
+
+
+def _kd(kind, since_ago=10, header=None, **extra):
+    d = {"kind": kind, "kind_since": NOW - since_ago, "header": header,
+         "state": "idle", "since": NOW - 999, "waiting_since": None,
+         "poll_sec": 15, "last_poll": NOW - 3}
+    d.update(extra)
+    return d
+
+
+def test_kind_labels():
+    expect = {"idle": "Muse 待機（指示待ち）", "responding": "Muse 応答中",
+              "processing": "Muse 処理中", "approval": "Muse 承認待ち",
+              "no_reply": "Muse 未応答", "unknown": "Muse 状態不明"}
+    for kind, label in expect.items():
+        view = mbs.panel_view(_kd(kind, 5), NOW)
+        assert view["kind"] == kind and view["kind_label"] == label, kind
+        assert view["kind_elapsed"] == 5
+    # 知らない kind は unknown
+    assert mbs.panel_view(_kd("zzz"), NOW)["kind_label"] == "Muse 状態不明"
+
+
+def test_kind_processing_header():
+    def lab(h):
+        return mbs.panel_view(_kd("processing", header=h), NOW)["kind_label"]
+    assert lab("実装中") == "Muse 処理中（実装中）"
+    assert lab("リンク済み") == "Muse 処理中"
+    assert lab("") == "Muse 処理中" and lab(None) == "Muse 処理中"
+    assert lab("あ" * 20) == "Muse 処理中（" + "あ" * 12 + "…）"
+    # processing 以外は見出しを添えない
+    assert (mbs.panel_view(_kd("idle", header="実装中"), NOW)["kind_label"]
+            == "Muse 待機（指示待ち）")
+
+
+def test_kind_tone():
+    def tone(kind, ago):
+        return mbs.panel_view(_kd(kind, ago), NOW)["tone"]
+    assert tone("idle", 9999) == "calm"
+    assert tone("responding", 5) == "active" and tone("processing", 5000) == "active"
+    assert tone("approval", 59) == "calm"
+    assert tone("approval", 60) == "warn" and tone("approval", 179) == "warn"
+    assert tone("approval", 180) == "alert"
+    assert tone("no_reply", 59) == "warn" and tone("no_reply", 60) == "alert"
+    assert tone("unknown", 59) == "calm" and tone("unknown", 60) == "alert"
+
+
+def test_kind_describe_and_stopped():
+    data = _kd("approval", 65)
+    assert mbs.describe(data, NOW)[0] == "Muse 承認待ち 1分05秒"
+    assert mbs.describe(data, NOW)[1] == "監視 15秒毎・次12秒"
+    # 停止中は従来どおり(kind があっても停止の行。view は stopped)
+    old = _kd("idle", last_poll=NOW - 180)
+    assert mbs.describe(old, NOW)[0].startswith("Muse監視 停止中")
+    assert mbs.panel_view(old, NOW)["stopped"]
+
+
+def test_no_kind_is_backward_compatible():
+    data = {"state": "busy", "since": NOW - 65, "waiting_since": NOW - 252,
+            "poll_sec": 15, "last_poll": NOW - 8, "approved": 2}
+    view = mbs.panel_view(data, NOW)
+    assert view["kind"] is None and view["kind_label"] is None
+    assert view["kind_elapsed"] is None and view["tone"] == "calm"
+    assert view["label"] == "作業中" and view["elapsed"] == 65
+    assert mbs.describe(data, NOW)[0] == "Muse返事待ち 4分12秒（作業中 1分05秒）"
+
+
+ALL_TESTS = [v for k, v in sorted(globals().items())
+             if k.startswith("test_") and callable(v)]
+
+
+if __name__ == "__main__":
+    for test in ALL_TESTS:
+        test()
+        print(f"PASS {test.__name__}")

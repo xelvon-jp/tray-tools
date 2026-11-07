@@ -3871,6 +3871,61 @@ def _check_viewer_encodings(tmp):
         v.close()
 
 
+def test_viewer_markup_render_mode():
+    import filer_viewer as fv
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    # 種類の判定(純粋な部分)
+    assert fv.markup_kind("a.html") == "html" and fv.markup_kind("a.HTM") == "html"
+    assert fv.markup_kind("a.md") == "markdown" and fv.markup_kind("a.markdown") == "markdown"
+    assert fv.markup_kind("a.txt") is None and fv.markup_kind("a.py") is None
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        page = Path(tmp, "page.html")
+        page.write_text("<h1>見出しテスト</h1><p>本文<b>太字</b>です</p>",
+                        encoding="utf-8")
+        v = fv.TextViewer(str(page))
+        v.show()
+        try:
+            # HTML はソースでなく整形表示が既定。タグは見えない
+            assert v.render_mode and v.rich is not None
+            assert v.rich.isVisible() and not v.area.isVisible()
+            plain = v.rich.toPlainText()
+            assert "見出しテスト" in plain and "太字" in plain and "<h1>" not in plain
+            assert "整形" in v.status.text()
+            # R でソースに切り替え、もう一度 R で整形に戻る
+            QTest.keyClick(v.rich, Qt.Key_R)
+            assert not v.render_mode and v.area.isVisible() and not v.rich.isVisible()
+            assert "ソース" in v.status.text()
+            QTest.keyClick(v.area, Qt.Key_R)
+            assert v.render_mode and v.rich.isVisible()
+            # 整形表示のまま Esc で閉じられる(キーがビュアに届く)
+            QTest.keyClick(v.rich, Qt.Key_Escape)
+            assert not v.isVisible()
+        finally:
+            v.close()
+        # Markdown も整形が既定
+        note = Path(tmp, "note.md")
+        note.write_text("# 題です\n\n- 項目ひとつ\n", encoding="utf-8")
+        v = fv.TextViewer(str(note))
+        v.show()
+        try:
+            assert v.render_mode and "題です" in v.rich.toPlainText()
+        finally:
+            v.close()
+        # ただのテキストは従来どおりソース(テキスト)表示だけ
+        plain_file = Path(tmp, "plain.txt")
+        plain_file.write_text("hello\n", encoding="utf-8")
+        v = fv.TextViewer(str(plain_file))
+        v.show()
+        try:
+            assert v.rich is None and not v.render_mode and v.area.isVisible()
+        finally:
+            v.close()
+
+
 def test_enter_viewer_routing():
     import filer
     from PySide6.QtCore import Qt

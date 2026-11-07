@@ -18,12 +18,13 @@ import threading
 import time
 from array import array
 
-from PySide6.QtCore import QEvent, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QInputDialog,
     QLabel,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +52,18 @@ ENCODING_LABELS = {
 DETECT_BYTES = 4 * 1024 * 1024   # UTF-8 として正しいかを見る長さ
 INDEX_CHUNK = 4 * 1024 * 1024    # 索引作りで一度に読む長さ
 MAX_LINE_BYTES = 64 * 1024       # 1行を表示・検索に読む上限(1行が巨大なファイル対策)
+
+# 整形表示できるマークアップ。HTML / Markdown は、ソースを見たい場面が
+# ほぼ無いので、ビュアでは整形(レンダリング結果)を既定にする。R で
+# ソース表示と切り替える。作りはプレビュー(filer_preview)と同じ。
+MARKUP_KINDS = {"html": "html", "htm": "html", "md": "markdown", "markdown": "markdown"}
+RENDER_MAX_BYTES = 8 * 1024 * 1024   # これより大きいファイルは整形しない(重さ対策)
+
+
+def markup_kind(path: str):
+    """HTML / Markdown なら "html" | "markdown"、それ以外は None。"""
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    return MARKUP_KINDS.get(ext)
 
 
 def detect_encoding(head: bytes):
@@ -428,6 +441,15 @@ class TextViewer(QWidget):
         self.reader = None
         self._open_index(encoding, start)
 
+        # HTML / Markdown は整形表示を用意し、既定でそちらを見せる
+        self.markup = markup_kind(path)
+        self.rich = None
+        self.render_mode = False
+        if self.markup is not None:
+            self._setup_rich()
+            if self.rich is not None:
+                self.set_render_mode(True)
+
         if geometry:
             self.setGeometry(*geometry)
         else:
@@ -449,6 +471,55 @@ class TextViewer(QWidget):
         self.reader = LineReader(self.index)
         self.area.update_ranges()
         self.area.viewport().update()
+
+    # --- 整形表示(HTML / Markdown) ---
+    def _setup_rich(self) -> None:
+        """整形表示(QTextBrowser)を用意する。読めない・大きすぎる場合は
+        用意せず、従来どおりのソース表示だけにする(整形は上乗せ)。"""
+        try:
+            if os.path.getsize(self.path) > RENDER_MAX_BYTES:
+                return
+            with open(self.path, "rb") as f:
+                data = f.read()
+            text = data.decode(self.encoding, errors="replace")
+        except OSError:
+            return
+        rich = QTextBrowser(self)
+        rich.setOpenLinks(False)            # プレビューと同じく、リンクは辿らない
+        rich.setOpenExternalLinks(False)
+        rich.setFont(self.area.font())
+        rich.document().setBaseUrl(QUrl.fromLocalFile(
+            os.path.dirname(os.path.abspath(self.path)) + os.sep))
+        if self.markup == "html":
+            rich.setHtml(text)
+        else:
+            rich.setMarkdown(text)
+        rich.installEventFilter(self)
+        rich.viewport().installEventFilter(self)
+        rich.hide()
+        self.layout().insertWidget(1, rich, 1)   # 本文エリアとステータスの間
+        self.rich = rich
+
+    def set_render_mode(self, on: bool) -> None:
+        """整形表示 ⇔ ソース表示の切り替え。"""
+        if self.rich is None:
+            return
+        self.render_mode = bool(on)
+        self.rich.setVisible(self.render_mode)
+        self.area.setVisible(not self.render_mode)
+        (self.rich if self.render_mode else self.area).setFocus()
+        self._refresh_title()
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt の上書き)
+        # 整形表示のキーも、ソース表示(TextArea.event)と同じくビュアが扱う
+        if (self.rich is not None and event.type() == QEvent.KeyPress
+                and obj in (self.rich, self.rich.viewport())):
+            try:
+                self.handle_key(event)
+            except Exception as e:  # noqa: BLE001  スロットで投げ切ると落ちる
+                self.set_status(f"エラー: {e}")
+            return True
+        return super().eventFilter(obj, event)
 
     @property
     def encoding(self) -> str:
@@ -503,6 +574,8 @@ class TextViewer(QWidget):
         self.setWindowTitle(f"{self.title_name} - {label} - {lines}")
         top = self.area.verticalScrollBar().value() + 1
         status = f"{label}  {lines}  {top:,}行目  TAB{self.tab_width}"
+        if getattr(self, "rich", None) is not None:
+            status += "  整形表示（R: ソース）" if self.render_mode else "  ソース表示（R: 整形）"
         if self.index.error:
             status += f"  読み取りエラー: {self.index.error}"
         if self._message:
@@ -633,6 +706,35 @@ class TextViewer(QWidget):
         if key in (Qt.Key_Insert, Qt.Key_Delete):
             self.change_font(-1 if key == Qt.Key_Insert else 1)
             return
+        if letter == "R" and not shift and not ctrl and self.rich is not None:
+            self.set_render_mode(not self.render_mode)   # 整形 ⇔ ソース
+            return
+        if self.render_mode:
+            # 整形表示のスクロールは整形側のスクロールバーで受ける。
+            # 検索・行ジャンプなど、それ以外のキーはソース表示に戻して受ける。
+            bar = self.rich.verticalScrollBar()
+            if key == Qt.Key_Up:
+                bar.setValue(bar.value() - 40)
+            elif key == Qt.Key_Down:
+                bar.setValue(bar.value() + 40)
+            elif key in (Qt.Key_PageUp, Qt.Key_Left) and ctrl:
+                bar.setValue(bar.minimum())
+            elif key in (Qt.Key_PageDown, Qt.Key_Right) and ctrl:
+                bar.setValue(bar.maximum())
+            elif key in (Qt.Key_PageUp, Qt.Key_Left):
+                bar.setValue(bar.value() - bar.pageStep())
+            elif key in (Qt.Key_PageDown, Qt.Key_Right):
+                bar.setValue(bar.value() + bar.pageStep())
+            elif key in (Qt.Key_Home, Qt.Key_F1):
+                bar.setValue(bar.minimum())
+            elif key in (Qt.Key_End, Qt.Key_F2):
+                bar.setValue(bar.maximum())
+            elif letter == "C" and ctrl:
+                self.rich.copy()
+            else:
+                self.set_render_mode(False)
+                return self.handle_key(event)
+            return
         if key == Qt.Key_Up:
             self.scroll_to(self.top_line() - 1)
         elif key == Qt.Key_Down:
@@ -689,6 +791,10 @@ class TextViewer(QWidget):
         self.area.setFont(font)
         self.area.update_ranges()
         self.area.viewport().update()
+        if self.rich is not None:
+            rich_font = QFont(self.rich.font())
+            rich_font.setPointSize(size)
+            self.rich.setFont(rich_font)
 
     def open_editor(self) -> None:
         if self.editor_callback is not None:

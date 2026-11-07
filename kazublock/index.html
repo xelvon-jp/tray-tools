@@ -32,27 +32,28 @@
   .bigbtn:active { transform: translateY(2px); box-shadow: none; }
   #clearbtn { background: #ffd9d9; color: #a33; }
 
-  /* challenge bar */
+  /* challenge bar (centered, big ghost) */
   #challengebar {
-    display: flex; align-items: center; gap: 16px;
-    padding: 8px 16px; background: #eaf6ff; border-bottom: 3px solid #9fd3f5;
-    min-height: 84px;
+    display: flex; align-items: center; justify-content: center; gap: 18px;
+    padding: 10px 16px; background: #eaf6ff; border-bottom: 3px solid #9fd3f5;
+    min-height: 96px;
   }
-  #challengetext { font-size: 30px; font-weight: bold; color: #1463a3; }
-  #ghost { display: grid; gap: 2px; opacity: .45; }
-  #ghost .gcell { width: 15px; height: 15px; border-radius: 3px; background: #7fb8dd; }
-  #donemsg { font-size: 34px; font-weight: bold; color: #e67e22; display: none; }
+  #challengetext { font-size: 34px; font-weight: bold; color: #1463a3; }
+  #challengesub { font-size: 22px; font-weight: bold; color: #5b8db8; margin-top: 4px; }
+  #ghost { display: grid; gap: 3px; opacity: .45; }
+  #ghost .gcell { width: 20px; height: 20px; border-radius: 4px; background: #7fb8dd; }
+  #donemsg { font-size: 38px; font-weight: bold; color: #e67e22; display: none; }
 
   /* play stage */
   #stage { position: relative; flex: 1; touch-action: none; overflow: hidden; }
 
   .block { position: absolute; cursor: grab; touch-action: none; }
   .block .cells { display: grid; gap: 3px; }
-  .block .cell { width: 36px; height: 36px; border-radius: 8px; box-shadow: inset 0 -4px 0 rgba(0,0,0,.18), inset 0 3px 0 rgba(255,255,255,.35); }
+  .block .cell { width: 48px; height: 48px; border-radius: 10px; box-shadow: inset 0 -5px 0 rgba(0,0,0,.18), inset 0 4px 0 rgba(255,255,255,.35); }
   .block .num {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    font-size: 42px; font-weight: bold; color: #fff;
-    text-shadow: 0 2px 0 rgba(0,0,0,.35), 0 0 6px rgba(0,0,0,.25); pointer-events: none;
+    font-size: 56px; font-weight: bold; color: #fff;
+    text-shadow: 0 2px 0 rgba(0,0,0,.35), 0 0 8px rgba(0,0,0,.25); pointer-events: none;
   }
   .block.pop { animation: pop .25s ease-out; }
   @keyframes pop { 0% { transform: scale(.6); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
@@ -66,8 +67,8 @@
   }
   #partslabel { font-size: 20px; font-weight: bold; color: #8a5a00; margin-right: 2px; }
   .partbtn {
-    width: 64px; height: 64px; border: none; border-radius: 14px; cursor: pointer;
-    font-size: 30px; font-weight: bold; color: #fff;
+    width: 68px; height: 68px; border: none; border-radius: 14px; cursor: pointer;
+    font-size: 32px; font-weight: bold; color: #fff;
     text-shadow: 0 2px 0 rgba(0,0,0,.3); box-shadow: 0 3px 0 rgba(0,0,0,.2);
     touch-action: manipulation;
   }
@@ -75,12 +76,12 @@
 
   /* celebration stars */
   .star {
-    position: absolute; font-size: 40px; pointer-events: none; z-index: 50;
+    position: absolute; font-size: 44px; pointer-events: none; z-index: 50;
     animation: starfly 1.6s ease-out forwards;
   }
   @keyframes starfly {
     0% { transform: translateY(0) scale(.5) rotate(0deg); opacity: 1; }
-    100% { transform: translateY(-260px) scale(1.3) rotate(160deg); opacity: 0; }
+    100% { transform: translateY(-280px) scale(1.3) rotate(160deg); opacity: 0; }
   }
 </style>
 </head>
@@ -93,7 +94,10 @@
     <button class="bigbtn" id="clearbtn">ぜんぶ けす</button>
   </div>
   <div id="challengebar">
-    <div id="challengetext">おだい</div>
+    <div>
+      <div id="challengetext">おだい</div>
+      <div id="challengesub"></div>
+    </div>
     <div id="ghost"></div>
     <div id="donemsg">できた！🎉</div>
   </div>
@@ -109,6 +113,7 @@
 const stage = document.getElementById("stage");
 const ghostEl = document.getElementById("ghost");
 const challengeText = document.getElementById("challengetext");
+const challengeSub = document.getElementById("challengesub");
 const doneMsg = document.getElementById("donemsg");
 
 const COLORS = {
@@ -117,11 +122,21 @@ const COLORS = {
 };
 function colorOf(n) { return COLORS[((n - 1) % 10) + 1]; }
 
-// columns for a block of total n, so the cell count reads clearly
+// columns for a block of total n: hand table for 1..10; above that pick the
+// width (2..7) that leaves the fewest empty cells, then the fewest rows,
+// so fused blocks read as a tidy near-rectangle (e.g. 11 -> rows of 6 + 5)
 function colsFor(n) {
   const table = { 1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3, 10: 5 };
   if (table[n]) return table[n];
-  return Math.min(6, Math.ceil(Math.sqrt(n)));
+  let best = 2, bestEmpty = Infinity, bestRows = Infinity;
+  for (let cols = 2; cols <= 7; cols++) {
+    const rows = Math.ceil(n / cols);
+    const empty = rows * cols - n;
+    if (empty < bestEmpty || (empty === bestEmpty && rows < bestRows)) {
+      best = cols; bestEmpty = empty; bestRows = rows;
+    }
+  }
+  return best;
 }
 
 // ---------- sound (WebAudio, quiet, mutable) ----------
@@ -166,7 +181,7 @@ function leavesOf(b, out) {
   leavesOf(b.left, out); leavesOf(b.right, out); return out;
 }
 
-const CELL = 36, GAP = 3;
+const CELL = 48, GAP = 3;
 function blockSize(n) {
   const cols = colsFor(n), rows = Math.ceil(n / cols);
   return { cols, rows, w: cols * CELL + (cols - 1) * GAP, h: rows * CELL + (rows - 1) * GAP };
@@ -214,6 +229,32 @@ function placeBlock(b, x, y) {
   if (b.el) { b.el.style.left = b.x + "px"; b.el.style.top = b.y + "px"; }
 }
 
+// find a spawn spot that does not overlap existing blocks:
+// random tries first, then a coarse grid scan, then a cascade fallback
+function overlapsAny(x, y, w, h, pad) {
+  for (const o of blocks.values()) {
+    const s = blockSize(totalOf(o));
+    if (!(x + w + pad < o.x || o.x + s.w + pad < x || y + h + pad < o.y || o.y + s.h + pad < y)) return true;
+  }
+  return false;
+}
+function findSpawnPos(w, h) {
+  const maxX = Math.max(0, stage.clientWidth - w);
+  const maxY = Math.max(0, stage.clientHeight - h);
+  for (let i = 0; i < 40; i++) {
+    const x = Math.random() * maxX;
+    const y = Math.random() * Math.min(maxY, 220);
+    if (!overlapsAny(x, y, w, h, 10)) return { x, y };
+  }
+  for (let y = 8; y <= maxY; y += 26) {
+    for (let x = 8; x <= maxX; x += 26) {
+      if (!overlapsAny(x, y, w, h, 10)) return { x, y };
+    }
+  }
+  const k = blocks.size;
+  return { x: (30 + k * 37) % Math.max(1, maxX), y: (20 + k * 53) % Math.max(1, maxY) };
+}
+
 // ---------- drag / long-press split / drop to fuse ----------
 let drag = null;
 function attachPointer(b) {
@@ -221,7 +262,6 @@ function attachPointer(b) {
     ensureAudio();
     ev.preventDefault();
     const rect = b.el.getBoundingClientRect();
-    const srect = stage.getBoundingClientRect();
     drag = {
       block: b, dx: ev.clientX - rect.left, dy: ev.clientY - rect.top,
       startX: ev.clientX, startY: ev.clientY, moved: false, splitDone: false,
@@ -269,6 +309,7 @@ function trySplit(d) {
   placeBlock(c, x + sizeC.w / 2 + 6, y);
   a.el.classList.add("pop"); c.el.classList.add("pop");
   sndSplit();
+  updateChallengeInfo();
 }
 
 function rectsNear(b1, b2, pad) {
@@ -286,7 +327,7 @@ function tryFuse(b) {
     const d = dx * dx + dy * dy;
     if (d < bestDist) { bestDist = d; best = other; }
   }
-  if (!best) return;
+  if (!best) { updateChallengeInfo(); return; }
   const merged = makeFused(b, best);
   const nx = Math.round((b.x + best.x) / 2), ny = Math.round((b.y + best.y) / 2);
   removeBlock(b); removeBlock(best);
@@ -295,12 +336,12 @@ function tryFuse(b) {
   placeBlock(merged, nx, ny);
   merged.el.classList.add("pop");
   sndFuse();
+  updateChallengeInfo();
   checkChallenge();
 }
 
 // ---------- parts box ----------
 const partsBox = document.getElementById("partsbox");
-let spawnCount = 0;
 for (let n = 1; n <= 10; n++) {
   const btn = document.createElement("button");
   btn.className = "partbtn";
@@ -311,13 +352,12 @@ for (let n = 1; n <= 10; n++) {
     const b = makeLeaf(n);
     blocks.set(b.id, b);
     renderBlock(b);
-    spawnCount++;
     const size = blockSize(n);
-    const x = 60 + (spawnCount * 47) % Math.max(80, stage.clientWidth - size.w - 80);
-    const y = 16 + (spawnCount * 31) % 90;
-    placeBlock(b, x, y);
+    const pos = findSpawnPos(size.w, size.h);
+    placeBlock(b, pos.x, pos.y);
     b.el.classList.add("pop");
     sndPop();
+    updateChallengeInfo();
     checkChallenge();
   });
   partsBox.appendChild(btn);
@@ -325,13 +365,26 @@ for (let n = 1; n <= 10; n++) {
 
 // ---------- challenge ----------
 let target = null;
+function biggestTotal() {
+  let m = 0;
+  for (const b of blocks.values()) m = Math.max(m, totalOf(b));
+  return m;
+}
+function updateChallengeInfo() {
+  if (celebrating || target === null) return;
+  const big = biggestTotal();
+  if (big === 0) { challengeSub.textContent = ""; return; }
+  let s = "いま いちばん おおきいのは " + big;
+  if (big < target) s += " ・ あと " + (target - big);
+  challengeSub.textContent = s;
+}
 function newChallenge() {
   let t;
   do { t = 5 + Math.floor(Math.random() * 16); } while (t === target); // 5..20
   target = t;
   challengeText.textContent = target + "を つくって！";
   const size = blockSize(target);
-  ghostEl.style.gridTemplateColumns = "repeat(" + size.cols + ", 15px)";
+  ghostEl.style.gridTemplateColumns = "repeat(" + size.cols + ", 20px)";
   ghostEl.innerHTML = "";
   for (let i = 0; i < target; i++) {
     const c = document.createElement("div");
@@ -340,7 +393,9 @@ function newChallenge() {
   }
   doneMsg.style.display = "none";
   challengeText.style.display = "";
+  challengeSub.style.display = "";
   ghostEl.style.display = "";
+  updateChallengeInfo();
 }
 let celebrating = false;
 function checkChallenge() {
@@ -354,6 +409,7 @@ function celebrate() {
   sndDone();
   doneMsg.style.display = "";
   challengeText.style.display = "none";
+  challengeSub.style.display = "none";
   ghostEl.style.display = "none";
   const marks = ["⭐", "🎈", "✨", "🌟", "🎉"];
   for (let i = 0; i < 14; i++) {
@@ -374,6 +430,7 @@ document.getElementById("clearbtn").addEventListener("click", () => {
   ensureAudio();
   for (const b of Array.from(blocks.values())) removeBlock(b);
   sndSplit();
+  updateChallengeInfo();
 });
 document.getElementById("mutebtn").addEventListener("click", (ev) => {
   ensureAudio();

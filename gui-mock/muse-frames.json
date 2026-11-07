@@ -1,0 +1,130 @@
+{
+  "palette": {
+    "B": "#F3E3C3",
+    "P": "#F4A6B7",
+    "E": "#222222",
+    "S": "#7FC4FF"
+  },
+  "frames": {
+    "idle": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBBBBBBBBB.",
+      ".BBEEBBEEBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "blink": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBBBBBBBBB.",
+      ".BBBBBBBBBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "work-a": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBEBBBBEBB.",
+      ".BBBBBBBBBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "work-b": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBEBBBBEBB.",
+      ".BBBBBBBBBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      ".BBB....BBB."
+    ],
+    "wait": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB.S",
+      ".BBBBBBBBBBS",
+      ".BBBEEBBEEB.",
+      ".BBBEEBBEEB.",
+      ".BPBBEBBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "alert": [
+      "............",
+      "....BBBB....",
+      "S.BBBBBBBB.S",
+      "SBBBEBBEBBBS",
+      ".BBEEBBEEBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBEBEBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "happy": [
+      "............",
+      "....BBBB....",
+      "B.BBBBBBBB.B",
+      "BBBBBBBBBBBB",
+      "BBBBEBBEBBBB",
+      "BBBEBEEBEBBB",
+      ".BPBBEEBBPB.",
+      ".BBBBEEBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "sleep": [
+      "..........EE",
+      "....BBBB..E.",
+      "..BBBBBBBBEE",
+      ".BBBBBBBBBB.",
+      ".BBBBBBBBBB.",
+      ".BBEEBBEEBB.",
+      ".BPBBBEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "look-l": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBBBBBBBBB.",
+      ".BEEBBEEBBB.",
+      ".BEEBBEEBBB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ],
+    "look-r": [
+      "............",
+      "....BBBB....",
+      "..BBBBBBBB..",
+      ".BBBBBBBBBB.",
+      ".BBBEEBBEEB.",
+      ".BBBEEBBEEB.",
+      ".BPBBEEBBPB.",
+      ".BBBBBBBBBB.",
+      "..BBBBBBBB..",
+      "..BBB..BBB.."
+    ]
+  }
+}

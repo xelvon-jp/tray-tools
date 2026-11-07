@@ -54,6 +54,7 @@
   #recipe .result { font-size: 44px; font-weight: bold; color: #e67e22; margin-left: 2px; }
   #recipe .term { display: flex; align-items: center; gap: 7px; }
   #recipe .termval { font-size: 32px; font-weight: bold; color: #333; }
+  #recipe .carrynote { font-size: 20px; font-weight: bold; color: #5b8db8; margin-top: 2px; }
   .mini { position: relative; }
   .mini .cells { display: grid; gap: 1px; }
   .mini .cell { border-radius: 1px; }
@@ -383,6 +384,9 @@ function clusterOf(start) {
   out.sort((p, q) => ((p.x - cx) ** 2 + (p.y - cy) ** 2) - ((q.x - cx) ** 2 + (q.y - cy) ** 2));
   return out;
 }
+// carries that happened during the current challenge (for the
+// addition review's supplement line)
+let carryLog = [];
 // short toast so the child can see what the carry just did
 const carryToast = document.getElementById("carrytoast");
 let toastTimer = null;
@@ -394,6 +398,7 @@ function showCarryToast(nextKind) {
 }
 function convertTen(ten, kind) {
   const nextKind = KINDS[kind].next;
+  if (mode === "add") carryLog.push(kind);
   let cx = 0, cy = 0;
   for (const p of ten) { const s = pieceSize(p.kind); cx += p.x + s.w / 2; cy += p.y + s.h / 2; }
   cx /= ten.length; cy /= ten.length;
@@ -623,6 +628,7 @@ function refreshInfo() {
   totalDisp.textContent = "いま " + fmt2(total);
   if (celebrating) return;
   if (mode === "compare") { challengeSub.textContent = ""; return; }
+  if (mode === "add") { challengeSub.textContent = ""; return; } // "ato" would give away the answer
   if (mode === "sub") {
     challengeSub.textContent = total === curA ? "いらない ぶんは ぶひんばこに もどしてね" : "";
     return;
@@ -661,6 +667,9 @@ function newChallenge() {
   mode = MODE_CYCLE[modeIdx % MODE_CYCLE.length];
   modeIdx++;
   compareState = null;
+  carryLog = [];
+  clearTimeout(reviewTimer);
+  reviewTimer = null;
   doneMsg.style.display = "none";
   reviewEl.style.display = "none";
   nextBtn.style.display = "none";
@@ -782,9 +791,35 @@ function celebrate() {
 }
 // recipe: one term per kind present, e.g. "0.3 + 0.07 = 0.37",
 // each term drawn as that kind's piece next to its value
+let reviewTimer = null;
 function showReview() {
   doneMsg.style.display = "none";
   recipeEl.innerHTML = "";
+  if (mode === "add") {
+    // addition reviews as the problem's own equation, with a small
+    // note about any carry that happened while building it
+    const wrap = document.createElement("div");
+    wrap.style.textAlign = "center";
+    const eqLine = document.createElement("div");
+    eqLine.className = "result";
+    eqLine.style.fontSize = "40px";
+    eqLine.textContent = fmtTrim(curA) + " ＋ " + fmtTrim(curB) + " ＝ " + fmtTrim(target);
+    wrap.appendChild(eqLine);
+    const notes = [];
+    if (carryLog.includes("hundredth")) notes.push("0.01 が 10こ → 0.1 が 1ぽん");
+    if (carryLog.includes("tenth")) notes.push("0.1 が 10ぽん → 1 が 1まい");
+    if (notes.length) {
+      const note = document.createElement("div");
+      note.className = "carrynote";
+      note.textContent = "くりあがり: " + notes.join(" ・ ");
+      wrap.appendChild(note);
+    }
+    recipeEl.appendChild(wrap);
+    nextBtn.style.display = "none";
+    reviewEl.style.display = "flex";
+    reviewTimer = setTimeout(() => { if (celebrating) nextBtn.style.display = "inline-block"; }, 2500);
+    return;
+  }
   if (mode === "sub") {
     // subtraction reviews as the equation itself
     const eqLine = document.createElement("div");
@@ -794,7 +829,7 @@ function showReview() {
     recipeEl.appendChild(eqLine);
     nextBtn.style.display = "none";
     reviewEl.style.display = "flex";
-    setTimeout(() => { nextBtn.style.display = "inline-block"; }, 2500);
+    reviewTimer = setTimeout(() => { if (celebrating) nextBtn.style.display = "inline-block"; }, 2500);
     return;
   }
   let first = true;
@@ -827,10 +862,13 @@ function showReview() {
   recipeEl.appendChild(res);
   nextBtn.style.display = "none";
   reviewEl.style.display = "flex";
-  setTimeout(() => { nextBtn.style.display = "inline-block"; }, 2500);
+  reviewTimer = setTimeout(() => { if (celebrating) nextBtn.style.display = "inline-block"; }, 2500);
 }
 nextBtn.addEventListener("click", () => {
   ensureAudio();
+  nextBtn.style.display = "none";
+  clearTimeout(reviewTimer);
+  reviewTimer = null;
   reviewEl.style.display = "none";
   celebrating = false;
   if (mode === "compare") {

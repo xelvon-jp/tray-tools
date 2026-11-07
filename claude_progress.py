@@ -161,6 +161,24 @@ def rows_to_show(entries, now, first_seen_done: dict) -> list:
     return full + compact[:MAX_COMPACT]
 
 
+TOOL_NAME_CHARS = 12
+
+
+def running_label(entry) -> str:
+    """running の行の言い回し。ツール実行中(phase=tool)は「Claude 処理中」、それ以外
+    (phase が無い古い状態ファイルを含む)は「Claude 応答中」。"""
+    if entry.get("phase") != "tool":
+        return "Claude 応答中"
+    name = str(entry.get("tool_name") or "").strip()
+    if not name:
+        return "Claude 処理中"
+    if name.startswith("mcp__") and name.count("__") >= 2:
+        name = name.split("__")[-1]   # mcp__サーバー__ツール は末尾のツール名だけ見せる
+    if len(name) > TOOL_NAME_CHARS:
+        name = name[:TOOL_NAME_CHARS] + "…"
+    return f"Claude 処理中（{name}）"
+
+
 def copilot_row(copilot) -> dict | None:
     """Copilot の手番(copilot_watchdog.read_turn_status の戻り)をパネルの行にする。
 
@@ -398,7 +416,7 @@ class ClaudeProgressPanel(QWidget):
             if ended:
                 tail += " " + cs.format_duration(now - ended)
         else:
-            tail = ("Claude 実行中 "
+            tail = (running_label(entry) + " "
                     + cs.format_duration(now - (entry.get("started") or now)))
         p.setFont(self._name_font)
         fm = QFontMetrics(self._name_font)

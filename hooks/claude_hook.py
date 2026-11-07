@@ -17,6 +17,8 @@
 #   python claude_hook.py ask     … Notification(permission_prompt)。確認待ちを知らせる
 #   python claude_hook.py tool    … PostToolUse(全ツール、async)。確認待ちが解けたことと、
 #                                   計画(update_plan / TodoWrite)の進み具合を状態に書く
+#   python claude_hook.py pretool … PreToolUse(全ツール、async)。ツール実行中(phase=tool)と
+#                                   その名前を状態に書く(running のときだけ。state は変えない)
 #
 # どのイベントでも、セッションの状態(実行中/確認待ち/完了/失敗)を claude_status の
 # ファイルに書く。トレイはそれを読んで輪の色・ツールチップ・メニューに出す。
@@ -58,6 +60,11 @@ if str(ROOT) not in sys.path:
 import claude_status  # noqa: E402  (標準ライブラリだけ。トレイの状態表示と共有)
 import mouse_jiggler  # noqa: E402  (ctypes だけ。副作用なし)
 import traytools_send  # noqa: E402  (標準ライブラリだけ)
+
+# running の中の段階。応答中(モデルが考えている)と処理中(ツール実行中)。表示側は
+# state==running のときだけ見る。
+PHASE_RESPONDING = "responding"
+PHASE_TOOL = "tool"
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
@@ -375,7 +382,7 @@ def on_start(config: dict, event: dict) -> None:
     # 送ったメッセージの書き出しを名前に添える(同じフォルダのセッションを見分けるため)。
     # 書き出しは手元の %TEMP% に置くだけで、どこへも送らない。
     fields = {"started": time.time(), "ended": None, "asked": None, "plan": [],
-              "background": 0}
+              "background": 0, "phase": PHASE_RESPONDING, "tool_name": None}
     title = claude_status.prompt_title(event.get("prompt"))[:80]
     if title:
         fields["title"] = title
@@ -402,11 +409,31 @@ def on_tool(config: dict, event: dict) -> None:
                and HOOK_STARTED > (data.get("ended") or 0))
     if revived:
         fields.update(started=HOOK_STARTED, ended=None, background=0)
+    # ツールが終わった＝次はモデルが考えている(応答中)。処理中(tool)のときだけ戻す。
+    # phase が無い・すでに responding なら書かない(ツールのたびに書き込まないため)。
+    if data.get("phase") == PHASE_TOOL or ((resumed or revived) and "phase" not in fields):
+        fields.update(phase=PHASE_RESPONDING, tool_name=None)
     if not fields and not resumed:
         return
     update_status(config, event,
                   claude_status.RUNNING if (resumed or revived) else None,
                   **({"asked": None} if resumed else {}), **fields)
+
+
+def on_pretool(config: dict, event: dict) -> None:
+    """PreToolUse(全ツール、async)。ツール実行中(phase=tool)と、その名前を状態に書く。
+
+    state は触らない。running のセッションにだけ書く(完了・失敗・確認待ちを running に
+    戻さない。async なので完了より後に届くこともある)。同じ内容なら書かずに戻る。"""
+    if not config.get("status_enabled") or not event.get("session_id"):
+        return
+    data = claude_status.read(event["session_id"])
+    if data.get("state") != claude_status.RUNNING:
+        return
+    tool_name = str(event.get("tool_name") or "")
+    if data.get("phase") == PHASE_TOOL and (data.get("tool_name") or "") == tool_name:
+        return
+    update_status(config, event, None, phase=PHASE_TOOL, tool_name=tool_name)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +443,8 @@ def on_stop(config: dict, event: dict) -> None:
     elapsed = take_elapsed(event)
     # 裏で走らせたまま終わっていない処理(終わるとアプリが Claude を起こして続きをさせる)。
     background = len(claude_status.pending_background_in(event.get("transcript_path")))
-    update_status(config, event, claude_status.DONE, ended=time.time(), background=background)
+    update_status(config, event, claude_status.DONE, ended=time.time(), background=background,
+                  phase=None, tool_name=None)
     if background:
         _record("stop", f"裏で {background}件 動いたまま応答を終えました")
     if elapsed is None:
@@ -441,7 +469,8 @@ def on_stop(config: dict, event: dict) -> None:
 def on_fail(config: dict, event: dict) -> None:
     # 失敗は時間で絞らない。短く終わったということは、たいてい早々に落ちたということ。
     elapsed = take_elapsed(event)
-    update_status(config, event, claude_status.FAIL, ended=time.time())
+    update_status(config, event, claude_status.FAIL, ended=time.time(),
+                  phase=None, tool_name=None)
     if config["beep_on_error"]:
         beep(config, "sound_error")
     _record("fail", f"経過 {_format_minutes(elapsed)} → {config['sound_error']} を鳴らす")
@@ -455,7 +484,8 @@ def on_fail(config: dict, event: dict) -> None:
 
 def on_ask(config: dict, event: dict) -> None:
     # 確認待ちは、放っておくといつまでも進まない。経過時間では絞らない。
-    update_status(config, event, claude_status.ASK, asked=time.time())
+    update_status(config, event, claude_status.ASK, asked=time.time(),
+                  phase=None, tool_name=None)
     _record("ask", f"{config['sound_ask']} を {config['ask_repeat']} 回鳴らす")
     if config["beep_on_ask"]:
         beep(config, "sound_ask", config["ask_repeat"], config["ask_repeat_interval"])
@@ -469,6 +499,7 @@ ACTIONS = {
     "fail": on_fail,
     "ask": on_ask,
     "tool": on_tool,
+    "pretool": on_pretool,
 }
 
 

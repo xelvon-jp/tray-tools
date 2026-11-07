@@ -123,6 +123,74 @@ def test_hook_writes_status_through_a_turn():
         assert cs.read("s-1")["state"] == cs.FAIL
 
 
+def test_pretool_phase():
+    import claude_hook as hook
+    import claude_progress as cp
+    hook.send = lambda command, args: True
+    hook.is_away = lambda config: False
+    with tempfile.TemporaryDirectory() as tmp:
+        cs.STATUS_DIR = Path(tmp, "status")
+        hook.STATE_DIR = Path(tmp)
+        hook.LOG_PATH = Path(tmp, "hook.log")
+        config = dict(hook.DEFAULTS, min_seconds=0)
+        event = {"session_id": "p-1", "cwd": r"R:\claude\tray-tools"}
+        # 状態ファイルが無いセッションには何も書かない
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        assert cs.read("p-1") == {}
+        hook.on_start(config, event)
+        assert cs.read("p-1")["phase"] == "responding"
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        data = cs.read("p-1")
+        assert data["state"] == cs.RUNNING and data["phase"] == "tool" and data["tool_name"] == "Bash"
+        # 同じ内容なら書かない
+        before = data["updated"]
+        time.sleep(0.01)
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        assert cs.read("p-1")["updated"] == before
+        hook.on_pretool(config, dict(event, tool_name="Read"))
+        assert cs.read("p-1")["tool_name"] == "Read"
+        # ツールが終わったら応答中へ。その後の PostToolUse は書かない
+        hook.on_tool(config, dict(event, tool_name="Read", tool_input={}))
+        data = cs.read("p-1")
+        assert data["phase"] == "responding" and data["tool_name"] is None
+        before = data["updated"]
+        time.sleep(0.01)
+        hook.on_tool(config, dict(event, tool_name="Read", tool_input={}))
+        assert cs.read("p-1")["updated"] == before
+        # running 以外は上書きしない(遅れて届いた pretool で戻さない)
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        hook.on_ask(config, event)
+        data = cs.read("p-1")
+        assert data["state"] == cs.ASK and data.get("phase") is None
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        data = cs.read("p-1")
+        assert data["state"] == cs.ASK and data.get("phase") is None
+        hook.on_stop(config, event)
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        data = cs.read("p-1")
+        assert data["state"] == cs.DONE and data.get("phase") is None
+        hook.on_fail(config, event)
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        assert cs.read("p-1")["state"] == cs.FAIL and cs.read("p-1").get("phase") is None
+        # 確認待ちが解けて走り出したら running + responding
+        hook.on_start(config, event)
+        hook.on_pretool(config, dict(event, tool_name="Bash"))
+        hook.on_ask(config, event)
+        hook.on_tool(config, dict(event, tool_name="Bash", tool_input={}))
+        data = cs.read("p-1")
+        assert data["state"] == cs.RUNNING and data["phase"] == "responding"
+    # パネルの言い回し
+    assert cp.running_label({"state": cs.RUNNING}) == "Claude 応答中"
+    assert cp.running_label({"phase": "responding"}) == "Claude 応答中"
+    assert cp.running_label({"phase": "tool"}) == "Claude 処理中"
+    assert cp.running_label({"phase": "tool", "tool_name": "Bash"}) == "Claude 処理中（Bash）"
+    # mcp__サーバー__ツール は末尾のツール名だけ見せる。普通の長い名前は12文字で切る
+    mcp = cp.running_label({"phase": "tool", "tool_name": "mcp__tray-tools__capture"})
+    assert mcp == "Claude 処理中（capture）", mcp
+    long = cp.running_label({"phase": "tool", "tool_name": "VeryLongToolNameHere"})
+    assert long == "Claude 処理中（VeryLongTool…）", long
+
+
 def test_title_tells_sessions_apart():
     assert cs.prompt_title("<pasted_content id=x>\n長い\n貼り付け</pasted_content>  修正して") == \
         "長い 貼り付け 修正して"

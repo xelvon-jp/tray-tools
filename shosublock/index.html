@@ -632,6 +632,7 @@ let target = null; // goal total in hundredths (not used by compare)
 let curA = 0, curB = 0; // operands of the current add/sub problem
 let compareState = null; // { left, right, answered }
 let celebrating = false;
+let winCounts = null; // piece counts at the moment of completion
 function refreshInfo() {
   const total = totalHundredths();
   totalDisp.textContent = "いま " + fmt2(total);
@@ -782,6 +783,9 @@ function checkChallenge() {
 }
 function celebrate() {
   celebrating = true;
+  // snapshot the winning composition now: the review is built from
+  // this, even if the child keeps playing during the celebration
+  winCounts = { one: countKind("one"), tenth: countKind("tenth"), hundredth: countKind("hundredth") };
   sndDone();
   doneMsg.style.display = "block";
   challengeInfo.style.display = "none";
@@ -841,7 +845,7 @@ function showReview() {
   }
   let first = true;
   for (const kind of KIND_ORDER) {
-    const c = countKind(kind);
+    const c = winCounts ? winCounts[kind] : countKind(kind);
     if (c === 0) continue;
     if (!first) {
       const op = document.createElement("div");

@@ -51,9 +51,9 @@
   /* recipe review */
   #review { display: none; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; max-width: 100%; }
   #recipe { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
-  #recipe .eqline { font-size: 40px; }
   #recipe .op { font-size: 34px; font-weight: bold; color: #1463a3; }
   #recipe .result { font-size: 44px; font-weight: bold; color: #e67e22; margin-left: 2px; }
+  #recipe .eqline { font-size: 40px; }
   #recipe .term { display: flex; align-items: center; gap: 7px; }
   #recipe .termval { font-size: 32px; font-weight: bold; color: #333; }
   #recipe .carrynote { font-size: 20px; font-weight: bold; color: #5b8db8; margin-top: 2px; }
@@ -64,8 +64,15 @@
 
   /* play stage */
   #stage { position: relative; flex: 1; touch-action: none; overflow: hidden; }
+  #frames { position: absolute; inset: 0; pointer-events: none; }
+  .frame {
+    position: absolute; border: 3px solid #e8b64c; border-radius: 8px;
+    background: rgba(255, 255, 255, .4);
+  }
+  .frame .cells { display: grid; gap: 2px; }
+  .frame .fcell { background: #ffffff; border-radius: 2px; box-shadow: inset 0 0 0 1px #f3e3bb; }
 
-  .piece { position: absolute; cursor: grab; touch-action: none; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,.18); }
+  .piece { position: absolute; cursor: grab; touch-action: none; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,.18); z-index: 2; }
   .piece .cells { display: grid; gap: 2px; }
   .piece .cell { border-radius: 3px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.15), inset 0 2px 0 rgba(255,255,255,.3); }
   .piece.exhibit { cursor: pointer; }
@@ -74,6 +81,11 @@
     0%, 100% { box-shadow: 0 2px 5px rgba(0,0,0,.18); }
     50% { box-shadow: 0 0 0 5px #ffb703, 0 0 28px 8px rgba(255,183,3,.75); }
   }
+  .piece.pop { animation: pop .25s ease-out; }
+  @keyframes pop { 0% { transform: scale(.6); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
+  .piece.wiggle { animation: wiggle .3s ease-in-out; }
+  @keyframes wiggle { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-2.5deg); } 75% { transform: rotate(2.5deg); } }
+
   #partsbox.droptarget { background: #ffd9d9; }
   #carrytoast {
     position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
@@ -82,10 +94,6 @@
     display: none; z-index: 60; pointer-events: none; white-space: nowrap;
     box-shadow: 0 3px 8px rgba(0,0,0,.18);
   }
-  .piece.pop { animation: pop .25s ease-out; }
-  @keyframes pop { 0% { transform: scale(.6); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
-  .piece.wiggle { animation: wiggle .3s ease-in-out; }
-  @keyframes wiggle { 0%,100% { transform: rotate(0); } 25% { transform: rotate(-2.5deg); } 75% { transform: rotate(2.5deg); } }
 
   /* parts box */
   #partsbox {
@@ -153,7 +161,7 @@
     </div>
     <div id="totaldisp">いま 0.00</div>
   </div>
-  <div id="stage"><div id="carrytoast"></div></div>
+  <div id="stage"><div id="frames"></div><div id="carrytoast"></div></div>
   <div id="partsbox">
     <div id="partslabel">ぶひんばこ</div>
   </div>
@@ -163,6 +171,7 @@
 "use strict";
 // ---------- basics ----------
 const stage = document.getElementById("stage");
+const framesLayer = document.getElementById("frames");
 const challengeBar = document.getElementById("challengebar");
 const challengeInfo = document.getElementById("challengeinfo");
 const challengeText = document.getElementById("challengetext");
@@ -174,19 +183,19 @@ const recipeEl = document.getElementById("recipe");
 const nextBtn = document.getElementById("nextbtn");
 const undoBtn = document.getElementById("undobtn");
 
-// kinds: value in hundredths, grid shape in cells (cell size is
-// computed from the stage size by computeCell below)
-// "one" is a 10x10 plate, "tenth" a 1x10 stick, "hundredth" a single square,
-// so ten of a kind tile the next unit exactly (area is conserved visually)
+// kinds: value in hundredths, grid shape in cells. The stage is made
+// of frames: one frame is a 10x10 grid and stands for "1". A stick
+// fills one column of a frame, a square fills one cell, a plate
+// fills the whole frame -- decimals are read off as filled area.
 const KINDS = {
-  one:       { value: 100, cols: 10, rows: 10, color: "#3498db", next: null },
-  tenth:     { value: 10,  cols: 1,  rows: 10, color: "#2ecc71", next: "one" },
-  hundredth: { value: 1,   cols: 1,  rows: 1,  color: "#e67e22", next: "tenth" }
+  one:       { value: 100, cols: 10, rows: 10, color: "#3498db" },
+  tenth:     { value: 10,  cols: 1,  rows: 10, color: "#2ecc71" },
+  hundredth: { value: 1,   cols: 1,  rows: 1,  color: "#e67e22" }
 };
 const KIND_ORDER = ["one", "tenth", "hundredth"];
-const GAP = 2;
+const GAP = 2, FRAME_GAP = 14, FRAME_BORDER = 3;
 let CELL = 20, PITCH = CELL + GAP;
-// pieces are sized from the stage: a plate is about 200px square
+// pieces are sized from the stage: a frame is about 200px square
 // (one cell about 20px), shrinking only when the stage is too small
 function computeCell() {
   const w = stage.clientWidth || 1024, h = stage.clientHeight || 500;
@@ -195,11 +204,12 @@ function computeCell() {
   if (fit < c) c = Math.max(12, fit);
   CELL = c; PITCH = CELL + GAP;
 }
-
 function pieceSize(kind) {
   const k = KINDS[kind];
   return { w: k.cols * CELL + (k.cols - 1) * GAP, h: k.rows * CELL + (k.rows - 1) * GAP };
 }
+function frameInner() { return 10 * CELL + 9 * GAP; }
+function frameSize() { return frameInner() + FRAME_BORDER * 2; }
 // amounts are integer hundredths everywhere (no float errors)
 function fmt2(h) { return Math.floor(h / 100) + "." + String(h % 100).padStart(2, "0"); }
 function fmtTrim(h) {
@@ -238,10 +248,12 @@ const sndBreak = () => { tone(784, 0, 0.12); tone(523, 0.07, 0.18); };
 const sndDone = () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, i * 0.11, 0.25)); };
 
 // ---------- piece model ----------
-// piece = { id, kind, x, y, el }
+// piece = { id, kind, frame, col, row, x, y, el, exhibit, side }
+// (frame, col, row) is its slot inside a frame; x/y are pixels and
+// follow the slot except while the piece is being dragged
 let nextId = 1;
 const blocks = new Map();
-function makePiece(kind) { return { id: nextId++, kind, x: 0, y: 0, el: null }; }
+function makePiece(kind) { return { id: nextId++, kind, frame: null, col: 0, row: 0, x: 0, y: 0, el: null, exhibit: false, side: "" }; }
 function totalHundredths() {
   let s = 0;
   for (const p of blocks.values()) s += KINDS[p.kind].value;
@@ -287,19 +299,171 @@ function removePiece(p) {
   if (p.el) p.el.remove();
   blocks.delete(p.id);
 }
-function placePiece(p, x, y) {
-  const size = pieceSize(p.kind);
-  const maxX = Math.max(0, stage.clientWidth - size.w);
-  const maxY = Math.max(0, stage.clientHeight - size.h);
-  p.x = Math.min(Math.max(0, x), maxX);
-  p.y = Math.min(Math.max(0, y), maxY);
-  if (p.el) { p.el.style.left = p.x + "px"; p.el.style.top = p.y + "px"; }
+
+// ---------- frames ----------
+let framesCount = 1;
+let frameOrigins = [];
+let compareLeftFrames = 0; // in compare mode: frames [0, left) are the left group
+function frameCapacity() {
+  const fw = frameSize();
+  const perRow = Math.max(1, Math.floor((stage.clientWidth + FRAME_GAP) / (fw + FRAME_GAP)));
+  const rows = Math.max(1, Math.floor((stage.clientHeight + FRAME_GAP) / (fw + FRAME_GAP)));
+  return perRow * rows;
+}
+function layoutFrames() {
+  const fw = frameSize();
+  const W = stage.clientWidth, H = stage.clientHeight;
+  frameOrigins = [];
+  if (mode === "compare") {
+    const y = Math.max(6, H * 0.08);
+    const groups = [
+      { n: compareLeftFrames, cx: W * 0.26 },
+      { n: framesCount - compareLeftFrames, cx: W * 0.74 }
+    ];
+    for (const g of groups) {
+      if (g.n <= 0) continue;
+      const gw = g.n * fw + (g.n - 1) * FRAME_GAP;
+      let x = Math.min(Math.max(4, g.cx - gw / 2), Math.max(4, W - gw - 4));
+      for (let i = 0; i < g.n; i++) { frameOrigins.push({ x, y }); x += fw + FRAME_GAP; }
+    }
+  } else {
+    const perRow = Math.max(1, Math.floor((W + FRAME_GAP) / (fw + FRAME_GAP)));
+    for (let i = 0; i < framesCount; i++) {
+      const r = Math.floor(i / perRow), c = i % perRow;
+      const inRow = Math.min(perRow, framesCount - r * perRow);
+      const rowW = inRow * fw + (inRow - 1) * FRAME_GAP;
+      frameOrigins.push({ x: (W - rowW) / 2 + c * (fw + FRAME_GAP), y: 10 + r * (fw + FRAME_GAP) });
+    }
+  }
+  renderFrames();
+  for (const p of blocks.values()) if (p.frame !== null && p.frame !== undefined) setAnchoredPos(p, false);
+}
+function renderFrames() {
+  framesLayer.innerHTML = "";
+  const fw = frameSize();
+  for (const o of frameOrigins) {
+    const f = document.createElement("div");
+    f.className = "frame";
+    f.style.left = o.x + "px"; f.style.top = o.y + "px";
+    f.style.width = fw + "px"; f.style.height = fw + "px";
+    const cells = document.createElement("div");
+    cells.className = "cells";
+    cells.style.display = "grid";
+    cells.style.gap = GAP + "px";
+    cells.style.gridTemplateColumns = "repeat(10, " + CELL + "px)";
+    for (let i = 0; i < 100; i++) {
+      const c = document.createElement("div");
+      c.className = "fcell";
+      c.style.width = CELL + "px"; c.style.height = CELL + "px";
+      cells.appendChild(c);
+    }
+    f.appendChild(cells);
+    framesLayer.appendChild(f);
+  }
+}
+function slotPos(frame, col, row) {
+  const o = frameOrigins[frame] || { x: 0, y: 0 };
+  return { x: o.x + FRAME_BORDER + col * PITCH, y: o.y + FRAME_BORDER + row * PITCH };
+}
+function setAnchoredPos(p, slide) {
+  if (p.frame === null || p.frame === undefined) return;
+  const pos = slotPos(p.frame, p.col, p.row);
+  if (slide && p.el) {
+    p.el.style.transition = "left .18s ease-out, top .18s ease-out";
+    setTimeout(() => { if (p.el) p.el.style.transition = ""; }, 200);
+  }
+  p.x = pos.x; p.y = pos.y;
+  if (p.el) { p.el.style.left = pos.x + "px"; p.el.style.top = pos.y + "px"; }
+}
+function growFrame() {
+  if (framesCount >= frameCapacity()) return false;
+  framesCount++;
+  layoutFrames();
+  return true;
+}
+
+// occupancy of every frame: which slots are taken
+// ignoreId: one piece (the one being moved) counts as absent
+function buildOccupancy(ignoreId) {
+  const occ = [];
+  for (let f = 0; f < framesCount; f++) {
+    occ.push({ plate: null, cols: Array.from({ length: 10 }, () => ({ stick: null, cells: new Map() })) });
+  }
+  for (const p of blocks.values()) {
+    if (p.id === ignoreId || p.frame === null || p.frame === undefined || !occ[p.frame]) continue;
+    if (p.kind === "one") occ[p.frame].plate = p;
+    else if (p.kind === "tenth") occ[p.frame].cols[p.col].stick = p;
+    else occ[p.frame].cols[p.col].cells.set(p.row, p);
+  }
+  return occ;
+}
+function frameIsEmpty(occF) {
+  return !occF.plate && occF.cols.every((c) => !c.stick && c.cells.size === 0);
+}
+// find a slot for kind inside one frame; near = {col, row} floats to
+// prefer the closest slot, or null for first-in-order filling
+function slotInFrame(occF, kind, near) {
+  if (kind === "one") return frameIsEmpty(occF) ? { col: 0, row: 0 } : null;
+  if (occF.plate) return null;
+  if (kind === "tenth") {
+    let best = null, bestD = Infinity;
+    for (let c = 0; c < 10; c++) {
+      const colState = occF.cols[c];
+      if (colState.stick || colState.cells.size > 0) continue;
+      const d = near ? Math.abs(c - near.col) : c;
+      if (d < bestD) { bestD = d; best = { col: c, row: 0 }; }
+    }
+    return best;
+  }
+  // hundredth: nearest (or first) empty cell in a column with no stick
+  let best = null, bestD = Infinity;
+  for (let c = 0; c < 10; c++) {
+    const colState = occF.cols[c];
+    if (colState.stick) continue;
+    for (let r = 0; r < 10; r++) {
+      if (colState.cells.has(r)) continue;
+      const d = near ? ((c - near.col) ** 2 + (r - near.row) ** 2) : (c * 10 + r);
+      if (d < bestD) { bestD = d; best = { col: c, row: r }; }
+    }
+  }
+  return best;
+}
+// slot search across frames, preferred frame first; may grow a frame
+function findSlot(kind, prefFrame, near, ignoreId, allowGrow) {
+  const occ = buildOccupancy(ignoreId);
+  const order = [];
+  if (prefFrame !== null && prefFrame !== undefined && prefFrame < framesCount) order.push(prefFrame);
+  const rest = [];
+  for (let f = 0; f < framesCount; f++) if (f !== prefFrame) rest.push(f);
+  if (near && near.cx !== undefined) {
+    rest.sort((a, b) => {
+      const ca = frameOrigins[a], cb = frameOrigins[b];
+      const da = ((ca.x + frameSize() / 2 - near.cx) ** 2 + (ca.y + frameSize() / 2 - near.cy) ** 2);
+      const db = ((cb.x + frameSize() / 2 - near.cx) ** 2 + (cb.y + frameSize() / 2 - near.cy) ** 2);
+      return da - db;
+    });
+  }
+  order.push(...rest);
+  for (const f of order) {
+    const s = slotInFrame(occ[f], kind, near);
+    if (s) return { frame: f, col: s.col, row: s.row };
+  }
+  if (allowGrow && growFrame()) {
+    const occ2 = buildOccupancy(ignoreId);
+    const f = framesCount - 1;
+    const s = slotInFrame(occ2[f], kind, near);
+    if (s) return { frame: f, col: s.col, row: s.row };
+  }
+  return null;
 }
 
 // ---------- undo (snapshots of all pieces, max 20) ----------
 const history = [];
 function snapshot() {
-  history.push(Array.from(blocks.values(), (p) => ({ k: p.kind, x: Math.round(p.x), y: Math.round(p.y) })));
+  history.push({
+    n: framesCount,
+    ps: Array.from(blocks.values(), (p) => ({ k: p.kind, f: p.frame, c: p.col, r: p.row }))
+  });
   if (history.length > 20) history.shift();
   syncUndoBtn();
 }
@@ -309,122 +473,27 @@ undoBtn.addEventListener("click", () => {
   if (drag || history.length === 0) return;
   const snap = history.pop();
   for (const p of Array.from(blocks.values())) removePiece(p);
-  for (const s of snap) {
+  framesCount = snap.n;
+  layoutFrames();
+  for (const s of snap.ps) {
+    if (s.f === null || s.f === undefined) continue;
     const p = makePiece(s.k);
+    p.frame = s.f; p.col = s.c; p.row = s.r;
     blocks.set(p.id, p);
     renderPiece(p);
-    placePiece(p, s.x, s.y);
+    setAnchoredPos(p, false);
   }
   syncUndoBtn();
   refreshInfo();
   sndBreak();
 });
 
-// ---------- spawn positions ----------
-// prefer a spot tiling right next to a same-kind piece, so tap-spawned
-// pieces gather into one cluster (which is what makes the carry fire)
-function overlapsAny(x, y, w, h, pad, ignoreId) {
-  for (const o of blocks.values()) {
-    if (o.id === ignoreId) continue;
-    const s = pieceSize(o.kind);
-    if (!(x + w + pad < o.x || o.x + s.w + pad < x || y + h + pad < o.y || o.y + s.h + pad < y)) return true;
-  }
-  return false;
-}
-function findSpawnPos(kind) {
-  const size = pieceSize(kind);
-  const W = stage.clientWidth, H = stage.clientHeight;
-  const maxX = Math.max(0, W - size.w);
-  const maxY = Math.max(0, H - size.h);
-  const cx = W / 2, cy = H / 2;
-  // 1) tiling next to a same-kind piece (keeps the cluster the carry
-  //    needs), starting from the piece closest to the stage centre
-  const same = Array.from(blocks.values()).filter((p) => p.kind === kind);
-  same.sort((a, b) => {
-    const sa = pieceSize(a.kind), sb = pieceSize(b.kind);
-    const da = (a.x + sa.w / 2 - cx) ** 2 + (a.y + sa.h / 2 - cy) ** 2;
-    const db = (b.x + sb.w / 2 - cx) ** 2 + (b.y + sb.h / 2 - cy) ** 2;
-    return da - db;
-  });
-  for (const o of same) {
-    const os = pieceSize(o.kind);
-    const cand = [
-      { x: o.x + os.w + 4, y: o.y }, { x: o.x, y: o.y + os.h + 4 },
-      { x: o.x - size.w - 4, y: o.y }, { x: o.x, y: o.y - size.h - 4 }
-    ];
-    for (const c of cand) {
-      if (c.x < 0 || c.y < 0 || c.x > maxX || c.y > maxY) continue;
-      if (!overlapsAny(c.x, c.y, size.w, size.h, 2, -1)) return c;
-    }
-  }
-  // 2) free space, biased to the centre of the stage
-  for (let i = 0; i < 40; i++) {
-    const x = Math.min(maxX, Math.max(0, cx + (Math.random() + Math.random() - 1) * maxX * 0.42 - size.w / 2));
-    const y = Math.min(maxY, Math.max(0, cy + (Math.random() + Math.random() - 1) * maxY * 0.42 - size.h / 2));
-    if (!overlapsAny(x, y, size.w, size.h, 10, -1)) return { x, y };
-  }
-  // 3) grid points, centre first
-  const pts = [];
-  for (let y = 8; y <= maxY; y += 26) for (let x = 8; x <= maxX; x += 26) pts.push({ x, y });
-  pts.sort((a, b) => ((a.x - cx) ** 2 + (a.y - cy) ** 2) - ((b.x - cx) ** 2 + (b.y - cy) ** 2));
-  for (const c of pts) if (!overlapsAny(c.x, c.y, size.w, size.h, 10, -1)) return c;
-  const k = blocks.size;
-  return { x: (30 + k * 37) % Math.max(1, maxX), y: (20 + k * 53) % Math.max(1, maxY) };
-}
-
-// pieces never rest on top of each other: when a piece is let go (or
-// a carry creates one) in a spot that overlaps another piece, it
-// slides to the nearest free spot instead
-function slideTo(p, nx, ny) {
-  if (!p.el) { p.x = nx; p.y = ny; return; }
-  p.el.style.transition = "left .18s ease-out, top .18s ease-out";
-  placePiece(p, nx, ny);
-  setTimeout(() => { if (p.el) p.el.style.transition = ""; }, 200);
-}
-function resolveOverlap(p) {
-  const s = pieceSize(p.kind);
-  if (!overlapsAny(p.x, p.y, s.w, s.h, 0, p.id)) return;
-  const ox = p.x, oy = p.y;
-  const maxX = Math.max(0, stage.clientWidth - s.w);
-  const maxY = Math.max(0, stage.clientHeight - s.h);
-  for (let r = 1; r <= 14; r++) {
-    for (let dx = -r; dx <= r; dx++) {
-      for (let dy = -r; dy <= r; dy++) {
-        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
-        const nx = ox + dx * PITCH, ny = oy + dy * PITCH;
-        if (nx < 0 || ny < 0 || nx > maxX || ny > maxY) continue;
-        if (!overlapsAny(nx, ny, s.w, s.h, 0, p.id)) { slideTo(p, nx, ny); return; }
-      }
-    }
-  }
-  // nowhere free nearby: stay where it was dropped
-}
-
-// ---------- carry-up: 10 of a kind gathered together become the next unit ----------
-function rectNear(a, b, pad) {
-  const sa = pieceSize(a.kind), sb = pieceSize(b.kind);
-  return !(a.x + sa.w + pad < b.x || b.x + sb.w + pad < a.x ||
-           a.y + sa.h + pad < b.y || b.y + sb.h + pad < a.y);
-}
-function clusterOf(start) {
-  const seen = new Set([start.id]);
-  const queue = [start];
-  const out = [start];
-  while (queue.length) {
-    const cur = queue.shift();
-    for (const o of blocks.values()) {
-      if (o.kind !== start.kind || seen.has(o.id)) continue;
-      if (rectNear(cur, o, 12)) { seen.add(o.id); queue.push(o); out.push(o); }
-    }
-  }
-  const cx = start.x, cy = start.y;
-  out.sort((p, q) => ((p.x - cx) ** 2 + (p.y - cy) ** 2) - ((q.x - cx) ** 2 + (q.y - cy) ** 2));
-  return out;
-}
-// carries that happened during the current challenge (for the
-// addition review's supplement line)
+// ---------- carry-up inside a frame ----------
+// a column filled with 10 squares becomes a stick; a frame filled
+// with 10 sticks becomes a plate. Carries are checked locally, where
+// a piece was just placed: breaking a stick into 10 squares does NOT
+// rejoin them until the child places something there again.
 let carryLog = [];
-// short toast so the child can see what the carry just did
 const carryToast = document.getElementById("carrytoast");
 let toastTimer = null;
 function showCarryToast(nextKind) {
@@ -433,78 +502,102 @@ function showCarryToast(nextKind) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { carryToast.style.display = "none"; }, 900);
 }
-function convertTen(ten, kind) {
-  const nextKind = KINDS[kind].next;
-  if (mode === "add") carryLog.push(kind);
-  let cx = 0, cy = 0;
-  for (const p of ten) { const s = pieceSize(p.kind); cx += p.x + s.w / 2; cy += p.y + s.h / 2; }
-  cx /= ten.length; cy /= ten.length;
-  for (const p of ten) {
-    blocks.delete(p.id);
-    const el = p.el, s = pieceSize(p.kind);
-    const dx = cx - (p.x + s.w / 2), dy = cy - (p.y + s.h / 2);
-    el.classList.add("dying");
-    el.style.pointerEvents = "none";
-    el.style.zIndex = 30;
-    if (el.animate) {
-      el.animate([
-        { transform: "translate(0px, 0px) scale(1)", opacity: 1 },
-        { transform: "translate(" + dx + "px, " + dy + "px) scale(0.15)", opacity: 0.3 }
-      ], { duration: 260, easing: "ease-in" });
-    }
-    const dying = el;
-    setTimeout(() => dying.remove(), 300);
+function flyOut(p, cx, cy) {
+  blocks.delete(p.id);
+  const el = p.el, s = pieceSize(p.kind);
+  const dx = cx - (p.x + s.w / 2), dy = cy - (p.y + s.h / 2);
+  el.classList.add("dying");
+  el.style.pointerEvents = "none";
+  el.style.zIndex = 30;
+  if (el.animate) {
+    el.animate([
+      { transform: "translate(0px, 0px) scale(1)", opacity: 1 },
+      { transform: "translate(" + dx + "px, " + dy + "px) scale(0.15)", opacity: 0.3 }
+    ], { duration: 260, easing: "ease-in" });
   }
-  const np = makePiece(nextKind);
+  setTimeout(() => el.remove(), 300);
+}
+function settleAt(frame, col, snapState) {
+  if (frame === null || frame === undefined) return;
+  let occ = buildOccupancy();
+  let occF = occ[frame];
+  if (!occF || occF.plate) return;
+  const colState = occF.cols[col];
+  if (colState && !colState.stick && colState.cells.size === 10) {
+    convertColumn(frame, col, snapState);
+    occ = buildOccupancy();
+    occF = occ[frame];
+  }
+  if (occF && !occF.plate && occF.cols.every((c) => c.stick)) {
+    convertFrame(frame, snapState);
+  }
+}
+function convertColumn(frame, col, snapState) {
+  const occ = buildOccupancy();
+  const cells = occ[frame].cols[col].cells;
+  if (cells.size !== 10) return;
+  if (!snapState.done) { snapshot(); snapState.done = true; }
+  if (mode === "add") carryLog.push("hundredth");
+  const pos = slotPos(frame, col, 0);
+  const cx = pos.x + CELL / 2, cy = pos.y + frameInner() / 2;
+  for (const p of cells.values()) flyOut(p, cx, cy);
+  const np = makePiece("tenth");
+  np.frame = frame; np.col = col; np.row = 0;
   blocks.set(np.id, np);
   renderPiece(np);
-  const ns = pieceSize(nextKind);
-  placePiece(np, cx - ns.w / 2, cy - ns.h / 2);
-  resolveOverlap(np);
+  setAnchoredPos(np, false);
   np.el.classList.add("pop");
   sndCarry();
-  showCarryToast(nextKind);
-  return np;
+  showCarryToast("tenth");
 }
-// after a piece arrives, convert any full cluster of 10 it belongs to;
-// a conversion can complete the next kind's cluster too (chain), and the
-// whole cascade is a single undo step
-function carryFrom(start) {
-  if (!start || !KINDS[start.kind].next) return;
-  let pivot = start, snapshotted = false;
-  while (pivot && blocks.has(pivot.id) && KINDS[pivot.kind].next) {
-    const cluster = clusterOf(pivot);
-    if (cluster.length < 10) break;
-    if (!snapshotted) { snapshot(); snapshotted = true; }
-    pivot = convertTen(cluster.slice(0, 10), pivot.kind);
-  }
-  if (snapshotted) refreshInfo();
+function convertFrame(frame, snapState) {
+  const occ = buildOccupancy();
+  const sticks = occ[frame].cols.map((c) => c.stick);
+  if (sticks.some((s) => !s)) return;
+  if (!snapState.done) { snapshot(); snapState.done = true; }
+  if (mode === "add") carryLog.push("tenth");
+  const o = frameOrigins[frame];
+  const cx = o.x + frameSize() / 2, cy = o.y + frameSize() / 2;
+  for (const p of sticks) flyOut(p, cx, cy);
+  const np = makePiece("one");
+  np.frame = frame; np.col = 0; np.row = 0;
+  blocks.set(np.id, np);
+  renderPiece(np);
+  setAnchoredPos(np, false);
+  np.el.classList.add("pop");
+  sndCarry();
+  showCarryToast("one");
 }
 
-// ---------- break apart (long-press): 1 -> ten 0.1, 0.1 -> ten 0.01 ----------
-// the ten children tile the parent's exact footprint, so the area is
-// visibly the same before and after
+// ---------- break apart (long-press): the children keep exactly ----------
+// the same footprint: a plate becomes its frame's 10 sticks, a
+// stick becomes its column's 10 squares
 function breakApart(p) {
-  const childKind = p.kind === "one" ? "tenth" : p.kind === "tenth" ? "hundredth" : null;
-  if (!childKind) { // a single square cannot break; just wiggle
+  if (p.kind === "hundredth") {
     p.el.classList.remove("wiggle"); void p.el.offsetWidth; p.el.classList.add("wiggle");
     return;
   }
   snapshot();
-  const x = p.x, y = p.y;
+  const frame = p.frame, col = p.col;
   removePiece(p);
-  // shift the whole row/column so all ten children stay on the stage
-  // instead of piling up against an edge
-  const span = 10 * PITCH - GAP;
-  const startX = Math.min(x, Math.max(0, stage.clientWidth - span));
-  const startY = Math.min(y, Math.max(0, stage.clientHeight - span));
-  for (let i = 0; i < 10; i++) {
-    const c = makePiece(childKind);
-    blocks.set(c.id, c);
-    renderPiece(c);
-    if (childKind === "tenth") placePiece(c, startX + i * PITCH, y);
-    else placePiece(c, x, startY + i * PITCH);
-    c.el.classList.add("pop");
+  if (p.kind === "one") {
+    for (let c = 0; c < 10; c++) {
+      const np = makePiece("tenth");
+      np.frame = frame; np.col = c; np.row = 0;
+      blocks.set(np.id, np);
+      renderPiece(np);
+      setAnchoredPos(np, false);
+      np.el.classList.add("pop");
+    }
+  } else {
+    for (let r = 0; r < 10; r++) {
+      const np = makePiece("hundredth");
+      np.frame = frame; np.col = col; np.row = r;
+      blocks.set(np.id, np);
+      renderPiece(np);
+      setAnchoredPos(np, false);
+      np.el.classList.add("pop");
+    }
   }
   sndBreak();
   refreshInfo();
@@ -535,8 +628,8 @@ function attachPointer(p) {
         if (!drag || drag.piece !== p || drag.moved) return;
         drag.broke = true;
         breakApart(p);
-        // the dragged element may be gone now, so this drag never gets its
-        // pointerup; close it here (same lesson as kazublock)
+        // the dragged element may be gone now, so this drag never
+        // gets its pointerup; close it here (same lesson as before)
         if (drag && drag.piece === p) drag = null;
       }, 600)
     };
@@ -550,7 +643,12 @@ function attachPointer(p) {
       drag.moved = true;
       clearTimeout(drag.timer);
     }
-    placePiece(p, ev.clientX - srect.left - drag.dx, ev.clientY - srect.top - drag.dy);
+    const size = pieceSize(p.kind);
+    const maxX = Math.max(0, stage.clientWidth - size.w);
+    const maxY = Math.max(0, stage.clientHeight - size.h);
+    p.x = Math.min(Math.max(0, ev.clientX - srect.left - drag.dx), maxX);
+    p.y = Math.min(Math.max(0, ev.clientY - srect.top - drag.dy), maxY);
+    p.el.style.left = p.x + "px"; p.el.style.top = p.y + "px";
     const pb = partsBox.getBoundingClientRect();
     partsBox.classList.toggle("droptarget", ev.clientY >= pb.top - 14);
   });
@@ -564,8 +662,7 @@ function attachPointer(p) {
     if (wasBroke) return;
     // dropped on the parts box: the piece goes back (this is how
     // subtraction takes pieces away). The test uses the pointer, not
-    // the piece centre: pieces are clamped inside the stage, so a
-    // tall stick's centre can never reach the box.
+    // the piece position: the finger is what "returns" it.
     const pb = partsBox.getBoundingClientRect();
     if (ev.clientX >= pb.left - 6 && ev.clientX <= pb.right + 6 && ev.clientY >= pb.top - 14) {
       snapshot();
@@ -575,16 +672,64 @@ function attachPointer(p) {
       checkChallenge();
       return;
     }
-    resolveOverlap(p);
-    carryFrom(p); refreshInfo(); checkChallenge();
+    // otherwise the piece snaps into the nearest free slot
+    const size = pieceSize(p.kind);
+    const cx = p.x + size.w / 2, cy = p.y + size.h / 2;
+    const slot = findDropSlot(p, cx, cy);
+    if (slot) {
+      p.frame = slot.frame; p.col = slot.col; p.row = slot.row;
+      setAnchoredPos(p, true);
+      const snapState = { done: false };
+      settleAt(p.frame, p.col, snapState);
+    } else {
+      setAnchoredPos(p, true); // no free slot anywhere: slide back home
+    }
+    refreshInfo();
+    checkChallenge();
   };
   p.el.addEventListener("pointerup", finish);
   p.el.addEventListener("pointercancel", finish);
 }
+// the frame/slot a dragged piece lands in: prefer the frame under the
+// drop point and the slot nearest to it; the piece's own current slot
+// counts as free, so a move always has somewhere to land
+function findDropSlot(p, cx, cy) {
+  const fw = frameSize();
+  let pref = null, bestD = Infinity;
+  for (let f = 0; f < framesCount; f++) {
+    const o = frameOrigins[f];
+    if (!o) continue;
+    const ccx = o.x + fw / 2, ccy = o.y + fw / 2;
+    const d = (ccx - cx) ** 2 + (ccy - cy) ** 2;
+    if (cx >= o.x && cx <= o.x + fw && cy >= o.y && cy <= o.y + fw) { pref = f; bestD = -1; break; }
+    if (d < bestD) { bestD = d; pref = f; }
+  }
+  let near = null;
+  if (pref !== null && frameOrigins[pref]) {
+    const o = frameOrigins[pref];
+    near = {
+      col: (cx - o.x - FRAME_BORDER) / PITCH - (KINDS[p.kind].cols - 1) / 2,
+      row: (cy - o.y - FRAME_BORDER) / PITCH - (KINDS[p.kind].rows - 1) / 2,
+      cx, cy
+    };
+  }
+  return findSlot(p.kind, pref, near, p.id, false);
+}
 
-// ---------- parts box (tap to spawn, or drag out to a chosen spot) ----------
+// ---------- parts box (tap to spawn, or drag out) ----------
 const partsBox = document.getElementById("partsbox");
 let suppressClick = false;
+function spawnAtSlot(kind, slot, withPop) {
+  const p = makePiece(kind);
+  p.frame = slot.frame; p.col = slot.col; p.row = slot.row;
+  blocks.set(p.id, p);
+  renderPiece(p);
+  setAnchoredPos(p, false);
+  if (withPop) p.el.classList.add("pop");
+  const snapState = { done: false };
+  settleAt(p.frame, p.col, snapState);
+  return p;
+}
 for (const kind of KIND_ORDER) {
   const btn = document.createElement("button");
   btn.className = "partbtn";
@@ -601,15 +746,11 @@ for (const kind of KIND_ORDER) {
     if (suppressClick) { suppressClick = false; return; }
     if (mode === "compare") return;
     ensureAudio();
+    const slot = findSlot(kind, null, null, -1, true);
+    if (!slot) return;
     snapshot();
-    const p = makePiece(kind);
-    blocks.set(p.id, p);
-    renderPiece(p);
-    const pos = findSpawnPos(kind);
-    placePiece(p, pos.x, pos.y);
-    p.el.classList.add("pop");
+    spawnAtSlot(kind, slot, true);
     sndPop();
-    carryFrom(p);
     refreshInfo();
     checkChallenge();
   });
@@ -633,7 +774,10 @@ for (const kind of KIND_ORDER) {
     }
     const srect = stage.getBoundingClientRect();
     const size = pieceSize(partDrag.kind);
-    placePiece(partDrag.piece, ev.clientX - srect.left - size.w / 2, ev.clientY - srect.top - size.h / 2);
+    const p = partDrag.piece;
+    p.x = Math.min(Math.max(0, ev.clientX - srect.left - size.w / 2), Math.max(0, stage.clientWidth - size.w));
+    p.y = Math.min(Math.max(0, ev.clientY - srect.top - size.h / 2), Math.max(0, stage.clientHeight - size.h));
+    p.el.style.left = p.x + "px"; p.el.style.top = p.y + "px";
   });
   const endPartDrag = (ev) => {
     if (!partDrag || ev.pointerId !== partDrag.pid) return;
@@ -642,10 +786,19 @@ for (const kind of KIND_ORDER) {
     if (!p) return; // a plain tap: the click handler spawns as before
     suppressClick = true;
     p.el.style.zIndex = "";
-    resolveOverlap(p);
-    p.el.classList.add("pop");
-    sndPop();
-    carryFrom(p);
+    const size = pieceSize(p.kind);
+    const slot = findDropSlot(p, p.x + size.w / 2, p.y + size.h / 2);
+    if (slot) {
+      p.frame = slot.frame; p.col = slot.col; p.row = slot.row;
+      setAnchoredPos(p, true);
+      p.el.classList.add("pop");
+      sndPop();
+      const snapState = { done: false };
+      settleAt(p.frame, p.col, snapState);
+    } else {
+      // nowhere to put it: it simply goes back into the box
+      removePiece(p);
+    }
     refreshInfo();
     checkChallenge();
   };
@@ -664,6 +817,7 @@ let curA = 0, curB = 0; // operands of the current add/sub problem
 let compareState = null; // { left, right, answered }
 let celebrating = false;
 let winCounts = null; // piece counts at the moment of completion
+let reviewTimer = null;
 function refreshInfo() {
   const total = totalHundredths();
   totalDisp.textContent = "いま " + fmt2(total);
@@ -677,32 +831,49 @@ function refreshInfo() {
   if (target === null) { challengeSub.textContent = ""; return; }
   challengeSub.textContent = total < target ? "あと " + fmtTrim(target - total) : "";
 }
-// canonical pieces for an amount: plates, then sticks, then squares
-function composeKinds(h) {
-  const kinds = [];
-  for (let i = 0; i < Math.floor(h / 100); i++) kinds.push("one");
-  for (let i = 0; i < Math.floor((h % 100) / 10); i++) kinds.push("tenth");
-  for (let i = 0; i < h % 10; i++) kinds.push("hundredth");
-  return kinds;
+// canonical slot list for an amount: whole frames for plates, then
+// sticks in columns, then squares in the following columns' cells
+function composeSlots(h) {
+  const slots = [];
+  let f = 0, usedMax = 0;
+  const push = (k, fr, c, r) => { slots.push({ k, f: fr, c, r }); if (fr > usedMax) usedMax = fr; };
+  const plates = Math.floor(h / 100);
+  for (let i = 0; i < plates; i++) { push("one", f, 0, 0); f++; }
+  let col = 0;
+  const sticks = Math.floor((h % 100) / 10);
+  for (let i = 0; i < sticks; i++) {
+    if (col === 10) { f++; col = 0; }
+    push("tenth", f, col, 0);
+    col++;
+  }
+  let row = 0;
+  const squares = h % 10;
+  for (let i = 0; i < squares; i++) {
+    if (col === 10) { f++; col = 0; row = 0; }
+    push("hundredth", f, col, row);
+    row++;
+    if (row === 10) { col++; row = 0; }
+  }
+  return { slots, framesUsed: usedMax + 1 };
 }
-// lay pieces out in one row, centred at cx; returns the created pieces
-function placeGroupAt(kinds, cx, topY, opts) {
+function placeComposed(h, frameOffset, opts) {
   opts = opts || {};
-  let totalW = 0;
-  for (const k of kinds) totalW += pieceSize(k).w + 6;
-  totalW -= 6;
-  let x = Math.min(Math.max(4, cx - totalW / 2), Math.max(4, stage.clientWidth - totalW - 4));
+  const comp = composeSlots(h);
   const made = [];
-  for (const k of kinds) {
-    const p = makePiece(k);
+  for (const s of comp.slots) {
+    const p = makePiece(s.k);
+    p.frame = s.f + frameOffset; p.col = s.c; p.row = s.r;
     if (opts.exhibit) { p.exhibit = true; p.side = opts.side; }
     blocks.set(p.id, p);
     renderPiece(p);
-    placePiece(p, x, topY);
-    x += pieceSize(k).w + 6;
+    setAnchoredPos(p, false);
     made.push(p);
   }
-  return made;
+  return { made, framesUsed: comp.framesUsed };
+}
+function resetFrames(n) {
+  framesCount = Math.max(1, n);
+  layoutFrames();
 }
 function newChallenge() {
   mode = MODE_CYCLE[modeIdx % MODE_CYCLE.length];
@@ -718,21 +889,26 @@ function newChallenge() {
   if (mode === "compare") { setupCompare(); return; }
   totalDisp.style.display = "block";
   if (mode === "make") {
+    resetFrames(1);
     let t;
     do { t = 5 + Math.floor(Math.random() * 95); } while (t === target); // 0.05..0.99
     target = t;
     challengeText.textContent = fmtTrim(target) + "を つくって！";
   } else if (mode === "add") {
+    resetFrames(1);
     const pr = pickAdd();
     curA = pr.a; curB = pr.b; target = pr.a + pr.b;
     challengeText.textContent = fmtTrim(curA) + " ＋ " + fmtTrim(curB) + " は？";
-  } else { // sub: the starting amount is dealt onto the stage
+  } else { // sub: the starting amount is dealt into the frames
     const pr = pickSubtraction();
     curA = pr.a; curB = pr.b; target = pr.a - pr.b;
     challengeText.textContent = fmtTrim(curA) + " − " + fmtTrim(curB) + " は？";
     history.length = 0;
     syncUndoBtn();
-    placeGroupAt(composeKinds(curA), stage.clientWidth / 2, Math.max(4, stage.clientHeight / 2 - 130), {});
+    const placed = placeComposed(curA, 0, {});
+    resetFrames(placed.framesUsed);
+    // pieces were anchored before the layout existed; re-anchor now
+    layoutFrames();
   }
   refreshInfo();
 }
@@ -768,9 +944,14 @@ function setupCompare() {
   challengeText.textContent = fmtTrim(leftVal) + " と " + fmtTrim(rightVal) + " どっちが おおきい？";
   challengeSub.textContent = "";
   totalDisp.style.display = "none";
-  const topY = Math.max(4, stage.clientHeight * 0.16);
-  placeGroupAt(composeKinds(leftVal), stage.clientWidth * 0.26, topY, { exhibit: true, side: "left" });
-  placeGroupAt(composeKinds(rightVal), stage.clientWidth * 0.74, topY, { exhibit: true, side: "right" });
+  const leftComp = composeSlots(leftVal);
+  const rightComp = composeSlots(rightVal);
+  compareLeftFrames = leftComp.framesUsed;
+  framesCount = leftComp.framesUsed + rightComp.framesUsed;
+  layoutFrames();
+  placeComposed(leftVal, 0, { exhibit: true, side: "left" });
+  placeComposed(rightVal, leftComp.framesUsed, { exhibit: true, side: "right" });
+  layoutFrames();
 }
 function pickCompare() {
   if (Math.random() < 0.5) { // trap pair: 0.5 vs 0.45 style
@@ -833,15 +1014,13 @@ function celebrate() {
   }
   setTimeout(showReview, 1900);
 }
-// recipe: one term per kind present, e.g. "0.3 + 0.07 = 0.37",
-// each term drawn as that kind's piece next to its value
-let reviewTimer = null;
+// recipe review: addition and subtraction review as the problem's
+// own equation (addition gets a small note about any carry that
+// happened); making reviews as the winning pieces, kind by kind
 function showReview() {
   doneMsg.style.display = "none";
   recipeEl.innerHTML = "";
   if (mode === "add") {
-    // addition reviews as the problem's own equation, with a small
-    // note about any carry that happened while building it
     const wrap = document.createElement("div");
     wrap.style.textAlign = "center";
     const eqLine = document.createElement("div");
@@ -864,7 +1043,6 @@ function showReview() {
     return;
   }
   if (mode === "sub") {
-    // subtraction reviews as the equation itself
     const eqLine = document.createElement("div");
     eqLine.className = "result eqline";
     eqLine.textContent = fmtTrim(curA) + " − " + fmtTrim(curB) + " ＝ " + fmtTrim(target);
@@ -919,11 +1097,13 @@ nextBtn.addEventListener("click", () => {
     history.length = 0;
     syncUndoBtn();
   } else if (blocks.size > 0) {
-    // the next challenge starts from an empty stage; the clear is one
-    // undoable step, so the pieces can be brought back with "modosu"
+    // the next challenge starts from an empty stage; the clear is
+    // one undoable step, so the pieces can be brought back
     snapshot();
     for (const p of Array.from(blocks.values())) removePiece(p);
   }
+  compareLeftFrames = 0;
+  resetFrames(1);
   sndPop();
   newChallenge();
 });
@@ -935,6 +1115,7 @@ document.getElementById("clearbtn").addEventListener("click", () => {
   if (blocks.size === 0) return;
   snapshot();
   for (const p of Array.from(blocks.values())) removePiece(p);
+  if (mode !== "sub") resetFrames(1);
   sndBreak();
   refreshInfo();
 });
@@ -953,17 +1134,11 @@ let resizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    const before = CELL;
     computeCell();
-    for (const p of Array.from(blocks.values())) {
-      const x = p.x, y = p.y;
-      if (CELL !== before) { p.el.remove(); renderPiece(p); }
-      // always re-clamp: a rotation can leave pieces outside a
-      // narrower stage even when the cell size did not change
-      placePiece(p, x, y);
-    }
+    layoutFrames(); // re-derives origins and re-anchors every piece
   }, 200);
 });
+layoutFrames();
 syncUndoBtn();
 newChallenge();
 </script>

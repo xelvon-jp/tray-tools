@@ -409,11 +409,6 @@ class ClaudeProgressPanel(QWidget):
         if self._rows[index].get("_coop"):
             return coop_stage.toggle_rect(rect)   # ✕ の位置にあるたたむ／ひろげるボタン
 
-    def _pause_rect(self, index) -> QRect:
-        """ブリッジの休止ボタンの場所(たたむボタンの左隣)。ブリッジ行以外は空の矩形。"""
-        if not self._rows[index].get("_coop"):
-            return QRect()
-        return coop_stage.pause_rect(self._row_rect(index))
         right = rect.right() - PAD_X // 2
         if self._rows[index].get("_compact"):
             top = rect.center().y() - CLOSE_SIZE // 2 + 1
@@ -421,6 +416,12 @@ class ClaudeProgressPanel(QWidget):
             line = QFontMetrics(self._name_font).height()
             top = rect.top() + 4 + (line - CLOSE_SIZE) // 2
         return QRect(right - CLOSE_SIZE + 1, top, CLOSE_SIZE, CLOSE_SIZE)
+
+    def _pause_rect(self, index) -> QRect:
+        """ブリッジの休止ボタンの場所(たたむボタンの左隣)。ブリッジ行以外は空の矩形。"""
+        if not self._rows[index].get("_coop"):
+            return QRect()
+        return coop_stage.pause_rect(self._row_rect(index))
 
     def _paint_close(self, p, index):
         box = QRectF(self._close_rect(index))

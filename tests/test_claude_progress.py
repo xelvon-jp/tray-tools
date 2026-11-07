@@ -319,12 +319,84 @@ def test_paint_survives_row_exception():
     panel.deleteLater()
 
 
+def test_pulse_alpha():
+    stage = cp.coop_stage
+    values = [stage.pulse_alpha(t) for t in range(0, stage.PULSE_PERIOD_MS, 100)]
+    assert min(values) >= stage.PULSE_MIN and max(values) <= stage.PULSE_MAX
+    assert stage.pulse_alpha(0) == stage.PULSE_MIN
+    assert stage.pulse_alpha(stage.PULSE_PERIOD_MS) == stage.PULSE_MIN   # 周期で戻る
+    assert stage.pulse_alpha(stage.PULSE_PERIOD_MS // 2) == stage.PULSE_MAX
+
+
+def test_pause_rect_left_of_toggle():
+    from PySide6.QtCore import QRect
+    rect = QRect(0, 0, 300, cp.coop_stage.COOP_HEIGHT)
+    pause = cp.coop_stage.pause_rect(rect)
+    toggle = cp.coop_stage.toggle_rect(rect)
+    assert pause.width() == toggle.width() == 20 and pause.top() == toggle.top()
+    assert pause.right() < toggle.left()          # 重ならない・左隣
+    collapsed = QRect(0, 0, 300, cp.coop_stage.COOP_COLLAPSED_HEIGHT)
+    assert cp.coop_stage.pause_rect(collapsed).top() == \
+        cp.coop_stage.toggle_rect(collapsed).top()   # たたんだ状態でも同じ段
+
+
+def test_panel_watch_pause_toggle():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    muse, entries = _tone_inputs(now)["sleep"]
+    flag = Path(_TMP) / f"pause{_COUNTER[0]}.json"
+    old = cp.bctl.PAUSE_PATH
+    cp.bctl.PAUSE_PATH = flag
+    try:
+        panel = _new_panel()
+        panel.set_entries(entries, None, muse)
+        app.processEvents()
+        assert panel._rows[0]["paused"] is False
+        panel._toggle_watch_pause(0)              # 休止の合図を書く
+        assert cp.bctl.is_paused() is True
+        panel.set_entries(entries, None, muse)
+        app.processEvents()
+        assert panel._rows[0]["paused"] is True   # 次の受け取りで表示も休止に
+        panel._toggle_watch_pause(0)              # 再開
+        assert cp.bctl.is_paused() is False
+        panel.close()
+        panel.deleteLater()
+    finally:
+        cp.bctl.PAUSE_PATH = old
+
+
+def test_show_bridge_expands():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    muse, entries = _tone_inputs(now)["sleep"]
+    path = _state_path()
+    cp.save_state({"coop_collapsed": True}, path)
+    panel = _new_panel(path)
+    assert panel._coop_collapsed is True
+    panel.set_entries(entries, None, muse)
+    app.processEvents()
+    assert cp.row_height(panel._rows[0]) == cp.coop_stage.COOP_COLLAPSED_HEIGHT
+    panel.show_bridge()
+    app.processEvents()
+    assert panel._coop_collapsed is False
+    assert cp.row_height(panel._rows[0]) == cp.coop_stage.COOP_HEIGHT
+    assert cp.load_state(path)["coop_collapsed"] is False   # 覚えた状態も戻る
+    panel.close()
+    panel.deleteLater()
+
+
 ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
              test_muse_kind_row_and_dismiss_key, test_coop_row,
              test_panel_coop_all_tones_paint, test_panel_coop_cannot_be_dismissed,
              test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint,
              test_item_position, test_rows_to_show_prunes_first_seen,
-             test_paint_survives_row_exception]
+             test_paint_survives_row_exception, test_pulse_alpha,
+             test_pause_rect_left_of_toggle, test_panel_watch_pause_toggle,
+             test_show_bridge_expands]
 
 
 if __name__ == "__main__":

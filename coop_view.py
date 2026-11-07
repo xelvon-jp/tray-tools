@@ -51,13 +51,16 @@ def _oldest(entries, key):
     return min(entries, key=stamp)
 
 
-def coop_view(muse, claude_entries, now=None):
+def coop_view(muse, claude_entries, now=None, paused=False):
     """連携ステージの表示内容(dict)。出さないなら None。
 
     banner_title / banner_sub / banner_time(経過を fmt_dur で。分からなければ空) /
     tone / muse_anim / clawd_anim / item(fly|parked|wobble|back|None) /
-    props(set) / cards(3つの (ラベル, 値))。
-    判定は上から順に勝つ(見張りの停止 > 郵便受け > 承認カード…)。"""
+    props(set) / cards(3つの (ラベル, 値)) / all_idle / paused。
+    all_idle は「全員待機中」(Muse も Claude も陽太さん待ち)のときだけ True で、
+    描く側がブリッジをゆっくり明滅させる目印。paused はブリッジから見張りの
+    休止が指示されているとき(bridge_control の合図。判定より優先して出す)。
+    判定は上から順に勝つ(休止 > 見張りの停止 > 郵便受け > 承認カード…)。"""
     if not isinstance(muse, dict):
         return None
     now = time.time() if now is None else now
@@ -84,10 +87,16 @@ def coop_view(muse, claude_entries, now=None):
     header = header.strip() if isinstance(header, str) else ""
 
     sub, tone, title, elapsed = "", "sleep", "", kind_elapsed
+    all_idle = False
     running = [e for e in entries if e.get("state") == "running"]
     asking = [e for e in entries if e.get("state") == "ask"]
 
-    if stopped:
+    if paused:
+        # 休止中は last_poll が進まなくても「止まっている」とは言わない
+        # (止めたのは陽太さん自身で、理由が分かっているため)。
+        tone, title, sub, elapsed = ("sleep", "見張り休止中",
+                                     "ブリッジのボタンで再開できます", None)
+    elif stopped:
         tone, title = "alert", "見張りが止まっています"
         sub = f"最後の確認 {mbs.fmt_dur(now - last_poll)}前"
         elapsed = now - last_poll
@@ -133,6 +142,7 @@ def coop_view(muse, claude_entries, now=None):
         tone, title, sub = "done", "完了しました", "Muse の作業が終わりました"
     else:
         tone, title, sub = "sleep", "全員待機中", "陽太さんの指示待ちです"
+        all_idle = True
 
     muse_anim, clawd_anim = ANIMS[tone]
     return {
@@ -144,11 +154,13 @@ def coop_view(muse, claude_entries, now=None):
         "clawd_anim": clawd_anim,
         "item": ITEMS.get(tone),
         "props": set(PROPS.get(tone, ())),
-        "cards": _cards(muse, kind, ke, stopped, fail, now),
+        "cards": _cards(muse, kind, ke, stopped, fail, now, paused),
+        "all_idle": all_idle,
+        "paused": bool(paused),
     }
 
 
-def _cards(muse, kind, kind_elapsed, stopped, fail, now) -> list:
+def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False) -> list:
     approval_sec = _num(muse, "last_approval_sec")
     if approval_sec is not None:
         approval_sec = max(0.0, approval_sec)
@@ -168,5 +180,5 @@ def _cards(muse, kind, kind_elapsed, stopped, fail, now) -> list:
         mailbox = f"受信 {int(now - mail_at)}秒前"
     else:
         mailbox = "空"
-    watch = "停止" if stopped else ("不調" if fail > 0 else "正常")
+    watch = "休止" if paused else ("停止" if stopped else ("不調" if fail > 0 else "正常"))
     return [("承認", approval), ("郵便受け", mailbox), ("見張り", watch)]

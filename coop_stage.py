@@ -4,6 +4,8 @@
 # 何を出すかは coop_view(純関数)、絵とフレームの選び方は chara_sprites(純データ)で、
 # ここは「それを座標に落として塗る」だけ。ファイルは読まない(受け取り済みの値と時計だけ)。
 # 見た目は動くデモ(anim_template.html)の配色・動き・文言に合わせてある。
+import math
+
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
                            QPixmap, QPolygonF)
@@ -18,11 +20,17 @@ GAP = 6
 COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + CARDS_H + PAD
 COOP_COLLAPSED_HEIGHT = 56    # たたんだとき: バナーだけ(上下に余白)
 TOGGLE_SIZE = 20              # 「たたむ／ひろげる」ボタンの当たり(px)
+PAUSE_GAP = 4                 # 休止ボタンとたたむボタンの間(px)
+# 全員待機中(all_idle)の明滅。ゆっくり一呼吸ぶん周期で、枠の明るさが上下する。
+PULSE_PERIOD_MS = 2800
+PULSE_MIN = 40                # 明滅する枠の不透明度(最も暗いとき)
+PULSE_MAX = 130               # 明滅する枠の不透明度(最も明るいとき)
+PULSE_COLOR = QColor(140, 220, 245)
 CELL = 5                      # キャラの1マス(px)。Claw'd は 60x40(12x8)。Muse は下の MUSE_CELL で 52x60(13x15)
 MUSE_CELL = 4                 # Muse の1マス(px)。v2 は 13x15 なので 52x60
 ITEM_CELL = 2                 # 手紙・受領・火花の1マス(px)
 ITEM_LEFT = 72                # 手紙の出発点(ステージ左端から)
-CLOSE_ROOM = 20               # 右上の ✕ のために空けておく幅
+CLOSE_ROOM = 44               # 右上のボタン2つ(休止・たたむ)のために空けておく幅
 
 BG = QColor("#0a1118")
 EDGE = QColor("#1e6f86")
@@ -125,6 +133,38 @@ def toggle_rect(rect) -> QRect:
                  TOGGLE_SIZE, TOGGLE_SIZE)
 
 
+def pause_rect(rect) -> QRect:
+    """「見張りを休止／再開」ボタンの矩形(たたむボタンの左隣)。"""
+    box = toggle_rect(rect)
+    return QRect(box.left() - PAUSE_GAP - TOGGLE_SIZE, box.top(),
+                 TOGGLE_SIZE, TOGGLE_SIZE)
+
+
+def pulse_alpha(t_ms) -> int:
+    """全員待機中の明滅の不透明度。周期 PULSE_PERIOD_MS で PULSE_MIN〜PULSE_MAX を
+    なめらかに往復する(頂点で跳ねないよう余弦でつなぐ)。"""
+    phase = (t_ms % PULSE_PERIOD_MS) / PULSE_PERIOD_MS
+    wave = 0.5 - 0.5 * math.cos(2 * math.pi * phase)
+    return round(PULSE_MIN + (PULSE_MAX - PULSE_MIN) * wave)
+
+
+def _paint_pause(p, rect, paused, hot):
+    """休止ボタン: 2本の縦棒。休止中は橙(止まっているのが見て分かるように)、
+    動いている間は控えめな水色。押すと合図ファイルが切り替わる(bridge_control)。"""
+    box = pause_rect(rect)
+    if hot:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 30))
+        p.drawRoundedRect(QRectF(box), 3, 3)
+    color = QColor("#f0b04a") if paused else (QColor("#bfe9f5") if hot
+                                              else QColor("#4a8da0"))
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    cx, cy = box.center().x(), box.center().y()
+    for dx in (-3.5, 1.5):
+        p.drawRect(QRectF(cx + dx, cy - 5, 2.6, 10))
+
+
 def _banner_top_offset(height) -> int:
     return PAD if height >= COOP_HEIGHT else (height - BANNER_H) // 2
 
@@ -147,9 +187,12 @@ def _paint_toggle(p, rect, collapsed, hot):
                               QPointF(c.x() + 4, c.y() - k)]))
 
 
-def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False):
+def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
+               hot_pause=False):
     """連携ステージの行を rect に描く。view は coop_view.coop_view の戻り、now は epoch 秒。
-    collapsed ならバナーだけ(ステージとカードは描かない)。hot はボタンにマウスが乗っている。"""
+    collapsed ならバナーだけ(ステージとカードは描かない)。hot / hot_pause は各ボタンに
+    マウスが乗っているか。全員待機中(view の all_idle)なら、枠をゆっくり明滅させる
+    (二人とも陽太さん待ちなのが、離れていても目に入るように)。"""
     accent = TONES.get(view["tone"], TONES["sleep"])
     t = now * 1000.0
     # 枠(ごく小さな丸みの長方形)
@@ -158,6 +201,12 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False):
     p.setPen(QPen(EDGE, 1))
     p.setBrush(BG)
     p.drawRoundedRect(box, 3, 3)
+    if view.get("all_idle"):
+        glow = QColor(PULSE_COLOR)
+        glow.setAlpha(pulse_alpha(t))
+        p.setPen(QPen(glow, 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(box.adjusted(1, 1, -1, -1), 3, 3)
     p.setRenderHint(QPainter.Antialiasing, False)
     top_pad = _banner_top_offset(rect.height())
     inner = QRect(rect.left() + PAD, rect.top() + top_pad,
@@ -195,6 +244,7 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False):
 
     if collapsed:
         p.setRenderHint(QPainter.Antialiasing, True)
+        _paint_pause(p, rect, bool(view.get("paused")), hot_pause)
         _paint_toggle(p, rect, True, hot)
         return
     # ステージ
@@ -237,6 +287,7 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False):
                          vfm.height()), Qt.AlignLeft | Qt.AlignVCenter,
                    vfm.elidedText(value, Qt.ElideRight, body.width()))
     p.setRenderHint(QPainter.Antialiasing, True)   # 呼び出し元(他の行)は丸みを使う
+    _paint_pause(p, rect, bool(view.get("paused")), hot_pause)
     _paint_toggle(p, rect, False, hot)
 
 

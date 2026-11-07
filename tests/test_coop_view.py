@@ -203,12 +203,35 @@ def test_negative_last_approval_sec_is_clamped():
     assert view(muse(last_approval_sec=-2.5))["cards"][0] == ("承認", "0.0秒")
 
 
+def test_all_idle_flag():
+    v = view(muse())
+    assert v["all_idle"] is True and v["paused"] is False
+    # Muse が作業中・Claude が実行中/承認待ちなら、全員待機ではない
+    assert view(muse(kind="processing"))["all_idle"] is False
+    assert view(muse(), [{"state": "running", "started": NOW - 10}])["all_idle"] is False
+    assert view(muse(), [{"state": "ask", "asked": NOW - 10}])["all_idle"] is False
+    # 完了の直後(完了表示の間)も待機とは言わない
+    done = muse(kind="idle", prev_kind="processing", kind_since=NOW - 2)
+    assert view(done)["all_idle"] is False
+
+
+def test_paused_view():
+    v = cv.coop_view(muse(), [], NOW, paused=True)
+    assert v["banner_title"] == "見張り休止中" and v["tone"] == "sleep"
+    assert v["banner_sub"] == "ブリッジのボタンで再開できます"
+    assert v["banner_time"] == "" and v["all_idle"] is False and v["paused"] is True
+    assert v["cards"][2] == ("見張り", "休止")
+    # 停止(last_poll が古い)より優先する: 休止中は異常と言わない
+    v2 = cv.coop_view(muse(last_poll=NOW - 300), [], NOW, paused=True)
+    assert v2["banner_title"] == "見張り休止中"
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
              test_done_window, test_sleep_default, test_cards,
              test_kind_without_kind_since_falls_back, test_negative_last_approval_sec_is_clamped,
-             test_state_claude_overrides_stale_kind]
+             test_state_claude_overrides_stale_kind, test_all_idle_flag, test_paused_view]
 
 
 if __name__ == "__main__":

@@ -2676,6 +2676,19 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
+    def _show_bridge(self):
+        """メニューの「ブリッジを開く」。進捗パネルが無効なら有効にして、
+        ブリッジ(連携ステージ)を ひろげて出す。見張りが動いていなくて
+        出す行が無いときは、窓は出ない(既存の作法どおり)。"""
+        try:
+            if not self._claude_progress_enabled:
+                self._toggle_claude_progress(True)
+            self._update_claude_progress()
+            if self._claude_progress is not None:
+                self._claude_progress.show_bridge()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
     def _rebuild_claude_menu(self):
         try:
             self._claude_entries = claude_status.list_sessions()
@@ -2703,6 +2716,7 @@ class ScreenFeature:
             panel.setChecked(self._claude_progress_enabled)
             # addAction(文字, 関数) だと checked が渡らないので triggered で受ける。
             panel.triggered.connect(self._toggle_claude_progress)
+            menu.addAction("🌉 ブリッジを開く", self._show_bridge)
             menu.addAction("↘ パネルの位置を右下に戻す", self._reset_claude_progress_position)
             self._refresh_state()
         except Exception:  # noqa: BLE001

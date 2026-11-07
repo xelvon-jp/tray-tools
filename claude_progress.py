@@ -29,6 +29,9 @@
 # (約200px)。何を出すかは coop_view(純関数)、絵は chara_sprites。ファイルが無い・
 # 古すぎる(6時間)ときは行を出さない。✕ はその tone(と kind_since)の間だけ閉じる。
 # 旧 muse_row / _paint_muse は使わなくなったが残してある(上の説明は旧仕様)。
+# この行の呼び名は「ブリッジ」(2026-11-07 決定)。バナー右のボタンは2つ: たたむ／
+# ひろげると、見張りの休止／再開(合図ファイル bridge_control を切り替えるだけ。
+# 従うのは見張り側)。全員待機中(Muse も Claude も指示待ち)は枠がゆっくり明滅する。
 #
 # 操作: 行をクリック = そのセッションをデスクトップアプリで開く(claude://code/continue)。
 #       行の右端の ✕ = その行を消す(状態ファイルを消す。そのセッションが次に動けばまた出る)。
@@ -45,6 +48,7 @@ from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+import bridge_control as bctl
 import claude_status as cs
 import coop_stage
 import coop_view as cv
@@ -228,11 +232,13 @@ def coop_row(muse, entries, now=None) -> dict | None:
     表示内容は描くときに now で計算し直す(3秒ごとの受け取りの間も経過が進むよう、
     生のデータを抱える)。_muse も立てるのは、✕ で閉じる・開く先が無い、という
     Muse 見張りの行の作法をそのまま引き継ぐため。"""
-    view = cv.coop_view(muse, entries, now)
+    paused = bctl.is_paused()
+    view = cv.coop_view(muse, entries, now, paused=paused)
     if view is None:
         return None
     has_kind = isinstance(muse.get("kind"), str) and bool(muse.get("kind"))
     return {"_coop": True, "_muse": True, "muse": muse, "entries": list(entries or []),
+            "paused": paused,
             "state": muse.get("state"), "since": muse.get("since"),
             # ✕で閉じた判定のキー: tone と、その状態になった時刻(kind があれば kind_since)
             "key": (view["tone"], muse.get("kind_since") if has_kind else muse.get("since"))}
@@ -265,6 +271,7 @@ class ClaudeProgressPanel(QWidget):
         self._on_remove = on_remove
         self._on_open_copilot = on_open_copilot
         self._hover_close = -1
+        self._hover_pause = -1   # ブリッジの休止ボタンにマウスが乗っている行
         self._state_path = state_path
         self._entries = []
         self._copilot = None
@@ -401,6 +408,12 @@ class ClaudeProgressPanel(QWidget):
         rect = self._row_rect(index)
         if self._rows[index].get("_coop"):
             return coop_stage.toggle_rect(rect)   # ✕ の位置にあるたたむ／ひろげるボタン
+
+    def _pause_rect(self, index) -> QRect:
+        """ブリッジの休止ボタンの場所(たたむボタンの左隣)。ブリッジ行以外は空の矩形。"""
+        if not self._rows[index].get("_coop"):
+            return QRect()
+        return coop_stage.pause_rect(self._row_rect(index))
         right = rect.right() - PAD_X // 2
         if self._rows[index].get("_compact"):
             top = rect.center().y() - CLOSE_SIZE // 2 + 1
@@ -425,12 +438,14 @@ class ClaudeProgressPanel(QWidget):
 
     def _paint_row(self, p, entry, rect, now, hover):
         if entry.get("_coop"):
-            view = cv.coop_view(entry["muse"], entry["entries"], now)
+            view = cv.coop_view(entry["muse"], entry["entries"], now,
+                                 paused=bool(entry.get("paused")))
             if view is not None:
                 coop_stage.paint_coop(
                     p, rect, view, now, self.devicePixelRatioF(), self._sub_font,
                     collapsed=bool(entry.get("_collapsed")),
-                    hot=self._rows.index(entry) == self._hover_close)
+                    hot=self._rows.index(entry) == self._hover_close,
+                    hot_pause=self._rows.index(entry) == self._hover_pause)
             return
         if entry.get("_copilot"):
             self._paint_copilot(p, entry, rect, now, hover)
@@ -699,22 +714,30 @@ class ClaudeProgressPanel(QWidget):
         hover = self._row_at(pos)
         hover_close = hover if hover >= 0 and self._close_rect(hover).adjusted(
             -3, -3, 3, 3).contains(pos) else -1
-        if hover != self._hover or hover_close != self._hover_close:
+        hover_pause = hover if hover >= 0 and self._rows[hover].get("_coop") and (
+            self._pause_rect(hover).adjusted(-3, -3, 3, 3).contains(pos)) else -1
+        if (hover != self._hover or hover_close != self._hover_close
+                or hover_pause != self._hover_pause):
             self._hover, self._hover_close = hover, hover_close
+            self._hover_pause = hover_pause
             row = self._rows[hover] if 0 <= hover < len(self._rows) else {}
             jumpable = cs.jump_url(row) or (
                 row.get("_copilot") and self._on_open_copilot is not None)
-            self.setCursor(Qt.PointingHandCursor if jumpable or hover_close >= 0
+            self.setCursor(Qt.PointingHandCursor
+                           if jumpable or hover_close >= 0 or hover_pause >= 0
                            else Qt.ArrowCursor)
-            if hover_close >= 0 and self._rows[hover_close].get("_coop"):
+            if hover_pause >= 0:
+                self.setToolTip("見張りを再開する" if row.get("paused")
+                                else "見張りを休止する")
+            elif hover_close >= 0 and self._rows[hover_close].get("_coop"):
                 self.setToolTip("ひろげる" if self._coop_collapsed else "たたむ")
             else:
                 self.setToolTip("")
             self.update()
 
     def leaveEvent(self, _event):
-        if self._hover != -1 or self._hover_close != -1:
-            self._hover = self._hover_close = -1
+        if self._hover != -1 or self._hover_close != -1 or self._hover_pause != -1:
+            self._hover = self._hover_close = self._hover_pause = -1
             self.update()
 
     def mousePressEvent(self, event):
@@ -726,6 +749,11 @@ class ClaudeProgressPanel(QWidget):
             return
         pos = event.position().toPoint()
         index = self._row_at(pos)
+        # ブリッジの休止ボタン(たたむボタンの左隣。当たりは少し広めに取る)
+        if 0 <= index < len(self._rows) and self._rows[index].get("_coop") and (
+                self._pause_rect(index).adjusted(-3, -3, 3, 3).contains(pos)):
+            self._toggle_watch_pause(index)
+            return
         # ✕ は少し広めに当たりを取る(小さいので押し損ねると、その行を開いてしまう)
         if 0 <= index < len(self._rows) and self._close_rect(index).adjusted(
                 -3, -3, 3, 3).contains(pos):
@@ -787,9 +815,33 @@ class ClaudeProgressPanel(QWidget):
         """連携ステージ行をたたむ／ひろげる。状態は保存先に覚える(トグルしたときだけ書く)。"""
         self._coop_collapsed = not self._coop_collapsed
         save_state({"coop_collapsed": self._coop_collapsed}, self._state_path)
-        self._hover = self._hover_close = -1
+        self._hover = self._hover_close = self._hover_pause = -1
         self.setToolTip("")
         self._tick()
+
+    def _toggle_watch_pause(self, index):
+        """見張りの休止／再開。合図ファイル(bridge_control)を切り替えるだけで、
+        従うのは見張り側。表示は次の _tick で合図を読み直して変わる。"""
+        try:
+            bctl.set_paused(not self._rows[index].get("paused"))
+        except Exception:  # noqa: BLE001  スロットの中で投げ切らない
+            import traceback
+            traceback.print_exc()
+        self._hover = self._hover_close = self._hover_pause = -1
+        self.setToolTip("")
+        self._tick()
+
+    def show_bridge(self):
+        """メニューの「ブリッジを開く」: たたんであれば ひろげて、パネルを出す。
+
+        行が無い(見張りが動いていない等)ときは _tick が畳むので何も出ない
+        (出すものが無いうちは窓を出さない、という既存の作法どおり)。"""
+        if self._coop_collapsed:
+            self._coop_collapsed = False
+            save_state({"coop_collapsed": False}, self._state_path)
+        self._tick()
+        if self._rows and not self.isVisible():
+            self.show()
 
     def mouseReleaseEvent(self, _event):
         if self._drag_origin is None:

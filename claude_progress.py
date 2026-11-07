@@ -153,6 +153,10 @@ def rows_to_show(entries, now, first_seen_done: dict) -> list:
     first_seen_done は「終わったのを最初に見た時刻」の控え(セッション ID ごと)。ファイルの
     ended はフックが書いた時刻だが、常駐が読むまでに数秒ずれるので、見えた時刻から数える。"""
     full, compact = [], []
+    # 今の一覧に無いセッションの控えは落とす(溜まり続けないように)
+    live = {e.get("session_id") or e.get("_path") for e in entries} - {None}
+    for stale in [k for k in first_seen_done if k not in live]:
+        del first_seen_done[stale]
     for entry in entries:
         state = entry.get("state")
         key = entry.get("session_id") or entry.get("_path")
@@ -160,7 +164,8 @@ def rows_to_show(entries, now, first_seen_done: dict) -> list:
             first_seen_done.pop(key, None)
             full.append(dict(entry, _compact=False))
         elif state in (cs.DONE, cs.FAIL):
-            seen = first_seen_done.setdefault(key, now)
+            # キーが無い entry は控えを作れない(時刻を覚えられない)ので、折りたたんだ行にする
+            seen = first_seen_done.setdefault(key, now) if key is not None else now - LINGER_SECONDS
             if now - seen < LINGER_SECONDS:
                 full.append(dict(entry, _compact=False))
             else:
@@ -380,9 +385,15 @@ class ClaudeProgressPanel(QWidget):
         p.drawRoundedRect(QRectF(self.rect()), 10, 10)
         now = time.time()
         for index, entry in enumerate(self._rows):
-            self._paint_row(p, entry, self._row_rect(index), now, index == self._hover)
-            if not entry.get("_coop"):   # 連携ステージ行は ✕ の代わりにたたむボタン(行の中で描く)
-                self._paint_close(p, index)
+            try:
+                self._paint_row(p, entry, self._row_rect(index), now, index == self._hover)
+                if not entry.get("_coop"):   # 連携ステージ行は ✕ の代わりにたたむボタン(行の中で描く)
+                    self._paint_close(p, index)
+            except Exception:  # noqa: BLE001  paintEvent で投げ切ると常駐ごと落ちる。その行はその回だけ描かない
+                import traceback
+                traceback.print_exc()
+                p.setOpacity(1.0)   # 途中で例外が出ても、次の行へ状態を持ち越さない
+                p.setClipping(False)
         p.end()
 
     def _close_rect(self, index) -> QRect:

@@ -178,10 +178,36 @@ def test_state_claude_overrides_stale_kind():
     assert v["banner_title"] == "承認カードが見えません" and v["tone"] == "alert"
 
 
+def test_kind_without_kind_since_falls_back():
+    # kind だけで kind_since が無い: since → waiting_since の順で経過を出す
+    m = muse(kind="approval", cards=0, since=NOW - 30)
+    del m["kind_since"]
+    v = view(m)
+    assert v["banner_title"] == "承認カードが見えません" and v["tone"] == "alert"
+    assert v["banner_time"] == "30秒"
+    m = muse(kind="approval", cards=0, waiting_since=NOW - 25)
+    del m["kind_since"]
+    assert view(m)["banner_title"] == "承認カードが見えません"
+    assert view(m)["banner_time"] == "25秒"
+    # どれも無ければ経過 0 とみなして警告は出さない
+    m = muse(kind="approval", cards=0)
+    del m["kind_since"]
+    assert view(m)["banner_title"] == "Muse が承認待ち"
+    # 承認待ち 180 秒の赤も since から数える
+    m = muse(kind="approval", cards=1, since=NOW - 200)
+    del m["kind_since"]
+    assert view(m)["tone"] == "alert"
+
+
+def test_negative_last_approval_sec_is_clamped():
+    assert view(muse(last_approval_sec=-2.5))["cards"][0] == ("承認", "0.0秒")
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
              test_done_window, test_sleep_default, test_cards,
+             test_kind_without_kind_since_falls_back, test_negative_last_approval_sec_is_clamped,
              test_state_claude_overrides_stale_kind]
 
 

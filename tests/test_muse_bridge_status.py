@@ -179,6 +179,28 @@ def test_no_kind_is_backward_compatible():
     assert mbs.describe(data, NOW)[0] == "Muse返事待ち 4分12秒（作業中 1分05秒）"
 
 
+def test_hold_last_good():
+    good = {"kind": "idle", "last_poll": NOW}
+    # 読めたらそれを使い、控えも更新する
+    assert mbs.hold_last_good(good, None, None, NOW) == (good, good, NOW)
+    # 読めなかったら直前の良いデータを10秒まで保持する
+    assert mbs.hold_last_good(None, good, NOW, NOW + 3) == (good, good, NOW)
+    assert mbs.hold_last_good(None, good, NOW, NOW + 10) == (good, good, NOW)
+    # 10秒を超えたら None(控えは使わない)
+    assert mbs.hold_last_good(None, good, NOW, NOW + 10.5)[0] is None
+    # 控えが無ければ None。dict でないもの(壊れた読み)は更新しない
+    assert mbs.hold_last_good(None, None, None, NOW)[0] is None
+    assert mbs.hold_last_good([1], good, NOW, NOW + 1)[0] is good
+
+
+def test_poll_sec_must_be_positive():
+    for bad in (-15, 0):
+        data = {"state": "idle", "since": NOW - 5, "last_poll": NOW - 3, "poll_sec": bad}
+        view = mbs.panel_view(data, NOW)
+        assert view["poll_fraction"] is None and view["poll_next_sec"] is None
+        assert all("次" not in line for line in mbs.describe(data, NOW))
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
 

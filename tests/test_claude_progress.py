@@ -250,10 +250,81 @@ def test_coop_collapsed_all_tones_paint():
         panel.deleteLater()
 
 
+def test_item_position():
+    ip = cp.coop_stage.item_position
+    w = 274
+    right = w - 100
+    # fly: 手紙は 0.85 で右端に着き、そこから消える。受領は1.5秒遅れて逆向き
+    assert ip("fly", "letter", 0, w) == (72, 1.0)
+    x, a = ip("fly", "letter", 3000 * 0.85, w)
+    assert abs(x - right) < 1e-6 and a == 1.0
+    x, a = ip("fly", "letter", 3000 * 0.925, w)
+    assert x == right and abs(a - 0.5) < 1e-6
+    assert ip("fly", "letter", 3000, w) == (72, 1.0)       # 周期 3000
+    assert ip("fly", "ack", 1500, w) == (right, 1.0)       # 1.5秒ずれて右端から出発
+    x, a = ip("fly", "ack", 1500 + 3000 * 0.85, w)
+    assert abs(x - 72) < 1e-6 and a == 1.0
+    assert ip("fly", "ack", 0, w)[0] != ip("fly", "letter", 0, w)[0]
+    # back: 受領だけが右から左へ(周期 2400)
+    assert ip("back", "ack", 0, w) == (right, 1.0)
+    x, a = ip("back", "ack", 2400 * 0.85, w)
+    assert abs(x - 72) < 1e-6 and a == 1.0
+    assert ip("back", "letter", 0, w) is None
+    # parked / wobble は手紙だけ
+    assert ip("parked", "letter", 123, w) == (right, 1.0) and ip("parked", "ack", 0, w) is None
+    xs = {ip("wobble", "letter", t, w)[0] for t in (0, 100, 200, 300)}
+    assert xs == {w * 0.46 - 2, w * 0.46 + 2}
+    assert ip("wobble", "ack", 0, w) is None
+    # どの時刻でも x は範囲内、不透明度は 0〜1
+    for kind in ("fly", "back", "parked", "wobble"):
+        for item in ("letter", "ack"):
+            for t in range(0, 7000, 37):
+                pos = ip(kind, item, t, w)
+                if pos is not None:
+                    assert 60 <= pos[0] <= w and 0.0 <= pos[1] <= 1.0
+
+
+def test_rows_to_show_prunes_first_seen():
+    now = time.time()
+    seen = {"gone": now - 100, "a": now - 1}
+    entries = [{"session_id": "a", "state": "done"}, {"session_id": "b", "state": "done"}]
+    rows = cp.rows_to_show(entries, now, seen)
+    assert set(seen) == {"a", "b"}                 # 一覧に無い gone は落ちる
+    assert [r["_compact"] for r in rows] == [False, False]
+    # キーが無い entry は控えを作らない(折りたたんだ行になる)
+    rows = cp.rows_to_show([{"state": "done"}], now, seen)
+    assert seen == {} and rows[0]["_compact"] is True
+
+
+def test_paint_survives_row_exception():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    muse, entries = _tone_inputs(now)["claude"]
+    panel = _new_panel()
+    panel.set_entries(entries, None, muse)
+    app.processEvents()
+    real = cp.coop_stage.paint_coop
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    cp.coop_stage.paint_coop = boom
+    try:
+        assert not panel.grab().isNull()           # 例外は握らず traceback を出すだけで落ちない
+    finally:
+        cp.coop_stage.paint_coop = real
+    panel.close()
+    panel.deleteLater()
+
+
 ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
              test_muse_kind_row_and_dismiss_key, test_coop_row,
              test_panel_coop_all_tones_paint, test_panel_coop_cannot_be_dismissed,
-             test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint]
+             test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint,
+             test_item_position, test_rows_to_show_prunes_first_seen,
+             test_paint_survives_row_exception]
 
 
 if __name__ == "__main__":

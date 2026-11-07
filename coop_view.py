@@ -70,7 +70,12 @@ def coop_view(muse, claude_entries, now=None):
     kind = muse.get("kind") if isinstance(muse.get("kind"), str) else None
     kind = kind or None
     prev_kind = muse.get("prev_kind")
+    # kind_since が無い(kind だけ書かれている)ときは since → waiting_since で経過を出す
     kind_since = _num(muse, "kind_since")
+    if kind_since is None:
+        kind_since = _num(muse, "since")
+    if kind_since is None:
+        kind_since = _num(muse, "waiting_since")
     kind_elapsed = max(0.0, now - kind_since) if kind_since is not None else None
     ke = kind_elapsed or 0.0
     cards_n = _num(muse, "cards")
@@ -145,6 +150,8 @@ def coop_view(muse, claude_entries, now=None):
 
 def _cards(muse, kind, kind_elapsed, stopped, fail, now) -> list:
     approval_sec = _num(muse, "last_approval_sec")
+    if approval_sec is not None:
+        approval_sec = max(0.0, approval_sec)
     approved = _num(muse, "approved") or 0
     if kind == "approval":
         approval = mbs.fmt_dur(kind_elapsed)      # 承認待ちの間は経過秒

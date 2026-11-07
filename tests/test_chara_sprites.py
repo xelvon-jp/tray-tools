@@ -47,7 +47,7 @@ def test_clawd_frame_cycles():
     assert sp.clawd_frame("watch", 3400) == "lookR"
     assert sp.clawd_frame("work", 0) == "walkB" and sp.clawd_frame("work", 160) == "walkA"
     assert sp.clawd_frame("work", 320) == "walkB"
-    assert sp.clawd_frame("wait", 0) == "waveB" and sp.clawd_frame("wait", 280) == "waveA"
+    assert sp.clawd_frame("wait", 0) == "waveB" and sp.clawd_frame("wait", 320) == "waveA"
     for a in ("alert", "happy", "sleep"):
         assert sp.clawd_frame(a, 12345) == a
     for a in ("watch", "work", "wait", "alert", "happy", "sleep"):
@@ -62,7 +62,7 @@ def test_muse_frame_cycles():
     assert sp.muse_frame("claude", 0) == "idle"
     assert sp.muse_frame("claude", 5000) == "blink"
     assert sp.muse_frame("claude", 2000) == "look-l" and sp.muse_frame("claude", 4500) == "look-r"
-    assert sp.muse_frame("approval", 0) == "look-r" and sp.muse_frame("approval", 300) == "wait"
+    assert sp.muse_frame("approval", 0) == "look-r" and sp.muse_frame("approval", 320) == "wait"
     assert sp.muse_frame("alert", 5) == "alert" and sp.muse_frame("done", 5) == "happy"
     assert sp.muse_frame("sleep", 5) == "sleep"
     for a in ("work", "claude", "approval", "alert", "done", "sleep"):

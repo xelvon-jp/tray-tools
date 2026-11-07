@@ -258,7 +258,7 @@ def clawd_frame(anim, t_ms) -> str:
     if anim == "work":
         return "walkA" if int(t // 160) % 2 else "walkB"
     if anim == "wait":
-        return "waveA" if int(t // 280) % 2 else "waveB"
+        return "waveA" if int(t // 320) % 2 else "waveB"
     if anim in ("alert", "happy", "sleep"):
         return anim
     return "base"
@@ -270,7 +270,7 @@ def muse_frame(anim, t_ms) -> str:
     if anim == "work":
         if t % 3000 < 500:
             return "look-r"
-        return "work-b" if int(t // 220) % 2 else "work-a"
+        return "work-b" if int(t // 240) % 2 else "work-a"
     if anim == "claude":
         c = t % 5200
         if 4900 < c < 5060:
@@ -282,7 +282,7 @@ def muse_frame(anim, t_ms) -> str:
             return "look-r"
         return "idle"
     if anim == "approval":
-        return "wait" if int(t // 300) % 2 else "look-r"
+        return "wait" if int(t // 320) % 2 else "look-r"
     if anim == "alert":
         return "alert"
     if anim == "done":

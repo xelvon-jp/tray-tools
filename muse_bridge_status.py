@@ -85,6 +85,23 @@ def fmt_dur(sec) -> str:
     return f"{s}秒"
 
 
+# 状態ファイルが書き込み中などで読めなかったとき、直前の良いデータを保持する最大秒数。
+HOLD_SEC = 10
+
+
+def hold_last_good(new, last, last_at, now, hold=HOLD_SEC):
+    """読めなかった(None)ときに直前の良いデータを最大 hold 秒だけ使い回す純関数。
+
+    戻り値は (表示に使うデータ, 控えのデータ, 控えた時刻)。new が dict なら更新して
+    それを返す。dict でなければ、控えが hold 秒以内ならそれを、過ぎたら None を返す
+    (控えは残すだけで、期限を過ぎたものは使わない)。"""
+    if isinstance(new, dict):
+        return new, new, now
+    if isinstance(last, dict) and last_at is not None and 0 <= now - last_at <= hold:
+        return last, last, last_at
+    return None, last, last_at
+
+
 def _num(data, key):
     v = data.get(key)
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -167,7 +184,7 @@ def describe(data, now=None) -> list:
             head += f" {int(settle)}/{int(need)}"
 
     parts = []
-    if poll_sec:
+    if poll_sec and poll_sec > 0:
         nxt = max(0, int(round(last_poll + poll_sec - now)))
         parts.append(f"{int(poll_sec)}秒毎・次{nxt}秒")
     approved = _num(data, "approved")
@@ -219,7 +236,7 @@ def panel_view(data, now=None):
         "settle_text": None,
         "stale_sec": max(0.0, now - last_poll) if stopped else None,
     }
-    if not stopped and poll_sec:
+    if not stopped and poll_sec and poll_sec > 0:
         remain = last_poll + poll_sec - now
         view["poll_next_sec"] = max(0, int(round(remain)))
         view["poll_fraction"] = min(1.0, max(0.0, remain / poll_sec))

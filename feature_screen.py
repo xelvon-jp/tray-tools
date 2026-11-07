@@ -2613,9 +2613,15 @@ class ScreenFeature:
 
         ツールチップ側の表示と同じファイル(muse_bridge_status)。読むだけ。"""
         try:
-            return muse_bridge_status.read()
+            data = muse_bridge_status.read()
         except Exception:  # noqa: BLE001  表示が出ないだけ
-            return None
+            data = None
+        # 書き込みとぶつかって読めない回があっても、連携ステージ行が1周期消えないよう、
+        # 直前の良いデータを最大 HOLD_SEC 秒だけ保持する
+        data, self._muse_last_good, self._muse_last_good_at = muse_bridge_status.hold_last_good(
+            data, getattr(self, "_muse_last_good", None),
+            getattr(self, "_muse_last_good_at", None), time.time())
+        return data
 
     def _update_claude_progress(self):
         copilot = self._read_copilot_turn()

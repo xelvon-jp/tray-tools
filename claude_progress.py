@@ -241,19 +241,21 @@ def muse_row(data, now=None) -> dict | None:
                     data.get("kind_since") if kind else data.get("since"))}
 
 
-def coop_row(muse, entries, now=None) -> dict | None:
+def coop_row(muse, entries, now=None, events=None) -> dict | None:
     """連携ステージの行(Muse 見張りの行の置き換え)。Muse 見張りの状態が無い・古すぎる
     ときは None(行を出さない)。
 
     表示内容は描くときに now で計算し直す(3秒ごとの受け取りの間も経過が進むよう、
     生のデータを抱える)。_muse も立てるのは、✕ で閉じる・開く先が無い、という
-    Muse 見張りの行の作法をそのまま引き継ぐため。"""
+    Muse 見張りの行の作法をそのまま引き継ぐため。events はやり取りの
+    記録(bridge_journal)のレコード列で、実イベントの飛行と履歴テープの材料。"""
     paused = bctl.is_paused()
-    view = cv.coop_view(muse, entries, now, paused=paused)
+    view = cv.coop_view(muse, entries, now, paused=paused, events=events)
     if view is None:
         return None
     has_kind = isinstance(muse.get("kind"), str) and bool(muse.get("kind"))
     return {"_coop": True, "_muse": True, "muse": muse, "entries": list(entries or []),
+            "events": list(events or []),
             "paused": paused,
             "state": muse.get("state"), "since": muse.get("since"),
             # ✕で閉じた判定のキー: tone と、その状態になった時刻(kind があれば kind_since)
@@ -292,6 +294,7 @@ class ClaudeProgressPanel(QWidget):
         self._entries = []
         self._copilot = None
         self._muse = None
+        self._events = []   # やり取りの記録(bridge_journal)。ステージの飛行とテープ用
         # ✕で閉じた Copilot の手番(状態, 開始時刻)。同じ手番の間は出さない。
         self._copilot_dismissed = None
         # ✕で閉じた Muse 見張りの状態((kind か state, kind_since か since))。同じ状態の間は出さない。
@@ -323,16 +326,18 @@ class ClaudeProgressPanel(QWidget):
         self._timer.timeout.connect(self._tick)
 
     # -- 中身 ------------------------------------------------------------
-    def set_entries(self, entries, copilot=None, muse=None) -> None:
+    def set_entries(self, entries, copilot=None, muse=None, events=None) -> None:
         """feature_screen から、読んだばかりの一覧を受け取る。
 
         copilot は Copilot の手番(read_turn_status の戻り)。あれば先頭に
         1行だけ相乗りさせる(背面・最小化でも見えるようにするのが目的)。
         muse は Muse 見張りの状態(muse_bridge_status.read の戻り)。
-        あれば Copilot の次に1行だけ相乗りさせる。"""
+        あれば Copilot の次に1行だけ相乗りさせる。events はやり取りの
+        記録(bridge_journal)のレコード列(ステージの飛行とテープ用)。"""
         self._entries = list(entries or [])
         self._copilot = copilot
         self._muse = muse
+        self._events = list(events or [])
         self._tick()
 
     def _tick(self):
@@ -343,7 +348,7 @@ class ClaudeProgressPanel(QWidget):
                     and (head["state"], head.get("since")) == self._copilot_dismissed):
                 head = None   # ✕で閉じた手番は、その手番の間は出さない
             # 連携ステージ行は ✕ で閉じられない(たたむだけ)ので、_muse_dismissed は見ない
-            muse = coop_row(self._muse, self._entries, now)
+            muse = coop_row(self._muse, self._entries, now, events=self._events)
             self._stealth_mode = False
             if muse is not None:
                 muse["_collapsed"] = self._coop_collapsed
@@ -351,7 +356,8 @@ class ClaudeProgressPanel(QWidget):
                 muse["_size"] = ("large" if self._bridge_size == "stealth"
                                  else self._bridge_size)
                 view_now = cv.coop_view(self._muse, self._entries, now,
-                                        paused=bool(muse.get("paused")))
+                                        paused=bool(muse.get("paused")),
+                                        events=self._events)
                 self._stealth_view = view_now
                 tone_now = view_now["tone"] if view_now else None
                 if tone_now is not None:
@@ -519,7 +525,8 @@ class ClaudeProgressPanel(QWidget):
     def _paint_row(self, p, entry, rect, now, hover):
         if entry.get("_coop"):
             view = cv.coop_view(entry["muse"], entry["entries"], now,
-                                 paused=bool(entry.get("paused")))
+                                 paused=bool(entry.get("paused")),
+                                 events=entry.get("events"))
             if view is not None:
                 coop_stage.paint_coop(
                     p, rect, view, now, self.devicePixelRatioF(), self._sub_font,

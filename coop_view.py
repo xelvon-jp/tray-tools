@@ -6,6 +6,7 @@
 # 経過時間は呼ぶたびに計算し直す。
 import time
 
+import bridge_events_view as bev
 import muse_bridge_status as mbs
 
 # tone の名前(色は描く側が持つ): work / claude / approval / alert / done / sleep
@@ -18,6 +19,9 @@ ANIMS = {
     "done": ("done", "happy"),
     "sleep": ("sleep", "sleep"),
 }
+# item は状態の表現: parked(承認待ちで止まった手紙)と wobble(異常で揺れる)
+# は描く側が今も使う。fly / back は状態の名前として残してあるが、飛行そのものは
+# ループ再生をやめ、実イベント駆動(view の flights)に置き換えた(work-board#8)。
 ITEMS = {"work": "fly", "approval": "parked", "alert": "wobble", "done": "back"}
 PROPS = {"work": {"spark"}, "claude": {"dots"}, "alert": {"bang", "sweat"},
          "sleep": {"zz"}, "done": {"hat", "confetti"}}
@@ -51,12 +55,15 @@ def _oldest(entries, key):
     return min(entries, key=stamp)
 
 
-def coop_view(muse, claude_entries, now=None, paused=False):
+def coop_view(muse, claude_entries, now=None, paused=False, events=None):
     """連携ステージの表示内容(dict)。出さないなら None。
 
     banner_title / banner_sub / banner_time(経過を fmt_dur で。分からなければ空) /
     tone / muse_anim / clawd_anim / item(fly|parked|wobble|back|None) /
-    props(set) / cards(3つの (ラベル, 値)) / all_idle / paused。
+    props(set) / cards(3つの (ラベル, 値)) / all_idle / paused /
+    flights(実イベントで飛んでいる手紙・受領。bridge_events_view) /
+    tape(履歴テープの行)。events はやり取りの記録(bridge_journal)の
+    レコード列で、渡さなければ flights / tape は空になる。
     all_idle は「全員待機中」(Muse も Claude も陽太さん待ち)のときだけ True で、
     描く側がブリッジをゆっくり明滅させる目印。paused はブリッジから見張りの
     休止が指示されているとき(bridge_control の合図。判定より優先して出す)。
@@ -157,6 +164,8 @@ def coop_view(muse, claude_entries, now=None, paused=False):
         "cards": _cards(muse, kind, ke, stopped, fail, now, paused),
         "all_idle": all_idle,
         "paused": bool(paused),
+        "flights": bev.flights(events, now) if events else [],
+        "tape": bev.tape_lines(events, now) if events else [],
     }
 
 

@@ -10,6 +10,7 @@ from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
                            QPixmap, QPolygonF)
 
+import bridge_events_view as bev
 import chara_sprites as sp
 
 STAGE_H = 116
@@ -17,7 +18,11 @@ BANNER_H = 36
 CARDS_H = 34
 PAD = 8
 GAP = 6
-COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + CARDS_H + PAD
+# 履歴テープ(ステージの下・カードの上)。行数は bridge_events_view の
+# TAPE_LINES と揃える。出すのはカードのある大きさ(large)だけ。
+TAPE_LINE_H = 13
+TAPE_H = TAPE_LINE_H * bev.TAPE_LINES
+COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + TAPE_H + GAP + CARDS_H + PAD
 COOP_COLLAPSED_HEIGHT = 56    # たたんだとき: バナーだけ(上下に余白)
 # ブリッジの大きさ(muse/launcher-bridge-size)。stage_h はステージ部分の高さ、
 # muse_cell / cell / item_cell は各ドット絵の1マス(px)。絵は格子データから
@@ -44,7 +49,7 @@ def coop_height(size) -> int:
     spec = size_spec(size)
     height = PAD + BANNER_H + GAP + spec["stage_h"] + PAD
     if spec["cards"]:
-        height += GAP + CARDS_H
+        height += GAP + TAPE_H + GAP + CARDS_H
     return height
 TOGGLE_SIZE = 20              # 「たたむ／ひろげる」ボタンの当たり(px)
 PAUSE_GAP = 4                 # 休止ボタンとたたむボタンの間(px)
@@ -305,8 +310,20 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
         _paint_toggle(p, rect, False, hot)
         return
 
+    # 履歴テープ(直近のやり取りを新しい順に)。ステージの下・カードの上。
+    tape_top = st.bottom() + 1 + GAP
+    tape_font = QFont("Meiryo", 8)
+    tape_fm = QFontMetrics(tape_font)
+    p.setFont(tape_font)
+    p.setPen(SUB)
+    for i, line in enumerate((view.get("tape") or [])[:bev.TAPE_LINES]):
+        r = QRect(inner.left() + 2, tape_top + i * TAPE_LINE_H,
+                  inner.width() - 4, TAPE_LINE_H)
+        p.drawText(r, Qt.AlignLeft | Qt.AlignVCenter,
+                   tape_fm.elidedText(line, Qt.ElideRight, r.width()))
+
     # カード3枚
-    top = st.bottom() + 1 + GAP
+    top = tape_top + TAPE_H + GAP
     gap = 5
     cw = (inner.width() - gap * 2) // 3
     label_font = QFont("Meiryo", 7)
@@ -359,10 +376,14 @@ def _paint_stage(p, dpr, view, st, accent, t, spec):
     mtop = feet - mh                          # Claw'd と足元(feet)を揃える
     _sprite(p, dpr, ("muse", mname), mrows, sp.MUSE_PALETTE,
             ox + 8 + mdx, mtop + mdy, muse_cell)
+    # 実イベントの飛行(bridge_events_view)。approval の直後は Claw'd が
+    # 「押す動き」をする(ハサミを一瞬閉じるように、少しだけ沈む)。
+    flights = view.get("flights") or []
+    press = any(f.get("press") for f in flights)
     cdx, cdy = sp.move_offset(sp.CLAWD_MOVE.get(view["clawd_anim"], ""), t)
     cname = sp.clawd_frame(view["clawd_anim"], t)
     cw = 12 * cell
-    cx, cy = ox + W - 10 - cw + cdx, feet - 8 * cell + cdy
+    cx, cy = ox + W - 10 - cw + cdx, feet - 8 * cell + cdy + (2 if press else 0)
     _sprite(p, dpr, ("clawd", cname), sp.CLAWD_FRAMES[cname], sp.CLAWD_PALETTE,
             cx, cy, cell)
     if "hat" in props:
@@ -373,19 +394,28 @@ def _paint_stage(p, dpr, view, st, accent, t, spec):
     fly_left = 8 + mw + 6
     fly_right = W - 10 - cw - 10 * item_cell - 4
     kind = view["item"]
-    if kind:
-        for name in ("letter", "ack"):
-            pos = item_position(kind, name, t, W, fly_left, fly_right)
-            if pos is None:
-                continue
+    if kind in ("parked", "wobble"):
+        # 状態の表現(承認待ちで止まった手紙・異常で揺れる手紙)は実態の
+        # 表現なので残す。飛ぶのは手紙だけ。
+        pos = item_position(kind, "letter", t, W, fly_left, fly_right)
+        if pos is not None:
             p.setOpacity(max(0.0, min(1.0, pos[1])))
-            dy = 0 if name == "ack" else 4 + (-2 if kind == "parked" and t % 1000 >= 500 else 0)
-            _sprite(p, dpr, ("item", name), ITEM_GRIDS[name], ITEM_PALETTE,
+            dy = 4 + (-2 if kind == "parked" and t % 1000 >= 500 else 0)
+            _sprite(p, dpr, ("item", "letter"), ITEM_GRIDS["letter"], ITEM_PALETTE,
                     ox + pos[0] + 1, item_top + dy, item_cell)
             p.setOpacity(1.0)
-    if kind in ("parked", "wobble"):
         _blink_text(p, "?", QRect(ox + W // 2 - 10, item_top - 22, 20, 20), accent, 16,
                     t % 800 < 400)
+    # 実イベントの飛行。直近のイベントが無ければ何も飛ばない。同時に
+    # 複数あるときは縦にずらして重ならないようにする。
+    for i, flight in enumerate(flights):
+        x, alpha = bev.flight_position(flight["progress"], flight["from"],
+                                       fly_left, fly_right)
+        grid_name = "letter" if flight["item"] == "letter" else "ack"
+        p.setOpacity(max(0.0, min(1.0, alpha)))
+        _sprite(p, dpr, ("item", grid_name), ITEM_GRIDS[grid_name], ITEM_PALETTE,
+                ox + x + 1, item_top + i * 7 * item_cell, item_cell)
+        p.setOpacity(1.0)
 
     # 火花(Muse の頭の上)
     if "spark" in props:

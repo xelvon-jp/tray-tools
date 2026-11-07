@@ -2629,9 +2629,29 @@ class ScreenFeature:
             getattr(self, "_muse_last_good_at", None), time.time())
         return data
 
+    def _read_bridge_events(self):
+        """やり取りの記録(bridge_journal)を読む。ステージの実イベント飛行と
+        履歴テープの材料。環境2・3では読まない(ブリッジ自体を出さない、
+        _read_muse_bridge と同じ作法)。
+
+        飛行用に直近60秒、テープ用に直近の数件を取り、重ねて返す
+        (重複は受け取り側の bridge_events_view が除く)。読めなければ
+        直前の結果を保つ(1周期だけ材料が古くても、絵が消えたりしない)。"""
+        if self.app_settings.get("environment") in (2, 3):
+            return []
+        try:
+            import bridge_journal
+            now = time.time()
+            events = bridge_journal.since(now - 60) + bridge_journal.tail(8)
+        except Exception:  # noqa: BLE001  表示の材料が無いだけ
+            return getattr(self, "_bridge_events", [])
+        self._bridge_events = events
+        return events
+
     def _update_claude_progress(self):
         copilot = self._read_copilot_turn()
         muse = self._read_muse_bridge()
+        events = self._read_bridge_events()
         if not self._claude_progress_enabled:
             if self._claude_progress is not None:
                 self._claude_progress.set_entries([], None, None)
@@ -2642,7 +2662,8 @@ class ScreenFeature:
             self._claude_progress = claude_progress.ClaudeProgressPanel(
                 on_open=self._open_claude_session, on_remove=self._remove_claude_session,
                 on_open_copilot=self._activate_copilot)
-        self._claude_progress.set_entries(self._claude_entries, copilot, muse)
+        self._claude_progress.set_entries(self._claude_entries, copilot, muse,
+                                          events=events)
 
     def _open_claude_session(self, entry):
         """そのセッションをデスクトップアプリで開く(メニューとパネルの行から)。"""

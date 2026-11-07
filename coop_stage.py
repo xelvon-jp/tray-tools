@@ -16,6 +16,8 @@ CARDS_H = 34
 PAD = 8
 GAP = 6
 COOP_HEIGHT = PAD + BANNER_H + GAP + STAGE_H + GAP + CARDS_H + PAD
+COOP_COLLAPSED_HEIGHT = 56    # たたんだとき: バナーだけ(上下に余白)
+TOGGLE_SIZE = 20              # 「たたむ／ひろげる」ボタンの当たり(px)
 CELL = 5                      # キャラの1マス(px)。Claw'd は 60x40、Muse は 60x50
 MUSE_CELL = 4                 # Muse の1マス(px)。v2 は 13x15 なので 52x60
 ITEM_CELL = 2                 # 手紙・受領・火花の1マス(px)
@@ -115,23 +117,51 @@ def _blink_text(p, text, rect, color, pixel_size, on):
     p.setOpacity(1.0)
 
 
-def paint_coop(p, rect, view, now, dpr, sub_font):
-    """連携ステージの行を rect に描く。view は coop_view.coop_view の戻り、now は epoch 秒。"""
+def toggle_rect(rect) -> QRect:
+    """「たたむ／ひろげる」ボタンの矩形(行の右上。バナーの右端)。広げた状態でもたたんだ
+    状態でも、バナーの右端に同じ大きさで置く。"""
+    top = rect.top() + _banner_top_offset(rect.height())
+    return QRect(rect.right() - PAD - TOGGLE_SIZE + 1, top + (BANNER_H - TOGGLE_SIZE) // 2,
+                 TOGGLE_SIZE, TOGGLE_SIZE)
+
+
+def _banner_top_offset(height) -> int:
+    return PAD if height >= COOP_HEIGHT else (height - BANNER_H) // 2
+
+
+def _paint_toggle(p, rect, collapsed, hot):
+    """小さなシェブロン。▾=広げている(押すとたたむ)、▴=たたんでいる(押すと広げる)。"""
+    box = toggle_rect(rect)
+    c = QPointF(box.center().x() + 0.5, box.center().y() + 0.5)
+    if hot:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 30))
+        p.drawRoundedRect(QRectF(box), 3, 3)
+    pen = QPen(QColor("#bfe9f5") if hot else QColor("#4a8da0"), 1.6)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    k = -2.0 if collapsed else 2.0   # 頂点の向き(▴ は上、▾ は下)
+    p.drawPolyline(QPolygonF([QPointF(c.x() - 4, c.y() - k), QPointF(c.x(), c.y() + k),
+                              QPointF(c.x() + 4, c.y() - k)]))
+
+
+def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False):
+    """連携ステージの行を rect に描く。view は coop_view.coop_view の戻り、now は epoch 秒。
+    collapsed ならバナーだけ(ステージとカードは描かない)。hot はボタンにマウスが乗っている。"""
     accent = TONES.get(view["tone"], TONES["sleep"])
     t = now * 1000.0
-    # 枠(右上と左下を斜めに切った形)
+    # 枠(ごく小さな丸みの長方形)
     box = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
-    c = 12.0
     p.setRenderHint(QPainter.Antialiasing, True)
     p.setPen(QPen(EDGE, 1))
     p.setBrush(BG)
-    p.drawPolygon(QPolygonF([
-        QPointF(box.left(), box.top()), QPointF(box.right() - c, box.top()),
-        QPointF(box.right(), box.top() + c), QPointF(box.right(), box.bottom()),
-        QPointF(box.left() + c, box.bottom()), QPointF(box.left(), box.bottom() - c)]))
+    p.drawRoundedRect(box, 3, 3)
     p.setRenderHint(QPainter.Antialiasing, False)
-    inner = QRect(rect.left() + PAD, rect.top() + PAD,
-                  rect.width() - PAD * 2, rect.height() - PAD * 2)
+    top_pad = _banner_top_offset(rect.height())
+    inner = QRect(rect.left() + PAD, rect.top() + top_pad,
+                  rect.width() - PAD * 2, rect.height() - top_pad - PAD)
 
     # バナー: 左に太線、右へ薄れるグラデーション、右端に経過(✕の分は空ける)
     ban = QRect(inner.left(), inner.top(), inner.width(), BANNER_H)
@@ -163,6 +193,10 @@ def paint_coop(p, rect, view, now, dpr, sub_font):
                Qt.AlignLeft | Qt.AlignVCenter,
                sfm.elidedText(view["banner_sub"], Qt.ElideRight, sub_w))
 
+    if collapsed:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        _paint_toggle(p, rect, True, hot)
+        return
     # ステージ
     st = QRect(inner.left(), ban.bottom() + 1 + GAP, inner.width(), STAGE_H)
     grad = QLinearGradient(0, st.top(), 0, st.bottom())
@@ -203,6 +237,7 @@ def paint_coop(p, rect, view, now, dpr, sub_font):
                          vfm.height()), Qt.AlignLeft | Qt.AlignVCenter,
                    vfm.elidedText(value, Qt.ElideRight, body.width()))
     p.setRenderHint(QPainter.Antialiasing, True)   # 呼び出し元(他の行)は丸みを使う
+    _paint_toggle(p, rect, False, hot)
 
 
 def _paint_stage(p, dpr, view, st, accent, t):

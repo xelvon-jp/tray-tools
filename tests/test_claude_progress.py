@@ -9,6 +9,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import claude_progress as cp
+import tempfile
+
+_TMP = tempfile.mkdtemp(prefix="cp_test_")
+_COUNTER = [0]
+
+
+def _state_path():
+    """テストごとの保存先(本物の claude_progress.json を読み書きしない)。"""
+    _COUNTER[0] += 1
+    return os.path.join(_TMP, f"state{_COUNTER[0]}.json")
+
+
+def _new_panel(path=None):
+    return cp.ClaudeProgressPanel(state_path=path or _state_path())
 
 
 def test_muse_row():
@@ -28,7 +42,7 @@ def test_panel_shows_muse_row():
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
-    panel = cp.ClaudeProgressPanel()
+    panel = _new_panel()
     now = time.time()
     data = {"state": "busy", "since": now - 65, "waiting_since": now - 252,
             "poll_sec": 15, "last_poll": now - 8, "approved": 2}
@@ -38,11 +52,9 @@ def test_panel_shows_muse_row():
     assert panel.isVisible()
     # 描画まで通す(paintEvent の例外が無いこと)
     panel.grab()
-    # 状態が同じ間は ✕ で消え、状態が変われば戻る
+    # 連携ステージ行は ✕ で閉じられない
     panel._remove_row(0)
-    assert panel._rows == []
-    panel.set_entries([], None, data)
-    assert panel._rows == []
+    assert [bool(r.get("_muse")) for r in panel._rows] == [True]
     changed = dict(data, state="waiting", since=now)
     panel.set_entries([], None, changed)
     assert [bool(r.get("_muse")) for r in panel._rows] == [True]
@@ -54,7 +66,7 @@ def test_muse_kind_row_and_dismiss_key():
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
-    panel = cp.ClaudeProgressPanel()
+    panel = _new_panel()
     now = time.time()
     data = {"kind": "approval", "kind_since": now - 100, "header": None,
             "state": "idle", "since": now - 500, "waiting_since": None,
@@ -66,10 +78,9 @@ def test_muse_kind_row_and_dismiss_key():
     panel.set_entries([], None, data)
     app.processEvents()
     panel.grab()   # kind 経路の描画で例外が出ないこと
-    panel._remove_row(0)
+    panel._remove_row(0)   # 連携ステージ行は閉じられない
     panel.set_entries([], None, data)
-    assert panel._rows == []
-    # kind が変われば(kind_since も変わる)また出る
+    assert [bool(r.get("_muse")) for r in panel._rows] == [True]
     panel.set_entries([], None, dict(data, kind="idle", kind_since=now))
     assert [bool(r.get("_muse")) for r in panel._rows] == [True]
     panel.grab()
@@ -111,7 +122,7 @@ def test_panel_coop_all_tones_paint():
     app = QApplication.instance() or QApplication([])
     now = time.time()
     for tone, (muse, entries) in _tone_inputs(now).items():
-        panel = cp.ClaudeProgressPanel()
+        panel = _new_panel()
         panel.set_entries(entries, None, muse)
         app.processEvents()
         assert panel._rows[0]["_coop"], tone
@@ -133,33 +144,116 @@ def test_panel_coop_all_tones_paint():
         panel.deleteLater()
 
 
-def test_panel_coop_dismiss_by_tone():
+def test_panel_coop_cannot_be_dismissed():
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
     now = time.time()
     inputs = _tone_inputs(now)
-    panel = cp.ClaudeProgressPanel()
+    panel = _new_panel()
     muse, entries = inputs["sleep"]
     panel.set_entries(entries, None, muse)
     app.processEvents()
     panel._remove_row(0)
-    assert panel._rows == []
+    assert panel._rows[0]["_coop"]               # ✕ では閉じられない
+    panel._muse_dismissed = panel._rows[0]["key"]
     panel.set_entries(entries, None, muse)
-    assert panel._rows == []                     # 同じ tone の間は出ない
-    muse2, entries2 = inputs["claude"]
-    panel.set_entries(entries2, None, muse2)
-    assert panel._rows[0]["_coop"]               # tone が変われば戻る
+    assert panel._rows[0]["_coop"]               # 古い「閉じた状態のキー」も効かない
     # 状態ファイルが無くなれば、Claude の行だけが残る(連携ステージは出ない)
-    panel.set_entries(entries2, None, None)
-    assert [bool(r.get("_coop")) for r in panel._rows] == [False]
+    panel.set_entries(entries, None, None)
+    assert [bool(r.get("_coop")) for r in panel._rows] == []
     panel.close()
     panel.deleteLater()
 
 
+def _click(panel, pos):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtCore import QEvent
+    ev = QMouseEvent(QEvent.MouseButtonPress, QPointF(pos), QPointF(pos),
+                     Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+    panel.mousePressEvent(ev)
+
+
+def test_coop_collapse_toggle_and_persist():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    muse, entries = _tone_inputs(now)["sleep"]   # Claude の行が無い(動く行は連携ステージだけ)
+    path = _state_path()
+    panel = _new_panel(path)
+    assert panel._coop_collapsed is False        # 既定は広げた状態
+    panel.set_entries(entries, None, muse)
+    app.processEvents()
+    coop_h = cp.coop_stage.COOP_HEIGHT
+    assert cp.row_height(panel._rows[0]) == coop_h
+    assert not os.path.exists(path)              # 触っていない間は書かない
+    # (d) ボタン以外のクリックでは変わらない
+    rect = panel._row_rect(0)
+    _click(panel, rect.center())
+    _click(panel, rect.topLeft() + cp.QPoint(30, 30))
+    assert panel._coop_collapsed is False and not os.path.exists(path)
+    # (a) ボタンのクリックでたたむ / ひろげる
+    btn = cp.coop_stage.toggle_rect(rect)
+    assert btn.width() == 20 and btn.height() == 20
+    _click(panel, btn.center())
+    assert panel._coop_collapsed is True
+    assert cp.row_height(panel._rows[0]) == cp.coop_stage.COOP_COLLAPSED_HEIGHT
+    assert panel.height() == cp.panel_height(panel._rows)
+    assert not panel._timer.isActive()           # たたんでいる間は回さない
+    # たたんだ状態でもボタンは同じ場所
+    assert cp.coop_stage.toggle_rect(panel._row_rect(0)).right() == btn.right()
+    _click(panel, panel._row_rect(0).center())   # ボタン以外は何もしない
+    assert panel._coop_collapsed is True
+    panel.grab()
+    # (c) 保存され、新しいパネルで復元される
+    assert cp.load_state(path).get("coop_collapsed") is True
+    panel2 = _new_panel(path)
+    assert panel2._coop_collapsed is True
+    panel2.set_entries(entries, None, muse)
+    assert cp.row_height(panel2._rows[0]) == cp.coop_stage.COOP_COLLAPSED_HEIGHT
+    assert not panel2._timer.isActive()
+    _click(panel2, cp.coop_stage.toggle_rect(panel2._row_rect(0)).center())
+    assert panel2._coop_collapsed is False
+    assert panel2._timer.isActive()
+    assert cp.load_state(path).get("coop_collapsed") is False
+    assert cp.row_height(panel2._rows[0]) == coop_h
+    # pos など他のキーを壊さない
+    cp.save_state({"pos": [5, 6]}, path)
+    panel2.toggle_coop()
+    assert cp.load_state(path).get("pos") == [5, 6]
+    for pnl in (panel, panel2):
+        pnl.close()
+        pnl.deleteLater()
+
+
+def test_coop_collapsed_all_tones_paint():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    now = time.time()
+    for tone, (muse, entries) in _tone_inputs(now).items():
+        path = _state_path()
+        cp.save_state({"coop_collapsed": True}, path)
+        panel = _new_panel(path)
+        panel.set_entries(entries, None, muse)
+        app.processEvents()
+        row = panel._rows[0]
+        assert row["_coop"] and row["_collapsed"], tone
+        assert cp.cv.coop_view(row["muse"], row["entries"], time.time())["tone"] == tone
+        assert not panel.grab().isNull()
+        # tone が変わっても(たたんだまま)色線とタイトルが更新される
+        panel.set_entries(entries, None, _tone_inputs(now)["sleep"][0])
+        panel.grab()
+        panel.close()
+        panel.deleteLater()
+
+
 ALL_TESTS = [test_muse_row, test_panel_shows_muse_row,
              test_muse_kind_row_and_dismiss_key, test_coop_row,
-             test_panel_coop_all_tones_paint, test_panel_coop_dismiss_by_tone]
+             test_panel_coop_all_tones_paint, test_panel_coop_cannot_be_dismissed,
+             test_coop_collapse_toggle_and_persist, test_coop_collapsed_all_tones_paint]
 
 
 if __name__ == "__main__":

@@ -235,7 +235,8 @@ def coop_row(muse, entries, now=None) -> dict | None:
 
 def row_height(row) -> int:
     if row.get("_coop"):
-        return coop_stage.COOP_HEIGHT
+        return (coop_stage.COOP_COLLAPSED_HEIGHT if row.get("_collapsed")
+                else coop_stage.COOP_HEIGHT)
     if row.get("_copilot") or row.get("_muse"):
         return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
@@ -267,6 +268,8 @@ class ClaudeProgressPanel(QWidget):
         self._copilot_dismissed = None
         # ✕で閉じた Muse 見張りの状態((kind か state, kind_since か since))。同じ状態の間は出さない。
         self._muse_dismissed = None
+        # 連携ステージ行をたたんでいるか(再起動しても保つ。既定は広げた状態)
+        self._coop_collapsed = bool(load_state(state_path).get("coop_collapsed"))
         self._rows = []
         self._first_seen_done = {}
         self._hover = -1
@@ -303,10 +306,10 @@ class ClaudeProgressPanel(QWidget):
             if (head is not None
                     and (head["state"], head.get("since")) == self._copilot_dismissed):
                 head = None   # ✕で閉じた手番は、その手番の間は出さない
+            # 連携ステージ行は ✕ で閉じられない(たたむだけ)ので、_muse_dismissed は見ない
             muse = coop_row(self._muse, self._entries, now)
-            if (muse is not None
-                    and muse["key"] == self._muse_dismissed):
-                muse = None   # ✕で閉じた状態は、その状態の間は出さない
+            if muse is not None:
+                muse["_collapsed"] = self._coop_collapsed
             rows = (([head] if head else []) + ([muse] if muse else [])
                     + rows_to_show(self._entries, now, self._first_seen_done))
             if not rows:
@@ -326,11 +329,12 @@ class ClaudeProgressPanel(QWidget):
             # 折りたたんだ行だけなら止まった絵なので、3秒ごとの set_entries で足りる。
             # Copilot の行は、帯が流れる応答待ち・応答中だけ回す(他の状態の
             # 経過表示は3秒ごとの受け取りで進めば足りる)。
-            # 連携ステージの行は、どの tone でもキャラが動く(寝息・点滅など)ので常に回す。
+            # 連携ステージの行は、どの tone でもキャラが動く(寝息・点滅など)ので回す。
+            # たたんでいる間は絵が無いので回さない(経過時間は3秒ごとの受け取りで進む)。
             if any((not r.get("_compact") and not r.get("_copilot") and not r.get("_muse"))
                    or (r.get("_copilot")
                        and r["state"] in ("responding", "waiting_ai"))
-                   or r.get("_coop")
+                   or (r.get("_coop") and not r.get("_collapsed"))
                    for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
@@ -377,12 +381,15 @@ class ClaudeProgressPanel(QWidget):
         now = time.time()
         for index, entry in enumerate(self._rows):
             self._paint_row(p, entry, self._row_rect(index), now, index == self._hover)
-            self._paint_close(p, index)
+            if not entry.get("_coop"):   # 連携ステージ行は ✕ の代わりにたたむボタン(行の中で描く)
+                self._paint_close(p, index)
         p.end()
 
     def _close_rect(self, index) -> QRect:
         """その行の ✕ の場所。バーの行は1行目(名前の行)の高さに、折りたたんだ行は真ん中に。"""
         rect = self._row_rect(index)
+        if self._rows[index].get("_coop"):
+            return coop_stage.toggle_rect(rect)   # ✕ の位置にあるたたむ／ひろげるボタン
         right = rect.right() - PAD_X // 2
         if self._rows[index].get("_compact"):
             top = rect.center().y() - CLOSE_SIZE // 2 + 1
@@ -409,8 +416,10 @@ class ClaudeProgressPanel(QWidget):
         if entry.get("_coop"):
             view = cv.coop_view(entry["muse"], entry["entries"], now)
             if view is not None:
-                coop_stage.paint_coop(p, rect, view, now, self.devicePixelRatioF(),
-                                      self._sub_font)
+                coop_stage.paint_coop(
+                    p, rect, view, now, self.devicePixelRatioF(), self._sub_font,
+                    collapsed=bool(entry.get("_collapsed")),
+                    hot=self._rows.index(entry) == self._hover_close)
             return
         if entry.get("_copilot"):
             self._paint_copilot(p, entry, rect, now, hover)
@@ -686,6 +695,10 @@ class ClaudeProgressPanel(QWidget):
                 row.get("_copilot") and self._on_open_copilot is not None)
             self.setCursor(Qt.PointingHandCursor if jumpable or hover_close >= 0
                            else Qt.ArrowCursor)
+            if hover_close >= 0 and self._rows[hover_close].get("_coop"):
+                self.setToolTip("ひろげる" if self._coop_collapsed else "たたむ")
+            else:
+                self.setToolTip("")
             self.update()
 
     def leaveEvent(self, _event):
@@ -705,7 +718,10 @@ class ClaudeProgressPanel(QWidget):
         # ✕ は少し広めに当たりを取る(小さいので押し損ねると、その行を開いてしまう)
         if 0 <= index < len(self._rows) and self._close_rect(index).adjusted(
                 -3, -3, 3, 3).contains(pos):
-            self._remove_row(index)
+            if self._rows[index].get("_coop"):
+                self.toggle_coop()   # ✕ ではなくたたむボタン
+            else:
+                self._remove_row(index)
             return
         if 0 <= index < len(self._rows) and self._rows[index].get("_copilot"):
             if self._on_open_copilot is not None:
@@ -727,6 +743,8 @@ class ClaudeProgressPanel(QWidget):
     def _remove_row(self, index):
         """その行を消す。手元の一覧からもすぐ外して描き直す(次の読み込みを待たない)。"""
         entry = self._rows[index]
+        if entry.get("_coop"):
+            return   # 連携ステージ行は ✕ で閉じられない(たたむボタンだけ)
         if entry.get("_copilot"):
             # Copilot の行の ✕: その手番の間だけ閉じる。手番が変われば
             # (状態か開始時刻が変われば)また出る。監視は止めない。
@@ -752,6 +770,14 @@ class ClaudeProgressPanel(QWidget):
         self._entries = [e for e in self._entries
                          if (e.get("session_id") or e.get("_path")) != key]
         self._hover = self._hover_close = -1
+        self._tick()
+
+    def toggle_coop(self):
+        """連携ステージ行をたたむ／ひろげる。状態は保存先に覚える(トグルしたときだけ書く)。"""
+        self._coop_collapsed = not self._coop_collapsed
+        save_state({"coop_collapsed": self._coop_collapsed}, self._state_path)
+        self._hover = self._hover_close = -1
+        self.setToolTip("")
         self._tick()
 
     def mouseReleaseEvent(self, _event):

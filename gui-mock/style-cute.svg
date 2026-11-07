@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" font-family="'Hiragino Maru Gothic ProN','Hiragino Sans','Yu Gothic',sans-serif">
+  <rect width="900" height="520" fill="#fff6ec"/>
+  <!-- ============ LEFT: NORMAL ============ -->
+  <g>
+    <rect x="14" y="14" width="426" height="492" rx="28" fill="#ffffff" stroke="#ffd9e8" stroke-width="3"/>
+    <text x="38" y="46" font-size="13" fill="#c294a8">平常</text>
+    <text x="416" y="46" font-size="13" fill="#c294a8" text-anchor="end">15:12</text>
+    <rect x="32" y="58" width="390" height="58" rx="29" fill="#dcf7e6"/>
+    <text x="227" y="94" font-size="18" font-weight="bold" fill="#3c5a48" text-anchor="middle">いま：Muse が作業中</text>
+    <!-- Muse character -->
+    <circle cx="110" cy="182" r="34" fill="#a8e6d5" stroke="#5fbfa8" stroke-width="3"/>
+    <circle cx="98" cy="176" r="4" fill="#23403a"/>
+    <circle cx="122" cy="176" r="4" fill="#23403a"/>
+    <path d="M 98 192 Q 110 202 122 192" fill="none" stroke="#23403a" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="84" cy="190" r="6" fill="#ffc7dd" opacity="0.8"/>
+    <circle cx="136" cy="190" r="6" fill="#ffc7dd" opacity="0.8"/>
+    <text x="110" y="240" font-size="16" font-weight="bold" fill="#46685a" text-anchor="middle">Muse</text>
+    <rect x="64" y="252" width="92" height="26" rx="13" fill="#eef7f2" stroke="#bfe6d2"/>
+    <text x="110" y="270" font-size="13" fill="#3c5a48" text-anchor="middle">処理中</text>
+    <!-- arrow -->
+    <path d="M 196 190 L 244 190" stroke="#ffb7d5" stroke-width="4" stroke-linecap="round"/>
+    <polygon points="258,190 242,180 242,200" fill="#ffb7d5"/>
+    <path d="M 227 160 l 3.5 7 7.7 1 -5.6 5.4 1.3 7.6 -6.9 -3.6 -6.9 3.6 1.3 -7.6 -5.6 -5.4 7.7 -1 z" fill="#ffd76e"/>
+    <!-- Claude character -->
+    <circle cx="344" cy="182" r="34" fill="#bcd9ff" stroke="#6ea8e8" stroke-width="3"/>
+    <circle cx="332" cy="176" r="4" fill="#22384f"/>
+    <circle cx="356" cy="176" r="4" fill="#22384f"/>
+    <path d="M 332 192 Q 344 202 356 192" fill="none" stroke="#22384f" stroke-width="3" stroke-linecap="round"/>
+    <line x1="344" y1="148" x2="344" y2="134" stroke="#6ea8e8" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="344" cy="130" r="5" fill="#ffd76e"/>
+    <text x="344" y="240" font-size="16" font-weight="bold" fill="#46607a" text-anchor="middle">Claude</text>
+    <rect x="290" y="252" width="108" height="26" rx="13" fill="#eef4fb" stroke="#c3d9f5"/>
+    <text x="344" y="270" font-size="13" fill="#3c546a" text-anchor="middle">監視中・自動承認</text>
+    <!-- bottom boxes -->
+    <rect x="32" y="300" width="190" height="96" rx="18" fill="#fdfdff" stroke="#e3ddff" stroke-width="2"/>
+    <circle cx="76" cy="348" r="21" fill="none" stroke="#f0ecff" stroke-width="7"/>
+    <circle cx="76" cy="348" r="21" fill="none" stroke="#ffb7d5" stroke-width="7" stroke-dasharray="79 132" transform="rotate(-90 76 348)" stroke-linecap="round"/>
+    <text x="110" y="342" font-size="15" font-weight="bold" fill="#5a4a56">承認 6.2秒</text>
+    <text x="110" y="364" font-size="12" fill="#a08b96">目標は10秒</text>
+    <rect x="232" y="300" width="190" height="96" rx="18" fill="#fdfdff" stroke="#e3ddff" stroke-width="2"/>
+    <text x="252" y="330" font-size="13" fill="#a08b96">郵便受け</text>
+    <text x="252" y="356" font-size="17" font-weight="bold" fill="#3fae6a">未ack 0件</text>
+    <text x="252" y="380" font-size="12" fill="#a08b96">見張り 元気（8秒前）</text>
+    <text x="38" y="440" font-size="12.5" fill="#b39aa6">15:12　ack が届いたよ（0.8秒）</text>
+    <text x="38" y="466" font-size="12.5" fill="#b39aa6">14:58　push を自動承認したよ（5.5秒）</text>
+  </g>
+  <!-- ============ RIGHT: ALERT ============ -->
+  <g>
+    <rect x="460" y="14" width="426" height="492" rx="28" fill="#ffffff" stroke="#ffc9a3" stroke-width="3"/>
+    <text x="484" y="46" font-size="13" fill="#c29468">異常</text>
+    <text x="862" y="46" font-size="13" fill="#c29468" text-anchor="end">15:21</text>
+    <rect x="478" y="58" width="390" height="58" rx="29" fill="#ffe6c7"/>
+    <text x="673" y="94" font-size="18" font-weight="bold" fill="#7a4a21" text-anchor="middle">承認待ち：カードが出ていないよ</text>
+    <!-- Muse character (worried) -->
+    <circle cx="556" cy="182" r="34" fill="#a8e6d5" stroke="#5fbfa8" stroke-width="3"/>
+    <circle cx="544" cy="176" r="4" fill="#23403a"/>
+    <circle cx="568" cy="176" r="4" fill="#23403a"/>
+    <path d="M 540 198 q 4 -5 8 0 q 4 5 8 0 q 4 -5 8 0" fill="none" stroke="#23403a" stroke-width="3" stroke-linecap="round"/>
+    <path d="M 596 156 c 5 8 7 11 7 15 a 7 7 0 1 1 -14 0 c 0 -4 2 -7 7 -15" fill="#8fc7ff"/>
+    <text x="556" y="240" font-size="16" font-weight="bold" fill="#46685a" text-anchor="middle">Muse</text>
+    <rect x="510" y="252" width="92" height="26" rx="13" fill="#fff4e2" stroke="#ffd9a8"/>
+    <text x="556" y="270" font-size="13" fill="#7a4a21" text-anchor="middle">承認待ち</text>
+    <!-- arrow (blocked) -->
+    <path d="M 642 190 L 690 190" stroke="#ffb59d" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 8"/>
+    <circle cx="673" cy="190" r="13" fill="#ffffff" stroke="#ff8a5c" stroke-width="3"/>
+    <text x="673" y="196" font-size="15" font-weight="bold" fill="#ff8a5c" text-anchor="middle">×</text>
+    <!-- Claude character -->
+    <circle cx="790" cy="182" r="34" fill="#bcd9ff" stroke="#6ea8e8" stroke-width="3"/>
+    <line x1="772" y1="176" x2="782" y2="176" stroke="#22384f" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="798" y1="176" x2="808" y2="176" stroke="#22384f" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="790" cy="196" r="4.5" fill="none" stroke="#22384f" stroke-width="2.5"/>
+    <line x1="790" y1="148" x2="790" y2="134" stroke="#6ea8e8" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="790" cy="130" r="5" fill="#ffd76e"/>
+    <text x="790" y="240" font-size="16" font-weight="bold" fill="#46607a" text-anchor="middle">Claude</text>
+    <rect x="736" y="252" width="108" height="26" rx="13" fill="#fff4e2" stroke="#ffd9a8"/>
+    <text x="790" y="270" font-size="13" fill="#7a4a21" text-anchor="middle">監視中・カードなし</text>
+    <!-- bottom boxes -->
+    <rect x="478" y="300" width="190" height="96" rx="18" fill="#fdfdff" stroke="#ffe0c2" stroke-width="2"/>
+    <circle cx="522" cy="348" r="21" fill="none" stroke="#fff0e0" stroke-width="7"/>
+    <circle cx="522" cy="348" r="21" fill="none" stroke="#ff9d5c" stroke-width="7" stroke-dasharray="132 132" transform="rotate(-90 522 348)" stroke-linecap="round"/>
+    <text x="556" y="342" font-size="15" font-weight="bold" fill="#7a4a21">承認 38秒</text>
+    <text x="556" y="364" font-size="12" fill="#c29468">目標オーバー</text>
+    <rect x="678" y="300" width="190" height="96" rx="18" fill="#fdfdff" stroke="#ffe0c2" stroke-width="2"/>
+    <text x="698" y="330" font-size="13" fill="#c29468">郵便受け</text>
+    <text x="698" y="356" font-size="17" font-weight="bold" fill="#e07b39">未ack 1件・3分</text>
+    <text x="698" y="380" font-size="12" fill="#c29468">見張り 元気（5秒前）</text>
+    <text x="484" y="440" font-size="12.5" fill="#b39a7d">15:20　合図を受け取ったよ</text>
+    <text x="484" y="466" font-size="12.5" fill="#b39a7d">15:21　カード待ちが続いているよ</text>
+  </g>
+</svg>

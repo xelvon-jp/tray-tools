@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
+  <rect width="900" height="520" fill="#ffffff"/>
+  <!-- ============ LEFT: NORMAL ============ -->
+  <g>
+    <rect x="14" y="14" width="426" height="492" fill="none" stroke="#e4e4e4"/>
+    <text x="38" y="52" font-size="12" letter-spacing="3" fill="#999999">平常</text>
+    <text x="416" y="52" font-size="12" fill="#999999" text-anchor="end">15:12</text>
+    <circle cx="42" cy="98" r="5" fill="#34c759"/>
+    <text x="62" y="106" font-size="21" fill="#111111">いま：Muse が作業中</text>
+    <text x="62" y="134" font-size="13" fill="#888888">検証テストを実行中・経過 2分31秒</text>
+    <text x="38" y="204" font-size="16" fill="#111111"><tspan font-weight="bold">Muse</tspan><tspan>　処理中</tspan></text>
+    <text x="416" y="204" font-size="13" fill="#888888" text-anchor="end">最終活動 12秒前</text>
+    <text x="38" y="240" font-size="13" fill="#888888">↓　流れ：なし</text>
+    <text x="38" y="282" font-size="16" fill="#111111"><tspan font-weight="bold">Claude</tspan><tspan>　監視中・自動承認 有効</tspan></text>
+    <text x="416" y="282" font-size="13" fill="#888888" text-anchor="end">生存確認 8秒前</text>
+    <line x1="38" y1="322" x2="416" y2="322" stroke="#eeeeee"/>
+    <text x="38" y="362" font-size="13" fill="#888888">承認</text>
+    <text x="86" y="363" font-size="16" fill="#111111">6.2秒</text>
+    <text x="150" y="362" font-size="13" fill="#888888">目標10秒</text>
+    <rect x="38" y="378" width="180" height="3" fill="#eeeeee"/>
+    <rect x="38" y="378" width="112" height="3" fill="#111111"/>
+    <text x="38" y="424" font-size="13" fill="#888888">郵便受け</text>
+    <text x="110" y="425" font-size="16" fill="#111111">未ack 0件</text>
+    <text x="38" y="478" font-size="12" fill="#aaaaaa">15:12 ack mb-…-02（0.8秒）／ 14:58 push 自動承認 5.5秒</text>
+  </g>
+  <!-- ============ RIGHT: ALERT ============ -->
+  <g>
+    <rect x="460" y="14" width="426" height="492" fill="none" stroke="#e4e4e4"/>
+    <text x="484" y="52" font-size="12" letter-spacing="3" fill="#999999">異常</text>
+    <text x="862" y="52" font-size="12" fill="#999999" text-anchor="end">15:21</text>
+    <circle cx="488" cy="98" r="5" fill="#ff3b30"/>
+    <text x="508" y="106" font-size="21" fill="#111111">いま：承認待ち</text>
+    <text x="508" y="134" font-size="13" fill="#888888">カードが PC に出ていません・38秒経過</text>
+    <text x="484" y="204" font-size="16" fill="#111111"><tspan font-weight="bold">Muse</tspan><tspan>　承認待ち</tspan></text>
+    <text x="862" y="204" font-size="13" fill="#888888" text-anchor="end">経過 00:38</text>
+    <text x="484" y="240" font-size="13" fill="#c0392b">↓　流れ：停止（カード未表示）</text>
+    <text x="484" y="282" font-size="16" fill="#111111"><tspan font-weight="bold">Claude</tspan><tspan>　監視中・カード表示 なし</tspan></text>
+    <text x="862" y="282" font-size="13" fill="#888888" text-anchor="end">生存確認 5秒前</text>
+    <line x1="484" y1="322" x2="862" y2="322" stroke="#eeeeee"/>
+    <text x="484" y="362" font-size="13" fill="#888888">承認</text>
+    <text x="532" y="363" font-size="16" fill="#c0392b">38秒</text>
+    <text x="584" y="362" font-size="13" fill="#888888">目標10秒</text>
+    <rect x="484" y="378" width="180" height="3" fill="#eeeeee"/>
+    <rect x="484" y="378" width="180" height="3" fill="#ff3b30"/>
+    <text x="484" y="424" font-size="13" fill="#888888">郵便受け</text>
+    <circle cx="562" cy="419" r="4" fill="#ff3b30"/>
+    <text x="576" y="425" font-size="16" fill="#111111">未ack 1件・最古 3分</text>
+    <text x="484" y="478" font-size="12" fill="#aaaaaa">15:20 合図を受信 ／ 15:21 つつき送信</text>
+  </g>
+</svg>

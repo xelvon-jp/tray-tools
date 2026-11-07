@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" font-family="ui-monospace,'Courier New',monospace">
+  <rect width="900" height="520" fill="#05080e"/>
+  <!-- ============ LEFT: NORMAL ============ -->
+  <g>
+    <rect x="14" y="14" width="426" height="492" fill="#0a0f16" stroke="#1b3a4a" stroke-width="1.5"/>
+    <polyline points="14,38 14,14 38,14" fill="none" stroke="#35e0ff" stroke-width="2.5"/>
+    <polyline points="416,14 440,14 440,38" fill="none" stroke="#35e0ff" stroke-width="2.5"/>
+    <polyline points="14,482 14,506 38,506" fill="none" stroke="#35e0ff" stroke-width="2.5"/>
+    <polyline points="416,506 440,506 440,482" fill="none" stroke="#35e0ff" stroke-width="2.5"/>
+    <text x="34" y="46" font-size="12" fill="#5f7f95">SYS // NORMAL</text>
+    <text x="420" y="46" font-size="12" fill="#5f7f95" text-anchor="end">15:12</text>
+    <rect x="30" y="58" width="394" height="62" fill="#0d1620" stroke="#35e0ff" stroke-width="1.5"/>
+    <text x="46" y="80" font-size="10" fill="#35e0ff">NOW</text>
+    <text x="46" y="106" font-size="19" font-weight="bold" fill="#e8fbff">いま：Muse が作業中</text>
+    <polygon points="42,142 50,150 42,158 34,150" fill="#35e0ff"/>
+    <text x="66" y="157" font-size="19" font-weight="bold" fill="#e8fbff">MUSE</text>
+    <rect x="150" y="136" width="86" height="24" fill="none" stroke="#35e0ff"/>
+    <text x="193" y="152" font-size="12" fill="#35e0ff" text-anchor="middle">ACTIVE</text>
+    <text x="420" y="157" font-size="13" fill="#5f7f95" text-anchor="end">T+02:31</text>
+    <line x1="42" y1="168" x2="42" y2="192" stroke="#35e0ff" stroke-width="1.5"/>
+    <polygon points="42,200 37,190 47,190" fill="#35e0ff"/>
+    <text x="66" y="188" font-size="12" fill="#7fd8a8">FLOW: NONE (NORMAL)</text>
+    <polygon points="42,216 50,224 42,232 34,224" fill="#35e0ff"/>
+    <text x="66" y="231" font-size="19" font-weight="bold" fill="#e8fbff">CLAUDE</text>
+    <rect x="162" y="210" width="86" height="24" fill="none" stroke="#35e0ff"/>
+    <text x="205" y="226" font-size="12" fill="#35e0ff" text-anchor="middle">WATCH</text>
+    <text x="262" y="231" font-size="12" fill="#9fb8c8">AUTO-APPROVE: ON</text>
+    <line x1="30" y1="256" x2="424" y2="256" stroke="#1b3a4a"/>
+    <circle cx="66" cy="316" r="26" fill="none" stroke="#12242f" stroke-width="5"/>
+    <circle cx="66" cy="316" r="26" fill="none" stroke="#35e0ff" stroke-width="5" stroke-dasharray="98 163" transform="rotate(-90 66 316)" stroke-linecap="round"/>
+    <text x="108" y="308" font-size="11" fill="#5f7f95">APPROVAL</text>
+    <text x="108" y="334" font-size="17" fill="#e8fbff">6.2s / TGT 10s</text>
+    <text x="248" y="292" font-size="11" fill="#5f7f95">MAILBOX</text>
+    <text x="248" y="318" font-size="17" fill="#7fd8a8">UNACK 0</text>
+    <text x="248" y="352" font-size="11" fill="#5f7f95">WATCHER</text>
+    <text x="248" y="378" font-size="17" fill="#e8fbff">ALIVE 8s AGO</text>
+    <line x1="30" y1="440" x2="424" y2="440" stroke="#1b3a4a"/>
+    <text x="30" y="466" font-size="11" fill="#46606f">LOG&gt; 15:12 ACK mb-...-02 0.8s</text>
+    <text x="30" y="488" font-size="11" fill="#46606f">LOG&gt; 14:58 PUSH AUTO-APPROVED 5.5s</text>
+  </g>
+  <!-- ============ RIGHT: ALERT ============ -->
+  <g>
+    <rect x="460" y="14" width="426" height="492" fill="#0d0a0c" stroke="#4a2b22" stroke-width="1.5"/>
+    <polyline points="460,38 460,14 484,14" fill="none" stroke="#ff5340" stroke-width="2.5"/>
+    <polyline points="862,14 886,14 886,38" fill="none" stroke="#ff5340" stroke-width="2.5"/>
+    <polyline points="460,482 460,506 484,506" fill="none" stroke="#ff5340" stroke-width="2.5"/>
+    <polyline points="862,506 886,506 886,482" fill="none" stroke="#ff5340" stroke-width="2.5"/>
+    <text x="480" y="46" font-size="12" fill="#a08a80">SYS // ALERT</text>
+    <text x="866" y="46" font-size="12" fill="#a08a80" text-anchor="end">15:21</text>
+    <rect x="476" y="58" width="394" height="62" fill="#1c0f0c" stroke="#ff5340" stroke-width="1.5"/>
+    <text x="492" y="80" font-size="10" fill="#ff5340">NOW</text>
+    <text x="492" y="106" font-size="19" font-weight="bold" fill="#ffe9e4">承認待ち：カードが出ていません</text>
+    <polygon points="488,142 496,150 488,158 480,150" fill="#f0a13c"/>
+    <text x="512" y="157" font-size="19" font-weight="bold" fill="#e8fbff">MUSE</text>
+    <rect x="596" y="136" width="104" height="24" fill="none" stroke="#f0a13c"/>
+    <text x="648" y="152" font-size="12" fill="#f0a13c" text-anchor="middle">WAIT-ACK</text>
+    <text x="866" y="157" font-size="13" fill="#a08a80" text-anchor="end">T+00:38</text>
+    <line x1="488" y1="168" x2="488" y2="192" stroke="#e05252" stroke-width="1.5" stroke-dasharray="4 4"/>
+    <line x1="480" y1="182" x2="496" y2="198" stroke="#e05252" stroke-width="3"/>
+    <line x1="496" y1="182" x2="480" y2="198" stroke="#e05252" stroke-width="3"/>
+    <text x="512" y="188" font-size="12" fill="#f0b1b1">FLOW: BLOCKED (NO CARD)</text>
+    <polygon points="488,216 496,224 488,232 480,224" fill="#f0a13c"/>
+    <text x="512" y="231" font-size="19" font-weight="bold" fill="#e8fbff">CLAUDE</text>
+    <rect x="608" y="210" width="86" height="24" fill="none" stroke="#35e0ff"/>
+    <text x="651" y="226" font-size="12" fill="#35e0ff" text-anchor="middle">WATCH</text>
+    <text x="708" y="231" font-size="12" fill="#f0b1b1">CARD: NOT SHOWN</text>
+    <line x1="476" y1="256" x2="870" y2="256" stroke="#4a2b22"/>
+    <circle cx="512" cy="316" r="26" fill="none" stroke="#2f1a14" stroke-width="5"/>
+    <circle cx="512" cy="316" r="26" fill="none" stroke="#ff5340" stroke-width="5" stroke-dasharray="163 163" transform="rotate(-90 512 316)" stroke-linecap="round"/>
+    <text x="554" y="308" font-size="11" fill="#a08a80">APPROVAL</text>
+    <text x="554" y="334" font-size="17" fill="#f0b1b1">38s OVER</text>
+    <text x="694" y="292" font-size="11" fill="#a08a80">MAILBOX</text>
+    <text x="694" y="318" font-size="17" fill="#f0a13c">UNACK 1 (3m)</text>
+    <text x="694" y="352" font-size="11" fill="#a08a80">WATCHER</text>
+    <text x="694" y="378" font-size="17" fill="#e8fbff">ALIVE 5s AGO</text>
+    <line x1="476" y1="440" x2="870" y2="440" stroke="#4a2b22"/>
+    <text x="476" y="466" font-size="11" fill="#7a655c">LOG&gt; 15:20 SIGNAL RECEIVED</text>
+    <text x="476" y="488" font-size="11" fill="#7a655c">LOG&gt; 15:21 NUDGE SENT</text>
+  </g>
+</svg>

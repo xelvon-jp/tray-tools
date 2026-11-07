@@ -1067,6 +1067,20 @@ def read_message(args):
         return f.read().rstrip("\r\n")
 
 
+def _journal_post(args, message, out):
+    """投稿を「やり取りの記録」に1行残す。記録のせいで投稿の結果は変えない(失敗は黙って捨てる)。"""
+    try:
+        if args.dry_run or not isinstance(out, dict):
+            return
+        import bridge_journal
+        to = args.desk or args.chat or ("current-chat" if args.current_chat else "new-chat")
+        bridge_journal.log("post_out", to=to, head=" ".join(str(message).split())[:80],
+                           ok=bool(out.get("ok")), reason=out.get("reason"),
+                           request_id=getattr(args, "request_id", None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -1112,6 +1126,7 @@ def main(argv=None):
                 code, out = cmd_post_desk(args, message)
             else:
                 code, out = cmd_post(args, message)
+            _journal_post(args, message, out)
         elif args.cmd == "desk":
             code, out = cmd_desk(args)
         elif args.cmd == "approve":

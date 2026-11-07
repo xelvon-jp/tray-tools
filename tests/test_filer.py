@@ -999,6 +999,94 @@ def test_picker_auto_width_and_elide():
         wide.close()
 
 
+def test_picker_input_guard_pure():
+    """ピッカーの入力ガードの判定(純粋関数)。候補が0件になる編集だけを止める。
+
+    候補の数え方は _refresh_list と同じ(前方一致・大小無視・前後の空白は無視)。
+    すでに0件の入力からは止めない(詰まらせない)。純粋な削除はいつでも通す。"""
+    from picker import accepts_input, filter_names, is_deletion
+
+    names = ["Claude", "camera", "Club", "memo"]
+    assert filter_names(names, "") == names
+    assert filter_names(names, "c") == ["Claude", "camera", "Club"]
+    assert filter_names(names, " CL ") == ["Claude", "Club"]   # strip + lower
+    assert filter_names(names, "cr") == []
+
+    # 候補が残る編集は通す / 0件になる編集は止める(work-board#15 の例)
+    assert accepts_input("c", "cl", 3, 1) is True
+    assert accepts_input("c", "cr", 3, 0) is False
+    assert accepts_input("", "z", 4, 0) is False    # 最初の1文字でも同じ
+    assert accepts_input("c", "cameraX", 3, 0) is False   # 貼り付けも丸ごと判定
+    # 何も打っていない状態で候補が0件のときは何も無効にしない(決定事項6)
+    assert accepts_input("", "z", 0, 0) is True
+    assert accepts_input("ab", "abx", 0, 0) is True   # すでに0件なら止めない
+    # 変更なし
+    assert accepts_input("c", "c", 3, 3) is True
+    # 純粋な削除(BackSpace / Delete 相当)はいつでも通す(決定事項3)
+    assert accepts_input("cr", "c", 0, 3) is True
+    assert accepts_input("ab", "a", 1, 0) is True
+    assert is_deletion("abc", "ab") and is_deletion("abc", "ac")
+    assert is_deletion("abc", "a") and is_deletion("abc", "")
+    assert not is_deletion("abc", "ax") and not is_deletion("abc", "abcd")
+    assert not is_deletion("abc", "abc")
+
+
+def test_picker_rejects_input_to_zero():
+    """ピッカー窓: 候補が0件になる打ち込みは入力欄が直前のままになり、
+    一瞬だけ色で知らせる。候補が残る打ち込み・削除はそのまま通る。"""
+    from picker import PickerWindow
+
+    _qapp()
+    items = [("claude", 1), ("camera", 2), ("club", 3), ("memo", 4)]
+    picker = PickerWindow("フォルダブックマーク", items, lambda n, d: None)
+    try:
+        picker.search.setText("c")
+        assert picker.search.text() == "c" and picker.list.count() == 3
+        # r を足すと候補が0件 → 無効。入力は c のまま、色の合図が出る
+        picker.search.setText("cr")
+        assert picker.search.text() == "c", picker.search.text()
+        assert picker.list.count() == 3
+        assert picker.search.styleSheet() != ""
+        picker._clear_search_flash()
+        assert picker.search.styleSheet() == ""
+        # 貼り付け(まとまった差し替え)も、結果が0件なら丸ごと無効
+        picker.search.setText("cameraX")
+        assert picker.search.text() == "c"
+        # 候補が残る続きは通る
+        picker.search.setText("cl")
+        assert picker.search.text() == "cl" and picker.list.count() == 2
+        # 削除は常に応じる
+        picker.search.setText("c")
+        assert picker.search.text() == "c" and picker.list.count() == 3
+        picker.search.setText("")
+        assert picker.search.text() == "" and picker.list.count() == 4
+    finally:
+        picker.close()
+
+
+def test_picker_guard_counts_dynamic_items():
+    """動的項目(打ったパスから作られる行)も候補に数える。パスの打ち込みが
+    ブックマーク名の絞り込みに引っかかって止められてはいけない。"""
+    from picker import PickerWindow
+
+    _qapp()
+
+    def dyn(text):
+        return [("→ C:\\\\", ("jump", "C:\\\\"))] if text == "c:" else []
+
+    picker = PickerWindow("フォルダブックマーク", [("claude", 1)],
+                          lambda n, d: None, dynamic_items=dyn)
+    try:
+        picker.search.setText("c")
+        assert picker.list.count() == 1
+        # 静的な候補は0件になるが、動的項目が1件出るので通す
+        picker.search.setText("c:")
+        assert picker.search.text() == "c:", picker.search.text()
+        assert picker.list.count() == 1
+    finally:
+        picker.close()
+
+
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
     そのまま表示され、ダウンロードは attachment で届く。"""

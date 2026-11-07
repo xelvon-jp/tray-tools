@@ -211,6 +211,44 @@ def test_grab_for_visual_check():
     window.close()
 
 
+def test_warm_idle_timeout_quits_when_not_sticky():
+    """待機役が WARM_MAX_IDLE_MS 経過したら app.quit() を呼ぶこと。"""
+    import capture_process
+
+    class _MockApp:
+        def __init__(self): self.quit_called = False
+        def quit(self): self.quit_called = True
+
+    class _MockTimer:
+        def stop(self): pass
+
+    host = object.__new__(capture_process._WarmHost)
+    host.became_sticky = False
+    host.app = _MockApp()
+    host.parent_timer = _MockTimer()
+    host._on_idle_timeout()
+    assert host.app.quit_called, "アイドルタイムアウトで app.quit() が呼ばれること"
+
+
+def test_warm_idle_timeout_noop_when_sticky():
+    """付箋になった後(became_sticky)はアイドルタイムアウトで終了しないこと。"""
+    import capture_process
+
+    class _MockApp:
+        def __init__(self): self.quit_called = False
+        def quit(self): self.quit_called = True
+
+    class _MockTimer:
+        def stop(self): pass
+
+    host = object.__new__(capture_process._WarmHost)
+    host.became_sticky = True
+    host.app = _MockApp()
+    host.parent_timer = _MockTimer()
+    host._on_idle_timeout()
+    assert not host.app.quit_called, "付箋になった後はアイドルタイムアウトで終了しないこと"
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

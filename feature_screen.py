@@ -131,6 +131,9 @@ AGENT_LOOP_RING_WIDTH = 4
 # プロセス起動を重ねると常駐が立ち上がるまでの体感が延びる。最初のキャプチャまでには
 # 十分間に合うので、少しずらして出す。
 PREWARM_STARTUP_DELAY_MS = 3000
+# 待機役は WARM_MAX_IDLE_MS(15分)でアイドル終了するため、それより短い間隔で
+# 「居なければ起こす」を回して補充漏れを防ぐ。
+PREWARM_REFRESH_INTERVAL_MS = 10 * 60 * 1000  # 10分
 
 
 # 予約の時刻になってから実際に寝るまでの猶予(秒)。すぐ寝ないのは、予約したことを
@@ -310,7 +313,7 @@ class ScreenFeature:
         # ここで持つのは参照ではなくタイマーだけ。居場所はやはりパイプの一覧から引く。
         self._prewarm_timer = QTimer()
         self._prewarm_timer.setSingleShot(True)
-        self._prewarm_timer.timeout.connect(self._ensure_prewarmed)
+        self._prewarm_timer.timeout.connect(self._on_prewarm_timer)
 
         self.topmost = TopmostTracker()
 
@@ -987,6 +990,17 @@ class ScreenFeature:
         false にすると1枚ごとにプロセスを起こす従来の形へ戻る。常時1プロセスぶん
         (専有27MB程度)のメモリを使うのが唯一の代償なので、そこを惜しむPC用の逃げ道。"""
         return bool(self.app_settings.get("capture", {}).get("prewarm", True))
+
+    def _on_prewarm_timer(self):
+        """起動後の初期プレウォームと、以後の定期補充確認を兼ねるタイマー発火。
+
+        最初の発火(起動3秒後)で待機役を起こし、以降は PREWARM_REFRESH_INTERVAL_MS
+        ごとに「居なければ起こす」を繰り返す。待機役は WARM_MAX_IDLE_MS(15分)で
+        アイドル終了するため、それより短い間隔(10分)で確認し、入れ替わりで生まれた
+        空白を埋める。"""
+        self._ensure_prewarmed()
+        if self._prewarm_enabled():
+            self._prewarm_timer.start(PREWARM_REFRESH_INTERVAL_MS)
 
     def _ensure_prewarmed(self):
         """待機役が居なければ1人起こす。

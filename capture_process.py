@@ -19,6 +19,13 @@
 #     送るだけ。送られた待機役はウインドウを出して普通の付箋になり、本体は次の待機役を
 #     裏で起こす。
 #
+#   長時間アイドルでメモリを追い出されると、最初の描画で読み戻しが起きて「表示→描画」
+#   が2秒を超えることが実測で分かった(待機278分→2231ms、637分→2095ms、1031分→
+#   2544ms。待機13分以内→56〜358ms)。これを防ぐため、待機役は WARM_MAX_IDLE_MS
+#   (15分)経ったら自分で終わる。本体は10分ごとに補充確認するので、入れ替わり後も
+#   10分以内に新しい待機役が用意される。付箋になった後は入れ替えタイマーを止めるので、
+#   表示中の付箋が消えることは無い。
+#
 #   待機役が居ないときは、必ず従来どおりの spawn() に落ちる(355msかかるが確実に出る)。
 #   待機役が死んでいてキャプチャが失敗する、という事態を作らないこと。
 #   常時1プロセスぶん(専有27MB程度)のメモリを使うため、settings.json の
@@ -127,6 +134,13 @@ QUIT_WARM_COMMAND = "quit_warm"       # まだ何も出していないなら終�
 # 待ち受けが一瞬消えるので、1回の空振りでは終わらせない。
 WARM_PARENT_CHECK_MS = 15000
 WARM_PARENT_MISS_LIMIT = 2
+
+# 待機役が何もしないまま自分で終わるまでの最大待機時間。長時間アイドルになると
+# Windows がメモリを追い出し、最初の描画で読み戻しが発生して「表示→描画」が
+# 2秒を超える(実測: 待機278分→2231ms、待機637分→2095ms、待機1031分→2544ms、
+# 待機13分以内→56〜358ms)。画像の大きさや本体側の保存は毎回0.3秒以下で安定して
+# おり、長時間待機だけが遅い。付箋になった後(became_sticky)は絶対に終わらないこと。
+WARM_MAX_IDLE_MS = 15 * 60 * 1000  # 15分
 
 # 待機役を起こしてから待ち受けが立つまでの猶予。この間は list_warm_pipes() に出ないので、
 # 「居ないならもう1人」を素直にやると待機役が増え続ける。直前に頼んだ時刻を覚えておいて
@@ -808,6 +822,13 @@ class _WarmHost:
         self.parent_timer.timeout.connect(self._check_parent)
         self.parent_timer.start(WARM_PARENT_CHECK_MS)
 
+        # 長時間アイドルでメモリを追い出されることを防ぐ入れ替えタイマー。
+        # WARM_MAX_IDLE_MS 経過したら自分で終わる。付箋になったら _become_sticky が止める。
+        self.idle_timer = QTimer()
+        self.idle_timer.setSingleShot(True)
+        self.idle_timer.timeout.connect(self._on_idle_timeout)
+        self.idle_timer.start(WARM_MAX_IDLE_MS)
+
         # 待っている間に画面取得(mss の実体)も作っておく。付箋になってからの
         # 初回の連番キャプチャで、生成コストを払わずに済むようにするため。
         QTimer.singleShot(0, capture_grab.prewarm_sct)
@@ -868,6 +889,7 @@ class _WarmHost:
         if command == QUIT_WARM_COMMAND:
             # 本体が終了した。まだ何も表示していないので付き合って終わる。
             self.parent_timer.stop()
+            self.idle_timer.stop()
             self.app.quit()
             return
         # 生存確認や知らないコマンド。待機役のままなので名乗り直す。
@@ -884,6 +906,7 @@ class _WarmHost:
             self._listen_as(self.warm_name)
             return
 
+        self.idle_timer.stop()
         self.parent_timer.stop()
         self.became_sticky = True
 
@@ -947,6 +970,16 @@ class _WarmHost:
         if self.parent_misses >= WARM_PARENT_MISS_LIMIT:
             self.parent_timer.stop()
             self.app.quit()
+
+    def _on_idle_timeout(self) -> None:
+        """WARM_MAX_IDLE_MS 経過したら自分で終わる。
+
+        長時間待機するとメモリを追い出され、最初の描画で「表示→描画」が2秒を超える。
+        付箋になった後(became_sticky)は絶対に終わらないこと。"""
+        if self.became_sticky:
+            return
+        self.parent_timer.stop()
+        self.app.quit()
 
 
 def _run_prewarmed(app, args) -> int:

@@ -2,6 +2,7 @@
 # やり取りの記録(bridge_journal)のテスト。標準ライブラリだけで確かめる。
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,11 +16,16 @@ import bridge_journal as bj  # noqa: E402
 
 
 def _today_file(base: Path) -> Path:
-    return base / f"{date.today().isoformat()}.jsonl"
+    """このプロセスが今日書くファイル(YYYY-MM-DD.<pid>.jsonl)。"""
+    return base / f"{date.today().isoformat()}.{os.getpid()}.jsonl"
 
 
 def _raw_lines(base: Path) -> list:
-    return _today_file(base).read_text(encoding="utf-8").splitlines()
+    """今日の全ファイル(全プロセス分・旧形式を含む)の行。"""
+    lines = []
+    for path in sorted(base.glob(f"{date.today().isoformat()}*.jsonl")):
+        lines.extend(path.read_text(encoding="utf-8").splitlines())
+    return lines
 
 
 def _write_day(base: Path, day: date, records: list) -> None:
@@ -132,34 +138,96 @@ def test_cleanup_keeps_14_days():
         for days_ago in (15, 14, 1):
             _write_day(base, today - timedelta(days=days_ago),
                        [{"ts": "x", "epoch": 1.0, "pid": 1, "ev": f"d{days_ago}"}])
+        # プロセスごとのファイル(新形式)も日付で消す
+        for days_ago in (20, 2):
+            (base / f"{(today - timedelta(days=days_ago)).isoformat()}.4321.jsonl").write_text(
+                "{}\n", encoding="utf-8")
         bj._last_cleanup_date = None   # このプロセスではまだ整理していないことにする
         assert bj.log("wake", dir=base, reason="test") is True
         names = {p.name for p in base.glob("*.jsonl")}
         assert f"{(today - timedelta(days=15)).isoformat()}.jsonl" not in names
         assert f"{(today - timedelta(days=14)).isoformat()}.jsonl" in names
         assert f"{(today - timedelta(days=1)).isoformat()}.jsonl" in names
+        assert f"{(today - timedelta(days=20)).isoformat()}.4321.jsonl" not in names
+        assert f"{(today - timedelta(days=2)).isoformat()}.4321.jsonl" in names
 
 
-def test_concurrent_appends_do_not_corrupt():
+_CHILD = (
+    "import sys; sys.path.insert(0, sys.argv[1]); import bridge_journal as bj; "
+    "base, worker, n = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]); "
+    "sys.exit(0 if all(bj.log('ack', dir=base, seq=worker * 1000 + i) for i in range(n)) else 1)"
+)
+
+
+def test_one_file_per_process():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
-        workers, per_worker = 8, 40
-        barrier = threading.Barrier(workers)
+        bj.log("ack", dir=base)
+        names = [p.name for p in base.glob("*.jsonl")]
+        assert names == [f"{date.today().isoformat()}.{os.getpid()}.jsonl"]
+        # 旧形式(pid なし)のファイルも一覧に入り、読める
+        _write_day(base, date.today(), [{"ts": "x", "epoch": 1.0, "pid": 1, "ev": "legacy"}])
+        files = bj._list_files(base)
+        assert len(files) == 2 and all(day == date.today() for day, _ in files)
+        assert [r["ev"] for r in bj.tail(10, dir=base)] == ["legacy", "ack"]
+        # 日付の形でない名前は無視する
+        (base / "notes.jsonl").write_text("x", encoding="utf-8")
+        (base / f"{date.today().isoformat()}.abc.jsonl").write_text("x", encoding="utf-8")
+        assert len(bj._list_files(base)) == 2
+
+
+def test_concurrent_appends_from_processes_and_threads():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        procs, per_proc = 4, 60
+        threads_n, per_thread = 8, 40
+        root = str(Path(__file__).resolve().parent.parent)
+        children = [subprocess.Popen([sys.executable, "-c", _CHILD, root, str(base), str(w), str(per_proc)])
+                    for w in range(1, procs + 1)]
+        barrier = threading.Barrier(threads_n)
 
         def run(worker):
             barrier.wait()
-            for i in range(per_worker):
-                assert bj.log("ack", dir=base, seq=worker * per_worker + i)
+            for i in range(per_thread):
+                assert bj.log("ack", dir=base, seq=(100 + worker) * 1000 + i)
 
-        threads = [threading.Thread(target=run, args=(w,)) for w in range(workers)]
+        threads = [threading.Thread(target=run, args=(w,)) for w in range(threads_n)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        for child in children:
+            assert child.wait(timeout=120) == 0
+        total = procs * per_proc + threads_n * per_thread
         lines = _raw_lines(base)
-        assert len(lines) == workers * per_worker
-        seqs = {json.loads(line)["seq"] for line in lines}   # 全行が無事に読める
-        assert seqs == set(range(workers * per_worker))
+        assert len(lines) == total                           # 欠けない
+        seqs = [json.loads(line)["seq"] for line in lines]   # 全行が壊れず読める
+        assert len(set(seqs)) == total
+        expected = {w * 1000 + i for w in range(1, procs + 1) for i in range(per_proc)}
+        expected |= {(100 + w) * 1000 + i for w in range(threads_n) for i in range(per_thread)}
+        assert set(seqs) == expected
+        # 別プロセスぶんのファイルに分かれている(1ファイル1プロセス)
+        assert len(list(base.glob("*.jsonl"))) == procs + 1
+        # 読み出しは epoch 順
+        records = bj.tail(total + 10, dir=base)
+        assert len(records) == total
+        epochs = [r["epoch"] for r in records]
+        assert epochs == sorted(epochs)
+        got = bj.since(0, dir=base)
+        assert len(got) == total and [r["epoch"] for r in got] == sorted(r["epoch"] for r in got)
+
+
+def test_reads_merge_files_in_epoch_order():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        today = date.today()
+        for pid, epochs in ((11, [10.0, 30.0, 50.0]), (22, [20.0, 40.0])):
+            path = base / f"{today.isoformat()}.{pid}.jsonl"
+            path.write_text("".join(json.dumps({"epoch": e, "ev": f"p{pid}-{int(e)}"}) + "\n"
+                                    for e in epochs) + "{壊れた行\n", encoding="utf-8")
+        assert [r["epoch"] for r in bj.tail(10, dir=base)] == [10.0, 20.0, 30.0, 40.0, 50.0]
+        assert [r["epoch"] for r in bj.tail(2, dir=base)] == [40.0, 50.0]
+        assert [r["epoch"] for r in bj.since(25.0, dir=base)] == [30.0, 40.0, 50.0]
 
 
 def test_write_failure_is_quiet():

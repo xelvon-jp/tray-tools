@@ -3,10 +3,14 @@
 #
 # 書くのは見張り・郵便受けの投稿スクリプト・フックなど複数のプロセスで、読むのは
 # 連携パネルの材料集めや、あとからの振り返り。だから作りは単純に寄せてある:
-#   - 保存先は <dir>/YYYY-MM-DD.jsonl(その日のローカル日付)。既定の置き場所は
-#     default_dir() で、公開リポジトリの外(%LOCALAPPDATA%\traytools\bridge_events)。
+#   - 保存先は <dir>/YYYY-MM-DD.<pid>.jsonl(その日のローカル日付 + 書いたプロセスの pid)。
+#     1つのファイルへ書くのは1プロセスだけ。Windows の O_APPEND は CRT の模擬で、複数
+#     プロセスが同じファイルへ同時に追記すると行が混ざる・欠けるため。読む側(tail / since)は
+#     その日の全ファイルを集めて epoch 順に並べ、壊れた行は飛ばす(旧形式の
+#     YYYY-MM-DD.jsonl も読む)。既定の置き場所は default_dir() で、公開リポジトリの外
+#     (%LOCALAPPDATA%\traytools\bridge_events)。
 #   - 追記は「1行を1回の書き込み(os.open の O_APPEND + os.write 1回)」にする。
-#     複数のプロセスが同時に書いても行同士が混ざらないため(1行は4KB未満に収める)。
+#     1行は4KB未満に収める。同じプロセスの複数スレッドは _WRITE_LOCK で順番に書く。
 #   - 記録のせいで本体を止めない: 書けなくても例外は出さず、False を返すだけ。
 #   - 漏えい防止: キー名に token / secret / password / key を含む項目は値を伏せる。
 # 標準ライブラリだけ(PySide6 不要)。Windows でも Linux でも動く。
@@ -21,6 +25,7 @@
 #   "wake"     起こしに行った(reason)
 import json
 import os
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -38,6 +43,9 @@ _CORE_KEYS = ("ts", "epoch", "pid", "ev")
 
 # 最後に古いファイルを整理した日。呼び出しのたびに一覧を見ないための控え。
 _last_cleanup_date = None
+# 同じプロセスの複数スレッドが同じファイルへ同時に書いて混ざらないようにする
+# (Windows の O_APPEND の模擬は「末尾へ移動 → 書く」の2手で、スレッド間でも割り込まれうる)。
+_WRITE_LOCK = threading.Lock()
 
 
 def default_dir() -> Path:
@@ -108,12 +116,13 @@ def log(ev, **fields) -> bool:
         record.update(_sanitize(fields))
         line = _fit_line(record)
         base.mkdir(parents=True, exist_ok=True)
-        path = base / f"{now.date().isoformat()}.jsonl"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            os.write(fd, line)   # 1行を1回で書く(他プロセスの行と混ざらない)
-        finally:
-            os.close(fd)
+        path = base / f"{now.date().isoformat()}.{os.getpid()}.jsonl"   # プロセスごとに別ファイル
+        with _WRITE_LOCK:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                os.write(fd, line)   # 1行を1回で書く
+            finally:
+                os.close(fd)
         _maybe_cleanup(base, now.date())
         return True
     except Exception:  # noqa: BLE001  記録のせいで呼び出し元を止めない
@@ -123,21 +132,32 @@ def log(ev, **fields) -> bool:
 # ---------------------------------------------------------------------------
 # 古いファイルの整理(1日1回だけ)
 # ---------------------------------------------------------------------------
+def _file_day(name: str):
+    """ファイル名の日付。YYYY-MM-DD.jsonl(旧形式)と YYYY-MM-DD.<pid>.jsonl を受ける。
+    それ以外の名前は None。"""
+    if not name.endswith(".jsonl"):
+        return None
+    head, dot, pid = name[:-6].partition(".")
+    if len(head) != 10 or (dot and not pid.isdigit()):
+        return None
+    try:
+        return date.fromisoformat(head)
+    except ValueError:
+        return None
+
+
 def _list_files(base: Path) -> list:
-    """(日付, パス) の一覧を古い順に。YYYY-MM-DD.jsonl の形のものだけ。"""
+    """(日付, パス) の一覧を日付の古い順に(同じ日は名前順)。同じ日に複数ある。"""
     out = []
     try:
         names = os.listdir(base)
     except OSError:
         return out
     for name in names:
-        if len(name) == 16 and name.endswith(".jsonl"):
-            try:
-                day = date.fromisoformat(name[:-6])
-            except ValueError:
-                continue
+        day = _file_day(name)
+        if day is not None:
             out.append((day, base / name))
-    out.sort(key=lambda item: item[0])
+    out.sort(key=lambda item: (item[0], item[1].name))
     return out
 
 
@@ -196,15 +216,32 @@ def _record_epoch(record: dict):
     return None
 
 
+def _day_records(paths) -> list:
+    """同じ日の全ファイルの記録を epoch 順に(epoch が無いものは先頭側)。"""
+    records = []
+    for path in paths:
+        records.extend(_iter_records(path))
+    records.sort(key=lambda r: _record_epoch(r) or 0.0)   # 安定ソート: 同時刻は読んだ順
+    return records
+
+
+def _files_by_day(base: Path) -> list:
+    """[(日付, [パス...])] を新しい日から。"""
+    days = {}
+    for day, path in _list_files(base):
+        days.setdefault(day, []).append(path)
+    return sorted(days.items(), key=lambda item: item[0], reverse=True)
+
+
 def tail(n, dir=None) -> list:
-    """直近 n 件を古い順に返す。日をまたいで、足りなければ前日へさかのぼる。"""
+    """直近 n 件を古い順(epoch 順)に返す。日をまたいで、足りなければ前日へさかのぼる。"""
     if n <= 0:
         return []
     base = _resolve_dir(dir)
     chunks = []
     remaining = n
-    for _day, path in reversed(_list_files(base)):
-        records = list(_iter_records(path))
+    for _day, paths in _files_by_day(base):
+        records = _day_records(paths)
         chunks.append(records[-remaining:])
         remaining -= len(records)
         if remaining <= 0:
@@ -216,11 +253,11 @@ def tail(n, dir=None) -> list:
 
 
 def since(epoch, dir=None) -> list:
-    """指定した epoch 秒以降の記録を古い順に返す。"""
+    """指定した epoch 秒以降の記録を古い順(epoch 順)に返す。"""
     base = _resolve_dir(dir)
     out = []
-    for _day, path in _list_files(base):
-        for record in _iter_records(path):
+    for _day, paths in reversed(_files_by_day(base)):
+        for record in _day_records(paths):
             stamp = _record_epoch(record)
             if stamp is not None and stamp >= epoch:
                 out.append(record)

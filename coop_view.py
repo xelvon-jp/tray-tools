@@ -150,6 +150,12 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
     else:
         tone, title, sub = "sleep", "全員待機中", "陽太さんの指示待ちです"
         all_idle = True
+        # 経過は「全員が待機になってから」。Muse だけの待機時間(kind_elapsed)だと、
+        # Claude が今終わったばかりでも長く見えてしまう。Claude 側の最後の更新と比べて短い方を採る。
+        ts = [e.get("updated") for e in entries if isinstance(e.get("updated"), (int, float))]
+        if ts:
+            since = now - max(ts)
+            elapsed = since if elapsed is None else min(elapsed, since)
 
     muse_anim, clawd_anim = ANIMS[tone]
     return {

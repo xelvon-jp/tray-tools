@@ -38,6 +38,15 @@ def test_stopped_wins():
     assert view(muse(last_poll=NOW - 90))["banner_title"] != "見張りが止まっています"
 
 
+def test_all_idle_elapsed_counts_from_both_idle():
+    # Muse は 13 分前から待機だが、Claude が 30 秒前に終わった → 全員待機の経過は 30 秒
+    v = view(muse(kind="idle", kind_since=NOW - 13 * 60), [{"state": "done", "updated": NOW - 30}])
+    assert v["banner_title"] == "全員待機中" and v["banner_time"] == "30秒"
+    # Claude の記録が無ければ、これまでどおり Muse の待機時間
+    v = view(muse(kind="idle", kind_since=NOW - 13 * 60))
+    assert v["banner_title"] == "全員待機中" and v["banner_time"] != "30秒"
+
+
 def test_mailbox_fail():
     v = view(muse(mailbox_fail=10, kind="approval", kind_since=NOW - 5))
     assert v["banner_title"] == "郵便受けにつながりません" and v["tone"] == "alert"
@@ -231,7 +240,8 @@ ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
              test_done_window, test_sleep_default, test_cards,
              test_kind_without_kind_since_falls_back, test_negative_last_approval_sec_is_clamped,
-             test_state_claude_overrides_stale_kind, test_all_idle_flag, test_paused_view]
+             test_state_claude_overrides_stale_kind, test_all_idle_flag, test_paused_view,
+             test_all_idle_elapsed_counts_from_both_idle]
 
 
 if __name__ == "__main__":

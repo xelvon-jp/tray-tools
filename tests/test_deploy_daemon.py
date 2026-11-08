@@ -395,6 +395,29 @@ def test_config_env_overrides():
     assert cfg.allowed_repos == ("tray-tools",)  # 既定は tray-tools のみ
 
 
+def test_config_send_script_override():
+    tmp = Path(tempfile.mkdtemp())
+    base = tmp / "cfg"
+    base.mkdir(parents=True)
+    stub = tmp / "stub_send.py"
+    (base / "config.json").write_text(
+        json.dumps({"checkout_dir": str(tmp / "co"), "send_script": str(stub)}),
+        encoding="utf-8",
+    )
+    cfg = load_config(base_dir=base, environ={})
+    assert cfg.send_script == stub  # config.json の send_script が効く
+    cfg2 = load_config(
+        base_dir=base,
+        environ={"DEPLOY_DAEMON_SEND_SCRIPT": str(tmp / "env_stub.py")},
+    )
+    assert cfg2.send_script == tmp / "env_stub.py"  # 環境変数が優先する
+    cfg3 = load_config(
+        base_dir=tmp / "cfg2",
+        environ={"DEPLOY_DAEMON_CHECKOUT_DIR": str(tmp / "co")},
+    )
+    assert cfg3.send_script == tmp / "co" / "traytools_send.py"  # 既定はチェックアウト内
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

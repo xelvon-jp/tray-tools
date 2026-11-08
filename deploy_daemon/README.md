@@ -126,6 +126,9 @@ body: {
 | `poll_interval_sec` | `DEPLOY_DAEMON_POLL_INTERVAL` | 見回り間隔（既定60秒） |
 | `blocker_wait_sec` / `blocker_retries` | ― | ブロッカー待ちの間隔と上限 |
 | `python_executable` | ― | `traytools_send.py` を呼ぶ実行系（既定 `python`。実機では venv の python.exe を想定） |
+| `send_script` | `DEPLOY_DAEMON_SEND_SCRIPT` | 再起動スクリプトの差し替え（既定は `checkout_dir` 内の `traytools_send.py`。初回テストでスタブに差し替えるときだけ指定する） |
+
+スタブを使う場合の応答仕様：`restart --check` は「差し支えありません」を含む出力で終了コード 0、`restart` と `status` は終了コード 0 を返すこと（配備係はこの形で本物と同じに読みます）。
 
 テストコマンドが未設定の場合、安全のため「テスト失敗」として扱い反映しない。
 

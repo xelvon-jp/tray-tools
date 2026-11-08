@@ -60,6 +60,7 @@ class DaemonConfig:
     intake_key: str = ""  # 環境変数からだけ読む。ファイルには書かない
 
     python_executable: str = "python"  # traytools_send.py を呼ぶ実行系
+    send_script_override: Path | None = None  # 再起動スクリプトの差し替え（初回テストのスタブ用）
 
     # ---- 派生パス ----
     @property
@@ -93,6 +94,8 @@ class DaemonConfig:
 
     @property
     def send_script(self) -> Path | None:
+        if self.send_script_override is not None:
+            return self.send_script_override
         if self.checkout_dir is None:
             return None
         return self.checkout_dir / "traytools_send.py"
@@ -165,6 +168,8 @@ def load_config(base_dir: Path | None = None, environ: dict | None = None) -> Da
         cfg.intake_url = str(file_data["intake_url"])
     if file_data.get("python_executable"):
         cfg.python_executable = str(file_data["python_executable"])
+    if file_data.get("send_script"):
+        cfg.send_script_override = Path(file_data["send_script"])
 
     # 環境変数はファイルより優先する
     if env.get("DEPLOY_DAEMON_CHECKOUT_DIR"):
@@ -177,6 +182,8 @@ def load_config(base_dir: Path | None = None, environ: dict | None = None) -> Da
         cfg.poll_interval_sec = float(env["DEPLOY_DAEMON_POLL_INTERVAL"])
     if env.get("DEPLOY_DAEMON_APPLY_MODE") in ("approval", "auto"):
         cfg.apply_mode = env["DEPLOY_DAEMON_APPLY_MODE"]
+    if env.get("DEPLOY_DAEMON_SEND_SCRIPT"):
+        cfg.send_script_override = Path(env["DEPLOY_DAEMON_SEND_SCRIPT"])
     key_env_name = str(file_data.get("intake_key_env") or "DEPLOY_DAEMON_INTAKE_KEY")
     cfg.intake_key = env.get(key_env_name, "")
     return cfg

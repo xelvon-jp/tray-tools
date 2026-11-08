@@ -395,6 +395,44 @@ def test_config_env_overrides():
     assert cfg.allowed_repos == ("tray-tools",)  # 既定は tray-tools のみ
 
 
+def test_urllib_transport_sets_user_agent():
+    # Cloudflare が Python 既定 UA を弾く（1010）ため、実輸送は
+    # curl 相当の User-Agent を付けることを確かめる。
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from deploy_daemon.intake import UrllibTransport
+
+    seen = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["ua"] = self.headers.get("User-Agent")
+            body = b'{"deliveries": []}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/deliveries"
+        status, _body = UrllibTransport(timeout=5.0).request(
+            "GET", url, {"x-deploy-key": "k"}, None
+        )
+    finally:
+        server.server_close()
+    assert status == 200
+    assert seen.get("ua"), "User-Agent が送られていません"
+    assert "Python-urllib" not in seen["ua"]
+
+
 def test_config_send_script_override():
     tmp = Path(tempfile.mkdtemp())
     base = tmp / "cfg"

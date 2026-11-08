@@ -37,6 +37,10 @@ class UrllibTransport:
         req = urllib.request.Request(url, data=body, method=method)
         for name, value in headers.items():
             req.add_header(name, value)
+        if not req.has_header("User-agent"):
+            # Cloudflare は Python 既定の User-Agent を 1010 で弾く
+            # （郵便受けで実測済み）。curl 相当の UA を付ける。
+            req.add_header("User-Agent", "curl/8.5.0")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return resp.status, resp.read()

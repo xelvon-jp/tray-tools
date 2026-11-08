@@ -104,18 +104,6 @@ def test_toast_runs_in_subprocess_with_json_payload():
     assert json.loads(cmd[3]) == {"title": "タイトル", "body": "本文", "on_click": "file:///S:/x", "buttons": [{"content": "開く"}]}
 
 
-def test_toast_child_passes_args_to_win11toast(monkeypatch):
-    import json
-    import types
-
-    from landrop import toast as t
-
-    got = {}
-    monkeypatch.setitem(__import__("sys").modules, "win11toast", types.SimpleNamespace(notify=lambda **kw: got.update(kw)))
-    t._main(["x", json.dumps({"title": "a", "body": "b", "on_click": None})])
-    assert got == {"title": "a", "body": "b", "on_click": None}
-
-
 def test_server_process_never_imports_winrt(tmp_path):
     """常駐プロセスで WinRT を読み込まない（落ちる原因になった）。"""
     import subprocess

@@ -1,7 +1,9 @@
 """設定の読み込み。
 
 config.toml が無ければ、ランダムなトークン入りで自動生成する。
-config.toml はトークンを含むので git 管理しない（.gitignore 済み）。
+config.toml はトークンを含むので git 管理しない。統合後の置き場は
+%LOCALAPPDATA%\\traytools\\landrop\\config.toml（repo の外）。
+統合前の置き場（プロジェクト直下）に既存の設定があれば、そのまま使い続ける。
 """
 
 from __future__ import annotations
@@ -14,7 +16,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
+LEGACY_CONFIG_PATH = PROJECT_ROOT / "config.toml"
+
+
+def app_config_dir() -> Path:
+    """統合後の設定の置き場（%LOCALAPPDATA%\\traytools\\landrop）。"""
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home() / "AppData" / "Local"
+    return root / "traytools" / "landrop"
+
+
+# import 時点の値。実際の判定は config_path() が毎回行う（tray.py が比較に使う）
+DEFAULT_CONFIG_PATH = app_config_dir() / "config.toml"
 
 
 @dataclass
@@ -110,12 +123,19 @@ mdns = false
 
 
 def config_path() -> Path:
-    return Path(os.environ.get("LANDROP_CONFIG", DEFAULT_CONFIG_PATH))
+    env = os.environ.get("LANDROP_CONFIG")
+    if env:
+        return Path(env)
+    default = app_config_dir() / "config.toml"
+    if default.exists() or not LEGACY_CONFIG_PATH.exists():
+        return default
+    return LEGACY_CONFIG_PATH  # 統合前の設定が残っていれば引き継ぐ（移動はしない）
 
 
 def load_settings(path: Path | None = None) -> Settings:
     path = path or config_path()
     if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             CONFIG_TEMPLATE.format(token=new_token(), save_dir=default_save_dir()),
             encoding="utf-8",

@@ -28,6 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from deploy_daemon.adapters import CommandTestRunner, SubprocessGit  # noqa: E402
 from deploy_daemon.config import DaemonConfig, load_config  # noqa: E402
+from deploy_daemon.digest import DigestPoster, build_digest  # noqa: E402
 from deploy_daemon.intake import FakeTransport, IntakeClient  # noqa: E402
 from deploy_daemon.log import JsonlLogger  # noqa: E402
 from deploy_daemon.model import DeliveryState  # noqa: E402
@@ -67,6 +68,25 @@ class FakeLiveness:
     def check(self):
         self.calls += 1
         return self._results.pop(0) if self._results else self._default
+
+
+class RecordingTransport:
+    """ダイジェスト送信用の記録フェイク。常に指定ステータスを返す。"""
+
+    def __init__(self, status=200):
+        self.status = status
+        self.calls = []  # (method, url, headers, body)
+
+    def request(self, method, url, headers, body):
+        self.calls.append((method, url, headers, body))
+        return self.status, b'{"ok": true}'
+
+
+class RaisingTransport:
+    """送るたびに例外を投げるフェイク（送信失敗の握りつぶし確認用）。"""
+
+    def request(self, method, url, headers, body):
+        raise RuntimeError("network down")
 
 
 # ---------- 一時リポジトリの世界 ----------
@@ -475,6 +495,152 @@ def test_config_send_script_override():
         environ={"DEPLOY_DAEMON_CHECKOUT_DIR": str(tmp / "co")},
     )
     assert cfg3.send_script == tmp / "co" / "traytools_send.py"  # 既定はチェックアウト内
+
+
+def test_digest_builds_from_store():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    writer = StateWriter(cfg.state_path)
+    writer.set_daemon("idle", "見回り完了")
+    writer.set_delivery(
+        "dlv-d1", "reported", "反映と再起動が完了しました", ref=world["sha_change"]
+    )
+    writer.set_delivery("dlv-d2", "test_failed", "テストが失敗しました")
+    writer.set_delivery("dlv-d3", "deferred", "変更がまだ見えません")
+    digest = build_digest(cfg, writer, SubprocessGit())
+    assert digest["schema"] == 1
+    assert digest["daemon"]["state"] == "idle"
+    assert digest["daemon"]["apply_mode"] == cfg.apply_mode
+    assert digest["daemon"]["checkout_dir"] == str(world["checkout"])
+    assert digest["daemon"]["updated_at"]
+    assert digest["checkout_head"] == world["sha_base"]  # 実チェックアウトの HEAD
+    by_id = {d["id"]: d for d in digest["deliveries"]}
+    assert set(by_id) == {"dlv-d1", "dlv-d2", "dlv-d3"}
+    assert by_id["dlv-d1"]["state"] == "reported"
+    assert by_id["dlv-d1"]["ok"] is True  # 成功側の終端
+    assert by_id["dlv-d1"]["ref"] == world["sha_change"]
+    assert by_id["dlv-d1"]["summary"] == "反映と再起動が完了しました"
+    assert by_id["dlv-d1"]["updated_at"]
+    assert by_id["dlv-d2"]["ok"] is False  # 失敗側の終端
+    assert by_id["dlv-d2"]["ref"] is None  # ref の記録が無ければ null
+    assert by_id["dlv-d3"]["ok"] is None  # 終端でなければ未確定
+
+
+def test_digest_deliveries_capped_recent_last():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    writer = StateWriter(cfg.state_path)
+    for i in range(25):
+        writer.set_delivery(f"dlv-c{i:02d}", "reported", "完了")
+    digest = build_digest(cfg, writer, SubprocessGit())
+    ids = [d["id"] for d in digest["deliveries"]]
+    assert len(ids) == 20  # 直近20件まで
+    assert ids == [f"dlv-c{i:02d}" for i in range(5, 25)]  # 古い5件が落ち、最新が末尾
+
+
+def test_digest_ref_flows_from_pipeline():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    transport = FakeTransport([_delivery("dlv-r1", "muse/change", world["sha_change"])])
+    pipeline = _pipeline(cfg, transport)
+    pipeline.run_once()
+    digest = build_digest(cfg, pipeline.state_writer, SubprocessGit())
+    by_id = {d["id"]: d for d in digest["deliveries"]}
+    assert by_id["dlv-r1"]["state"] == "reported"
+    assert by_id["dlv-r1"]["ok"] is True
+    assert by_id["dlv-r1"]["ref"] == world["sha_change"]  # _sync 経由で ref が残る
+    assert digest["checkout_head"] == world["sha_change"]  # 反映後の HEAD
+
+
+def _poster_cfg(tmp, world, **overrides):
+    base = {
+        "intake_url": "https://example.invalid/intake",
+        "intake_key": "test-key",
+        "digest_heartbeat_polls": 3,
+    }
+    base.update(overrides)
+    return _config(tmp, world, **base)
+
+
+def test_digest_poster_posts_on_processed():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _poster_cfg(tmp, world)
+    writer = StateWriter(cfg.state_path)
+    writer.set_delivery("dlv-p1", "reported", "完了", ref=world["sha_change"])
+    transport = RecordingTransport()
+    poster = DigestPoster(cfg, transport, writer, SubprocessGit())
+    assert poster.maybe_post(True) is True  # 処理があった見回りでは送る
+    assert len(transport.calls) == 1
+    method, url, headers, body = transport.calls[0]
+    assert method == "POST"
+    assert url == "https://example.invalid/intake/daemon-state"
+    assert headers["x-deploy-key"] == "test-key"
+    digest = json.loads(body.decode("utf-8"))
+    assert digest["schema"] == 1
+    assert digest["deliveries"][0]["id"] == "dlv-p1"
+
+
+def test_digest_poster_heartbeat_cadence():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _poster_cfg(tmp, world)  # heartbeat = 3回に1回
+    transport = RecordingTransport()
+    poster = DigestPoster(cfg, transport, StateWriter(cfg.state_path), SubprocessGit())
+    assert poster.maybe_post(False) is False  # 1回目: まだ送らない
+    assert poster.maybe_post(False) is False  # 2回目: まだ送らない
+    assert transport.calls == []
+    assert poster.maybe_post(False) is True  # 3回目: ハートビートで送る
+    assert len(transport.calls) == 1
+    assert poster.maybe_post(False) is False  # 成功したら数え直し
+
+
+def test_digest_poster_swallows_errors():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _poster_cfg(tmp, world)
+    writer = StateWriter(cfg.state_path)
+    raising = DigestPoster(cfg, RaisingTransport(), writer, SubprocessGit())
+    assert raising.maybe_post(True) is False  # 例外を投げず False
+    failing = DigestPoster(cfg, RecordingTransport(status=500), writer, SubprocessGit())
+    assert failing.maybe_post(True) is False  # 200 でなければ失敗として扱う
+    off_transport = RecordingTransport()
+    off = DigestPoster(
+        _poster_cfg(tmp, world, digest_enabled=False),
+        off_transport,
+        writer,
+        SubprocessGit(),
+    )
+    assert off.maybe_post(True) is False  # 無効化時は処理があっても送らない
+    assert off_transport.calls == []
+
+
+def test_digest_config_overrides():
+    tmp = Path(tempfile.mkdtemp())
+    base = tmp / "cfg"
+    base.mkdir(parents=True)
+    (base / "config.json").write_text(
+        json.dumps({"digest_enabled": False, "digest_heartbeat_polls": 5}),
+        encoding="utf-8",
+    )
+    cfg = load_config(base_dir=base, environ={})
+    assert cfg.digest_enabled is False
+    assert cfg.digest_heartbeat_polls == 5
+    cfg2 = load_config(
+        base_dir=base,
+        environ={
+            "DEPLOY_DAEMON_DIGEST_ENABLED": "true",
+            "DEPLOY_DAEMON_DIGEST_HEARTBEAT_POLLS": "2",
+        },
+    )
+    assert cfg2.digest_enabled is True  # 環境変数が優先する
+    assert cfg2.digest_heartbeat_polls == 2
+    cfg3 = load_config(base_dir=tmp / "cfg-empty", environ={})
+    assert cfg3.digest_enabled is True  # 既定は有効
+    assert cfg3.digest_heartbeat_polls == 10  # 既定は10回に1回
 
 
 def main():

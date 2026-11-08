@@ -30,12 +30,16 @@ class StateWriter:
         self._daemon = {"state": state, "summary": summary}
         self._flush()
 
-    def set_delivery(self, delivery_id: str, state: str, summary: str = "") -> None:
-        self._deliveries[delivery_id] = {
-            "state": state,
-            "summary": summary,
-            "updated_at": now_iso(),
-        }
+    def set_delivery(
+        self, delivery_id: str, state: str, summary: str = "", ref: str | None = None
+    ) -> None:
+        # ref は任意（状態ダイジェスト用）。渡されなければ既存の記録を保つ。
+        # 古い状態ファイルに ref が無くても、そのまま読み書きできる。
+        entry = {"state": state, "summary": summary, "updated_at": now_iso()}
+        kept_ref = ref or (self._deliveries.get(delivery_id) or {}).get("ref")
+        if kept_ref:
+            entry["ref"] = kept_ref
+        self._deliveries[delivery_id] = entry
         self._flush()
 
     def snapshot(self) -> dict:

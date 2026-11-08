@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .adapters import CommandTestRunner, SendScriptLiveness, SendScriptRestarter, SubprocessGit
 from .config import load_config
+from .digest import DigestPoster
 from .intake import IntakeClient
 from .log import JsonlLogger
 from .pipeline import Pipeline
@@ -60,13 +61,20 @@ def main(argv=None) -> int:
         config.poll_interval_sec = args.interval
     pipeline = build_pipeline(config)
     config.base_dir.mkdir(parents=True, exist_ok=True)
+    # 状態ダイジェスト（仕様書 第12節）。パイプラインと同じ輸送・状態・
+    # git を使い、見回りの節目に自分の状態を受け取り口へ送る。
+    poster = DigestPoster(
+        config, pipeline.intake.transport, pipeline.state_writer, pipeline.git
+    )
 
     if args.once:
-        pipeline.run_once()
+        records = pipeline.run_once()
+        poster.maybe_post(bool(records))
         return 0
     try:
         while True:
-            pipeline.run_once()
+            records = pipeline.run_once()
+            poster.maybe_post(bool(records))
             time.sleep(max(1.0, config.poll_interval_sec))
     except KeyboardInterrupt:
         pipeline.state_writer.set_daemon("stopped", "手動で止められました")

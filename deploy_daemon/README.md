@@ -109,6 +109,55 @@ body: {
 途中の状態（received／deferred／awaiting_apply_approval）は
 `terminal: false` で報告され、Worker 側は最新だけを保持すればよい。
 
+## 状態ダイジェスト（仕様書 第12節）
+
+報告（ack）とは別に、配備係は自分の状態の写しを定期的に受け取り口へ
+送る。Muse が PC 側の状態（届け出の処理状態、反映対象の HEAD、生存）を
+自分で読めるようにするため（第12節）。読み手がいなくても、見回りや
+配備の動作には一切影響しない（送信失敗は握りつぶし、次の見回りで
+送り直す）。
+
+```
+POST {intake_url}/daemon-state
+x-deploy-key: <キー>（報告と同じ1本）
+body: <ダイジェスト JSON>
+-> 200 {"ok": true}
+```
+
+ダイジェストの形（`deploy_daemon/digest.py` が正本）:
+
+```json
+{
+  "schema": 1,
+  "daemon": {
+    "state": "idle など",
+    "apply_mode": "approval / auto",
+    "checkout_dir": "実チェックアウトのパス",
+    "updated_at": "状態ファイルの更新時刻"
+  },
+  "checkout_head": "実チェックアウトの現在 HEAD（読めなければ null）",
+  "deliveries": [
+    {
+      "id": "dlv-...",
+      "state": "reported など",
+      "ok": "成功側の終端なら true、失敗側の終端なら false、終端でなければ null",
+      "summary": "状態の要約",
+      "ref": "届け出の ref（記録が無ければ null）",
+      "updated_at": "その届け出の最終更新時刻"
+    }
+  ]
+}
+```
+
+- 届け出は直近20件まで、新しいものが末尾に来る順で入る。
+- 送るタイミング：届け出を処理した見回りでは毎回。処理が無い見回り
+  では、生存を知らせるハートビートとして `digest_heartbeat_polls`
+  回に1回（既定10回）。
+- 読み側は Worker 側の差分（collab-workspace の
+  `docs/status-digest/worker-patch/`）で、`GET {intake_url}/digest` を
+  読み取り専用キー（Worker 側の環境変数 `DEPLOY_DIGEST_KEY`、ヘッダ
+  `x-digest-key`）で読む。読み取りキーは配備係には渡らない。
+
 ## 設定
 
 基底フォルダは Windows では `%LOCALAPPDATA%\traytools\deploy-daemon\`
@@ -127,6 +176,8 @@ body: {
 | `test_commands` | `DEPLOY_DAEMON_TEST_COMMAND` | 検証用コピーで実行するコマンド列 |
 | `apply_mode` | `DEPLOY_DAEMON_APPLY_MODE` | `"approval"`（既定）／`"auto"` |
 | `poll_interval_sec` | `DEPLOY_DAEMON_POLL_INTERVAL` | 見回り間隔（既定60秒） |
+| `digest_enabled` | `DEPLOY_DAEMON_DIGEST_ENABLED` | 状態ダイジェストの送信（既定は有効） |
+| `digest_heartbeat_polls` | `DEPLOY_DAEMON_DIGEST_HEARTBEAT_POLLS` | 処理が無い見回りでもダイジェストを送る間隔（既定10回） |
 | `blocker_wait_sec` / `blocker_retries` | ― | ブロッカー待ちの間隔と上限 |
 | `python_executable` | ― | `traytools_send.py` を呼ぶ実行系（既定 `python`。実機では venv の python.exe を想定） |
 | `send_script` | `DEPLOY_DAEMON_SEND_SCRIPT` | 再起動スクリプトの差し替え（既定は `checkout_dir` 内の `traytools_send.py`。初回テストでスタブに差し替えるときだけ指定する） |

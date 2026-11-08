@@ -59,6 +59,11 @@ class DaemonConfig:
     intake_url: str = ""  # 例: https://<worker>/intake
     intake_key: str = ""  # 環境変数からだけ読む。ファイルには書かない
 
+    # 状態ダイジェスト（仕様書 第12節）。自分の状態を受け取り口へ送り、
+    # Muse が読み取り専用キーで読めるようにする。
+    digest_enabled: bool = True
+    digest_heartbeat_polls: int = 10  # 処理が無い見回りでも、この回数に1回は送る
+
     python_executable: str = "python"  # traytools_send.py を呼ぶ実行系
     send_script_override: Path | None = None  # 再起動スクリプトの差し替え（初回テストのスタブ用）
 
@@ -159,11 +164,14 @@ def load_config(base_dir: Path | None = None, environ: dict | None = None) -> Da
         "liveness_interval_sec",
         "ref_wait_retries",
         "test_timeout_sec",
+        "digest_heartbeat_polls",
     ):
         if file_data.get(key) is not None:
             setattr(cfg, key, type(getattr(cfg, key))(file_data[key]))
     if file_data.get("apply_mode") in ("approval", "auto"):
         cfg.apply_mode = str(file_data["apply_mode"])
+    if file_data.get("digest_enabled") is not None:
+        cfg.digest_enabled = bool(file_data["digest_enabled"])
     if file_data.get("intake_url"):
         cfg.intake_url = str(file_data["intake_url"])
     if file_data.get("python_executable"):
@@ -184,6 +192,15 @@ def load_config(base_dir: Path | None = None, environ: dict | None = None) -> Da
         cfg.apply_mode = env["DEPLOY_DAEMON_APPLY_MODE"]
     if env.get("DEPLOY_DAEMON_SEND_SCRIPT"):
         cfg.send_script_override = Path(env["DEPLOY_DAEMON_SEND_SCRIPT"])
+    if env.get("DEPLOY_DAEMON_DIGEST_ENABLED") is not None:
+        cfg.digest_enabled = env["DEPLOY_DAEMON_DIGEST_ENABLED"].strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    if env.get("DEPLOY_DAEMON_DIGEST_HEARTBEAT_POLLS"):
+        cfg.digest_heartbeat_polls = int(env["DEPLOY_DAEMON_DIGEST_HEARTBEAT_POLLS"])
     key_env_name = str(file_data.get("intake_key_env") or "DEPLOY_DAEMON_INTAKE_KEY")
     cfg.intake_key = env.get(key_env_name, "")
     return cfg

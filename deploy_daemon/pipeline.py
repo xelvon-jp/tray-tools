@@ -383,7 +383,10 @@ class Pipeline:
 
     def _sync(self, rec: DeliveryRecord, summary: str = "") -> None:
         self.state_writer.set_delivery(
-            rec.delivery.id, rec.state.value, summary or rec.delivery.summary
+            rec.delivery.id,
+            rec.state.value,
+            summary or rec.delivery.summary,
+            ref=rec.delivery.ref or None,
         )
 
     def _report(

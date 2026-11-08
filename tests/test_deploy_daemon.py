@@ -330,6 +330,27 @@ def test_conflict_not_applied():
     assert restarter.restart_calls == 0
 
 
+def test_ancestor_ref_is_not_reported_as_applied():
+    """dd-20261109-02 の再現: 届け出の ref が現在位置の祖先だと ff-only は
+    何もせず成功するが、HEAD は ref に一致しないので成功にしてはならない。"""
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    # 作業用チェックアウトを v2（sha_change）まで進めておく
+    _git(world["checkout"], "fetch", "origin", "muse/change")
+    _git(world["checkout"], "checkout", world["sha_change"])
+    assert _head(world["checkout"]) == world["sha_change"]
+    cfg = _config(tmp, world)
+    # 祖先（v1 = sha_base）を指す届け出
+    transport = FakeTransport([_delivery("dlv-10b", "muse/change", world["sha_base"])])
+    restarter = FakeRestarter()
+    records = _pipeline(cfg, transport, restarter=restarter).run_once()
+    assert records[0].state == DeliveryState.CONFLICT, records[0].history
+    assert _head(world["checkout"]) == world["sha_change"]  # 何も動かしていない
+    assert restarter.restart_calls == 0  # 再起動もしない
+    terminal = [r for r in transport.reports if r["body"]["terminal"]]
+    assert terminal and terminal[-1]["body"]["ok"] is False
+
+
 def test_dirty_checkout_stops():
     tmp = Path(tempfile.mkdtemp())
     world = _make_world(tmp)

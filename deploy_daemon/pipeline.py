@@ -185,6 +185,18 @@ class Pipeline:
             return self._finish(
                 rec, DeliveryState.CONFLICT, f"反映できませんでした: {e}", detail=str(e)
             )
+        # 反映の必須検証（dd-20261109-02 の教訓）: ff-only は届け出の ref が
+        # 現在位置の祖先だと何もせず成功するので、HEAD が ref と一致するかを
+        # 必ず確かめる。no-op や後戻りを成功として報告しない。承認ファイルは
+        # この検証を通るまで消費せず、再起動にも進まない。
+        applied_head = self.git.head(checkout)
+        if not self._head_matches(delivery.ref, applied_head):
+            return self._finish(
+                rec,
+                DeliveryState.CONFLICT,
+                "反映後に HEAD が届け出の ref と一致しませんでした",
+                detail=f"HEAD={applied_head} ref={delivery.ref}",
+            )
         self._consume_approval(delivery.id)
         rec.transition(DeliveryState.APPLIED, f"{(prev_head_hint or prev_head)[:8]} -> {delivery.ref[:8]}")
         self._sync(rec)
@@ -337,6 +349,16 @@ class Pipeline:
             "delivery_deferred", delivery_id=rec.delivery.id, attempts=attempts, detail=reason
         )
         return rec
+
+    @staticmethod
+    def _head_matches(ref: str, head: str) -> bool:
+        """HEAD と届け出の ref が同一コミットか（短縮 SHA も許す）。
+
+        from_dict で ref は小文字化済み。head は git が返す40桁の小文字。
+        """
+        ref = ref.strip().lower()
+        head = head.strip().lower()
+        return head.startswith(ref) or ref.startswith(head)
 
     def _finish(
         self,

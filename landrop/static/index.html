@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="LAN Drop">
+<meta name="theme-color" content="#1f6feb">
+<title>LAN Drop</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #fff; --fg: #1d1d1f; --muted: #6e6e73;
+    --accent: #1f6feb; --ok: #1a7f37; --ng: #cf222e; --line: #e3e5e8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111214; --card: #1c1d20; --fg: #f2f2f2; --muted: #9a9aa0;
+            --accent: #4c8dff; --ok: #3fb950; --ng: #ff6b6b; --line: #2c2d31; }
+  }
+  * { box-sizing: border-box; }
+  /* ダブルタップでの拡大を止める（ボタンの連打やサムネのタップで勝手に拡大されないように） */
+  html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+  }
+  main { max-width: 560px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 4px; margin: 4px 0 2px; }
+  h1 { font-size: 22px; margin: 0; flex: 1; }
+  button.icon { width: 44px; height: 44px; margin: 0; padding: 0; border-radius: 22px; font-size: 20px;
+                background: transparent; color: var(--fg); }
+  button.icon:active { background: var(--line); }
+  .status { font-size: 13px; color: var(--muted); margin: 0 0 14px; }
+  .menu { padding: 4px 16px; }
+  .menu .row { display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .menu .row:first-child { border-top: 0; }
+  .menu .muted { color: var(--muted); }
+  button.danger { background: transparent; color: var(--ng); border: 1px solid var(--ng); margin: 4px 0 12px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .status.ok { color: var(--ok); } .status.ng { color: var(--ng); }
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 16px;
+          border: 1px solid var(--line); }
+  .pick { display: block; width: 100%; padding: 28px 16px; text-align: center; border-radius: 12px;
+          border: 2px dashed var(--accent); color: var(--accent); font-size: 18px; font-weight: 600;
+          cursor: pointer; }
+  .pick input { display: none; }
+  button { width: 100%; padding: 14px; font-size: 17px; font-weight: 600; border: 0; border-radius: 12px;
+           background: var(--accent); color: #fff; margin-top: 12px; }
+  button:disabled { opacity: .4; }
+  button.sub { background: transparent; color: var(--accent); padding: 8px; font-size: 14px; font-weight: normal; }
+  ul { list-style: none; padding: 0; margin: 12px 0 0; }
+  li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  li:first-child { border-top: 0; }
+  .row { display: flex; gap: 8px; align-items: baseline; }
+  .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .meta.ok { color: var(--ok); } .meta.ng { color: var(--ng); }
+  progress { width: 100%; height: 4px; appearance: none; border: 0; border-radius: 2px; background: var(--line); }
+  progress::-webkit-progress-bar { background: var(--line); border-radius: 2px; }
+  progress::-webkit-progress-value { background: var(--accent); border-radius: 2px; }
+  input[type=text] { width: 100%; padding: 12px; font-size: 16px; border-radius: 10px;
+                     border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  textarea { width: 100%; min-height: 96px; padding: 12px; font: inherit; font-size: 16px; border-radius: 10px;
+             border: 1px solid var(--line); background: var(--bg); color: var(--fg); resize: vertical; }
+  .btns { display: flex; gap: 8px; }
+  .btns button { flex: 1; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .msg { font-size: 13px; margin: 8px 0 0; min-height: 1.5em; color: var(--muted); }
+  .msg.ok { color: var(--ok); } .msg.ng { color: var(--ng); }
+  #pcLink { display: block; margin-top: 8px; font-size: 14px; color: var(--accent); word-break: break-all; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 4px; }
+  .tile { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: var(--line);
+          border: 0; padding: 0; margin: 0; }
+  .tile img, .tile video { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+  .tile.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .tile .badge { position: absolute; right: 4px; bottom: 4px; font-size: 11px; color: #fff;
+                 background: rgba(0,0,0,.55); border-radius: 4px; padding: 0 4px; }
+  select { width: 100%; padding: 10px 12px; margin: 0 0 10px; font-size: 16px; border-radius: 10px;
+           border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  .tile .vname { position: absolute; inset: 4px; font-size: 10px; color: var(--muted); overflow: hidden;
+                 word-break: break-all; text-align: left; }
+  .hint2 { font-size: 12px; color: var(--muted); font-weight: normal; margin-left: 6px; }
+  .qrwrap { border-top: 1px solid var(--line); padding: 12px 0 4px; text-align: center; }
+  .qr { display: inline-block; background: #fff; padding: 10px; border-radius: 10px; width: 200px; height: 200px; }
+  .qr svg { width: 100%; height: 100%; display: block; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>📤 LAN Drop</h1>
+    <button class="icon" id="reload" aria-label="再読み込み" title="再読み込み">↻</button>
+    <button class="icon" id="menuBtn" aria-label="設定" title="設定">⚙</button>
+  </header>
+  <p id="status" class="status">確認中…</p>
+
+  <section class="card menu" id="menuCard" hidden>
+    <div class="row"><span>バージョン</span><span class="muted" id="verInfo">-</span></div>
+    <div class="row"><span>接続先</span><span class="muted" id="hostInfo">-</span></div>
+    <div class="qrwrap">
+      <div class="qr" id="qrBox" aria-label="接続用のQRコード"></div>
+      <p class="hint">別の iPhone のカメラで読むと、この PC に接続できます（トークン入り。家族以外には見せないでください）</p>
+    </div>
+    <button class="danger" id="resetToken">トークンを入れ直す</button>
+  </section>
+
+  <section class="card" id="tokenCard" hidden>
+    <div>トークンを入力してください</div>
+    <p class="hint">PCで <b>http://localhost:8000/setup</b> を開くとQRコードとトークンが出ます。QRを読むと自動で入ります。</p>
+    <input type="text" id="tokenInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="トークン">
+    <button id="tokenSave">保存</button>
+  </section>
+
+  <section class="card" id="sendCard">
+    <label class="pick">
+      写真・ファイルを選ぶ
+      <input type="file" id="files" multiple>
+    </label>
+    <ul id="list"></ul>
+    <button id="send" disabled>送信</button>
+    <p class="hint" id="summary"></p>
+  </section>
+
+  <section class="card" id="galleryCard" hidden>
+    <h2>PCで表示<span class="hint2">タップするとPCの画面に映ります</span></h2>
+    <select id="gsrc" aria-label="表示する写真の選択"></select>
+    <div class="grid" id="gallery"></div>
+    <div class="btns">
+      <button class="ghost" id="prev">◀ 前</button>
+      <button class="ghost" id="next">次 ▶</button>
+    </div>
+    <p class="msg" id="showMsg"></p>
+  </section>
+
+  <section class="card" id="textCard">
+    <h2>テキスト</h2>
+    <textarea id="textOut" placeholder="URL やメモを貼り付け（長押し →「ペースト」）"></textarea>
+    <div class="btns">
+      <button id="textSend">PCへ送る</button>
+      <button class="ghost" id="textGet">PCから取得</button>
+    </div>
+    <p class="msg" id="textMsg"></p>
+    <a id="pcLink" target="_blank" rel="noopener" hidden></a>
+  </section>
+
+  <footer id="footer">LAN Drop</footer>
+</main>
+
+<script>
+(() => {
+  const KEY = "landrop.token";
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get() { try { return localStorage.getItem(KEY) || ""; } catch { return ""; } },
+    set(v) { try { localStorage.setItem(KEY, v); } catch {} },
+  };
+
+  // QRのURL（…/#t=トークン）から来たら保存する。
+  // #以降はサーバーに送られない。URLから消さないのは、「ホーム画面に追加」した
+  // Webアプリは Safari と localStorage が別になり、URLに残っていないとトークンを引き継げないため
+  function takeTokenFromHash() {
+    const m = location.hash.match(/[#&]t=([^&]+)/);
+    if (!m) return false;
+    token = decodeURIComponent(m[1]);
+    store.set(token);
+    return true;
+  }
+
+  let token = store.get();
+  takeTokenFromHash();
+  // 既に開いているページで同じQRを読んだ場合（再読み込みされない）
+  addEventListener("hashchange", () => { if (takeTokenFromHash()) ping(); });
+  let queue = [];
+  let sending = false;
+
+  const fmt = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB`
+                   : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+
+  function setStatus(text, cls) {
+    const s = $("status"); s.textContent = text; s.className = "status " + (cls || "");
+  }
+
+  async function ping() {
+    if (!token) { showToken(true); setStatus("未設定", "ng"); return; }
+    try {
+      const r = await fetch("/api/ping", { headers: { "X-LanDrop-Token": token }, cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        setStatus(`接続OK: ${j.host}`, "ok");
+        showToken(false);
+        $("verInfo").textContent = `v${j.version}`;
+        $("hostInfo").textContent = location.host;
+        $("footer").textContent = `LAN Drop v${j.version}`;
+        loadFolders();
+      }
+      else if (r.status === 401) { setStatus("トークン違い", "ng"); showToken(true); }
+      else setStatus(`エラー ${r.status}`, "ng");
+    } catch { setStatus("PCに届きません", "ng"); }
+  }
+
+  function showToken(show) {
+    $("tokenCard").hidden = !show;
+    $("sendCard").hidden = show;
+    $("textCard").hidden = show;
+    if (show) $("galleryCard").hidden = true;
+    if (show) $("tokenInput").value = token;
+  }
+
+  $("tokenSave").onclick = () => {
+    token = $("tokenInput").value.trim();
+    store.set(token);
+    ping();
+  };
+  $("resetToken").onclick = () => { $("menuCard").hidden = true; showToken(true); };
+  $("menuBtn").onclick = () => {
+    $("menuCard").hidden = !$("menuCard").hidden;
+    if (!$("menuCard").hidden) loadQr();
+  };
+
+  // 接続用の QR。<img> ではトークンのヘッダーを付けられないので、fetch して SVG を埋め込む
+  async function loadQr() {
+    const box = $("qrBox");
+    try {
+      const r = await fetch("/api/qr", { headers: { "X-LanDrop-Token": token }, cache: "no-store" });
+      if (!r.ok) throw new Error();
+      box.innerHTML = await r.text();  // 自分のサーバーが作った SVG
+    } catch { box.textContent = "QRを表示できませんでした"; }
+  }
+  // ホーム画面から開いた Web アプリには再読み込みの手段が無いので、ボタンで用意する（#t= は残る）
+  $("reload").onclick = () => location.reload();
+
+  $("files").onchange = (e) => {
+    if (sending) return;
+    queue = [...e.target.files].map((file) => ({ file, state: "wait", sent: 0 }));
+    render();
+    $("send").disabled = queue.length === 0;
+    $("summary").textContent = queue.length ? `${queue.length} 件 / ${fmt(queue.reduce((a, q) => a + q.file.size, 0))}` : "";
+  };
+
+  function render() {
+    const ul = $("list");
+    ul.innerHTML = "";
+    for (const q of queue) {
+      const li = document.createElement("li");
+      const label = { wait: fmt(q.file.size), send: `${Math.floor(q.sent * 100 / (q.file.size || 1))}%`,
+                      ok: q.duplicate ? "✓ 保存済み（同じものあり）" : "✓ 保存", ng: `✗ ${q.error || "失敗"}` }[q.state];
+      li.innerHTML = `<div class="row"><span class="name"></span><span class="meta ${q.state}"></span></div>`;
+      li.querySelector(".name").textContent = q.file.name;
+      li.querySelector(".meta").textContent = label;
+      if (q.state === "send") {
+        const p = document.createElement("progress");
+        p.max = q.file.size || 1; p.value = q.sent;
+        li.appendChild(p);
+      }
+      ul.appendChild(li);
+    }
+  }
+
+  // 進捗を出したいので fetch ではなく XHR。1ファイル1リクエストで順番に送る
+  function sendOne(q) {
+    return new Promise((resolve) => {
+      const fd = new FormData();
+      fd.append("files", q.file, q.file.name);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.setRequestHeader("X-LanDrop-Token", token);
+      xhr.upload.onprogress = (e) => { q.sent = e.loaded; render(); };
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          q.state = "ok";
+          try {
+            const saved = JSON.parse(xhr.responseText).saved[0];
+            q.id = saved.id;
+            q.duplicate = saved.duplicate;
+          } catch {}
+        }
+        else {
+          q.state = "ng";
+          try { q.error = JSON.parse(xhr.responseText).detail; } catch { q.error = `HTTP ${xhr.status}`; }
+          if (xhr.status === 401) showToken(true);
+        }
+        render(); resolve();
+      };
+      xhr.onerror = () => { q.state = "ng"; q.error = "通信エラー"; render(); resolve(); };
+      q.state = "send"; render();
+      xhr.send(fd);
+    });
+  }
+
+  $("send").onclick = async () => {
+    sending = true;
+    $("send").disabled = true;
+    for (const q of queue) if (q.state !== "ok") await sendOne(q);
+    const ok = queue.filter((q) => q.state === "ok").length;
+    $("summary").textContent = `${ok} / ${queue.length} 件 送信しました`;
+    const sentMedia = queue.filter((q) => q.state === "ok" && q.id && isMedia(q.file));
+    rememberSent(sentMedia);
+    await loadFolders("r:0");  // 今送った分＝「直近」
+    if (sentMedia.length) $("galleryCard").scrollIntoView({ behavior: "smooth", block: "start" });
+    sending = false;
+    $("send").disabled = ok === queue.length;
+    $("files").value = "";
+  };
+
+  // ---- PCで表示（iPhone をリモコンにする） ----
+  // 候補は「直近」「一つ前」の受信と、PC の日付フォルダから選ぶ
+  const isMedia = (f) => /^(image|video)\//.test(f.type);
+  const blobById = new Map();  // このページから送ったファイルは手元の実物をサムネに使う（動画も絵が出る）
+  let shown = [];      // いま並べているもの { id, url, isVideo, name }
+  let current = -1;
+
+  function rememberSent(queueItems) {
+    for (const q of queueItems) if (!blobById.has(q.id)) blobById.set(q.id, URL.createObjectURL(q.file));
+  }
+
+  async function loadFolders(select) {
+    let data = { recent: [], folders: [] };
+    try {
+      const r = await fetch("/api/folders", { headers: { "X-LanDrop-Token": token }, cache: "no-store" });
+      if (r.ok) data = await r.json();
+    } catch {}
+    const sel = $("gsrc");
+    const prev = select ?? sel.value;
+    sel.replaceChildren();
+    for (const f of data.recent) sel.add(new Option(f.label, `r:${f.key}`));
+    if (data.recent.length && data.folders.length) {
+      const sep = new Option("──────────", ""); sep.disabled = true; sel.add(sep);
+    }
+    for (const f of data.folders) sel.add(new Option(`${f.label}（${f.count}）`, `f:${f.name}`));
+    $("galleryCard").hidden = sel.options.length === 0;
+    if (!sel.options.length) return;
+    sel.value = [...sel.options].some((o) => o.value === prev && !o.disabled) ? prev : sel.options[0].value;
+    await loadSource(sel.value);
+  }
+
+  async function loadSource(value) {
+    const q = value.startsWith("r:") ? `recent=${value.slice(2)}` : `name=${encodeURIComponent(value.slice(2))}`;
+    try {
+      const r = await fetch(`/api/folder?${q}`, { headers: { "X-LanDrop-Token": token }, cache: "no-store" });
+      if (!r.ok) throw new Error();
+      const { items } = await r.json();
+      renderGallery(items.filter((it) => it.kind !== "other").map((it) => ({
+        id: it.id, name: it.name, isVideo: it.kind === "video",
+        url: blobById.get(it.id) || (it.kind === "image" ? `/thumb/${it.id}` : null),
+      })));
+    } catch {
+      renderGallery([]);
+      $("showMsg").textContent = "読み込めませんでした"; $("showMsg").className = "msg ng";
+    }
+  }
+  $("gsrc").onchange = (e) => loadSource(e.target.value);
+
+  function renderGallery(items) {
+    shown = items;
+    current = -1;
+    const grid = $("gallery");
+    grid.replaceChildren();
+    shown.forEach((it, i) => {
+      const b = document.createElement("button");
+      b.className = "tile";
+      b.setAttribute("aria-label", `${i + 1}枚目（${it.name}）をPCで表示`);
+      if (it.isVideo && it.url) {
+        const v = document.createElement("video");
+        v.src = it.url + "#t=0.1";  // 先頭から少し進めた位置を静止画として見せる
+        v.muted = true; v.playsInline = true; v.preload = "metadata";
+        b.appendChild(v);
+      } else if (it.isVideo) {
+        // PC 側の動画はサムネイルを作れない（ffmpeg が要る）ので名前だけ
+        const t = document.createElement("span");
+        t.className = "vname"; t.textContent = it.name;
+        b.appendChild(t);
+      } else {
+        const img = new Image();
+        img.src = it.url; img.loading = "lazy"; img.decoding = "async"; img.alt = "";
+        b.appendChild(img);
+      }
+      if (it.isVideo) {
+        const badge = document.createElement("span");
+        badge.className = "badge"; badge.textContent = "▶";
+        b.appendChild(badge);
+      }
+      b.onclick = () => showAt(i);
+      grid.appendChild(b);
+    });
+    $("showMsg").textContent = shown.length ? "" : "写真・動画がありません";
+    $("showMsg").className = "msg";
+  }
+
+  async function showAt(i) {
+    if (i < 0 || i >= shown.length) return;
+    current = i;
+    [...$("gallery").children].forEach((el, j) => el.classList.toggle("sel", j === i));
+    const msg = $("showMsg");
+    try {
+      const r = await fetch("/api/show", {
+        method: "POST",
+        headers: { "X-LanDrop-Token": token, "Content-Type": "application/json" },
+        body: JSON.stringify({ id: shown[i].id, ids: shown.map((it) => it.id) }),  // PC の ←→ で前後に動けるように
+      });
+      if (r.ok) {
+        const j = await r.json();
+        msg.textContent = j.viewers ? `${i + 1} / ${shown.length} を表示中` : "PCでビューアーを開いています…";
+        msg.className = "msg ok";
+      } else {
+        msg.textContent = await r.json().then((j) => j.detail, () => `表示できませんでした（${r.status}）`);
+        msg.className = "msg ng";
+      }
+    } catch { msg.textContent = "PCに届きません"; msg.className = "msg ng"; }
+  }
+  $("prev").onclick = () => showAt(current <= 0 ? 0 : current - 1);
+  $("next").onclick = () => showAt(Math.min(shown.length - 1, current + 1));
+
+  // ---- テキスト ----
+  function textMsg(text, cls) { const m = $("textMsg"); m.textContent = text; m.className = "msg " + (cls || ""); }
+
+  $("textSend").onclick = async () => {
+    const text = $("textOut").value;
+    if (!text.trim()) { textMsg("テキストが空です", "ng"); return; }
+    try {
+      const r = await fetch("/api/text", {
+        method: "POST",
+        headers: { "X-LanDrop-Token": token, "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        textMsg(j.copied ? "送りました（PCのクリップボードに入りました）"
+                : j.shown ? "送りました（PCの画面に表示しました）" : "送りました", "ok");
+        $("textOut").value = "";
+      }
+      else { textMsg(`送れませんでした（${r.status}）`, "ng"); if (r.status === 401) showToken(true); }
+    } catch { textMsg("PCに届きません", "ng"); }
+  };
+
+  // HTTP のページでは navigator.clipboard が使えないので、選択して execCommand("copy") で代用する
+  function copyFromTextarea() {
+    const ta = $("textOut");
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(ta.value).then(() => true, () => false);
+    ta.focus();
+    ta.setSelectionRange(0, ta.value.length);
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch {}
+    ta.blur();
+    return Promise.resolve(ok);
+  }
+
+  $("textGet").onclick = async () => {
+    try {
+      const r = await fetch("/api/text/pc", { headers: { "X-LanDrop-Token": token }, cache: "no-store" });
+      if (!r.ok) {
+        const detail = await r.json().then((j) => j.detail, () => "");
+        textMsg(detail || `受け取れませんでした（${r.status}）`, "ng");
+        return;
+      }
+      const { text } = await r.json();
+      if (!text) { textMsg("PCのクリップボードにテキストがありません", "ng"); return; }
+      $("textOut").value = text;
+      const url = /^https?:\/\/\S+$/.test(text.trim()) ? text.trim() : "";
+      const link = $("pcLink");
+      link.hidden = !url;
+      if (url) { link.href = url; link.textContent = "開く: " + url; }
+      const copied = await copyFromTextarea();
+      textMsg(copied ? "受け取りました（iPhoneにコピー済み）" : "受け取りました（長押しでコピーしてください）", "ok");
+    } catch { textMsg("PCに届きません", "ng"); }
+  };
+  $("textOut").oninput = () => { $("pcLink").hidden = true; textMsg(""); };
+
+  ping();
+})();
+</script>
+</body>
+</html>

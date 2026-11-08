@@ -257,6 +257,18 @@ class Pipeline:
     def _restart_and_verify(self, rec: DeliveryRecord, note: str = ""):
         """再起動（ブロッカー待ちつき）と生存確認。-> (outcome, message)
 
+        アダプタ側の想定外の例外は "failed" として扱い、呼び出し側の
+        ロールバック手順（A3）を必ず回す。例外を見回りの外へ逃がして
+        配備係全体を落とさない（dd-20261109-04 の教訓）。
+        """
+        try:
+            return self._restart_and_verify_inner(rec, note)
+        except Exception as e:  # noqa: BLE001 - 失敗として手順を回すのが目的
+            return "failed", f"再起動処理で想定外の例外が発生しました: {e!r}"
+
+    def _restart_and_verify_inner(self, rec: DeliveryRecord, note: str = ""):
+        """_restart_and_verify の本体。
+
         outcome は "verified" | "held" | "failed"。
         ブロッカーがある間は再起動を実行せず、間隔を空けて確かめ直す。
         上限まで続いたら "held"（再起動は未実施のまま）。

@@ -49,6 +49,28 @@ def build_pipeline(config, transport=None) -> Pipeline:
     )
 
 
+def _guarded_run_once(pipeline):
+    """見回りを例外から守る。1件の失敗で配備係全体を落とさない。
+
+    例外はログと状態ファイルに残し、None を返す（呼び出し側は
+    そのまま次の見回りへ進む）。dd-20261109-04 の教訓。
+    """
+    import traceback
+
+    try:
+        return pipeline.run_once()
+    except Exception:  # noqa: BLE001 - 見回りを止めないことが目的
+        detail = traceback.format_exc()
+        try:
+            pipeline.logger.log("loop_error", detail=detail)
+            pipeline.state_writer.set_daemon(
+                "error", "見回りで想定外の例外が発生しました（ログ参照）"
+            )
+        except Exception:  # noqa: BLE001 - 記録の失敗でも見回りは続ける
+            pass
+        return None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="deploy_daemon")
     parser.add_argument("--once", action="store_true", help="1回だけ見回って終わる")
@@ -73,7 +95,7 @@ def main(argv=None) -> int:
         return 0
     try:
         while True:
-            records = pipeline.run_once()
+            records = _guarded_run_once(pipeline)
             poster.maybe_post(bool(records))
             time.sleep(max(1.0, config.poll_interval_sec))
     except KeyboardInterrupt:

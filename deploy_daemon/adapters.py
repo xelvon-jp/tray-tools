@@ -125,15 +125,21 @@ class SendScriptRestarter:
     言い回しが読めない場合は安全側（再起動しない）に倒す。
     """
 
-    def __init__(self, python_executable: str, send_script: Path):
+    def __init__(self, python_executable: str, send_script: Path, timeout_sec: float = 60.0):
         self.python_executable = python_executable
         self.send_script = Path(send_script)
+        self.timeout_sec = timeout_sec
 
     def _send(self, *args: str):
+        # errors="replace"： 相手の出力が想定外のバイト列でも
+        # UnicodeDecodeError で落ちない（dd-20261109-04 の教訓）。
+        # timeout： 応答が無い相手に無限に付き合わない。
         proc = subprocess.run(
             [self.python_executable, str(self.send_script), *args],
             capture_output=True,
             text=True,
+            errors="replace",
+            timeout=self.timeout_sec,
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
@@ -141,6 +147,8 @@ class SendScriptRestarter:
         """-> (kind, message)。kind は "ok" | "blocked" | "error"。"""
         try:
             _code, out = self._send("restart", "--check")
+        except subprocess.TimeoutExpired:
+            return "error", "traytools_send.py の応答がタイムアウトしました"
         except OSError as e:
             return "error", f"traytools_send.py を実行できません: {e}"
         text = out.strip()
@@ -156,6 +164,8 @@ class SendScriptRestarter:
         """-> (ok, message)"""
         try:
             code, out = self._send("restart")
+        except subprocess.TimeoutExpired:
+            return False, "traytools_send.py の応答がタイムアウトしました"
         except OSError as e:
             return False, f"traytools_send.py を実行できません: {e}"
         return code == 0, out.strip()
@@ -168,9 +178,10 @@ class SendScriptLiveness:
     「落ちていたのを起こした」ケースと区別がつかない。実機での切り分けは残件。
     """
 
-    def __init__(self, python_executable: str, send_script: Path):
+    def __init__(self, python_executable: str, send_script: Path, timeout_sec: float = 30.0):
         self.python_executable = python_executable
         self.send_script = Path(send_script)
+        self.timeout_sec = timeout_sec
 
     def check(self) -> bool:
         try:
@@ -178,7 +189,9 @@ class SendScriptLiveness:
                 [self.python_executable, str(self.send_script), "status"],
                 capture_output=True,
                 text=True,
+                errors="replace",
+                timeout=self.timeout_sec,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return False
         return proc.returncode == 0

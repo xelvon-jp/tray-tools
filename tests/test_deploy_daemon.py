@@ -26,7 +26,12 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-from deploy_daemon.adapters import CommandTestRunner, SubprocessGit  # noqa: E402
+from deploy_daemon.adapters import (  # noqa: E402
+    CommandTestRunner,
+    SendScriptLiveness,
+    SendScriptRestarter,
+    SubprocessGit,
+)
 from deploy_daemon.config import DaemonConfig, load_config  # noqa: E402
 from deploy_daemon.digest import DigestPoster, build_digest  # noqa: E402
 from deploy_daemon.intake import FakeTransport, IntakeClient  # noqa: E402
@@ -563,6 +568,89 @@ def _poster_cfg(tmp, world, **overrides):
     }
     base.update(overrides)
     return _config(tmp, world, **base)
+
+
+def test_send_script_bad_bytes_do_not_raise():
+    """dd-20261109-04 の教訓: 相手の出力が想定外のバイト列でも
+    UnicodeDecodeError で落ちず、"error" として返ること。"""
+    tmp = Path(tempfile.mkdtemp())
+    script = tmp / "bad_send.py"
+    lines = ["import sys", "sys.stdout.buffer.write(bytes([255, 254, 0]) + b'bad')"]
+    script.write_bytes((chr(10).join(lines) + chr(10)).encode("utf-8"))
+    kind, _message = SendScriptRestarter(sys.executable, script).check()
+    assert kind == "error"
+    # 生存確認も例外で落ちない（真偽どちらでもよい）
+    assert SendScriptLiveness(sys.executable, script).check() in (True, False)
+
+
+def test_send_script_timeout_is_error_not_hang():
+    tmp = Path(tempfile.mkdtemp())
+    script = tmp / "slow_send.py"
+    lines = ["import time", "time.sleep(30)"]
+    script.write_bytes((chr(10).join(lines) + chr(10)).encode("utf-8"))
+    restarter = SendScriptRestarter(sys.executable, script, timeout_sec=1.0)
+    kind, message = restarter.check()
+    assert kind == "error" and "タイムアウト" in message
+
+
+def test_restarter_exception_becomes_rollback_failed_not_crash():
+    """再起動アダプタが例外を投げても、見回りは例外で終わらず
+    ロールバック失敗として終端報告されること。"""
+
+    class RaisingRestarter:
+        def check(self):
+            raise RuntimeError("boom")
+
+        def restart(self):
+            raise RuntimeError("boom")
+
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    transport = FakeTransport([_delivery("dlv-raise", "muse/change", world["sha_change"])])
+    records = _pipeline(cfg, transport, restarter=RaisingRestarter()).run_once()
+    assert records[0].state == DeliveryState.ROLLBACK_FAILED, records[0].history
+    terminal = [r for r in transport.reports if r["body"]["terminal"]]
+    assert terminal and terminal[-1]["body"]["ok"] is False
+
+
+def test_guarded_run_once_swallows_exceptions():
+    from deploy_daemon.__main__ import _guarded_run_once
+
+    class FakeLogger:
+        def __init__(self):
+            self.events = []
+
+        def log(self, event, **fields):
+            self.events.append(event)
+
+    class FakeStateWriter:
+        def __init__(self):
+            self.daemon = None
+
+        def set_daemon(self, state, summary):
+            self.daemon = (state, summary)
+
+    class BoomPipeline:
+        def __init__(self):
+            self.logger = FakeLogger()
+            self.state_writer = FakeStateWriter()
+
+        def run_once(self):
+            raise RuntimeError("boom")
+
+    boom = BoomPipeline()
+    assert _guarded_run_once(boom) is None
+    assert boom.logger.events == ["loop_error"]
+    assert boom.state_writer.daemon is not None
+    assert boom.state_writer.daemon[0] == "error"
+
+    class OkPipeline:
+        @staticmethod
+        def run_once():
+            return ["rec"]
+
+    assert _guarded_run_once(OkPipeline()) == ["rec"]
 
 
 def test_digest_poster_posts_on_processed():

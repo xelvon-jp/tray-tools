@@ -111,6 +111,10 @@ class Muse:
         self.profile = profile
         main, render = find_window(profile)
         if not main:
+            # 開き直した直後など、窓のタイトルが「Muse」だけで「— Muse」を含まないことがある。
+            # exe とクラスは同じ条件のまま、タイトルだけ緩めて1回だけ探し直す。
+            main, render = find_window(dict(profile, window_title_contains="Muse"))
+        if not main:
             raise MuseNotFound("Muse の窓が見つからない")
         self.hwnd_main, self.hwnd_render = main, render
         self.uia = None

@@ -7352,8 +7352,8 @@ def test_version_label_reads_git_and_zip():
         assert u.quick_version(tmp)["source"] == "file"
     with tempfile.TemporaryDirectory() as tmp:
         assert u.version_label(tmp) == ""           # どちらも取れない
-    assert u.window_title("C:\\x", "20261031-02") == "C:\\x - あっふ ★デモ★ 20261031-02"
-    assert u.window_title("", "") == "あっふ ★デモ★" and u.window_title("C:\\x", "") == "C:\\x - あっふ ★デモ★"
+    assert u.window_title("C:\\x", "20261031-02") == "C:\\x - あっふ 20261031-02"
+    assert u.window_title("", "") == "あっふ" and u.window_title("C:\\x", "") == "C:\\x - あっふ"
 
 
 def test_ask_name_dialog_stays_on_top():

@@ -198,7 +198,7 @@ def _head_file_time(repo_dir: Path):
 
 
 def window_title(path: str, version: str) -> str:
-    name = f"あっふ ★デモ★ {version}" if version else "あっふ ★デモ★"
+    name = f"あっふ {version}" if version else "あっふ"
     return f"{path} - {name}" if path else name
 
 

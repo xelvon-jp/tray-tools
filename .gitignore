@@ -66,3 +66,8 @@ copilot_loop_responses.log*
 # 作業ツリーには作らないが、うっかり持ち込んだときの保険。
 phone_ca/
 ca_key.pem
+
+# LAN Drop が実行時に使う設定とアイコン。設定は端末ごとの値、アイコンは
+# 実行時に置かれるものなので、どちらも追跡しない。
+config.toml
+landrop/static/icon.ico

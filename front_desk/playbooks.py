@@ -25,7 +25,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import model
+from . import activity, model
 from .executor import ExecOutcome
 
 GIT_TIMEOUT_SEC = 180
@@ -1087,9 +1087,10 @@ PLAYBOOKS = {
 class PlaybookExecutor:
     """tier="playbook" の依頼を実行する。モデルの Executor と同じ口。"""
 
-    def __init__(self, config, runner=None):
+    def __init__(self, config, runner=None, activity_path=None):
         self._config = config
         self._runner = runner or SubprocessRunner()
+        self._activity_path = activity_path
 
     def run(self, request: model.Request) -> ExecOutcome:
         if request.kind != "ops":
@@ -1127,13 +1128,19 @@ class PlaybookExecutor:
             runner=self._runner,
             settings=dict(self._config.playbook_settings.get(
                 playbook_id, {})))
+        t0 = time.time()
+        activity.begin(playbook_id, request.id,
+                       path=self._activity_path, now=t0)
         try:
-            return fn(ctx, params)
+            outcome = fn(ctx, params)
         except Exception:
-            return ExecOutcome(
+            outcome = ExecOutcome(
                 ok=False,
                 summary=f"プレイブック {playbook_id} の実行中に例外が発生しました",
                 detail=traceback.format_exc()[-2000:])
+        activity.finish(playbook_id, request.id, outcome,
+                        path=self._activity_path, started_at=t0)
+        return outcome
 
 
 class RoutingExecutor:

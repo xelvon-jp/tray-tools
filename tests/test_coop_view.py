@@ -56,12 +56,16 @@ def test_mailbox_fail():
 
 
 def test_route_label():
+    # 経路は郵便受けカードの値の頭に出る(バナーのサブ行には出さない)
     v = view(muse(route="home"))
-    assert v["banner_sub"].endswith("経路：家")
-    v = view(muse(route="worker"))
-    assert v["banner_sub"].endswith("経路：私書箱")
-    v = view(muse())
+    assert v["cards"][1] == ("郵便受け", "家・空")
     assert "経路" not in v["banner_sub"]
+    v = view(muse(route="worker"))
+    assert v["cards"][1] == ("郵便受け", "私書箱・空")
+    v = view(muse(route="home", mailbox_fail=10, kind="approval", kind_since=NOW - 5))
+    assert v["cards"][1] == ("郵便受け", "家・取得失敗")
+    v = view(muse())
+    assert v["cards"][1] == ("郵便受け", "空")
 
 
 def test_approval_card_missing():

@@ -157,10 +157,6 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
             since = now - max(ts)
             elapsed = since if elapsed is None else min(elapsed, since)
 
-    route_label = {"home": "経路：家", "worker": "経路：私書箱"}.get(muse.get("route"))
-    if route_label:
-        sub = f"{sub} ・ {route_label}" if sub else route_label
-
     muse_anim, clawd_anim = ANIMS[tone]
     return {
         "banner_title": title,
@@ -201,5 +197,8 @@ def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False) -> list:
         mailbox = f"受信 {int(now - mail_at)}秒前"
     else:
         mailbox = "空"
+    route_name = {"home": "家", "worker": "私書箱"}.get(muse.get("route"))
+    if route_name:
+        mailbox = f"{route_name}・{mailbox}"
     watch = "休止" if paused else ("停止" if stopped else ("不調" if fail > 0 else "正常"))
     return [("承認", approval), ("郵便受け", mailbox), ("見張り", watch)]

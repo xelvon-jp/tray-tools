@@ -53,34 +53,44 @@ class _CREDENTIAL(ctypes.Structure):
     ]
 
 
-_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+try:
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通し、読み書きは
+    # 「失敗」(False / None)に倒す(呼び出し側の例外処理が受ける)。
+    _advapi32 = None
 
-_CredWriteW = _advapi32.CredWriteW
-_CredWriteW.argtypes = [ctypes.POINTER(_CREDENTIAL), wintypes.DWORD]
-_CredWriteW.restype = wintypes.BOOL
+if _advapi32 is not None:
 
-_CredReadW = _advapi32.CredReadW
-_CredReadW.argtypes = [
-    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-    ctypes.POINTER(ctypes.POINTER(_CREDENTIAL)),
-]
-_CredReadW.restype = wintypes.BOOL
+    _CredWriteW = _advapi32.CredWriteW
+    _CredWriteW.argtypes = [ctypes.POINTER(_CREDENTIAL), wintypes.DWORD]
+    _CredWriteW.restype = wintypes.BOOL
 
-_CredDeleteW = _advapi32.CredDeleteW
-_CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
-_CredDeleteW.restype = wintypes.BOOL
+    _CredReadW = _advapi32.CredReadW
+    _CredReadW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(_CREDENTIAL)),
+    ]
+    _CredReadW.restype = wintypes.BOOL
 
-_CredFree = _advapi32.CredFree
-_CredFree.argtypes = [ctypes.c_void_p]
-_CredFree.restype = None
+    _CredDeleteW = _advapi32.CredDeleteW
+    _CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    _CredDeleteW.restype = wintypes.BOOL
+
+    _CredFree = _advapi32.CredFree
+    _CredFree.argtypes = [ctypes.c_void_p]
+    _CredFree.restype = None
+else:
+    _CredWriteW = _CredReadW = _CredDeleteW = _CredFree = None
 
 
 def _complain(where: str) -> None:
     """失敗の理由を標準エラーへ。トークンそのものは絶対に書かないこと。
 
     pythonw 起動では誰も読めないが、デバッグ起動(TrayTools-debug.bat)では見える。"""
+    last_error = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
     print(f"[tray-tools] 資格情報の{where}に失敗しました "
-          f"(GetLastError={ctypes.get_last_error()})", file=sys.stderr)
+          f"(GetLastError={last_error})", file=sys.stderr)
 
 
 def write(target: str, username: str, secret: str) -> bool:

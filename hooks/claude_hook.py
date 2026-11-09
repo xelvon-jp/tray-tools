@@ -50,7 +50,7 @@ import os
 import re
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 # 親フォルダ(tray-tools 本体)を import できるようにする。フックはどこから呼ばれるか
 # 分からないので、カレントディレクトリには頼らない。
@@ -331,7 +331,9 @@ def _format_minutes(seconds) -> str:
 
 def _project_name(event: dict) -> str:
     cwd = (event.get("cwd") or "").strip()
-    return Path(cwd).name if cwd else "Claude Code"
+    # cwd は常に Windows のパス。ホスト OS の Path で解くと Linux では
+    # バックスラッシュが区切りにならない(claude_status.project_name と同じ)。
+    return PureWindowsPath(cwd).name if cwd else "Claude Code"
 
 
 def maybe_pushover(config: dict, event: dict, title: str, body: str, elapsed=None) -> None:

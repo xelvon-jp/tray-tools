@@ -742,7 +742,10 @@ class ClaudeProgressPanel(QWidget):
                                      track.height()), 3, 3)
 
         # 2段目: 補足(返事待ちの総時間・確定の段階・次の読み取り・自動承認)
-        if stopped:
+        # 自己申告と判定が食い違うときは、補足の代わりに注意を出す。
+        if view["caution"]:
+            sub = "⚠ " + view["caution"]
+        elif stopped:
             sub = f"最後の確認は {cs.format_duration(view['stale_sec'])}前"
         else:
             parts = []
@@ -754,10 +757,13 @@ class ClaudeProgressPanel(QWidget):
                 parts.append(f"次に読むまで {view['poll_next_sec']}秒")
             if view["approved"]:
                 parts.append(f"自動承認 {view['approved']}件")
+            if view["self_label"]:
+                parts.append(f"自己申告 {view['self_label']}")
             sub = "・".join(parts)
         p.setFont(self._sub_font)
         sub_fm = QFontMetrics(self._sub_font)
-        p.setPen(MUSE_STOPPED_COLOR if stopped else SUBTEXT)
+        p.setPen(MUSE_TONE_COLORS["warn"] if view["caution"]
+                 else MUSE_STOPPED_COLOR if stopped else SUBTEXT)
         sub_rect = QRect(inner.left(), int(track.bottom()) + 2, inner.width(),
                          sub_fm.height())
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,

@@ -31,8 +31,14 @@ import re
 import sys
 import time
 
-import comtypes
-import comtypes.client
+try:
+    import comtypes
+    import comtypes.client
+except ImportError:
+    # comtypes は Windows の COM 用。他の環境では import だけ通し、
+    # UIA を実際に使う段(_ensure_uia)で止める。状態の分類など COM と
+    # 無関係な部分はそのまま動く(テストを通すためでもある)。
+    comtypes = None
 
 # UIAutomationCore の型ライブラリ。最初に本当に使うときまで読まない(_ensure_uia)。
 UIA = None
@@ -59,6 +65,8 @@ def _ensure_uia():
     どのスレッドから使っても初期化済みになる。2回目以降の CoInitialize は
     参照カウントが増えるだけで害はない。"""
     global UIA
+    if comtypes is None:
+        raise RuntimeError("comtypes が無い環境では UIA を使えません")
     comtypes.CoInitialize()
     if UIA is None:
         comtypes.client.GetModule("UIAutomationCore.dll")
@@ -179,19 +187,26 @@ WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 # 埋め込みオブジェクト(ボタンや画像)の位置に入る文字。本文には要らない。
 OBJECT_MARK = "￼"
 
-user32 = ctypes.windll.user32
-user32.SendMessageTimeoutW.argtypes = [
-    ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
-    ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
-]
-# HWND は 64bit。argtypes を省くと ctypes が C int(32bit)に落として上位が消える
-# (CLAUDE.md「argtypes/restype は必須」)。
-user32.IsWindow.argtypes = [ctypes.c_void_p]
-user32.IsWindow.restype = ctypes.c_bool
-user32.IsIconic.argtypes = [ctypes.c_void_p]
-user32.IsIconic.restype = ctypes.c_bool
-user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
-user32.IsWindowVisible.restype = ctypes.c_bool
+try:
+    user32 = ctypes.windll.user32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通し、窓の実探査は
+    # しない(状態の分類など user32 と無関係な部分はそのまま動く)。
+    user32 = None
+
+if user32 is not None:
+    user32.SendMessageTimeoutW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
+        ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    # HWND は 64bit。argtypes を省くと ctypes が C int(32bit)に落として上位が消える
+    # (CLAUDE.md「argtypes/restype は必須」)。
+    user32.IsWindow.argtypes = [ctypes.c_void_p]
+    user32.IsWindow.restype = ctypes.c_bool
+    user32.IsIconic.argtypes = [ctypes.c_void_p]
+    user32.IsIconic.restype = ctypes.c_bool
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_bool
 
 
 class _RECT(ctypes.Structure):
@@ -199,8 +214,9 @@ class _RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
-user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
-user32.GetWindowRect.restype = ctypes.c_bool
+if user32 is not None:
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+    user32.GetWindowRect.restype = ctypes.c_bool
 
 
 def window_bounds(hwnd):

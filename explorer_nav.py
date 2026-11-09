@@ -11,8 +11,16 @@ import ctypes
 import os
 import urllib.parse
 
-import comtypes
-import comtypes.client
+try:
+    import comtypes
+    import comtypes.client
+    _COM_ERROR = comtypes.COMError
+except ImportError:
+    # comtypes は Windows の COM 用。他の環境では import だけ通す。
+    # 実際の呼び出しは AttributeError になり、_SHELL_ERRORS で拾われて
+    # 「取れなかった」(None / False)に倒れる(この部品の約束どおり)。
+    comtypes = None
+    _COM_ERROR = None
 
 import window_tools
 
@@ -30,12 +38,19 @@ _EXPLORER_EXE = "explorer.exe"
 # AttributeError も併せて捕まえるのは、comtypes の遅延バインディングでは実際に呼ぶまで
 # メンバの有無が分からないため(w.Document.Folder.Self.Path はここで落ちる。だから
 # パスは LocationURL から組み立てている)。
-_SHELL_ERRORS = (OSError, comtypes.COMError, AttributeError)
+_SHELL_ERRORS = (OSError, AttributeError) + (
+    (_COM_ERROR,) if _COM_ERROR is not None else ())
 
-_user32 = ctypes.windll.user32
+try:
+    _user32 = ctypes.windll.user32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通す
+    # (クラス名は _class_name が空文字で返す)。
+    _user32 = None
 
-_user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
-_user32.GetClassNameW.restype = ctypes.c_int
+if _user32 is not None:
+    _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    _user32.GetClassNameW.restype = ctypes.c_int
 
 # クラス名の受け皿。Windowsのクラス名は256文字までと決まっている。
 _CLASS_NAME_BUFFER = 256
@@ -45,6 +60,8 @@ def _ensure_com_initialized() -> None:
     # feature_audio / mic_control と同じ作法。keyboardライブラリのホットキーコールバックは
     # 専用スレッドで実行され、そのスレッドではCOMが未初期化のまま呼ぶと失敗する。
     # (現状ここへ来るのはQtのメインスレッド経由だけだが、入口が増えても壊れないようにする)
+    if comtypes is None:
+        return
     try:
         comtypes.CoInitialize()
     except OSError:
@@ -61,7 +78,7 @@ def foreground_hwnd() -> int:
 
 def window_class(hwnd: int) -> str:
     """ウィンドウクラス名。無効なHWNDなら空文字。"""
-    if not hwnd:
+    if not hwnd or _user32 is None:
         return ""
     buffer = ctypes.create_unicode_buffer(_CLASS_NAME_BUFFER)
     if not _user32.GetClassNameW(hwnd, buffer, _CLASS_NAME_BUFFER):

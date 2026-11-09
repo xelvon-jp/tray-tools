@@ -12,7 +12,12 @@
 import os
 import subprocess
 import sys
-import winreg
+try:
+    import winreg
+except ImportError:
+    # winreg は Windows 専用。他の環境では import だけ通し、
+    # レジストリ引き(_from_app_paths)は「見つからない」に倒す。
+    winreg = None
 from pathlib import Path
 
 # 設定に書ける名前と、App Paths レジストリに登録されている実行ファイル名の対応。
@@ -30,6 +35,8 @@ DEFAULT_BROWSER = "edge"
 def _from_app_paths(exe_name: str):
     """App Paths レジストリから実行ファイルのフルパスを引く。無ければ None。"""
     sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % exe_name
+    if winreg is None:
+        return None
     for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
         try:
             with winreg.OpenKey(root, sub) as key:

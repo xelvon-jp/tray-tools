@@ -367,13 +367,20 @@ GW_HWNDPREV = 3
 # ここに当たったら「調べきれなかった」とみなして押し上げる側に倒す。
 Z_ORDER_SCAN_LIMIT = 64
 
-_user32 = ctypes.windll.user32
-_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-_user32.GetAsyncKeyState.restype = ctypes.c_short
-_user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-_user32.GetWindow.restype = ctypes.c_void_p
-_user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
-_user32.IsWindowVisible.restype = ctypes.c_int
+try:
+    _user32 = ctypes.windll.user32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通す
+    # (窓の実探査は Windows でしか呼ばれない)。
+    _user32 = None
+
+if _user32 is not None:
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
+    _user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _user32.GetWindow.restype = ctypes.c_void_p
+    _user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    _user32.IsWindowVisible.restype = ctypes.c_int
 
 
 class _RECT(ctypes.Structure):
@@ -385,8 +392,9 @@ class _RECT(ctypes.Structure):
     ]
 
 
-_user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
-_user32.GetWindowRect.restype = ctypes.c_int
+if _user32 is not None:
+    _user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+    _user32.GetWindowRect.restype = ctypes.c_int
 
 
 def _window_bounds(hwnd):

@@ -12,14 +12,20 @@ ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 
 # 0x80000000 は符号付きintに収まらないため、argtypes/restype を明示して符号なしで渡す。
-_SetThreadExecutionState = ctypes.windll.kernel32.SetThreadExecutionState
-_SetThreadExecutionState.argtypes = [ctypes.c_uint32]
-_SetThreadExecutionState.restype = ctypes.c_uint32
+try:
+    _SetThreadExecutionState = ctypes.windll.kernel32.SetThreadExecutionState
+    _SetThreadExecutionState.argtypes = [ctypes.c_uint32]
+    _SetThreadExecutionState.restype = ctypes.c_uint32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通し、呼び出しは失敗に倒す。
+    _SetThreadExecutionState = None
 
 
 def set_keep_awake(enabled: bool) -> bool:
     """スリープ抑止のON/OFFを切り替える。戻り値は成功したかどうか
     (SetThreadExecutionStateは失敗時に0を返す)。"""
+    if _SetThreadExecutionState is None:
+        return False
     flags = ES_CONTINUOUS
     if enabled:
         flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
@@ -33,9 +39,12 @@ def set_keep_awake(enabled: bool) -> bool:
 # Hibernate=False でスリープ(休止ではない)、ForceCritical=False にするのは、
 # 各アプリに「これから寝る」を知らせて保存の機会を与えるため。True にすると
 # 問答無用で落とすので、編集中のものが失われうる。
-_SetSuspendState = ctypes.windll.powrprof.SetSuspendState
-_SetSuspendState.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
-_SetSuspendState.restype = ctypes.c_bool
+try:
+    _SetSuspendState = ctypes.windll.powrprof.SetSuspendState
+    _SetSuspendState.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
+    _SetSuspendState.restype = ctypes.c_bool
+except AttributeError:
+    _SetSuspendState = None
 
 
 def hibernate_available() -> bool:
@@ -65,4 +74,6 @@ def suspend(hibernate: bool = False) -> bool:
     戻り値はAPIが受け付けたかどうか。実際に寝るかはOSとドライバ次第で、
     ここが True でも寝ないことはある。"""
     set_keep_awake(False)
+    if _SetSuspendState is None:
+        return False
     return bool(_SetSuspendState(bool(hibernate), False, False))

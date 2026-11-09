@@ -370,11 +370,18 @@ class _LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 
-_user32 = ctypes.windll.user32
-_user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
-_user32.GetLastInputInfo.restype = ctypes.c_bool
-_kernel32 = ctypes.windll.kernel32
-_kernel32.GetTickCount.restype = ctypes.c_uint
+try:
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通し、
+    # seconds_since_input は None(取れなかった)を返す。
+    _user32 = _kernel32 = None
+
+if _user32 is not None:
+    _user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+    _user32.GetLastInputInfo.restype = ctypes.c_bool
+    _kernel32.GetTickCount.restype = ctypes.c_uint
 
 
 def seconds_since_input():
@@ -388,6 +395,8 @@ def seconds_since_input():
 
     GetTickCount は約49日でひと回りする。回った直後は負になりうるので、
     負なら「たった今」として扱う(0を返す)。"""
+    if _user32 is None:
+        return None
     info = _LASTINPUTINFO()
     info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
     if not _user32.GetLastInputInfo(ctypes.byref(info)):

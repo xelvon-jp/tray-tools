@@ -209,3 +209,68 @@ if __name__ == "__main__":
     for test in ALL_TESTS:
         test()
         print(f"PASS {test.__name__}")
+
+
+# ---- 自己申告(muse_self)の上乗せと食い違い ----
+
+def _self(state="working", age=60, summary="作業の要約"):
+    return {"state": state, "summary": summary, "at": NOW - age}
+
+
+def test_self_report_fresh():
+    rep = mbs.self_report({"muse_self": _self()}, NOW)
+    assert rep["label"] == "作業中" and rep["summary"] == "作業の要約"
+    assert rep["group"] == "active" and rep["age"] == 60
+
+
+def test_self_report_stale_or_missing():
+    assert mbs.self_report({"muse_self": _self(age=3601)}, NOW) is None
+    assert mbs.self_report({"muse_self": _self(age=3600)}, NOW) is not None
+    assert mbs.self_report({}, NOW) is None
+    assert mbs.self_report({"muse_self": {"state": "working"}}, NOW) is None
+    assert mbs.self_report({"muse_self": "working"}, NOW) is None
+
+
+def test_self_report_timestamp_key_variants():
+    for key in ("at", "received_at", "ts"):
+        raw = {"state": "idle", "summary": "", key: NOW - 5}
+        assert mbs.self_report({"muse_self": raw}, NOW)["label"] == "待機中"
+
+
+def test_self_caution_disagreement():
+    data = {"kind": "idle", "kind_since": NOW - 30,
+            "muse_self": _self("working")}
+    caution = mbs.self_caution(data, NOW)
+    assert caution and "食い違っています" in caution
+
+
+def test_self_caution_agreement_and_unjudgeable():
+    base = {"kind_since": NOW - 30}
+    assert mbs.self_caution({**base, "kind": "processing",
+                             "muse_self": _self("working")}, NOW) is None
+    assert mbs.self_caution({**base, "kind": "approval",
+                             "muse_self": _self("waiting_approval")}, NOW) is None
+    # 判定不能(no_reply / unknown)は食い違いにしない
+    assert mbs.self_caution({**base, "kind": "no_reply",
+                             "muse_self": _self("working")}, NOW) is None
+    assert mbs.self_caution({**base, "kind": "unknown",
+                             "muse_self": _self("idle")}, NOW) is None
+
+
+def test_self_caution_quiet_working():
+    data = {"kind": "processing", "kind_since": NOW - 700,
+            "muse_self": _self("working", age=700)}
+    caution = mbs.self_caution(data, NOW)
+    assert caution and "更新されていません" in caution
+
+
+def test_panel_view_carries_self_and_caution():
+    data = {"state": "busy", "since": NOW - 65, "poll_sec": 15,
+            "last_poll": NOW - 8, "kind": "idle", "kind_since": NOW - 30,
+            "muse_self": _self("working")}
+    v = mbs.panel_view(data, NOW)
+    assert v["self_label"] == "作業中" and v["self_summary"] == "作業の要約"
+    assert v["caution"] and "食い違っています" in v["caution"]
+    v2 = mbs.panel_view({"state": "busy", "since": NOW - 65, "poll_sec": 15,
+                         "last_poll": NOW - 8}, NOW)
+    assert v2["self_label"] is None and v2["caution"] is None

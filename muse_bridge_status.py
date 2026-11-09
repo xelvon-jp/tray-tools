@@ -21,6 +21,12 @@
 #   header        Muse の画面の見出し(「実装中」など。自由文で null のこともある)
 # kind があればラベルと経過時間はそちらを基準にする。無ければ state / since で従来どおり。
 #
+#   muse_self     Muse の自己申告(郵便受け kind=status を見張りが受けて転記したもの)。
+#                 {"state": "working" | "waiting_approval" | "waiting_user" |
+#                  "idle" | "done", "summary": 一言, "at": 受けた時刻(epoch 秒)}。
+#                 表示は画面判定(kind)を土台に上乗せし、食い違いは注意表示にする
+#                 (どちらも黙って正にしない)。60分より古い申告は無いものとして扱う。
+#
 # 使い道は2つ: ツールチップの行(describe)と、進捗パネルの Muse 見張り行
 # (panel_view。バーの割合まで含めてここで計算し、描画は claude_progress が担う)。
 import json
@@ -148,6 +154,78 @@ def _kind_info(data, now):
     return kind, _kind_label(kind, data.get("header")), elapsed, _tone(kind, elapsed)
 
 
+# ---- Muse の自己申告(kind=status の転記) ----
+SELF_STALE_SEC = 3600   # これより古い申告は無いものとして扱う(状態提供の原則)
+SELF_QUIET_SEC = 600    # 作業中・承認待ちの申告がこの秒数を超えて無更新なら注意
+
+SELF_LABELS = {
+    "working": "作業中",
+    "waiting_approval": "承認待ち",
+    "waiting_user": "ユーザー待ち",
+    "idle": "待機中",
+    "done": "完了",
+}
+# 自己申告と画面判定を比べるための粗い分類。None は「比べない」。
+_SELF_GROUPS = {"working": "active", "waiting_approval": "approval",
+                "waiting_user": "idle", "idle": "idle", "done": "idle"}
+_KIND_GROUPS = {"responding": "active", "processing": "active",
+                "approval": "approval", "idle": "idle"}
+
+
+def self_report(data, now=None):
+    """自己申告(muse_self)を表示用に解決する。無い・壊れている・古い(>60分)なら None。
+
+    戻り値: {"state", "label", "summary", "age", "group"}。group は画面判定と
+    比べるための分類(active / approval / idle / None)。"""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("muse_self")
+    if not isinstance(raw, dict):
+        return None
+    state = raw.get("state")
+    if not isinstance(state, str) or not state:
+        return None
+    at = None
+    for key in ("at", "received_at", "ts"):
+        at = _num(raw, key)
+        if at is not None:
+            break
+    if at is None:
+        return None
+    now = time.time() if now is None else now
+    age = max(0.0, now - at)
+    if age > SELF_STALE_SEC:
+        return None
+    summary = raw.get("summary")
+    return {
+        "state": state,
+        "label": SELF_LABELS.get(state, state),
+        "summary": summary.strip() if isinstance(summary, str) else "",
+        "age": age,
+        "group": _SELF_GROUPS.get(state),
+    }
+
+
+def self_caution(data, now=None):
+    """自己申告と見張りの判定の食い違い(注意文)。無ければ None。
+
+    ①分類が食い違う(申告=作業中なのに画面は待機、など)。画面判定が
+    no_reply / unknown のときは比べない(判定不能を食い違いにしない)。
+    ②申告が作業中・承認待ちのまま SELF_QUIET_SEC を超えて無更新。"""
+    now = time.time() if now is None else now
+    rep = self_report(data, now)
+    if rep is None:
+        return None
+    kind, kind_label, _elapsed, _tone_name = _kind_info(data, now)
+    kind_group = _KIND_GROUPS.get(kind) if kind else None
+    if rep["group"] and kind_group and rep["group"] != kind_group:
+        return (f"自己申告と見張りの判定が食い違っています"
+                f"(申告: {rep['label']} / 見張り: {kind_label})")
+    if rep["group"] in ("active", "approval") and rep["age"] > SELF_QUIET_SEC:
+        return f"自己申告(「{rep['label']}」)が {fmt_dur(rep['age'])} 更新されていません"
+    return None
+
+
 def describe(data, now=None) -> list:
     """ツールチップに足す行(0〜2行)を返す。
 
@@ -218,7 +296,12 @@ def panel_view(data, now=None):
     poll_sec = _num(data, "poll_sec")
     stopped = now - last_poll > STALE_SEC
     kind, kind_label, kind_elapsed, tone = _kind_info(data, now)
+    rep = self_report(data, now)
     view = {
+        "self_label": rep["label"] if rep else None,
+        "self_summary": rep["summary"] if rep else "",
+        "self_age": rep["age"] if rep else None,
+        "caution": self_caution(data, now),
         "kind": kind,
         "kind_label": kind_label,
         "kind_elapsed": kind_elapsed,

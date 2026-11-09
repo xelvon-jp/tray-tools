@@ -248,3 +248,19 @@ if __name__ == "__main__":
     for test in ALL_TESTS:
         test()
         print(f"PASS {test.__name__}")
+
+
+def test_self_overlay_and_caution():
+    # 自己申告が無ければ self / caution は空(従来の表示と変わらない)
+    v = view(muse())
+    assert v["self"] is None and v["caution"] is None
+    # 申告=作業中・画面判定も処理中なら、上乗せだけ(注意なし)
+    m = muse(kind="processing",
+             muse_self={"state": "working", "summary": "実装中", "at": NOW - 30})
+    v = view(m)
+    assert v["self"]["label"] == "作業中" and v["caution"] is None
+    # 申告=作業中なのに画面は待機 → 食い違いの注意
+    m2 = muse(kind="idle",
+              muse_self={"state": "working", "summary": "実装中", "at": NOW - 30})
+    v2 = view(m2)
+    assert v2["caution"] and "食い違っています" in v2["caution"]

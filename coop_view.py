@@ -170,6 +170,8 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
         "cards": _cards(muse, kind, ke, stopped, fail, now, paused),
         "all_idle": all_idle,
         "paused": bool(paused),
+        "self": mbs.self_report(muse, now),
+        "caution": mbs.self_caution(muse, now),
         "flights": bev.flights(events, now) if events else [],
         "tape": bev.tape_lines(events, now) if events else [],
     }

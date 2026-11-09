@@ -36,30 +36,36 @@ MIN_WINDOW_EDGE = 20
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 
-_user32 = ctypes.windll.user32
+try:
+    _user32 = ctypes.windll.user32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通す(窓の操作自体は
+    # Windows でしか呼ばれない)。dwmapi の読み込みと同じ作法。
+    _user32 = None
 
-# HWNDは64bit Windowsではポインタ幅。ctypesの既定の戻り値は32bit intなので、
-# 明示しないとハンドルが切り詰められて別ウィンドウを操作しかねない。
-_user32.GetForegroundWindow.restype = ctypes.c_void_p
-_user32.IsWindow.argtypes = [ctypes.c_void_p]
-_user32.IsWindow.restype = ctypes.c_bool
-_user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
-_user32.GetWindowTextLengthW.restype = ctypes.c_int
-_user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
-_user32.GetWindowTextW.restype = ctypes.c_int
-_user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
-_user32.SetWindowPos.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
-]
-_user32.SetWindowPos.restype = ctypes.c_bool
+if _user32 is not None:
+    # HWNDは64bit Windowsではポインタ幅。ctypesの既定の戻り値は32bit intなので、
+    # 明示しないとハンドルが切り詰められて別ウィンドウを操作しかねない。
+    _user32.GetForegroundWindow.restype = ctypes.c_void_p
+    _user32.IsWindow.argtypes = [ctypes.c_void_p]
+    _user32.IsWindow.restype = ctypes.c_bool
+    _user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    _user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    _user32.SetWindowPos.restype = ctypes.c_bool
 
-_user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
-_user32.IsWindowVisible.restype = ctypes.c_bool
-_user32.IsIconic.argtypes = [ctypes.c_void_p]
-_user32.IsIconic.restype = ctypes.c_bool
-_user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
-_user32.GetClassNameW.restype = ctypes.c_int
+    _user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    _user32.IsWindowVisible.restype = ctypes.c_bool
+    _user32.IsIconic.argtypes = [ctypes.c_void_p]
+    _user32.IsIconic.restype = ctypes.c_bool
+    _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    _user32.GetClassNameW.restype = ctypes.c_int
 
 
 class RECT(ctypes.Structure):
@@ -77,12 +83,14 @@ class RECT(ctypes.Structure):
 
 # EnumWindows のコールバック。第1引数のHWNDは c_void_p で受ける(このファイル冒頭の
 # restype 指定と同じ理由で、64bit環境ではintだとハンドルが切り詰められる)。
-_ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+_ENUM_WINDOWS_PROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
-_user32.EnumWindows.argtypes = [_ENUM_WINDOWS_PROC, ctypes.c_void_p]
-_user32.EnumWindows.restype = ctypes.c_bool
-_user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
-_user32.GetWindowRect.restype = ctypes.c_bool
+if _user32 is not None:
+    _user32.EnumWindows.argtypes = [_ENUM_WINDOWS_PROC, ctypes.c_void_p]
+    _user32.EnumWindows.restype = ctypes.c_bool
+    _user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+    _user32.GetWindowRect.restype = ctypes.c_bool
 
 # dwmapi は Vista 以降なら必ずあるが、読み込めない環境でもモジュールのimportごと
 # 失敗させたくない。使えないときは GetWindowRect だけで動かす(影の分だけ大きくなる)。
@@ -392,22 +400,29 @@ class TopmostTracker:
 # ---------------------------------------------------------------
 # 窓の配置(窓を集める・配置プリセット。window_layout.py から使う)
 # ---------------------------------------------------------------
-_user32.IsZoomed.argtypes = [ctypes.c_void_p]
-_user32.IsZoomed.restype = ctypes.c_bool
+if _user32 is not None:
+    _user32.IsZoomed.argtypes = [ctypes.c_void_p]
+    _user32.IsZoomed.restype = ctypes.c_bool
 
-_kernel32 = ctypes.windll.kernel32
+try:
+    _kernel32 = ctypes.windll.kernel32
+except AttributeError:
+    _kernel32 = None
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
-_kernel32.OpenProcess.restype = ctypes.c_void_p
-_kernel32.QueryFullProcessImageNameW.argtypes = [
-    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
-_kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
-_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-_kernel32.CloseHandle.restype = ctypes.c_bool
+if _kernel32 is not None:
+    _kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
+    _kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+    _kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_bool
 
 
 def is_zoomed(hwnd) -> bool:
     """最大化されているか。"""
+    if _user32 is None:
+        return False
     return bool(_user32.IsZoomed(hwnd))
 
 
@@ -441,15 +456,16 @@ class _MONITORINFO(ctypes.Structure):
                 ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
 
 
-_MONITOR_ENUM_PROC = ctypes.WINFUNCTYPE(
+_MONITOR_ENUM_PROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
     ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_void_p)
-_user32.EnumDisplayMonitors.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, _MONITOR_ENUM_PROC, ctypes.c_void_p]
-_user32.EnumDisplayMonitors.restype = ctypes.c_bool
-_user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
-_user32.GetMonitorInfoW.restype = ctypes.c_bool
-_user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
-_user32.GetCursorPos.restype = ctypes.c_bool
+if _user32 is not None:
+    _user32.EnumDisplayMonitors.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, _MONITOR_ENUM_PROC, ctypes.c_void_p]
+    _user32.EnumDisplayMonitors.restype = ctypes.c_bool
+    _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetMonitorInfoW.restype = ctypes.c_bool
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+    _user32.GetCursorPos.restype = ctypes.c_bool
 
 
 def list_monitor_work_areas() -> list:
@@ -470,6 +486,8 @@ def list_monitor_work_areas() -> list:
             pass
         return True
 
+    if _user32 is None:
+        return areas
     callback = _MONITOR_ENUM_PROC(on_monitor)
     try:
         _user32.EnumDisplayMonitors(None, None, callback, None)
@@ -481,6 +499,8 @@ def list_monitor_work_areas() -> list:
 def get_cursor_pos():
     """マウスカーソルの位置 (x, y)(物理ピクセル)。取れなければ None。"""
     point = _POINT()
+    if _user32 is None:
+        return None
     if _user32.GetCursorPos(ctypes.byref(point)):
         return point.x, point.y
     return None
@@ -491,12 +511,15 @@ SW_MAXIMIZE = 3
 SW_SHOWNOACTIVATE = 4
 
 GWL_EXSTYLE = -20
-_user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+if _user32 is not None:
+    _user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 
 
 def get_ex_style(hwnd) -> int:
     """拡張スタイル(WS_EX_*)。取れなければ 0。"""
+    if _user32 is None:
+        return 0
     return int(_user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & 0xFFFFFFFF
 
 
@@ -506,10 +529,11 @@ class _WINDOWPLACEMENT(ctypes.Structure):
                 ("ptMaxPosition", _POINT), ("rcNormalPosition", RECT)]
 
 
-_user32.SetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
-_user32.SetWindowPlacement.restype = ctypes.c_bool
-_user32.GetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
-_user32.GetWindowPlacement.restype = ctypes.c_bool
+if _user32 is not None:
+    _user32.SetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
+    _user32.SetWindowPlacement.restype = ctypes.c_bool
+    _user32.GetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINDOWPLACEMENT)]
+    _user32.GetWindowPlacement.restype = ctypes.c_bool
 
 
 def get_placement(hwnd):

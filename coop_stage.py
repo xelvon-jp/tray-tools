@@ -68,6 +68,7 @@ BG = QColor("#0a1118")
 EDGE = QColor("#1e6f86")
 STAGE_EDGE = QColor("#17485a")
 SUB = QColor("#9fd5e4")
+CAUTION = QColor("#f0c44c")   # 自己申告と判定の食い違いの注意表示
 LABEL = QColor("#4fb7d0")
 CARD_BG = QColor("#0d1a22")
 CARD_VALUE = QColor("#e6faff")
@@ -277,11 +278,20 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
                    view["banner_time"])
     sfm = QFontMetrics(sub_font)
     p.setFont(sub_font)
-    p.setPen(SUB)
     sub_w = max(0, ban.right() - CLOSE_ROOM - text_l)
+    if view.get("caution"):
+        # 自己申告と見張りの判定の食い違いは、sub の代わりに注意を出す(色も変える)
+        p.setPen(CAUTION)
+        sub_text = "⚠ " + view["caution"]
+    else:
+        p.setPen(SUB)
+        sub_text = view["banner_sub"]
+        rep = view.get("self")
+        if rep:
+            sub_text += f"(自己申告: {rep['label']})"
     p.drawText(QRect(text_l, ban.top() + 2 + tfm.height(), sub_w, sfm.height()),
                Qt.AlignLeft | Qt.AlignVCenter,
-               sfm.elidedText(view["banner_sub"], Qt.ElideRight, sub_w))
+               sfm.elidedText(sub_text, Qt.ElideRight, sub_w))
 
     if collapsed:
         p.setRenderHint(QPainter.Antialiasing, True)

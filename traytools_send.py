@@ -29,7 +29,12 @@
 #  pythonw で呼ばれるとこのスクリプトの標準エラーもどこにも出ない)。
 import ctypes
 import json
-import msvcrt
+try:
+    import msvcrt
+except ImportError:
+    # msvcrt は Windows 専用(名前付きパイプのハンドル変換に使う)。
+    # 他の環境では import だけ通す(その経路自体が Windows でしか動かない)。
+    msvcrt = None
 import subprocess
 import sys
 import time

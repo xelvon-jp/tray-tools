@@ -74,25 +74,35 @@ class LASTINPUTINFO(ctypes.Structure):
     ]
 
 
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
+try:
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+except AttributeError:
+    # Windows 以外では windll 自体が無い。import だけ通し、実呼び出しはしない
+    # (idle_seconds は None、jiggle は False を返す。どちらも「何もしない」側)。
+    _user32 = _kernel32 = None
 
-# argtypes/restype は必ず指定する。64bitでポインタがintに切り詰められると即クラッシュする。
-_SendInput = _user32.SendInput
-_SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
-_SendInput.restype = ctypes.c_uint
+if _user32 is not None:
+    # argtypes/restype は必ず指定する。64bitでポインタがintに切り詰められると即クラッシュする。
+    _SendInput = _user32.SendInput
+    _SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    _SendInput.restype = ctypes.c_uint
 
-_GetLastInputInfo = _user32.GetLastInputInfo
-_GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
-_GetLastInputInfo.restype = ctypes.c_bool
+    _GetLastInputInfo = _user32.GetLastInputInfo
+    _GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+    _GetLastInputInfo.restype = ctypes.c_bool
 
-_GetTickCount = _kernel32.GetTickCount
-_GetTickCount.argtypes = []
-_GetTickCount.restype = ctypes.c_uint32
+    _GetTickCount = _kernel32.GetTickCount
+    _GetTickCount.argtypes = []
+    _GetTickCount.restype = ctypes.c_uint32
+else:
+    _SendInput = _GetLastInputInfo = _GetTickCount = None
 
 
 def idle_seconds():
     """最後のキーボード/マウス入力からの経過秒を返す。取得に失敗したらNone。"""
+    if _GetLastInputInfo is None:
+        return None
     info = LASTINPUTINFO()
     info.cbSize = ctypes.sizeof(LASTINPUTINFO)
     if not _GetLastInputInfo(ctypes.byref(info)):
@@ -113,6 +123,8 @@ def jiggle() -> bool:
 
     SendInput は「実際に送れた件数」を返す。UIPI(管理者権限のウィンドウが前面など)で
     弾かれると0になるので、渡した件数と一致しなければ失敗として扱う。"""
+    if _SendInput is None:
+        return False
     events = (INPUT * 2)()
     for event, dx in zip(events, (1, -1)):
         event.type = INPUT_MOUSE

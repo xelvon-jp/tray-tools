@@ -16,7 +16,7 @@ import json
 import os
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 STATUS_DIR = (Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".")
               / "tray-tools-hooks" / "status")
@@ -190,7 +190,9 @@ def display_name(entry: dict, limit: int = TITLE_CHARS) -> str:
 
 def project_name(cwd) -> str:
     cwd = str(cwd or "").strip().rstrip("\\/")
-    return Path(cwd).name if cwd else "Claude Code"
+    # cwd は常に Windows のパス。ホスト OS の Path で解くと、Linux では
+    # バックスラッシュが区切りにならず名前が取れない(テストが通らない)。
+    return PureWindowsPath(cwd).name if cwd else "Claude Code"
 
 
 # ---------------------------------------------------------------------------

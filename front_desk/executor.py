@@ -1,5 +1,9 @@
 """front_desk.executor — 依頼の実行 (tier ごとのコマンド起動)。
 
+入出力の文字コードは UTF-8 に固定する。Windows のロケール
+(cp932) で読むと、実行側の UTF-8 出力が文字化けするため
+(2026-11-09 の実地試験で確認)。
+
 本文は標準入力で渡し、出力を結果にする。作法は front-desk の
 README を参照。具体的なコマンド (Claude Code の起動作法) は
 PC 側での実地確認 (A7) の後に設定で確定する。
@@ -64,6 +68,7 @@ class SubprocessExecutor:
                 input=request.body,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 errors="replace",
                 timeout=self._timeout,
                 cwd=self._workdir,

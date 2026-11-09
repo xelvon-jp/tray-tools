@@ -274,6 +274,31 @@ def test_subprocess_executor_timeout():
     assert not out.ok and out.timed_out
 
 
+def test_subprocess_executor_uses_utf8():
+    import front_desk.executor as ex_mod
+    seen = {}
+    real_run = ex_mod.subprocess.run
+
+    class FakeProc:
+        returncode = 0
+        stdout = "結果\n結論: OK"
+        stderr = ""
+
+    def spy(argv, **kwargs):
+        seen.update(kwargs)
+        return FakeProc()
+
+    ex_mod.subprocess.run = spy
+    try:
+        ex = SubprocessExecutor({"haiku": ["claude", "-p"]}, timeout_sec=5)
+        out = ex.run(make_request())
+    finally:
+        ex_mod.subprocess.run = real_run
+    assert out.ok and out.summary == "結論: OK"
+    assert seen.get("encoding") == "utf-8"
+    assert seen.get("errors") == "replace"
+
+
 # ---- 実行器 -----------------------------------------------------------------
 
 def _run_all():

@@ -32,6 +32,7 @@ import beep
 import capture_grab
 import com_gc_probe
 import pushover
+import remote_capture
 import settings as settings_module
 from feature_audio import AudioFeature
 from feature_screen import ScreenFeature
@@ -982,6 +983,12 @@ def main():
     hotkey_bridge = setup_hotkeys(app_settings, handlers, on_error=on_hotkey_error)  # noqa: F841
     # 調査モードのときだけ、メインスレッドで定期的に gc.garbage を調べる(無効なら None)。
     probe_timer = com_gc_probe.start_timer()  # noqa: F841
+
+    # リモート撮影の起動時チェック。合言葉(remote_capture.json の nonce)が
+    # 新しければ1回だけ画面を撮る。少し遅らせるのは、再起動直後の画面と
+    # 機能の組み立てが落ち着いてから撮るため。失敗しても起動は止めない
+    # (remote_capture 側で握りつぶしてある)。
+    QTimer.singleShot(8000, lambda: remote_capture.check_and_run(app_settings))
 
     sys.exit(app.exec())
 

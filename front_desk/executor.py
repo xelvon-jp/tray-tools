@@ -26,6 +26,10 @@ class ExecOutcome:
     summary: str = ""
     detail: str = ""
     timed_out: bool = False
+    # 結果 state の上書き (model の RESULT_* の値)。空なら pipeline が
+    # ok / timed_out から決める。プレイブックの「ガードで停止」は
+    # blocked、「形式不正」は rejected を明示するために使う。
+    state: str = ""
 
 
 def summarize_output(text: str) -> tuple:

@@ -54,6 +54,33 @@ Muse からの依頼を Worker 経由で受け取り、実行モデル目安 (ti
   tier の依頼は `failed` (未設定) で返る。
 - 窓口鍵は設定に書かず、環境変数 `FRONT_DESK_KEY` で渡す。
 
+## プレイブック (モデルなし実行)
+
+tier は「実行エンジン」の指定で、`haiku` / `opus` はモデル、
+`playbook` はモデルを起動せず `front_desk.playbooks` のコードが
+実行する (A9 の第2段)。依頼の body は JSON で
+`{"playbook": "<id>", "params": {...}}` と書く。kind は当面
+`ops` だけ。
+
+```json
+{
+  "allowed_kinds": ["inspect", "ops"],
+  "allowed_playbooks": ["traytools_sync"],
+  "playbook_settings": {
+    "traytools_sync": {"repo_path": "R:\\claude\\tray-tools"}
+  }
+}
+```
+
+- `allowed_playbooks` に無い id は実行されず `rejected` で返る
+  (既定は空 = 1つも実行できない)。
+- `traytools_sync`: 対象リポジトリへ対象ブランチを ff-only で
+  取り込み、traytools_send.py の口で再起動し、HEAD と生存を
+  検証する。作業ツリーが dirty・別ブランチ・再起動の吹き添え
+  確認が NG のときは、何も変えず `blocked` で返す。反映後の
+  失敗では、ツリーが依然 clean な場合だけ巻き戻しを1回試す。
+- 設計と有効化の手順は claude-bridge の playbook-spec.md。
+
 ## 起動と停止
 
 ```

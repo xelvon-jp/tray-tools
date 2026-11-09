@@ -139,7 +139,9 @@ class DeskPipeline:
                                         else "post_failed")))
             return
 
-        if outcome.timed_out:
+        if outcome.state:
+            state = outcome.state
+        elif outcome.timed_out:
             state = model.RESULT_BLOCKED
         elif outcome.ok:
             state = model.RESULT_DONE

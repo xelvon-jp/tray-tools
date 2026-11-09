@@ -35,6 +35,12 @@ class DeskConfig:
     state_heartbeat_polls: int = 10
     # 実行を許可する kind。第1段は読み取り確認 (inspect) だけ。
     allowed_kinds: tuple = ("inspect",)
+    # 有効化済みプレイブックの id (tier=playbook の実行許可)。
+    # 既定は空 = プレイブックは1つも実行できない。
+    allowed_playbooks: tuple = ()
+    # プレイブックごとの設定値 {id: {キー: 値}}。対象パスなど、
+    # コードに直書きしない値をここで受ける。
+    playbook_settings: dict = dataclasses.field(default_factory=dict)
     # tier ごとの実行コマンド (argv の列)。本文は標準入力で渡す。
     # 例: {"haiku": ["claude", "-p", "--model", "haiku"]}
     # 未設定の tier は実行できず failed で返す。
@@ -85,6 +91,20 @@ class DeskConfig:
             safe = tuple(k for k in kinds
                          if isinstance(k, str) and k in REQUEST_KINDS)
             kwargs["allowed_kinds"] = safe
+        books = data.get("allowed_playbooks")
+        if isinstance(books, list):
+            kwargs["allowed_playbooks"] = tuple(
+                b for b in books if isinstance(b, str) and b)
+        settings = data.get("playbook_settings")
+        if isinstance(settings, dict):
+            safe_settings = {}
+            for pid, values in settings.items():
+                if not isinstance(values, dict):
+                    continue
+                safe_values = {str(k): v for k, v in values.items()
+                               if isinstance(v, str)}
+                safe_settings[str(pid)] = safe_values
+            kwargs["playbook_settings"] = safe_settings
         commands = data.get("executor_commands")
         if isinstance(commands, dict):
             safe_cmds = {}

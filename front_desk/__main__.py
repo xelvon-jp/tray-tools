@@ -17,6 +17,7 @@ from .executor import SubprocessExecutor
 from .intake import UrllibTransport
 from .log import JsonlLog
 from .pipeline import DeskPipeline
+from .playbooks import PlaybookExecutor, RoutingExecutor
 from .statefile import DeskStateStore, ProcessedStore
 
 ENV_DESK_KEY = "FRONT_DESK_KEY"
@@ -24,8 +25,9 @@ ENV_DESK_KEY = "FRONT_DESK_KEY"
 
 def build_pipeline(config: DeskConfig, desk_key: str) -> DeskPipeline:
     transport = UrllibTransport(config.worker_base_url, desk_key)
-    executor = SubprocessExecutor(
+    model_executor = SubprocessExecutor(
         config.executor_commands, config.exec_timeout_sec, config.workdir)
+    executor = RoutingExecutor(PlaybookExecutor(config), model_executor)
     return DeskPipeline(
         config, transport, executor,
         log=JsonlLog(config.log_path),

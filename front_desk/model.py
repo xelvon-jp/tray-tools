@@ -5,7 +5,9 @@ import dataclasses
 from typing import Any, Optional
 
 # Worker 側 (requests.js) の許可値と揃える。
-REQUEST_TIERS = ("haiku", "opus")
+# tier は「実行エンジン」の指定: haiku / opus はモデル、
+# playbook はモデルなし実行 (front_desk.playbooks)。
+REQUEST_TIERS = ("haiku", "opus", "playbook")
 REQUEST_KINDS = ("inspect", "ops", "general")
 
 # 結果の state (窓口が書く値)。

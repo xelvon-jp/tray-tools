@@ -55,6 +55,15 @@ def test_mailbox_fail():
     assert v["cards"][1] == ("郵便受け", "取得失敗") and v["cards"][2] == ("見張り", "不調")
 
 
+def test_route_label():
+    v = view(muse(route="home"))
+    assert v["banner_sub"].endswith("経路：家")
+    v = view(muse(route="worker"))
+    assert v["banner_sub"].endswith("経路：私書箱")
+    v = view(muse())
+    assert "経路" not in v["banner_sub"]
+
+
 def test_approval_card_missing():
     v = view(muse(kind="approval", cards=0, kind_since=NOW - 20))
     assert v["banner_title"] == "承認カードが見えません" and v["tone"] == "alert"
@@ -235,7 +244,7 @@ def test_paused_view():
     assert v2["banner_title"] == "見張り休止中"
 
 
-ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail,
+ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
              test_done_window, test_sleep_default, test_cards,

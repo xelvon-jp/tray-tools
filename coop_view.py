@@ -157,6 +157,10 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
             since = now - max(ts)
             elapsed = since if elapsed is None else min(elapsed, since)
 
+    route_label = {"home": "経路：家", "worker": "経路：私書箱"}.get(muse.get("route"))
+    if route_label:
+        sub = f"{sub} ・ {route_label}" if sub else route_label
+
     muse_anim, clawd_anim = ANIMS[tone]
     return {
         "banner_title": title,

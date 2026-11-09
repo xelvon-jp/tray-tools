@@ -79,6 +79,31 @@ tier は「実行エンジン」の指定で、`haiku` / `opus` はモデル、
   検証する。作業ツリーが dirty・別ブランチ・再起動の吹き添え
   確認が NG のときは、何も変えず `blocked` で返す。反映後の
   失敗では、ツリーが依然 clean な場合だけ巻き戻しを1回試す。
+- `daemon_sync` (PB-2): 配備係へ `muse/deploy-daemon` を取り込み、
+  タスク `DeployDaemon` を Stop → 10秒 → Start で再起動する。
+  検証は HEAD 一致とタスクが Running であること。巻き戻しはしない。
+- `desk_sync` (PB-3): 窓口自身へ `muse/front-desk` を取り込む。
+  再起動は結果を報告した後に、切り離したヘルパーが遅延実行する
+  (自分を止めると報告そのものができなくなるため)。
+- `traytools_restart` (PB-6): tray-tools の再起動だけを行う
+  (PB-1 から反映を除いた形)。
+- `config_set` (PB-5): `%LOCALAPPDATA%\traytools\` の合図ファイル
+  4つ (`stall_nudge` / `bridge_pause` / `coax_realinput` /
+  `logview`) の決まったキーを1つ差し替える。`expected` で現在値の
+  照合もできる。検証 NG のときは変更前の内容へ書き戻す。
+- `watcher_sync` (PB-7): 見張り (`muse_monitor.py`) を正本で
+  差し替え、タスク `MuseBridgeMonitor` を Stop → 10秒以上 →
+  Start する。正本の置き場は未決のため
+  `playbook_settings.watcher_sync.source_path` が必須で、未設定
+  では実行しない。検証はハッシュ一致と新しい `monitor_start` の
+  到着で、失敗時はバックアップから戻して再起動する。
+- `pc_capture` (PB-8): 常駐の `capture` の口で画面を撮り、
+  OneDrive の `traytools-remote-capture` フォルダへ届ける。
+- `deploy_approve` (PB-4): 配備係の承認ファイル
+  (`approvals/<delivery_id>.approve`) を置く。**Nagato の明示の
+  了承がある場合にだけ使う前提で、定常の有効化対象には含めない。**
+  配備係の置き場 (`daemon_base_dir`) も `playbook_settings` で
+  必須とし、未設定では実行しない。
 - 設計と有効化の手順は claude-bridge の playbook-spec.md。
 
 ## 起動と停止

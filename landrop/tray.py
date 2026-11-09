@@ -26,6 +26,7 @@ from .config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, Settings, config_path, lo
 from .hooks import ReceivedFile, build_hooks
 from .server import advertised_host, create_app
 from .texts import ReceivedText
+from .startup_link import ICON_FILE, STARTUP_LNK, icon_image, set_startup, startup_enabled, write_icon_file
 
 log = logging.getLogger("landrop")
 
@@ -38,62 +39,6 @@ def log_file() -> Path:
 
 
 LOG_FILE = log_file()
-STARTUP_LNK = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup\LAN Drop.lnk"
-ICON_FILE = Path(__file__).parent / "static" / "icon.ico"
-
-
-def icon_image(size: int = 64) -> Image.Image:
-    """青い角丸に白い「受け取り」矢印。16px に潰れても形が分かるよう太めに描く。"""
-    s = size / 64
-    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    d.rounded_rectangle((2 * s, 2 * s, 62 * s, 62 * s), radius=14 * s, fill=(31, 111, 235, 255))
-    white = (255, 255, 255, 255)
-    d.rectangle((26 * s, 10 * s, 38 * s, 32 * s), fill=white)                       # 矢印の軸
-    d.polygon([(14 * s, 28 * s), (50 * s, 28 * s), (32 * s, 46 * s)], fill=white)  # 矢じり
-    d.rectangle((12 * s, 50 * s, 52 * s, 55 * s), fill=white)                       # 受け皿
-    return im
-
-
-def write_icon_file(path: Path = ICON_FILE) -> Path:
-    icon_image(256).save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
-    return path
-
-
-# ---- スタートアップ登録 ----
-
-def startup_enabled(lnk: Path = STARTUP_LNK) -> bool:
-    return lnk.exists()
-
-
-def set_startup(enabled: bool, lnk: Path = STARTUP_LNK) -> None:
-    """ログイン時に `pythonw -m landrop --tray` を起動するショートカットを置く／消す。"""
-    if not enabled:
-        lnk.unlink(missing_ok=True)
-        return
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    if not ICON_FILE.exists():
-        write_icon_file()
-    # 値は環境変数で渡す（パスに空白や引用符があってもコマンド文字列を組み立てずに済む）
-    env = {
-        **os.environ,
-        "LD_LNK": str(lnk),
-        "LD_TARGET": str(pythonw),
-        "LD_ARGS": "-m landrop --tray",
-        "LD_DIR": str(PROJECT_ROOT),
-        "LD_ICON": str(ICON_FILE),
-    }
-    script = (
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:LD_LNK);"
-        "$s.TargetPath=$env:LD_TARGET;$s.Arguments=$env:LD_ARGS;$s.WorkingDirectory=$env:LD_DIR;"
-        "$s.IconLocation=$env:LD_ICON;$s.Description='LAN Drop 受信サーバー';$s.Save()"
-    )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        env=env, check=True, creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-
 # ---- 常駐本体 ----
 
 def open_dir(path: Path) -> None:

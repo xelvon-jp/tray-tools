@@ -1,0 +1,11 @@
+# -*- coding: utf-8 -*-
+# LAN Drop 専用の依存。tray-tools 本体の requirements.txt とは分けてある
+# (LAN Drop を使わない環境に重い依存を入れないため。受信に使う PC だけで
+#  setup の venv に入れる: pip install -r requirements-landrop.txt)
+fastapi
+uvicorn[standard]
+python-multipart
+pystray
+qrcode
+pillow-heif
+Pillow

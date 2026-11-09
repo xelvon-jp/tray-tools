@@ -54,6 +54,10 @@ received → staged → tested → [awaiting_apply_approval] → applied
 
 - 承認シグナル： `<base>/approvals/<届け出ID>.approve` という空ファイル。
   置かれたことを次の見回りで検知して反映へ進む。承認は使い切り（反映時に消す）。
+- 承認待ちの見回りではテストを回し直さない。前回テスト合格した
+  記録（状態ファイルの当該届け出が tested / awaiting_apply_approval で、
+  ref が同じ）があれば、承認ファイルの確認だけを行う。承認が来れば
+  再テストなしで反映へ進む。ref が変わっていれば従来どおり全部やり直す。
 - `apply_mode = "auto"` にすると、承認なしで全面自動になる。
   切り替えは config.json の `apply_mode` か環境変数 `DEPLOY_DAEMON_APPLY_MODE`。
 

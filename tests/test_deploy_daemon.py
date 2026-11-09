@@ -792,6 +792,71 @@ def test_pipeline_test_progress_writes_state_and_posts():
     assert len(posts) == 1  # 間引き（60秒）で増えない
 
 
+class _CountingRunner:
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    def run(self, cwd, on_progress=None):
+        self.calls += 1
+        return self.inner.run(cwd, on_progress=on_progress)
+
+
+def test_awaiting_delivery_skips_retest():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world, apply_mode="approval")
+    delivery = _delivery("dlv-await", "muse/change", world["sha_change"])
+    transport = FakeTransport([delivery])
+    pipeline = _pipeline(cfg, transport, restarter=FakeRestarter())
+    counter = _CountingRunner(pipeline.test_runner)
+    pipeline.test_runner = counter
+
+    records = pipeline.run_once()
+    assert records[0].state == DeliveryState.AWAITING_APPLY_APPROVAL
+    assert counter.calls == 1
+
+    # 承認が無い見回りは、テストを回し直さず・処理記録も残さない
+    records = pipeline.run_once()
+    assert records == []
+    assert counter.calls == 1
+    assert _head(world["checkout"]) == world["sha_base"]
+
+    # 承認が来たら、再テストなしで反映まで進む
+    cfg.approval_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.approval_dir / "dlv-await.approve").write_text("", encoding="utf-8")
+    records = pipeline.run_once()
+    assert records[0].state == DeliveryState.REPORTED, records[0].history
+    assert counter.calls == 1
+    assert _head(world["checkout"]) == world["sha_change"]
+
+
+def test_awaiting_skip_not_used_when_ref_changes():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world, apply_mode="approval")
+    transport = FakeTransport(
+        [_delivery("dlv-await2", "muse/change", world["sha_change"])]
+    )
+    pipeline = _pipeline(cfg, transport, restarter=FakeRestarter())
+    counter = _CountingRunner(pipeline.test_runner)
+    pipeline.test_runner = counter
+    records = pipeline.run_once()
+    assert records[0].state == DeliveryState.AWAITING_APPLY_APPROVAL
+    assert counter.calls == 1
+
+    # 同じ id でも ref が変われば、従来どおりテストからやり直す
+    transport2 = FakeTransport(
+        [_delivery("dlv-await2", "muse/change", world["sha_base"])]
+    )
+    pipeline.intake = IntakeClient(
+        "https://example.invalid/intake", "test-key", transport=transport2
+    )
+    records = pipeline.run_once()
+    assert counter.calls == 2
+    assert records[0].state == DeliveryState.AWAITING_APPLY_APPROVAL
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

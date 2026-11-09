@@ -84,14 +84,21 @@ class Pipeline:
                     state=self.seen.terminal_state(delivery.id),
                 )
                 continue
-            records.append(self.process(delivery))
+            rec = self.process(delivery)
+            if rec is not None:  # 承認待ちの確認だけの周は数えない
+                records.append(rec)
         self.state_writer.set_daemon("idle", f"見回り完了（{len(records)}件処理）")
         return records
 
     # ---------- 1件の処理 ----------
 
-    def process(self, delivery) -> DeliveryRecord:
+    def process(self, delivery) -> DeliveryRecord | None:
         cfg = self.config
+        # 前回の状態は、今回の RECEIVED で上書きする前に読む
+        # （承認待ちの引き継ぎ判定に使う）。
+        prior = (self.state_writer.snapshot().get("deliveries") or {}).get(
+            delivery.id
+        ) or {}
         rec = DeliveryRecord(delivery)
         rec.transition(DeliveryState.RECEIVED, delivery.summary)
         self._sync(rec)
@@ -107,6 +114,36 @@ class Pipeline:
         reason = self._scope_reason(delivery)
         if reason:
             return self._finish(rec, DeliveryState.REJECTED, reason)
+
+        # 承認待ちの再処理では、テストを回し直さない（本番のテストは
+        # 長く、承認を待つ間ずっと回し続けると無駄が大きい）。
+        # 前回 TESTED 以降まで進んだ記録が状態に残っていて、ref が
+        # 同じなら、承認ファイルの確認だけを行う。
+        if (
+            cfg.apply_mode != "auto"
+            and prior.get("state")
+            in (
+                DeliveryState.AWAITING_APPLY_APPROVAL.value,
+                DeliveryState.TESTED.value,
+            )
+            and prior.get("ref") == delivery.ref
+        ):
+            if not self._approval_exists(delivery.id):
+                rec.transition(
+                    DeliveryState.AWAITING_APPLY_APPROVAL,
+                    "テスト合格。承認シグナル待ち",
+                )
+                self._sync(rec)
+                self.logger.log(
+                    "delivery_still_awaiting_approval", delivery_id=delivery.id
+                )
+                return None  # 実質的な処理なし（見回りの集計にも数えない）
+            rec.transition(
+                DeliveryState.TESTED,
+                "前回のテスト合格を引き継ぎました（再テストなし）",
+            )
+            self._sync(rec)
+            return self._apply_and_restart(rec, self._checkout_head())
 
         remote = cfg.remote_for(delivery.repo_name)
         if not remote:

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -729,6 +730,66 @@ def test_digest_config_overrides():
     cfg3 = load_config(base_dir=tmp / "cfg-empty", environ={})
     assert cfg3.digest_enabled is True  # 既定は有効
     assert cfg3.digest_heartbeat_polls == 10  # 既定は10回に1回
+
+
+def test_test_runner_reports_progress():
+    tmp = Path(tempfile.mkdtemp())
+    runner = CommandTestRunner(
+        ((sys.executable, "-c", "import time; time.sleep(1.2)"),),
+        timeout_sec=30,
+        poll_interval_sec=0.2,
+    )
+    calls = []
+    ok, _out = runner.run(tmp, on_progress=lambda i, n, cmd, e: calls.append((i, n, e)))
+    assert ok
+    assert len(calls) >= 3
+    assert calls[0][2] == 0.0  # 開始時は即時
+    assert all(c[0] == 1 and c[1] == 1 for c in calls)
+    assert all(b[2] >= a[2] for a, b in zip(calls, calls[1:]))  # 経過は単調
+
+
+def test_test_runner_timeout_still_fails():
+    tmp = Path(tempfile.mkdtemp())
+    runner = CommandTestRunner(
+        ((sys.executable, "-c", "import time; time.sleep(10)"),),
+        timeout_sec=0.6,
+        poll_interval_sec=0.1,
+    )
+    started = time.monotonic()
+    ok, out = runner.run(tmp)
+    assert not ok
+    assert "タイムアウト" in out
+    assert time.monotonic() - started < 5  # kill されて戻る
+
+
+def test_digest_carries_daemon_detail():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    writer = StateWriter(cfg.state_path)
+    writer.set_daemon("working", "dlv-x のテスト実行中（1/2）: test_filer.py・経過 3分07秒")
+    digest = build_digest(cfg, writer, SubprocessGit())
+    assert digest["daemon"]["detail"] == (
+        "dlv-x のテスト実行中（1/2）: test_filer.py・経過 3分07秒"
+    )
+
+
+def test_pipeline_test_progress_writes_state_and_posts():
+    tmp = Path(tempfile.mkdtemp())
+    world = _make_world(tmp)
+    cfg = _config(tmp, world)
+    pipeline = _pipeline(cfg, FakeTransport())
+    posts = []
+    pipeline.progress_post = lambda: posts.append(1)
+    cb = pipeline._test_progress(type("D", (), {"id": "dlv-x"})())
+    cb(1, 2, ("python", "tests/test_filer.py"), 0.0)
+    snap = pipeline.state_writer.snapshot()
+    assert snap["daemon"]["state"] == "working"
+    assert "テスト実行中（1/2）" in snap["daemon"]["summary"]
+    assert "test_filer.py" in snap["daemon"]["summary"]
+    assert len(posts) == 1  # 開始時は即時に1回送る
+    cb(1, 2, ("python", "tests/test_filer.py"), 5.0)
+    assert len(posts) == 1  # 間引き（60秒）で増えない
 
 
 def main():

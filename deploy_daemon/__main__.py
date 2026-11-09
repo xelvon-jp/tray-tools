@@ -88,6 +88,8 @@ def main(argv=None) -> int:
     poster = DigestPoster(
         config, pipeline.intake.transport, pipeline.state_writer, pipeline.git
     )
+    # 長いテストの途中経過もダイジェストへ出す（パイプライン側の口）。
+    pipeline.progress_post = poster.post_now
 
     if args.once:
         records = pipeline.run_once()

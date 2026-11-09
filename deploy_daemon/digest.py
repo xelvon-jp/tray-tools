@@ -80,6 +80,7 @@ def build_digest(config, store, git) -> dict:
             "checkout_dir": (
                 str(config.checkout_dir) if config.checkout_dir is not None else None
             ),
+            "detail": daemon.get("summary"),
             "updated_at": snap.get("updated_at"),
         },
         "checkout_head": _checkout_head(config, git),
@@ -115,6 +116,19 @@ class DigestPoster:
         due = processed_any or self._polls_since_post >= cfg.digest_heartbeat_polls
         if not due:
             return False
+        return self._send()
+
+    def post_now(self) -> bool:
+        """タイミングに関係なく1回送る（長い処理の途中経過用）。
+
+        見回りの途中から呼ばれる前提で、例外は投げない。
+        """
+        if not self.config.digest_enabled:
+            return False
+        return self._send()
+
+    def _send(self) -> bool:
+        cfg = self.config
         try:
             digest = build_digest(cfg, self.store, self.git)
             body = json.dumps(digest, ensure_ascii=False).encode("utf-8")

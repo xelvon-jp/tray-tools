@@ -8,6 +8,7 @@ pipeline は小さなインターフェース越しにこれらを使うので�
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -90,27 +91,64 @@ class SubprocessGit:
 class CommandTestRunner:
     """設定されたテストコマンド列を検証用コピーの中で実行する。"""
 
-    def __init__(self, commands: tuple, timeout_sec: float = 1800.0):
+    def __init__(
+        self, commands: tuple, timeout_sec: float = 1800.0, poll_interval_sec: float = 5.0
+    ):
         self.commands = commands
         self.timeout_sec = timeout_sec
+        self.poll_interval_sec = poll_interval_sec
 
-    def run(self, cwd: Path):
-        """-> (ok, output_tail)。コマンド未設定なら安全側に倒して失敗を返す。"""
+    def run(self, cwd: Path, on_progress=None):
+        """-> (ok, output_tail)。コマンド未設定なら安全側に倒して失敗を返す。
+
+        on_progress があれば、各コマンドの開始時と実行中に
+        on_progress(何本目か, 全本数, コマンド, 経過秒) を呼ぶ。
+        長いテストの途中経過を状態へ出すための口で、間引きは
+        呼び出し側の責任（ここでは poll のたびに呼ぶ）。
+        """
         if not self.commands:
             return False, "テストコマンドが設定されていません（安全のため反映しません）"
         outputs = []
-        for cmd in self.commands:
+        total = len(self.commands)
+        for index, cmd in enumerate(self.commands, start=1):
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     list(cmd),
                     cwd=str(cwd),
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self.timeout_sec,
+                    errors="replace",
                 )
-            except (OSError, subprocess.TimeoutExpired) as e:
+            except OSError as e:
                 return False, f"テストコマンドを実行できませんでした {cmd}: {e}"
-            outputs.append(proc.stdout + proc.stderr)
+            started = time.monotonic()
+            if on_progress is not None:
+                on_progress(index, total, cmd, 0.0)
+            try:
+                while True:
+                    try:
+                        out, err = proc.communicate(timeout=self.poll_interval_sec)
+                        break
+                    except subprocess.TimeoutExpired:
+                        elapsed = time.monotonic() - started
+                        if elapsed > self.timeout_sec:
+                            proc.kill()
+                            out, err = proc.communicate()
+                            outputs.append((out or "") + (err or ""))
+                            outputs.append(
+                                f"テストがタイムアウトしました（{self.timeout_sec}秒）: {cmd}"
+                            )
+                            return False, _tail("\n".join(outputs))
+                        if on_progress is not None:
+                            on_progress(index, total, cmd, elapsed)
+            except Exception as e:  # noqa: BLE001 - テスト実行の想定外は失敗として扱う
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                return False, f"テストコマンドを実行できませんでした {cmd}: {e}"
+            outputs.append((out or "") + (err or ""))
             if proc.returncode != 0:
                 return False, _tail("\n".join(outputs))
         return True, _tail("\n".join(outputs))

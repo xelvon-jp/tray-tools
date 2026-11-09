@@ -53,6 +53,9 @@ class Pipeline:
         self.state_writer = state_writer
         self.seen = seen
         self.sleep = sleep
+        # 長い処理の途中経過をダイジェストへ即時送信するための口
+        # （__main__ が DigestPoster.post_now を差す。未設定なら送らない）。
+        self.progress_post = None
 
     # ---------- 1周分 ----------
 
@@ -139,8 +142,11 @@ class Pipeline:
                     "常時承認の範囲外のファイルが含まれています: " + "、".join(bad[:5]),
                 )
 
-        # テスト（A2）
-        ok, output = self.test_runner.run(staging)
+        # テスト（A2）。実行中は経過を状態とダイジェストへ出す
+        # （長いテストの間、配備係が黙り込まないように）。
+        ok, output = self.test_runner.run(
+            staging, on_progress=self._test_progress(delivery)
+        )
         if not ok:
             shutil.rmtree(staging, ignore_errors=True)  # 検証用コピーを破棄
             return self._finish(
@@ -302,6 +308,37 @@ class Pipeline:
                 return "verified", ""
             self.sleep(cfg.liveness_interval_sec)
         return "failed", "再起動後の生存確認ができませんでした"
+
+    def _test_progress(self, delivery):
+        """テストの途中経過を受けて、状態ファイルとダイジェストへ出す。
+
+        状態の書き換えは20秒に、ダイジェスト送信は60秒に1回まで
+        間引く（開始時だけは即時）。見える化の失敗でテスト自体を
+        止めないよう、例外はここで受ける。
+        """
+        last = {"state": -1e9, "post": -1e9}
+
+        def _cb(index, total, cmd, elapsed):
+            now = time.monotonic()
+            label = Path(cmd[-1]).name if cmd else ""
+            mins, secs = divmod(int(elapsed), 60)
+            text = (
+                f"{delivery.id} のテスト実行中（{index}/{total}）: {label}"
+                f"・経過 {mins}分{secs:02d}秒"
+            )
+            try:
+                if elapsed == 0.0 or now - last["state"] >= 20.0:
+                    last["state"] = now
+                    self.state_writer.set_daemon("working", text)
+                if self.progress_post is not None and (
+                    elapsed == 0.0 or now - last["post"] >= 60.0
+                ):
+                    last["post"] = now
+                    self.progress_post()
+            except Exception:  # noqa: BLE001 - 見える化は添え物
+                pass
+
+        return _cb
 
     # ---------- 範囲チェック・承認シグナル ----------
 

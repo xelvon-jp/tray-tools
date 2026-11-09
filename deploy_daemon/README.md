@@ -134,6 +134,7 @@ body: <ダイジェスト JSON>
     "state": "idle など",
     "apply_mode": "approval / auto",
     "checkout_dir": "実チェックアウトのパス",
+    "detail": "配備係の状態の要約（テスト実行中は、実行中のコマンドと経過が入る）",
     "updated_at": "状態ファイルの更新時刻"
   },
   "checkout_head": "実チェックアウトの現在 HEAD（読めなければ null）",
@@ -154,6 +155,10 @@ body: <ダイジェスト JSON>
 - 送るタイミング：届け出を処理した見回りでは毎回。処理が無い見回り
   では、生存を知らせるハートビートとして `digest_heartbeat_polls`
   回に1回（既定10回）。
+- テストの実行中は、途中経過も送る：実行中のコマンドと経過時間を
+  状態ファイル（20秒に1回まで）とダイジェスト（60秒に1回まで）へ
+  出し、`daemon.detail` に載る。長いテストの間も「いま何が・
+  どれだけ進んでいるか」が読み側から分かる。
 - 読み側は Worker 側の差分（collab-workspace の
   `docs/status-digest/worker-patch/`）で、`GET {intake_url}/digest` を
   読み取り専用キー（Worker 側の環境変数 `DEPLOY_DIGEST_KEY`、ヘッダ

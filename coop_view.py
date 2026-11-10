@@ -268,6 +268,7 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
         "flag_up": kind == "approval",
         "route": muse.get("route") if isinstance(muse.get("route"), str) else None,
         "pb_active": bool(pb and desk.get("state") == "running"),
+        "desk_stale": _desk_stale(desk, now),
         "all_idle": all_idle,
         "paused": bool(paused),
         "self": mbs.self_report(muse, now),
@@ -278,14 +279,33 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
 
 
 PB_CARD_SEC = 1800              # 窓口カードに直近の PB を残しておく秒数
+DESK_STALE_SEC = 180            # ハートビートがこれより古ければ窓口は応答なし
+
+
+def _desk_stale(desk, now):
+    """窓口のハートビート (desk_activity の heartbeat_at) が古いか。
+    ハートビート自体が無い (旧い窓口) ときは判定しない (False)。"""
+    if not isinstance(desk, dict):
+        return False
+    hb = _num(desk, "heartbeat_at")
+    return hb is not None and now - hb > DESK_STALE_SEC
 
 
 def _desk_card(desk, now):
     """窓口カードの (ラベル, 値)。直近のプレイブックと結果を残す(バナーは
     60秒で消えるが、カードは PB_CARD_SEC の間「最後に何をしたか」を持つ)。
-    ラベル側に状態(実行中/完了/失敗)、値に PB 番号を出す(カードは狭い)。"""
+    ラベル側に状態(実行中/完了/失敗)、値に PB 番号を出す(カードは狭い)。
+    ハートビートが古ければ「応答なし」を最優先で出す。"""
     if not isinstance(desk, dict):
         return ("窓口", "—")
+    if _desk_stale(desk, now):
+        name = desk.get("playbook")
+        if isinstance(name, str):
+            name = PB_ALIASES.get(name, name)
+        if (isinstance(name, str) and name.startswith("pb")
+                and len(name) == 6 and name[2:].isdigit()):
+            return ("窓口・応答なし", f"PB-{name[2:]}")
+        return ("窓口・応答なし", "—")
     name = desk.get("playbook")
     if isinstance(name, str):
         name = PB_ALIASES.get(name, name)

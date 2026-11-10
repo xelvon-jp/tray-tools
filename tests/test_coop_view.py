@@ -338,6 +338,20 @@ def test_desk_and_claude_cards():
     assert view(muse(), [{"state": "done"}])["cards"][4] == ("Claude", "待機")
     # 旗は承認待ちの間だけ
     assert view(muse(kind="approval", cards=1))["flag_up"] is True
+    # ハートビート: 新しければ通常表示、古ければ「応答なし」が最優先
+    desk = {"playbook": "pb1001", "state": "done", "ok": True,
+            "started_at": NOW - 900, "finished_at": NOW - 600,
+            "heartbeat_at": NOW - 10}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口・完了", "PB-1001") and v["desk_stale"] is False
+    desk = dict(desk, heartbeat_at=NOW - 181)
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口・応答なし", "PB-1001") and v["desk_stale"] is True
+    # ハートビートが無い (旧い窓口) ときは応答なしとは言わない
+    desk = {"playbook": "pb1001", "state": "done", "ok": True,
+            "started_at": NOW - 900, "finished_at": NOW - 600}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["desk_stale"] is False
 
 
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,

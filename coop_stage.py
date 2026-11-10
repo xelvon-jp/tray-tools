@@ -652,11 +652,15 @@ def _paint_scene(p, dpr, view, st, accent, t, spec):
                    Qt.AlignLeft | Qt.AlignVCenter, "z z")
 
     # --- 窓口(右下)。プレイブック実行中だけ金のドットが往復する ---
+    # ハートビートが古い (窓口が応答なし) ときはベルを薄くして出す。
     desk_cell = 2.2
     dx_, dy_ = pt(A["desk"])
+    if view.get("desk_stale"):
+        p.setOpacity(0.35)
     _sprite(p, dpr, ("scene", "desk"), sp.DESK_GRID, sp.DESK_PALETTE,
             dx_ - 6 * desk_cell, dy_ - 5 * desk_cell, desk_cell)
-    if view.get("pb_active"):
+    p.setOpacity(1.0)
+    if view.get("pb_active") and not view.get("desk_stale"):
         ph = (t % 1800) / 1800.0
         prog = 1.0 - abs(1.0 - 2.0 * ph)
         dot = _path_point([pt(A["pc"]), pt((0.85, 0.70)), pt(A["desk"])], prog)

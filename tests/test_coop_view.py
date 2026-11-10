@@ -256,11 +256,10 @@ def test_playbook_display():
     assert v["banner_title"] == "プレイブック(PB-4006)実行中" and v["tone"] == "work"
     assert v["banner_sub"] == "常駐の再起動（req-t1）"
     assert v["banner_time"] == "30秒"
-    # 移行期間は旧名の合図も同じ表示にする
+    # 旧名の合図はもう受けない (窓口は正規 ID で書く)
     v = cv.coop_view(muse(kind="processing"), [], NOW,
                      desk=dict(desk_run, playbook="traytools_restart"))
-    assert v["banner_title"] == "プレイブック(PB-4006)実行中"
-    assert v["banner_sub"] == "常駐の再起動（req-t1）"
+    assert v["banner_title"] != "プレイブック(PB-4006)実行中"
     # 承認待ちには勝たない
     v = cv.coop_view(muse(kind="approval", kind_since=NOW - 5), [], NOW, desk=desk_run)
     assert v["banner_title"] == "Muse が承認待ち"

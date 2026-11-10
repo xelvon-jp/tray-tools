@@ -66,17 +66,6 @@ PB_LABELS = {
     "pb1007": "見張りの同期",
     "pb5008": "画面の撮影",
 }
-# 移行期間の別名 (旧名 → 正規 ID)。窓口が旧名で合図を書く間だけ受ける。
-PB_ALIASES = {
-    "traytools_sync": "pb1001",
-    "daemon_sync": "pb1002",
-    "desk_sync": "pb1003",
-    "deploy_approve": "pb2004",
-    "config_set": "pb3005",
-    "traytools_restart": "pb4006",
-    "watcher_sync": "pb1007",
-    "pc_capture": "pb5008",
-}
 PB_RUN_STALE_SEC = 600            # 実行中がこれより古ければ合図ファイルの残骸とみなす
 PB_DONE_SHOW_SEC = 60             # 完了・失敗の結果を出しておく秒数
 
@@ -95,8 +84,6 @@ def _pb_view(desk, now):
     if not isinstance(desk, dict):
         return None
     name = desk.get("playbook")
-    if isinstance(name, str):
-        name = PB_ALIASES.get(name, name)
     label = PB_LABELS.get(name, name) if isinstance(name, str) and name else None
     if not label:
         return None
@@ -302,15 +289,11 @@ def _desk_card(desk, now):
         return ("窓口", "—")
     if _desk_stale(desk, now):
         name = desk.get("playbook")
-        if isinstance(name, str):
-            name = PB_ALIASES.get(name, name)
         if (isinstance(name, str) and name.startswith("pb")
                 and len(name) == 6 and name[2:].isdigit()):
             return ("窓口・応答なし", f"PB-{name[2:]}")
         return ("窓口・応答なし", "—")
     name = desk.get("playbook")
-    if isinstance(name, str):
-        name = PB_ALIASES.get(name, name)
     if not (isinstance(name, str) and name.startswith("pb")
             and len(name) == 6 and name[2:].isdigit()):
         return ("窓口", "待機")

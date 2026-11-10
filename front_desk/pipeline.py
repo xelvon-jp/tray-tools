@@ -50,6 +50,8 @@ class DeskPipeline:
         self._idle_polls = 0
         self._desk_state = "idle"
         self._desk_detail = "起動しました"
+        self._long_poll_wait = config.effective_long_poll_wait_sec
+        self.last_fetch_error = False
 
     # -- 状態 ------------------------------------------------------------
 
@@ -166,11 +168,13 @@ class DeskPipeline:
         self._reconcile()
         fetched = self._transport.list_requests()
         if fetched.error:
+            self.last_fetch_error = True
             self._log.write(LogRecord(
                 at=now_iso(), event="poll_error", detail=fetched.error))
             self._set_state("error", f"取得に失敗しました: {fetched.error}",
                             post=True)
             return 0
+        self.last_fetch_error = False
         processed = 0
         for request in fetched.requests:
             if self._processed.is_done(request.id):
@@ -191,12 +195,28 @@ class DeskPipeline:
                 self._set_state("idle", "見回り完了（0件処理）")
         return processed
 
+    def _next_sleep(self, elapsed: float) -> int:
+        """次の見回りまでの待ち (秒)。
+
+        ロングポールが効いているときは取得自体が待つので、取得に
+        時間がかかった周はすぐ次を張る。取得がすぐ返った周 (相手が
+        ロングポールに応じない旧サーバ) は5秒あけて空転を避ける。
+        取得が失敗した周は通常間隔に戻して休ませる。
+        """
+        wait = self._long_poll_wait
+        if wait <= 0 or self.last_fetch_error:
+            return max(1, self._config.poll_interval_sec)
+        if elapsed >= wait * 0.8:
+            return 1
+        return 5
+
     def run_forever(self, sleep_fn=time.sleep, should_stop=None) -> None:
         """見回りを続ける。1回の失敗で全体を止めない。"""
         self._set_state("idle", "起動しました", post=True)
         while True:
             if should_stop is not None and should_stop():
                 break
+            started = time.monotonic()
             try:
                 self.poll_once()
             except Exception:
@@ -205,5 +225,6 @@ class DeskPipeline:
                     detail=traceback.format_exc()))
                 self._set_state("error", "見回りで例外が発生しました",
                                 post=True)
-            sleep_fn(max(1, self._config.poll_interval_sec))
+                self.last_fetch_error = True
+            sleep_fn(self._next_sleep(time.monotonic() - started))
         self._set_state("stopped", "停止しました", post=True)

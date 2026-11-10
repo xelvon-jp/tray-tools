@@ -38,6 +38,7 @@ Muse からの依頼を Worker 経由で受け取り、実行モデル目安 (ti
 {
   "worker_base_url": "https://<worker の基底 URL>",
   "poll_interval_sec": 60,
+  "long_poll_wait_sec": 50,
   "exec_timeout_sec": 1800,
   "state_heartbeat_polls": 10,
   "allowed_kinds": ["inspect"],
@@ -53,6 +54,10 @@ Muse からの依頼を Worker 経由で受け取り、実行モデル目安 (ti
   は、PC 側での実地確認 (ロードマップ A7) の後に確定する。未設定の
   tier の依頼は `failed` (未設定) で返る。
 - 窓口鍵は設定に書かず、環境変数 `FRONT_DESK_KEY` で渡す。
+- `long_poll_wait_sec` は、接続先がこの PC 内 (家サーバ) のときだけ
+  効く。依頼の取得 (`GET /requests?wait=`) を張って新規登録を待ち、
+  拾うまでの遅れをほぼ無くす。Worker 経路では枠を食うので使わない
+  (接続先がループバックでなければ自動で無効)。
 
 ## プレイブック (モデルなし実行)
 

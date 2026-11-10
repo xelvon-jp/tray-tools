@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import urllib.parse
 from typing import Optional
 
 from .model import REQUEST_KINDS
@@ -24,6 +25,12 @@ def default_base_dir() -> str:
     return os.path.join(local, "traytools", "front-desk")
 
 
+def is_loopback_url(url: str) -> bool:
+    """接続先がこの PC 内かどうか。ロングポールの可否を決める。"""
+    host = urllib.parse.urlparse(url or "").hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 @dataclasses.dataclass(frozen=True)
 class DeskConfig:
     # 依頼の置き場 (Worker の基底 URL)。/requests 等はここへ足す。
@@ -31,6 +38,10 @@ class DeskConfig:
     # 見回り間隔と、実行の打ち切り。
     poll_interval_sec: int = 60
     exec_timeout_sec: int = 1800
+    # ロングポール: 接続先がこの PC 内 (家サーバ) のときだけ、依頼の
+    # 取得を最大この秒数まで張って新規登録を待つ。0 で無効。Worker
+    # 経路では枠 (DO の読み取り) を食うので絶対に使わない。
+    long_poll_wait_sec: int = 50
     # 状態 (desk-state) の heartbeat: 何回の見回りごとに送るか。
     state_heartbeat_polls: int = 10
     # 実行を許可する kind。第1段は読み取り確認 (inspect) だけ。
@@ -54,6 +65,14 @@ class DeskConfig:
     log_filename: str = LOG_FILENAME
     processed_filename: str = PROCESSED_FILENAME
     stop_filename: str = STOP_FILENAME
+
+    @property
+    def effective_long_poll_wait_sec(self) -> int:
+        """実際に使うロングポールの待ち秒。接続先が PC 内のときだけ有効。"""
+        if self.long_poll_wait_sec > 0 \
+                and is_loopback_url(self.worker_base_url):
+            return self.long_poll_wait_sec
+        return 0
 
     @property
     def state_path(self) -> str:
@@ -86,6 +105,9 @@ class DeskConfig:
             if isinstance(value, int) and not isinstance(value, bool) \
                     and value > 0:
                 kwargs[key] = value
+        lp = data.get("long_poll_wait_sec")
+        if isinstance(lp, int) and not isinstance(lp, bool) and lp >= 0:
+            kwargs["long_poll_wait_sec"] = min(lp, 55)
         kinds = data.get("allowed_kinds")
         if isinstance(kinds, list):
             safe = tuple(k for k in kinds

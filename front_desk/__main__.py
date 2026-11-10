@@ -24,7 +24,9 @@ ENV_DESK_KEY = "FRONT_DESK_KEY"
 
 
 def build_pipeline(config: DeskConfig, desk_key: str) -> DeskPipeline:
-    transport = UrllibTransport(config.worker_base_url, desk_key)
+    transport = UrllibTransport(
+        config.worker_base_url, desk_key,
+        wait_sec=config.effective_long_poll_wait_sec)
     model_executor = SubprocessExecutor(
         config.executor_commands, config.exec_timeout_sec, config.workdir)
     executor = RoutingExecutor(PlaybookExecutor(config), model_executor)

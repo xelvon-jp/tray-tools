@@ -299,6 +299,86 @@ def test_subprocess_executor_uses_utf8():
     assert seen.get("errors") == "replace"
 
 
+# ---- ロングポール -------------------------------------------------------------
+
+def test_loopback_url_detection():
+    from front_desk.config import is_loopback_url
+    assert is_loopback_url("http://127.0.0.1:8770")
+    assert is_loopback_url("http://localhost:8770")
+    assert is_loopback_url("http://[::1]:8770")
+    assert not is_loopback_url("https://example.workers.dev")
+    assert not is_loopback_url("http://100.117.230.34:8770")
+    assert not is_loopback_url("")
+
+
+def test_config_long_poll_effective():
+    local = DeskConfig.from_json({"worker_base_url": "http://127.0.0.1:8770"})
+    assert local.long_poll_wait_sec == 50
+    assert local.effective_long_poll_wait_sec == 50
+    remote = DeskConfig.from_json({
+        "worker_base_url": "https://example.workers.dev",
+        "long_poll_wait_sec": 30})
+    assert remote.effective_long_poll_wait_sec == 0
+    off = DeskConfig.from_json({
+        "worker_base_url": "http://127.0.0.1:8770",
+        "long_poll_wait_sec": 0})
+    assert off.effective_long_poll_wait_sec == 0
+    clamped = DeskConfig.from_json({
+        "worker_base_url": "http://127.0.0.1:8770",
+        "long_poll_wait_sec": 999})
+    assert clamped.long_poll_wait_sec == 55
+
+
+def test_transport_wait_url_and_timeout():
+    import front_desk.intake as intake_mod
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"requests": []}'
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        return Resp()
+
+    real = intake_mod.urllib.request.urlopen
+    intake_mod.urllib.request.urlopen = fake_urlopen
+    try:
+        t = intake_mod.UrllibTransport("http://127.0.0.1:8770", "k",
+                                       wait_sec=50)
+        got = t.list_requests()
+        assert got.error == "" and got.requests == ()
+        assert seen["url"] == "http://127.0.0.1:8770/requests?wait=50"
+        assert seen["timeout"] >= 65
+        t2 = intake_mod.UrllibTransport("http://127.0.0.1:8770", "k")
+        t2.list_requests()
+        assert seen["url"] == "http://127.0.0.1:8770/requests"
+        assert seen["timeout"] == 30
+    finally:
+        intake_mod.urllib.request.urlopen = real
+
+
+def test_next_sleep_long_poll():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        local = make_pipeline(tmp, FakeTransport(), FakeExecutor(),
+                              worker_base_url="http://127.0.0.1:8770")
+        assert local._next_sleep(50.0) == 1
+        assert local._next_sleep(0.1) == 5
+        local.last_fetch_error = True
+        assert local._next_sleep(50.0) == 60
+        remote = make_pipeline(tmp, FakeTransport(), FakeExecutor(),
+                               worker_base_url="https://example.workers.dev")
+        assert remote._next_sleep(0.1) == 60
+
+
 # ---- 実行器 -----------------------------------------------------------------
 
 def _run_all():

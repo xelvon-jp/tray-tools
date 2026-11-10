@@ -357,7 +357,30 @@ def test_desk_and_claude_cards():
     assert v["desk_stale"] is False
 
 
+def test_mirror_bad():
+    # mirror が無い (旧い見張り)・無効のときは異常と言わない
+    assert view(muse())["mirror_bad"] is False
+    assert view(muse(mirror=None))["mirror_bad"] is False
+    assert view(muse(mirror={"enabled": False, "last_ok": None,
+                             "error": None}))["mirror_bad"] is False
+    # 健全: 最後の成功が新しく、エラー無し
+    ok = {"enabled": True, "last_ok": NOW - 100, "error": None}
+    assert view(muse(mirror=ok))["mirror_bad"] is False
+    # エラーが残っている (次の成功で消える) なら異常
+    err = {"enabled": True, "last_ok": NOW - 100, "error": "alive: HTTP 500"}
+    assert view(muse(mirror=err))["mirror_bad"] is True
+    # 最後の成功が10分より古ければ異常、境界 (600秒) はまだ健全
+    stale = {"enabled": True, "last_ok": NOW - 601, "error": None}
+    assert view(muse(mirror=stale))["mirror_bad"] is True
+    edge = {"enabled": True, "last_ok": NOW - 600, "error": None}
+    assert view(muse(mirror=edge))["mirror_bad"] is False
+    # まだ一度も成功していない (起動直後) は判定しない
+    fresh = {"enabled": True, "last_ok": None, "error": None}
+    assert view(muse(mirror=fresh))["mirror_bad"] is False
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,
+             test_mirror_bad,
              test_route_mailbox_wording, test_desk_and_claude_cards,
              test_playbook_display, test_auto_approval_display,
              test_approval_card_missing, test_approval_turns_alert_at_180,

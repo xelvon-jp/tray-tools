@@ -256,6 +256,7 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
         "route": muse.get("route") if isinstance(muse.get("route"), str) else None,
         "pb_active": bool(pb and desk.get("state") == "running"),
         "desk_stale": _desk_stale(desk, now),
+        "mirror_bad": _mirror_bad(muse, now),
         "all_idle": all_idle,
         "paused": bool(paused),
         "self": mbs.self_report(muse, now),
@@ -263,6 +264,28 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
         "flights": bev.flights(events, now) if events else [],
         "tape": bev.tape_lines(events, now) if events else [],
     }
+
+
+MIRROR_STALE_SEC = 600          # 鏡写しの最後の成功がこれより古ければ異常
+
+
+def _mirror_bad(muse, now):
+    """鏡写し (家→Worker の表示用転送) が止まっていないか。
+    mirror 自体が無い (旧い見張り)・無効のときは判定しない (False)。
+    エラーが残っている (次の成功で消える) か、最後の成功が
+    MIRROR_STALE_SEC より古ければ bad。まだ一度も成功していない
+    (家サーバの起動直後) は判定しない。"""
+    if not isinstance(muse, dict):
+        return False
+    mirror = muse.get("mirror")
+    if not isinstance(mirror, dict) or not mirror.get("enabled"):
+        return False
+    if mirror.get("error"):
+        return True
+    last_ok = mirror.get("last_ok")
+    if isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool):
+        return now - last_ok > MIRROR_STALE_SEC
+    return False
 
 
 PB_CARD_SEC = 60                # 窓口カードに完了・失敗を残しておく秒数

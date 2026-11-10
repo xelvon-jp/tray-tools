@@ -599,6 +599,12 @@ def _paint_scene(p, dpr, view, st, accent, t, spec):
         wave = 0 if t % 800 < 400 else 1
         p.fillRect(int(post_left + 15 + wave), int(post_top + 2), 7, 4,
                    QColor("#FF7847"))
+    if view.get("mirror_bad"):
+        # 鏡写し (家→Worker の表示用転送) が止まっている: 左上に「！」の印
+        bx, by = int(post_left), int(post_top)
+        p.fillRect(bx, by, 9, 9, QColor("#FF7847"))
+        p.fillRect(bx + 4, by + 2, 1, 4, QColor("#1A1A2E"))
+        p.fillRect(bx + 4, by + 7, 1, 1, QColor("#1A1A2E"))
 
     # --- Muse(左) ---
     muse_cell = 2.2

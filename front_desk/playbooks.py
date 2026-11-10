@@ -859,22 +859,44 @@ def _write_bytes_atomic(path: str, data: bytes) -> bool:
         return False
 
 
-def _events_marker(events_path: str) -> int:
-    try:
-        return os.path.getsize(events_path)
-    except OSError:
-        return 0
+def _monitor_start_ts(text: str):
+    """events ファイルの本文から monitor_start の ts 一覧を取り出す。
+
+    見張りの events ファイルは追記ではなく全体の書き直し (deque の
+    dump) なので、バイト位置で前後を比べることはできない。ts の
+    新旧で判定する。ts が無い記録は None として数だけ数える。"""
+    out = []
+    for m in re.finditer(r'\{[^{}]*"ev"\s*:\s*"monitor_start"[^{}]*\}',
+                         text):
+        t = re.search(r'"ts"\s*:\s*([0-9]+(?:\.[0-9]+)?)', m.group(0))
+        out.append(float(t.group(1)) if t else None)
+    return out
 
 
-def _fresh_monitor_start(events_path: str, marker: int) -> bool:
-    """marker 以降に monitor_start が記録されていれば True。"""
+def _read_events_text(events_path: str) -> str:
     try:
-        with open(events_path, "rb") as fh:
-            fh.seek(marker)
-            new_content = fh.read().decode("utf-8", errors="replace")
+        with open(events_path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
     except OSError:
-        return False
-    return "monitor_start" in new_content
+        return ""
+
+
+def _events_marker(events_path: str):
+    """再起動前の monitor_start の (件数, 最大 ts)。"""
+    starts = _monitor_start_ts(_read_events_text(events_path))
+    dated = [t for t in starts if t is not None]
+    return (len(starts), max(dated) if dated else None)
+
+
+def _fresh_monitor_start(events_path: str, marker) -> bool:
+    """marker の時点より新しい monitor_start が記録されていれば True。
+    deque が溢れて古い記録が押し出されても、ts の新しさで拾える。"""
+    count0, max0 = marker
+    starts = _monitor_start_ts(_read_events_text(events_path))
+    if len(starts) > count0:
+        return True
+    return any(t is not None and (max0 is None or t > max0)
+               for t in starts)
 
 
 def watcher_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:

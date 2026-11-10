@@ -283,8 +283,28 @@ def test_playbook_display():
     assert v["banner_title"] != "プレイブック(PB-4006)実行中"
 
 
+def test_auto_approval_display():
+    import time as _time
+    m = muse(last_approval_at=NOW - 30, last_approval_preview="mb-20261110-99")
+    v = cv.coop_view(m, [], NOW)
+    assert v["banner_title"] == "自動承認しました" and v["tone"] == "done"
+    assert v["banner_sub"] == "予告 mb-20261110-99"
+    hhmm = _time.strftime("%H:%M", _time.localtime(NOW - 30))
+    assert v["cards"][0] == ("承認", f"自動 {hhmm}")
+    # 承認待ちには勝たない
+    v = cv.coop_view(muse(kind="approval", kind_since=NOW - 5, cards=1,
+                          last_approval_at=NOW - 30), [], NOW)
+    assert v["banner_title"] == "Muse が承認待ち"
+    # バナーは90秒だけ。カードの「自動 HH:MM」は30分残る
+    v = cv.coop_view(muse(last_approval_at=NOW - 91, approved=3), [], NOW)
+    assert v["banner_title"] == "全員待機中"
+    assert v["cards"][0][1].startswith("自動 ")
+    v = cv.coop_view(muse(last_approval_at=NOW - 1801, approved=3), [], NOW)
+    assert v["cards"][0] == ("承認", "3件")
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,
-             test_playbook_display,
+             test_playbook_display, test_auto_approval_display,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,
              test_done_window, test_sleep_default, test_cards,

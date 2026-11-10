@@ -123,6 +123,21 @@ def _pb_view(desk, now):
     return None
 
 
+AUTO_SHOW_SEC = 90              # 自動承認のバナーを出しておく秒数
+AUTO_CARD_SEC = 1800            # 承認カードに「自動 HH:MM」を出しておく秒数
+
+
+def _auto_view(muse, now):
+    """直近の自動承認のバナー (見張りの状態ファイルから)。無ければ None。"""
+    at = _num(muse, "last_approval_at")
+    if at is None or not (0 <= now - at <= AUTO_SHOW_SEC):
+        return None
+    preview = muse.get("last_approval_preview")
+    sub = f"予告 {preview}" if isinstance(preview, str) and preview else ""
+    return {"tone": "done", "title": "自動承認しました", "sub": sub,
+            "elapsed": now - at}
+
+
 def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=None):
     """連携ステージの表示内容(dict)。出さないなら None。
 
@@ -166,6 +181,7 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
     running = [e for e in entries if e.get("state") == "running"]
     asking = [e for e in entries if e.get("state") == "ask"]
     pb = _pb_view(desk, now)
+    auto = _auto_view(muse, now)
 
     if paused:
         # 休止中は last_poll が進まなくても「止まっている」とは言わない
@@ -199,6 +215,8 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
         tone, title, sub = "alert", "状態が分かりません", "Muse の画面を判定できません"
     elif pb is not None:
         tone, title, sub, elapsed = pb["tone"], pb["title"], pb["sub"], pb["elapsed"]
+    elif auto is not None:
+        tone, title, sub, elapsed = auto["tone"], auto["title"], auto["sub"], auto["elapsed"]
     elif kind in ("processing", "responding"):
         tone, title = "work", "いま：Muse が作業中"
         sub = header if header not in mbs.HEADER_PLAIN else "Claw'd が見守っています"
@@ -253,8 +271,11 @@ def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False) -> list:
     if approval_sec is not None:
         approval_sec = max(0.0, approval_sec)
     approved = _num(muse, "approved") or 0
+    auto_at = _num(muse, "last_approval_at")
     if kind == "approval":
         approval = mbs.fmt_dur(kind_elapsed)      # 承認待ちの間は経過秒
+    elif auto_at is not None and 0 <= now - auto_at <= AUTO_CARD_SEC:
+        approval = "自動 " + time.strftime("%H:%M", time.localtime(auto_at))
     elif approval_sec is not None:
         approval = f"{approval_sec:.1f}秒"
     elif approved > 0:

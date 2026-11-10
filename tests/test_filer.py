@@ -9058,7 +9058,7 @@ def test_window_copy_path_box_dialog():
     import filer
     import filer_box
     from PySide6.QtCore import QUrl
-    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtGui import QGuiApplication, QTextCursor
     from PySide6.QtWidgets import QLabel, QPushButton
 
     _qapp()
@@ -9146,12 +9146,27 @@ def test_window_copy_path_box_dialog():
                 seen_dialog["names"] = {b.objectName()
                                         for b in dialog.findChildren(QPushButton)}
                 preview = dialog.findChild(filer._LinkPreview, "copyKindPreview")
-                seen_dialog["preview_path"] = preview.toPlainText().strip()
-                dialog.findChild(QPushButton, "copyKindBoth").click()
-                seen_dialog["still_open"] = dialog.result() != filer.QDialog.Accepted
+                # プレビューには最初から両方のテキストが入っている
                 both_text = preview.toPlainText()
                 seen_dialog["both_has_full"] = full in both_text
                 seen_dialog["both_has_share"] = "https://app.box.com/folder/9101" in both_text
+                doc = preview.document()
+                # フルパスの中にも同じ文字列が含まれるので、後ろの塊を後方検索で取る
+                pos_box = both_text.find("/Box/ProjA/資料/", len(full))
+
+                def fg(pos):
+                    cur = QTextCursor(doc)
+                    cur.setPosition(pos)
+                    return cur.charFormat().foreground().color()
+
+                # 既定(フルパス): 前の塊が有効、後ろの塊がグレー
+                seen_dialog["fg_path"] = (fg(0), fg(pos_box))
+                dialog.findChild(QPushButton, "copyKindBoth").click()
+                seen_dialog["still_open"] = dialog.result() != filer.QDialog.Accepted
+                seen_dialog["fg_both"] = (fg(0), fg(pos_box))
+                dialog.findChild(QPushButton, "copyKindBox").click()
+                seen_dialog["fg_box"] = (fg(0), fg(pos_box))
+                dialog.findChild(QPushButton, "copyKindBoth").click()
                 url = "https://app.box.com/folder/9101"
                 seen_dialog["tip"] = preview.tip_for(url)
                 preview.anchorClicked.emit(QUrl(url))
@@ -9166,9 +9181,12 @@ def test_window_copy_path_box_dialog():
             assert seen_dialog["names"] == {"copyKindPath", "copyKindBox",
                                             "copyKindBoth", "copyKindOk",
                                             "copyKindCancel"}, seen_dialog
-            assert seen_dialog["preview_path"] == full, seen_dialog
             assert seen_dialog["still_open"]
             assert seen_dialog["both_has_full"] and seen_dialog["both_has_share"]
+            fg_active, fg_dim = seen_dialog["fg_path"]
+            assert fg_active != fg_dim                       # 選んでいない塊はグレー
+            assert seen_dialog["fg_both"] == (fg_active, fg_active)
+            assert seen_dialog["fg_box"] == (fg_dim, fg_active)
             assert "資料（フォルダ）" in seen_dialog["tip"]
             assert "パス：/Box/ProjA/資料/" in seen_dialog["tip"]
             assert "フォルダ ID：9101" in seen_dialog["tip"]

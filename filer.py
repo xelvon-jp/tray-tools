@@ -52,7 +52,10 @@ from PySide6.QtGui import (
     QKeySequence,
     QLinearGradient,
     QPainter,
+    QPalette,
     QShortcut,
+    QTextCharFormat,
+    QTextCursor,
 )
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -6125,28 +6128,20 @@ class FilerWindow(QWidget):
                 "クリックでブラウザで開きます")
 
     @staticmethod
-    def _copy_preview_html(kind, full_text, data):
-        """プレビューに出す HTML。コピーされる文字列を <pre> でそのまま見せ、
-        共有用テキストのフォルダ URL だけをリンクにする。"""
+    def _copy_preview_html(full_text, data):
+        """プレビュー全体の HTML。フルパス → 空行 → 共有用テキスト(作れたとき)を
+        1つの <pre> に入れ、共有用テキストのフォルダ URL だけをリンクにする。
+        選択に応じた強調は、文書を作ったあと文字の範囲への書式付けで切り替える
+        (中身は作り替えない)。"""
         import html as _html
+        body = _html.escape(full_text.replace("\r\n", "\n"))
         share = data["text"]
-
-        def linked(text):
-            out = _html.escape(text.replace("\r\n", "\n"))
+        if share is not None:
+            linked = _html.escape(share.replace("\r\n", "\n"))
             for _shown, url in data["blocks"]:
                 esc = _html.escape(url)
-                out = out.replace(esc, f'<a href="{esc}">{esc}</a>')
-            return out
-
-        if kind == "path":
-            body = _html.escape(full_text.replace("\r\n", "\n"))
-        elif kind == "box":
-            body = (linked(share) if share is not None
-                    else "共有用テキストは作れませんでした。")
-        else:  # both
-            body = _html.escape(full_text.replace("\r\n", "\n"))
-            if share is not None:
-                body += "\n\n" + linked(share)
+                linked = linked.replace(esc, f'<a href="{esc}">{esc}</a>')
+            body += "\n\n" + linked
         return f"<pre>{body}</pre>"
 
     @staticmethod
@@ -6166,11 +6161,13 @@ class FilerWindow(QWidget):
         """C→P で Box の共有用テキストも作れるとき、プレビューを見せて何をコピーするか聞く。
         "path" / "box" / "both" / None(キャンセル)を返す。(テストではここを差し替える)
 
-        選択(P / L / B のキー・↑↓・ボタンのクリック)だけではコピーせず、プレビューが
-        切り替わるだけ。Enter か「コピー」で確定する。既定はフルパス。
+        プレビューには最初から両方のテキスト(フルパス → 空行 → 共有用テキスト)が
+        入っていて、選択(P / B / A のキー・←→・↑↓・ボタンのクリック)では中身を
+        作り替えず、コピーされる部分を強調し、されない部分をグレーにするだけ。
+        Enter か「コピー」で確定する。既定はフルパス。
         プレビューのフォルダ URL はリンクで、ホバーでリンク先フォルダの情報を出し、
         クリックでブラウザで開く(窓は閉じない)。共有用テキストが作れなかったときは
-        「共有用テキスト」を選んでも確定できない。"""
+        「Box の共有用テキスト」を選んでも確定できない。"""
         dialog = QDialog(self)
         dialog.setWindowTitle("何をコピーしますか？")
         layout = QVBoxLayout(dialog)
@@ -6179,9 +6176,9 @@ class FilerWindow(QWidget):
         buttons = {}
         row = QHBoxLayout()
         for kind, label, name in (
-                ("path", "フルパス（通常）", "copyKindPath"),
-                ("box", "共有用テキスト", "copyKindBox"),
-                ("both", "両方", "copyKindBoth")):
+                ("path", "P フルパス", "copyKindPath"),
+                ("box", "B Box の共有用テキスト", "copyKindBox"),
+                ("both", "A 両方", "copyKindBoth")):
             button = QPushButton(label)
             button.setObjectName(name)
             button.setCheckable(True)
@@ -6191,10 +6188,10 @@ class FilerWindow(QWidget):
             buttons[kind] = button
         row.addStretch(1)
         layout.addLayout(row)
-        layout.addWidget(QLabel("プレビュー"))
         preview = _LinkPreview(dialog)
         preview.setObjectName("copyKindPreview")
         preview.setMinimumHeight(150)
+        preview.setHtml(self._copy_preview_html(full_text, data))
         tips = {url: self._box_link_tip(shown, url) for shown, url in data["blocks"]}
         preview.tip_for = tips.get
 
@@ -6206,6 +6203,9 @@ class FilerWindow(QWidget):
 
         preview.anchorClicked.connect(open_link)
         layout.addWidget(preview)
+        hint = QLabel("グレー表示の部分はコピーされません")
+        hint.setObjectName("copyKindHint")
+        layout.addWidget(hint)
         note = QLabel(dialog)
         note.setObjectName("copyKindNote")
         note.setWordWrap(True)
@@ -6222,11 +6222,38 @@ class FilerWindow(QWidget):
         bottom.addWidget(cancel)
         layout.addLayout(bottom)
 
+        # 強調の切り替え: 文書は作り替えず、2つの範囲の文字書式だけを差し替える
+        doc = preview.document()
+        plain = doc.toPlainText()
+        full_plain = full_text.replace("\r\n", "\n")
+        ranges = {"path": (0, len(full_plain)), "box": None}
+        if data["text"] is not None:
+            start = plain.find(data["text"].replace("\r\n", "\n").split("\n", 1)[0],
+                               len(full_plain))
+            if start >= 0:
+                ranges["box"] = (start, len(plain))
+        active_fmt = QTextCharFormat()
+        active_fmt.setForeground(preview.palette().color(QPalette.ColorRole.Text))
+        active_fmt.setBackground(QColor("#dcebfb"))
+        dim_fmt = QTextCharFormat()
+        dim_fmt.setForeground(QColor("#8f8f8f"))
+        dim_fmt.setBackground(QBrush(Qt.BrushStyle.NoBrush))
+
+        def emphasize(kind):
+            for key, rng in ranges.items():
+                if rng is None:
+                    continue
+                cursor = QTextCursor(doc)
+                cursor.setPosition(rng[0])
+                cursor.setPosition(rng[1], QTextCursor.MoveMode.KeepAnchor)
+                on = kind == "both" or kind == key
+                cursor.mergeCharFormat(active_fmt if on else dim_fmt)
+
         def select(kind):
             state["kind"] = kind
             for k, b in buttons.items():
                 b.setChecked(k == kind)
-            preview.setHtml(self._copy_preview_html(kind, full_text, data))
+            emphasize(kind)
             note.setText(self._copy_preview_note(kind, data))
             ok.setEnabled(kind != "box" or data["text"] is not None)
 
@@ -6242,13 +6269,12 @@ class FilerWindow(QWidget):
         def cycle(delta):
             select(order[(order.index(state["kind"]) + delta) % len(order)])
 
-        for key, kind in (("P", "path"), ("L", "box"), ("B", "both")):
+        for key, kind in (("P", "path"), ("B", "box"), ("A", "both")):
             shortcut = QShortcut(QKeySequence(key), dialog)
             shortcut.activated.connect(lambda k=kind: select(k))
-        up = QShortcut(QKeySequence("Up"), dialog)
-        up.activated.connect(lambda: cycle(-1))
-        down = QShortcut(QKeySequence("Down"), dialog)
-        down.activated.connect(lambda: cycle(1))
+        for seq, delta in (("Up", -1), ("Down", 1), ("Left", -1), ("Right", 1)):
+            move = QShortcut(QKeySequence(seq), dialog)
+            move.activated.connect(lambda d=delta: cycle(d))
         for seq in ("Return", "Enter"):
             enter = QShortcut(QKeySequence(seq), dialog)
             enter.activated.connect(confirm)

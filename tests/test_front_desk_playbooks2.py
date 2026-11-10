@@ -257,6 +257,12 @@ def test_desk_sync_happy_path_defers_restart():
     helper = spawns[0]
     assert "Stop-ScheduledTask" in helper and "FrontDesk" in helper
     assert "Start-Sleep -Seconds 20" in helper, helper
+    # 停止→開始だけでは切り離された本体が生き残る (2026-11-10 実測)。
+    # ヘルパーは本体の python プロセスを止めてからタスクを起こす。
+    assert "Stop-Process" in helper and "front_desk" in helper, helper
+    assert (helper.index("Stop-ScheduledTask")
+            < helper.index("Stop-Process")
+            < helper.index("Start-ScheduledTask")), helper
     # 窓口自身は直接タスクを止めない (止めると報告できないため)
     direct = [s for s in m.ps_scripts() if s.startswith("Stop-ScheduledTask")]
     assert direct == [], m.ps_scripts()

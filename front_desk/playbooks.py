@@ -446,9 +446,28 @@ def _spawn_delayed_task_restart(ctx: PlaybookContext, task: str,
     窓口自身を止めると報告 (結果 POST) ができなくなるため、再起動は
     ヘルパー側で delay_sec 待ってから行う (仕様 §PB-3 の特例)。
     ヘルパーは Start-Process で切り離すので、この呼び出し自体は
-    すぐ返る。"""
+    すぐ返る。
+
+    Stop/Start-ScheduledTask だけでは本体が切り替わらない。
+    2026-11-10 09:20 JST の実測で、タスクの停止→開始を回しても
+    切り離されて動いている本体プロセスが生き残り、合図ファイルが
+    作られず古い窓口が動き続けた。同じ日に手で直した手順
+    (CommandLine に front_desk を含む python プロセスを止めてから
+    タスクを起こす) を、ヘルパーの中に同じ順序で入れてある。
+    ヘルパー自身は powershell なので、python の絞り込みには当たらない。
+
+    絞り込みの文字列は単一引用符で書く。Start-Process の引数連結
+    (PS 5.1) は二重引用符を含む引数を壊すことがあり、旧版の
+    Stop/Start のみ版が 2026-11-10 12:29 に無言で効かなかった
+    疑いが濃いため。
+    """
+    kill = ("Get-CimInstance Win32_Process | Where-Object "
+            "{ $_.Name -like 'python*' -and "
+            "$_.CommandLine -like '*front_desk*' } | ForEach-Object "
+            "{ Stop-Process -Id $_.ProcessId -Force }")
     inner = (f"Start-Sleep -Seconds {delay_sec}; "
              f"Stop-ScheduledTask -TaskName {task}; "
+             f"{kill}; "
              f"Start-Sleep -Seconds {gap_sec}; "
              f"Start-ScheduledTask -TaskName {task}")
     script = ("Start-Process powershell -WindowStyle Hidden "

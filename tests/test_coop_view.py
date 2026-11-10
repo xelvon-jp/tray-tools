@@ -249,33 +249,38 @@ def test_paused_view():
 
 
 def test_playbook_display():
-    desk_run = {"state": "running", "playbook": "traytools_restart",
+    desk_run = {"state": "running", "playbook": "pb4006",
                 "request_id": "req-t1", "started_at": NOW - 30}
     # Muse の作業中より優先して出す
     v = cv.coop_view(muse(kind="processing"), [], NOW, desk=desk_run)
-    assert v["banner_title"] == "プレイブック(PB6)実行中" and v["tone"] == "work"
+    assert v["banner_title"] == "プレイブック(PB-4006)実行中" and v["tone"] == "work"
     assert v["banner_sub"] == "常駐の再起動（req-t1）"
     assert v["banner_time"] == "30秒"
+    # 移行期間は旧名の合図も同じ表示にする
+    v = cv.coop_view(muse(kind="processing"), [], NOW,
+                     desk=dict(desk_run, playbook="traytools_restart"))
+    assert v["banner_title"] == "プレイブック(PB-4006)実行中"
+    assert v["banner_sub"] == "常駐の再起動（req-t1）"
     # 承認待ちには勝たない
     v = cv.coop_view(muse(kind="approval", kind_since=NOW - 5), [], NOW, desk=desk_run)
     assert v["banner_title"] == "Muse が承認待ち"
     # 完了 (60秒以内) は done で出す
-    desk_done = {"state": "done", "playbook": "traytools_restart", "ok": True,
+    desk_done = {"state": "done", "playbook": "pb4006", "ok": True,
                  "summary": "再起動しました", "started_at": NOW - 50,
                  "finished_at": NOW - 20}
     v = cv.coop_view(muse(), [], NOW, desk=desk_done)
-    assert v["banner_title"] == "プレイブック(PB6)完了" and v["tone"] == "done"
+    assert v["banner_title"] == "プレイブック(PB-4006)完了" and v["tone"] == "done"
     assert v["banner_sub"] == "常駐の再起動: 再起動しました"
     # 完了から60秒を超えたら出さない
     v = cv.coop_view(muse(), [], NOW, desk=dict(desk_done, finished_at=NOW - 61))
     assert v["banner_title"] == "全員待機中"
     # 失敗は alert
     v = cv.coop_view(muse(), [], NOW, desk=dict(desk_done, ok=False, finished_at=NOW - 5))
-    assert v["banner_title"] == "プレイブック(PB6)失敗" and v["tone"] == "alert"
+    assert v["banner_title"] == "プレイブック(PB-4006)失敗" and v["tone"] == "alert"
     # 実行中でも10分を超えたら古い合図として無視する
     v = cv.coop_view(muse(kind="processing"), [], NOW,
                      desk=dict(desk_run, started_at=NOW - 601))
-    assert v["banner_title"] != "プレイブック(PB6)実行中"
+    assert v["banner_title"] != "プレイブック(PB-4006)実行中"
 
 
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,

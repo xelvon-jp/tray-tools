@@ -56,33 +56,38 @@ def _oldest(entries, key):
 
 
 PB_LABELS = {
-    "traytools_sync": "tray-tools 同期",
-    "daemon_sync": "配備係の同期",
-    "desk_sync": "窓口の同期",
-    "deploy_approve": "配備の承認",
-    "config_set": "設定の変更",
-    "traytools_restart": "常駐の再起動",
-    "watcher_sync": "見張りの同期",
-    "pc_capture": "画面の撮影",
+    "pb1001": "tray-tools 同期",
+    "pb1002": "配備係の同期",
+    "pb1003": "窓口の同期",
+    "pb2004": "配備の承認",
+    "pb3005": "設定の変更",
+    "pb4006": "常駐の再起動",
+    "pb4031": "PowerShell 実行",
+    "pb1007": "見張りの同期",
+    "pb5008": "画面の撮影",
+}
+# 移行期間の別名 (旧名 → 正規 ID)。窓口が旧名で合図を書く間だけ受ける。
+PB_ALIASES = {
+    "traytools_sync": "pb1001",
+    "daemon_sync": "pb1002",
+    "desk_sync": "pb1003",
+    "deploy_approve": "pb2004",
+    "config_set": "pb3005",
+    "traytools_restart": "pb4006",
+    "watcher_sync": "pb1007",
+    "pc_capture": "pb5008",
 }
 PB_RUN_STALE_SEC = 600            # 実行中がこれより古ければ合図ファイルの残骸とみなす
 PB_DONE_SHOW_SEC = 60             # 完了・失敗の結果を出しておく秒数
-PB_NUMBERS = {
-    "traytools_sync": 1,
-    "daemon_sync": 2,
-    "desk_sync": 3,
-    "deploy_approve": 4,
-    "config_set": 5,
-    "traytools_restart": 6,
-    "watcher_sync": 7,
-    "pc_capture": 8,
-}
 
 
 def _pb_title(name, suffix):
-    """「プレイブック(PB6)実行中」の形。番号表に無い PB は番号なしで出す。"""
-    num = PB_NUMBERS.get(name)
-    return f"プレイブック(PB{num}){suffix}" if num else f"プレイブック{suffix}"
+    """「プレイブック(PB-4006)実行中」の形。4桁 ID でない PB は番号なしで出す。"""
+    if isinstance(name, str) and name.startswith("pb"):
+        digits = name[2:]
+        if len(digits) == 4 and digits.isdigit():
+            return f"プレイブック(PB-{digits}){suffix}"
+    return f"プレイブック{suffix}"
 
 
 def _pb_view(desk, now):
@@ -90,6 +95,8 @@ def _pb_view(desk, now):
     if not isinstance(desk, dict):
         return None
     name = desk.get("playbook")
+    if isinstance(name, str):
+        name = PB_ALIASES.get(name, name)
     label = PB_LABELS.get(name, name) if isinstance(name, str) and name else None
     if not label:
         return None

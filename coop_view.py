@@ -67,6 +67,22 @@ PB_LABELS = {
 }
 PB_RUN_STALE_SEC = 600            # 実行中がこれより古ければ合図ファイルの残骸とみなす
 PB_DONE_SHOW_SEC = 60             # 完了・失敗の結果を出しておく秒数
+PB_NUMBERS = {
+    "traytools_sync": 1,
+    "daemon_sync": 2,
+    "desk_sync": 3,
+    "deploy_approve": 4,
+    "config_set": 5,
+    "traytools_restart": 6,
+    "watcher_sync": 7,
+    "pc_capture": 8,
+}
+
+
+def _pb_title(name, suffix):
+    """「プレイブック(PB6)実行中」の形。番号表に無い PB は番号なしで出す。"""
+    num = PB_NUMBERS.get(name)
+    return f"プレイブック(PB{num}){suffix}" if num else f"プレイブック{suffix}"
 
 
 def _pb_view(desk, now):
@@ -83,7 +99,7 @@ def _pb_view(desk, now):
     if desk.get("state") == "running":
         if started is None or now - started > PB_RUN_STALE_SEC:
             return None
-        return {"tone": "work", "title": "プレイブック実行中", "sub": who,
+        return {"tone": "work", "title": _pb_title(name, "実行中"), "sub": who,
                 "elapsed": max(0.0, now - started)}
     if desk.get("state") == "done":
         finished = _num(desk, "finished_at")
@@ -93,9 +109,9 @@ def _pb_view(desk, now):
         summary = desk.get("summary")
         sub = f"{label}: {summary}" if isinstance(summary, str) and summary else label
         if desk.get("ok"):
-            return {"tone": "done", "title": "プレイブック完了", "sub": sub,
+            return {"tone": "done", "title": _pb_title(name, "完了"), "sub": sub,
                     "elapsed": dur}
-        return {"tone": "alert", "title": "プレイブック失敗", "sub": sub,
+        return {"tone": "alert", "title": _pb_title(name, "失敗"), "sub": sub,
                 "elapsed": dur}
     return None
 

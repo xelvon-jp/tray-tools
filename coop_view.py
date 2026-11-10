@@ -55,7 +55,52 @@ def _oldest(entries, key):
     return min(entries, key=stamp)
 
 
-def coop_view(muse, claude_entries, now=None, paused=False, events=None):
+PB_LABELS = {
+    "traytools_sync": "tray-tools 同期",
+    "daemon_sync": "配備係の同期",
+    "desk_sync": "窓口の同期",
+    "deploy_approve": "配備の承認",
+    "config_set": "設定の変更",
+    "traytools_restart": "常駐の再起動",
+    "watcher_sync": "見張りの同期",
+    "pc_capture": "画面の撮影",
+}
+PB_RUN_STALE_SEC = 600            # 実行中がこれより古ければ合図ファイルの残骸とみなす
+PB_DONE_SHOW_SEC = 60             # 完了・失敗の結果を出しておく秒数
+
+
+def _pb_view(desk, now):
+    """窓口の合図ファイル (desk_activity) からプレイブック表示を作る。無ければ None。"""
+    if not isinstance(desk, dict):
+        return None
+    name = desk.get("playbook")
+    label = PB_LABELS.get(name, name) if isinstance(name, str) and name else None
+    if not label:
+        return None
+    rid = desk.get("request_id")
+    who = f"{label}（{rid}）" if isinstance(rid, str) and rid else label
+    started = _num(desk, "started_at")
+    if desk.get("state") == "running":
+        if started is None or now - started > PB_RUN_STALE_SEC:
+            return None
+        return {"tone": "work", "title": "プレイブック実行中", "sub": who,
+                "elapsed": max(0.0, now - started)}
+    if desk.get("state") == "done":
+        finished = _num(desk, "finished_at")
+        if finished is None or not (0 <= now - finished <= PB_DONE_SHOW_SEC):
+            return None
+        dur = finished - started if started is not None else None
+        summary = desk.get("summary")
+        sub = f"{label}: {summary}" if isinstance(summary, str) and summary else label
+        if desk.get("ok"):
+            return {"tone": "done", "title": "プレイブック完了", "sub": sub,
+                    "elapsed": dur}
+        return {"tone": "alert", "title": "プレイブック失敗", "sub": sub,
+                "elapsed": dur}
+    return None
+
+
+def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=None):
     """連携ステージの表示内容(dict)。出さないなら None。
 
     banner_title / banner_sub / banner_time(経過を fmt_dur で。分からなければ空) /
@@ -97,6 +142,7 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
     all_idle = False
     running = [e for e in entries if e.get("state") == "running"]
     asking = [e for e in entries if e.get("state") == "ask"]
+    pb = _pb_view(desk, now)
 
     if paused:
         # 休止中は last_poll が進まなくても「止まっている」とは言わない
@@ -128,6 +174,8 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None):
         tone, title, sub = "alert", "Muse が返事をしていません", "Claude の発言に未返答です"
     elif kind == "unknown" and ke >= UNKNOWN_ALERT_SEC:
         tone, title, sub = "alert", "状態が分かりません", "Muse の画面を判定できません"
+    elif pb is not None:
+        tone, title, sub, elapsed = pb["tone"], pb["title"], pb["sub"], pb["elapsed"]
     elif kind in ("processing", "responding"):
         tone, title = "work", "いま：Muse が作業中"
         sub = header if header not in mbs.HEADER_PLAIN else "Claw'd が見守っています"

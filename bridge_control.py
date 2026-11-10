@@ -16,6 +16,21 @@ from pathlib import Path
 PAUSE_PATH = (Path(os.environ.get("LOCALAPPDATA") or ".")
               / "traytools" / "muse_bridge_pause.json")
 
+# 窓口 (front desk) が書く合図ファイル。こちらはブリッジが読む側:
+# プレイブックの実行状態が入る (書き手は front_desk.activity)。
+ACTIVITY_PATH = (Path(os.environ.get("LOCALAPPDATA") or ".")
+                 / "traytools" / "desk_activity.json")
+
+
+def read_desk_activity(path=None):
+    """窓口の合図ファイルを読む。ファイルが無い・壊れている・dict でないなら None。"""
+    target = Path(path) if path is not None else ACTIVITY_PATH
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
 
 def _resolve(path):
     return Path(path) if path is not None else PAUSE_PATH

@@ -250,7 +250,8 @@ def coop_row(muse, entries, now=None, events=None) -> dict | None:
     Muse 見張りの行の作法をそのまま引き継ぐため。events はやり取りの
     記録(bridge_journal)のレコード列で、実イベントの飛行と履歴テープの材料。"""
     paused = bctl.is_paused()
-    view = cv.coop_view(muse, entries, now, paused=paused, events=events)
+    view = cv.coop_view(muse, entries, now, paused=paused, events=events,
+                        desk=bctl.read_desk_activity())
     if view is None:
         return None
     has_kind = isinstance(muse.get("kind"), str) and bool(muse.get("kind"))

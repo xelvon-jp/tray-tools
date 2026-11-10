@@ -323,15 +323,19 @@ def test_desk_and_claude_cards():
             "started_at": NOW - 30, "request_id": "req-1"}
     v = cv.coop_view(muse(), [], NOW, desk=desk)
     assert v["cards"][3] == ("窓口・実行中", "PB-4006") and v["pb_active"] is True
-    # 完了はバナーが消えた後もカードに残る(30分)
+    # 完了・失敗はバナーと同じ 60秒だけカードに出て、あとは待機に戻る
     desk = {"playbook": "pb1001", "state": "done", "ok": True,
-            "started_at": NOW - 900, "finished_at": NOW - 600}
+            "started_at": NOW - 90, "finished_at": NOW - 30}
     v = cv.coop_view(muse(), [], NOW, desk=desk)
     assert v["cards"][3] == ("窓口・完了", "PB-1001") and v["pb_active"] is False
     desk = {"playbook": "pb1001", "state": "done", "ok": False,
-            "started_at": NOW - 900, "finished_at": NOW - 600}
+            "started_at": NOW - 90, "finished_at": NOW - 30}
     v = cv.coop_view(muse(), [], NOW, desk=desk)
     assert v["cards"][3] == ("窓口・失敗", "PB-1001")
+    desk = {"playbook": "pb1001", "state": "done", "ok": True,
+            "started_at": NOW - 900, "finished_at": NOW - 600}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口", "待機")
     # Claude カード: 承認待ち > 作業中 > 待機
     assert view(muse(), [{"state": "running"}])["cards"][4] == ("Claude", "作業中")
     assert view(muse(), [{"state": "ask"}])["cards"][4] == ("Claude", "承認待ち")
@@ -340,7 +344,7 @@ def test_desk_and_claude_cards():
     assert view(muse(kind="approval", cards=1))["flag_up"] is True
     # ハートビート: 新しければ通常表示、古ければ「応答なし」が最優先
     desk = {"playbook": "pb1001", "state": "done", "ok": True,
-            "started_at": NOW - 900, "finished_at": NOW - 600,
+            "started_at": NOW - 90, "finished_at": NOW - 30,
             "heartbeat_at": NOW - 10}
     v = cv.coop_view(muse(), [], NOW, desk=desk)
     assert v["cards"][3] == ("窓口・完了", "PB-1001") and v["desk_stale"] is False

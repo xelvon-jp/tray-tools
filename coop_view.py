@@ -278,7 +278,9 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
     }
 
 
-PB_CARD_SEC = 1800              # 窓口カードに直近の PB を残しておく秒数
+PB_CARD_SEC = 60                # 窓口カードに完了・失敗を残しておく秒数
+# (バナーの PB_DONE_SHOW_SEC と同じ。30分残していた頃は「完了」が
+#  常駐表示のようになって長すぎたので揃えた)
 DESK_STALE_SEC = 180            # ハートビートがこれより古ければ窓口は応答なし
 
 
@@ -292,9 +294,9 @@ def _desk_stale(desk, now):
 
 
 def _desk_card(desk, now):
-    """窓口カードの (ラベル, 値)。直近のプレイブックと結果を残す(バナーは
-    60秒で消えるが、カードは PB_CARD_SEC の間「最後に何をしたか」を持つ)。
-    ラベル側に状態(実行中/完了/失敗)、値に PB 番号を出す(カードは狭い)。
+    """窓口カードの (ラベル, 値)。ラベル側に状態(実行中/完了/失敗)、
+    値に PB 番号を出す(カードは狭い)。完了・失敗はバナーと同じ
+    PB_CARD_SEC (60秒) だけ出し、それを過ぎたら「待機」に戻る。
     ハートビートが古ければ「応答なし」を最優先で出す。"""
     if not isinstance(desk, dict):
         return ("窓口", "—")

@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from typing import Optional
@@ -63,6 +64,28 @@ class SubprocessRunner:
             return CommandResult(None, f"実行を開始できませんでした: {exc}")
         return CommandResult(
             proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
+
+    def run_bytes(self, argv, timeout_sec: float) -> CommandResult:
+        """出力をバイトで受け、UTF-8 → cp932 の順に読む (PB-4031 用)。"""
+        try:
+            proc = subprocess.run(
+                list(argv), capture_output=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            raw = (exc.output or b"") + (exc.stderr or b"")
+            return CommandResult(None, _decode_output(raw), timed_out=True)
+        except OSError as exc:
+            return CommandResult(None, f"実行を開始できませんでした: {exc}")
+        raw = (proc.stdout or b"") + (proc.stderr or b"")
+        return CommandResult(proc.returncode, _decode_output(raw))
+
+
+def _decode_output(raw: bytes) -> str:
+    for enc in ("utf-8", "cp932"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 class StepLog:
@@ -111,15 +134,15 @@ def _failed(log: StepLog, summary: str) -> ExecOutcome:
     return ExecOutcome(ok=False, summary=summary, detail=log.text())
 
 
-# -- PB-1: traytools_sync ------------------------------------------------
+# -- PB-1001: traytools_sync ------------------------------------------------
 
 def traytools_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """tray-tools 本体へ main を反映し、再起動して着地を確認する。"""
-    log = StepLog("traytools_sync")
+    log = StepLog("pb1001")
     if params:
         return ExecOutcome(
             ok=False, state=model.RESULT_REJECTED,
-            summary="traytools_sync に引数はありません",
+            summary="pb1001 に引数はありません",
             detail=log.text())
     repo = ctx.settings.get("repo_path") or r"R:\claude\tray-tools"
     branch = ctx.settings.get("branch") or "main"
@@ -351,13 +374,13 @@ def _reject_params(log: StepLog, playbook_id: str) -> ExecOutcome:
         detail=log.text())
 
 
-# -- PB-2: daemon_sync -----------------------------------------------------
+# -- PB-1002: daemon_sync -----------------------------------------------------
 
 def daemon_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """配備係へ muse/deploy-daemon を反映し、タスクを再起動する。"""
-    log = StepLog("daemon_sync")
+    log = StepLog("pb1002")
     if params:
-        return _reject_params(log, "daemon_sync")
+        return _reject_params(log, "pb1002")
     repo = ctx.settings.get("repo_path") or r"R:\claude\deploy-daemon\app"
     branch = ctx.settings.get("branch") or "muse/deploy-daemon"
     task = ctx.settings.get("task_name") or "DeployDaemon"
@@ -414,7 +437,7 @@ def daemon_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         detail=log.text())
 
 
-# -- PB-3: desk_sync ---------------------------------------------------------
+# -- PB-1003: desk_sync ---------------------------------------------------------
 
 def _spawn_delayed_task_restart(ctx: PlaybookContext, task: str,
                                 delay_sec: int, gap_sec: int) -> CommandResult:
@@ -435,9 +458,9 @@ def _spawn_delayed_task_restart(ctx: PlaybookContext, task: str,
 
 def desk_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """窓口自身へ muse/front-desk を反映する。再起動は報告の後。"""
-    log = StepLog("desk_sync")
+    log = StepLog("pb1003")
     if params:
-        return _reject_params(log, "desk_sync")
+        return _reject_params(log, "pb1003")
     repo = ctx.settings.get("repo_path") or r"R:\claude\front-desk\app"
     branch = ctx.settings.get("branch") or "muse/front-desk"
     task = ctx.settings.get("task_name") or "FrontDesk"
@@ -487,13 +510,13 @@ def desk_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         detail=log.text())
 
 
-# -- PB-6: traytools_restart -------------------------------------------------
+# -- PB-4006: traytools_restart -------------------------------------------------
 
 def traytools_restart(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """tray-tools の再起動のみ (PB-1 から反映を除いた形)。"""
-    log = StepLog("traytools_restart")
+    log = StepLog("pb4006")
     if params:
-        return _reject_params(log, "traytools_restart")
+        return _reject_params(log, "pb4006")
     repo = ctx.settings.get("repo_path") or r"R:\claude\tray-tools"
     send_script = ctx.settings.get("send_script") or os.path.join(
         repo, "traytools_send.py")
@@ -527,7 +550,7 @@ def traytools_restart(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     return ExecOutcome(
         ok=True, summary="tray-tools を再起動しました", detail=log.text())
 
-# -- PB-5: config_set --------------------------------------------------------
+# -- PB-3005: config_set --------------------------------------------------------
 # 初期範囲は %LOCALAPPDATA%\traytools\ の合図ファイル4つだけ (仕様 §PB-5)。
 # 実パスは引数で受けず、許可リストのキーから引く。窓口・配備係自身の
 # config と tray-tools の settings.json は範囲に含めない。
@@ -564,7 +587,7 @@ def _short_json(value) -> str:
 
 def config_set(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """合図ファイルの決まったキーを1つ差し替える。"""
-    log = StepLog("config_set")
+    log = StepLog("pb3005")
     file_key = params.get("file")
     key = params.get("key")
     if not isinstance(file_key, str) or file_key not in FLAG_FILES:
@@ -665,7 +688,7 @@ def config_set(ctx: PlaybookContext, params: dict) -> ExecOutcome:
                  "（手動で確認してください）")
 
 
-# -- PB-4: deploy_approve ------------------------------------------------------
+# -- PB-2004: deploy_approve ------------------------------------------------------
 # 【有効化に関する注意】このプレイブックは、Nagato の明示の了承が
 # ある場合にだけ依頼を登録する前提のもの (仕様 §PB-4 の前提)。
 # コードは置くが、allowed_playbooks への追加 (有効化) は了承を
@@ -695,7 +718,7 @@ def _approval_filename(delivery_id: str) -> str:
 
 def deploy_approve(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """配備の承認ファイルを置く (案A の1タップ承認の置き換え)。"""
-    log = StepLog("deploy_approve")
+    log = StepLog("pb2004")
     delivery_id = params.get("delivery_id")
     if not isinstance(delivery_id, str) \
             or not DELIVERY_ID_RE.match(delivery_id):
@@ -714,7 +737,7 @@ def deploy_approve(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     if not approvals_dir or not state_path:
         log.step("guard.config", "ng", "not_configured")
         log.stopped(
-            "playbook_settings.deploy_approve.daemon_base_dir "
+            "playbook_settings.pb2004.daemon_base_dir "
             "(or approvals_dir/state_path)", "missing")
         return _blocked(
             log, "配備係の置き場が未設定のため実行できません"
@@ -780,7 +803,7 @@ def deploy_approve(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         detail=log.text())
 
 
-# -- PB-7: watcher_sync --------------------------------------------------------
+# -- PB-1007: watcher_sync --------------------------------------------------------
 # 見張り (muse_monitor.py) の正本の置き場は未決 (仕様 §PB-7 の前提)
 # のため、正本パスは playbook_settings で受ける (コードに固定しない)。
 # 未設定なら not_configured で fail-closed に止める。
@@ -837,13 +860,13 @@ def _fresh_monitor_start(events_path: str, marker: int) -> bool:
 
 def watcher_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """見張りの正本を取り込んで差し替え、タスクを再起動する。"""
-    log = StepLog("watcher_sync")
+    log = StepLog("pb1007")
     if params:
-        return _reject_params(log, "watcher_sync")
+        return _reject_params(log, "pb1007")
     source = ctx.settings.get("source_path")
     if not source:
         log.step("guard.config", "ng", "not_configured")
-        log.stopped("playbook_settings.watcher_sync.source_path", "missing")
+        log.stopped("playbook_settings.pb1007.source_path", "missing")
         return _blocked(
             log, "見張りの正本の置き場が未設定のため実行できません"
                  "（not_configured: source_path。正本の git 管理先が未決）")
@@ -974,7 +997,7 @@ def watcher_sync(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         detail=log.text())
 
 
-# -- PB-8: pc_capture -----------------------------------------------------------
+# -- PB-5008: pc_capture -----------------------------------------------------------
 # 常駐の capture の口 (traytools_send.py) で画面を撮り、保存された
 # 画像を OneDrive の受け渡しフォルダへ写す。スマホからは OneDrive
 # 側で見る (2026-11-10 の remote_capture 実験の、窓口から叩く版)。
@@ -984,7 +1007,7 @@ CAPTURE_FOLDER_NAME = "traytools-remote-capture"
 
 def pc_capture(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     """PC の画面を撮って OneDrive のフォルダへ届ける。"""
-    log = StepLog("pc_capture")
+    log = StepLog("pb5008")
     screen = params.get("screen")
     if screen is not None:
         if isinstance(screen, bool) or not isinstance(screen, int) \
@@ -1070,17 +1093,106 @@ def pc_capture(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         detail=log.text())
 
 
+# -- PB-4031: powershell_run --------------------------------------------
+
+PS_SCRIPT_MAX_CHARS = 20000
+PS_TIMEOUT_DEFAULT_SEC = 120
+PS_TIMEOUT_MIN_SEC = 10
+PS_TIMEOUT_MAX_SEC = 600
+PS_OUTPUT_TAIL_CHARS = 6000
+_PS_PROLOGUE = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+    "$OutputEncoding = [System.Text.Encoding]::UTF8\n")
+
+
+def powershell_run(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """依頼に書かれた PowerShell スクリプトを実行する。
+
+    前提はチャット承認 (承認されたスクリプトだけが依頼として届く)。
+    スクリプト全文は依頼 body に残るので、報告には sha256 と文字数、
+    出力の末尾を残して監査できる形にする。
+    """
+    log = StepLog("pb4031")
+    unknown = sorted(set(params) - {"script", "timeout_sec"})
+    if unknown:
+        return _blocked(log, f"未知の params です: {unknown}")
+    script = params.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return _blocked(log, "script が空です")
+    if len(script) > PS_SCRIPT_MAX_CHARS:
+        return _blocked(
+            log, f"script が長すぎます ({len(script)} > {PS_SCRIPT_MAX_CHARS})")
+    timeout = params.get("timeout_sec", PS_TIMEOUT_DEFAULT_SEC)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return _blocked(log, "timeout_sec が数値ではありません")
+    timeout = max(PS_TIMEOUT_MIN_SEC,
+                  min(PS_TIMEOUT_MAX_SEC, float(timeout)))
+    digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
+    log.step("script", "received", f"sha256:{digest} chars:{len(script)}")
+    fd, path = tempfile.mkstemp(suffix=".ps1", prefix="pb4031_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"\xef\xbb\xbf"
+                     + (_PS_PROLOGUE + script).encode("utf-8"))
+        log.step("write", "ok")
+        result = ctx.runner.run_bytes(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", path], timeout)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    output = result.output or ""
+    tail = output[-PS_OUTPUT_TAIL_CHARS:]
+    if len(output) > PS_OUTPUT_TAIL_CHARS:
+        tail = (f"…(先頭 {len(output) - PS_OUTPUT_TAIL_CHARS} 文字を省略)\n"
+                + tail)
+    if result.timed_out:
+        log.step("run", "timeout", f"{timeout:.0f}s")
+        return ExecOutcome(
+            ok=False,
+            summary=f"PowerShell がタイムアウトしました ({timeout:.0f}秒)",
+            detail=log.text() + "\n--- output ---\n" + tail)
+    log.step("run", f"exit {result.returncode}")
+    detail = log.text() + "\n--- output ---\n" + tail
+    if result.returncode is None:
+        return ExecOutcome(ok=False, summary="PowerShell を開始できませんでした",
+                           detail=detail)
+    if result.returncode != 0:
+        return ExecOutcome(
+            ok=False,
+            summary=f"PowerShell が失敗しました (exit {result.returncode})",
+            detail=detail)
+    return ExecOutcome(ok=True, summary="PowerShell を実行しました (exit 0)",
+                       detail=detail)
+
+
 # -- 登録簿と実行の振り分け ----------------------------------------------
 
 PLAYBOOKS = {
-    "traytools_sync": traytools_sync,
-    "daemon_sync": daemon_sync,
-    "desk_sync": desk_sync,
-    "deploy_approve": deploy_approve,
-    "config_set": config_set,
-    "traytools_restart": traytools_restart,
-    "watcher_sync": watcher_sync,
-    "pc_capture": pc_capture,
+    "pb1001": traytools_sync,
+    "pb1002": daemon_sync,
+    "pb1003": desk_sync,
+    "pb2004": deploy_approve,
+    "pb3005": config_set,
+    "pb4006": traytools_restart,
+    "pb4031": powershell_run,
+    "pb1007": watcher_sync,
+    "pb5008": pc_capture,
+}
+
+# 移行期間の別名 (旧名 → 正規 ID)。PC 側の許可リストと設定が 4桁 ID に
+# 揃ったら外す。許可判定は、正規 ID と別名のどちらが設定にあっても通す。
+PLAYBOOK_ALIASES = {
+    "traytools_sync": "pb1001",
+    "daemon_sync": "pb1002",
+    "desk_sync": "pb1003",
+    "deploy_approve": "pb2004",
+    "config_set": "pb3005",
+    "traytools_restart": "pb4006",
+    "watcher_sync": "pb1007",
+    "pc_capture": "pb5008",
 }
 
 
@@ -1115,30 +1227,35 @@ class PlaybookExecutor:
             return ExecOutcome(
                 ok=False, state=model.RESULT_REJECTED,
                 summary="依頼の params が dict ではありません")
-        fn = PLAYBOOKS.get(playbook_id)
+        canonical = PLAYBOOK_ALIASES.get(playbook_id, playbook_id)
+        fn = PLAYBOOKS.get(canonical)
         if fn is None:
             return ExecOutcome(
                 ok=False, state=model.RESULT_REJECTED,
                 summary=f"未知のプレイブックです: {playbook_id}")
-        if playbook_id not in self._config.allowed_playbooks:
+        names = {canonical} | {
+            alias for alias, target in PLAYBOOK_ALIASES.items()
+            if target == canonical}
+        if not names & set(self._config.allowed_playbooks):
             return ExecOutcome(
                 ok=False, state=model.RESULT_REJECTED,
-                summary=f"プレイブック {playbook_id} はまだ有効化されていません")
+                summary=f"プレイブック {canonical} はまだ有効化されていません")
+        settings = self._config.playbook_settings.get(canonical)
+        if settings is None:
+            settings = self._config.playbook_settings.get(playbook_id, {})
         ctx = PlaybookContext(
-            runner=self._runner,
-            settings=dict(self._config.playbook_settings.get(
-                playbook_id, {})))
+            runner=self._runner, settings=dict(settings))
         t0 = time.time()
-        activity.begin(playbook_id, request.id,
+        activity.begin(canonical, request.id,
                        path=self._activity_path, now=t0)
         try:
             outcome = fn(ctx, params)
         except Exception:
             outcome = ExecOutcome(
                 ok=False,
-                summary=f"プレイブック {playbook_id} の実行中に例外が発生しました",
+                summary=f"プレイブック {canonical} の実行中に例外が発生しました",
                 detail=traceback.format_exc()[-2000:])
-        activity.finish(playbook_id, request.id, outcome,
+        activity.finish(canonical, request.id, outcome,
                         path=self._activity_path, started_at=t0)
         return outcome
 

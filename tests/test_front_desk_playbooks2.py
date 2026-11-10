@@ -154,8 +154,8 @@ def make_request(body, rid="req-t2"):
 
 def test_all_playbooks_registered():
     assert set(playbooks.PLAYBOOKS) == {
-        "traytools_sync", "daemon_sync", "desk_sync", "deploy_approve",
-        "config_set", "traytools_restart", "watcher_sync", "pc_capture"}
+        "pb1001", "pb1002", "pb1003", "pb2004",
+        "pb3005", "pb4006", "pb4031", "pb1007", "pb5008"}
 
 
 def test_new_playbooks_not_enabled_by_default():

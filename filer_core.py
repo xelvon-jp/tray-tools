@@ -123,6 +123,7 @@ DEFAULT_KEYMAP = {
     "4068": "diff_view",          # Alt+D 内蔵の差分ビューア(対象の選び方は Alt+W と同じ)
     "4083": "sftp_open",          # Alt+S WinSCP で SFTP 接続先を開く(filer.sftp の設定)
     "0080": "zip_create",         # P 圧縮(反対窓に ZIP / 7z で作る。AFXW.key 0080 &MENU press.txt の代わり)
+    "0085": "extract_archive",    # U 書庫を展開(メニューで反対窓へ / この窓へ)
     # --- マスク ---
     "0186": "mask_clear",         # :  (VK_OEM_1)
     "1186": "mask_input",         # Shift+: (AFXW.key 1186 &MASK)

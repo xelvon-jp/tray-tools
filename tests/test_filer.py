@@ -2660,6 +2660,97 @@ def test_archive_password_and_missing_py7zr():
             sys.modules["py7zr"] = saved
 
 
+def test_archive_tar_aes_whole():
+    import io
+    import tarfile
+    import filer_archive as fa
+    with tempfile.TemporaryDirectory() as tmp:
+        # tar.gz: 一覧も展開も tarfile で(書庫として開く閲覧も同じ索引を通る)
+        tpath = os.path.join(tmp, "bundle.tar.gz")
+        with tarfile.open(tpath, "w:gz") as tf:
+            for name, data in (("pkg/a.txt", b"A"), ("pkg/sub/b.txt", b"B")):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        assert fa.archive_kind(tpath) == "tar" and fa.is_archive_name("x.TGZ")
+        index = fa.get_index(tpath)
+        assert index.kind == "tar"
+        assert [e.name for e in index.list_dir("")] == ["pkg"]
+        assert sorted(e.name for e in index.list_dir("pkg")) == ["a.txt", "sub"]
+        out = os.path.join(tmp, "out")
+        os.mkdir(out)
+        result = fa.extract(index, fa.plan_extract(index, "", ["pkg"]), out)
+        assert result.written == 2 and not result.errors, result
+        assert Path(out, "pkg", "sub", "b.txt").read_bytes() == b"B"
+        # tar(無圧縮)も
+        ppath = os.path.join(tmp, "plain.tar")
+        with tarfile.open(ppath, "w") as tf:
+            info = tarfile.TarInfo("one.txt")
+            info.size = 1
+            tf.addfile(info, io.BytesIO(b"1"))
+        pindex = fa.get_index(ppath)
+        assert [e.name for e in pindex.list_dir("")] == ["one.txt"]
+
+        # 書庫名のフォルダ名(複合拡張子はまとめて除く)
+        assert fa.archive_stem("a.tar.gz") == "a" and fa.archive_stem("a.tgz") == "a"
+        assert fa.archive_stem("a.tar.bz2") == "a" and fa.archive_stem("a.zip") == "a"
+        # whole_plan: 単一フォルダだけならそのまま(単位はそのフォルダ)
+        plan, unit = fa.whole_plan(index, "bundle.tar.gz")
+        assert unit == "pkg"
+        assert sorted(p.rel for p in plan if not p.is_dir) == ["pkg/a.txt", "pkg/sub/b.txt"]
+        # バラなら書庫名のフォルダが単位
+        zpath = os.path.join(tmp, "loose.zip")
+        with zipfile.ZipFile(zpath, "w") as z:
+            z.writestr("x.txt", b"x")
+            z.writestr("y.txt", b"y")
+        plan, unit = fa.whole_plan(fa.get_index(zpath), "loose.zip")
+        assert unit == "loose" and sorted(p.rel for p in plan) == ["loose/x.txt", "loose/y.txt"]
+        # 単一ファイルだけでもフォルダを作る側
+        spath = os.path.join(tmp, "single.zip")
+        with zipfile.ZipFile(spath, "w") as z:
+            z.writestr("only.txt", b"o")
+        plan, unit = fa.whole_plan(fa.get_index(spath), "single.zip")
+        assert unit == "single" and [p.rel for p in plan] == ["single/only.txt"]
+
+        # AES 形式の ZIP(pyzipper): 一覧・要パスワード判定・展開・違いの報告
+        import pyzipper
+        apath = os.path.join(tmp, "aes.zip")
+        with pyzipper.AESZipFile(apath, "w", compression=pyzipper.ZIP_DEFLATED,
+                                 encryption=pyzipper.WZ_AES) as z:
+            z.setpassword(b"pw-123")
+            z.writestr("secret.txt", b"topsecret")
+        aindex = fa.get_index(apath)
+        aplan = fa.plan_extract(aindex, "", ["secret.txt"])
+        assert fa.needs_password(aindex, aplan)
+        ok_out = os.path.join(tmp, "aes_out")
+        os.mkdir(ok_out)
+        result = fa.extract(aindex, aplan, ok_out, password="pw-123")
+        assert result.written == 1, result
+        assert Path(ok_out, "secret.txt").read_bytes() == b"topsecret"
+        result = fa.extract(aindex, aplan, os.path.join(tmp, "aes_ng"), password="wrong")
+        assert result.written == 0 and result.errors, result
+        assert all("パスワード" in e for e in result.errors), result.errors
+
+        # ファイル名まで暗号化された 7z: パスワード無しでは一覧から PasswordRequired、
+        # パスワードを渡せば一覧も展開もできる(U の入口が使う経路)
+        import py7zr
+        hpath = os.path.join(tmp, "hdr.7z")
+        with py7zr.SevenZipFile(hpath, "w", password="pw-9", header_encryption=True) as z:
+            z.writestr(b"secret", "s.txt")
+        try:
+            fa.get_index(hpath)
+            raise AssertionError("パスワード無しで一覧が出てしまった")
+        except fa.PasswordRequired:
+            pass
+        hindex = fa.get_index(hpath, password="pw-9")
+        assert [e.name for e in hindex.list_dir("")] == ["s.txt"]
+        hout = os.path.join(tmp, "hdr_out")
+        os.mkdir(hout)
+        result = fa.extract(hindex, fa.plan_extract(hindex, "", ["s.txt"]), hout,
+                            password="pw-9")
+        assert result.written == 1 and Path(hout, "s.txt").read_bytes() == b"secret"
+
+
 def _wait_extract(w, timeout=10.0):
     from PySide6.QtTest import QTest
     deadline = time.monotonic() + timeout
@@ -2833,6 +2924,69 @@ def test_window_archive():
         assert w2.left.archive == (str(zpath), "docs/sub")
         w2.close()
         w2.deleteLater()
+
+
+def test_window_extract_archive_u():
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        with zipfile.ZipFile(str(left / "single.zip"), "w") as z:
+            z.writestr("inner/a.txt", b"ia")
+            z.writestr("inner/b.txt", b"ib")
+        _make_zip(str(left / "pack.zip"))   # トップがバラ(フォルダ+ファイル)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "ed"}}, str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        w.choose_menu = lambda title, items: "other"
+
+        # 単一フォルダの書庫は、そのまま反対窓へ
+        L.set_cursor(L._row_of("single.zip"))
+        key(Qt.Key_U)
+        _wait_extract(w)
+        _wait(w)
+        assert Path(right, "inner", "a.txt").read_bytes() == b"ia"
+        assert Path(right, "inner", "b.txt").read_bytes() == b"ib"
+
+        # 単位フォルダが既にある: いいえでスキップ、はいで上書き
+        confirms = []
+        w.confirm = lambda title, text, default_yes=True, **_: confirms.append(text) or False
+        L.set_cursor(L._row_of("single.zip"))
+        key(Qt.Key_U)
+        _wait(w)
+        assert confirms and Path(right, "inner", "a.txt").read_bytes() == b"ia"
+        w.confirm = lambda title, text, default_yes=True, **_: True
+        Path(right, "inner", "a.txt").write_bytes(b"changed")
+        L.set_cursor(L._row_of("single.zip"))
+        key(Qt.Key_U)
+        _wait_extract(w)
+        _wait(w)
+        assert Path(right, "inner", "a.txt").read_bytes() == b"ia"
+
+        # バラの書庫は書庫名のフォルダの中へ
+        L.set_cursor(L._row_of("pack.zip"))
+        key(Qt.Key_U)
+        _wait_extract(w)
+        _wait(w)
+        assert Path(right, "pack", "docs", "sub", "deep.txt").read_bytes() == b"deep"
+
+        # この窓へも展開できる
+        w.choose_menu = lambda title, items: "here"
+        L.set_cursor(L._row_of("single.zip"))
+        key(Qt.Key_U)
+        _wait_extract(w)
+        _wait(w)
+        assert Path(left, "inner", "b.txt").read_bytes() == b"ib"
 
 
 def test_ask_overwrite_defaults():

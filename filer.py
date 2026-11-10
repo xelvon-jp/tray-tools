@@ -7456,6 +7456,115 @@ class FilerWindow(QWidget):
         if len(result.skipped) > 5:
             self.log(f"圧縮: ほか {len(result.skipped) - 5}件入れられませんでした")
 
+    # --- 書庫の展開(U。書庫ファイルそのものを展開する) ---
+    def cmd_extract_archive(self):
+        src = self.active
+        if self._refuse_archive("展開", source=True):
+            return
+        if self._extracting is not None:
+            self.log("展開: ほかの展開が終わるまで待ってください")
+            return
+        targets = [e for e in src.targets()
+                   if not e.is_dir and filer_archive.is_archive_name(e.name)]
+        if not targets:
+            self.log("展開: 書庫が選ばれていません")
+            return
+        dest_kind = self.choose_menu("展開", [
+            ("O", "反対窓へ展開", "other"),
+            ("H", "この窓へ展開", "here"),
+            ("Q", "キャンセル", None),
+        ])
+        if dest_kind is None:
+            return
+        dst = self.other if dest_kind == "other" else src
+        if dst.archive is not None:
+            self.log(f"展開: {ARCHIVE_NO_WRITE}")
+            return
+        if dst.stash:
+            self.log("展開: 一時置き場へは展開できません")
+            return
+        if not dst.path:
+            return
+        if len(targets) >= 2 and not self.confirm(
+                "展開", f"{len(targets)}個の書庫をすべて展開しますか？"):
+            return
+        queue = [(os.path.join(src.path, e.name), e.name) for e in targets]
+        self._extract_archive_queue(queue, dst.path)
+
+    def _extract_archive_queue(self, queue, dest: str) -> None:
+        """U の展開を1書庫ずつ進める。入口の確認(単位フォルダの同名・パスワード)を
+        済ませてから処理に渡し、終わったら次へ。"""
+        if not queue:
+            self.left.reload()
+            self.right.reload()
+            return
+        (path, name), rest = queue[0], queue[1:]
+        index = None
+        password = None
+        while index is None:
+            try:
+                index = filer_archive.get_index(path, password)
+            except filer_archive.PasswordRequired:
+                # ファイル名まで暗号化された 7z は、パスワードが無いと一覧も出ない。
+                password = self.ask_password(name)
+                if password is None:
+                    self.log(f"展開: {name} を取り消しました（パスワード）")
+                    self._extract_archive_queue(rest, dest)
+                    return
+            except filer_archive.ArchiveError as e:
+                self.log(f"展開: {name}: {e}")
+                self._extract_archive_queue(rest, dest)
+                return
+        plan, unit = filer_archive.whole_plan(index, name)
+        if not plan:
+            self.log(f"展開: {name} には中身がありません")
+            self._extract_archive_queue(rest, dest)
+            return
+        if os.path.lexists(os.path.join(dest, unit)):
+            if not self.confirm("展開",
+                                f"{unit} は既にあります。上書きしますか？\n"
+                                "（「いいえ」でこの書庫をスキップします）",
+                                default_yes=False):
+                self.log(f"展開: {name} をスキップしました")
+                self._extract_archive_queue(rest, dest)
+                return
+        if password is None and filer_archive.needs_password(index, plan):
+            password = self.ask_password(name)
+            if password is None:
+                self.log(f"展開: {name} を取り消しました（パスワード）")
+                self._extract_archive_queue(rest, dest)
+                return
+        self._extract_archive_run(index, plan, dest, password, rest, name)
+
+    def _extract_archive_run(self, index, plan, dest, password, rest, name) -> None:
+        def done(result):
+            if isinstance(result, Exception):
+                self.log(f"展開: {name}: {type(result).__name__}: {result}")
+                self._extract_archive_queue(rest, dest)
+                return
+            password_failed = (not result.cancelled and result.written == 0
+                               and bool(result.errors)
+                               and all("パスワード" in e for e in result.errors))
+            if password_failed:
+                # 間違っていたら再入力を求める(取消でこの書庫をやめる)。
+                retry = self.ask_password(name)
+                if retry is None:
+                    self._report_extract(result, dest)
+                    self._extract_archive_queue(rest, dest)
+                    return
+                self._extract_archive_run(index, plan, dest, retry, rest, name)
+                return
+            self._report_extract(result, dest)
+            self.left.reload()
+            self.right.reload()
+            if result.cancelled:
+                if rest:
+                    self.log("展開: 残りの書庫は中止しました")
+                return
+            self._extract_archive_queue(rest, dest)
+
+        self._start_extract(index, plan, dest, (), password, "展開", done)
+
     # --- WinMerge で比較(Alt+W) ---
     def _marked_entries(self, pane) -> list:
         return [e for e in pane.entries if e.name in pane.marks and not e.is_parent]

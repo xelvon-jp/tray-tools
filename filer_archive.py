@@ -1,8 +1,9 @@
 # filer_archive.py
 # あっふの「書庫の中を見る」部分(あふｗの仮想フォルダに当たるもの)。Qt を使わない。
 #
-# ZIP は標準の zipfile、7z は py7zr で読む。py7zr は書庫を開くときに初めて import する
-# (ファイラの起動を重くしない・入っていない PC でも ZIP は使える)。
+# ZIP は標準の zipfile、7z は py7zr、tar 系は標準の tarfile で読む。py7zr と
+# pyzipper(AES 形式の ZIP 用)は書庫を開くときに初めて import する
+# (ファイラの起動を重くしない・入っていない PC でも ZIP と tar は使える)。
 #
 # パスの形
 #   書庫の中は「書庫ファイルのパス＋中のパス」で表す。D:\x\foo.zip\sub のように、
@@ -22,7 +23,29 @@ from dataclasses import dataclass
 
 import filer_core as core
 
-ARCHIVE_EXTS = (".zip", ".7z")
+TAR_EXTS = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")
+
+ARCHIVE_EXTS = (".zip", ".7z") + TAR_EXTS
+
+
+def archive_kind(path: str) -> str:
+    """"zip" / "7z" / "tar" のどれで読むか(拡張子で決める)。"""
+    lower = path.lower()
+    if lower.endswith(".7z"):
+        return "7z"
+    if lower.endswith(TAR_EXTS):
+        return "tar"
+    return "zip"
+
+
+def archive_stem(name: str) -> str:
+    """書庫のファイル名から拡張子を除いた名前(.tar.gz のような複合もまとめて除く)。
+    U の展開で「書庫名のフォルダ」を作るときに使う。"""
+    lower = name.lower()
+    for ext in sorted(ARCHIVE_EXTS, key=len, reverse=True):
+        if lower.endswith(ext):
+            return name[: -len(ext)] or name
+    return name
 
 # 書庫の一覧は大きいと時間がかかり、ネットワーク上の書庫もありうるので見切りを長めに。
 ARCHIVE_LIST_TIMEOUT = 30.0
@@ -128,6 +151,7 @@ class Member:
     mtime: float = 0.0
     encrypted: bool = False
     attrs: int = 0       # DOS 属性(隠し・システム・読み込み専用)。取れなければ 0
+    compress_type: int = 0  # ZIP の圧縮種別(99 は WinZip AES。zipfile では開けない)
 
 
 # ZIP の external_attr の下位バイトに入る DOS 属性のうち、表示に使うもの。
@@ -215,7 +239,7 @@ def _build_zip(path: str) -> ArchiveIndex:
                 continue
             index.add(inner, Member(info.filename, info.is_dir(), info.file_size,
                                     _zip_mtime(info), bool(info.flag_bits & 0x1),
-                                    zip_dos_attrs(info)))
+                                    zip_dos_attrs(info), info.compress_type))
     return index
 
 
@@ -227,11 +251,11 @@ def _import_py7zr():
     return py7zr
 
 
-def _build_7z(path: str) -> ArchiveIndex:
+def _build_7z(path: str, password: str = None) -> ArchiveIndex:
     py7zr = _import_py7zr()
     index = ArchiveIndex(path, "7z")
     try:
-        with py7zr.SevenZipFile(path, "r") as z:
+        with py7zr.SevenZipFile(path, "r", password=password or None) as z:
             index.needs_password = bool(z.needs_password())
             infos = z.list()
     except py7zr.exceptions.PasswordRequired as e:
@@ -249,6 +273,28 @@ def _build_7z(path: str) -> ArchiveIndex:
     return index
 
 
+def _build_tar(path: str) -> ArchiveIndex:
+    import tarfile  # noqa: PLC0415  標準だが書庫を開くときにだけ読む(zipfile と揃える)
+    index = ArchiveIndex(path, "tar")
+    try:
+        tf = tarfile.open(path, "r:*")
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise ArchiveError(f"tar として読めません: {e}") from e
+    with tf:
+        try:
+            members = tf.getmembers()
+        except (tarfile.TarError, OSError, EOFError) as e:
+            raise ArchiveError(f"tar として読めません: {e}") from e
+        for info in members:
+            inner = safe_relpath(info.name)
+            if inner is None:
+                index.skipped += 1
+                continue
+            index.add(inner, Member(info.name, bool(info.isdir()),
+                                    int(info.size or 0), float(info.mtime or 0.0)))
+    return index
+
+
 # 開いた書庫の一覧は覚えておく(書庫の中で移動するたびに読み直すと、大きな書庫で遅い)。
 # 書庫ファイルの更新日時と大きさが変われば読み直す。読み取りスレッドから触るので鍵を掛ける。
 _cache = {}
@@ -256,19 +302,29 @@ _cache_lock = threading.Lock()
 _CACHE_LIMIT = 8
 
 
-def get_index(path: str) -> ArchiveIndex:
+def get_index(path: str, password: str = None) -> ArchiveIndex:
+    """書庫の索引。password はファイル名まで暗号化された 7z の一覧用
+    (パスワード付きで作った索引は覚えない。パスワード自体も残さない)。"""
     st = os.stat(path)
     key = os.path.normcase(os.path.abspath(path))
     stamp = (st.st_mtime, st.st_size)
-    with _cache_lock:
-        hit = _cache.get(key)
-        if hit is not None and hit[0] == stamp:
-            return hit[1]
-    index = _build_7z(path) if path.lower().endswith(".7z") else _build_zip(path)
-    with _cache_lock:
-        _cache[key] = (stamp, index)
-        while len(_cache) > _CACHE_LIMIT:
-            _cache.pop(next(iter(_cache)))
+    if password is None:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit is not None and hit[0] == stamp:
+                return hit[1]
+    kind = archive_kind(path)
+    if kind == "7z":
+        index = _build_7z(path, password)
+    elif kind == "tar":
+        index = _build_tar(path)
+    else:
+        index = _build_zip(path)
+    if password is None:
+        with _cache_lock:
+            _cache[key] = (stamp, index)
+            while len(_cache) > _CACHE_LIMIT:
+                _cache.pop(next(iter(_cache)))
     return index
 
 
@@ -312,6 +368,24 @@ def plan_extract(index: ArchiveIndex, base: str, names) -> list:
             seen.add(inner)
             plan.append(PlanItem(inner, rel, index.members[inner].is_dir))
     return plan
+
+
+def whole_plan(index: ArchiveIndex, archive_name: str):
+    """書庫全体を展開する計画と、単位になるフォルダ名。(計画, 単位フォルダ名)。
+
+    U の展開用。トップが単一フォルダだけならそのまま展開先へ出す(単位はその
+    フォルダ)。そうでなければ書庫名のフォルダを作ってその中へ出す(単位は書庫名の
+    フォルダ)。計画の rel は展開先からの相対で、単位フォルダを含む。"""
+    tops = [e.name for e in index.list_dir("")]
+    plan = plan_extract(index, "", tops)
+    if len(tops) == 1:
+        member = index.members.get(tops[0])
+        if member is not None and member.is_dir:
+            return plan, tops[0]
+    stem = archive_stem(archive_name)
+    for item in plan:
+        item.rel = f"{stem}/{item.rel}"
+    return plan, stem
 
 
 def find_conflicts(plan, dest: str) -> list:
@@ -437,12 +511,19 @@ def extract(index: ArchiveIndex, plan, dest: str, skip=(), password: str = None,
                 result.errors.append(f"{item.rel}: {e}")
     if index.kind == "7z":
         _extract_7z(index, files, dest, skip, password, progress, cancel, result, total)
+    elif index.kind == "tar":
+        _extract_tar(index, files, dest, skip, password, progress, cancel, result, total)
     else:
         _extract_zip(index, files, dest, skip, password, progress, cancel, result, total)
     return result
 
 
 def _extract_zip(index, files, dest, skip, password, progress, cancel, result, total):
+    if any(index.members[p.inner].compress_type == 99 for p in files):
+        # WinZip AES 形式は zipfile では開けない。pyzipper に任せる。
+        _extract_zip_aes(index, files, dest, skip, password, progress, cancel,
+                         result, total)
+        return
     pwd = password.encode("utf-8") if password else None
     try:
         zf = zipfile.ZipFile(index.path)
@@ -493,6 +574,127 @@ def _extract_zip(index, files, dest, skip, password, progress, cancel, result, t
                 _remove_quietly(part)
                 result.errors.append(f"{item.rel}: 未対応の圧縮・暗号です（{e}）")
             except (OSError, zipfile.BadZipFile, EOFError) as e:
+                _remove_quietly(part)
+                result.errors.append(f"{item.rel}: {e}")
+    if progress:
+        progress(total, total, "")
+
+
+def _import_pyzipper():
+    try:
+        import pyzipper  # noqa: PLC0415  AES 形式の ZIP を開くときにだけ読む
+    except ImportError as e:
+        raise ArchiveError("AES 形式の ZIP を開くには pyzipper が必要です"
+                           "（pip install pyzipper）") from e
+    return pyzipper
+
+
+def _extract_zip_aes(index, files, dest, skip, password, progress, cancel, result, total):
+    """AES 形式の ZIP の展開。_extract_zip と同じ進み方(一時ファイル→置き換え、
+    中止で半端を残さない)で、開く所だけ pyzipper。"""
+    try:
+        pyzipper = _import_pyzipper()
+    except ArchiveError as e:
+        result.errors.append(str(e))
+        return
+    try:
+        zf = pyzipper.AESZipFile(index.path)
+    except (OSError, zipfile.BadZipFile) as e:
+        result.errors.append(str(e))
+        return
+    with zf:
+        if password:
+            zf.setpassword(password.encode("utf-8"))
+        for done, item in enumerate(files):
+            if cancel.is_set():
+                result.cancelled = True
+                return
+            if progress:
+                progress(done, total, item.rel)
+            if item.rel in skip:
+                result.skipped += 1
+                continue
+            target = _target_path(dest, item.rel)
+            if target is None:
+                result.errors.append(f"{item.rel}: 展開先の外を指しています")
+                continue
+            member = index.members[item.inner]
+            part = target + PART_SUFFIX
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member.source) as src, open(part, "wb") as out:
+                    while True:
+                        if cancel.is_set():
+                            break
+                        chunk = src.read(_COPY_CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                if cancel.is_set():
+                    _remove_quietly(part)
+                    result.cancelled = True
+                    return
+                if member.mtime:
+                    os.utime(part, (member.mtime, member.mtime))
+                os.replace(part, target)
+                result.written += 1
+            except Exception as e:  # noqa: BLE001  パスワード違いの例外の型が一定しない
+                _remove_quietly(part)
+                text = str(e).lower()
+                if "password" in text or "decrypt" in text or "aes" in text:
+                    result.errors.append(f"{item.rel}: パスワードが違うか、ありません（{e}）")
+                else:
+                    result.errors.append(f"{item.rel}: {e}")
+    if progress:
+        progress(total, total, "")
+
+
+def _extract_tar(index, files, dest, skip, password, progress, cancel, result, total):
+    """tar 系の展開。_extract_zip と同じ進み方(一時ファイル→置き換え)。パスワードは無い。"""
+    import tarfile  # noqa: PLC0415
+    try:
+        tf = tarfile.open(index.path, "r:*")
+    except (tarfile.TarError, OSError, EOFError) as e:
+        result.errors.append(str(e))
+        return
+    with tf:
+        for done, item in enumerate(files):
+            if cancel.is_set():
+                result.cancelled = True
+                return
+            if progress:
+                progress(done, total, item.rel)
+            if item.rel in skip:
+                result.skipped += 1
+                continue
+            target = _target_path(dest, item.rel)
+            if target is None:
+                result.errors.append(f"{item.rel}: 展開先の外を指しています")
+                continue
+            member = index.members[item.inner]
+            part = target + PART_SUFFIX
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                src = tf.extractfile(member.source)
+                if src is None:
+                    raise OSError("中身を取り出せません")
+                with src, open(part, "wb") as out:
+                    while True:
+                        if cancel.is_set():
+                            break
+                        chunk = src.read(_COPY_CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                if cancel.is_set():
+                    _remove_quietly(part)
+                    result.cancelled = True
+                    return
+                if member.mtime:
+                    os.utime(part, (member.mtime, member.mtime))
+                os.replace(part, target)
+                result.written += 1
+            except (OSError, tarfile.TarError, EOFError) as e:
                 _remove_quietly(part)
                 result.errors.append(f"{item.rel}: {e}")
     if progress:

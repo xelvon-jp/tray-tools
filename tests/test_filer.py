@@ -8822,17 +8822,15 @@ def _add_box_item_table(conn, rows):
 
 
 def test_window_copy_box_share():
-    """C→L: 対象がすべて Box Drive の中のときだけ項目が出る。URL は常に
-    https://app.box.com/folder/<ID> の形(共有リンクは作らない・聞かない)。コピーしたあとは確認窓
-    (ブラウザで開いて確かめる)。同じ名前の記録が複数あって決められないものは作らない。
-    Box の根と sync.db は一時フォルダに作った偽物(本物の Box Drive には触れない)。"""
+    """Box の共有用テキスト: C メニューに独立した項目は無く、C→P の窓の中で選ぶ。
+    URL は常に https://app.box.com/folder/<ID> の形(共有リンクは作らない・聞かない)。
+    コピー後の確認窓は無い(プレビューで事前に確かめる)。同じ名前の記録が複数あって
+    決められないものは作らない。Box の根と sync.db は一時フォルダに作った偽物
+    (本物の Box Drive には触れない)。"""
     import sqlite3
     import filer
     import filer_box
-    from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
-    from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QLabel, QPushButton
 
     _qapp()
     with tempfile.TemporaryDirectory() as tmp:
@@ -8875,32 +8873,27 @@ def test_window_copy_box_share():
         filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
         filer_box.discard_cache()
         w = filer.FilerWindow(app_settings, str(settings_path))
-        shown_blocks = []
-        w.show_box_copied = lambda blocks: shown_blocks.append(blocks)    # 確認窓は出さない
         try:
             w.show()
             w.start()
             _wait(w)
+            # C メニューに Box の独立項目は無い(Box の中でも外でも)
             w.choose_menu = capture
             w.left.set_cursor(w.left._row_of("alpha.txt"))
             w.cmd_copy_menu()
             assert "box" not in [i[2] for i in seen["items"]]
-
-            # Box の中に入ると出る
             w.left.load(str(folder))
             _wait(w)
             w.left.set_cursor(w.left._row_of("見積書.xlsx"))
             w.cmd_copy_menu()
-            assert ("L", "Box の共有用テキスト", "box") in seen["items"]
-            # 記録(sync.db)が無い PC では出ない
-            filer_box.DB_OVERRIDE = str(db) + ".none"
-            w.cmd_copy_menu()
             assert "box" not in [i[2] for i in seen["items"]]
-            filer_box.DB_OVERRIDE = str(db)
 
             # 常に /folder/<ID> の形。登録を聞くことも、共有リンクを取りに行くこともない
             assert not hasattr(w, "ask_box_link") and not hasattr(w, "fetch_box_link")
-            w.choose_menu = lambda title, items: "box"
+            # コピー後の確認窓は廃止された(プレビューに置き換え)
+            assert not hasattr(w, "show_box_copied")
+            w.choose_menu = lambda title, items: "path"
+            w.ask_copy_kind = lambda count, full_text, data: "box"
             clip = QGuiApplication.clipboard()
             w.left.set_cursor(w.left._row_of("見積書.xlsx"))
             w.cmd_copy_menu()
@@ -8909,9 +8902,6 @@ def test_window_copy_box_share():
                         "　　見積書.xlsx")
             assert clip.text() == expected, repr(clip.text())
             assert "Box: 1件をクリップボードへ" in w.log_view.toPlainText()
-            # コピーしたあと、確認窓に出す塊(見出しと URL)を渡す
-            assert shown_blocks == [[("/Box/ProjA/資料/", "https://app.box.com/folder/9101")]], \
-                shown_blocks
             # 古い box_links は読まず、書き換えもしない
             assert "/s/" not in clip.text()
             assert app_settings["filer"]["box_links"] == old_links
@@ -8924,69 +8914,12 @@ def test_window_copy_box_share():
 
             # 同期の記録に無いものは飛ばしてログに出す。全部だめなら何もしない
             clip.setText("keep")
-            n_blocks = len(shown_blocks)
             w.left.set_cursor(w.left._row_of("notsynced.txt"))
             w.cmd_copy_menu()
-            assert clip.text() == "keep" and len(shown_blocks) == n_blocks
+            assert clip.text() == "keep"
             assert "Box: 同期の記録に見つかりません: notsynced.txt" in w.log_view.toPlainText()
 
-            # --- コピー後の確認窓(本物。exec とブラウザは差し替え。窓は出さない) ---
-            del w.show_box_copied
-            opened = []
-            w.open_url = lambda url: opened.append(url)
-            url = "https://app.box.com/folder/9101"
-            seen_dialog = {}
-
-            def drive_confirm(key):
-                def run(dialog):
-                    seen_dialog["title"] = dialog.windowTitle()
-                    seen_dialog["labels"] = [l.text() for l in dialog.findChildren(QLabel)]
-                    buttons = {b.objectName(): b for b in dialog.findChildren(QPushButton)}
-                    seen_dialog["texts"] = [b.text() for b in dialog.findChildren(QPushButton)]
-                    assert buttons["boxCopiedClose"].isDefault()
-                    buttons["boxCopiedOpen1"].click()
-                    assert opened == [url], opened
-                    assert dialog.result() != filer.QDialog.Accepted      # 開いても閉じない
-                    buttons["boxCopiedOpen1"].click()                     # 続けて何度でも
-                    assert opened == [url, url]
-                    dialog.show()
-                    QTest.keyClick(dialog, key)
-                    seen_dialog["result"] = dialog.result()
-                    return dialog.result()
-                return run
-
-            w.exec_dialog = drive_confirm(Qt.Key_Return)
-            clip.setText("")
-            w.left.set_cursor(w.left._row_of("memo.txt"))
-            w.cmd_copy_menu()
-            assert seen_dialog["title"] == "Box の共有用テキストをコピーしました"
-            assert "/Box/ProjA/資料/" in seen_dialog["labels"], seen_dialog
-            assert seen_dialog["texts"] == ["ブラウザで開いて確かめる(&O)", "閉じる"], seen_dialog
-            assert seen_dialog["result"] == filer.QDialog.Accepted        # Enter(既定の「閉じる」)
-            assert clip.text().endswith("　　memo.txt")                   # 閉じてもコピーは残る
-            # Esc でも閉じる
-            seen_dialog.clear()
-            opened.clear()
-            w.exec_dialog = drive_confirm(Qt.Key_Escape)
-            w.cmd_copy_menu()
-            assert seen_dialog["result"] == filer.QDialog.Rejected and opened == [url, url]
-            # 開く処理が例外を投げても、窓もプロセスも落ちない(ログに残る)
-            filer.ERROR_LOG_PATH = os.path.join(tmp, "filer_error.log")
-
-            def boom(_url):
-                raise RuntimeError("boom")
-            w.open_url = boom
-
-            def drive_boom(dialog):
-                dialog.findChild(QPushButton, "boxCopiedOpen1").click()
-                seen_dialog["alive"] = True
-                return dialog.result()
-            w.exec_dialog = drive_boom
-            w.cmd_copy_menu()
-            assert seen_dialog.get("alive") and "boom" in w.log_view.toPlainText()
-
             # --- 同じ名前の記録が複数ある(古い行の残りなど)と、リンクを作らない ---
-            del w.exec_dialog
             conn = sqlite3.connect(str(db))
             conn.execute("INSERT INTO local_item VALUES (?,?,?,?)", (190, 0, 101, "memo.txt"))
             conn.execute("INSERT INTO item_mapping_between_fs VALUES (?,?,?,?)",
@@ -8994,10 +8927,6 @@ def test_window_copy_box_share():
             conn.commit()
             conn.close()
             filer_box.discard_cache()
-
-            def never(blocks):
-                raise AssertionError("決められないのに確認窓が出た")
-            w.show_box_copied = never
             clip.setText("keep")
             w.left.set_cursor(w.left._row_of("memo.txt"))
             w.cmd_copy_menu()
@@ -9023,7 +8952,6 @@ def test_window_copy_box_share():
             filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
             w.close()
             w.deleteLater()
-
 
 def test_window_ext_menu_box_open():
     """Ctrl+Enter に「Box.comで開く」が出るのは、対象が Box Drive の中のときだけ。選ぶと
@@ -9122,13 +9050,16 @@ def test_window_ext_menu_box_open():
 
 
 def test_window_copy_path_box_dialog():
-    """C→P: 対象がすべて Box の中なら、先に何をコピーするか聞く(フルパス/
-    共有用テキスト/両方)。両方で共有分が取れなければフルパスだけ入れる。
-    Box の外では聞かずに従来どおり即フルパス。"""
+    """C→P: 対象がすべて Box の中なら、プレビュー付きの窓で何をコピーするか聞く
+    (フルパス/共有用テキスト/両方)。選択だけではコピーせず、確定で初めて入る。
+    プレビューの URL はリンクで、ホバー情報とクリック(ブラウザで開く)を持つ。
+    コピー後の確認窓は無い。Box の外では聞かずに従来どおり即フルパス。"""
     import sqlite3
     import filer
     import filer_box
+    from PySide6.QtCore import QUrl
     from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QLabel, QPushButton
 
     _qapp()
     with tempfile.TemporaryDirectory() as tmp:
@@ -9159,8 +9090,6 @@ def test_window_copy_path_box_dialog():
         filer_box.ROOT_OVERRIDE, filer_box.DB_OVERRIDE = str(box_root), str(db)
         filer_box.discard_cache()
         w = filer.FilerWindow(app_settings, str(settings_path))
-        shown_blocks = []
-        w.show_box_copied = lambda blocks: shown_blocks.append(blocks)    # 確認窓は出さない
         try:
             w.show()
             w.start()
@@ -9176,68 +9105,106 @@ def test_window_copy_path_box_dialog():
             w.left.set_cursor(w.left._row_of("memo.txt"))
 
             # フルパス(通常)
-            w.ask_copy_kind = lambda count: "path"
+            w.ask_copy_kind = lambda count, full_text, data: "path"
             clip.setText("")
             w.cmd_copy_menu()
             assert clip.text() == full, repr(clip.text())
 
-            # 共有用テキスト(C→L と同じ)
-            w.ask_copy_kind = lambda count: "box"
+            # 共有用テキスト
+            w.ask_copy_kind = lambda count, full_text, data: "box"
             w.cmd_copy_menu()
             assert clip.text() == share, repr(clip.text())
-            blocks = [("/Box/ProjA/資料/", "https://app.box.com/folder/9101")]
-            assert shown_blocks == [blocks], shown_blocks
 
             # 両方: フルパス → 空行 → 共有用テキスト
-            w.ask_copy_kind = lambda count: "both"
+            w.ask_copy_kind = lambda count, full_text, data: "both"
             w.cmd_copy_menu()
             assert clip.text() == full + "\r\n\r\n" + share, repr(clip.text())
             assert "フルパス 1件＋Box の共有用テキスト 1件" in w.log_view.toPlainText()
-            assert shown_blocks == [blocks, blocks], shown_blocks
-            # フルパスだけのときは確認窓を出さない
-            w.ask_copy_kind = lambda count: "path"
-            w.cmd_copy_menu()
-            assert len(shown_blocks) == 2
-            w.ask_copy_kind = lambda count: "both"
 
             # キャンセル: 何も入らない
-            w.ask_copy_kind = lambda count: None
+            w.ask_copy_kind = lambda count, full_text, data: None
             clip.setText("keep")
             w.cmd_copy_menu()
             assert clip.text() == "keep"
 
-            # 両方で共有用テキストが作れなかった(決められない・記録が読めない等)ら、フルパスだけ入る
-            real_share = w._box_share_text
-            w._box_share_text = lambda: None
-            w.ask_copy_kind = lambda count: "both"
-            n_blocks = len(shown_blocks)
+            # 両方で共有用テキストが作れなかったら、フルパスだけ入る
+            real_data = w._box_share_data
+            w._box_share_data = lambda: None
+            w.ask_copy_kind = lambda count, full_text, data: "both"
             clip.setText("")
             w.cmd_copy_menu()
             assert clip.text() == full, repr(clip.text())
-            assert len(shown_blocks) == n_blocks
-            w._box_share_text = real_share
+            w._box_share_data = real_data
 
-            # 本物の選択ダイアログ: ボタンの並びと、「両方」を押した結果
-            from PySide6.QtWidgets import QPushButton
+            # 本物の窓: 選択では確定せずプレビューが切り替わり、「コピー」で確定する。
+            # リンクのホバー情報と、クリックでブラウザが開くこと(窓は閉じない)も見る
             seen_dialog = {}
+            opened = []
+            w.open_url = lambda url: opened.append(url)
 
             def drive(dialog):
-                seen_dialog["names"] = [b.objectName()
-                                        for b in dialog.findChildren(QPushButton)]
+                seen_dialog["names"] = {b.objectName()
+                                        for b in dialog.findChildren(QPushButton)}
+                preview = dialog.findChild(filer._LinkPreview, "copyKindPreview")
+                seen_dialog["preview_path"] = preview.toPlainText().strip()
                 dialog.findChild(QPushButton, "copyKindBoth").click()
+                seen_dialog["still_open"] = dialog.result() != filer.QDialog.Accepted
+                both_text = preview.toPlainText()
+                seen_dialog["both_has_full"] = full in both_text
+                seen_dialog["both_has_share"] = "https://app.box.com/folder/9101" in both_text
+                url = "https://app.box.com/folder/9101"
+                seen_dialog["tip"] = preview.tip_for(url)
+                preview.anchorClicked.emit(QUrl(url))
+                seen_dialog["opened_in_dialog"] = list(opened)
+                dialog.findChild(QPushButton, "copyKindOk").click()
                 return dialog.result()
 
             del w.ask_copy_kind
             w.exec_dialog = drive
             clip.setText("")
             w.cmd_copy_menu()
-            assert seen_dialog["names"] == ["copyKindPath", "copyKindBox",
-                                            "copyKindBoth", "copyKindCancel"], seen_dialog
+            assert seen_dialog["names"] == {"copyKindPath", "copyKindBox",
+                                            "copyKindBoth", "copyKindOk",
+                                            "copyKindCancel"}, seen_dialog
+            assert seen_dialog["preview_path"] == full, seen_dialog
+            assert seen_dialog["still_open"]
+            assert seen_dialog["both_has_full"] and seen_dialog["both_has_share"]
+            assert "資料（フォルダ）" in seen_dialog["tip"]
+            assert "パス：/Box/ProjA/資料/" in seen_dialog["tip"]
+            assert "フォルダ ID：9101" in seen_dialog["tip"]
+            assert seen_dialog["opened_in_dialog"] == ["https://app.box.com/folder/9101"]
             assert clip.text() == full + "\r\n\r\n" + share, repr(clip.text())
             del w.exec_dialog
 
+            # 共有用テキストが作れないとき: 「共有用テキスト」は確定できず、
+            # 「両方」はフルパスだけのプレビューになる
+            w._box_share_data = lambda: {"text": None, "count": 0, "blocks": [],
+                                         "problems": ["memo.txt：同期の記録に見つかりません"]}
+            seen2 = {}
+
+            def drive2(dialog):
+                preview = dialog.findChild(filer._LinkPreview, "copyKindPreview")
+                dialog.findChild(QPushButton, "copyKindBox").click()
+                seen2["ok_enabled"] = dialog.findChild(QPushButton, "copyKindOk").isEnabled()
+                dialog.findChild(QPushButton, "copyKindBoth").click()
+                seen2["preview_both"] = preview.toPlainText().strip()
+                seen2["note"] = dialog.findChild(QLabel, "copyKindNote").text()
+                dialog.findChild(QPushButton, "copyKindOk").click()
+                return dialog.result()
+
+            w.exec_dialog = drive2
+            clip.setText("")
+            w.cmd_copy_menu()
+            assert seen2["ok_enabled"] is False
+            assert seen2["preview_both"] == full, seen2
+            assert "リンクを作れなかったもの" in seen2["note"]
+            assert "memo.txt：同期の記録に見つかりません" in seen2["note"]
+            assert clip.text() == full, repr(clip.text())
+            del w.exec_dialog
+            w._box_share_data = real_data
+
             # Box の外では聞かない
-            def no_ask(count):
+            def no_ask(count, full_text, data):
                 raise AssertionError("Box の外で聞かれた")
 
             w.ask_copy_kind = no_ask
@@ -9251,7 +9218,6 @@ def test_window_copy_path_box_dialog():
             filer_box.ROOT_OVERRIDE = filer_box.DB_OVERRIDE = None
             w.close()
             w.deleteLater()
-
 
 def test_workspace_store():
     """ワークスペースの保存先はデータ置き場(テストでは一時フォルダ。本物の

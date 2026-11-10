@@ -78,6 +78,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyledItemDelegate,
     QTableView,
+    QTextBrowser,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -2766,6 +2768,34 @@ def _menu_style_sheet(colors) -> str:
     )
 
 
+class _LinkPreview(QTextBrowser):
+    """C→P のプレビュー表示。フォルダ URL にマウスを乗せると、tip_for が返した
+    リンク先フォルダの情報(名前・パス・ID)をツールチップで出す。クリックは
+    anchorClicked で呼び出し側へ渡す(自分では開かない)。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setOpenLinks(False)
+        self.setUndoRedoEnabled(False)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.tip_for = None
+        self._hover_href = ""
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        href = self.anchorAt(event.pos())
+        if href == self._hover_href:
+            return
+        self._hover_href = href
+        tip = self.tip_for(href) if href and self.tip_for else None
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, self)
+        else:
+            QToolTip.hideText()
+
+
 class FilerWindow(QWidget):
     def __init__(self, app_settings=None, settings_path=None):
         super().__init__()
@@ -4248,7 +4278,7 @@ class FilerWindow(QWidget):
         """Ctrl+Enter「Box.comで開く」: Box Drive 自身の右クリック項目「Box.comで表示」を、
         F7 と同じ子プロセス(filer_contextmenu.py --item)に画面へ出さず実行させる。Box が
         ブラウザを開く。こちらで組み立てた URL ではなく Box 自身の項目を使うので確かで、
-        C→L の URL の独立した確認にもなる。UI は止めない(子の終了は別スレッドで待つ)。"""
+        C→P で作る URL の独立した確認にもなる。UI は止めない(子の終了は別スレッドで待つ)。"""
         for path in list(paths)[:5]:      # 項目は1件ずつにしか出ないので1件ずつ。多すぎる開き方はしない
             args = core.context_menu_args([path], 0, 0, self._hwnd(),
                                           items=filer_box.VIEW_ON_BOX_ITEMS)
@@ -5938,8 +5968,6 @@ class FilerWindow(QWidget):
         if self.phone_enabled:
             # 環境1のときだけ出す(無効な PC では項目自体を見せない)
             items.append(("S", "スマホへ送る（QR）", "phone"))
-        if self._box_menu_ok():
-            items.append(("L", "Box の共有用テキスト", "box"))
         if self._web_link_menu_ok():
             items.append(("W", "Web リンクをコピー（SharePoint 等）", "weblink"))
         items.append(("Q", "キャンセル", None))
@@ -5956,8 +5984,6 @@ class FilerWindow(QWidget):
             self._copy_renamed(to_other=False, rename=False)
         elif choice == "phone":
             self.cmd_phone_send()
-        elif choice == "box":
-            self._copy_box_share()
         elif choice == "weblink":
             self._copy_web_links()
         elif choice == "name":
@@ -5998,8 +6024,8 @@ class FilerWindow(QWidget):
         self.log(f"クリップボード: Web リンク {len(links)}件（{links[0][0]}）")
 
     def _box_menu_ok(self) -> bool:
-        """C メニューに「Box の共有用テキスト」を出すか。対象がすべて Box Drive の中にあり、
-        Box Drive の記録(sync.db)があるときだけ。ほかの PC・ほかの場所では項目自体を見せない。"""
+        """C→P で Box の共有用テキストの選択肢を出すか。対象がすべて Box Drive の中にあり、
+        Box Drive の記録(sync.db)があるときだけ。ほかの PC・ほかの場所では聞かずに即フルパス。"""
         try:
             if self.active.archive is not None:
                 return False
@@ -6007,13 +6033,18 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001  メニューが開けなくなるのが最悪
             return False
 
-    def _box_share_text(self):
-        """対象の共有用テキストを作り、(テキスト, 件数, 塊ごとの[(見出し, URL)]) で返す。
-        中止・失敗・対象が無ければ None(クリップボードへは入れない。入れる先は呼び出し側が決める)。
+    def _box_share_data(self):
+        """対象の Box 共有用テキストの材料を解決して返す。C→P の窓を開く前に
+        1回だけ呼ぶ(プレビューと確定で同じ材料を使うため)。
 
-        URL は常に https://app.box.com/folder/<ID> の形(フォルダのメンバーとして招待された人が
-        開ける)。共有リンクは作らない・取らない。同じ名前の記録が複数あって決められないものは
-        リンクを作らない。"""
+        {text, count, blocks, problems} を返す。text は作れた共有用テキスト
+        (1件も作れなければ None)、blocks は塊ごとの [(見出し, URL)]、problems は
+        リンクを作れなかった対象の表示文(プレビューの注記用)。記録そのものが
+        読めないときは None。問題のログ出力はここで済ませる。
+
+        URL は常に https://app.box.com/folder/<ID> の形(フォルダのメンバーとして
+        招待された人が開ける)。共有リンクは作らない・取らない。同じ名前の記録が
+        複数あって決められないものはリンクを作らない。"""
         paths = self.active.target_paths()
         cache_dir = os.path.join(filer_archive.TEMP_ROOT, "box_db")
         try:
@@ -6022,140 +6053,211 @@ class FilerWindow(QWidget):
         except filer_box.BoxDbError:
             self.log("Box: Box Drive の記録が読めません")
             return None
+        problems = []
         for name in missing:
             self.log(f"Box: 同期の記録に見つかりません: {name}（アップロード前かも）")
+            problems.append(f"{name}：同期の記録に見つかりません")
         for name in ambiguous:
             self.log(f"Box: 同じ名前の記録が複数あるため特定できません: {name}（リンクは作りません）")
+            problems.append(f"{name}：同じ名前の記録が複数あるため特定できません")
         for name in mismatched:
             self.log(f"Box: Box 側の記録と一致しないため、リンクを作りません: {name}")
+            problems.append(f"{name}：Box 側の記録と一致しません")
         if not items:
+            return {"text": None, "count": 0, "blocks": [], "problems": problems}
+        return {"text": filer_box.build_share_text(items), "count": len(items),
+                "blocks": filer_box.share_blocks(items), "problems": problems}
+
+    def _box_share_text(self):
+        """_box_share_data を (テキスト, 件数, 塊) の形で返す。作れなければ None。"""
+        data = self._box_share_data()
+        if data is None or data["text"] is None:
             return None
-        return (filer_box.build_share_text(items), len(items),
-                filer_box.share_blocks(items))
+        return (data["text"], data["count"], data["blocks"])
 
     def open_url(self, url):
         """URL を既定のブラウザで開く(テストではここを差し替える)。"""
         return QDesktopServices.openUrl(QUrl(url))
 
-    def show_box_copied(self, blocks):
-        """共有用テキストをコピーした直後の確認窓(テストではここを差し替える)。
-
-        塊ごとに見出しのパスと「ブラウザで開いて確かめる」ボタンを出す(1つ目は O、複数なら
-        2つ目以降は 1, 2…)。開いても窓は閉じない(いくつも確かめられるように)。
-        「閉じる」が既定で、Enter / Esc で閉じる。"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Box の共有用テキストをコピーしました")
-        layout = QVBoxLayout(dialog)
-        for number, (shown, url) in enumerate(blocks, start=1):
-            label = QLabel(shown)
-            label.setObjectName(f"boxCopiedLabel{number}")
-            layout.addWidget(label)
-            mnemonic = "O" if number == 1 else str(number - 1)
-            button = QPushButton(f"ブラウザで開いて確かめる(&{mnemonic})")
-            button.setObjectName(f"boxCopiedOpen{number}")
-            button.setAutoDefault(False)
-
-            def open_it(_checked=False, target=url):
-                try:
-                    self.open_url(target)
-                except Exception:  # noqa: BLE001  スロットから例外を投げ切らない
-                    self.log(f"エラー: {_log_exception('boxOpen')}")
-
-            button.clicked.connect(open_it)
-            layout.addWidget(button)
-        close = QPushButton("閉じる")
-        close.setObjectName("boxCopiedClose")
-        close.setDefault(True)
-        close.clicked.connect(dialog.accept)
-        layout.addWidget(close)
-        close.setFocus()
-        self.exec_dialog(dialog)
-
-    def _notify_box_copied(self, blocks):
-        try:
-            self.show_box_copied(blocks)
-        except Exception:  # noqa: BLE001  確認窓の失敗でコピー自体を無かったことにしない
-            self.log(f"エラー: {_log_exception('boxCopied')}")
-
-    def _copy_box_share(self):
-        """C→L: 共有用テキストをクリップボードへ入れる(取ったときに Box が入れた
-        リンクは、最後に共有用テキストで上書きされる)。"""
-        got = self._box_share_text()
-        if got is None:
-            return
-        text, count, blocks = got
-        QGuiApplication.clipboard().setText(text)
-        self.log(f"Box: {count}件をクリップボードへ")
-        self._notify_box_copied(blocks)
-
     def _copy_paths(self):
-        """C→P: フルパスをクリップボードへ入れる。対象がすべて Box の中で共有用テキストが
-        取得できるなら(C→L が出る条件と同じ)、先に何をコピーするか聞く
-        (フルパス/共有用テキスト/両方)。"""
+        """C→P: フルパスをクリップボードへ入れる。対象がすべて Box の中で共有用テキストも
+        作れるなら(条件は _box_menu_ok と同じ)、プレビュー付きの窓で何をコピーするか聞く
+        (フルパス/共有用テキスト/両方)。Box の解決は窓を開く前に1回だけ行い、
+        プレビューと確定で同じ材料を使う。"""
         paths = self.active.target_paths()
         full = core.clip_text(paths)
+        clip = QGuiApplication.clipboard()
         if not self._box_menu_ok():
-            QGuiApplication.clipboard().setText(full)
+            clip.setText(full)
             self.log(f"クリップボード: {len(paths)}件のフルパス")
             return
-        kind = self.ask_copy_kind(len(paths))
+        data = self._box_share_data()
+        if data is None:
+            data = {"text": None, "count": 0, "blocks": [],
+                    "problems": ["Box Drive の記録が読めません"]}
+        kind = self.ask_copy_kind(len(paths), full, data)
         if kind is None:
             return
         if kind == "path":
-            QGuiApplication.clipboard().setText(full)
+            clip.setText(full)
             self.log(f"クリップボード: {len(paths)}件のフルパス")
         elif kind == "box":
-            self._copy_box_share()
-        else:  # both: 共有分が取れなかった(中止・失敗)ときはフルパスだけ入れる
-            got = self._box_share_text()
-            if got is None:
-                QGuiApplication.clipboard().setText(full)
+            if data["text"] is None:
+                return
+            clip.setText(data["text"])
+            self.log(f"Box: {data['count']}件をクリップボードへ")
+        else:  # both: 共有分が取れなかったときはフルパスだけ入れる
+            if data["text"] is None:
+                clip.setText(full)
                 self.log(f"クリップボード: {len(paths)}件のフルパス（共有用テキストは含めず）")
             else:
-                text, count, blocks = got
-                QGuiApplication.clipboard().setText(full + "\r\n\r\n" + text)
-                self.log(f"クリップボード: フルパス {len(paths)}件＋Box の共有用テキスト {count}件")
-                self._notify_box_copied(blocks)
+                clip.setText(full + "\r\n\r\n" + data["text"])
+                self.log(f"クリップボード: フルパス {len(paths)}件＋"
+                         f"Box の共有用テキスト {data['count']}件")
 
-    def ask_copy_kind(self, count):
-        """C→P で Box の共有用テキストも作れるとき、何をコピーするか聞く。
+    @staticmethod
+    def _box_link_tip(shown, url):
+        """プレビューのフォルダ URL にホバーしたときのポップアップ文。
+        リンク先フォルダの素性(名前・パス・ID)だけを出す。"""
+        name = shown.rstrip("/").rsplit("/", 1)[-1] if shown else ""
+        folder_id = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+        return (f"{name}（フォルダ）\nパス：{shown}\nフォルダ ID：{folder_id}\n"
+                "クリックでブラウザで開きます")
+
+    @staticmethod
+    def _copy_preview_html(kind, full_text, data):
+        """プレビューに出す HTML。コピーされる文字列を <pre> でそのまま見せ、
+        共有用テキストのフォルダ URL だけをリンクにする。"""
+        import html as _html
+        share = data["text"]
+
+        def linked(text):
+            out = _html.escape(text.replace("\r\n", "\n"))
+            for _shown, url in data["blocks"]:
+                esc = _html.escape(url)
+                out = out.replace(esc, f'<a href="{esc}">{esc}</a>')
+            return out
+
+        if kind == "path":
+            body = _html.escape(full_text.replace("\r\n", "\n"))
+        elif kind == "box":
+            body = (linked(share) if share is not None
+                    else "共有用テキストは作れませんでした。")
+        else:  # both
+            body = _html.escape(full_text.replace("\r\n", "\n"))
+            if share is not None:
+                body += "\n\n" + linked(share)
+        return f"<pre>{body}</pre>"
+
+    @staticmethod
+    def _copy_preview_note(kind, data):
+        """プレビューの下に出す注記(コピーされる文字列には含めない)。"""
+        if kind == "path":
+            return ""
+        lines = []
+        if data["text"] is None and kind == "both":
+            lines.append("共有用テキストは作れなかったため、フルパスだけをコピーします。")
+        if data["problems"]:
+            lines.append("リンクを作れなかったもの：")
+            lines += [f"・{p}" for p in data["problems"]]
+        return "\n".join(lines)
+
+    def ask_copy_kind(self, count, full_text, data):
+        """C→P で Box の共有用テキストも作れるとき、プレビューを見せて何をコピーするか聞く。
         "path" / "box" / "both" / None(キャンセル)を返す。(テストではここを差し替える)
 
-        既定はフルパス(最初のボタンにフォーカス)。P / L / B のキーでも選べて、
-        その場で実行する(この小さい窓だけの特例)。"""
+        選択(P / L / B のキー・↑↓・ボタンのクリック)だけではコピーせず、プレビューが
+        切り替わるだけ。Enter か「コピー」で確定する。既定はフルパス。
+        プレビューのフォルダ URL はリンクで、ホバーでリンク先フォルダの情報を出し、
+        クリックでブラウザで開く(窓は閉じない)。共有用テキストが作れなかったときは
+        「共有用テキスト」を選んでも確定できない。"""
         dialog = QDialog(self)
         dialog.setWindowTitle("何をコピーしますか？")
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f"Box の共有用テキストも作れます（{count}件）"))
-        result = {}
-
-        def pick(kind):
-            result["kind"] = kind
-            dialog.accept()
-
-        first = None
+        state = {"kind": "path"}
+        buttons = {}
+        row = QHBoxLayout()
         for kind, label, name in (
                 ("path", "フルパス（通常）", "copyKindPath"),
                 ("box", "共有用テキスト", "copyKindBox"),
                 ("both", "両方", "copyKindBoth")):
             button = QPushButton(label)
             button.setObjectName(name)
-            button.clicked.connect(lambda _checked=False, k=kind: pick(k))
-            layout.addWidget(button)
-            if first is None:
-                first = button
+            button.setCheckable(True)
+            button.setAutoDefault(False)
+            button.clicked.connect(lambda _checked=False, k=kind: select(k))
+            row.addWidget(button)
+            buttons[kind] = button
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addWidget(QLabel("プレビュー"))
+        preview = _LinkPreview(dialog)
+        preview.setObjectName("copyKindPreview")
+        preview.setMinimumHeight(150)
+        tips = {url: self._box_link_tip(shown, url) for shown, url in data["blocks"]}
+        preview.tip_for = tips.get
+
+        def open_link(qurl):
+            try:
+                self.open_url(qurl.toString())
+            except Exception:  # noqa: BLE001  スロットから例外を投げ切らない
+                self.log(f"エラー: {_log_exception('boxOpen')}")
+
+        preview.anchorClicked.connect(open_link)
+        layout.addWidget(preview)
+        note = QLabel(dialog)
+        note.setObjectName("copyKindNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        ok = QPushButton("コピー")
+        ok.setObjectName("copyKindOk")
+        ok.setDefault(True)
+        bottom.addWidget(ok)
         cancel = QPushButton("キャンセル")
         cancel.setObjectName("copyKindCancel")
+        cancel.setAutoDefault(False)
+        bottom.addWidget(cancel)
+        layout.addLayout(bottom)
+
+        def select(kind):
+            state["kind"] = kind
+            for k, b in buttons.items():
+                b.setChecked(k == kind)
+            preview.setHtml(self._copy_preview_html(kind, full_text, data))
+            note.setText(self._copy_preview_note(kind, data))
+            ok.setEnabled(kind != "box" or data["text"] is not None)
+
+        def confirm():
+            if state["kind"] == "box" and data["text"] is None:
+                return
+            dialog.accept()
+
+        ok.clicked.connect(confirm)
         cancel.clicked.connect(dialog.reject)
-        layout.addWidget(cancel)
+        order = ["path", "box", "both"]
+
+        def cycle(delta):
+            select(order[(order.index(state["kind"]) + delta) % len(order)])
+
         for key, kind in (("P", "path"), ("L", "box"), ("B", "both")):
             shortcut = QShortcut(QKeySequence(key), dialog)
-            shortcut.activated.connect(lambda k=kind: pick(k))
-        if first is not None:
-            first.setFocus()
+            shortcut.activated.connect(lambda k=kind: select(k))
+        up = QShortcut(QKeySequence("Up"), dialog)
+        up.activated.connect(lambda: cycle(-1))
+        down = QShortcut(QKeySequence("Down"), dialog)
+        down.activated.connect(lambda: cycle(1))
+        for seq in ("Return", "Enter"):
+            enter = QShortcut(QKeySequence(seq), dialog)
+            enter.activated.connect(confirm)
+        select("path")
+        buttons["path"].setFocus()
+        dialog.resize(560, 430)
         if self.exec_dialog(dialog) != QDialog.Accepted:
             return None
-        return result.get("kind")
+        return state["kind"]
 
     def cmd_phone_send(self):
         """C→S(環境1のときだけ): 対象ファイルをスマホへ QR で渡す。

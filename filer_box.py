@@ -1,4 +1,4 @@
-"""あっふ(filer.py)の C→L「Box の共有用テキスト」の、Qt に依存しない部分。
+"""あっふ(filer.py)の C→P「Box の共有用テキスト」の、Qt に依存しない部分。
 
 Box Drive が手元に持つ同期の記録(sync.db)から、ファイル・フォルダの Box 上の ID を引き、
 「/Box/案件/資料/」「フォルダの URL(https://app.box.com/folder/<ID>)」「ファイル名」の

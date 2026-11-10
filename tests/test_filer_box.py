@@ -1,5 +1,5 @@
 # tests/test_filer_box.py
-# あっふの C→L「Box の共有用テキスト」(filer_box.py)を確かめる。Qt は使わない。
+# あっふの C→P「Box の共有用テキスト」(filer_box.py)を確かめる。Qt は使わない。
 # 本物の Box Drive には触れず、手で作った sync.db(必要な2表だけ)と一時フォルダを使う。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_filer_box.py

@@ -358,7 +358,8 @@ class ClaudeProgressPanel(QWidget):
                                  else self._bridge_size)
                 view_now = cv.coop_view(self._muse, self._entries, now,
                                         paused=bool(muse.get("paused")),
-                                        events=self._events)
+                                        events=self._events,
+                                        desk=bctl.read_desk_activity())
                 self._stealth_view = view_now
                 tone_now = view_now["tone"] if view_now else None
                 if tone_now is not None:
@@ -527,7 +528,8 @@ class ClaudeProgressPanel(QWidget):
         if entry.get("_coop"):
             view = cv.coop_view(entry["muse"], entry["entries"], now,
                                  paused=bool(entry.get("paused")),
-                                 events=entry.get("events"))
+                                 events=entry.get("events"),
+                                 desk=bctl.read_desk_activity())
             if view is not None:
                 coop_stage.paint_coop(
                     p, rect, view, now, self.devicePixelRatioF(), self._sub_font,

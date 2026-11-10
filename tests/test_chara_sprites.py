@@ -95,9 +95,27 @@ def test_confetti():
     assert sp.confetti_particles(1234, 274) == sp.confetti_particles(1234, 274)   # 決定的
 
 
+def test_scene_grids():
+    # 最終イメージの場面の小物(マトリクス案A の写し)。格子が長方形で、
+    # 使う文字が全部パレットにあること。
+    pairs = [(sp.GITHUB_GRID, sp.GITHUB_PALETTE), (sp.POST_GRID, sp.POST_PALETTE),
+             (sp.WATCH_GRID, sp.WATCH_PALETTE),
+             (sp.WATCH_BLINK_GRID, sp.WATCH_PALETTE),
+             (sp.DEPLOY_GRID, sp.DEPLOY_PALETTE),
+             (sp.DEPLOY_WALK_A, sp.DEPLOY_PALETTE),
+             (sp.DEPLOY_WALK_B, sp.DEPLOY_PALETTE),
+             (sp.HOME_GRID, sp.HOME_PALETTE), (sp.PC_GRID, sp.PC_PALETTE),
+             (sp.YOTA_GRID, sp.YOTA_PALETTE), (sp.DESK_GRID, sp.DESK_PALETTE)]
+    for grid, palette in pairs:
+        w = len(grid[0])
+        assert all(len(row) == w for row in grid)
+        used = {ch for row in grid for ch in row if ch != "."}
+        assert used <= set(palette), (used, palette)
+
+
 ALL_TESTS = [test_frame_sizes, test_clawd_shape, test_muse_sleep_z_is_light_blue,
              test_clawd_frame_cycles, test_muse_frame_cycles, test_move_offset,
-             test_confetti]
+             test_confetti, test_scene_grids]
 
 
 if __name__ == "__main__":

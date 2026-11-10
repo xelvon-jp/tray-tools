@@ -13,7 +13,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainte
 import bridge_events_view as bev
 import chara_sprites as sp
 
-STAGE_H = 116
+STAGE_H = 148   # 大きさ「大」のステージ高さ(SIZES['large'] と一致させる)
 BANNER_H = 36
 CARDS_H = 34
 PAD = 8
@@ -30,7 +30,7 @@ COOP_COLLAPSED_HEIGHT = 56    # たたんだとき: バナーだけ(上下に余
 # ない)。cards は下のカード3枚を出すか。中・小ではカードを落として背を低く
 # する。名前(MUSE / CLAW'D の文字)はどの大きさでも描かない(陽太さんの指定)。
 SIZES = {
-    "large": {"stage_h": 116, "muse_cell": 4, "cell": 5, "item_cell": 2, "cards": True},
+    "large": {"stage_h": 148, "muse_cell": 4, "cell": 5, "item_cell": 2, "cards": True},
     "medium": {"stage_h": 74, "muse_cell": 2, "cell": 2.5, "item_cell": 1, "cards": False},
     "small": {"stage_h": 50, "muse_cell": 1, "cell": 1.25, "item_cell": 1, "cards": False},
 }
@@ -310,7 +310,12 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
     p.save()
     try:
         p.setClipRect(st.adjusted(1, 1, -1, -1))
-        _paint_stage(p, dpr, view, st, accent, t, spec)
+        if spec["cards"]:
+            # 大きさ「大」は最終イメージの場面(家=PC を中心にした接続図)。
+            # 中・小は従来の二人のステージのまま。
+            _paint_scene(p, dpr, view, st, accent, t, spec)
+        else:
+            _paint_stage(p, dpr, view, st, accent, t, spec)
     finally:
         p.restore()
 
@@ -332,10 +337,11 @@ def paint_coop(p, rect, view, now, dpr, sub_font, collapsed=False, hot=False,
         p.drawText(r, Qt.AlignLeft | Qt.AlignVCenter,
                    tape_fm.elidedText(line, Qt.ElideRight, r.width()))
 
-    # カード3枚
+    # カード(枚数は view の cards に合わせる。いまは5枚)
     top = tape_top + TAPE_H + GAP
     gap = 5
-    cw = (inner.width() - gap * 2) // 3
+    n_cards = max(1, len(view["cards"]))
+    cw = (inner.width() - gap * (n_cards - 1)) // n_cards
     label_font = QFont("Meiryo", 7)
     value_font = QFont("Meiryo", 8)
     value_font.setBold(True)
@@ -462,6 +468,262 @@ def _paint_stage(p, dpr, view, st, accent, t, spec):
         p.drawText(QRect(int(cx + 48 * f + 10 * k * f), int(cy - 16 * f - 22 * k * f), 40, 16),
                    Qt.AlignLeft | Qt.AlignVCenter, "z z Z")
         p.setOpacity(1.0)
+    if "confetti" in props:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for x, y, color, angle, alpha in sp.confetti_particles(t, W):
+            p.save()
+            p.setOpacity(max(0.0, min(1.0, alpha)))
+            p.translate(ox + x + 2, oy + y + 2)
+            p.rotate(angle)
+            p.fillRect(-2, -2, 4, 4, QColor(color))
+            p.restore()
+        p.setRenderHint(QPainter.Antialiasing, False)
+
+
+def _path_point(points, progress):
+    """折れ線(points は (x, y) の列)の上を progress(0..1)だけ進んだ点。
+    最終イメージのドットの移動(Manhattan 経路を等速で)と同じ考え方。"""
+    if not points:
+        return (0.0, 0.0)
+    if len(points) == 1 or progress <= 0:
+        return points[0]
+    total = 0.0
+    segs = []
+    for a, b in zip(points, points[1:]):
+        d = math.hypot(b[0] - a[0], b[1] - a[1])
+        segs.append((a, b, d))
+        total += d
+    if total <= 0:
+        return points[-1]
+    rest = min(1.0, progress) * total
+    for a, b, d in segs:
+        if rest <= d:
+            k = rest / d if d else 0.0
+            return (a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k)
+        rest -= d
+    return points[-1]
+
+
+# 最終イメージの場面(大きさ「大」専用)。座標はステージに対する割合で持つ
+# (モック bridge-final-image.html のアンカー配置に対応)。
+SCENE_ANCHORS = {
+    "github": (0.50, 0.13), "post": (0.70, 0.13), "muse": (0.15, 0.42),
+    "pc": (0.85, 0.42), "desk": (0.68, 0.70), "user": (0.38, 0.85),
+}
+WATCH_BASE = (0.83, 0.54)       # 見張り(フクロウ)の定位置(PC の足元)
+WATCH_FAR = (0.17, 0.54)        # 見張りの往復の向こう側(Muse の足元)
+WATCH_LOW = 0.62                # 往復路の下段の y(割合)
+
+
+def _watcher_point(t, active, alert):
+    """フクロウの居場所(割合座標)。動くのは Muse が動いている間だけ:
+    PC の足元 → 下の点線路 → Muse の足元、をゆっくり往復する。
+    異常のときは Muse 側で小刻みに揺れる。待機中は PC の足元で止まる。"""
+    if alert:
+        dx = -0.004 if t % 160 < 80 else 0.004
+        return (WATCH_FAR[0] + dx, WATCH_FAR[1])
+    if not active:
+        return WATCH_BASE
+    route = [WATCH_BASE, (WATCH_BASE[0], WATCH_LOW),
+             (WATCH_FAR[0], WATCH_LOW), WATCH_FAR]
+    c = t % 12000
+    if c < 3000:
+        return WATCH_BASE
+    if c < 4500:
+        return _path_frac(route, (c - 3000) / 1500.0)
+    if c < 7500:
+        return WATCH_FAR
+    if c < 9000:
+        return _path_frac(list(reversed(route)), (c - 7500) / 1500.0)
+    return WATCH_BASE
+
+
+def _path_frac(points, progress):
+    """割合座標の折れ線上の点。長さは割合のまま測る(縦横比は無視する)。"""
+    return _path_point([(float(x), float(y)) for x, y in points], progress)
+
+
+def _paint_scene(p, dpr, view, st, accent, t, spec):
+    """最終イメージの場面。家=PC(右のモニタ。家サーバはこの中)が中心で、
+    Muse(左)・GitHub(上)・私書箱(上・観測)・窓口(右下)・あなたの席(下)と
+    線でつながる。動きは実イベント駆動: 手紙の飛行は bridge_journal の記録、
+    窓口のドットはプレイブック実行中だけ、見張りの往復は Muse の活動中だけ。"""
+    W, H = st.width(), st.height()
+    ox, oy = st.left(), st.top()
+
+    def pt(frac):
+        return (ox + W * frac[0], oy + H * frac[1])
+
+    A = SCENE_ANCHORS
+    # --- 線(実線=やり取りの経路、点線=鏡写しと見張りの往復路) ---
+    solid = [
+        [A["user"], (0.15, 0.85), A["muse"]],
+        [A["user"], (0.85, 0.85), A["pc"]],
+        [A["muse"], A["pc"]],
+        [A["pc"], (0.85, 0.70), A["desk"]],
+        [A["muse"], (0.15, 0.13), A["github"]],
+        [A["pc"], (0.85, 0.13), A["github"]],
+    ]
+    p.setPen(QPen(QColor("#5a5d66"), 1))
+    p.setBrush(Qt.NoBrush)
+    for line in solid:
+        p.drawPolyline(QPolygonF([QPointF(*pt(f)) for f in line]))
+    mirror = [(0.85, 0.375), (0.64, 0.375), (0.64, 0.13), A["post"]]
+    pen = QPen(QColor("#7a7e89"), 1)
+    pen.setDashPattern([1, 2])
+    p.setPen(pen)
+    p.drawPolyline(QPolygonF([QPointF(*pt(f)) for f in mirror]))
+    route = [WATCH_FAR, (WATCH_FAR[0], WATCH_LOW),
+             (WATCH_BASE[0], WATCH_LOW), WATCH_BASE]
+    p.drawPolyline(QPolygonF([QPointF(*pt(f)) for f in route]))
+    p.setPen(Qt.NoPen)
+
+    props = view["props"]
+    flights = view.get("flights") or []
+    press = any(f.get("press") for f in flights)
+
+    # --- GitHub(上・中央) ---
+    gh_cell = 1.6
+    gx, gy = pt(A["github"])
+    _sprite(p, dpr, ("scene", "github"), sp.GITHUB_GRID, sp.GITHUB_PALETTE,
+            gx - 10 * gh_cell, gy - 10 * gh_cell, gh_cell)
+
+    # --- 私書箱(上・GitHub の右)。旗は承認待ちの合図があるときだけ上がる ---
+    post_cell = 2.0
+    px_, py_ = pt(A["post"])
+    post_left, post_top = px_ - 6 * post_cell, py_ - 6 * post_cell
+    _sprite(p, dpr, ("scene", "post"), sp.POST_GRID, sp.POST_PALETTE,
+            post_left, post_top, post_cell)
+    if view.get("flag_up"):
+        wave = 0 if t % 800 < 400 else 1
+        p.fillRect(int(post_left + 15 + wave), int(post_top + 2), 7, 4,
+                   QColor("#FF7847"))
+
+    # --- Muse(左) ---
+    muse_cell = 2.2
+    mname = sp.muse_frame(view["muse_anim"], t)
+    mrows = sp.muse_rows(mname)
+    mw, mh = len(mrows[0]) * muse_cell, len(mrows) * muse_cell
+    mdx, mdy = sp.move_offset(sp.MUSE_MOVE.get(view["muse_anim"], ""), t)
+    mx, my = pt(A["muse"])
+    m_left, m_top = mx - mw / 2 + mdx, my - mh / 2 + mdy
+    _sprite(p, dpr, ("muse", mname), mrows, sp.MUSE_PALETTE,
+            m_left, m_top, muse_cell)
+    if "spark" in props:
+        p.setOpacity(1.0 if t % 500 < 250 else 0.15)
+        _sprite(p, dpr, ("item", "spark"), ITEM_GRIDS["spark"], ITEM_PALETTE,
+                mx + (mw - 18) // 2, m_top - 7 * 2 - 2, 2)
+        p.setOpacity(1.0)
+
+    # --- PC=家(右)。モニタの中に Claw'd、左上に家の印 ---
+    pc_cell = 2.2
+    pcw, pch = len(sp.PC_GRID[0]) * pc_cell, len(sp.PC_GRID) * pc_cell
+    pcx, pcy = pt(A["pc"])
+    pc_left, pc_top = pcx - pcw / 2, pcy - pch / 2
+    _sprite(p, dpr, ("scene", "pc"), sp.PC_GRID, sp.PC_PALETTE,
+            pc_left, pc_top, pc_cell)
+    _sprite(p, dpr, ("scene", "home"), sp.HOME_GRID, sp.HOME_PALETTE,
+            pc_left - 9, pc_top - 9, 1.1)
+    cname = sp.clawd_frame(view["clawd_anim"], t)
+    c_cell = 1.6
+    cdx, cdy = sp.move_offset(sp.CLAWD_MOVE.get(view["clawd_anim"], ""), t)
+    claw_left = pc_left + 4 * pc_cell + (18 * pc_cell - 12 * c_cell) / 2 + cdx
+    claw_top = pc_top + 2 * pc_cell + (10 * pc_cell - 8 * c_cell) / 2 + cdy \
+        + (2 if press else 0)
+    _sprite(p, dpr, ("clawd", cname), sp.CLAWD_FRAMES[cname], sp.CLAWD_PALETTE,
+            claw_left, claw_top, c_cell)
+    if "hat" in props:
+        _sprite(p, dpr, ("hat",), sp.HAT, sp.CLAWD_PALETTE,
+                claw_left, claw_top - 6 * c_cell, c_cell)
+    if "dots" in props:
+        for i in range(3):
+            phase = ((t - i * 250) % 1000) / 1000.0
+            p.fillRect(int(pcx - 12 + i * 9), int(pc_top - 12), 4, 4,
+                       QColor(79, 224, 255, 255 if phase >= 0.3 else 38))
+    if "bang" in props:
+        _blink_text(p, "!", QRect(int(pc_left + pcw - 4), int(pc_top - 22), 14, 20),
+                    QColor("#ff5a5f"), 16, t % 500 < 250)
+    if "zz" in props:
+        font = QFont("Consolas", 8)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor("#8fb4c2"))
+        p.drawText(QRect(int(pc_left + pcw - 2), int(pc_top - 16), 40, 14),
+                   Qt.AlignLeft | Qt.AlignVCenter, "z z")
+
+    # --- 窓口(右下)。プレイブック実行中だけ金のドットが往復する ---
+    desk_cell = 2.2
+    dx_, dy_ = pt(A["desk"])
+    _sprite(p, dpr, ("scene", "desk"), sp.DESK_GRID, sp.DESK_PALETTE,
+            dx_ - 6 * desk_cell, dy_ - 5 * desk_cell, desk_cell)
+    if view.get("pb_active"):
+        ph = (t % 1800) / 1800.0
+        prog = 1.0 - abs(1.0 - 2.0 * ph)
+        dot = _path_point([pt(A["pc"]), pt((0.85, 0.70)), pt(A["desk"])], prog)
+        p.fillRect(int(dot[0] - 2), int(dot[1] - 2), 5, 5, QColor("#FFD166"))
+
+    # --- 鏡写しのドット(家→私書箱。家経由のときだけ、ゆっくり) ---
+    if view.get("route") == "home" and view["tone"] != "alert":
+        prog = (t % 6000) / 6000.0
+        if prog <= 0.4:
+            dot = _path_point([pt(f) for f in mirror], prog / 0.4)
+            p.fillRect(int(dot[0] - 2), int(dot[1] - 2), 4, 4,
+                       QColor(79, 224, 255, 140))
+
+    # --- 配備係(PC の足元に待機。PB 実行中は足踏み) ---
+    dep_cell = 1.8
+    dep_x, dep_y = pt((0.60, 0.575))
+    if view.get("pb_active"):
+        dep_rows = sp.DEPLOY_WALK_A if int(t // 320) % 2 else sp.DEPLOY_WALK_B
+        dep_key = ("scene", "deploy-walk", dep_rows is sp.DEPLOY_WALK_A)
+    else:
+        dep_rows, dep_key = sp.DEPLOY_GRID, ("scene", "deploy")
+    dep_dy = 0 if view.get("pb_active") else (0 if t % 1200 < 600 else -1)
+    _sprite(p, dpr, dep_key, dep_rows, sp.DEPLOY_PALETTE,
+            dep_x - 6 * dep_cell, dep_y - 5 * dep_cell + dep_dy, dep_cell)
+
+    # --- 見張り(フクロウ)。下の点線路を往復する ---
+    owl_cell = 1.8
+    active = view["tone"] in ("work", "claude", "approval")
+    ofrac = _watcher_point(t, active, view["tone"] == "alert")
+    owx, owy = pt(ofrac)
+    blink = 4900 < t % 5200 < 5060
+    owl_rows = sp.WATCH_BLINK_GRID if blink else sp.WATCH_GRID
+    _sprite(p, dpr, ("scene", "owl", blink), owl_rows, sp.WATCH_PALETTE,
+            owx - 6 * owl_cell, owy - 5.5 * owl_cell, owl_cell)
+
+    # --- あなたの席(下) ---
+    yota_cell = 2.2
+    ux, uy = pt(A["user"])
+    _sprite(p, dpr, ("scene", "yota"), sp.YOTA_GRID, sp.YOTA_PALETTE,
+            ux - 8 * yota_cell, uy - 7.5 * yota_cell, yota_cell)
+
+    # --- 手紙(状態の表現と実イベントの飛行)。Muse と PC の間の線の上 ---
+    item_cell = 2
+    fly_left = W * 0.15 + 18
+    fly_right = W * 0.85 - 48
+    item_top = oy + H * 0.42 - 8
+    kind = view["item"]
+    if kind in ("parked", "wobble"):
+        pos = item_position(kind, "letter", t, W, fly_left, fly_right)
+        if pos is not None:
+            p.setOpacity(max(0.0, min(1.0, pos[1])))
+            dy2 = 4 + (-2 if kind == "parked" and t % 1000 >= 500 else 0)
+            _sprite(p, dpr, ("item", "letter"), ITEM_GRIDS["letter"], ITEM_PALETTE,
+                    ox + pos[0] + 1, item_top + dy2, item_cell)
+            p.setOpacity(1.0)
+        _blink_text(p, "?", QRect(ox + W // 2 - 10, int(item_top) - 22, 20, 20),
+                    accent, 16, t % 800 < 400)
+    for i, flight in enumerate(flights):
+        x, alpha = bev.flight_position(flight["progress"], flight["from"],
+                                       fly_left, fly_right)
+        grid_name = "letter" if flight["item"] == "letter" else "ack"
+        p.setOpacity(max(0.0, min(1.0, alpha)))
+        _sprite(p, dpr, ("item", grid_name), ITEM_GRIDS[grid_name], ITEM_PALETTE,
+                ox + x + 1, item_top + i * 7 * item_cell, item_cell)
+        p.setOpacity(1.0)
+
+    # --- 紙吹雪(完了) ---
     if "confetti" in props:
         p.setRenderHint(QPainter.Antialiasing, True)
         for x, y, color, angle, alpha in sp.confetti_particles(t, W):

@@ -161,7 +161,7 @@ def test_sleep_default():
     assert v["banner_sub"] == "陽太さんの指示待ちです"
     assert v["muse_anim"] == "sleep" and v["clawd_anim"] == "sleep"
     assert v["item"] is None and v["props"] == {"zz"}
-    assert len(v["cards"]) == 3
+    assert len(v["cards"]) == 5
 
 
 def test_cards():
@@ -170,8 +170,8 @@ def test_cards():
     assert view(muse(approved=4))["cards"][0] == ("承認", "4件")
     assert view(muse(approved=0))["cards"][0] == ("承認", "—")
     assert view(muse(last_approval_sec=1.5, approved=4))["cards"][0] == ("承認", "1.5秒")
-    assert view(muse(last_mail_at=NOW - 59))["cards"][1] == ("郵便受け", "受信 59秒前")
-    assert view(muse(last_mail_at=NOW - 60))["cards"][1] == ("郵便受け", "受信 60秒前")
+    assert view(muse(last_mail_at=NOW - 59))["cards"][1] == ("郵便受け", "59秒前")
+    assert view(muse(last_mail_at=NOW - 60))["cards"][1] == ("郵便受け", "60秒前")
     assert view(muse(last_mail_at=NOW - 61))["cards"][1] == ("郵便受け", "空")
     assert view(muse())["cards"][1] == ("郵便受け", "空")
     assert view(muse(mailbox_fail=1, last_mail_at=NOW - 1))["cards"][1] == ("郵便受け", "取得失敗")
@@ -185,7 +185,7 @@ def test_state_claude_overrides_stale_kind():
     assert v["tone"] == "claude" and v["banner_title"] == "Claude が確認中"
     assert v["banner_sub"] == "Muse の見張りが起こしました" and v["banner_time"] == "30秒"
     assert v["muse_anim"] == "claude" and v["clawd_anim"] == "work"
-    assert v["item"] is None and v["props"] == {"dots"} and len(v["cards"]) == 3
+    assert v["item"] is None and v["props"] == {"dots"} and len(v["cards"]) == 5
     # since が無ければ kind_since からの経過
     m2 = dict(m)
     del m2["since"]
@@ -303,7 +303,45 @@ def test_auto_approval_display():
     assert v["cards"][0] == ("承認", "3件")
 
 
+def test_route_mailbox_wording():
+    # つながらないときの文言は経路に合わせる
+    v = view(muse(route="home", mailbox_fail=10, kind="idle"))
+    assert v["banner_title"] == "家につながりません"
+    v = view(muse(route="worker", mailbox_fail=10, kind="idle"))
+    assert v["banner_title"] == "私書箱につながりません"
+    v = view(muse(mailbox_fail=10, kind="idle"))
+    assert v["banner_title"] == "郵便受けにつながりません"
+
+
+def test_desk_and_claude_cards():
+    # 窓口が無ければ「—」、Claude の記録が無ければ「—」
+    v = view(muse())
+    assert v["cards"][3] == ("窓口", "—") and v["cards"][4] == ("Claude", "—")
+    assert v["pb_active"] is False and v["flag_up"] is False
+    # 実行中: ラベルに状態、値に PB 番号。pb_active も立つ
+    desk = {"playbook": "pb4006", "state": "running",
+            "started_at": NOW - 30, "request_id": "req-1"}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口・実行中", "PB-4006") and v["pb_active"] is True
+    # 完了はバナーが消えた後もカードに残る(30分)
+    desk = {"playbook": "pb1001", "state": "done", "ok": True,
+            "started_at": NOW - 900, "finished_at": NOW - 600}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口・完了", "PB-1001") and v["pb_active"] is False
+    desk = {"playbook": "pb1001", "state": "done", "ok": False,
+            "started_at": NOW - 900, "finished_at": NOW - 600}
+    v = cv.coop_view(muse(), [], NOW, desk=desk)
+    assert v["cards"][3] == ("窓口・失敗", "PB-1001")
+    # Claude カード: 承認待ち > 作業中 > 待機
+    assert view(muse(), [{"state": "running"}])["cards"][4] == ("Claude", "作業中")
+    assert view(muse(), [{"state": "ask"}])["cards"][4] == ("Claude", "承認待ち")
+    assert view(muse(), [{"state": "done"}])["cards"][4] == ("Claude", "待機")
+    # 旗は承認待ちの間だけ
+    assert view(muse(kind="approval", cards=1))["flag_up"] is True
+
+
 ALL_TESTS = [test_none_cases, test_stopped_wins, test_mailbox_fail, test_route_label,
+             test_route_mailbox_wording, test_desk_and_claude_cards,
              test_playbook_display, test_auto_approval_display,
              test_approval_card_missing, test_approval_turns_alert_at_180,
              test_no_reply_and_unknown, test_muse_working, test_claude_ask_and_running,

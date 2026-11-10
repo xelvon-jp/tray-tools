@@ -100,6 +100,12 @@ def flight_position(progress, from_side, left, right):
     return (b, 1.0 - (p - 0.85) / 0.15)
 
 
+# 状態(kind)の値をテープに出すときの日本語。生の英語名をそのまま出さない。
+_KIND_JA = {"idle": "待機", "processing": "作業中", "responding": "返信中",
+            "approval": "承認待ち", "no_reply": "返事なし", "unknown": "不明",
+            "claude": "Claude確認中"}
+
+
 def _summary(record) -> tuple:
     """テープの (種類, 要約)。要約は短く切る(描く側でも省略される)。"""
     ev = record["ev"]
@@ -108,11 +114,12 @@ def _summary(record) -> tuple:
     if ev == "mail_in":
         return "受信", str(record.get("note") or record.get("id") or "")
     if ev == "ack":
-        return "ack", str(record.get("id") or "")
+        return "受領", str(record.get("id") or "")
     if ev == "approval":
         return "承認", str(record.get("card") or "")
     if ev == "kind":
-        return "状態", str(record.get("kind") or "")
+        kind = str(record.get("kind") or "")
+        return "状態", _KIND_JA.get(kind, kind)
     if ev == "wake":
         return "起床", str(record.get("reason") or "")
     if ev == "monitor":

@@ -354,3 +354,187 @@ def confetti_particles(t_ms, stage_w) -> list:
             y = 6 + _rnd(n, 20 + j) * 10 + 78 * prog
             out.append((x, y, CONFETTI_COLORS[(n * 2 + j) % 5], 200 * prog, 1.0 - prog))
     return out
+
+
+# ---- 連携ステージの場面(最終イメージ)の小物たち -------------------------------
+# キャラデザインマトリクス(2026-11-08)の案A の格子をそのまま写したもの。
+# 郵便受け=私書箱、見張り=フクロウ、配備係=ロボット、家=PC の印。
+# 窓口のベルだけはマトリクスに無いので後付けの仮絵(2026-11-10)。
+GITHUB_GRID = [
+    '.........KK.........',
+    '......KKKKKKKK......',
+    '....KKKKKKKKKKKK....',
+    '...KKWWKKKKKKWWKK...',
+    '..KKKWWWWWWWWWWKKK..',
+    '..KKKWWWWWWWWWWKKK..',
+    '.KKKKWWWWWWWWWWKKKK.',
+    '.KKKWWWWWWWWWWWWKKK.',
+    '.KKKWWWWWWWWWWWWKKK.',
+    'KKKKKWWWWWWWWWWKKKKK',
+    'KKKKKWWWWWWWWWWKKKKK',
+    '.KKWWWKWWWWWWKKKKKK.',
+    '.KWWWWKWWWWWWKKKKKK.',
+    '.KWWKKKWWWWWWKKKKKK.',
+    '..WWWKKWWWWWWKKKKK..',
+    '..KWWWWWWWWWWKKKKK..',
+    '...KWWWWWWWWWKKKK...',
+    '....KKKWWWWWWKKK....',
+    '......KWWWWWWK......',
+    '.........KK.........',
+]
+GITHUB_PALETTE = {'K': '#101012', 'W': '#FFFFFF'}
+
+POST_GRID = [
+    '............',
+    '....RRRR..F.',
+    '...RRRRRR.F.',
+    '..RRRRRRRRF.',
+    '..RRDDDDRR..',
+    '..RRRRRRRR..',
+    '..RRRRRRRR..',
+    '..RRRRRRRR..',
+    '...RRRRRR...',
+    '.....GG.....',
+    '.....GG.....',
+    '....GGGG....',
+]
+POST_PALETTE = {'R': '#D64541', 'D': '#7E2721', 'F': '#FF7847', 'G': '#6B7280'}
+
+WATCH_GRID = [
+    'B..........B',
+    'BB.BBBBBB.BB',
+    '.BBBBBBBBBB.',
+    '.BFFFFFFFFB.',
+    '.BFFFFFFFFB.',
+    '.BFEEFFEEFB.',
+    '.BFEEFFEEFB.',
+    '.BFFFFFFFFB.',
+    '..BBBBBBBB..',
+    '..BBBBBBBB..',
+    '...BB..BB...',
+]
+WATCH_PALETTE = {'B': '#A9805A', 'F': '#E8DCC4', 'E': '#1A1A1A'}
+
+WATCH_BLINK_GRID = [
+    'B..........B',
+    'BB.BBBBBB.BB',
+    '.BBBBBBBBBB.',
+    '.BFFFFFFFFB.',
+    '.BFFFFFFFFB.',
+    '.BFFFFFFFFB.',
+    '.BFEEFFEEFB.',
+    '.BFFFFFFFFB.',
+    '..BBBBBBBB..',
+    '..BBBBBBBB..',
+    '...BB..BB...',
+]
+
+DEPLOY_GRID = [
+    '.....A......',
+    '.....M......',
+    '..MMMMMMMM..',
+    '..MMMMMMMM..',
+    '..MeeMMeeM..',
+    '..MMMMMMMM..',
+    '.MMMMMMMMMM.',
+    '..MMMMMMMM..',
+    '...MM..MM...',
+    '...MM..MM...',
+]
+DEPLOY_PALETTE = {'M': '#3FA7A0', 'e': '#BFF3EC', 'A': '#FFD166'}
+
+DEPLOY_WALK_A = [
+    '.....A......',
+    '.....M......',
+    '..MMMMMMMM..',
+    '..MMMMMMMM..',
+    '..MeeMMeeM..',
+    '..MMMMMMMM..',
+    '.MMMMMMMMMM.',
+    '..MMMMMMMM..',
+    '...MM..MM...',
+    '..MM....MM..',
+]
+
+DEPLOY_WALK_B = [
+    '.....A......',
+    '.....M......',
+    '..MMMMMMMM..',
+    '..MMMMMMMM..',
+    '..MeeMMeeM..',
+    '..MMMMMMMM..',
+    '.MMMMMMMMMM.',
+    '..MMMMMMMM..',
+    '..MM....MM..',
+    '...MM..MM...',
+]
+
+HOME_GRID = [
+    '.....RR.....',
+    '....RRRR....',
+    '...RRRRRR...',
+    '..RRRRRRRR..',
+    '.RRRRRRRRRR.',
+    '..WWWWWWWW..',
+    '..WYYWWDDW..',
+    '..WYYWWDDW..',
+    '..WWWWWDDW..',
+    '..WWWWWWWW..',
+    '............',
+]
+HOME_PALETTE = {'R': '#C0533B', 'W': '#E9DFC9', 'Y': '#FFD166', 'D': '#8A5A33'}
+
+PC_GRID = [
+    '..........................',
+    '..FFFFFFFFFFFFFFFFFFFFFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFSSSSSSSSSSSSSSSSSSFF..',
+    '..FFFFFFFFFFFFFFFFFFFFFF..',
+    '...........FFFF...........',
+    '.........FFFFFFFF.........',
+    'DDDDDDDDDDDDDDDDDDDDDDDDDD',
+    'DD......................DD',
+    'DD......................DD',
+]
+PC_PALETTE = {'F': '#3A3F47', 'S': '#A8DCF0', 'D': '#C98F4E'}
+
+YOTA_GRID = [
+    '................',
+    '......DDDD......',
+    '....DDDDDDDD....',
+    '...DDDDDDDDDD...',
+    '...DDDDDDDDDD...',
+    '...DDDDDDDDDD...',
+    '....DDDDDDDD....',
+    '......DDDD......',
+    '.......DD.......',
+    '.....DDDDDD.....',
+    '...DDDDDDDDDD...',
+    '..DDDDDDDDDDDD..',
+    '.DDDDDDDDDDDDDD.',
+    '.DDDDDDDDDDDDDD.',
+    '.DDDDDDDDDDDDDD.',
+]
+YOTA_PALETTE = {'D': '#7E8CA3'}
+
+DESK_GRID = [
+    '............',
+    '.....KK.....',
+    '....KYYK....',
+    '...YYYYYY...',
+    '..YYYYYYYY..',
+    '..YYYYYYYY..',
+    '..YYYYYYYY..',
+    '.DDDDDDDDDD.',
+    'DDDDDDDDDDDD',
+    '............',
+]
+DESK_PALETTE = {'K': '#8A6D2F', 'Y': '#E8C86A', 'D': '#7A6238'}

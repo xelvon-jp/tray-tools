@@ -105,9 +105,9 @@ def test_tape_lines():
     assert len(lines) == bev.TAPE_LINES == 4
     # 新しい順。時刻は HH:MM:SS
     assert lines[0].endswith("起床 mailbox"), lines
-    assert "状態 processing" in lines[1]
+    assert "状態 作業中" in lines[1]   # kind の値は日本語で出す
     assert "承認 push files" in lines[2]
-    assert "ack mb-20261108-02" in lines[3]
+    assert "受領 mb-20261108-02" in lines[3]
     for line in lines:
         stamp = line.split(" ", 1)[0]
         hh, mm, ss = stamp.split(":")

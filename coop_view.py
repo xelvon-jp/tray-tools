@@ -202,8 +202,15 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
             since = kind_since
         elapsed = max(0.0, now - since) if since is not None else None
     elif fail >= MAILBOX_FAIL_LIMIT:
-        tone, title = "alert", "郵便受けにつながりません"
-        sub = "メールの取得に失敗しています"
+        # 文言は今の経路に合わせる(家経由なら「家」、Worker 経由なら「私書箱」)
+        tone = "alert"
+        route_name = {"home": "家", "worker": "私書箱"}.get(muse.get("route"))
+        if route_name == "家":
+            title, sub = "家につながりません", "家のサーバへの取得に失敗しています"
+        elif route_name == "私書箱":
+            title, sub = "私書箱につながりません", "メールの取得に失敗しています"
+        else:
+            title, sub = "郵便受けにつながりません", "メールの取得に失敗しています"
     elif kind == "approval" and cards_n == 0 and ke >= CARD_APPROVAL_ALERT_SEC:
         tone, title, sub = "alert", "承認カードが見えません", "見張りが確認しています"
     elif kind == "approval":
@@ -256,7 +263,11 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
         "clawd_anim": clawd_anim,
         "item": ITEMS.get(tone),
         "props": set(PROPS.get(tone, ())),
-        "cards": _cards(muse, kind, ke, stopped, fail, now, paused),
+        "cards": _cards(muse, kind, ke, stopped, fail, now, paused,
+                        desk=desk, entries=entries),
+        "flag_up": kind == "approval",
+        "route": muse.get("route") if isinstance(muse.get("route"), str) else None,
+        "pb_active": bool(pb and desk.get("state") == "running"),
         "all_idle": all_idle,
         "paused": bool(paused),
         "self": mbs.self_report(muse, now),
@@ -266,7 +277,47 @@ def coop_view(muse, claude_entries, now=None, paused=False, events=None, desk=No
     }
 
 
-def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False) -> list:
+PB_CARD_SEC = 1800              # 窓口カードに直近の PB を残しておく秒数
+
+
+def _desk_card(desk, now):
+    """窓口カードの (ラベル, 値)。直近のプレイブックと結果を残す(バナーは
+    60秒で消えるが、カードは PB_CARD_SEC の間「最後に何をしたか」を持つ)。
+    ラベル側に状態(実行中/完了/失敗)、値に PB 番号を出す(カードは狭い)。"""
+    if not isinstance(desk, dict):
+        return ("窓口", "—")
+    name = desk.get("playbook")
+    if isinstance(name, str):
+        name = PB_ALIASES.get(name, name)
+    if not (isinstance(name, str) and name.startswith("pb")
+            and len(name) == 6 and name[2:].isdigit()):
+        return ("窓口", "待機")
+    value = f"PB-{name[2:]}"
+    if desk.get("state") == "running":
+        started = _num(desk, "started_at")
+        if started is not None and now - started <= PB_RUN_STALE_SEC:
+            return ("窓口・実行中", value)
+        return ("窓口", "待機")
+    if desk.get("state") == "done":
+        finished = _num(desk, "finished_at")
+        if finished is not None and 0 <= now - finished <= PB_CARD_SEC:
+            return ("窓口・完了" if desk.get("ok") else "窓口・失敗", value)
+    return ("窓口", "待機")
+
+
+def _claude_card(muse, entries):
+    """Claude カードの値。セッション一覧と見張りの state から出す。"""
+    if muse.get("state") == "claude":
+        return "確認中"
+    if any(e.get("state") == "ask" for e in entries):
+        return "承認待ち"
+    if any(e.get("state") == "running" for e in entries):
+        return "作業中"
+    return "待機" if entries else "—"
+
+
+def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False,
+           desk=None, entries=()) -> list:
     approval_sec = _num(muse, "last_approval_sec")
     if approval_sec is not None:
         approval_sec = max(0.0, approval_sec)
@@ -286,11 +337,12 @@ def _cards(muse, kind, kind_elapsed, stopped, fail, now, paused=False) -> list:
     if fail > 0:
         mailbox = "取得失敗"
     elif mail_at is not None and 0 <= now - mail_at <= MAIL_RECENT_SEC:
-        mailbox = f"受信 {int(now - mail_at)}秒前"
+        mailbox = f"{int(now - mail_at)}秒前"   # カードが狭いので「受信」は省く
     else:
         mailbox = "空"
     route_name = {"home": "家", "worker": "私書箱"}.get(muse.get("route"))
     if route_name:
         mailbox = f"{route_name}・{mailbox}"
     watch = "休止" if paused else ("停止" if stopped else ("不調" if fail > 0 else "正常"))
-    return [("承認", approval), ("郵便受け", mailbox), ("見張り", watch)]
+    return [("承認", approval), ("郵便受け", mailbox), ("見張り", watch),
+            _desk_card(desk, now), ("Claude", _claude_card(muse, entries))]

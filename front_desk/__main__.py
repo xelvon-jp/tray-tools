@@ -12,6 +12,7 @@ import argparse
 import os
 import sys
 
+from . import activity
 from .config import DeskConfig
 from .executor import SubprocessExecutor
 from .intake import UrllibTransport
@@ -35,6 +36,7 @@ def build_pipeline(config: DeskConfig, desk_key: str) -> DeskPipeline:
         log=JsonlLog(config.log_path),
         state_store=DeskStateStore(config.state_path),
         processed_store=ProcessedStore(config.processed_path),
+        activity_path=activity.default_path(),
     )
 
 

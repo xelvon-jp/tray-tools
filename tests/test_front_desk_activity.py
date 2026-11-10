@@ -83,9 +83,32 @@ def test_executor_writes_nothing_for_rejected():
     assert not os.path.exists(path)
 
 
+def test_heartbeat_merges_and_is_preserved():
+    path = _tmp()
+    # ハートビートだけ先に書かれている状態から begin しても落ちない
+    activity.heartbeat(path=path, now=500.0)
+    d = _read(path)
+    assert d == {"heartbeat_at": 500.0}
+    activity.begin("pb1001", "req-9", path=path, now=1000.0)
+    d = _read(path)
+    assert d["state"] == "running" and d["heartbeat_at"] == 500.0
+    # ハートビートはプレイブックの状態を保ったまま時刻だけ進める
+    activity.heartbeat(path=path, now=1060.0)
+    d = _read(path)
+    assert d["state"] == "running" and d["playbook"] == "pb1001"
+    assert d["heartbeat_at"] == 1060.0
+    # finish でも引き継ぐ
+    outcome = SimpleNamespace(ok=True, summary="完了")
+    activity.finish("pb1001", "req-9", outcome, path=path,
+                    started_at=1000.0, now=1090.0)
+    d = _read(path)
+    assert d["state"] == "done" and d["heartbeat_at"] == 1060.0
+
+
 ALL_TESTS = [test_begin_writes_running, test_finish_writes_done,
              test_executor_writes_activity_for_real_run,
-             test_executor_writes_nothing_for_rejected]
+             test_executor_writes_nothing_for_rejected,
+             test_heartbeat_merges_and_is_preserved]
 
 
 if __name__ == "__main__":

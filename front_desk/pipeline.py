@@ -14,9 +14,11 @@ import datetime
 import time
 import traceback
 
-from . import model
+from . import activity, model
 from .config import DeskConfig
 from .log import JsonlLog, LogRecord
+
+HEARTBEAT_SEC = 60      # 合図ファイルへ heartbeat_at を書く間隔 (秒)
 
 
 def now_iso() -> str:
@@ -39,7 +41,8 @@ def build_desk_state(*, state: str, detail: str = "",
 
 class DeskPipeline:
     def __init__(self, config: DeskConfig, transport, executor, *,
-                 log: JsonlLog, state_store, processed_store):
+                 log: JsonlLog, state_store, processed_store,
+                 activity_path=None, heartbeat_sec=HEARTBEAT_SEC):
         self._config = config
         self._transport = transport
         self._executor = executor
@@ -52,6 +55,21 @@ class DeskPipeline:
         self._desk_detail = "起動しました"
         self._long_poll_wait = config.effective_long_poll_wait_sec
         self.last_fetch_error = False
+        # ブリッジ表示用の合図ファイルへのハートビート。activity_path が
+        # 無ければ書かない (テストや --once の単発実行では騒がない)。
+        self._activity_path = activity_path
+        self._heartbeat_sec = heartbeat_sec
+        self._last_heartbeat = None
+
+    def _beat(self) -> None:
+        if not self._activity_path:
+            return
+        now = time.monotonic()
+        if (self._last_heartbeat is not None
+                and now - self._last_heartbeat < self._heartbeat_sec):
+            return
+        self._last_heartbeat = now
+        activity.heartbeat(path=self._activity_path)
 
     # -- 状態 ------------------------------------------------------------
 
@@ -165,6 +183,7 @@ class DeskPipeline:
 
     def poll_once(self) -> int:
         """1回の見回り。処理した件数を返す。"""
+        self._beat()
         self._reconcile()
         fetched = self._transport.list_requests()
         if fetched.error:

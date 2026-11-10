@@ -161,6 +161,30 @@ def test_happy_path_and_no_rerun():
         assert transport.states[-1]["desk"]["state"] == "idle"
 
 
+def test_pipeline_heartbeat_writes_activity_file():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        act = tmp / "desk_activity.json"
+        transport = FakeTransport([])
+        pipe = DeskPipeline(
+            DeskConfig(base_dir=str(tmp)), transport, FakeExecutor(),
+            log=JsonlLog(str(tmp / "operations.jsonl")),
+            state_store=DeskStateStore(str(tmp / "state.json")),
+            processed_store=ProcessedStore(str(tmp / "processed.json")),
+            activity_path=str(act), heartbeat_sec=3600)
+        assert pipe.poll_once() == 0
+        data = json.loads(act.read_text(encoding="utf-8"))
+        first = data["heartbeat_at"]
+        assert isinstance(first, float)
+        # 間隔の内は書き直さない
+        assert pipe.poll_once() == 0
+        data = json.loads(act.read_text(encoding="utf-8"))
+        assert data["heartbeat_at"] == first
+        # activity_path が無ければ書かない (既定の作り)
+        pipe2 = make_pipeline(tmp, transport, FakeExecutor())
+        assert pipe2.poll_once() == 0
+
+
 def test_rejected_kind_not_executed():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

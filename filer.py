@@ -6092,7 +6092,7 @@ class FilerWindow(QWidget):
         clip = QGuiApplication.clipboard()
         if not self._box_menu_ok():
             clip.setText(full)
-            self.log(f"クリップボード: {len(paths)}件のフルパス")
+            self.log(f"クリップボード: フルパス {len(paths)}件")
             return
         data = self._box_share_data()
         if data is None:
@@ -6103,16 +6103,16 @@ class FilerWindow(QWidget):
             return
         if kind == "path":
             clip.setText(full)
-            self.log(f"クリップボード: {len(paths)}件のフルパス")
+            self.log(f"クリップボード: フルパス {len(paths)}件")
         elif kind == "box":
             if data["text"] is None:
                 return
             clip.setText(data["text"])
-            self.log(f"Box: {data['count']}件をクリップボードへ")
+            self.log(f"クリップボード: Box の共有用テキスト {data['count']}件")
         else:  # both: 共有分が取れなかったときはフルパスだけ入れる
             if data["text"] is None:
                 clip.setText(full)
-                self.log(f"クリップボード: {len(paths)}件のフルパス（共有用テキストは含めず）")
+                self.log(f"クリップボード: フルパス {len(paths)}件（共有用テキストは含めず）")
             else:
                 clip.setText(full + "\r\n\r\n" + data["text"])
                 self.log(f"クリップボード: フルパス {len(paths)}件＋"

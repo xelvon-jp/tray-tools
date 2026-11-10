@@ -8901,7 +8901,7 @@ def test_window_copy_box_share():
                         "　https://app.box.com/folder/9101\r\n"
                         "　　見積書.xlsx")
             assert clip.text() == expected, repr(clip.text())
-            assert "Box: 1件をクリップボードへ" in w.log_view.toPlainText()
+            assert "クリップボード: Box の共有用テキスト 1件" in w.log_view.toPlainText()
             # 古い box_links は読まず、書き換えもしない
             assert "/s/" not in clip.text()
             assert app_settings["filer"]["box_links"] == old_links

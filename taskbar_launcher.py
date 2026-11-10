@@ -184,6 +184,13 @@ def _draw_palette(draw: ImageDraw.ImageDraw, color: str) -> None:
     draw.line((36, 34, 54, 52), fill="white", width=7)
 
 
+def _draw_terminal(draw: ImageDraw.ImageDraw, color: str) -> None:
+    """コマンドランチャ。窓の枠にプロンプト(>)とカーソル(_)を色で抜く。"""
+    draw.rounded_rectangle((8, 12, 56, 52), radius=4, fill="white")
+    draw.line((14, 24, 24, 32, 14, 40), fill=color, width=5)
+    draw.line((30, 42, 46, 42), fill=color, width=5)
+
+
 def _draw_calendar(draw: ImageDraw.ImageDraw, color: str) -> None:
     """カレンダー。綴じ具の付いた月めくりのページ。日付は背景色の四角で抜く。"""
     draw.rounded_rectangle((21, 12, 25, 21), radius=2, fill="white")
@@ -268,6 +275,7 @@ _GLYPHS = {
     "calendar": _draw_calendar,
     "calculator": _draw_calculator,
     "palette": _draw_palette,
+    "terminal": _draw_terminal,
     "cursor": _draw_cursor_finder,
     "filer": _draw_filer,
     "checker": _draw_transparency,
@@ -335,6 +343,14 @@ ITEMS = {
         "args": (),
         "icon": "palette",
         "color": "#7c3aed",
+    },
+    "cmdlauncher": {
+        "label": "コマンドランチャ",
+        "feature": "screen",
+        "method": "show_cmd_launcher",
+        "args": (),
+        "icon": "terminal",
+        "color": "#16a34a",
     },
     "capture": {
         "label": "キャプチャ",
@@ -501,7 +517,7 @@ ITEMS = {
 }
 
 # 既定の並び。上から順にパネルへ縦に並ぶ。
-DEFAULT_ITEMS = ["palette", "capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator", "cursor"]
+DEFAULT_ITEMS = ["palette", "cmdlauncher", "capture", "audio", "ruler", "color_picker", "snippets", "bookmarks", "calendar", "calculator", "cursor"]
 
 # settings.json に書かれがちな別名を正規のキーへ寄せる。hotkeys セクションでは同じ機能が
 # capture_now / audio_toggle / snippet_picker / launcher という名前で並んでおり、そちらを
@@ -518,6 +534,8 @@ ITEM_ALIASES = {
     "snippet_picker": "snippets",
     "launcher": "bookmarks",
     "folder": "bookmarks",
+    # コマンドランチャは hotkeys セクションでの名前でも受ける。
+    "command_launcher": "cmdlauncher",
     "presenter": "presenter",
     "web": "web_presenter",
     "site": "web_presenter",

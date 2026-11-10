@@ -226,6 +226,49 @@ def save_bookmark(app_settings: dict, settings_path, name: str, path: str) -> bo
     return _rewrite_stored_bookmarks(settings_path, lambda bookmarks: bookmarks + [entry])
 
 
+def upsert_bookmark(app_settings: dict, settings_path, entry: dict) -> bool:
+    """ブックマークを (name, path) で突き合わせて追加または差し替える。成否を返す。
+
+    コマンドランチャ(command_launcher.py)の登録用。entry は {"name", "path"} に
+    任意で "params"(パラメタ)・"dir"(作業フォルダ) を足したもの。同じ (name, path)
+    が既にあれば、その位置のまま中身だけ差し替える(並びを守るため)。"""
+    entry = dict(entry)
+
+    def change(bookmarks):
+        index = _find_bookmark(bookmarks, entry.get("name"), entry.get("path"))
+        if index is None:
+            return bookmarks + [entry]
+        updated = list(bookmarks)
+        updated[index] = entry
+        return updated
+
+    _rewrite_memory_bookmarks(app_settings, change)
+    return _rewrite_stored_bookmarks(settings_path, change)
+
+
+def update_bookmark(app_settings: dict, settings_path, old_name: str, old_path: str,
+                    entry: dict) -> bool:
+    """(old_name, old_path) のブックマークを entry の内容へ差し替える。成否を返す。
+
+    名前やパス自体を編集するとき用。対象が無ければ何もしない(False)。"""
+    entry = dict(entry)
+
+    def change(bookmarks):
+        index = _find_bookmark(bookmarks, old_name, old_path)
+        if index is None:
+            return None
+        updated = list(bookmarks)
+        updated[index] = entry
+        return updated
+
+    def memory_change(bookmarks):
+        updated = change(bookmarks)
+        return bookmarks if updated is None else updated
+
+    _rewrite_memory_bookmarks(app_settings, memory_change)
+    return _rewrite_stored_bookmarks(settings_path, change)
+
+
 # ---------------------------------------------------------------
 # ブラウザのお気に入りの取り込み
 # ---------------------------------------------------------------

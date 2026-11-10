@@ -315,6 +315,7 @@ DEFAULT_SETTINGS = {
         "launcher_enabled": True,
         "launcher_items": [
             "palette",
+            "cmdlauncher",
             "capture",
             "audio",
             "ruler",
@@ -523,6 +524,8 @@ DEFAULT_SETTINGS = {
         # 統合コマンドパレット。既定は未割り当て(空文字=登録しない)。使う人が
         # 縦ランチャの項目以外からも開きたいときに割り当てる。
         "command_palette": "",
+        # 登録コマンドランチャ(command_launcher.py)。既定は未割り当て。
+        "command_launcher": "",
         # カーソルファインダー(カーソルの位置に波紋を出す)。既定は未割り当て。
         "cursor_finder": "",
         # 画面に重ねるプレゼン支援(presenter_overlay.py)。レーザーとスポットライトは

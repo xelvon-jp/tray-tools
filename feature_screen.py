@@ -29,6 +29,7 @@ import calendar_popup
 import calculator
 import capture_process
 import color_picker
+import command_launcher
 import command_palette
 import cursor_finder
 import explorer_nav
@@ -272,6 +273,9 @@ class ScreenFeature:
         self._palette_apps_cache = None
         self._palette_es_cache = None
         self._palette_history_cache = None
+        self.cmd_launcher_window = None
+        self._cmd_history_cache = None
+        self._cmd_hwnd = 0
         self.launcher_picker = None
         # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
@@ -520,6 +524,12 @@ class ScreenFeature:
         self.menu.addAction(
             self._with_hotkey("📁 あっふ", hotkey_config.get("filer")),
             self.start_filer,
+        )
+        # 登録コマンドランチャ。名前を打って実行する道具なので、あっふの隣に置く
+        # (フォルダブックマークと登録を一本化してあり、行き来が近いため)。
+        self.menu.addAction(
+            self._with_hotkey("⌨ コマンドランチャ", hotkey_config.get("command_launcher")),
+            self.show_cmd_launcher,
         )
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
@@ -860,6 +870,7 @@ class ScreenFeature:
             "launcher": lambda: self.start_launcher(),
             "filer": self.start_filer,
             "command_palette": self.show_palette,
+            "command_launcher": self.show_cmd_launcher,
             "cursor_finder": self.find_cursor,
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
@@ -1328,6 +1339,117 @@ class ScreenFeature:
                     os.startfile(path)  # noqa: S606  本人が選んだ候補を開くだけ
         except Exception:
             traceback.print_exc()
+
+    # ---------------------------------------------------------------
+    # 登録コマンドランチャ(command_launcher.py)
+    # ---------------------------------------------------------------
+    def _cmd_all_entries(self):
+        return (command_launcher.build_entries(self.app_settings)
+                + command_launcher.builtin_entries())
+
+    def show_cmd_launcher(self):
+        """登録コマンドランチャを開く(開いていたら閉じるトグル)。"""
+        if self.cmd_launcher_window is not None:
+            self.cmd_launcher_window.close()
+            return
+        # フォルダの開き先(前面がエクスプローラか)の判定用に、窓を出す前に掴む。
+        self._cmd_hwnd = explorer_nav.foreground_hwnd()
+        if self._cmd_history_cache is None:
+            self._cmd_history_cache = command_launcher.load_history()
+        window = command_launcher.create_window(
+            self._cmd_all_entries(), self._cmd_history_cache)
+        window.chosen.connect(self._on_cmd_chosen)
+        window.dropped.connect(self._on_cmd_dropped)
+        window.closed.connect(self._close_cmd_launcher)
+        window.on_forget = self._on_cmd_forget
+        self.cmd_launcher_window = window
+        window.show_at_cursor_screen()
+
+    def _close_cmd_launcher(self):
+        self.cmd_launcher_window = None
+
+    def _on_cmd_forget(self, raw_text):
+        """Ctrl+K: 入力中の文字列を履歴から消す。窓へ新しい履歴を返す。"""
+        if self._cmd_history_cache is None:
+            self._cmd_history_cache = command_launcher.load_history()
+        self._cmd_history_cache = command_launcher.forget_history(
+            self._cmd_history_cache, raw_text)
+        command_launcher.save_history(self._cmd_history_cache)
+        return self._cmd_history_cache
+
+    def _on_cmd_dropped(self, items):
+        """窓へドロップされたファイルや URL を、その名前で登録する。"""
+        added = 0
+        for item in items:
+            text = (item or "").strip()
+            if not text:
+                continue
+            if command_launcher.classify(text) in (
+                    command_launcher.KIND_URL, command_launcher.KIND_URI):
+                name = text
+            elif Path(text).is_file():
+                name = Path(text).stem
+            else:
+                name = Path(text).name
+            if not name:
+                continue
+            launcher.upsert_bookmark(
+                self.app_settings, self.settings_path,
+                {"name": name, "path": text})
+            added += 1
+        if self.cmd_launcher_window is not None:
+            self.cmd_launcher_window.refresh(self._cmd_all_entries())
+        if added:
+            show_toast(f"コマンドランチャ\n{added}件を登録しました")
+
+    def _on_cmd_chosen(self, entry, param_text, raw_text):
+        try:
+            action, payload = command_launcher.build_command(entry, param_text)
+            if action == "builtin":
+                self._on_cmd_builtin(payload)
+                return
+            ok = False
+            if action == "jump":
+                ok = launcher.jump(
+                    payload, launcher.afxw_path(self.app_settings),
+                    launcher.target_mode(self.app_settings), hwnd=self._cmd_hwnd)
+            elif action == "open":
+                os.startfile(payload)  # noqa: S606  本人が登録した対象を開くだけ
+                ok = True
+            elif action == "exec":
+                command, workdir = payload
+                ok = command_launcher.run_exec(command, workdir)
+            if ok:
+                if self._cmd_history_cache is None:
+                    self._cmd_history_cache = command_launcher.load_history()
+                self._cmd_history_cache = command_launcher.record_history(
+                    self._cmd_history_cache, raw_text)
+                command_launcher.save_history(self._cmd_history_cache)
+            else:
+                show_toast(f"コマンドランチャ\n開けませんでした\n{entry.target}")
+        except Exception:
+            traceback.print_exc()
+
+    def _on_cmd_builtin(self, builtin_id):
+        if builtin_id == "command":
+            command_launcher.open_manager(self.app_settings, self.settings_path)
+            if self.cmd_launcher_window is not None:
+                self.cmd_launcher_window.refresh(self._cmd_all_entries())
+        elif builtin_id == "config":
+            if self.settings_path and os.path.exists(self.settings_path):
+                os.startfile(self.settings_path)  # noqa: S606  設定ファイルを開くだけ
+            else:
+                show_toast("コマンドランチャ\nsettings.json が見つかりません")
+        elif builtin_id == "reload":
+            if self.cmd_launcher_window is not None:
+                self.cmd_launcher_window.refresh(self._cmd_all_entries())
+            show_toast("コマンドランチャ\n登録を読み直しました")
+        elif builtin_id == "history":
+            if self.cmd_launcher_window is not None:
+                if self._cmd_history_cache is None:
+                    self._cmd_history_cache = command_launcher.load_history()
+                self.cmd_launcher_window.set_history(self._cmd_history_cache)
+                self.cmd_launcher_window.show_history()
 
     # ---------------------------------------------------------------
     # 背景を透過(bg_remove.py。窓は別プロセス)

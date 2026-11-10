@@ -507,7 +507,7 @@ def _path_point(points, progress):
 # 最終イメージの場面(大きさ「大」専用)。座標はステージに対する割合で持つ
 # (モック bridge-final-image.html のアンカー配置に対応)。
 SCENE_ANCHORS = {
-    "github": (0.50, 0.13), "post": (0.70, 0.13), "muse": (0.15, 0.42),
+    "github": (0.50, 0.13), "post": (0.70, 0.22), "muse": (0.15, 0.42),
     "pc": (0.85, 0.42), "desk": (0.68, 0.70), "user": (0.38, 0.85),
 }
 WATCH_BASE = (0.83, 0.54)       # 見張り(フクロウ)の定位置(PC の足元)
@@ -545,9 +545,10 @@ def _path_frac(points, progress):
 
 def _paint_scene(p, dpr, view, st, accent, t, spec):
     """最終イメージの場面。家=PC(右のモニタ。家サーバはこの中)が中心で、
-    Muse(左)・GitHub(上)・私書箱(上・観測)・窓口(右下)・あなたの席(下)と
-    線でつながる。動きは実イベント駆動: 手紙の飛行は bridge_journal の記録、
-    窓口のドットはプレイブック実行中だけ、見張りの往復は Muse の活動中だけ。"""
+    Muse(左)・GitHub(上)・私書箱(PC の左上・観測)・窓口(右下)・
+    あなたの席(下)と線でつながる。動きは実イベント駆動: 手紙の飛行は
+    bridge_journal の記録、窓口のドットはプレイブック実行中だけ、
+    見張りの往復は Muse の活動中だけ。"""
     W, H = st.width(), st.height()
     ox, oy = st.left(), st.top()
 
@@ -568,7 +569,7 @@ def _paint_scene(p, dpr, view, st, accent, t, spec):
     p.setBrush(Qt.NoBrush)
     for line in solid:
         p.drawPolyline(QPolygonF([QPointF(*pt(f)) for f in line]))
-    mirror = [(0.85, 0.375), (0.64, 0.375), (0.64, 0.13), A["post"]]
+    mirror = [(0.79, 0.30), (0.70, 0.30), A["post"]]
     pen = QPen(QColor("#7a7e89"), 1)
     pen.setDashPattern([1, 2])
     p.setPen(pen)
@@ -588,7 +589,7 @@ def _paint_scene(p, dpr, view, st, accent, t, spec):
     _sprite(p, dpr, ("scene", "github"), sp.GITHUB_GRID, sp.GITHUB_PALETTE,
             gx - 10 * gh_cell, gy - 10 * gh_cell, gh_cell)
 
-    # --- 私書箱(上・GitHub の右)。旗は承認待ちの合図があるときだけ上がる ---
+    # --- 私書箱(PC の左上)。旗は承認待ちの合図があるときだけ上がる ---
     post_cell = 2.0
     px_, py_ = pt(A["post"])
     post_left, post_top = px_ - 6 * post_cell, py_ - 6 * post_cell
@@ -615,15 +616,13 @@ def _paint_scene(p, dpr, view, st, accent, t, spec):
                 mx + (mw - 18) // 2, m_top - 7 * 2 - 2, 2)
         p.setOpacity(1.0)
 
-    # --- PC=家(右)。モニタの中に Claw'd、左上に家の印 ---
+    # --- PC=家(右)。モニタ自体が家なので、家の印は付けない ---
     pc_cell = 2.2
     pcw, pch = len(sp.PC_GRID[0]) * pc_cell, len(sp.PC_GRID) * pc_cell
     pcx, pcy = pt(A["pc"])
     pc_left, pc_top = pcx - pcw / 2, pcy - pch / 2
     _sprite(p, dpr, ("scene", "pc"), sp.PC_GRID, sp.PC_PALETTE,
             pc_left, pc_top, pc_cell)
-    _sprite(p, dpr, ("scene", "home"), sp.HOME_GRID, sp.HOME_PALETTE,
-            pc_left - 9, pc_top - 9, 1.1)
     cname = sp.clawd_frame(view["clawd_anim"], t)
     c_cell = 1.6
     cdx, cdy = sp.move_offset(sp.CLAWD_MOVE.get(view["clawd_anim"], ""), t)

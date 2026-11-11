@@ -255,6 +255,14 @@ DEFAULT_SETTINGS = {
             {"name": "Box", "url": "https://app.box.com/search?query={query}"},
         ],
     },
+    # 統合ピッカーのスタメン管理。pinned_features は `*` で広げて実行した機能を
+    # 通常表示へ昇格させたもの(縦ランチャの項目キー)。declined は昇格を断った
+    # 項目("feature:<キー>" / "app:<パス>")で、二度聞かないために覚える。
+    # どちらもピッカーが自分で書き足す値なので、手で編集する必要はない。
+    "unified_picker": {
+        "pinned_features": [],
+        "declined": [],
+    },
     # 定型文。recent は最近コピーしたテンプレート名(新しいものが先頭・上限20件)で、
     # ピッカーの並び順に使う。アプリが自分で書き足す値なので手で編集する必要はない。
     "snippets": {

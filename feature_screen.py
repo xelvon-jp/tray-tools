@@ -33,6 +33,7 @@ import command_launcher
 import command_palette
 import cursor_finder
 from picker import PickerWindow
+from settings import save_settings
 import unified_picker
 import explorer_nav
 import claude_progress
@@ -1302,6 +1303,66 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
+    def _unified_picker_state(self):
+        """統合ピッカーのスタメン管理(settings の unified_picker 節)。
+
+        pinned_features: 通常表示に昇格した機能のキー。declined: 昇格を断った
+        項目("feature:<キー>" / "app:<パス>")で、二度聞かないために覚える。"""
+        state = self.app_settings.get("unified_picker")
+        if not isinstance(state, dict):
+            state = {}
+            self.app_settings["unified_picker"] = state
+        if not isinstance(state.get("pinned_features"), list):
+            state["pinned_features"] = []
+        if not isinstance(state.get("declined"), list):
+            state["declined"] = []
+        return state
+
+    def _save_unified_picker_state(self):
+        try:
+            save_settings(self.app_settings, self.settings_path)
+        except Exception:  # noqa: BLE001  保存できなくても実行は続ける
+            traceback.print_exc()
+
+    def _maybe_promote(self, picker, data):
+        """`*` で広げて出した控えを実行したあと、スタメン昇格を聞く。
+
+        アプリはブックマークとして登録し、機能はピン留めする。断ったら
+        その項目では二度聞かない(declined に覚える)。"""
+        if not data.get("pool"):
+            return
+        kind = data.get("kind")
+        if kind == "feature":
+            ident = f"feature:{data.get('item_key') or ''}"
+        elif kind == "app":
+            ident = f"app:{data.get('path') or ''}"
+        else:
+            return
+        state = self._unified_picker_state()
+        if ident in state["declined"]:
+            return
+        name = data.get("name") or ""
+        answer = QMessageBox.question(
+            picker, "統合ピッカー",
+            f"『{name}』を通常表示（スタメン）に加えますか？\n"
+            "（次回からは * を打たなくても出ます）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            state["declined"].append(ident)
+            self._save_unified_picker_state()
+            return
+        if kind == "feature":
+            key = data.get("item_key") or ""
+            if key and key not in state["pinned_features"]:
+                state["pinned_features"].append(key)
+                self._save_unified_picker_state()
+            show_toast(f"統合ピッカー\nスタメンに加えました\n{name}")
+        elif launcher.save_bookmark(self.app_settings, self.settings_path,
+                                    name, data.get("path") or ""):
+            show_toast(f"統合ピッカー\nスタメンに加えました\n{name}")
+        else:
+            show_toast("統合ピッカー\n設定ファイルに保存できませんでした")
+
     def _on_unified_accept(self, picker, data, hwnd, rebuild):
         """統合ピッカーで選ばれた候補を実行する。True を返すと窓を開けたままにする。
 
@@ -1358,6 +1419,7 @@ class ScreenFeature:
                 if callable(method):
                     method(*item.get("args", ()))
                     self._record_unified_use(data)
+                    self._maybe_promote(picker, data)
                 else:
                     show_toast(f"統合ピッカー\n{item.get('label')}を呼び出せません")
                 return None
@@ -1366,6 +1428,8 @@ class ScreenFeature:
                 if path:
                     os.startfile(path)  # noqa: S606
                     self._record_unified_use(data)
+                    if kind == "app":
+                        self._maybe_promote(picker, data)
                 return None
             if kind == "calc":
                 QApplication.clipboard().setText(data.get("value") or "")
@@ -1461,7 +1525,27 @@ class ScreenFeature:
         return "", ""
 
     def _on_unified_delete(self, picker, _name, data, rebuild):
-        """Ctrl+D。登録(ブックマーク)の行だけ。確認を出してから消す。"""
+        """Ctrl+D。登録(ブックマーク)の行と、ピン留め機能の行が対象。
+
+        ピン留めの行ではピンを外す(控えに戻る)。どちらも確認を出してから。"""
+        if isinstance(data, dict) and data.get("kind") == "feature" \
+                and data.get("pinned"):
+            key = data.get("item_key") or ""
+            name = data.get("name") or ""
+            answer = QMessageBox.question(
+                picker, "統合ピッカー",
+                f"『{name}』のピン留めを外しますか？\n"
+                "（* を打てばまた出ます）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            state = self._unified_picker_state()
+            if key in state["pinned_features"]:
+                state["pinned_features"].remove(key)
+                self._save_unified_picker_state()
+            picker.set_items(rebuild())
+            show_toast(f"統合ピッカー\nピン留めを外しました\n{name}")
+            return
         if not isinstance(data, dict) or not data.get("bookmark"):
             return
         name, path = self._unified_bookmark_identity(data)
@@ -2050,12 +2134,19 @@ class ScreenFeature:
         features = [(key, item["label"])
                     for key, item in taskbar_launcher.ITEMS.items()]
         add_path = launcher.resolve_add_path(current_path, hwnd)
+        pinned_keys = list(self._unified_picker_state()["pinned_features"])
 
         def rebuild():
+            # ピン留めは窓を開いている間にも変わる(昇格・解除)ので、作るたびに
+            # 現在の設定から組み直す。
+            state = self._unified_picker_state()
+            pinned_pairs = [
+                (key, taskbar_launcher.ITEMS[key]["label"])
+                for key in state["pinned_features"]
+                if key in taskbar_launcher.ITEMS]
             return unified_picker.build_items(
                 command_launcher.build_entries(self.app_settings),
-                features=features, apps=self._palette_apps_cache,
-                palette_history=self._palette_history_cache, add_path=add_path)
+                pinned_features=pinned_pairs, add_path=add_path)
 
         dynamics = unified_picker.make_dynamic_items(
             entries=command_launcher.build_entries(self.app_settings),
@@ -2063,7 +2154,8 @@ class ScreenFeature:
             web_searches=(self.app_settings.get("command_palette") or {})
             .get("web_searches"),
             file_search=self._unified_file_search,
-            history_inputs=self._cmd_history_cache)
+            palette_history=self._palette_history_cache,
+            pinned_keys=pinned_keys)
         picker = None
 
         def accept(_name, data):
@@ -2080,7 +2172,7 @@ class ScreenFeature:
             placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
             preview_provider=lambda data: unified_picker.preview_text(data),
             dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
-            on_delete=delete, on_move=move)
+            on_delete=delete, on_move=move, dynamic_last=True)
         picker.closed.connect(self._close_launcher)
         self.launcher_picker = picker
         picker.show()

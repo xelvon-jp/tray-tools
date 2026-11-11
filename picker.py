@@ -193,6 +193,7 @@ class PickerWindow(QWidget):
         tab_text=None,
         on_delete=None,
         on_move=None,
+        dynamic_last: bool = False,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -210,6 +211,7 @@ class PickerWindow(QWidget):
         self._on_open_folder = on_open_folder
         self._dynamic_items = dynamic_items
         self._tab_text = tab_text
+        self._dynamic_last = dynamic_last
         self._on_delete = on_delete
         self._on_move = on_move
         # 入力から作った項目。self._items には足さない(添字がずれると Qt側に持たせた
@@ -666,24 +668,37 @@ class PickerWindow(QWidget):
         """前方一致(大文字小文字を無視)で候補そのものを減らす。絞り込んだ結果が
         見た目に残っていると ↑↓ で選べてしまい、Enterの行き先が分からなくなる。
 
-        dynamic_items がある場合、そこから作った項目を返ってきた順に先頭へ置く。
-        初期選択は先頭行なので、打った直後に Enter を押せばその1件目が選ばれる。"""
+        dynamic_items がある場合、そこから作った項目を返ってきた順に置く。
+        既定は先頭(初期選択は先頭行なので、打った直後に Enter を押せばその
+        1件目が選ばれる)。dynamic_last=True のときは静的候補の後ろに置く
+        (登録など常設の候補を上に残したい窓用)。"""
         keyword = text.strip().lower()
         self.list.clear()
         self._dynamic = self._build_dynamic(text)
-        for dynamic_index, (name, _data) in enumerate(self._dynamic):
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, dynamic_role(dynamic_index))
-            self.list.addItem(item)
-        for index, entry in enumerate(self._items):
-            name, _data, match = split_item(entry)
-            if not name_matches(match, keyword):
-                continue
-            item = QListWidgetItem(name)
-            # データそのものではなく元リストの添字を持たせる。Qtの項目データは
-            # QVariant を経由するため、タプルなどはPython側の型が変わって戻ることがある。
-            item.setData(Qt.UserRole, index)
-            self.list.addItem(item)
+
+        def add_dynamic():
+            for dynamic_index, (name, _data) in enumerate(self._dynamic):
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, dynamic_role(dynamic_index))
+                self.list.addItem(item)
+
+        def add_static():
+            for index, entry in enumerate(self._items):
+                name, _data, match = split_item(entry)
+                if not name_matches(match, keyword):
+                    continue
+                item = QListWidgetItem(name)
+                # データそのものではなく元リストの添字を持たせる。Qtの項目データは
+                # QVariant を経由するため、タプルなどはPython側の型が変わって戻ることがある。
+                item.setData(Qt.UserRole, index)
+                self.list.addItem(item)
+
+        if self._dynamic_last:
+            add_static()
+            add_dynamic()
+        else:
+            add_dynamic()
+            add_static()
         if self.list.count():
             self.list.setCurrentRow(0)
 

@@ -4,7 +4,20 @@
 # J ピッカー / Win+J ピッカー / コマンドパレット / コマンドランチャを1つの窓
 # (picker.PickerWindow)に寄せたもの。ここは「候補をどう並べ、Enter で何が起きる
 # かをどう見せるか」だけを持ち、窓そのものと実行は呼び出し側(feature_screen、
-# 後段では filer)が持つ。
+# filer)が持つ。
+#
+# 表示ルール(2026-11-11、Nagato の要望で確定):
+#   - 開いた直後に出る静的候補は、明示的に登録したものだけ。並びは
+#     フォルダ → URL・URI → 実行コマンド の順(フォルダジャンプが基本)。
+#     その下にピン留めした機能、内蔵コマンド、文脈の行が続く。
+#   - 機能とアプリ(登録の外の大量候補)は最初は出さない。入力に `*` が
+#     含まれたときだけ範囲を広げて出す(Exe* で Excel が出る。照合は
+#     前方>部分>部分列の score_match)。広げた候補は動的候補として
+#     登録の下に出る。
+#   - 入力から作る候補(打ったパス・計算・ファイル検索・Web検索)は
+#     常に一覧の下の方に出る(呼び出し側が dynamic_last=True で窓を開く)。
+#   - `*` 経由で実行した機能・アプリは、呼び出し側が「通常表示(スタメン)へ
+#     昇格するか」を聞く。アプリはブックマーク登録、機能はピン留めで昇格する。
 #
 # 候補の見分け:
 #   表示名の頭に種別のアイコンを付け、絞り込みは本来の名前で効くよう
@@ -16,8 +29,9 @@
 #   jump    フォルダを開く(開き先は文脈: 常駐=launcher.jump / あっふ=自窓の移動)
 #   open    URL・URI を OS で開く(url / onenote / uri)
 #   exec    登録コマンドを実行(command_launcher.Entry を持つ。param は任意)
-#   feature 縦ランチャの機能を呼ぶ
-#   app     スタートメニューのアプリを起動
+#   feature 縦ランチャの機能を呼ぶ(pinned=True はピン留め済み、pool=True は
+#           `*` で広げて出した控え)
+#   app     スタートメニューのアプリを起動(pool=True は控え)
 #   file    Everything の検索結果ファイルを開く
 #   calc    計算結果をクリップボードへ
 #   web     Web 検索の結果ページを開く
@@ -44,10 +58,9 @@ ICONS = {
     "calc": "🧮",
     "web": "🔍",
     "builtin": "⚙️",
-    "history": "⌛",
 }
 
-PLACEHOLDER = "絞り込み（名前・パス・計算 / ; で引数 / ↑↓選択 / Enter実行 / Esc閉じる）"
+PLACEHOLDER = "絞り込み（名前・パス・計算 / ; で引数 / * で範囲を広げる / Enter実行）"
 HINT = "Tab 掘り下げ・引数へ / Ctrl+D 削除 / Ctrl+↑↓ 並べ替え"
 
 
@@ -79,6 +92,15 @@ def _entry_icon(entry) -> str:
     return ICONS["exec"] if entry.params else ICONS["app"]
 
 
+def _entry_group(entry) -> int:
+    """登録の並びグループ。フォルダを最上位に固定する。"""
+    if entry.kind == command_launcher.KIND_FOLDER:
+        return 0
+    if entry.kind in (command_launcher.KIND_URL, command_launcher.KIND_URI):
+        return 1
+    return 2
+
+
 def _frecency_sorted(pairs, palette_history, key_of):
     """(表示のもと, Candidate キー) の列を frecency の押し上げ順に並べる。
 
@@ -95,13 +117,15 @@ def _frecency_sorted(pairs, palette_history, key_of):
     return sorted(pairs, key=lambda pair: -boost(pair))
 
 
-def build_items(entries, *, features, apps, palette_history=None,
-                add_path=None, stash_count=None, show_import=True) -> list:
+def build_items(entries, *, pinned_features=(), add_path=None,
+                stash_count=None, show_import=True) -> list:
     """統合ピッカーの静的候補を (表示名, データ, 絞り込み名) で返す。
 
+    開いた直後に出るのは登録とピン留めだけ。機能・アプリの全体はここには
+    入れず、`*` を打ったときに make_dynamic_items 側が広げて出す。
+
     entries: command_launcher.build_entries の結果(登録順)
-    features: [(項目キー, ラベル)]
-    apps: command_palette.scan_app_candidates の結果(Candidate の列)
+    pinned_features: [(項目キー, ラベル)] ピン留め済みの機能
     stash_count: あっふ文脈用。一時置き場の件数を渡すと先頭にその行を出す
     show_import: お気に入り取り込みの行を出すか(あっふ文脈では出さない)
     """
@@ -109,27 +133,19 @@ def build_items(entries, *, features, apps, palette_history=None,
     if stash_count is not None:
         items.append((f"🧺 一時置き場（{stash_count}件）",
                       {"kind": "stash"}, "一時置き場"))
-    for entry in entries:
+    ordered = sorted(enumerate(entries),
+                     key=lambda pair: (_entry_group(pair[1]), pair[0]))
+    for _index, entry in ordered:
         items.append((f"{_entry_icon(entry)} {entry.name}",
                       entry_payload(entry), entry.name))
-    feature_pairs = _frecency_sorted(
-        list(features), palette_history,
-        lambda pair: f"feature:{pair[0]}")
-    for key, label in feature_pairs:
+    for key, label in pinned_features:
         items.append((f"{ICONS['feature']} {label}",
-                      {"kind": "feature", "item_key": key, "name": label},
+                      {"kind": "feature", "item_key": key, "name": label,
+                       "pinned": True},
                       label))
-    app_pairs = _frecency_sorted(
-        list(apps), palette_history,
-        lambda cand: command_palette.candidate_key(cand) or "")
-    for cand in app_pairs:
-        path = cand.payload.get("path") or ""
-        items.append((f"{ICONS['app']} {cand.title}",
-                      {"kind": "app", "path": path, "name": cand.title},
-                      cand.title))
     for name, builtin_id, _desc in command_launcher._BUILTINS:
         if builtin_id == "history":
-            continue  # 履歴は空入力時の動的候補で出す(下記)
+            continue  # 履歴の窓は統合ピッカーには出さない
         items.append((f"{ICONS['builtin']} {name}",
                       {"kind": "builtin", "id": builtin_id, "name": name},
                       name))
@@ -144,41 +160,88 @@ def build_items(entries, *, features, apps, palette_history=None,
 def resolve_input(raw: str, entries):
     """打たれた文字列(名前;引数)を候補データに解釈する。解釈できなければ None。
 
-    履歴の再実行用。名前が登録と完全一致したときだけ拾う(前方一致では拾わない。
-    履歴は「前に実行したそのもの」なので、曖昧に別物を指す方が危ない)。"""
+    名前が登録と完全一致したときだけ拾う(前方一致では拾わない)。"""
     name, param = command_launcher.parse_input(raw or "")
     if not name:
         return None
     for entry in entries:
         if entry.name.casefold() == name.casefold():
-            payload = entry_payload(entry, param)
-            payload["history_text"] = raw
-            return payload
+            return entry_payload(entry, param)
     return None
 
 
 def make_dynamic_items(*, entries, features, apps, web_searches,
-                       file_search, history_inputs):
+                       file_search, palette_history=None, pinned_keys=()):
     """入力から作る候補(dynamic_items フック)を返す関数を作る。
 
+    features / apps は「控え」。静的候補には入らず、入力に `*` が含まれた
+    ときだけここから広げて出す。ピン留め済み(pinned_keys)の機能は
+    控えではなくスタメン扱いで、`*` の検索でも先に出す。
+
     file_search: func(文字列) -> パスの列(Everything。失敗時は空)
-    history_inputs: 実行履歴の文字列(新しい順)
     """
     searches = command_palette.normalize_web_searches(web_searches or [])
-    static_names = [e.name for e in entries] \
-        + [label for _key, label in features] \
-        + [cand.title for cand in apps]
+    pinned = set(pinned_keys or ())
+    entry_names = [e.name for e in entries]
+
+    def feature_row(key, label):
+        return (f"{ICONS['feature']} {label}",
+                {"kind": "feature", "item_key": key, "name": label,
+                 "pool": key not in pinned,
+                 **({"pinned": True} if key in pinned else {})})
+
+    def app_row(cand):
+        return (f"{ICONS['app']} {cand.title}",
+                {"kind": "app", "path": cand.payload.get("path") or "",
+                 "name": cand.title, "pool": True})
+
+    def widened_rows(raw):
+        """`*` を含む入力で、登録+機能+アプリ全体から探して返す。
+
+        `*` を除いた残りを command_palette.score_match で照らす(前方一致 >
+        部分一致 > 部分列)。Exe* で Excel が出るのはこの部分列のおかげ
+        (Excel は Exe では始まらない)。`*` だけなら全部。
+        並びは 登録(フォルダ→URL→実行) → ピン留め機能 → 控えの機能 → アプリで、
+        グループの中はスコア順(同点は元の順序)。"""
+        pattern = raw.split(";", 1)[0].replace("*", "").strip()
+        rows = []
+
+        def scored(pairs, name_of, row_of):
+            hits = []
+            for pair in pairs:
+                score = command_palette.score_match(pattern, name_of(pair))
+                if score is not None:
+                    hits.append((score, row_of(pair)))
+            hits.sort(key=lambda hit_row: -hit_row[0])
+            rows.extend(row for _score, row in hits)
+
+        ordered = sorted(enumerate(entries),
+                         key=lambda pair: (_entry_group(pair[1]), pair[0]))
+        scored([entry for _i, entry in ordered],
+               lambda entry: entry.name,
+               lambda entry: (f"{_entry_icon(entry)} {entry.name}",
+                              entry_payload(entry)))
+        feature_pairs = _frecency_sorted(
+            list(features), palette_history,
+            lambda pair: f"feature:{pair[0]}")
+        for want_pinned in (True, False):
+            scored([pair for pair in feature_pairs
+                    if (pair[0] in pinned) == want_pinned],
+                   lambda pair: pair[1],
+                   lambda pair: feature_row(pair[0], pair[1]))
+        app_pairs = _frecency_sorted(
+            list(apps), palette_history,
+            lambda cand: command_palette.candidate_key(cand) or "")
+        scored(app_pairs, lambda cand: cand.title, app_row)
+        return rows
 
     def dynamics(text: str) -> list:
         raw = (text or "").strip()
         if not raw:
-            rows = []
-            for past in (history_inputs or [])[:5]:
-                payload = resolve_input(past, entries)
-                if payload is not None:
-                    rows.append((f"{ICONS['history']} {past}", payload))
-            return rows
+            return []
         rows = []
+        if "*" in raw:
+            rows.extend(widened_rows(raw))
         calc = command_palette.evaluate_query(raw)
         if calc is not None:
             rows.append((f"{ICONS['calc']} {calc.title}",
@@ -206,30 +269,16 @@ def make_dynamic_items(*, entries, features, apps, web_searches,
                 rows.append((label, {"kind": "jump", "path": path,
                                      "typed": True}))
         keyword = raw.lower()
-        if ";" not in raw and not any(
-                n.lower().startswith(keyword) for n in static_names):
-            # 前方一致が0件のときだけ、あいまい(部分列)一致を動的候補として出す。
+        if "*" not in raw and ";" not in raw and not any(
+                n.lower().startswith(keyword) for n in entry_names):
+            # 前方一致が0件のときだけ、あいまい(部分列)一致を出す。対象は登録
+            # の中だけ(控えは `*` を打たない限り出さない)。
             scored = []
             for entry in entries:
                 score = command_palette.score_match(raw, entry.name)
                 if score is not None:
                     scored.append((score, f"{_entry_icon(entry)} {entry.name}",
                                    entry_payload(entry)))
-            for key, label in features:
-                score = command_palette.score_match(raw, label)
-                if score is None:
-                    score = command_palette.score_match(raw, key)
-                if score is not None:
-                    scored.append((score, f"{ICONS['feature']} {label}",
-                                   {"kind": "feature", "item_key": key,
-                                    "name": label}))
-            for cand in apps:
-                score = command_palette.score_match(raw, cand.title)
-                if score is not None:
-                    scored.append((score, f"{ICONS['app']} {cand.title}",
-                                   {"kind": "app",
-                                    "path": cand.payload.get("path") or "",
-                                    "name": cand.title}))
             scored.sort(key=lambda row: -row[0])
             rows.extend((label, payload) for _s, label, payload in scored[:5])
         if file_search is not None and len(raw) >= 2 and ";" not in raw:
@@ -274,8 +323,6 @@ def preview_text(data, *, context: str = "resident") -> str:
     """選択中の候補について「Enter でどうなるか」を文章で返す。"""
     if not isinstance(data, dict):
         return ""
-    if data.get("history_text"):
-        return f"Enter でもう一度実行します: {data['history_text']}"
     kind = data.get("kind")
     if kind == "stash":
         return "Enter で一時置き場を開きます"

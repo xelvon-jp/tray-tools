@@ -1,6 +1,10 @@
 # test_unified_picker.py
 # 統合ピッカー(unified_picker.py)の候補生成・動的候補・プレビュー文と、
 # picker.PickerWindow の絞り込み名(3要素タプル)対応のテスト。
+#
+# 表示ルール(2026-11-11): 静的候補は登録+ピン留めだけ(フォルダ最上位)。
+# 機能・アプリは入力に `*` が入ったときだけ動的候補として広げて出す。
+# 動的候補は窓の dynamic_last で登録の下に出る。
 import os
 import sys
 import tempfile
@@ -17,28 +21,31 @@ WEB = [{"name": "Google", "url": "https://www.google.com/search?q={query}"}]
 
 
 def _settings(tmp):
+    # 登録順はわざと種別を混ぜてある。表示は フォルダ→URL/URI→実行 の順に
+    # 並び替わることを確かめるため。
     return {"launcher": {"bookmarks": [
-        {"name": "作業", "path": tmp},
-        {"name": "ページ", "path": "https://example.com/"},
-        {"name": "ノート", "path": "onenote:https://example.com/p"},
         {"name": "道具", "path": r"C:\tools\app.exe", "params": "/open %param%"},
+        {"name": "ページ", "path": "https://example.com/"},
+        {"name": "作業", "path": tmp},
+        {"name": "ノート", "path": "onenote:https://example.com/p"},
         {"name": "電卓もどき", "path": r"C:\tools\calc.exe"},
     ]}}
 
 
 def _apps():
-    return [cp.Candidate("app", "メモ帳", "", {"path": r"C:\apps\notepad.lnk"})]
+    return [cp.Candidate("app", "メモ帳", "", {"path": r"C:\apps\notepad.lnk"}),
+            cp.Candidate("app", "Excel", "", {"path": r"C:\apps\excel.lnk"})]
 
 
 def _dynamics(entries, **kwargs):
     args = {"entries": entries, "features": [], "apps": [],
-            "web_searches": [], "file_search": None, "history_inputs": []}
+            "web_searches": [], "file_search": None}
     args.update(kwargs)
     return up.make_dynamic_items(**args)
 
 
 # ---------------------------------------------------------------
-# picker の絞り込み名
+# picker の絞り込み名と動的候補の位置
 # ---------------------------------------------------------------
 def test_split_item():
     assert picker_mod.split_item(("名前", 1)) == ("名前", 1, "名前")
@@ -62,16 +69,42 @@ def test_picker_match_name():
         window.close()
 
 
+def test_picker_dynamic_last():
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    items = [("📁 登録", {"kind": "jump"}, "登録")]
+    dynamics = lambda text: [("🧮 計算", {"kind": "calc"})]  # noqa: E731
+    window = picker_mod.PickerWindow(
+        "test", items, lambda n, d: None, dynamic_items=dynamics,
+        dynamic_last=True)
+    try:
+        texts = [window.list.item(i).text() for i in range(window.list.count())]
+        assert texts == ["📁 登録", "🧮 計算"], texts
+    finally:
+        window.close()
+    window = picker_mod.PickerWindow(
+        "test", items, lambda n, d: None, dynamic_items=dynamics)
+    try:
+        texts = [window.list.item(i).text() for i in range(window.list.count())]
+        assert texts == ["🧮 計算", "📁 登録"], texts
+    finally:
+        window.close()
+
+
 # ---------------------------------------------------------------
-# 静的候補
+# 静的候補(登録+ピン留めだけ。フォルダが最上位)
 # ---------------------------------------------------------------
 def test_build_items():
     with tempfile.TemporaryDirectory() as tmp:
         entries = cl.build_entries(_settings(tmp))
-        items = up.build_items(entries, features=[("capture", "キャプチャ")],
-                               apps=_apps(), add_path=tmp)
+        items = up.build_items(
+            entries, pinned_features=[("capture", "キャプチャ")], add_path=tmp)
+        matches = [m for _d, _p, m in items]
+        # 登録は フォルダ→URL/URI→実行 の順(登録順は種別混在でも)
+        assert matches[:5] == ["作業", "ページ", "ノート", "道具", "電卓もどき"], \
+            matches
         by_match = {match: (display, payload)
-                    for display, payload, match in items}
+                    for display, payload, match in items if match}
         assert by_match["作業"][0] == "📁 作業"
         assert by_match["作業"][1]["kind"] == "jump"
         assert by_match["ページ"][0] == "🌐 ページ"
@@ -82,12 +115,13 @@ def test_build_items():
         assert by_match["道具"][0] == "▶ 道具"
         assert by_match["道具"][1]["kind"] == "exec"
         assert by_match["電卓もどき"][0] == "🚀 電卓もどき"
+        # ピン留めした機能だけが静的候補に出る
         assert by_match["キャプチャ"][0] == "🔧 キャプチャ"
-        assert by_match["キャプチャ"][1] == {"kind": "feature",
-                                             "item_key": "capture",
-                                             "name": "キャプチャ"}
-        assert by_match["メモ帳"][0] == "🚀 メモ帳"
-        assert by_match["メモ帳"][1]["kind"] == "app"
+        assert by_match["キャプチャ"][1] == {
+            "kind": "feature", "item_key": "capture", "name": "キャプチャ",
+            "pinned": True}
+        # 控え(機能の全体・アプリ)は静的候補には出ない
+        assert "メモ帳" not in by_match and "Excel" not in by_match
         builtin_names = [m for m in by_match
                          if by_match[m][1].get("kind") == "builtin"]
         assert sorted(builtin_names) == ["Command", "Config", "Reload"]
@@ -101,15 +135,11 @@ def test_entry_payload():
     assert payload["kind"] == "open" and payload["via"] == "uri"
 
 
-# ---------------------------------------------------------------
-# 履歴の解釈
-# ---------------------------------------------------------------
 def test_resolve_input():
     with tempfile.TemporaryDirectory() as tmp:
         entries = cl.build_entries(_settings(tmp))
         payload = up.resolve_input("道具;xyz", entries)
         assert payload["kind"] == "exec" and payload["param"] == "xyz"
-        assert payload["history_text"] == "道具;xyz"
         assert up.resolve_input("道", entries) is None  # 前方一致では拾わない
         assert up.resolve_input("知らない", entries) is None
         assert up.resolve_input("", entries) is None
@@ -135,23 +165,84 @@ def test_dynamics_exec_semicolon():
         assert exec_rows and exec_rows[0]["param"] == "abc"
 
 
-def test_dynamics_history():
+def test_dynamics_empty_input():
     with tempfile.TemporaryDirectory() as tmp:
         entries = cl.build_entries(_settings(tmp))
-        dynamics = _dynamics(entries, history_inputs=["道具;xyz", "知らない;1"])
-        rows = dynamics("")
-        assert len(rows) == 1
-        assert rows[0][0].startswith("⌛")
-        assert rows[0][1]["history_text"] == "道具;xyz"
+        dynamics = _dynamics(entries, apps=_apps())
+        assert dynamics("") == []  # 空入力では何も足さない(静的候補だけ)
+
+
+def test_dynamics_pool_hidden_without_star():
+    dynamics = _dynamics([], features=[("capture", "キャプチャ")],
+                         apps=_apps())
+    rows = dynamics("メモ")
+    assert not any(p.get("kind") == "app" for _d, p in rows)
+    rows = dynamics("キャプ")
+    assert not any(p.get("kind") == "feature" for _d, p in rows)
+
+
+def test_dynamics_widen_star_suffix():
+    # Exe* で、スタメンにいない Excel が候補に出る(Nagato の期待した形)
+    dynamics = _dynamics([], apps=_apps())
+    rows = dynamics("Exe*")
+    app_rows = [p for _d, p in rows if p.get("kind") == "app"]
+    assert app_rows and app_rows[0]["name"] == "Excel"
+    assert app_rows[0]["pool"] is True
+    rows = dynamics("exe*")  # 大文字小文字は無視
+    assert any(p.get("name") == "Excel" for _d, p in rows)
+
+
+def test_dynamics_widen_star_prefix_contains():
+    dynamics = _dynamics([], apps=_apps())
+    rows = dynamics("*cel")  # 先頭の * は部分一致
+    assert any(p.get("name") == "Excel" for _d, p in rows)
+    rows = dynamics("*メモ")
+    assert any(p.get("name") == "メモ帳" for _d, p in rows)
+
+
+def test_dynamics_widen_star_all_and_order():
+    with tempfile.TemporaryDirectory() as tmp:
+        entries = cl.build_entries(_settings(tmp))
+        dynamics = _dynamics(
+            entries, features=[("capture", "キャプチャ"),
+                               ("memo", "メモ機能")],
+            apps=_apps(), pinned_keys=("capture",))
+        rows = dynamics("*")
+        kinds = [p.get("kind") for _d, p in rows]
+        # 登録 → ピン留め機能 → 控えの機能 → アプリ の順
+        assert kinds.index("jump") < kinds.index("feature")
+        feature_rows = [p for _d, p in rows if p.get("kind") == "feature"]
+        assert feature_rows[0]["item_key"] == "capture"
+        assert feature_rows[0]["pinned"] is True
+        assert feature_rows[0]["pool"] is False
+        assert feature_rows[1]["item_key"] == "memo"
+        assert feature_rows[1]["pool"] is True
+        assert any(p.get("kind") == "app" for _d, p in rows)
+        # 登録の中もフォルダが先
+        jump_at = kinds.index("jump")
+        open_at = kinds.index("open")
+        assert jump_at < open_at
+
+
+def test_dynamics_widen_registered_prefix():
+    with tempfile.TemporaryDirectory() as tmp:
+        entries = cl.build_entries(_settings(tmp))
+        dynamics = _dynamics(entries, apps=_apps())
+        rows = dynamics("作*")
+        assert any(p.get("kind") == "jump" and p.get("name") == "作業"
+                   for _d, p in rows)
 
 
 def test_dynamics_fuzzy_fallback():
     with tempfile.TemporaryDirectory() as tmp:
         settings = {"launcher": {"bookmarks": [{"name": "Google", "path": tmp}]}}
         entries = cl.build_entries(settings)
-        dynamics = _dynamics(entries)
+        dynamics = _dynamics(entries, apps=_apps())
         rows = dynamics("ggl")
         assert any(p.get("kind") == "jump" for _d, p in rows)
+        # あいまい一致の対象は登録だけ(アプリの Excel 等は出ない)
+        rows = dynamics("exl")
+        assert not any(p.get("kind") == "app" for _d, p in rows)
         # 前方一致があるときは、あいまいの行は出さない
         rows = dynamics("Goo")
         assert not any(d == "📁 Google" for d, _p in rows)
@@ -176,8 +267,9 @@ def test_preview_text():
     assert "OneNote" in up.preview_text(
         {"kind": "open", "target": "onenote:x", "via": "onenote"})
     assert up.preview_text({"kind": "builtin", "id": "config"}) != ""
-    assert "もう一度" in up.preview_text(
-        {"kind": "exec", "history_text": "道具;1"})
+    entry = cl.Entry("道具", r"C:\tools\app.exe", "/open %param%",
+                     kind=cl.KIND_FILE)
+    assert "app.exe" in up.preview_text({"kind": "exec", "entry": entry})
     assert up.preview_text({"kind": "unknown"}) == ""
     assert up.preview_text("not-a-dict") == ""
 
@@ -196,7 +288,7 @@ def test_tab_text():
 def test_build_items_filer_context():
     with tempfile.TemporaryDirectory() as tmp:
         entries = cl.build_entries(_settings(tmp))
-        items = up.build_items(entries, features=[], apps=[], add_path=tmp,
+        items = up.build_items(entries, add_path=tmp,
                                stash_count=3, show_import=False)
         assert items[0][1] == {"kind": "stash"}
         assert items[0][0].startswith("🧺 一時置き場（3件）")
@@ -364,9 +456,14 @@ def test_filer_j_unified_flow():
             ["B", "C_new"]
 
 
-ALL_TESTS = [test_split_item, test_picker_match_name, test_build_items,
-             test_entry_payload, test_resolve_input, test_dynamics_calc_and_web,
-             test_dynamics_exec_semicolon, test_dynamics_history,
+ALL_TESTS = [test_split_item, test_picker_match_name, test_picker_dynamic_last,
+             test_build_items, test_entry_payload, test_resolve_input,
+             test_dynamics_calc_and_web, test_dynamics_exec_semicolon,
+             test_dynamics_empty_input, test_dynamics_pool_hidden_without_star,
+             test_dynamics_widen_star_suffix,
+             test_dynamics_widen_star_prefix_contains,
+             test_dynamics_widen_star_all_and_order,
+             test_dynamics_widen_registered_prefix,
              test_dynamics_fuzzy_fallback, test_dynamics_file_search,
              test_preview_text, test_tab_text, test_build_items_filer_context,
              test_preview_filer_context, test_call_signatures_match,

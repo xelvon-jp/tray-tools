@@ -5315,7 +5315,7 @@ class FilerWindow(QWidget):
         def build_items() -> list:
             return unified_picker.build_items(
                 command_launcher.build_entries(current),
-                features=[], apps=apps, add_path=add_path,
+                add_path=add_path,
                 stash_count=len(self.stash_paths), show_import=False)
 
         def record(data, param=None):
@@ -5371,6 +5371,8 @@ class FilerWindow(QWidget):
                 path = data.get("path") or ""
                 if path:
                     os.startfile(path)  # noqa: S606
+                    if kind == "app":
+                        promote(data)
                 return None
             if kind == "calc":
                 QApplication.clipboard().setText(data.get("value") or "")
@@ -5471,12 +5473,54 @@ class FilerWindow(QWidget):
             if launcher.move_bookmark(current, self.settings_path, name, path, step):
                 picker.set_items(build_items())
 
+        def promote(data):
+            """`*` で広げて出したアプリを実行したあと、スタメン昇格を聞く。
+
+            昇格はブックマーク登録。断ったらその項目では二度聞かない
+            (settings の unified_picker.declined に覚える)。"""
+            if not data.get("pool"):
+                return
+            state = current.get("unified_picker")
+            if not isinstance(state, dict):
+                state = current["unified_picker"] = {}
+            declined = state.get("declined")
+            if not isinstance(declined, list):
+                declined = state["declined"] = []
+            ident = f"app:{data.get('path') or ''}"
+            if ident in declined:
+                return
+            name = data.get("name") or ""
+            if self.confirm(
+                    "統合ピッカー",
+                    f"『{name}』を通常表示（スタメン）に加えますか？\n"
+                    "（次回からは * を打たなくても出ます）",
+                    default_yes=False, parent=picker):
+                if launcher.save_bookmark(current, self.settings_path, name,
+                                          data.get("path") or ""):
+                    self.log(f"ブックマーク: スタメンに加えました（{name}）")
+                else:
+                    self.log("ブックマーク: 設定ファイルに保存できませんでした")
+                return
+            declined.append(ident)
+            if not self.settings_path:
+                return
+            try:
+                stored = {}
+                if os.path.exists(self.settings_path):
+                    with open(self.settings_path, "r", encoding="utf-8") as f:
+                        stored = json.load(f)
+                if not isinstance(stored, dict):
+                    stored = {}
+                stored["unified_picker"] = state
+                settings_module.save_settings(stored, self.settings_path)
+            except Exception:  # noqa: BLE001  覚えられないだけ
+                pass
+
         dynamics = unified_picker.make_dynamic_items(
             entries=command_launcher.build_entries(current),
             features=[], apps=apps,
             web_searches=(current.get("command_palette") or {}).get("web_searches"),
-            file_search=self._unified_filer_file_search(),
-            history_inputs=history)
+            file_search=self._unified_filer_file_search())
 
         picker = self._open_picker(
             "統合ピッカー", build_items(), self.jump_to, on_accept=accept,
@@ -5484,7 +5528,7 @@ class FilerWindow(QWidget):
             preview_provider=lambda data: unified_picker.preview_text(
                 data, context="filer"),
             dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
-            on_delete=delete, on_move=move)
+            on_delete=delete, on_move=move, dynamic_last=True)
 
     def _unified_apps(self):
         """統合ピッカー用に、スタートメニューのアプリ候補を1度だけ走査する。"""

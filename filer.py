@@ -557,7 +557,12 @@ class RowDelegate(QStyledItemDelegate):
             align = Qt.AlignVCenter | (
                 Qt.AlignRight if index.column() == COL_SIZE else Qt.AlignLeft)
             fm = QFontMetrics(option.font)
-            text = fm.elidedText(text, Qt.ElideRight, max(text_rect.width(), 0))
+            # パスを含む名前(フラット表示・検索結果)は真ん中を省く。末尾のファイル名が
+            # 切れて見えなくなるのを避けるため(通常の名前は従来どおり右を省く)。
+            elide = (Qt.ElideMiddle
+                     if index.column() == COL_NAME and "\\" in text
+                     else Qt.ElideRight)
+            text = fm.elidedText(text, elide, max(text_rect.width(), 0))
             painter.drawText(text_rect, align, text)
         finally:
             painter.restore()
@@ -826,6 +831,9 @@ class Pane(QWidget):
         self.ns_cancel = None
         self.ns_status = "done"
         self.ns_count = 0
+        # 結果の並び("path" = パス順で窓の並べ方に従う / "name" = ファイル名順)。
+        # 検索を始めるたびに窓の前回値(window_.name_search_sort)を取り込む。
+        self.ns_sort = "path"
         # ★写真抽出(Shift+F → P)。配下の写真のうち★1以上をフラット表示の形で並べる(写真フォルダ
         # モードを強制。窓の下の★の範囲スライダーとは AND)。pick_root は抽出した根(表示中だけ。
         # 抜けたら None)。集めている間は pick_phase が "scan"(写真を探す) / "read"(★を読む)で、
@@ -936,6 +944,27 @@ class Pane(QWidget):
         self.history_bar.close_requested.connect(self._on_history_close)
         self.history_bar.hide()
         layout.addWidget(self.history_bar)
+        # 名前で検索の結果の並びを切り替える段(結果を表示している間だけ。一覧の真下)。
+        self.ns_sort_bar = QWidget(self)
+        ns_bar_layout = QHBoxLayout(self.ns_sort_bar)
+        ns_bar_layout.setContentsMargins(6, 2, 6, 2)
+        ns_bar_layout.setSpacing(4)
+        ns_label = QLabel("並び:", self.ns_sort_bar)
+        ns_label.setFont(window.log_font)
+        ns_bar_layout.addWidget(ns_label)
+        self.ns_sort_buttons = {}
+        for value, label in core.NAME_SEARCH_SORT_LABELS.items():
+            button = QPushButton(label, self.ns_sort_bar)
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setFont(window.log_font)
+            button.clicked.connect(
+                lambda _checked=False, v=value: self._on_ns_sort_clicked(v))
+            ns_bar_layout.addWidget(button)
+            self.ns_sort_buttons[value] = button
+        ns_bar_layout.addStretch(1)
+        self.ns_sort_bar.hide()
+        layout.addWidget(self.ns_sort_bar)
         self._rating_pending = None     # まだ掛けていないスライダーの値 (lo, hi)
         self._rating_timer = QTimer(self)
         self._rating_timer.setSingleShot(True)
@@ -1170,6 +1199,7 @@ class Pane(QWidget):
         # 2行目: ドライブのラベル(読み取りは別スレッド。まだなら空)。★の絞り込みは
         # 下の★の範囲の段に出す。
         self.header2.setText(self.window_.drive_label_text(self.drive_root()))
+        self.update_ns_sort_bar()
 
     def update_footer(self) -> None:
         if not hasattr(self, "footer"):
@@ -1464,9 +1494,16 @@ class Pane(QWidget):
             self.update_photo_mode()
             self.update_rating_bar()
             self.update_history_bar()
+            self.update_ns_sort_bar()
             return
         masked = core.filter_entries(shown, self.patterns)
-        visible = core.sort_entries(core.live_filter_entries(masked, self.live_words), self.sort)
+        filtered = core.live_filter_entries(masked, self.live_words)
+        if self.ns_query is not None and not self.ns_loading and self.ns_sort == "name":
+            # 名前で検索の結果を「名前順」にしたときだけ、窓の並べ方ではなく
+            # ファイル名(相対パスの末尾)で並べる。
+            visible = core.sort_name_search(filtered)
+        else:
+            visible = core.sort_entries(filtered, self.sort)
         names = {e.name for e in self.all_entries}
         self.marks = {m for m in self.marks if m in names}
         if self.pick_root is not None:
@@ -1486,6 +1523,7 @@ class Pane(QWidget):
         self.update_photo_mode()
         self.update_rating_bar()
         self.update_history_bar()
+        self.update_ns_sort_bar()
 
     def _row_of(self, name):
         if not name:
@@ -2061,6 +2099,7 @@ class Pane(QWidget):
         self.ns_cancel = cancel
         self.ns_query = query
         self.ns_mode = mode
+        self.ns_sort = self.window_.name_search_sort
         self.ns_loading = True
         self.loading = True
         self.ns_count = 0
@@ -2591,6 +2630,39 @@ class Pane(QWidget):
                        self.window_.photo_config, move_slider=pending is None,
                        keywords=keywords)
 
+    def update_ns_sort_bar(self) -> None:
+        """名前で検索の並びの段をこの窓の状態に合わせる。結果を表示している
+        間だけ出し、押されているボタンを現在の並びに合わせる。"""
+        bar = getattr(self, "ns_sort_bar", None)
+        if bar is None:
+            return  # 組み立ての途中
+        shown = self.ns_query is not None and not self.ns_loading and self.flat
+        bar.setVisible(shown)
+        if not shown:
+            return
+        for value, button in self.ns_sort_buttons.items():
+            button.setChecked(value == self.ns_sort)
+
+    def _on_ns_sort_clicked(self, value: str) -> None:
+        """並びの段のボタンを押した: この窓をアクティブにして並べ直し、前回値として
+        設定に覚える(窓の側の name_search_sort が正本)。"""
+        try:
+            if not self.is_active():
+                self.window_.activate(self.side)
+            if value not in core.NAME_SEARCH_SORTS or value == self.ns_sort:
+                self.update_ns_sort_bar()
+                return
+            self.ns_sort = value
+            win = self.window_
+            if win.name_search_sort != value:
+                win.name_search_sort = value
+                save_values(win.app_settings, win.settings_path,
+                            {"name_search_sort": value})
+            self._rebuild()
+            self.update_ns_sort_bar()
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("nsSort")
+
     def _on_rating_bar_pressed(self) -> None:
         """段のスライダーか ✕ を押した: この窓をアクティブにする(フォーカスはファイル窓。
         段の部品はフォーカスを取らない)。"""
@@ -2972,6 +3044,9 @@ class FilerWindow(QWidget):
         # 名前で検索(Shift+F → N)の前回の一致方式。次回も覚える。
         mode = section.get("name_search_mode")
         self.name_search_mode = mode if mode in core.NAME_MODES else "partial"
+        # 名前で検索の結果の前回の並び("path" / "name")。次回も覚える。
+        nsort = section.get("name_search_sort")
+        self.name_search_sort = nsort if nsort in core.NAME_SEARCH_SORTS else "path"
         # フォルダ構成をコピー(C→I)の深さと行数の上限。
         try:
             self.tree_depth = max(1, int(section.get("tree_depth") or core.TREE_DEPTH))
@@ -5984,11 +6059,11 @@ class FilerWindow(QWidget):
                                         exists=self.menu_exists)
 
     def cmd_everything(self):
-        """Shift+F: 検索のメニュー。E で Everything 検索、N で名前で検索、P で★写真抽出
-        (頭の文字で選んで Enter)。"""
+        """Shift+F: 検索のメニュー。N で名前で検索、E で Everything 検索、P で★写真抽出
+        (頭の文字で選んで Enter。先頭の N が Enter の既定)。"""
         choice = self.choose_menu("検索", [
-            ("E", "Everything 検索", "everything_search"),
             ("N", "名前で検索", "name_search"),
+            ("E", "Everything 検索", "everything_search"),
             ("P", "★写真抽出（配下の★1以上の写真）", "photo_pick"),
             ("Q", "キャンセル", None),
         ])

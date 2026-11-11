@@ -5595,6 +5595,43 @@ def test_name_matcher_logic():
     assert core.COMMAND_SHORT_NAMES["name_search"] == "名前検索"
 
 
+def test_name_matcher_wildcards():
+    # 部分一致: * ? を含む語はワイルドカードとして名前の中に当てはめる
+    match = core.build_name_matcher("log*2026", "partial")
+    assert match("log_a_2026.txt") and match("mylog2026.txt")
+    assert not match("log_2025.txt") and not match("2026_log.txt")
+    match = core.build_name_matcher("a?c", "partial")
+    assert match("xabc.txt") and not match("abbc.txt")
+    # ワイルドカードの語と通常の語の AND
+    match = core.build_name_matcher("log* *.txt", "partial")
+    assert match("log_1.txt") and not match("log_1.md")
+    # [ ] は文字どおり(* ? だけが特別)
+    match = core.build_name_matcher("*[a]", "partial")
+    assert match("x[a]") and not match("xa")
+    # 完全一致: * ? があれば名前全体をパターンで照合する
+    match = core.build_name_matcher("*.txt", "exact")
+    assert match("a.txt") and match("A.TXT") and not match("a.txt.bak")
+    match = core.build_name_matcher("log_???.txt", "exact")
+    assert match("log_001.txt") and not match("log_01.txt")
+    # * ? が無ければ従来どおりの完全一致
+    match = core.build_name_matcher("a[1].txt", "exact")
+    assert match("A[1].TXT") and not match("a1.txt")
+    assert core.NAME_SEARCH_SORT_LABELS["name"] == "名前順"
+
+
+def test_name_search_sort_logic():
+    # ファイル名(相対パスの末尾)で並べ、同名はパス順で安定させる
+    def ent(name):
+        return core.Entry(name, False, 1, 0.0, 0)
+    entries = [ent("b\\z.txt"), ent("a\\m.txt"), ent("c\\a.txt"), ent("a\\a.txt")]
+    ordered = [e.name for e in core.sort_name_search(entries)]
+    assert ordered == ["a\\a.txt", "c\\a.txt", "a\\m.txt", "b\\z.txt"], ordered
+    # 大文字小文字は区別しない
+    entries = [ent("x\\B.txt"), ent("y\\a.txt")]
+    ordered = [e.name for e in core.sort_name_search(entries)]
+    assert ordered == ["y\\a.txt", "x\\B.txt"], ordered
+
+
 def test_collect_name_search_logic():
     # フォルダ階層の歩き方は collect_flat と同一コードの形なので、ここでは
     # 平らな木で「名前で絞る」部分を確かめる(階層の相対パスは test_collect_flat_logic 側)

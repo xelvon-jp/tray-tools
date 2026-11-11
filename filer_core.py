@@ -664,32 +664,73 @@ def flat_footer_text(files: int, total: int, mark_count: int = 0, mark_bytes: in
 NAME_SEARCH_LIMIT = 10_000    # ヒット件数の上限(結果が一覧にならない量は実用でないため)
 NAME_MODES = ("partial", "exact", "regex")
 NAME_MODE_LABELS = {"partial": "部分一致", "exact": "完全一致", "regex": "正規表現"}
+# 名前で検索の結果の並び。path = パス順(窓の並べ方に従う)、name = ファイル名順。
+NAME_SEARCH_SORTS = ("path", "name")
+NAME_SEARCH_SORT_LABELS = {"path": "パス順", "name": "名前順"}
+
+
+def sort_name_search(entries):
+    """名前で検索の結果をファイル名(相対パスの末尾)で並べる。同名ならパス順で
+    安定させる。大文字小文字は区別しない。"""
+    def key(entry):
+        base = entry.name.replace("/", "\\").rsplit("\\", 1)[-1]
+        return (base.casefold(), entry.name.casefold())
+    return sorted(entries, key=key)
+
+
+def _wildcard_regex(term: str) -> "re.Pattern":
+    """ワイルドカードの語を正規表現にする。特別なのは * (任意の文字列)と ? (任意の
+    1文字)だけで、他の文字([ ] など)は文字どおりに当てる。"""
+    pat = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                  for c in term)
+    return re.compile(pat, re.IGNORECASE)
+
+
+def _has_wildcard(term: str) -> bool:
+    return "*" in term or "?" in term
 
 
 def build_name_matcher(query: str, mode: str):
     """検索語と一致方式から、ファイル名への述語を作る。不正な方式・正規表現は ValueError。
 
     どれも大文字小文字は区別しない(Windows の名前の流儀)。
-    - partial: 名前に文字列を含む。空白区切りで複数書くと全部含むもの(AND)
-    - exact:   名前全体が一致
+    - partial: 名前に文字列を含む。空白区切りで複数書くと全部含むもの(AND)。
+      語に * ? があれば、その語はワイルドカードとして名前の中に当てはめる(例: log*2026)
+    - exact:   名前全体が一致。検索語に * ? があれば、名前全体をワイルドカードの
+      パターンとして照合する(例: *.txt)
     - regex:   正規表現で検索(re.search)"""
     if mode == "partial":
-        terms = [term.casefold() for term in (query or "").split()]
-        if not terms:
+        raw_terms = (query or "").split()
+        if not raw_terms:
             raise ValueError("検索語が空です")
+        checks = []
+        for term in raw_terms:
+            if _has_wildcard(term):
+                pattern = _wildcard_regex(term)
+                checks.append(lambda name, p=pattern: p.search(name) is not None)
+            else:
+                folded = term.casefold()
+                checks.append(lambda name, f=folded: f in name.casefold())
 
         def match_partial(name: str) -> bool:
-            folded = name.casefold()
-            return all(term in folded for term in terms)
+            return all(check(name) for check in checks)
 
         return match_partial
     if mode == "exact":
-        target = (query or "").strip().casefold()
+        target = (query or "").strip()
         if not target:
             raise ValueError("検索語が空です")
+        if _has_wildcard(target):
+            pattern = _wildcard_regex(target)
+
+            def match_wild(name: str) -> bool:
+                return pattern.fullmatch(name) is not None
+
+            return match_wild
+        folded = target.casefold()
 
         def match_exact(name: str) -> bool:
-            return name.casefold() == target
+            return name.casefold() == folded
 
         return match_exact
     if mode == "regex":

@@ -57,7 +57,8 @@ def test_default_keymap_matches_afxw_key():
     assert km["1186"] == "mask_input" and km["0186"] == "mask_clear"
     assert km["0188"] == "back" and km["0190"] == "forward"
     assert km["4115"] == "quit"
-    assert km["0074"] == "bookmark_jump" and km["1074"] == "path_jump"
+    assert km["0074"] == "bookmark_jump" and "1074" not in km
+    assert "path_jump" not in core.COMMAND_SHORT_NAMES
     assert km["0120"] == "open_shell" and km["0121"] == "open_explorer"   # F9 / F10
     # ←/→ は窓のアクティブ化だけ。親へ行くのは BS だけ
     assert km["0037"] == "focus_left" and km["0039"] == "focus_right"
@@ -2351,17 +2352,22 @@ def test_bookmark_add_delete_move():
 
         w.run_command("bookmark_jump")
         p = w._picker
-        names = [n for n, _ in p._items]
-        # 先頭は一時置き場の行(仕様)。ブックマークはその次から並ぶ
+        names = [n for n, _d, _m in p._items]
+        matches = [m for _n, _d, m in p._items]
+        # 先頭は一時置き場の行(仕様)。ブックマークはその次から並ぶ(表示名には
+        # 種別のアイコンが付くので、素の名前は絞り込み名のほうで見る)
         assert names[0].startswith("🧺 一時置き場"), names
-        assert names[1:3] == ["A", "B"], names
-        assert names[3].startswith(launcher.ADD_ITEM_PREFIX) and str(left) in names[3], names
+        assert matches[1:3] == ["A", "B"], matches
+        add_item = next(e for e in p._items
+                        if isinstance(e[1], dict) and e[1].get("kind") == "add")
+        assert add_item[0].startswith(launcher.ADD_ITEM_PREFIX) \
+            and str(left) in add_item[0], add_item[0]
 
         # 「ここを登録」
         original = launcher._ask_name
         launcher._ask_name = lambda parent, default: default + "_new"
         try:
-            p._on_accept(*p._items[3])
+            p._on_accept(add_item[0], add_item[1])
         finally:
             launcher._ask_name = original
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -2372,14 +2378,14 @@ def test_bookmark_add_delete_move():
         # 並べ替え(B を上へ)と削除(A)。先頭の一時置き場の行は動かない
         w.run_command("bookmark_jump")
         p = w._picker
-        p._on_move(*p._items[2], -1)
-        assert [n for n, _ in p._items][1:3] == ["B", "A"]
+        p._on_move(*p._items[2][:2], -1)
+        assert [m for _n, _d, m in p._items][1:3] == ["B", "A"]
         w.confirm = lambda *a, **k: True
         # 削除の控えは本物の bookmark_deleted.log ではなく一時フォルダへ
         original_log = launcher.DELETED_LOG_PATH
         launcher.DELETED_LOG_PATH = str(Path(tmp, "bookmark_deleted.log"))
         try:
-            p._on_delete(*p._items[2])
+            p._on_delete(*p._items[2][:2])
         finally:
             launcher.DELETED_LOG_PATH = original_log
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -2391,17 +2397,21 @@ def test_bookmark_add_delete_move():
         new_name = os.path.basename(str(left)) + "_new"
         w.run_command("bookmark_jump")
         p = w._picker
-        add_item = next(e for e in p._items if e[1][0] == launcher.KIND_ADD)
+        add_item = next(e for e in p._items
+                        if isinstance(e[1], dict) and e[1].get("kind") == "add")
         asked = []
         original = launcher._ask_name
         launcher._ask_name = lambda parent, default: asked.append(default) or "dup"
         try:
-            assert p.select_data(add_item[1])
+            assert p.select_data(add_item[1], add_item[0])
             p._commit()
         finally:
             launcher._ask_name = original
         assert asked == [] and p.isVisible() and w._picker is p
-        assert p._entry_at(p.list.currentItem()) == (new_name, (launcher.KIND_JUMP, str(left)))
+        selected = p._entry_at(p.list.currentItem())
+        assert selected[0] == f"📁 {new_name}", selected
+        assert selected[1]["kind"] == "jump" and selected[1]["path"] == str(left) \
+            and selected[1]["name"] == new_name, selected
         assert "登録済みです" in w.log_view.toPlainText()
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
         assert [b["name"] for b in saved["launcher"]["bookmarks"]] == ["B", new_name]

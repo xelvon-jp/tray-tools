@@ -193,11 +193,184 @@ def test_tab_text():
     assert result == "/docs\\"
 
 
+def test_build_items_filer_context():
+    with tempfile.TemporaryDirectory() as tmp:
+        entries = cl.build_entries(_settings(tmp))
+        items = up.build_items(entries, features=[], apps=[], add_path=tmp,
+                               stash_count=3, show_import=False)
+        assert items[0][1] == {"kind": "stash"}
+        assert items[0][0].startswith("🧺 一時置き場（3件）")
+        assert items[0][2] == "一時置き場"
+        assert not any(p.get("kind") == "import" for _d, p, _m in items)
+
+
+def test_preview_filer_context():
+    text = up.preview_text({"kind": "jump", "path": r"C:\x"}, context="filer")
+    assert "アクティブな窓" in text and r"C:\x" in text
+    assert "一時置き場" in up.preview_text({"kind": "stash"}, context="filer")
+
+
+def test_call_signatures_match():
+    """feature_screen / filer が呼ぶ部品の関数が、実在し引数の形も合うこと。
+
+    統合の配線は窓まわりで実機でしか動かせない部分が多く、存在しない関数や
+    引数の渡し間違いが潜りやすい(第1段で実際に踏んだ)。ここは静的に守る。"""
+    import ast
+    import inspect
+    import pathlib
+
+    import command_palette as cp_mod
+    import launcher as launcher_mod
+
+    modules = {"launcher": launcher_mod, "command_launcher": cl,
+               "command_palette": cp_mod, "unified_picker": up}
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for filename in ("feature_screen.py", "filer.py"):
+        tree = ast.parse((root / filename).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in modules):
+                continue
+            module = modules[func.value.id]
+            target = getattr(module, func.attr, None)
+            assert target is not None, \
+                f"{filename}: {func.value.id}.{func.attr} が存在しない"
+            if not callable(target):
+                continue
+            try:
+                sig = inspect.signature(target)
+            except (TypeError, ValueError):
+                continue
+            params = [p for p in sig.parameters.values()
+                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            required = [p.name for p in params if p.default is p.empty]
+            given_kw = {kw.arg for kw in node.keywords if kw.arg}
+            assert len(node.args) <= len(params), \
+                f"{filename}: {func.value.id}.{func.attr} の位置引数が多すぎる"
+            missing = [name for name in required[len(node.args):]
+                       if name not in given_kw]
+            assert not missing, \
+                f"{filename}: {func.value.id}.{func.attr} に {missing} が渡っていない"
+
+
+def test_filer_j_unified_flow():
+    """あっふの J(cmd_bookmark_jump)が統合窓の候補で動き、登録・削除・並べ替えが
+    settings.json に効くこと。FilerWindow 本体は Windows 専用 API で VM では
+    起動できないので、必要な属性だけを持つ代役でメソッド単体を駆動する。"""
+    import json
+    import types
+    from pathlib import Path
+
+    try:
+        import filer
+    except Exception:  # noqa: BLE001  filer は Windows 専用 API を読み込むため
+        return  # 読み込めない環境(VM)では飛ばす。Windows の CI で効く
+    import launcher
+
+    class FakeSearch:
+        def text(self):
+            return ""
+
+    class FakePicker:
+        def __init__(self):
+            self.search = FakeSearch()
+            self.items = []
+            self.selected = None
+
+        def set_items(self, items):
+            self.items = items
+
+        def select_data(self, data, name=None):
+            self.selected = (data, name)
+            return True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        left = Path(tmp, "left")
+        right = Path(tmp, "right")
+        left.mkdir()
+        right.mkdir()
+        settings_path = Path(tmp, "settings.json")
+        stored = {"launcher": {"bookmarks": [
+            {"name": "A", "path": str(right)},
+            {"name": "B", "path": str(left)},
+        ]}}
+        settings_path.write_text(json.dumps(stored), encoding="utf-8")
+
+        captured = {}
+        picker = FakePicker()
+
+        stub = types.SimpleNamespace()
+        stub.settings_path = str(settings_path)
+        stub.app_settings = {}
+        stub.stash_paths = []
+        stub.jumped = []
+        stub.logs = []
+        stub.stash_shown = []
+        stub.jump_to = lambda path: stub.jumped.append(path)
+        stub.log = lambda message: stub.logs.append(message)
+        stub.confirm = lambda *a, **k: True
+        stub._unified_apps = lambda: []
+        stub._unified_filer_file_search = lambda: (lambda query: [])
+        stub.active = types.SimpleNamespace(
+            real_dir=lambda: str(left),
+            show_stash=lambda: stub.stash_shown.append(True))
+
+        def fake_open_picker(title, items, on_path, on_accept=None, **kwargs):
+            captured.update(title=title, items=items, accept=on_accept,
+                            delete=kwargs.get("on_delete"),
+                            move=kwargs.get("on_move"))
+            picker.items = items
+            return picker
+
+        stub._open_picker = fake_open_picker
+        filer.FilerWindow.cmd_bookmark_jump(stub)
+
+        items = captured["items"]
+        assert items[0][1] == {"kind": "stash"}
+        matches = [m for _n, _d, m in items]
+        assert matches[1:3] == ["A", "B"], matches
+        assert not any(p.get("kind") == "import" for _n, p, _m in items)
+
+        def row(match):
+            return next(e for e in picker.items if e[2] == match)
+
+        # フォルダの行 → アクティブ窓の移動(jump_to)
+        captured["accept"](*row("B")[:2])
+        assert stub.jumped == [str(left)]
+        # 一時置き場の行
+        captured["accept"](*items[0][:2])
+        assert stub.stash_shown == [True]
+        # 「ここを登録」→ settings に増える
+        original = launcher._ask_name
+        launcher._ask_name = lambda parent, default: "C_new"
+        try:
+            add_row = next(e for e in picker.items
+                           if isinstance(e[1], dict) and e[1].get("kind") == "add")
+            captured["accept"](add_row[0], add_row[1])
+        finally:
+            launcher._ask_name = original
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert [b["name"] for b in saved["launcher"]["bookmarks"]] == \
+            ["A", "B", "C_new"]
+        # 並べ替えと削除(ピッカー側の一覧は set_items で組み直される)
+        captured["move"](*row("B")[:2], -1)
+        captured["delete"](*row("A")[:2])
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert [b["name"] for b in saved["launcher"]["bookmarks"]] == \
+            ["B", "C_new"]
+
+
 ALL_TESTS = [test_split_item, test_picker_match_name, test_build_items,
              test_entry_payload, test_resolve_input, test_dynamics_calc_and_web,
              test_dynamics_exec_semicolon, test_dynamics_history,
              test_dynamics_fuzzy_fallback, test_dynamics_file_search,
-             test_preview_text, test_tab_text]
+             test_preview_text, test_tab_text, test_build_items_filer_context,
+             test_preview_filer_context, test_call_signatures_match,
+             test_filer_j_unified_flow]
 
 
 if __name__ == "__main__":

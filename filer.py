@@ -5295,41 +5295,131 @@ class FilerWindow(QWidget):
     def cmd_bookmark_jump(self):
         # launcher は explorer_nav 経由で comtypes を読み込む。ファイラの起動を軽く保つ
         # ため、J を押したときに初めて読む(COM のオブジェクトは作らない。読み込むだけ)。
+        import command_launcher
         import launcher
+        import unified_picker
 
-        # 押すたびに settings.json を読み直す。ファイラを開いている間に常駐側(Win+J や
-        # あふｗの Alt+J)で足したブックマークも、開き直さずに出るように。登録・削除・
-        # 並べ替えも読み直した dict に対して launcher の関数で行う(ファイルはキーだけ
-        # 差し替えるので、ファイラ自身の filer セクションとは消し合わない)。
+        # 押すたびに settings.json を読み直す。ファイラを開いている間に常駐側(Win+J)で
+        # 足したブックマークも、開き直さずに出るように。登録・削除・並べ替えも読み直した
+        # dict に対して launcher の関数で行う(ファイルはキーだけ差し替えるので、ファイラ
+        # 自身の filer セクションとは消し合わない)。
         current = (settings_module.load_settings(self.settings_path)
                    if self.settings_path else self.app_settings)
         # 書庫の中なら書庫のあるフォルダを登録する。ブックマークはあふｗ・エクスプローラ
         # からも使うので、書庫の中のパスを渡しても向こうが開けない。
         add_path = self.active.real_dir()
         picker = None
+        history = command_launcher.load_history()
+        apps = self._unified_apps()
 
         def build_items() -> list:
-            found = [(f"🧺 一時置き場（{len(self.stash_paths)}件）", ("stash", ""))]
-            found += [(b["name"], (launcher.KIND_JUMP, b["path"]))
-                      for b in launcher.load_bookmarks(current)]
-            if add_path:
-                found.append((f"{launcher.ADD_ITEM_PREFIX}   {add_path}",
-                              (launcher.KIND_ADD, add_path)))
-            return found
+            return unified_picker.build_items(
+                command_launcher.build_entries(current),
+                features=[], apps=apps, add_path=add_path,
+                stash_count=len(self.stash_paths), show_import=False)
+
+        def record(data, param=None):
+            nonlocal history
+            raw = data.get("history_text")
+            if not raw and data.get("bookmark") and data.get("name"):
+                raw = data["name"]
+                if data.get("kind") == "exec" and param:
+                    raw = f"{raw};{param}"
+            if raw:
+                history = command_launcher.record_history(history, raw)
+                command_launcher.save_history(history)
 
         def accept(_name, data):
-            kind, path = data
+            if not isinstance(data, dict):
+                return None
+            kind = data.get("kind")
             if kind == "stash":
                 self.active.show_stash()
-                return
-            if kind != launcher.KIND_ADD:
-                self.jump_to(path)
-                return
+                return None
+            if kind == "jump":
+                self.jump_to(data.get("path") or "")
+                record(data)
+                return None
+            if kind == "open":
+                os.startfile(data.get("target") or "")  # noqa: S606
+                record(data)
+                return None
+            if kind == "exec":
+                entry = data.get("entry")
+                if entry is None:
+                    return None
+                param = data.get("param")
+                if param is None:
+                    typed_name, typed_param = command_launcher.parse_input(
+                        picker.search.text() if picker is not None else "")
+                    param = typed_param if typed_name.casefold() == \
+                        (entry.name or "").casefold() else ""
+                action, payload = command_launcher.build_command(entry,
+                                                                 param or "")
+                if action == "exec":
+                    command, workdir = payload
+                    if command_launcher.run_exec(command, workdir):
+                        record(data, param or None)
+                elif action == "open":
+                    os.startfile(payload)  # noqa: S606
+                    record(data, param or None)
+                elif action == "jump":
+                    self.jump_to(payload)
+                    record(data, param or None)
+                return None
+            if kind == "app" or kind == "file":
+                path = data.get("path") or ""
+                if path:
+                    os.startfile(path)  # noqa: S606
+                return None
+            if kind == "calc":
+                QApplication.clipboard().setText(data.get("value") or "")
+                return None
+            if kind == "web":
+                url = data.get("url") or ""
+                if url:
+                    os.startfile(url)  # noqa: S606
+                return None
+            if kind == "builtin":
+                return builtin(data.get("id"))
+            if kind == "add":
+                return add(data)
+            return None
+
+        def builtin(builtin_id):
+            nonlocal current
+            if builtin_id == "command":
+                # 管理窓はモーダルで、保存は窓の側が行う。閉じたら一覧を作り直す。
+                command_launcher.open_manager(current, self.settings_path, picker)
+                picker.set_items(build_items())
+                return True
+            if builtin_id == "config":
+                if self.settings_path:
+                    os.startfile(self.settings_path)  # noqa: S606
+                return None
+            if builtin_id == "reload":
+                current = (settings_module.load_settings(self.settings_path)
+                           if self.settings_path else self.app_settings)
+                picker.set_items(build_items())
+                self.log("ブックマーク: 登録を読み直しました")
+                return True
+            return None
+
+        def add(data):
+            path = data.get("path") or ""
+            if not path:
+                return None
             # 登録済みのフォルダなら増やさない。知らせて、その行を選んだまま窓を開けておく
             existing = launcher.find_bookmark_by_path(current, path)
             if existing is not None:
-                picker.select_data((launcher.KIND_JUMP, existing["path"]),
-                                   name=existing["name"])
+                items = build_items()
+                picker.set_items(items)
+                for display, payload, _match in items:
+                    if isinstance(payload, dict) and (
+                            payload.get("path") == path
+                            or payload.get("target") == path):
+                        picker.select_data(payload, display)
+                        break
                 self.log(f"ブックマーク: 登録済みです（{existing['name']} → {existing['path']}）")
                 return True
             # 名前の既定値はフォルダ名。ルート(C:\)は basename が空なのでパスそのもの。
@@ -5338,15 +5428,30 @@ class FilerWindow(QWidget):
             # 塞いでしまい、あっふ全体が操作できなくなった(2026-11-01)
             name = launcher._ask_name(picker, default_name)
             if name is None:
-                return
+                return True
             if launcher.save_bookmark(current, self.settings_path, name, path):
                 self.log(f"ブックマーク: 登録しました（{name} → {path}）")
             else:
                 self.log("ブックマーク: 設定ファイルに保存できませんでした")
+            return None
 
-        def delete(name, data):
-            kind, path = data
-            if kind != launcher.KIND_JUMP:
+        def identity(data):
+            kind = data.get("kind")
+            if kind == "jump":
+                return data.get("name") or "", data.get("path") or ""
+            if kind == "open":
+                return data.get("name") or "", data.get("target") or ""
+            if kind == "exec":
+                entry = data.get("entry")
+                if entry is not None:
+                    return entry.name, entry.target
+            return "", ""
+
+        def delete(_name, data):
+            if not isinstance(data, dict) or not data.get("bookmark"):
+                return
+            name, path = identity(data)
+            if not name:
                 return
             if not self.confirm("フォルダブックマーク", f"{name} を削除しますか？",
                                 default_yes=False, parent=picker):
@@ -5357,25 +5462,65 @@ class FilerWindow(QWidget):
             else:
                 self.log("ブックマーク: 設定ファイルに保存できませんでした")
 
-        def move(name, data, step):
-            kind, path = data
-            if kind != launcher.KIND_JUMP:
+        def move(_name, data, step):
+            if not isinstance(data, dict) or not data.get("bookmark"):
+                return
+            name, path = identity(data)
+            if not name:
                 return
             if launcher.move_bookmark(current, self.settings_path, name, path, step):
                 picker.set_items(build_items())
 
+        dynamics = unified_picker.make_dynamic_items(
+            entries=command_launcher.build_entries(current),
+            features=[], apps=apps,
+            web_searches=(current.get("command_palette") or {}).get("web_searches"),
+            file_search=self._unified_filer_file_search(),
+            history_inputs=history)
+
         picker = self._open_picker(
-            "フォルダブックマーク", build_items(), self.jump_to, on_accept=accept,
-            placeholder=launcher.PLACEHOLDER, hint=launcher.HINT,
-            dynamic_items=launcher.typed_items, tab_text=launcher.tab_text,
+            "統合ピッカー", build_items(), self.jump_to, on_accept=accept,
+            placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
+            preview_provider=lambda data: unified_picker.preview_text(
+                data, context="filer"),
+            dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
             on_delete=delete, on_move=move)
 
-    def cmd_path_jump(self):
-        text = self.ask_text("パスを入力", "移動先（フォルダかファイルのパス）",
-                             self.active.path or "")
-        path = core.expand_typed_path(text) if text else None
-        if path:
-            self.jump_to(path)
+    def _unified_apps(self):
+        """統合ピッカー用に、スタートメニューのアプリ候補を1度だけ走査する。"""
+        cached = getattr(self, "_unified_apps_cache", None)
+        if cached is None:
+            import command_palette
+
+            cached = command_palette.scan_app_candidates()
+            self._unified_apps_cache = cached
+        return cached
+
+    def _unified_filer_file_search(self):
+        """統合ピッカーの動的候補用に、Everything 検索の関数を返す。
+
+        es が無い・時間切れのときは候補が出ないだけ。時間切れしたら、その窓を
+        開いている間はもう試さない(打ち込みが引っかかり続けるため)。"""
+        state = {"dead": False, "argv": None}
+
+        def search(query):
+            if state["dead"]:
+                return []
+            if state["argv"] is None:
+                state["argv"] = self.active.find_es() or False
+                if not state["argv"]:
+                    state["dead"] = True
+                    return []
+            result = filer_everything.run_search(
+                state["argv"], query, None, limit=5, timeout=1.5)
+            if result.status == "timeout":
+                state["dead"] = True
+                return []
+            if result.status not in ("done", "limit"):
+                return []
+            return list(result.paths)
+
+        return search
 
     def cmd_desktop(self):
         self.active.load(filer_shell.desktop_path())

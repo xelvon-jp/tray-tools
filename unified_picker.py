@@ -24,6 +24,7 @@
 #   builtin 内蔵コマンド(command / config / reload)
 #   add     「ここを登録」
 #   import  ブラウザのお気に入りの取り込み
+#   stash   あっふの一時置き場(あっふ文脈だけ)
 import os
 import time
 
@@ -95,14 +96,19 @@ def _frecency_sorted(pairs, palette_history, key_of):
 
 
 def build_items(entries, *, features, apps, palette_history=None,
-                add_path=None) -> list:
+                add_path=None, stash_count=None, show_import=True) -> list:
     """統合ピッカーの静的候補を (表示名, データ, 絞り込み名) で返す。
 
     entries: command_launcher.build_entries の結果(登録順)
     features: [(項目キー, ラベル)]
     apps: command_palette.scan_app_candidates の結果(Candidate の列)
+    stash_count: あっふ文脈用。一時置き場の件数を渡すと先頭にその行を出す
+    show_import: お気に入り取り込みの行を出すか(あっふ文脈では出さない)
     """
     items = []
+    if stash_count is not None:
+        items.append((f"🧺 一時置き場（{stash_count}件）",
+                      {"kind": "stash"}, "一時置き場"))
     for entry in entries:
         items.append((f"{_entry_icon(entry)} {entry.name}",
                       entry_payload(entry), entry.name))
@@ -130,7 +136,8 @@ def build_items(entries, *, features, apps, palette_history=None,
     if add_path:
         items.append((f"{launcher.ADD_ITEM_PREFIX}   {add_path}",
                       {"kind": "add", "path": add_path}, ""))
-    items.append((launcher.IMPORT_ITEM_LABEL, {"kind": "import"}, ""))
+    if show_import:
+        items.append((launcher.IMPORT_ITEM_LABEL, {"kind": "import"}, ""))
     return items
 
 
@@ -270,7 +277,11 @@ def preview_text(data, *, context: str = "resident") -> str:
     if data.get("history_text"):
         return f"Enter でもう一度実行します: {data['history_text']}"
     kind = data.get("kind")
+    if kind == "stash":
+        return "Enter で一時置き場を開きます"
     if kind == "jump":
+        if context == "filer":
+            return f"Enter でアクティブな窓をこのフォルダへ移動します: {data.get('path') or ''}"
         return f"Enter でフォルダを開きます: {data.get('path') or ''}"
     if kind == "open":
         target = data.get("target") or ""

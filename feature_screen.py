@@ -1398,19 +1398,18 @@ class ScreenFeature:
 
     def _on_unified_builtin(self, picker, builtin_id, rebuild):
         if builtin_id == "command":
-            entries = [e for e in command_launcher.build_entries(self.app_settings)
-                       if not e.builtin]
-
-            def saved(rows):
-                command_launcher.save_entries(self.app_settings,
-                                              self.settings_path, rows)
-                if picker is not None:
-                    picker.set_items(rebuild())
-
-            command_launcher.open_manager(picker, entries, on_save=saved)
+            # 管理窓はモーダルで、保存は窓の側が settings に対して行う。
+            # 閉じたら一覧を作り直して、直した結果をその場で見せる。
+            command_launcher.open_manager(self.app_settings, self.settings_path,
+                                          picker)
+            if picker is not None:
+                picker.set_items(rebuild())
             return True
         if builtin_id == "config":
-            os.startfile(self.settings_path)  # noqa: S606
+            if self.settings_path and os.path.exists(self.settings_path):
+                os.startfile(self.settings_path)  # noqa: S606
+            else:
+                show_toast("統合ピッカー\nsettings.json が見つかりません")
             return None
         if builtin_id == "reload":
             if picker is not None:
@@ -1424,7 +1423,7 @@ class ScreenFeature:
         path = data.get("path") or ""
         if not path:
             return None
-        existing = launcher.find_bookmark(self.app_settings, path=path)
+        existing = launcher.find_bookmark_by_path(self.app_settings, path)
         if existing is not None:
             show_toast(f"フォルダブックマーク\n登録済みです\n{existing['name']}")
             if picker is not None:
@@ -1441,7 +1440,7 @@ class ScreenFeature:
         if not name:
             return True
         if launcher.save_bookmark(self.app_settings, self.settings_path,
-                                  {"name": name, "path": path}):
+                                  name, path):
             show_toast(f"フォルダブックマーク\n登録しました\n{name}")
         else:
             show_toast("フォルダブックマーク\n設定ファイルに保存できませんでした")

@@ -88,8 +88,7 @@ DEFAULT_KEYMAP = {
     "1066": "forward",            # Shift+B
     "0190": "forward",            # .
     "0072": "history_jump",       # H
-    "0074": "bookmark_jump",      # J (tray-tools のフォルダブックマーク)
-    "1074": "path_jump",          # Shift+J パス入力
+    "0074": "bookmark_jump",      # J (統合ピッカー。旧 Shift+J のパス入力は J の打ち込みに吸収)
     "4074": "workspace",          # Alt+J ワークスペース(左右のパスの組を名前付きで保存・呼び出し)
     "0078": "desktop",            # N (AFXW.key 0078 &EXCD Desktop)
     "0076": "drive",              # L
@@ -1135,7 +1134,6 @@ COMMAND_SHORT_NAMES = {
     "bookmark_jump": "Bookmark",
     "stash_toggle": "Stash",
     "stash_add": "Stash+",
-    "path_jump": "Jump",
     "desktop": "Desktop",
     "drive": "Drive",
     "live_filter": "Filter",

@@ -315,7 +315,6 @@ DEFAULT_SETTINGS = {
         "launcher_enabled": True,
         "launcher_items": [
             "palette",
-            "cmdlauncher",
             "capture",
             "audio",
             "ruler",
@@ -520,12 +519,8 @@ DEFAULT_SETTINGS = {
         "always_on_top": "ctrl+alt+t",
         "snippet_picker": "ctrl+alt+v",
         # あふｗ側でも同じ機能を J に割り当てているので、単独で呼ぶときも同じ指に置く。
+        # 統合ピッカー(J ピッカー/パレット/ランチャを寄せた窓)はこのキー1つで開く。
         "launcher": "win+j",
-        # 統合コマンドパレット。既定は未割り当て(空文字=登録しない)。使う人が
-        # 縦ランチャの項目以外からも開きたいときに割り当てる。
-        "command_palette": "",
-        # 登録コマンドランチャ(command_launcher.py)。既定は未割り当て。
-        "command_launcher": "",
         # カーソルファインダー(カーソルの位置に波紋を出す)。既定は未割り当て。
         "cursor_finder": "",
         # 画面に重ねるプレゼン支援(presenter_overlay.py)。レーザーとスポットライトは

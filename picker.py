@@ -78,6 +78,17 @@ def dynamic_role(index: int) -> int:
     return -(index + 1)
 
 
+def split_item(entry):
+    """一覧の項目を (表示名, データ, 絞り込み名) にそろえる。
+
+    項目は (表示名, データ) が基本。3つ目に絞り込み名を足した項目では、
+    絞り込みを表示名ではなくそちらで判定する(表示名の頭に種別の印を付けても、
+    本来の名前で絞り込めるようにするため。統合ピッカー用)。"""
+    if len(entry) >= 3:
+        return entry[0], entry[1], entry[2]
+    return entry[0], entry[1], entry[0]
+
+
 def name_matches(name: str, keyword: str) -> bool:
     """絞り込みの判定そのもの(前方一致)。keyword は strip + lower 済みの前提。
 
@@ -133,7 +144,8 @@ REJECT_FLASH_STYLE = "QLineEdit { background-color: #6e2434; }"
 class PickerWindow(QWidget):
     """枠なしの小さな選択ウインドウ。上の入力欄で絞り込み、下のリストから1つ決める。
 
-    items は [(表示名, 任意のデータ), ...]。決定すると on_accept(表示名, データ) を呼び、
+    items は [(表示名, 任意のデータ), ...]。3つ目に絞り込み名を足すと、絞り込みは
+    表示名ではなくそちらで判定する(split_item)。決定すると on_accept(表示名, データ) を呼び、
     その後このウインドウは必ず閉じて closed を出す(呼び出し側は参照を捨てるだけでよい)。
     on_accept は「閉じるかどうか」を決められない。二択にすると呼び出し側ごとに閉じ忘れの
     経路が生まれ、枠なし・最前面のウインドウが画面に残る事故になるため。
@@ -377,7 +389,7 @@ class PickerWindow(QWidget):
         # 下限は従来の固定幅(短い一覧では広げない)、上限は画面幅の MAX_WIDTH_RATIO
         # で、それでも収まらない分は一覧の中央省略が末尾を見せる。
         metrics = self.list.fontMetrics()
-        longest = max((metrics.horizontalAdvance(name) for name, _data in self._items),
+        longest = max((metrics.horizontalAdvance(entry[0]) for entry in self._items),
                       default=0)
         needed = (longest + ITEM_PADDING_H * 2 + self.list.frameWidth() * 2
                   + margins.left() + margins.right())
@@ -621,7 +633,8 @@ class PickerWindow(QWidget):
             return self._dynamic[dynamic_index]
         if not (index < len(self._items)):
             return None
-        return self._items[index]
+        name, data, _match = split_item(self._items[index])
+        return (name, data)
 
     def _build_dynamic(self, text: str) -> list:
         """dynamic_items を呼んで項目の一覧を作る。作れなければ空リスト。
@@ -662,8 +675,9 @@ class PickerWindow(QWidget):
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, dynamic_role(dynamic_index))
             self.list.addItem(item)
-        for index, (name, _data) in enumerate(self._items):
-            if not name_matches(name, keyword):
+        for index, entry in enumerate(self._items):
+            name, _data, match = split_item(entry)
+            if not name_matches(match, keyword):
                 continue
             item = QListWidgetItem(name)
             # データそのものではなく元リストの添字を持たせる。Qtの項目データは

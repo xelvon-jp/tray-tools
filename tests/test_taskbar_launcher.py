@@ -21,15 +21,19 @@ def test_resolve_items_calendar():
     assert launcher.resolve_items({}) == launcher.DEFAULT_ITEMS
     assert "calendar" in launcher.DEFAULT_ITEMS
     assert launcher.DEFAULT_ITEMS[-1] == "cursor"
-    # 先頭はコマンドパレット。呼び先が feature_screen 側に実在すること
+    # 先頭はコマンドパレット。統合ピッカー(start_launcher)を開くようになり、
+    # 呼び先が feature_screen 側に実在すること。旧ランチャ(cmdlauncher)は統合で消えた
     assert launcher.DEFAULT_ITEMS[0] == "palette"
-    assert launcher.ITEMS["palette"]["method"] == "show_palette"
+    assert launcher.ITEMS["palette"]["method"] == "start_launcher"
+    assert "cmdlauncher" not in launcher.ITEMS
+    assert "cmdlauncher" not in launcher.DEFAULT_ITEMS
     assert launcher.ITEMS["cursor"]["method"] == "find_cursor"
     import ast
     import pathlib
     tree = ast.parse(pathlib.Path("feature_screen.py").read_text(encoding="utf-8"))
     methods = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    assert "show_palette" in methods
+    assert "start_launcher" in methods
+    assert "show_palette" not in methods
     assert "find_cursor" in methods
     # 設定を書かなかった場合の受け取り方(知らない名前は飛ばす・重複は1つ)
     keys = launcher.resolve_items({"launcher_items": ["calendar", "calendar", "nope"]})

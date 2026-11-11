@@ -32,6 +32,8 @@ import color_picker
 import command_launcher
 import command_palette
 import cursor_finder
+from picker import PickerWindow
+import unified_picker
 import explorer_nav
 import claude_progress
 import claude_status
@@ -269,13 +271,11 @@ class ScreenFeature:
         self.calendar_popup = None
         self.calculator_window = None
         self.cursor_finder = None
-        self.palette_window = None
         self._palette_apps_cache = None
         self._palette_es_cache = None
         self._palette_history_cache = None
-        self.cmd_launcher_window = None
         self._cmd_history_cache = None
-        self._cmd_hwnd = 0
+        self._unified_es_dead = False
         self.launcher_picker = None
         # 画面に重ねるプレゼン支援(レーザー・スポットライト・黒/白画面)。窓は最大4枚に
         # なるうえ排他関係もあるので、参照と開閉は presenter_overlay 側の
@@ -525,12 +525,9 @@ class ScreenFeature:
             self._with_hotkey("📁 あっふ", hotkey_config.get("filer")),
             self.start_filer,
         )
-        # 登録コマンドランチャ。名前を打って実行する道具なので、あっふの隣に置く
+        # 統合ピッカー。名前を打って実行する道具なので、あっふの隣に置く
         # (フォルダブックマークと登録を一本化してあり、行き来が近いため)。
-        self.menu.addAction(
-            self._with_hotkey("⌨ コマンドランチャ", hotkey_config.get("command_launcher")),
-            self.show_cmd_launcher,
-        )
+        self.menu.addAction("⌨ コマンドランチャ", lambda: self.start_launcher())
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -869,8 +866,6 @@ class ScreenFeature:
             "bg_remove": self.start_bg_remove,
             "launcher": lambda: self.start_launcher(),
             "filer": self.start_filer,
-            "command_palette": self.show_palette,
-            "command_launcher": self.show_cmd_launcher,
             "cursor_finder": self.find_cursor,
             # レーザーとスポットライトはマウスを透過する＝自分ではキーもマウスも
             # 受け取れない。ここが実質唯一の畳む手段なので、必ず登録しておくこと。
@@ -1228,51 +1223,13 @@ class ScreenFeature:
         self.cursor_finder.start()
 
     # ---------------------------------------------------------------
-    # コマンドパレット(縦ランチャの項目・ホットキー。command_palette.py)
+    # 統合ピッカー(Win+J・トレイ・縦ランチャの入口。窓は picker.PickerWindow、
+    # 候補生成は unified_picker.py。旧来のコマンドパレット/コマンドランチャの
+    # 窓はここに寄せた。あっふ側の J は filer 側で同じ窓を使う)
     # ---------------------------------------------------------------
-    def show_palette(self):
-        """統合パレットを出す。出ているときに呼ばれたら閉じる(トグル)。"""
-        if self.palette_window is not None:
-            self._close_palette()
-            return
-        if self._palette_history_cache is None:
-            self._palette_history_cache = command_palette.load_history()
-        window = command_palette.create_window(
-            self._palette_static_candidates(), self._palette_file_search,
-            self._palette_history_cache,
-            (self.app_settings.get("command_palette") or {}).get("web_searches"))
-        window.chosen.connect(self._on_palette_chosen)
-        window.closed.connect(self._close_palette)
-        self.palette_window = window
-        window.show_at_cursor_screen()
-
-    def _close_palette(self):
-        if self.palette_window is None:
-            return
-        window = self.palette_window
-        self.palette_window = None
-        window.close()
-        window.deleteLater()
-
-    def _palette_static_candidates(self):
-        """打たなくても並ぶ候補: 機能(縦ランチャの全項目)・フォルダ
-        ブックマーク・アプリ(スタートメニューのショートカット)。"""
-        candidates = []
-        for key, item in taskbar_launcher.ITEMS.items():
-            candidates.append(command_palette.Candidate(
-                "feature", item["label"], "縦ランチャの項目",
-                {"item_key": key}, keywords=key))
-        for entry in launcher.load_bookmarks(self.app_settings):
-            path = entry.get("path") or ""
-            if not path:
-                continue
-            name = entry.get("name") or os.path.basename(path.rstrip("\\/")) or path
-            candidates.append(command_palette.Candidate(
-                "folder", name, path, {"path": path}, keywords=path))
-        if self._palette_apps_cache is None:
-            self._palette_apps_cache = command_palette.scan_app_candidates()
-        candidates.extend(self._palette_apps_cache)
-        return candidates
+    def show_unified_picker(self):
+        """縦ランチャの項目から開くときの入口(start_launcher と同じ窓)。"""
+        self.start_launcher()
 
     def _palette_es_argv(self):
         """ファイル検索用の es.exe の引数列。探すのは初回だけ(結果は保持)。"""
@@ -1284,172 +1241,256 @@ class ScreenFeature:
             self._palette_es_cache = argv
         return self._palette_es_cache or None
 
-    def _palette_file_search(self, query: str):
-        """Everything でファイルを探して file 候補にする(別スレッドから呼ばれる)。
+    def _unified_file_search(self, query: str):
+        """Everything でファイルを探してパスの列を返す(統合ピッカーの動的候補用)。
 
-        es.exe が無い・Everything が起きていないときは空を返す(候補が出ないだけ)。"""
+        es.exe が無い・Everything が起きていないときは空を返す(候補が出ないだけ)。
+        打鍵のたびに同期で呼ばれるので、時間切れは短めにし、一度時間切れしたら
+        この窓を開いている間はもう試さない(打ち込みが引っかかり続けるため)。"""
+        if self._unified_es_dead:
+            return []
         argv = self._palette_es_argv()
         if argv is None:
+            self._unified_es_dead = True
             return []
-        result = filer_everything.run_search(argv, query, None, limit=8, timeout=3.0)
+        result = filer_everything.run_search(argv, query, None, limit=5,
+                                              timeout=1.5)
+        if result.status == "timeout":
+            self._unified_es_dead = True
+            return []
         if result.status not in ("done", "limit"):
             return []
-        return [
-            command_palette.Candidate(
-                "file", os.path.basename(path) or path, path,
-                {"path": path}, keywords=path)
-            for path in result.paths
-        ]
+        return list(result.paths)
 
-    def _on_palette_chosen(self, cand):
-        """選ばれた候補を実行する。入口なので例外は必ず受ける(常駐を落とさない)。"""
+    def _record_unified_use(self, data, param=None):
+        """統合ピッカーでの実行を学習に残す。
+
+        frecency は command_palette の履歴(機能・アプリ・ファイル・Web検索)へ、
+        入力の履歴は command_launcher の履歴(登録の名前で再実行できる形)へ。
+        学習は添え物なので、失敗しても実行そのものは邪魔しない。"""
         try:
-            key = command_palette.candidate_key(cand)
-            if key is not None:
-                # frecency の学習: 選んだものを数える(実行の成否は問わない。
-                # 開こうとした時点で「使うもの」なのは確かなため)
-                if self._palette_history_cache is None:
-                    self._palette_history_cache = command_palette.load_history()
-                self._palette_history_cache = command_palette.record_use(
-                    self._palette_history_cache, key, time.time())
-                command_palette.save_history(self._palette_history_cache)
-        except Exception:  # noqa: BLE001  学習は添え物。失敗しても実行は続ける
+            kind = data.get("kind")
+            if kind in ("feature", "app", "file", "web"):
+                if kind == "feature":
+                    cand = command_palette.Candidate(
+                        "feature", "", "", {"item_key": data.get("item_key")})
+                elif kind == "web":
+                    cand = command_palette.Candidate(
+                        "web", "", "", {"service": data.get("service")})
+                else:
+                    cand = command_palette.Candidate(
+                        kind, "", "", {"path": data.get("path")})
+                key = command_palette.candidate_key(cand)
+                if key is not None:
+                    if self._palette_history_cache is None:
+                        self._palette_history_cache = command_palette.load_history()
+                    self._palette_history_cache = command_palette.record_use(
+                        self._palette_history_cache, key, time.time())
+                    command_palette.save_history(self._palette_history_cache)
+            if data.get("bookmark") or data.get("history_text"):
+                raw = data.get("history_text")
+                if not raw and data.get("name"):
+                    raw = data["name"]
+                    if kind == "exec" and param:
+                        raw = f"{raw};{param}"
+                if raw:
+                    if self._cmd_history_cache is None:
+                        self._cmd_history_cache = command_launcher.load_history()
+                    self._cmd_history_cache = command_launcher.record_history(
+                        self._cmd_history_cache, raw)
+                    command_launcher.save_history(self._cmd_history_cache)
+        except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def _on_unified_accept(self, picker, data, hwnd, rebuild):
+        """統合ピッカーで選ばれた候補を実行する。True を返すと窓を開けたままにする。
+
+        入口なので例外は必ず受ける(常駐を落とさない)。"""
+        if not isinstance(data, dict):
+            return None
+        kind = data.get("kind")
         try:
-            if cand.kind == "feature":
-                item = taskbar_launcher.ITEMS.get(cand.payload.get("item_key") or "")
+            if kind == "jump":
+                if launcher.jump(data.get("path") or "",
+                                 launcher.afxw_path(self.app_settings),
+                                 launcher.target_mode(self.app_settings),
+                                 hwnd=hwnd):
+                    self._record_unified_use(data)
+                return None
+            if kind == "open":
+                os.startfile(data.get("target") or "")  # noqa: S606
+                self._record_unified_use(data)
+                return None
+            if kind == "exec":
+                entry = data.get("entry")
+                if entry is None:
+                    return None
+                param = data.get("param")
+                if param is None:
+                    typed_name, typed_param = command_launcher.parse_input(
+                        picker.search.text() if picker is not None else "")
+                    param = typed_param if typed_name.casefold() == \
+                        (entry.name or "").casefold() else ""
+                action, payload = command_launcher.build_command(entry,
+                                                                 param or "")
+                used = False
+                if action == "exec":
+                    command, workdir = payload
+                    used = command_launcher.run_exec(command, workdir)
+                elif action == "open":
+                    os.startfile(payload)  # noqa: S606
+                    used = True
+                elif action == "jump":
+                    used = launcher.jump(
+                        payload, launcher.afxw_path(self.app_settings),
+                        launcher.target_mode(self.app_settings), hwnd=hwnd)
+                if used:
+                    self._record_unified_use(data, param or None)
+                return None
+            if kind == "feature":
+                item = taskbar_launcher.ITEMS.get(data.get("item_key") or "")
                 if item is None:
-                    return
-                target = self._audio_feature if item.get("feature") == "audio" else self
+                    return None
+                target = self._audio_feature if item.get("feature") == "audio" \
+                    else self
                 method = (getattr(target, item.get("method", ""), None)
                           if target is not None else None)
                 if callable(method):
                     method(*item.get("args", ()))
+                    self._record_unified_use(data)
                 else:
-                    show_toast(f"コマンドパレット\n{item.get('label')}を呼び出せません")
-            elif cand.kind == "calc":
-                QApplication.clipboard().setText(cand.payload.get("value", ""))
-            elif cand.kind == "web":
-                url = cand.payload.get("url") or ""
-                if url:
-                    os.startfile(url)  # noqa: S606  本人が選んだ検索先を開くだけ
-            elif cand.kind in ("folder", "file", "app"):
-                path = cand.payload.get("path") or ""
+                    show_toast(f"統合ピッカー\n{item.get('label')}を呼び出せません")
+                return None
+            if kind in ("app", "file"):
+                path = data.get("path") or ""
                 if path:
-                    os.startfile(path)  # noqa: S606  本人が選んだ候補を開くだけ
-        except Exception:
+                    os.startfile(path)  # noqa: S606
+                    self._record_unified_use(data)
+                return None
+            if kind == "calc":
+                QApplication.clipboard().setText(data.get("value") or "")
+                return None
+            if kind == "web":
+                url = data.get("url") or ""
+                if url:
+                    os.startfile(url)  # noqa: S606
+                    self._record_unified_use(data)
+                return None
+            if kind == "builtin":
+                return self._on_unified_builtin(picker, data.get("id"), rebuild)
+            if kind == "add":
+                return self._on_unified_add(picker, data, rebuild)
+            if kind == "import":
+                added, discovered = launcher.import_browser_bookmarks(
+                    self.app_settings, self.settings_path)
+                if discovered == 0:
+                    show_toast("フォルダブックマーク\nお気に入りが見つかりませんでした")
+                elif added == 0:
+                    show_toast("フォルダブックマーク\n新しいお気に入りはありませんでした")
+                else:
+                    show_toast(f"フォルダブックマーク\n{added} 件のお気に入りを取り込みました")
+                if picker is not None:
+                    picker.set_items(rebuild())
+                return True
+        except Exception:  # noqa: BLE001
             traceback.print_exc()
+        return None
 
-    # ---------------------------------------------------------------
-    # 登録コマンドランチャ(command_launcher.py)
-    # ---------------------------------------------------------------
-    def _cmd_all_entries(self):
-        return (command_launcher.build_entries(self.app_settings)
-                + command_launcher.builtin_entries())
-
-    def show_cmd_launcher(self):
-        """登録コマンドランチャを開く(開いていたら閉じるトグル)。"""
-        if self.cmd_launcher_window is not None:
-            self.cmd_launcher_window.close()
-            return
-        # フォルダの開き先(前面がエクスプローラか)の判定用に、窓を出す前に掴む。
-        self._cmd_hwnd = explorer_nav.foreground_hwnd()
-        if self._cmd_history_cache is None:
-            self._cmd_history_cache = command_launcher.load_history()
-        window = command_launcher.create_window(
-            self._cmd_all_entries(), self._cmd_history_cache)
-        window.chosen.connect(self._on_cmd_chosen)
-        window.dropped.connect(self._on_cmd_dropped)
-        window.closed.connect(self._close_cmd_launcher)
-        window.on_forget = self._on_cmd_forget
-        self.cmd_launcher_window = window
-        window.show_at_cursor_screen()
-
-    def _close_cmd_launcher(self):
-        self.cmd_launcher_window = None
-
-    def _on_cmd_forget(self, raw_text):
-        """Ctrl+K: 入力中の文字列を履歴から消す。窓へ新しい履歴を返す。"""
-        if self._cmd_history_cache is None:
-            self._cmd_history_cache = command_launcher.load_history()
-        self._cmd_history_cache = command_launcher.forget_history(
-            self._cmd_history_cache, raw_text)
-        command_launcher.save_history(self._cmd_history_cache)
-        return self._cmd_history_cache
-
-    def _on_cmd_dropped(self, items):
-        """窓へドロップされたファイルや URL を、その名前で登録する。"""
-        added = 0
-        for item in items:
-            text = (item or "").strip()
-            if not text:
-                continue
-            if command_launcher.classify(text) in (
-                    command_launcher.KIND_URL, command_launcher.KIND_URI):
-                name = text
-            elif Path(text).is_file():
-                name = Path(text).stem
-            else:
-                name = Path(text).name
-            if not name:
-                continue
-            launcher.upsert_bookmark(
-                self.app_settings, self.settings_path,
-                {"name": name, "path": text})
-            added += 1
-        if self.cmd_launcher_window is not None:
-            self.cmd_launcher_window.refresh(self._cmd_all_entries())
-        if added:
-            show_toast(f"コマンドランチャ\n{added}件を登録しました")
-
-    def _on_cmd_chosen(self, entry, param_text, raw_text):
-        try:
-            action, payload = command_launcher.build_command(entry, param_text)
-            if action == "builtin":
-                self._on_cmd_builtin(payload)
-                return
-            ok = False
-            if action == "jump":
-                ok = launcher.jump(
-                    payload, launcher.afxw_path(self.app_settings),
-                    launcher.target_mode(self.app_settings), hwnd=self._cmd_hwnd)
-            elif action == "open":
-                os.startfile(payload)  # noqa: S606  本人が登録した対象を開くだけ
-                ok = True
-            elif action == "exec":
-                command, workdir = payload
-                ok = command_launcher.run_exec(command, workdir)
-            if ok:
-                if self._cmd_history_cache is None:
-                    self._cmd_history_cache = command_launcher.load_history()
-                self._cmd_history_cache = command_launcher.record_history(
-                    self._cmd_history_cache, raw_text)
-                command_launcher.save_history(self._cmd_history_cache)
-            else:
-                show_toast(f"コマンドランチャ\n開けませんでした\n{entry.target}")
-        except Exception:
-            traceback.print_exc()
-
-    def _on_cmd_builtin(self, builtin_id):
+    def _on_unified_builtin(self, picker, builtin_id, rebuild):
         if builtin_id == "command":
-            command_launcher.open_manager(self.app_settings, self.settings_path)
-            if self.cmd_launcher_window is not None:
-                self.cmd_launcher_window.refresh(self._cmd_all_entries())
-        elif builtin_id == "config":
-            if self.settings_path and os.path.exists(self.settings_path):
-                os.startfile(self.settings_path)  # noqa: S606  設定ファイルを開くだけ
-            else:
-                show_toast("コマンドランチャ\nsettings.json が見つかりません")
-        elif builtin_id == "reload":
-            if self.cmd_launcher_window is not None:
-                self.cmd_launcher_window.refresh(self._cmd_all_entries())
-            show_toast("コマンドランチャ\n登録を読み直しました")
-        elif builtin_id == "history":
-            if self.cmd_launcher_window is not None:
-                if self._cmd_history_cache is None:
-                    self._cmd_history_cache = command_launcher.load_history()
-                self.cmd_launcher_window.set_history(self._cmd_history_cache)
-                self.cmd_launcher_window.show_history()
+            entries = [e for e in command_launcher.build_entries(self.app_settings)
+                       if not e.builtin]
+
+            def saved(rows):
+                command_launcher.save_entries(self.app_settings,
+                                              self.settings_path, rows)
+                if picker is not None:
+                    picker.set_items(rebuild())
+
+            command_launcher.open_manager(picker, entries, on_save=saved)
+            return True
+        if builtin_id == "config":
+            os.startfile(self.settings_path)  # noqa: S606
+            return None
+        if builtin_id == "reload":
+            if picker is not None:
+                picker.set_items(rebuild())
+            show_toast("統合ピッカー\n登録を読み直しました")
+            return True
+        return None
+
+    def _on_unified_add(self, picker, data, rebuild):
+        """「ここを登録」。既にあれば、その行を選んで知らせる(窓は開けたまま)。"""
+        path = data.get("path") or ""
+        if not path:
+            return None
+        existing = launcher.find_bookmark(self.app_settings, path=path)
+        if existing is not None:
+            show_toast(f"フォルダブックマーク\n登録済みです\n{existing['name']}")
+            if picker is not None:
+                items = rebuild()
+                picker.set_items(items)
+                for display, payload, _match in items:
+                    if isinstance(payload, dict) and (
+                            payload.get("path") == path
+                            or payload.get("target") == path):
+                        picker.select_data(payload, display)
+                        break
+            return True
+        name = launcher._ask_name(picker, os.path.basename(path.rstrip("\\/")))
+        if not name:
+            return True
+        if launcher.save_bookmark(self.app_settings, self.settings_path,
+                                  {"name": name, "path": path}):
+            show_toast(f"フォルダブックマーク\n登録しました\n{name}")
+        else:
+            show_toast("フォルダブックマーク\n設定ファイルに保存できませんでした")
+        return None
+
+    @staticmethod
+    def _unified_bookmark_identity(data):
+        """候補データから、ブックマークの同一性(名前, パス)を取る。"""
+        kind = data.get("kind")
+        if kind == "jump":
+            return data.get("name") or "", data.get("path") or ""
+        if kind == "open":
+            return data.get("name") or "", data.get("target") or ""
+        if kind == "exec":
+            entry = data.get("entry")
+            if entry is not None:
+                return entry.name, entry.target
+        return "", ""
+
+    def _on_unified_delete(self, picker, _name, data, rebuild):
+        """Ctrl+D。登録(ブックマーク)の行だけ。確認を出してから消す。"""
+        if not isinstance(data, dict) or not data.get("bookmark"):
+            return
+        name, path = self._unified_bookmark_identity(data)
+        if not name:
+            return
+        answer = QMessageBox.question(
+            picker, "フォルダブックマーク", f"{name} を削除しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        if launcher.delete_bookmark(self.app_settings, self.settings_path,
+                                    name, path):
+            picker.set_items(rebuild())
+            show_toast(f"フォルダブックマーク\n削除しました\n{name}"
+                       f"\n（控え: {launcher.DELETED_LOG_NAME}）")
+        else:
+            show_toast("フォルダブックマーク\n設定ファイルに保存できませんでした")
+
+    def _on_unified_move(self, picker, _name, data, step, rebuild):
+        """Ctrl+↑↓。登録の行だけ。確認は出さない(すぐ戻せるので)。"""
+        if not isinstance(data, dict) or not data.get("bookmark"):
+            return
+        name, path = self._unified_bookmark_identity(data)
+        if not name:
+            return
+        if launcher.move_bookmark(self.app_settings, self.settings_path,
+                                  name, path, step):
+            picker.set_items(rebuild())
 
     # ---------------------------------------------------------------
     # 背景を透過(bg_remove.py。窓は別プロセス)
@@ -1981,10 +2022,10 @@ class ScreenFeature:
             self._log_failure("一人会議の知らせ")
 
     # ---------------------------------------------------------------
-    # フォルダブックマーク
+    # 統合ピッカーの窓(フォルダブックマークの入口でもある)
     # ---------------------------------------------------------------
     def start_launcher(self, current_path: str = None):
-        """フォルダブックマークを開く。current_path はあふｗ側の現在のパスで、
+        """統合ピッカーを開く。current_path はあふｗ側の現在のパスで、
         IPC(main.py)から呼ばれたときだけ渡る。メニューやホットキーからは渡らないが、
         前面がエクスプローラならそちらからパスを読めるので「ここを登録」は出せる。"""
         # 何よりも先に前面ウィンドウを掴む。ピッカーを出した時点で前面はこちらに移り、
@@ -2000,11 +2041,47 @@ class ScreenFeature:
             self.launcher_picker.raise_()
             self.launcher_picker.activateWindow()
             return
-        picker = launcher.create_picker(
-            self.app_settings, self.settings_path, current_path=current_path, hwnd=hwnd
-        )
-        if picker is None:
-            return  # ブックマークが1件も無い(通知は launcher 側が出している)
+        if self._palette_history_cache is None:
+            self._palette_history_cache = command_palette.load_history()
+        if self._cmd_history_cache is None:
+            self._cmd_history_cache = command_launcher.load_history()
+        if self._palette_apps_cache is None:
+            self._palette_apps_cache = command_palette.scan_app_candidates()
+        self._unified_es_dead = False
+        features = [(key, item["label"])
+                    for key, item in taskbar_launcher.ITEMS.items()]
+        add_path = launcher.resolve_add_path(current_path, hwnd)
+
+        def rebuild():
+            return unified_picker.build_items(
+                command_launcher.build_entries(self.app_settings),
+                features=features, apps=self._palette_apps_cache,
+                palette_history=self._palette_history_cache, add_path=add_path)
+
+        dynamics = unified_picker.make_dynamic_items(
+            entries=command_launcher.build_entries(self.app_settings),
+            features=features, apps=self._palette_apps_cache,
+            web_searches=(self.app_settings.get("command_palette") or {})
+            .get("web_searches"),
+            file_search=self._unified_file_search,
+            history_inputs=self._cmd_history_cache)
+        picker = None
+
+        def accept(_name, data):
+            return self._on_unified_accept(picker, data, hwnd, rebuild)
+
+        def delete(name, data):
+            self._on_unified_delete(picker, name, data, rebuild)
+
+        def move(name, data, step):
+            self._on_unified_move(picker, name, data, step, rebuild)
+
+        picker = PickerWindow(
+            "統合ピッカー", rebuild(), accept,
+            placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
+            preview_provider=lambda data: unified_picker.preview_text(data),
+            dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
+            on_delete=delete, on_move=move)
         picker.closed.connect(self._close_launcher)
         self.launcher_picker = picker
         picker.show()

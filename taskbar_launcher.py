@@ -25,9 +25,13 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen, QPixmap, QPolygon,
+    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette, QPen,
+    QPixmap, QPolygon,
 )
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView, QDialog, QHBoxLayout, QListWidget, QListWidgetItem, QMenu,
+    QPushButton, QVBoxLayout, QWidget,
+)
 
 import window_tools
 from qt_image import pil_to_qpixmap
@@ -563,6 +567,13 @@ def resolve_items(config: dict) -> list:
     if not config.get("launcher_enabled", True):
         return []
 
+    if isinstance(config.get("launcher_hidden"), list):
+        # 新しい持ち方: launcher_items が表示・非表示を通した並び全体で、
+        # launcher_hidden に入っているものだけを落とす。
+        full, hidden = arrangement(config)
+        hidden_set = set(hidden)
+        return [key for key in full if key not in hidden_set]
+
     raw = config.get("launcher_items")
     if raw is None:
         raw = DEFAULT_ITEMS
@@ -588,17 +599,77 @@ def resolve_items(config: dict) -> list:
 
 
 def toggle_item_key(keys, key: str) -> list:
-    """並べる項目の付け外し。入っていれば外し、無ければ末尾に足した新しいリストを返す。
+    """表示リストだけに対する付け外し。入っていれば外し、無ければ末尾に足す。
 
-    パネルの右クリックメニューから使う。順番の入れ替えはここではしない(並びは
-    settings.json の記述順のまま。GUI で並べ替えまでやると、ドラッグ中の見た目と
-    保存のタイミングの面倒が増える割に、並べ替えは滅多にしない)。"""
+    右クリックメニューの付け外しは、並びの中の位置を残す toggle_arrangement の
+    ほうを使う(外しても位置が残り、付け直すと元の場所へ戻る)。こちらは
+    「表示するものの並び」だけを相手にする単純な操作として残してある。"""
     result = list(keys)
     if key in result:
         result.remove(key)
     else:
         result.append(key)
     return result
+
+
+def _sanitize_item_keys(raw) -> list:
+    """項目名の並びを、知っている名前だけ・重複なしに整える(resolve_items と同じ規則)。
+
+    警告は出さない。arrangement が何度も呼ばれるので、書き損じの知らせは
+    resolve_items 側の1回きりの警告に任せる。"""
+    keys = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        name = value.strip().lower()
+        key = ITEM_ALIASES.get(name, name)
+        if key in ITEMS and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def arrangement(config: dict):
+    """並びの全体(表示・非表示を通した順)と、隠している項目の並びを返す。
+
+    新しい持ち方は、launcher_items が全体の順、launcher_hidden が隠している
+    項目。launcher_hidden が無い設定(これまでの形)では、launcher_items に
+    入っていない項目を隠しているものとして扱う。次に保存するときに新しい
+    形で書き戻るので、移行は保存のついでに済む。
+
+    全体の末尾には、カタログ(ITEMS)にあって並びに入っていない項目を
+    カタログの順で足す。新しく増えた項目がここに来る。"""
+    raw = config.get("launcher_items")
+    if isinstance(raw, (list, tuple)):
+        base = _sanitize_item_keys(raw)
+    else:
+        base = list(DEFAULT_ITEMS)
+    full = list(base)
+    for key in ITEMS:
+        if key not in full:
+            full.append(key)
+    raw_hidden = config.get("launcher_hidden")
+    if isinstance(raw_hidden, (list, tuple)):
+        hidden = [key for key in _sanitize_item_keys(raw_hidden) if key in full]
+    else:
+        hidden = [key for key in full if key not in base]
+    return full, hidden
+
+
+def toggle_arrangement(full, hidden, key: str):
+    """並び全体と隠しリストに対する付け外し。新しい (全体, 隠し) を返す。
+
+    外すときは隠しリストへ入れるだけにして、並びの中の位置は残す。再び
+    付けたときに元の位置へ戻るので、並べ替えで先に決めた位置が活きる。
+    全体に入っていない項目を付けるときは、末尾に足して表示する。"""
+    full = list(full)
+    hidden = list(hidden)
+    if key in hidden:
+        hidden.remove(key)
+    elif key in full:
+        hidden.append(key)
+    else:
+        full.append(key)
+    return full, hidden
 
 
 def _brightness(color: QColor) -> float:
@@ -912,6 +983,86 @@ class ItemLabel(QWidget):
         painter.drawText(self.rect(), Qt.AlignCenter, self._text)
 
 
+class _ReorderList(QListWidget):
+    """Alt+↑/↓ で現在の項目を動かせるリスト。動かす処理は move_callback に委ねる。"""
+
+    move_callback = None
+
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.AltModifier and event.key() in (Qt.Key_Up, Qt.Key_Down):
+            if self.move_callback is not None:
+                self.move_callback(-1 if event.key() == Qt.Key_Up else 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class LauncherReorderDialog(QDialog):
+    """ランチャの並び替え。隠している項目も薄字で並ぶ。
+
+    付け外しはここでは扱わない(右クリックのチェックリストの担当)。
+    動かすたびに on_apply(並び全体のキーの並び)を呼び、即反映と保存は
+    呼び出し側が行う。反映は済んでいるので、ボタンは OK/キャンセルでは
+    なく「閉じる」だけ。"""
+
+    def __init__(self, parent, full_keys, hidden_keys, on_apply):
+        super().__init__(parent)
+        self._on_apply = on_apply
+        self.setWindowTitle("ランチャの並び替え")
+        self._list = _ReorderList(self)
+        self._list.setDragDropMode(QAbstractItemView.InternalMove)
+        self._list.setDefaultDropAction(Qt.MoveAction)
+        self._list.move_callback = self._move_current
+        dim = self.palette().brush(QPalette.Disabled, QPalette.ColorRole.Text)
+        hidden_set = set(hidden_keys)
+        for key in full_keys:
+            item = QListWidgetItem(ITEMS.get(key, {}).get("label") or key)
+            item.setData(Qt.UserRole, key)
+            if key in hidden_set:
+                item.setForeground(dim)
+            self._list.addItem(item)
+        if self._list.count():
+            self._list.setCurrentRow(0)
+        self._list.model().rowsMoved.connect(lambda *args: self._emit_apply())
+
+        self._up_button = QPushButton("↑", self)
+        self._up_button.setToolTip("上へ (Alt+↑)")
+        self._up_button.clicked.connect(lambda: self._move_current(-1))
+        self._down_button = QPushButton("↓", self)
+        self._down_button.setToolTip("下へ (Alt+↓)")
+        self._down_button.clicked.connect(lambda: self._move_current(1))
+        close_button = QPushButton("閉じる", self)
+        close_button.clicked.connect(self.accept)
+
+        side = QVBoxLayout()
+        side.addWidget(self._up_button)
+        side.addWidget(self._down_button)
+        side.addStretch(1)
+        body = QHBoxLayout()
+        body.addWidget(self._list, 1)
+        body.addLayout(side)
+        layout = QVBoxLayout(self)
+        layout.addLayout(body, 1)
+        layout.addWidget(close_button)
+        self.resize(300, 420)
+
+    def _move_current(self, step: int) -> None:
+        row = self._list.currentRow()
+        target = row + step
+        if row < 0 or target < 0 or target >= self._list.count():
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(target, item)
+        self._list.setCurrentRow(target)
+        self._emit_apply()
+
+    def _emit_apply(self) -> None:
+        keys = [
+            self._list.item(i).data(Qt.UserRole) for i in range(self._list.count())
+        ]
+        self._on_apply(keys)
+
+
 class LauncherPanel(QWidget):
     """タスクバーウィジェットの真上に出る、アイコンを縦一列に並べた枠なしの窓。
 
@@ -939,9 +1090,10 @@ class LauncherPanel(QWidget):
         self._widget = widget
         self._screen = screen_feature
         self._audio = audio_feature
-        # 右クリックメニューで項目を付け外ししたときの保存先(キーのリストを受け取る
-        # 呼び出し可能オブジェクト)。本体(taskbar_widget)が settings.json への
-        # 書き戻しを持つので、そこへ委ねる。無い場合はメモリ上の設定だけ変える。
+        # 右クリックメニューで項目を付け外し・並べ替えしたときの保存先
+        # (並び全体と隠しリストを受け取る呼び出し可能オブジェクト)。
+        # 本体(taskbar_widget)が settings.json への書き戻しを持つので、そこへ
+        # 委ねる。無い場合はメモリ上の設定だけ変える。
         self._items_saver = items_saver
         # 付け外しメニューを出している間は True。閉じる判定を止めるために使う
         # (メニューはパネルの外に広がるので、座標だけ見ると「離れた」になる)。
@@ -1331,9 +1483,11 @@ class LauncherPanel(QWidget):
 
         付け外しのたびにメニューを出し直す(選ぶ→閉じる→また右クリック、を
         繰り返させない)。外をクリックするか Esc で終わる。変更はその場で
-        パネルに反映し、settings.json の launcher_items に保存する。"""
+        パネルに反映し、settings.json の launcher_items と launcher_hidden
+        に保存する。末尾の「並べ替え…」を選ぶと、並べ替えダイアログへ移る。"""
         try:
             pos = event.globalPos()
+            want_reorder = False
             while True:
                 current = resolve_items(self._config)
                 menu = QMenu(self)
@@ -1345,6 +1499,8 @@ class LauncherPanel(QWidget):
                     action.setCheckable(True)
                     action.setChecked(key in current)
                     actions[action] = key
+                menu.addSeparator()
+                reorder = menu.addAction("並べ替え…")
                 self._menu_open = True
                 self._close_timer.stop()
                 try:
@@ -1352,11 +1508,19 @@ class LauncherPanel(QWidget):
                 finally:
                     self._menu_open = False
                     menu.deleteLater()
+                if chosen is reorder:
+                    want_reorder = True
+                    break
                 if chosen is None or chosen not in actions:
                     break
-                self._apply_items(toggle_item_key(current, actions[chosen]))
+                full, hidden = arrangement(self._config)
+                self._apply_arrangement(
+                    *toggle_arrangement(full, hidden, actions[chosen])
+                )
                 if not self.isVisible():
                     break   # 全部外れてパネルが畳まれたら終わる
+            if want_reorder:
+                self._open_reorder_dialog()
             # メニューが終わったあと、カーソルが本体・パネル・音量バーの外なら
             # 通常の猶予つきで閉じる(中なら開いたまま)。
             if self.isVisible() and not self._cursor_on_widget_or_panel():
@@ -1364,16 +1528,17 @@ class LauncherPanel(QWidget):
         except Exception:
             _guard("項目の付け外しメニュー")
 
-    def _apply_items(self, keys) -> None:
-        """並べる項目を差し替える。メモリ上の設定→保存→パネルの並び直しの順。
+    def _apply_arrangement(self, full, hidden) -> None:
+        """並び全体と隠しリストを差し替える。メモリ上の設定→保存→パネルの並び直しの順。
 
         保存は本体側の items_saver に委ねる(settings.json の読み直し・該当キー
         だけの書き戻しは向こうの作法)。失敗してもメモリ上の並びは変えておく
         (次の保存のときに揃う)。"""
-        self._config["launcher_items"] = list(keys)
+        self._config["launcher_items"] = list(full)
+        self._config["launcher_hidden"] = list(hidden)
         if self._items_saver is not None:
             try:
-                self._items_saver(list(keys))
+                self._items_saver(list(full), list(hidden))
             except Exception:
                 _guard("項目の保存", notify=False)
         if not self.isVisible():
@@ -1391,6 +1556,24 @@ class LauncherPanel(QWidget):
         self.setGeometry(rect)
         self._show_volume(rect)
         self.update()
+
+    def _open_reorder_dialog(self) -> None:
+        """並べ替えダイアログを開く。動かすたびに即反映する(ダイアログ側は
+        並びを返すだけで、保存と並び直しは _apply_arrangement が担う)。"""
+        full, hidden = arrangement(self._config)
+        dialog = LauncherReorderDialog(self, full, hidden, self._apply_dialog_order)
+        self._menu_open = True
+        self._close_timer.stop()
+        try:
+            dialog.exec()
+        finally:
+            self._menu_open = False
+            dialog.deleteLater()
+
+    def _apply_dialog_order(self, full) -> None:
+        """ダイアログからの並び替えを受ける。隠しリストは今のまま。"""
+        _full_now, hidden = arrangement(self._config)
+        self._apply_arrangement(list(full), hidden)
 
 
 def _screen_bounds(rect: QRect) -> QRect:

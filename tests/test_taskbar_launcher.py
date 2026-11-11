@@ -128,6 +128,103 @@ def test_new_items_filer_and_bg_remove():
     assert "start_filer" in methods and "start_bg_remove" in methods
 
 
+def test_arrangement_legacy_and_hidden():
+    """並び全体と隠しリスト: 旧形式は補完で読み、新形式は hidden を落として表示する。"""
+    # 旧形式(launcher_hidden が無い): 並びに入っていない項目が隠し扱い
+    full, hidden = launcher.arrangement({"launcher_items": ["calendar"]})
+    assert full[0] == "calendar"
+    assert set(full) == set(launcher.ITEMS)
+    assert "palette" in hidden and "calendar" not in hidden
+    assert launcher.resolve_items({"launcher_items": ["calendar"]}) == ["calendar"]
+
+    # 既定(何も書いていない): 従来どおり DEFAULT_ITEMS がそのまま表示される
+    full, hidden = launcher.arrangement({})
+    assert full[: len(launcher.DEFAULT_ITEMS)] == launcher.DEFAULT_ITEMS
+    assert launcher.resolve_items({}) == launcher.DEFAULT_ITEMS
+
+    # 新形式: launcher_items が全体の順で、hidden のものだけ落ちる。
+    # どちらにも入っていない項目(新しく増えたカタログ項目)は末尾に表示される
+    config = {
+        "launcher_items": ["capture", "palette", "calendar"],
+        "launcher_hidden": ["palette"],
+    }
+    resolved = launcher.resolve_items(config)
+    assert resolved[:2] == ["capture", "calendar"]
+    assert "palette" not in resolved
+    assert set(resolved) == set(launcher.ITEMS) - {"palette"}
+    full, hidden = launcher.arrangement(config)
+    assert full[:3] == ["capture", "palette", "calendar"]
+    assert hidden == ["palette"]
+    assert resolved == [key for key in full if key not in hidden]
+
+
+def test_toggle_arrangement_restores_position():
+    """付け外しで位置が残る: 外して付け直すと元の場所へ戻る(末尾へ行かない)。"""
+    full, hidden = launcher.toggle_arrangement(
+        ["palette", "capture", "calendar"], [], "capture"
+    )
+    assert full == ["palette", "capture", "calendar"]   # 並びは動かない
+    assert hidden == ["capture"]
+    full, hidden = launcher.toggle_arrangement(full, hidden, "capture")
+    assert full == ["palette", "capture", "calendar"]   # 元の位置のまま
+    assert hidden == []
+    # 全体に入っていない項目を付けると末尾に足す
+    full, hidden = launcher.toggle_arrangement(["palette"], [], "calendar")
+    assert full == ["palette", "calendar"] and hidden == []
+
+
+def test_reorder_dialog_moves():
+    """並べ替えダイアログ: Alt+↓・ボタンで動き、隠し項目は薄字、動くたびに通知される。"""
+    from PySide6.QtCore import QModelIndex, Qt
+    from PySide6.QtGui import QPalette
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    applied = []
+    dialog = launcher.LauncherReorderDialog(
+        None,
+        ["palette", "capture", "calendar", "cursor"],
+        ["cursor"],
+        applied.append,
+    )
+    dialog.show()
+    lst = dialog._list
+
+    def keys():
+        return [lst.item(i).data(Qt.UserRole) for i in range(lst.count())]
+
+    assert keys() == ["palette", "capture", "calendar", "cursor"]
+    # 隠している項目(cursor)は無効色で薄字になっている
+    dim = dialog.palette().brush(QPalette.Disabled, QPalette.ColorRole.Text)
+    assert lst.item(3).foreground() == dim
+    assert lst.item(0).foreground() != dim
+
+    # Alt+↓ で1つ下へ。即反映の通知にも新しい並びが届く
+    lst.setCurrentRow(0)
+    QTest.keyClick(lst, Qt.Key_Down, Qt.AltModifier)
+    assert keys() == ["capture", "palette", "calendar", "cursor"]
+    assert applied[-1] == keys()
+
+    # 先頭で ↑ ボタンを押しても動かない(通知も増えない)
+    lst.setCurrentRow(0)
+    calls = len(applied)
+    dialog._up_button.click()
+    assert keys()[0] == "capture" and len(applied) == calls
+
+    # ↓ ボタンでも動く
+    dialog._down_button.click()
+    assert keys() == ["palette", "capture", "calendar", "cursor"]
+    assert applied[-1] == keys()
+
+    # ドラッグ相当のモデル移動でも通知される(rowsMoved)
+    calls = len(applied)
+    moved = lst.model().moveRow(QModelIndex(), 0, QModelIndex(), 3)
+    assert moved
+    assert len(applied) > calls and applied[-1] == keys()
+    dialog.close()
+    dialog.deleteLater()
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

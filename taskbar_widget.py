@@ -967,13 +967,16 @@ class TaskbarWidget(QWidget):
         except Exception:
             _guard("時計表示への切り替え")
 
-    def _save_launcher_items(self, keys) -> None:
+    def _save_launcher_items(self, keys, hidden=None) -> None:
         """ランチャの並べる項目の保存(パネルの右クリックメニューから呼ばれる)。
 
-        settings.json は読み直して taskbar_widget.launcher_items だけ差し替える
-        (save_config の作法)。書けなくてもメモリ上の設定は向こうで差し替え
-        済みなので、動作は続ける。"""
-        save_config(self.app_settings, self.settings_path, launcher_items=list(keys))
+        settings.json は読み直して taskbar_widget の launcher_items(並び全体)と
+        launcher_hidden(隠している項目)だけ差し替える(save_config の作法)。
+        書けなくてもメモリ上の設定は向こうで差し替え済みなので、動作は続ける。"""
+        values = {"launcher_items": list(keys)}
+        if hidden is not None:
+            values["launcher_hidden"] = list(hidden)
+        save_config(self.app_settings, self.settings_path, **values)
 
     def on_launcher_closed(self) -> None:
         """ランチャのパネルが閉じたときに、本体の見た目を現実に合わせ直す。

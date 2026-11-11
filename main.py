@@ -22,7 +22,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QRect, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
@@ -240,6 +240,11 @@ class _Reply(QObject):
         """応答を出す。別スレッドから呼んでよい唯一の入口。"""
         self.ready.emit(text)
 
+    def extend_deadline(self, ms: int) -> None:
+        """応答期限を ms に延ばす(人の操作を待つ口用)。メインスレッドから呼ぶこと。"""
+        if not self._sent:
+            self._deadline.start(ms)
+
     def _on_deadline(self) -> None:
         self._write("ERR 応答が返りませんでした（タイムアウト）")
 
@@ -388,7 +393,12 @@ def _build_command_handlers(features) -> dict:
         # 画像そのものは返さない。この口の応答は1行のテキストで、画像を載せるなら
         # base64 で数MBを流すことになる。保存してパスを返せば、読む側は普通に
         # ファイルを開けばよい(保存先は capture.save_folder と同じ)。
-        "capture": lambda args, reply: reply(_capture_command(screen, args)),
+        #
+        # 範囲を指定して撮る口(後方互換。引数なし・画面番号だけの呼び方は従来どおり)。
+        #   traytools_send.py capture --region=x,y,w,h   仮想デスクトップの論理座標の矩形だけ
+        #   traytools_send.py capture --select           ドラッグで範囲を選んでもらい、その範囲を撮る
+        # --select は人の操作を待つので応答が遅れる(キャンセル・無操作60秒で撮らずに返る)。
+        "capture": lambda args, reply: _capture_dispatch(screen, args, reply),
         # Copilot アプリを相手にした疑似エージェントループ。
         #
         #   traytools_send.py agent-loop start <お題ファイル> [--auto] [--max N]
@@ -472,17 +482,114 @@ def _keep_awake_command(screen, args) -> str:
     return "OK " + screen.keep_awake_status()
 
 
+CAPTURE_SELECT_TIMEOUT_MS = 60000  # --select で人が選ぶのを待つ上限。超えたら撮らずに戻す
+
+
+def _parse_capture_args(args):
+    """capture の引数を (画面番号の文字列 or None, 矩形 or None, select か, エラー文 or None) にする。
+
+    従来の `capture [画面番号]` はそのまま通る(先頭の `--` で始まらない引数が画面番号)。
+    新しい口は `--region=x,y,w,h` と `--select`。どれか1つだけ。"""
+    positional = []
+    region = None
+    select = False
+    for raw in args:
+        text = str(raw).strip()
+        if text.startswith("--region="):
+            try:
+                parts = [int(v) for v in text[len("--region="):].split(",")]
+            except ValueError:
+                return None, None, False, f"--region を解釈できません: {text}（x,y,width,height の整数）"
+            if len(parts) != 4:
+                return None, None, False, f"--region は x,y,width,height の4つです: {text}"
+            if parts[2] <= 0 or parts[3] <= 0:
+                return None, None, False, "--region の width と height は 1 以上です"
+            region = QRect(parts[0], parts[1], parts[2], parts[3])
+        elif text == "--select":
+            select = True
+        elif text.startswith("--"):
+            return None, None, False, f"知らないオプションです: {text}"
+        else:
+            positional.append(text)
+    if region is not None and select:
+        return None, None, False, "--region と --select は同時に指定できません"
+    if positional and (region is not None or select):
+        return None, None, False, "画面番号と --region/--select は同時に指定できません"
+    return (positional[0] if positional else None), region, select, None
+
+
+def _capture_dispatch(screen, args, reply) -> None:
+    """capture の入口。--select だけは人の操作を待つので応答を遅らせ、他は同期で返す。"""
+    index_text, region, select, error = _parse_capture_args(args)
+    if error:
+        reply(f"ERR {error}")
+        return
+    if select:
+        _capture_select(screen, reply)
+        return
+    reply(_capture_command(screen, args))
+
+
+def _save_capture(screen, image, label: str) -> str:
+    """撮った画像を保存して応答文を作る(画面番号・全画面・範囲指定・選択で共通)。"""
+    path = capture_grab.save_image(
+        image, screen.app_settings.get("capture", {}), stem=capture_grab.new_session_stem()
+    )
+    if not path:
+        return "ERR 保存できませんでした（保存先を確認してください）"
+    action_log.record("画面キャプチャ", f"{label} {image.width()}x{image.height()}", "external")
+    return f"OK {label} {image.width()}x{image.height()}\n{path}"
+
+
+def _capture_select(screen, reply) -> None:
+    """ドラッグ（またはクリックでウィンドウ単位）で範囲を選んでもらい、その範囲を撮る。
+
+    ホットキー・トレイと同じ FrozenSelectionOverlay を ScreenFeature 経由で出す。
+    応答は選択が終わってから返す(確定=撮った結果、キャンセル・時間切れ=撮らなかった旨)。"""
+    if not QApplication.screens():
+        reply("ERR 画面が見つかりません")
+        return
+    # 人が選ぶ間、既定の応答期限(20秒)で切られないよう、選択の上限より少し長く取る。
+    reply.extend_deadline(CAPTURE_SELECT_TIMEOUT_MS + 10000)
+
+    def done(image, rect):
+        try:
+            if image is None:
+                reply("OK キャンセルされました（撮っていません）")
+                return
+            reply(_save_capture(screen, image, f"範囲選択({rect.x()},{rect.y()} {rect.width()}x{rect.height()})"))
+        except Exception as e:  # noqa: BLE001  外部から叩かれる口。落とさない
+            reply(f"ERR 撮影結果を保存できません: {e}")
+
+    if not screen.pick_region_for_capture(done, CAPTURE_SELECT_TIMEOUT_MS):
+        reply("ERR 範囲選択をすでに実行中です（撮っていません）")
+
+
 def _capture_command(screen, args) -> str:
-    """画面を1枚撮って保存し、そのパスを返す。args[0] があれば画面番号(1始まり)。"""
+    """画面を1枚撮って保存し、そのパスを返す。
+
+    args[0] があれば画面番号(1始まり)。`--region=x,y,w,h` があれば仮想デスクトップの
+    論理座標でその範囲だけを撮る。"""
     screens = QApplication.screens()
     if not screens:
         return "ERR 画面が見つかりません"
 
-    if args:
+    index_text, region, _select, error = _parse_capture_args(args)
+    if error:
+        return f"ERR {error}"
+
+    if region is not None:
+        desktop = capture_grab.virtual_geometry()
+        rect = region.intersected(desktop)
+        if rect.isEmpty():
+            return (f"ERR 指定範囲が画面の外です（仮想デスクトップ: "
+                    f"{desktop.x()},{desktop.y()} {desktop.width()}x{desktop.height()}）")
+        label = f"範囲({rect.x()},{rect.y()} {rect.width()}x{rect.height()})"
+    elif index_text is not None:
         try:
-            index = int(str(args[0]).strip())
+            index = int(index_text)
         except (TypeError, ValueError):
-            return f"ERR 画面番号を解釈できません: {args[0]}"
+            return f"ERR 画面番号を解釈できません: {index_text}"
         if not 1 <= index <= len(screens):
             return f"ERR 画面番号は 1〜{len(screens)} です（指定: {index}）"
         rect = screens[index - 1].geometry()
@@ -499,14 +606,7 @@ def _capture_command(screen, args) -> str:
     if image.isNull():
         return "ERR 撮影できませんでした（空の画像）"
 
-    path = capture_grab.save_image(
-        image, screen.app_settings.get("capture", {}), stem=capture_grab.new_session_stem()
-    )
-    if not path:
-        return "ERR 保存できませんでした（保存先を確認してください）"
-
-    action_log.record("画面キャプチャ", f"{label} {image.width()}x{image.height()}", "external")
-    return f"OK {label} {image.width()}x{image.height()}\n{path}"
+    return _save_capture(screen, image, label)
 
 
 def _log_command(args) -> str:

@@ -301,6 +301,8 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   pushover <本文> [--title T] [--priority N] [--sound S]
                                スマホへプッシュ通知（要トークン登録）
   capture [画面番号]           画面を1枚撮って保存し、パスを返す
+  capture --region=x,y,w,h     論理座標の矩形だけ撮る
+  capture --select             ドラッグで範囲を選んでもらって撮る（人の操作を待つ）
   agent-loop status            疑似エージェントループの状態
   agent-loop cancel            走っているループに停止要求（次の周の頭で止まる）
   agent-loop start <お題ファイル> [--auto] [--max=N] [--ps-timeout=N]

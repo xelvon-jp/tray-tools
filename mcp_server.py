@@ -60,6 +60,7 @@ LATEST_PROTOCOL = SUPPORTED_PROTOCOLS[0]
 # 応答を待つ上限(秒)。pushover だけは外へ HTTP を投げるので長い。
 TIMEOUTS = {"pushover": 25.0}
 DEFAULT_TIMEOUT = 8.0
+SELECT_TIMEOUT = 75.0  # capture の select: 常駐側の選択上限(60秒)より少し長く
 
 INSTRUCTIONS = (
     "常駐している tray-tools を操作します。"
@@ -200,7 +201,18 @@ TOOLS = [
                 "type": "integer",
                 "minimum": 1,
                 "description": "撮る画面の番号(1始まり)。省略すると全画面をまとめて1枚",
-            }
+            },
+            "x": {"type": "integer", "description": "region 指定: 左上のX(仮想デスクトップの論理座標)"},
+            "y": {"type": "integer", "description": "region 指定: 左上のY(仮想デスクトップの論理座標)"},
+            "width": {"type": "integer", "minimum": 1, "description": "region 指定: 幅"},
+            "height": {"type": "integer", "minimum": 1, "description": "region 指定: 高さ"},
+            "select": {
+                "type": "boolean",
+                "description": "true なら範囲選択のオーバーレイを画面に出し、ユーザーがドラッグ"
+                "(またはクリックでウィンドウ単位)で選んだ範囲を撮る。キャンセル時は撮らずにその旨を返す。"
+                "**画面に出て人の操作を待つので、頼まれていないのに使わないこと。**"
+                "x/y/width/height・screen とは同時に使えない",
+            },
         },
     ),
     _tool(
@@ -315,6 +327,22 @@ def _to_command(name: str, params: dict):
 
     if name == "capture":
         screen = params.get("screen")
+        region_keys = ("x", "y", "width", "height")
+        given = [k for k in region_keys if params.get(k) is not None]
+        select = params.get("select") is True
+        if given:
+            if len(given) != 4:
+                raise ValueError("region には x, y, width, height の4つが全部必要です")
+            if select or screen is not None:
+                raise ValueError("region は screen / select と同時に使えません")
+            x, y, w, h = (int(params[k]) for k in region_keys)
+            if w <= 0 or h <= 0:
+                raise ValueError("width と height は 1 以上です")
+            return "capture", [f"--region={x},{y},{w},{h}"]
+        if select:
+            if screen is not None:
+                raise ValueError("select は screen と同時に使えません")
+            return "capture", ["--select"]
         return "capture", ([str(int(screen))] if screen is not None else [])
 
     if name == "bookmark":
@@ -360,6 +388,8 @@ def call_tool(name: str, params: dict) -> dict:
         return _result(f"引数が不正です: {e}", is_error=True)
 
     timeout = TIMEOUTS.get(command, DEFAULT_TIMEOUT)
+    if command == "capture" and "--select" in args:
+        timeout = SELECT_TIMEOUT  # 人が範囲を選ぶのを待つ
     try:
         response = traytools_send._exchange(command, args, timeout)
     except FileNotFoundError:

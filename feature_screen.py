@@ -932,6 +932,43 @@ class ScreenFeature:
         self.overlay.canceled.connect(self._on_canceled)
         self.overlay.show()
 
+    def pick_region_for_capture(self, on_done, timeout_ms: int) -> bool:
+        """外部(MCP の capture --select)用。範囲選択だけして、付箋は出さずに結果を返す。
+
+        ホットキーと同じ FrozenSelectionOverlay を使う(ドラッグ選択もクリックのウィンドウ
+        単位も同じ)。on_done(image, rect) を1回だけ呼ぶ。キャンセル・時間切れは (None, None)。
+        既に範囲選択中(または遅延カウントダウン中)なら何もせず False を返す。"""
+        if self.overlay is not None or self.countdown is not None:
+            return False
+        overlay = FrozenSelectionOverlay()
+        self.overlay = overlay
+        finished = []  # 1回だけ呼ぶための印
+
+        def finish(image, rect):
+            if finished:
+                return
+            finished.append(True)
+            timer.stop()
+            try:
+                overlay.close()
+                overlay.deleteLater()
+            finally:
+                self.overlay = None
+            on_done(image, rect)
+
+        def on_selected(rect_global):
+            # 撮り直さず、ユーザーが見ていた凍結画像から切り出す(_on_selection_made と同じ)。
+            finish(overlay.crop(rect_global), rect_global)
+
+        timer = QTimer(overlay)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: finish(None, None))
+        overlay.selection_made.connect(on_selected)
+        overlay.canceled.connect(lambda: finish(None, None))
+        timer.start(timeout_ms)
+        overlay.show()
+        return True
+
     def _on_canceled(self):
         # SelectionOverlayはEscでcanceledをemitするだけで自分では閉じない。参照を
         # 捨てるだけだと全画面を覆うウィジェットが消えるかどうかGC任せになり、

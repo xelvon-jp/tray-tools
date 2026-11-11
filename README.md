@@ -355,7 +355,7 @@ traytools_send.py sleep cancel           予約を取り消す
 | `notify` | `message`（必須） | |
 | `beep` | `kind` | |
 | `pushover` | `message`（必須）, `title`, `priority`, `sound` | `openWorldHint` |
-| `capture` | `screen` | |
+| `capture` | `screen`, または `x`/`y`/`width`/`height`, または `select` | |
 | `bookmark` | `path` | |
 | `agent_loop` | `action`（必須）, `prompt_file`, `watch`, `auto`, `max_rounds`, `finish_word` | **`destructiveHint`** |
 
@@ -381,7 +381,11 @@ traytools_send.py sleep cancel           予約を取り消す
 ```
 traytools_send.py capture        画面全体（仮想デスクトップ）を1枚
 traytools_send.py capture 2      2番目の画面だけ
+traytools_send.py capture --region=x,y,w,h   仮想デスクトップの論理座標で、その矩形だけ
+traytools_send.py capture --select           範囲選択のオーバーレイを出し、ドラッグ（またはクリックでウィンドウ単位）で選んだ範囲を撮る
 ```
+
+`--region` と `--select` と画面番号は同時に指定できません。`--select` はホットキーと同じ `FrozenSelectionOverlay` を使い、付箋は出さずに保存だけします。応答は選び終わってから返り、Esc でのキャンセルや60秒無操作のときは撮らずに「OK キャンセルされました（撮っていません）」を返します。範囲選択中・遅延カウントダウン中に呼ぶと ERR を返します。MCP の `capture` では `x` `y` `width` `height`（4つ揃えて）と `select: true` がこれに当たります。
 
 保存先は Rapture と同じ `capture.save_folder` で、応答の2行目に保存したパスが返ります。
 

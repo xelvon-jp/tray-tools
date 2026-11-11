@@ -5566,6 +5566,75 @@ def test_collect_flat_logic():
     assert core.DEFAULT_KEYMAP["4066"] == "flat_view"
 
 
+def test_name_matcher_logic():
+    # 部分一致: 含むか。大文字小文字は無視し、空白区切りは AND(全角空白も区切る)
+    match = core.build_name_matcher("log", "partial")
+    assert match("log_001.txt") and match("LOG.md") and not match("top.txt")
+    match = core.build_name_matcher("log 2026", "partial")
+    assert match("2026_log.txt") and not match("log_001.txt")
+    match = core.build_name_matcher("log　2026", "partial")
+    assert match("2026_log.txt")
+    # 完全一致: 名前全体。大文字小文字は無視するが、部分では当たらない
+    match = core.build_name_matcher("Top.TXT", "exact")
+    assert match("top.txt") and not match("top.txt.bak") and not match("mytop.txt")
+    # 正規表現: re.search の意味で、大文字小文字は無視
+    match = core.build_name_matcher(r"\.md$", "regex")
+    assert match("x.md") and match("X.MD") and not match("x.md.txt")
+    match = core.build_name_matcher(r"^log_\d+\.txt$", "regex")
+    assert match("log_001.txt") and not match("a_log_001.txt")
+    # 不正な正規表現・空の語・知らない方式は ValueError
+    for query, mode in (("(", "regex"), ("", "partial"), ("  ", "exact"),
+                        ("x", "unknown")):
+        try:
+            core.build_name_matcher(query, mode)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"ValueError にならない: {query!r} / {mode}")
+    assert core.NAME_MODE_LABELS["partial"] == "部分一致"
+    assert core.COMMAND_SHORT_NAMES["name_search"] == "名前検索"
+
+
+def test_collect_name_search_logic():
+    # フォルダ階層の歩き方は collect_flat と同一コードの形なので、ここでは
+    # 平らな木で「名前で絞る」部分を確かめる(階層の相対パスは test_collect_flat_logic 側)
+    import threading as th
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp, "r")
+        root.mkdir()
+        for name in ("log_001.txt", "report_log.txt", "top.txt", "x.md",
+                     "note.txt"):
+            (root / name).write_bytes(b"1")
+        # 部分一致: 名前に log を含むものだけ(フォルダ自体は入らない)
+        entries, status = core.collect_name_search(
+            str(root), core.build_name_matcher("log", "partial"))
+        assert status == "done"
+        assert sorted(e.name for e in entries) == ["log_001.txt", "report_log.txt"]
+        assert all(not e.is_dir for e in entries)
+        # 完全一致
+        entries, _ = core.collect_name_search(
+            str(root), core.build_name_matcher("TOP.txt", "exact"))
+        assert [e.name for e in entries] == ["top.txt"]
+        # 正規表現
+        entries, _ = core.collect_name_search(
+            str(root), core.build_name_matcher(r"^log_\d+\.txt$", "regex"))
+        assert [e.name for e in entries] == ["log_001.txt"]
+        # 上限はヒット件数で効く
+        entries, status = core.collect_name_search(
+            str(root), lambda name: True, limit=2)
+        assert status == "limit" and len(entries) == 2
+        # 中止
+        stop = th.Event()
+        stop.set()
+        assert core.collect_name_search(str(root), lambda name: True,
+                                        cancel=stop)[1] == "cancel"
+        # progress はヒット件数(最後は総ヒット数)
+        seen = []
+        core.collect_name_search(str(root), lambda name: True,
+                                 progress=seen.append)
+        assert seen and seen[-1] == 5
+
+
 def test_window_flat_view():
     import zipfile
     import filer

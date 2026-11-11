@@ -77,6 +77,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSplitter,
     QStyledItemDelegate,
@@ -817,6 +818,14 @@ class Pane(QWidget):
         self.es_loading = False
         self.es_cancel = None
         self.es_status = "done"
+        # 名前で検索(Shift+F → N)。配下を自前で歩いて名前で絞り、結果はフラット表示の形で
+        # 出す。ns_mode は "partial" / "exact" / "regex"(core.NAME_MODES)。
+        self.ns_query = None
+        self.ns_mode = "partial"
+        self.ns_loading = False
+        self.ns_cancel = None
+        self.ns_status = "done"
+        self.ns_count = 0
         # ★写真抽出(Shift+F → P)。配下の写真のうち★1以上をフラット表示の形で並べる(写真フォルダ
         # モードを強制。窓の下の★の範囲スライダーとは AND)。pick_root は抽出した根(表示中だけ。
         # 抜けたら None)。集めている間は pick_phase が "scan"(写真を探す) / "read"(★を読む)で、
@@ -1138,6 +1147,9 @@ class Pane(QWidget):
         elif self.es_query is not None or self.es_loading:
             scope = "全体" if self.es_all else "以下"
             text += f"   [Everything({scope}): {self.es_query or ''}]"
+        elif self.ns_query is not None or self.ns_loading:
+            mode = core.NAME_MODE_LABELS.get(self.ns_mode, "")
+            text += f"   [名前検索({mode}): {self.ns_query or ''}]"
         elif self.grep_query is not None or self.grep_loading:
             text += f"   [検索: {self.grep_query or ''}]"
         elif self.flat or self.flat_loading:
@@ -1204,6 +1216,17 @@ class Pane(QWidget):
             lines = sum(c for c, _ in self.grep_matches.values())
             size = sum(e.size for e in self.entries if not e.is_dir)
             text = f"検索「{self.grep_query}」 {files}件 / {lines:,}行ヒット   {size:,} bytes"
+            if count:
+                text += f"   Mark {count} ({total:,})"
+        elif self.ns_loading:
+            text = f"名前で検索中 {self.ns_count:,}件ヒット（Esc で中止）"
+        elif self.ns_query is not None:
+            size = sum(e.size for e in self.entries if not e.is_dir)
+            mode = core.NAME_MODE_LABELS.get(self.ns_mode, "")
+            text = f"名前検索「{self.ns_query}」（{mode}） {dirs + files}件"
+            if self.ns_status == "limit":
+                text += "（上限で打ち切り）"
+            text += f"   {size:,} bytes"
             if count:
                 text += f"   Mark {count} ({total:,})"
         elif self.flat_loading:
@@ -1295,6 +1318,7 @@ class Pane(QWidget):
         self._stop_grep()
         self._stop_es()
         self._stop_pick()
+        self._stop_name_search()
         self._stop_hist()
         self.hist_from = None
         was_stash = self.stash
@@ -1485,6 +1509,9 @@ class Pane(QWidget):
         if self.es_query is not None and self.path:
             self.load_everything(self.es_query, self.es_all, keep_marks=keep_marks)
             return
+        if self.ns_query is not None and self.path:
+            self.load_name_search(self.ns_query, self.ns_mode, keep_marks=keep_marks)
+            return
         if self.grep_query is not None and self.path:
             self.load_grep(self.grep_query, self.grep_case, keep_marks=keep_marks)
             return
@@ -1507,6 +1534,7 @@ class Pane(QWidget):
         self._stop_grep()
         self._stop_es()
         self._stop_pick()
+        self._stop_name_search()
         self.request_id += 1   # 進行中のフォルダ読み込みを無効化する
         self.loading = False
         entries, missing = core.stash_entries(win.stash_paths)
@@ -1558,6 +1586,7 @@ class Pane(QWidget):
         self._stop_grep()
         self._stop_es()
         self._stop_pick()
+        self._stop_name_search()
         if self.stash:
             self.stash = False
             self.stash_from = None
@@ -1761,7 +1790,7 @@ class Pane(QWidget):
     def _tick_flat(self) -> None:
         try:
             if (self.flat_loading or self.grep_loading or self.es_loading
-                    or self.pick_loading or self.hist_loading):
+                    or self.ns_loading or self.pick_loading or self.hist_loading):
                 self.update_footer()
                 if self.pick_loading:
                     self._update_pick_progress()
@@ -1819,6 +1848,7 @@ class Pane(QWidget):
         self._stop_flat()
         self._stop_es()
         self._stop_pick()
+        self._stop_name_search()
         if self.grep_cancel is not None:
             self.grep_cancel.set()
         self.request_id += 1
@@ -1925,6 +1955,7 @@ class Pane(QWidget):
         self._stop_flat()
         self._stop_grep()
         self._stop_pick()
+        self._stop_name_search()
         if self.es_cancel is not None:
             self.es_cancel.set()
         self.request_id += 1
@@ -2002,6 +2033,107 @@ class Pane(QWidget):
             text += f"  ※{self.window_.es_limit:,}件で打ち切りました（語を足して絞ってください）"
         if missing:
             text += f"  ※索引にあって実在しない {missing}件は除きました"
+        self.window_.log(text)
+
+    # --- 名前で検索(Shift+F → N) ---
+    def _stop_name_search(self) -> None:
+        if self.ns_cancel is not None:
+            self.ns_cancel.set()
+        self.ns_cancel = None
+        self.ns_query = None
+        self.ns_loading = False
+        self.ns_status = "done"
+
+    def load_name_search(self, query: str, mode: str,
+                         keep_marks: bool = False) -> None:
+        """いまのフォルダより下のファイルを自前で歩いて名前で絞り、結果をフラット
+        表示の形(相対パス名)で並べる。Everything は使わない。集めている間は窓の
+        下の行にヒット件数を出し、Esc で中止できる(cancel_name_search)。"""
+        self._stop_flat()
+        self._stop_grep()
+        self._stop_es()
+        self._stop_pick()
+        if self.ns_cancel is not None:
+            self.ns_cancel.set()
+        self.request_id += 1
+        request = self.request_id
+        cancel = threading.Event()
+        self.ns_cancel = cancel
+        self.ns_query = query
+        self.ns_mode = mode
+        self.ns_loading = True
+        self.loading = True
+        self.ns_count = 0
+        root = self.path
+        win = self.window_
+        args = dict(path=root, name_search=query, name_mode=mode,
+                    keep_marks=keep_marks)
+        bridge = win.bridge
+        show_hidden, show_system = win.show_hidden, win.show_system
+
+        def progress(count):
+            self.ns_count = count
+
+        def worker():
+            try:
+                match = core.build_name_matcher(query, mode)
+                entries, status = core.collect_name_search(
+                    root, match, show_hidden, show_system,
+                    core.NAME_SEARCH_LIMIT, cancel, progress)
+                payload = (self.side, request, True, (entries, status), args)
+            except Exception as e:  # noqa: BLE001
+                payload = (self.side, request, False, f"{type(e).__name__}: {e}", args)
+            try:
+                bridge.finished.emit(payload)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True,
+                         name=f"filer-name-{self.side}").start()
+        self._flat_timer.start(200)
+        self.update_header()
+        self.update_footer()
+
+    def cancel_name_search(self) -> None:
+        if self.ns_loading and self.ns_cancel is not None:
+            self.ns_cancel.set()
+
+    def on_name_loaded(self, request, ok, result, args) -> None:
+        if request != self.request_id:
+            return
+        self.loading = False
+        self.ns_loading = False
+        self.ns_cancel = None
+        self._flat_timer.stop()
+        query = args["name_search"]
+        mode = args["name_mode"]
+        if not ok:
+            self.window_.log(f"名前検索: 探せません: {args['path']}  ({result})")
+            self._stop_name_search()
+            self.update_header()
+            self.update_footer()
+            return
+        entries, status = result
+        if status == "cancel":
+            self.window_.log("名前検索: 中止しました")
+            self._stop_name_search()
+            self.reload()
+            return
+        if not args.get("keep_marks"):
+            self.marks = set()
+        self.flat = True
+        self.ns_status = status
+        self.all_entries = entries
+        self._rebuild()
+        self.set_cursor(0)
+        self.update_header()
+        self.update_footer()
+        if self.is_active():
+            self.window_.update_status_bar()
+        label = core.NAME_MODE_LABELS.get(mode, mode)
+        text = f"名前検索: 「{query}」（{label}） {len(entries)}件"
+        if status == "limit":
+            text += f"  ※{core.NAME_SEARCH_LIMIT:,}件で打ち切りました（語を足して絞ってください）"
         self.window_.log(text)
 
     # --- ★写真抽出(Shift+F → P) ---
@@ -2837,6 +2969,9 @@ class FilerWindow(QWidget):
             self.es_timeout = filer_everything.ES_TIMEOUT
         self.es_scope_all = False
         self.es_environ = None      # None なら os.environ(テストで差し替える)
+        # 名前で検索(Shift+F → N)の前回の一致方式。次回も覚える。
+        mode = section.get("name_search_mode")
+        self.name_search_mode = mode if mode in core.NAME_MODES else "partial"
         # フォルダ構成をコピー(C→I)の深さと行数の上限。
         try:
             self.tree_depth = max(1, int(section.get("tree_depth") or core.TREE_DEPTH))
@@ -3729,6 +3864,8 @@ class FilerWindow(QWidget):
                 self.pane(side).on_pick_loaded(request, ok, result, args)
             elif args.get("everything") is not None:
                 self.pane(side).on_es_loaded(request, ok, result, args)
+            elif args.get("name_search") is not None:
+                self.pane(side).on_name_loaded(request, ok, result, args)
             elif args.get("grep"):
                 self.pane(side).on_grep_loaded(request, ok, result, args)
             elif args.get("flat"):
@@ -3814,6 +3951,9 @@ class FilerWindow(QWidget):
             return
         if event.key() == Qt.Key_Escape and self.active.es_loading:
             self.active.cancel_es()     # Esc は「処理の中止」: Everything 検索を止める
+            return
+        if event.key() == Qt.Key_Escape and self.active.ns_loading:
+            self.active.cancel_name_search()   # Esc は「処理の中止」: 名前検索を止める
             return
         if event.key() == Qt.Key_Escape and self.active.pick_loading:
             self.active.cancel_pick()   # Esc は「処理の中止」: ★写真抽出を止める
@@ -5844,9 +5984,11 @@ class FilerWindow(QWidget):
                                         exists=self.menu_exists)
 
     def cmd_everything(self):
-        """Shift+F: 検索のメニュー。E で Everything 検索、P で★写真抽出(頭の文字で選んで Enter)。"""
+        """Shift+F: 検索のメニュー。E で Everything 検索、N で名前で検索、P で★写真抽出
+        (頭の文字で選んで Enter)。"""
         choice = self.choose_menu("検索", [
             ("E", "Everything 検索", "everything_search"),
+            ("N", "名前で検索", "name_search"),
             ("P", "★写真抽出（配下の★1以上の写真）", "photo_pick"),
             ("Q", "キャンセル", None),
         ])
@@ -5891,6 +6033,30 @@ class FilerWindow(QWidget):
             return
         self.es_scope_all = bool(scope_all)
         pane.load_everything(query.strip(), self.es_scope_all)
+
+    def cmd_name_search(self):
+        """Shift+F → N: 名前で検索。配下を自前で歩いて名前で絞り、結果をフラット表示の
+        形で並べる(範囲はアクティブ窓のフォルダ以下だけ)。"""
+        pane = self.active
+        if pane.stash:
+            self.log("名前検索: 一時置き場では使えません（T で通常の表示へ）")
+            return
+        if not pane.path:
+            return
+        if pane.archive is not None:
+            self.log("名前検索: 書庫内では使えません")
+            return
+        answer = self.ask_name_search(pane.ns_query or "", self.name_search_mode)
+        if answer is None:
+            return
+        query, mode = answer
+        if not query.strip():
+            return
+        if mode != self.name_search_mode:
+            self.name_search_mode = mode
+            save_values(self.app_settings, self.settings_path,
+                        {"name_search_mode": mode})
+        pane.load_name_search(query.strip(), mode)
 
     def cmd_mask_input(self):
         current = self.active.mask_text
@@ -8448,6 +8614,55 @@ class FilerWindow(QWidget):
         if dialog.exec() != QDialog.Accepted:
             return None
         return edit.text(), check.isChecked()
+
+    def ask_name_search(self, text: str, mode: str):
+        """名前で検索の入力窓。(検索語, 一致方式) か、取消なら None。
+
+        一致方式はラジオボタン(部分一致／完全一致／正規表現)。正規表現が不正なら
+        窓の中に知らせて閉じない。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("名前で検索")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("探す名前（部分一致は空白区切りで AND）")
+        layout.addWidget(label)
+        edit = QLineEdit(text)
+        edit.selectAll()
+        layout.addWidget(edit)
+        radios = {}
+        for value, caption in (("partial", "部分一致(&P)"),
+                               ("exact", "完全一致(&E)"),
+                               ("regex", "正規表現(&R)")):
+            radio = QRadioButton(caption)
+            radio.setChecked(value == mode)
+            radios[value] = radio
+            layout.addWidget(radio)
+        error = QLabel("")
+        error.setStyleSheet("color: #c00000;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def chosen_mode():
+            for value, radio in radios.items():
+                if radio.isChecked():
+                    return value
+            return "partial"
+
+        def try_accept():
+            if chosen_mode() == "regex":
+                try:
+                    core.build_name_matcher(edit.text(), "regex")
+                except ValueError as e:
+                    error.setText(str(e))
+                    return
+            dialog.accept()
+
+        buttons.accepted.connect(try_accept)
+        edit.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return edit.text(), chosen_mode()
 
 
 # ---------------------------------------------------------------

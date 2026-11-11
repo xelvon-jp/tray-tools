@@ -659,6 +659,97 @@ def flat_footer_text(files: int, total: int, mark_count: int = 0, mark_bytes: in
 
 
 # ---------------------------------------------------------------
+# 名前で検索(Shift+F → N。Everything を使わない名前検索)
+# ---------------------------------------------------------------
+NAME_SEARCH_LIMIT = 10_000    # ヒット件数の上限(結果が一覧にならない量は実用でないため)
+NAME_MODES = ("partial", "exact", "regex")
+NAME_MODE_LABELS = {"partial": "部分一致", "exact": "完全一致", "regex": "正規表現"}
+
+
+def build_name_matcher(query: str, mode: str):
+    """検索語と一致方式から、ファイル名への述語を作る。不正な方式・正規表現は ValueError。
+
+    どれも大文字小文字は区別しない(Windows の名前の流儀)。
+    - partial: 名前に文字列を含む。空白区切りで複数書くと全部含むもの(AND)
+    - exact:   名前全体が一致
+    - regex:   正規表現で検索(re.search)"""
+    if mode == "partial":
+        terms = [term.casefold() for term in (query or "").split()]
+        if not terms:
+            raise ValueError("検索語が空です")
+
+        def match_partial(name: str) -> bool:
+            folded = name.casefold()
+            return all(term in folded for term in terms)
+
+        return match_partial
+    if mode == "exact":
+        target = (query or "").strip().casefold()
+        if not target:
+            raise ValueError("検索語が空です")
+
+        def match_exact(name: str) -> bool:
+            return name.casefold() == target
+
+        return match_exact
+    if mode == "regex":
+        try:
+            pattern = re.compile(query or "", re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"正規表現が不正です: {e}") from e
+
+        def match_regex(name: str) -> bool:
+            return pattern.search(name) is not None
+
+        return match_regex
+    raise ValueError(f"一致方式が不正です: {mode}")
+
+
+def collect_name_search(root: str, match, show_hidden: bool = True,
+                        show_system: bool = True, limit: int = NAME_SEARCH_LIMIT,
+                        cancel=None, progress=None):
+    """root より下のファイルから、名前が match に合うものだけを集める。読み取りスレッドで呼ぶ。
+
+    collect_flat と同じ歩き方・同じ返し方((項目, 状態))。項目の名前は root からの
+    相対パス。フォルダ自体は入れない。progress(ヒット件数) をフォルダごとに呼ぶ。"""
+    found = []
+    stack = [root]
+    while stack:
+        if cancel is not None and cancel.is_set():
+            return found, "cancel"
+        folder = stack.pop()
+        subdirs = []
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    attrs = getattr(st, "st_file_attributes", 0)
+                    if not show_hidden and attrs & stat.FILE_ATTRIBUTE_HIDDEN:
+                        continue
+                    if not show_system and attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                        continue
+                    if attrs & stat.FILE_ATTRIBUTE_DIRECTORY:
+                        if not attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                            subdirs.append(entry.path)
+                        continue
+                    if not match(entry.name):
+                        continue
+                    found.append(Entry(os.path.relpath(entry.path, root), False,
+                                       st.st_size, st.st_mtime, attrs))
+                    if len(found) >= limit:
+                        return found, "limit"
+        except OSError:
+            continue
+        stack.extend(sorted(subdirs, key=str.casefold, reverse=True))
+        if progress is not None:
+            progress(len(found))
+    return found, "done"
+
+
+# ---------------------------------------------------------------
 # 文字列検索(Grep。G キー)
 # ---------------------------------------------------------------
 GREP_LIMIT = 2_000            # ヒット件数の上限(結果が一覧にならない量は実用でないため)
@@ -1117,6 +1208,7 @@ COMMAND_SHORT_NAMES = {
     "grep": "Grep",
     "everything": "Everything",
     "everything_search": "Everything",
+    "name_search": "名前検索",
     "photo_pick": "★抽出",
     "workspace": "Workspace",
     "sort_dialog": "Sort",

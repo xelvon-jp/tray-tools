@@ -276,6 +276,65 @@ def _exe_of(hwnd):
         return ""
 
 
+_AUMID_IFACE = None
+
+
+def _aumid_of(hwnd):
+    """窓に付いているアプリの識別子(AppUserModelID)。取れなければ ''。
+
+    【なぜ要るのか】Edge の PWA(Muse アプリ)と普通の Edge の窓は、exe も
+    プロセス(pid)も窓クラスも同じ。2026-11-12 の実測で違ったのはこれだけ:
+    PWA は 'muse.ai-B8452CE7_e417885h3ma38!App'、普通の Edge は 'MSEdge'。
+    タイトルは Edge 側が "Microsoft\\u200b Edge" のようにゼロ幅文字を混ぜるなど
+    当てにならない。"""
+    global _AUMID_IFACE
+    if comtypes is None:
+        return ""
+    try:
+        from ctypes import wintypes as w
+        if _AUMID_IFACE is None:
+            class PROPERTYKEY(ctypes.Structure):
+                _fields_ = [("fmtid", comtypes.GUID), ("pid", w.DWORD)]
+
+            class PROPVARIANT(ctypes.Structure):
+                _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                            ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                            ("p", ctypes.c_void_p), ("p2", ctypes.c_void_p)]
+
+            class IPropertyStore(comtypes.IUnknown):
+                _iid_ = comtypes.GUID("{886d8eeb-8cf2-4446-8d02-cdba1dbdcf99}")
+                _methods_ = [
+                    comtypes.COMMETHOD([], comtypes.HRESULT, "GetCount",
+                                       (["out"], ctypes.POINTER(w.DWORD))),
+                    comtypes.COMMETHOD([], comtypes.HRESULT, "GetAt",
+                                       (["in"], w.DWORD), (["in"], ctypes.c_void_p)),
+                    comtypes.COMMETHOD([], comtypes.HRESULT, "GetValue",
+                                       (["in"], ctypes.POINTER(PROPERTYKEY)),
+                                       (["in"], ctypes.POINTER(PROPVARIANT))),
+                ]
+            key = PROPERTYKEY(comtypes.GUID("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5)
+            _AUMID_IFACE = (IPropertyStore, PROPVARIANT, key)
+        IPropertyStore, PROPVARIANT, key = _AUMID_IFACE
+        try:
+            comtypes.CoInitialize()
+        except OSError:
+            pass  # 既に別モードで初期化済みのスレッド。そのまま使える
+        store = ctypes.POINTER(IPropertyStore)()
+        hr = ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+            ctypes.c_void_p(hwnd), ctypes.byref(IPropertyStore._iid_), ctypes.byref(store))
+        if hr != 0 or not store:
+            return ""
+        pv = PROPVARIANT()
+        store.GetValue(ctypes.byref(key), ctypes.byref(pv))
+        value = ctypes.wstring_at(pv.p) if pv.vt == 31 and pv.p else ""  # VT_LPWSTR
+        if pv.vt:
+            ctypes.windll.ole32.PropVariantClear(ctypes.byref(pv))
+        store = None  # 同じスレッドでその場で手放す
+        return value
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _find_render_child(hwnd, render_class):
     """レンダラの窓を再帰的に探す。見つからなければ None。
 
@@ -304,10 +363,15 @@ def find_window(profile):
     """プロファイルに合う可視の窓を探す。(hwnd_main, hwnd_render) を返す。
 
     照合は exe 名 → クラス → タイトル(部分一致)の順。指定が空の項目は見ない。
-    exe 名が取れない環境では、その条件だけ飛ばして残りで絞る。"""
+    exe 名が取れない環境では、その条件だけ飛ばして残りで絞る。
+
+    app_id_prefix(AppUserModelID の頭)が指定されていて、窓から識別子が取れたときは
+    タイトルを見ずに識別子だけで決める(PWA と普通の Edge はこれでしか分からない)。
+    識別子が取れない窓だけ、従来どおりタイトルで判定する。"""
     want_exe = (profile.get("process_name") or "").lower()
     want_class = profile.get("window_class") or ""
     want_title = profile.get("window_title_contains") or ""
+    want_app_id = (profile.get("app_id_prefix") or "").lower()
     found = {}
     EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
@@ -316,7 +380,11 @@ def find_window(profile):
             return True
         if want_class and _class_of(hwnd) != want_class:
             return True
-        if want_title and want_title.lower() not in _title_of(hwnd).lower():
+        app_id = _aumid_of(hwnd).lower() if want_app_id else ""
+        if app_id:
+            if not app_id.startswith(want_app_id):
+                return True
+        elif want_title and want_title.lower() not in _title_of(hwnd).lower():
             return True
         if want_exe:
             exe = _exe_of(hwnd)

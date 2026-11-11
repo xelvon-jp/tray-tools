@@ -22,6 +22,9 @@ MUSE_PROFILE = {
     # (ノート名に Muse が入っていることがある)に当たる。em dash(U+2014)付きの
     # 末尾で探し、さらに exe で絞る。find_window は大文字小文字を区別しない部分一致。
     "window_title_contains": "\u2014 Muse",
+    # \u672c\u547d\u306e\u898b\u5206\u3051\u65b9(2026-11-12)\u3002\u7a93\u306e AppUserModelID \u304c PWA \u306f 'muse.ai-\u2026!App'\u3001
+    # \u666e\u901a\u306e Edge \u306f 'MSEdge'\u3002\u53d6\u308c\u305f\u7a93\u306f\u3053\u308c\u3060\u3051\u3067\u6c7a\u3081\u3001\u53d6\u308c\u306a\u3044\u7a93\u3060\u3051\u30bf\u30a4\u30c8\u30eb\u3067\u898b\u308b\u3002
+    "app_id_prefix": "muse.ai-",
     "render_class": "Chrome_RenderWidgetHostHWND",
     # 投稿欄。AutomationId が無いので Name で探す。Name「検索」の Edit も居るので
     # Name の一致は必須(Edit というだけで拾うと検索欄に書いてしまう)。

@@ -85,7 +85,7 @@ except ImportError as _e:  # ModuleNotFoundError を含む
     _ensure_uia = find_window = None
     _UIA_IMPORT_ERROR = _e
 
-VERSION = "20261105-05"
+VERSION = "20261112-01"
 
 
 # =========================================================================

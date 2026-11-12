@@ -63,14 +63,38 @@ def _kinds(rows):
 
 
 def _names(rows):
-    # 絞り込み名(3要素目)。無ければ表示名。
-    return [row[2] if len(row) > 2 else row[0] for row in rows]
+    # 絞り込み名(3要素目)。無ければ表示名。列で来たら本来の名前(先頭)。
+    result = []
+    for row in rows:
+        match = row[2] if len(row) > 2 else row[0]
+        result.append(match[0] if isinstance(match, list) else match)
+    return result
 
 
 def test_split_item():
     # 項目は (表示名, データ) が基本。3つ目に絞り込み名を足せる。
     assert picker_mod.split_item(("名前", 1)) == ("名前", 1, "名前")
     assert picker_mod.split_item(("📁 名前", 1, "名前")) == ("📁 名前", 1, "名前")
+
+
+def test_split_item_match_keys():
+    # 絞り込み名の列は、そのまま窓側へ渡る(判定は name_matches_any の役目)。
+    keys = ["名前", "alias"]
+    assert picker_mod.split_item(("表示名", 1, keys)) == ("表示名", 1, keys)
+
+
+def test_picker_match_any():
+    # 絞り込み名が列なら、どれか1つに当たれば残る。文字列なら従来どおり。
+    keys = ["電卓", "calculator"]
+    assert picker_mod.name_matches_any(keys, "calc")
+    assert picker_mod.name_matches_any(keys, "電")
+    assert not picker_mod.name_matches_any(keys, "メモ")
+    assert picker_mod.name_matches_any(keys, "")
+    assert picker_mod.name_matches_any("メモ帳", "メモ")
+    assert not picker_mod.name_matches_any("メモ帳", "帳")
+    # ワイルドカードもキーごとに効く。タプルでもよい
+    assert picker_mod.name_matches_any(keys, "cal*tor")
+    assert picker_mod.name_matches_any(("a", "b"), "b")
 
 
 def test_picker_match_name():
@@ -156,6 +180,60 @@ def test_mode_items_command(tmp_path):
     assert _kinds(rows) == ["open", "exec", "exec", "feature", "feature",
                             "builtin", "builtin", "builtin"], rows
     assert _names(rows)[3:5] == ["電卓", "あっふ"]
+
+
+def test_entry_alias():
+    # URL はホスト名。中に URL が入る URI はそのホスト名、
+    # ホストが取れない URI はスキーム固有部分の先頭。
+    assert up._entry_alias(cl.Entry(
+        "ページ", "https://example.com/path?q=1", kind="url")) == "example.com"
+    assert up._entry_alias(cl.Entry(
+        "ノート", "onenote:https://d.docs.live.net/abc",
+        kind="uri")) == "d.docs.live.net"
+    assert up._entry_alias(cl.Entry(
+        "メール", "mailto:foo@example.com", kind="uri")) == "foo@example.com"
+    # プログラムは、パスの末尾のファイル名から拡張子を除いたもの
+    assert up._entry_alias(cl.Entry("メモ帳", r"C:\tools\NotePad.exe")) == \
+        "NotePad"
+    assert up._entry_alias(cl.Entry("メモ帳", "notepad.exe")) == "notepad"
+
+
+def test_mode_items_command_search_keys(tmp_path):
+    features = [("checklist", "実機確認チェックリスト"),
+                ("calculator", "電卓")]
+    rows = up.build_mode_items("!", _entries(tmp_path), features=features,
+                               pinned_keys=["checklist"])
+    by_kind = {}
+    for row in rows:
+        by_kind.setdefault(row[1].get("kind"), []).append(row)
+    # 機能は「ラベル + 項目キー」。ピン留めでも通常でも同じ
+    assert by_kind["feature"][0][2] == ["実機確認チェックリスト", "checklist"]
+    assert by_kind["feature"][1][2] == ["電卓", "calculator"]
+    # 登録したプログラムは「名前 + exe 名(拡張子なし)」
+    execs = {row[1]["name"]: row[2] for row in by_kind["exec"]}
+    assert execs["メモ帳"] == ["メモ帳", "notepad"], execs
+    assert execs["電卓アプリ"] == ["電卓アプリ", "calc"], execs
+    # URL の登録は「名前 + ホスト名」
+    assert by_kind["open"][0][2] == ["ページ", "example.com"]
+    # 内蔵コマンドは、名前と id が大文字小文字だけの違いなら1つにまとまる
+    assert all(row[2] == [row[1]["name"]] for row in by_kind["builtin"])
+
+
+def test_command_mode_incremental_search_by_alias(tmp_path):
+    # `!` の候補を半角で絞れること(窓側の _refresh_list と同じ判定)。
+    features = [("checklist", "実機確認チェックリスト")]
+    rows = up.build_mode_items("!", _entries(tmp_path), features=features)
+
+    def hits(keyword):
+        return [row[1].get("kind") for row in rows
+                if picker_mod.name_matches_any(row[2], keyword)]
+
+    assert hits("che") == ["feature"]   # 機能キー checklist の前方一致
+    assert hits("note") == ["exec"]     # notepad.exe のファイル名
+    assert hits("exam") == ["open"]     # URL のホスト名
+    assert hits("メモ") == ["exec"]     # 日本語の名前も従来どおり当たる
+    assert hits("check*") == ["feature"]  # ワイルドカードもキーに効く
+    assert hits("zzz") == []
 
 
 def test_mode_items_search_and_calc_are_empty():
@@ -468,6 +546,24 @@ def test_picker_window_command_mode_more_apps_row():
         texts = [window.list.item(i).text()
                  for i in range(window.list.count())]
         assert texts == [up.MORE_APPS_LABEL], texts
+    finally:
+        window.close()
+
+
+def test_picker_window_command_alias_search(tmp_path):
+    # 窓でも、半角の別名で `!` の候補を絞れる(機能キーで探す場面)。
+    _qapp()
+    features = [("checklist", "実機確認チェックリスト")]
+    items = up.build_mode_items("!", _entries(tmp_path), features=features)
+    window = picker_mod.PickerWindow(
+        "統合ピッカー", items, lambda *_a: None,
+        modes=up.MODES, initial_mode="!")
+    try:
+        window.show()
+        window.search.setText("che")
+        texts = [window.list.item(i).text()
+                 for i in range(window.list.count())]
+        assert texts == ["🔧 実機確認チェックリスト"], texts
     finally:
         window.close()
 

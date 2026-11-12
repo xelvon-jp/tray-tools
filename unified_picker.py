@@ -21,6 +21,9 @@
 # 照合: 既定は前方一致(picker.name_matches)。`*` / `?` を含む入力は
 # ワイルドカードとして名前の中に探す。以前の「`*` を含むと機能・アプリへ
 # 展開」する仕組みと、`名前;引数` の解釈は廃止した(モードが明示になったため)。
+# `!` の項目だけは、絞り込み名を「名前 + 半角の別名」の列にする(機能キー・
+# exe 名・ホスト名)。項目名が日本語でも半角で探せるようにするためで、
+# 判定は picker.name_matches_any(どれか1つに当たれば残る)。
 #
 # 候補の見分け:
 #   表示名の頭に種別のアイコンを付け、絞り込みは本来の名前で効くよう
@@ -42,6 +45,7 @@
 #   stash   あっふの一時置き場(あっふ文脈だけ)
 #   more_apps 「未登録アプリも探す」(`!` の一番下。選ぶとその場で広げる)
 import os
+import urllib.parse
 
 import command_launcher
 import command_palette
@@ -102,6 +106,46 @@ def _entry_icon(entry) -> str:
         return ICONS["onenote"] if entry.target.lower().startswith("onenote:") \
             else ICONS["uri"]
     return ICONS["exec"] if entry.params else ICONS["app"]
+
+
+def _search_keys(primary, *aliases) -> list:
+    """絞り込み名の列。本来の名前 + 半角の別名(空・重複は除く)。
+
+    照合は前方一致なので、日本語の名前だけでは半角の入力で探せない。
+    別名を添えて、名前からでも別名からでも当たるようにする。"""
+    keys = [primary]
+    seen = {primary.lower()}
+    for alias in aliases:
+        alias = (alias or "").strip()
+        if alias and alias.lower() not in seen:
+            seen.add(alias.lower())
+            keys.append(alias)
+    return keys
+
+
+def _entry_alias(entry) -> str:
+    """登録1件の半角の別名。
+
+    URL・URI はホスト名(取れなければスキーム固有部分の先頭の区切りまで。
+    OneNote のように中にもう1つ URL が入る形は、そのホスト名を取る)。
+    ファイル・プログラムは、パスの末尾のファイル名から拡張子を除いたもの
+    (例: C:\\tools\\NotePad.exe → NotePad)。"""
+    target = entry.target or ""
+    if entry.kind in (command_launcher.KIND_URL, command_launcher.KIND_URI):
+        host = urllib.parse.urlparse(target).hostname
+        if host:
+            return host
+        rest = target.split(":", 1)[1] if ":" in target else target
+        if "://" in rest:
+            host = urllib.parse.urlparse(rest).hostname
+            if host:
+                return host
+        segment = rest.lstrip("/")
+        for sep in "/?#":
+            segment = segment.split(sep)[0]
+        return segment.split(":")[0]
+    base = target.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return os.path.splitext(base)[0]
 
 
 def _entry_group(entry) -> int:
@@ -169,7 +213,8 @@ def build_mode_items(mode, entries, *, features=(), pinned_keys=(),
             if entry.kind == command_launcher.KIND_FOLDER:
                 continue
             items.append((f"{_entry_icon(entry)} {entry.name}",
-                          entry_payload(entry), entry.name))
+                          entry_payload(entry),
+                          _search_keys(entry.name, _entry_alias(entry))))
         pinned = set(pinned_keys or ())
         labels = dict(features)
         for key in pinned_keys or ():
@@ -177,19 +222,19 @@ def build_mode_items(mode, entries, *, features=(), pinned_keys=(),
                 items.append((f"{ICONS['feature']} {labels[key]}",
                               {"kind": "feature", "item_key": key,
                                "name": labels[key], "pinned": True},
-                              labels[key]))
+                              _search_keys(labels[key], key)))
         for key, label in features:
             if key in pinned:
                 continue
             items.append((f"{ICONS['feature']} {label}",
                           {"kind": "feature", "item_key": key, "name": label},
-                          label))
+                          _search_keys(label, key)))
         for name, builtin_id, _desc in command_launcher._BUILTINS:
             if builtin_id == "history":
                 continue  # 履歴の窓は統合ピッカーには出さない
             items.append((f"{ICONS['builtin']} {name}",
                           {"kind": "builtin", "id": builtin_id, "name": name},
-                          name))
+                          _search_keys(name, builtin_id)))
         return items
     return []
 

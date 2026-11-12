@@ -84,7 +84,9 @@ def split_item(entry):
 
     項目は (表示名, データ) が基本。3つ目に絞り込み名を足した項目では、
     絞り込みを表示名ではなくそちらで判定する(表示名の頭に種別の印を付けても、
-    本来の名前で絞り込めるようにするため。統合ピッカー用)。"""
+    本来の名前で絞り込めるようにするため。統合ピッカー用)。
+    絞り込み名は文字列のほか、文字列の列でもよい(名前と半角の別名など。
+    判定は name_matches_any が担う)。ここではそのまま通す。"""
     if len(entry) >= 3:
         return entry[0], entry[1], entry[2]
     return entry[0], entry[1], entry[0]
@@ -113,6 +115,17 @@ def name_matches(name: str, keyword: str) -> bool:
     if "*" in keyword or "?" in keyword:
         return wildcard_match(name, keyword)
     return name.lower().startswith(keyword)
+
+
+def name_matches_any(match, keyword: str) -> bool:
+    """絞り込み名が複数の項目の判定。どれか1つでも name_matches に当たれば残す。
+
+    絞り込み名は文字列が基本。統合ピッカーの `!` のように、日本語の名前に
+    半角の別名(機能キー・exe 名・ホスト名)を添えた項目では文字列の列で来る。
+    文字列なら name_matches そのもの(従来どおり)。"""
+    if isinstance(match, str):
+        return name_matches(match, keyword)
+    return any(name_matches(key, keyword) for key in match)
 
 
 def filter_names(names, text: str) -> list:
@@ -911,7 +924,7 @@ class PickerWindow(QWidget):
         def add_static():
             for index, entry in enumerate(self._items):
                 name, _data, match = split_item(entry)
-                if not name_matches(match, keyword):
+                if not name_matches_any(match, keyword):
                     continue
                 item = QListWidgetItem(name)
                 # データそのものではなく元リストの添字を持たせる。Qtの項目データは

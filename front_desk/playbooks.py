@@ -1736,6 +1736,8 @@ def _wake_screen_deliver(text) -> tuple:
 
     安全の作法 (見張りのつつき v39 と同じ):
     - 前面の窓が Claude アプリのものだと確認できるまで打たない
+    - 前面にいなければ、アイドルを確認してから窓をクリック
+      して前面化する (待つだけでは前面にならない場合がある)
     - 陽太さんがキー・マウスに触れている間は打たない
       (アイドル WAKE_IDLE_SEC 秒を確認してから打つ)
     - 打鍵の途中で前面の窓が変わったら中断する
@@ -1752,13 +1754,27 @@ def _wake_screen_deliver(text) -> tuple:
 
 
 def _wake_screen_deliver_win(text) -> tuple:
-    """_wake_screen_deliver の Windows 実装 (ctypes の SendInput)。"""
+    """_wake_screen_deliver の Windows 実装 (ctypes の SendInput)。
+
+    手順: deep link で Claude の窓が前面に来るのを少し待ち、
+    来なければ、アイドルを確認してから窓の入力欄あたりを
+    クリックして前面化し (見張りのつつき v39 と同じ作法)、
+    本文を打って Enter で送る。実地の初回試行 (2026-11-13
+    req-20261113-28) では、窓は見えていたがアクティブでなく、
+    待つだけでは前面にならなかったため、この前面化を足した。
+    """
     import ctypes
     from ctypes import wintypes
 
+    INPUT_MOUSE = 0
     INPUT_KEYBOARD = 1
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004
+    MOUSEEVENTF_MOVE = 0x0001
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_ABSOLUTE = 0x8000
+    MOUSEEVENTF_VIRTUALDESK = 0x4000
     VK_RETURN = 0x0D
     VK_SHIFT = 0x10
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -1795,6 +1811,17 @@ def _wake_screen_deliver_win(text) -> tuple:
     user32.SendInput.argtypes = [
         wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
     user32.SendInput.restype = wintypes.UINT
+    user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
     kernel32.GetTickCount.argtypes = []
     kernel32.GetTickCount.restype = wintypes.DWORD
     kernel32.OpenProcess.argtypes = [
@@ -1807,27 +1834,46 @@ def _wake_screen_deliver_win(text) -> tuple:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
-    def foreground_claude():
-        """前面の窓が Claude アプリのものなら HWND、違えば None。"""
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return None
+    def process_name(hwnd) -> str:
         pid = wintypes.DWORD(0)
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         handle = kernel32.OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
         if not handle:
-            return None
+            return ""
         try:
             size = wintypes.DWORD(1024)
             buf = ctypes.create_unicode_buffer(size.value)
             if not kernel32.QueryFullProcessImageNameW(
                     handle, 0, buf, ctypes.byref(size)):
-                return None
-            name = buf.value.replace("/", "\\").rsplit("\\", 1)[-1].lower()
-            return hwnd if name.startswith("claude") else None
+                return ""
+            return buf.value.replace("/", "\\").rsplit("\\", 1)[-1].lower()
         finally:
             kernel32.CloseHandle(handle)
+
+    def is_claude(hwnd) -> bool:
+        try:
+            return bool(hwnd) and process_name(hwnd).startswith("claude")
+        except Exception:  # noqa: BLE001
+            return False
+
+    def main_claude_window():
+        """見えている Claude の窓のうち一番大きいものの HWND。"""
+        found = []
+        enum_proc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd) and is_claude(hwnd):
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    area = (rect.right - rect.left) * (rect.bottom - rect.top)
+                    if area > 0:
+                        found.append((area, hwnd))
+            return True
+
+        user32.EnumWindows(enum_proc(_cb), 0)
+        return max(found)[1] if found else None
 
     def send_inputs(events) -> bool:
         arr = (INPUT * len(events))(*events)
@@ -1840,32 +1886,87 @@ def _wake_screen_deliver_win(text) -> tuple:
         item.u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
         return item
 
-    # 1. 前面の窓が Claude アプリのものになるまで待つ
-    deadline = time.time() + WAKE_FOREGROUND_WAIT_SEC
+    def wait_idle() -> bool:
+        """陽太さんのアイドル (WAKE_IDLE_SEC 秒) を確認する。"""
+        deadline = time.time() + WAKE_IDLE_WAIT_SEC
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        while True:
+            if not user32.GetLastInputInfo(ctypes.byref(info)):
+                return False
+            idle_ms = (kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+            if idle_ms >= WAKE_IDLE_SEC * 1000:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+
+    def activate(hwnd) -> bool:
+        """窓の入力欄あたりをクリックして前面化する。"""
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        x = (rect.left + rect.right) // 2
+        y = rect.bottom - 90
+        vx = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vy = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        nx = (x - vx) * 65535 // max(1, vw - 1)
+        ny = (y - vy) * 65535 // max(1, vh - 1)
+        move = INPUT()
+        move.type = INPUT_MOUSE
+        move.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_MOVE
+                               | MOUSEEVENTF_ABSOLUTE
+                               | MOUSEEVENTF_VIRTUALDESK, 0, 0)
+        down = INPUT()
+        down.type = INPUT_MOUSE
+        down.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_LEFTDOWN
+                               | MOUSEEVENTF_ABSOLUTE
+                               | MOUSEEVENTF_VIRTUALDESK, 0, 0)
+        up = INPUT()
+        up.type = INPUT_MOUSE
+        up.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_LEFTUP
+                             | MOUSEEVENTF_ABSOLUTE
+                             | MOUSEEVENTF_VIRTUALDESK, 0, 0)
+        send_inputs([move, down, up])
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+            time.sleep(0.3)
+        user32.SetForegroundWindow(hwnd)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+            time.sleep(0.3)
+        return False
+
+    # 1. deep link で前面に来るのを少し待つ (新規セッション等)
+    deadline = time.time() + 8
     hwnd = None
     while time.time() < deadline:
-        hwnd = foreground_claude()
-        if hwnd:
+        fg = user32.GetForegroundWindow()
+        if fg and is_claude(fg):
+            hwnd = fg
             break
         time.sleep(0.4)
+    # 2. 来なければ、アイドルを確認してから窓を前面化する
     if not hwnd:
-        return False, "window_not_foreground"
-
-    # 2. 陽太さんがキー・マウスに触れていないことを確認する
-    deadline = time.time() + WAKE_IDLE_WAIT_SEC
-    info = LASTINPUTINFO()
-    info.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    while True:
-        if not user32.GetLastInputInfo(ctypes.byref(info)):
-            return False, "idle_check_failed"
-        idle_ms = (kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
-        if idle_ms >= WAKE_IDLE_SEC * 1000:
-            break
-        if time.time() >= deadline:
+        if not wait_idle():
             return False, "user_active"
-        time.sleep(0.5)
+        target = main_claude_window()
+        if not target:
+            return False, "window_not_found"
+        if not activate(target):
+            return False, "activation_failed"
+        hwnd = target
+    # 3. 打つ前に、もう一度アイドルを確認する
+    if not wait_idle():
+        return False, "user_active"
 
-    # 3. 本文を打つ (text が None のときは送信だけ)
+    # 4. 本文を打つ (text が None のときは送信だけ)
     if text is not None:
         events = []
         for ch in text:
@@ -1884,14 +1985,16 @@ def _wake_screen_deliver_win(text) -> tuple:
                 events.append(key(scan=unit,
                                   flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
         for start in range(0, len(events), 100):
-            if foreground_claude() != hwnd:
+            fg = user32.GetForegroundWindow()
+            if not fg or not is_claude(fg):
                 return False, "focus_lost"
             if not send_inputs(events[start:start + 100]):
                 return False, "send_input_failed"
             time.sleep(0.02)
 
-    # 4. 送信 (Enter)
-    if foreground_claude() != hwnd:
+    # 5. 送信 (Enter)
+    fg = user32.GetForegroundWindow()
+    if not fg or not is_claude(fg):
         return False, "focus_lost"
     if not send_inputs([key(VK_RETURN),
                         key(VK_RETURN, flags=KEYEVENTF_KEYUP)]):

@@ -201,6 +201,141 @@ def test_poll_sec_must_be_positive():
         assert all("次" not in line for line in mbs.describe(data, NOW))
 
 
+# ---- 取り次ぎ依頼(requests)の進捗行 ----
+
+def _req(rid="req-20261113-01", stage="saved", title="件名", reason=None,
+         updated_ago=None, **times_ago):
+    """見張りの形式の要素を作る。times_ago は段階名=何秒前。
+    updated は既定でいちばん新しい段階の時刻(明示もできる)。"""
+    times = {k: NOW - ago for k, ago in times_ago.items()}
+    e = {"id": rid, "title": title, "stage": stage, "times": times,
+         "updated": (NOW - updated_ago if updated_ago is not None
+                     else max(times.values()) if times else NOW)}
+    if reason is not None:
+        e["reason"] = reason
+    return e
+
+
+def test_request_rows_fractions():
+    cases = [
+        (_req(stage="detected", detected=10), 0.4),
+        (_req(stage="saved", detected=12, saved=10), 0.6),
+        (_req(stage="ack", detected=12, saved=10, ack=5), 0.8),
+        (_req(stage="done", detected=12, saved=10, ack=8, done=5), 1.0),
+        # 失敗は満タン(色は描く側が失敗の色にする)
+        (_req(stage="failed", detected=12, saved=10, ack=5,
+              reason="だめでした"), 1.0),
+    ]
+    for entry, frac in cases:
+        rows = mbs.request_rows({"requests": [entry]}, NOW)
+        assert len(rows) == 1 and rows[0]["fraction"] == frac, entry["stage"]
+        assert rows[0]["stage_label"] == mbs.REQ_STAGE_LABELS[entry["stage"]]
+    rows = mbs.request_rows({"requests": [cases[-1][0]]}, NOW)
+    assert rows[0]["finished"] and rows[0]["fail_reason"] == "だめでした"
+    assert rows[0]["note"] == "だめでした"
+
+
+def test_request_rows_warn_recorded_gaps():
+    # 検知→保存が61秒(記録済み) → warn。60秒ちょうどは warn にしない
+    e = _req(stage="ack", detected=200, saved=139, ack=100)
+    assert mbs.request_rows({"requests": [e]}, NOW)[0]["warn"] == "warn"
+    e = _req(stage="ack", detected=200, saved=140, ack=100)
+    assert mbs.request_rows({"requests": [e]}, NOW)[0]["warn"] == "none"
+    # 保存→受領が61秒(記録済み) → warn
+    e = _req(stage="ack", detected=200, saved=180, ack=119)
+    assert mbs.request_rows({"requests": [e]}, NOW)[0]["warn"] == "warn"
+    # 受領→完了が30分超(記録済み。完了しても注意は残る)
+    base = NOW - 2000
+    e = {"id": "req-20261113-02", "title": "件名", "stage": "done",
+         "times": {"detected": base, "saved": base + 10, "ack": base + 20,
+                   "done": base + 20 + 1801},
+         "updated": base + 20 + 1801}
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["warn"] == "warn" and rows[0]["fraction"] == 1.0
+
+
+def test_request_rows_warn_waiting_and_red():
+    # 保存が来ないまま61秒(検知→保存の区間で待ち) → warn
+    rows = mbs.request_rows({"requests": [_req(stage="detected", detected=61)]}, NOW)
+    assert rows[0]["warn"] == "warn"
+    # 受領が来ないまま61秒(保存→受領の区間で待ち) → warn
+    rows = mbs.request_rows({"requests": [
+        _req(stage="saved", detected=100, saved=90)]}, NOW)
+    assert rows[0]["warn"] == "warn"
+    # 完了が来ないまま30分超(受領→完了の区間で待ち) → warn
+    rows = mbs.request_rows({"requests": [
+        _req(stage="ack", detected=2000, saved=1990, ack=1801)]}, NOW)
+    assert rows[0]["warn"] == "warn"
+    # 検知から5分を超えて受領が無い → red(warn より強い)
+    rows = mbs.request_rows({"requests": [
+        _req(stage="saved", detected=301, saved=290)]}, NOW)
+    assert rows[0]["warn"] == "red"
+    # 5分ちょうどは red にしない(保存→受領の待ちで warn にはなる)
+    rows = mbs.request_rows({"requests": [
+        _req(stage="saved", detected=300, saved=290)]}, NOW)
+    assert rows[0]["warn"] == "warn"
+    # 受領があれば、長く待っても red にはならない(受領→完了の待ちで warn)
+    rows = mbs.request_rows({"requests": [
+        _req(stage="ack", detected=4000, saved=3990, ack=3900)]}, NOW)
+    assert rows[0]["warn"] == "warn"
+
+
+def test_request_rows_selection_limits():
+    active = [_req(rid=f"req-20261113-{i:02d}", stage="saved",
+                   detected=12 + i * 10, saved=10 + i * 10) for i in range(7)]
+    rows = mbs.request_rows({"requests": active}, NOW)
+    assert len(rows) == 5   # 進行中は新しい順に5件まで
+    assert [r["id"] for r in rows] == [f"req-20261113-{i:02d}" for i in range(5)]
+    done = [_req(rid=f"req-20261112-{i:02d}", stage="done",
+                 detected=130 + i * 10, saved=120 + i * 10,
+                 ack=110 + i * 10, done=100 + i * 10) for i in range(5)]
+    rows = mbs.request_rows({"requests": done}, NOW)
+    assert len(rows) == 3   # 終わったものは新しい順に3件まで
+    assert [r["id"] for r in rows] == [f"req-20261112-{i:02d}" for i in range(3)]
+    # 進行中が先、終わったものが後
+    rows = mbs.request_rows({"requests": done + active}, NOW)
+    assert [r["finished"] for r in rows] == [False] * 5 + [True] * 3
+
+
+def test_request_rows_done_expiry():
+    # 完了から10分を超えたら出さない。ちょうど10分は出す
+    e = _req(stage="done", detected=730, saved=720, ack=710, done=601)
+    assert mbs.request_rows({"requests": [e]}, NOW) == []
+    e = _req(stage="done", detected=730, saved=720, ack=710, done=600)
+    assert len(mbs.request_rows({"requests": [e]}, NOW)) == 1
+    # 失敗は古くても残る(消すのは見る人)
+    f = _req(stage="failed", detected=9000, saved=8990, ack=8980,
+             reason="失敗の理由", updated_ago=8900)
+    rows = mbs.request_rows({"requests": [f]}, NOW)
+    assert len(rows) == 1 and rows[0]["note"] == "失敗の理由"
+
+
+def test_request_rows_labels():
+    rows = mbs.request_rows({"requests": [
+        _req(stage="saved", detected=30, saved=25)]}, NOW)
+    assert rows[0]["label"] == "保存 25秒"
+    assert rows[0]["title"] == "件名" and not rows[0]["finished"]
+    rows = mbs.request_rows({"requests": [
+        _req(stage="done", detected=100, saved=90, ack=80, done=70)]}, NOW)
+    assert rows[0]["label"] == "完了" and rows[0]["finished"]
+
+
+def test_request_rows_bad_input_is_quiet():
+    assert mbs.request_rows(None, NOW) == []
+    assert mbs.request_rows({}, NOW) == []
+    assert mbs.request_rows({"requests": None}, NOW) == []
+    assert mbs.request_rows({"requests": [{"id": "x"}]}, NOW) == []
+    assert mbs.request_rows({"requests": [
+        {"id": "req-1", "stage": "sent", "times": {"detected": NOW}}]}, NOW) == []
+    assert mbs.request_rows({"requests": [
+        {"id": "req-1", "stage": "saved", "times": {}}]}, NOW) == []
+    assert mbs.request_rows({"requests": ["junk", 42]}, NOW) == []
+    # 見張りが止まって古すぎるファイルは丸ごと出さない
+    data = {"last_poll": NOW - mbs.FORGET_SEC - 1,
+            "requests": [_req(stage="saved", detected=8, saved=5)]}
+    assert mbs.request_rows(data, NOW) == []
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
 

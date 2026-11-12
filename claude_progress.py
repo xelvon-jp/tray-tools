@@ -33,6 +33,11 @@
 # ひろげると、見張りの休止／再開(合図ファイル bridge_control を切り替えるだけ。
 # 従うのは見張り側)。全員待機中(Muse も Claude も指示待ち)は枠がゆっくり明滅する。
 #
+# 取り次ぎ依頼(req-*)の進捗行も相乗りする: 同じ状態ファイルの requests を
+# muse_bridge_status.request_rows(純関数)で整え、ブリッジ行の下に出す。バーは
+# 段階(送信→検知→保存→受領→完了)の進み具合。失敗の行は ✕ で消すまで残る
+# (消した控えはこのパネルが持つだけで、データ側は消えない)。
+#
 # 操作: 行をクリック = そのセッションをデスクトップアプリで開く(claude://code/continue)。
 #       行の右端の ✕ = その行を消す(状態ファイルを消す。そのセッションが次に動けばまた出る)。
 #       Ctrl+ドラッグ = 移動(場所を覚える)。Copilot の状態監視バーと同じ作法で、
@@ -263,11 +268,18 @@ def coop_row(muse, entries, now=None, events=None) -> dict | None:
             "key": (view["tone"], muse.get("kind_since") if has_kind else muse.get("since"))}
 
 
+def req_rows(data, now=None) -> list:
+    """取り次ぎ依頼の進捗行。出す行の選別と割合・注意の計算は
+    muse_bridge_status.request_rows(純関数)。計算結果をそのまま行に持たせる
+    (経過の表示は3秒ごとの受け取りとタイマーで進む)。"""
+    return [dict(r, _req=True) for r in mbs.request_rows(data, now)]
+
+
 def row_height(row) -> int:
     if row.get("_coop"):
         return (coop_stage.COOP_COLLAPSED_HEIGHT if row.get("_collapsed")
                 else coop_stage.coop_height(row.get("_size") or "large"))
-    if row.get("_copilot") or row.get("_muse"):
+    if row.get("_copilot") or row.get("_muse") or row.get("_req"):
         return ROW_HEIGHT   # Claude の行と同じ2段組み
     return COMPACT_HEIGHT if row.get("_compact") else ROW_HEIGHT
 
@@ -300,6 +312,9 @@ class ClaudeProgressPanel(QWidget):
         self._copilot_dismissed = None
         # ✕で閉じた Muse 見張りの状態((kind か state, kind_since か since))。同じ状態の間は出さない。
         self._muse_dismissed = None
+        # ✕で閉じた取り次ぎ依頼の行のキー(request_rows の "key")の控え。
+        # 段階が進んでキーが変わればまた出る。失敗はキーが変わらないので残る。
+        self._req_dismissed = set()
         # 連携ステージ行をたたんでいるか(再起動しても保つ。既定は広げた状態)
         self._coop_collapsed = bool(load_state(state_path).get("coop_collapsed"))
         # ブリッジの大きさ(再起動しても保つ)。stealth のときは帯だけの姿が
@@ -374,7 +389,11 @@ class ClaudeProgressPanel(QWidget):
                     self._bridge_size == "stealth"
                     and not self._stealth_hover
                     and now >= self._stealth_until)
-            rows = (([head] if head else []) + ([muse] if muse else [])
+            # 取り次ぎ依頼の行はブリッジ行の下。✕で閉じたものは、そのキーの間は出さない
+            all_reqs = req_rows(self._muse, now)
+            self._req_dismissed &= {r["key"] for r in all_reqs}
+            reqs = [r for r in all_reqs if r["key"] not in self._req_dismissed]
+            rows = (([head] if head else []) + ([muse] if muse else []) + reqs
                     + rows_to_show(self._entries, now, self._first_seen_done))
             if not rows:
                 self._rows = []
@@ -410,10 +429,13 @@ class ClaudeProgressPanel(QWidget):
             # 経過表示は3秒ごとの受け取りで進めば足りる)。
             # 連携ステージの行は、どの tone でもキャラが動く(寝息・点滅など)ので回す。
             # たたんでいる間は絵が無いので回さない(経過時間は3秒ごとの受け取りで進む)。
-            if any((not r.get("_compact") and not r.get("_copilot") and not r.get("_muse"))
+            # 取り次ぎ依頼の行は、進行中のものは経過が進むので回す。
+            if any((not r.get("_compact") and not r.get("_copilot")
+                    and not r.get("_muse") and not r.get("_req"))
                    or (r.get("_copilot")
                        and r["state"] in ("responding", "waiting_ai"))
                    or (r.get("_coop") and not r.get("_collapsed"))
+                   or (r.get("_req") and not r.get("finished"))
                    for r in rows):
                 if not self._timer.isActive():
                     self._timer.start(ANIMATION_MS)
@@ -543,6 +565,9 @@ class ClaudeProgressPanel(QWidget):
             return
         if entry.get("_muse"):
             self._paint_muse(p, entry, rect, now, hover)
+            return
+        if entry.get("_req"):
+            self._paint_req(p, entry, rect, now, hover)
             return
         if hover and cs.jump_url(entry):
             p.setPen(Qt.NoPen)
@@ -772,6 +797,64 @@ class ClaudeProgressPanel(QWidget):
         p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
                    sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
 
+    def _paint_req(self, p, entry, rect, now, hover):
+        """取り次ぎ依頼の行: Claude の行と同じ2段組み(件名と段階 / バーと補足)。
+
+        バーは段階の進み(検知 2/5 → 完了 5/5。送信は見張りからは見えない)。
+        割合・注意・ラベルは muse_bridge_status.request_rows が計算済み
+        (描くときに計算し直さない)。色は、完了=緑、失敗と赤信号=赤、
+        注意=橙、それ以外は実行中の青。"""
+        if entry["stage"] == "done":
+            color = STATE_COLORS[cs.DONE]
+        elif entry["stage"] == "failed" or entry["warn"] == "red":
+            color = MUSE_TONE_COLORS["alert"]
+        elif entry["warn"] == "warn":
+            color = MUSE_TONE_COLORS["warn"]
+        else:
+            color = STATE_COLORS[cs.RUNNING]
+        inner = rect.adjusted(PAD_X // 2, 4, -PAD_X // 2, -4)
+
+        # 1段目: 左に件名(無ければ ID)、右に段階と経過(注意は ⚠ と色で示す)
+        tail = entry["label"]
+        if entry["warn"] != "none":
+            tail = "⚠ " + tail
+        p.setFont(self._name_font)
+        fm = QFontMetrics(self._name_font)
+        tail_w = fm.horizontalAdvance(tail)
+        head = QRect(inner.left(), inner.top(), inner.width() - CLOSE_SIZE - CLOSE_GAP,
+                     fm.height())
+        p.setPen(color if entry["warn"] != "none" else SUBTEXT)
+        p.drawText(head, Qt.AlignRight | Qt.AlignVCenter, tail)
+        p.setPen(TEXT)
+        name = fm.elidedText(entry["title"] or entry["id"], Qt.ElideRight,
+                             max(0, head.width() - tail_w - 8))
+        p.drawText(head, Qt.AlignLeft | Qt.AlignVCenter, name)
+
+        # バー
+        track = QRectF(inner.left(), head.bottom() + 4, inner.width(), TRACK_HEIGHT)
+        p.setPen(Qt.NoPen)
+        p.setBrush(TRACK)
+        p.drawRoundedRect(track, 3, 3)
+        fraction = entry["fraction"]
+        if fraction > 0:
+            p.setBrush(color)
+            p.drawRoundedRect(QRectF(track.left(), track.top(),
+                                     max(track.height(), track.width() * fraction),
+                                     track.height()), 3, 3)
+
+        # 2段目: ID と、注意の説明・失敗の理由
+        sub = entry["id"]
+        if entry["note"]:
+            sub += "・" + entry["note"]
+        p.setFont(self._sub_font)
+        sub_fm = QFontMetrics(self._sub_font)
+        p.setPen(color if (entry["warn"] != "none" or entry["stage"] == "failed")
+                 else SUBTEXT)
+        sub_rect = QRect(inner.left(), int(track.bottom()) + 2, inner.width(),
+                         sub_fm.height())
+        p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                   sub_fm.elidedText(sub, Qt.ElideRight, inner.width()))
+
     def _paint_compact(self, p, entry, rect, color):
         """折りたたんだ行: 状態の色の点・名前・終わった時刻だけ。バーの行より控えめに。"""
         inner = rect.adjusted(PAD_X // 2, 0, -PAD_X // 2, 0)
@@ -920,6 +1003,8 @@ class ClaudeProgressPanel(QWidget):
             return
         if 0 <= index < len(self._rows) and self._rows[index].get("_muse"):
             return   # Muse 見張りの行は開く先が無い(見るだけ)
+        if 0 <= index < len(self._rows) and self._rows[index].get("_req"):
+            return   # 取り次ぎ依頼の行も開く先が無い(見るだけ)
         if 0 <= index < len(self._rows) and self._on_open is not None:
             try:
                 self._on_open(self._rows[index])
@@ -944,6 +1029,14 @@ class ClaudeProgressPanel(QWidget):
             # Muse 見張りの行の ✕: その状態の間だけ閉じる(Copilot と同じ作法)。
             self._muse_dismissed = entry["key"]
             self._muse = None
+            self._hover = self._hover_close = -1
+            self._tick()
+            return
+        if entry.get("_req"):
+            # 取り次ぎ依頼の行の ✕: その段階の間だけ閉じる。段階が進んで
+            # キーが変わればまた出る。失敗はキーが変わらないので、データから
+            # 消えるまで閉じたまま(状態ファイルや見張り側は触らない)。
+            self._req_dismissed.add(entry["key"])
             self._hover = self._hover_close = -1
             self._tick()
             return

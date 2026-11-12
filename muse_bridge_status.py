@@ -27,6 +27,18 @@
 #                 表示は画面判定(kind)を土台に上乗せし、食い違いは注意表示にする
 #                 (どちらも黙って正にしない)。60分より古い申告は無いものとして扱う。
 #
+#   requests      取り次ぎ依頼(req-YYYYMMDD-NN)の進み具合。見張りが @ミドリ の
+#                 依頼と、ミドリの返事(受領／完了／失敗の書き出しの行)を見て
+#                 書き込む列(形式の正本は見張り側)。新しい順に最大10件。
+#                 要素は {"id", "title"(短い件名。最大40字), "stage", "times",
+#                 "updated"} と、失敗のときだけ "reason"(失敗の理由)。
+#                 stage は "detected"(検知) | "saved"(保存) | "ack"(受領) |
+#                 "done"(完了) | "failed"(失敗)。送信は見張りからは見えない
+#                 ので stage には無い(バーの段階としては1段目に数える)。
+#                 times は届いた段階だけを持つ {"detected": 時刻, ...} の形
+#                 (時刻は epoch 秒)。updated は最後に更新した時刻(epoch 秒)。
+#                 表示への変換は request_rows(純関数)。
+#
 # 使い道は2つ: ツールチップの行(describe)と、進捗パネルの Muse 見張り行
 # (panel_view。バーの割合まで含めてここで計算し、描画は claude_progress が担う)。
 import json
@@ -329,3 +341,130 @@ def panel_view(data, now=None):
             view["settle_fraction"] = min(1.0, max(0.0, settle / need))
             view["settle_text"] = f"{int(settle)}/{int(need)}"
     return view
+
+
+# ---- 取り次ぎ依頼(requests)の進み具合 ----
+# バーは5段(送信→検知→保存→受領→完了)。送信はデータに無いので検知が
+# 2/5 から始まる。失敗は満タンで、色は描く側が失敗の色にする。
+REQ_FRACTIONS = {"detected": 0.4, "saved": 0.6, "ack": 0.8,
+                 "done": 1.0, "failed": 1.0}
+REQ_STAGE_LABELS = {"detected": "検知", "saved": "保存", "ack": "受領",
+                    "done": "完了", "failed": "失敗"}
+REQ_MAX_ACTIVE = 5      # 進行中は新しい順にこの数まで
+REQ_MAX_FINISHED = 3    # 終わったものは新しい順にこの数まで
+REQ_DONE_TTL_SEC = 600  # 完了はこの秒数が過ぎたら出さない(失敗は消えない)
+# 段階の間の目安(開始の段階, 終わりの段階, 秒数)。待ちの間は経過で、
+# 次の段階に届いたあとは記録された間で判定する。
+REQ_SPANS = (("detected", "saved", 60),
+             ("saved", "ack", 60),
+             ("ack", "done", 30 * 60))
+REQ_NO_ACK_RED_SEC = 300  # 検知からこの秒数、受領が無ければ赤(red)
+
+
+def _req_row(entry, now):
+    """requests の要素1つを表示用の行にする。形が合わなければ None。"""
+    rid = entry.get("id")
+    stage = entry.get("stage")
+    if not isinstance(rid, str) or not rid or stage not in REQ_STAGE_LABELS:
+        return None
+    raw_times = entry.get("times")
+    if not isinstance(raw_times, dict):
+        return None
+    times = {}
+    for name in ("detected", "saved", "ack", "done"):
+        v = raw_times.get(name)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            times[name] = v
+    if not times:
+        return None
+    updated = _num(entry, "updated")
+    finished = stage in ("done", "failed")
+    # 終わった時刻(完了は times の done、失敗は updated。欠けたら他方で代用)
+    ended = times.get("done") or updated
+    if ended is None:
+        ended = max(times.values())
+    earliest = min(times.values())   # 送信は無いので、最初の検知時刻が起点
+    warn, note = "none", ""
+    for a_key, b_key, limit in REQ_SPANS:
+        a = times.get(a_key)
+        if a is None:
+            continue
+        b = times.get(b_key)
+        if b is None and finished and b_key == "done":
+            b = ended   # 失敗は終わりの時刻で受領からの間を判定する
+        if b is not None:
+            gap, waiting = b - a, False
+        elif not finished:
+            gap, waiting = now - a, True
+        else:
+            continue
+        if gap > limit:
+            warn = "warn"
+            note = (f"{REQ_STAGE_LABELS[a_key]}から{REQ_STAGE_LABELS[b_key]}まで "
+                    f"{fmt_dur(gap)}" + (" 経過" if waiting else " かかりました"))
+            break
+    if not finished and "ack" not in times \
+            and now - earliest > REQ_NO_ACK_RED_SEC:
+        warn = "red"
+        note = "受領が5分以上来ていません"
+    reason = entry.get("reason")
+    reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    if stage == "failed" and not note:
+        note = reason or ""
+    stage_at = ended if finished else times.get(stage)
+    if finished or stage_at is None:
+        label = REQ_STAGE_LABELS[stage]
+    else:
+        label = f"{REQ_STAGE_LABELS[stage]} {fmt_dur(now - stage_at)}"
+    title = entry.get("title")
+    return {
+        "id": rid,
+        "title": title.strip() if isinstance(title, str) else "",
+        "stage": stage,
+        "stage_label": REQ_STAGE_LABELS[stage],
+        "fraction": REQ_FRACTIONS[stage],
+        "warn": warn,
+        "label": label,
+        "note": note,
+        "fail_reason": reason if stage == "failed" else None,
+        "finished": finished,
+        "sent_at": earliest,
+        "ended_at": ended if finished else None,
+        # ✕で閉じた判定のキー。段階が進めば(キーが変われば)また出る。
+        "key": (rid, stage, stage_at),
+    }
+
+
+def request_rows(data, now=None) -> list:
+    """取り次ぎ依頼の進捗行(描く側がそのまま使える形)を返す純関数。
+
+    進行中は新しい順に REQ_MAX_ACTIVE 件、終わったものは新しい順に
+    REQ_MAX_FINISHED 件(進行中を先に並べる)。完了は REQ_DONE_TTL_SEC を
+    過ぎたら落とす(失敗はデータにある限り残す。消すのは見る人)。
+    見張りが止まって FORGET_SEC より古いファイルは丸ごと出さない。"""
+    if not isinstance(data, dict):
+        return []
+    now = time.time() if now is None else now
+    last_poll = _num(data, "last_poll")
+    if last_poll is not None and now - last_poll > FORGET_SEC:
+        return []
+    raw = data.get("requests")
+    if not isinstance(raw, list):
+        return []
+    active, finished = [], []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        row = _req_row(entry, now)
+        if row is None:
+            continue
+        if row["stage"] == "done":
+            ended = row["ended_at"] if row["ended_at"] is not None \
+                else row["sent_at"]
+            if now - ended > REQ_DONE_TTL_SEC:
+                continue
+        (finished if row["finished"] else active).append(row)
+    active.sort(key=lambda r: -r["sent_at"])
+    finished.sort(key=lambda r: -(r["ended_at"] if r["ended_at"] is not None
+                                  else r["sent_at"]))
+    return active[:REQ_MAX_ACTIVE] + finished[:REQ_MAX_FINISHED]

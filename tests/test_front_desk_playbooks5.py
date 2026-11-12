@@ -39,31 +39,52 @@ def make_ctx(settings=None):
 class OpenRecorder:
     """_open_link の差し替え。開いた URL を記録する。"""
 
-    def __init__(self, result=True):
+    def __init__(self, result=True, fail_first=0):
         self.result = result
+        self.fail_first = fail_first
         self.urls = []
 
     def __call__(self, url):
         self.urls.append(url)
+        if len(self.urls) <= self.fail_first:
+            return False
         return self.result
 
 
-def patched(open_result=True):
-    """_open_link と _notify_pushover を差し替える文脈管理もどき。"""
+class DeliverRecorder:
+    """_wake_screen_deliver の差し替え。渡された text を記録する。"""
+
+    def __init__(self, result=(True, "sent")):
+        self.result = result
+        self.texts = []
+
+    def __call__(self, text):
+        self.texts.append(text)
+        return self.result
+
+
+def patched(open_result=True, screen_result=(True, "sent"),
+            open_fail_first=0):
+    """_open_link と _notify_pushover と _wake_screen_deliver を
+    差し替える文脈管理もどき。"""
     class _Patch:
         def __enter__(self):
-            self.opener = OpenRecorder(open_result)
+            self.opener = OpenRecorder(open_result, open_fail_first)
+            self.deliver = DeliverRecorder(screen_result)
             self.notes = []
             self._open = playbooks._open_link
             self._notify = playbooks._notify_pushover
+            self._deliver = playbooks._wake_screen_deliver
             playbooks._open_link = self.opener
             playbooks._notify_pushover = \
                 lambda title, message: self.notes.append(title) or True
+            playbooks._wake_screen_deliver = self.deliver
             return self
 
         def __exit__(self, *exc):
             playbooks._open_link = self._open
             playbooks._notify_pushover = self._notify
+            playbooks._wake_screen_deliver = self._deliver
             return False
 
     return _Patch()
@@ -101,6 +122,7 @@ def test_pb4034_new_session_success():
             out = session_wake(make_ctx({"log_path": log_path}), _params())
         assert out.ok, out.summary
         assert len(p.opener.urls) == 1
+        assert p.deliver.texts == [None]
         url = p.opener.urls[0]
         assert url.startswith("claude://code/new?q="), url
         query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
@@ -264,24 +286,96 @@ def test_pb4034_opus_deferred_to_relay():
         assert records[-1]["outcome"] == "deferred_to_relay"
 
 
-def test_pb4034_opus_screen_route_pending():
+def test_pb4034_opus_screen_route():
     now = time.time()
     cases = [
-        ({"host_session_id": OPUS, "state": "done", "ended": now}, "idle"),
-        ({"host_session_id": OPUS, "state": "fail", "ended": now},
-         "failed"),
-        (None, "absent"),
+        {"host_session_id": OPUS, "state": "done", "ended": now},
+        {"host_session_id": OPUS, "state": "fail", "ended": now},
+        None,
     ]
-    for entry, expected in cases:
+    for entry in cases:
         with tempfile.TemporaryDirectory() as td:
             ctx = _opus_ctx(td, entry, None)
             with patched() as p:
                 out = session_wake(ctx, _params(target="opus"))
-            assert not out.ok, (entry, out.summary)
-            assert expected in out.summary, (expected, out.summary)
-            assert p.opener.urls == []
+            assert out.ok, (entry, out.summary)
+            assert len(p.opener.urls) == 1
+            assert p.opener.urls[0].startswith(
+                "claude://claude.ai/epitaxy/"), p.opener.urls
+            assert OPUS in p.opener.urls[0]
+            assert p.deliver.texts == [MARKER + "\nお願いします"]
             records = _records(os.path.join(td, "wake-log.jsonl"))
-            assert records[-1]["outcome"] == "not_implemented"
+            assert records[-1]["outcome"] == "sent"
+
+
+def test_pb4034_screen_route_second_url():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as td:
+        ctx = _opus_ctx(
+            td, {"host_session_id": OPUS, "state": "done", "ended": now},
+            None)
+        with patched(open_fail_first=1) as p:
+            out = session_wake(ctx, _params(target="opus"))
+        assert out.ok, out.summary
+        assert len(p.opener.urls) == 2
+        assert "continue?session=" in p.opener.urls[1]
+        records = _records(os.path.join(td, "wake-log.jsonl"))
+        assert records[-1]["outcome"] == "sent"
+
+
+def test_pb4034_new_opened_not_sent():
+    with tempfile.TemporaryDirectory() as td:
+        log_path = os.path.join(td, "wake-log.jsonl")
+        with patched(screen_result=(False, "user_active")) as p:
+            out = session_wake(make_ctx({"log_path": log_path}), _params())
+        assert not out.ok
+        assert len(p.notes) == 1
+        assert _records(log_path)[-1]["outcome"] == "opened_not_sent"
+
+
+def test_pb4034_midori_screen_route():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as td:
+        ctx = _opus_ctx(
+            td, None,
+            {"host_session_id": HAIKU, "state": "done", "ended": now})
+        with patched() as p:
+            out = session_wake(ctx, _params(target="midori"))
+        assert out.ok, out.summary
+        assert len(p.opener.urls) == 1 and HAIKU in p.opener.urls[0]
+        assert p.deliver.texts == [MARKER + "\nお願いします"]
+        records = _records(os.path.join(td, "wake-log.jsonl"))
+        assert records[-1]["outcome"] == "sent"
+        assert records[-1]["target"] == "midori"
+
+
+def test_pb4034_midori_busy():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as td:
+        ctx = _opus_ctx(
+            td, None,
+            {"host_session_id": HAIKU, "state": "running", "updated": now})
+        with patched() as p:
+            out = session_wake(ctx, _params(target="midori"))
+        assert not out.ok and out.state == model.RESULT_BLOCKED
+        assert p.opener.urls == [] and p.deliver.texts == []
+        records = _records(os.path.join(td, "wake-log.jsonl"))
+        assert records[-1]["outcome"] == "busy"
+
+
+def test_pb4034_midori_deferred_to_relay():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as td:
+        ctx = _opus_ctx(
+            td,
+            {"host_session_id": OPUS, "state": "done", "ended": now},
+            {"host_session_id": HAIKU, "state": "done", "ended": now})
+        with patched() as p:
+            out = session_wake(ctx, _params(target="midori"))
+        assert not out.ok and out.state == model.RESULT_BLOCKED
+        assert p.opener.urls == []
+        records = _records(os.path.join(td, "wake-log.jsonl"))
+        assert records[-1]["outcome"] == "deferred_to_relay"
 
 
 # ---- 登録 ---------------------------------------------------------------------
@@ -302,7 +396,12 @@ ALL_TESTS = [
     test_pb4034_guards,
     test_pb4034_opus_busy,
     test_pb4034_opus_deferred_to_relay,
-    test_pb4034_opus_screen_route_pending,
+    test_pb4034_opus_screen_route,
+    test_pb4034_screen_route_second_url,
+    test_pb4034_new_opened_not_sent,
+    test_pb4034_midori_screen_route,
+    test_pb4034_midori_busy,
+    test_pb4034_midori_deferred_to_relay,
     test_pb4034_registered,
 ]
 

@@ -1618,7 +1618,18 @@ WAKE_NEW_URL = "claude://code/new"
 WAKE_RATE_LIMIT = 3
 WAKE_RATE_WINDOW_SEC = 3600
 WAKE_BODY_MAX_CHARS = 20000
-_WAKE_TARGETS = ("opus", "new")
+_WAKE_TARGETS = ("opus", "midori", "new")
+# 既存セッションを開く deep link の候補 (順に試す。どちらで開けるか
+# 実地で確定するまで両方を残す。候補の出所は 2026-11-12 の Opus の回答)
+WAKE_SESSION_URLS = (
+    "claude://claude.ai/epitaxy/{sid}",
+    "claude://code/continue?session={sid}",
+)
+# 画面経由の送信の待ち: 前面の窓が Claude になるまで (秒)、
+# 陽太さんのアイドルを確認するまで (秒) と、必要なアイドル (秒)
+WAKE_FOREGROUND_WAIT_SEC = 25
+WAKE_IDLE_WAIT_SEC = 30
+WAKE_IDLE_SEC = 3
 
 
 def _wake_log_path(ctx: PlaybookContext) -> str:
@@ -1713,6 +1724,179 @@ def _open_link(url: str) -> bool:
         return True
     except (AttributeError, OSError):
         return False
+
+
+def _wake_screen_deliver(text) -> tuple:
+    """前面の Claude の窓へ text を打ち込み、Enter で送信する。
+
+    text が None のときは打ち込まず、送信 (Enter) だけを行う
+    (新規セッションは deep link が本文を入力欄へ入れてあるため)。
+    戻り値は (成否, 理由)。Windows 以外では (False, "not_windows")。
+    テストでは差し替える。
+
+    安全の作法 (見張りのつつき v39 と同じ):
+    - 前面の窓が Claude アプリのものだと確認できるまで打たない
+    - 陽太さんがキー・マウスに触れている間は打たない
+      (アイドル WAKE_IDLE_SEC 秒を確認してから打つ)
+    - 打鍵の途中で前面の窓が変わったら中断する
+    画面への入力と送信は、2026-11-13 に Nagato の OK を得て実装した
+    (それまでは PB-4034 の画面経由は未実装で not_implemented を
+    返していた)。
+    """
+    if os.name != "nt":
+        return False, "not_windows"
+    try:
+        return _wake_screen_deliver_win(text)
+    except Exception:  # noqa: BLE001
+        return False, "exception"
+
+
+def _wake_screen_deliver_win(text) -> tuple:
+    """_wake_screen_deliver の Windows 実装 (ctypes の SendInput)。"""
+    import ctypes
+    from ctypes import wintypes
+
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    VK_RETURN = 0x0D
+    VK_SHIFT = 0x10
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+    user32.GetLastInputInfo.restype = wintypes.BOOL
+    user32.SendInput.argtypes = [
+        wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+    kernel32.GetTickCount.argtypes = []
+    kernel32.GetTickCount.restype = wintypes.DWORD
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    def foreground_claude():
+        """前面の窓が Claude アプリのものなら HWND、違えば None。"""
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return None
+        try:
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)):
+                return None
+            name = buf.value.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+            return hwnd if name.startswith("claude") else None
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def send_inputs(events) -> bool:
+        arr = (INPUT * len(events))(*events)
+        sent = user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+        return sent == len(events)
+
+    def key(vk=0, scan=0, flags=0):
+        item = INPUT()
+        item.type = INPUT_KEYBOARD
+        item.u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+        return item
+
+    # 1. 前面の窓が Claude アプリのものになるまで待つ
+    deadline = time.time() + WAKE_FOREGROUND_WAIT_SEC
+    hwnd = None
+    while time.time() < deadline:
+        hwnd = foreground_claude()
+        if hwnd:
+            break
+        time.sleep(0.4)
+    if not hwnd:
+        return False, "window_not_foreground"
+
+    # 2. 陽太さんがキー・マウスに触れていないことを確認する
+    deadline = time.time() + WAKE_IDLE_WAIT_SEC
+    info = LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    while True:
+        if not user32.GetLastInputInfo(ctypes.byref(info)):
+            return False, "idle_check_failed"
+        idle_ms = (kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+        if idle_ms >= WAKE_IDLE_SEC * 1000:
+            break
+        if time.time() >= deadline:
+            return False, "user_active"
+        time.sleep(0.5)
+
+    # 3. 本文を打つ (text が None のときは送信だけ)
+    if text is not None:
+        events = []
+        for ch in text:
+            if ch == "\r":
+                continue
+            if ch == "\n":
+                # 入力欄の改行は Shift+Enter (素の Enter は送信になる)
+                events += [key(VK_SHIFT), key(VK_RETURN),
+                           key(VK_RETURN, flags=KEYEVENTF_KEYUP),
+                           key(VK_SHIFT, flags=KEYEVENTF_KEYUP)]
+                continue
+            raw = ch.encode("utf-16-le")
+            for i in range(0, len(raw), 2):
+                unit = raw[i] | (raw[i + 1] << 8)
+                events.append(key(scan=unit, flags=KEYEVENTF_UNICODE))
+                events.append(key(scan=unit,
+                                  flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+        for start in range(0, len(events), 100):
+            if foreground_claude() != hwnd:
+                return False, "focus_lost"
+            if not send_inputs(events[start:start + 100]):
+                return False, "send_input_failed"
+            time.sleep(0.02)
+
+    # 4. 送信 (Enter)
+    if foreground_claude() != hwnd:
+        return False, "focus_lost"
+    if not send_inputs([key(VK_RETURN),
+                        key(VK_RETURN, flags=KEYEVENTF_KEYUP)]):
+        return False, "send_input_failed"
+    return True, "sent"
 
 
 def _notify_pushover(title: str, message: str) -> bool:
@@ -1818,47 +2002,80 @@ def session_wake(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         if folder:
             url += "&folder=" + urllib.parse.quote(folder)
         log.step("open", "start", WAKE_NEW_URL)
-        if _open_link(url):
-            log.step("open", "ok")
+        if not _open_link(url):
+            log.step("open", "ng")
+            return finish(
+                _failed(log, "新規セッションの deep link を"
+                             "開けませんでした"),
+                "failed", notify=True)
+        log.step("open", "ok")
+        # 本文は deep link が入力欄へ入れてある。送信 (Enter) だけ
+        # 画面経由で行う (2026-11-13、Nagato の OK で実装)。
+        sent, why = _wake_screen_deliver(None)
+        log.step("screen", "ok" if sent else "ng", why)
+        if sent:
             return finish(
                 ExecOutcome(
                     ok=True,
-                    summary="新規セッションを開きました。セッションの"
-                            "報告は記録ファイルに delivery_id と"
-                            "対応付けて書かれます"),
+                    summary="新規セッションを開いて送信しました。"
+                            "セッションの報告は記録ファイルに "
+                            "delivery_id と対応付けて書かれます"),
                 "sent")
-        log.step("open", "ng")
         return finish(
-            _failed(log, "新規セッションの deep link を開けませんでした"),
-            "failed", notify=True)
+            _failed(log, "新規セッションは開きましたが送信できません"
+                         f"でした ({why})"),
+            "opened_not_sent", notify=True)
 
-    # target == "opus": まず両セッションの状態を見る。
+    # 既存セッション (opus / midori): まず両セッションの状態を見る。
+    # midori は 2026-11-13 に Nagato の指示で宛先へ追加した
+    # (2026-11-12 の「窓口セッションは宛先に入れない」を変更)。
     opus_id = ctx.settings.get("opus_session_id") \
         or WAKE_DEFAULT_OPUS_SESSION
     haiku_id = ctx.settings.get("haiku_session_id") \
         or WAKE_DEFAULT_HAIKU_SESSION
-    opus_state = _wake_session_state(ctx, opus_id, now)
-    log.step("session.opus", opus_state, opus_id)
-    if opus_state == "busy":
+    if target == "opus":
+        target_id, other_id = opus_id, haiku_id
+    else:
+        target_id, other_id = haiku_id, opus_id
+    target_state = _wake_session_state(ctx, target_id, now)
+    log.step(f"session.{target}", target_state, target_id)
+    if target_state == "busy":
         return finish(
             _blocked(log, "宛先のセッションが作業中です (running/ask)"),
             "busy", notify=True)
-    haiku_state = _wake_session_state(ctx, haiku_id, now)
-    log.step("session.haiku", haiku_state, haiku_id)
-    if haiku_state != "absent":
-        # 窓口が起きている間は SendMessage の取り次ぎが一番安全。
+    other_state = _wake_session_state(ctx, other_id, now)
+    log.step("session.other", other_state, other_id)
+    if other_state != "absent":
+        # もう一方が起きている間は SendMessage の取り次ぎが一番安全。
         # 画面経由は使わず、取り次ぎに任せる。
         return finish(
-            _blocked(log, "窓口が起きているため、画面経由は使わず、"
-                          "窓口の SendMessage 取り次ぎに任せます"),
+            _blocked(log, "もう一方のセッションが起きているため、"
+                          "画面経由は使わず、SendMessage の取り次ぎ"
+                          "に任せます"),
             "deferred_to_relay")
-    # 誰も起きていないので画面経由の対象だが、入力と送信は
-    # 実地テスト (Nagato の OK) 待ちで未実装。
+    # 誰も起きていないので画面経由: セッションを deep link で開き、
+    # 本文を打ち込んで送信する (2026-11-13、Nagato の OK で実装。
+    # それまでは not_implemented を返していた)。
+    why = "no_url"
+    for template in WAKE_SESSION_URLS:
+        url = template.format(sid=target_id)
+        log.step("open", "start", template)
+        if not _open_link(url):
+            log.step("open", "ng", template)
+            continue
+        log.step("open", "ok", template)
+        sent, why = _wake_screen_deliver(text)
+        log.step("screen", "ok" if sent else "ng", why)
+        if sent:
+            return finish(
+                ExecOutcome(
+                    ok=True,
+                    summary=f"{target} のセッションへ画面経由で"
+                            "送信しました"),
+                "sent")
     return finish(
-        _failed(log, "誰も起きていないため画面経由の対象ですが、"
-                     "入力と送信の実装は実地テスト待ちです "
-                     f"(セッションの状態: {opus_state})"),
-        "not_implemented")
+        _failed(log, f"画面経由で送信できませんでした ({why})"),
+        "failed", notify=True)
 
 
 # -- 登録簿と実行の振り分け ----------------------------------------------

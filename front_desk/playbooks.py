@@ -13,6 +13,7 @@ playbook-spec.md (A9 の具体化)。
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import json
@@ -457,10 +458,12 @@ def _spawn_delayed_task_restart(ctx: PlaybookContext, task: str,
     タスクを起こす) を、ヘルパーの中に同じ順序で入れてある。
     ヘルパー自身は powershell なので、python の絞り込みには当たらない。
 
-    絞り込みの文字列は単一引用符で書く。Start-Process の引数連結
-    (PS 5.1) は二重引用符を含む引数を壊すことがあり、旧版の
-    Stop/Start のみ版が 2026-11-10 12:29 に無言で効かなかった
-    疑いが濃いため。
+    絞り込みの文字列は単一引用符で書く。ただし inner をそのまま
+    単一引用符で囲んで Start-Process に渡すと、中の単一引用符
+    ('python*' など) のところで文字列が切れて文法が壊れ、
+    Start-Process の例外になる (2026-11-12 実測、req-20261112-68)。
+    inner は UTF-16LE の base64 にして -EncodedCommand で渡す。
+    base64 には引用符が含まれないので、この問題が丸ごと消える。
     """
     kill = ("Get-CimInstance Win32_Process | Where-Object "
             "{ $_.Name -like 'python*' -and "
@@ -471,8 +474,9 @@ def _spawn_delayed_task_restart(ctx: PlaybookContext, task: str,
              f"{kill}; "
              f"Start-Sleep -Seconds {gap_sec}; "
              f"Start-ScheduledTask -TaskName {task}")
+    encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
     script = ("Start-Process powershell -WindowStyle Hidden "
-              f"-ArgumentList '-NoProfile','-Command','{inner}'")
+              f"-ArgumentList '-NoProfile','-EncodedCommand','{encoded}'")
     return _ps(ctx, script, timeout=30)
 
 
@@ -1428,6 +1432,12 @@ INBOX_STATUS_DEFAULT_TAIL = 15
 INBOX_STATUS_MAX_TAIL = 100
 INBOX_STATUS_MAX_ROWS = 100
 INBOX_STATUS_MAX_CHARS = 12000
+# 部分ごとの文字数の割り振り。全体を末尾から一括で切ると、最後にある
+# 見張りログが先に消える (2026-11-12、アオのレビュー)。部分ごとに
+# 絞れば、どこかが膨れても他の部分は残る。合計は全体の上限に収まる。
+INBOX_STATUS_INBOX_CHARS = 4000
+INBOX_STATUS_WAKE_CHARS = 3000
+INBOX_STATUS_MONITOR_CHARS = 4000
 
 
 def _inbox_listing(inbox_dir: str):
@@ -1502,6 +1512,11 @@ def inbox_status(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         inbox_count = len(rows)
         log.step("inbox", "ok", f"{inbox_dir} ({inbox_count} 件)")
         shown = rows[-INBOX_STATUS_MAX_ROWS:]
+        # 文字数の割り振りでも絞る。落とすのは古い方で、新しい方を残す。
+        while len(shown) > 1 and sum(
+                len(name) + len(rid) + 5 for name, rid in shown
+        ) > INBOX_STATUS_INBOX_CHARS:
+            shown.pop(0)
         body_lines = []
         if len(shown) < len(rows):
             body_lines.append(f"…(先頭 {len(rows) - len(shown)} 件を省略)")
@@ -1527,7 +1542,11 @@ def inbox_status(ctx: PlaybookContext, params: dict) -> ExecOutcome:
                                           tail, contains))
             except OSError as exc:
                 seg.append(f"(読めません: {str(exc)[:80]})")
-        parts.append("\n".join(seg))
+        wake_body = "\n".join(seg[1:])
+        if len(wake_body) > INBOX_STATUS_WAKE_CHARS:
+            wake_body = ("…(この部分の先頭を省略)\n"
+                         + wake_body[-INBOX_STATUS_WAKE_CHARS:])
+        parts.append(seg[0] + "\n" + wake_body)
 
     try:
         size = os.path.getsize(monitor_path)
@@ -1541,8 +1560,12 @@ def inbox_status(ctx: PlaybookContext, params: dict) -> ExecOutcome:
             mlines = [ln for ln in mlines if needle in ln.lower()]
         mlines = mlines[-tail:]
         log.step("monitor", "ok", f"{monitor_path} ({len(mlines)} 行)")
+        mbody = "\n".join(mlines)
+        if len(mbody) > INBOX_STATUS_MONITOR_CHARS:
+            mbody = ("…(この部分の先頭を省略)\n"
+                     + mbody[-INBOX_STATUS_MONITOR_CHARS:])
         parts.append("--- monitor log ---\n"
-                     + ("\n".join(mlines) or "(該当行なし)"))
+                     + (mbody or "(該当行なし)"))
     except OSError as exc:
         log.step("monitor", "ng", str(exc)[:120])
         parts.append(f"--- monitor log ---\n読めません: {monitor_path}")

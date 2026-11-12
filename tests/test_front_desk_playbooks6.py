@@ -115,6 +115,28 @@ def test_pb5015_tail_clamp():
         assert "line 29" in out.detail and "line 0" not in out.detail
 
 
+def test_pb5015_section_caps_keep_monitor_tail():
+    # 置き場が大きくても、見張りログの末尾 (いちばん欲しい部分) が
+    # 全体の上限で先に削られないこと (部分ごとの割り振り)
+    with tempfile.TemporaryDirectory() as td:
+        settings = _seed(td)
+        inbox = settings["inbox_dir"]
+        for i in range(60):
+            _write(os.path.join(
+                inbox, f"20261112-10{i:04d}-req-20261112-{i:02d}.json"),
+                json.dumps({"id": f"req-20261112-{i:02d}",
+                            "at": "x", "body": "b"}))
+        monitor = settings["monitor_log_path"]
+        _write(monitor, "".join(
+            f"[2026-11-12 23:00:{i:02d}] watcher line {i} " + "x" * 150 + "\n"
+            for i in range(40)))
+        out = inbox_status(make_ctx(settings), {"tail_lines": 100})
+        assert out.ok, out.summary
+        assert "watcher line 39" in out.detail
+        assert "--- monitor log ---" in out.detail
+        assert len(out.detail) <= playbooks.INBOX_STATUS_MAX_CHARS + 20
+
+
 def test_pb5015_registered():
     assert playbooks.PLAYBOOKS["pb5015"] is inbox_status
     assert playbooks.PLAYBOOK_ALIASES["inbox_status"] == "pb5015"
@@ -126,6 +148,7 @@ ALL_TESTS = [
     test_pb5015_missing_pieces,
     test_pb5015_guards,
     test_pb5015_tail_clamp,
+    test_pb5015_section_caps_keep_monitor_tail,
     test_pb5015_registered,
 ]
 

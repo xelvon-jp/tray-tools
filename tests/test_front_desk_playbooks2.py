@@ -255,7 +255,15 @@ def test_desk_sync_happy_path_defers_restart():
     assert m.git_called("merge", "--ff-only"), m.calls
     spawns = m.ps_called("Start-Process")
     assert len(spawns) == 1, m.ps_scripts()
-    helper = spawns[0]
+    outer = spawns[0]
+    # ヘルパーの中身は base64 (UTF-16LE) で -EncodedCommand に渡る。
+    # そのまま引用符で囲むと中の単一引用符で壊れるため (2026-11-12 実測)。
+    import base64
+    import re
+    assert "-EncodedCommand" in outer, outer
+    assert "Stop-Process" not in outer and "front_desk" not in outer, outer
+    encoded = re.search(r"-EncodedCommand','([^']+)'", outer).group(1)
+    helper = base64.b64decode(encoded).decode("utf-16-le")
     assert "Stop-ScheduledTask" in helper and "FrontDesk" in helper
     assert "Start-Sleep -Seconds 20" in helper, helper
     # 停止→開始だけでは切り離された本体が生き残る (2026-11-10 実測)。

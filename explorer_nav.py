@@ -51,6 +51,12 @@ except AttributeError:
 if _user32 is not None:
     _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
     _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.IsIconic.argtypes = [ctypes.c_void_p]
+    _user32.IsIconic.restype = ctypes.c_bool
+    _user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _user32.ShowWindow.restype = ctypes.c_bool
+    _user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    _user32.SetForegroundWindow.restype = ctypes.c_bool
 
 # クラス名の受け皿。Windowsのクラス名は256文字までと決まっている。
 _CLASS_NAME_BUFFER = 256
@@ -179,6 +185,27 @@ def navigate(hwnd: int, path: str) -> bool:
         return True
 
     return bool(_with_explorer_window(hwnd, go))
+
+
+# 最小化を戻すための ShowWindow の指定(SW_RESTORE)。
+_SW_RESTORE = 9
+
+
+def activate_window(hwnd: int) -> bool:
+    """そのウインドウを前面に出す。成否を返す(例外は投げない)。
+
+    呼び出し側がメニュー選択などの手操作の直後に呼ぶ前提。前面化は
+    「選んだらその窓で作業する」ためのもので、勝手にフォーカスを
+    奪う用途には使わない(window_tools が前面化を持たないのと同じ理由)。
+    最小化されていたら先に戻す。"""
+    if not hwnd or _user32 is None:
+        return False
+    try:
+        if _user32.IsIconic(hwnd):
+            _user32.ShowWindow(hwnd, _SW_RESTORE)
+        return bool(_user32.SetForegroundWindow(hwnd))
+    except OSError:
+        return False
 
 
 def last_active_hwnd() -> int:

@@ -5975,6 +5975,9 @@ class FilerWindow(QWidget):
                       if dest == "explorer_tab"
                       else explorer_nav.navigate(hwnd, path))
                 if ok:
+                    # 直前アクティブを選んだのだから、その窓を前面に出す
+                    # (実機確認 #6。前面化できなくても移動は済んでいる)
+                    explorer_nav.activate_window(hwnd)
                     return
                 self.log("フォルダを開く: エクスプローラで開けなかったので、新規窓で開きます")
             else:

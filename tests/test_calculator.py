@@ -168,3 +168,24 @@ def test_expression_mode_units_and_blank_seed():
         assert window._display.text() == "2+3 = 5"
     finally:
         window.close()
+
+
+def test_show_at_places_window():
+    """show_at: 指定の位置に出し、画面の端では内側に寄せる。"""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    window = calculator.create_window()
+    try:
+        window.show_at(QPoint(10, 10))
+        assert window.isVisible()
+        assert window.pos() == QPoint(10, 10)
+        screen = app.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            window.show_at(QPoint(avail.right() + 500, avail.bottom() + 500))
+            assert window.frameGeometry().right() <= avail.right()
+            assert window.frameGeometry().bottom() <= avail.bottom()
+    finally:
+        window.close()

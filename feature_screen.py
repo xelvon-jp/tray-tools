@@ -2111,19 +2111,23 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # 統合ピッカーの窓(フォルダブックマークの入口でもある)
     # ---------------------------------------------------------------
-    def _open_picker_calculator(self, expr: str):
+    def _open_picker_calculator(self, expr: str, pos=None):
         """統合ピッカーの `=` から電卓(式の作法)を開く。
 
         ピッカーは既に閉じている。縦ランチャの電卓と窓の持ち方を共有する
         (calculator_window / _close_calculator)。出ていたら作り直す
-        (作法が違う窓を使い回すと、種まきした式が残らないため)。"""
+        (作法が違う窓を使い回すと、種まきした式が残らないため)。
+        位置はピッカーのあった場所(実機確認 #1)。"""
         if self.calculator_window is not None:
             self._close_calculator()
         window = calculator.create_window(expression_mode=True,
                                           seed=expr or "")
         window.closed.connect(self._close_calculator)
         self.calculator_window = window
-        window.show_at_cursor_screen()
+        if pos is not None:
+            window.show_at(pos)
+        else:
+            window.show_at_cursor_screen()
 
     def _on_unified_ctrl_enter(self, picker, _name, data):
         """常駐側ピッカーの Ctrl+Enter。未登録アプリの行だけが対象で、

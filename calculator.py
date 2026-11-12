@@ -414,6 +414,27 @@ class CalculatorWindow(QWidget):
     # ---------------------------------------------------------------
     # 表示
     # ---------------------------------------------------------------
+    def show_at(self, pos) -> None:
+        """指定の位置(左上)に寄せて出す。画面からはみ出す分は内側に寄せる。
+
+        ピッカーの `=` から移るとき用。ピッカーのあった場所に出すことで、
+        画面の右下まで視線を動かさずに済む(実機確認 #1)。"""
+        screen = QGuiApplication.screenAt(pos)
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = min(max(pos.x(), avail.left()),
+                    max(avail.right() + 1 - self.width(), avail.left()))
+            y = min(max(pos.y(), avail.top()),
+                    max(avail.bottom() + 1 - self.height(), avail.top()))
+            self.move(x, y)
+        else:
+            self.move(pos)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def show_at_cursor_screen(self) -> None:
         """カーソルのある画面の右下(タスクバーを除いた領域)に出す。
         カレンダーと同じ場所感。"""

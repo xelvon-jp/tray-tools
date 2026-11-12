@@ -5852,8 +5852,10 @@ class FilerWindow(QWidget):
         threading.Thread(target=work, daemon=True).start()
         self.log(f"機能: 常駐へ実行を依頼しました（{item_key}）")
 
-    def _open_picker_calculator(self, expr: str) -> None:
-        """統合ピッカーの `=` から電卓(式の作法)を開く。ピッカーは閉じている。"""
+    def _open_picker_calculator(self, expr: str, pos=None) -> None:
+        """統合ピッカーの `=` から電卓(式の作法)を開く。ピッカーは閉じている。
+
+        位置はピッカーのあった場所(実機確認 #1)。"""
         import calculator
 
         old = getattr(self, "_picker_calculator", None)
@@ -5868,7 +5870,10 @@ class FilerWindow(QWidget):
                 self._picker_calculator = None
 
         window.closed.connect(forget)
-        window.show_at_cursor_screen()
+        if pos is not None:
+            window.show_at(pos)
+        else:
+            window.show_at_cursor_screen()
 
     @staticmethod
     def _picker_row_path(data):

@@ -220,7 +220,7 @@ class PickerWindow(QWidget):
       ヒント行になり、行を選ぶとそのモードへ移る。モードが変わるたびに
       on_mode_change(予約文字 or None) が呼ばれ、候補の差し替えは呼び出し側が
       set_items で行う(dynamic_items の中身も呼び出し側がモードで切り替える)。
-      `=` は特殊で、選んだ瞬間にこの窓を閉じて on_calc(式) を呼ぶ(電卓は別窓)。
+      `=` は特殊で、選んだ瞬間にこの窓を閉じて on_calc(式, 位置) を呼ぶ(電卓は別窓)。
     - on_ctrl_enter(表示名, データ) … Ctrl+Enter。渡したときだけ効き、窓は閉じない
       (上にメニューを重ねるような使い方は呼び出し側が行う)。動的項目でも呼ばれる。"""
 
@@ -526,11 +526,15 @@ class PickerWindow(QWidget):
             self._refresh_list("")
 
     def _enter_calc(self, expr: str) -> None:
-        """`=` が選ばれた。ピッカーは閉じて、続きは電卓の窓に任せる。"""
+        """`=` が選ばれた。ピッカーは閉じて、続きは電卓の窓に任せる。
+
+        電卓をこの窓のあった場所に出せるよう、閉じる前に左上の位置を
+        渡す。"""
         if self._on_calc is None:
             return
+        pos = self.pos()
         self.close()
-        self._on_calc(expr)
+        self._on_calc(expr, pos)
 
     def _mode_split_text(self, text: str) -> None:
         """文字列として入ってきた先頭の予約文字をモードとして解釈する。

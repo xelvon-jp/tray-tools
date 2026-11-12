@@ -421,7 +421,7 @@ def test_picker_window_modes():
         "統合ピッカー", [("フォルダ1", {"kind": "jump", "path": "C:/a"})],
         lambda path: None,
         modes=up.MODES, initial_mode="[", on_mode_change=on_mode_change,
-        on_calc=lambda expr: calc.append(expr))
+        on_calc=lambda expr, pos=None: calc.append(expr))
     try:
         window.show()
         # 開いた直後は `[` モード。チップが見え、入力欄は空。
@@ -473,7 +473,7 @@ def test_picker_window_leading_space_escape():
          ("通常", {"kind": "jump", "path": "C:/a"})],
         lambda path: None,
         modes=up.MODES, initial_mode="[",
-        on_calc=lambda expr: calc.append(expr))
+        on_calc=lambda expr, pos=None: calc.append(expr))
     try:
         window.show()
         # 先頭に空白を入れると、予約文字はモード切り替えにならず文字になる

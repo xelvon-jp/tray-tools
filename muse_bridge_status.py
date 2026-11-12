@@ -363,7 +363,19 @@ REQ_LATE_SEC = 600      # 受領までこの秒数以上で「遅延」(見張�
 REQ_SPANS = (("detected", "saved", 60),
              ("saved", "ack", 60),
              ("ack", "done", 30 * 60))
-REQ_NO_ACK_RED_SEC = 300  # 検知からこの秒数、受領が無ければ赤(red)
+REQ_NO_ACK_RED_SEC = REQ_LATE_SEC  # 受領が無く遅延(late)になったら赤(red)
+
+
+def _no_ack_late(entry, now, earliest, late):
+    """受領がまだ無い段階で遅延かどうか。赤くするかは late だけで決める
+    (2026-11-13、アオの指定)。見張りの late / ack_wait_sec があればそれを
+    使い、無ければ検知からの経過で判定する。"""
+    if isinstance(entry.get("late"), bool):
+        return entry["late"]
+    w = _num(entry, "ack_wait_sec")
+    if w is None:
+        w = now - earliest
+    return w >= REQ_LATE_SEC
 
 
 def _req_row(entry, now):
@@ -422,10 +434,9 @@ def _req_row(entry, now):
                 note = (f"{REQ_STAGE_LABELS[a_key]}から{REQ_STAGE_LABELS[b_key]}まで "
                         f"{fmt_dur(gap)}" + (" 経過" if waiting else " かかりました"))
                 break
-        if not finished and "ack" not in times \
-                and now - earliest > REQ_NO_ACK_RED_SEC:
+        if not finished and "ack" not in times and _no_ack_late(entry, now, earliest, late):
             warn = "red"
-            note = "受領が5分以上来ていません"
+            note = "受領が10分以上来ていません"
         if stage == "failed" and not note:
             note = reason or ""
     stage_at = ended if finished else times.get(stage)

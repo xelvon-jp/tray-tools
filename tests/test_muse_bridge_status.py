@@ -267,14 +267,20 @@ def test_request_rows_warn_waiting_and_red():
     rows = mbs.request_rows({"requests": [
         _req(stage="ack", detected=2000, saved=1990, ack=1801)]}, NOW)
     assert rows[0]["warn"] == "warn"
-    # 検知から5分を超えて受領が無い → red(warn より強い)
+    # 受領が無く遅延(10分)になったら → red(warn より強い)
     rows = mbs.request_rows({"requests": [
-        _req(stage="saved", detected=301, saved=290)]}, NOW)
+        _req(stage="saved", detected=601, saved=590)]}, NOW)
     assert rows[0]["warn"] == "red"
-    # 5分ちょうどは red にしない(保存→受領の待ちで warn にはなる)
+    assert rows[0]["note"] == "受領が10分以上来ていません"
+    # 10分未満は red にしない(保存→受領の待ちで warn にはなる)
     rows = mbs.request_rows({"requests": [
         _req(stage="saved", detected=300, saved=290)]}, NOW)
     assert rows[0]["warn"] == "warn"
+    # 見張りの late があれば、それだけで決める(経過が短くても赤)
+    e = _req(stage="saved", detected=100, saved=90)
+    e["late"] = True
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["warn"] == "red"
     # 受領があれば、長く待っても red にはならない(受領→完了の待ちで warn)
     rows = mbs.request_rows({"requests": [
         _req(stage="ack", detected=4000, saved=3990, ack=3900)]}, NOW)

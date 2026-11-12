@@ -926,7 +926,15 @@ class PickerWindow(QWidget):
                 name, _data, match = split_item(entry)
                 if not name_matches_any(match, keyword):
                     continue
-                item = QListWidgetItem(name)
+                label = name
+                if not isinstance(match, str) and len(match) >= 2 \
+                        and match[1] != match[0]:
+                    # 半角の別名(列の2つ目)を持つ項目は、別名をいつも末尾に
+                    # 添えて出す。検索していないときでも「どの半角で探せるか」
+                    # が見えるようにするため(統合ピッカーの `!`)。絞り込みの
+                    # 有無や、名前と別名のどちらで当たったかにはよらない。
+                    label = f"{name} ({match[1]})"
+                item = QListWidgetItem(label)
                 # データそのものではなく元リストの添字を持たせる。Qtの項目データは
                 # QVariant を経由するため、タプルなどはPython側の型が変わって戻ることがある。
                 item.setData(Qt.UserRole, index)

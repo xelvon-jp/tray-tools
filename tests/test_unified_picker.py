@@ -552,6 +552,7 @@ def test_picker_window_command_mode_more_apps_row():
 
 def test_picker_window_command_alias_search(tmp_path):
     # 窓でも、半角の別名で `!` の候補を絞れる(機能キーで探す場面)。
+    # 別名は常時表示なので、行には「(checklist)」が付いたまま出る。
     _qapp()
     features = [("checklist", "実機確認チェックリスト")]
     items = up.build_mode_items("!", _entries(tmp_path), features=features)
@@ -563,9 +564,83 @@ def test_picker_window_command_alias_search(tmp_path):
         window.search.setText("che")
         texts = [window.list.item(i).text()
                  for i in range(window.list.count())]
-        assert texts == ["🔧 実機確認チェックリスト"], texts
+        assert texts == ["🔧 実機確認チェックリスト (checklist)"], texts
+        # 日本語の名前で絞っても同じ行が残り、別名の表示も付いたまま。
+        window.search.setText("実機")
+        texts = [window.list.item(i).text()
+                 for i in range(window.list.count())]
+        assert texts == ["🔧 実機確認チェックリスト (checklist)"], texts
     finally:
         window.close()
+
+
+def test_picker_window_command_alias_always_shown(tmp_path):
+    # `!` では、検索していなくても別名がいつも行に出る。内蔵コマンドは
+    # 名前と id が大文字小文字だけの違いでキーが1つにまとまるので付かない。
+    _qapp()
+    features = [("checklist", "実機確認チェックリスト")]
+    items = up.build_mode_items("!", _entries(tmp_path), features=features)
+    window = picker_mod.PickerWindow(
+        "統合ピッカー", items, lambda *_a: None,
+        modes=up.MODES, initial_mode="!")
+    try:
+        window.show()
+        texts = [window.list.item(i).text()
+                 for i in range(window.list.count())]
+        assert texts == [
+            "🌐 ページ (example.com)",
+            "🚀 電卓アプリ (calc)",
+            "🚀 メモ帳 (notepad)",
+            "🔧 実機確認チェックリスト (checklist)",
+            "⚙️ Command",
+            "⚙️ Config",
+            "⚙️ Reload",
+        ], texts
+    finally:
+        window.close()
+
+
+def test_picker_window_match_list_alias_label():
+    # 窓の作法そのもの: 絞り込み名が「名前 + 別名」の列なら別名を添える。
+    # 文字列・1つだけの列・先頭と同名の列では付けない。
+    _qapp()
+    items = [
+        ("機能X", {"kind": "builtin"}, ["機能X", "feature-x"]),
+        ("機能Y", {"kind": "builtin"}, "機能Y"),
+        ("機能Z", {"kind": "builtin"}, ["機能Z"]),
+        ("機能W", {"kind": "builtin"}, ["機能W", "機能W"]),
+    ]
+    window = picker_mod.PickerWindow(
+        "統合ピッカー", items, lambda *_a: None,
+        modes=up.MODES, initial_mode="!")
+    try:
+        window.show()
+        texts = [window.list.item(i).text()
+                 for i in range(window.list.count())]
+        assert texts == ["機能X (feature-x)", "機能Y", "機能Z", "機能W"], texts
+    finally:
+        window.close()
+
+
+def test_picker_window_other_modes_no_alias_label(tmp_path):
+    # `[` と `]` の絞り込み名は文字列なので、別名表示は付かない。
+    _qapp()
+    for mode, items, expected in (
+        ("[", up.build_mode_items("[", _entries(tmp_path)),
+         ["📁 資料", up.launcher.IMPORT_ITEM_LABEL]),
+        ("]", up.build_mode_items("]", [], recent=["C:/docs", "C:/work"]),
+         ["📁 C:/docs", "📁 C:/work"]),
+    ):
+        window = picker_mod.PickerWindow(
+            "統合ピッカー", items, lambda *_a: None,
+            modes=up.MODES, initial_mode=mode)
+        try:
+            window.show()
+            texts = [window.list.item(i).text()
+                     for i in range(window.list.count())]
+            assert texts == expected, (mode, texts)
+        finally:
+            window.close()
 
 
 def test_picker_window_ctrl_enter_keeps_open():

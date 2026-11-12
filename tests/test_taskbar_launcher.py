@@ -173,6 +173,21 @@ def test_toggle_arrangement_restores_position():
     assert full == ["palette", "calendar"] and hidden == []
 
 
+def test_context_menu_opens_reorder_directly():
+    """右クリックはメニューを挟まず、並べ替えダイアログを直接開く(#8)。"""
+    _qapp()
+    panel = launcher.LauncherPanel.__new__(launcher.LauncherPanel)
+    opened = []
+    panel._open_reorder_dialog = lambda: opened.append(True)
+
+    class _Event:
+        def globalPos(self):
+            return None
+
+    panel.contextMenuEvent(_Event())
+    assert opened == [True]
+
+
 def test_reorder_dialog_moves():
     """並べ替えダイアログ: 並び替えと付け外しができ、動くたびに通知される。"""
     from PySide6.QtCore import QModelIndex, Qt

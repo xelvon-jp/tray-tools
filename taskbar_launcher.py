@@ -1512,50 +1512,15 @@ class LauncherPanel(QWidget):
     # 項目の付け外し(右クリック)
     # ---------------------------------------------------------------
     def contextMenuEvent(self, event):
-        """右クリックで「並べる項目」のチェックリストを出す。
+        """右クリックで並べ替えダイアログを直接開く。
 
-        付け外しのたびにメニューを出し直す(選ぶ→閉じる→また右クリック、を
-        繰り返させない)。外をクリックするか Esc で終わる。変更はその場で
-        パネルに反映し、settings.json の launcher_items と launcher_hidden
-        に保存する。末尾の「並べ替え…」を選ぶと、並べ替えダイアログへ移る。"""
+        以前はチェックリストのメニューを出していたが、付け外しも
+        並べ替えもダイアログ側でできるため、実機確認 #8 の指摘で
+        メニューを挟まずに直接開く形にした。"""
         try:
-            pos = event.globalPos()
-            want_reorder = False
-            while True:
-                current = resolve_items(self._config)
-                menu = QMenu(self)
-                header = menu.addAction("並べる項目")
-                header.setEnabled(False)
-                actions = {}
-                for key, item in ITEMS.items():
-                    action = menu.addAction(item.get("label") or key)
-                    action.setCheckable(True)
-                    action.setChecked(key in current)
-                    actions[action] = key
-                menu.addSeparator()
-                reorder = menu.addAction("並べ替え…")
-                self._menu_open = True
-                self._close_timer.stop()
-                try:
-                    chosen = menu.exec(pos)
-                finally:
-                    self._menu_open = False
-                    menu.deleteLater()
-                if chosen is reorder:
-                    want_reorder = True
-                    break
-                if chosen is None or chosen not in actions:
-                    break
-                full, hidden = arrangement(self._config)
-                self._apply_arrangement(
-                    *toggle_arrangement(full, hidden, actions[chosen])
-                )
-                if not self.isVisible():
-                    break   # 全部外れてパネルが畳まれたら終わる
-            if want_reorder:
-                self._open_reorder_dialog()
-            # メニューが終わったあと、カーソルが本体・パネル・音量バーの外なら
-            # 通常の猶予つきで閉じる(中なら開いたまま)。
+            self._open_reorder_dialog()
+            # ダイアログが終わったあと、カーソルが本体・パネル・音量バーの
+            # 外なら通常の猶予つきで閉じる(中なら開いたまま)。
             if self.isVisible() and not self._cursor_on_widget_or_panel():
                 self._close_timer.start(self._close_delay())
         except Exception:

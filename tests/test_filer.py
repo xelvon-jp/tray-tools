@@ -8286,6 +8286,73 @@ def test_window_add_tool_from_edit_gui():
             w.deleteLater()
 
 
+def test_window_ext_menu_unregistered_kind_opens_own_page():
+    """未登録の拡張子で「メニューを編集」を開くと、その拡張子のページで開く(M の直し)。
+
+    editor.add_kind はメモリ上だけの追加なので、開いただけでは定義ファイルは
+    できない(操作した時点で初めて書き込まれる)。"""
+    import filer_extmenu
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, right, jp = _menu_window(tmp)
+        try:
+            shared = os.path.join(tmp, "sharedmenus")
+            os.makedirs(shared)
+            editor = filer_extmenu.MenuEditor(shared, w.menu_local_dir)
+            assert "xyz" not in editor.kinds()
+            dialog = w.build_menu_edit_dialog("xyz", editor)
+            try:
+                assert dialog.current_kind() == "xyz", dialog.current_kind()
+            finally:
+                dialog.close()
+                dialog.deleteLater()
+            assert not os.path.exists(os.path.join(shared, "xyz.txt"))
+            assert not os.path.exists(
+                os.path.join(w.menu_local_dir, "xyz.txt"))
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_window_ext_menu_register_launcher():
+    """実行ファイルの Ctrl+Enter に「ランチャ登録する」が出て、選ぶと即登録される。
+
+    名前はファイル名(拡張子なし)で、確認はしない。登録済みになったら次は出ない。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        settings_path = os.path.join(tmp, "settings.json")
+        w, left, right, jp = _menu_window(tmp, settings_path=settings_path)
+        try:
+            exe = Path(left, "mytool.exe")
+            exe.write_bytes(b"")
+            w.left.load(str(left))
+            _wait(w)
+            seen = []
+            w._exec_menu = _drive_menu(w, "L", seen)
+            w.left.set_cursor(w.left._row_of("mytool.exe"))
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            labels = seen[0]
+            assert any("ランチャ登録する" in t for t in labels), labels
+            saved = json.loads(
+                Path(settings_path).read_text(encoding="utf-8"))
+            marks = saved["launcher"]["bookmarks"]
+            assert [b["name"] for b in marks] == ["mytool"], marks
+            assert marks[0]["path"] == str(exe), marks
+            # 登録済みになったら、もう出ない
+            w._startfile = lambda path, **kw: None
+            seen2 = []
+            w._exec_menu = _drive_menu(w, "", seen2)
+            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            assert not any("ランチャ登録する" in t for t in seen2[0]), seen2
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_add_tool_dialog():
     import filer_extmenu as m
     import filer_settings
@@ -11863,6 +11930,8 @@ FULL_ONLY = frozenset({
     "test_window_ext_colors_and_settings_dialog",
     "test_window_ext_menu",
     "test_window_ext_menu_property_and_archive",
+    "test_window_ext_menu_register_launcher",
+    "test_window_ext_menu_unregistered_kind_opens_own_page",
     "test_window_f7_jump_range",
     "test_window_flat_view",
     "test_window_frecency_jump",

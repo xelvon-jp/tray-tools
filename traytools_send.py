@@ -292,6 +292,7 @@ def send(command: str, args: list) -> int:
 USAGE = """使い方: traytools_send.py <command> [args...]
 
   bookmark [パス]              フォルダブックマークを開く
+  feature <項目キー>           機能を1つ実行する
   keep-awake on|off [分]       スリープ抑止の入切
   sleep [秒|cancel] [hibernate] スリープ／休止の予約・取り消し
   status                       いまの状態を返す

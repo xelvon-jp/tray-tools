@@ -4625,6 +4625,47 @@ class FilerWindow(QWidget):
                 if cursor is not None and not cursor.is_dir else "",
                 "cwd": pane.real_dir()}
 
+    # ランチャ登録の対象にする拡張子(実行ファイル系)。
+    _LAUNCHER_REGISTRABLE_EXTS = {".exe", ".bat", ".cmd", ".com", ".lnk"}
+
+    def _launcher_registerable(self, path: str) -> bool:
+        """そのパスが「ランチャ登録する」の対象か(実行ファイル系で未登録)。"""
+        if os.path.splitext(path)[1].lower() not in self._LAUNCHER_REGISTRABLE_EXTS:
+            return False
+        import launcher
+
+        current = (settings_module.load_settings(self.settings_path)
+                   if self.settings_path else self.app_settings)
+        return launcher.find_bookmark_by_path(current, path) is None
+
+    def _launcher_register_path(self, pane, entry):
+        """Ctrl+Enter の対象行から、ランチャ登録できるパスを返す。無ければ None。"""
+        if entry is None or entry.is_dir or getattr(entry, "is_parent", False):
+            return None
+        if pane.archive is not None:
+            return None  # 書庫の中のパスは実在のファイルではない
+        path = os.path.join(pane.path, entry.name)
+        return path if self._launcher_registerable(path) else None
+
+    def _register_launcher(self, path: str) -> None:
+        """実行ファイルをランチャ(ブックマーク)に登録する。名前はファイル名で即登録。
+
+        登録の置き場は統合ピッカーと同じ launcher.bookmarks。設定は読み直して
+        該当キーだけ差し替える(launcher.save_bookmark の作法)。"""
+        import launcher
+
+        current = (settings_module.load_settings(self.settings_path)
+                   if self.settings_path else self.app_settings)
+        if launcher.find_bookmark_by_path(current, path) is not None:
+            self.log(f"ランチャ登録: 登録済みです（{path}）")
+            return
+        name = os.path.splitext(os.path.basename(path))[0] \
+            or os.path.basename(path)
+        if launcher.save_bookmark(current, self.settings_path, name, path):
+            self.log(f"ランチャ登録: 登録しました（{name} → {path}）")
+        else:
+            self.log("ランチャ登録: 設定ファイルに保存できませんでした")
+
     def cmd_ext_menu(self):
         """Ctrl+Enter: 対象の拡張子(フォルダなら folder)のメニューを出す。
 
@@ -4663,6 +4704,11 @@ class FilerWindow(QWidget):
             key = next((k for k in "BWXVJ" if k not in used), "?")
             items.append(None)
             items.append((key, "Box.comで開く", ("box_open",)))
+        register_path = self._launcher_register_path(pane, kind_entry)
+        if register_path:
+            used = {str(i[0]).upper() for i in items if i} | {"M"}
+            key = next((k for k in "LKR" if k not in used), "?")
+            items.append((key, "ランチャ登録する", ("register_launcher", register_path)))
         items.append(("M", "メニューを編集", ("edit",)))
         choice = self.choose_menu(kind, items)
         if choice is None:
@@ -4674,6 +4720,10 @@ class FilerWindow(QWidget):
         pane = self.active
         if choice == ("add",):
             self.add_tool(kind)
+            return
+        if isinstance(choice, tuple) and len(choice) == 2 \
+                and choice[0] == "register_launcher":
+            self._register_launcher(choice[1])
             return
         if choice == ("box_open",):
             self.open_on_box(pane.target_paths())
@@ -4853,6 +4903,11 @@ class FilerWindow(QWidget):
         """「メニューを編集」の GUI を組む(テストではここまでで操作する)。"""
         import filer_settings  # 使うときに読む
 
+        # 未登録の拡張子でも、その拡張子のページで開く。種類の一覧は
+        # ダイアログが構築時に editor.kinds() で読むので、足すのは構築より
+        # 前に。add_kind はメモリ上だけの追加で、ページを開いただけでは
+        # ファイルは作られない(操作した時点で書き込まれる)。
+        editor.add_kind(kind)
         dialog = filer_settings.MenuEditDialog(
             self, editor,
             ask_tool=lambda k, initial=None: self.ask_add_tool(k, editor, initial),
@@ -5577,20 +5632,34 @@ class FilerWindow(QWidget):
         picker = None
         history = command_launcher.load_history()
         apps = self._unified_apps()
+        try:
+            import taskbar_launcher
+
+            features = [(key, item["label"])
+                        for key, item in taskbar_launcher.ITEMS.items()]
+        except Exception:  # noqa: BLE001  機能の表が読めなくても他のモードは出す
+            features = []
+        # モードと「未登録アプリを広げたか」は、候補を作る側と共有する dict で持つ。
+        state = {"mode": unified_picker.INITIAL_MODE, "apps_expanded": False}
 
         def build_items() -> list:
-            return unified_picker.build_items(
+            picker_state = current.get("unified_picker")
+            pinned = picker_state.get("pinned_features") \
+                if isinstance(picker_state, dict) else []
+            return unified_picker.build_mode_items(
+                state["mode"],
                 command_launcher.build_entries(current),
+                features=features,
+                pinned_keys=[k for k in pinned if isinstance(k, str)],
+                recent=list(self.recent),
                 add_path=add_path,
                 stash_count=len(self.stash_paths), show_import=False)
 
-        def record(data, param=None):
+        def record(data):
             nonlocal history
             raw = data.get("history_text")
             if not raw and data.get("bookmark") and data.get("name"):
                 raw = data["name"]
-                if data.get("kind") == "exec" and param:
-                    raw = f"{raw};{param}"
             if raw:
                 history = command_launcher.record_history(history, raw)
                 command_launcher.save_history(history)
@@ -5614,34 +5683,30 @@ class FilerWindow(QWidget):
                 entry = data.get("entry")
                 if entry is None:
                     return None
-                param = data.get("param")
-                if param is None:
-                    typed_name, typed_param = command_launcher.parse_input(
-                        picker.search.text() if picker is not None else "")
-                    param = typed_param if typed_name.casefold() == \
-                        (entry.name or "").casefold() else ""
-                action, payload = command_launcher.build_command(entry,
-                                                                 param or "")
+                action, payload = command_launcher.build_command(entry, "")
                 if action == "exec":
                     command, workdir = payload
                     if command_launcher.run_exec(command, workdir):
-                        record(data, param or None)
+                        record(data)
                 elif action == "open":
                     os.startfile(payload)  # noqa: S606
-                    record(data, param or None)
+                    record(data)
                 elif action == "jump":
                     self.jump_to(payload)
-                    record(data, param or None)
+                    record(data)
                 return None
+            if kind == "feature":
+                # 機能の実行は常駐のプロセスの役目。IPC で依頼する。
+                self._run_resident_feature(data.get("item_key") or "")
+                return None
+            if kind == "more_apps":
+                state["apps_expanded"] = True
+                picker.set_items(build_items())
+                return True
             if kind == "app" or kind == "file":
                 path = data.get("path") or ""
                 if path:
                     os.startfile(path)  # noqa: S606
-                    if kind == "app":
-                        promote(data)
-                return None
-            if kind == "calc":
-                QApplication.clipboard().setText(data.get("value") or "")
                 return None
             if kind == "web":
                 url = data.get("url") or ""
@@ -5739,62 +5804,186 @@ class FilerWindow(QWidget):
             if launcher.move_bookmark(current, self.settings_path, name, path, step):
                 picker.set_items(build_items())
 
-        def promote(data):
-            """`*` で広げて出したアプリを実行したあと、スタメン昇格を聞く。
 
-            昇格はブックマーク登録。断ったらその項目では二度聞かない
-            (settings の unified_picker.declined に覚える)。"""
-            if not data.get("pool"):
-                return
-            state = current.get("unified_picker")
-            if not isinstance(state, dict):
-                state = current["unified_picker"] = {}
-            declined = state.get("declined")
-            if not isinstance(declined, list):
-                declined = state["declined"] = []
-            ident = f"app:{data.get('path') or ''}"
-            if ident in declined:
-                return
-            name = data.get("name") or ""
-            if self.confirm(
-                    "統合ピッカー",
-                    f"『{name}』を通常表示（スタメン）に加えますか？\n"
-                    "（次回からは * を打たなくても出ます）",
-                    default_yes=False, parent=picker):
-                if launcher.save_bookmark(current, self.settings_path, name,
-                                          data.get("path") or ""):
-                    self.log(f"ブックマーク: スタメンに加えました（{name}）")
-                else:
-                    self.log("ブックマーク: 設定ファイルに保存できませんでした")
-                return
-            declined.append(ident)
-            if not self.settings_path:
-                return
-            try:
-                stored = {}
-                if os.path.exists(self.settings_path):
-                    with open(self.settings_path, "r", encoding="utf-8") as f:
-                        stored = json.load(f)
-                if not isinstance(stored, dict):
-                    stored = {}
-                stored["unified_picker"] = state
-                settings_module.save_settings(stored, self.settings_path)
-            except Exception:  # noqa: BLE001  覚えられないだけ
-                pass
-
-        dynamics = unified_picker.make_dynamic_items(
+        dynamics = unified_picker.make_mode_dynamics(
             entries=command_launcher.build_entries(current),
-            features=[], apps=apps,
+            apps=apps,
             web_searches=(current.get("command_palette") or {}).get("web_searches"),
-            file_search=self._unified_filer_file_search())
+            file_search=self._unified_filer_file_search(),
+            state=state)
+
+        def mode_change(char):
+            state["mode"] = char
+            if char is not None:
+                picker.set_items(build_items())
 
         picker = self._open_picker(
             "統合ピッカー", build_items(), self.jump_to, on_accept=accept,
             placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
             preview_provider=lambda data: unified_picker.preview_text(
                 data, context="filer"),
-            dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
-            on_delete=delete, on_move=move, dynamic_last=True)
+            dynamic_items=dynamics,
+            tab_text=unified_picker.make_tab_text(state),
+            on_delete=delete, on_move=move, dynamic_last=True,
+            modes=unified_picker.MODES,
+            initial_mode=unified_picker.INITIAL_MODE,
+            on_mode_change=mode_change,
+            on_calc=self._open_picker_calculator,
+            on_ctrl_enter=lambda name, data: self._picker_ctrl_enter(
+                picker, name, data))
+
+    def _run_resident_feature(self, item_key: str) -> None:
+        """統合ピッカー(!)で選ばれた機能の実行を、常駐へ IPC で依頼する。
+
+        機能は常駐のプロセスでしか実行できない。送信は応答待ちで詰まる
+        ことがあるので別スレッドで投げ、こちらは依頼したことだけ記録する。"""
+        if not item_key:
+            return
+
+        def work():
+            try:
+                import traytools_send
+
+                traytools_send.send("feature", [item_key])
+            except Exception:  # noqa: BLE001  届かなくてもファイラは続ける
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+        self.log(f"機能: 常駐へ実行を依頼しました（{item_key}）")
+
+    def _open_picker_calculator(self, expr: str) -> None:
+        """統合ピッカーの `=` から電卓(式の作法)を開く。ピッカーは閉じている。"""
+        import calculator
+
+        old = getattr(self, "_picker_calculator", None)
+        if old is not None:
+            old.close()
+        window = calculator.create_window(expression_mode=True,
+                                          seed=expr or "")
+        self._picker_calculator = window
+
+        def forget():
+            if getattr(self, "_picker_calculator", None) is window:
+                self._picker_calculator = None
+
+        window.closed.connect(forget)
+        window.show_at_cursor_screen()
+
+    @staticmethod
+    def _picker_row_path(data):
+        """ピッカーの行データから (パス, フォルダか) を取る。パスでなければ (None, False)。"""
+        kind = data.get("kind")
+        if kind == "jump":
+            return data.get("path") or None, True
+        if kind == "file" or kind == "app":
+            return data.get("path") or None, False
+        if kind == "exec":
+            entry = data.get("entry")
+            if entry is not None:
+                return entry.target or None, False
+        if kind == "open":
+            target = data.get("target") or ""
+            if target and os.path.exists(target):
+                return target, os.path.isdir(target)
+        return None, False
+
+    def _picker_ctrl_enter(self, picker, _name, data) -> None:
+        """統合ピッカーの Ctrl+Enter: あっふの Ctrl+Enter メニューをピッカーの上に重ねる。
+
+        対象はパスを持つ行。ピッカーは閉じず、メニューを選ばずに閉じたら
+        ピッカーに戻る(モーダルなメニューを exec するだけなので自然に戻る)。
+        フォルダの行では、先頭に開き方(あっふ左窓・右窓・Explorer 系)を足す。
+        実行ファイルの行では「ランチャ登録する」も足す(cmd_ext_menu と同じ)。"""
+        if not isinstance(data, dict):
+            return
+        path, is_dir = self._picker_row_path(data)
+        if not path:
+            return
+        import types
+
+        entry = types.SimpleNamespace(
+            name=os.path.basename(path.rstrip("\\/")) or path,
+            is_dir=is_dir, is_parent=False)
+        kind = filer_extmenu.menu_kind(entry)
+        shared, local = filer_extmenu.find_menus(
+            kind, self.menu_shared_dir, self.menu_local_dir)
+        common = filer_extmenu.common_items(self.menu_shared_dir)
+        resolver = self.menu_resolver()
+        lines = filer_extmenu.visible_layers(
+            [shared, local, common], resolver, in_archive=False)
+        items = []
+        for line in lines:
+            items.append(None if line.separator else (line.key or "?", line.label, line))
+        used = {str(i[0]).upper() for i in items if i} | {"M"}
+
+        def free_key(candidates):
+            for key in candidates:
+                if key not in used:
+                    used.add(key)
+                    return key
+            return "?"
+
+        if is_dir:
+            items.append(None)
+            for label, value in (
+                    ("あっふ左窓で開く", ("open_dest", "left")),
+                    ("あっふ右窓で開く", ("open_dest", "right")),
+                    ("Explorer（直前アクティブ）", ("open_dest", "explorer")),
+                    ("Explorer（直前アクティブに新規タブ）", ("open_dest", "explorer_tab")),
+                    ("Explorer（新規窓）", ("open_dest", "explorer_new"))):
+                items.append((free_key("LRTEWN"), label, value))
+        elif self._launcher_registerable(path):
+            items.append((free_key("LKR"), "ランチャ登録する",
+                          ("register_launcher", path)))
+        items.append(("M", "メニューを編集", ("edit",)))
+        menu, chosen = self.build_menu(kind, items)
+        view = picker.list
+        rect = view.visualRect(view.currentIndex())
+        pos = view.viewport().mapToGlobal(
+            rect.bottomLeft() if rect.isValid() else view.rect().center())
+        choice = chosen.get(menu.exec(pos))
+        if choice is None:
+            return
+        if isinstance(choice, tuple) and len(choice) == 2 \
+                and choice[0] == "open_dest":
+            self._open_folder_dest(path, choice[1])
+            return
+        ctx = {"targets": [path], "P": os.path.dirname(path),
+               "F": os.path.basename(path), "O": self.other.path or "",
+               "E": "" if is_dir else filer_extmenu.kind_of_name(
+                   os.path.basename(path)),
+               "cwd": os.path.dirname(path)}
+        self.run_menu_choice(choice, kind, ctx, resolver)
+
+    def _open_folder_dest(self, path: str, dest: str) -> None:
+        """ピッカーのフォルダ行で選ばれた開き方を実行する。"""
+        if dest == "left":
+            self.left.load(path)
+            self.activate("left")
+            return
+        if dest == "right":
+            self.right.load(path)
+            self.activate("right")
+            return
+        if dest in ("explorer", "explorer_tab"):
+            import explorer_nav
+
+            hwnd = explorer_nav.last_active_hwnd()
+            if hwnd:
+                ok = (explorer_nav.navigate_new_tab(hwnd, path)
+                      if dest == "explorer_tab"
+                      else explorer_nav.navigate(hwnd, path))
+                if ok:
+                    return
+                self.log("フォルダを開く: エクスプローラで開けなかったので、新規窓で開きます")
+            else:
+                self.log("フォルダを開く: エクスプローラが開いていないので、新規窓で開きます")
+        # explorer_new、および explorer / explorer_tab で届かなかったときの受け皿
+        try:
+            subprocess.Popen(["explorer.exe", os.path.normpath(path)],
+                             close_fds=True)
+        except OSError as e:
+            self.log(f"フォルダを開けません: {path}  ({e})")
 
     def _unified_apps(self):
         """統合ピッカー用に、スタートメニューのアプリ候補を1度だけ走査する。"""

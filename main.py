@@ -344,6 +344,12 @@ def _build_command_handlers(features) -> dict:
     return {
         # あふｗから $P(カレントパス)を渡して呼ぶ。パスが無ければ登録なしで一覧だけ出す。
         "bookmark": lambda args, reply: _bookmark_command(screen, args, reply),
+        # あふｗの統合ピッカー(! モード)から、機能の実行だけを常駐に頼む。
+        # 機能は常駐のプロセスでしか実行できないので、この口に載せる
+        # (「常駐でなければできないこと」の線引きどおり)。引数は項目キー1つ。
+        #
+        #   traytools_send.py feature calculator
+        "feature": lambda args, reply: reply(_feature_command(screen, args)),
         # スリープ抑止の入切。長い処理を外から回すとき、始める前に掛けて終わったら
         # 外す、という使い方ができる(席を外している間に寝られると処理が止まるため)。
         #
@@ -437,6 +443,19 @@ def _build_command_handlers(features) -> dict:
 def _bookmark_command(screen, args, reply) -> None:
     screen.start_launcher(args[0] if args else None)
     reply("OK フォルダブックマークを開きました")
+
+
+def _feature_command(screen, args) -> str:
+    """外から来た feature の引数を解いて、機能を1つ実行する。
+
+    想定外は「何もしない」に倒し、成否は応答の1行で返す(keep-awake と同じ作法)。
+    項目キーの実在と実行可否は ScreenFeature.run_feature_item が判断する。"""
+    key = (args[0] if args else "").strip()
+    if not key:
+        return "ERR 項目キーがありません（何もしませんでした）"
+    if screen.run_feature_item(key):
+        return f"OK 機能を実行しました: {key}"
+    return f"ERR 機能を実行できませんでした: {key}"
 
 
 def _sleep_command(screen, args) -> str:

@@ -5,6 +5,7 @@
 # 「表示名で絞り込んで1つ決める」以上のことはしない。決めた後に何をするか(コピー・移動・
 # 登録)は呼び出し側の on_accept が行い、ウインドウの開閉はこちらが受け持つ。
 import ctypes
+import fnmatch
 import sys
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
@@ -89,12 +90,29 @@ def split_item(entry):
     return entry[0], entry[1], entry[0]
 
 
-def name_matches(name: str, keyword: str) -> bool:
-    """絞り込みの判定そのもの(前方一致)。keyword は strip + lower 済みの前提。
+def wildcard_match(name: str, keyword: str) -> bool:
+    """`*` / `?` を含む keyword の照合(名前で検索の `*` と同じ考え方)。
 
-    _refresh_list の絞り込みと、候補を数える filter_names で同じ関数を使う
-    (判定を二重に持たない。work-board#15 の決定事項)。"""
-    return not keyword or name.lower().startswith(keyword)
+    keyword を空白で割り、各語をグロブとして名前の中に探す(語は順不同)。
+    前方一致ではなく「名前の中にパターンが現れるか」で見るので、
+    `Exe*` でも `*cel` でも Excel に当たる。"""
+    lowered = name.lower()
+    return all(fnmatch.fnmatchcase(lowered, f"*{token}*")
+               for token in keyword.split())
+
+
+def name_matches(name: str, keyword: str) -> bool:
+    """絞り込みの判定そのもの。keyword は strip + lower 済みの前提。
+
+    既定は前方一致。`*` / `?` が含まれるときだけワイルドカード照合に
+    切り替える(wildcard_match)。_refresh_list の絞り込みと、候補を数える
+    filter_names で同じ関数を使う(判定を二重に持たない。work-board#15
+    の決定事項)。"""
+    if not keyword:
+        return True
+    if "*" in keyword or "?" in keyword:
+        return wildcard_match(name, keyword)
+    return name.lower().startswith(keyword)
 
 
 def filter_names(names, text: str) -> list:
@@ -173,7 +191,18 @@ class PickerWindow(QWidget):
     - on_delete(表示名, データ) / on_move(表示名, データ, step) … Ctrl+D / Ctrl+↑↓。
       こちらは閉じない。続けて2件消す・何段も動かす、をそのままやれるようにするため。
       呼び出し側は変更を反映した一覧を set_items で渡し直す(選択行の面倒はこちらで見る)。
-      動的項目では呼ばない(設定ファイルに実体が無い)。"""
+      動的項目では呼ばない(設定ファイルに実体が無い)。
+    - modes=[(予約文字, モード名, 色), ...] … モード切り替え(統合ピッカー用)。
+      渡すと、入力欄の左端に予約文字の色付きチップ部品が出て、モード名が入力欄の
+      背景(プレースホルダ)に薄く出る。開いた直後は initial_mode のモード。入力が
+      空のときに予約文字を打つとそのモードへ移り、入力が空のときに Backspace を
+      押すとチップが外れてモード無しになる。モード無しの間は一覧がモード切り替えの
+      ヒント行になり、行を選ぶとそのモードへ移る。モードが変わるたびに
+      on_mode_change(予約文字 or None) が呼ばれ、候補の差し替えは呼び出し側が
+      set_items で行う(dynamic_items の中身も呼び出し側がモードで切り替える)。
+      `=` は特殊で、選んだ瞬間にこの窓を閉じて on_calc(式) を呼ぶ(電卓は別窓)。
+    - on_ctrl_enter(表示名, データ) … Ctrl+Enter。渡したときだけ効き、窓は閉じない
+      (上にメニューを重ねるような使い方は呼び出し側が行う)。動的項目でも呼ばれる。"""
 
     closed = Signal()
 
@@ -194,6 +223,11 @@ class PickerWindow(QWidget):
         on_delete=None,
         on_move=None,
         dynamic_last: bool = False,
+        modes=None,
+        initial_mode: str = None,
+        on_mode_change=None,
+        on_calc=None,
+        on_ctrl_enter=None,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -214,6 +248,21 @@ class PickerWindow(QWidget):
         self._dynamic_last = dynamic_last
         self._on_delete = on_delete
         self._on_move = on_move
+        # モード切り替え(modes を渡したときだけ)。チップは入力欄に重ねる部品で、
+        # 予約文字そのものは入力欄の文字列には入らない。
+        self._mode_list = list(modes) if modes else None
+        self._mode_map = ({char: (name, color) for char, name, color in modes}
+                          if modes else {})
+        # 初期モードは候補の組み立てより前に決めておく(最初の _refresh_list で
+        # ヒント行ではなく初期モードの一覧になるように)。`=` は開いた瞬間に
+        # 電卓へ行く文字なので、初期モードにはしない。
+        self._mode = (initial_mode if initial_mode in self._mode_map
+                      and initial_mode != "=" else None)
+        self._on_mode_change = on_mode_change
+        self._on_calc = on_calc
+        self._on_ctrl_enter = on_ctrl_enter
+        self._mode_switching = False
+        self._placeholder_base = placeholder or DEFAULT_PLACEHOLDER
         # 入力から作った項目。self._items には足さない(添字がずれると Qt側に持たせた
         # UserRole の意味が変わってしまう)。一覧に出ている間だけここに居る。
         self._dynamic = []
@@ -231,10 +280,23 @@ class PickerWindow(QWidget):
         self.search.setFont(font)
         self.search.setPlaceholderText(placeholder or DEFAULT_PLACEHOLDER)
         self.search.textChanged.connect(self._refresh_list)
+        if self._mode_list is not None:
+            # 貼り付けなどで「予約文字+続き」が一度に入ったときの解釈。
+            # 打鍵のほうは eventFilter で先に拾うので、ここは文字列として
+            # 入ってきた場合だけが対象。
+            self.search.textChanged.connect(self._mode_split_text)
         # 入力欄にフォーカスがある間も ↑↓ / Enter / Esc を効かせたい。QLineEdit が先に
         # 食べてしまうので、イベントフィルタで横取りする。
         self.search.installEventFilter(self)
         layout.addWidget(self.search)
+
+        # モードのチップ。入力欄の左端に重ねる小さい部品(試作 D4 の寸法:
+        # 9pt・余白最小・角丸 3px)。文字として打たれるのではない。
+        self._chip = None
+        if self._mode_list is not None:
+            self._chip = QLabel(self.search)
+            self._chip.setFont(QFont("Meiryo", 9))
+            self._chip.hide()
 
         self.list = QListWidget()
         self.list.setFont(font)
@@ -316,6 +378,8 @@ class PickerWindow(QWidget):
         self._accepted_count = self.list.count()
         self._rejecting = False
         self.search.textChanged.connect(self._guard_search_text)
+        if self._mode_list is not None:
+            self._apply_mode_visuals()
 
     def _guard_search_text(self, text: str) -> None:
         """候補が0件になる入力を無効にする。textChanged の時点で
@@ -327,6 +391,10 @@ class PickerWindow(QWidget):
         (未確定文字列は textChanged を出さない)ので判定は走らず、
         確定した時点で確定分がまとめて判定される。"""
         if self._rejecting:
+            return
+        if self._mode_switching:
+            # モード切り替えに伴う書き換えの最中。基準は切り替え側が
+            # 合わせ直すので、ここでは判定しない。
             return
         if accepts_input(self._accepted_text, text,
                          self._accepted_count, self.list.count()):
@@ -351,6 +419,119 @@ class PickerWindow(QWidget):
             self.search.setStyleSheet("")
         except RuntimeError:
             pass   # 色が戻る前に窓が閉じた。合図は済んでいるので問題ない
+
+    # ---------------------------------------------------------------
+    # モード切り替え(modes を渡したときだけ)
+    # ---------------------------------------------------------------
+    def current_mode(self):
+        """いまのモードの予約文字。モード無し・モード未対応なら None。"""
+        return self._mode
+
+    def _position_chip(self) -> None:
+        """チップを入力欄の左端・縦中央に置く(試作 D4 の置き方)。"""
+        if self._chip is None or not self._chip.isVisible():
+            return
+        height = self.search.height()
+        y = (height - self._chip.height()) // 2 if height > 0 else 7
+        self._chip.move(5, max(y, 0))
+
+    def _apply_mode_visuals(self) -> None:
+        """チップとプレースホルダを、いまのモードに合わせる。
+
+        モード名は入力欄の背景に薄く出す(プレースホルダの仕組みそのまま。
+        入力が始まれば Qt が消す)。モード無しでは呼び出し側のプレースホルダ
+        に戻す。"""
+        if self._chip is None:
+            return
+        if self._mode is None:
+            self._chip.hide()
+            self.search.setTextMargins(0, 0, 0, 0)
+            self.search.setPlaceholderText(self._placeholder_base)
+            return
+        name, color = self._mode_map[self._mode]
+        self._chip.setText(self._mode)
+        self._chip.setStyleSheet(
+            f"background: {color}; color: white; border-radius: 3px;"
+            " padding: 0px 2px; font-weight: bold;")
+        self._chip.adjustSize()
+        self._chip.show()
+        self._position_chip()
+        self.search.setTextMargins(self._chip.width() + 7, 0, 0, 0)
+        self.search.setPlaceholderText(f"{name}モード")
+
+    def _mode_key_press(self, event) -> bool:
+        """予約文字の打鍵と、空入力での Backspace(チップ外し)を拾う。
+
+        予約文字が効くのは入力が空のときだけ。文字が入っているときの
+        `[` などは、ただの文字として通す(パスや検索語の一部でありうる)。"""
+        if event.key() == Qt.Key_Backspace and not self.search.text() \
+                and self._mode is not None:
+            self._enter_mode(None)
+            return True
+        text = event.text()
+        if len(text) == 1 and text in self._mode_map \
+                and not self.search.text():
+            self._enter_mode(text)
+            return True
+        return False
+
+    def _enter_mode(self, char) -> None:
+        """モードを切り替える。候補の差し替えは on_mode_change 側の役目。
+
+        入力は空に戻す(モードを決めるための文字・絞り込みの残りは、
+        新しいモードの入力ではないため)。`=` は電卓行きで、この窓は閉じる。"""
+        if char == "=" and self._on_calc is not None:
+            self._enter_calc("")
+            return
+        self._mode = char
+        self._mode_switching = True
+        try:
+            self.search.setText("")
+        finally:
+            self._mode_switching = False
+        self._apply_mode_visuals()
+        if self._on_mode_change is not None:
+            self._on_mode_change(char)
+        if char is None or self._on_mode_change is None:
+            # モード無しでは、候補ではなく切替ヒント行が本体。コールバック側は
+            # モード無し用の候補を持たないので、ここで必ず描き直す。
+            self._refresh_list("")
+
+    def _enter_calc(self, expr: str) -> None:
+        """`=` が選ばれた。ピッカーは閉じて、続きは電卓の窓に任せる。"""
+        if self._on_calc is None:
+            return
+        self.close()
+        self._on_calc(expr)
+
+    def _mode_split_text(self, text: str) -> None:
+        """文字列として入ってきた先頭の予約文字をモードとして解釈する。
+
+        貼り付けや setText で「[そら」の形が一度に来たとき用。打鍵は
+        _mode_key_press が先に拾うので、ここに来るのは文字列の経路だけ。
+        モードが決まっている間の先頭文字は解釈しない(ただの文字)。"""
+        if self._mode_switching or self._mode is not None or not text:
+            return
+        char = text[0]
+        if char not in self._mode_map:
+            return
+        rest = text[1:]
+        if char == "=" and self._on_calc is not None:
+            self._enter_calc(rest)
+            return
+        self._mode = char
+        self._mode_switching = True
+        try:
+            self.search.setText(rest)
+        finally:
+            self._mode_switching = False
+        # 入力ガードの基準を、切り替え後の入力と行数に合わせ直す
+        # (ガードは _mode_switching の間は判定しない取り決め)。
+        self._accepted_text = self.search.text()
+        self._accepted_count = self.list.count()
+        self._apply_mode_visuals()
+        if self._on_mode_change is not None:
+            self._on_mode_change(char)
 
     def _fit_to_items(self):
         """項目数に合わせて高さを決める。
@@ -419,6 +600,7 @@ class PickerWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._position_chip()
         # 常駐アプリのメニューやホットキーから開くとフォーカスが来ないことがある。
         # 入力欄まで明示的にフォーカスを渡さないと、そのまま打った文字が前のアプリへ飛ぶ。
         self.raise_()
@@ -469,6 +651,8 @@ class PickerWindow(QWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.search and event.type() == QEvent.KeyPress:
+            if self._mode_list is not None and self._mode_key_press(event):
+                return True
             if self._handle_shortcut(event):
                 return True
             key = event.key()
@@ -505,6 +689,20 @@ class PickerWindow(QWidget):
         if not (event.modifiers() & Qt.ControlModifier):
             return False
         key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter) \
+                and self._on_ctrl_enter is not None:
+            # Ctrl+Enter は「いまの行に追加のメニューを重ねる」ための口。
+            # 窓は閉じず、行の解釈と見せ方は呼び出し側が持つ。動的項目でも
+            # 呼ぶ(ファイル検索の結果など、実体がパスとして読める行がある)。
+            entry = self._entry_at(self.list.currentItem())
+            if entry is not None:
+                name, data = entry
+                try:
+                    self._on_ctrl_enter(name, data)
+                except Exception as e:  # noqa: BLE001  窓を落とさない
+                    print(f"[tray-tools] Ctrl+Enter の処理に失敗しました"
+                          f" ({name}): {e}", file=sys.stderr)
+            return True
         if key == Qt.Key_N and self._on_new is not None:
             self._run_action(lambda: self._on_new())
             return True
@@ -674,6 +872,21 @@ class PickerWindow(QWidget):
         (登録など常設の候補を上に残したい窓用)。"""
         keyword = text.strip().lower()
         self.list.clear()
+        if self._mode_list is not None and self._mode is None:
+            # モード無しの間は、候補ではなくモード切り替えのヒント行を出す。
+            # 行の UserRole には "mode:<文字>" を持たせ、_commit で拾う。
+            # 絞り込みはモード名への前方一致(他の候補と同じ判定)。
+            self._dynamic = []
+            for char, name, _color in self._mode_list:
+                label = f"{char} {name}モード"
+                if not name_matches(f"{name}モード", keyword):
+                    continue
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, f"mode:{char}")
+                self.list.addItem(item)
+            if self.list.count():
+                self.list.setCurrentRow(0)
+            return
         self._dynamic = self._build_dynamic(text)
 
         def add_dynamic():
@@ -748,7 +961,14 @@ class PickerWindow(QWidget):
     def _commit(self):
         if self._committing:
             return
-        entry = self._entry_at(self.list.currentItem())
+        current = self.list.currentItem()
+        if current is not None:
+            role = current.data(Qt.UserRole)
+            if isinstance(role, str) and role.startswith("mode:"):
+                # モード切り替えのヒント行。決定ではなくモードへの移行。
+                self._enter_mode(role[len("mode:"):])
+                return
+        entry = self._entry_at(current)
         if entry is None:
             return
         self._committing = True

@@ -12,10 +12,12 @@
 # 見に行くのが普通の使い方で、そのたびに消えると困るため。閉じ方は、項目を
 # もう一度押す(トグルは feature_screen.show_calculator 側)/ Esc / タイトルバー
 # 左の閉じ箱、の3つ。
+import re
+
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
-    QGridLayout, QLineEdit, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QGridLayout, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 _MARGIN = 8
@@ -254,11 +256,18 @@ _KEY_MAP = {
 
 
 class CalculatorWindow(QWidget):
-    """電卓の小窓。閉じたら closed が出る(参照の始末は持ち主の役目)。"""
+    """電卓の小窓。閉じたら closed が出る(参照の始末は持ち主の役目)。
+
+    expression_mode は統合ピッカーの `=` から開くときの作法。式をそのまま
+    表示に溜め、結果を横に並べて見せる(評価は command_palette.evaluate_query
+    に任せるので、単位変換もそのまま効く)。この作法では Enter は何もしない
+    (結果は打つそばから出る)。Ctrl+C で結果をコピーする(閉じない)。
+    既定の作法(縦ランチャから開くとき)は従来どおり CalculatorCore の
+    押した順の計算で、Enter は = として働く。"""
 
     closed = Signal()
 
-    def __init__(self):
+    def __init__(self, expression_mode: bool = False, seed: str = ""):
         super().__init__()
         self.setObjectName("calcRoot")
         self.setWindowTitle("Calculator")
@@ -267,13 +276,17 @@ class CalculatorWindow(QWidget):
         )
         self.setStyleSheet(_STYLE)
         self.core = CalculatorCore()
+        self._expr_mode = expression_mode
+        self._expr = seed if expression_mode else ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 4, 6, 6)
         root.setSpacing(6)
         root.addWidget(_TitleBar(self, "Calculator"))
 
-        self._display = QLineEdit(self.core.display, self)
+        self._display = QLineEdit(
+            self._expr_display() if self._expr_mode else self.core.display,
+            self)
         self._display.setObjectName("calcDisplay")
         self._display.setReadOnly(True)
         self._display.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -292,13 +305,96 @@ class CalculatorWindow(QWidget):
 
     # ---------------------------------------------------------------
     def _press(self, key: str) -> None:
+        if self._expr_mode:
+            self._press_expr(key)
+            self._display.setText(self._expr_display())
+            return
         self.core.press(key)
         self._display.setText(self.core.display)
+
+    # ---------------------------------------------------------------
+    # 式の作法(統合ピッカーの `=` 用)
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _evaluate(expr: str):
+        """式を評価して結果の文字列を返す。評価できなければ None。
+
+        評価そのものは command_palette.evaluate_query(四則・単位変換)に
+        寄せる。読み込みは使うときに遅らせる(この窓だけを使う経路で
+        パレット側の都合を持ち込まないため)。"""
+        if not expr:
+            return None
+        try:
+            import command_palette
+            cand = command_palette.evaluate_query(expr)
+        except Exception:  # noqa: BLE001  評価できないことは結果が無いことと同じ
+            return None
+        if cand is None:
+            return None
+        return cand.payload.get("value") or None
+
+    def _expr_display(self) -> str:
+        """式と、いま評価できるなら結果を並べた表示。"""
+        if not self._expr:
+            return "0"
+        value = self._evaluate(self._expr)
+        if value is not None:
+            return f"{self._expr} = {value}"
+        return self._expr
+
+    def _press_expr(self, key: str) -> None:
+        if key == "C":
+            self._expr = ""
+        elif key == "E":
+            # 入力中の最後の数(無ければ末尾1文字)を消す。Core の E と同じ役目。
+            match = re.search(r"[0-9.]+$", self._expr)
+            self._expr = self._expr[:match.start()] if match \
+                else self._expr[:-1]
+        elif key == "backspace":
+            self._expr = self._expr[:-1]
+        elif key == "=":
+            # = は「結果を確定させる」。式を結果で置き換えて、続きを
+            # その結果から計算できるようにする。
+            value = self._evaluate(self._expr)
+            if value is not None:
+                self._expr = value
+        else:
+            self._expr += key
+
+    def _copy_result(self) -> None:
+        """Ctrl+C: 結果をコピーする。窓は閉じない。
+
+        クリップボードは、本人が明示的に押したときだけ書き換える
+        (Enter で勝手に書き換わる作法にしない、という決めのため)。"""
+        if self._expr_mode:
+            text = self._evaluate(self._expr) or self._expr
+        else:
+            text = self.core.display
+        if text:
+            QApplication.clipboard().setText(text)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close()
             return
+        if (event.modifiers() & Qt.ControlModifier) \
+                and event.key() == Qt.Key_C:
+            self._copy_result()
+            return
+        if self._expr_mode:
+            if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier
+                                    | Qt.MetaModifier):
+                return super().keyPressEvent(event)
+            if event.key() in (Qt.Key_Enter, Qt.Key_Return):
+                return  # Enter は何もしない(結果は打つそばから出ている)
+            if event.key() == Qt.Key_Backspace:
+                self._press("backspace")
+                return
+            text = event.text()
+            if len(text) == 1 and text.isprintable():
+                self._press(text)
+                return
+            return super().keyPressEvent(event)
         if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
             return super().keyPressEvent(event)
         key = None
@@ -338,5 +434,6 @@ class CalculatorWindow(QWidget):
         super().closeEvent(event)
 
 
-def create_window() -> CalculatorWindow:
-    return CalculatorWindow()
+def create_window(expression_mode: bool = False,
+                  seed: str = "") -> CalculatorWindow:
+    return CalculatorWindow(expression_mode=expression_mode, seed=seed)

@@ -114,3 +114,57 @@ def test_window_buttons_offscreen():
     event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Escape, Qt.NoModifier)
     window.keyPressEvent(event)
     assert closed == [True]
+
+
+def test_expression_mode_window():
+    """式の作法(統合ピッカーの `=` から): 式を打つそばから結果が出る。
+
+    Enter は何もしない。Ctrl+C で結果をコピーして閉じない。Esc で閉じる。"""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    _qapp()
+    window = calculator.create_window(expression_mode=True, seed="100+50")
+    try:
+        assert window._display.text() == "100+50 = 150", window._display.text()
+        # Enter は何もしない(表示は変わらず、閉じもしない)
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Return, Qt.NoModifier)
+        window.keyPressEvent(event)
+        assert window._display.text() == "100+50 = 150"
+        # Ctrl+C で結果をコピーする(閉じない)
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_C, Qt.ControlModifier)
+        window.keyPressEvent(event)
+        assert QApplication.clipboard().text() == "150"
+        # 打ち足すと式が伸びる。= で結果を確定させて、続きを計算できる
+        window._press("0")
+        assert window._display.text() == "100+500 = 600"
+        window._press("=")
+        assert window._display.text() == "600"
+        # Esc で閉じる
+        closed = []
+        window.closed.connect(lambda: closed.append(True))
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Escape, Qt.NoModifier)
+        window.keyPressEvent(event)
+        assert closed == [True]
+    finally:
+        window.close()
+
+
+def test_expression_mode_units_and_blank_seed():
+    """単位換算も式の作法の中で効く。seed が無ければ 0 から打ち始める。"""
+    _qapp()
+    window = calculator.create_window(expression_mode=True, seed="100cm to m")
+    try:
+        assert window._display.text() == "100cm to m = 1", \
+            window._display.text()
+    finally:
+        window.close()
+    window = calculator.create_window(expression_mode=True)
+    try:
+        assert window._display.text() == "0"
+        for key in "2+3":
+            window._press(key)
+        assert window._display.text() == "2+3 = 5"
+    finally:
+        window.close()

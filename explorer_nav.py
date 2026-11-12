@@ -179,3 +179,36 @@ def navigate(hwnd: int, path: str) -> bool:
         return True
 
     return bool(_with_explorer_window(hwnd, go))
+
+
+def last_active_hwnd() -> int:
+    """直前にアクティブだったエクスプローラの HWND。無ければ 0。
+
+    EnumWindows の Z 順(前面から)で、CabinetWClass の最初の1件を取る。
+    呼び出し側(あふｗなど)が前面にいるとき、「その裏でいちばん上にいた
+    エクスプローラ」が直近に触っていたものにいちばん近い。"""
+    try:
+        found = window_tools.find_windows_by_class(EXPLORER_CLASS)
+    except Exception:  # noqa: BLE001  取れないことは「無い」ことと同じ
+        return 0
+    return found[0] if found else 0
+
+
+# 新しいタブで開くためのフラグ(Shell の BrowserNavConstants:
+# navOpenInNewTab)。Windows 11 のエクスプローラのタブ用。
+_NAV_OPEN_IN_NEW_TAB = 0x0800
+
+
+def navigate_new_tab(hwnd: int, path: str) -> bool:
+    """そのエクスプローラの新しいタブで path を開く。成否を返す。
+
+    タブの無い環境では Navigate が失敗するので False が返る(呼び出し側が
+    別の開き方に倒す)。"""
+    if not path:
+        return False
+
+    def go(window):
+        window.Navigate(path, _NAV_OPEN_IN_NEW_TAB)
+        return True
+
+    return bool(_with_explorer_window(hwnd, go))

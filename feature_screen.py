@@ -1300,7 +1300,7 @@ class ScreenFeature:
             return []
         return list(result.paths)
 
-    def _record_unified_use(self, data, param=None):
+    def _record_unified_use(self, data):
         """統合ピッカーでの実行を学習に残す。
 
         frecency は command_palette の履歴(機能・アプリ・ファイル・Web検索)へ、
@@ -1329,8 +1329,6 @@ class ScreenFeature:
                 raw = data.get("history_text")
                 if not raw and data.get("name"):
                     raw = data["name"]
-                    if kind == "exec" and param:
-                        raw = f"{raw};{param}"
                 if raw:
                     if self._cmd_history_cache is None:
                         self._cmd_history_cache = command_launcher.load_history()
@@ -1341,10 +1339,10 @@ class ScreenFeature:
             traceback.print_exc()
 
     def _unified_picker_state(self):
-        """統合ピッカーのスタメン管理(settings の unified_picker 節)。
+        """統合ピッカーのピン留め管理(settings の unified_picker 節)。
 
-        pinned_features: 通常表示に昇格した機能のキー。declined: 昇格を断った
-        項目("feature:<キー>" / "app:<パス>")で、二度聞かないために覚える。"""
+        pinned_features: `!` で機能の先頭に並べる機能のキー。declined は
+        旧い「昇格を聞く」仕組みの名残で、もう書かない(読みもしない)。"""
         state = self.app_settings.get("unified_picker")
         if not isinstance(state, dict):
             state = {}
@@ -1361,46 +1359,25 @@ class ScreenFeature:
         except Exception:  # noqa: BLE001  保存できなくても実行は続ける
             traceback.print_exc()
 
-    def _maybe_promote(self, picker, data):
-        """`*` で広げて出した控えを実行したあと、スタメン昇格を聞く。
+    def run_feature_item(self, item_key) -> bool:
+        """縦ランチャの機能を項目キーで実行する。実行できたら True。
 
-        アプリはブックマークとして登録し、機能はピン留めする。断ったら
-        その項目では二度聞かない(declined に覚える)。"""
-        if not data.get("pool"):
-            return
-        kind = data.get("kind")
-        if kind == "feature":
-            ident = f"feature:{data.get('item_key') or ''}"
-        elif kind == "app":
-            ident = f"app:{data.get('path') or ''}"
-        else:
-            return
-        state = self._unified_picker_state()
-        if ident in state["declined"]:
-            return
-        name = data.get("name") or ""
-        answer = QMessageBox.question(
-            picker, "統合ピッカー",
-            f"『{name}』を通常表示（スタメン）に加えますか？\n"
-            "（次回からは * を打たなくても出ます）",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
-            state["declined"].append(ident)
-            self._save_unified_picker_state()
-            return
-        if kind == "feature":
-            key = data.get("item_key") or ""
-            if key and key not in state["pinned_features"]:
-                state["pinned_features"].append(key)
-                self._save_unified_picker_state()
-            show_toast(f"統合ピッカー\nスタメンに加えました\n{name}")
-        elif launcher.save_bookmark(self.app_settings, self.settings_path,
-                                    name, data.get("path") or ""):
-            show_toast(f"統合ピッカー\nスタメンに加えました\n{name}")
-        else:
-            show_toast("統合ピッカー\n設定ファイルに保存できませんでした")
+        統合ピッカーの `!` と、外からの依頼(あっふのピッカー→ IPC の
+        feature コマンド)で同じ実行経路を使うための口。"""
+        item = taskbar_launcher.ITEMS.get(item_key or "")
+        if item is None:
+            return False
+        target = self._audio_feature if item.get("feature") == "audio" \
+            else self
+        method = (getattr(target, item.get("method", ""), None)
+                  if target is not None else None)
+        if not callable(method):
+            show_toast(f"統合ピッカー\n{item.get('label')}を呼び出せません")
+            return False
+        method(*item.get("args", ()))
+        return True
 
-    def _on_unified_accept(self, picker, data, hwnd, rebuild):
+    def _on_unified_accept(self, picker, data, hwnd, rebuild, state=None):
         """統合ピッカーで選ばれた候補を実行する。True を返すと窓を開けたままにする。
 
         入口なので例外は必ず受ける(常駐を落とさない)。"""
@@ -1423,14 +1400,7 @@ class ScreenFeature:
                 entry = data.get("entry")
                 if entry is None:
                     return None
-                param = data.get("param")
-                if param is None:
-                    typed_name, typed_param = command_launcher.parse_input(
-                        picker.search.text() if picker is not None else "")
-                    param = typed_param if typed_name.casefold() == \
-                        (entry.name or "").casefold() else ""
-                action, payload = command_launcher.build_command(entry,
-                                                                 param or "")
+                action, payload = command_launcher.build_command(entry, "")
                 used = False
                 if action == "exec":
                     command, workdir = payload
@@ -1443,34 +1413,26 @@ class ScreenFeature:
                         payload, launcher.afxw_path(self.app_settings),
                         launcher.target_mode(self.app_settings), hwnd=hwnd)
                 if used:
-                    self._record_unified_use(data, param or None)
+                    self._record_unified_use(data)
                 return None
             if kind == "feature":
-                item = taskbar_launcher.ITEMS.get(data.get("item_key") or "")
-                if item is None:
-                    return None
-                target = self._audio_feature if item.get("feature") == "audio" \
-                    else self
-                method = (getattr(target, item.get("method", ""), None)
-                          if target is not None else None)
-                if callable(method):
-                    method(*item.get("args", ()))
+                if self.run_feature_item(data.get("item_key") or ""):
                     self._record_unified_use(data)
-                    self._maybe_promote(picker, data)
-                else:
-                    show_toast(f"統合ピッカー\n{item.get('label')}を呼び出せません")
                 return None
             if kind in ("app", "file"):
                 path = data.get("path") or ""
                 if path:
                     os.startfile(path)  # noqa: S606
                     self._record_unified_use(data)
-                    if kind == "app":
-                        self._maybe_promote(picker, data)
                 return None
-            if kind == "calc":
-                QApplication.clipboard().setText(data.get("value") or "")
-                return None
+            if kind == "more_apps":
+                # 未登録アプリをその場で一覧に加える。窓は開けたまま、
+                # 同じ入力で一覧を作り直すと動的候補にアプリが出る。
+                if state is not None:
+                    state["apps_expanded"] = True
+                if picker is not None:
+                    picker.set_items(rebuild())
+                return True
             if kind == "web":
                 url = data.get("url") or ""
                 if url:
@@ -1572,7 +1534,7 @@ class ScreenFeature:
             answer = QMessageBox.question(
                 picker, "統合ピッカー",
                 f"『{name}』のピン留めを外しますか？\n"
-                "（* を打てばまた出ます）",
+                "（! モードでまた出ます）",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
                 return
@@ -2144,6 +2106,47 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # 統合ピッカーの窓(フォルダブックマークの入口でもある)
     # ---------------------------------------------------------------
+    def _open_picker_calculator(self, expr: str):
+        """統合ピッカーの `=` から電卓(式の作法)を開く。
+
+        ピッカーは既に閉じている。縦ランチャの電卓と窓の持ち方を共有する
+        (calculator_window / _close_calculator)。出ていたら作り直す
+        (作法が違う窓を使い回すと、種まきした式が残らないため)。"""
+        if self.calculator_window is not None:
+            self._close_calculator()
+        window = calculator.create_window(expression_mode=True,
+                                          seed=expr or "")
+        window.closed.connect(self._close_calculator)
+        self.calculator_window = window
+        window.show_at_cursor_screen()
+
+    def _on_unified_ctrl_enter(self, picker, _name, data):
+        """常駐側ピッカーの Ctrl+Enter。未登録アプリの行だけが対象で、
+        「ランチャ登録する」の小さなメニューをピッカーの上に重ねる。
+
+        登録はその場で settings に書く(名前はアプリ名)。登録済みなら
+        メニュー自体を出さない。あっふ側のピッカーでは、同じ行に
+        あっふの Ctrl+Enter メニュー(開き先・拡張子メニュー付き)が出る。"""
+        if not isinstance(data, dict) or data.get("kind") != "app":
+            return
+        path = data.get("path") or ""
+        name = data.get("name") or ""
+        if not path or not name:
+            return
+        if launcher.find_bookmark_by_path(self.app_settings, path) is not None:
+            return
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(picker)
+        action = menu.addAction("ランチャ登録する")
+        if menu.exec(QCursor.pos()) is not action:
+            return
+        if launcher.save_bookmark(self.app_settings, self.settings_path,
+                                  name, path):
+            show_toast(f"統合ピッカー\nランチャに登録しました\n{name}")
+        else:
+            show_toast("統合ピッカー\n設定ファイルに保存できませんでした")
+
     def start_launcher(self, current_path: str = None):
         """統合ピッカーを開く。current_path はあふｗ側の現在のパスで、
         IPC(main.py)から呼ばれたときだけ渡る。メニューやホットキーからは渡らないが、
@@ -2171,32 +2174,32 @@ class ScreenFeature:
         features = [(key, item["label"])
                     for key, item in taskbar_launcher.ITEMS.items()]
         add_path = launcher.resolve_add_path(current_path, hwnd)
-        pinned_keys = list(self._unified_picker_state()["pinned_features"])
+        # モードと「未登録アプリを広げたか」は、候補を作る側と共有する dict で持つ。
+        state = {"mode": unified_picker.INITIAL_MODE, "apps_expanded": False}
 
         def rebuild():
-            # ピン留めは窓を開いている間にも変わる(昇格・解除)ので、作るたびに
-            # 現在の設定から組み直す。
-            state = self._unified_picker_state()
-            pinned_pairs = [
-                (key, taskbar_launcher.ITEMS[key]["label"])
-                for key in state["pinned_features"]
-                if key in taskbar_launcher.ITEMS]
-            return unified_picker.build_items(
+            # ピン留めは窓を開いている間にも変わる(解除)ので、作るたびに
+            # 現在の設定から組み直す。モードは state の現在値を見る。
+            picker_state = self._unified_picker_state()
+            return unified_picker.build_mode_items(
+                state["mode"],
                 command_launcher.build_entries(self.app_settings),
-                pinned_features=pinned_pairs, add_path=add_path)
+                features=features,
+                pinned_keys=list(picker_state["pinned_features"]),
+                recent=unified_picker.recent_folders(self.app_settings),
+                add_path=add_path)
 
-        dynamics = unified_picker.make_dynamic_items(
+        dynamics = unified_picker.make_mode_dynamics(
             entries=command_launcher.build_entries(self.app_settings),
-            features=features, apps=self._palette_apps_cache,
+            apps=self._palette_apps_cache,
             web_searches=(self.app_settings.get("command_palette") or {})
             .get("web_searches"),
             file_search=self._unified_file_search,
-            palette_history=self._palette_history_cache,
-            pinned_keys=pinned_keys)
+            state=state)
         picker = None
 
         def accept(_name, data):
-            return self._on_unified_accept(picker, data, hwnd, rebuild)
+            return self._on_unified_accept(picker, data, hwnd, rebuild, state)
 
         def delete(name, data):
             self._on_unified_delete(picker, name, data, rebuild)
@@ -2204,12 +2207,24 @@ class ScreenFeature:
         def move(name, data, step):
             self._on_unified_move(picker, name, data, step, rebuild)
 
+        def mode_change(char):
+            state["mode"] = char
+            if char is not None and picker is not None:
+                picker.set_items(rebuild())
+
         picker = PickerWindow(
             "統合ピッカー", rebuild(), accept,
             placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
             preview_provider=lambda data: unified_picker.preview_text(data),
-            dynamic_items=dynamics, tab_text=unified_picker.make_tab_text(),
-            on_delete=delete, on_move=move, dynamic_last=True)
+            dynamic_items=dynamics,
+            tab_text=unified_picker.make_tab_text(state),
+            on_delete=delete, on_move=move, dynamic_last=True,
+            modes=unified_picker.MODES,
+            initial_mode=unified_picker.INITIAL_MODE,
+            on_mode_change=mode_change,
+            on_calc=self._open_picker_calculator,
+            on_ctrl_enter=lambda name, data: self._on_unified_ctrl_enter(
+                picker, name, data))
         picker.closed.connect(self._close_launcher)
         self.launcher_picker = picker
         picker.show()

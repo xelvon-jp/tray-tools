@@ -32,6 +32,9 @@
 #                 書き込む列(形式の正本は見張り側)。新しい順に最大10件。
 #                 要素は {"id", "title"(短い件名。最大40字), "stage", "times",
 #                 "updated"} と、失敗のときだけ "reason"(失敗の理由)。
+#                 任意で "kind"("task" | "note"。note は印だけの依頼で、
+#                 バーに出さない)、"ack_wait_sec"(受領までの秒数)、
+#                 "late"(受領まで10分以上。真偽値)、"done_at"(完了時刻)。
 #                 stage は "detected"(検知) | "saved"(保存) | "ack"(受領) |
 #                 "done"(完了) | "failed"(失敗)。送信は見張りからは見えない
 #                 ので stage には無い(バーの段階としては1段目に数える)。
@@ -351,8 +354,10 @@ REQ_FRACTIONS = {"detected": 0.4, "saved": 0.6, "ack": 0.8,
 REQ_STAGE_LABELS = {"detected": "検知", "saved": "保存", "ack": "受領",
                     "done": "完了", "failed": "失敗"}
 REQ_MAX_ACTIVE = 5      # 進行中は新しい順にこの数まで
-REQ_MAX_FINISHED = 3    # 終わったものは新しい順にこの数まで
-REQ_DONE_TTL_SEC = 600  # 完了はこの秒数が過ぎたら出さない(失敗は消えない)
+REQ_MAX_FINISHED = 3    # 終わったばかりの完了は新しい順にこの数まで
+REQ_DONE_COLLAPSE_SEC = 180   # 完了はこの秒数を過ぎたら畳んだ1行にまとめる
+REQ_DONE_TTL_SEC = 24 * 3600  # 完了はこの秒数を過ぎたら出さない(見張りの保持と揃える)
+REQ_LATE_SEC = 600      # 受領までこの秒数以上で「遅延」(見張りの late と同じ)
 # 段階の間の目安(開始の段階, 終わりの段階, 秒数)。待ちの間は経過で、
 # 次の段階に届いたあとは記録された間で判定する。
 REQ_SPANS = (("detected", "saved", 60),
@@ -379,38 +384,50 @@ def _req_row(entry, now):
         return None
     updated = _num(entry, "updated")
     finished = stage in ("done", "failed")
-    # 終わった時刻(完了は times の done、失敗は updated。欠けたら他方で代用)
-    ended = times.get("done") or updated
+    # 終わった時刻(done_at → times の done → updated の順。欠けたら他方で代用)
+    ended = _num(entry, "done_at") or times.get("done") or updated
     if ended is None:
         ended = max(times.values())
     earliest = min(times.values())   # 送信は無いので、最初の検知時刻が起点
-    warn, note = "none", ""
-    for a_key, b_key, limit in REQ_SPANS:
-        a = times.get(a_key)
-        if a is None:
-            continue
-        b = times.get(b_key)
-        if b is None and finished and b_key == "done":
-            b = ended   # 失敗は終わりの時刻で受領からの間を判定する
-        if b is not None:
-            gap, waiting = b - a, False
-        elif not finished:
-            gap, waiting = now - a, True
-        else:
-            continue
-        if gap > limit:
-            warn = "warn"
-            note = (f"{REQ_STAGE_LABELS[a_key]}から{REQ_STAGE_LABELS[b_key]}まで "
-                    f"{fmt_dur(gap)}" + (" 経過" if waiting else " かかりました"))
-            break
-    if not finished and "ack" not in times \
-            and now - earliest > REQ_NO_ACK_RED_SEC:
-        warn = "red"
-        note = "受領が5分以上来ていません"
+    # 受領までの時間と遅延か(見張りの値があればそれを使い、無ければ times から)
+    ack_wait = _num(entry, "ack_wait_sec")
+    if ack_wait is None and "ack" in times:
+        ack_wait = times["ack"] - earliest
+    late = entry.get("late")
+    if not isinstance(late, bool):
+        late = ack_wait is not None and ack_wait >= REQ_LATE_SEC
     reason = entry.get("reason")
     reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
-    if stage == "failed" and not note:
-        note = reason or ""
+    warn, note = "none", ""
+    if stage == "done":
+        # 完了したら注意の色は戻す。受領の遅れだけ小さな印で残す(2026-11-13 合意)
+        if late and ack_wait is not None:
+            note = f"受領まで{fmt_dur(ack_wait)}"
+    else:
+        for a_key, b_key, limit in REQ_SPANS:
+            a = times.get(a_key)
+            if a is None:
+                continue
+            b = times.get(b_key)
+            if b is None and finished and b_key == "done":
+                b = ended   # 失敗は終わりの時刻で受領からの間を判定する
+            if b is not None:
+                gap, waiting = b - a, False
+            elif not finished:
+                gap, waiting = now - a, True
+            else:
+                continue
+            if gap > limit:
+                warn = "warn"
+                note = (f"{REQ_STAGE_LABELS[a_key]}から{REQ_STAGE_LABELS[b_key]}まで "
+                        f"{fmt_dur(gap)}" + (" 経過" if waiting else " かかりました"))
+                break
+        if not finished and "ack" not in times \
+                and now - earliest > REQ_NO_ACK_RED_SEC:
+            warn = "red"
+            note = "受領が5分以上来ていません"
+        if stage == "failed" and not note:
+            note = reason or ""
     stage_at = ended if finished else times.get(stage)
     if finished or stage_at is None:
         label = REQ_STAGE_LABELS[stage]
@@ -428,6 +445,10 @@ def _req_row(entry, now):
         "note": note,
         "fail_reason": reason if stage == "failed" else None,
         "finished": finished,
+        "kind": entry.get("kind") if entry.get("kind") in ("task", "note")
+                else "task",
+        "ack_wait_sec": ack_wait,
+        "late": bool(late),
         "sent_at": earliest,
         "ended_at": ended if finished else None,
         # ✕で閉じた判定のキー。段階が進めば(キーが変われば)また出る。
@@ -438,10 +459,14 @@ def _req_row(entry, now):
 def request_rows(data, now=None) -> list:
     """取り次ぎ依頼の進捗行(描く側がそのまま使える形)を返す純関数。
 
-    進行中は新しい順に REQ_MAX_ACTIVE 件、終わったものは新しい順に
-    REQ_MAX_FINISHED 件(進行中を先に並べる)。完了は REQ_DONE_TTL_SEC を
-    過ぎたら落とす(失敗はデータにある限り残す。消すのは見る人)。
-    見張りが止まって FORGET_SEC より古いファイルは丸ごと出さない。"""
+    並びは 進行中 → 失敗 → 終わったばかりの完了 → 畳んだ完了の1行。
+    進行中は新しい順に REQ_MAX_ACTIVE 件、終わったばかりの完了
+    (REQ_DONE_COLLAPSE_SEC 以内)は新しい順に REQ_MAX_FINISHED 件まで出し、
+    それより古い完了は「完了 N件(最後: …)」の1行(stage="summary")に
+    畳んで一番下に出す。失敗は畳まず、データにある限り残す(消すのは
+    見る人)。kind="note"(印だけの依頼)はバーに出さない。
+    見張りが止まって FORGET_SEC より古いファイルは丸ごと出さない。
+    (表示の切り分けは 2026-11-13 にアオと合意)"""
     if not isinstance(data, dict):
         return []
     now = time.time() if now is None else now
@@ -451,9 +476,11 @@ def request_rows(data, now=None) -> list:
     raw = data.get("requests")
     if not isinstance(raw, list):
         return []
-    active, finished = [], []
+    active, failed, done_fresh, done_pool = [], [], [], []
     for entry in raw:
         if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "note":
             continue
         row = _req_row(entry, now)
         if row is None:
@@ -461,10 +488,50 @@ def request_rows(data, now=None) -> list:
         if row["stage"] == "done":
             ended = row["ended_at"] if row["ended_at"] is not None \
                 else row["sent_at"]
-            if now - ended > REQ_DONE_TTL_SEC:
+            age = now - ended
+            if age > REQ_DONE_TTL_SEC:
                 continue
-        (finished if row["finished"] else active).append(row)
+            (done_fresh if age <= REQ_DONE_COLLAPSE_SEC
+             else done_pool).append(row)
+        elif row["finished"]:
+            failed.append(row)
+        else:
+            active.append(row)
+
+    def _by_ended(rows):
+        return sorted(rows, key=lambda r: -(r["ended_at"]
+                                            if r["ended_at"] is not None
+                                            else r["sent_at"]))
+
     active.sort(key=lambda r: -r["sent_at"])
-    finished.sort(key=lambda r: -(r["ended_at"] if r["ended_at"] is not None
-                                  else r["sent_at"]))
-    return active[:REQ_MAX_ACTIVE] + finished[:REQ_MAX_FINISHED]
+    failed = _by_ended(failed)
+    done_fresh = _by_ended(done_fresh)
+    done_pool.extend(done_fresh[REQ_MAX_FINISHED:])
+    done_fresh = done_fresh[:REQ_MAX_FINISHED]
+    rows = active[:REQ_MAX_ACTIVE] + failed + done_fresh
+    if done_pool:
+        done_pool = _by_ended(done_pool)
+        last = done_pool[0]
+        late_n = sum(1 for r in done_pool if r["late"])
+        rows.append({
+            "id": last["id"],
+            "title": f"完了 {len(done_pool)}件（最後: "
+                     f"{last['title'] or last['id']}）",
+            "stage": "summary",
+            "stage_label": "完了",
+            "fraction": 1.0,
+            "warn": "none",
+            "label": "完了",
+            "note": f"うち遅延{late_n}件" if late_n else "",
+            "fail_reason": None,
+            "finished": True,
+            "kind": "task",
+            "ack_wait_sec": None,
+            "late": False,
+            "sent_at": last["sent_at"],
+            "ended_at": last["ended_at"],
+            # ✕で閉じた判定のキー。畳んだ中身が変われば(キーが変われば)また出る。
+            "key": ("__done_summary__", len(done_pool),
+                    last["id"], last["ended_at"]),
+        })
+    return rows

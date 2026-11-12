@@ -244,14 +244,15 @@ def test_request_rows_warn_recorded_gaps():
     # 保存→受領が61秒(記録済み) → warn
     e = _req(stage="ack", detected=200, saved=180, ack=119)
     assert mbs.request_rows({"requests": [e]}, NOW)[0]["warn"] == "warn"
-    # 受領→完了が30分超(記録済み。完了しても注意は残る)
+    # 受領→完了が30分超でも、完了したら注意の色は戻す(2026-11-13 合意)
     base = NOW - 2000
     e = {"id": "req-20261113-02", "title": "件名", "stage": "done",
          "times": {"detected": base, "saved": base + 10, "ack": base + 20,
                    "done": base + 20 + 1801},
          "updated": base + 20 + 1801}
     rows = mbs.request_rows({"requests": [e]}, NOW)
-    assert rows[0]["warn"] == "warn" and rows[0]["fraction"] == 1.0
+    assert rows[0]["warn"] == "none" and rows[0]["fraction"] == 1.0
+    assert rows[0]["note"] == ""   # 受領は速かったので遅延の印も無い
 
 
 def test_request_rows_warn_waiting_and_red():
@@ -290,24 +291,85 @@ def test_request_rows_selection_limits():
                  detected=130 + i * 10, saved=120 + i * 10,
                  ack=110 + i * 10, done=100 + i * 10) for i in range(5)]
     rows = mbs.request_rows({"requests": done}, NOW)
-    assert len(rows) == 3   # 終わったものは新しい順に3件まで
-    assert [r["id"] for r in rows] == [f"req-20261112-{i:02d}" for i in range(3)]
-    # 進行中が先、終わったものが後
+    # 終わったばかりの完了は3件まで。あふれた分は畳んだ1行になる
+    assert [r["id"] for r in rows[:3]] == [f"req-20261112-{i:02d}"
+                                           for i in range(3)]
+    assert rows[3]["stage"] == "summary" and "完了 2件" in rows[3]["title"]
+    # 進行中が先、終わったものが後(畳んだ1行は一番下)
     rows = mbs.request_rows({"requests": done + active}, NOW)
-    assert [r["finished"] for r in rows] == [False] * 5 + [True] * 3
+    assert [r["finished"] for r in rows] == [False] * 5 + [True] * 4
 
 
 def test_request_rows_done_expiry():
-    # 完了から10分を超えたら出さない。ちょうど10分は出す
-    e = _req(stage="done", detected=730, saved=720, ack=710, done=601)
+    # 完了から3分以内のものは1本で出す(180秒ちょうども)
+    e = _req(stage="done", detected=280, saved=270, ack=260, done=180)
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert len(rows) == 1 and rows[0]["stage"] == "done"
+    # 3分を超えた完了は畳んだ1行になる(600秒でも601秒でも)
+    for ago in (181, 600, 601):
+        e = _req(stage="done", detected=ago + 130, saved=ago + 120,
+                 ack=ago + 110, done=ago)
+        rows = mbs.request_rows({"requests": [e]}, NOW)
+        assert len(rows) == 1 and rows[0]["stage"] == "summary", ago
+        assert "完了 1件（最後: 件名）" in rows[0]["title"]
+    # 24時間を超えた完了は出さない
+    e = _req(stage="done", detected=90000, saved=89990, ack=89980,
+             done=mbs.REQ_DONE_TTL_SEC + 1)
     assert mbs.request_rows({"requests": [e]}, NOW) == []
-    e = _req(stage="done", detected=730, saved=720, ack=710, done=600)
-    assert len(mbs.request_rows({"requests": [e]}, NOW)) == 1
     # 失敗は古くても残る(消すのは見る人)
     f = _req(stage="failed", detected=9000, saved=8990, ack=8980,
              reason="失敗の理由", updated_ago=8900)
     rows = mbs.request_rows({"requests": [f]}, NOW)
     assert len(rows) == 1 and rows[0]["note"] == "失敗の理由"
+
+
+def test_request_rows_done_late_note():
+    # 受領まで25分(見張りの late / ack_wait_sec あり) → 小さな印だけ残る
+    e = _req(stage="done", detected=1600, saved=1590, ack=100, done=90)
+    e["late"] = True
+    e["ack_wait_sec"] = 1500
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["warn"] == "none" and rows[0]["note"] == "受領まで25分00秒"
+    assert rows[0]["late"]
+    # 見張りの値が無くても times から判定する(受領まで10分以上で遅延)
+    e = _req(stage="done", detected=800, saved=790, ack=100, done=90)
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["late"] and rows[0]["note"] == "受領まで11分40秒"
+    # 遅延でなければ印は無い
+    e = _req(stage="done", detected=200, saved=190, ack=100, done=90)
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert not rows[0]["late"] and rows[0]["note"] == ""
+
+
+def test_request_rows_summary_late_count():
+    # 畳んだ行には遅延の件数も出す
+    old1 = _req(rid="req-20261113-21", stage="done", title="遅れた件",
+                detected=5000, saved=4990, ack=4300, done=4200)
+    old2 = _req(rid="req-20261113-22", stage="done", title="普通の件",
+                detected=4000, saved=3990, ack=3980, done=3900)
+    rows = mbs.request_rows({"requests": [old1, old2]}, NOW)
+    assert len(rows) == 1 and rows[0]["stage"] == "summary"
+    assert "完了 2件（最後: 普通の件）" in rows[0]["title"]   # 最後は一番新しい完了
+    assert rows[0]["note"] == "うち遅延1件"
+
+
+def test_request_rows_note_kind_hidden():
+    # kind="note"(印だけの依頼)はバーに出さない。完了になっても畳みにも数えない
+    e = _req(stage="done", detected=5000, saved=4990, ack=4980, done=4970)
+    e["kind"] = "note"
+    assert mbs.request_rows({"requests": [e]}, NOW) == []
+    e = _req(stage="ack", detected=100, saved=90, ack=80)
+    e["kind"] = "note"
+    assert mbs.request_rows({"requests": [e]}, NOW) == []
+
+
+def test_request_rows_failed_not_collapsed():
+    # 失敗は件数の上限なく残る(畳まない)
+    fails = [_req(rid=f"req-20261113-3{i}", stage="failed",
+                  detected=500 + i * 10, saved=490 + i * 10,
+                  ack=480 + i * 10, reason="理由") for i in range(4)]
+    rows = mbs.request_rows({"requests": fails}, NOW)
+    assert len(rows) == 4 and all(r["stage"] == "failed" for r in rows)
 
 
 def test_request_rows_labels():

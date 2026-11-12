@@ -802,9 +802,11 @@ class ClaudeProgressPanel(QWidget):
 
         バーは段階の進み(検知 2/5 → 完了 5/5。送信は見張りからは見えない)。
         割合・注意・ラベルは muse_bridge_status.request_rows が計算済み
-        (描くときに計算し直さない)。色は、完了=緑、失敗と赤信号=赤、
-        注意=橙、それ以外は実行中の青。"""
-        if entry["stage"] == "done":
+        (描くときに計算し直さない)。色は、完了=緑、畳んだ完了=灰緑、
+        失敗と赤信号=赤、注意=橙、それ以外は実行中の青。"""
+        if entry["stage"] == "summary":
+            color = MUSE_TONE_COLORS["calm"]
+        elif entry["stage"] == "done":
             color = STATE_COLORS[cs.DONE]
         elif entry["stage"] == "failed" or entry["warn"] == "red":
             color = MUSE_TONE_COLORS["alert"]

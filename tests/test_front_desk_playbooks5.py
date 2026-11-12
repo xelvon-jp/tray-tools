@@ -222,6 +222,29 @@ def test_pb4034_rate_limit():
         assert out.ok, out.summary
 
 
+def test_pb4034_rate_reset():
+    with tempfile.TemporaryDirectory() as td:
+        log_path = os.path.join(td, "wake-log.jsonl")
+        now = time.time()
+        _seed(log_path, [
+            {"ts": now - 60, "delivery_id": f"old-{i}", "outcome": "sent"}
+            for i in range(3)])
+        ctx = make_ctx({"log_path": log_path})
+        with patched() as p:
+            out = session_wake(ctx, _params())
+            assert not out.ok
+            assert _records(log_path)[-1]["outcome"] == "rate_limited"
+            out = session_wake(ctx, {"action": "reset_rate",
+                                     "delivery_id": "wake-reset-1",
+                                     "reason": "テスト"})
+            assert out.ok, out.summary
+            out = session_wake(ctx, _params(delivery_id="wake-test-2"))
+            assert out.ok, out.summary
+        outcomes = [r["outcome"] for r in _records(log_path)]
+        assert outcomes[-3:] == ["rate_limited", "rate_reset", "sent"], \
+            outcomes
+
+
 def test_pb4034_guards():
     with tempfile.TemporaryDirectory() as td:
         log_path = os.path.join(td, "wake-log.jsonl")
@@ -393,6 +416,7 @@ ALL_TESTS = [
     test_pb4034_duplicate_blocked,
     test_pb4034_retry_after_failure_allowed,
     test_pb4034_rate_limit,
+    test_pb4034_rate_reset,
     test_pb4034_guards,
     test_pb4034_opus_busy,
     test_pb4034_opus_deferred_to_relay,

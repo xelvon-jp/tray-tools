@@ -2073,10 +2073,24 @@ def session_wake(ctx: PlaybookContext, params: dict) -> ExecOutcome:
         return _wake_finish(ctx, log, record, outcome, notify=notify)
 
     unknown = sorted(set(params) - {"target", "body", "delivery_id",
-                                     "folder"})
+                                     "folder", "action", "reason"})
     if unknown:
         return finish(_blocked(log, f"未知の params です: {unknown}"),
                       "invalid")
+    if params.get("action") == "reset_rate":
+        # 上限のリセット (2026-11-13、Nagato の許可制で追加)。
+        # 記録は書き換えず、リセット自体を1件の記録として残す。
+        # 以後の上限カウントは、この記録より後の送信だけを数える。
+        reset_id = params.get("delivery_id")
+        if not isinstance(reset_id, str) or not reset_id.strip():
+            return finish(_blocked(log, "delivery_id が必要です"),
+                          "invalid")
+        record["reason"] = params.get("reason") or ""
+        log.step("rate_reset", "ok", record["reason"])
+        return finish(
+            ExecOutcome(ok=True,
+                        summary="送信上限をリセットしました"),
+            "rate_reset")
     target = params.get("target")
     if target not in _WAKE_TARGETS:
         return finish(_blocked(log, f"target が不正です: {target}"),
@@ -2095,18 +2109,23 @@ def session_wake(ctx: PlaybookContext, params: dict) -> ExecOutcome:
     if folder is not None and not isinstance(folder, str):
         return finish(_blocked(log, "folder が文字列ではありません"),
                       "invalid")
+    records = _wake_read_records(_wake_log_path(ctx))
     log.step("params", "ok", f"target:{target} delivery:{delivery_id}")
 
-    records = _wake_read_records(_wake_log_path(ctx))
     if any(r.get("delivery_id") == delivery_id
            and r.get("outcome") == "sent" for r in records):
         log.step("dedupe", "ng", "送信済みの delivery_id です")
         return finish(_blocked(log, "この delivery_id は送信済みです "
                                     "(二重送信の防止)"), "duplicate")
     log.step("dedupe", "ok")
+    last_reset = max(
+        (r.get("ts") or 0 for r in records
+         if r.get("outcome") == "rate_reset"),
+        default=0)
     sent_recent = sum(
         1 for r in records
         if r.get("outcome") == "sent"
+        and (r.get("ts") or 0) > last_reset
         and now - (r.get("ts") or 0) < WAKE_RATE_WINDOW_SEC)
     if sent_recent >= WAKE_RATE_LIMIT:
         log.step("rate", "ng", f"直近1時間で {sent_recent} 回送信済み")

@@ -852,6 +852,17 @@ def test_call_signatures_match():
     assert checked > 20, checked
 
 
+def test_make_accept_empty():
+    state = {"mode": "["}
+    accept_empty = up.make_accept_empty(state)
+    assert accept_empty("C:")
+    assert accept_empty("\\")
+    assert not accept_empty("C")
+    assert not accept_empty("C:\\Users")
+    state["mode"] = "!"
+    assert not accept_empty("C:")   # [ モード以外では抜け道は使わない
+
+
 ALL_TESTS = [value for name, value in sorted(globals().items())
              if name.startswith("test_")]
 

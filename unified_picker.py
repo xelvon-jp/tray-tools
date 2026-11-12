@@ -321,6 +321,18 @@ def make_mode_dynamics(*, entries, apps, web_searches, file_search, state):
     return dynamics
 
 
+def make_accept_empty(state):
+    """ピッカーの入力ガードへの抜け道(accept_empty)を返す関数を作る。
+
+    `[` モードでパスを打ちかけている間(C: や UNC の最初の \)は、候補が
+    0件でも巻き戻さない。それ以外のモード・形では抜け道は使わない。"""
+    def accept_empty(text: str) -> bool:
+        if (state.get("mode") or INITIAL_MODE) != "[":
+            return False
+        return launcher.is_path_prefix(text)
+    return accept_empty
+
+
 def make_tab_text(state=None):
     """Tab の行き先。フォルダは掘り下げる。`?` では補完は効かない。
 

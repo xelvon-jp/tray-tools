@@ -192,6 +192,10 @@ class PickerWindow(QWidget):
       (引用符や空白をどう扱うかは呼び出し側にしか決められない)。ここでも「テキストが
       何を意味するか」は解釈しない。返ってきた順にそのまま並べる(並べ替えない。
       どの順に見せたいかを知っているのは呼び出し側だけ)
+    - accept_empty(テキスト) -> bool … 候補が0件になる編集でも、True を返せば
+      巻き戻さずに受け付ける(パスの打ちかけのように、続きを打てば候補が出る形の
+      ための抜け道)。テキストが何を意味するかは呼び出し側だけが知るので、
+      判定はここでは持たない
     - tab_text(表示名, データ) -> str or None … Tab を押したときに入力欄へ入れる文字列。
       返すと入力欄がそれに差し替わり(カーソルは末尾)、textChanged で一覧が組み直る。
       窓は閉じない。渡した場合、None が返るときも Tab は食べる(Qtの既定のフォーカス
@@ -244,6 +248,7 @@ class PickerWindow(QWidget):
         on_mode_change=None,
         on_calc=None,
         on_ctrl_enter=None,
+        accept_empty=None,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -277,6 +282,7 @@ class PickerWindow(QWidget):
         self._on_mode_change = on_mode_change
         self._on_calc = on_calc
         self._on_ctrl_enter = on_ctrl_enter
+        self._accept_empty = accept_empty
         self._mode_switching = False
         self._placeholder_base = placeholder or DEFAULT_PLACEHOLDER
         # 入力から作った項目。self._items には足さない(添字がずれると Qt側に持たせた
@@ -414,6 +420,12 @@ class PickerWindow(QWidget):
             return
         if accepts_input(self._accepted_text, text,
                          self._accepted_count, self.list.count()):
+            self._accepted_text = text
+            self._accepted_count = self.list.count()
+            return
+        if self._accept_empty is not None and self._accept_empty(text):
+            # 候補は0件だが、呼び出し側が「打ちかけ」として受け付ける形
+            # (パスの C: など)。巻き戻すと続きが打てなくなるので通す。
             self._accepted_text = text
             self._accepted_count = self.list.count()
             return

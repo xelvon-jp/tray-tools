@@ -103,7 +103,18 @@ def test_import_browser_bookmarks():
         assert added3 == [] and discovered3 == 0
 
 
-ALL_TESTS = [test_is_url, test_jump_url_opens_browser, test_tab_text_url_is_none,
+def test_is_path_prefix():
+    # パスの打ちかけとして受け付ける形(候補0件でも巻き戻さない)
+    assert launcher.is_path_prefix("C:")
+    assert launcher.is_path_prefix("c:")
+    assert launcher.is_path_prefix("\\")
+    assert launcher.is_path_prefix(" C: ")   # 前後の空白は除いて見る
+    # それ以外は受け付けない(C は名前の打ちかけでもある)
+    for text in ("", "C", "Ch", "C:\\", ":", "CC:", "1:", "あ"):
+        assert not launcher.is_path_prefix(text), text
+
+
+ALL_TESTS = [test_is_url, test_is_path_prefix, test_jump_url_opens_browser, test_tab_text_url_is_none,
              test_parse_browser_bookmarks, test_import_browser_bookmarks]
 
 

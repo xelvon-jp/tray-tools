@@ -523,6 +523,22 @@ def typed_items(text: str) -> list:
     return found
 
 
+_DRIVE_COLON_RE = re.compile(r"^[A-Za-z]:$")
+
+
+def is_path_prefix(text: str) -> bool:
+    """入力が「パスの打ちかけ」で、候補が0件でも受け付けるべき形か。
+
+    ドライブ文字の直後(C:)と、UNC の最初の \\ だけを指す。どちらも名前の
+    絞り込みでは出てこない字面で、ここで入力を巻き戻すとパスを手で打つ
+    ことができない(実機確認 #5)。C そのものは名前の打ちかけでもあるので
+    含めない。"""
+    if not text:
+        return False
+    t = text.strip()
+    return bool(_DRIVE_COLON_RE.match(t)) or t == "\\"
+
+
 def tab_text(_name: str, data):
     """Tab を押したときに入力欄へ入れる文字列。掘り下げる先が無ければ None。
 

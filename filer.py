@@ -5823,6 +5823,7 @@ class FilerWindow(QWidget):
             preview_provider=lambda data: unified_picker.preview_text(
                 data, context="filer"),
             dynamic_items=dynamics,
+            accept_empty=unified_picker.make_accept_empty(state),
             tab_text=unified_picker.make_tab_text(state),
             on_delete=delete, on_move=move, dynamic_last=True,
             modes=unified_picker.MODES,

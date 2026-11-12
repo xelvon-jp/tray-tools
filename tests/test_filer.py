@@ -1088,6 +1088,34 @@ def test_picker_guard_counts_dynamic_items():
         picker.close()
 
 
+def test_picker_guard_accept_empty():
+    """accept_empty が True を返す形は、候補が0件でも巻き戻さない。
+    パスの打ちかけ(C:)を通して、続きを打てるようにするため。"""
+    from picker import PickerWindow
+
+    _qapp()
+    picker = PickerWindow("フォルダブックマーク", [("claude", 1)],
+                          lambda n, d: None,
+                          accept_empty=lambda t: t == "c:")
+    try:
+        picker.search.setText("c")
+        assert picker.list.count() == 1
+        picker.search.setText("c:")
+        assert picker.search.text() == "c:", picker.search.text()
+        assert picker.list.count() == 0   # 候補は無いが、入力は残る
+    finally:
+        picker.close()
+    # 抜け道が無ければ、従来どおり巻き戻る
+    picker = PickerWindow("フォルダブックマーク", [("claude", 1)],
+                          lambda n, d: None)
+    try:
+        picker.search.setText("c")
+        picker.search.setText("c:")
+        assert picker.search.text() == "c", picker.search.text()
+    finally:
+        picker.close()
+
+
 def test_phone_share_server():
     """スマホ送信のサーバ: 合言葉が無いと何も出ず、画像はページに
     そのまま表示され、ダウンロードは attachment で届く。"""

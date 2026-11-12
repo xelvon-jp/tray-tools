@@ -361,7 +361,7 @@ def test_picker_window_modes():
         texts = [window.list.item(i).text()
                  for i in range(window.list.count())]
         assert texts == [f"{c} {n}モード" for c, n, _ in up.MODES] + [
-            "先頭に空白を入れると記号をそのまま打てます"], texts
+            "記号で始まる名前は、先頭に空白を入れて探せます"], texts
         # 案内行は選べず、色も薄い(モード行と見分けるため)
         info = window.list.item(window.list.count() - 1)
         assert not (info.flags() & Qt.ItemIsEnabled)

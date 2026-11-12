@@ -9,6 +9,7 @@
 #
 # 見つからなければ既定のブラウザへ落とす。ブラウザを名指しできないより、
 # 「開くには開く」ほうがましなため。
+import json
 import os
 import subprocess
 import sys
@@ -77,3 +78,39 @@ def open_html(path, browser: str = DEFAULT_BROWSER) -> str:
             print(f"[tray-tools] {browser} で開けませんでした: {e}", file=sys.stderr)
     os.startfile(str(path))
     return "default"
+
+
+def open_url(url, browser: str = DEFAULT_BROWSER) -> str:
+    """URL をブラウザで開く。open_html の URL 版 (パスの解決はしない)。
+
+    例外は投げない (open_html と同じ作法。関連付けが無い場合だけ
+    os.startfile が投げるので、そこは呼ぶ側で受けること)。"""
+    exe = resolve_browser(browser)
+    if exe:
+        try:
+            subprocess.Popen([exe, str(url)], close_fds=True)
+            return browser
+        except OSError as e:
+            print(f"[tray-tools] {browser} で開けませんでした: {e}", file=sys.stderr)
+    os.startfile(str(url))
+    return "default"
+
+
+def checklist_url(settings, keys_path=None) -> str:
+    """実機確認チェックリスト (家サーバの /checklist) を開く URL を組み立てる。
+
+    鍵 (checklist_key) が家サーバの keys.json から読めれば、URL の断片に
+    付けて返す。断片はサーバへ送られず、ページ側がブラウザに覚えるので、
+    付けるのは実質初回だけ。読めなければ鍵なしの URL を返す (その場合は
+    ページ側で鍵の入力を求められる)。
+    """
+    settings = settings or {}
+    url = settings.get("checklist_url") or "http://127.0.0.1:8770/checklist"
+    path = (keys_path or settings.get("checklist_keys_path")
+            or r"R:\claude\home-server\keys.json")
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            key = (json.load(fh) or {}).get("checklist_key") or ""
+    except (OSError, ValueError):
+        key = ""
+    return url + ("#t=" + key if key else "")

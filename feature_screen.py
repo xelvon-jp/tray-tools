@@ -703,6 +703,11 @@ class ScreenFeature:
         self._claude_menu = self.menu.addMenu(CLAUDE_MENU_TITLE)
         self._claude_menu.aboutToShow.connect(self._rebuild_claude_menu)
 
+        # 実機確認チェックリスト (家サーバが正本)。ブリッジと同じ作法で
+        # 環境2・3では出さない (未設定は環境1扱い)。
+        if self.app_settings.get("environment") not in (2, 3):
+            self.menu.addAction("✅ 実機確認チェックリスト", self._open_checklist)
+
         self.menu.addSeparator()
         # 電源まわりをひとつの傘に。狙いが近い(席を外す・寝かせる・寝させない)ので、
         # 探すときに同じ場所を見れば済む。
@@ -3042,6 +3047,14 @@ class ScreenFeature:
                 self._claude_progress.reset_position()
             else:
                 claude_progress.save_state({"pos": None})
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _open_checklist(self):
+        """トレイのメニューから実機確認チェックリストをブラウザで開く。"""
+        try:
+            browser_open.open_url(browser_open.checklist_url(self.app_settings),
+                                  self._browser_name())
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 

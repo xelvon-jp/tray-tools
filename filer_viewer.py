@@ -401,7 +401,8 @@ class TextViewer(QWidget):
     closed = Signal(object)
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
-                 colors: dict = None, editor_callback=None, geometry=None, parent=None):
+                 colors: dict = None, editor_callback=None, nav_callback=None,
+                 geometry=None, parent=None):
         super().__init__(parent, Qt.Window)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.path = path
@@ -410,6 +411,9 @@ class TextViewer(QWidget):
         if colors:
             self.colors.update({k: v for k, v in colors.items() if k in self.colors and v})
         self.editor_callback = editor_callback
+        # ←→ の行き先(前・次のファイル)を返す callback。方向(-1/+1)を受けて
+        # (パス, 表示名) か None を返す。ファイラが窓の並びから作る。
+        self.nav_callback = nav_callback
         self.show_numbers = False
         self.tab_width = 4
         self.highlight = None          # (行, 桁, 長さ)
@@ -434,21 +438,12 @@ class TextViewer(QWidget):
         layout.addWidget(self.status)
         self._message = ""
 
-        with open(path, "rb") as f:
-            self._head = f.read(DETECT_BYTES)
-        encoding, start = detect_encoding(self._head)
         self.index = None
         self.reader = None
-        self._open_index(encoding, start)
-
-        # HTML / Markdown は整形表示を用意し、既定でそちらを見せる
-        self.markup = markup_kind(path)
+        self.markup = None
         self.rich = None
         self.render_mode = False
-        if self.markup is not None:
-            self._setup_rich()
-            if self.rich is not None:
-                self.set_render_mode(True)
+        self._load_file(path, title_name)
 
         if geometry:
             self.setGeometry(*geometry)
@@ -471,6 +466,36 @@ class TextViewer(QWidget):
         self.reader = LineReader(self.index)
         self.area.update_ranges()
         self.area.viewport().update()
+
+    def _load_file(self, path: str, title_name: str = None) -> None:
+        """ファイルを開く(最初の読み込みと、←→ での移動で共通)。
+
+        前のファイルの索引は _open_index が止める。検索は中止し、スクロールは
+        先頭へ戻す。整形表示(HTML / Markdown)は今のファイルで作り直す。"""
+        self._cancel_search()
+        self.path = path
+        self.title_name = title_name or os.path.basename(path)
+        self.search_word = ""
+        self._search_result = None
+        with open(path, "rb") as f:
+            self._head = f.read(DETECT_BYTES)
+        encoding, start = detect_encoding(self._head)
+        self._open_index(encoding, start)
+        self.area.verticalScrollBar().setValue(0)
+        self.area.horizontalScrollBar().setValue(0)
+        if self.rich is not None:
+            self.layout().removeWidget(self.rich)
+            self.rich.deleteLater()
+            self.rich = None
+        self.render_mode = False
+        self.area.setVisible(True)
+        # HTML / Markdown は整形表示を用意し、既定でそちらを見せる
+        self.markup = markup_kind(path)
+        if self.markup is not None:
+            self._setup_rich()
+            if self.rich is not None:
+                self.set_render_mode(True)
+        self._refresh_title()
 
     # --- 整形表示(HTML / Markdown) ---
     def _setup_rich(self) -> None:
@@ -587,6 +612,24 @@ class TextViewer(QWidget):
         self._refresh_title()
 
     # --- 移動 ---
+    def _move_file(self, step: int) -> None:
+        """←→: 前・次のファイルへ移る。行き先は nav_callback に聞く。
+
+        ←→ は PageUp/PageDown と同じ働きだったので、Nagato の指定で
+        ファイル間移動に変えた(2026-11-12)。スクロールは PageUp/PageDown、
+        先頭・末尾は Ctrl+←→ と Home/End が担う。callback が無い
+        (書庫から開いた等)・端のときは何もしない。"""
+        if self.nav_callback is None:
+            return
+        target = self.nav_callback(step)
+        if not target:
+            return
+        path, title_name = target
+        try:
+            self._load_file(path, title_name)
+        except OSError as e:
+            self.set_status(f"開けません: {path}  ({e})")
+
     def scroll_to(self, line: int) -> None:
         self.area.update_ranges()
         bar = self.area.verticalScrollBar()
@@ -721,10 +764,14 @@ class TextViewer(QWidget):
                 bar.setValue(bar.minimum())
             elif key in (Qt.Key_PageDown, Qt.Key_Right) and ctrl:
                 bar.setValue(bar.maximum())
-            elif key in (Qt.Key_PageUp, Qt.Key_Left):
+            elif key == Qt.Key_PageUp:
                 bar.setValue(bar.value() - bar.pageStep())
-            elif key in (Qt.Key_PageDown, Qt.Key_Right):
+            elif key == Qt.Key_PageDown:
                 bar.setValue(bar.value() + bar.pageStep())
+            elif key == Qt.Key_Left:
+                self._move_file(-1)
+            elif key == Qt.Key_Right:
+                self._move_file(1)
             elif key in (Qt.Key_Home, Qt.Key_F1):
                 bar.setValue(bar.minimum())
             elif key in (Qt.Key_End, Qt.Key_F2):
@@ -743,10 +790,14 @@ class TextViewer(QWidget):
             self.go_top()
         elif key in (Qt.Key_PageDown, Qt.Key_Right) and ctrl:
             self.go_bottom()
-        elif key in (Qt.Key_PageUp, Qt.Key_Left):
+        elif key == Qt.Key_PageUp:
             self.scroll_to(self.top_line() - page)
-        elif key in (Qt.Key_PageDown, Qt.Key_Right):
+        elif key == Qt.Key_PageDown:
             self.scroll_to(self.top_line() + page)
+        elif key == Qt.Key_Left:
+            self._move_file(-1)
+        elif key == Qt.Key_Right:
+            self._move_file(1)
         elif key in (Qt.Key_Home, Qt.Key_F1):
             self.go_top()
         elif key in (Qt.Key_End, Qt.Key_F2):

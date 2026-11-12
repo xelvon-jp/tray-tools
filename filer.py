@@ -4250,6 +4250,35 @@ class FilerWindow(QWidget):
             return
         self.open_viewer(display)
 
+    def _viewer_nav_callback(self, path: str):
+        """ビュアの ←→(ファイル間移動)の行き先を返す callback を作る。
+
+        開いた時点のアクティブな窓の並びの中で、ビュアで開けるファイル
+        (テキスト拡張子)だけを順に移る。端では None を返す。書庫の中の
+        ファイルや、窓の並びに無いファイルでは移動できない(None)。"""
+        pane = self.active
+        if pane is None or pane.archive is not None:
+            return None
+        targets = []
+        for entry in pane.entries:
+            if entry.is_dir or entry.is_parent:
+                continue
+            if core.opens_in_viewer(entry.name, self.viewer_extensions):
+                targets.append(os.path.join(pane.path, entry.name))
+        try:
+            state = {"index": targets.index(path)}
+        except ValueError:
+            return None
+
+        def navigate(step):
+            nxt = state["index"] + step
+            if 0 <= nxt < len(targets):
+                state["index"] = nxt
+                return targets[nxt], targets[nxt]
+            return None
+
+        return navigate
+
     def open_viewer(self, path: str, title: str = None):
         """ビュアの窓を開く(モードレス。いくつ開いてもよい)。開いた窓を返す。"""
         import filer_viewer  # 使うときに読む(ファイラの起動を軽く保つ)
@@ -4265,7 +4294,8 @@ class FilerWindow(QWidget):
         try:
             viewer = filer_viewer.TextViewer(
                 path, title_name=title or path, font=self.active.pane_font, colors=colors,
-                editor_callback=lambda p: self._open_in_editor([p]), geometry=geometry)
+                editor_callback=lambda p: self._open_in_editor([p]),
+                nav_callback=self._viewer_nav_callback(path), geometry=geometry)
         except OSError as e:
             self.log(f"ビュアで開けません: {path}  ({e})")
             return None

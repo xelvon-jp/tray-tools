@@ -4090,6 +4090,119 @@ def test_viewer_markup_render_mode():
             v.close()
 
 
+def test_viewer_left_right_moves_between_files():
+    """ビュアの ←→ はファイル間移動。PageUp/Dn のスクロールと Ctrl+←→ は従来どおり。"""
+    import filer_viewer as fv
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for name in ("a.txt", "b.txt", "c.txt"):
+            p = Path(tmp, name)
+            p.write_text("\n".join(f"{name} line {i}" for i in range(300)) + "\n",
+                         encoding="utf-8")
+            paths.append(str(p))
+        state = {"index": 0}
+
+        def navigate(step):
+            nxt = state["index"] + step
+            if 0 <= nxt < len(paths):
+                state["index"] = nxt
+                return paths[nxt], paths[nxt]
+            return None
+
+        v = fv.TextViewer(paths[0], nav_callback=navigate)
+        v.resize(800, 600)
+        v.show()
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(v.area, k, mods)  # noqa: E731
+        try:
+            _wait_viewer(v, lambda: v.index.done)
+            assert v.path == paths[0]
+            # PageDown は従来どおりスクロール(ファイルは移らない)
+            key(Qt.Key_PageDown)
+            assert v.path == paths[0] and v.top_line() == v.area.page_lines()
+            # → で次のファイルへ。スクロールは先頭へ戻る
+            key(Qt.Key_Right)
+            _wait_viewer(v, lambda: v.index.done)
+            assert v.path == paths[1] and v.top_line() == 0
+            assert v.raw_line(0).startswith("b.txt line 0")
+            # 端では止まる
+            key(Qt.Key_Right)
+            _wait_viewer(v, lambda: v.index.done)
+            assert v.path == paths[2]
+            key(Qt.Key_Right)
+            assert v.path == paths[2]
+            # ← で戻る。Ctrl+→ は従来どおり末尾へ
+            key(Qt.Key_Left)
+            _wait_viewer(v, lambda: v.index.done)
+            assert v.path == paths[1]
+            key(Qt.Key_Right, Qt.ControlModifier)
+            assert v.top_line() == 300 - v.area.page_lines()
+        finally:
+            v.close()
+
+        # 整形表示(Markdown)でも ←→ で移る
+        mds = []
+        for name in ("m1.md", "m2.md"):
+            p = Path(tmp, name)
+            p.write_text(f"# {name} の題\n\n本文\n", encoding="utf-8")
+            mds.append(str(p))
+        state2 = {"index": 0}
+
+        def navigate2(step):
+            nxt = state2["index"] + step
+            if 0 <= nxt < len(mds):
+                state2["index"] = nxt
+                return mds[nxt], mds[nxt]
+            return None
+
+        v = fv.TextViewer(mds[0], nav_callback=navigate2)
+        v.show()
+        try:
+            assert v.render_mode and v.rich is not None
+            QTest.keyClick(v.rich, Qt.Key_Right)
+            assert v.path == mds[1] and v.render_mode
+            assert "m2.md の題" in v.rich.toPlainText()
+        finally:
+            v.close()
+
+
+def test_viewer_nav_callback_from_pane():
+    """ファイラ側の行き先: 窓の並びの中で、ビュアで開けるファイルだけを順に移る。"""
+    import filer
+    from PySide6.QtTest import QTest  # noqa: F401 (窓の起動に要る作法を揃える)
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name in ("a.txt", "b.log", "c.txt"):
+            Path(left, name).write_text("x\n", encoding="utf-8")
+        Path(left, "tool.exe").write_bytes(b"MZ")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            join = lambda name: os.path.join(w.left.path, name)  # noqa: E731
+            nav = w._viewer_nav_callback(join("b.log"))
+            assert nav is not None
+            assert nav(1) == (join("c.txt"), join("c.txt"))   # exe は飛ばす
+            assert nav(1) is None                              # 端では止まる
+            assert nav(-1) == (join("b.log"), join("b.log"))
+            assert nav(-1) == (join("a.txt"), join("a.txt"))
+            assert nav(-1) is None
+            # ビュアで開けないファイルには callback 自体が無い
+            assert w._viewer_nav_callback(join("tool.exe")) is None
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_enter_viewer_routing():
     import filer
     from PySide6.QtCore import Qt

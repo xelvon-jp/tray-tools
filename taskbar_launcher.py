@@ -25,7 +25,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette, QPen,
+    QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen,
     QPixmap, QPolygon,
 )
 from PySide6.QtWidgets import (
@@ -998,32 +998,38 @@ class _ReorderList(QListWidget):
 
 
 class LauncherReorderDialog(QDialog):
-    """ランチャの並び替え。隠している項目も薄字で並ぶ。
+    """ランチャの並び替えと付け外し。隠している項目も並ぶ。
 
-    付け外しはここでは扱わない(右クリックのチェックリストの担当)。
-    動かすたびに on_apply(並び全体のキーの並び)を呼び、即反映と保存は
-    呼び出し側が行う。反映は済んでいるので、ボタンは OK/キャンセルでは
-    なく「閉じる」だけ。"""
+    各行のチェックが表示・非表示(チェックなし=隠す)。隠している項目は
+    薄字+斜体にして、表示中のものと見分けやすくする。当初は付け外しを
+    右クリックのチェックリスト側だけに分けていたが、実機確認で「この
+    画面から切り替えたい。チェックリスト形式は分かりづらい」との指摘が
+    あり、こちらへ寄せた(2026-11-12)。チェックリスト側も従来どおり使える。
+    動かす・切り替えるたびに on_apply(並び全体, 隠しリスト)を呼び、
+    即反映と保存は呼び出し側が行う。反映は済んでいるので、ボタンは
+    OK/キャンセルではなく「閉じる」だけ。"""
 
     def __init__(self, parent, full_keys, hidden_keys, on_apply):
         super().__init__(parent)
         self._on_apply = on_apply
+        self._busy = False
         self.setWindowTitle("ランチャの並び替え")
         self._list = _ReorderList(self)
         self._list.setDragDropMode(QAbstractItemView.InternalMove)
         self._list.setDefaultDropAction(Qt.MoveAction)
         self._list.move_callback = self._move_current
-        dim = self.palette().brush(QPalette.Disabled, QPalette.ColorRole.Text)
         hidden_set = set(hidden_keys)
         for key in full_keys:
             item = QListWidgetItem(ITEMS.get(key, {}).get("label") or key)
             item.setData(Qt.UserRole, key)
-            if key in hidden_set:
-                item.setForeground(dim)
+            item.setCheckState(
+                Qt.Unchecked if key in hidden_set else Qt.Checked)
+            self._style_item(item, key in hidden_set)
             self._list.addItem(item)
         if self._list.count():
             self._list.setCurrentRow(0)
         self._list.model().rowsMoved.connect(lambda *args: self._emit_apply())
+        self._list.itemChanged.connect(self._on_item_changed)
 
         self._up_button = QPushButton("↑", self)
         self._up_button.setToolTip("上へ (Alt+↑)")
@@ -1046,21 +1052,48 @@ class LauncherReorderDialog(QDialog):
         layout.addWidget(close_button)
         self.resize(300, 420)
 
+    def _style_item(self, item, hidden: bool) -> None:
+        """隠している項目は薄字+斜体にする(チェックの有無が主の合図で、
+        これは補助。無効色だけでは表示中のものと差が少なく分かりづらい、
+        という実機確認の指摘を受けて強めた)。"""
+        if hidden:
+            item.setForeground(QBrush(QColor("#9aa0a6")))
+        else:
+            item.setForeground(QBrush())
+        font = item.font()
+        font.setItalic(hidden)
+        item.setFont(font)
+
+    def _on_item_changed(self, item) -> None:
+        if self._busy:
+            return
+        self._style_item(item, item.checkState() != Qt.Checked)
+        self._emit_apply()
+
     def _move_current(self, step: int) -> None:
         row = self._list.currentRow()
         target = row + step
         if row < 0 or target < 0 or target >= self._list.count():
             return
-        item = self._list.takeItem(row)
-        self._list.insertItem(target, item)
-        self._list.setCurrentRow(target)
+        self._busy = True
+        try:
+            item = self._list.takeItem(row)
+            self._list.insertItem(target, item)
+            self._list.setCurrentRow(target)
+        finally:
+            self._busy = False
         self._emit_apply()
 
     def _emit_apply(self) -> None:
-        keys = [
-            self._list.item(i).data(Qt.UserRole) for i in range(self._list.count())
-        ]
-        self._on_apply(keys)
+        keys = []
+        hidden = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            key = item.data(Qt.UserRole)
+            keys.append(key)
+            if item.checkState() != Qt.Checked:
+                hidden.append(key)
+        self._on_apply(keys, hidden)
 
 
 class LauncherPanel(QWidget):
@@ -1570,10 +1603,9 @@ class LauncherPanel(QWidget):
             self._menu_open = False
             dialog.deleteLater()
 
-    def _apply_dialog_order(self, full) -> None:
-        """ダイアログからの並び替えを受ける。隠しリストは今のまま。"""
-        _full_now, hidden = arrangement(self._config)
-        self._apply_arrangement(list(full), hidden)
+    def _apply_dialog_order(self, full, hidden) -> None:
+        """ダイアログからの並び替えと付け外しを受ける。"""
+        self._apply_arrangement(list(full), list(hidden))
 
 
 def _screen_bounds(rect: QRect) -> QRect:

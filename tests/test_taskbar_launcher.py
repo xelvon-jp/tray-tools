@@ -174,9 +174,9 @@ def test_toggle_arrangement_restores_position():
 
 
 def test_reorder_dialog_moves():
-    """並べ替えダイアログ: Alt+↓・ボタンで動き、隠し項目は薄字、動くたびに通知される。"""
+    """並べ替えダイアログ: 並び替えと付け外しができ、動くたびに通知される。"""
     from PySide6.QtCore import QModelIndex, Qt
-    from PySide6.QtGui import QPalette
+    from PySide6.QtGui import QColor
     from PySide6.QtTest import QTest
 
     _qapp()
@@ -185,7 +185,7 @@ def test_reorder_dialog_moves():
         None,
         ["palette", "capture", "calendar", "cursor"],
         ["cursor"],
-        applied.append,
+        lambda full, hidden: applied.append((full, hidden)),
     )
     dialog.show()
     lst = dialog._list
@@ -194,16 +194,18 @@ def test_reorder_dialog_moves():
         return [lst.item(i).data(Qt.UserRole) for i in range(lst.count())]
 
     assert keys() == ["palette", "capture", "calendar", "cursor"]
-    # 隠している項目(cursor)は無効色で薄字になっている
-    dim = dialog.palette().brush(QPalette.Disabled, QPalette.ColorRole.Text)
-    assert lst.item(3).foreground() == dim
-    assert lst.item(0).foreground() != dim
+    # 隠している項目(cursor)はチェックなし+薄字+斜体、表示中はチェックあり
+    assert lst.item(3).checkState() == Qt.Unchecked
+    assert lst.item(3).foreground().color() == QColor("#9aa0a6")
+    assert lst.item(3).font().italic()
+    assert lst.item(0).checkState() == Qt.Checked
+    assert not lst.item(0).font().italic()
 
-    # Alt+↓ で1つ下へ。即反映の通知にも新しい並びが届く
+    # Alt+↓ で1つ下へ。即反映の通知にも新しい並びと隠しが届く
     lst.setCurrentRow(0)
     QTest.keyClick(lst, Qt.Key_Down, Qt.AltModifier)
     assert keys() == ["capture", "palette", "calendar", "cursor"]
-    assert applied[-1] == keys()
+    assert applied[-1] == (keys(), ["cursor"])
 
     # 先頭で ↑ ボタンを押しても動かない(通知も増えない)
     lst.setCurrentRow(0)
@@ -214,13 +216,23 @@ def test_reorder_dialog_moves():
     # ↓ ボタンでも動く
     dialog._down_button.click()
     assert keys() == ["palette", "capture", "calendar", "cursor"]
-    assert applied[-1] == keys()
+    assert applied[-1] == (keys(), ["cursor"])
 
     # ドラッグ相当のモデル移動でも通知される(rowsMoved)
     calls = len(applied)
     moved = lst.model().moveRow(QModelIndex(), 0, QModelIndex(), 3)
     assert moved
-    assert len(applied) > calls and applied[-1] == keys()
+    assert len(applied) > calls and applied[-1][0] == keys()
+
+    # チェックを外すと隠しに入り、薄字+斜体になる。付け直すと戻る
+    row = keys().index("capture")
+    lst.item(row).setCheckState(Qt.Unchecked)
+    assert set(applied[-1][1]) == {"capture", "cursor"}
+    assert lst.item(row).foreground().color() == QColor("#9aa0a6")
+    assert lst.item(row).font().italic()
+    lst.item(row).setCheckState(Qt.Checked)
+    assert applied[-1][1] == ["cursor"]
+    assert not lst.item(row).font().italic()
     dialog.close()
     dialog.deleteLater()
 

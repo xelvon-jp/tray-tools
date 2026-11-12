@@ -250,7 +250,7 @@ _KEY_MAP = {
     Qt.Key_Period: ".", Qt.Key_Comma: ".",
     Qt.Key_Plus: "+", Qt.Key_Minus: "-",
     Qt.Key_Asterisk: "*", Qt.Key_Slash: "/",
-    Qt.Key_Enter: "=", Qt.Key_Return: "=", Qt.Key_Equal: "=",
+    Qt.Key_Equal: "=",
     Qt.Key_Backspace: "backspace",
 }
 

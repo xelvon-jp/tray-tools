@@ -1400,7 +1400,7 @@ class ScreenFeature:
                 entry = data.get("entry")
                 if entry is None:
                     return None
-                action, payload = command_launcher.build_command(entry, "")
+                action, payload = command_launcher.build_command(entry)
                 used = False
                 if action == "exec":
                     command, workdir = payload

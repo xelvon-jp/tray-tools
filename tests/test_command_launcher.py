@@ -80,26 +80,20 @@ def test_common_prefix():
     assert cl.common_prefix([]) == ""
 
 
-def test_parse_input():
-    assert cl.parse_input("Google;keyhac") == ("Google", "keyhac")
-    assert cl.parse_input("Google") == ("Google", "")
-    assert cl.parse_input("名前 ; 引数;追加") == ("名前", " 引数;追加")
-    assert cl.name_part("Google;abc") == "Google"
-
-
 # ---------------------------------------------------------------
 # 置換と実行コマンド
 # ---------------------------------------------------------------
 def test_expand():
     env = {"HOME": r"C:\Users\me", "DOCS": r"D:\docs"}
-    assert cl.expand("%param%", "abc", env) == "abc"
-    assert cl.expand("%HOME%", "", env) == r"C:\Users\me"
-    assert cl.expand("%env[DOCS]%", "", env) == r"D:\docs"
-    assert cl.expand("100%%", "", env) == "100%"
-    assert cl.expand("%UNKNOWN%", "", env) == "%UNKNOWN%"
-    assert cl.expand(r"%HOME%\tool %param%", "x y", env) == r"C:\Users\me\tool x y"
+    assert cl.expand("%HOME%", env) == r"C:\Users\me"
+    assert cl.expand("%env[DOCS]%", env) == r"D:\docs"
+    assert cl.expand("100%%", env) == "100%"
+    assert cl.expand("%UNKNOWN%", env) == "%UNKNOWN%"
+    # %param% の置き換えは廃止。環境変数 param は無いので元の表記のまま残る
+    assert cl.expand("%param%", env) == "%param%"
+    assert cl.expand(r"%HOME%\tool %param%", env) == r"C:\Users\me\tool %param%"
     # %% で守った中身は環境変数として展開しない
-    assert cl.expand("%%HOME%%", "", env) == "%HOME%"
+    assert cl.expand("%%HOME%%", env) == "%HOME%"
 
 
 def test_build_command():
@@ -114,15 +108,16 @@ def test_build_command():
 
     tool = cl.Entry("道具", r"C:\my tools\app.exe",
                     params="/open %param%", workdir=r"C:\my tools")
-    action, (command, workdir) = cl.build_command(tool, "a b.txt")
+    action, (command, workdir) = cl.build_command(tool)
     assert action == "exec"
-    assert command == r'"C:\my tools\app.exe" /open a b.txt'
+    # %param% は置き換えず、登録の params がそのまま付く
+    assert command == r'"C:\my tools\app.exe" /open %param%'
     assert workdir is None  # この環境には無いフォルダなので落とす
 
-    # %param% の置き場が無いパラメタ無し登録では、引数を後ろに足す
+    # パラメタ無し登録は、対象だけのコマンドになる
     plain = cl.Entry("素", r"C:\tools\app.exe", kind=cl.KIND_FILE)
-    action, (command, workdir) = cl.build_command(plain, "file.txt")
-    assert command == r"C:\tools\app.exe file.txt"
+    action, (command, workdir) = cl.build_command(plain)
+    assert command == r"C:\tools\app.exe"
     assert workdir is None
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -228,12 +223,12 @@ def test_window_completion_and_enter():
         # Space の巡回で次の候補へ
         assert window._cycle_candidate(1)
         assert window._input.text() == "Goo辞書"
-        # Esc 相当(文字クリア)を挟んで、; の引数つきで実行できる
+        # Esc 相当(文字クリア)を挟んで、名前だけで実行できる
         window._on_escape()
-        window._input.setText("Google;keyhac")
+        window._input.setText("Google")
         window._on_enter()
         assert chosen and chosen[-1][0].name == "Google"
-        assert chosen[-1][1] == "keyhac"
+        assert chosen[-1][1] == ""
 
         # フォルダ名の確定後の Tab は掘り下げに入る
         window2 = cl.create_window(entries, [])
@@ -252,7 +247,7 @@ def test_window_completion_and_enter():
 
 
 ALL_TESTS = [test_classify, test_build_entries, test_prefix_candidates,
-             test_common_prefix, test_parse_input, test_expand,
+             test_common_prefix, test_expand,
              test_build_command, test_history_record_and_forget,
              test_history_save_load, test_upsert_bookmark, test_update_bookmark,
              test_window_completion_and_enter]

@@ -360,7 +360,11 @@ def test_picker_window_modes():
         assert window.current_mode() is None
         texts = [window.list.item(i).text()
                  for i in range(window.list.count())]
-        assert texts == [f"{c} {n}モード" for c, n, _ in up.MODES], texts
+        assert texts == [f"{c} {n}モード" for c, n, _ in up.MODES] + [
+            "先頭に空白を入れると記号をそのまま打てます"], texts
+        # 案内行は選べない
+        info = window.list.item(window.list.count() - 1)
+        assert not (info.flags() & Qt.ItemIsEnabled)
         # ヒント行を選ぶと、そのモードに入る
         window.list.setCurrentRow(0)
         window._commit()
@@ -374,6 +378,55 @@ def test_picker_window_modes():
         window.search.setText("")
         assert _key(window, Qt.Key_Equal, "=") is True
         assert calc == [""], calc
+        assert not window.isVisible()
+    finally:
+        window.close()
+
+
+def test_picker_window_leading_space_escape():
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    calc = []
+    window = picker_mod.PickerWindow(
+        "統合ピッカー",
+        [("]メモ", {"kind": "jump", "path": "C:/b"}),
+         ("通常", {"kind": "jump", "path": "C:/a"})],
+        lambda path: None,
+        modes=up.MODES, initial_mode="[",
+        on_calc=lambda expr: calc.append(expr))
+    try:
+        window.show()
+        # 先頭に空白を入れると、予約文字はモード切り替えにならず文字になる
+        window.search.setText(" ")
+        assert _key(window, Qt.Key_BracketRight, "]") is False
+        assert window.current_mode() == "["
+        window.search.setText(" ]")
+        texts = [window.list.item(i).text()
+                 for i in range(window.list.count())]
+        assert texts == ["]メモ"], texts
+        # `=` も同じ。空白の後では電卓へ行かない
+        window.search.setText(" ")
+        assert _key(window, Qt.Key_Equal, "=") is False
+        assert calc == []
+        assert window.current_mode() == "["
+    finally:
+        window.close()
+
+
+def test_picker_window_escape_closes_with_chip():
+    from PySide6.QtCore import Qt
+
+    _qapp()
+    window = picker_mod.PickerWindow(
+        "統合ピッカー", [("フォルダ1", {"kind": "jump", "path": "C:/a"})],
+        lambda path: None,
+        modes=up.MODES, initial_mode="[")
+    try:
+        window.show()
+        assert window.current_mode() == "["
+        # チップが付いていても Esc はピッカーを閉じる(チップ外しは BS の役目)
+        assert _key(window, Qt.Key_Escape) is True
         assert not window.isVisible()
     finally:
         window.close()

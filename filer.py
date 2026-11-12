@@ -5683,7 +5683,7 @@ class FilerWindow(QWidget):
                 entry = data.get("entry")
                 if entry is None:
                     return None
-                action, payload = command_launcher.build_command(entry, "")
+                action, payload = command_launcher.build_command(entry)
                 if action == "exec":
                     command, workdir = payload
                     if command_launcher.run_exec(command, workdir):

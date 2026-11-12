@@ -228,7 +228,9 @@ def make_mode_dynamics(*, entries, apps, web_searches, file_search, state):
         if mode == "[":
             rows = []
             try:
-                typed = launcher.typed_items(text)
+                # 照合は先頭の空白を除いた形で(先頭の空白は、予約文字を
+                # モード切り替えに使わず名前として打つための印)。
+                typed = launcher.typed_items(raw)
             except Exception:  # noqa: BLE001  パスの解釈に失敗しても他は出す
                 typed = []
             for label, data in typed:

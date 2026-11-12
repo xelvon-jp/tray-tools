@@ -19,9 +19,8 @@
 #
 # 入力の作法(旧 CraftLaunch に合わせた部分)
 #   - 補完は前方一致。Space で次の候補、Shift+Space で前の候補、Tab で共通部分まで確定
-#   - 引数は「名前;引数」。; の後ろは補完しない
 #   - Tab は、フォルダの名前が確定しているときはそのフォルダ配下への掘り下げに使う
-#   - パラメタ・対象・作業フォルダでは %param%(引数)・%環境変数%・旧版式の
+#   - パラメタ・対象・作業フォルダでは %環境変数%・旧版式の
 #     %env[名前]% を展開する。%% は % そのもの
 #   - Esc は、掘り下げ中なら戻る、文字があれば消す、無ければ窓を閉じる
 #   - Ctrl+K で、入力中の文字列を履歴から消す
@@ -136,17 +135,6 @@ def list_subfolders(base: str, prefix: str = "") -> list:
 # 補完・入力の解釈(純粋な部分)
 # ---------------------------------------------------------------
 
-def name_part(text: str) -> str:
-    """入力のうちコマンド名の部分(最初の ; まで)。"""
-    return (text or "").split(";", 1)[0]
-
-
-def parse_input(text: str):
-    """入力を (名前, 引数) に分ける。; が無ければ引数は空。"""
-    name, sep, param = (text or "").partition(";")
-    return name.strip(), (param if sep else "")
-
-
 def prefix_candidates(entries, typed: str) -> list:
     """typed で始まる名前の項目を、登録順のまま返す。大文字小文字は無視する。"""
     keyword = (typed or "").casefold()
@@ -178,22 +166,23 @@ def common_prefix(names) -> str:
 _ESCAPED_PERCENT = "\ue000"
 
 
-def expand(template: str, param: str = "", env=None) -> str:
-    """%param% / %env[名前]% / %名前% を展開する。%% は % そのもの。
+def expand(template: str, env=None) -> str:
+    """%env[名前]% / %名前% を展開する。%% は % そのもの。
 
-    見つからない環境変数は、壊さないよう元の表記のまま残す。"""
+    見つからない環境変数は、壊さないよう元の表記のまま残す。
+    %param% の置き換えは廃止した(2026-11-12、「名前;引数」の削除と一括)。
+    """
     env = os.environ if env is None else env
     text = (template or "").replace("%%", _ESCAPED_PERCENT)
     # 旧版式の %env[名前]。末尾の % を付けた書き方も受ける。
     text = re.sub(r"%env\[([^\]]+)\]%?",
                   lambda m: env.get(m.group(1), m.group(0)), text)
-    text = text.replace("%param%", param or "")
     text = re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%",
                   lambda m: env.get(m.group(1), m.group(0)), text)
     return text.replace(_ESCAPED_PERCENT, "%")
 
 
-def build_command(entry: Entry, param_text: str = ""):
+def build_command(entry: Entry):
     """実行の振り分けを決める。(種別, 中身) を返す。
 
     folder → ("jump", パス)      持ち主が launcher.jump で開く
@@ -201,22 +190,18 @@ def build_command(entry: Entry, param_text: str = ""):
     file   → ("exec", (コマンドライン文字列, 作業フォルダ or None))
     builtin → ("builtin", id)
     """
-    target = expand(entry.target, param_text)
+    target = expand(entry.target)
     if entry.kind == KIND_BUILTIN:
         return ("builtin", entry.target)
     if entry.kind in (KIND_URL, KIND_URI):
         return ("open", target)
     if entry.kind == KIND_FOLDER:
         return ("jump", target)
-    params = expand(entry.params, param_text)
-    if param_text and "%param%" not in (entry.params or ""):
-        # 置き場が無いのに引数が来たら、後ろに足す(名前;対象ファイル の素朴な
-        # 使い方を拾うため)。
-        params = f"{params} {param_text}".strip()
+    params = expand(entry.params)
     command = f'"{target}"' if (" " in target and not target.startswith('"')) else target
     if params:
         command = f"{command} {params}"
-    workdir = expand(entry.workdir, param_text) or None
+    workdir = expand(entry.workdir) or None
     if workdir and not os.path.isdir(workdir):
         workdir = None
     return ("exec", (command, workdir))
@@ -438,13 +423,6 @@ class LauncherWindow(QWidget):
     def _on_text_edited(self, text: str) -> None:
         self._cycle = -1
         self._hist_index = None
-        if self._mode == "name" and ";" in text:
-            # 引数を打っている間は補完しない(名前の部分だけ覚えておく)。
-            self._typed = name_part(text)
-            self._shown = []
-            self._list.setVisible(False)
-            self._fit()
-            return
         self._typed = text
         self._apply_completion()
         self._update_popup()
@@ -554,7 +532,7 @@ class LauncherWindow(QWidget):
             self._hist_index -= 1
         text = "" if self._hist_index < 0 else self._history[self._hist_index]
         self._input.setText(text)
-        self._typed = name_part(text)
+        self._typed = text
         self._update_popup()
         return True
 
@@ -574,7 +552,7 @@ class LauncherWindow(QWidget):
                 return
             self._mode = "name"
             self._input.setText(payload)
-            self._typed = name_part(payload)
+            self._typed = payload
             self._apply_completion()
             self._update_popup()
             return
@@ -594,7 +572,7 @@ class LauncherWindow(QWidget):
             self.close()
             return
         raw = self._input.text()
-        name, param = parse_input(raw)
+        name = raw.strip()
         if not name:
             return
         candidates = prefix_candidates(self._entries, name)
@@ -611,7 +589,7 @@ class LauncherWindow(QWidget):
         if entry is None:
             QApplication.beep()
             return
-        self.chosen.emit(entry, param, raw)
+        self.chosen.emit(entry, "", raw)
         # History だけは窓に残って履歴モードへ移るので、ここでは閉じない。
         if not (entry.kind == KIND_BUILTIN and entry.target == "history"):
             self.close()
@@ -640,7 +618,7 @@ class LauncherWindow(QWidget):
         if self._mode == "history":
             self._mode = "name"
             self._input.setText(payload)
-            self._typed = name_part(payload)
+            self._typed = payload
         else:
             self._typed = label
             self._input.setText(label)
@@ -738,7 +716,7 @@ class _EntryDialog(QDialog):
         target_row.addWidget(folder_button)
         form.addRow("対象", target_row)
         self._params = QLineEdit(entry.get("params") or "")
-        self._params.setPlaceholderText("%param% で引数を受けられます")
+        self._params.setPlaceholderText("そのまま実行時に渡されます")
         form.addRow("パラメタ", self._params)
         dir_row = QHBoxLayout()
         self._dir = QLineEdit(entry.get("dir") or "")

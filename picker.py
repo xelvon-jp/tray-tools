@@ -196,7 +196,10 @@ class PickerWindow(QWidget):
       渡すと、入力欄の左端に予約文字の色付きチップ部品が出て、モード名が入力欄の
       背景(プレースホルダ)に薄く出る。開いた直後は initial_mode のモード。入力が
       空のときに予約文字を打つとそのモードへ移り、入力が空のときに Backspace を
-      押すとチップが外れてモード無しになる。モード無しの間は一覧がモード切り替えの
+      押すとチップが外れてモード無しになる。先頭に空白を入れてから予約文字を
+      打つと、モードへ移らず文字として入る(その文字で始まる名前を打つため。
+      照合では先頭の空白を除いて扱う)。Esc はチップの有無によらず窓を閉じる。
+      モード無しの間は一覧がモード切り替えの
       ヒント行になり、行を選ぶとそのモードへ移る。モードが変わるたびに
       on_mode_change(予約文字 or None) が呼ばれ、候補の差し替えは呼び出し側が
       set_items で行う(dynamic_items の中身も呼び出し側がモードで切り替える)。
@@ -884,6 +887,13 @@ class PickerWindow(QWidget):
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, f"mode:{char}")
                 self.list.addItem(item)
+            if not keyword:
+                # 予約文字で始まる名前の打ち方(先頭に空白)の案内。選べない行
+                # として末尾に置く(2026-11-12、アオとの相談で確定)。
+                info = QListWidgetItem(
+                    "先頭に空白を入れると記号をそのまま打てます")
+                info.setFlags(Qt.NoItemFlags)
+                self.list.addItem(info)
             if self.list.count():
                 self.list.setCurrentRow(0)
             return

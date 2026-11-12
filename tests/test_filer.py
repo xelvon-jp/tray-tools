@@ -4035,6 +4035,25 @@ def _check_viewer_encodings(tmp):
         v.close()
 
 
+def test_viewer_move_file_failure_keeps_current():
+    # ←→ の行き先が開けなかったら、いまのファイルのまま (path と題も変えない)
+    import filer_viewer as fv
+    with tempfile.TemporaryDirectory() as tmp:
+        first = Path(tmp, "first.txt")
+        first.write_text("first\n", encoding="utf-8")
+        missing = str(Path(tmp, "missing.txt"))
+        v = fv.TextViewer(str(first),
+                          nav_callback=lambda step: (missing, "missing.txt"))
+        try:
+            _wait_viewer(v, lambda: v.index.done)
+            v._move_file(1)
+            assert v.path == str(first), v.path
+            assert v.title_name == "first.txt", v.title_name
+            assert "開けません" in v._message, v._message
+        finally:
+            v.close()
+
+
 def test_viewer_markup_render_mode():
     import filer_viewer as fv
     from PySide6.QtCore import Qt
@@ -11922,6 +11941,7 @@ FULL_ONLY = frozenset({
     "test_transfer_cursor_follows_to_other_pane",
     "test_update_decide_and_check",
     "test_viewer_encoding_and_index_logic",
+    "test_viewer_move_file_failure_keeps_current",
     "test_viewer_window_big_file",
     "test_window_add_tool_from_menu",
     "test_window_bs_at_drive_root",

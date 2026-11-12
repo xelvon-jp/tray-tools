@@ -471,14 +471,20 @@ class TextViewer(QWidget):
         """ファイルを開く(最初の読み込みと、←→ での移動で共通)。
 
         前のファイルの索引は _open_index が止める。検索は中止し、スクロールは
-        先頭へ戻す。整形表示(HTML / Markdown)は今のファイルで作り直す。"""
+        先頭へ戻す。整形表示(HTML / Markdown)は今のファイルで作り直す。
+
+        path と題は、開けることが確かになってから引き受ける。先に書き換えて
+        しまうと、開けなかったときに表示は前のファイルのまま、パスと題だけ
+        新しいファイルになり、エディタで開く等の操作が食い違う
+        (2026-11-12、アオのレビュー)。"""
+        with open(path, "rb") as f:
+            head = f.read(DETECT_BYTES)
         self._cancel_search()
         self.path = path
         self.title_name = title_name or os.path.basename(path)
         self.search_word = ""
         self._search_result = None
-        with open(path, "rb") as f:
-            self._head = f.read(DETECT_BYTES)
+        self._head = head
         encoding, start = detect_encoding(self._head)
         self._open_index(encoding, start)
         self.area.verticalScrollBar().setValue(0)

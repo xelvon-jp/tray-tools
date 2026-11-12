@@ -218,11 +218,15 @@ def test_reorder_dialog_moves():
     assert keys() == ["palette", "capture", "calendar", "cursor"]
     assert applied[-1] == (keys(), ["cursor"])
 
-    # ドラッグ相当のモデル移動でも通知される(rowsMoved)
+    # ドラッグ相当のモデル移動でも通知される(rowsMoved)。
+    # 途中で項目が欠けた並びが通知されないことも確かめる
+    # (2026-11-12、アオのレビューで挙がったドラッグ中の保存の懸念)
     calls = len(applied)
     moved = lst.model().moveRow(QModelIndex(), 0, QModelIndex(), 3)
     assert moved
     assert len(applied) > calls and applied[-1][0] == keys()
+    assert all(sorted(full) == ["calendar", "capture", "cursor", "palette"]
+               for full, _hidden in applied[calls:])
 
     # チェックを外すと隠しに入り、薄字+斜体になる。付け直すと戻る
     row = keys().index("capture")

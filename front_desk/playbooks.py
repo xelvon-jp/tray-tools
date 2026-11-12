@@ -1822,6 +1822,8 @@ def _wake_screen_deliver_win(text) -> tuple:
     user32.SetForegroundWindow.restype = wintypes.BOOL
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    user32.MapVirtualKeyW.restype = wintypes.UINT
     kernel32.GetTickCount.argtypes = []
     kernel32.GetTickCount.restype = wintypes.DWORD
     kernel32.OpenProcess.argtypes = [
@@ -1881,6 +1883,9 @@ def _wake_screen_deliver_win(text) -> tuple:
         return sent == len(events)
 
     def key(vk=0, scan=0, flags=0):
+        if vk and not scan:
+            # スキャンコードも入れる (アプリ側が参照する場合がある)
+            scan = user32.MapVirtualKeyW(vk, 0)
         item = INPUT()
         item.type = INPUT_KEYBOARD
         item.u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
@@ -1901,35 +1906,30 @@ def _wake_screen_deliver_win(text) -> tuple:
                 return False
             time.sleep(0.5)
 
-    def activate(hwnd) -> bool:
-        """窓の入力欄あたりをクリックして前面化する。"""
-        rect = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            return False
-        x = (rect.left + rect.right) // 2
-        y = rect.bottom - 90
+    def click_at(x, y) -> None:
+        """画面上の点をクリックする (仮想デスクトップ絶対座標)。"""
         vx = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
         vy = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
         vw = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
         vh = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
         nx = (x - vx) * 65535 // max(1, vw - 1)
         ny = (y - vy) * 65535 // max(1, vh - 1)
-        move = INPUT()
-        move.type = INPUT_MOUSE
-        move.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_MOVE
-                               | MOUSEEVENTF_ABSOLUTE
-                               | MOUSEEVENTF_VIRTUALDESK, 0, 0)
-        down = INPUT()
-        down.type = INPUT_MOUSE
-        down.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_LEFTDOWN
-                               | MOUSEEVENTF_ABSOLUTE
-                               | MOUSEEVENTF_VIRTUALDESK, 0, 0)
-        up = INPUT()
-        up.type = INPUT_MOUSE
-        up.u.mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_LEFTUP
-                             | MOUSEEVENTF_ABSOLUTE
-                             | MOUSEEVENTF_VIRTUALDESK, 0, 0)
-        send_inputs([move, down, up])
+        flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        events = []
+        for flag in (MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN,
+                     MOUSEEVENTF_LEFTUP):
+            item = INPUT()
+            item.type = INPUT_MOUSE
+            item.u.mi = MOUSEINPUT(nx, ny, 0, flag | flags, 0, 0)
+            events.append(item)
+        send_inputs(events)
+
+    def activate(hwnd) -> bool:
+        """窓の入力欄あたりをクリックして前面化する。"""
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        click_at((rect.left + rect.right) // 2, rect.bottom - 90)
         deadline = time.time() + 5
         while time.time() < deadline:
             if user32.GetForegroundWindow() == hwnd:
@@ -1942,6 +1942,21 @@ def _wake_screen_deliver_win(text) -> tuple:
                 return True
             time.sleep(0.3)
         return False
+
+    def click_input() -> None:
+        """前面の Claude の窓の入力欄あたりをクリックする。
+
+        窓が前面でも、キーボードの宛先が入力欄とは限らない。
+        実地 (req-20261113-31) では、文面は入ったが Enter が
+        入力欄に届かず送信されなかった。送る前に必ず入力欄を
+        クリックして宛先を定める。
+        """
+        fg = user32.GetForegroundWindow()
+        if not fg or not is_claude(fg):
+            return
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(fg, ctypes.byref(rect)):
+            click_at((rect.left + rect.right) // 2, rect.bottom - 90)
 
     # 1. deep link で前面に来るのを少し待つ (新規セッション等)
     deadline = time.time() + 8
@@ -1965,6 +1980,10 @@ def _wake_screen_deliver_win(text) -> tuple:
     # 3. 打つ前に、もう一度アイドルを確認する
     if not wait_idle():
         return False, "user_active"
+
+    # 3.5 入力欄をクリックして、キーボードの宛先を定めてから少し待つ
+    click_input()
+    time.sleep(1.0)
 
     # 4. 本文を打つ (text が None のときは送信だけ)
     if text is not None:

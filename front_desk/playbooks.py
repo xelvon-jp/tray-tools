@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
 from typing import Optional
 
 from . import activity, model
@@ -1170,6 +1171,16 @@ def powershell_run(ctx: PlaybookContext, params: dict) -> ExecOutcome:
                   min(PS_TIMEOUT_MAX_SEC, float(timeout)))
     digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
     log.step("script", "received", f"sha256:{digest} chars:{len(script)}")
+    return _run_ps_script(ctx, log, script, timeout)
+
+
+def _run_ps_script(ctx: PlaybookContext, log: StepLog, script: str,
+                   timeout: float) -> ExecOutcome:
+    """スクリプト文字列を一時 .ps1 にして実行し、末尾つきで報告する。
+
+    PB-4031 と PB-4033 (保存庫からの実行) で共用する。検証 (空・長さ・
+    型) は呼び出し側の責務で、ここは実行と報告だけを行う。
+    """
     fd, path = tempfile.mkstemp(suffix=".ps1", prefix="pb4031_")
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -1209,6 +1220,624 @@ def powershell_run(ctx: PlaybookContext, params: dict) -> ExecOutcome:
                        detail=detail)
 
 
+# -- PB-4033: script_library ------------------------------------------------
+# PB-4031 で承認・実行したスクリプトを、名前と sha256 で保存しておき、
+# 2回目以降は名前で呼び出すための保存庫。保存も実行も、PB-4031 と
+# 同じ前提 (Muse がチャットで提示し、Nagato の承認を経た依頼だけが
+# 届く) に立つ。実行時は、保存時の sha256 と依頼側が申告する
+# sha256 (先頭16桁) の一致を確かめてから実行する。
+
+LIB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+LIB_DEFAULT_DIR = r"R:\claude\front-desk\script-library"
+LIB_INDEX = "index.json"
+
+
+def _lib_dir(ctx: PlaybookContext) -> str:
+    return ctx.settings.get("library_dir") or LIB_DEFAULT_DIR
+
+
+def _lib_load_index(lib_dir: str) -> dict:
+    try:
+        with open(os.path.join(lib_dir, LIB_INDEX), "r",
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _lib_save_index(lib_dir: str, index: dict) -> None:
+    _write_text_atomic(
+        os.path.join(lib_dir, LIB_INDEX),
+        json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+
+
+def script_library(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """PB-4031 の承認済みスクリプトの保存・一覧・名前での再実行。"""
+    log = StepLog("pb4033")
+    action = params.get("action")
+    if action not in ("save", "list", "run"):
+        return _blocked(log, f"action が不正です: {action}")
+    lib_dir = _lib_dir(ctx)
+    log.step("library", "ok", lib_dir)
+    if action == "list":
+        index = _lib_load_index(lib_dir)
+        lines = []
+        for name in sorted(index):
+            e = index[name]
+            lines.append(
+                f"{name} sha256:{str(e.get('sha256', ''))[:16]} "
+                f"chars:{e.get('chars')} saved:{e.get('saved_at')} "
+                f"uses:{e.get('uses', 0)}")
+        return ExecOutcome(
+            ok=True,
+            summary=f"保存庫には {len(index)} 件あります",
+            detail=log.text() + "\n" + "\n".join(lines))
+    name = params.get("name")
+    if not isinstance(name, str) or not LIB_NAME_RE.match(name):
+        return _blocked(log, f"名前が不正です: {name}")
+    if action == "save":
+        unknown = sorted(set(params) - {"action", "name", "script"})
+        if unknown:
+            return _blocked(log, f"未知の params です: {unknown}")
+        script = params.get("script")
+        if not isinstance(script, str) or not script.strip():
+            return _blocked(log, "script が空です")
+        if len(script) > PS_SCRIPT_MAX_CHARS:
+            return _blocked(
+                log, f"script が長すぎます ({len(script)} > {PS_SCRIPT_MAX_CHARS})")
+        try:
+            os.makedirs(lib_dir, exist_ok=True)
+            _write_text_atomic(os.path.join(lib_dir, name + ".ps1"), script)
+        except OSError as exc:
+            log.step("save", "ng", str(exc)[:120])
+            return _failed(log, "保存庫へ書けませんでした")
+        index = _lib_load_index(lib_dir)
+        digest = hashlib.sha256(script.encode("utf-8")).hexdigest()
+        existed = name in index
+        index[name] = {
+            "sha256": digest, "chars": len(script),
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "uses": (index.get(name) or {}).get("uses", 0) if existed else 0,
+            "last_used_at": (index.get(name) or {}).get("last_used_at")
+            if existed else None,
+        }
+        _lib_save_index(lib_dir, index)
+        log.step("save", "ok", f"sha256:{digest[:16]} chars:{len(script)}"
+                               + (" (上書き)" if existed else ""))
+        return ExecOutcome(
+            ok=True,
+            summary=f"スクリプトを保存しました: {name} (sha256:{digest[:16]})",
+            detail=log.text())
+    # action == "run"
+    unknown = sorted(set(params) - {"action", "name", "confirm_sha256",
+                                     "timeout_sec"})
+    if unknown:
+        return _blocked(log, f"未知の params です: {unknown}")
+    confirm = params.get("confirm_sha256")
+    if not isinstance(confirm, str) or len(confirm) < 16:
+        return _blocked(log, "confirm_sha256 (先頭16桁) が必要です")
+    timeout = params.get("timeout_sec", PS_TIMEOUT_DEFAULT_SEC)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return _blocked(log, "timeout_sec が数値ではありません")
+    timeout = max(PS_TIMEOUT_MIN_SEC,
+                  min(PS_TIMEOUT_MAX_SEC, float(timeout)))
+    index = _lib_load_index(lib_dir)
+    entry = index.get(name)
+    if entry is None:
+        return _blocked(log, f"保存庫にありません: {name}")
+    try:
+        with open(os.path.join(lib_dir, name + ".ps1"), "r",
+                  encoding="utf-8") as fh:
+            script = fh.read()
+    except OSError:
+        return _blocked(log, f"保存庫のファイルが読めません: {name}")
+    digest = hashlib.sha256(script.encode("utf-8")).hexdigest()
+    if digest != entry.get("sha256"):
+        log.step("verify.hash", "ng", "file changed after save")
+        return _blocked(log, "保存後にファイルが変わっています (sha256 不一致)")
+    if not digest.startswith(confirm.lower()):
+        log.step("verify.confirm", "ng")
+        return _blocked(log, "申告された sha256 が保存時と一致しません")
+    log.step("script", "received", f"sha256:{digest[:16]} chars:{len(script)}")
+    outcome = _run_ps_script(ctx, log, script, timeout)
+    if outcome.ok:
+        entry["uses"] = int(entry.get("uses", 0)) + 1
+        entry["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        index[name] = entry
+        try:
+            _lib_save_index(lib_dir, index)
+        except OSError:
+            pass
+    return outcome
+
+
+# -- PB-5012: log_fetch ----------------------------------------------
+
+WATCHER_LOG_DEFAULT = r"R:\claude\claude-bridge\muse_monitor.log"
+WATCHER_LOG_TAIL_BYTES = 1_000_000
+WATCHER_LOG_MAX_CHARS = 12000
+WATCHER_LOG_DEFAULT_LINES = 300
+WATCHER_LOG_MAX_LINES = 2000
+
+
+def log_fetch(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """見張り (muse_monitor) のログの末尾を、絞って返す。
+
+    障害の切り分けで Muse が実ログを読むための取得系プレイブック。
+    ログの場所は playbook_settings.pb5012.log_path、無ければ標準の
+    設置場所。返す量は末尾 WATCHER_LOG_MAX_CHARS 字までに制限する。
+    """
+    log = StepLog("pb5012")
+    unknown = sorted(set(params) - {"tail_lines", "contains"})
+    if unknown:
+        return _blocked(log, f"未知の params です: {unknown}")
+    tail_lines = params.get("tail_lines", WATCHER_LOG_DEFAULT_LINES)
+    if isinstance(tail_lines, bool) or not isinstance(tail_lines, int):
+        return _blocked(log, "tail_lines が整数ではありません")
+    tail_lines = max(1, min(WATCHER_LOG_MAX_LINES, tail_lines))
+    contains = params.get("contains")
+    if contains is not None and not isinstance(contains, str):
+        return _blocked(log, "contains が文字列ではありません")
+    path = ctx.settings.get("log_path") or WATCHER_LOG_DEFAULT
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > WATCHER_LOG_TAIL_BYTES:
+                fh.seek(size - WATCHER_LOG_TAIL_BYTES)
+            raw = fh.read()
+    except OSError as exc:
+        log.step("read", "ng", str(exc)[:120])
+        return _blocked(log, f"見張りログが読めません: {path}")
+    text = _decode_output(raw)
+    lines = text.splitlines()
+    lines = lines[-tail_lines:]
+    if contains:
+        needle = contains.lower()
+        lines = [ln for ln in lines if needle in ln.lower()]
+    body = "\n".join(lines)
+    omitted = 0
+    if len(body) > WATCHER_LOG_MAX_CHARS:
+        body = body[-WATCHER_LOG_MAX_CHARS:]
+        omitted = 1
+    log.step("read", "ok", f"{path} ({size} bytes)")
+    log.step("lines", "ok", f"{len(lines)} lines"
+                            + (f" contains:{contains}" if contains else ""))
+    detail = log.text() + "\n--- log ---\n"
+    if omitted:
+        detail += "…(先頭を省略)\n"
+    detail += body
+    return ExecOutcome(
+        ok=True,
+        summary=f"見張りログを {len(lines)} 行返しました",
+        detail=detail)
+
+
+# -- PB-5015: inbox_status -------------------------------------------------
+# ミドリへの依頼の置き場 (front-desk inbox) と、読了の記録
+# (wake-log)、見張りログの該当行を、決まった形で読み取って返す
+# 取得系プレイブック。2026-11-12 夜、@ミドリ投稿の取りこぼし
+# (collab Issue #6) の切り分けで PB-4031 の承認付きスクリプト
+# として実行した確認を、承認不要の専用 PB にしたもの。
+# パスもスクリプトも外からは渡せない。絞り込みは contains の
+# 部分一致だけ。読み取り専用で、PC 側の状態は一切変えない。
+
+INBOX_STATUS_DEFAULT_INBOX = r"R:\claude\front-desk\inbox"
+INBOX_STATUS_DEFAULT_DESK_DIR = r"R:\claude\front-desk"
+INBOX_STATUS_DEFAULT_TAIL = 15
+INBOX_STATUS_MAX_TAIL = 100
+INBOX_STATUS_MAX_ROWS = 100
+INBOX_STATUS_MAX_CHARS = 12000
+
+
+def _inbox_listing(inbox_dir: str):
+    """置き場の *.json を名前順に (ファイル名, id) の列で返す。
+
+    id が無い・読めないファイルも落とさず、その旨を id の代わりに
+    入れて返す (ID の無い置き場ファイル自体が切り分けの対象に
+    なるため)。フォルダ自体が無ければ (None, 理由) を返す。
+    """
+    if not os.path.isdir(inbox_dir):
+        return None, f"置き場フォルダがありません: {inbox_dir}"
+    rows = []
+    for name in sorted(os.listdir(inbox_dir)):
+        if not name.endswith(".json"):
+            continue
+        rid = "(idなし)"
+        try:
+            with open(os.path.join(inbox_dir, name), "r",
+                      encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data.get("id"):
+                rid = str(data["id"])
+        except (OSError, ValueError):
+            rid = "(読めない)"
+        rows.append((name, rid))
+    return rows, ""
+
+
+def _filtered_tail(path: str, tail: int, contains: str) -> list:
+    """ファイルの末尾 tail 行 (contains があれば部分一致で絞る)。"""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    lines = _decode_output(raw).splitlines()
+    if contains:
+        needle = contains.lower()
+        lines = [ln for ln in lines if needle in ln.lower()]
+    return lines[-tail:]
+
+
+def inbox_status(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """置き場・読了記録・見張りログの状態を決まった形で返す。
+
+    宛先の不在や読めないファイルは失敗にせず、見つからなかった
+    こと自体を報告に残す (状態確認が目的なので、欠けている事実
+    こそ要る)。params 不正だけは blocked にする。
+    """
+    log = StepLog("pb5015")
+    unknown = sorted(set(params) - {"tail_lines", "contains"})
+    if unknown:
+        return _blocked(log, f"未知の params です: {unknown}")
+    tail = params.get("tail_lines", INBOX_STATUS_DEFAULT_TAIL)
+    if isinstance(tail, bool) or not isinstance(tail, int):
+        return _blocked(log, "tail_lines が整数ではありません")
+    tail = max(1, min(INBOX_STATUS_MAX_TAIL, tail))
+    contains = params.get("contains")
+    if contains is not None and not isinstance(contains, str):
+        return _blocked(log, "contains が文字列ではありません")
+    contains = contains or ""
+
+    inbox_dir = ctx.settings.get("inbox_dir") or INBOX_STATUS_DEFAULT_INBOX
+    desk_dir = ctx.settings.get("desk_dir") or INBOX_STATUS_DEFAULT_DESK_DIR
+    monitor_path = (ctx.settings.get("monitor_log_path")
+                    or WATCHER_LOG_DEFAULT)
+
+    parts = []
+    rows, err = _inbox_listing(inbox_dir)
+    if rows is None:
+        log.step("inbox", "ng", err)
+        parts.append(f"--- inbox ---\n{err}")
+        inbox_count = 0
+    else:
+        inbox_count = len(rows)
+        log.step("inbox", "ok", f"{inbox_dir} ({inbox_count} 件)")
+        shown = rows[-INBOX_STATUS_MAX_ROWS:]
+        body_lines = []
+        if len(shown) < len(rows):
+            body_lines.append(f"…(先頭 {len(rows) - len(shown)} 件を省略)")
+        body_lines += [f"{name} id={rid}" for name, rid in shown]
+        parts.append("--- inbox ---\n"
+                     + ("\n".join(body_lines) or "(ファイルなし)"))
+
+    wake_names = []
+    if os.path.isdir(desk_dir):
+        wake_names = sorted(n for n in os.listdir(desk_dir)
+                            if n.startswith("wake-log"))
+    if not wake_names:
+        log.step("wake-log", "ng", "wake-log* に一致するファイルなし")
+        parts.append("--- wake-log ---\n"
+                     "wake-log* に一致するファイルはありません")
+    else:
+        log.step("wake-log", "ok", ", ".join(wake_names))
+        seg = ["--- wake-log ---"]
+        for name in wake_names:
+            seg.append(f"[{name}]")
+            try:
+                seg.extend(_filtered_tail(os.path.join(desk_dir, name),
+                                          tail, contains))
+            except OSError as exc:
+                seg.append(f"(読めません: {str(exc)[:80]})")
+        parts.append("\n".join(seg))
+
+    try:
+        size = os.path.getsize(monitor_path)
+        with open(monitor_path, "rb") as fh:
+            if size > WATCHER_LOG_TAIL_BYTES:
+                fh.seek(size - WATCHER_LOG_TAIL_BYTES)
+            raw = fh.read()
+        mlines = _decode_output(raw).splitlines()
+        if contains:
+            needle = contains.lower()
+            mlines = [ln for ln in mlines if needle in ln.lower()]
+        mlines = mlines[-tail:]
+        log.step("monitor", "ok", f"{monitor_path} ({len(mlines)} 行)")
+        parts.append("--- monitor log ---\n"
+                     + ("\n".join(mlines) or "(該当行なし)"))
+    except OSError as exc:
+        log.step("monitor", "ng", str(exc)[:120])
+        parts.append(f"--- monitor log ---\n読めません: {monitor_path}")
+
+    detail = log.text() + "\n" + "\n".join(parts)
+    if len(detail) > INBOX_STATUS_MAX_CHARS:
+        detail = detail[:INBOX_STATUS_MAX_CHARS] + "\n…(末尾を省略)"
+    return ExecOutcome(
+        ok=True,
+        summary=(f"置き場 {inbox_count} 件・wake-log "
+                 f"{len(wake_names)} ファイルの状態を返しました"),
+        detail=detail)
+
+
+# -- PB-4034: session_wake -------------------------------------------------
+# 待ち受けのない Claude セッションを、陽太さんの依頼で起こす。
+# 設計は 2026-11-12 に Nagato が決定: 宛先は Opus セッションと
+# 新規セッションの2つだけ、上限は合計で1時間3回、全件記録、本文の
+# 頭には必ず『[Muse経由・陽太さんの依頼]』を付ける。報告は窓口の
+# 通常の報告と PC のローカル記録ファイル、失敗通知は Pushover。
+#
+# 届け方 (2026-11-12、Opus の回答で確定):
+# - 起きている Claude へは、セッション同士の SendMessage が公式の
+#   方法。窓口 (Haiku) が起きている間は、窓口が取り次ぐのが一番
+#   安全なので、このプレイブックは画面経由を使わず、取り次ぎに
+#   任せる (deferred_to_relay で記録して返す)。
+# - 誰も起きていないときだけ、画面経由 (deep link で開き、入力欄
+#   に書いて送信) を使う。ただし入力と送信の実動作は Nagato の
+#   OK が前提で、実装も実地テスト待ち (not_implemented で返す)。
+# - 新規セッションは deep link (claude://code/new) で開く。
+# - CLI とファイル経由は使わない。
+#
+# 上限と記録は「届けた側が同じ記録に同じ形式で書く」が共通の
+# 決め。窓口が SendMessage で届けた分も wake-log に sent として
+# 残る前提で、このプレイブックも同じ記録を読んで上限を数える。
+# 記録は1試行1行の JSONL (設定 log_path、既定は窓口のフォルダ)。
+# 二重送信は「送信済みの delivery_id の再送」だけを指し、失敗した
+# 試行の再送は妨げない。
+#
+# セッションの状態は claude_status.py と同じ置き場所・同じ TTL で
+# ファイルから読む (import はせず、置き場所の約束だけ合わせる)。
+# 状態の意味: running/ask は作業中、done は入力待ちで空き、
+# fail は直近の失敗。一覧に無い (TTL 切れを含む) ものは absent。
+
+WAKE_MARKER = "[Muse経由・陽太さんの依頼]"
+WAKE_DEFAULT_LOG = r"R:\claude\front-desk\wake-log.jsonl"
+WAKE_DEFAULT_OPUS_SESSION = "local_87a918e5-457a-4531-87e0-165e674e5d17"
+WAKE_DEFAULT_HAIKU_SESSION = "local_5463a201-c272-463c-931e-680b9c76f23e"
+WAKE_NEW_URL = "claude://code/new"
+WAKE_RATE_LIMIT = 3
+WAKE_RATE_WINDOW_SEC = 3600
+WAKE_BODY_MAX_CHARS = 20000
+_WAKE_TARGETS = ("opus", "new")
+
+
+def _wake_log_path(ctx: PlaybookContext) -> str:
+    return ctx.settings.get("log_path") or WAKE_DEFAULT_LOG
+
+
+def _wake_read_records(path: str) -> list:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines[-500:]:
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def _wake_append(path: str, record: dict) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _wake_status_dir(ctx: PlaybookContext) -> str:
+    configured = ctx.settings.get("status_dir")
+    if configured:
+        return configured
+    temp = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    return os.path.join(temp, "tray-tools-hooks", "status")
+
+
+def _wake_session_state(ctx: PlaybookContext, session_id: str,
+                        now: float) -> str:
+    """セッションの状態を busy / idle / failed / absent で返す。
+
+    状態ファイルはセッションごとに1つ。デスクトップアプリの
+    セッション ID (local_…) は entry の host_session_id に入って
+    いるので、全ファイルを走査して一致するものを探す。
+    TTL は claude_status.py に合わせる (done/fail は30分、
+    running/ask は6時間で一覧から外れたものとして扱う)。
+    """
+    directory = _wake_status_dir(ctx)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return "absent"
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), "r",
+                      encoding="utf-8") as fh:
+                entry = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("host_session_id") != session_id
+                and entry.get("session_id") != session_id):
+            continue
+        state = entry.get("state")
+        updated = entry.get("ended") or entry.get("updated") or 0
+        if state in ("done", "fail"):
+            if now - updated >= 30 * 60:
+                return "absent"
+            return "idle" if state == "done" else "failed"
+        if state in ("running", "ask"):
+            if now - updated >= 6 * 3600:
+                return "absent"
+            return "busy"
+        return "absent"
+    return "absent"
+
+
+def _open_link(url: str) -> bool:
+    """deep link を OS に開かせる。Windows の os.startfile 前提。
+
+    テストでは差し替える。開けない環境 (VM 等) では False。
+    """
+    try:
+        os.startfile(url)
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def _notify_pushover(title: str, message: str) -> bool:
+    """Pushover で陽太さんへ知らせる。送れなければ False (落とさない)。
+
+    pushover.py はリポジトリ直下の部品で、資格情報は Windows の
+    資格情報マネージャにある。import できない環境 (VM のテスト等)
+    では黙って諦める。PB-4034 の成否は通知に依存させない。
+    """
+    try:
+        import pushover
+        pushover.send(message, title=title)
+        return True
+    except Exception:
+        return False
+
+
+def _wake_finish(ctx: PlaybookContext, log: StepLog, record: dict,
+                 outcome: ExecOutcome, notify: bool = False) -> ExecOutcome:
+    if _wake_append(_wake_log_path(ctx), record):
+        log.step("record", "ok", _wake_log_path(ctx))
+    else:
+        log.step("record", "ng", "記録ファイルへ書けませんでした")
+    if notify:
+        sent = _notify_pushover(
+            "ARiA: セッションを起こせませんでした",
+            f"{record.get('target')} 宛の起こしが {record['outcome']} で"
+            f"止まりました。delivery_id={record.get('delivery_id')}")
+        log.step("notify", "ok" if sent else "skipped")
+    detail = log.text() + ("\n" + outcome.detail if outcome.detail else "")
+    return ExecOutcome(ok=outcome.ok, summary=outcome.summary,
+                       detail=detail, timed_out=outcome.timed_out,
+                       state=outcome.state)
+
+
+def session_wake(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """待ち受けのない Claude セッションを起こす (PB-4034)。"""
+    log = StepLog("pb4034")
+    now = time.time()
+    record = {
+        "ts": now,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+        "delivery_id": params.get("delivery_id"),
+        "target": params.get("target"),
+        "body": params.get("body"),
+        "outcome": "invalid",
+    }
+
+    def finish(outcome: ExecOutcome, result: str,
+               notify: bool = False) -> ExecOutcome:
+        record["outcome"] = result
+        return _wake_finish(ctx, log, record, outcome, notify=notify)
+
+    unknown = sorted(set(params) - {"target", "body", "delivery_id",
+                                     "folder"})
+    if unknown:
+        return finish(_blocked(log, f"未知の params です: {unknown}"),
+                      "invalid")
+    target = params.get("target")
+    if target not in _WAKE_TARGETS:
+        return finish(_blocked(log, f"target が不正です: {target}"),
+                      "invalid")
+    body = params.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return finish(_blocked(log, "body が空です"), "invalid")
+    if len(body) > WAKE_BODY_MAX_CHARS:
+        return finish(
+            _blocked(log, f"body が長すぎます ({len(body)} > "
+                          f"{WAKE_BODY_MAX_CHARS})"), "invalid")
+    delivery_id = params.get("delivery_id")
+    if not isinstance(delivery_id, str) or not delivery_id.strip():
+        return finish(_blocked(log, "delivery_id が必要です"), "invalid")
+    folder = params.get("folder")
+    if folder is not None and not isinstance(folder, str):
+        return finish(_blocked(log, "folder が文字列ではありません"),
+                      "invalid")
+    log.step("params", "ok", f"target:{target} delivery:{delivery_id}")
+
+    records = _wake_read_records(_wake_log_path(ctx))
+    if any(r.get("delivery_id") == delivery_id
+           and r.get("outcome") == "sent" for r in records):
+        log.step("dedupe", "ng", "送信済みの delivery_id です")
+        return finish(_blocked(log, "この delivery_id は送信済みです "
+                                    "(二重送信の防止)"), "duplicate")
+    log.step("dedupe", "ok")
+    sent_recent = sum(
+        1 for r in records
+        if r.get("outcome") == "sent"
+        and now - (r.get("ts") or 0) < WAKE_RATE_WINDOW_SEC)
+    if sent_recent >= WAKE_RATE_LIMIT:
+        log.step("rate", "ng", f"直近1時間で {sent_recent} 回送信済み")
+        return finish(
+            _blocked(log, f"上限 (1時間に {WAKE_RATE_LIMIT} 回) に"
+                          "達しています"), "rate_limited", notify=True)
+    log.step("rate", "ok", f"直近1時間の送信 {sent_recent} 回")
+
+    text = body if body.startswith(WAKE_MARKER) \
+        else WAKE_MARKER + "\n" + body
+
+    if target == "new":
+        folder = folder or ctx.settings.get("default_folder") or ""
+        url = WAKE_NEW_URL + "?q=" + urllib.parse.quote(text)
+        if folder:
+            url += "&folder=" + urllib.parse.quote(folder)
+        log.step("open", "start", WAKE_NEW_URL)
+        if _open_link(url):
+            log.step("open", "ok")
+            return finish(
+                ExecOutcome(
+                    ok=True,
+                    summary="新規セッションを開きました。セッションの"
+                            "報告は記録ファイルに delivery_id と"
+                            "対応付けて書かれます"),
+                "sent")
+        log.step("open", "ng")
+        return finish(
+            _failed(log, "新規セッションの deep link を開けませんでした"),
+            "failed", notify=True)
+
+    # target == "opus": まず両セッションの状態を見る。
+    opus_id = ctx.settings.get("opus_session_id") \
+        or WAKE_DEFAULT_OPUS_SESSION
+    haiku_id = ctx.settings.get("haiku_session_id") \
+        or WAKE_DEFAULT_HAIKU_SESSION
+    opus_state = _wake_session_state(ctx, opus_id, now)
+    log.step("session.opus", opus_state, opus_id)
+    if opus_state == "busy":
+        return finish(
+            _blocked(log, "宛先のセッションが作業中です (running/ask)"),
+            "busy", notify=True)
+    haiku_state = _wake_session_state(ctx, haiku_id, now)
+    log.step("session.haiku", haiku_state, haiku_id)
+    if haiku_state != "absent":
+        # 窓口が起きている間は SendMessage の取り次ぎが一番安全。
+        # 画面経由は使わず、取り次ぎに任せる。
+        return finish(
+            _blocked(log, "窓口が起きているため、画面経由は使わず、"
+                          "窓口の SendMessage 取り次ぎに任せます"),
+            "deferred_to_relay")
+    # 誰も起きていないので画面経由の対象だが、入力と送信は
+    # 実地テスト (Nagato の OK) 待ちで未実装。
+    return finish(
+        _failed(log, "誰も起きていないため画面経由の対象ですが、"
+                     "入力と送信の実装は実地テスト待ちです "
+                     f"(セッションの状態: {opus_state})"),
+        "not_implemented")
+
+
 # -- 登録簿と実行の振り分け ----------------------------------------------
 
 PLAYBOOKS = {
@@ -1219,8 +1848,12 @@ PLAYBOOKS = {
     "pb3005": config_set,
     "pb4006": traytools_restart,
     "pb4031": powershell_run,
+    "pb4033": script_library,
+    "pb4034": session_wake,
     "pb1007": watcher_sync,
     "pb5008": pc_capture,
+    "pb5012": log_fetch,
+    "pb5015": inbox_status,
 }
 
 # 移行期間の別名 (旧名 → 正規 ID)。PC 側の許可リストと設定が 4桁 ID に
@@ -1234,6 +1867,11 @@ PLAYBOOK_ALIASES = {
     "traytools_restart": "pb4006",
     "watcher_sync": "pb1007",
     "pc_capture": "pb5008",
+    "script_library": "pb4033",
+    "session_wake": "pb4034",
+    "log_fetch": "pb5012",
+    "watcher_log_fetch": "pb5012",
+    "inbox_status": "pb5015",
 }
 
 

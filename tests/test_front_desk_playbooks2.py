@@ -155,7 +155,8 @@ def make_request(body, rid="req-t2"):
 def test_all_playbooks_registered():
     assert set(playbooks.PLAYBOOKS) == {
         "pb1001", "pb1002", "pb1003", "pb2004",
-        "pb3005", "pb4006", "pb4031", "pb1007", "pb5008"}
+        "pb3005", "pb4006", "pb4031", "pb4033", "pb4034", "pb1007",
+        "pb5008", "pb5012", "pb5015"}
 
 
 def test_new_playbooks_not_enabled_by_default():

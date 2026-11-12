@@ -8,4 +8,3 @@ afx folder
 "C:PhotoCuller" {tool:photoculler} $MF
 "L:このフォルダでスライドショー" &SLIDESHOW $MF
 "S:PowerShell" &SHELL $MF
-"R:プロパティ" &PROPERTY $MF

@@ -1,0 +1,6 @@
+afx common
+# 共通メニュー(Ctrl+Enter で全種類に出す)。種類別・この PC の分の後ろに付く。
+# ここにある項目は、種類別の定義には書かない(重なるので)。
+"O:関連付けで開く" &OPEN $MF
+"S:エクスプローラで選択" explorer.exe /select, $MF
+"R:プロパティ" &PROPERTY $MF

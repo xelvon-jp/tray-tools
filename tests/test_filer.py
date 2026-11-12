@@ -7555,6 +7555,33 @@ def test_extmenu_find_menus_aliases_local():
                 assert not m.has_personal_path(line), (path, line)
 
 
+def test_extmenu_common_and_layers():
+    import filer_extmenu as m
+    r = _fake_resolver(m)
+    own = m.parse_menu_text('"V:見る" &VIEW $MF\n')
+    local = m.parse_menu_text('"A:自前" &NOP\n')
+    common = m.parse_menu_text('"O:関連付けで開く" &OPEN $MF\n"R:プロパティ" &PROPERTY $MF\n')
+    # 3層は 種類別 → この PC → 共通 の順で、層の間に区切りが1つずつ入る
+    lines = m.visible_layers([own, local, common], r)
+    assert [l.label for l in lines if not l.separator] == [
+        "見る", "自前", "関連付けで開く", "プロパティ"], lines
+    assert [i for i, l in enumerate(lines) if l.separator] == [1, 3], lines
+    # 定義が無い種類でも、共通だけでメニューになる
+    lines = m.visible_layers([None, None, common], r)
+    assert [l.label for l in lines] == ["関連付けで開く", "プロパティ"], lines
+    # 書庫の中では &PROPERTY は出ない(&OPEN は出る)
+    lines = m.visible_layers([None, None, common], r, in_archive=True)
+    assert [l.label for l in lines] == ["関連付けで開く"], lines
+    # リポジトリの共通定義は3項目で、種類別の定義と重なる項目は種類別に残っていない
+    items = m.common_items()
+    assert [l.label for l in items] == ["関連付けで開く", "エクスプローラで選択", "プロパティ"]
+    for name in ("folder", "jpg", "mp4", "md"):
+        shared, _l = m.find_menus(name, m.MENU_DIR, None)
+        labels = [l.label for l in shared or []]
+        assert "プロパティ" not in labels and "エクスプローラで選択" not in labels, (name, labels)
+        assert name == "folder" or "関連付けで開く" not in labels, (name, labels)
+
+
 def test_extmenu_editor_files_and_tools():
     import filer_extmenu as m
     with tempfile.TemporaryDirectory() as tmp:
@@ -8058,7 +8085,10 @@ def test_window_ext_menu():
             assert labels[0].startswith("&P:開く"), labels
             # PhotoCuller は tools に無く App Paths でも見つからないので出ない
             assert not any("PhotoCuller" in t for t in labels), labels
-            assert labels[-2:] == ["&T:ツールを追加…", "&M:メニューを編集"], labels
+            # 末尾は共通メニューの3項目 →「メニューを編集」。追加は編集 GUI の中へ移った
+            assert labels[-4:] == ["&O:関連付けで開く", "&S:エクスプローラで選択",
+                                   "&R:プロパティ", "&M:メニューを編集"], labels
+            assert not any("ツールを追加" in t for t in labels), labels
             # P(先頭のまま Enter)は今の窓でそのフォルダを開く(末尾 \ 付き → 中を開く)
             w._exec_menu = _drive_menu(w, "")
             L.set_cursor(L._row_of("sub2"))
@@ -8071,13 +8101,20 @@ def test_window_ext_menu():
             key(Qt.Key_Return, Qt.ControlModifier)
             assert calls[-1] == (["C:\\Windows\\explorer.exe", str(left / "sub2")],
                                  str(left / "sub2")), calls
-            # 定義の無い拡張子は今までどおり関連付けで開く
+            # 定義の無い拡張子でも、共通メニューだけは出る
             L.load(str(left))
             _wait(w)
             opened = []
-            w._startfile = opened.append
-            w._exec_menu = lambda m, c: (_ for _ in ()).throw(AssertionError("メニューが出た"))
+            w._startfile = lambda path, **kw: opened.append(path)
+            seen2 = []
+            w._exec_menu = lambda m, c: (seen2.append(
+                [a.text() for a in m.actions() if not a.isSeparator()]), None)[1]
             L.set_cursor(L._row_of("data.xyz"))
+            key(Qt.Key_Return, Qt.ControlModifier)
+            assert seen2[0] == ["&O:関連付けで開く", "&S:エクスプローラで選択",
+                                "&R:プロパティ", "&M:メニューを編集"], seen2
+            # 共通の「関連付けで開く」を選べば、今までどおり関連付けで開く
+            w._exec_menu = _drive_menu(w, "O")
             key(Qt.Key_Return, Qt.ControlModifier)
             assert opened == [str(left / "data.xyz")], opened
         finally:
@@ -8108,13 +8145,13 @@ def test_window_ext_menu():
             QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
             assert calls == [(["C:\\Windows\\explorer.exe", "/select,", str(jp)],
                               str(Path(jp).parent))], calls
-            # 「メニューを編集」: この PC の追加ファイルをエディタで(無ければ雛形を作る)
-            calls.clear()
+            # 「メニューを編集」: 編集 GUI を開く(対象の種類を渡す)
+            edited = []
+            w.edit_menu_gui = edited.append
             w.left.set_cursor(w.left._row_of("alpha.txt"))
             w._exec_menu = _drive_menu(w, "M")
             QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
-            made = Path(w.menu_local_dir, "txt.txt")
-            assert made.exists() and calls == [(["x", str(made)], None)], calls
+            assert edited == ["txt"], edited
             # テキストの &EDIT はエディタ(filer.editor)で対象を
             calls.clear()
             w._exec_menu = _drive_menu(w, "E")
@@ -8166,10 +8203,12 @@ def test_window_ext_menu_property_and_archive():
             w.deleteLater()
 
 
-def test_window_add_tool_from_menu():
-    """Ctrl+Enter → ツールを追加: この PC だけ / 全 PC で共有 のそれぞれで、メニューの
-    ファイルと settings.json の filer.tools(キーだけ)がどうなるか。"""
+def test_window_add_tool_from_edit_gui():
+    """Ctrl+Enter「メニューを編集」の GUI からツールを追加: この PC だけ / 全 PC で
+    共有 のそれぞれで、メニューのファイルと settings.json の filer.tools
+    (キーだけ)がどうなるか。変更はその場で書き込まれる。"""
     import filer
+    import filer_settings
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
 
@@ -8185,6 +8224,7 @@ def test_window_add_tool_from_menu():
         exe = str(Path(tmp, "My Tool", "tool.exe"))
         Path(exe).parent.mkdir()
         Path(exe).write_bytes(b"")
+        dialog = None
         try:
             w.left.set_cursor(w.left._row_of("alpha.txt"))
             asked = []
@@ -8194,8 +8234,10 @@ def test_window_add_tool_from_menu():
                 return {"label": "マイツール", "key": "Y", "program": ("exe", exe),
                         "args": "$MF", "cwd": "", "scope": "local"}
             w.ask_add_tool = ask
-            w._exec_menu = _drive_menu(w, "T")
-            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            editor = w.menu_editor()
+            dialog = w.build_menu_edit_dialog("txt", editor)
+            assert dialog.current_kind() == "txt"
+            dialog.tool_add()
             assert asked == ["txt"]
             local = Path(w.menu_local_dir, "txt.txt")
             assert local.read_text(encoding="utf-8") == '"Y:マイツール" {tool:tool} $MF\n'
@@ -8213,8 +8255,7 @@ def test_window_add_tool_from_menu():
             w.ask_add_tool = lambda kind, editor, initial=None: {
                 "label": "共有ツール", "key": "K", "program": ("exe", exe), "args": "$MF",
                 "cwd": "", "scope": "shared"}
-            w._exec_menu = _drive_menu(w, "T")
-            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+            dialog.tool_add()
             assert (shared / "txt.txt").read_text(encoding="utf-8") == '"K:共有ツール" {tool:tool} $MF\n'
             assert "commit・push" in w.log_view.toPlainText()
             assert not (shared / "txt.txt.bak").exists()
@@ -8222,13 +8263,25 @@ def test_window_add_tool_from_menu():
             assert set(stored["filer"]["tools"]) == {"keep", "tool"}
             # 個人のパスが共有に入る書き方は断る(ファイルは変わらない)
             w.ask_add_tool = lambda kind, editor, initial=None: {
-                "label": "直書き", "key": "Z", "program": ("raw", exe), "args": "",
-                "cwd": "", "scope": "shared"}
-            w._exec_menu = _drive_menu(w, "T")
-            QTest.keyClick(w.active.view, Qt.Key_Return, Qt.ControlModifier)
+                "label": "直書き", "key": "Z", "program": ("raw", "C:\\Tools\\tool.exe"),
+                "args": "", "cwd": "", "scope": "shared"}
+            warnings = []
+
+            class _Msg:
+                @staticmethod
+                def warning(parent, title, text):
+                    warnings.append(text)
+            real_box = filer_settings.QMessageBox
+            filer_settings.QMessageBox = _Msg
+            try:
+                dialog.tool_add()
+            finally:
+                filer_settings.QMessageBox = real_box
+            assert warnings and "共有のメニュー" in warnings[0], warnings
             assert "直書き" not in (shared / "txt.txt").read_text(encoding="utf-8")
-            assert "追加できません" in w.log_view.toPlainText()
         finally:
+            if dialog is not None:
+                dialog.deleteLater()
             w.close()
             w.deleteLater()
 
@@ -8282,6 +8335,50 @@ def test_add_tool_dialog():
             assert d.label_edit.text() == "VLC" and d.args_edit.text() == '"$MF"'
             d.scope_shared.setChecked(True)
             assert d.result_value()["scope"] == "local"
+        finally:
+            d.deleteLater()
+            parent.deleteLater()
+
+
+def test_menu_edit_dialog():
+    """「メニューを編集」の専用窓: 種類別・共通は灰色で編集できず、この PC の分だけ
+    変えられる。変更のたびに on_change が呼ばれ、テキストで開くには種類が渡る。"""
+    import filer_extmenu as m
+    import filer_settings
+    from PySide6.QtWidgets import QWidget
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        shared, local = Path(tmp, "s"), Path(tmp, "l")
+        shared.mkdir()
+        local.mkdir()
+        (shared / "_aliases.txt").write_text("text: txt\n", encoding="utf-8")
+        (shared / "text.txt").write_text('"V:見る" &VIEW $MF\n', encoding="utf-8")
+        (shared / "common.txt").write_text('"O:関連付けで開く" &OPEN $MF\n', encoding="utf-8")
+        (local / "txt.txt").write_text('"A:一" &NOP\n', encoding="utf-8")
+        ed = m.MenuEditor({}, shared, local)
+        parent = QWidget()
+        changes, opened = [], []
+        d = filer_settings.MenuEditDialog(
+            parent, ed,
+            ask_tool=lambda kind, initial=None: {
+                "label": "二", "key": "B", "program": ("raw", "&NOP"), "args": ""},
+            on_change=lambda: changes.append(1), open_text=opened.append)
+        try:
+            d.select_kind("txt")
+            rows = [(d.tool_tree.topLevelItem(i).text(0), d.tool_tree.topLevelItem(i).text(1),
+                     d.tool_tree.topLevelItem(i).text(3))
+                    for i in range(d.tool_tree.topLevelItemCount())]
+            assert rows == [("V", "見る", "共有 text.txt"), ("A", "一", "この PC txt.txt"),
+                            ("O", "関連付けで開く", "共通 common.txt")], rows
+            d.select_tool_row(0)
+            assert d.current_local() is None          # 種類別は編集できない
+            d.select_tool_row(2)
+            assert d.current_local() is None          # 共通も編集できない
+            d.tool_add()                              # この PC に足す → その場で通知
+            assert changes == [1] and d.tool_tree.topLevelItemCount() == 4
+            d.open_text_file()
+            assert opened == ["txt"]
         finally:
             d.deleteLater()
             parent.deleteLater()

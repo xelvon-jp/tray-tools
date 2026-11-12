@@ -48,7 +48,7 @@ INTERNAL_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "SHELL", "PROPERTY", "VIEW
 ARCHIVE_OK_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "VIEW", "OPEN"})
 
 LOCAL_TEMPLATE = (
-    "# この PC だけで使うメニュー項目(共有のメニューの後ろに付け足されます)。\n"
+    "# この PC だけで使うメニュー項目(種類別の後ろ・共通の前に付け足されます)。\n"
     "# 書式: \"K:表示名\" コマンド   (K は選択キー1字)\n"
     "#   \"-----\" で区切り、# で始まる行はコメント\n"
     "# マクロ: $MF 対象のフルパス(複数可) / $P 今の窓のパス / $F カーソルのファイル名 /\n"
@@ -385,13 +385,32 @@ def tidy_separators(lines) -> list:
     return result
 
 
+def visible_layers(layers, resolver: Resolver, in_archive: bool = False) -> list:
+    """層の並び(種類別 → この PC → 共通など)を、層ごとに出してよい項目だけに
+    絞り、空でない層どうしを区切りでつないで返す。"""
+    result = []
+    for layer in layers:
+        lines = tidy_separators([line for line in (layer or [])
+                                 if usable(line, resolver, in_archive)])
+        if lines:
+            if result:
+                result.append(MenuLine(separator=True))
+            result.extend(lines)
+    return result
+
+
 def visible_items(shared, local, resolver: Resolver, in_archive: bool = False) -> list:
     """共有 → 区切り → この PC の分、の順に、出してよい項目だけを並べる。"""
-    lines = list(shared or [])
-    if local:
-        lines.append(MenuLine(separator=True))
-        lines.extend(local)
-    return tidy_separators([line for line in lines if usable(line, resolver, in_archive)])
+    return visible_layers([shared, local], resolver, in_archive)
+
+
+COMMON_FILE = "common.txt"
+COMMON_KIND = "common"      # 種類の一覧には出さない(全種類に付く層なので)
+
+
+def common_items(shared_dir=None) -> list:
+    """共通メニュー(全種類に出す GitHub 側の定義)。無ければ空。"""
+    return read_menu_file(Path(shared_dir or MENU_DIR) / COMMON_FILE) or []
 
 
 def _quote_join(paths) -> str:
@@ -679,6 +698,7 @@ class MenuEditor:
                 pass
         groups = set(aliases.values())
         found -= {g for g in groups if g not in aliases}   # image などのグループ名は出さない
+        found.discard(COMMON_KIND)                         # 共通は種類ではない
         found.add(FOLDER_KIND)
         return [FOLDER_KIND] + sorted(k for k in found if k != FOLDER_KIND)
 
@@ -718,6 +738,10 @@ class MenuEditor:
 
     def local_items(self, kind: str) -> list:
         return self.local_file(kind).items()
+
+    def common_items(self) -> list:
+        """共通メニュー(共有の common.txt)。編集 GUI の表示用。"""
+        return common_items(self.shared_dir)
 
     def used_keys(self, kind: str) -> set:
         return {line.key for _s, line in self.readonly_items(kind) if line.key} | {

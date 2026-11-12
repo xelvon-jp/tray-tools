@@ -46,7 +46,226 @@ import filer_extmenu
 from photometa import config as photo_config
 
 
-class SettingsDialog(QDialog):
+class _MenuToolsMixin:
+    """「拡張子とツール」の編集面(種類の一覧・項目の一覧・追加/変更/削除/上下)。
+
+    設定ダイアログのタブと、Ctrl+Enter「メニューを編集」の専用窓で共用する。
+    項目の変更は MenuEditor の写しの上だけで、書き込みは呼び出し側の流儀に任せる
+    (設定ダイアログは決定でまとめて、「メニューを編集」は _after_tool_change で
+    その場で)。灰色の行(共有・グループ・共通)はここでは変えられない。"""
+
+    # --- 専用窓だけの差し替え点 ---
+    show_common_rows = False        # 共通(common.txt)の行も灰色で出すか
+    tools_note = None               # 一覧の上の注記(None なら設定ダイアログの文言)
+
+    def _after_tool_change(self) -> None:
+        """項目を変えた直後の後始末(既定は何もしない)。"""
+
+
+    # ---------------------------------------------------------------
+    # 「拡張子とツール」タブ
+    # ---------------------------------------------------------------
+    def _build_tool_page(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        left = QVBoxLayout()
+        left.addWidget(QLabel("拡張子"))
+        self.kind_list = QListWidget()
+        self.kind_list.setMaximumWidth(140)
+        self.kind_list.currentRowChanged.connect(lambda _row: self.tool_refresh_items())
+        left.addWidget(self.kind_list)
+        self.kind_add_button = QPushButton("拡張子(&X)…")
+        self.kind_add_button.clicked.connect(self.tool_add_kind)
+        left.addWidget(self.kind_add_button)
+        layout.addLayout(left)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel(self.tools_note or
+                               "メニューの項目（灰色は共有・グループの分で、ここでは変えられません）"))
+        self.tool_tree = QTreeWidget()
+        self.tool_tree.setColumnCount(4)
+        self.tool_tree.setHeaderLabels(["キー", "表示名", "コマンド", "置き場"])
+        self.tool_tree.setRootIsDecorated(False)
+        self.tool_tree.setUniformRowHeights(True)
+        self.tool_tree.header().resizeSection(0, 40)
+        self.tool_tree.header().resizeSection(1, 150)
+        self.tool_tree.header().resizeSection(2, 220)
+        self.tool_tree.itemDoubleClicked.connect(lambda _i, _c: self.tool_edit())
+        right.addWidget(self.tool_tree)
+        buttons = QHBoxLayout()
+        self.tool_add_button = QPushButton("追加(&A)")
+        self.tool_edit_button = QPushButton("変更(&C)")
+        self.tool_delete_button = QPushButton("削除(&D)")
+        self.tool_up_button = QPushButton("上(&U)")
+        self.tool_down_button = QPushButton("下(&S)")
+        self.tool_add_button.clicked.connect(self.tool_add)
+        self.tool_edit_button.clicked.connect(self.tool_edit)
+        self.tool_delete_button.clicked.connect(self.tool_delete)
+        self.tool_up_button.clicked.connect(lambda: self.tool_move(-1))
+        self.tool_down_button.clicked.connect(lambda: self.tool_move(1))
+        for button in (self.tool_add_button, self.tool_edit_button, self.tool_delete_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.tool_up_button)
+        buttons.addWidget(self.tool_down_button)
+        for button in (self.kind_add_button, self.tool_add_button, self.tool_edit_button,
+                       self.tool_delete_button, self.tool_up_button, self.tool_down_button):
+            button.setAutoDefault(False)
+        right.addLayout(buttons)
+        layout.addLayout(right, 1)
+        self.tool_rows = []
+        return page
+
+    def current_kind(self) -> str:
+        item = self.kind_list.currentItem()
+        return item.text() if item is not None else ""
+
+    def tool_refresh_kinds(self, select=None) -> None:
+        kinds = self.menu_editor.kinds()
+        self.kind_list.blockSignals(True)
+        self.kind_list.clear()
+        self.kind_list.addItems(kinds)
+        self.kind_list.blockSignals(False)
+        if kinds:
+            if isinstance(select, str):
+                row = kinds.index(select) if select in kinds else 0
+            else:
+                row = select if isinstance(select, int) else 0
+            self.kind_list.setCurrentRow(max(0, min(row, len(kinds) - 1)))
+        self.tool_refresh_items()
+
+    def select_kind(self, kind: str) -> None:
+        kinds = [self.kind_list.item(i).text() for i in range(self.kind_list.count())]
+        if kind in kinds:
+            self.kind_list.setCurrentRow(kinds.index(kind))
+
+    def tool_refresh_items(self, select_local=None) -> None:
+        self.tool_tree.clear()
+        self.tool_rows = []
+        kind = self.current_kind()
+        if not kind:
+            return
+        gray = QBrush(QColor("#808080"))
+        for source, line in self.menu_editor.readonly_items(kind):
+            item = QTreeWidgetItem(self._tool_columns(line, source))
+            for col in range(4):
+                item.setForeground(col, gray)
+            self.tool_tree.addTopLevelItem(item)
+            self.tool_rows.append(None)
+        current = None
+        for number, line in enumerate(self.menu_editor.local_items(kind)):
+            item = QTreeWidgetItem(self._tool_columns(line, f"この PC {kind}.txt"))
+            self.tool_tree.addTopLevelItem(item)
+            self.tool_rows.append(number)
+            if number == select_local:
+                current = item
+        if self.show_common_rows:
+            for line in self.menu_editor.common_items():
+                item = QTreeWidgetItem(self._tool_columns(line, "共通 common.txt"))
+                for col in range(4):
+                    item.setForeground(col, gray)
+                self.tool_tree.addTopLevelItem(item)
+                self.tool_rows.append(None)
+        if current is not None:
+            self.tool_tree.setCurrentItem(current)
+        elif self.tool_tree.topLevelItemCount():
+            self.tool_tree.setCurrentItem(self.tool_tree.topLevelItem(0))
+
+    @staticmethod
+    def _tool_columns(line, source) -> list:
+        if line.separator:
+            return ["", "――――", "", source]
+        return [line.key, line.label, line.command, source]
+
+    def current_local(self):
+        """選んでいる行が この PC の項目ならその番号、共有の分や未選択なら None。"""
+        item = self.tool_tree.currentItem()
+        if item is None:
+            return None
+        row = self.tool_tree.indexOfTopLevelItem(item)
+        return self.tool_rows[row] if 0 <= row < len(self.tool_rows) else None
+
+    def select_tool_row(self, row: int) -> None:
+        item = self.tool_tree.topLevelItem(row)
+        if item is not None:
+            self.tool_tree.setCurrentItem(item)
+
+    # 入力の口(テストではここを差し替える)
+    def ask_tool(self, kind, initial=None):
+        if self.ask_tool_fn is None:
+            return None
+        return self.ask_tool_fn(kind, initial)
+
+    def ask_kind(self):
+        value, ok = QInputDialog.getText(self, "拡張子を追加",
+                                         "拡張子（例: pdf）。フォルダは folder")
+        return value if ok else None
+
+    def tool_add_kind(self) -> None:
+        text = self.ask_kind()
+        if not text:
+            return
+        kind = self.menu_editor.add_kind(text)
+        if kind:
+            self.tool_refresh_kinds(kind)
+
+    def tool_add(self) -> None:
+        kind = self.current_kind()
+        if not kind:
+            return
+        result = self.ask_tool(kind)
+        if not result:
+            return
+        try:
+            self.menu_editor.add_item(kind, result, result.get("scope") or "local")
+        except ValueError as e:
+            QMessageBox.warning(self, "拡張子とツール", str(e))
+            return
+        local = self.menu_editor.local_items(kind)
+        self.tool_refresh_items(len(local) - 1 if result.get("scope") != "shared" else None)
+        self._after_tool_change()
+
+    def tool_edit(self) -> None:
+        kind = self.current_kind()
+        number = self.current_local()
+        if number is None:
+            return
+        line = self.menu_editor.local_items(kind)[number]
+        if line.separator:
+            return
+        program, args = filer_extmenu.describe_program(line.command)
+        result = self.ask_tool(kind, {"label": line.label, "key": line.key,
+                                      "program": program, "args": args})
+        if not result:
+            return
+        self.menu_editor.replace_local(kind, number, result)
+        self.tool_refresh_items(number)
+        self._after_tool_change()
+
+    def tool_delete(self) -> None:
+        kind = self.current_kind()
+        number = self.current_local()
+        if number is None:
+            return
+        line = self.menu_editor.local_items(kind)[number]
+        if not self.confirm(f"この項目を削除しますか？\n{line.label or '区切り'}"):
+            return
+        self.menu_editor.delete_local(kind, number)
+        self.tool_refresh_items(max(0, number - 1))
+        self._after_tool_change()
+
+    def tool_move(self, step: int) -> None:
+        kind = self.current_kind()
+        number = self.current_local()
+        if number is None:
+            return
+        if self.menu_editor.move_local(kind, number, step):
+            self.tool_refresh_items(number + step)
+            self._after_tool_change()
+
+
+
+class SettingsDialog(_MenuToolsMixin, QDialog):
     def __init__(self, parent, ext_rules, font=None, menu_editor=None, ask_tool=None,
                  label_config=None):
         super().__init__(parent)
@@ -251,195 +470,6 @@ class SettingsDialog(QDialog):
             self.refresh(0)
 
     # ---------------------------------------------------------------
-    # 「拡張子とツール」タブ
-    # ---------------------------------------------------------------
-    def _build_tool_page(self) -> QWidget:
-        page = QWidget()
-        layout = QHBoxLayout(page)
-        left = QVBoxLayout()
-        left.addWidget(QLabel("拡張子"))
-        self.kind_list = QListWidget()
-        self.kind_list.setMaximumWidth(140)
-        self.kind_list.currentRowChanged.connect(lambda _row: self.tool_refresh_items())
-        left.addWidget(self.kind_list)
-        self.kind_add_button = QPushButton("拡張子(&X)…")
-        self.kind_add_button.clicked.connect(self.tool_add_kind)
-        left.addWidget(self.kind_add_button)
-        layout.addLayout(left)
-
-        right = QVBoxLayout()
-        right.addWidget(QLabel("メニューの項目（灰色は共有・グループの分で、ここでは変えられません）"))
-        self.tool_tree = QTreeWidget()
-        self.tool_tree.setColumnCount(4)
-        self.tool_tree.setHeaderLabels(["キー", "表示名", "コマンド", "置き場"])
-        self.tool_tree.setRootIsDecorated(False)
-        self.tool_tree.setUniformRowHeights(True)
-        self.tool_tree.header().resizeSection(0, 40)
-        self.tool_tree.header().resizeSection(1, 150)
-        self.tool_tree.header().resizeSection(2, 220)
-        self.tool_tree.itemDoubleClicked.connect(lambda _i, _c: self.tool_edit())
-        right.addWidget(self.tool_tree)
-        buttons = QHBoxLayout()
-        self.tool_add_button = QPushButton("追加(&A)")
-        self.tool_edit_button = QPushButton("変更(&C)")
-        self.tool_delete_button = QPushButton("削除(&D)")
-        self.tool_up_button = QPushButton("上(&U)")
-        self.tool_down_button = QPushButton("下(&S)")
-        self.tool_add_button.clicked.connect(self.tool_add)
-        self.tool_edit_button.clicked.connect(self.tool_edit)
-        self.tool_delete_button.clicked.connect(self.tool_delete)
-        self.tool_up_button.clicked.connect(lambda: self.tool_move(-1))
-        self.tool_down_button.clicked.connect(lambda: self.tool_move(1))
-        for button in (self.tool_add_button, self.tool_edit_button, self.tool_delete_button):
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.tool_up_button)
-        buttons.addWidget(self.tool_down_button)
-        for button in (self.kind_add_button, self.tool_add_button, self.tool_edit_button,
-                       self.tool_delete_button, self.tool_up_button, self.tool_down_button):
-            button.setAutoDefault(False)
-        right.addLayout(buttons)
-        layout.addLayout(right, 1)
-        self.tool_rows = []
-        return page
-
-    def current_kind(self) -> str:
-        item = self.kind_list.currentItem()
-        return item.text() if item is not None else ""
-
-    def tool_refresh_kinds(self, select=None) -> None:
-        kinds = self.menu_editor.kinds()
-        self.kind_list.blockSignals(True)
-        self.kind_list.clear()
-        self.kind_list.addItems(kinds)
-        self.kind_list.blockSignals(False)
-        if kinds:
-            if isinstance(select, str):
-                row = kinds.index(select) if select in kinds else 0
-            else:
-                row = select if isinstance(select, int) else 0
-            self.kind_list.setCurrentRow(max(0, min(row, len(kinds) - 1)))
-        self.tool_refresh_items()
-
-    def select_kind(self, kind: str) -> None:
-        kinds = [self.kind_list.item(i).text() for i in range(self.kind_list.count())]
-        if kind in kinds:
-            self.kind_list.setCurrentRow(kinds.index(kind))
-
-    def tool_refresh_items(self, select_local=None) -> None:
-        self.tool_tree.clear()
-        self.tool_rows = []
-        kind = self.current_kind()
-        if not kind:
-            return
-        gray = QBrush(QColor("#808080"))
-        for source, line in self.menu_editor.readonly_items(kind):
-            item = QTreeWidgetItem(self._tool_columns(line, source))
-            for col in range(4):
-                item.setForeground(col, gray)
-            self.tool_tree.addTopLevelItem(item)
-            self.tool_rows.append(None)
-        current = None
-        for number, line in enumerate(self.menu_editor.local_items(kind)):
-            item = QTreeWidgetItem(self._tool_columns(line, f"この PC {kind}.txt"))
-            self.tool_tree.addTopLevelItem(item)
-            self.tool_rows.append(number)
-            if number == select_local:
-                current = item
-        if current is not None:
-            self.tool_tree.setCurrentItem(current)
-        elif self.tool_tree.topLevelItemCount():
-            self.tool_tree.setCurrentItem(self.tool_tree.topLevelItem(0))
-
-    @staticmethod
-    def _tool_columns(line, source) -> list:
-        if line.separator:
-            return ["", "――――", "", source]
-        return [line.key, line.label, line.command, source]
-
-    def current_local(self):
-        """選んでいる行が この PC の項目ならその番号、共有の分や未選択なら None。"""
-        item = self.tool_tree.currentItem()
-        if item is None:
-            return None
-        row = self.tool_tree.indexOfTopLevelItem(item)
-        return self.tool_rows[row] if 0 <= row < len(self.tool_rows) else None
-
-    def select_tool_row(self, row: int) -> None:
-        item = self.tool_tree.topLevelItem(row)
-        if item is not None:
-            self.tool_tree.setCurrentItem(item)
-
-    # 入力の口(テストではここを差し替える)
-    def ask_tool(self, kind, initial=None):
-        if self.ask_tool_fn is None:
-            return None
-        return self.ask_tool_fn(kind, initial)
-
-    def ask_kind(self):
-        value, ok = QInputDialog.getText(self, "拡張子を追加",
-                                         "拡張子（例: pdf）。フォルダは folder")
-        return value if ok else None
-
-    def tool_add_kind(self) -> None:
-        text = self.ask_kind()
-        if not text:
-            return
-        kind = self.menu_editor.add_kind(text)
-        if kind:
-            self.tool_refresh_kinds(kind)
-
-    def tool_add(self) -> None:
-        kind = self.current_kind()
-        if not kind:
-            return
-        result = self.ask_tool(kind)
-        if not result:
-            return
-        try:
-            self.menu_editor.add_item(kind, result, result.get("scope") or "local")
-        except ValueError as e:
-            QMessageBox.warning(self, "拡張子とツール", str(e))
-            return
-        local = self.menu_editor.local_items(kind)
-        self.tool_refresh_items(len(local) - 1 if result.get("scope") != "shared" else None)
-
-    def tool_edit(self) -> None:
-        kind = self.current_kind()
-        number = self.current_local()
-        if number is None:
-            return
-        line = self.menu_editor.local_items(kind)[number]
-        if line.separator:
-            return
-        program, args = filer_extmenu.describe_program(line.command)
-        result = self.ask_tool(kind, {"label": line.label, "key": line.key,
-                                      "program": program, "args": args})
-        if not result:
-            return
-        self.menu_editor.replace_local(kind, number, result)
-        self.tool_refresh_items(number)
-
-    def tool_delete(self) -> None:
-        kind = self.current_kind()
-        number = self.current_local()
-        if number is None:
-            return
-        line = self.menu_editor.local_items(kind)[number]
-        if not self.confirm(f"この項目を削除しますか？\n{line.label or '区切り'}"):
-            return
-        self.menu_editor.delete_local(kind, number)
-        self.tool_refresh_items(max(0, number - 1))
-
-    def tool_move(self, step: int) -> None:
-        kind = self.current_kind()
-        number = self.current_local()
-        if number is None:
-            return
-        if self.menu_editor.move_local(kind, number, step):
-            self.tool_refresh_items(number + step)
-
-    # ---------------------------------------------------------------
     # 「ラベル」タブ(写真のキーワードの定義)
     # ---------------------------------------------------------------
     def _build_label_page(self) -> QWidget:
@@ -527,6 +557,57 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------
 # ツールを追加(小ダイアログ)
 # ---------------------------------------------------------------
+class MenuEditDialog(_MenuToolsMixin, QDialog):
+    """Ctrl+Enter「メニューを編集」の専用窓。設定ダイアログの「拡張子とツール」と
+    同じ編集面を使い、共通(common.txt)の分も灰色で出す。変更はその場で
+    on_change(ファイルへの書き込み)まで進めるので、ボタンは閉じるだけ。
+    GitHub 側の定義(種類別・共通)はここでは変えられない代わりに、この PC の
+    定義をテキストで開くボタンを置く(従来の「メニューを編集」の行き先)。"""
+
+    show_common_rows = True
+    tools_note = "メニューの項目（灰色は種類別・共通＝GitHub の分で、ここでは変えられません）"
+
+    def __init__(self, parent, menu_editor, ask_tool=None, on_change=None,
+                 open_text=None, font=None):
+        super().__init__(parent)
+        self.setWindowTitle("メニューを編集")
+        if font is not None:
+            self.setFont(font)
+        self.menu_editor = menu_editor
+        self.ask_tool_fn = ask_tool
+        self.on_change = on_change
+        self.open_text_fn = open_text
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._build_tool_page())
+        bottom = QHBoxLayout()
+        self.text_button = QPushButton("この PC の定義をテキストで開く(&T)")
+        self.text_button.setAutoDefault(False)
+        self.text_button.clicked.connect(self.open_text_file)
+        bottom.addWidget(self.text_button)
+        bottom.addStretch(1)
+        self.close_button = QPushButton("閉じる")
+        self.close_button.setAutoDefault(False)
+        self.close_button.clicked.connect(self.accept)
+        bottom.addWidget(self.close_button)
+        layout.addLayout(bottom)
+        self.resize(780, 500)
+        self.tool_refresh_kinds(0)
+
+    def confirm(self, text: str) -> bool:
+        return QMessageBox.question(self, "メニューを編集", text,
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes
+
+    def _after_tool_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def open_text_file(self) -> None:
+        kind = self.current_kind()
+        if kind and self.open_text_fn is not None:
+            self.open_text_fn(kind)
+
+
 class AddToolDialog(QDialog):
     """拡張子にツールを紐づける。実行するものは「この拡張子を開けるアプリ」の候補・
     filer.tools に登録済みのツール・参照(exe を選ぶ)から選ぶ。

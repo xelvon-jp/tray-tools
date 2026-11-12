@@ -4630,7 +4630,9 @@ class FilerWindow(QWidget):
 
         対象はマーク、無ければカーソル行。".." の上ならいまのフォルダ自身(あふｗと同じ)。
         マークの拡張子が混ざっていたら、カーソル行がマークの中にあればその種類、
-        無ければマークの先頭の種類で決める。定義が無い拡張子は今までどおり関連付けで開く。"""
+        無ければマークの先頭の種類で決める。メニューは3層(種類別 → この PC →
+        共通 filer_menus/common.txt)で、定義が無い拡張子でも共通だけは出る。
+        共通すら無いときだけ、今までどおり関連付けで開く。"""
         pane = self.active
         entry = pane.cursor_entry()
         if entry is None or not pane.path:
@@ -4644,24 +4646,23 @@ class FilerWindow(QWidget):
             kind_entry = entry
         kind = filer_extmenu.menu_kind(kind_entry)
         shared, local = filer_extmenu.find_menus(kind, self.menu_shared_dir, self.menu_local_dir)
-        if shared is None and local is None:
-            self.cmd_open_assoc()
-            return
+        common = filer_extmenu.common_items(self.menu_shared_dir)
         resolver = self.menu_resolver()
-        lines = filer_extmenu.visible_items(shared, local, resolver,
-                                            in_archive=pane.archive is not None)
+        lines = filer_extmenu.visible_layers([shared, local, common], resolver,
+                                             in_archive=pane.archive is not None)
         items = []
         for line in lines:
             items.append(None if line.separator else (line.key or "?", line.label, line))
-        if items:
-            items.append(None)
+        if not items:
+            self.cmd_open_assoc()
+            return
+        items.append(None)
         if self._box_menu_ok():
             # Box Drive の中: Box 自身の右クリック項目「Box.comで表示」を実行する項目を足す
-            used = {str(i[0]).upper() for i in items if i} | {"T", "M"}
+            used = {str(i[0]).upper() for i in items if i} | {"M"}
             key = next((k for k in "BWXVJ" if k not in used), "?")
             items.append(None)
             items.append((key, "Box.comで開く", ("box_open",)))
-        items.append(("T", "ツールを追加…", ("add",)))
         items.append(("M", "メニューを編集", ("edit",)))
         choice = self.choose_menu(kind, items)
         if choice is None:
@@ -4678,8 +4679,7 @@ class FilerWindow(QWidget):
             self.open_on_box(pane.target_paths())
             return
         if choice == ("edit",):
-            path = filer_extmenu.ensure_local_file(kind, self.menu_local_dir)
-            self._open_in_editor([path])
+            self.edit_menu_gui(kind)
             return
         line = choice
         name = filer_extmenu.internal_name(line.command)
@@ -4848,6 +4848,27 @@ class FilerWindow(QWidget):
             self.log("リポジトリのファイルを変更しました（他の PC へ配るには commit・push が"
                      "必要です）: " + ", ".join(os.path.basename(p) for p in written["shared"]))
         return written
+
+    def build_menu_edit_dialog(self, kind: str, editor):
+        """「メニューを編集」の GUI を組む(テストではここまでで操作する)。"""
+        import filer_settings  # 使うときに読む
+
+        dialog = filer_settings.MenuEditDialog(
+            self, editor,
+            ask_tool=lambda k, initial=None: self.ask_add_tool(k, editor, initial),
+            on_change=lambda: self.commit_menu_editor(editor),
+            open_text=lambda k: self._open_in_editor(
+                [filer_extmenu.ensure_local_file(k, self.menu_local_dir)]),
+            font=self.log_font)
+        dialog.select_kind(kind)
+        return dialog
+
+    def edit_menu_gui(self, kind: str) -> None:
+        """Ctrl+Enter「メニューを編集」: 編集 GUI を開く。変更はその場で書き込む。"""
+        editor = self.menu_editor()
+        dialog = self.build_menu_edit_dialog(kind, editor)
+        self.exec_dialog(dialog)
+        dialog.deleteLater()
 
     def save_tools(self, updates: dict) -> None:
         """filer.tools の該当キーだけを差し替える(ほかのツールや filer の他のキーは触らない)。"""

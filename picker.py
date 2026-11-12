@@ -9,7 +9,7 @@ import fnmatch
 import sys
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
@@ -893,6 +893,9 @@ class PickerWindow(QWidget):
                 info = QListWidgetItem(
                     "先頭に空白を入れると記号をそのまま打てます")
                 info.setFlags(Qt.NoItemFlags)
+                # 選べるモード行と見分けがつくよう、案内は薄い色にする
+                # (2026-11-12、アオの見た目確認の指摘)。
+                info.setForeground(QBrush(QColor("#8a8a8a")))
                 self.list.addItem(info)
             if self.list.count():
                 self.list.setCurrentRow(0)

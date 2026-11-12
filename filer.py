@@ -5972,6 +5972,7 @@ class FilerWindow(QWidget):
             self.activate("right")
             return
         if dest in ("explorer", "explorer_tab"):
+            import action_log
             import explorer_nav
 
             hwnd = explorer_nav.last_active_hwnd()
@@ -5983,9 +5984,20 @@ class FilerWindow(QWidget):
                     # 直前アクティブを選んだのだから、その窓を前面に出す
                     # (実機確認 #6。前面化できなくても移動は済んでいる)
                     explorer_nav.activate_window(hwnd)
+                    # 画面のログ欄はファイルに残らないので、開き方の分岐を
+                    # action.log にも残す(新規タブの効きの切り分け用 #6)
+                    action_log.record(
+                        "フォルダを開く", f"dest={dest} path={path}", "filer")
                     return
+                action_log.record(
+                    "フォルダを開く",
+                    f"dest={dest} 移動できず新規窓へ path={path}", "filer")
                 self.log("フォルダを開く: エクスプローラで開けなかったので、新規窓で開きます")
             else:
+                action_log.record(
+                    "フォルダを開く",
+                    f"dest={dest} エクスプローラ無し・新規窓へ path={path}",
+                    "filer")
                 self.log("フォルダを開く: エクスプローラが開いていないので、新規窓で開きます")
         # explorer_new、および explorer / explorer_tab で届かなかったときの受け皿
         try:

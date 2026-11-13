@@ -11,7 +11,7 @@ DEFAULT_KEYMAP = {
     "new": "Ctrl+N",
     "open": "Ctrl+O",
     "save": "Ctrl+S",
-    "save_as": "Ctrl+Shift+S",
+    "save_as": "F12",
     "close_window": "Ctrl+W",
     "find": "Ctrl+F",
     "find_next": "F3",

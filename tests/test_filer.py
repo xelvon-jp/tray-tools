@@ -937,7 +937,7 @@ def test_window_newtext_stamp():
             return answers.pop(0)
 
         w.ask_text = ask
-        w._open_in_editor = lambda paths: opened.append(list(paths))
+        w.open_text_editor = lambda path: opened.append(path)
         try:
             before = set(os.listdir(left))
             # 拡張子なし → .txt
@@ -948,12 +948,12 @@ def test_window_newtext_stamp():
             assert seen["select"] == len(prefix)
             p = left / "メモ.txt"
             assert p.is_file() and p.read_bytes() == b""
-            assert opened == [[str(p)]], opened
+            assert opened == [str(p)], opened
             # 拡張子あり → そのまま
             answers.append("memo.md")
             w.cmd_newtext()
             assert (left / "memo.md").is_file() and not (left / "memo.md.txt").exists()
-            assert opened[-1] == [str(left / "memo.md")]
+            assert opened[-1] == str(left / "memo.md")
             # 日時だけ → 末尾の _ なし
             answers.append(prefix)
             w.cmd_newtext()

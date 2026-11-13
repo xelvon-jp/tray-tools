@@ -7588,7 +7588,7 @@ class FilerWindow(QWidget):
         pane.reload(focus=name)
 
     def cmd_newtext(self):
-        """Shift+E: 空のテキストファイルを作って、そのまま filer.editor で開く。
+        """Shift+E: 空のテキストファイルを作って、そのまま内蔵エディタで開く。
         K(フォルダ作成)と同じく日時プレフィックスを選択状態で入れる(打てば置き換わり、
         → で確定すれば日時付き)。拡張子が無ければ .txt を付ける。中身は空(BOM なし)。"""
         pane = self.active
@@ -7622,7 +7622,8 @@ class FilerWindow(QWidget):
             return
         self.log(f"テキスト作成: {path}")
         pane.reload(focus=name)
-        self._open_in_editor([path])
+        # 開く先は Ctrl+E と同じ内蔵エディタ(以前は外のエディタだった)。
+        self.open_text_editor(path)
 
     def cmd_rename(self):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更

@@ -24,6 +24,7 @@
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QKeySequence,
     QPainter,
     QPalette,
@@ -52,6 +53,13 @@ FALLBACK_FONT_SIZE = 10
 
 # 行番号エリアの色は配色(editor/colors.py)が持つ。標準の組の値が
 # 従来の (242,242,242) / (144,144,144) と同じにしてある。
+
+
+# 改行の種別 → 行末に描く記号。CR と LF を分けて出す(混在した文書
+# でも種類が見分けられること)。字形は MS Gothic にある矢印の範囲。
+NEWLINE_GLYPHS = {"\r\n": "←↓", "\n": "↓", "\r": "←"}
+# 文書の末尾(最後のブロックの末尾)に出す印。小さい字で描く。
+EOF_MARK = "EOF"
 
 
 def wrap_right_margin(available_width, char_width, document_margin, column):
@@ -107,6 +115,10 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._line_numbers = True
         self._wrap_column = None
         self._updating_margins = False
+        # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
+        # 控えが無い・足りない行は _default_newline で描く。
+        self._line_newlines = None
+        self._default_newline = "\r\n"
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
@@ -201,17 +213,60 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._show_invisibles = visible
         self.viewport().update()
 
+    def set_line_newlines(self, kinds, default_newline=None):
+        """行ごとの改行種別の控えを据える(窓が開く・保存のたびに渡す)。
+
+        kinds はブロック番号と同じ並びで、値は改行そのもの
+        ("\\r\\n" / "\\n" / "\\r")か、改行が無い行は None。控えが無い
+        行や、編集で増えた行は default_newline(文書の改行設定)で
+        描く。描画だけの話で、文書の内容には触らない。"""
+        self._line_newlines = list(kinds) if kinds is not None else None
+        if default_newline:
+            self._default_newline = default_newline
+        if self._show_invisibles:
+            self.viewport().update()
+
+    def newline_glyph(self, block_number) -> str:
+        """ブロック(行)を終える改行の記号。控えから種別を引き、
+        無ければ文書の改行設定で決める。"""
+        kind = None
+        if (self._line_newlines is not None
+                and 0 <= block_number < len(self._line_newlines)):
+            kind = self._line_newlines[block_number]
+        if kind is None:
+            kind = self._default_newline
+        return NEWLINE_GLYPHS.get(kind, NEWLINE_GLYPHS["\n"])
+
+    def block_end_mark(self, block) -> str:
+        """ブロックの末尾に描く印。改行があればその種別の記号、
+        文書の最後のブロックなら EOF_MARK。"""
+        if block.next().isValid():
+            return self.newline_glyph(block.blockNumber())
+        return EOF_MARK
+
+    def _eof_font(self):
+        """EOF の印用の、本文より小さいフォント。"""
+        font = QFont(self.font())
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(6.0, font.pointSizeF() * 0.7))
+        elif font.pixelSize() > 0:
+            font.setPixelSize(max(6, round(font.pixelSize() * 0.7)))
+        return font
+
     def paintEvent(self, event):  # noqa: N802  Qt の上書き
         super().paintEvent(event)
         if self._show_invisibles:
             self._paint_invisibles()
 
     def _paint_invisibles(self):
-        """見えている行のタブ・スペース・改行を記号で描く。
+        """見えている行のタブ・スペース・改行・末尾を記号で描く。
 
-        タブは →、半角スペースは ・、全角スペースは □、改行は行末に
-        ↵。位置は cursorRect で取る(折り返しやスクロールに追随する)。
-        描くのは見えているブロックだけに絞る。"""
+        タブは →、半角スペースは ·、全角スペースは □。行末には
+        改行の種別の記号(LF は ↓、CR は ←、CRLF は ←↓)を、文書の
+        最後の行には EOF の印を小さい字で描く。すべて配色の
+        invisible の色(本文より薄い色)。位置は cursorRect で取る
+        (折り返しやスクロールに追随する)。描くのは見えている
+        ブロックだけに絞る。"""
         painter = QPainter(self.viewport())
         painter.setPen(self._invisible_color)
         painter.setFont(self.font())
@@ -239,11 +294,17 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     rect = self.cursorRect(scratch)
                     painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
                                      | Qt.AlignmentFlag.AlignVCenter, symbol)
-                if block.next().isValid():
-                    scratch.setPosition(base + len(text))
-                    rect = self.cursorRect(scratch)
+                scratch.setPosition(base + len(text))
+                rect = self.cursorRect(scratch)
+                mark = self.block_end_mark(block)
+                if mark == EOF_MARK:
+                    painter.setFont(self._eof_font())
                     painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
-                                     | Qt.AlignmentFlag.AlignVCenter, "↵")
+                                     | Qt.AlignmentFlag.AlignVCenter, mark)
+                    painter.setFont(self.font())
+                else:
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
+                                     | Qt.AlignmentFlag.AlignVCenter, mark)
             block = block.next()
 
     def keyPressEvent(self, event):  # noqa: N802  Qt の上書き

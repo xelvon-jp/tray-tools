@@ -1337,19 +1337,17 @@ def test_wrap_settings_read_at_open():
 
 def test_wrap_right_margin_calculation():
     # 桁数折り返しの余白の計算(純粋関数)。目標の本文幅は
-    # 桁数 × 文字幅 + 文書の余白(両側)。
+    # 桁数 × 文字幅 + 文書の余白(両側)。第1引数は「余白で動かない幅」。
     from editor.text_edit import wrap_right_margin
     # 幅1000・文字幅10・文書の余白4・80桁: 目標808、余白は192。
-    assert wrap_right_margin(1000, 0, 10, 4, 80) == 192
-    # 余白を取った後の幅(808)でもう一度計算しても同じ(冪等)。
-    assert wrap_right_margin(808, 192, 10, 4, 80) == 192
+    assert wrap_right_margin(1000, 10, 4, 80) == 192
     # 幅が足りなければ 0(負にはしない)。
-    assert wrap_right_margin(500, 0, 10, 4, 80) == 0
+    assert wrap_right_margin(500, 10, 4, 80) == 0
     # 桁数を減らすと余白は広がる。
-    assert wrap_right_margin(1000, 0, 10, 4, 40) == 592
+    assert wrap_right_margin(1000, 10, 4, 40) == 592
     # 桁数なし・文字幅なしは 0。
-    assert wrap_right_margin(1000, 0, 10, 4, None) == 0
-    assert wrap_right_margin(1000, 0, 0, 4, 80) == 0
+    assert wrap_right_margin(1000, 10, 4, None) == 0
+    assert wrap_right_margin(1000, 0, 4, 80) == 0
 
 
 def test_wrap_column_margin_tracks_resize_and_font():
@@ -1362,10 +1360,12 @@ def test_wrap_column_margin_tracks_resize_and_font():
         app().processEvents()
         margin_wide = edit.viewportMargins().right()
         assert margin_wide > 0
-        # 見える幅がほぼ目標(80桁ぶん)に収まっている。
+        # 見える幅がほぼ目標(80桁ぶん)に収まっている。スクロールバー
+        # の幅は常時差し引いて計算するので、その分までのずれは許す。
         char = edit.fontMetrics().averageCharWidth()
         target = 80 * char + 2 * edit.document().documentMargin()
-        assert abs(edit.viewport().width() - target) <= char
+        assert abs(edit.viewport().width() - target) <= (
+            edit._scrollbar_extent() + char)
         # 窓を狭めると余白は減り、目標以下では 0 になる。
         window.resize(700, 600)
         app().processEvents()
@@ -1381,6 +1381,27 @@ def test_wrap_column_margin_tracks_resize_and_font():
         edit.set_font_size(edit.font_size() + 6)
         app().processEvents()
         assert edit.viewportMargins().right() < before
+    finally:
+        discard_close(window)
+
+
+def test_wrap_column_font_change_does_not_recurse():
+    # 再現手順(レビュー req-20261113-109): 桁数40で窓を広げてから
+    # フォントを大きくすると、余白の再計算が resizeEvent と往復して
+    # スタックオーバーフローでプロセスごと落ちた。処理が終わることと、
+    # 余白が安定している(再計算しても変わらない)ことを確かめる。
+    window = make_window(editor_settings={
+        "wrap_mode": "column", "wrap_column": 40})
+    try:
+        window.resize(1600, 600)
+        app().processEvents()
+        edit = window._edit
+        edit.set_font_size(20)
+        app().processEvents()
+        first = edit.viewportMargins().right()
+        edit._update_area_width()
+        app().processEvents()
+        assert edit.viewportMargins().right() == first
     finally:
         discard_close(window)
 

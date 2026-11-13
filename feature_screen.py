@@ -56,6 +56,7 @@ import window_layout
 import screen_ruler
 import snippets
 import teams_meeting
+import tomorrow_memo
 import browser_open
 import capture_grab
 import taskbar_widget
@@ -271,6 +272,9 @@ class ScreenFeature:
         self.snippet_picker = None
         self.calendar_popup = None
         self.text_editor = None
+        self.tomorrow_memo_window = None
+        self._tomorrow_memo_store = None
+        self._tomorrow_memo_waiters = []
         self.calculator_window = None
         self.cursor_finder = None
         self._palette_apps_cache = None
@@ -533,6 +537,9 @@ class ScreenFeature:
         # 内蔵テキストエディタ(秀丸の代替)。あっふの隣に置く(ファイルを開く
         # 行き来が近いため)。窓は1つだけ持ち回す(start_text_editor)。
         self.menu.addAction("📝 EDDy", self.start_text_editor)
+        # 明日の自分へメモ(昨日の自分から今日の自分への手紙)。就業前に書くのが
+        # 本命なので、環境2・3(職場PC)でも出す(ブリッジ等の環境ガードには入れない)。
+        self.menu.addAction("🌅 明日の自分へメモ", self.open_tomorrow_memo)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -865,6 +872,11 @@ class ScreenFeature:
 
         # フォルダ監視移動のタイマーを組み立てる(enabled なルールだけ自動で始まる)。
         self._rebuild_folder_watch()
+
+        # 明日の自分へメモ: まだ見ていないメモがあれば、起動が落ち着いてから
+        # 表示用に出す(昨日の自分からの手紙)。
+        QTimer.singleShot(
+            tomorrow_memo.STARTUP_SHOW_DELAY_MS, self._show_unseen_tomorrow_memo)
 
     def hotkeys(self) -> dict:
         return {
@@ -1283,6 +1295,72 @@ class ScreenFeature:
                 section["geometry"] = geometry
         except Exception:  # noqa: BLE001
             self._log_failure("テキストエディタの位置の保存")
+
+    # ---------------------------------------------------------------
+    # 明日の自分へメモ(tomorrow_memo.py)
+    # ---------------------------------------------------------------
+    def _get_tomorrow_memo_store(self):
+        if self._tomorrow_memo_store is None:
+            self._tomorrow_memo_store = tomorrow_memo.TomorrowMemoStore()
+        return self._tomorrow_memo_store
+
+    def open_tomorrow_memo(self):
+        """メモを書く窓を開く(トレイのメニューから)。開いていれば前面に出す。
+        開けたら True。"""
+        return self._show_tomorrow_memo("write") is not None
+
+    def open_tomorrow_memo_for_call(self, on_closed):
+        """外からの呼び出し(PC を落とすスクリプト)用。書く窓を開き、
+        窓が閉じたら on_closed を1回呼ぶ。開けなければ False。
+
+        窓の中身は入力のたびに自動保存されるので、常駐の再起動の
+        巻き添え(restart_blockers)には数えない。"""
+        if self._show_tomorrow_memo("write") is None:
+            return False
+        self._tomorrow_memo_waiters.append(on_closed)
+        return True
+
+    def _show_tomorrow_memo(self, mode):
+        window = self.tomorrow_memo_window
+        if window is None:
+            window = tomorrow_memo.TomorrowMemoWindow(
+                self._get_tomorrow_memo_store())
+            window.closed.connect(self._on_tomorrow_memo_closed)
+            self.tomorrow_memo_window = window
+        if mode == "read":
+            window.show_read()
+        else:
+            window.present_write()
+        return window
+
+    def _show_unseen_tomorrow_memo(self, today=None):
+        """起動時: まだ見ていないメモがあれば表示用に出す。
+
+        出すのは「書いた日が今日より前」で「今日が最後に表示した日より後」
+        のときだけ(日付で判定する。PC の起動時刻は長期連続稼働や休止・
+        高速スタートアップで当てにならないため使わない)。同じ日の再起動や
+        自動反映では出直さない。today はテスト用で、省略時は今日。"""
+        try:
+            if self.tomorrow_memo_window is not None:
+                return
+            store = self._get_tomorrow_memo_store()
+            if store.has_unseen_for_startup(today):
+                self._show_tomorrow_memo("read")
+                store.note_shown(today)
+        except Exception:  # noqa: BLE001  起動時のおまけ。本体は落とさない
+            self._log_failure("明日の自分へメモの表示")
+
+    def _on_tomorrow_memo_closed(self):
+        window = self.tomorrow_memo_window
+        self.tomorrow_memo_window = None
+        if window is not None:
+            window.deleteLater()
+        waiters, self._tomorrow_memo_waiters = self._tomorrow_memo_waiters, []
+        for waiter in waiters:
+            try:
+                waiter()
+            except Exception:  # noqa: BLE001  応答側の都合で落とさない
+                self._log_failure("明日の自分へメモの呼び出しへの応答")
 
     # ---------------------------------------------------------------
     # カレンダー(縦ランチャの項目。見る専用の小窓)

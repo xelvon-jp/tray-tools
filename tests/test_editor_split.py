@@ -30,6 +30,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QTextCursor  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPlainTextEdit  # noqa: E402
 
 import editor  # noqa: E402
@@ -312,18 +313,24 @@ def test_split_pane_follows_display_settings():
 def test_keymap_includes_split_commands_without_default_keys():
     names = [name for name, _label in COMMAND_LABELS]
     assert names == list(DEFAULT_KEYMAP)  # 並びがそろっている前提の確認
-    for name in ("split_horizontal", "split_vertical",
-                 "close_split", "focus_next_pane"):
+    for name in ("split_horizontal", "split_vertical", "close_split"):
         assert DEFAULT_KEYMAP[name] == ""  # 既定ではキーなし
+    # ペインの切り替えだけは、秀丸の分割ウィンドウ切り替えに
+    # 合わせて既定で F6(2026-11-14)。
+    assert DEFAULT_KEYMAP["focus_next_pane"] == "F6"
     with tempfile.TemporaryDirectory() as tmp:
         path = write_file(tmp, "a.txt", LONG_TEXT)
         window = make_window(path)
         try:
-            assert window.keymap()["focus_next_pane"] == ""
-            # 割り当て画面と同じ経路で F6 を付けると、その場で効く。
-            window.apply_keymap_settings({"focus_next_pane": "F6"})
             assert window.keymap()["focus_next_pane"] == "F6"
             action = window._keymap_actions["focus_next_pane"][0]
+            assert action.shortcut().toString() == "F6"
+            # 割り当て画面と同じ経路で外したり付け直したりが効く。
+            window.apply_keymap_settings({"focus_next_pane": ""})
+            assert window.keymap()["focus_next_pane"] == ""
+            assert action.shortcut().toString() == ""
+            window.apply_keymap_settings({"focus_next_pane": "F6"})
+            assert window.keymap()["focus_next_pane"] == "F6"
             assert action.shortcut().toString() == "F6"
             view = window._current_view()
             window.split_current_view("horizontal")
@@ -332,6 +339,28 @@ def test_keymap_includes_split_commands_without_default_keys():
             action.trigger()
             app().processEvents()
             assert view.active_edit() is view.edit
+        finally:
+            close_window(window)
+
+
+def test_f6_key_switches_pane():
+    # 既定の F6 を実際に押して、ペインが切り替わること。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_file(tmp, "a.txt", LONG_TEXT)
+        window = make_window(path)
+        try:
+            view = window._current_view()
+            window.split_current_view("horizontal")
+            app().processEvents()
+            assert view.active_edit() is view.split_edit
+            view.split_edit.setFocus()
+            app().processEvents()
+            QTest.keyClick(view.split_edit, Qt.Key.Key_F6)
+            app().processEvents()
+            assert view.active_edit() is view.edit
+            QTest.keyClick(view.edit, Qt.Key.Key_F6)
+            app().processEvents()
+            assert view.active_edit() is view.split_edit
         finally:
             close_window(window)
 

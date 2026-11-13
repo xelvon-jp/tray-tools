@@ -54,7 +54,7 @@
 # マークの保持と追随は本文(text_edit)が行い、窓は開いた直後と
 # 保存した直後に消して基準にする。次の編集行・前の編集行への
 # 移動は命令(next_edited_line / prev_edited_line、既定は
-# F2 / Shift+F2)で、端では反対側へ回る。
+# F2 / Ctrl+F2)で、端では反対側へ回る。
 #
 # ブックマーク(2026-11-13): 行に印を付けると、行番号のわきに ● が
 # 出る(配色の line_number_bookmark_foreground)。印の保持と追随は
@@ -62,7 +62,8 @@
 # 直後と新規の直後だけ消す(保存では消えない。ファイルには保存
 # しない、開いている間だけの印)。付け外し・次・前への移動は命令
 # (toggle_bookmark / next_bookmark / prev_bookmark、既定は
-# F7 / F8 / Shift+F8)、一覧は bookmark_dialog の窓(既定は
+# Ctrl+F7 / Ctrl+F8 / Ctrl+Shift+F8。F7 / F8 は秀丸に合わせて
+# 切り取り・コピーが使う)、一覧は bookmark_dialog の窓(既定は
 # Ctrl+Shift+B)から選んで飛ぶ。
 #
 # タブ＋メモ帳式セッション(2026-11-13): ファイルは窓の中のタブ
@@ -154,8 +155,8 @@
 # (窓の _edit はビューの active_edit を指す)。編集マーク・ブック
 # マーク・行ごとの改行種別の控えは、置き場(_TrackingState)を共有
 # するので両ペインでそろう。追随の計算は文書に付いた1枚目だけが
-# 行う。ペイン間の移動は命令 focus_next_pane(秀丸の F6 相当。
-# 既定ではキーなし、キー割り当ての画面で付けられる)。分割の状態
+# 行う。ペイン間の移動は命令 focus_next_pane(秀丸の F6 相当で、
+# 既定も F6。キー割り当ての画面で変えられる)。分割の状態
 # (向き・2枚目のカーソル・スプリッタの幅)はセッションの控えに残り、
 # 次に開いたときも戻る。
 #
@@ -492,6 +493,15 @@ def _compile_or_default(text, default_rx, default_text):
         return re.compile(text), text
     except re.error:
         return default_rx, default_text
+
+
+def _clipboard_text(text):
+    """選択範囲の文字列を、クリップボードへ入れる形に直す。
+
+    QTextCursor.selectedText() は段落の区切りを U+2029 で返すので、
+    通常の改行 (LF) へ置き換える(通常のコピーがクリップボードへ
+    入れる形に合わせる)。"""
+    return text.replace("\u2029", "\n")
 
 
 class SaveOptionsDialog(QDialog):
@@ -1324,8 +1334,8 @@ class EditorWindow(QMainWindow):
         """もう片方のペインへフォーカスを移す(秀丸の F6 相当)。
 
         分割していないタブでは何もしない。キー割り当ての命令
-        focus_next_pane として用意してあり、既定ではキーは付いて
-        いない(キー割り当ての画面で付けられる)。"""
+        focus_next_pane として用意してあり、既定は F6(キー割り
+        当ての画面で変えられる)。"""
         view = self._current_view()
         if view is None or view.split_edit is None:
             return
@@ -1670,10 +1680,32 @@ class EditorWindow(QMainWindow):
         self._action("元に戻す(&U)", self._undo_edit, None, edit_menu)
         self._action("やり直し(&R)", self._redo_edit, None, edit_menu)
         edit_menu.addSeparator()
-        self._action("切り取り(&T)", self._edit.cut, None, edit_menu)
-        self._action("コピー(&C)", self._edit.copy, None, edit_menu)
-        self._action("貼り付け(&P)", self._edit.paste, None, edit_menu)
+        # 切り取り・コピー・貼り付けは、秀丸の F7 / F8 / F9 を受ける
+        # ためキー割り当ての命令にもする。槽は呼ぶたびに今のペインを
+        # 引く(組み立て時点の本文へ固定すると、タブや分割を切り替え
+        # たあとも最初のペインを触ってしまう)。Ctrl+X / Ctrl+C /
+        # Ctrl+V の標準キーも従来どおり効く。
+        self._action("切り取り(&T)", lambda: self._edit.cut(),
+                     "cut", edit_menu)
+        self._action("コピー(&C)", lambda: self._edit.copy(),
+                     "copy", edit_menu)
+        self._action("貼り付け(&P)", lambda: self._edit.paste(),
+                     "paste", edit_menu)
         self._action("すべて選択(&A)", self._edit.selectAll, None, edit_menu)
+        edit_menu.addSeparator()
+        self._action("単語をコピー(&W)", self.copy_word_at_cursor,
+                     "copy_word", edit_menu)
+        self._action("行をコピー(&Y)", self.copy_current_line,
+                     "copy_line", edit_menu)
+        self._action("追加切り抜き(&Q)", self.cut_append_selection,
+                     "cut_append", edit_menu)
+        self._action("追加コピー(&X)", self.copy_append_selection,
+                     "copy_append", edit_menu)
+        # バックスペース(Ctrl+H)はメニューには出さない。本文に
+        # フォーカスがあるときだけ効くアクションとして置く(命令
+        # delete_backward を呼ぶので、マクロにも記録される)。
+        self._action("バックスペース", lambda: self.execute_command(
+            "delete_backward"), "backspace")
         edit_menu.addSeparator()
         self._act_cut_eol = self._action(
             "行末まで切り取り(&K)",
@@ -1742,7 +1774,7 @@ class EditorWindow(QMainWindow):
         self._action("前を検索(&P)", lambda: self.execute_command("find_prev"),
                      "find_prev", search_menu)
         search_menu.addSeparator()
-        self._action("置換(&R)…", self.show_find_bar, None, search_menu)
+        self._action("置換(&R)…", self.show_find_bar, "replace", search_menu)
         self._action("すべて検索(&A)…", self.show_find_all_dialog,
                      "find_all", search_menu)
         self._action("フォルダ内を検索(&G)…", self.show_grep_dialog,
@@ -1819,8 +1851,9 @@ class EditorWindow(QMainWindow):
         self._act_markdown.toggled.connect(self.set_markdown_highlight)
         view_menu.addAction(self._act_markdown)
         view_menu.addSeparator()
-        # 分割表示(同じ文書を2ペインで見る)。キーは既定では付けず、
-        # キー割り当ての画面で付けられる(命令 split_horizontal /
+        # 分割表示(同じ文書を2ペインで見る)。ペインの切り替えだけ
+        # 秀丸に合わせて既定で F6 を付け、分割そのものはキー割り
+        # 当ての画面で付けられる(命令 split_horizontal /
         # split_vertical / close_split / focus_next_pane)。
         self._action("左右に分割(&H)",
                      lambda: self.split_current_view("horizontal"),
@@ -1842,7 +1875,22 @@ class EditorWindow(QMainWindow):
         self._act_macro_record.setCheckable(True)
         self._act_macro_record.toggled.connect(self.set_macro_recording)
         macro_menu.addAction(self._act_macro_record)
-        self._action("再生(&P)", self.play_macro, None, macro_menu)
+        # 記録の開始／終了にもキー割り当て(既定は Shift+F1)を付ける。
+        # _action で作るアクションと同じ作法(本文にフォーカスがある
+        # ときだけ効く・付け直しと新しい本文への登録の対象にする)。
+        record_keys = self._keymap.get("macro_record")
+        if record_keys:
+            self._act_macro_record.setShortcut(QKeySequence(record_keys))
+        self._act_macro_record.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._edit.addAction(self._act_macro_record)
+        self._keymap_actions.setdefault("macro_record", []).append(
+            self._act_macro_record)
+        # play_macro は引数 commands を取るので、QAction.triggered の
+        # bool をそのまま渡さないよう lambda で受ける(False が
+        # 「マクロなし」として伝わり、再生できなくなる)。
+        self._action("再生(&P)", lambda: self.play_macro(),
+                     "macro_play", macro_menu)
         macro_menu.addSeparator()
         self._action("マクロを保存(&S)…", self.save_macro_dialog,
                      None, macro_menu)
@@ -3173,6 +3221,69 @@ class EditorWindow(QMainWindow):
         cursor.removeSelectedText()
         cursor.endEditBlock()
         self._edit.setTextCursor(cursor)
+
+    def copy_word_at_cursor(self):
+        """単語をコピー(キー割り当ての命令 copy_word、既定は F5)。
+
+        選択範囲があれば、その範囲をコピーする(通常のコピーと
+        同じ)。無ければ、カーソル位置の単語をコピーする。単語の
+        切り取りは写し用のカーソルで行い、本体のカーソルと選択は
+        動かさない。単語が取れない位置(空白の上など)では何もしない。"""
+        cursor = self._edit.textCursor()
+        if cursor.hasSelection():
+            self._edit.copy()
+            return
+        probe = QTextCursor(cursor)
+        probe.select(QTextCursor.SelectionType.WordUnderCursor)
+        text = probe.selectedText()
+        if text:
+            QGuiApplication.clipboard().setText(text)
+
+    def copy_current_line(self):
+        """行をコピー(キー割り当ての命令 copy_line、既定は Shift+F5)。
+
+        選択範囲があれば、その範囲をコピーする(通常のコピーと
+        同じ)。無ければ、カーソルのある行全体をコピーする。行の
+        後ろに改行があれば改行も含める(貼ると行として入る)。文書
+        の最後の行で後ろに改行が無いときは、行の文字だけになる。
+        カーソルと選択は動かさない。"""
+        cursor = self._edit.textCursor()
+        if cursor.hasSelection():
+            self._edit.copy()
+            return
+        block = cursor.block()
+        text = block.text()
+        if block.next().isValid():
+            text += "\n"
+        QGuiApplication.clipboard().setText(text)
+
+    def copy_append_selection(self):
+        """追加コピー(キー割り当ての命令 copy_append、既定は
+        Shift+F8)。選択範囲を、クリップボードの今の中身の末尾へ
+        足してコピーする。選択が無ければ何もしない。"""
+        cursor = self._edit.textCursor()
+        if not cursor.hasSelection():
+            return
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText(
+            clipboard.text() + _clipboard_text(cursor.selectedText()))
+
+    def cut_append_selection(self):
+        """追加切り抜き(キー割り当ての命令 cut_append、既定は
+        Shift+F7)。選択範囲を切り取り、クリップボードの今の中身の
+        末尾へ足す。選択が無ければ何もしない。切り取りは1回の
+        undo で戻せる単位にする。"""
+        cursor = self._edit.textCursor()
+        if not cursor.hasSelection():
+            return
+        clipboard = QGuiApplication.clipboard()
+        combined = clipboard.text() + _clipboard_text(
+            cursor.selectedText())
+        cursor.beginEditBlock()
+        cursor.removeSelectedText()
+        cursor.endEditBlock()
+        self._edit.setTextCursor(cursor)
+        clipboard.setText(combined)
 
     # ---------------------------------------------------------------
     # 命令層(キー割り当てとマクロの再生が同じ命令を呼ぶ)

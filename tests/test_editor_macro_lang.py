@@ -299,12 +299,14 @@ def test_window_macro_key_follows_keymap_changes():
     saved = []
     window = make_window("", on_settings_change=saved.append)
     try:
+        # F10 は既定で使われていないキー(F9 は貼り付けの既定に
+        # なったので、登録マクロには最初から付けられない)。
         window.register_macro(
-            "印", [{"cmd": "toggle_bookmark", "args": {}}], key="F9")
+            "印", [{"cmd": "toggle_bookmark", "args": {}}], key="F10")
         action = window._registered_macro_actions["印"]
-        assert action.shortcut().toString() == "F9"
-        # 組み込みに F9 を付けたら、マクロ側のショートカットは外れる。
-        window.apply_keymap_settings({"goto_line": "F9"})
+        assert action.shortcut().toString() == "F10"
+        # 組み込みに F10 を付けたら、マクロ側のショートカットは外れる。
+        window.apply_keymap_settings({"goto_line": "F10"})
         action = window._registered_macro_actions["印"]
         assert action.shortcut().isEmpty()
     finally:

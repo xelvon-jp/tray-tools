@@ -81,6 +81,66 @@ def test_normalize_keys():
     assert normalize_keys("Ctrl+X, Ctrl+Y") == "Ctrl+X"
 
 
+def test_hidemaru_aligned_defaults():
+    # 2026-11-14 に Nagato の秀丸の割り当てへ寄せた既定。正本は
+    # workspace/user/hidemaru-keymap-2026-11-14.txt。
+    table = keymapmod.DEFAULT_KEYMAP
+    assert table["find"] == "Ctrl+F"           # 検索
+    assert table["replace"] == "Ctrl+R"        # 置換
+    assert table["find_next"] == "F3"          # 下候補
+    assert table["find_prev"] == "Shift+F3"    # 上候補
+    assert table["repeat_last"] == "F4"
+    assert table["copy_word"] == "F5"          # 単語をコピー
+    assert table["copy_line"] == "Shift+F5"    # 行をコピー
+    assert table["focus_next_pane"] == "F6"    # 分割ウィンドウ切り替え
+    assert table["cut"] == "F7"                # 切り抜き
+    assert table["copy"] == "F8"               # コピー
+    assert table["paste"] == "F9"              # 貼り付け
+    assert table["cut_append"] == "Shift+F7"   # 追加切り抜き
+    assert table["copy_append"] == "Shift+F8"  # 追加コピー
+    assert table["macro_record"] == "Shift+F1"  # 記録開始／終了
+    assert table["macro_play"] == "Shift+F2"   # 再生
+    assert table["delete_line"] == "Ctrl+Return"  # 行削除
+    assert table["backspace"] == "Ctrl+H"      # バックスペース
+    assert table["goto_line"] == "Ctrl+G"      # 指定行
+
+
+def test_displaced_defaults_moved_to_free_keys():
+    # 秀丸の割り当てに押し出された EDDy 側の命令の移し先。
+    table = keymapmod.DEFAULT_KEYMAP
+    assert table["toggle_bookmark"] == "Ctrl+F7"      # 旧 F7
+    assert table["next_bookmark"] == "Ctrl+F8"        # 旧 F8
+    assert table["prev_bookmark"] == "Ctrl+Shift+F8"  # 旧 Shift+F8
+    assert table["prev_edited_line"] == "Ctrl+F2"     # 旧 Shift+F2
+    # F2 は秀丸で未割り当てなので、次の編集行は据え置き。
+    assert table["next_edited_line"] == "F2"
+
+
+def test_defaults_have_no_key_collisions():
+    by_key = {}
+    for name, keys in keymapmod.DEFAULT_KEYMAP.items():
+        if keys:
+            assert keys not in by_key, (
+                f"{keys} が {by_key[keys]} と {name} で重なっています")
+            by_key[keys] = name
+    dialog = make_dialog()
+    try:
+        assert dialog.conflicts() == {}
+    finally:
+        dialog.close()
+
+
+def test_user_override_still_wins_over_new_defaults():
+    # 利用者が保存した差分は、既定の変更より優先される。
+    table = keymapmod.merge_keymap(
+        {"cut": "Ctrl+Alt+X", "toggle_bookmark": ""})
+    assert table["cut"] == "Ctrl+Alt+X"
+    assert table["toggle_bookmark"] == ""  # 外したまま既定に戻らない
+    assert table["copy"] == "F8"
+    assert keymapmod.diff_overrides(table) == {
+        "cut": "Ctrl+Alt+X", "toggle_bookmark": ""}
+
+
 # ---------------------------------------------------------------
 # keymap_dialog.py
 # ---------------------------------------------------------------
@@ -135,9 +195,12 @@ def test_dialog_edit_widget_drives_change():
     calls = []
     dialog = make_dialog(on_change=calls.append)
     try:
-        dialog._edits["find_next"].setKeySequence(QKeySequence("F6"))
-        assert dialog.command_key("find_next") == "F6"
-        assert calls[-1] == {"find_next": "F6"}
+        # F10 は既定の割り当てで使われていないキー(既定で F6 には
+        # focus_next_pane が付いたので、そちらを使うと押し出しが
+        # 一緒に流れてしまう)。
+        dialog._edits["find_next"].setKeySequence(QKeySequence("F10"))
+        assert dialog.command_key("find_next") == "F10"
+        assert calls[-1] == {"find_next": "F10"}
     finally:
         dialog.close()
 

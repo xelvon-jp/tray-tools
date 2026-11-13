@@ -798,6 +798,169 @@ def test_cut_to_end_keymap_default():
         discard_close(window)
 
 
+# ---------------------------------------------------------------
+# 秀丸に寄せたキー(2026-11-14): F7 / F8 / F9、単語・行のコピー、
+# 追加切り抜き・追加コピー、Ctrl+H、Ctrl+Enter、マクロのキー
+# ---------------------------------------------------------------
+def _focus_edit_with_cursor(window, position, anchor=None):
+    cursor = window._edit.textCursor()
+    cursor.setPosition(position)
+    if anchor is not None:
+        cursor.setPosition(anchor, QTextCursor.MoveMode.KeepAnchor)
+    window._edit.setTextCursor(cursor)
+    window._edit.setFocus()
+    app().processEvents()
+
+
+def test_hidemaru_keys_cut_copy_paste():
+    window = make_window()
+    try:
+        window._edit.setPlainText("hello world")
+        _focus_edit_with_cursor(window, 0, anchor=5)
+        # F8: コピー(本文は変わらない)
+        QTest.keyClick(window._edit, Qt.Key.Key_F8)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "hello"
+        assert window.text() == "hello world"
+        # F7: 切り取り
+        QTest.keyClick(window._edit, Qt.Key.Key_F7)
+        app().processEvents()
+        assert window.text() == " world"
+        assert QGuiApplication.clipboard().text() == "hello"
+        # F9: 貼り付け(カーソル位置=行頭へ戻る)
+        QTest.keyClick(window._edit, Qt.Key.Key_F9)
+        app().processEvents()
+        assert window.text() == "hello world"
+    finally:
+        discard_close(window)
+
+
+def test_copy_word_and_line_keys():
+    window = make_window()
+    try:
+        window._edit.setPlainText("hello world\nsecond line\nlast")
+        _focus_edit_with_cursor(window, 8)  # "world" の中
+        # F5: 単語をコピー。カーソルは動かず、選択も付かない。
+        QTest.keyClick(window._edit, Qt.Key.Key_F5)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "world"
+        cursor = window._edit.textCursor()
+        assert cursor.position() == 8 and not cursor.hasSelection()
+        # Shift+F5: 行をコピー(後ろの改行も含む)
+        QTest.keyClick(window._edit, Qt.Key.Key_F5,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "hello world\n"
+        # 文書の最後の行は、後ろに改行が無いので行の文字だけ。
+        cursor = window._edit.textCursor()
+        cursor.setPosition(len("hello world\nsecond line\nlast"))
+        window._edit.setTextCursor(cursor)
+        window.copy_current_line()
+        assert QGuiApplication.clipboard().text() == "last"
+        # 選択があれば、単語・行ではなく選択範囲をコピーする。
+        _focus_edit_with_cursor(window, 0, anchor=2)
+        QTest.keyClick(window._edit, Qt.Key.Key_F5)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "he"
+    finally:
+        discard_close(window)
+
+
+def test_append_cut_copy_keys():
+    window = make_window()
+    try:
+        window._edit.setPlainText("ab cd ef")
+        QGuiApplication.clipboard().setText("X")
+        _focus_edit_with_cursor(window, 0, anchor=2)
+        # Shift+F8: 追加コピー(本文は変わらず、末尾へ足される)
+        QTest.keyClick(window._edit, Qt.Key.Key_F8,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "Xab"
+        assert window.text() == "ab cd ef"
+        # Shift+F7: 追加切り抜き(選択は追加コピーで残っている)
+        QTest.keyClick(window._edit, Qt.Key.Key_F7,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "Xabab"
+        assert window.text() == " cd ef"
+        window._edit.undo()  # 1回の undo で戻る
+        assert window.text() == "ab cd ef"
+        # 選択が無ければ、追加切り抜き・追加コピーは何もしない。
+        QGuiApplication.clipboard().setText("Y")
+        _focus_edit_with_cursor(window, 3)
+        window.cut_append_selection()
+        window.copy_append_selection()
+        assert QGuiApplication.clipboard().text() == "Y"
+        assert window.text() == "ab cd ef"
+    finally:
+        discard_close(window)
+
+
+def test_ctrl_h_backspace_and_ctrl_return_delete_line():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc\ndef\nghi")
+        _focus_edit_with_cursor(window, 2)
+        # Ctrl+H: バックスペース(カーソルの前の1文字を消す)
+        QTest.keyClick(window._edit, Qt.Key.Key_H,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert window.text() == "ac\ndef\nghi"
+        # Ctrl+Enter: 行を削除(改行は挿入されない)
+        _focus_edit_with_cursor(window, 4)  # 2行目 "def" の中
+        QTest.keyClick(window._edit, Qt.Key.Key_Return,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert window.text() == "ac\nghi"
+    finally:
+        discard_close(window)
+
+
+def test_ctrl_r_opens_find_bar():
+    window = make_window()
+    try:
+        assert not window._find_bar.isVisible()
+        window._edit.setFocus()
+        app().processEvents()
+        QTest.keyClick(window._edit, Qt.Key.Key_R,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert window._find_bar.isVisible()
+    finally:
+        discard_close(window)
+
+
+def test_macro_record_and_play_keys():
+    window = make_window()
+    try:
+        window._edit.setPlainText("")
+        window._edit.setFocus()
+        app().processEvents()
+        # Shift+F1: 記録開始
+        QTest.keyClick(window._edit, Qt.Key.Key_F1,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert window.macro_recording
+        assert window._act_macro_record.isChecked()
+        QTest.keyClicks(window._edit, "ab")
+        app().processEvents()
+        # Shift+F1: 記録終了
+        QTest.keyClick(window._edit, Qt.Key.Key_F1,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert not window.macro_recording
+        assert window.text() == "ab"
+        window._edit.setPlainText("")
+        # Shift+F2: 再生
+        QTest.keyClick(window._edit, Qt.Key.Key_F2,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert window.text() == "ab"
+    finally:
+        discard_close(window)
+
+
 def _select_blocks(window, first, last, to_line_start=False):
     """first〜last ブロックを選択する。to_line_start が真なら選択の
     終わりを last ブロックの行頭にする(その行を含めない形)。"""
@@ -2772,7 +2935,7 @@ def test_edit_marks_next_prev_navigation():
     # 次の編集行・前の編集行への移動。端では反対側へ回る。
     # マークが無ければ動かず、記録にも残らない。
     assert DEFAULT_KEYMAP["next_edited_line"] == "F2"
-    assert DEFAULT_KEYMAP["prev_edited_line"] == "Shift+F2"
+    assert DEFAULT_KEYMAP["prev_edited_line"] == "Ctrl+F2"
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")
         Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\nl6\n".encode("utf-8"))
@@ -2887,12 +3050,12 @@ def _toggle_bookmark_at(window, block_number):
 
 
 def test_bookmarks_toggle():
-    # 付け外し。キー割り当ての既定もここで固定する(F2 系は編集
-    # マーク、F3 系は検索で使用済みなので、ブックマークは空いて
-    # いる F7 / F8 と Ctrl+Shift+B)。
-    assert DEFAULT_KEYMAP["toggle_bookmark"] == "F7"
-    assert DEFAULT_KEYMAP["next_bookmark"] == "F8"
-    assert DEFAULT_KEYMAP["prev_bookmark"] == "Shift+F8"
+    # 付け外し。キー割り当ての既定もここで固定する(2026-11-14 に
+    # 秀丸へ寄せ、F7 / F8 は切り取り・コピー、Shift+F8 は追加コピー
+    # が使うため、ブックマークは Ctrl を付けた F7 / F8 系へ移した)。
+    assert DEFAULT_KEYMAP["toggle_bookmark"] == "Ctrl+F7"
+    assert DEFAULT_KEYMAP["next_bookmark"] == "Ctrl+F8"
+    assert DEFAULT_KEYMAP["prev_bookmark"] == "Ctrl+Shift+F8"
     assert DEFAULT_KEYMAP["bookmark_list"] == "Ctrl+Shift+B"
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")
@@ -3281,10 +3444,12 @@ def test_keymap_dialog_drives_open_window():
             window, keymap=window.keymap(),
             on_change=window.apply_keymap_settings)
         try:
-            dialog.set_command_key("goto_line", "F9")
+            # F10 は既定で使われていないキー(F9 は貼り付けの既定に
+            # なったので、使うと押し出しの分まで保存に流れてしまう)。
+            dialog.set_command_key("goto_line", "F10")
             assert _action_by_text(
-                window, "指定行へ移動").shortcut().toString() == "F9"
-            assert saved[-1] == {"keymap": {"goto_line": "F9"}}
+                window, "指定行へ移動").shortcut().toString() == "F10"
+            assert saved[-1] == {"keymap": {"goto_line": "F10"}}
             dialog.reset_all()
             assert _action_by_text(
                 window, "指定行へ移動").shortcut().toString() == \

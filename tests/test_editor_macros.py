@@ -300,7 +300,7 @@ def test_save_and_load_macro_file():
 # ---------------------------------------------------------------
 def test_keymap_defaults_have_repeat_and_delete_line():
     assert DEFAULT_KEYMAP["repeat_last"] == "F4"
-    assert DEFAULT_KEYMAP["delete_line"] == "Ctrl+Shift+K"
+    assert DEFAULT_KEYMAP["delete_line"] == "Ctrl+Return"
 
 
 def test_f4_repeats_insert_text_once():

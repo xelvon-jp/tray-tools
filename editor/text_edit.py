@@ -61,6 +61,10 @@ FONT_SIZE_MAX = 32
 # フォントの大きさが取れないとき(Pixel 指定等)の代わりの起点。
 FALLBACK_FONT_SIZE = 10
 
+# タブの表示幅(ピクセル)の Qt の既定。タブ幅(文字数)の指定が無い
+# ときは触らないが、一度指定したあとで解除するときはこの値に戻す。
+DEFAULT_TAB_STOP_DISTANCE = 80.0
+
 # 行番号エリアの色は配色(editor/colors.py)が持つ。標準の組の値が
 # 従来の (242,242,242) / (144,144,144) と同じにしてある。
 
@@ -127,6 +131,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         super().__init__(parent)
         self._line_numbers = True
         self._wrap_column = None
+        # タブの表示幅(半角の文字数)。None は Qt の既定のまま
+        # 触らない(距離を設定しない)。
+        self._tab_width = None
         self._updating_margins = False
         # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
         # 編集には _track_line_newlines が追随させ、控えが無い・
@@ -734,6 +741,37 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     def wrap_column(self):
         return self._wrap_column
 
+    # ---------------------------------------------------------------
+    # タブの表示幅(半角の文字数で指定する)
+    # ---------------------------------------------------------------
+    def set_tab_width(self, width):
+        """タブの表示幅を、半角の文字数で指定する。None で解除
+        (Qt の既定の距離に戻す)。距離の実体は setTabStopDistance で、
+        フォントの文字幅から計算するので、フォントが変わったら
+        changeEvent 側で計算し直す。"""
+        if width is not None:
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                width = None
+            if width is not None and width <= 0:
+                width = None
+        if width == self._tab_width:
+            return
+        self._tab_width = width
+        self._refresh_tab_stop()
+
+    def tab_width(self):
+        return self._tab_width
+
+    def _refresh_tab_stop(self):
+        if self._tab_width is None:
+            self.setTabStopDistance(DEFAULT_TAB_STOP_DISTANCE)
+            return
+        width = self._char_width()
+        if width > 0:
+            self.setTabStopDistance(width * self._tab_width)
+
     def _char_width(self) -> float:
         """半角1文字の幅(ピクセル)。取れなければ 0。"""
         metrics = self.fontMetrics()
@@ -782,6 +820,10 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             # 字の大きさが変わると番号の桁幅も変わる。
             self._update_area_width()
             self._area.update()
+            # タブの表示幅は文字幅から計算するので、フォントが
+            # 変わったら距離も計算し直す(指定が無ければ触らない)。
+            if self._tab_width is not None:
+                self._refresh_tab_stop()
 
     def paint_line_number_area(self, event):
         painter = QPainter(self._area)

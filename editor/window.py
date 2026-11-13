@@ -107,6 +107,19 @@
 #   (trial_patterns)、適用の前に「適用中」の印を書いて起動時に
 #   残っていたら既定に戻す(pattern_applying、起動時の保険)。
 #
+# 拡張子別の設定(2026-11-13): 折り返し(方式と桁数)、Markdown の
+# 色付け、フォント(名前と大きさ)、タブの幅を、ファイルの拡張子
+# ごとに変えられる。持ち方は色の設定と同じ「全体+上書き」で、
+# editor 節の extension_settings(拡張子 → 項目 → 値)に上書きだけを
+# 持ち、上書きの無い項目は全体の設定に追随する(editor/
+# ext_settings.py が対応表と解決、ext_settings_dialog.py が設定
+# 画面)。適用はタブ(ビュー)ごとで、文書を読み込んだときと名前を
+# 付けて保存したときに、その拡張子の実効値へ合わせ直す。無題は
+# 全体に従う。全体のタブ幅は editor 節の tab_width(無いときは
+# Qt の既定のまま触らない)。Ctrl+ホイールの大きさ変更は、効いて
+# いる大きさの出どころ(その拡張子の上書きか全体か)へ書き戻す。
+# タブキーでスペースを入れる類の扱いは無い(タブは常にタブ文字)。
+#
 # 落ちないための作法(このリポジトリの決まり):
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
 #     スロットで投げ切るとプロセスごと終了する
@@ -165,6 +178,7 @@ import text_encoding
 from editor import colors as colormod
 from editor import convert as convmod
 from editor import document as docmod
+from editor import ext_settings as extmod
 from editor import macros as macmod
 from editor import outline
 from editor import editor_icon
@@ -174,6 +188,7 @@ from editor import session as sessionmod
 from editor.document_view import DocumentView
 from editor.bookmark_dialog import BookmarkDialog
 from editor.color_dialog import ColorSettingsDialog
+from editor.ext_settings_dialog import ExtensionSettingsDialog
 from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
@@ -226,6 +241,17 @@ INCREMENTAL_SEARCH_DELAY_MS = 120
 # キー割り当ての画面(editor/keymap_dialog.py)から変えると、その場で
 # この窓のアクションへ付け直して、差分をこのキーで保存する。
 KEYMAP_KEY = "keymap"
+
+# 拡張子別の設定(settings の editor 節 extension_settings のキー)。
+# 値は拡張子 → 項目 → 値の対応(全体と違う項目だけの上書き分)で、
+# 実効の組は editor/ext_settings.py の resolve で作る。設定画面
+# (editor/ext_settings_dialog.py)から変えると、その場で開いている
+# タブへ付け直して、差分をこのキーで保存する。
+EXTENSION_SETTINGS_KEY = "extension_settings"
+
+# 全体のタブ幅(settings の editor 節 tab_width のキー)。値は半角の
+# 文字数で、無いときは Qt の既定のまま触らない(None)。拡張子別の
+# 上書きの受けにもなる(editor/ext_settings.py の tab_width)。
 
 
 def sanitize_recent_files(value, limit=RECENT_FILES_LIMIT):
@@ -551,10 +577,11 @@ class EditorWindow(QMainWindow):
     font_size / show_line_numbers / show_outline_pane / outline_pattern /
     highlight_pattern / pattern_applying(適用中の印。起動時の保険で
     読む)/ keymap(キー割り当ての上書き分。コンストラクタの
-    keymap_overrides でも受ける)を読み(無いキーは既定)、表示や
-    フォントや正規表現が変わったら、差分を on_settings_change
-    (辞書を受ける関数)へ流すので、保存は呼び側の流儀
-    (update_settings_section)に任せる。
+    keymap_overrides でも受ける)/ extension_settings(拡張子別の
+    上書き分)/ tab_width(全体のタブ幅。無いときは Qt の既定)を
+    読み(無いキーは既定)、表示やフォントや正規表現が変わったら、
+    差分を on_settings_change(辞書を受ける関数)へ流すので、保存は
+    呼び側の流儀(update_settings_section)に任せる。
 
     session_path は、タブと控えの置き場(editor/session.py の
     セッションファイル)。渡されたときだけ、前回のタブを戻し、
@@ -748,8 +775,24 @@ class EditorWindow(QMainWindow):
         self._markdown_pref = bool(section.get("markdown_highlight", True))
         self._outline_pane_pref = bool(section.get("show_outline_pane", True))
 
+        # 拡張子別の設定(全体+上書き。editor/ext_settings.py)。
+        # 全体のフォント(名前と大きさ)は、上の _edit_font を正本に
+        # して控える(Ctrl+ホイールの書き戻し先の判定に使う)。
+        self._font_family = self._edit_font.family()
+        base_size = self._edit_font.pointSize()
+        self._font_size_base = (base_size if base_size > 0
+                                else DEFAULT_FONT_SIZE)
+        self._tab_width = extmod.sanitize_tab_width(
+            section.get("tab_width"))
+        self._ext_settings = extmod.sanitize(
+            section.get(EXTENSION_SETTINGS_KEY))
+
         # フォントの大きさの遅延保存(Ctrl+ホイールの嵐対策)。
+        # _pending_font_persist は、たまっている保存の差分そのもの
+        # (全体の大きさなら {"font_size": n}、拡張子の上書きなら
+        # {"extension_settings": {...}})。
         self._pending_font_size = None
+        self._pending_font_persist = None
         self._font_save_timer = QTimer(self)
         self._font_save_timer.setSingleShot(True)
         self._font_save_timer.setInterval(FONT_SAVE_DELAY_MS)
@@ -916,7 +959,7 @@ class EditorWindow(QMainWindow):
         表示の設定(フォント・行番号・配色・折り返し等)は窓の設定値
         でそろえ、文書ごとの信号を窓へつなぐ。"""
         view = DocumentView(self._tabs)
-        view.edit.setFont(self._edit_font)
+        self._apply_font_to_view(view)
         if not self._line_numbers_pref:
             view.edit.set_line_numbers_visible(False)
         view.edit.set_show_invisibles(self._invisibles_pref)
@@ -951,7 +994,8 @@ class EditorWindow(QMainWindow):
             lambda v=view: self._on_view_cursor_moved(v))
         view.edit.selectionChanged.connect(
             lambda v=view: self._on_view_selection_changed(v))
-        view.edit.font_size_changed.connect(self._on_font_size_changed)
+        view.edit.font_size_changed.connect(
+            lambda size, v=view: self._on_font_size_changed(size, v))
         document.contentsChanged.connect(
             lambda v=view: self._on_view_contents_changed(v))
         document.contentsChange.connect(
@@ -1418,6 +1462,8 @@ class EditorWindow(QMainWindow):
                      None, view_menu)
         self._action("キー割り当ての設定(&K)…", self.show_keymap_settings,
                      None, view_menu)
+        self._action("拡張子別の設定(&X)…", self.show_extension_settings,
+                     None, view_menu)
         wrap_menu = view_menu.addMenu("折り返し(&R)")
         self._wrap_actions = {}
         for mode, label in ((WRAP_MODE_COLUMN, "桁数で折り返す(&C)"),
@@ -1668,11 +1714,98 @@ class EditorWindow(QMainWindow):
         return self._edit.cursorWidth() > 1
 
     # ---------------------------------------------------------------
+    # 拡張子別の設定(全体+上書き。editor/ext_settings.py)
+    # ---------------------------------------------------------------
+    def _view_extension(self, view) -> str:
+        """そのタブのファイルの拡張子(小文字・ドット無し)。
+        無題・ビューが無ければ ""(全体の設定に従う)。"""
+        if view is None or view.doc is None:
+            return ""
+        return extmod.extension_of(view.doc.path)
+
+    def _global_display_values(self) -> dict:
+        """全体の表示設定の値(拡張子別の解決の土台)。"""
+        return {
+            "wrap_mode": self._wrap_mode,
+            "wrap_column": self._wrap_column,
+            "markdown_highlight": self._markdown_pref,
+            "font_family": self._font_family,
+            "font_size": self._font_size_base,
+            "tab_width": self._tab_width,
+        }
+
+    def _effective_display(self, view) -> dict:
+        """そのタブの実効の表示設定(全体に拡張子の上書きを重ねた組)。"""
+        return extmod.resolve(self._global_display_values(),
+                              self._ext_settings,
+                              self._view_extension(view))
+
+    def _apply_font_to_view(self, view):
+        """実効のフォントとタブ幅を、1つのビューの本文へ適用する
+        (保存はしない)。"""
+        effective = self._effective_display(view)
+        view.edit.setFont(
+            QFont(effective["font_family"], effective["font_size"]))
+        view.edit.set_tab_width(effective["tab_width"])
+
+    def _apply_view_display(self, view):
+        """実効の表示設定(折り返し・Markdown・フォント・タブ幅)を、
+        1つのビューへまとめて適用する(保存はしない)。
+
+        文書を読み込んだとき・名前を付けて保存したときのように、
+        そのタブの拡張子が決まった(変わった)タイミングで呼ぶ。"""
+        self._apply_wrap_to_view(view)
+        self._update_markdown_highlight(view)
+        self._apply_font_to_view(view)
+
+    def apply_extension_settings(self, settings_map):
+        """拡張子別の設定画面からの変更(上書きの対応)を反映して
+        保存する。開いているタブは、その場でその拡張子の実効値に
+        合わせ直す。保存は extension_settings キーへの差分のみ。"""
+        self._ext_settings = extmod.sanitize(settings_map)
+        for view in self._views:
+            self._apply_view_display(view)
+        self._persist_settings({
+            EXTENSION_SETTINGS_KEY: {
+                ext: dict(items)
+                for ext, items in self._ext_settings.items()},
+        })
+
+    def show_extension_settings(self):
+        """拡張子別の設定画面(editor/ext_settings_dialog.py)を開く。
+
+        変更はその場でこの窓へ反映され、設定へ保存される
+        (apply_extension_settings 経由)。"""
+        current_ext = self._view_extension(self._current_view())
+        dialog = ExtensionSettingsDialog(
+            self, settings_map=self._ext_settings,
+            global_values=self._global_display_values(),
+            extensions=self._known_extensions(),
+            current_extension=current_ext or "txt",
+            on_change=self.apply_extension_settings)
+        dialog.exec()
+
+    def extension_settings(self) -> dict:
+        """設定へ保存している上書き分(拡張子 → 項目 → 値)の写し。"""
+        return {ext: dict(items)
+                for ext, items in self._ext_settings.items()}
+
+    def _known_extensions(self) -> list:
+        """設定済みと、開いているタブの拡張子の並び(画面の候補用)。"""
+        found = set(self._ext_settings)
+        for view in self._views:
+            ext = self._view_extension(view)
+            if ext:
+                found.add(ext)
+        return sorted(found)
+
+    # ---------------------------------------------------------------
     # 折り返し(見た目だけ。文書の内容は変えない)
     # ---------------------------------------------------------------
     def _apply_wrap_to_view(self, view):
-        """今の方式・桁数を、1つのビューの本文へ適用する(保存はしない)。"""
-        if self._wrap_mode == WRAP_MODE_NONE:
+        """そのタブの実効の方式・桁数を、本文へ適用する(保存はしない)。"""
+        effective = self._effective_display(view)
+        if effective["wrap_mode"] == WRAP_MODE_NONE:
             view.edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         else:
             # 「桁数」も「ウィンドウ幅」も、折り返し自体は窓幅で
@@ -1681,20 +1814,21 @@ class EditorWindow(QMainWindow):
                 QPlainTextEdit.LineWrapMode.WidgetWidth)
         # 桁数は、方式が「桁数」のときだけ余白を取る。
         view.edit.set_wrap_column(
-            self._wrap_column
-            if self._wrap_mode == WRAP_MODE_COLUMN else None)
+            effective["wrap_column"]
+            if effective["wrap_mode"] == WRAP_MODE_COLUMN else None)
 
     def _apply_wrap_mode(self):
-        """今の方式・桁数を、全部のタブへ適用する(保存はしない)。"""
+        """方式・桁数を、全部のタブへ適用する(保存はしない)。
+
+        各タブは自分の拡張子の実効値で適用される(上書きのある
+        タブは、全体を変えても上書きのまま)。"""
         for view in self._views:
             self._apply_wrap_to_view(view)
 
     def _apply_wrap_column(self):
-        """桁数を全部のタブへ伝える。"""
+        """桁数を全部のタブへ伝える(各タブは実効値で適用)。"""
         for view in self._views:
-            view.edit.set_wrap_column(
-                self._wrap_column
-                if self._wrap_mode == WRAP_MODE_COLUMN else None)
+            self._apply_wrap_to_view(view)
 
     def set_wrap_mode(self, mode):
         if mode not in WRAP_MODES:
@@ -1745,17 +1879,21 @@ class EditorWindow(QMainWindow):
         """そのタブのファイルが Markdown なら色付けを効かせる。
 
         効くのは、利用者の希望(設定 markdown_highlight)が入っていて、
-        かつ拡張子が .md / .markdown のときだけ。view が無ければ
-        全部のタブへ適用する。"""
+        かつ拡張子が .md / .markdown のときだけ。ただし、その拡張子に
+        拡張子別の上書き(markdown_highlight)があれば、そちらが
+        そのまま効く(.md で切ることも、.txt で入れることもできる)。
+        view が無ければ全部のタブへ適用する。"""
         if view is None:
             for item in self._views:
                 self._update_markdown_highlight(item)
             return
-        path = view.doc.path if view.doc else None
-        enabled = False
-        if path and self._markdown_pref:
-            ext = os.path.splitext(path)[1].lstrip(".").lower()
-            enabled = ext in MARKDOWN_EXTENSIONS
+        ext = self._view_extension(view)
+        overrides = self._ext_settings.get(ext) or {}
+        if "markdown_highlight" in overrides:
+            enabled = bool(overrides["markdown_highlight"])
+        else:
+            enabled = bool(self._markdown_pref) \
+                and ext in MARKDOWN_EXTENSIONS
         if view.highlighter is not None:
             view.highlighter.set_markdown_enabled(enabled)
 
@@ -1884,26 +2022,46 @@ class EditorWindow(QMainWindow):
     def font_size(self) -> int:
         return self._edit.font_size()
 
-    def _on_font_size_changed(self, size):
-        # Ctrl+ホイールは連続して流れてくるので、その場では書かず、
-        # 止まってから最後の大きさを1回だけ書く(遅延保存)。
+    def _on_font_size_changed(self, size, view=None):
+        # Ctrl+ホイールは連続して流れてくるので、設定への保存は
+        # その場ではせず、止まってから最後の差分を1回だけ書く
+        # (遅延保存)。控えへの反映はその場で行う。
+        if view is None:
+            view = self._current_view()
         self._pending_font_size = size
+        # 書き戻し先は、そのタブに効いている大きさの出どころ。
+        # その拡張子に大きさの上書きがあれば上書きへ、無ければ
+        # 全体の大きさへ(従来どおり、他のタブにも同じ大きさが
+        # 当たる)。上書きのある他のタブは、自分の上書きのまま。
+        ext = self._view_extension(view)
+        overrides = self._ext_settings.get(ext) or {}
+        if ext and "font_size" in overrides:
+            updated = {name: dict(items)
+                       for name, items in self._ext_settings.items()}
+            updated[ext]["font_size"] = size
+            self._ext_settings = extmod.sanitize(updated)
+            self._pending_font_persist = {
+                EXTENSION_SETTINGS_KEY: {
+                    name: dict(items)
+                    for name, items in self._ext_settings.items()},
+            }
+        else:
+            self._font_size_base = size
+            self._pending_font_persist = {"font_size": size}
         self._font_save_timer.start()
-        # フォントの大きさは文書ごとの希望ではなく窓共通の希望
-        # なので、他のタブの本文にも同じ大きさを当てる(既に同じ
-        # 大きさの本文では何も起きないので、信号が連鎖しても
-        # 止まる)。
-        for view in self._views:
-            view.edit.set_font_size(size)
+        for item in self._views:
+            self._apply_font_to_view(item)
 
     def _flush_pending_font_size(self):
         """たまっているフォントの大きさの保存を、いま書く。"""
-        if self._pending_font_size is None:
+        if self._pending_font_persist is None:
+            self._pending_font_size = None
             return
-        size = self._pending_font_size
+        updates = self._pending_font_persist
+        self._pending_font_persist = None
         self._pending_font_size = None
         self._font_save_timer.stop()
-        self._persist_settings({"font_size": size})
+        self._persist_settings(updates)
 
     # ---------------------------------------------------------------
     # アウトラインと左ペインの情報
@@ -2147,6 +2305,9 @@ class EditorWindow(QMainWindow):
         view.external_change_pending = external_pending
         self._update_tab_label(view)
         self._update_watcher(view)
+        # 拡張子が決まったので、表示設定はその拡張子の実効値に
+        # 合わせ直す(拡張子別の設定)。
+        self._apply_view_display(view)
         if view is self._current_view():
             self._refresh_all()
         else:
@@ -2388,6 +2549,9 @@ class EditorWindow(QMainWindow):
         self._edit.clear_edited_lines()
         self._refresh_all()
         self._update_watcher()
+        # 名前を付けて保存して拡張子が付いた(変わった)ら、表示
+        # 設定はその拡張子の実効値に切り替える(拡張子別の設定)。
+        self._apply_view_display(self._current_view())
         # 名前を付けて保存したら、そのファイルも履歴に入れる
         # (無題の新規文書は、名前が付くまでは入らない)。
         self._note_recent_file(self._doc.path)
@@ -2806,7 +2970,10 @@ class EditorWindow(QMainWindow):
         document = self._edit.document()
         lines = [document.findBlockByNumber(n).text()
                  for n in range(first, last + 1)]
-        new_lines = refmtmod.format_lines(lines, self.wrap_column())
+        # 桁数は、そのタブの実効値(拡張子別の上書きがあればそれ)。
+        column = self._effective_display(
+            self._current_view())["wrap_column"]
+        new_lines = refmtmod.format_lines(lines, column)
         if not new_lines or new_lines == lines:
             return None
         self._replace_line_range(first, last, new_lines)

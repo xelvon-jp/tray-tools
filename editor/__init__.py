@@ -15,6 +15,8 @@
 #   grep_dialog.py  横断検索の窓(入力・進捗・結果の一覧)
 #   colors.py       配色プリセット(標準・秀丸風)と上書きの解決
 #   color_dialog.py 色の設定画面(プリセット+項目ごとの上書き)
+#   ext_settings.py 拡張子別の設定(全体+拡張子ごとの上書きの解決)
+#   ext_settings_dialog.py 拡張子別の設定画面(拡張子を選んで上書き)
 #   bookmark_dialog.py ブックマークの一覧の窓(選んだ行へ飛ぶ)
 #   text_edit.py    本文(QPlainTextEdit＋行番号＋Ctrl+ホイールで大きさ
 #                   ＋矩形選択は rect_edit.py の共用部品)

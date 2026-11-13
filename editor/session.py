@@ -46,6 +46,14 @@
 # + os.replace)。だから、窓を閉じても・プロセスが落ちても、最後に
 # 書き出された控えからタブが戻る。
 #
+# 保存のときは、ディスクの控えが「このプロセスが最後に見た印
+# (更新時刻とサイズ)」と違うかも確かめる。違えば、別の EDDy や
+# 新しい版が、このプロセスの知らない間に先に書いた新しい控えなの
+# で、黙って上書きせず、新しい側を別名(editor_session.json.newer、
+# あれば連番)へ退避してから書く。退避の結果は save の戻り値で
+# 窓へ渡り、ステータスで利用者へ知らせる。自分の書いた控えを
+# 自分で更新する通常の保存は、印がその都度追いつくので止まらない。
+#
 # このモジュールは Qt に依存しない(テストのため)。
 import json
 import os
@@ -153,23 +161,47 @@ def sanitize_session(data):
 _CORRUPT_NOTICES = {}
 
 
-def _evacuate_corrupt(path):
-    """壊れたセッションファイルを別名へ退避し、退避先を返す。
+def _file_stamp(path):
+    """セッションファイルの印((更新時刻 ns, サイズ)。無ければ None)。
 
-    次の保存で黙って上書きして、壊れる前の控えごと消さないため。
-    退避先は「元の名前 + .broken」で、既にあれば .broken-2、…と
-    連番にする(前の退避も上書きしない)。退避できなければ None。"""
+    「最後に見たときのファイルそのものか」を判定するための印。
+    文書ファイルの disk_mtime / disk_size と同じ流儀で、時刻だけ
+    では無くサイズも組にする。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _evacuate_with_suffix(path, suffix):
+    """セッションファイルを「元の名前 + suffix」の別名へ退避し、
+    退避先を返す。既にあれば suffix-2、…と連番にする(前の退避も
+    上書きしない)。退避できなければ None。"""
     path = Path(path)
-    candidate = path.with_name(path.name + ".broken")
+    candidate = path.with_name(path.name + suffix)
     serial = 2
     while candidate.exists():
-        candidate = path.with_name(f"{path.name}.broken-{serial}")
+        candidate = path.with_name(f"{path.name}{suffix}-{serial}")
         serial += 1
     try:
         os.replace(path, candidate)
     except OSError:
         return None
     return str(candidate)
+
+
+def _evacuate_corrupt(path):
+    """壊れたセッションファイルを別名(.broken)へ退避し、退避先を
+    返す。次の保存で黙って上書きして、壊れる前の控えごと消さない
+    ため。退避できなければ None。"""
+    return _evacuate_with_suffix(path, ".broken")
+
+
+def _evacuate_newer(path):
+    """別の EDDy 等が先に書いた新しいセッションファイルを別名
+    (.newer)へ退避し、退避先を返す。退避できなければ None。"""
+    return _evacuate_with_suffix(path, ".newer")
 
 
 def take_corrupt_notice(path):
@@ -241,15 +273,24 @@ class _PathRegistry:
 
     states は窓スロットの並び(中身は窓が capture した dict)。
     live は「いま開いている窓が持っているスロット」の id の組。
+    stamp は「このプロセスが最後に見たディスクの控え」の印
+    (_file_stamp。ファイルが無かったときは None)。読み込みの
+    ときと、自分の保存が成功したときに取り直す。保存のときに
+    ディスクの印がこれと違えば、よそが先に書いた新しい控えが
+    あると分かる。
     ファイルから読むのは最初の claim のときだけ(遅延)。"""
 
     def __init__(self):
         self.states = None      # None はまだ読んでいない
         self.live = set()
+        self.stamp = None
 
     def ensure_loaded(self, path):
         if self.states is None:
             self.states = load_session_file(path)
+            # 読み込みの直後の姿を印にする(壊れた控えが退避されて
+            # ファイルが無くなった場合は None のまま)。
+            self.stamp = _file_stamp(path)
 
 
 _REGISTRIES = {}
@@ -295,8 +336,24 @@ def release(path, slot):
 def save(path):
     """いまのスロット全部(使用中・未使用とも)をファイルへ書く。
 
-    中身の無いスロット(タブが1つも無いもの)は書かない。"""
+    中身の無いスロット(タブが1つも無いもの)は書かない。
+
+    書く前に、ディスクの控えの印が「このプロセスが最後に見た印」
+    と違うか確かめる。違えば、別の EDDy や新しい版が先に書いた
+    新しい控えなので、黙って上書きせず、新しい側を別名
+    (editor_session.json.newer、あれば連番)へ退避してから書く。
+    退避したら {"backup": 退避先のパス文字列(退避できなかった
+    ときは None)} を返し、何も無ければ None を返す(窓が
+    ステータスで知らせるための戻り値)。自分の控えを自分で
+    更新する通常の保存では、印が保存のたびに追いつくので、
+    退避は起きず戻り値も None のまま。"""
     registry = _registry_for(path)
     registry.ensure_loaded(path)
+    notice = None
+    current = _file_stamp(path)
+    if current is not None and current != registry.stamp:
+        notice = {"backup": _evacuate_newer(path)}
     windows = [state for state in registry.states if state.get("tabs")]
     save_session_file(path, windows)
+    registry.stamp = _file_stamp(path)
+    return notice

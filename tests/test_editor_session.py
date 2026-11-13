@@ -373,6 +373,99 @@ def test_window_reports_corrupt_session():
             close_window(window)
 
 
+def _tab_record(text):
+    """控えの要るタブ1件分の記録(session.save へ渡す形)。"""
+    return {"path": None, "dirty": True, "text": text,
+            "encoding": "utf-8", "bom": False, "newline": "\n",
+            "cursor": 0, "anchor": 0}
+
+
+def test_newer_session_file_is_evacuated_not_overwritten():
+    """よそが先に書いた新しい控えは、保存で黙って上書きせず、
+    別名(.newer)へ退避して残す。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        slot = sessionmod.claim(path)
+        slot.update({"tabs": [_tab_record("自分の控え")], "active": 0})
+        # 自分の控えを自分で更新する通常の保存は、知らせ無しで通る。
+        assert sessionmod.save(path) is None
+        # 別の EDDy が先に、新しい控えを書いた(中身も大きさも違う)。
+        sessionmod.save_session_file(path, [{"tabs": [
+            _tab_record("他の側の新しい控えです")], "active": 0}])
+        notice = sessionmod.save(path)
+        assert notice is not None and notice["backup"]
+        backup = Path(notice["backup"])
+        assert backup.name == "editor_session.json.newer"
+        # 新しい側の内容は退避先に残り、表の控えは自分の内容になる。
+        assert sessionmod.load_session_file(
+            backup)[0]["tabs"][0]["text"] == "他の側の新しい控えです"
+        assert sessionmod.load_session_file(
+            path)[0]["tabs"][0]["text"] == "自分の控え"
+        # 続けての保存では、退避も知らせも繰り返さない。
+        assert sessionmod.save(path) is None
+        assert not Path(str(path) + ".newer-2").exists()
+
+
+def test_newer_session_created_after_load_is_evacuated():
+    """読み込みの時点では無かった控えが、よそに先に作られていた
+    場合も、黙って上書きせず退避する。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        slot = sessionmod.claim(path)  # この時点ではファイルは無い
+        slot.update({"tabs": [_tab_record("自分の控え")], "active": 0})
+        sessionmod.save_session_file(path, [{"tabs": [
+            _tab_record("先に書いた他の側")], "active": 0}])
+        notice = sessionmod.save(path)
+        assert notice is not None and notice["backup"]
+        assert sessionmod.load_session_file(
+            Path(notice["backup"]))[0]["tabs"][0]["text"] \
+            == "先に書いた他の側"
+        assert sessionmod.load_session_file(
+            path)[0]["tabs"][0]["text"] == "自分の控え"
+
+
+def test_repeated_saves_by_two_slots_do_not_evacuate():
+    """複数窓(スロット)が順に保存する通常の使い方は止まらず、
+    退避も起きない。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        slot1 = sessionmod.claim(path)
+        slot2 = sessionmod.claim(path)
+        slot1.update({"tabs": [_tab_record("窓1の控え")], "active": 0})
+        assert sessionmod.save(path) is None
+        slot2.update({"tabs": [_tab_record("窓2の控え")], "active": 0})
+        assert sessionmod.save(path) is None
+        assert sessionmod.save(path) is None
+        assert not Path(str(path) + ".newer").exists()
+        loaded = sessionmod.load_session_file(path)
+        assert [w["tabs"][0]["text"] for w in loaded] \
+            == ["窓1の控え", "窓2の控え"]
+
+
+def test_window_reports_newer_session_evacuated():
+    """よその新しい控えと重なった窓は、退避したことをステータスに
+    残し、自分の編集は表の控えに残る。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        try:
+            type_text(window, "自分の編集")
+            # 窓が開いている間に、他の EDDy が新しい控えを書いた。
+            path = Path(d) / "editor_session.json"
+            sessionmod.save_session_file(path, [{"tabs": [
+                _tab_record("他の側の新しい控えです")], "active": 0}])
+            assert window._flush_session()
+            message = window.statusBar().currentMessage()
+            assert "退避しました" in message
+            backup = Path(str(path) + ".newer")
+            assert backup.exists()
+            assert sessionmod.load_session_file(
+                backup)[0]["tabs"][0]["text"] == "他の側の新しい控えです"
+            assert sessionmod.load_session_file(
+                path)[0]["tabs"][0]["text"] == "自分の編集"
+        finally:
+            close_window(window)
+
+
 def _break_session_save():
     """sessionmod.save を失敗させる差し替え。元を返す。"""
     original = sessionmod.save

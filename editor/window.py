@@ -1668,10 +1668,12 @@ class EditorWindow(QMainWindow):
             state = self._capture_session_state()
             self._session_slot.clear()
             self._session_slot.update(state)
-            sessionmod.save(self._session_path)
+            notice = sessionmod.save(self._session_path)
         except Exception:  # noqa: BLE001  控えの失敗で編集を止めない
             self.statusBar().showMessage("控えを保存できませんでした", 4000)
             return False
+        if notice is not None:
+            self._notify_newer_session(notice)
         return True
 
     def _notify_corrupt_session(self):
@@ -1692,6 +1694,23 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(
                 "控えのファイルが壊れていて読み直せませんでした"
                 "（前回のタブは戻せませんでした）", 15000)
+
+    def _notify_newer_session(self, notice):
+        """新しい側の控えを退避していたら、ステータスで知らせる。
+
+        退避そのものは session.save が保存のときに済ませている。
+        ここでは結果を受け取って文にするだけ。"""
+        backup = notice.get("backup")
+        if backup:
+            self.statusBar().showMessage(
+                "他の EDDy が書いた新しい控えがあったため、"
+                f"{os.path.basename(backup)} へ退避しました"
+                "（この窓の控えを優先しました）", 15000)
+        else:
+            self.statusBar().showMessage(
+                "他の EDDy が書いた新しい控えがありましたが、"
+                "退避できませんでした（この窓の控えを優先しました）",
+                15000)
 
     def _ask_session_save_failed_choice(self):
         """閉じるときに控えが書けなかった場合の行き先を聞く。

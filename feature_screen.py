@@ -33,7 +33,7 @@ import command_launcher
 import command_palette
 import cursor_finder
 from picker import PickerWindow
-from settings import update_settings
+from settings import update_settings, update_settings_section
 import unified_picker
 import explorer_nav
 import claude_progress
@@ -270,6 +270,7 @@ class ScreenFeature:
         self.ruler = None
         self.snippet_picker = None
         self.calendar_popup = None
+        self.text_editor = None
         self.calculator_window = None
         self.cursor_finder = None
         self._palette_apps_cache = None
@@ -529,6 +530,9 @@ class ScreenFeature:
         # 統合ピッカー。名前を打って実行する道具なので、あっふの隣に置く
         # (フォルダブックマークと登録を一本化してあり、行き来が近いため)。
         self.menu.addAction("⌨ コマンドランチャ", lambda: self.start_launcher())
+        # 内蔵テキストエディタ(秀丸の代替)。あっふの隣に置く(ファイルを開く
+        # 行き来が近いため)。窓は1つだけ持ち回す(start_text_editor)。
+        self.menu.addAction("📝 テキストエディタ", self.start_text_editor)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -1212,6 +1216,49 @@ class ScreenFeature:
         self.snippet_picker = None
         picker.close()
         picker.deleteLater()
+
+    # ---------------------------------------------------------------
+    # テキストエディタ(editor/。秀丸の代替の内蔵エディタ)
+    # ---------------------------------------------------------------
+    def start_text_editor(self, path=None):
+        """内蔵テキストエディタを開く。開いていれば前面に出すだけ
+        (パスが渡されていたら、そのファイルを開き直す)。
+
+        窓は常駐の中で開く(あっふ のビュアと同じ)。常駐の再起動で
+        道連れになるので、未保存の窓は restart_blockers に数える
+        (レビュー req-20261113-99 の重大3)。"""
+        import editor as editor_module  # 使うときに読む(起動を軽く保つ)
+
+        if self.text_editor is not None:
+            if path:
+                self.text_editor.open_path(path)
+            self.text_editor.raise_()
+            self.text_editor.activateWindow()
+            return
+        section = self.app_settings.get("editor") or {}
+        geometry = section.get("geometry")
+        if not (isinstance(geometry, list) and len(geometry) == 4
+                and all(isinstance(v, int) for v in geometry)):
+            geometry = None
+        window = editor_module.create_window(
+            path, geometry=geometry, keymap_overrides=section.get("keymap"))
+        window.closed.connect(self._on_text_editor_closed)
+        self.text_editor = window
+        window.show()
+
+    def _on_text_editor_closed(self, geometry):
+        window = self.text_editor
+        self.text_editor = None
+        if window is not None:
+            window.deleteLater()
+        try:
+            update_settings_section(
+                "editor", {"geometry": geometry}, self.settings_path)
+            section = self.app_settings.get("editor")
+            if isinstance(section, dict):
+                section["geometry"] = geometry
+        except Exception:  # noqa: BLE001
+            self._log_failure("テキストエディタの位置の保存")
 
     # ---------------------------------------------------------------
     # カレンダー(縦ランチャの項目。見る専用の小窓)
@@ -3699,6 +3746,22 @@ class ScreenFeature:
             # 予約は再起動で消える。寝るつもりだったのに寝ないのは、
             # 気づきにくいぶん厄介。
             blockers.append("スリープ予約")
+        editor = getattr(self, "text_editor", None)
+        if editor is not None:
+            # 未保存のエディタは、再起動で編集中の内容が消える。無人の
+            # 自動反映では「保存しますか」の窓で古いプロセスが居座る
+            # 事故にもなるので、巻き添えに数える(レビュー
+            # req-20261113-99 の重大3)。
+            try:
+                import editor as editor_module
+
+                dirty, unreadable = editor_module.dirty_window_state([editor])
+                if dirty:
+                    blockers.append(f"未保存のエディタ {dirty}窓")
+                if unreadable:
+                    blockers.append("エディタ(状態を読めず)")
+            except Exception:  # noqa: BLE001  読めないなら「あるかも」に倒す
+                blockers.append("エディタ(状態を読めず)")
         return blockers
 
     def restart_from_ipc(self) -> str:
@@ -3729,6 +3792,26 @@ class ScreenFeature:
             if self._restart_app is None:
                 self._notify("再起動", "この起動のしかたでは再起動できません")
                 return
+            editor = getattr(self, "text_editor", None)
+            if editor is not None:
+                # 未保存のエディタがあるまま再起動すると、編集中の内容が
+                # 消えるうえ、「保存しますか」で止まって二重に動く。
+                # 先に確かめる(restart_blockers と同じ判定)。
+                try:
+                    import editor as editor_module
+
+                    dirty, unreadable = editor_module.dirty_window_state(
+                        [editor])
+                except Exception:  # noqa: BLE001  読めないなら止まる側に倒す
+                    dirty, unreadable = 0, 1
+                if dirty or unreadable:
+                    answer = QMessageBox.question(
+                        self.menu, "再起動",
+                        "未保存のエディタがあります。再起動すると編集中の"
+                        "内容が失われます。\nそれでも再起動しますか？",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if answer != QMessageBox.Yes:
+                        return
             if self._restart_app():
                 # メニューの exec() が回しているイベントループの中から quit() を呼ぶと、
                 # そのループを抜けるだけでアプリ本体が終わらないことがある。実際、

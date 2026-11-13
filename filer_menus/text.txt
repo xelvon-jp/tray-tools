@@ -1,5 +1,6 @@
 afx text
 # テキスト(_aliases.txt の text)のメニュー。
 "V:内蔵ビュア" &VIEW $MF
+"T:内蔵エディタ" &TEDIT $MF
 "E:エディタ" &EDIT $MF
 "N:メモ帳" notepad.exe $MF

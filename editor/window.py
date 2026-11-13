@@ -59,6 +59,14 @@
 # (toggle_bookmark / next_bookmark / prev_bookmark、既定は
 # F7 / F8 / Shift+F8)、一覧は bookmark_dialog の窓(既定は
 # Ctrl+Shift+B)から選んで飛ぶ。
+#
+# 自動保存(2026-11-13): 名前の付いたファイルの未保存の変更を、
+# 設定した間隔(既定はオフ、間隔の既定は60秒)で、通常の保存経路
+# を通して書く。外部で変更されたファイルと、保存先の文字コード
+# で書けない文字がある文書は、確認ダイアログを出さずに見送って
+# ステータスに残す(自動で上書き・化けはさせない)。無題は対象外。
+# 間隔が来たときの処理は autosave_now に寄せてあり、テストは
+# 実時間を待たずに直接呼べる。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -164,6 +172,17 @@ PATTERN_APPLYING_KEY = "pattern_applying"
 RECENT_FILES_KEY = "recent_files"
 RECENT_FILES_LIMIT = 20
 
+# 自動保存(settings の editor 節 autosave_enabled /
+# autosave_interval_sec のキーと、間隔の既定・範囲)。
+# 既定はオフ(勝手に書き始める機能なので、入れるのは利用者の操作)。
+# 間隔は秒。範囲は「うっかり短すぎて書き込みが嵐になる」のと
+# 「長すぎて意味が無い」のを避けるための上下限。
+AUTOSAVE_ENABLED_KEY = "autosave_enabled"
+AUTOSAVE_INTERVAL_KEY = "autosave_interval_sec"
+DEFAULT_AUTOSAVE_INTERVAL_SEC = 60
+AUTOSAVE_INTERVAL_MIN_SEC = 10
+AUTOSAVE_INTERVAL_MAX_SEC = 3600
+
 
 def sanitize_recent_files(value, limit=RECENT_FILES_LIMIT):
     """設定から読んだ履歴を整える(文字列だけ・重複なし・上限まで)。
@@ -197,6 +216,19 @@ def remember_recent_file(recent, path, limit=RECENT_FILES_LIMIT):
     kept = [item for item in sanitize_recent_files(recent)
             if os.path.normcase(os.path.abspath(item)) != key]
     return ([target] + kept)[:limit]
+
+
+def sanitize_autosave_interval(value):
+    """設定から読んだ自動保存の間隔(秒)を整える。
+
+    整数でない・範囲外の値は既定(60秒)に倒す。設定ファイルが手で
+    書き換えられていても、窓が開かなくならず、タイマーが変な
+    間隔で回り始めないため。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_AUTOSAVE_INTERVAL_SEC
+    if not AUTOSAVE_INTERVAL_MIN_SEC <= value <= AUTOSAVE_INTERVAL_MAX_SEC:
+        return DEFAULT_AUTOSAVE_INTERVAL_SEC
+    return value
 
 # 折り返しの方式(settings の editor 節 wrap_mode の値)。
 #   column … 指定の桁数で折り返す / window … 窓の幅で折り返す /
@@ -467,7 +499,8 @@ class EditorWindow(QMainWindow):
     editor_settings は settings の editor 節(辞書)。font_family /
     font_size / show_line_numbers / show_outline_pane / outline_pattern /
     highlight_pattern / pattern_applying(適用中の印。起動時の保険で
-    読む)を読み(無いキーは既定)、表示やフォントや正規表現が
+    読む)/ autosave_enabled / autosave_interval_sec(自動保存)を
+    読み(無いキーは既定)、表示やフォントや正規表現が
     変わったら、差分を on_settings_change(辞書を受ける関数)へ流すので、
     保存は呼び側の流儀(update_settings_section)に任せる。"""
 
@@ -659,6 +692,16 @@ class EditorWindow(QMainWindow):
         self._watched_path = None
         self._external_change_pending = False
 
+        # 自動保存。既定はオフ(設定 autosave_enabled)。間隔が来たら
+        # autosave_now が、名前のあるファイルの未保存の変更だけを
+        # 通常の保存経路で書く(対象外・衝突時は見送る)。
+        self._autosave_enabled = bool(section.get(AUTOSAVE_ENABLED_KEY))
+        self._autosave_interval_sec = sanitize_autosave_interval(
+            section.get(AUTOSAVE_INTERVAL_KEY))
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._on_autosave_timeout)
+        self._apply_autosave_timer()
+
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
@@ -748,6 +791,14 @@ class EditorWindow(QMainWindow):
         self._recent_menu = file_menu.addMenu("最近使ったファイル(&R)")
         self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
         self._rebuild_recent_menu()
+        file_menu.addSeparator()
+        self._act_autosave = QAction("自動保存(&U)", self)
+        self._act_autosave.setCheckable(True)
+        self._act_autosave.setChecked(self._autosave_enabled)
+        self._act_autosave.toggled.connect(self.set_autosave_enabled)
+        file_menu.addAction(self._act_autosave)
+        self._action("自動保存の間隔(&I)…", self._ask_autosave_interval,
+                     None, file_menu)
         file_menu.addSeparator()
         self._action("閉じる(&C)", self.close, "close_window", file_menu)
 
@@ -1630,6 +1681,101 @@ class EditorWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes)
         return answer == QMessageBox.StandardButton.Yes
+
+    # ---------------------------------------------------------------
+    # 自動保存
+    # ---------------------------------------------------------------
+    def autosave_enabled(self) -> bool:
+        return self._autosave_enabled
+
+    def autosave_interval_sec(self) -> int:
+        return self._autosave_interval_sec
+
+    def set_autosave_enabled(self, enabled):
+        self._autosave_enabled = bool(enabled)
+        if self._act_autosave.isChecked() != self._autosave_enabled:
+            blocker = QSignalBlocker(self._act_autosave)
+            self._act_autosave.setChecked(self._autosave_enabled)
+        self._apply_autosave_timer()
+        self._persist_settings({AUTOSAVE_ENABLED_KEY: self._autosave_enabled})
+
+    def set_autosave_interval(self, seconds):
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            return
+        if not AUTOSAVE_INTERVAL_MIN_SEC <= seconds <= AUTOSAVE_INTERVAL_MAX_SEC:
+            return
+        self._autosave_interval_sec = seconds
+        self._apply_autosave_timer()
+        self._persist_settings({AUTOSAVE_INTERVAL_KEY: seconds})
+
+    def _ask_autosave_interval(self):
+        try:
+            value, ok = QInputDialog.getInt(
+                self, APP_NAME, "自動保存の間隔（秒）",
+                self._autosave_interval_sec,
+                AUTOSAVE_INTERVAL_MIN_SEC, AUTOSAVE_INTERVAL_MAX_SEC, 10)
+            if ok:
+                self.set_autosave_interval(value)
+                # 間隔を決めたら、そのまま有効にもする(チェックを
+                # 付けに戻る手間を無くす。_ask_wrap_column が方式まで
+                # 切り替えるのと同じ作法)。
+                if not self._autosave_enabled:
+                    self.set_autosave_enabled(True)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"設定できませんでした ({e})")
+
+    def _apply_autosave_timer(self):
+        """有効・間隔の設定をタイマーへ反映する。"""
+        if self._autosave_enabled:
+            self._autosave_timer.start(self._autosave_interval_sec * 1000)
+        else:
+            self._autosave_timer.stop()
+
+    def _on_autosave_timeout(self):
+        try:
+            self.autosave_now()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(
+                f"自動保存できませんでした ({e})", 8000)
+
+    def autosave_now(self) -> bool:
+        """自動保存の1回分。タイマーから呼ばれ、テストからも直接呼べる。
+
+        保存したら True。次のどれかなら何もせず False:
+          - 自動保存がオフ
+          - 無題(保存先が無い)。勝手に名前は付けない
+          - 未保存の変更が無い
+          - ファイルが外部で変更されている。上書きの確認は手動保存
+            のときだけにして、ここでは見送ってステータスに残す
+          - 保存先の文字コードで書けない文字がある。手動保存では
+            承知の上で置換して書けるが、自動では黙って化けさせない
+        保存は通常の経路(_write → save_to)を通すので、文字コード・
+        改行の保持と .bak は手動保存と同じ。確認ダイアログは、外部
+        変更と書けない文字を先に確かめて見送るため出ない(編集中に
+        ダイアログでフォーカスを奪わない)。"""
+        if not self._autosave_enabled:
+            return False
+        if self._doc.path is None:
+            return False
+        if not self.is_dirty():
+            return False
+        if docmod.external_changed(self._doc):
+            self.statusBar().showMessage(
+                "自動保存を見送りました（ファイルが外部で変更されて"
+                "います。保存するときに確認します）", 8000)
+            return False
+        self._sync_text()
+        if docmod.find_unencodable(self._doc.text, self._doc.encoding):
+            self.statusBar().showMessage(
+                "自動保存を見送りました（保存先の文字コードで書けない"
+                "文字があります）", 8000)
+            return False
+        if not self._write():
+            return False
+        self.statusBar().showMessage("自動保存しました", 4000)
+        return True
 
     # ---------------------------------------------------------------
     # 保存

@@ -932,6 +932,88 @@ def test_sort_and_convert_are_recorded_and_replayed():
         discard_close(window)
 
 
+def test_reformat_command_and_undo():
+    window = make_window()
+    try:
+        # 段落の中の改行は繋がり、句点で改行し直される。
+        # 全体が1回の undo で戻る。
+        window._edit.setPlainText("今日は\n晴れです。明日も\n晴れでしょう。")
+        assert window.execute_command("reformat_text")
+        assert window.text() == "今日は晴れです。\n明日も晴れでしょう。"
+        window._edit.undo()
+        assert window.text() == "今日は\n晴れです。明日も\n晴れでしょう。"
+        # 既に整っている文書では何も起きない。
+        window._edit.setPlainText("一文目。\n二文目。")
+        assert window.execute_command("reformat_text")
+        assert window.text() == "一文目。\n二文目。"
+    finally:
+        discard_close(window)
+
+
+def test_reformat_selection_only():
+    window = make_window()
+    try:
+        window._edit.setPlainText(
+            "一文目。二文目。\n\n三文目。四文目。\n\n五文目。六文目。")
+        _select_blocks(window, 0, 0)
+        assert window.execute_command("reformat_text")
+        # 対象は選択のある段落だけ。他の段落は動かない。
+        assert window.text() == (
+            "一文目。\n二文目。\n\n三文目。四文目。\n\n五文目。六文目。")
+    finally:
+        discard_close(window)
+
+
+def test_reformat_respects_wrap_column():
+    window = make_window()
+    try:
+        window.set_wrap_column(10)
+        window._edit.setPlainText("ああああ、ああああ、ああああ。")
+        assert window.execute_command("reformat_text")
+        # 折り返しの桁数を超える行は、読点で改行される。
+        assert window.text() == "ああああ、\nああああ、\nああああ。"
+    finally:
+        discard_close(window)
+
+
+def test_reformat_keeps_markdown_structures():
+    window = make_window()
+    try:
+        window._edit.setPlainText(
+            "# 見出し。です\n\n```\n中。です。\n```\n\n"
+            "- 一文目。二文目。\n\n> 今日は。次です。")
+        assert window.execute_command("reformat_text")
+        assert window.text() == (
+            "# 見出し。です\n\n```\n中。です。\n```\n\n"
+            "- 一文目。\n  二文目。\n\n> 今日は。\n> 次です。")
+    finally:
+        discard_close(window)
+
+
+def test_reformat_recorded_and_replayed():
+    window = make_window()
+    try:
+        assert DEFAULT_KEYMAP["reformat_text"] == "Ctrl+Shift+F"
+        window._edit.setPlainText("一文目。二文目。")
+        window.set_macro_recording(True)
+        window.execute_command("reformat_text")
+        window.set_macro_recording(False)
+        commands = window.recorded_commands()
+        assert {"cmd": "reformat_text", "args": {}} in commands
+        _name, parsed = macmod.macro_from_json(
+            macmod.macro_to_json(commands))
+        assert parsed == commands
+        other = make_window()
+        try:
+            other._edit.setPlainText("三文目。四文目。")
+            assert other.play_macro(parsed)
+            assert other.text() == "三文目。\n四文目。"
+        finally:
+            discard_close(other)
+    finally:
+        discard_close(window)
+
+
 def test_ctrl_k_scoped_to_text_edit():
     window = make_window()
     try:

@@ -27,6 +27,7 @@
 #   move_char_right {count, extend} 右へ
 #   sort_lines {order}          行の並べ替え(order は "asc" / "desc")
 #   remove_duplicate_lines {}   重複行の削除
+#   reformat_text {}            整形(句点で改行、読点は桁数を超えるとき)
 #   convert_halfwidth {}        選択範囲を全角 → 半角
 #   convert_fullwidth {}        選択範囲を半角 → 全角
 #   convert_lower {}            選択範囲の英字を大文字 → 小文字
@@ -58,6 +59,7 @@ KNOWN_COMMANDS = frozenset({
     "move_char_right",
     "sort_lines",
     "remove_duplicate_lines",
+    "reformat_text",
     "convert_halfwidth",
     "convert_fullwidth",
     "convert_lower",

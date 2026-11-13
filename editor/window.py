@@ -101,6 +101,7 @@ from editor import document as docmod
 from editor import macros as macmod
 from editor import outline
 from editor import editor_icon
+from editor import reformat as refmtmod
 from editor import rxfind
 from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
@@ -477,6 +478,7 @@ class EditorWindow(QMainWindow):
             "move_char_right": self._cmd_move_char_right,
             "sort_lines": self._cmd_sort_lines,
             "remove_duplicate_lines": self._cmd_remove_duplicate_lines,
+            "reformat_text": self._cmd_reformat_text,
             "convert_halfwidth": self._cmd_convert_halfwidth,
             "convert_fullwidth": self._cmd_convert_fullwidth,
             "convert_lower": self._cmd_convert_lower,
@@ -693,6 +695,9 @@ class EditorWindow(QMainWindow):
         self._action("重複行を削除(&U)",
                      lambda: self.execute_command("remove_duplicate_lines"),
                      None, edit_menu)
+        self._action("整形(&M)",
+                     lambda: self.execute_command("reformat_text"),
+                     "reformat_text", edit_menu)
         convert_menu = edit_menu.addMenu("変換(&T)")
         self._action("全角 → 半角(&H)",
                      lambda: self.execute_command("convert_halfwidth"),
@@ -1703,7 +1708,7 @@ class EditorWindow(QMainWindow):
         return {}
 
     # ---------------------------------------------------------------
-    # 行の並べ替え・重複行の削除・範囲の変換
+    # 行の並べ替え・重複行の削除・整形・範囲の変換
     # ---------------------------------------------------------------
     def _target_line_range(self):
         """並べ替え・重複削除の対象の (開始ブロック, 終了ブロック)。
@@ -1774,6 +1779,24 @@ class EditorWindow(QMainWindow):
                 new_lines.append(line)
         if len(new_lines) == len(lines):
             return None  # 重複が無ければ何もしない
+        self._replace_line_range(first, last, new_lines)
+        return {}
+
+    def _cmd_reformat_text(self, args):
+        """整形(命令 reformat_text)。対象は並べ替えと同じ行範囲
+        (選択があればその行、無ければ文書全体)。段落の中の改行を
+        取り除いてから、句点で文ごとに改行し直し、行が折り返しの
+        桁数を超えるときだけ読点でも改行する。実処理は reformat.py
+        (Markdown を壊さない保護込み)。置き換えは行範囲の置換な
+        ので、入る改行は文書の改行設定に従い、1回の undo で戻る。
+        変わらなければ None(記録も undo も作らない)。"""
+        first, last = self._target_line_range()
+        document = self._edit.document()
+        lines = [document.findBlockByNumber(n).text()
+                 for n in range(first, last + 1)]
+        new_lines = refmtmod.format_lines(lines, self.wrap_column())
+        if not new_lines or new_lines == lines:
+            return None
         self._replace_line_range(first, last, new_lines)
         return {}
 

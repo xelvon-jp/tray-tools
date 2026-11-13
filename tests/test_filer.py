@@ -7478,6 +7478,23 @@ def test_extmenu_parse_and_format():
     assert m.menu_kind(F("d", is_dir=True)) == "folder" and m.menu_kind(F("x.Md")) == "md"
 
 
+def test_extmenu_lines_are_hashable():
+    # ピッカーの Ctrl+Enter は、メニュー項目の値(MenuLine)を集めて
+    # 照合する。MenuLine が set に入らない(unhashable)と TypeError で
+    # 落ちる(レビュー req-20261113-108 の指摘)。値が同じ行は同じ物
+    # として扱えることも含めて確かめる。
+    import filer_extmenu as m
+    items = m.parse_menu_text(
+        '"I:IrfanView" C:\\soft\\i_view64.exe $MF\n'
+        '"-----"\n'
+        '"9:キャンセル" &NOP\n')
+    values = {line for line in items}
+    assert len(values) == 3, values
+    same = m.parse_line('"I:IrfanView" C:\\soft\\i_view64.exe $MF')
+    assert same in values
+    assert m.SEPARATOR in values
+
+
 def test_extmenu_split_command():
     import filer_extmenu as m
     assert m.split_command('"C:\\a b\\x.exe" -m "日本 語" x') == ["C:\\a b\\x.exe", "-m", "日本 語", "x"]

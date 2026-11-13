@@ -154,6 +154,13 @@ def test_save_backup_and_no_temp_left():
 def test_save_preserves_file_permissions():
     # 原子的な保存(os.replace)で新しいファイルになっても、元の
     # アクセス権は引き継がれる(レビュー req-20261113-107 の指摘)。
+    # POSIX のアクセス権ビット前提の確認なので、Windows では
+    # 飛ばす(Windows 側は属性ビットと作成日時の引き継ぎで、
+    # test_capture_restore_file_attrs_units の win32 側が見る)。
+    if os.name == "nt":
+        print("skip  test_save_preserves_file_permissions: "
+              "Windows には POSIX のアクセス権ビットが無いので飛ばします")
+        return
     import stat as statmod
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")
@@ -168,28 +175,34 @@ def test_save_preserves_file_permissions():
 
 
 def test_capture_restore_file_attrs_units():
-    # 属性の控えと引き継ぎの単体: 控えが元のモードを持ち、別の
-    # ファイルへ適用できる。存在しないファイルの控えは None。
+    # 属性の控えと引き継ぎの単体: 控えが取れ、別のファイルへ適用
+    # できる。存在しないファイルの控えは None。アクセス権ビットの
+    # 値の確認は POSIX 前提なので Windows では飛ばし、Windows 側は
+    # 隠し属性・作成日時の控え(windows)が取れることだけを見る。
     import stat as statmod
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "src.txt")
         dst = os.path.join(tmp, "dst.txt")
         _write(src, "a".encode("utf-8"))
         _write(dst, "b".encode("utf-8"))
-        os.chmod(src, 0o600)
-        os.chmod(dst, 0o644)
         saved = docmod._capture_file_attrs(src)
-        assert saved is not None and saved["mode"] == 0o600
-        docmod._restore_file_attrs(dst, saved)
-        assert statmod.S_IMODE(os.stat(dst).st_mode) == 0o600
+        assert saved is not None
+        if os.name == "nt":
+            # Windows 固有ぶん(隠し属性・作成日時)の控えが取れる。
+            assert saved["windows"] is not None
+        else:
+            os.chmod(src, 0o600)
+            os.chmod(dst, 0o644)
+            saved = docmod._capture_file_attrs(src)
+            assert saved["mode"] == 0o600
+            docmod._restore_file_attrs(dst, saved)
+            assert statmod.S_IMODE(os.stat(dst).st_mode) == 0o600
         assert docmod._capture_file_attrs(
             os.path.join(tmp, "無い.txt")) is None
         docmod._restore_file_attrs(dst, None)   # 控え無しは無事に何もしない
-        if sys.platform == "win32":
-            # Windows 固有ぶん(隠し属性・作成日時)の控えが取れる。
-            assert saved["windows"] is not None
-        # Windows 以外では windows の控えは None(Linux の VM では
-        # 隠し属性・作成日時は未実施=実機確認待ち)。
+
+
+def test_save_failure_keeps_original():
     """書き込みの途中で失敗しても、元のファイルは壊れない(原子性)。"""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")

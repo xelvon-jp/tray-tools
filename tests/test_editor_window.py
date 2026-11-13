@@ -1216,6 +1216,25 @@ def test_find_window_for_path_helper():
             discard_close(window)
 
 
+def test_editor_package_public_surface():
+    # あっふ(filer)とトレイ(feature_screen)は `import editor` して
+    # パッケージの公開名だけを使う。__init__ の公開が欠けると入口が
+    # 全部 AttributeError で落ちる(レビュー req-20261113-108 の指摘)。
+    # editor.window からでなく、パッケージ経由で確かめる。
+    for name in ("create_window", "dirty_window_state",
+                 "find_window_for_path", "EditorWindow"):
+        assert callable(getattr(editor, name)), name
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = os.path.join(tmp, "a.txt")
+        Path(p1).write_text("a", encoding="utf-8")
+        window = make_window(p1)
+        try:
+            assert editor.find_window_for_path([window], p1) is window
+            assert editor.find_window_for_path([window], None) is None
+        finally:
+            discard_close(window)
+
+
 def test_view_toggles_and_color_scheme():
     from PySide6.QtGui import QColor, QPalette
     saved = []
@@ -1266,26 +1285,36 @@ def test_wrap_modes_switch_and_persist():
         assert window.wrap_mode() == "window"
         assert (window._edit.lineWrapMode()
                 == QPlainTextEdit.LineWrapMode.WidgetWidth)
+        window.resize(1600, 600)
+        app().processEvents()
         window.set_wrap_mode("column")
         assert window.wrap_mode() == "column"
+        # 桁数指定は QPlainTextEdit に無いので、折り返し自体は窓幅で
+        # 行い、右の余白で見える幅を桁数ぶんに狭める。
         assert (window._edit.lineWrapMode()
-                == QPlainTextEdit.LineWrapMode(3))   # FixedColumnWidth
+                == QPlainTextEdit.LineWrapMode.WidgetWidth)
         assert window.wrap_column() == 80   # 既定は80桁
-        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
-            assert window._edit.lineWrapColumnOrWidth() == 80
+        assert window._edit.wrap_column() == 80
         assert saved[-1] == {"wrap_mode": "column"}
+        margin = window._edit.viewportMargins().right()
+        assert margin > 0, margin
         window.set_wrap_column(40)
         assert window.wrap_column() == 40
-        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
-            assert window._edit.lineWrapColumnOrWidth() == 40
+        assert window._edit.wrap_column() == 40
         assert saved[-1] == {"wrap_column": 40}
+        # 桁数が減ると余白は広がる。
+        assert window._edit.viewportMargins().right() > margin
         window.set_wrap_mode("none")
         assert (window._edit.lineWrapMode()
                 == QPlainTextEdit.LineWrapMode.NoWrap)
+        # 方式を離れたら余白は戻る。
+        assert window._edit.wrap_column() is None
+        assert window._edit.viewportMargins().right() == 0
         assert saved[-1] == {"wrap_mode": "none"}
         window.set_wrap_mode("window")
         assert (window._edit.lineWrapMode()
                 == QPlainTextEdit.LineWrapMode.WidgetWidth)
+        assert window._edit.viewportMargins().right() == 0
         # 折り返しは見た目だけ: 文書は変わっていない。
         assert window.text() == before
         assert not window._edit.document().isModified()
@@ -1296,15 +1325,62 @@ def test_wrap_modes_switch_and_persist():
 
 
 def test_wrap_settings_read_at_open():
-    # 桁数の実反映(setLineWrapColumnOrWidth)は、この VM の Qt
-    # ビルドに API が無く未確認(実機確認待ち)。保持と復元は確かめる。
     window = make_window(editor_settings={
         "wrap_mode": "column", "wrap_column": 42})
     try:
         assert window.wrap_mode() == "column"
         assert window.wrap_column() == 42
-        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
-            assert window._edit.lineWrapColumnOrWidth() == 42
+        assert window._edit.wrap_column() == 42
+    finally:
+        discard_close(window)
+
+
+def test_wrap_right_margin_calculation():
+    # 桁数折り返しの余白の計算(純粋関数)。目標の本文幅は
+    # 桁数 × 文字幅 + 文書の余白(両側)。
+    from editor.text_edit import wrap_right_margin
+    # 幅1000・文字幅10・文書の余白4・80桁: 目標808、余白は192。
+    assert wrap_right_margin(1000, 0, 10, 4, 80) == 192
+    # 余白を取った後の幅(808)でもう一度計算しても同じ(冪等)。
+    assert wrap_right_margin(808, 192, 10, 4, 80) == 192
+    # 幅が足りなければ 0(負にはしない)。
+    assert wrap_right_margin(500, 0, 10, 4, 80) == 0
+    # 桁数を減らすと余白は広がる。
+    assert wrap_right_margin(1000, 0, 10, 4, 40) == 592
+    # 桁数なし・文字幅なしは 0。
+    assert wrap_right_margin(1000, 0, 10, 4, None) == 0
+    assert wrap_right_margin(1000, 0, 0, 4, 80) == 0
+
+
+def test_wrap_column_margin_tracks_resize_and_font():
+    # 桁数方式の余白は、窓のリサイズとフォントサイズの変更に追随する。
+    window = make_window(editor_settings={
+        "wrap_mode": "column", "wrap_column": 80})
+    try:
+        edit = window._edit
+        window.resize(1600, 600)
+        app().processEvents()
+        margin_wide = edit.viewportMargins().right()
+        assert margin_wide > 0
+        # 見える幅がほぼ目標(80桁ぶん)に収まっている。
+        char = edit.fontMetrics().averageCharWidth()
+        target = 80 * char + 2 * edit.document().documentMargin()
+        assert abs(edit.viewport().width() - target) <= char
+        # 窓を狭めると余白は減り、目標以下では 0 になる。
+        window.resize(700, 600)
+        app().processEvents()
+        assert edit.viewportMargins().right() < margin_wide
+        window.resize(320, 600)
+        app().processEvents()
+        assert edit.viewportMargins().right() == 0
+        # フォントを大きくすると文字幅が広がり、余白は減る。
+        window.resize(1600, 600)
+        app().processEvents()
+        before = edit.viewportMargins().right()
+        assert before > 0
+        edit.set_font_size(edit.font_size() + 6)
+        app().processEvents()
+        assert edit.viewportMargins().right() < before
     finally:
         discard_close(window)
 

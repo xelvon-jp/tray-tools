@@ -54,6 +54,21 @@ FALLBACK_FONT_SIZE = 10
 # 従来の (242,242,242) / (144,144,144) と同じにしてある。
 
 
+def wrap_right_margin(viewport_width, right_margin, char_width,
+                      document_margin, column):
+    """桁数で折り返すための右余白(ピクセル)を計算する純粋関数。
+
+    QPlainTextEdit には桁数指定の折り返しが無いので、右に余白を
+    取って本文の見える幅を狭める。今の余白を含めた現在の幅から
+    差し引く形にすると、枠やスクロールバーの幅を数えなくて済む。
+    目標は「本文の幅 = column × char_width + 文書の余白(両側)」。
+    桁数が無い・文字幅が取れない・幅が足りないときは 0。"""
+    if not column or column <= 0 or char_width <= 0:
+        return 0
+    target = column * char_width + 2 * document_margin
+    return max(0, int(round(right_margin + viewport_width - target)))
+
+
 class LineNumberArea(QWidget):
     """行番号を描く帯。描画そのものはエディタ側が持つ(本文のブロック
     形状が要るため)。"""
@@ -87,10 +102,15 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._line_numbers = True
+        self._wrap_column = None
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
         self.updateRequest.connect(self._on_update_request)
+        # スクロールバーの出入りで本文の幅が変わったら、桁数折り返し
+        # の余白を計算し直す(余白は現在の幅から決めるので冪等)。
+        self.verticalScrollBar().rangeChanged.connect(
+            lambda *_args: self._update_area_width())
         self._update_area_width()
         # エディタの矩形は、貼り付けで行が足りなければ足せる。
         self.init_rect_selection(fixed_rows=False)
@@ -282,7 +302,49 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         return self.fontMetrics().horizontalAdvance("9") * digits + 10
 
     def _update_area_width(self, *_args):
-        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+        # 左は行番号エリア、右は桁数折り返しの余白。両方ここで決める。
+        self.setViewportMargins(self.line_number_area_width(), 0,
+                                self._wrap_right_margin(), 0)
+
+    # ---------------------------------------------------------------
+    # 桁数での折り返し(右の余白で見える幅を狭める)
+    # ---------------------------------------------------------------
+    def set_wrap_column(self, column):
+        """桁数で折り返す。column 桁(半角の文字数)で折り返して
+        見えるよう、右に余白を取る。None で解除(余白を戻す)。
+        折り返しそのものは窓側が WidgetWidth にして行う。"""
+        if column is not None:
+            try:
+                column = int(column)
+            except (TypeError, ValueError):
+                column = None
+            if column is not None and column <= 0:
+                column = None
+        if column == self._wrap_column:
+            if column is not None:
+                self._update_area_width()
+            return
+        self._wrap_column = column
+        self._update_area_width()
+
+    def wrap_column(self):
+        return self._wrap_column
+
+    def _char_width(self) -> float:
+        """半角1文字の幅(ピクセル)。取れなければ 0。"""
+        metrics = self.fontMetrics()
+        width = metrics.averageCharWidth()
+        if width <= 0:
+            width = metrics.horizontalAdvance("0")
+        return width
+
+    def _wrap_right_margin(self) -> int:
+        if not self._wrap_column:
+            return 0
+        margins = self.viewportMargins()
+        return wrap_right_margin(
+            self.viewport().width(), margins.right(), self._char_width(),
+            self.document().documentMargin(), self._wrap_column)
 
     def _on_update_request(self, rect, dy):
         if dy:
@@ -298,6 +360,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._area.setGeometry(QRect(
             contents.left(), contents.top(),
             self.line_number_area_width(), contents.height()))
+        # 窓の幅が変わったら、桁数折り返しの余白も計算し直す。
+        self._update_area_width()
 
     def changeEvent(self, event):  # noqa: N802  Qt の上書き
         super().changeEvent(event)

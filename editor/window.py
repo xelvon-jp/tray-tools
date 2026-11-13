@@ -137,9 +137,9 @@ WRAP_MODE_NONE = "none"
 WRAP_MODES = (WRAP_MODE_COLUMN, WRAP_MODE_WINDOW, WRAP_MODE_NONE)
 DEFAULT_WRAP_MODE = WRAP_MODE_WINDOW
 DEFAULT_WRAP_COLUMN = 80
-# Qt の QPlainTextEdit.LineWrapMode.FixedColumnWidth(値 3)。
-# PySide6 では環境によってこの名前が列挙に現れないため、値で持つ。
-LINE_WRAP_FIXED_COLUMN = QPlainTextEdit.LineWrapMode(3)
+# 「桁数」の実体は QPlainTextEdit に無い(FixedColumnWidth は
+# QTextEdit のもの)。本文の右に余白を取って見える幅を桁数ぶんに
+# 狭める形で実現する(editor/text_edit.py の set_wrap_column)。
 
 # 設定ダイアログの試験を別プロセスで待つ上限(秒)。試験自体の制限
 # (outline.TRIAL_TIME_LIMIT_SEC)に、子プロセスの起動のぶんを足したもの。
@@ -974,22 +974,21 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     def _apply_wrap_mode(self):
         """今の方式・桁数を本文へ適用する(保存はしない)。"""
-        if self._wrap_mode == WRAP_MODE_COLUMN:
-            self._edit.setLineWrapMode(LINE_WRAP_FIXED_COLUMN)
-            self._apply_wrap_column()
-        elif self._wrap_mode == WRAP_MODE_NONE:
+        if self._wrap_mode == WRAP_MODE_NONE:
             self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         else:
+            # 「桁数」も「ウィンドウ幅」も、折り返し自体は窓幅で
+            # 行う。「桁数」は右の余白で見える幅を狭めて実現する。
             self._edit.setLineWrapMode(
                 QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._apply_wrap_column()
 
     def _apply_wrap_column(self):
-        """桁数を本文へ伝える。Qt の setLineWrapColumnOrWidth が
-        無い環境(この VM の Qt ビルドでは欠けている)では伝える口が
-        無いので飛ばす。方式と桁数の保持・保存は環境によらず効く。"""
-        setter = getattr(self._edit, "setLineWrapColumnOrWidth", None)
-        if setter is not None:
-            setter(self._wrap_column)
+        """桁数を本文へ伝える。方式が「桁数」のときだけ余白を取り、
+        それ以外の方式では余白を戻す(None を渡す)。"""
+        self._edit.set_wrap_column(
+            self._wrap_column
+            if self._wrap_mode == WRAP_MODE_COLUMN else None)
 
     def set_wrap_mode(self, mode):
         if mode not in WRAP_MODES:

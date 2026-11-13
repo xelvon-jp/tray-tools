@@ -468,6 +468,13 @@ DEFAULT_SETTINGS = {
         "fkey_labels": {},
         "tools": {},
     },
+    # テキストエディタ(editor/。秀丸の代替として作った内蔵エディタ)。
+    #   keymap   … キー割り当ての上書き(命令名 → QKeySequence の文字列)。
+    #              既定は editor/keymap.py の DEFAULT_KEYMAP
+    #   geometry … 窓の位置と大きさ [x, y, w, h]。エディタを閉じたときに書く
+    "editor": {
+        "keymap": {},
+    },
     # 写真のスライドショー(slideshow.py。全画面のフォトフレーム)。トレイの
     # 「🖼 スライドショー」から開始・設定する。窓は常駐とは別のプロセス。
     #   folders          … [{"path": フォルダ, "recursive": サブフォルダも含めるか}] の並び。

@@ -4,7 +4,7 @@
 # 何をするか
 #   対象の拡張子(フォルダなら folder)のメニュー定義を読み、その PC で使える項目だけを
 #   並べる。項目を選んだら、マクロ($MF $P $F $O $E)を展開して外部コマンドを起こすか、
-#   内部命令(&EXCD &EDIT &NOP &SHELL &PROPERTY &VIEW &OPEN &SLIDESHOW)を filer.py に返す。
+#   内部命令(&EXCD &EDIT &NOP &SHELL &PROPERTY &VIEW &OPEN &SLIDESHOW &TEDIT)を filer.py に返す。
 #
 # 置き場所(複数の PC で使う前提)
 #   - 共有: リポジトリの filer_menus/<名前>.txt(UTF-8)。個人のパスは書かない。
@@ -41,11 +41,13 @@ APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
 
 # 内部命令。ここに無い & 命令の項目は出さない。
 # &SLIDESHOW <フォルダ> は写真のスライドショー(slideshow.py)をそのフォルダで起こす。
+# &TEDIT は内蔵テキストエディタ(editor/)で開く(filer.py の open_text_editor)。
 INTERNAL_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "SHELL", "PROPERTY", "VIEW", "OPEN",
-                               "SLIDESHOW"})
+                               "SLIDESHOW", "TEDIT"})
 # 書庫の中でも使える内部命令(書庫の中のパスを扱えるもの)。外部ツール・&SHELL・
 # &PROPERTY・&SLIDESHOW は実体のファイルが要るので、書庫の中では出さない。
-ARCHIVE_OK_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "VIEW", "OPEN"})
+# &TEDIT は、対象を一時フォルダへ取り出してから内蔵エディタで開くので含める。
+ARCHIVE_OK_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "VIEW", "OPEN", "TEDIT"})
 
 LOCAL_TEMPLATE = (
     "# この PC だけで使うメニュー項目(種類別の後ろ・共通の前に付け足されます)。\n"
@@ -56,6 +58,7 @@ LOCAL_TEMPLATE = (
     "# 内部命令: &EXCD -P<パス> / &EXCD -O<パス> / &EDIT <ファイル> / &SHELL <フォルダ> /\n"
     "#           &PROPERTY <パス> / &VIEW <ファイル> / &OPEN <パス> / &NOP /\n"
     "#           &SLIDESHOW <フォルダ>(写真のスライドショー)\n"
+    "#           &TEDIT <ファイル>(内蔵テキストエディタで開く)\n"
     "# ツールは {tool:名前} と書くと settings.json の filer.tools(無ければ App Paths・PATH)で探します。\n"
     "# 例: \"V:VLC\" {tool:vlc} $MF\n"
 )

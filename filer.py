@@ -3039,6 +3039,7 @@ class FilerWindow(QWidget):
         self.viewer_extensions = core.normalize_viewer_extensions(
             section.get("viewer_extensions"))
         self._viewers = []
+        self._text_editors = []
         # 拡張子ごとの既定アプリ(settings の filer.default_apps。関連付けの代わりに
         # あっふの中で開くアプリを差し替える)
         self.default_apps = core.normalize_default_apps(section.get("default_apps"))
@@ -3714,6 +3715,8 @@ class FilerWindow(QWidget):
                 self._extracting["cancel"].set()
             for viewer in list(self._viewers):
                 viewer.close()
+            for editor_window in list(self._text_editors):
+                editor_window.close()
             # ★の読み取りを止める(閉じたあとも写真を開いたままにしない)
             for pane in (self.left, self.right):
                 pane._photo_cancel.set()
@@ -4340,6 +4343,45 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001
             _log_exception("viewerClosed")
 
+    # --- 内蔵テキストエディタ ---
+    def open_text_editor(self, path: str):
+        """内蔵テキストエディタ(editor/)の窓を開く(モードレス。いくつ開いても
+        よい)。開いた窓を返す。Ctrl+Enter の &TEDIT から来る。"""
+        import editor as editor_module  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        section = _section(self.app_settings)
+        geometry = section.get("editor_geometry")
+        if not (isinstance(geometry, list) and len(geometry) == 4
+                and all(isinstance(v, int) for v in geometry)
+                and any(s.availableGeometry().intersects(QRect(*geometry))
+                        for s in QGuiApplication.screens())):
+            geometry = None
+        editor_section = self.app_settings.get("editor") or {}
+        window = editor_module.create_window(
+            path, geometry=geometry,
+            keymap_overrides=editor_section.get("keymap"),
+            font=self.active.pane_font)
+        window.closed.connect(
+            lambda geo, w=window: self._on_text_editor_closed(w, geo))
+        self._text_editors.append(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self.log(f"エディタ: {path}")
+        return window
+
+    def _on_text_editor_closed(self, window, geometry) -> None:
+        try:
+            if window in self._text_editors:
+                self._text_editors.remove(window)
+            save_values(self.app_settings, self.settings_path,
+                        {"editor_geometry": geometry})
+            if self.isVisible():
+                self.activateWindow()
+                self.active.view.setFocus()
+        except Exception:  # noqa: BLE001
+            _log_exception("textEditorClosed")
+
     def cmd_open_assoc(self):
         entry = self.active.cursor_entry()
         if entry is None or entry.is_parent:
@@ -4794,6 +4836,20 @@ class FilerWindow(QWidget):
             files = [p for p in paths if not os.path.isdir(p)]
             if files:
                 self._open_in_editor(files)
+            return
+        if name == "TEDIT":
+            # 内蔵テキストエディタ(editor/)で開く。書庫の中は &EDIT と同じく
+            # 一時フォルダへ取り出してから(保存は取り出した側に書かれる)。
+            if pane.archive is not None and uses_targets:
+                entries = [e for e in pane.targets() if not e.is_dir]
+                if entries:
+                    self._extract_to_temp(
+                        entries,
+                        lambda taken: [self.open_text_editor(p) for p in taken])
+                return
+            files = [p for p in paths if not os.path.isdir(p)]
+            for p in files:
+                self.open_text_editor(p)
             return
         if name == "SHELL":
             folder = paths[0] if paths else pane.real_dir()

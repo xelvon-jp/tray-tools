@@ -12,7 +12,6 @@
 #
 # 文字コードは BOM → UTF-8 として正しいか(先頭の数 MB) → cp932 の順に決める。
 # 手で切り替えるキーはあふｗと同じ(Shift+O/S/U/I/E/J)。
-import codecs
 import os
 import threading
 import time
@@ -32,23 +31,19 @@ from PySide6.QtWidgets import (
 # ---------------------------------------------------------------
 # 文字コード(Qt を使わない部分。tests/test_filer.py で確かめる)
 # ---------------------------------------------------------------
-# 表示名と Python のコーデック名。キーはあふｗのテキストビュアの切り替えキー。
-ENCODING_KEYS = {
-    "O": "utf-8",
-    "S": "cp932",
-    "U": "utf-16-le",
-    "I": "utf-16-be",
-    "E": "euc_jp",
-    "J": "iso2022_jp",
-}
-ENCODING_LABELS = {
-    "utf-8": "UTF-8",
-    "cp932": "SJIS",
-    "utf-16-le": "UTF-16LE",
-    "utf-16-be": "UTF-16BE",
-    "euc_jp": "EUC-JP",
-    "iso2022_jp": "JIS",
-}
+# 判定と BOM・改行まわりは text_encoding.py に切り出した(ビュア・プレビュー・
+# 差分・エディタで共用)。ここでは従来どおり filer_viewer.detect_encoding の
+# 形でも引けるよう、名前をそのまま持ち込む。
+from text_encoding import (  # noqa: F401  (再 export が目的)
+    ENCODING_KEYS,
+    ENCODING_LABELS,
+    bom_length,
+    decode_line,
+    detect_encoding,
+    find_in_line,
+    newline_of,
+)
+
 DETECT_BYTES = 4 * 1024 * 1024   # UTF-8 として正しいかを見る長さ
 INDEX_CHUNK = 4 * 1024 * 1024    # 索引作りで一度に読む長さ
 MAX_LINE_BYTES = 64 * 1024       # 1行を表示・検索に読む上限(1行が巨大なファイル対策)
@@ -64,43 +59,6 @@ def markup_kind(path: str):
     """HTML / Markdown なら "html" | "markdown"、それ以外は None。"""
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     return MARKUP_KINDS.get(ext)
-
-
-def detect_encoding(head: bytes):
-    """(コーデック名, 本文の始まりの位置)。BOM があればそれ、無ければ UTF-8 として
-    正しいか(途中で切れた最後の1文字は見逃す)、だめなら cp932。"""
-    if head.startswith(codecs.BOM_UTF8):
-        return "utf-8", 3
-    if head.startswith(codecs.BOM_UTF16_LE):
-        return "utf-16-le", 2
-    if head.startswith(codecs.BOM_UTF16_BE):
-        return "utf-16-be", 2
-    decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    try:
-        decoder.decode(head, final=False)
-        return "utf-8", 0
-    except UnicodeDecodeError:
-        return "cp932", 0
-
-
-def bom_length(head: bytes, encoding: str) -> int:
-    """手で切り替えたときの本文の始まり。その文字コードの BOM があれば飛ばす。"""
-    if encoding == "utf-8" and head.startswith(codecs.BOM_UTF8):
-        return 3
-    if encoding == "utf-16-le" and head.startswith(codecs.BOM_UTF16_LE):
-        return 2
-    if encoding == "utf-16-be" and head.startswith(codecs.BOM_UTF16_BE):
-        return 2
-    return 0
-
-
-def newline_of(encoding: str) -> bytes:
-    """その文字コードでの改行(LF)のバイト列。行の区切りはこれで探す。"""
-    if encoding == "utf-16-le":
-        return b"\n\x00"
-    if encoding == "utf-16-be":
-        return b"\x00\n"
-    return b"\n"
 
 
 def scan_line_starts(data: bytes, base: int, newline: bytes, align: int, out, size: int) -> None:
@@ -125,18 +83,6 @@ def align_origin(out) -> int:
     return out[0] if len(out) else 0
 
 
-def decode_line(raw: bytes, encoding: str) -> str:
-    """1行ぶんのバイト列を文字にする(読めないバイトは置換文字)。行末の改行は落とす。"""
-    text = raw.decode(encoding, errors="replace")
-    return text.rstrip("\r\n")
-
-
-def find_in_line(text: str, word: str):
-    """大文字小文字を無視して word を探す。見つかった桁(文字単位)か None。"""
-    if not word:
-        return None
-    index = text.casefold().find(word.casefold())
-    return index if index >= 0 else None
 
 
 # ---------------------------------------------------------------

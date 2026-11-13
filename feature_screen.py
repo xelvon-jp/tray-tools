@@ -1225,8 +1225,8 @@ class ScreenFeature:
         (パスが渡されていたら、そのファイルを開き直す)。
 
         窓は常駐の中で開く(あっふ のビュアと同じ)。常駐の再起動で
-        道連れになるので、未保存の確認は窓側が出す。restart_blockers に
-        足すかどうかは、実地で様子を見てから決める(第1段では足さない)。"""
+        道連れになるので、未保存の窓は restart_blockers に数える
+        (レビュー req-20261113-99 の重大3)。"""
         import editor as editor_module  # 使うときに読む(起動を軽く保つ)
 
         if self.text_editor is not None:
@@ -3746,6 +3746,22 @@ class ScreenFeature:
             # 予約は再起動で消える。寝るつもりだったのに寝ないのは、
             # 気づきにくいぶん厄介。
             blockers.append("スリープ予約")
+        editor = getattr(self, "text_editor", None)
+        if editor is not None:
+            # 未保存のエディタは、再起動で編集中の内容が消える。無人の
+            # 自動反映では「保存しますか」の窓で古いプロセスが居座る
+            # 事故にもなるので、巻き添えに数える(レビュー
+            # req-20261113-99 の重大3)。
+            try:
+                import editor as editor_module
+
+                dirty, unreadable = editor_module.dirty_window_state([editor])
+                if dirty:
+                    blockers.append(f"未保存のエディタ {dirty}窓")
+                if unreadable:
+                    blockers.append("エディタ(状態を読めず)")
+            except Exception:  # noqa: BLE001  読めないなら「あるかも」に倒す
+                blockers.append("エディタ(状態を読めず)")
         return blockers
 
     def restart_from_ipc(self) -> str:
@@ -3776,6 +3792,26 @@ class ScreenFeature:
             if self._restart_app is None:
                 self._notify("再起動", "この起動のしかたでは再起動できません")
                 return
+            editor = getattr(self, "text_editor", None)
+            if editor is not None:
+                # 未保存のエディタがあるまま再起動すると、編集中の内容が
+                # 消えるうえ、「保存しますか」で止まって二重に動く。
+                # 先に確かめる(restart_blockers と同じ判定)。
+                try:
+                    import editor as editor_module
+
+                    dirty, unreadable = editor_module.dirty_window_state(
+                        [editor])
+                except Exception:  # noqa: BLE001  読めないなら止まる側に倒す
+                    dirty, unreadable = 0, 1
+                if dirty or unreadable:
+                    answer = QMessageBox.question(
+                        self.menu, "再起動",
+                        "未保存のエディタがあります。再起動すると編集中の"
+                        "内容が失われます。\nそれでも再起動しますか？",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if answer != QMessageBox.Yes:
+                        return
             if self._restart_app():
                 # メニューの exec() が回しているイベントループの中から quit() を呼ぶと、
                 # そのループを抜けるだけでアプリ本体が終わらないことがある。実際、

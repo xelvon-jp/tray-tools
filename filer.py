@@ -3665,6 +3665,28 @@ class FilerWindow(QWidget):
                     f"待ち {len(self._op_queue)}件）。\n{verb}？",
                     default_yes=False):
                 return False
+        editors = getattr(self, "_text_editors", None)
+        if editors:
+            # 未保存のエディタは、閉じると編集中の内容が消える。窓側の
+            # closeEvent でも確認は出るが、再起動(Shift+F5 含む)は
+            # ここを先に通るので、まとめて止める(レビュー
+            # req-20261113-99 の重大3)。
+            try:
+                import editor as editor_module
+
+                dirty, unreadable = editor_module.dirty_window_state(editors)
+            except Exception:  # noqa: BLE001  読めないなら止まる側に倒す
+                dirty, unreadable = 0, 1
+            if dirty or unreadable:
+                if dirty:
+                    what = f"未保存のエディタが {dirty}窓"
+                else:
+                    what = "状態の読めないエディタの窓"
+                if not self.confirm(
+                        "あっふ",
+                        f"{what}あります。\n{verb}？",
+                        default_yes=False):
+                    return False
         return True
 
     def safe_emit(self, signal, payload) -> bool:

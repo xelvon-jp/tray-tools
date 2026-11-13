@@ -25,13 +25,15 @@ class FakeTransport:
     """copilot_loop.Copilot の代わり。fail_at で落とす場所を指定できる。"""
 
     def __init__(self, *, send_ok=True, idle=True, response="応答の本文",
-                 blocks=("print(1)",), snapshot=100, fail_at=None):
+                 blocks=("print(1)",), snapshot=100, fail_at=None,
+                 input_value=None):
         self._send_ok = send_ok
         self._idle = idle
         self._response = response
         self._blocks = list(blocks)
         self._snapshot = snapshot
         self._fail_at = fail_at
+        self._input_value = input_value
         self.sent = []
         self.new_response_args = None
         self.closed = False
@@ -43,6 +45,10 @@ class FakeTransport:
     def snapshot_length(self):
         self._maybe_fail("snapshot")
         return self._snapshot
+
+    def input_text(self):
+        self._maybe_fail("input")
+        return self._input_value
 
     def send_prompt(self, text):
         self._maybe_fail("send")
@@ -142,6 +148,151 @@ def test_response_failure_is_message():
     assert session.send("質問").ok
     response = session.last_response()
     assert not response.ok and "取り出せませんでした" in response.message
+
+
+def test_send_blocked_by_existing_input():
+    """入力欄に書きかけの文があるときは、送らずに確認待ちで返す。"""
+    fake = FakeTransport(input_value="書きかけの文")
+    result = copilot_io.send_text("質問です", transport=fake)
+    assert not result.ok and result.needs_confirm
+    assert "書きかけ" in result.message
+    assert fake.sent == []  # まだ送っていない
+
+
+def test_send_forced_despite_existing_input():
+    """確認が取れたあとは force=True で送り直せる。"""
+    fake = FakeTransport(input_value="書きかけの文")
+    result = copilot_io.send_text("質問です", transport=fake, force=True)
+    assert result.ok and not result.needs_confirm
+    assert fake.sent == ["質問です"]
+
+
+def test_send_ignores_blank_input():
+    """入力欄が空白だけなら、書きかけとはみなさない。"""
+    fake = FakeTransport(input_value="  \n ")
+    result = copilot_io.send_text("質問です", transport=fake)
+    assert result.ok and fake.sent == ["質問です"]
+
+
+# ---------------------------------------------------------------------------
+# SubprocessTransport(fake の裏方実行役)
+# ---------------------------------------------------------------------------
+class FakeRunner:
+    """裏方プロセスの代わり。op ごとに決まった応答を返す。"""
+
+    def __init__(self, *, input_value=None, error=None, raise_error=None):
+        self._input_value = input_value
+        self._error = error
+        self._raise_error = raise_error
+        self.requests = []
+
+    def __call__(self, request, timeout):
+        self.requests.append(request["op"])
+        if self._raise_error is not None:
+            raise self._raise_error
+        if self._error is not None:
+            return {"ok": False, "error": self._error}
+        op = request["op"]
+        if op == "snapshot":
+            return {"ok": True, "length": 777}
+        if op == "input":
+            return {"ok": True, "input_text": self._input_value}
+        if op == "send":
+            return {"ok": True, "sent": True}
+        if op == "wait":
+            return {"ok": True, "done": True, "elapsed": 2.0}
+        if op == "response":
+            assert request["previous_length"] == 777
+            return {"ok": True, "text": "裏方からの応答"}
+        if op == "blocks":
+            return {"ok": True, "blocks": ["y = 2"]}
+        raise AssertionError(f"知らない op: {op}")
+
+
+def test_subprocess_session_flow():
+    runner = FakeRunner()
+    session = copilot_io.CopilotSession(copilot_io.SubprocessTransport(runner))
+    assert session.send("聞きたいこと").ok
+    waited = session.wait(timeout=10)
+    assert waited.ok and waited.elapsed == 2.0
+    response = session.last_response()
+    assert response.ok and response.text == "裏方からの応答"
+    assert response.code_blocks == ["y = 2"]
+    # 操作は全部裏方へ流れ、順番も往復のとおり
+    assert runner.requests == ["snapshot", "input", "send",
+                               "wait", "response", "blocks"]
+
+
+def test_subprocess_no_window():
+    runner = FakeRunner(error="Copilot の窓が見つかりません")
+    result = copilot_io.send_text(
+        "質問です", transport=copilot_io.SubprocessTransport(runner))
+    assert not result.ok
+    assert "窓が見つかりません" in result.message
+
+
+def test_subprocess_input_occupied_needs_confirm():
+    runner = FakeRunner(input_value="書きかけの文")
+    transport = copilot_io.SubprocessTransport(runner)
+    result = copilot_io.send_text("質問です", transport=transport)
+    assert not result.ok and result.needs_confirm
+    assert "send" not in runner.requests  # 裏方でも送っていない
+    forced = copilot_io.send_text("質問です", transport=transport, force=True)
+    assert forced.ok
+    assert runner.requests.count("send") == 1
+
+
+def test_subprocess_worker_timeout_is_failure_result():
+    runner = FakeRunner(raise_error=copilot_io.WorkerError(
+        "Copilot の裏方が 90 秒以内に終わりませんでした"))
+    result = copilot_io.send_text(
+        "質問です", transport=copilot_io.SubprocessTransport(runner))
+    assert not result.ok
+    assert "裏方" in result.message and "終わりませんでした" in result.message
+
+
+# ---------------------------------------------------------------------------
+# run_worker(本物のサブプロセス。UIA は叩かない小さなスクリプトで確かめる)
+# ---------------------------------------------------------------------------
+def _script_argv(code):
+    return [sys.executable, "-c", code]
+
+
+def test_run_worker_ok():
+    argv = _script_argv(
+        "import json; print(json.dumps({'ok': True, 'length': 42}))")
+    response = copilot_io.run_worker({"op": "snapshot"}, timeout=30, argv=argv)
+    assert response == {"ok": True, "length": 42}
+
+
+def test_run_worker_garbage_is_error():
+    argv = _script_argv("print('JSON ではない')")
+    try:
+        copilot_io.run_worker({"op": "snapshot"}, timeout=30, argv=argv)
+    except copilot_io.WorkerError as e:
+        assert "異常終了" in str(e)
+    else:
+        raise AssertionError("WorkerError になるはず")
+
+
+def test_run_worker_timeout_is_error():
+    argv = _script_argv("import time; time.sleep(30)")
+    try:
+        copilot_io.run_worker({"op": "snapshot"}, timeout=1, argv=argv)
+    except copilot_io.WorkerError as e:
+        assert "終わりませんでした" in str(e)
+    else:
+        raise AssertionError("WorkerError になるはず")
+
+
+def test_worker_script_fails_cleanly_without_uia():
+    """本物の裏方を起こしても、UIA の無い環境では例外でなく
+    失敗の結果が返る(窓が無い実機でも同じ形になる)。"""
+    session = copilot_io.CopilotSession(
+        copilot_io.SubprocessTransport(op_timeout=60))
+    result = session.send("質問です")
+    assert not result.ok and result.message
+    session.close()
 
 
 def main():

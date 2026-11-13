@@ -240,6 +240,95 @@ def test_new_document_after_discard():
         discard_close(window)
 
 
+def test_open_path_asks_before_discarding():
+    """未保存の編集があるときに別のファイルを開く経路(重大1)。
+    確認でキャンセルしたら内容が残り、破棄を選んだら開ける。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        first = os.path.join(tmp, "first.txt")
+        second = os.path.join(tmp, "second.txt")
+        Path(first).write_bytes("最初の文書\n".encode("utf-8"))
+        Path(second).write_bytes("次の文書\n".encode("utf-8"))
+        window = make_window(first)
+        try:
+            type_text(window, "X")
+            assert window.is_dirty()
+            window.ask_save_changes = lambda: "cancel"
+            assert window.open_path(second) is False
+            assert window.text().startswith("X")  # 編集はそのまま残る
+            assert window.current_document().path == first
+            assert window.is_dirty()
+            window.ask_save_changes = lambda: "discard"
+            assert window.open_path(second) is True
+            assert window.text() == "次の文書\n"
+            assert not window.is_dirty()
+        finally:
+            discard_close(window)
+
+
+def test_open_path_with_save_answer():
+    """確認で「保存」を選んだら、元のファイルを書いてから開く。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        first = os.path.join(tmp, "first.txt")
+        second = os.path.join(tmp, "second.txt")
+        Path(first).write_bytes("前\n".encode("utf-8"))
+        Path(second).write_bytes("後\n".encode("utf-8"))
+        window = make_window(first)
+        try:
+            type_text(window, "Y")
+            window.ask_save_changes = lambda: "save"
+            assert window.open_path(second) is True
+            assert Path(first).read_bytes() == "Y前\n".encode("utf-8")
+            assert window.text() == "後\n"
+        finally:
+            discard_close(window)
+
+
+def test_send_selection_input_occupied_confirm_flow():
+    """入力欄に書きかけがあると、確認を挟んでから送り直す(重大2の補足)。"""
+    calls = []
+
+    def fake_sender(text, force=False):
+        calls.append(force)
+        if not force:
+            return copilot_io.SendResult(
+                False, "入力欄に書きかけの文があります", needs_confirm=True)
+        return copilot_io.SendResult(True, "送信できました(テスト)")
+
+    window = make_window(sender=fake_sender)
+    try:
+        window.ask_overwrite_input = lambda: True
+        window._edit.setPlainText("送りたい範囲")
+        window._edit.selectAll()
+        window.send_selection()
+        _wait_send(window)
+        assert calls == [False, True]  # 確認のあと force で送り直した
+        assert window.statusBar().currentMessage() == "送信できました(テスト)"
+    finally:
+        discard_close(window)
+
+
+def test_send_selection_input_occupied_declined():
+    """上書きの確認で断ったら、送り直さずに終わる。"""
+    calls = []
+
+    def fake_sender(text, force=False):
+        calls.append(force)
+        return copilot_io.SendResult(
+            False, "入力欄に書きかけの文があります", needs_confirm=True)
+
+    window = make_window(sender=fake_sender)
+    try:
+        window.ask_overwrite_input = lambda: False
+        window._edit.setPlainText("送りたい範囲")
+        window._edit.selectAll()
+        window.send_selection()
+        _wait_send(window)
+        assert calls == [False]  # 送り直していない
+        assert "送信をやめました" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

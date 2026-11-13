@@ -11,7 +11,9 @@
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
 #     スロットで投げ切るとプロセスごと終了する
 #   - Copilot への送信は別スレッドで走らせ、結果は Signal 経由で窓に戻す
-#     (ワーカースレッドから Qt を直接触らない。_AgentLoopBridge と同じ)
+#     (ワーカースレッドから Qt を直接触らない。_AgentLoopBridge と同じ)。
+#     UIA の実体は copilot_io の裏方プロセスが持つ(常駐の中で UIA を
+#     動かすと pycaw と同居して即死するため。copilot_io 側の作法)
 import os
 import threading
 
@@ -49,6 +51,25 @@ class _SendBridge(QObject):
     """送信スレッド → 窓への結果の受け渡し(オブジェクトは使い回す)。"""
 
     finished = Signal(object)
+
+
+def dirty_window_state(windows):
+    """エディタの窓の並びから、未保存の (件数, 状態を読めなかった件数) を返す。
+
+    再起動・終了の巻き添え判定(feature_screen.restart_blockers と
+    filer.confirm_losses)が共用する。読めない窓は「未保存があるかも」
+    側に倒すため、落とさず件数として返す。"""
+    dirty = 0
+    unreadable = 0
+    for window in windows or []:
+        if window is None:
+            continue
+        try:
+            if window.is_dirty():
+                dirty += 1
+        except Exception:  # noqa: BLE001  読めない窓は「あるかも」側に倒す
+            unreadable += 1
+    return dirty, unreadable
 
 
 class SaveOptionsDialog(QDialog):
@@ -119,6 +140,10 @@ class EditorWindow(QMainWindow):
         # (テストは QMessageBox を出さずにここを差す)。
         # 戻り値は "save" / "discard" / "cancel"。
         self.ask_save_changes = None
+        # Copilot の入力欄に書きかけの文があるとき、上書きして送って
+        # よいかの確認も差し替えられる(戻り値は bool)。
+        self.ask_overwrite_input = None
+        self._pending_send_text = None
 
         self._edit = QPlainTextEdit()
         self._edit.setFont(font if font is not None else QFont("Consolas", 10))
@@ -249,7 +274,12 @@ class EditorWindow(QMainWindow):
     # 開く・新規
     # ---------------------------------------------------------------
     def open_path(self, path) -> bool:
-        """ファイルを開く。失敗したら理由をステータスに出して False。"""
+        """ファイルを開く。失敗したら理由をステータスに出して False。
+
+        未保存の編集があるときは、先に確認する(黙って捨てない)。
+        __init__ からの初回は未編集なので、確認はそのまま通る。"""
+        if not self._confirm_discard():
+            return False
         try:
             doc = docmod.load_document(path)
         except OSError as e:
@@ -423,11 +453,21 @@ class EditorWindow(QMainWindow):
             return
         # QPlainTextEdit の選択文字列は段落の区切りが U+2029 になる。
         text = cursor.selectedText().replace("\u2029", "\n")
+        self._start_send(text, force=False)
+
+    def _start_send(self, text, force):
+        """送信を裏のスレッドで始める。sender の呼び方は
+        sender(text) が通常、sender(text, True) が「入力欄の上書きを
+        承知で送る」再送(copilot_io.send_text の force 引数)。"""
+        self._pending_send_text = text
         self.statusBar().showMessage("Copilot へ送信しています…")
 
         def run():
             try:
-                result = self._sender(text)
+                if force:
+                    result = self._sender(text, True)
+                else:
+                    result = self._sender(text)
             except Exception as e:  # noqa: BLE001  理由は利用者への文にする
                 result = copilot_io.SendResult(
                     False, f"Copilot に送れませんでした（{e}）")
@@ -439,11 +479,40 @@ class EditorWindow(QMainWindow):
 
     def _on_send_finished(self, result):
         self._send_thread = None
+        if getattr(result, "needs_confirm", False):
+            # Copilot の入力欄に書きかけの文がある。そのまま送ると
+            # 上書きされて消えるので、利用者に確かめてから送り直す。
+            if self._confirm_overwrite_input():
+                text = self._pending_send_text
+                if text:
+                    self._start_send(text, force=True)
+                    return
+            self.statusBar().showMessage(
+                "送信をやめました（入力欄の文はそのままです）", 8000)
+            return
         self.statusBar().showMessage(result.message, 0 if not result.ok else 8000)
+
+    def _confirm_overwrite_input(self) -> bool:
+        """Copilot の入力欄の書きかけを上書きして送ってよいか。"""
+        if self.ask_overwrite_input is not None:
+            return bool(self.ask_overwrite_input())
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            "Copilot の入力欄に書きかけの文があります。\n"
+            "そのまま送ると、選択している範囲で上書きされて、"
+            "書きかけの文は消えます。送りますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     # ---------------------------------------------------------------
     # テスト・呼び側からの参照
     # ---------------------------------------------------------------
+    def is_dirty(self) -> bool:
+        """未保存の変更があるか。再起動・終了の巻き添え判定
+        (feature_screen.restart_blockers、filer.confirm_losses)から呼ばれる。"""
+        return self._edit.document().isModified()
+
     def current_document(self) -> docmod.TextDocument:
         self._sync_text()
         return self._doc

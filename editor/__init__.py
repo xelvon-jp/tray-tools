@@ -10,7 +10,7 @@
 #
 # 既存のビューワー(filer_viewer)は「見る」ための作りなので拡張しない。
 # 文字コードの判定だけ text_encoding.py に切り出して共用している。
-from editor.window import EditorWindow
+from editor.window import EditorWindow, dirty_window_state
 
 
 def create_window(path=None, **kwargs) -> EditorWindow:
@@ -19,4 +19,4 @@ def create_window(path=None, **kwargs) -> EditorWindow:
     return EditorWindow(path, **kwargs)
 
 
-__all__ = ["EditorWindow", "create_window"]
+__all__ = ["EditorWindow", "create_window", "dirty_window_state"]

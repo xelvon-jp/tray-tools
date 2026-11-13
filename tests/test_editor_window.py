@@ -20,12 +20,21 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-from PySide6.QtGui import QAction  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QAction,
+    QGuiApplication,
+    QTextCursor,
+    QWheelEvent,
+)
+from PySide6.QtWidgets import QApplication, QDialog, QToolBar  # noqa: E402
 
 import copilot_io  # noqa: E402
 import editor  # noqa: E402
+from editor import outline  # noqa: E402
+from editor.highlighter import STAR_BACKGROUND  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
+from editor.window import PatternSettingsDialog  # noqa: E402
 
 APP = None
 
@@ -325,6 +334,307 @@ def test_send_selection_input_occupied_declined():
         _wait_send(window)
         assert calls == [False]  # 送り直していない
         assert "送信をやめました" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
+def _wheel_event(delta_y, modifiers):
+    return QWheelEvent(
+        QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, delta_y),
+        Qt.MouseButton.NoButton, modifiers,
+        Qt.ScrollPhase.NoScrollPhase, False)
+
+
+def test_line_numbers_toggle_and_persist():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        assert window.line_numbers_visible()  # 既定はオン
+        assert window._edit.line_number_area_width() > 0
+        assert window._act_line_numbers.isChecked()
+        window.set_line_numbers_visible(False)
+        assert not window.line_numbers_visible()
+        assert window._edit.line_number_area_width() == 0
+        assert not window._act_line_numbers.isChecked()
+        assert saved[-1] == {"show_line_numbers": False}
+        window._act_line_numbers.setChecked(True)  # アクションから戻す
+        assert window.line_numbers_visible()
+        assert saved[-1] == {"show_line_numbers": True}
+    finally:
+        discard_close(window)
+
+
+def test_line_numbers_off_from_settings():
+    window = make_window(editor_settings={"show_line_numbers": False})
+    try:
+        assert not window.line_numbers_visible()
+        assert window._edit.line_number_area_width() == 0
+        assert not window._act_line_numbers.isChecked()
+    finally:
+        discard_close(window)
+
+
+def test_font_default_ms_gothic():
+    window = make_window()
+    try:
+        assert window._edit.font().family() == "MS Gothic"
+        assert window.font_size() == 10
+    finally:
+        discard_close(window)
+
+
+def test_font_from_settings():
+    window = make_window(
+        editor_settings={"font_family": "Consolas", "font_size": 14})
+    try:
+        assert window._edit.font().family() == "Consolas"
+        assert window.font_size() == 14
+    finally:
+        discard_close(window)
+
+
+def test_ctrl_wheel_changes_font_size():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        edit = window._edit
+        base = window.font_size()
+        edit.wheelEvent(_wheel_event(
+            120, Qt.KeyboardModifier.ControlModifier))
+        assert window.font_size() == base + 1
+        assert saved[-1] == {"font_size": base + 1}
+        edit.wheelEvent(_wheel_event(
+            -120, Qt.KeyboardModifier.ControlModifier))
+        assert window.font_size() == base
+        # Ctrl 無しのホイールはスクロールで、大きさは変わらない。
+        edit.wheelEvent(_wheel_event(
+            120, Qt.KeyboardModifier.NoModifier))
+        assert window.font_size() == base
+    finally:
+        discard_close(window)
+
+
+def test_font_size_clamp():
+    window = make_window()
+    try:
+        edit = window._edit
+        edit.set_font_size(32)
+        assert window.font_size() == 32
+        edit.wheelEvent(_wheel_event(
+            120, Qt.KeyboardModifier.ControlModifier))
+        assert window.font_size() == 32  # 上限で止まる
+        edit.set_font_size(7)
+        edit.wheelEvent(_wheel_event(
+            -120, Qt.KeyboardModifier.ControlModifier))
+        assert window.font_size() == 7  # 下限で止まる
+        edit.set_font_size(100)
+        assert window.font_size() == 32
+    finally:
+        discard_close(window)
+
+
+def test_toolbar_has_main_actions():
+    window = make_window()
+    try:
+        toolbars = window.findChildren(QToolBar)
+        assert len(toolbars) == 1
+        actions = toolbars[0].actions()
+        for action in (window._act_open, window._act_save,
+                       window._act_save_as, window._act_find,
+                       window._act_send, window._act_outline,
+                       window._act_line_numbers):
+            assert action in actions
+    finally:
+        discard_close(window)
+
+
+def test_outline_pane_tree_and_jump():
+    window = make_window()
+    try:
+        window._edit.setPlainText(
+            "■ 大見出し\n本文\n  ■ 小見出し\n■ 次の大見出し")
+        window._rebuild_outline()
+        tree = window._outline_pane.tree()
+        assert tree.topLevelItemCount() == 2
+        first = tree.topLevelItem(0)
+        assert first.text(0) == "■ 大見出し"
+        assert first.childCount() == 1
+        assert first.child(0).text(0) == "■ 小見出し"
+        # 子の項目を選ぶと、その行へカーソルが移る。
+        tree.itemClicked.emit(first.child(0), 0)
+        assert window._edit.textCursor().blockNumber() == 2
+    finally:
+        discard_close(window)
+
+
+def test_outline_pane_toggle_and_persist():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        assert window.outline_pane_visible()  # 既定はオン
+        window.set_outline_pane_visible(False)
+        assert not window.outline_pane_visible()
+        assert not window._act_outline.isChecked()
+        assert saved[-1] == {"show_outline_pane": False}
+    finally:
+        discard_close(window)
+    window2 = make_window(editor_settings={"show_outline_pane": False})
+    try:
+        assert not window2.outline_pane_visible()
+    finally:
+        discard_close(window2)
+
+
+def test_outline_pane_shows_file_info():
+    window = make_window()
+    try:
+        window._edit.setPlainText("1行目\n2行目")
+        pane = window._outline_pane
+        assert pane._path_label.text() == "（無題）"
+        assert "UTF-8" in pane._format_label.text()
+        assert "BOM なし" in pane._format_label.text()
+        assert pane._counts_label.text() == "2 行 / 7 文字"
+    finally:
+        discard_close(window)
+
+
+def test_window_custom_pattern_from_settings():
+    window = make_window(editor_settings={"outline_pattern": r"^第.+章"})
+    try:
+        window._edit.setPlainText("第一章 始まり\n本文")
+        window._rebuild_outline()
+        assert window._outline_pane.tree().topLevelItemCount() == 1
+    finally:
+        discard_close(window)
+
+
+def test_window_set_patterns_reflects_immediately():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        window._edit.setPlainText("第一章 始まり\n本文\n第二章 続き")
+        window._set_patterns(r"^第.+章", r"^!{3,}")
+        assert window._outline_pane.tree().topLevelItemCount() == 2
+        assert saved[-1] == {
+            "outline_pattern": r"^第.+章",
+            "highlight_pattern": r"^!{3,}",
+        }
+    finally:
+        discard_close(window)
+
+
+def test_pattern_dialog_rejects_invalid_regex():
+    app()
+    dialog = PatternSettingsDialog(
+        outline.DEFAULT_OUTLINE_PATTERN, outline.DEFAULT_HIGHLIGHT_PATTERN)
+    try:
+        dialog._outline_edit.setText("[abc")
+        dialog.accept()
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert dialog.validation_error()
+        assert "不正" in dialog._error_label.text()
+        dialog._outline_edit.setText("^■")
+        dialog.accept()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert dialog.values()[0] == "^■"
+    finally:
+        dialog.deleteLater()
+        app().processEvents()
+
+
+def test_pattern_dialog_reset_defaults():
+    app()
+    dialog = PatternSettingsDialog("^x", "^y")
+    try:
+        dialog._reset_button.click()
+        assert dialog.values() == (
+            outline.DEFAULT_OUTLINE_PATTERN,
+            outline.DEFAULT_HIGHLIGHT_PATTERN)
+    finally:
+        dialog.deleteLater()
+        app().processEvents()
+
+
+def test_star_line_highlight():
+    window = make_window()
+    try:
+        window._edit.setPlainText("普通の行\n★ 重要な行\n  ☆ メモ")
+        window._highlighter.rehighlight()
+        blocks = []
+        block = window._edit.document().firstBlock()
+        while block.isValid():
+            blocks.append(block)
+            block = block.next()
+        formats = [b.layout().formats() for b in blocks]
+        assert formats[0] == []
+        assert formats[1], "星印の行に書式が付いていません"
+        assert (formats[1][0].format.background().color()
+                == STAR_BACKGROUND)
+        assert formats[2], "空白の後の星印の行に書式が付いていません"
+        assert (formats[2][0].format.background().color()
+                == STAR_BACKGROUND)
+    finally:
+        discard_close(window)
+
+
+def test_cut_to_end_of_line():
+    window = make_window()
+    try:
+        window._edit.setPlainText("hello world")
+        window._edit.document().setModified(False)
+        cursor = window._edit.textCursor()
+        cursor.setPosition(5)
+        window._edit.setTextCursor(cursor)
+        window.cut_to_end_of_line()
+        assert window.text() == "hello"
+        assert QGuiApplication.clipboard().text() == " world"
+        assert window.is_dirty()
+        window._edit.undo()  # 1回の undo で戻る
+        assert window.text() == "hello world"
+    finally:
+        discard_close(window)
+
+
+def test_cut_to_end_at_block_end_does_nothing():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc")
+        window._edit.document().setModified(False)
+        cursor = window._edit.textCursor()
+        cursor.setPosition(3)
+        window._edit.setTextCursor(cursor)
+        QGuiApplication.clipboard().setText("前のクリップボード")
+        window.cut_to_end_of_line()
+        assert window.text() == "abc"
+        assert QGuiApplication.clipboard().text() == "前のクリップボード"
+        assert not window.is_dirty()
+    finally:
+        discard_close(window)
+
+
+def test_cut_to_end_with_selection_cuts_selection():
+    window = make_window()
+    try:
+        window._edit.setPlainText("hello world")
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(4, QTextCursor.MoveMode.KeepAnchor)
+        window._edit.setTextCursor(cursor)
+        window.cut_to_end_of_line()
+        assert window.text() == "o world"
+        assert QGuiApplication.clipboard().text() == "hell"
+    finally:
+        discard_close(window)
+
+
+def test_cut_to_end_keymap_default():
+    window = make_window()
+    try:
+        assert DEFAULT_KEYMAP["cut_to_end"] == "Ctrl+K"
+        action = next(
+            a for a in window.findChildren(QAction)
+            if a.text().startswith("行末まで切り取り"))
+        assert action.shortcut().toString() == "Ctrl+K"
     finally:
         discard_close(window)
 

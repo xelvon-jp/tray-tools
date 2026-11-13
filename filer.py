@@ -4382,6 +4382,8 @@ class FilerWindow(QWidget):
         window = editor_module.create_window(
             path, geometry=geometry,
             keymap_overrides=editor_section.get("keymap"),
+            editor_settings=editor_section,
+            on_settings_change=self._save_editor_settings,
             font=self.active.pane_font)
         window.closed.connect(
             lambda geo, w=window: self._on_text_editor_closed(w, geo))
@@ -4391,6 +4393,18 @@ class FilerWindow(QWidget):
         window.activateWindow()
         self.log(f"エディタ: {path}")
         return window
+
+    def _save_editor_settings(self, updates) -> None:
+        """エディタの表示・フォント・正規表現の変更を editor 節へ保存する
+        (窓側の on_settings_change から差分だけ渡ってくる)。"""
+        try:
+            settings_module.update_settings_section(
+                "editor", updates, self.settings_path)
+            section = self.app_settings.get("editor")
+            if isinstance(section, dict):
+                section.update(updates)
+        except Exception:  # noqa: BLE001  覚えられないだけ。操作は止めない
+            _log_exception("editorSettingsSave")
 
     def _on_text_editor_closed(self, window, geometry) -> None:
         try:

@@ -1241,10 +1241,23 @@ class ScreenFeature:
                 and all(isinstance(v, int) for v in geometry)):
             geometry = None
         window = editor_module.create_window(
-            path, geometry=geometry, keymap_overrides=section.get("keymap"))
+            path, geometry=geometry, keymap_overrides=section.get("keymap"),
+            editor_settings=section,
+            on_settings_change=self._save_editor_settings)
         window.closed.connect(self._on_text_editor_closed)
         self.text_editor = window
         window.show()
+
+    def _save_editor_settings(self, updates):
+        """エディタの表示・フォント・正規表現の変更を editor 節へ保存する
+        (窓側の on_settings_change から差分だけ渡ってくる)。"""
+        try:
+            update_settings_section("editor", updates, self.settings_path)
+            section = self.app_settings.get("editor")
+            if isinstance(section, dict):
+                section.update(updates)
+        except Exception:  # noqa: BLE001
+            self._log_failure("テキストエディタの設定の保存")
 
     def _on_text_editor_closed(self, geometry):
         window = self.text_editor

@@ -1,11 +1,20 @@
 # editor/window.py
-# テキストエディタの窓。土台は QPlainTextEdit、独立した QMainWindow。
+# テキストエディタの窓。土台は QPlainTextEdit(editor/text_edit.py の
+# TextEdit)、独立した QMainWindow。
 #
 # 第1段の範囲(仕様 docs/work-tools/spec.md 案B):
 #   開く / 新規 / 上書き保存 / 名前を付けて保存(文字コードと改行は
 #   開いたときのものを守り、変換は利用者が選んだときだけ)、
 #   検索(次へ・前へ)、選択範囲を Copilot に投げる(copilot_io 経由)。
 # マクロは第2段なので、ここには無い。
+#
+# 実機フィードバック(2026-11-13)で足したもの:
+#   行番号、リボン風ツールバー、左ペイン(アウトラインのツリー＋下部の
+#   ファイル情報)、フォントの既定(MS Gothic)と Ctrl+ホイールでの
+#   大きさ変更、星印の行の強調表示、アウトライン・強調の正規表現の
+#   設定ダイアログ、行末まで切り取り(Ctrl+K、命令 cut_to_end)。
+# 表示の状態とフォントと正規表現は settings の editor 節に保存され、
+# 呼び側が on_settings_change で受けて update_settings_section する。
 #
 # 落ちないための作法(このリポジトリの決まり):
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
@@ -15,10 +24,18 @@
 #     UIA の実体は copilot_io の裏方プロセスが持つ(常駐の中で UIA を
 #     動かすと pycaw と同居して即死するため。copilot_io 側の作法)
 import os
+import re
 import threading
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut, QTextCursor
+from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QFont,
+    QGuiApplication,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,8 +49,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -41,10 +58,20 @@ from PySide6.QtWidgets import (
 import copilot_io
 import text_encoding
 from editor import document as docmod
+from editor import outline
+from editor.highlighter import LineHighlighter
 from editor.keymap import merge_keymap
+from editor.outline_pane import OutlinePane
+from editor.text_edit import TextEdit
 
 APP_NAME = "テキストエディタ"
 ENCODING_ORDER = ["utf-8", "cp932", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
+# フォントの既定。settings の editor 節(font_family / font_size)で
+# 上書きできる。大きさは第1段までの既定(10pt)に合わせた。
+DEFAULT_FONT_FAMILY = "MS Gothic"
+DEFAULT_FONT_SIZE = 10
+# アウトラインの再構築を編集に追随させるときのまとめ待ち(ms)。
+OUTLINE_REBUILD_DELAY_MS = 300
 
 
 class _SendBridge(QObject):
@@ -70,6 +97,16 @@ def dirty_window_state(windows):
         except Exception:  # noqa: BLE001  読めない窓は「あるかも」側に倒す
             unreadable += 1
     return dirty, unreadable
+
+
+def _compile_or_default(text, default_rx, default_text):
+    """正規表現の文字列をコンパイルする。不正なら (既定, 既定の文字列)。
+
+    設定ファイルが手で書き換えられていても、窓が開かなくならないため。"""
+    try:
+        return re.compile(text), text
+    except re.error:
+        return default_rx, default_text
 
 
 class SaveOptionsDialog(QDialog):
@@ -120,14 +157,82 @@ class SaveOptionsDialog(QDialog):
                 self._bom.isChecked())
 
 
+class PatternSettingsDialog(QDialog):
+    """アウトラインとみなす行・強調表示する行の正規表現を編集する窓。
+
+    不正な正規表現はエラーを出して受け付けない(保存しない)。"""
+
+    def __init__(self, outline_pattern, highlight_pattern, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("アウトライン・強調の設定")
+        self._outline_edit = QLineEdit(outline_pattern)
+        self._highlight_edit = QLineEdit(highlight_pattern)
+        self._error_label = QLabel()
+        self._error_label.setWordWrap(True)
+        self._error_label.setStyleSheet("color: #c00000;")
+
+        form = QFormLayout(self)
+        form.addRow("アウトラインとみなす行の正規表現", self._outline_edit)
+        form.addRow("強調表示する行の正規表現", self._highlight_edit)
+        form.addRow(self._error_label)
+        row = QHBoxLayout()
+        self._reset_button = QPushButton("既定に戻す")
+        self._reset_button.clicked.connect(self._reset_defaults)
+        row.addWidget(self._reset_button)
+        row.addStretch(1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        row.addWidget(buttons)
+        form.addRow(row)
+
+    def _reset_defaults(self):
+        self._outline_edit.setText(outline.DEFAULT_OUTLINE_PATTERN)
+        self._highlight_edit.setText(outline.DEFAULT_HIGHLIGHT_PATTERN)
+        self._error_label.clear()
+
+    def validation_error(self):
+        """不正があれば利用者向けの文を、無ければ None を返す。"""
+        for label, value in (
+                ("アウトライン", self._outline_edit.text()),
+                ("強調表示", self._highlight_edit.text())):
+            if not value.strip():
+                return f"{label}の正規表現が空です"
+            try:
+                re.compile(value)
+            except re.error as e:
+                return f"{label}の正規表現が不正です（{e}）"
+        return None
+
+    def accept(self):  # noqa: N802  Qt の上書きではないが名前は Qt 側に合わせる
+        error = self.validation_error()
+        if error is not None:
+            self._error_label.setText(error)
+            return
+        super().accept()
+
+    def values(self):
+        """(アウトラインの正規表現, 強調表示の正規表現)。"""
+        return (self._outline_edit.text(), self._highlight_edit.text())
+
+
 class EditorWindow(QMainWindow):
     """テキストエディタの窓。閉じたら closed にジオメトリ([x, y, w, h])が流れる
-    (ビュアと同じ形。呼び側が設定へ保存する)。"""
+    (ビュアと同じ形。呼び側が設定へ保存する)。
+
+    editor_settings は settings の editor 節(辞書)。font_family /
+    font_size / show_line_numbers / show_outline_pane / outline_pattern /
+    highlight_pattern を読む(無いキーは既定)。表示やフォントや正規表現が
+    変わったら、差分を on_settings_change(辞書を受ける関数)へ流すので、
+    保存は呼び側の流儀(update_settings_section)に任せる。"""
 
     closed = Signal(object)
 
     def __init__(self, path=None, *, geometry=None, keymap_overrides=None,
-                 sender=None, font=None, parent=None):
+                 sender=None, font=None, editor_settings=None,
+                 on_settings_change=None, parent=None):
         super().__init__(parent)
         self._doc = docmod.TextDocument()
         self._keymap = merge_keymap(keymap_overrides)
@@ -144,24 +249,69 @@ class EditorWindow(QMainWindow):
         # よいかの確認も差し替えられる(戻り値は bool)。
         self.ask_overwrite_input = None
         self._pending_send_text = None
+        self._on_settings_change = on_settings_change
+        section = editor_settings if isinstance(editor_settings, dict) else {}
 
-        self._edit = QPlainTextEdit()
-        self._edit.setFont(font if font is not None else QFont("Consolas", 10))
+        self._edit = TextEdit()
+        if font is not None:
+            edit_font = font
+        else:
+            family = section.get("font_family") or DEFAULT_FONT_FAMILY
+            size = section.get("font_size")
+            if not isinstance(size, int) or size <= 0:
+                size = DEFAULT_FONT_SIZE
+            edit_font = QFont(str(family), size)
+        self._edit.setFont(edit_font)
+        if not section.get("show_line_numbers", True):
+            self._edit.set_line_numbers_visible(False)
+
+        # アウトライン・強調の正規表現(実効値)。設定が空なら既定、
+        # 不正なら既定に倒す(窓が開かなくならないため)。
+        outline_rx, self._outline_pattern_text = _compile_or_default(
+            section.get("outline_pattern") or outline.DEFAULT_OUTLINE_PATTERN,
+            outline.DEFAULT_OUTLINE_RX, outline.DEFAULT_OUTLINE_PATTERN)
+        self._outline_rx = outline_rx
+        highlight_rx, self._highlight_pattern_text = _compile_or_default(
+            section.get("highlight_pattern")
+            or outline.DEFAULT_HIGHLIGHT_PATTERN,
+            outline.DEFAULT_HIGHLIGHT_RX, outline.DEFAULT_HIGHLIGHT_PATTERN)
+        self._highlighter = LineHighlighter(
+            self._edit.document(), highlight_rx)
+
+        self._outline_pane = OutlinePane()
+        self._outline_pane.jump_requested.connect(self._jump_to_line)
+        if not section.get("show_outline_pane", True):
+            self._outline_pane.setVisible(False)
+        self._outline_timer = QTimer(self)
+        self._outline_timer.setSingleShot(True)
+        self._outline_timer.setInterval(OUTLINE_REBUILD_DELAY_MS)
+        self._outline_timer.timeout.connect(self._rebuild_outline)
+
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
+        self._edit.font_size_changed.connect(self._on_font_size_changed)
+        self._edit.document().contentsChanged.connect(
+            self._on_contents_changed)
 
         self._find_bar = self._build_find_bar()
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self._edit)
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+        body_layout.addWidget(self._outline_pane)
+        body_layout.addWidget(self._edit, 1)
+        layout.addWidget(body)
         layout.addWidget(self._find_bar)
         self.setCentralWidget(central)
         self._find_bar.hide()
 
         self._build_menus()
+        self._build_toolbar()
         self._enc_label = QLabel()
         self._pos_label = QLabel()
         self.statusBar().addPermanentWidget(self._enc_label)
@@ -191,9 +341,12 @@ class EditorWindow(QMainWindow):
     def _build_menus(self):
         file_menu = self.menuBar().addMenu("ファイル(&F)")
         self._action("新規(&N)", self.new_document, "new", file_menu)
-        self._action("開く(&O)…", self.open_dialog, "open", file_menu)
-        self._action("上書き保存(&S)", lambda: self.save(), "save", file_menu)
-        self._action("名前を付けて保存(&A)…", self.save_as, "save_as", file_menu)
+        self._act_open = self._action(
+            "開く(&O)…", self.open_dialog, "open", file_menu)
+        self._act_save = self._action(
+            "上書き保存(&S)", lambda: self.save(), "save", file_menu)
+        self._act_save_as = self._action(
+            "名前を付けて保存(&A)…", self.save_as, "save_as", file_menu)
         file_menu.addSeparator()
         self._action("閉じる(&C)", self.close, "close_window", file_menu)
 
@@ -207,17 +360,53 @@ class EditorWindow(QMainWindow):
         self._action("コピー(&C)", self._edit.copy, None, edit_menu)
         self._action("貼り付け(&P)", self._edit.paste, None, edit_menu)
         self._action("すべて選択(&A)", self._edit.selectAll, None, edit_menu)
+        edit_menu.addSeparator()
+        self._act_cut_eol = self._action(
+            "行末まで切り取り(&K)", self.cut_to_end_of_line,
+            "cut_to_end", edit_menu)
 
         search_menu = self.menuBar().addMenu("検索(&S)")
-        self._action("検索(&F)…", self.show_find_bar, "find", search_menu)
+        self._act_find = self._action(
+            "検索(&F)…", self.show_find_bar, "find", search_menu)
         self._action("次を検索(&N)", lambda: self._do_find(True),
                      "find_next", search_menu)
         self._action("前を検索(&P)", lambda: self._do_find(False),
                      "find_prev", search_menu)
 
+        view_menu = self.menuBar().addMenu("表示(&V)")
+        self._act_outline = QAction("アウトライン(&O)", self)
+        self._act_outline.setCheckable(True)
+        self._act_outline.setChecked(self._outline_pane.isVisible())
+        self._act_outline.toggled.connect(self.set_outline_pane_visible)
+        view_menu.addAction(self._act_outline)
+        self._act_line_numbers = QAction("行番号(&L)", self)
+        self._act_line_numbers.setCheckable(True)
+        self._act_line_numbers.setChecked(self._edit.line_numbers_visible())
+        self._act_line_numbers.toggled.connect(self.set_line_numbers_visible)
+        view_menu.addAction(self._act_line_numbers)
+        view_menu.addSeparator()
+        self._action("アウトライン・強調の設定(&P)…",
+                     self.show_pattern_settings, None, view_menu)
+
         copilot_menu = self.menuBar().addMenu("Copilot(&C)")
-        self._action("選択範囲を Copilot に投げる(&S)", self.send_selection,
-                     "send_selection", copilot_menu)
+        self._act_send = self._action(
+            "選択範囲を Copilot に投げる(&S)", self.send_selection,
+            "send_selection", copilot_menu)
+
+    def _build_toolbar(self):
+        """リボン風のツールバー。メニューと同じ QAction を並べるので、
+        処理もチェック状態も二重にならない。"""
+        toolbar = QToolBar("操作", self)
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        for action in (self._act_open, self._act_save, self._act_save_as,
+                       self._act_find, self._act_send):
+            toolbar.addAction(action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._act_outline)
+        toolbar.addAction(self._act_line_numbers)
+        self.addToolBar(toolbar)
+        self._toolbar = toolbar
 
     def _build_find_bar(self):
         bar = QFrame()
@@ -244,6 +433,127 @@ class EditorWindow(QMainWindow):
         return bar
 
     # ---------------------------------------------------------------
+    # 設定の保存(呼び側へ差分を流す)
+    # ---------------------------------------------------------------
+    def _persist_settings(self, updates):
+        """表示・フォント・正規表現の変更を呼び側へ渡す。
+
+        スロットから呼ばれるので、保存に失敗しても窓を落とさない。"""
+        if self._on_settings_change is None:
+            return
+        try:
+            self._on_settings_change(dict(updates))
+        except Exception:  # noqa: BLE001  保存の失敗で編集を止めない
+            self.statusBar().showMessage("設定を保存できませんでした", 4000)
+
+    # ---------------------------------------------------------------
+    # 表示の切り替え
+    # ---------------------------------------------------------------
+    def set_outline_pane_visible(self, visible):
+        visible = bool(visible)
+        self._outline_pane.setVisible(visible)
+        if self._act_outline.isChecked() != visible:
+            blocker = QSignalBlocker(self._act_outline)
+            self._act_outline.setChecked(visible)
+        self._persist_settings({"show_outline_pane": visible})
+
+    def outline_pane_visible(self) -> bool:
+        return self._outline_pane.isVisible()
+
+    def set_line_numbers_visible(self, visible):
+        visible = bool(visible)
+        self._edit.set_line_numbers_visible(visible)
+        if self._act_line_numbers.isChecked() != visible:
+            blocker = QSignalBlocker(self._act_line_numbers)
+            self._act_line_numbers.setChecked(visible)
+        self._persist_settings({"show_line_numbers": visible})
+
+    def line_numbers_visible(self) -> bool:
+        return self._edit.line_numbers_visible()
+
+    def font_size(self) -> int:
+        return self._edit.font_size()
+
+    def _on_font_size_changed(self, size):
+        self._persist_settings({"font_size": size})
+
+    # ---------------------------------------------------------------
+    # アウトラインと左ペインの情報
+    # ---------------------------------------------------------------
+    def _on_contents_changed(self):
+        self._outline_timer.start()
+        self._refresh_pane_counts()
+
+    def _rebuild_outline(self):
+        entries = outline.extract_outline(
+            self._edit.toPlainText(), self._outline_rx)
+        self._outline_pane.set_outline(outline.build_outline_tree(entries))
+
+    def _jump_to_line(self, line_number):
+        document = self._edit.document()
+        if line_number < 0 or line_number >= document.blockCount():
+            return
+        block = document.findBlockByLineNumber(line_number)
+        cursor = QTextCursor(block)
+        self._edit.setTextCursor(cursor)
+        self._edit.centerCursor()
+        self._edit.setFocus()
+
+    def _file_size_text(self):
+        path = self._doc.path
+        if path:
+            try:
+                return f"{os.path.getsize(path):,} バイト"
+            except OSError:
+                pass
+        return "—"
+
+    def _refresh_pane_info(self):
+        label = text_encoding.ENCODING_LABELS.get(self._doc.encoding,
+                                                  self._doc.encoding)
+        format_text = (
+            f"{label} / BOM {'あり' if self._doc.bom else 'なし'} / "
+            f"{docmod.NEWLINE_LABELS.get(self._doc.newline, '')}")
+        if self._doc.lossy_decode:
+            format_text += " / 一部読み替えあり"
+        self._outline_pane.set_file_info(
+            path=self._doc.path, format_text=format_text,
+            size_text=self._file_size_text())
+        self._refresh_pane_counts()
+
+    def _refresh_pane_counts(self):
+        self._outline_pane.set_counts(
+            self._edit.document().blockCount(),
+            len(self._edit.toPlainText()))
+
+    # ---------------------------------------------------------------
+    # アウトライン・強調の正規表現の設定
+    # ---------------------------------------------------------------
+    def show_pattern_settings(self):
+        try:
+            dialog = PatternSettingsDialog(
+                self._outline_pattern_text, self._highlight_pattern_text,
+                self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                outline_text, highlight_text = dialog.values()
+                self._set_patterns(outline_text, highlight_text)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"設定を開けませんでした ({e})")
+
+    def _set_patterns(self, outline_text, highlight_text):
+        """正規表現を差し替え、開いている窓へ即反映して保存する。"""
+        self._outline_pattern_text = outline_text
+        self._highlight_pattern_text = highlight_text
+        self._outline_rx = outline.compile_pattern(outline_text)
+        self._highlighter.set_pattern(
+            outline.compile_pattern(highlight_text))
+        self._rebuild_outline()
+        self._persist_settings({
+            "outline_pattern": outline_text,
+            "highlight_pattern": highlight_text,
+        })
+
+    # ---------------------------------------------------------------
     # 表示の更新
     # ---------------------------------------------------------------
     def _refresh_title(self):
@@ -264,11 +574,14 @@ class EditorWindow(QMainWindow):
         line = cursor.blockNumber() + 1
         column = cursor.positionInBlock() + 1
         self._pos_label.setText(f"{line} 行 {column} 桁")
+        self._outline_pane.set_cursor_position(line, column)
 
     def _refresh_all(self):
         self._refresh_title()
         self._refresh_status_labels()
         self._refresh_position()
+        self._refresh_pane_info()
+        self._rebuild_outline()
 
     # ---------------------------------------------------------------
     # 開く・新規
@@ -399,6 +712,33 @@ class EditorWindow(QMainWindow):
         g = self.geometry()
         self.closed.emit([g.x(), g.y(), g.width(), g.height()])
         super().closeEvent(event)
+
+    # ---------------------------------------------------------------
+    # 編集(標準に無いもの)
+    # ---------------------------------------------------------------
+    def cut_to_end_of_line(self):
+        """行末まで切り取り(命令 cut_to_end、既定は Ctrl+K)。
+
+        選択範囲があれば通常の切り取り。無ければ、カーソル位置から
+        行末まで(改行そのものは含めない)を切り取ってクリップボードへ
+        入れる。行末にカーソルがあるときは何もしない。削除は1回の
+        undo で戻せる単位にする。"""
+        cursor = self._edit.textCursor()
+        if cursor.hasSelection():
+            self._edit.cut()
+            return
+        if cursor.atBlockEnd():
+            return
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                            QTextCursor.MoveMode.KeepAnchor)
+        text = cursor.selectedText()
+        if not text:
+            return
+        QGuiApplication.clipboard().setText(text)
+        cursor.beginEditBlock()
+        cursor.removeSelectedText()
+        cursor.endEditBlock()
+        self._edit.setTextCursor(cursor)
 
     # ---------------------------------------------------------------
     # 検索

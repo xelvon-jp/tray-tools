@@ -107,12 +107,85 @@ def test_numbered_line_inside_paragraph_is_not_a_list():
     src = ["手順は1. 開く。2. 閉じて、確認する。"]
     once = fmt(src, 20)
     assert fmt(once, 20) == once
-    # 「1)」は段落を割り込める(CommonMark と同じ)。
+    # 「1)」のような閉じかっこ付きの番号は、段落を割り込まな
+    # い(日本語の文中の手順でよく出る形のため)。
     assert fmt(["説明です。", "1) 最初の項目。二文目。"], 80) == [
-        "説明です。", "1) 最初の項目。", "   二文目。"]
+        "説明です。", "1) 最初の項目。", "二文目。"]
     # 塊の頭や項目の後ろでは、番号つきリストとして扱う。
     assert fmt(["1) 開く。", "2) 閉じる。二文目。"], 80) == [
         "1) 開く。", "2) 閉じる。", "   二文目。"]
+
+
+def test_number_one_dot_interrupts_only_with_second():
+    # 「1.」は、後ろに「2.」の項目が連番で続くときだけ、段落
+    # を割り込んでリストの始まりになる(項目の続きの字下げ行
+    # が間に入ってもよい)。
+    assert fmt(["説明です。", "1. 最初の項目。二文目。", "2. 次の項目。"],
+               80) == ["説明です。", "1. 最初の項目。", "   二文目。",
+                       "2. 次の項目。"]
+    # 「2.」が続かなければ、段落の続きとして扱う。
+    assert fmt(["説明です。", "1. 一つだけの手順。次の文。"], 80) == [
+        "説明です。", "1. 一つだけの手順。", "次の文。"]
+    # 「2)」は連番にならない(閉じかっこ付きは割り込まない)。
+    src = ["説明です。", "1. 一つだけの手順。次の文。", "2) 別の文。"]
+    once = fmt(src, 80)
+    assert fmt(once, 80) == once
+
+
+def test_numbered_sentences_in_prose_are_idempotent():
+    # アオイの再現例: 文の頭に来た「1)」が、2回目にリストと
+    # して扱われて次の行が字下げされる、という崩れがない。
+    src = ["(笑) そうだね。1) 手順一。e.g. これ。"]
+    once = fmt(src, 80)
+    assert once == ["(笑) そうだね。", "1) 手順一。", "e.g. これ。"]
+    assert fmt(once, 80) == once
+    # 「1.」の文も同じ。
+    src = ["そうだね。1. 手順一。これだけ。"]
+    once = fmt(src, 80)
+    assert fmt(once, 80) == once
+    # 段落の先頭が番号つきの文でも、中の番号つきの文が項目と
+    # して拾われ直して、字下げが深くなることはない。
+    src = ["1. 最初に開きます。結果は良好でした。"
+           "1) 補足です。本当？！すごいです。"]
+    for cols in (20, 40, 80):
+        once = fmt(src, cols)
+        assert fmt(once, cols) == once
+
+
+def test_random_prose_is_idempotent():
+    # 自然な散文の乱数ケースでも、整形を2回かけると結果が変
+    # わらない。種は固定。材料には、文頭・文中の番号つきの文
+    # を混ぜる。段落を行に割るときは文の区切りでだけ割る
+    # (印の途中では割らない)。
+    import random
+    rng = random.Random(20261113)
+    plain = ["今日は晴れです。", "まず確認します。", "結果は良好でした。",
+             "値は e.g. これです。", "彼は（行きます。必ず。）と言いました。",
+             "ああああ、ああああ、ああああです。", "本当？！すごいです。",
+             "次に進みます、それから戻ります。", "以上です。よろしいですか？"]
+    numbered = ["1) 開いて、閉じます。", "2) それから確認します。",
+                "手順は1) 起動して、2) 終了します。", "終わり。1) 補足です。",
+                "1. のように書きます。", "1) 最初に開きます。"]
+    for _ in range(300):
+        lines = []
+        for _para in range(rng.randint(1, 3)):
+            sentences = [rng.choice(plain + numbered)
+                         for _ in range(rng.randint(1, 5))]
+            if rng.random() < 0.5:
+                # 手順の連番は、段落の締めに置く形で混ぜる。
+                sentences += ["1. 最初に開きます。", "2. 次に閉じます。"]
+            text = "".join(sentences)
+            if rng.random() < 0.3 and len(sentences) > 1:
+                cut = rng.randrange(1, len(sentences))
+                head = "".join(sentences[:cut])
+                lines.extend([head, text[len(head):]])
+            else:
+                lines.append(text)
+            lines.append("")
+        lines.pop()
+        cols = rng.choice([20, 40, 80])
+        once = fmt(lines, cols)
+        assert fmt(once, cols) == once, (lines, cols, once)
 
 
 def test_paragraph_newlines_are_joined_first():

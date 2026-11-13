@@ -25,11 +25,17 @@
 #     文字として扱う(閉じ忘れや、（「あ。）」のような種類の
 #     食い違いで、段落の残り全部が整形されなくなるのを防ぐ)。
 #     対応の付かない閉じかっこは無視する。
-#   - 段落の途中の行頭にある番号つきの印(「2)」「3.」など)は、
-#     リストの始まりと見なさず段落の続きとして扱う(CommonMark
-#     と同じく、段落を割り込めるのは「1」のときだけ)。整形で
-#     生まれた行が、2回目にリストとして字下げされて冪等で
-#     なくなるのを防ぐため。
+#   - 行頭にある番号つきの印は、リストの並びとして続く位置
+#     (塊の頭、同じ深さか浅い位置で項目が続くとき)でのみ、項
+#     目の始まりとして扱う。それ以外(段落の途中、今の項目より
+#     深い字下げの位置)では、原則として段落や項目の続きとし
+#     て扱い、例外は「1.」で、後ろに「2.」の項目が同じ深さで
+#     連番に続くときだけ始まりになる(連番の判定では、項目の
+#     続きの字下げ行を飛ばして先を見る)。「1)」のような閉じ
+#     かっこ付きの番号は始まりにならない(日本語の文中の手順
+#     でよく出るため。CommonMark とはここが違う)。整形で生ま
+#     れた行が、2回目にリストとして拾われ直して字下げが深く
+#     なり、冪等でなくなるのを防ぐため。
 #   - 文の頭に残った空白(句点の後ろの空白など)は取り除く。読点
 #     で改行した続きの行も同じ。整形を2回かけても結果が変わら
 #     ない(冪等)ための決め。
@@ -353,16 +359,46 @@ def _html_block_end(lines, i):
     return len(lines)
 
 
-def _interrupts_paragraph(cur, marker):
-    """段落の途中の行が、リストの始まりとして段落を割り込めるか。
-    番号つきの印は、CommonMark と同じく「1」のときだけ割り込め
-    る。それ以外の番号は段落の続きとして扱う。段落でないところ
-    (塊の頭、項目や引用の後ろ)では、従来どおり始まりになる。"""
-    if cur is None or cur["kind"] != "para":
+def _followed_by_second(lines, i, indent_width):
+    """lines[i] の後ろに、「2.」の項目が連番で続いているか。
+    項目の続きの行(字下げされた、リストでない行)は飛ばして見
+    る。「2.」の行は、字下げの深さが lines[i] と同じときだけ
+    連番とみなす(外側のリストの「2.」は数えない)。それ以外の
+    行に当たれば、連番は続いていない。"""
+    for line in lines[i + 1:]:
+        m = _LIST_RX.match(line)
+        if m:
+            if m.group(2) == "2." \
+                    and display_width(m.group(1)) == indent_width:
+                return True
+            if display_width(m.group(1)) <= indent_width:
+                return False
+            continue
+        if line[:1] in (" ", "\t", "　"):
+            continue
+        return False
+    return False
+
+
+def _numbered_starts_item(cur, marker, indent, lines, i):
+    """番号つきの印の行が、新しい項目の始まりになるか。
+    塊の頭では常になる。同じ深さか浅い位置で項目が続くときも
+    なる(リストの並び)。それ以外(段落の途中、今の項目より深い
+    字下げの位置)では、散文の決めで判定する: 閉じかっこの付い
+    た番号(「1)」など)はならず、「1.」は後ろに「2.」の項目が
+    連番で続くときだけなる。整形で生まれた行(項目の続きの行
+    など)が、2回目にリストとして拾われ直して字下げが深くな
+    り、冪等でなくなるのを防ぐため。"""
+    if cur is None:
         return True
-    if not marker[0].isdigit():
+    if cur["kind"] == "item" \
+            and display_width(indent) <= display_width(cur["indent"]):
         return True
-    return int(marker[:-1]) == 1
+    if marker.endswith(")"):
+        return False
+    if int(marker[:-1]) != 1:
+        return False
+    return _followed_by_second(lines, i, display_width(indent))
 
 
 def _group_units(lines):
@@ -390,7 +426,9 @@ def _group_units(lines):
             i += 1
             continue
         m = _LIST_RX.match(line)
-        if m and _interrupts_paragraph(cur, m.group(2)):
+        if m and (not m.group(2)[0].isdigit()
+                  or _numbered_starts_item(
+                      cur, m.group(2), m.group(1), lines, i)):
             flush()
             cur = {"kind": "item", "indent": m.group(1),
                    "marker": m.group(2), "lines": [m.group(4)]}

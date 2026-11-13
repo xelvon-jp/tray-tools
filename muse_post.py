@@ -347,6 +347,24 @@ def _dry_run_plan(s, current_chat, message, chat=None, expect_text=None):
     return plan
 
 
+def _invoke_send_with_retry(muse, refs, message, tries=4, wait=8.0):
+    """送信を押す。2026-11-13: 送信ボタンが一瞬押せない (COMError 0x80040200) ことがあり、
+    10秒後に押し直したら送れた。投稿欄に自分の文がそのまま残っている (=送れていない) ときだけ押し直す。"""
+    import time as _t
+    for i in range(tries):
+        try:
+            muse.invoke(refs["send"][0])
+            return
+        except Exception:  # noqa: BLE001
+            if i == tries - 1:
+                raise
+            _t.sleep(wait)
+            s, refs2 = muse.scan()
+            if not refs2["input"] or not _same_text(muse.read_value(refs2["input"][0]), message) or len(refs2["send"]) != 1:
+                raise
+            refs = refs2
+
+
 def _restore_input(muse, refs, message):
     """送らずに中止するとき、自分が書いた文字だけを消して元に戻す。
 
@@ -530,7 +548,7 @@ def cmd_post(args, message, muse_factory=None):
 
         send_attempted = True
         try:
-            muse.invoke(refs["send"][0])
+            _invoke_send_with_retry(muse, refs, message)
         except Exception as e:  # noqa: BLE001  押せたかどうか自体が分からない
             result["reason"] = (f"送信ボタンを押す際に例外: {type(e).__name__}: {e}"
                                 "(送れたか不明。二重投稿に注意)") + note_suffix()

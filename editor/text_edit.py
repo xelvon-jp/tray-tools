@@ -14,6 +14,10 @@
 #   - 不可視文字の表示(タブ・スペース・全角スペース・改行を記号で
 #     描く)。描画だけの話で、文書の内容は変えない
 #   - 配色(editor/colors.py の組)をパレットと各部の色へ反映する
+#   - 編集マーク: 開いて(または保存して)から編集した行の行番号を
+#     別の色で描く。マークの追随は改行種別の控えと同じく
+#     contentsChange で行い、基準化(開く・保存)は窓が
+#     clear_edited_lines で行う
 #
 # キーの通知(窓側がマクロ記録と F4 のために受ける):
 #   move_key(命令名, 選択を広げるか) … Home / End / 矢印などの素の
@@ -125,6 +129,12 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         # 置く(_track_line_newlines が挿入された改行の種別として拾う)。
         self._paste_kinds = None
         self.document().contentsChange.connect(self._track_line_newlines)
+        # 編集マーク(ブロック番号の組)。開いた直後・保存した直後が
+        # 基準で、そこから変わった行に付く。_edited_base_count は
+        # 直前の contentsChange 時点のブロック数(増減の切り分け用)。
+        self._edited_lines = set()
+        self._edited_base_count = self.document().blockCount()
+        self.document().contentsChange.connect(self._track_edited_lines)
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
@@ -146,6 +156,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             self._scheme["line_number_background"])
         self._area_foreground = QColor(
             self._scheme["line_number_foreground"])
+        self._edited_color = QColor(
+            self._scheme["line_number_edited_foreground"])
         self.cursorPositionChanged.connect(self._refresh_extra_selections)
 
     def _on_rect_changed(self) -> None:
@@ -186,6 +198,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._invisible_color = QColor(scheme["invisible"])
         self._area_background = QColor(scheme["line_number_background"])
         self._area_foreground = QColor(scheme["line_number_foreground"])
+        self._edited_color = QColor(
+            scheme["line_number_edited_foreground"])
         self._refresh_extra_selections()
         self._area.update()
         self.viewport().update()
@@ -335,6 +349,93 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         if block.next().isValid():
             return self.newline_glyph(block.blockNumber())
         return EOF_MARK
+
+    # ---------------------------------------------------------------
+    # 編集マーク(開いて・保存してから編集した行)
+    # ---------------------------------------------------------------
+    def edited_lines(self):
+        """編集マークの付いた行のブロック番号(昇順のリスト)。"""
+        return sorted(self._edited_lines)
+
+    def edited_line_color(self) -> QColor:
+        """編集マークの行番号に使う色(配色の組から)。"""
+        return QColor(self._edited_color)
+
+    def clear_edited_lines(self):
+        """編集マークを全部消し、いまの内容を新しい基準にする。
+
+        窓が、文書を開いた直後と保存した直後に呼ぶ。ブロック数の
+        控えもいまの文書に合わせ直す(差し替えの最中の追随で残った
+        ずれを、ここで断ち切る)。"""
+        self._edited_lines = set()
+        self._edited_base_count = self.document().blockCount()
+        self._area.update()
+
+    def _track_edited_lines(self, position, chars_removed, chars_added):
+        """文書の変化に、編集マークを追随させる。
+
+        考え方は改行種別の控え(_track_line_newlines)と同じで、
+        変わった範囲(スパン)の新しい行にマークを付ける:
+          - 範囲より前の行はそのまま、後ろの行は増減ぶんずれる
+          - 範囲に含まれた古い行のマークは消え、代わりに新しい
+            行に付く(行が消えれば、その行のマークも消える)
+        例外を2つだけ置く:
+          - 追加がちょうど行の境目で終わり、変化の位置も行の
+            先頭だったとき(行の先頭への行ごとの貼り付け等)は、
+            境目の先の行は変わっていないので範囲に含めない
+          - 削除だけで行が減り、位置が行の先頭に来たとき(行ごとの
+            削除)は、位置に残った行そのものは変わっていないので
+            新しくは付けない。ただし、その行がもともと範囲の
+            最後の行としてマークを持っていたら引き継ぐ(消えた
+            行のマークが次の行へ移るのとは別の話)
+        元に戻す・やり直しの変化も同じく追随する。開いた時点の
+        内容に完全に戻しても、変わった行のマークは残る(保存すれば
+        消える)。マークは「基準から一度でも変わった行」の印で、
+        内容の比較まではしない、という単純な決め。"""
+        if chars_removed == 0 and chars_added == 0:
+            return
+        doc = self.document()
+        new_count = doc.blockCount()
+        old_count = self._edited_base_count
+        self._edited_base_count = new_count
+        last_pos = max(0, doc.characterCount() - 1)
+        first_block = doc.findBlock(min(position, last_pos))
+        if not first_block.isValid():
+            return
+        first = first_block.blockNumber()
+        end_block = doc.findBlock(min(position + chars_added, last_pos))
+        last = end_block.blockNumber() if end_block.isValid() else first
+        if chars_added > 0 and end_block.isValid() \
+                and position + chars_added == end_block.position() \
+                and position == first_block.position():
+            # 追加がちょうど行の境目で終わった。境目の先の行は
+            # 変化に含まれない(上の例外1)。
+            last -= 1
+        if last < first:
+            last = first
+        span_new = last - first + 1
+        delta = new_count - old_count
+        span_old = span_new - delta
+        if span_old < 0:
+            span_old = 0
+        pure_line_removal = (
+            chars_added == 0 and delta < 0
+            and position == first_block.position())
+        updated = set()
+        for line in self._edited_lines:
+            if line < first:
+                updated.add(line)
+            elif line >= first + span_old:
+                updated.add(line + delta)
+        if pure_line_removal:
+            # 範囲の最後に残った行のマークだけ引き継ぐ(例外2)。
+            if first + span_old - 1 in self._edited_lines:
+                updated.add(last)
+        else:
+            updated.update(range(first, last + 1))
+        if updated != self._edited_lines:
+            self._edited_lines = updated
+            self._area.update()
 
     def _eof_font(self):
         """EOF の印用の、本文より小さいフォント。"""
@@ -552,7 +653,6 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     def paint_line_number_area(self, event):
         painter = QPainter(self._area)
         painter.fillRect(event.rect(), self._area_background)
-        painter.setPen(self._area_foreground)
         height = self.fontMetrics().height()
         block = self.firstVisibleBlock()
         number = block.blockNumber()
@@ -561,6 +661,10 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         bottom = top + self.blockBoundingRect(block).height()
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
+                # 編集マークの行は、行番号の色を変えて描く。
+                painter.setPen(
+                    self._edited_color if number in self._edited_lines
+                    else self._area_foreground)
                 painter.drawText(
                     0, int(top), self._area.width() - 4, height,
                     Qt.AlignmentFlag.AlignRight, str(number + 1))

@@ -2259,6 +2259,189 @@ def test_recent_files_untitled_not_recorded_until_saved():
             discard_close(window)
 
 
+def _edit_block(window, block_number, text="X"):
+    """指定の行(ブロック番号)の頭に文字を入れる(実編集の経路)。"""
+    block = window._edit.document().findBlockByNumber(block_number)
+    QTextCursor(block).insertText(text)
+
+
+def test_edit_marks_appear_on_edit():
+    # 開いた直後はマークなし。編集した行にだけ付く。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            assert window.edited_lines() == []
+            _edit_block(window, 2)
+            assert window.edited_lines() == [3]
+            _edit_block(window, 0)
+            assert window.edited_lines() == [1, 3]
+            # 編集していない行には付かない。
+            _edit_block(window, 4)
+            assert window.edited_lines() == [1, 3, 5]
+        finally:
+            discard_close(window)
+
+
+def test_edit_marks_cleared_on_save():
+    # 保存すると、その時点までのマークは消える(新しい基準になる)。
+    # その後の編集では、また付き始める。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _edit_block(window, 1)
+            assert window.edited_lines() == [2]
+            assert window.save()
+            assert window.edited_lines() == []
+            _edit_block(window, 0)
+            assert window.edited_lines() == [1]
+        finally:
+            discard_close(window)
+
+
+def test_edit_marks_follow_insert_and_delete_lines():
+    # 行の挿入・削除にマークが追随する。消えた行のマークは消える。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _edit_block(window, 2)
+            assert window.edited_lines() == [3]
+            # 先頭に行を挿入すると、マークは後ろへずれる。挿入した
+            # 行にも付き、もともとの1行目には付かない。
+            cursor = QTextCursor(window._edit.document())
+            cursor.setPosition(0)
+            cursor.insertText("new\n")
+            assert window.text() == "new\nl1\nl2\nXl3\nl4\nl5\n"
+            assert window.edited_lines() == [1, 4]
+            # 先頭の行を削除すると、マークは前へ戻る。
+            window._edit.setTextCursor(QTextCursor(
+                window._edit.document().findBlockByNumber(0)))
+            assert window.execute_command("delete_line")
+            assert window.text() == "l1\nl2\nXl3\nl4\nl5\n"
+            assert window.edited_lines() == [3]
+            # マークの付いた行自体を削除すると、マークも消える
+            # (次の行へ移らない)。
+            window._edit.setTextCursor(QTextCursor(
+                window._edit.document().findBlockByNumber(2)))
+            assert window.execute_command("delete_line")
+            assert window.text() == "l1\nl2\nl4\nl5\n"
+            assert window.edited_lines() == []
+        finally:
+            discard_close(window)
+
+
+def test_edit_marks_next_prev_navigation():
+    # 次の編集行・前の編集行への移動。端では反対側へ回る。
+    # マークが無ければ動かず、記録にも残らない。
+    assert DEFAULT_KEYMAP["next_edited_line"] == "F2"
+    assert DEFAULT_KEYMAP["prev_edited_line"] == "Shift+F2"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\nl6\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            window.set_macro_recording(True)
+            window.execute_command("next_edited_line")
+            window.set_macro_recording(False)
+            assert window._edit.textCursor().blockNumber() == 0
+            assert window.recorded_commands() == []
+
+            _edit_block(window, 1)
+            _edit_block(window, 4)
+            assert window.edited_lines() == [2, 5]
+            window._edit.setTextCursor(QTextCursor(
+                window._edit.document().findBlockByNumber(0)))
+            window.execute_command("next_edited_line")
+            assert window._edit.textCursor().blockNumber() == 1
+            window.execute_command("next_edited_line")
+            assert window._edit.textCursor().blockNumber() == 4
+            # 最後のマークの次は、先頭のマークへ回る。
+            window.execute_command("next_edited_line")
+            assert window._edit.textCursor().blockNumber() == 1
+            # 先頭のマークの前は、最後のマークへ回る。
+            window.execute_command("prev_edited_line")
+            assert window._edit.textCursor().blockNumber() == 4
+            window.execute_command("prev_edited_line")
+            assert window._edit.textCursor().blockNumber() == 1
+        finally:
+            discard_close(window)
+
+
+def test_edit_marks_undo_keeps_marks_simple():
+    # 元に戻して開いた時点の内容に戻っても、マークは残る(単純な
+    # 決め: マークは「基準から一度でも変わった行」の印で、内容の
+    # 比較はしない。保存すれば消える)。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _edit_block(window, 1)
+            assert window.edited_lines() == [2]
+            window._edit.undo()
+            assert window.text() == "l1\nl2\nl3\n"
+            assert window.edited_lines() == [2]
+        finally:
+            discard_close(window)
+
+
+def test_edit_marks_color_per_scheme():
+    # 編集マークの色は配色の項目(line_number_edited_foreground)。
+    # プリセットごとに値を持ち、配色の切り替えで本文へ反映される。
+    from PySide6.QtGui import QColor
+
+    from editor import colors as colormod
+    for name in colormod.scheme_names():
+        scheme = colormod.get_scheme(name)
+        assert scheme["line_number_edited_foreground"], name
+    window = make_window()
+    try:
+        standard = colormod.get_scheme("標準")
+        assert window._edit.edited_line_color() == QColor(
+            standard["line_number_edited_foreground"])
+        window.apply_color_scheme("秀丸風")
+        hidemaru = colormod.get_scheme("秀丸風")
+        assert window._edit.edited_line_color() == QColor(
+            hidemaru["line_number_edited_foreground"])
+    finally:
+        discard_close(window)
+
+
+def test_edit_marks_navigation_recorded_and_replayed():
+    # 次の編集行への移動はマクロに記録でき、再生でも同じ行へ飛ぶ。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\n".encode("utf-8"))
+        window = make_window(path)
+        other = None
+        try:
+            _edit_block(window, 1)
+            _edit_block(window, 3)
+            window.set_macro_recording(True)
+            window.execute_command("next_edited_line")
+            window.set_macro_recording(False)
+            assert window._edit.textCursor().blockNumber() == 1
+            commands = window.recorded_commands()
+            assert {"cmd": "next_edited_line", "args": {}} in commands
+            _name, parsed = macmod.macro_from_json(
+                macmod.macro_to_json(commands))
+            assert parsed == commands
+            other = make_window(path)
+            _edit_block(other, 1)
+            _edit_block(other, 3)
+            assert other.play_macro(parsed)
+            assert other._edit.textCursor().blockNumber() == 1
+        finally:
+            if other is not None:
+                discard_close(other)
+            discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

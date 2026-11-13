@@ -8,6 +8,8 @@
 #   current_line          現在行の強調の背景
 #   invisible             不可視文字(タブ・スペース・改行)の色
 #   line_number_background / line_number_foreground  行番号エリア
+#   line_number_edited_foreground  編集マーク(開いて・保存してから
+#     編集した行)の行番号の色
 #   star_background       星印の行の強調(ハイライタ)の背景
 #
 # 「秀丸風」は、秀丸エディタの既定の見た目の印象に寄せた組:
@@ -24,6 +26,7 @@ COLOR_SCHEMES = {
         "invisible": "#c0c0c0",
         "line_number_background": "#f2f2f2",
         "line_number_foreground": "#909090",
+        "line_number_edited_foreground": "#e07020",
         "star_background": "#fff3b0",
     },
     "秀丸風": {
@@ -34,6 +37,7 @@ COLOR_SCHEMES = {
         "invisible": "#7fb3d5",
         "line_number_background": "#f0f0f0",
         "line_number_foreground": "#606060",
+        "line_number_edited_foreground": "#d06000",
         "star_background": "#ffe699",
     },
 }

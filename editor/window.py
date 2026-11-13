@@ -41,6 +41,13 @@
 # サブメニューから開き直せる。同じファイルは先頭へ繰り上げる。
 # 無くなったファイルは、選んだときに静かに失敗して履歴から外す。
 # 無題の新規文書は履歴に入れない(名前を付けて保存したら入る)。
+#
+# 編集マーク(2026-11-13): 開いて(または保存して)から編集した行は、
+# 行番号の色が変わる(配色の line_number_edited_foreground)。
+# マークの保持と追随は本文(text_edit)が行い、窓は開いた直後と
+# 保存した直後に消して基準にする。次の編集行・前の編集行への
+# 移動は命令(next_edited_line / prev_edited_line、既定は
+# F2 / Shift+F2)で、端では反対側へ回る。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -523,6 +530,8 @@ class EditorWindow(QMainWindow):
             "move_line_start": self._cmd_move_line_start,
             "move_line_end": self._cmd_move_line_end,
             "goto_line": self._cmd_goto_line,
+            "next_edited_line": self._cmd_next_edited_line,
+            "prev_edited_line": self._cmd_prev_edited_line,
             "move_line_up": self._cmd_move_line_up,
             "move_line_down": self._cmd_move_line_down,
             "move_char_left": self._cmd_move_char_left,
@@ -768,6 +777,12 @@ class EditorWindow(QMainWindow):
                      None, convert_menu)
         self._action("指定行へ移動(&G)…", self.ask_goto_line,
                      "goto_line", edit_menu)
+        self._action("次の編集行へ(&N)",
+                     lambda: self.execute_command("next_edited_line"),
+                     "next_edited_line", edit_menu)
+        self._action("前の編集行へ(&P)",
+                     lambda: self.execute_command("prev_edited_line"),
+                     "prev_edited_line", edit_menu)
         edit_menu.addSeparator()
         self._action("直前の操作を繰り返す(&F)", self.repeat_last,
                      "repeat_last", edit_menu)
@@ -1365,6 +1380,8 @@ class EditorWindow(QMainWindow):
             self._suppress_change_record = False
         # 行ごとの改行種別の控えを本文へ渡す(改行記号の描き分け用)。
         self._edit.set_line_newlines(doc.line_newlines, doc.newline)
+        # 読み込んだ内容が編集マークの基準になる。
+        self._edit.clear_edited_lines()
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1416,6 +1433,7 @@ class EditorWindow(QMainWindow):
         finally:
             self._suppress_change_record = False
         self._edit.set_line_newlines(None, self._doc.newline)
+        self._edit.clear_edited_lines()
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1583,6 +1601,8 @@ class EditorWindow(QMainWindow):
         # 保存で改行はそろったので、描き分けの控えもそろった形にする。
         self._edit.set_line_newlines(self._doc.line_newlines,
                                      self._doc.newline)
+        # 保存した内容が編集マークの新しい基準になる。
+        self._edit.clear_edited_lines()
         self._refresh_all()
         self._update_watcher()
         # 名前を付けて保存したら、そのファイルも履歴に入れる
@@ -1790,6 +1810,37 @@ class EditorWindow(QMainWindow):
         line = max(1, min(line, max(1, block_count)))
         self._jump_to_line(line - 1)
         return {"line": line}
+
+    def edited_lines(self):
+        """編集マークの付いた行(1始まり、昇順)。
+
+        開いて(または保存して)から編集した行。本文がブロック番号で
+        持っているものを、利用者向けの行番号に直して返す。"""
+        return [number + 1 for number in self._edit.edited_lines()]
+
+    def _cmd_next_edited_line(self, args):
+        return self._move_to_edited_line(forward=True)
+
+    def _cmd_prev_edited_line(self, args):
+        return self._move_to_edited_line(forward=False)
+
+    def _move_to_edited_line(self, forward):
+        """編集マークのある行へ順に移動する(命令 next_edited_line /
+        prev_edited_line)。カーソルより後ろ(前)の直近のマークへ
+        飛び、端まで行ったら反対側の端に回る。マークが無ければ
+        None(移動も記録もしない)。移動そのものは _jump_to_line
+        (行頭に置いて中央に寄せる)。"""
+        marks = self._edit.edited_lines()
+        if not marks:
+            return None
+        current = self._edit.textCursor().blockNumber()
+        if forward:
+            target = next((n for n in marks if n > current), marks[0])
+        else:
+            target = next(
+                (n for n in reversed(marks) if n < current), marks[-1])
+        self._jump_to_line(target)
+        return {}
 
     def _cmd_move_line_up(self, args):
         return self._move_cursor(QTextCursor.MoveOperation.Up, args)

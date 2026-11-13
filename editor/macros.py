@@ -23,6 +23,9 @@
 #   move_line_end {extend}      行末へ
 #   goto_line {line}            指定行へ移動(line は1始まり。範囲外は
 #                               文書の範囲に収めてから記録される)
+#   next_edited_line {}         次の編集行へ移動(編集マークの行。
+#                               無ければ記録されない)
+#   prev_edited_line {}         前の編集行へ移動
 #   move_line_up {count, extend}    上の行へ
 #   move_line_down {count, extend}  下の行へ
 #   move_char_left {count, extend}  左へ
@@ -56,6 +59,8 @@ KNOWN_COMMANDS = frozenset({
     "move_line_start",
     "move_line_end",
     "goto_line",
+    "next_edited_line",
+    "prev_edited_line",
     "move_line_up",
     "move_line_down",
     "move_char_left",

@@ -1267,6 +1267,28 @@ def test_regex_find_selects_matches():
         discard_close(window)
 
 
+def test_regex_find_japanese_text_positions():
+    # 日本語の文書でも、ヒットが文字単位で正確に合うこと。
+    # 別プロセスとの受け渡しで位置がずれると、「1」の検索で
+    # 無関係の漢字が選ばれたり、「^.*test.*$」で複数行が
+    # 選ばれたりする(実機で起きた不具合)。
+    window = make_window()
+    try:
+        window._edit.setPlainText(
+            "最初の行です\n次の行に 1 があります\ntest を含む行です\n最後の行\n")
+        window._find_regex.setChecked(True)
+        window._find_edit.setText("1")
+        assert window.execute_command("find_next")
+        wait_rx(window)
+        assert window._edit.textCursor().selectedText() == "1"
+        window._find_edit.setText("^.*test.*$")
+        assert window.execute_command("find_next")
+        wait_rx(window)
+        assert window._edit.textCursor().selectedText() == "test を含む行です"
+    finally:
+        discard_close(window)
+
+
 def test_regex_replace_all_with_group_reference():
     window = make_window()
     try:
@@ -1685,6 +1707,49 @@ def test_view_settings_read_at_open():
         assert window.color_scheme_name() == "秀丸風"
     finally:
         discard_close(window)
+
+
+def _changed_pixel_count(image_a, image_b, height=120):
+    """2枚の画像で色が違う画素の数(上の height px の範囲だけ)。"""
+    a = image_a.copy(0, 0, image_a.width(), height)
+    b = image_b.copy(0, 0, image_b.width(), height)
+    changed = 0
+    for y in range(a.height()):
+        for x in range(a.width()):
+            if a.pixel(x, y) != b.pixel(x, y):
+                changed += 1
+    return changed
+
+
+def test_invisibles_are_actually_painted():
+    # 不可視文字を ON にすると、記号が実際に画素として描かれる
+    # こと。フラグが立つだけでは足りない(cursorRect の幅で描く
+    # と、drawText に字が切り取られて見えなくなる不具合が
+    # あった)。新しく開いたタブでも描かれること。
+    content = "a b\tc\n全角　スペース 半角\n".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        first = os.path.join(tmp, "inv1.txt")
+        second = os.path.join(tmp, "inv2.txt")
+        Path(first).write_bytes(content)
+        Path(second).write_bytes(content)
+        window = make_window(first)
+        try:
+            app().processEvents()
+            off = window._edit.viewport().grab().toImage()
+            window.set_invisibles_visible(True)
+            app().processEvents()
+            on = window._edit.viewport().grab().toImage()
+            assert _changed_pixel_count(off, on) > 100
+            # 2つ目のタブ: 開いた時点で ON が行き渡り、描かれる。
+            assert window.open_path(second)
+            app().processEvents()
+            on_second = window._edit.viewport().grab().toImage()
+            window.set_invisibles_visible(False)
+            app().processEvents()
+            off_second = window._edit.viewport().grab().toImage()
+            assert _changed_pixel_count(off_second, on_second) > 100
+        finally:
+            discard_close(window)
 
 
 def test_wrap_modes_switch_and_persist():

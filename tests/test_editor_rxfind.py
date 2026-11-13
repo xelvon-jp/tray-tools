@@ -145,6 +145,49 @@ def test_pure_helpers():
         raise AssertionError("RegexFault になるはず")
 
 
+def test_dot_does_not_cross_newlines():
+    # . は改行に当たらない(通常のエディタの作法)。行をまたいだ
+    # マッチが返ると、複数行がまるごと選択されてしまう。
+    result = rxfind.run_operation("find_next", text="a\nb",
+                                  pattern="a.b", start=0)
+    assert result["span"] is None
+    result = rxfind.run_operation("find_next", text="xa by",
+                                  pattern="a.b", start=0)
+    assert result["span"] == (1, 4)
+
+
+def test_run_operation_with_non_utf8_stdio():
+    # 子プロセスの標準入出力の文字コードが OS の既定(日本語
+    # Windows では cp932)になっている環境でも、ヒット位置が
+    # ずれないこと。親は UTF-8 で送るので、子が既定のまま読み
+    # 書きすると日本語が化けて文字数が変わり、無関係の文字が
+    # ヒットする(実機で起きた不具合)。PYTHONIOENCODING は
+    # プロセスの起動時にだけ効くので、子の起動環境に入れる
+    # ことで日本語 Windows の状態を再現する。
+    text = "最初の行です\n次の行に 1 があります\ntest を含む行です\n最後の行\n"
+    old = os.environ.get("PYTHONIOENCODING")
+    os.environ["PYTHONIOENCODING"] = "cp932"
+    try:
+        result = rxfind.run_operation("find_next", text=text,
+                                      pattern="1", start=0)
+        begin = text.index("1")
+        assert result["span"] == (begin, begin + 1), result
+        result = rxfind.run_operation("find_next", text=text,
+                                      pattern="^.*test.*$", start=0)
+        line = "test を含む行です"
+        begin = text.index(line)
+        assert result["span"] == (begin, begin + len(line)), result
+        result = rxfind.run_operation("replace_all", text=text,
+                                      pattern="行", repl="ギョウ")
+        assert result["text"] == text.replace("行", "ギョウ")
+        assert result["count"] == 4
+    finally:
+        if old is None:
+            os.environ.pop("PYTHONIOENCODING", None)
+        else:
+            os.environ["PYTHONIOENCODING"] = old
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

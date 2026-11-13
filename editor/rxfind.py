@@ -11,6 +11,10 @@
 # 子プロセスへは標準入力の JSON で {op, text, pattern, repl, start,
 # regex, case} を渡し、最後の JSON 行で結果を受ける。op は
 # find_next / find_prev / replace_one / replace_all。
+# 入出力の文字コードは UTF-8 と決め打ちする(子の標準入出力は
+# バイト列のまま読み書きする)。OS の既定(日本語 Windows では
+# cp932)に任せると、親が UTF-8 で送った日本語本文が化けて文字数が
+# 変わり、ヒットの位置がすべてずれる。
 # 置換文字列のグループ参照(\1 や \g<name>)は re の expand の流儀。
 # regex=False のときは、パターンは文字どおり(escape する)、置換文字列も
 # 文字どおり(グループ参照は効かない)。
@@ -156,15 +160,26 @@ def span_prev(text, rx, start):
         return None
     return [found.start(), found.end()]
 
+def emit(result):
+    # 結果はバイト列で UTF-8 と決め打ちして書く(読み込み側と同じ
+    # 理由。print / sys.stdout の既定の文字コードに任せない)。
+    sys.stdout.buffer.write(
+        json.dumps(result, ensure_ascii=False).encode("utf-8") + b"\n")
+
 def main():
-    data = json.load(sys.stdin)
+    # 受け取りもバイト列のまま読み、UTF-8 と決め打ちする。
+    # sys.stdin の既定の文字コード(OS で違う。日本語 Windows は
+    # cp932)で読むと、UTF-8 の日本語が化けて文字数が変わり、
+    # ヒットの位置がすべてずれる(化けた並びが不正なときは読み
+    # 込み自体が落ちて、結果が返らない)。
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     op = data["op"]
     text = data["text"]
     regex = bool(data.get("regex", True))
     try:
         rx = compile_search(data["pattern"], regex, bool(data.get("case")))
     except re.error as e:
-        print(json.dumps({"ok": False, "error": "pattern", "detail": str(e)}))
+        emit({"ok": False, "error": "pattern", "detail": str(e)})
         return
     try:
         if op == "find_next":
@@ -192,7 +207,7 @@ def main():
             result = {"ok": False, "error": "op", "detail": op}
     except (re.error, IndexError) as e:
         result = {"ok": False, "error": "repl", "detail": str(e)}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    emit(result)
 
 main()
 """

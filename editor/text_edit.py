@@ -34,6 +34,7 @@ from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QKeySequence,
     QPainter,
     QPalette,
@@ -607,6 +608,20 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         painter = QPainter(self.viewport())
         painter.setPen(self._invisible_color)
         painter.setFont(self.font())
+        metrics = self.fontMetrics()
+        eof_metrics = QFontMetrics(self._eof_font())
+
+        def draw_mark(rect, mark, mark_metrics):
+            # cursorRect の幅はカーソルの幅(1px。太いカーソルでも
+            # 3px)しか無く、drawText はその幅で字を切り取って
+            # しまう(・も→も幅1pxに潰れて見えなくなる)。記号の
+            # 実幅まで広げてから描く。
+            width = mark_metrics.horizontalAdvance(mark)
+            if rect.width() < width:
+                rect.setWidth(width)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
+                             | Qt.AlignmentFlag.AlignVCenter, mark)
+
         scratch = QTextCursor(self.document())
         block = self.firstVisibleBlock()
         viewport_height = self.viewport().height()
@@ -629,19 +644,16 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                         continue
                     scratch.setPosition(base + i)
                     rect = self.cursorRect(scratch)
-                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
-                                     | Qt.AlignmentFlag.AlignVCenter, symbol)
+                    draw_mark(rect, symbol, metrics)
                 scratch.setPosition(base + len(text))
                 rect = self.cursorRect(scratch)
                 mark = self.block_end_mark(block)
                 if mark == EOF_MARK:
                     painter.setFont(self._eof_font())
-                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
-                                     | Qt.AlignmentFlag.AlignVCenter, mark)
+                    draw_mark(rect, mark, eof_metrics)
                     painter.setFont(self.font())
                 else:
-                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
-                                     | Qt.AlignmentFlag.AlignVCenter, mark)
+                    draw_mark(rect, mark, metrics)
             block = block.next()
 
     def keyPressEvent(self, event):  # noqa: N802  Qt の上書き

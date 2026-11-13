@@ -1829,6 +1829,117 @@ def test_grep_dialog_lists_and_jumps():
         dialog.deleteLater()
 
 
+def _wait_find_all(dialog):
+    deadline = time.time() + 30
+    while dialog._thread is not None and time.time() < deadline:
+        app().processEvents()
+        time.sleep(0.02)
+    app().processEvents()
+
+
+def test_find_all_dialog_lists_and_jumps():
+    from editor.findall_dialog import FindAllDialog
+    jumped = []
+    dialog = FindAllDialog(
+        None, text="1行目\n探す語 あり\n3行目\nまた探す語\n", word="探す語",
+        on_jump=lambda line: jumped.append(line))
+    dialog.start_search()
+    _wait_find_all(dialog)
+    try:
+        assert dialog._results.count() == 2
+        assert dialog._results.item(0).text() == "2: 探す語 あり"
+        assert dialog._results.item(1).text() == "4: また探す語"
+        assert dialog._status_label.text() == "2 件見つかりました"
+        dialog._on_item_activated(dialog._results.item(1))
+        assert jumped == [4]
+    finally:
+        dialog.deleteLater()
+
+
+def test_find_all_dialog_conditions():
+    from editor.findall_dialog import FindAllDialog
+
+    def run(text, word, **kwargs):
+        dialog = FindAllDialog(None, text=text, word=word, **kwargs)
+        dialog.start_search()
+        _wait_find_all(dialog)
+        try:
+            lines = [dialog._results.item(i).text()
+                     for i in range(dialog._results.count())]
+            return lines, dialog._status_label.text()
+        finally:
+            dialog.deleteLater()
+
+    # 大文字小文字の区別(検索バーと同じ条件の効き)。
+    lines, status = run("Foo\nfoo\nFOO\n", "foo")
+    assert len(lines) == 3 and status == "3 件見つかりました"
+    lines, _status = run("Foo\nfoo\nFOO\n", "foo", case_sensitive=True)
+    assert lines == ["2: foo"]
+    # 正規表現の有無で、メタ文字の扱いが変わる。
+    lines, _status = run("abc\na.c\naxc\n", "a.c")
+    assert lines == ["2: a.c"]
+    lines, _status = run("abc\na.c\naxc\n", "a.c", regex=True)
+    assert len(lines) == 3
+    # ヒット無し。
+    lines, status = run("abc\n", "無い語")
+    assert lines == [] and status == "見つかりませんでした"
+    # 不正な正規表現は、利用者向けの文がステータスに出る。
+    lines, status = run("abc\n", "(", regex=True)
+    assert lines == [] and "正規表現が不正です" in status
+
+
+def test_find_all_window_inherits_find_bar_and_jumps():
+    import editor.window as winmod
+    from PySide6.QtGui import QKeySequence
+
+    assert DEFAULT_KEYMAP["find_all"] == "Ctrl+Shift+G"
+
+    class _FakeFindAllDialog:
+        seen = None
+
+        def __init__(self, parent=None, **kwargs):
+            _FakeFindAllDialog.seen = kwargs
+
+        def exec(self):
+            _FakeFindAllDialog.seen["on_jump"](3)
+            return 1
+
+    window = make_window()
+    original = winmod.FindAllDialog
+    winmod.FindAllDialog = _FakeFindAllDialog
+    try:
+        window._edit.setPlainText("1\n2\n3\n4\n5")
+        window._find_edit.setText("探す語")
+        window._find_case.setChecked(True)
+        window._find_regex.setChecked(True)
+        window.show_find_all_dialog()
+        seen = _FakeFindAllDialog.seen
+        # 検索バーの語と条件と、今の本文がそのまま渡る。
+        assert seen["word"] == "探す語"
+        assert seen["case_sensitive"] is True
+        assert seen["regex"] is True
+        assert seen["text"] == "1\n2\n3\n4\n5"
+        # 一覧で選んだ行へ、行頭に置く作法(_jump_to_line)で移動する。
+        cursor = window._edit.textCursor()
+        assert cursor.blockNumber() == 2
+        block = window._edit.document().findBlockByNumber(2)
+        assert cursor.position() == block.position()
+        # 検索メニューの項目に、キー割り当てのキーが付いている。
+        found = None
+        for top in window.menuBar().actions():
+            menu = top.menu()
+            if menu is None:
+                continue
+            for action in menu.actions():
+                if "すべて検索" in action.text():
+                    found = action
+        assert found is not None
+        assert found.shortcut() == QKeySequence("Ctrl+Shift+G")
+    finally:
+        winmod.FindAllDialog = original
+        discard_close(window)
+
+
 def _all_blocks(window):
     blocks = []
     block = window._edit.document().begin()

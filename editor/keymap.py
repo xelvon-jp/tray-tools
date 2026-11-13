@@ -16,6 +16,7 @@ DEFAULT_KEYMAP = {
     "find": "Ctrl+F",
     "find_next": "F3",
     "find_prev": "Shift+F3",
+    "find_all": "Ctrl+Shift+G",
     "goto_line": "Ctrl+G",
     "next_edited_line": "F2",
     "prev_edited_line": "Shift+F2",

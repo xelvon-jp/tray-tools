@@ -25,6 +25,8 @@
 #   正規表現の検索・置換(命令 replace_next / replace_all。実処理は
 #   editor/rxfind.py が別プロセスで回す。固まる式でも窓は止まらない)、
 #   フォルダ内の横断検索(grep。editor/grep.py と grep_dialog.py)、
+#   文書内のすべて検索(ヒットした行の一覧から飛ぶ。editor/findall.py
+#   と findall_dialog.py。検索バーの語と条件を引き継いで開く)、
 #   不可視文字の表示・現在行の強調・太いカーソル・配色プリセット
 #   (editor/colors.py。「秀丸風」あり)、外部で変更されたファイルの
 #   監視(QFileSystemWatcher)と再読み込みの提案。
@@ -116,6 +118,7 @@ from editor import outline
 from editor import editor_icon
 from editor import reformat as refmtmod
 from editor import rxfind
+from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor.keymap import merge_keymap
@@ -796,6 +799,8 @@ class EditorWindow(QMainWindow):
                      "find_prev", search_menu)
         search_menu.addSeparator()
         self._action("置換(&R)…", self.show_find_bar, None, search_menu)
+        self._action("すべて検索(&A)…", self.show_find_all_dialog,
+                     "find_all", search_menu)
         self._action("フォルダ内を検索(&G)…", self.show_grep_dialog,
                      None, search_menu)
 
@@ -2509,6 +2514,32 @@ class EditorWindow(QMainWindow):
                 self, folder=folder, word=word,
                 case_sensitive=self._find_case.isChecked(),
                 on_jump=self.open_path_at_line)
+            dialog.exec()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"検索を開けませんでした ({e})")
+
+    # ---------------------------------------------------------------
+    # 文書内のすべて検索(ヒットした行の一覧)
+    # ---------------------------------------------------------------
+    def show_find_all_dialog(self):
+        """今の文書のすべて検索の窓を開く。
+
+        検索の語と条件(大小区別・正規表現)は検索バーから引き継ぐ
+        (語が空なら、選択中の1行を語にする。grep の窓と同じ作法)。
+        選んだ行への移動は _jump_to_line(行頭に置いて中央に寄せる)。"""
+        try:
+            word = self._find_edit.text()
+            if not word:
+                cursor = self._edit.textCursor()
+                if cursor.hasSelection():
+                    word = cursor.selectedText().replace("\u2029", "\n")
+                    if "\n" in word:
+                        word = ""
+            dialog = FindAllDialog(
+                self, text=self._edit.toPlainText(), word=word,
+                case_sensitive=self._find_case.isChecked(),
+                regex=self._find_regex.isChecked(),
+                on_jump=lambda line: self._jump_to_line(max(0, line - 1)))
             dialog.exec()
         except Exception as e:  # noqa: BLE001  スロットで投げ切らない
             self.statusBar().showMessage(f"検索を開けませんでした ({e})")

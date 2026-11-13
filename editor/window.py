@@ -758,8 +758,7 @@ class EditorWindow(QMainWindow):
         # ここで付ければ全部に付く。
         self.setWindowIcon(editor_icon.qicon())
         # タスクバーのアプリIDは、窓が画面に出たとき(showEvent)に
-        # 1回だけ付ける。HWND が要るので作った直後には付けない。
-        self._taskbar_identity_applied = False
+        # 付ける。HWND が要るので作った直後には付けない。
         # タブとビュー。プロパティ(_edit / _doc 等)はこの並びの
         # 「今のタブ」を見るので、他の初期化より先に用意する。
         self._views = []
@@ -2455,11 +2454,17 @@ class EditorWindow(QMainWindow):
 
     def _apply_font_to_view(self, view):
         """実効のフォントとタブ幅を、1つのビューの本文へ適用する
-        (保存はしない)。分割していれば両ペインへ行き渡る。"""
+        (保存はしない)。分割していれば両ペインへ行き渡る。
+
+        フォントは今のものを写して family / 大きさだけ変える
+        (QFont を作り直すと、太字などの他の属性が落ちてしまうため)。
+        """
         effective = self._effective_display(view)
         for edit in view.panes():
-            edit.setFont(
-                QFont(effective["font_family"], effective["font_size"]))
+            font = edit.font()
+            font.setFamily(effective["font_family"])
+            font.setPointSize(effective["font_size"])
+            edit.setFont(font)
             edit.set_tab_width(effective["tab_width"])
 
     def _apply_view_display(self, view):
@@ -3482,9 +3487,10 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     def showEvent(self, event):  # noqa: N802  Qt の上書き
         super().showEvent(event)
-        if not self._taskbar_identity_applied:
-            self._taskbar_identity_applied = True
-            self._apply_taskbar_identity()
+        # 表示のたびに付け直す(窓を作り直すと HWND が変わって
+        # AppUserModelID が外れるため。同じ値を同じ窓へ書くのは
+        # 上書きなので害はない)。
+        self._apply_taskbar_identity()
 
     def _apply_taskbar_identity(self) -> None:
         """窓に EDDy 専用の AppUserModelID を付ける(Windows のみ)。
@@ -4754,7 +4760,10 @@ class EditorWindow(QMainWindow):
                     # 見落とさないため)。
                     used.add(normalized.split(", ")[0])
         for name, entry in self._registered_macros.items():
-            action = QAction(name, self)
+            # 名前の "&" は Qt のメニューではニーモニックの印になる
+            # ので、表示だけ "&&" に逃がす(名前そのものは変えない。
+            # "&" が消えて別のキーに割り当たるのを防ぐため)。
+            action = QAction(name.replace("&", "&&"), self)
             keys = (entry.get("key") or "").strip()
             normalized = (QKeySequence(keys).toString(
                 QKeySequence.SequenceFormat.PortableText) if keys else "")

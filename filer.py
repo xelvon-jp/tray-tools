@@ -4581,11 +4581,14 @@ class FilerWindow(QWidget):
 
     # --- 内蔵テキストエディタで開く(E / Ctrl+E / 右クリック / プレビュー中も同じ) ---
     def _text_editor_entries(self, pane) -> list:
-        """内蔵エディタで開ける対象(マーク、無ければカーソル行のうち、
-        フォルダでなく、テキストとして開けるもの)。テキストの判定は
-        ビュアと同じ拡張子の表(opens_in_viewer)。画像・バイナリは
-        対象にしない(無理に開くと文字化けした文書として編集・保存
-        されてしまうため)。"""
+        """右クリックメニューに「EDDyで開く」を出すかどうかの判定に
+        使う対象(マーク、無ければカーソル行のうち、フォルダでなく、
+        ビュア表にある拡張子のもの)。
+
+        E キー自体はこの絞り込みを使わない(表に無い拡張子でも
+        「EDDy で開きますか」と聞いて開ける。_open_targets_in_text_
+        editor)。メニューの出し分けだけが、従来の表による絞り込み
+        のままになっている。"""
         return [e for e in pane.targets()
                 if not e.is_dir
                 and core.opens_in_viewer(e.name, self.viewer_extensions)]

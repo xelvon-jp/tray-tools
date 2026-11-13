@@ -510,6 +510,99 @@ def test_second_execute_keeps_first_backup():
         assert path.read_bytes() == "置換1 と 置換2\n".encode("utf-8")
 
 
+def test_preview_skips_link_files():
+    # シンボリックリンクとハードリンクは対象から外れ、件数と理由
+    # が残る。実ファイルは対象のまま。
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "plain.txt").write_text("探す語 あり\n", encoding="utf-8")
+        (root / "orig.txt").write_text("探す語 あり\n", encoding="utf-8")
+        os.symlink(root / "plain.txt", root / "link.txt")
+        os.link(root / "orig.txt", root / "hard.txt")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        assert [os.path.basename(t.path) for t in preview.targets] == [
+            "plain.txt"]
+        assert {os.path.basename(p) for p in preview.skipped_link} == {
+            "link.txt", "orig.txt", "hard.txt"}
+        assert "探す語" in (root / "plain.txt").read_text(encoding="utf-8")
+
+
+def test_execute_skips_link_created_after_preview():
+    # プレビューの後でリンクになったファイルも、実行の段で止める
+    # (プレビューだけの判定では間の変化を拾えないため)。
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        target = root / "a.txt"
+        target.write_text("探す語 あり\n", encoding="utf-8")
+        other = root / "other.txt"
+        other.write_text("探す語 あり\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        assert len(preview.targets) == 2
+        target.unlink()
+        os.symlink(other, target)
+        result = replacemod.execute_replace(preview, "探す語", "置換語")
+        by_path = {os.path.basename(o.path): o for o in result.outcomes}
+        assert by_path["a.txt"].status == replacemod.STATUS_LINK
+        assert os.path.islink(target)
+        assert by_path["other.txt"].status == replacemod.STATUS_DONE
+        assert "置換語" in other.read_text(encoding="utf-8")
+
+
+def test_execute_skips_hardlink_without_breaking_it():
+    # ハードリンクは置換で切れて別の中身になるので、実行の段でも
+    # 止めて、リンクを壊さない。
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        real = root / "real.txt"
+        real.write_text("探す語 あり\n", encoding="utf-8")
+        hard = root / "hard.txt"
+        os.link(real, hard)
+        ino_before = os.stat(real).st_ino
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        assert preview.targets == []
+        assert len(preview.skipped_link) == 2
+        # 手で作ったプレビューで実行しても、リンクは壊れない。
+        target = replacemod.ReplaceTarget(
+            path=str(real), count=1, first_line=1,
+            mtime=real.stat().st_mtime, size=real.stat().st_size)
+        fake = replacemod.ReplacePreview(targets=[target])
+        result = replacemod.execute_replace(fake, "探す語", "置換語")
+        assert result.outcomes[0].status == replacemod.STATUS_LINK
+        assert os.stat(real).st_ino == ino_before
+        assert os.stat(hard).st_ino == ino_before
+        assert "探す語" in real.read_text(encoding="utf-8")
+
+
+def test_dialog_preview_reports_link_files():
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "a.txt").write_text("探す語 あり\n", encoding="utf-8")
+        os.symlink(root / "a.txt", root / "link.txt")
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        try:
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            status = dialog._status_label.text()
+            assert "対象 1 ファイル" in status, status
+            assert "リンク 1 件" in status, status
+        finally:
+            dialog.deleteLater()
+
+
+def test_execute_summary_reports_link_files():
+    from editor.greplace_dialog import GrepReplaceDialog
+    result = replacemod.ReplaceRunResult(outcomes=[
+        replacemod.ReplaceOutcome("x.txt", replacemod.STATUS_DONE, count=1),
+        replacemod.ReplaceOutcome(
+            "y.txt", replacemod.STATUS_LINK,
+            detail="リンクのファイルのため飛ばしました"),
+    ])
+    assert "リンク 1 件" in GrepReplaceDialog._execute_summary(result)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

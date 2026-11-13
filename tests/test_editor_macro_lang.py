@@ -462,6 +462,129 @@ def test_dialog_key_state_duplicate_macros():
         dialog.close()
 
 
+def test_scalar_args_rejected_on_save_and_load():
+    # 引数の値が文字列・数値・真偽でないものは、保存と読み込みの
+    # 両方で落とす(JSON では書けてしまうが、テキスト形式では読め
+    # なくなり、再生でも意味が変わるため)。
+    import json
+    for bad in (None, [1, 2], {"a": 1}):
+        commands = [{"cmd": "insert_text", "args": {"text": bad}}]
+        for fn in (lambda: macmod.macro_to_json(commands, "t"),
+                   lambda: macmod.commands_to_text(commands, "t"),
+                   lambda: macmod.macro_from_json(
+                       json.dumps({"name": "t", "commands": commands}))):
+            try:
+                fn()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted {bad!r}")
+    # スカラー(文字列・数値・真偽)は通る。
+    ok = [{"cmd": "insert_text", "args": {"text": "a"}},
+          {"cmd": "delete_backward", "args": {"count": 2}},
+          {"cmd": "find_next", "args": {"text": "x", "case": True,
+                                        "regex": False}},
+          {"cmd": "goto_line", "args": {"line": 1.5}}]
+    name, back = macmod.macro_from_json(macmod.macro_to_json(ok, "t"))
+    assert name == "t" and back == ok
+
+
+def test_insert_text_non_string_text_roundtrips():
+    # insert_text の text が文字列でないときは key=値の形で書く
+    # (簡便形 insert_text 5 は、読み込み側が文字列でないと受け付け
+    # ないため)。
+    commands = [{"cmd": "insert_text", "args": {"text": 5}}]
+    text = macmod.commands_to_text(commands, "t")
+    assert "insert_text text=5" in text, text
+    _name, back = macmod.commands_from_text(text)
+    assert back == commands
+
+
+def test_macro_name_with_newline_is_rejected():
+    commands = [{"cmd": "select_all", "args": {}}]
+    # テキスト形式への保存でエラー(「# name:」の行が壊れるため)。
+    try:
+        macmod.commands_to_text(commands, "a\nb")
+    except ValueError as e:
+        assert "改行" in str(e)
+    else:
+        raise AssertionError("commands_to_text accepted a newline name")
+    # 設定の整えでは落とす(窓が開かなくなるよりまし)。
+    clean = macmod.sanitize_registered(
+        {"a\nb": {"commands": commands, "key": ""}})
+    assert clean == {}
+    # 管理画面の登録・名前変更でもエラー。
+    dialog = make_dialog(macros={})
+    try:
+        try:
+            dialog.register_macro("a\nb", commands)
+        except ValueError as e:
+            assert "改行" in str(e)
+        else:
+            raise AssertionError("register_macro accepted a newline name")
+        dialog.register_macro("ok", commands)
+        try:
+            dialog.rename_macro("ok", "x\ny")
+        except ValueError as e:
+            assert "改行" in str(e)
+        else:
+            raise AssertionError("rename_macro accepted a newline name")
+        assert dialog.names() == ["ok"]
+    finally:
+        dialog.close()
+
+
+def test_sanitize_strip_collision_keeps_first():
+    # 前後空白を取った結果の衝突は、先のものを残す(後のものを
+    # 黙って上書きしない)。
+    first = [{"cmd": "delete_line", "args": {}}]
+    second = [{"cmd": "select_all", "args": {}}]
+    clean = macmod.sanitize_registered({
+        "a": {"commands": first, "key": ""},
+        " a ": {"commands": second, "key": ""},
+    })
+    assert list(clean) == ["a"]
+    assert clean["a"]["commands"] == first
+    # 管理画面では、空白を取った名前が既にあると登録できない。
+    dialog = make_dialog(macros={"a": {"commands": first, "key": ""}})
+    try:
+        try:
+            dialog.register_macro(" a ", first)
+        except ValueError as e:
+            assert "既にあります" in str(e)
+        else:
+            raise AssertionError(
+                "register_macro accepted a stripped duplicate")
+    finally:
+        dialog.close()
+
+
+def test_sanitize_keeps_duplicate_keys_for_dialog():
+    # キーの重なりは設定の整えでは落とさない(窓側が先のものを優先
+    # し、管理画面が「効いていない」と表示する)。
+    macros = {
+        "甲": {"commands": SAMPLE[:1], "key": "Ctrl+Alt+1"},
+        "乙": {"commands": SAMPLE[:1], "key": "Ctrl+Alt+1"},
+    }
+    clean = macmod.sanitize_registered(macros)
+    assert set(clean) == {"甲", "乙"}
+    assert clean["甲"]["key"] == clean["乙"]["key"] == "Ctrl+Alt+1"
+
+
+def test_registered_macro_menu_escapes_ampersand():
+    # 名前の "&" はメニューではニーモニックの印になるので、表示
+    # だけ "&&" に逃がす(名前そのものは変えない)。
+    window = make_window("ab\ncd")
+    try:
+        window.register_macro("a&b", SAMPLE[:1])
+        action = window._registered_macro_actions["a&b"]
+        assert action.text() == "a&&b", action.text()
+        assert window.play_registered_macro("a&b")
+        assert window.text() == "abcab\ncd"
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

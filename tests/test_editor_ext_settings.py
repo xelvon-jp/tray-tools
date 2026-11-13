@@ -451,6 +451,45 @@ def test_dialog_starts_from_given_state():
         dialog.close()
 
 
+def test_wheel_zoom_range_matches_settings_range():
+    # Ctrl+ホイールの範囲と設定画面の範囲は同じ(設定画面で選んだ
+    # 大きさが、ホイール1ノッチで潰れないように)。
+    import editor.text_edit as temod
+    assert temod.FONT_SIZE_MIN == extmod.FONT_SIZE_MIN
+    assert temod.FONT_SIZE_MAX == extmod.FONT_SIZE_MAX
+    edit = TextEdit()
+    edit.setFont(edit.font())
+    edit.set_font_size(48)
+    assert edit.font_size() == 48
+    edit.set_font_size(6)
+    assert edit.font_size() == 6
+    edit.set_font_size(200)
+    assert edit.font_size() == extmod.FONT_SIZE_MAX
+
+
+def test_apply_font_keeps_bold_and_italic():
+    # _apply_font_to_view は今のフォントを写して family/大きさ
+    # だけ変える(太字などが落ちないこと)。
+    from PySide6.QtGui import QFont
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        write_file(path)
+        window = make_window(editor_settings={
+            "extension_settings": {"txt": {"font_size": 14}}})
+        try:
+            assert window.open_path(path)
+            font = QFont(window._edit.font())
+            font.setBold(True)
+            font.setItalic(True)
+            window._edit.setFont(font)
+            window._apply_font_to_view(window._views[0])
+            assert window._edit.font().bold()
+            assert window._edit.font().italic()
+            assert window._edit.font_size() == 14
+        finally:
+            close_window(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

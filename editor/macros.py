@@ -134,7 +134,14 @@ _COALESCE_COUNT = frozenset({
 
 
 def macro_to_json(commands, name="") -> str:
-    """命令の列を JSON 文字列にする。"""
+    """命令の列を JSON 文字列にする。
+
+    引数の値が文字列・数値・真偽でないもの(None / list / dict)は、
+    ここで ValueError にする(JSON では書けてしまうが、テキスト形式
+    への書き出しや再生で意味が変わるため。_check_scalar_args)。"""
+    for entry in commands:
+        _check_scalar_args(entry.get("args") or {},
+                           f"{entry.get('cmd')} の ")
     payload = {
         "name": name,
         "commands": [
@@ -143,6 +150,41 @@ def macro_to_json(commands, name="") -> str:
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+# 引数の値に書けるもの(JSON のスカラー)。None / list / dict は
+# 書けない(_check_scalar_args)。
+_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _check_scalar_args(args, where):
+    """引数の値を確かめる。文字列・数値・真偽だけが書ける。
+
+    None / list / dict が入ると、JSON では読めるのに再生で意味が
+    変わり(insert_text の text が None なら ""、list なら "[1, 2]"
+    という文字列が入る)、テキスト形式では読み込み時に ValueError
+    になる(値の種類が決まっているため)。往復できない値は、保存
+    する側(macro_to_json / commands_to_text)と読み込む側
+    (_checked_commands)の両方で落とす。"""
+    for key, value in (args or {}).items():
+        if not isinstance(value, _SCALAR_TYPES):
+            raise ValueError(
+                f"{where}{key} の値には、文字列・数値・真偽だけが書けます")
+
+
+def validate_macro_name(name) -> str:
+    """登録名を確かめて、前後空白を取った名前を返す。
+
+    空の名前と、改行を含む名前は ValueError。改行が入るとテキスト
+    形式の「# name: 名前」の行が壊れて読み戻せなくなるため。
+    前後空白は取る(読み込み側も取るので、取らないと保存と読み込み
+    で名前がずれる)。"""
+    text = str(name or "").strip()
+    if not text:
+        raise ValueError("マクロの名前が空です")
+    if "\n" in text or "\r" in text:
+        raise ValueError("マクロの名前に改行は使えません")
+    return text
 
 
 def _checked_commands(raw):
@@ -158,6 +200,7 @@ def _checked_commands(raw):
         args = entry.get("args") or {}
         if not isinstance(args, dict):
             raise ValueError(f"{i + 1} 件目の args が辞書になっていません")
+        _check_scalar_args(args, f"{i + 1} 件目の ")
         commands.append({"cmd": entry["cmd"], "args": dict(args)})
     return commands
 
@@ -206,22 +249,29 @@ def _json_literal(value) -> str:
 def commands_to_text(commands, name="") -> str:
     """命令の列をテキスト形式(1行1命令)にする。
 
-    先頭に「# name: 名前」の行を置く(名前があるとき)。引数の値は
-    JSON リテラルで書くので、文字列の中の改行や引用符はエスケープ
-    されて1行に収まる。U+2028 / U+2029 / U+0085 も \\uXXXX の形に
-    逃がす(そのまま書くと、読み込み時の行の切り分けがずれる)。
-    insert_text は text だけのときに簡便形
-    (insert_text "…")で書く。"""
+    先頭に「# name: 名前」の行を置く(名前があるとき)。名前は
+    validate_macro_name で確かめる(改行が入ると行が壊れて読み戻せ
+    ないため)。引数の値は JSON リテラルで書くので、文字列の中の
+    改行や引用符はエスケープされて1行に収まる。U+2028 / U+2029 /
+    U+0085 も \\uXXXX の形に逃がす(そのまま書くと、読み込み時の行の
+    切り分けがずれる)。引数の値が文字列・数値・真偽でないものは、
+    ここで ValueError にする(書いたテキストが読めなくなるため)。
+    insert_text は text が文字列のときにだけ簡便形
+    (insert_text "…")で書く(数値などは key=値の形でないと、
+    読み込み側が文字列でないと受け付けないため)。"""
     lines = []
     if name:
+        name = validate_macro_name(name)
         lines.append(f"{_NAME_LINE} {name}")
     for entry in commands:
         cmd = entry["cmd"]
         args = dict(entry.get("args") or {})
+        _check_scalar_args(args, f"{cmd} の ")
         if not args:
             lines.append(cmd)
-        elif cmd == "insert_text" and set(args) == {"text"}:
-            lines.append("insert_text " + _json_literal(str(args["text"])))
+        elif (cmd == "insert_text" and set(args) == {"text"}
+                and isinstance(args["text"], str)):
+            lines.append("insert_text " + _json_literal(args["text"]))
         else:
             parts = [cmd]
             for key, value in args.items():
@@ -310,15 +360,24 @@ def sanitize_registered(raw):
 
     形は {名前: {"commands": [...], "key": "..."}}。値が命令の列
     そのもの([..])なら、キーなしの登録として受ける。壊れた項目
-    (知らない命令を含む・命令が空など)は黙って落とす(設定ファイル
+    (知らない命令を含む・命令が空・引数の値が文字列・数値・真偽
+    でない・名前が空か改行を含むなど)は黙って落とす(設定ファイル
     の書き間違いで窓が開かなくなるのを防ぐため。他の設定の整えと
-    同じ作法)。"""
+    同じ作法)。名前は前後空白を取って揃え、取った結果が重なったら
+    先のものを残して後のものを落とす(黙って上書きすると、保存した
+    はずのマクロが消えるため)。キーの重なり(同じキーを2つのマクロ
+    が持つ)はここでは落とさない(窓側が先のものを優先し、管理画面
+    が「効いていない」ことを表示する。どちらかを捨てるより、
+    直せる形で残すほうがましなため)。"""
     clean = {}
     if not isinstance(raw, dict):
         return clean
     for raw_name, entry in raw.items():
-        name = str(raw_name).strip()
-        if not name:
+        try:
+            name = validate_macro_name(raw_name)
+        except ValueError:
+            continue
+        if name in clean:
             continue
         if isinstance(entry, list):
             commands_raw, key, source = entry, "", None

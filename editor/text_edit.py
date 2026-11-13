@@ -81,8 +81,14 @@ _MODIFIER_KEYS = frozenset({
     Qt.Key.Key_AltGr,
 })
 
-FONT_SIZE_MIN = 7
-FONT_SIZE_MAX = 32
+# Ctrl+ホイールのフォントの大きさの範囲。設定画面の範囲
+# (editor/ext_settings.py の FONT_SIZE_MIN / FONT_SIZE_MAX)と
+# 揃える。ホイールで変えた大きさは設定へ書き戻すので、範囲が
+# 狭いと設定画面で選んだ大きさ(例: 48pt)が1ノッチで潰れて
+# しまう。1ノッチ1pt なので、広げても大きく飛ぶことはない。
+# 一致は tests/test_editor_ext_settings.py で見張る。
+FONT_SIZE_MIN = 6
+FONT_SIZE_MAX = 72
 # フォントの大きさが取れないとき(Pixel 指定等)の代わりの起点。
 FALLBACK_FONT_SIZE = 10
 

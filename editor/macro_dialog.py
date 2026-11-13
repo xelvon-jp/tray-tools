@@ -254,9 +254,7 @@ class MacroLibraryDialog(QDialog):
     # ---------------------------------------------------------------
     def register_macro(self, name, commands, key=""):
         """マクロを登録する。同じ名前があれば ValueError。"""
-        name = str(name or "").strip()
-        if not name:
-            raise ValueError("マクロの名前が空です")
+        name = macmod.validate_macro_name(name)
         if name in self._macros:
             raise ValueError(f"同じ名前のマクロが既にあります（{name}）")
         checked = macmod.sanitize_registered(
@@ -272,11 +270,9 @@ class MacroLibraryDialog(QDialog):
 
     def rename_macro(self, old, new):
         """登録マクロの名前を変える。"""
-        new = str(new or "").strip()
+        new = macmod.validate_macro_name(new)
         if old not in self._macros:
             raise ValueError(f"マクロがありません（{old}）")
-        if not new:
-            raise ValueError("マクロの名前が空です")
         if new != old and new in self._macros:
             raise ValueError(f"同じ名前のマクロが既にあります（{new}）")
         if new != old:

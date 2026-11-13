@@ -25,6 +25,10 @@
 #   - 拡張子の無いファイル(既定。Makefile や LICENSE のような
 #     文章ファイルもあるが、実行形式まで入ってしまうため。
 #     プレビュー側の除外の扱いに揃えて件数と理由を返す)
+#   - リンクのファイル(シンボリックリンク／ハードリンク。書き込み
+#     が os.replace による差し替えなので、リンク自体が通常ファイル
+#     に置き換わってしまう(シンボリックリンクは消え、ハードリンク
+#     は切れる)ため。件数を数えて外す)
 #   - 読めなかったファイル
 #   - バイナリらしいファイル(読み替えが発生したもの、本文に
 #     U+0000 を含むもの)
@@ -67,6 +71,7 @@ class ReplacePreview:
     total_count: int = 0            # 置換の合計件数
     skipped_open: list = field(default_factory=list)        # パス
     skipped_no_extension: list = field(default_factory=list)  # パス
+    skipped_link: list = field(default_factory=list)        # パス
     skipped_unreadable: list = field(default_factory=list)  # パス
     skipped_binary: list = field(default_factory=list)      # パス
     skipped_unencodable: list = field(default_factory=list)  # (パス, 書けない文字)
@@ -80,6 +85,7 @@ STATUS_CHANGED = "changed"          # プレビュー後に変わっていた
 STATUS_OPEN = "open"                # 実行時点で EDDy で開かれていた
 STATUS_UNREADABLE = "unreadable"    # 読めなかった
 STATUS_BINARY = "binary"            # バイナリらしい
+STATUS_LINK = "link"                # リンクのファイルのため飛ばした
 STATUS_UNENCODABLE = "unencodable"  # 書けない文字がある
 STATUS_FAILED = "failed"            # 書き込み等で失敗した
 
@@ -134,6 +140,20 @@ def _is_binary_like(doc) -> bool:
     return doc.lossy_decode or "\x00" in doc.text
 
 
+def _is_link(path) -> bool:
+    """リンクのファイルか(シンボリックリンク、またはハードリンク
+    で他にも同じ中身の名前があるもの)。
+
+    書き込みは os.replace による差し替えなので、リンク自体が通常
+    ファイルに置き換わってしまう(シンボリックリンクは消え、ハード
+    リンクは切れて別の中身になる)。読まずに確かめられる。消えて
+    いたら False(読み込みの段で読めないものとして扱う)。"""
+    try:
+        return os.path.islink(path) or os.stat(path).st_nlink > 1
+    except OSError:
+        return False
+
+
 def preview_replace(root, word, repl, *, case_sensitive=False, regex=False,
                     exclude_paths=(), extensions=None,
                     max_bytes=grepmod.MAX_FILE_BYTES,
@@ -163,6 +183,11 @@ def preview_replace(root, word, repl, *, case_sensitive=False, regex=False,
                 pass
         if normalize_path(path) in excluded:
             preview.skipped_open.append(path)
+            continue
+        if _is_link(path):
+            # リンクは置換の書き込みでリンク自体が置き換わって
+            # しまうので、読む前に対象から外す(件数と理由を残す)。
+            preview.skipped_link.append(path)
             continue
         if (exclude_no_extension
                 and not os.path.splitext(path)[1]):
@@ -226,6 +251,13 @@ def execute_replace(preview, word, repl, *, case_sensitive=False,
             result.outcomes.append(ReplaceOutcome(
                 path, STATUS_OPEN,
                 detail="EDDy で開いているため対象外にしました"))
+            continue
+        if _is_link(path):
+            # プレビューの後にリンクになったものも、ここで止める
+            # (プレビューだけの判定では、間の変化を拾えないため)。
+            result.outcomes.append(ReplaceOutcome(
+                path, STATUS_LINK,
+                detail="リンクのファイルのため飛ばしました"))
             continue
         try:
             doc = docmod.load_document(path)

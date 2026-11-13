@@ -476,20 +476,22 @@ def test_ctrl_wheel_changes_font_size():
 
 
 def test_font_size_clamp():
+    # 大きさの範囲は設定画面と同じ 6〜72pt(Ctrl+ホイールと設定画面
+    # の範囲を揃えたため。旧 7〜32pt)。
     window = make_window()
     try:
         edit = window._edit
-        edit.set_font_size(32)
-        assert window.font_size() == 32
+        edit.set_font_size(72)
+        assert window.font_size() == 72
         edit.wheelEvent(_wheel_event(
             120, Qt.KeyboardModifier.ControlModifier))
-        assert window.font_size() == 32  # 上限で止まる
-        edit.set_font_size(7)
+        assert window.font_size() == 72  # 上限で止まる
+        edit.set_font_size(6)
         edit.wheelEvent(_wheel_event(
             -120, Qt.KeyboardModifier.ControlModifier))
-        assert window.font_size() == 7  # 下限で止まる
+        assert window.font_size() == 6  # 下限で止まる
         edit.set_font_size(100)
-        assert window.font_size() == 32
+        assert window.font_size() == 72
     finally:
         discard_close(window)
 
@@ -3476,10 +3478,12 @@ def test_keymap_readback_from_overrides():
         discard_close(window)
 
 
-def test_taskbar_identity_applied_once_on_show():
-    """タスクバーのアプリID付けは、初回の表示で1回だけ走る(再表示では
-    走らない)。実付けは Windows でのみ filer_shell へ届き、それ以外では
-    何もしない(例外も出ない)。付け先のIDは、常駐とあっふ のIDと違う。"""
+def test_taskbar_identity_applied_on_every_show():
+    """タスクバーのアプリID付けは、表示のたびに走る(窓を作り直すと
+    HWND が変わって外れるため。同じ値を同じ窓へ書くのは上書きなの
+    で害はない)。実付けは Windows でのみ filer_shell へ届き、それ
+    以外では何もしない(例外も出ない)。付け先のIDは、常駐とあっふ
+    のIDと違う。"""
     import editor.window as windowmod
 
     assert windowmod.TASKBAR_APP_ID not in ("traytools.app.1", "traytools.affx")
@@ -3493,7 +3497,7 @@ def test_taskbar_identity_applied_once_on_show():
         window.hide()
         window.show()
         app().processEvents()
-        assert calls == [1], calls  # 再表示では付け直さない
+        assert calls == [1, 1], calls  # 再表示でも付け直す
     finally:
         discard_close(window)
 

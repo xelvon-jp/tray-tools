@@ -269,6 +269,8 @@ class GrepReplaceDialog(QDialog):
             parts.append(f"開いている {len(preview.skipped_open)} 件")
         if preview.skipped_no_extension:
             parts.append(f"拡張子がない {len(preview.skipped_no_extension)} 件")
+        if preview.skipped_link:
+            parts.append(f"リンク {len(preview.skipped_link)} 件")
         if preview.skipped_unreadable:
             parts.append(f"読めない {len(preview.skipped_unreadable)} 件")
         if preview.skipped_binary:
@@ -354,6 +356,7 @@ class GrepReplaceDialog(QDialog):
             replacemod.STATUS_OPEN: "飛ばしました",
             replacemod.STATUS_UNREADABLE: "飛ばしました",
             replacemod.STATUS_BINARY: "飛ばしました",
+            replacemod.STATUS_LINK: "飛ばしました",
             replacemod.STATUS_UNENCODABLE: "飛ばしました",
             replacemod.STATUS_FAILED: "失敗しました",
         }
@@ -389,6 +392,9 @@ class GrepReplaceDialog(QDialog):
         binary = result.by_status(replacemod.STATUS_BINARY)
         if binary:
             reasons.append(f"バイナリらしい {len(binary)} 件")
+        linked = result.by_status(replacemod.STATUS_LINK)
+        if linked:
+            reasons.append(f"リンク {len(linked)} 件")
         failed = result.by_status(replacemod.STATUS_FAILED)
         if failed:
             reasons.append(f"失敗 {len(failed)} 件")

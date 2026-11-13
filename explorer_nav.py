@@ -42,9 +42,11 @@ _SHELL_ERRORS = (OSError, AttributeError) + (
     (_COM_ERROR,) if _COM_ERROR is not None else ())
 
 try:
-    _user32 = ctypes.windll.user32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通す
+    # 専用の WinDLL(ctypes.windll は共有で、argtypes/restype が他モジュールと
+    # 取り合いになるため。window_tools と同じ作法)。
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通す
     # (クラス名は _class_name が空文字で返す)。
     _user32 = None
 

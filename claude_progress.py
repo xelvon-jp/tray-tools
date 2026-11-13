@@ -845,9 +845,10 @@ class ClaudeProgressPanel(QWidget):
                                      track.height()), 3, 3)
 
         # 2段目: ID と、注意の説明・失敗の理由
-        sub = entry["id"]
+        # 畳んだ完了(summary)の id は固定文字列なので出さない(件名で足りる)
+        sub = "" if entry["stage"] == "summary" else entry["id"]
         if entry["note"]:
-            sub += "・" + entry["note"]
+            sub = (sub + "・" if sub else "") + entry["note"]
         p.setFont(self._sub_font)
         sub_fm = QFontMetrics(self._sub_font)
         p.setPen(color if (entry["warn"] != "none" or entry["stage"] == "failed")

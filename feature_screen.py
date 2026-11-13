@@ -33,7 +33,7 @@ import command_launcher
 import command_palette
 import cursor_finder
 from picker import PickerWindow
-from settings import save_settings
+from settings import update_settings
 import unified_picker
 import explorer_nav
 import claude_progress
@@ -1360,7 +1360,11 @@ class ScreenFeature:
 
     def _save_unified_picker_state(self):
         try:
-            save_settings(self.app_settings, self.settings_path)
+            # unified_picker 節だけを差し替える。メモリ上の設定全体を書くと、
+            # 起動時の姿のままで他のプロセスの変更を戻してしまう。
+            update_settings(
+                {"unified_picker": self._unified_picker_state()},
+                self.settings_path)
         except Exception:  # noqa: BLE001  保存できなくても実行は続ける
             traceback.print_exc()
 
@@ -2223,18 +2227,12 @@ class ScreenFeature:
 
         picker = PickerWindow(
             "統合ピッカー", rebuild(), accept,
-            placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
-            preview_provider=lambda data: unified_picker.preview_text(data),
-            dynamic_items=dynamics,
-            accept_empty=unified_picker.make_accept_empty(state),
-            tab_text=unified_picker.make_tab_text(state),
-            on_delete=delete, on_move=move, dynamic_last=True,
-            modes=unified_picker.MODES,
-            initial_mode=unified_picker.INITIAL_MODE,
-            on_mode_change=mode_change,
-            on_calc=self._open_picker_calculator,
-            on_ctrl_enter=lambda name, data: self._on_unified_ctrl_enter(
-                picker, name, data))
+            **unified_picker.picker_kwargs(
+                state, dynamics=dynamics, on_delete=delete, on_move=move,
+                on_mode_change=mode_change,
+                on_calc=self._open_picker_calculator,
+                on_ctrl_enter=lambda name, data: self._on_unified_ctrl_enter(
+                    picker, name, data)))
         picker.closed.connect(self._close_launcher)
         self.launcher_picker = picker
         picker.show()

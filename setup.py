@@ -380,9 +380,19 @@ def _backup_settings() -> Path:
 
 
 def _save_settings(data: dict) -> None:
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    """書き込みの作法は settings.save_settings に一本化する(一時ファイル→
+    os.replace、.bak 1世代)。settings.py が読めないときだけ、同じ作法で書く。"""
+    try:
+        sys.path.insert(0, str(PROJECT_DIR))
+        import settings as settings_module
+
+        settings_module.save_settings(data, SETTINGS_PATH)
+    except Exception:
+        tmp = SETTINGS_PATH.with_name(f"{SETTINGS_PATH.name}.tmp-{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, SETTINGS_PATH)
 
 
 def _print_devices(title: str, devices: list) -> None:

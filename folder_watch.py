@@ -180,17 +180,8 @@ def save_config(settings_path, updates: dict, app_settings=None) -> None:
     if not settings_path:
         return
     import settings as settings_module
-    stored = {}
-    if os.path.exists(settings_path):
-        with open(settings_path, "r", encoding="utf-8") as f:
-            stored = json.load(f)
-    if not isinstance(stored, dict):
-        stored = {}
-    section = stored.get(SECTION)
-    if not isinstance(section, dict):
-        section = stored[SECTION] = {}
-    section.update(json.loads(json.dumps(updates)))
-    settings_module.save_settings(stored, settings_path)
+
+    settings_module.update_settings_section(SECTION, updates, settings_path)
 
 
 def validate_rule(rule: dict) -> str | None:

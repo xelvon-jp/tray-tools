@@ -75,10 +75,12 @@ class LASTINPUTINFO(ctypes.Structure):
 
 
 try:
-    _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通し、実呼び出しはしない
+    # 専用の WinDLL(ctypes.windll は共有で、argtypes/restype が他モジュールと
+    # 取り合いになるため。window_tools と同じ作法)。
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通し、実呼び出しはしない
     # (idle_seconds は None、jiggle は False を返す。どちらも「何もしない」側)。
     _user32 = _kernel32 = None
 

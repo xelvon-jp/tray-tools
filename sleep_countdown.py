@@ -9,6 +9,7 @@
 # 作業中の視線からいちばん遠いため。中央に出すと、それ自体が作業の邪魔になる。
 import sys
 
+import errlog
 from PySide6.QtCore import Qt, QRect, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter
 from PySide6.QtWidgets import QPushButton, QWidget
@@ -31,11 +32,13 @@ URGENT = "#ff5252"
 
 
 def _guard(where: str) -> None:
-    """スロットの中で起きた例外をここで止める。
+    """スロットの中で起きた例外をここで止め、errlog へ残す。
 
     PySide6 はスロットから例外が投げ切られるとプロセスごと終了する。1秒ごとに走る
-    タイマーなので、1回の失敗で常駐アプリごと消えては割に合わない。"""
-    print(f"[tray-tools] スリープの予告: {where}に失敗しました", file=sys.stderr)
+    タイマーなので、1回の失敗で常駐アプリごと消えては割に合わない。
+    通知はしない(1秒ごとのタイマーで、失敗が続くと画面が埋まるため)。
+    以前は標準エラーへ1行出すだけで、例外の中身はどこにも残らなかった。"""
+    errlog.guard("スリープの予告", where, notify=False)
 
 
 class SleepCountdown(QWidget):

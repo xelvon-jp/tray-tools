@@ -37,6 +37,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+import errlog
 from toast import show_toast
 
 # ---------------------------------------------------------------
@@ -118,18 +119,15 @@ EXCLUSIVE_KINDS = {
 
 
 def _guard(where: str, notify: bool = True) -> None:
-    """スロットの中で起きた例外をここで止め、標準エラー(と必要なら通知)へ回す。
+    """スロットの中で起きた例外をここで止め、errlog へ回す。
 
     PySide6 はスロットから例外が投げ切られるとプロセスごと終了する。このオーバーレイは
     タイマーとマウスだけで動くので、1回の失敗で常駐アプリごと消えては割に合わない。
-    しかも通常起動は pythonw.exe で標準エラーがどこにも出ず、落ちた理由が残らない。
+    記録と通知は errlog.guard に一本化した(以前は標準エラーへ出すだけで、
+    通常起動(pythonw.exe)ではどこにも残らなかった)。
 
-    notify=False は周期タイマーと描画用。毎周期トーストを出すと画面が埋まる
-    (taskbar_launcher._guard と同じ役目・同じ理由)。"""
-    traceback.print_exc()
-    print(f"[tray-tools] プレゼン支援: {where}に失敗しました", file=sys.stderr)
-    if notify:
-        show_toast(f"プレゼン支援\n{where}に失敗しました")
+    notify=False は周期タイマーと描画用。毎周期トーストを出すと画面が埋まる。"""
+    errlog.guard("プレゼン支援", where, notify=notify)
 
 
 def _as_int(value, default: int) -> int:

@@ -91,26 +91,6 @@ def test_sync_end_to_end():
         assert "calendar" not in saved2["taskbar_widget"]["launcher_items"]
 
 
-def main() -> int:
-    tests = [(name, fn) for name, fn in sorted(globals().items())
-             if name.startswith("test_") and callable(fn)]
-    failed = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"ok    {name}")
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            import traceback
-
-            traceback.print_exc()
-            print(f"FAIL  {name}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
-    return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 def test_sync_unexpected_exception_swallowed():
     """処理の途中で予期しない例外が出ても、投げずに空の一覧を返す(起動を止めない)。"""
@@ -137,3 +117,25 @@ def test_save_settings_trailing_newline():
         text = path.read_text(encoding="utf-8")
         assert text.endswith("\n")
         assert json.loads(text) == {"environment": 1}
+
+
+def main() -> int:
+    tests = [(name, fn) for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"ok    {name}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            import traceback
+
+            traceback.print_exc()
+            print(f"FAIL  {name}: {type(e).__name__}: {e}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

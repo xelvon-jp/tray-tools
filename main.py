@@ -31,6 +31,7 @@ import action_log
 import beep
 import capture_grab
 import com_gc_probe
+import errlog
 import pushover
 import remote_capture
 import settings as settings_module
@@ -1042,6 +1043,10 @@ def _install_excepthook():
 def main():
     _install_crash_log()
     _install_excepthook()
+    # errlog の通知の宛先をトーストに繋ぐ。各モジュールの _guard は errlog 経由で
+    # ここへ来る(通知の間引きは errlog 側が持つ)。
+    errlog.notify_hook = lambda title, where: show_toast(
+        f"{title}\n{where}に失敗しました")
     # 調査モード(既定は無効)。COM ポインタが作られる前に入れないと作成元を記録できないので、
     # Feature を組み立てるより先に置く。有効にする方法と中身は com_gc_probe.py の冒頭。
     if com_gc_probe.is_requested():

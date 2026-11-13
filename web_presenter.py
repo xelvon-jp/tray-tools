@@ -166,19 +166,11 @@ def remember_url(app_settings: dict, settings_path, url: str) -> bool:
     if not settings_path:
         return False
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        stored_tools = stored.get("tools")
-        if not isinstance(stored_tools, dict):
-            stored_tools = stored["tools"] = {}
-        stored_tools["web_presenter_recent"] = recent
-        settings_module.save_settings(stored, settings_path)
+        settings_module.update_settings_section(
+            "tools", {"web_presenter_recent": recent}, settings_path)
         return True
-    except (OSError, ValueError, TypeError, AttributeError) as e:
+    except (OSError, ValueError, TypeError, AttributeError,
+            settings_module.SettingsError) as e:
         print(f"[tray-tools] 取り込み履歴を保存できません: {e}", file=sys.stderr)
         return False
 

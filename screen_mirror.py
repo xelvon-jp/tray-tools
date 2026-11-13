@@ -118,6 +118,7 @@ import presenter_overlay
 from capture_grab import grab_region
 from capture_overlay import SelectionOverlay
 from qt_image import pil_to_qpixmap
+import errlog
 from toast import show_toast
 
 # ---------------------------------------------------------------
@@ -368,9 +369,11 @@ GW_HWNDPREV = 3
 Z_ORDER_SCAN_LIMIT = 64
 
 try:
-    _user32 = ctypes.windll.user32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通す
+    # 専用の WinDLL(ctypes.windll は共有で、argtypes/restype が他モジュールと
+    # 取り合いになるため。window_tools と同じ作法)。
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通す
     # (窓の実探査は Windows でしか呼ばれない)。
     _user32 = None
 
@@ -445,18 +448,15 @@ def _overlapped_from_above(hwnd: int) -> bool:
 
 
 def _guard(where: str, notify: bool = True) -> None:
-    """スロットの中で起きた例外をここで止め、標準エラー(と必要なら通知)へ回す。
+    """スロットの中で起きた例外をここで止め、errlog へ回す。
 
     PySide6 はスロットから例外が投げ切られるとプロセスごと終了する。ミラーは
     毎フレーム走るタイマーで動くので、1回の失敗で常駐アプリごと消えては割に合わない。
-    しかも通常起動は pythonw.exe で標準エラーがどこにも出ず、落ちた理由が残らない。
+    記録と通知は errlog.guard に一本化した(以前は標準エラーへ出すだけで、
+    通常起動(pythonw.exe)ではどこにも残らなかった)。
 
-    notify=False は周期タイマーと描画用。毎フレームトーストを出すと画面が埋まる
-    (presenter_overlay._guard と同じ役目・同じ理由)。"""
-    traceback.print_exc()
-    print(f"[tray-tools] 画面ミラー: {where}に失敗しました", file=sys.stderr)
-    if notify:
-        show_toast(f"画面ミラー\n{where}に失敗しました")
+    notify=False は周期タイマーと描画用。毎フレームトーストを出すと画面が埋まる。"""
+    errlog.guard("画面ミラー", where, notify=notify)
 
 
 def _as_int(value, default: int) -> int:
@@ -3397,24 +3397,12 @@ class MirrorController:
         if not self.settings_path:
             return
         try:
-            import json
-            import os
-
             import settings as settings_module
 
-            stored = {}
-            if os.path.exists(self.settings_path):
-                with open(self.settings_path, "r", encoding="utf-8") as f:
-                    stored = json.load(f)
-            if not isinstance(stored, dict):
-                stored = {}
-            section = stored.setdefault(section_name, {})
-            if not isinstance(section, dict):
-                section = {}
-                stored[section_name] = section
-            section.update(values)
-            settings_module.save_settings(stored, self.settings_path)
-        except (OSError, ValueError, TypeError, AttributeError) as e:
+            settings_module.update_settings_section(
+                section_name, values, self.settings_path)
+        except (OSError, ValueError, TypeError, AttributeError,
+                settings_module.SettingsError) as e:
             print(f"[tray-tools] 画面ミラーの設定を保存できません: {e}", file=sys.stderr)
 
     # ---------------------------------------------------------------

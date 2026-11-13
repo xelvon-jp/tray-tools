@@ -371,8 +371,8 @@ class _LASTINPUTINFO(ctypes.Structure):
 
 
 try:
-    _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 except AttributeError:
     # Windows 以外では windll 自体が無い。import だけ通し、
     # seconds_since_input は None(取れなかった)を返す。

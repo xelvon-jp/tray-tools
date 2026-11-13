@@ -33,7 +33,9 @@ def is_network_path(path) -> bool:
         root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
         if not root.strip("\\"):
             return False
-        kernel32 = ctypes.windll.kernel32
+        # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書くと、
+        # 他モジュールの同じ関数の署名と取り合いになるため)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
         kernel32.GetDriveTypeW.restype = ctypes.c_uint
         return kernel32.GetDriveTypeW(root) == 4  # DRIVE_REMOTE
@@ -501,7 +503,7 @@ def set_taskbar_identity(hwnd: int, app_id: str, command: str,
                          icon_path: str, display_name: str) -> None:
     """ピン留め用の再起動情報(アプリID・起動コマンド・アイコン・表示名)を
     窓に書く。失敗したら例外を上げる(呼び出し側で握る)。"""
-    shell32 = ctypes.windll.shell32
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     shell32.SHGetPropertyStoreForWindow.argtypes = [
         wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p]
     shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long

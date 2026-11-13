@@ -3431,8 +3431,10 @@ def downloads_folder() -> str:
                              (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4,
                                                   0x92, 0xE4, 0x67, 0x5A))
             path_ptr = ctypes.c_wchar_p()
-            shell32 = ctypes.windll.shell32
-            ole32 = ctypes.windll.ole32
+            # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書くと、
+            # 他モジュールの同じ関数の署名と取り合いになるため)
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            ole32 = ctypes.WinDLL("ole32", use_last_error=True)
             shell32.SHGetKnownFolderPath.argtypes = [
                 ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
                 ctypes.POINTER(ctypes.c_wchar_p)]

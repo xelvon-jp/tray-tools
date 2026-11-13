@@ -113,6 +113,30 @@ from traytools_send import pythonw_executable
 
 SETTINGS_SECTION = "filer"
 ERROR_LOG_PATH = Path(__file__).resolve().parent / "filer_error.log"
+# メッセージ窓の内容の控え。画面のログ欄は窓を閉じたら消えるので、ファイルにも残す。
+MESSAGE_LOG_PATH = Path(
+    os.environ.get("LOCALAPPDATA") or Path.home()
+) / "traytools" / "filer.log"
+MESSAGE_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _append_message_log(text: str) -> None:
+    """メッセージ窓の1行を filer.log へ追記する。書けなくても例外にしない。
+
+    大きくなったら filer.log.1 へ1世代だけ退避する。"""
+    try:
+        MESSAGE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if MESSAGE_LOG_PATH.stat().st_size > MESSAGE_LOG_MAX_BYTES:
+                os.replace(
+                    MESSAGE_LOG_PATH,
+                    MESSAGE_LOG_PATH.with_name("filer.log.1"))
+        except OSError:
+            pass
+        with open(MESSAGE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {text}\n")
+    except OSError:
+        pass
 # F7 のコンテキストメニューを出す子プロセス(COM を使うのはそちらだけ)。
 CONTEXT_MENU_SCRIPT = Path(__file__).resolve().parent / "filer_contextmenu.py"
 # 既定の配色は、ユーザーのあふｗの「表示色」設定から拾った値(濃紺の地に白、カーソルは
@@ -263,7 +287,9 @@ def _thread_com_init() -> bool:
     _thread_com_uninit() を呼ぶ。モード違いで初期化できなかった
     (RPC_E_CHANGED_MODE)ときは False(戻す対が無い)。"""
     try:
-        ole32 = ctypes.windll.ole32
+        # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書くと、
+        # 他モジュールの同じ関数の署名と取り合いになるため)
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
         ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         ole32.CoInitializeEx.restype = ctypes.c_long  # HRESULT
         # COINIT_APARTMENTTHREADED(0x2) | COINIT_DISABLE_OLE1DDE(0x4)
@@ -275,7 +301,7 @@ def _thread_com_init() -> bool:
 
 def _thread_com_uninit() -> None:
     try:
-        ole32 = ctypes.windll.ole32
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
         ole32.CoUninitialize.argtypes = []
         ole32.CoUninitialize.restype = None
         ole32.CoUninitialize()
@@ -301,17 +327,8 @@ def save_values(app_settings, settings_path, updates: dict) -> None:
     if not settings_path:
         return
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        section = stored.get(SETTINGS_SECTION)
-        if not isinstance(section, dict):
-            section = stored[SETTINGS_SECTION] = {}
-        section.update(updates)
-        settings_module.save_settings(stored, settings_path)
+        settings_module.update_settings_section(
+            SETTINGS_SECTION, updates, settings_path)
     except Exception as e:  # noqa: BLE001  覚えられないだけ。閉じる操作を止めない
         print(f"[filer] 設定を保存できません: {e}", file=sys.stderr)
 
@@ -3955,6 +3972,7 @@ class FilerWindow(QWidget):
     # --- メッセージ窓 ---
     def log(self, text: str) -> None:
         self.log_view.appendPlainText(f"{datetime.now():%H:%M:%S}  {text}")
+        _append_message_log(text)
 
     # --- 前面化(filer_launch からの "show") ---
     def listen(self) -> None:
@@ -4000,7 +4018,9 @@ class FilerWindow(QWidget):
         """前面化ロックで activateWindow が黙って失敗したときに、もう一度だけ取りに行く
         (picker._ensure_foreground と同じ。filer_launch が前面化の権利を譲ってある)。"""
         try:
-            user32 = ctypes.windll.user32
+            # 専用の WinDLL から取る(picker の _ensure_foreground と署名が
+            # 違うので、共有だと取り合いになる)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.GetForegroundWindow.argtypes = []
             user32.GetForegroundWindow.restype = wintypes.HWND
             user32.SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -4936,20 +4956,16 @@ class FilerWindow(QWidget):
         if not self.settings_path:
             return
         try:
-            stored = {}
-            if os.path.exists(self.settings_path):
-                with open(self.settings_path, "r", encoding="utf-8") as f:
-                    stored = json.load(f)
-            if not isinstance(stored, dict):
-                stored = {}
-            filer_section = stored.get(SETTINGS_SECTION)
-            if not isinstance(filer_section, dict):
-                filer_section = stored[SETTINGS_SECTION] = {}
-            tools = filer_section.get("tools")
-            if not isinstance(tools, dict):
-                tools = filer_section["tools"] = {}
-            tools.update(updates)
-            settings_module.save_settings(stored, self.settings_path)
+            def apply(raw):
+                filer_section = raw.get(SETTINGS_SECTION)
+                if not isinstance(filer_section, dict):
+                    filer_section = raw[SETTINGS_SECTION] = {}
+                tools = filer_section.get("tools")
+                if not isinstance(tools, dict):
+                    tools = filer_section["tools"] = {}
+                tools.update(updates)
+
+            settings_module.update_settings(apply, self.settings_path)
         except Exception as e:  # noqa: BLE001
             self.log(f"settings.json に書けません: {e}")
 
@@ -4984,17 +5000,9 @@ class FilerWindow(QWidget):
         if not self.settings_path:
             return
         try:
-            stored = {}
-            if os.path.exists(self.settings_path):
-                with open(self.settings_path, "r", encoding="utf-8") as f:
-                    stored = json.load(f)
-            if not isinstance(stored, dict):
-                stored = {}
-            filer_section = stored.get(SETTINGS_SECTION)
-            if not isinstance(filer_section, dict):
-                filer_section = stored[SETTINGS_SECTION] = {}
-            filer_section["update_zip_folder"] = value
-            settings_module.save_settings(stored, self.settings_path)
+            settings_module.update_settings_section(
+                SETTINGS_SECTION, {"update_zip_folder": value},
+                self.settings_path)
         except Exception as e:  # noqa: BLE001
             self.log(f"settings.json に書けません: {e}")
 
@@ -5819,19 +5827,13 @@ class FilerWindow(QWidget):
 
         picker = self._open_picker(
             "統合ピッカー", build_items(), self.jump_to, on_accept=accept,
-            placeholder=unified_picker.PLACEHOLDER, hint=unified_picker.HINT,
-            preview_provider=lambda data: unified_picker.preview_text(
-                data, context="filer"),
-            dynamic_items=dynamics,
-            accept_empty=unified_picker.make_accept_empty(state),
-            tab_text=unified_picker.make_tab_text(state),
-            on_delete=delete, on_move=move, dynamic_last=True,
-            modes=unified_picker.MODES,
-            initial_mode=unified_picker.INITIAL_MODE,
-            on_mode_change=mode_change,
-            on_calc=self._open_picker_calculator,
-            on_ctrl_enter=lambda name, data: self._picker_ctrl_enter(
-                picker, name, data))
+            **unified_picker.picker_kwargs(
+                state, dynamics=dynamics, on_delete=delete, on_move=move,
+                on_mode_change=mode_change,
+                on_calc=self._open_picker_calculator,
+                on_ctrl_enter=lambda name, data: self._picker_ctrl_enter(
+                    picker, name, data),
+                context="filer"))
 
     def _run_resident_feature(self, item_key: str) -> None:
         """統合ピッカー(!)で選ばれた機能の実行を、常駐へ IPC で依頼する。

@@ -189,3 +189,25 @@ def test_show_at_places_window():
             assert window.frameGeometry().bottom() <= avail.bottom()
     finally:
         window.close()
+
+
+def main() -> int:
+    tests = [(name, fn) for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"ok    {name}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            import traceback
+
+            traceback.print_exc()
+            print(f"FAIL  {name}: {type(e).__name__}: {e}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

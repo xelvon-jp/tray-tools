@@ -239,19 +239,11 @@ def push_recent(app_settings: dict, settings_path, name: str) -> bool:
     if not settings_path:
         return False
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        stored_snippets = stored.get("snippets")
-        if not isinstance(stored_snippets, dict):
-            stored_snippets = stored["snippets"] = {}
-        stored_snippets["recent"] = recent
-        settings_module.save_settings(stored, settings_path)
+        settings_module.update_settings_section(
+            "snippets", {"recent": recent}, settings_path)
         return True
-    except (OSError, ValueError, TypeError, AttributeError) as e:
+    except (OSError, ValueError, TypeError, AttributeError,
+            settings_module.SettingsError) as e:
         print(f"[tray-tools] 定型文の使用履歴を保存できません: {e}", file=sys.stderr)
         return False
 

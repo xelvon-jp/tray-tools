@@ -287,21 +287,11 @@ class LogViewer(QWidget):
             section[SETTINGS_ALWAYS_ON_TOP] = bool(checked)
         if not self._settings_path:
             return
-        import json
-        import os
         try:
-            stored = {}
-            if os.path.exists(self._settings_path):
-                with open(self._settings_path, "r", encoding="utf-8") as f:
-                    stored = json.load(f)
-            if not isinstance(stored, dict):
-                stored = {}
-            section = stored.get(SETTINGS_SECTION)
-            if not isinstance(section, dict):
-                section = stored[SETTINGS_SECTION] = {}
-            section[SETTINGS_ALWAYS_ON_TOP] = bool(checked)
-            settings_module.save_settings(stored, self._settings_path)
-        except OSError as e:
+            settings_module.update_settings_section(
+                SETTINGS_SECTION, {SETTINGS_ALWAYS_ON_TOP: bool(checked)},
+                self._settings_path)
+        except (OSError, settings_module.SettingsError) as e:
             print(f"[agent_loop_viewer] 最前面固定の保存に失敗: {e}")
 
     def _apply_always_on_top(self, checked: bool) -> None:

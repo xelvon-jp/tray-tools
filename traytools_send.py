@@ -249,11 +249,13 @@ def _allow_foreground() -> bool:
     失敗しても送信は続ける。フォーカスが来ないだけで、窓は出るし操作もできる
     (いままでと同じ状態に戻るだけ)。ここで送信ごと止めるほうが害が大きい。"""
     try:
-        user32 = ctypes.windll.user32
+        # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書かない作法に
+        # 他モジュールと揃える)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.AllowSetForegroundWindow.argtypes = [ctypes.c_ulong]
         user32.AllowSetForegroundWindow.restype = ctypes.c_bool
         return bool(user32.AllowSetForegroundWindow(ctypes.c_ulong(ASFW_ANY)))
-    except OSError:
+    except (OSError, AttributeError):
         return False
 
 

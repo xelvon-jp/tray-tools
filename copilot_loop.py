@@ -188,9 +188,12 @@ WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 OBJECT_MARK = "￼"
 
 try:
-    user32 = ctypes.windll.user32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通し、窓の実探査は
+    # 専用の WinDLL(ctypes.windll は共有で、argtypes/restype が他モジュールと
+    # 取り合いになるため)。copilot_status_process と muse_post が、この
+    # user32 とその署名を借りに来るので、名前と署名は変えないこと。
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通し、窓の実探査は
     # しない(状態の分類など user32 と無関係な部分はそのまま動く)。
     user32 = None
 

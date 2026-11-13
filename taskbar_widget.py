@@ -51,6 +51,7 @@ from PySide6.QtWidgets import QWidget
 import taskbar_launcher
 import window_tools
 from capture_grab import device_bounds_to_logical, grab_region
+import errlog
 from toast import show_toast
 
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
@@ -159,19 +160,17 @@ def _ensure_time_locale() -> None:
 
 
 def _guard(where: str, notify: bool = True) -> None:
-    """スロットの中で起きた例外をここで止め、標準エラー(と必要なら通知)へ回す。
+    """スロットの中で起きた例外をここで止め、errlog へ回す。
 
     PySide6 はスロットから例外が投げ切られるとプロセスごと終了する。このウィジェットは
     タイマーとマウスイベントで動き続けるため、1回の失敗で常駐アプリが消えてしまう。
 
     main.log_exception と同じ役目だが、import が main → feature_screen → ここ の
-    一方通行なので、あちらを呼ぶと循環参照になる。
+    一方通行なので、あちらは呼べない。errlog は依存が標準ライブラリだけなので、
+    記録の宛先をそちらへ一本化した。
 
     notify=False は周期タイマー用。毎周期トーストを出すと画面が埋まる。"""
-    traceback.print_exc()
-    print(f"[tray-tools] タスクバーウィジェット: {where}に失敗しました", file=sys.stderr)
-    if notify:
-        show_toast(f"タスクバーウィジェット\n{where}に失敗しました")
+    errlog.guard("タスクバーウィジェット", where, notify=notify)
 
 
 def save_config(app_settings: dict, settings_path, **values) -> None:

@@ -359,6 +359,36 @@ def test_request_rows_summary_late_count():
     assert rows[0]["note"] == "うち遅延1件"
 
 
+def test_request_rows_summary_id_is_fixed():
+    # 畳んだ行の id は固定の "summary"(最後の依頼の id を借りると重なる)
+    done = [_req(rid=f"req-20261112-{i:02d}", stage="done",
+                 detected=130 + i * 10, saved=120 + i * 10,
+                 ack=110 + i * 10, done=100 + i * 10) for i in range(5)]
+    rows = mbs.request_rows({"requests": done}, NOW)
+    summary = rows[-1]
+    assert summary["stage"] == "summary" and summary["id"] == "summary"
+    assert summary["stalled"] is False
+
+
+def test_request_rows_stalled():
+    # stalled(見張り v48: 受領のあと30分止まった)は薄い警告で出す
+    e = _req(stage="ack", detected=100, saved=90, ack=80)
+    e["stalled"] = True
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["stalled"] is True
+    assert rows[0]["warn"] == "warn"
+    assert rows[0]["note"] == "受領のあと止まっています"
+    # 付いていなければ印は無い
+    rows = mbs.request_rows({"requests": [
+        _req(stage="ack", detected=100, saved=90, ack=80)]}, NOW)
+    assert rows[0]["stalled"] is False and rows[0]["warn"] == "none"
+    # 終わった行には効かない
+    e = _req(stage="done", detected=200, saved=190, ack=100, done=90)
+    e["stalled"] = True
+    rows = mbs.request_rows({"requests": [e]}, NOW)
+    assert rows[0]["warn"] == "none"
+
+
 def test_request_rows_note_kind_hidden():
     # kind="note"(印だけの依頼)はバーに出さない。完了になっても畳みにも数えない
     e = _req(stage="done", detected=5000, saved=4990, ack=4980, done=4970)

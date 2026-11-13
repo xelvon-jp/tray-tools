@@ -410,6 +410,9 @@ def _req_row(entry, now):
         late = ack_wait is not None and ack_wait >= REQ_LATE_SEC
     reason = entry.get("reason")
     reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    # 受領のあと止まっている(見張り v48 が requests に付ける)。表示は late と
+    # 同じ薄い警告に留める(2026-11-13 の討論、テーマ14)。
+    stalled = entry.get("stalled") is True
     warn, note = "none", ""
     if stage == "done":
         # 完了したら注意の色は戻す。受領の遅れだけ小さな印で残す(2026-11-13 合意)
@@ -437,6 +440,9 @@ def _req_row(entry, now):
         if not finished and "ack" not in times and _no_ack_late(entry, now, earliest, late):
             warn = "red"
             note = "受領が10分以上来ていません"
+        if not finished and stalled and warn == "none":
+            warn = "warn"
+            note = "受領のあと止まっています"
         if stage == "failed" and not note:
             note = reason or ""
     stage_at = ended if finished else times.get(stage)
@@ -460,6 +466,7 @@ def _req_row(entry, now):
                 else "task",
         "ack_wait_sec": ack_wait,
         "late": bool(late),
+        "stalled": stalled,
         "sent_at": earliest,
         "ended_at": ended if finished else None,
         # ✕で閉じた判定のキー。段階が進めば(キーが変われば)また出る。
@@ -525,7 +532,9 @@ def request_rows(data, now=None) -> list:
         last = done_pool[0]
         late_n = sum(1 for r in done_pool if r["late"])
         rows.append({
-            "id": last["id"],
+            # id は固定の "summary"(最後の依頼の id を借りると、行のキーが
+            # 実在の依頼と重なって描く側が混同する。2026-11-13 の討論、テーマ3)
+            "id": "summary",
             "title": f"完了 {len(done_pool)}件（最後: "
                      f"{last['title'] or last['id']}）",
             "stage": "summary",
@@ -539,6 +548,7 @@ def request_rows(data, now=None) -> list:
             "kind": "task",
             "ack_wait_sec": None,
             "late": False,
+            "stalled": False,
             "sent_at": last["sent_at"],
             "ended_at": last["ended_at"],
             # ✕で閉じた判定のキー。畳んだ中身が変われば(キーが変われば)また出る。

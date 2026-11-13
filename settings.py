@@ -1,8 +1,14 @@
 # settings.py
 # settings.json の読み書きを行う。存在しない場合は自動生成し、壊れている場合は
 # デフォルトにフォールバックする(rapture-py/settings.py の挙動を踏襲)。
+# 書き込みは必ず一時ファイル経由の os.replace で行い、直前の内容を
+# settings.json.bak(1世代)に残す。壊れたファイルは settings.json.broken-<日時> へ
+# 退避し、そのプロセスでは以後そのファイルへの保存を止める(既定値で上書きして
+# 利用者の設定を消してしまわないため)。
 import json
+import os
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -584,6 +590,65 @@ DEFAULT_SETTINGS = {
 SETTINGS_PATH = Path(__file__).resolve().parent / "settings.json"
 
 
+class SettingsError(RuntimeError):
+    """設定ファイルが壊れていて保存できない、ロックが取れない等のときに上げる。"""
+
+
+# 壊れていて退避したファイルの置き場所(解決済みパス文字列 -> 退避先パス)。
+# このプロセスで壊れたと分かったファイルには、以後 save_settings /
+# update_settings で書き込まない(既定値の丸ごと書きで消さないため)。
+_broken_files: dict = {}
+
+
+def settings_load_error(path=None):
+    """path の設定ファイルが壊れて退避済みなら退避先パスを、そうでなければ None を返す。"""
+    target_path = Path(path) if path else SETTINGS_PATH
+    return _broken_files.get(str(target_path.resolve()))
+
+
+def _quarantine_broken(target_path: Path, reason: str) -> None:
+    """壊れた設定ファイルを settings.json.broken-<日時> へ退避し、記録する。"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    quarantine = target_path.with_name(f"{target_path.name}.broken-{stamp}")
+    counter = 2
+    while quarantine.exists():
+        quarantine = target_path.with_name(
+            f"{target_path.name}.broken-{stamp}-{counter}"
+        )
+        counter += 1
+    try:
+        os.replace(target_path, quarantine)
+    except OSError:
+        quarantine = target_path  # 退避できなければ元の場所のまま記録だけする
+    _broken_files[str(target_path.resolve())] = quarantine
+    print(
+        f"settings: {target_path} が壊れているため {quarantine} へ退避し、"
+        f"既定値で動作を続けます。保存は止めています({reason})",
+        file=sys.stderr,
+    )
+
+
+def _write_json_atomic(target_path: Path, data: dict) -> None:
+    """JSON を一時ファイルに書いてから os.replace で差し替える。
+
+    書きかけでプロセスが落ちても、元のファイルは壊れない。差し替え前に
+    直前の内容を settings.json.bak(1世代)へ残す。
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target_path.with_name(f"{target_path.name}.tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")  # setup.py の _save_settings と末尾改行を揃える
+        f.flush()
+        os.fsync(f.fileno())
+    if target_path.exists():
+        bak = target_path.with_name(f"{target_path.name}.bak")
+        bak_tmp = target_path.with_name(f"{target_path.name}.bak.tmp-{os.getpid()}")
+        shutil.copyfile(target_path, bak_tmp)
+        os.replace(bak_tmp, bak)
+    os.replace(tmp, target_path)
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """base(デフォルト)にoverride(読み込んだ値)を再帰的に重ねる。
     セクションごと上書きすると未指定キーが消えてしまうため、辞書同士は再帰的にマージする。"""
@@ -597,7 +662,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_settings(path=None) -> dict:
-    """settings.json を読み込む。存在しない/壊れている場合はデフォルトにフォールバックする。"""
+    """settings.json を読み込む。存在しない場合は既定値で作り、壊れている場合は
+    ファイルを退避してからデフォルトにフォールバックする。"""
     target_path = Path(path) if path else SETTINGS_PATH
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # ディープコピー
 
@@ -605,24 +671,118 @@ def load_settings(path=None) -> dict:
         try:
             with open(target_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                merged = _deep_merge(merged, loaded)
-        except (json.JSONDecodeError, OSError):
-            # 壊れたJSONはそのまま使わず、デフォルト値で継続する
-            pass
-    else:
+            if not isinstance(loaded, dict):
+                raise ValueError("中身が辞書ではありません")
+            merged = _deep_merge(merged, loaded)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            # 壊れたファイルは退避し、既定値で継続する。新しいファイルは作らない
+            # (作ると利用者の設定が既定値に置き換わってしまう)。
+            _quarantine_broken(target_path, str(e))
+    elif str(target_path.resolve()) not in _broken_files:
         save_settings(merged, target_path)
 
     return merged
 
 
 def save_settings(settings_dict: dict, path=None) -> None:
-    """settings.json へ書き込む。保存先フォルダが無ければ作成する。"""
+    """settings.json へ書き込む。保存先フォルダが無ければ作成する。
+
+    書き込みは _write_json_atomic(一時ファイル→os.replace、.bak 1世代)。
+    そのプロセスで壊れたと分かったファイルには書かない(標準エラーへ出して
+    戻る。呼び出し側の多くが Qt スロットの中で例外を投げられないため、
+    ここでは例外にしない)。
+    """
     target_path = Path(path) if path else SETTINGS_PATH
+    if str(target_path.resolve()) in _broken_files:
+        print(
+            f"settings: {target_path} は壊れて退避済みのため保存を止めています",
+            file=sys.stderr,
+        )
+        return
+    _write_json_atomic(target_path, settings_dict)
+
+
+def update_settings(changes, path=None, lock_timeout: float = 5.0) -> dict:
+    """settings.json の該当キーだけを、ロックを取りながら差し替える。
+
+    ファイルの生の辞書(既定値と混ぜる前の姿)に対して changes のキーだけを
+    代入して書き戻すので、他のプロセスが書いたキーや、既定値しか無いキーを
+    巻き込まない。一緒に変わるキーは1回の呼び出しでまとめて渡すこと。
+
+    changes には辞書の代わりに、生の辞書を受けて書き換える関数も渡せる
+    (節の中のキーだけを触る場合)。関数が False を返したら書き込まず、
+    読み込んだ辞書のまま返す。
+
+    ロックは settings.json.lock の O_EXCL 作成で取る。60秒以上前のロックは
+    残骸として捨てる。書き換えた生の辞書を返す。壊れたファイル・ロックが
+    取れない場合は SettingsError を上げる(save_settings と違い、こちらの
+    呼び出し側は新しい作法に合わせて例外を受ける前提)。
+    """
+    target_path = Path(path) if path else SETTINGS_PATH
+    if str(target_path.resolve()) in _broken_files:
+        raise SettingsError(f"{target_path} は壊れて退避済みのため保存できません")
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(settings_dict, f, ensure_ascii=False, indent=2)
-        f.write("\n")  # setup.py の _save_settings と末尾改行を揃える
+    lock_path = target_path.with_name(f"{target_path.name}.lock")
+    deadline = time.time() + lock_timeout
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 60:
+                    lock_path.unlink()  # 残骸のロックは捨てて取り直す
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                raise SettingsError(f"{lock_path} のロックが取れませんでした")
+            time.sleep(0.1)
+    try:
+        os.write(fd, f"{os.getpid()} {time.time():.0f}\n".encode("ascii"))
+        raw: dict = {}
+        if target_path.exists():
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("中身が辞書ではありません")
+            except (json.JSONDecodeError, OSError, ValueError) as e:
+                _quarantine_broken(target_path, str(e))
+                raise SettingsError(
+                    f"{target_path} が壊れていたため退避しました: {e}"
+                ) from e
+        if callable(changes):
+            if changes(raw) is False:
+                return raw  # 書き換え側が「書かなくてよい」と判断した
+        else:
+            for key, value in changes.items():
+                raw[key] = json.loads(json.dumps(value))  # 呼び出し側の辞書と切り離す
+        _write_json_atomic(target_path, raw)
+        return raw
+    finally:
+        os.close(fd)
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def update_settings_section(section: str, updates: dict, path=None) -> dict:
+    """settings.json の1つの節の中だけを、ロックを取りながら差し替える。
+
+    節が無ければ辞書として作り、updates のキーだけを代入する(節の中の
+    他のキーはそのまま)。書き換えた生の辞書を返す。
+    """
+
+    def apply(raw: dict) -> None:
+        current = raw.get(section)
+        if not isinstance(current, dict):
+            current = raw[section] = {}
+        for key, value in updates.items():
+            current[key] = json.loads(json.dumps(value))
+
+    return update_settings(apply, path)
 
 
 def fill_missing(defaults: dict, current: dict, prefix: str = "") -> list:

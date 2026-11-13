@@ -174,30 +174,33 @@ def _rewrite_stored_bookmarks(settings_path, change) -> bool:
     メモリ上の app_settings はデフォルト値をマージ済みなので、それを丸ごと書き出すと
     未設定の既定値まで明示的に書かれてファイルの姿が変わってしまう。feature_audio の
     _save_device_identity と同じく、ファイルを読み直して要るところだけを書き換える
-    (書き出し自体は settings.save_settings を使う)。
+    (書き出し自体は settings.update_settings を使う)。
 
     change(ファイル側のブックマーク一覧) は新しい一覧を返す。None を返したときは
     「対象が無かった」とみなして何も書かない(黙って別の行を触らないため)。
-    追加・削除・並べ替えの3つが同じ読み書きを別々に持たないよう、ここに寄せてある。"""
+    追加・削除・並べ替えの3つが同じ読み書きを別々に持たないよう、ここに寄せてある。
+    読み書きは settings.update_settings(ロックつき・原子的な書き込み)に寄せた。"""
     if not settings_path:
         return False
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        stored_launcher = stored.setdefault("launcher", {})
-        if not isinstance(stored_launcher.get("bookmarks"), list):
-            stored_launcher["bookmarks"] = []
-        updated = change(stored_launcher["bookmarks"])
-        if updated is None:
-            return False
-        stored_launcher["bookmarks"] = updated
-        settings_module.save_settings(stored, settings_path)
-        return True
-    except (OSError, ValueError, TypeError, AttributeError) as e:
+        written = []
+
+        def apply(raw):
+            stored_launcher = raw.setdefault("launcher", {})
+            if not isinstance(stored_launcher, dict):
+                stored_launcher = raw["launcher"] = {}
+            if not isinstance(stored_launcher.get("bookmarks"), list):
+                stored_launcher["bookmarks"] = []
+            updated = change(stored_launcher["bookmarks"])
+            if updated is None:
+                return False
+            stored_launcher["bookmarks"] = updated
+            written.append(True)
+
+        settings_module.update_settings(apply, settings_path)
+        return bool(written)
+    except (OSError, ValueError, TypeError, AttributeError,
+            settings_module.SettingsError) as e:
         print(f"[tray-tools] ブックマークを保存できません: {e}", file=sys.stderr)
         return False
 
@@ -531,12 +534,18 @@ def is_path_prefix(text: str) -> bool:
 
     ドライブ文字の直後(C:)と、UNC の最初の \\ だけを指す。どちらも名前の
     絞り込みでは出てこない字面で、ここで入力を巻き戻すとパスを手で打つ
-    ことができない(実機確認 #5)。C そのものは名前の打ちかけでもあるので
-    含めない。"""
+    ことができない(実機確認 #5)。
+
+    1文字だけのときは、その文字のドライブが実在すれば打ちかけとして扱う。
+    「Q:」の最初の Q が、Q で始まるブックマーク名が無いという理由で
+    巻き戻されると、Q: まで到達できないため(2026-11-13 の討論での指摘)。
+    実在しない文字は、名前の打ちかけとして扱う(従来どおり含めない)。"""
     if not text:
         return False
     t = text.strip()
-    return bool(_DRIVE_COLON_RE.match(t)) or t == "\\"
+    if _DRIVE_COLON_RE.match(t) or t == "\\":
+        return True
+    return len(t) == 1 and t.isalpha() and os.path.exists(f"{t}:\\")
 
 
 def tab_text(_name: str, data):
@@ -591,7 +600,10 @@ def is_network_drive(path: str) -> bool:
     判定できなかったときは False(＝ローカル扱い)に倒す。分からないことを理由に
     機能を止めない。最悪でも「これまでどおり存在確認をする」に戻るだけ。"""
     try:
-        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+        # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書くと、
+        # 他モジュールの同じ関数の署名と取り合いになるため)
+        get_drive_type = ctypes.WinDLL(
+            "kernel32", use_last_error=True).GetDriveTypeW
         # 64bit では既定の戻り値(int)で切り詰められて落ちた実績があるので、
         # argtypes / restype は必ず明示する。
         get_drive_type.argtypes = [ctypes.c_wchar_p]

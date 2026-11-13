@@ -12,12 +12,16 @@ ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 
 # 0x80000000 は符号付きintに収まらないため、argtypes/restype を明示して符号なしで渡す。
+# 専用の WinDLL から取る(ctypes.windll は共有で、署名が他モジュールと取り合いに
+# なるため。window_tools と同じ作法)。
 try:
-    _SetThreadExecutionState = ctypes.windll.kernel32.SetThreadExecutionState
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _SetThreadExecutionState = _kernel32.SetThreadExecutionState
     _SetThreadExecutionState.argtypes = [ctypes.c_uint32]
     _SetThreadExecutionState.restype = ctypes.c_uint32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通し、呼び出しは失敗に倒す。
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通し、呼び出しは失敗に倒す。
+    _kernel32 = None
     _SetThreadExecutionState = None
 
 
@@ -40,10 +44,12 @@ def set_keep_awake(enabled: bool) -> bool:
 # 各アプリに「これから寝る」を知らせて保存の機会を与えるため。True にすると
 # 問答無用で落とすので、編集中のものが失われうる。
 try:
-    _SetSuspendState = ctypes.windll.powrprof.SetSuspendState
+    _powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
+    _SetSuspendState = _powrprof.SetSuspendState
     _SetSuspendState.argtypes = [ctypes.c_bool, ctypes.c_bool, ctypes.c_bool]
     _SetSuspendState.restype = ctypes.c_bool
-except AttributeError:
+except (AttributeError, OSError):
+    _powrprof = None
     _SetSuspendState = None
 
 
@@ -56,8 +62,10 @@ def hibernate_available() -> bool:
 
     判定は powercfg の予約領域(hiberfil.sys)の有無ではなく、電源APIに聞く。
     IsPwrHibernateAllowed は「いま休止できるか」を返す。"""
+    if _powrprof is None:
+        return False
     try:
-        return bool(ctypes.windll.powrprof.IsPwrHibernateAllowed())
+        return bool(_powrprof.IsPwrHibernateAllowed())
     except Exception:
         return False
 

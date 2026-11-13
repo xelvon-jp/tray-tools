@@ -656,7 +656,9 @@ class PickerWindow(QWidget):
         """前面が自分でなければ、明示的に取りにいく。取れなければ黙って諦める。"""
         try:
             hwnd = int(self.winId())
-            user32 = ctypes.windll.user32
+            # 専用の WinDLL から取る(filer の _ensure_foreground と署名が
+            # 違うので、共有だと取り合いになる)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.GetForegroundWindow.restype = ctypes.c_void_p
             if user32.GetForegroundWindow() == hwnd:
                 return

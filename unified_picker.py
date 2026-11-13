@@ -333,6 +333,32 @@ def make_accept_empty(state):
     return accept_empty
 
 
+def picker_kwargs(state, *, dynamics, on_delete, on_move, on_mode_change,
+                  on_calc, on_ctrl_enter, context: str = "resident") -> dict:
+    """PickerWindow へ渡す共通の引数を1か所に寄せたもの。
+
+    常駐(feature_screen)とあっふ(filer)で別々に並べていたため、片方にだけ
+    足した引数(accept_empty や on_calc など)がもう片方に無い、という
+    食い違いが起きていた(2026-11-13 の討論、テーマ1)。呼び出し側ごとに
+    違うのは context とコールバックだけ。"""
+    return {
+        "placeholder": PLACEHOLDER,
+        "hint": HINT,
+        "preview_provider": lambda data: preview_text(data, context=context),
+        "dynamic_items": dynamics,
+        "accept_empty": make_accept_empty(state),
+        "tab_text": make_tab_text(state),
+        "on_delete": on_delete,
+        "on_move": on_move,
+        "dynamic_last": True,
+        "modes": MODES,
+        "initial_mode": INITIAL_MODE,
+        "on_mode_change": on_mode_change,
+        "on_calc": on_calc,
+        "on_ctrl_enter": on_ctrl_enter,
+    }
+
+
 def make_tab_text(state=None):
     """Tab の行き先。フォルダは掘り下げる。`?` では補完は効かない。
 

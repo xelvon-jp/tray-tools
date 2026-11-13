@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 import window_tools
 from qt_image import pil_to_qpixmap
+import errlog
 from toast import show_toast
 
 RAPTURE_ICON_PATH = Path(__file__).resolve().parent / "icons" / "rapture.png"
@@ -99,19 +100,16 @@ _DEFAULT_ICON_COLOR = "#64748b"
 
 
 def _guard(where: str, notify: bool = True) -> None:
-    """スロットの中で起きた例外をここで止め、標準エラー(と必要なら通知)へ回す。
+    """スロットの中で起きた例外をここで止め、errlog へ回す。
 
     PySide6 はスロットから例外が投げ切られるとプロセスごと終了する。パネルはマウスと
     タイマーだけで動くので、1回の失敗で常駐アプリが消えては割に合わない。
 
-    taskbar_widget._guard と同じ役目だが、あちらを呼ぶと import が循環する
-    (taskbar_widget → ここ の一方通行を保つ)。
+    記録と通知は errlog.guard に一本化した(taskbar_widget の _guard と同じ役目。
+    あちらを呼ぶと import が循環するので、共通の宛先は errlog に置く)。
 
     notify=False は周期タイマーと描画用。毎周期トーストを出すと画面が埋まる。"""
-    traceback.print_exc()
-    print(f"[tray-tools] ランチャ: {where}に失敗しました", file=sys.stderr)
-    if notify:
-        show_toast(f"タスクバーのランチャ\n{where}に失敗しました")
+    errlog.guard("ランチャ", where, notify=notify, title="タスクバーのランチャ")
 
 
 # ---------------------------------------------------------------

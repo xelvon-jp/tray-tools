@@ -37,11 +37,17 @@ DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 
 try:
-    _user32 = ctypes.windll.user32
-except AttributeError:
-    # Windows 以外では windll 自体が無い。import だけ通す(窓の操作自体は
+    # 専用の WinDLL で読み込む。ctypes.windll は全モジュール共有で、下で
+    # 設定する argtypes/restype が他モジュールの同じ関数と取り合いになる
+    # (最後に読み込んだ側の設定が勝ち、片方の呼び出しが壊れる)。
+    # 専用なら自前で完結する(filer_launch などと同じ作法)。
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except (AttributeError, OSError):
+    # Windows 以外では WinDLL 自体が無い。import だけ通す(窓の操作自体は
     # Windows でしか呼ばれない)。dwmapi の読み込みと同じ作法。
     _user32 = None
+    _kernel32 = None
 
 if _user32 is not None:
     # HWNDは64bit Windowsではポインタ幅。ctypesの既定の戻り値は32bit intなので、
@@ -95,7 +101,7 @@ if _user32 is not None:
 # dwmapi は Vista 以降なら必ずあるが、読み込めない環境でもモジュールのimportごと
 # 失敗させたくない。使えないときは GetWindowRect だけで動かす(影の分だけ大きくなる)。
 try:
-    _dwmapi = ctypes.windll.dwmapi
+    _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
     _dwmapi.DwmGetWindowAttribute.argtypes = [
         ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
     ]
@@ -124,7 +130,7 @@ def is_own_window(hwnd: int) -> bool:
     意味が無いうえ、付箋は元から最前面なので解除side effectだけが残る。"""
     pid = ctypes.c_ulong()
     _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return pid.value == ctypes.windll.kernel32.GetCurrentProcessId()
+    return pid.value == _kernel32.GetCurrentProcessId()
 
 
 def set_topmost(hwnd: int, topmost: bool) -> bool:
@@ -404,10 +410,7 @@ if _user32 is not None:
     _user32.IsZoomed.argtypes = [ctypes.c_void_p]
     _user32.IsZoomed.restype = ctypes.c_bool
 
-try:
-    _kernel32 = ctypes.windll.kernel32
-except AttributeError:
-    _kernel32 = None
+# _kernel32 は冒頭で _user32 と一緒に読み込む(専用 WinDLL)。
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 if _kernel32 is not None:
     _kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]

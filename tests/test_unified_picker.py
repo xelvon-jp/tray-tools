@@ -686,8 +686,12 @@ def test_filer_j_unified_flow():
     source = inspect.getsource(filer.FilerWindow.cmd_bookmark_jump)
     assert "unified_picker.build_mode_items" in source
     assert "command_launcher.build_entries" in source
-    assert "make_tab_text" in source
-    assert "unified_picker.MODES" in source
+    # 共通の引数は picker_kwargs に寄せた(中身の配線はそちらで確かめる)
+    assert "unified_picker.picker_kwargs" in source
+    kwargs_source = inspect.getsource(up.picker_kwargs)
+    assert "make_tab_text" in kwargs_source
+    assert "make_accept_empty" in kwargs_source
+    assert "MODES" in kwargs_source
 
     class FakeSearch:
         def text(self):
@@ -853,14 +857,43 @@ def test_call_signatures_match():
 
 
 def test_make_accept_empty():
+    from unittest import mock
+
     state = {"mode": "["}
     accept_empty = up.make_accept_empty(state)
     assert accept_empty("C:")
     assert accept_empty("\\")
-    assert not accept_empty("C")
+    with mock.patch("os.path.exists", return_value=False):
+        assert not accept_empty("C")   # ドライブが無い文字は名前の打ちかけ
+    with mock.patch("os.path.exists", return_value=True):
+        assert accept_empty("Q")       # 実在するドライブの1文字は打ちかけ
     assert not accept_empty("C:\\Users")
     state["mode"] = "!"
     assert not accept_empty("C:")   # [ モード以外では抜け道は使わない
+
+
+def test_picker_kwargs():
+    """共通の引数(picker_kwargs): キーがそろい、context がプレビューに効く。"""
+    state = {"mode": "["}
+    sentinel = object()
+    kwargs = up.picker_kwargs(
+        state, dynamics=sentinel, on_delete=None, on_move=None,
+        on_mode_change=None, on_calc=None, on_ctrl_enter=None)
+    assert set(kwargs) == {
+        "placeholder", "hint", "preview_provider", "dynamic_items",
+        "accept_empty", "tab_text", "on_delete", "on_move", "dynamic_last",
+        "modes", "initial_mode", "on_mode_change", "on_calc",
+        "on_ctrl_enter"}
+    assert kwargs["dynamic_items"] is sentinel
+    assert kwargs["dynamic_last"] is True
+    jump = {"kind": "jump", "path": "C:\\x"}
+    assert "フォルダを開きます" in kwargs["preview_provider"](jump)
+    kwargs_f = up.picker_kwargs(
+        state, dynamics=None, on_delete=None, on_move=None,
+        on_mode_change=None, on_calc=None, on_ctrl_enter=None,
+        context="filer")
+    assert "アクティブな窓をこのフォルダへ移動します" in \
+        kwargs_f["preview_provider"](jump)
 
 
 ALL_TESTS = [value for name, value in sorted(globals().items())

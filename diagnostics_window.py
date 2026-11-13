@@ -152,17 +152,8 @@ def _save_size(app_settings, settings_path, width: int, height: int) -> None:
     if not settings_path:
         return
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        section = stored.get(SETTINGS_SECTION)
-        if not isinstance(section, dict):
-            section = stored[SETTINGS_SECTION] = {}
-        section[SETTINGS_KEY] = [width, height]
-        settings_module.save_settings(stored, settings_path)
+        settings_module.update_settings_section(
+            SETTINGS_SECTION, {SETTINGS_KEY: [width, height]}, settings_path)
     except Exception as e:  # noqa: BLE001
         print(f"[tray-tools] 診断の窓の大きさを保存できません: {e}", file=sys.stderr)
 

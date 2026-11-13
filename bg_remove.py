@@ -1947,19 +1947,15 @@ def _save_values(app_settings, settings_path, updates: dict, remove=()) -> None:
     if not settings_path:
         return
     try:
-        stored = {}
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        if not isinstance(stored, dict):
-            stored = {}
-        section = stored.get(SETTINGS_SECTION)
-        if not isinstance(section, dict):
-            section = stored[SETTINGS_SECTION] = {}
-        section.update(updates)
-        for key in remove:
-            section.pop(key, None)
-        settings_module.save_settings(stored, settings_path)
+        def apply(raw):
+            section = raw.get(SETTINGS_SECTION)
+            if not isinstance(section, dict):
+                section = raw[SETTINGS_SECTION] = {}
+            section.update(updates)
+            for key in remove:
+                section.pop(key, None)
+
+        settings_module.update_settings(apply, settings_path)
     except Exception as e:
         # 覚えられないだけ。窓の操作を止めるほどのことではない。
         print(f"[bg_remove] 設定を保存できません: {e}", file=sys.stderr)
@@ -4391,7 +4387,10 @@ def _install_excepthook() -> None:
 
 def _set_app_user_model_id() -> None:
     try:
-        func = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        # 専用の WinDLL から取る(共有の関数オブジェクトに署名を書くと、
+        # 他モジュールの同じ関数の署名と取り合いになるため)
+        func = ctypes.WinDLL(
+            "shell32", use_last_error=True).SetCurrentProcessExplicitAppUserModelID
         func.argtypes = [wintypes.LPCWSTR]
         func.restype = ctypes.c_long  # HRESULT
         func(APP_USER_MODEL_ID)

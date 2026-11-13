@@ -109,9 +109,17 @@ def test_is_path_prefix():
     assert launcher.is_path_prefix("c:")
     assert launcher.is_path_prefix("\\")
     assert launcher.is_path_prefix(" C: ")   # 前後の空白は除いて見る
-    # それ以外は受け付けない(C は名前の打ちかけでもある)
-    for text in ("", "C", "Ch", "C:\\", ":", "CC:", "1:", "あ"):
+    # それ以外は受け付けない
+    for text in ("", "Ch", "C:\\", ":", "CC:", "1:", "あ"):
         assert not launcher.is_path_prefix(text), text
+    # 1文字は、その文字のドライブが実在するときだけ打ちかけとして扱う
+    # (Q: の最初の Q が巻き戻されると、Q: まで到達できないため)
+    from unittest import mock
+
+    with mock.patch("os.path.exists", return_value=True):
+        assert launcher.is_path_prefix("Q")
+    with mock.patch("os.path.exists", return_value=False):
+        assert not launcher.is_path_prefix("Q")
 
 
 ALL_TESTS = [test_is_url, test_is_path_prefix, test_jump_url_opens_browser, test_tab_text_url_is_none,

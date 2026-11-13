@@ -527,6 +527,30 @@ DEFAULT_SETTINGS = {
     "folder_watch": {
         "rules": [],
     },
+    # スクリプト実行パネル(script_runner.py)。ダウンロードフォルダに届いた
+    # .py / .ps1 を自動でチェック(読むだけ)し、F5 で実行して結果を
+    # クリップボードへ入れる別プロセスの窓。仕様は collab-workspace の
+    # docs/work-tools/script-runner-spec.md。
+    #   watch_folder    … 見張るフォルダ。空ならダウンロードフォルダ
+    #   recent_hours    … 開いた時点で並べる「直近」の幅(時間)
+    #   max_items       … 一覧の上限
+    #   python          … 実行に使う Python(パスか PATH 上の名前。"py" も可)
+    #   timeout_seconds … 実行の時間切れ
+    #   head_lines / tail_lines / max_chars … クリップボード文の切り詰め
+    #   window_geometry … [x, y, w, h]。窓が覚える
+    #   always_on_top   … 前面に固定。窓のチェックで切り替える
+    "script_runner": {
+        "watch_folder": "",
+        "recent_hours": 24,
+        "max_items": 20,
+        "python": "python",
+        "timeout_seconds": 120,
+        "head_lines": 200,
+        "tail_lines": 50,
+        "max_chars": 20000,
+        "window_geometry": None,
+        "always_on_top": False,
+    },
     # 窓の配置(window_layout.py)。画面アイコンの「🪟 窓の配置」から使う。
     #   presets … [{name, items: [{exe, title, rect: [l, t, r, b], zoomed}]}]
     #             選んだ窓の位置と大きさを名前付きで覚えたもの。適用は手動だけ

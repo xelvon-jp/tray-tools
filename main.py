@@ -380,6 +380,11 @@ def _build_command_handlers(features) -> dict:
         #   traytools_send.py tomorrow-memo           窓を開き、閉じるまで待つ
         #   traytools_send.py tomorrow-memo nowait    窓を開いてすぐ返す
         "tomorrow-memo": lambda args, reply: _tomorrow_memo_command(screen, args, reply),
+        # スクリプト実行パネルを開く。窓自体は別プロセスだが、起こすのは
+        # 常駐の作法(script_runner_launch)にそろえるため、この口に載せる。
+        #
+        #   traytools_send.py script-runner
+        "script-runner": lambda args, reply: reply(_script_runner_command(screen)),
         # 操作ログの末尾を読む。既定20行、引数で行数を指定できる。
         #
         #   traytools_send.py log 50
@@ -453,6 +458,16 @@ def _build_command_handlers(features) -> dict:
 # 十分に足りる。超えたら窓は開いたまま、応答だけを打ち切って返す(スクリプトが
 # シャットダウンを止め続けないため)。
 TOMORROW_MEMO_WAIT_MS = 60 * 60 * 1000
+
+
+def _script_runner_command(screen) -> str:
+    """script-runner の入口。パネル(別プロセス)を起こすか、開いていれば
+    前に出してもらう。"""
+    try:
+        screen.start_script_runner()
+    except Exception as e:  # noqa: BLE001
+        return f"ERR スクリプト実行パネルを開けませんでした ({e})"
+    return "OK スクリプト実行パネルを開きました"
 
 
 def _tomorrow_memo_command(screen, args, reply) -> None:

@@ -540,6 +540,10 @@ class ScreenFeature:
         # 明日の自分へメモ(昨日の自分から今日の自分への手紙)。就業前に書くのが
         # 本命なので、環境2・3(職場PC)でも出す(ブリッジ等の環境ガードには入れない)。
         self.menu.addAction("🌅 明日の自分へメモ", self.open_tomorrow_memo)
+        # スクリプト実行パネル(script_runner.py)。ダウンロードフォルダに
+        # 届いたスクリプトをチェックして F5 で実行し、結果をクリップボード
+        # へ入れる。窓は常駐とは別のプロセス(script_runner_launch)。
+        self.menu.addAction("🐍 スクリプト実行", self.start_script_runner)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -1749,6 +1753,16 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # 写真のスライドショー(slideshow.py。窓は別プロセス)
     # ---------------------------------------------------------------
+    def start_script_runner(self) -> None:
+        """スクリプト実行パネルを開く。窓は別プロセス(script_runner_launch)。
+        動いていれば前面に出してもらう。"""
+        try:
+            import script_runner_launch
+            script_runner_launch.start(self.settings_path)
+        except Exception as e:  # noqa: BLE001  メニューのスロット。投げ切ると常駐ごと落ちる
+            self._log_failure("スクリプト実行パネルの開始")
+            self._notify("スクリプト実行", f"起動できませんでした\n{e}")
+
     def start_slideshow(self, folders=None) -> None:
         """登録済みのフォルダで再生する。動いていれば、動いているものに再生し直してもらう
         (判定は slideshow_launch が名前付きミューテックスで行う)。"""

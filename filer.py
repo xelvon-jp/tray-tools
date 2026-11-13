@@ -4596,6 +4596,16 @@ class FilerWindow(QWidget):
     def cmd_text_editor(self):
         self._open_targets_in_text_editor(self.active)
 
+    def cmd_script_runner(self):
+        """スクリプト実行パネル(別プロセス)を開く。ダウンロードフォルダへ
+        届いたスクリプトのチェックと実行はあちらで行う。"""
+        import script_runner_launch  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        try:
+            script_runner_launch.start(self.settings_path)
+        except OSError as e:
+            self.log(f"スクリプト実行パネルを起動できません ({e})")
+
     def ask_open_in_editor(self, ext: str, count: int) -> bool:
         """表に無い拡張子のファイルを EDDy で開くか聞く。ext は点なし・
         小文字(空文字は拡張子なし)、count は件数。テストからは

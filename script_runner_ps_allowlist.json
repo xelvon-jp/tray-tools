@@ -1,0 +1,1 @@
+{"allowed":["Get-*","Select-*","Measure-*","Test-Path","Sort-Object","Group-Object","Where-Object","ForEach-Object","Format-*","Out-String","Write-Output","ConvertTo-*","Set-Clipboard"],"note":"スクリプト実行パネルの PowerShell チェックで「読むだけ」とみなす命令の許可リスト。ここに入らない命令が1つでもあると「要確認」になる。足すときは陽太さんの OK を取る(仕様 script-runner-spec.md)。* はワイルドカード、大文字小文字は区別しない。別名(rm など)は実体に引き直してから照らす。"}

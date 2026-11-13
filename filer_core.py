@@ -69,6 +69,8 @@ DEFAULT_KEYMAP = {
                                   # Shift+Enter に残る)
     "2069": "text_editor",        # Ctrl+E E と同じく内蔵テキストエディタで開く
                                   # (Shift+E=新規テキスト)
+    "3082": "script_runner",      # Ctrl+Shift+R スクリプト実行パネルを開く
+                                  # (別プロセス。script_runner_launch)
     # --- マーク ---
     "0032": "mark_down",          # Space
     "1032": "mark_up",            # Shift+Space
@@ -1242,6 +1244,7 @@ COMMAND_SHORT_NAMES = {
     "update_restart": "更新",
     "edit": "Edit",
     "text_editor": "EDDy",
+    "script_runner": "Script",
     "open_in_other": "Open他",
     "copy_menu": "Copy",
     "copy_direct": "Copy",

@@ -1234,27 +1234,18 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     def start_text_editor(self, path=None):
         """内蔵テキストエディタを開く。開いていれば前面に出すだけ
-        (パスが渡されていたら、そのファイルを開き直す)。
+        (パスが渡されていたら、そのファイルをタブで開く。既に
+        タブにあれば、そのタブを前に出す)。
 
-        窓は常駐の中で開く(あっふ のビュアと同じ)。常駐の再起動で
-        道連れになるので、未保存の窓は restart_blockers に数える
-        (レビュー req-20261113-99 の重大3)。"""
+        窓は常駐の中で開く(あっふ のビュアと同じ)。セッション
+        (控え)が有効なので、未保存の内容も閉じれば戻る。再起動の
+        巻き添えには数えない(dirty_window_state が
+        restart_loss_count=0 を返す)。"""
         import editor as editor_module  # 使うときに読む(起動を軽く保つ)
 
         if self.text_editor is not None:
             if path:
-                # 既に同じファイルを開いているなら、読み直さず
-                # 前に出すだけ(二重に開かない・未保存の確認も出ない)。
-                current = None
-                try:
-                    current = self.text_editor.current_document().path
-                except Exception:  # noqa: BLE001  読めなければ開き直す
-                    current = None
-                same = (current is not None
-                        and os.path.normcase(os.path.abspath(current))
-                        == os.path.normcase(os.path.abspath(path)))
-                if not same:
-                    self.text_editor.open_path(path)
+                self.text_editor.open_path(path)
             self.text_editor.raise_()
             self.text_editor.activateWindow()
             return
@@ -1266,7 +1257,8 @@ class ScreenFeature:
         window = editor_module.create_window(
             path, geometry=geometry, keymap_overrides=section.get("keymap"),
             editor_settings=section,
-            on_settings_change=self._save_editor_settings)
+            on_settings_change=self._save_editor_settings,
+            session_path=editor_module.default_session_path())
         window.closed.connect(self._on_text_editor_closed)
         self.text_editor = window
         window.show()
@@ -3850,10 +3842,11 @@ class ScreenFeature:
             blockers.append("スリープ予約")
         editor = getattr(self, "text_editor", None)
         if editor is not None:
-            # 未保存のエディタは、再起動で編集中の内容が消える。無人の
-            # 自動反映では「保存しますか」の窓で古いプロセスが居座る
-            # 事故にもなるので、巻き添えに数える(レビュー
-            # req-20261113-99 の重大3)。
+            # EDDy は控え(ドラフト)を常に取っているので、未保存でも
+            # 再起動で内容は消えず、次に開けばタブごと戻る。だから
+            # 巻き添えには数えない(dirty_window_state が
+            # restart_loss_count を使う。セッション有効な窓は 0)。
+            # 状態が読めないときだけ「あるかも」に倒す。
             try:
                 import editor as editor_module
 

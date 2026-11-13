@@ -60,13 +60,18 @@
 # F7 / F8 / Shift+F8)、一覧は bookmark_dialog の窓(既定は
 # Ctrl+Shift+B)から選んで飛ぶ。
 #
-# 自動保存(2026-11-13): 名前の付いたファイルの未保存の変更を、
-# 設定した間隔(既定はオフ、間隔の既定は60秒)で、通常の保存経路
-# を通して書く。外部で変更されたファイルと、保存先の文字コード
-# で書けない文字がある文書は、確認ダイアログを出さずに見送って
-# ステータスに残す(自動で上書き・化けはさせない)。無題は対象外。
-# 間隔が来たときの処理は autosave_now に寄せてあり、テストは
-# 実時間を待たずに直接呼べる。
+# タブ＋メモ帳式セッション(2026-11-13): ファイルは窓の中のタブ
+# として開く(ファイルごとに新しい窓は出さない)。文書ごとの表示と
+# 状態は editor/document_view.py の DocumentView が持ち、窓は
+# 「今のタブ」を _edit / _doc 等のプロパティで指す。編集した内容は
+# 控え(ドラフト)を自動で取り続け(editor/session.py。置き場は
+# %LOCALAPPDATA%\traytools\editor_session.json で、リポジトリの外)、
+# ファイル自体は明示的に保存するまで書き換わらない。窓やタブを
+# 閉じるとき「保存しますか」は出さず、次に開くと前回のタブ・
+# 未保存の内容・カーソル位置がそのまま戻る(無題も同じ)。控えが
+# 常に取れているので、未保存のタブは再起動の妨げに数えない
+# (restart_loss_count)。先にあった間隔式の自動保存(間隔が来たら
+# 実ファイルへ書く形)は、この方式に置き換えて取り除いた。
 #
 # キー割り当ての画面(2026-11-13): 命令と現在の割り当てを一覧し、
 # その場でキーを押して変えられる(editor/keymap_dialog.py)。変更は
@@ -140,6 +145,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -155,6 +161,8 @@ from editor import outline
 from editor import editor_icon
 from editor import reformat as refmtmod
 from editor import rxfind
+from editor import session as sessionmod
+from editor.document_view import DocumentView
 from editor.bookmark_dialog import BookmarkDialog
 from editor.color_dialog import ColorSettingsDialog
 from editor.findall_dialog import FindAllDialog
@@ -193,16 +201,11 @@ PATTERN_APPLYING_KEY = "pattern_applying"
 RECENT_FILES_KEY = "recent_files"
 RECENT_FILES_LIMIT = 20
 
-# 自動保存(settings の editor 節 autosave_enabled /
-# autosave_interval_sec のキーと、間隔の既定・範囲)。
-# 既定はオフ(勝手に書き始める機能なので、入れるのは利用者の操作)。
-# 間隔は秒。範囲は「うっかり短すぎて書き込みが嵐になる」のと
-# 「長すぎて意味が無い」のを避けるための上下限。
-AUTOSAVE_ENABLED_KEY = "autosave_enabled"
-AUTOSAVE_INTERVAL_KEY = "autosave_interval_sec"
-DEFAULT_AUTOSAVE_INTERVAL_SEC = 60
-AUTOSAVE_INTERVAL_MIN_SEC = 10
-AUTOSAVE_INTERVAL_MAX_SEC = 3600
+# 控え(ドラフト)を書き出すまとめ待ち(ms)。打鍵やカーソル移動の
+# たびにファイルへ書くと書き込みが嵐になるので、止まってから
+# まとめて1回だけ書く(フォントの大きさの遅延保存と同じ作法)。
+# 窓を閉じるときとアプリの終了時は、その場で書き切る。
+SESSION_SAVE_DELAY_MS = 500
 # リアルタイム検索で、正規表現のときに探し始めるまでの間引き(ms)。
 # 打つたびに別プロセスを起こさないための待ちで、通常の文字列の
 # ときは待たずにその場で探す。
@@ -249,18 +252,6 @@ def remember_recent_file(recent, path, limit=RECENT_FILES_LIMIT):
             if os.path.normcase(os.path.abspath(item)) != key]
     return ([target] + kept)[:limit]
 
-
-def sanitize_autosave_interval(value):
-    """設定から読んだ自動保存の間隔(秒)を整える。
-
-    整数でない・範囲外の値は既定(60秒)に倒す。設定ファイルが手で
-    書き換えられていても、窓が開かなくならず、タイマーが変な
-    間隔で回り始めないため。"""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return DEFAULT_AUTOSAVE_INTERVAL_SEC
-    if not AUTOSAVE_INTERVAL_MIN_SEC <= value <= AUTOSAVE_INTERVAL_MAX_SEC:
-        return DEFAULT_AUTOSAVE_INTERVAL_SEC
-    return value
 
 # 折り返しの方式(settings の editor 節 wrap_mode の値)。
 #   column … 指定の桁数で折り返す / window … 窓の幅で折り返す /
@@ -339,10 +330,15 @@ class _RxBridge(QObject):
 
 
 def dirty_window_state(windows):
-    """エディタの窓の並びから、未保存の (件数, 状態を読めなかった件数) を返す。
+    """エディタの窓の並びから、再起動・終了で失われる (件数,
+    状態を読めなかった件数) を返す。
 
     再起動・終了の巻き添え判定(feature_screen.restart_blockers と
-    filer.confirm_losses)が共用する。読めない窓は「未保存があるかも」
+    filer.confirm_losses)が共用する。数えるのは「閉じたら失われる
+    未保存の内容」で、窓が restart_loss_count を持てばそれを使う
+    (EDDy は控えが常に取れているので、セッションが有効な窓は 0 を
+    返す。未保存でも EDDy のために再起動を止めない)。持たない窓は
+    is_dirty で代用する。読めない窓は「失われるものがあるかも」
     側に倒すため、落とさず件数として返す。"""
     dirty = 0
     unreadable = 0
@@ -350,7 +346,10 @@ def dirty_window_state(windows):
         if window is None:
             continue
         try:
-            if window.is_dirty():
+            counter = getattr(window, "restart_loss_count", None)
+            if callable(counter):
+                dirty += int(counter())
+            elif window.is_dirty():
                 dirty += 1
         except Exception:  # noqa: BLE001  読めない窓は「あるかも」側に倒す
             unreadable += 1
@@ -361,8 +360,9 @@ def find_window_for_path(windows, path):
     """窓の並びから、path を開いている窓を探す。無ければ None。
 
     同じファイルを二重に開かないために、呼び側(ファイラ)が窓を
-    作る前に使う。パスの比べは、大文字小文字と表記の揺れを吸収する
-    ため normcase + abspath でそろえる。"""
+    作る前に使う。タブのどれかに開いていれば、その窓が当たる
+    (open_paths を持つ窓)。パスの比べは、大文字小文字と表記の
+    揺れを吸収するため normcase + abspath でそろえる。"""
     if not path:
         return None
     target = os.path.normcase(os.path.abspath(path))
@@ -370,11 +370,16 @@ def find_window_for_path(windows, path):
         if window is None:
             continue
         try:
-            opened = window.current_document().path
+            if hasattr(window, "open_paths"):
+                opened_paths = window.open_paths()
+            else:
+                opened_paths = [window.current_document().path]
         except Exception:  # noqa: BLE001  読めない窓は飛ばす
             continue
-        if opened and os.path.normcase(os.path.abspath(opened)) == target:
-            return window
+        for opened in opened_paths:
+            if opened and os.path.normcase(
+                    os.path.abspath(opened)) == target:
+                return window
     return None
 
 
@@ -525,29 +530,49 @@ class PatternSettingsDialog(QDialog):
 
 
 class EditorWindow(QMainWindow):
-    """テキストエディタの窓。閉じたら closed にジオメトリ([x, y, w, h])が流れる
-    (ビュアと同じ形。呼び側が設定へ保存する)。
+    """テキストエディタの窓。ファイルはタブとして開き、文書ごとの
+    表示と状態は DocumentView(editor/document_view.py)が持つ。窓は
+    「今のタブ」を _edit / _doc 等のプロパティで指す。閉じたら
+    closed にジオメトリ([x, y, w, h])が流れる(ビュアと同じ形。
+    呼び側が設定へ保存する)。
 
     editor_settings は settings の editor 節(辞書)。font_family /
     font_size / show_line_numbers / show_outline_pane / outline_pattern /
     highlight_pattern / pattern_applying(適用中の印。起動時の保険で
-    読む)/ autosave_enabled / autosave_interval_sec(自動保存)/
-    keymap(キー割り当ての上書き分。コンストラクタの keymap_overrides
-    でも受ける)を読み(無いキーは既定)、表示やフォントや正規表現が
-    変わったら、差分を on_settings_change(辞書を受ける関数)へ流すので、
-    保存は呼び側の流儀(update_settings_section)に任せる。"""
+    読む)/ keymap(キー割り当ての上書き分。コンストラクタの
+    keymap_overrides でも受ける)を読み(無いキーは既定)、表示や
+    フォントや正規表現が変わったら、差分を on_settings_change
+    (辞書を受ける関数)へ流すので、保存は呼び側の流儀
+    (update_settings_section)に任せる。
+
+    session_path は、タブと控えの置き場(editor/session.py の
+    セッションファイル)。渡されたときだけ、前回のタブを戻し、
+    編集中の控えを取り続ける。渡さなければ(テスト等)、タブは
+    動くが控えの保存・復元はしない。"""
 
     closed = Signal(object)
 
     def __init__(self, path=None, *, geometry=None, keymap_overrides=None,
                  sender=None, font=None, editor_settings=None,
-                 on_settings_change=None, parent=None):
+                 on_settings_change=None, session_path=None, parent=None):
         super().__init__(parent)
         # 窓のアイコンはテキストエディタ用(常駐の Rapture と区別する)。
         # 入口(feature_screen / ファイラ)はすべてこの窓を通るので、
         # ここで付ければ全部に付く。
         self.setWindowIcon(editor_icon.qicon())
-        self._doc = docmod.TextDocument()
+        # タブとビュー。プロパティ(_edit / _doc 等)はこの並びの
+        # 「今のタブ」を見るので、他の初期化より先に用意する。
+        self._views = []
+        self._tabs = None
+        # セッション(タブと控え)。slot は session.claim で引き取った
+        # 自分の窓ぶんの記録で、capture のたびに中身を差し替える。
+        self._session_path = (str(session_path)
+                              if session_path is not None else None)
+        self._session_slot = None
+        self._session_timer = QTimer(self)
+        self._session_timer.setSingleShot(True)
+        self._session_timer.setInterval(SESSION_SAVE_DELAY_MS)
+        self._session_timer.timeout.connect(self._flush_session)
         self._keymap = keymapmod.merge_keymap(keymap_overrides)
         self._keymap_overrides = keymapmod.sanitize_overrides(
             keymap_overrides)
@@ -563,24 +588,16 @@ class EditorWindow(QMainWindow):
         self._send_thread = None
         self._bridge = _SendBridge(self)
         self._bridge.finished.connect(self._on_send_finished)
-        # 正規表現の非同期実行(結果は世代で切り分ける)。
+        # 正規表現の非同期実行(結果は世代で切り分ける)。世代と
+        # 実行中の控えは文書ごと(ビュー)が持ち、受け渡しの橋だけ
+        # 窓に置く(結果には、対象のビューも一緒に流す)。
         self._rx_bridge = _RxBridge(self)
         self._rx_bridge.finished.connect(self._on_rx_finished)
-        self._rx_generation = 0
-        self._rx_pending = None
-        # リアルタイム検索の状態。_inc_base は打ち始めたときの本文
-        # カーソル位置(検索の起点)、_inc_span は直前に当てたヒット
-        # の範囲(どちらも本文の位置)。タイマーは正規表現のときの
-        # 間引き用で、timeout が _do_incremental_search を呼ぶ。
-        self._inc_base = None
-        self._inc_span = None
+        # リアルタイム検索の間引きタイマー(正規表現のとき用)。
+        # 起点と直前のヒットの控えは文書ごと(ビュー)が持つ。
         self._inc_timer = QTimer(self)
         self._inc_timer.setSingleShot(True)
         self._inc_timer.timeout.connect(self._do_incremental_search)
-        # 未保存で閉じる/新規にするときの確認は差し替えられる
-        # (テストは QMessageBox を出さずにここを差す)。
-        # 戻り値は "save" / "discard" / "cancel"。
-        self.ask_save_changes = None
         # Copilot の入力欄に書きかけの文があるとき、上書きして送って
         # よいかの確認も差し替えられる(戻り値は bool)。
         self.ask_overwrite_input = None
@@ -612,10 +629,9 @@ class EditorWindow(QMainWindow):
         self._current_macro_name = ""
         self._in_command = False      # 命令の実行中(変化を二重に数えない)
         self._replaying = False       # マクロの再生中
-        self._suppress_change_record = False  # 元に戻す・やり直しの最中
-        # 変化の直前の (選択の開始, 選択の終了, カーソル位置)。削除の
-        # 向き(BS か Del か、選択の削除か)の判定に使う。
-        self._change_cache = (0, 0, 0)
+        # 元に戻す・やり直しの最中かと、変化の直前の (選択の開始,
+        # 選択の終了, カーソル位置) は、文書ごと(ビュー)が持つ
+        # (suppress_change_record / change_cache)。
         self._command_impls = {
             "insert_text": self._cmd_insert_text,
             "delete_backward": self._cmd_delete_backward,
@@ -648,18 +664,17 @@ class EditorWindow(QMainWindow):
             "replace_all": self._cmd_replace_all,
         }
 
-        self._edit = TextEdit()
+        # 本文のフォントと、ビューごとに効かせる表示の希望。実際の
+        # 適用はビューを作るとき(_add_view)に行う。
         if font is not None:
-            edit_font = font
+            self._edit_font = font
         else:
             family = section.get("font_family") or DEFAULT_FONT_FAMILY
             size = section.get("font_size")
             if not isinstance(size, int) or size <= 0:
                 size = DEFAULT_FONT_SIZE
-            edit_font = QFont(str(family), size)
-        self._edit.setFont(edit_font)
-        if not section.get("show_line_numbers", True):
-            self._edit.set_line_numbers_visible(False)
+            self._edit_font = QFont(str(family), size)
+        self._line_numbers_pref = bool(section.get("show_line_numbers", True))
 
         # アウトライン・強調の正規表現(実効値)。設定が空なら既定、
         # 不正なら既定に倒す(窓が開かなくならないため)。
@@ -685,16 +700,18 @@ class EditorWindow(QMainWindow):
         highlight_rx, self._highlight_pattern_text = _compile_or_default(
             highlight_text or outline.DEFAULT_HIGHLIGHT_PATTERN,
             outline.DEFAULT_HIGHLIGHT_RX, outline.DEFAULT_HIGHLIGHT_PATTERN)
-        self._highlighter = LineHighlighter(
-            self._edit.document(), highlight_rx)
+        # 強調表示は文書ごと(ビュー)が持つ。式の実効値だけ窓に置き、
+        # ビューを作るときにその文書のハイライタへ渡す。
+        self._highlight_rx = highlight_rx
         self._pattern_guard_armed = False
 
         # 表示の設定(第3段): 不可視文字・現在行の強調・太いカーソル・
         # 配色。ここでは設定を読むだけ(保存は切り替えのときに流す)。
-        self._edit.set_show_invisibles(bool(section.get("show_invisibles")))
-        self._edit.set_current_line_enabled(
-            bool(section.get("highlight_current_line", True)))
-        self._edit.setCursorWidth(3 if section.get("wide_cursor") else 1)
+        # 適用はビューごと(_add_view)。
+        self._invisibles_pref = bool(section.get("show_invisibles"))
+        self._current_line_pref = bool(
+            section.get("highlight_current_line", True))
+        self._wide_cursor_pref = bool(section.get("wide_cursor"))
         # 配色は「プリセット+上書き」(editor/colors.py)。プリセット名の
         # 正本は color_preset で、旧キー color_scheme は移行前の設定を
         # 読むための受け(書き込みは color_preset のみ)。
@@ -706,28 +723,19 @@ class EditorWindow(QMainWindow):
         self._color_scheme_name = scheme_name
         self._color_overrides = colormod.sanitize_overrides(
             section.get("color_overrides"))
-        self._apply_color_scheme_to_views()
 
         # 折り返し(方式と桁数)と、Markdown の色付けの希望。適用は
-        # ここ(保存は切り替えのときに流す)。Markdown が実際に効くかは
-        # 開いているファイルの拡張子で決まる(_update_markdown_highlight)。
+        # ビューごと(保存は切り替えのときに流す)。Markdown が実際に
+        # 効くかは、そのタブのファイルの拡張子で決まる
+        # (_update_markdown_highlight)。
         wrap_mode = section.get("wrap_mode")
         self._wrap_mode = (wrap_mode if wrap_mode in WRAP_MODES
                            else DEFAULT_WRAP_MODE)
         wrap_column = section.get("wrap_column")
         self._wrap_column = (wrap_column if isinstance(wrap_column, int)
                              and wrap_column > 0 else DEFAULT_WRAP_COLUMN)
-        self._apply_wrap_mode()
         self._markdown_pref = bool(section.get("markdown_highlight", True))
-
-        self._outline_pane = OutlinePane()
-        self._outline_pane.jump_requested.connect(self._jump_to_line)
-        if not section.get("show_outline_pane", True):
-            self._outline_pane.setVisible(False)
-        self._outline_timer = QTimer(self)
-        self._outline_timer.setSingleShot(True)
-        self._outline_timer.setInterval(OUTLINE_REBUILD_DELAY_MS)
-        self._outline_timer.timeout.connect(self._rebuild_outline)
+        self._outline_pane_pref = bool(section.get("show_outline_pane", True))
 
         # フォントの大きさの遅延保存(Ctrl+ホイールの嵐対策)。
         self._pending_font_size = None
@@ -736,53 +744,32 @@ class EditorWindow(QMainWindow):
         self._font_save_timer.setInterval(FONT_SAVE_DELAY_MS)
         self._font_save_timer.timeout.connect(self._flush_pending_font_size)
 
-        # 開いているファイルの外部変更の監視(第3段)。自分の保存でも
-        # 発火するので、受けた側でディスクの印と比べて切り分ける。
-        self._watcher = QFileSystemWatcher(self)
-        self._watcher.fileChanged.connect(self._on_watched_file_changed)
-        self._watched_path = None
-        self._external_change_pending = False
-
-        # 自動保存。既定はオフ(設定 autosave_enabled)。間隔が来たら
-        # autosave_now が、名前のあるファイルの未保存の変更だけを
-        # 通常の保存経路で書く(対象外・衝突時は見送る)。
-        self._autosave_enabled = bool(section.get(AUTOSAVE_ENABLED_KEY))
-        self._autosave_interval_sec = sanitize_autosave_interval(
-            section.get(AUTOSAVE_INTERVAL_KEY))
-        self._autosave_timer = QTimer(self)
-        self._autosave_timer.timeout.connect(self._on_autosave_timeout)
-        self._apply_autosave_timer()
-
-        self._edit.document().modificationChanged.connect(
-            lambda _modified: self._refresh_title())
-        self._edit.cursorPositionChanged.connect(self._refresh_position)
-        self._edit.selectionChanged.connect(self._refresh_position)
-        self._edit.cursorPositionChanged.connect(self._track_change_cache)
-        self._edit.font_size_changed.connect(self._on_font_size_changed)
-        self._edit.document().contentsChanged.connect(
-            self._on_contents_changed)
-        self._edit.document().contentsChange.connect(
-            self._on_document_change_for_macro)
-        self._edit.move_key.connect(self._on_move_key)
-        self._edit.unrecorded_move.connect(self._note_macro_skip)
-        self._edit.mouse_pressed.connect(self._note_macro_skip)
-        self._edit.undo_redo_started.connect(
-            lambda: setattr(self, "_suppress_change_record", True))
-        self._edit.undo_redo_finished.connect(
-            lambda: setattr(self, "_suppress_change_record", False))
+        # タブと最初のビュー(無題)。外部変更の監視・正規表現の状態・
+        # マクロ記録の控え等の文書ごとの状態は、ビューが持ち、
+        # 信号の接続もビューごと(_connect_view)。
+        self._tabs = QTabWidget()
+        self._tabs.setTabsClosable(True)
+        self._tabs.tabCloseRequested.connect(self.close_tab)
+        self._tabs.currentChanged.connect(self._on_current_tab_changed)
+        self._add_view()
+        # Ctrl+Tab / Ctrl+Shift+Tab でタブを切り替える。
+        self._next_tab_shortcut = QShortcut(
+            QKeySequence("Ctrl+Tab"), self)
+        self._next_tab_shortcut.setContext(
+            Qt.ShortcutContext.WindowShortcut)
+        self._next_tab_shortcut.activated.connect(self.activate_next_tab)
+        self._prev_tab_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+Tab"), self)
+        self._prev_tab_shortcut.setContext(
+            Qt.ShortcutContext.WindowShortcut)
+        self._prev_tab_shortcut.activated.connect(self.activate_prev_tab)
 
         self._find_bar = self._build_find_bar()
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        body = QWidget()
-        body_layout = QHBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(0)
-        body_layout.addWidget(self._outline_pane)
-        body_layout.addWidget(self._edit, 1)
-        layout.addWidget(body)
+        layout.addWidget(self._tabs)
         layout.addWidget(self._find_bar)
         self.setCentralWidget(central)
         self._find_bar.hide()
@@ -802,12 +789,457 @@ class EditorWindow(QMainWindow):
         # 固まれば印が残り、次回の起動で既定に戻る(起動時の保険)。
         self._arm_pattern_guard()
         self._refresh_all()
+        # セッションがあれば、前回のタブと控えを戻す。そのうえで
+        # 起動時に渡されたファイルを開く(戻したタブにあれば、
+        # そのタブを前に出すだけ)。
+        restored = self._restore_session()
         if path:
             self.open_path(path)
+        elif restored:
+            self._refresh_all()
         self._disarm_pattern_guard()
+        if self._session_path is not None:
+            # 終了時(再起動含む)にも控えを書き切る。aboutToQuit は
+            # 窓の closeEvent を経ずに落ちる経路の受け。
+            app = QGuiApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(self._flush_session)
         # 開いた直後は本文にフォーカスを置く(ショートカットは本文に
         # フォーカスがあるときだけ効く作りなので)。
         self._edit.setFocus()
+
+    # ---------------------------------------------------------------
+    # ビュー(タブ)とセッション
+    # ---------------------------------------------------------------
+    # 文書ごとの状態は DocumentView が持つ。窓の既存の処理は
+    # 「今のタブ」に対して書かれているので、_edit / _doc 等は
+    # プロパティで今のビューへ寄せる。
+    def _current_view(self):
+        """今開いているタブのビュー。タブが無ければ None。"""
+        if self._tabs is None or not self._views:
+            return None
+        index = self._tabs.currentIndex()
+        if 0 <= index < len(self._views):
+            return self._views[index]
+        return self._views[-1]
+
+    @property
+    def _edit(self):
+        return self._current_view().edit
+
+    @_edit.setter
+    def _edit(self, value):
+        self._current_view().edit = value
+
+    @property
+    def _doc(self):
+        return self._current_view().doc
+
+    @_doc.setter
+    def _doc(self, value):
+        self._current_view().doc = value
+
+    @property
+    def _highlighter(self):
+        return self._current_view().highlighter
+
+    @_highlighter.setter
+    def _highlighter(self, value):
+        self._current_view().highlighter = value
+
+    @property
+    def _outline_pane(self):
+        return self._current_view().outline_pane
+
+    @property
+    def _rx_pending(self):
+        return self._current_view().rx_pending
+
+    @_rx_pending.setter
+    def _rx_pending(self, value):
+        self._current_view().rx_pending = value
+
+    @property
+    def _rx_generation(self):
+        return self._current_view().rx_generation
+
+    @_rx_generation.setter
+    def _rx_generation(self, value):
+        self._current_view().rx_generation = value
+
+    @property
+    def _inc_base(self):
+        return self._current_view().inc_base
+
+    @_inc_base.setter
+    def _inc_base(self, value):
+        self._current_view().inc_base = value
+
+    @property
+    def _inc_span(self):
+        return self._current_view().inc_span
+
+    @_inc_span.setter
+    def _inc_span(self, value):
+        self._current_view().inc_span = value
+
+    @property
+    def _suppress_change_record(self):
+        return self._current_view().suppress_change_record
+
+    @_suppress_change_record.setter
+    def _suppress_change_record(self, value):
+        self._current_view().suppress_change_record = value
+
+    @property
+    def _external_change_pending(self):
+        return self._current_view().external_change_pending
+
+    @_external_change_pending.setter
+    def _external_change_pending(self, value):
+        self._current_view().external_change_pending = value
+
+    def _add_view(self):
+        """新しいタブ(無題のビュー)を足して返す。
+
+        表示の設定(フォント・行番号・配色・折り返し等)は窓の設定値
+        でそろえ、文書ごとの信号を窓へつなぐ。"""
+        view = DocumentView(self._tabs)
+        view.edit.setFont(self._edit_font)
+        if not self._line_numbers_pref:
+            view.edit.set_line_numbers_visible(False)
+        view.edit.set_show_invisibles(self._invisibles_pref)
+        view.edit.set_current_line_enabled(self._current_line_pref)
+        view.edit.setCursorWidth(3 if self._wide_cursor_pref else 1)
+        view.highlighter = LineHighlighter(
+            view.edit.document(), self._highlight_rx)
+        view.outline_pane.setVisible(self._outline_pane_pref)
+        view.outline_timer.setInterval(OUTLINE_REBUILD_DELAY_MS)
+        self._apply_color_scheme_to_view(view)
+        self._apply_wrap_to_view(view)
+        self._update_markdown_highlight(view)
+        self._connect_view(view)
+        # キー割り当ての付いたアクションは、本文にフォーカスがある
+        # ときだけ効く作りなので、新しい本文にも登録する
+        # (メニューより前に作った最初のビューは _action 側で登録
+        # される。_keymap_actions が空の間はここでは何もしない)。
+        for actions in self._keymap_actions.values():
+            for action in actions:
+                view.edit.addAction(action)
+        self._views.append(view)
+        self._tabs.addTab(view, "")
+        self._update_tab_label(view)
+        return view
+
+    def _connect_view(self, view):
+        """ビューの文書ごとの信号を、窓の処理へつなぐ。"""
+        document = view.edit.document()
+        document.modificationChanged.connect(
+            lambda _modified, v=view: self._on_view_modified(v))
+        view.edit.cursorPositionChanged.connect(
+            lambda v=view: self._on_view_cursor_moved(v))
+        view.edit.selectionChanged.connect(
+            lambda v=view: self._on_view_selection_changed(v))
+        view.edit.font_size_changed.connect(self._on_font_size_changed)
+        document.contentsChanged.connect(
+            lambda v=view: self._on_view_contents_changed(v))
+        document.contentsChange.connect(
+            lambda pos, removed, added, v=view:
+            self._on_document_change_for_macro(v, pos, removed, added))
+        view.edit.move_key.connect(self._on_move_key)
+        view.edit.unrecorded_move.connect(self._note_macro_skip)
+        view.edit.mouse_pressed.connect(self._note_macro_skip)
+        view.edit.undo_redo_started.connect(
+            lambda v=view: setattr(v, "suppress_change_record", True))
+        view.edit.undo_redo_finished.connect(
+            lambda v=view: setattr(v, "suppress_change_record", False))
+        view.watcher.fileChanged.connect(
+            lambda path, v=view: self._on_watched_file_changed(v, path))
+        view.outline_timer.timeout.connect(
+            lambda v=view: self._rebuild_outline(v))
+        view.outline_pane.jump_requested.connect(
+            lambda line, v=view: self._jump_to_line(line, v))
+
+    def _on_view_modified(self, view):
+        self._update_tab_label(view)
+        if view is self._current_view():
+            self._refresh_title()
+        self._schedule_session_save()
+
+    def _on_view_cursor_moved(self, view):
+        view.track_change_cache()
+        if view is self._current_view() and hasattr(self, "_pos_label"):
+            self._refresh_position()
+        self._schedule_session_save()
+
+    def _on_view_selection_changed(self, view):
+        if view is self._current_view() and hasattr(self, "_pos_label"):
+            self._refresh_position()
+
+    def _on_view_contents_changed(self, view):
+        view.outline_timer.start()
+        self._refresh_pane_counts(view)
+        self._schedule_session_save()
+
+    def _update_tab_label(self, view):
+        """タブの見出しを、文書の名前(未保存なら *)に合わせる。"""
+        try:
+            index = self._views.index(view)
+        except ValueError:
+            return
+        name = view.doc.display_name
+        if view.is_modified():
+            name += " *"
+        self._tabs.setTabText(index, name)
+
+    def _activate_view(self, view):
+        try:
+            index = self._views.index(view)
+        except ValueError:
+            return
+        self._tabs.setCurrentIndex(index)
+
+    def activate_next_tab(self):
+        """次のタブへ(Ctrl+Tab)。端では反対側へ回る。"""
+        if len(self._views) > 1:
+            index = (self._tabs.currentIndex() + 1) % len(self._views)
+            self._tabs.setCurrentIndex(index)
+
+    def activate_prev_tab(self):
+        """前のタブへ(Ctrl+Shift+Tab)。端では反対側へ回る。"""
+        if len(self._views) > 1:
+            index = (self._tabs.currentIndex() - 1) % len(self._views)
+            self._tabs.setCurrentIndex(index)
+
+    def _on_current_tab_changed(self, _index):
+        view = self._current_view()
+        if view is None or not hasattr(self, "_enc_label"):
+            return  # 組み立ての途中(タブだけ先にできる間)は何もしない
+        self._reset_incremental_search()
+        self._refresh_all()
+        if view.external_change_pending:
+            # 裏のタブで起きた外部変更は、前に出たときに決着させる。
+            self._handle_external_change(view)
+
+    def _remove_view(self, view):
+        """ビューをタブから外す。タブが無くなったら無題を1つ足す。"""
+        watched = view.watcher.files()
+        if watched:
+            view.watcher.removePaths(watched)
+        view.watched_path = None
+        try:
+            index = self._views.index(view)
+        except ValueError:
+            return
+        self._views.pop(index)
+        self._tabs.removeTab(index)
+        view.deleteLater()
+        if not self._views:
+            self._add_view()
+
+    def close_tab(self, index=None):
+        """タブを閉じる。確認は出さない。
+
+        閉じたタブはセッションからも外れる(次に開いても戻らない。
+        メモ帳と同じ)。窓を閉じた場合は、開いているタブが全部
+        そのまま戻る。最後のタブを閉じたら、新しい無題のタブに
+        置き換わる(窓は閉じない)。"""
+        if index is None:
+            index = self._tabs.currentIndex()
+        if not 0 <= index < len(self._views):
+            return
+        self._remove_view(self._views[index])
+        self._flush_session()
+
+    def close_current_tab_or_window(self):
+        """「閉じる」(Ctrl+W)。タブが複数あれば今のタブを閉じ、
+        1つだけなら窓を閉じる(タブが無かった頃の動きと同じ)。"""
+        if len(self._views) > 1:
+            self.close_tab(self._tabs.currentIndex())
+        else:
+            self.close()
+
+    @staticmethod
+    def _same_path(a, b):
+        return (a is not None and b is not None
+                and os.path.normcase(os.path.abspath(a))
+                == os.path.normcase(os.path.abspath(b)))
+
+    def find_view_for_path(self, path):
+        """path を開いているタブ(ビュー)を探す。無ければ None。"""
+        if not path:
+            return None
+        for view in self._views:
+            if self._same_path(view.doc.path, path):
+                return view
+        return None
+
+    def _is_pristine(self, view):
+        """手付かずの無題か(開くときに置き換えてよいタブか)。"""
+        return (view.doc.path is None and not view.is_modified()
+                and view.edit.toPlainText() == "")
+
+    # ---------------------------------------------------------------
+    # セッション(タブと控えの保存・復元)
+    # ---------------------------------------------------------------
+    def _restore_session(self) -> bool:
+        """セッションがあれば、前回のタブと控えを戻す。戻したら True。
+
+        戻せなかったタブ(変更の無いタブで、ファイルが消えている
+        もの)は静かに落とす。控えのあるタブは、ファイルが消えて
+        いても内容を戻す(本文が失われる経路を作らない)。"""
+        if self._session_path is None:
+            return False
+        try:
+            self._session_slot = sessionmod.claim(self._session_path)
+        except Exception:  # noqa: BLE001  控えが読めなくても窓は開く
+            self._session_slot = None
+            return False
+        entries = list((self._session_slot or {}).get("tabs") or [])
+        if not entries:
+            return False
+        initial = self._current_view()
+        restored = []
+        for entry in entries:
+            view = self._add_view()
+            if self._restore_view(view, entry):
+                restored.append(view)
+            else:
+                self._remove_view(view)
+        if not restored:
+            return False
+        if initial is not None and self._is_pristine(initial):
+            self._remove_view(initial)
+        active = (self._session_slot or {}).get("active") or 0
+        try:
+            active = int(active)
+        except (TypeError, ValueError):
+            active = 0
+        active = max(0, min(active, len(restored) - 1))
+        self._activate_view(restored[active])
+        # 戻した顔ぶれで控えを取り直す(落としたタブを記録から消す)。
+        self._flush_session()
+        return True
+
+    def _restore_view(self, view, entry) -> bool:
+        """セッションの記録1件をビューへ戻す。戻せたら True。"""
+        path = entry.get("path")
+        dirty = bool(entry.get("dirty"))
+        if not dirty:
+            if path is None:
+                self._apply_loaded_doc(view, docmod.TextDocument())
+                return True
+            try:
+                doc = docmod.load_document(path)
+            except OSError:
+                return False  # 変更の無いタブでファイルが消えた
+            self._apply_loaded_doc(view, doc)
+            self._restore_cursor(view, entry)
+            return True
+        text = entry.get("text") or ""
+        doc = None
+        if path is not None:
+            try:
+                doc = docmod.load_document(path)
+            except OSError:
+                doc = None
+        external_pending = False
+        if doc is None:
+            # ファイルが読めない(消えた等)。控えの形式で文書を作り、
+            # 本文は控えから戻す(保存すればファイルは作り直される)。
+            doc = docmod.TextDocument(
+                path=path,
+                encoding=entry.get("encoding")
+                or docmod.DEFAULT_ENCODING,
+                bom=bool(entry.get("bom")),
+                newline=entry.get("newline") or docmod.DEFAULT_NEWLINE)
+        elif (entry.get("disk_mtime") is not None
+                and (entry.get("disk_mtime") != doc.disk_mtime
+                     or entry.get("disk_size") != doc.disk_size)):
+            # ディスクが、控えを取った時点から変わっていた。控えを
+            # 優先して戻し、外部変更として扱う: ディスクの印は控え
+            # 時点のものにしておくので、保存のときに既存の確認
+            # (外部で変更されています)がそのまま効く。
+            external_pending = True
+            doc.disk_mtime = entry.get("disk_mtime")
+            doc.disk_size = entry.get("disk_size")
+        self._apply_loaded_doc(view, doc, text=text, modified=True,
+                               external_pending=external_pending)
+        self._restore_cursor(view, entry)
+        if external_pending and view is self._current_view():
+            self.statusBar().showMessage(
+                "このファイルは外部で変更されました"
+                "（編集中の内容はそのままです。保存するときに確認します）", 0)
+        return True
+
+    @staticmethod
+    def _restore_cursor(view, entry):
+        """記録しておいたカーソル位置と選択を戻す。
+
+        位置は QTextCursor の単位で記録してあり、範囲外は Qt 側が
+        文書の範囲に収める。"""
+        try:
+            position = int(entry.get("cursor") or 0)
+            anchor = int(entry.get("anchor") or 0)
+        except (TypeError, ValueError):
+            return
+        cursor = view.edit.textCursor()
+        cursor.setPosition(anchor)
+        if position != anchor:
+            cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+        view.edit.setTextCursor(cursor)
+
+    def _capture_session_state(self):
+        """いまのタブの顔ぶれを、セッションの記録の形で返す。
+
+        変更の無いタブはパスとカーソルだけ(戻すときはディスクから
+        読み直す)。変更のあるタブは本文と形式とディスクの印まで
+        控える(ファイル自体は書き換わらない)。"""
+        tabs = []
+        for view in self._views:
+            view.sync_text()
+            doc = view.doc
+            cursor = view.edit.textCursor()
+            entry = {
+                "path": doc.path,
+                "dirty": bool(view.is_modified()),
+                "cursor": cursor.position(),
+                "anchor": cursor.anchor(),
+            }
+            if entry["dirty"]:
+                entry.update({
+                    "text": doc.text,
+                    "encoding": doc.encoding,
+                    "bom": doc.bom,
+                    "newline": doc.newline,
+                    "disk_mtime": doc.disk_mtime,
+                    "disk_size": doc.disk_size,
+                })
+            tabs.append(entry)
+        index = self._tabs.currentIndex() if self._tabs is not None else 0
+        return {"tabs": tabs, "active": max(0, index)}
+
+    def _schedule_session_save(self):
+        """控えの書き出しを予約する(まとめ待ち。止まってから書く)。"""
+        if self._session_path is not None and self._session_slot is not None:
+            self._session_timer.start()
+
+    def _flush_session(self):
+        """控えをいま書き出す。セッションが無ければ何もしない。
+
+        スロットの中身をいまのタブで差し替えてから、ファイル全体
+        (他の窓のスロットと未使用分を含む)を書く。失敗しても編集は
+        止めない(ステータスに残すだけ)。"""
+        if self._session_path is None or self._session_slot is None:
+            return
+        self._session_timer.stop()
+        try:
+            state = self._capture_session_state()
+            self._session_slot.clear()
+            self._session_slot.update(state)
+            sessionmod.save(self._session_path)
+        except Exception:  # noqa: BLE001  控えの失敗で編集を止めない
+            self.statusBar().showMessage("控えを保存できませんでした", 4000)
 
     # ---------------------------------------------------------------
     # 組み立て
@@ -844,15 +1276,10 @@ class EditorWindow(QMainWindow):
         self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
         self._rebuild_recent_menu()
         file_menu.addSeparator()
-        self._act_autosave = QAction("自動保存(&U)", self)
-        self._act_autosave.setCheckable(True)
-        self._act_autosave.setChecked(self._autosave_enabled)
-        self._act_autosave.toggled.connect(self.set_autosave_enabled)
-        file_menu.addAction(self._act_autosave)
-        self._action("自動保存の間隔(&I)…", self._ask_autosave_interval,
-                     None, file_menu)
-        file_menu.addSeparator()
-        self._action("閉じる(&C)", self.close, "close_window", file_menu)
+        # 「閉じる」はタブを閉じる(複数あるとき)。1つだけなら窓を
+        # 閉じる(close_current_tab_or_window)。
+        self._action("閉じる(&C)", self.close_current_tab_or_window,
+                     "close_window", file_menu)
 
         edit_menu = self.menuBar().addMenu("編集(&E)")
         # 元に戻す等は QPlainTextEdit の標準キー(Ctrl+Z 等)が効く。
@@ -1166,7 +1593,9 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     def set_outline_pane_visible(self, visible):
         visible = bool(visible)
-        self._outline_pane.setVisible(visible)
+        self._outline_pane_pref = visible
+        for view in self._views:
+            view.outline_pane.setVisible(visible)
         if self._act_outline.isChecked() != visible:
             blocker = QSignalBlocker(self._act_outline)
             self._act_outline.setChecked(visible)
@@ -1177,7 +1606,9 @@ class EditorWindow(QMainWindow):
 
     def set_line_numbers_visible(self, visible):
         visible = bool(visible)
-        self._edit.set_line_numbers_visible(visible)
+        self._line_numbers_pref = visible
+        for view in self._views:
+            view.edit.set_line_numbers_visible(visible)
         if self._act_line_numbers.isChecked() != visible:
             blocker = QSignalBlocker(self._act_line_numbers)
             self._act_line_numbers.setChecked(visible)
@@ -1188,7 +1619,9 @@ class EditorWindow(QMainWindow):
 
     def set_invisibles_visible(self, visible):
         visible = bool(visible)
-        self._edit.set_show_invisibles(visible)
+        self._invisibles_pref = visible
+        for view in self._views:
+            view.edit.set_show_invisibles(visible)
         if self._act_invisibles.isChecked() != visible:
             blocker = QSignalBlocker(self._act_invisibles)
             self._act_invisibles.setChecked(visible)
@@ -1199,7 +1632,9 @@ class EditorWindow(QMainWindow):
 
     def set_current_line_highlight(self, enabled):
         enabled = bool(enabled)
-        self._edit.set_current_line_enabled(enabled)
+        self._current_line_pref = enabled
+        for view in self._views:
+            view.edit.set_current_line_enabled(enabled)
         if self._act_current_line.isChecked() != enabled:
             blocker = QSignalBlocker(self._act_current_line)
             self._act_current_line.setChecked(enabled)
@@ -1210,7 +1645,9 @@ class EditorWindow(QMainWindow):
 
     def set_wide_cursor(self, wide):
         wide = bool(wide)
-        self._edit.setCursorWidth(3 if wide else 1)
+        self._wide_cursor_pref = wide
+        for view in self._views:
+            view.edit.setCursorWidth(3 if wide else 1)
         if self._act_wide_cursor.isChecked() != wide:
             blocker = QSignalBlocker(self._act_wide_cursor)
             self._act_wide_cursor.setChecked(wide)
@@ -1222,23 +1659,31 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     # 折り返し(見た目だけ。文書の内容は変えない)
     # ---------------------------------------------------------------
-    def _apply_wrap_mode(self):
-        """今の方式・桁数を本文へ適用する(保存はしない)。"""
+    def _apply_wrap_to_view(self, view):
+        """今の方式・桁数を、1つのビューの本文へ適用する(保存はしない)。"""
         if self._wrap_mode == WRAP_MODE_NONE:
-            self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            view.edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         else:
             # 「桁数」も「ウィンドウ幅」も、折り返し自体は窓幅で
             # 行う。「桁数」は右の余白で見える幅を狭めて実現する。
-            self._edit.setLineWrapMode(
+            view.edit.setLineWrapMode(
                 QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self._apply_wrap_column()
-
-    def _apply_wrap_column(self):
-        """桁数を本文へ伝える。方式が「桁数」のときだけ余白を取り、
-        それ以外の方式では余白を戻す(None を渡す)。"""
-        self._edit.set_wrap_column(
+        # 桁数は、方式が「桁数」のときだけ余白を取る。
+        view.edit.set_wrap_column(
             self._wrap_column
             if self._wrap_mode == WRAP_MODE_COLUMN else None)
+
+    def _apply_wrap_mode(self):
+        """今の方式・桁数を、全部のタブへ適用する(保存はしない)。"""
+        for view in self._views:
+            self._apply_wrap_to_view(view)
+
+    def _apply_wrap_column(self):
+        """桁数を全部のタブへ伝える。"""
+        for view in self._views:
+            view.edit.set_wrap_column(
+                self._wrap_column
+                if self._wrap_mode == WRAP_MODE_COLUMN else None)
 
     def set_wrap_mode(self, mode):
         if mode not in WRAP_MODES:
@@ -1285,17 +1730,23 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     # Markdown の色付け(拡張子で判定し、希望で切り替える)
     # ---------------------------------------------------------------
-    def _update_markdown_highlight(self):
-        """開いているファイルが Markdown なら色付けを効かせる。
+    def _update_markdown_highlight(self, view=None):
+        """そのタブのファイルが Markdown なら色付けを効かせる。
 
         効くのは、利用者の希望(設定 markdown_highlight)が入っていて、
-        かつ拡張子が .md / .markdown のときだけ。"""
-        path = self._doc.path if self._doc else None
+        かつ拡張子が .md / .markdown のときだけ。view が無ければ
+        全部のタブへ適用する。"""
+        if view is None:
+            for item in self._views:
+                self._update_markdown_highlight(item)
+            return
+        path = view.doc.path if view.doc else None
         enabled = False
         if path and self._markdown_pref:
             ext = os.path.splitext(path)[1].lstrip(".").lower()
             enabled = ext in MARKDOWN_EXTENSIONS
-        self._highlighter.set_markdown_enabled(enabled)
+        if view.highlighter is not None:
+            view.highlighter.set_markdown_enabled(enabled)
 
     def set_markdown_highlight(self, enabled):
         enabled = bool(enabled)
@@ -1311,13 +1762,21 @@ class EditorWindow(QMainWindow):
         よるので、ハイライタ側の markdown_enabled を見ること。"""
         return self._markdown_pref
 
-    def _apply_color_scheme_to_views(self):
-        """実効の配色(プリセット+上書き)を本文とハイライタへ反映する。"""
+    def _apply_color_scheme_to_view(self, view):
+        """実効の配色(プリセット+上書き)を、1つのビューの本文と
+        ハイライタへ反映する。"""
         scheme = colormod.resolve_scheme(
             self._color_scheme_name, self._color_overrides)
-        self._edit.apply_colors(scheme)
-        self._highlighter.set_background(QColor(scheme["star_background"]))
-        self._highlighter.set_markdown_colors(scheme)
+        view.edit.apply_colors(scheme)
+        if view.highlighter is not None:
+            view.highlighter.set_background(
+                QColor(scheme["star_background"]))
+            view.highlighter.set_markdown_colors(scheme)
+
+    def _apply_color_scheme_to_views(self):
+        """実効の配色(プリセット+上書き)を全部のタブへ反映する。"""
+        for view in self._views:
+            self._apply_color_scheme_to_view(view)
 
     def _sync_scheme_actions(self):
         for scheme_name, action in self._scheme_actions.items():
@@ -1419,6 +1878,12 @@ class EditorWindow(QMainWindow):
         # 止まってから最後の大きさを1回だけ書く(遅延保存)。
         self._pending_font_size = size
         self._font_save_timer.start()
+        # フォントの大きさは文書ごとの希望ではなく窓共通の希望
+        # なので、他のタブの本文にも同じ大きさを当てる(既に同じ
+        # 大きさの本文では何も起きないので、信号が連鎖しても
+        # 止まる)。
+        for view in self._views:
+            view.edit.set_font_size(size)
 
     def _flush_pending_font_size(self):
         """たまっているフォントの大きさの保存を、いま書く。"""
@@ -1432,31 +1897,39 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     # アウトラインと左ペインの情報
     # ---------------------------------------------------------------
-    def _on_contents_changed(self):
-        self._outline_timer.start()
-        self._refresh_pane_counts()
-
-    def _rebuild_outline(self):
+    def _rebuild_outline(self, view=None):
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
         entries, truncated = outline.extract_outline_ex(
-            self._edit.toPlainText(), self._outline_rx,
+            view.edit.toPlainText(), self._outline_rx,
             limit=outline.OUTLINE_ENTRY_LIMIT)
-        self._outline_pane.set_outline(
+        view.outline_pane.set_outline(
             outline.build_outline_tree(entries), truncated=truncated)
 
-    def _jump_to_line(self, line_number):
-        document = self._edit.document()
+    def _jump_to_line(self, line_number, view=None):
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
+        if view is not self._current_view():
+            self._activate_view(view)
+        document = view.edit.document()
         if line_number < 0 or line_number >= document.blockCount():
             return
         # ブロック番号で引く。findBlockByLineNumber は折り返した
         # 「見た目の行」で数えるので、長い行があると別の行へ飛ぶ。
         block = document.findBlockByNumber(line_number)
         cursor = QTextCursor(block)
-        self._edit.setTextCursor(cursor)
-        self._edit.centerCursor()
-        self._edit.setFocus()
+        view.edit.setTextCursor(cursor)
+        view.edit.centerCursor()
+        view.edit.setFocus()
 
-    def _file_size_text(self):
-        path = self._doc.path
+    def _file_size_text(self, view=None):
+        if view is None:
+            view = self._current_view()
+        path = view.doc.path if view is not None else None
         if path:
             try:
                 return f"{os.path.getsize(path):,} バイト"
@@ -1464,25 +1937,34 @@ class EditorWindow(QMainWindow):
                 pass
         return "—"
 
-    def _refresh_pane_info(self):
-        label = text_encoding.ENCODING_LABELS.get(self._doc.encoding,
-                                                  self._doc.encoding)
+    def _refresh_pane_info(self, view=None):
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
+        doc = view.doc
+        label = text_encoding.ENCODING_LABELS.get(doc.encoding,
+                                                  doc.encoding)
         format_text = (
-            f"{label} / BOM {'あり' if self._doc.bom else 'なし'} / "
-            f"{docmod.NEWLINE_LABELS.get(self._doc.newline, '')}")
-        if self._doc.lossy_decode:
+            f"{label} / BOM {'あり' if doc.bom else 'なし'} / "
+            f"{docmod.NEWLINE_LABELS.get(doc.newline, '')}")
+        if doc.lossy_decode:
             format_text += " / 一部読み替えあり"
-        self._outline_pane.set_file_info(
-            path=self._doc.path, format_text=format_text,
-            size_text=self._file_size_text())
-        self._refresh_pane_counts()
+        view.outline_pane.set_file_info(
+            path=doc.path, format_text=format_text,
+            size_text=self._file_size_text(view))
+        self._refresh_pane_counts(view)
 
-    def _refresh_pane_counts(self):
-        document = self._edit.document()
+    def _refresh_pane_counts(self, view=None):
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
+        document = view.edit.document()
         # 文字数は characterCount で数える(toPlainText の全文コピーは
         # 大きい文書で打鍵のたびに重い。characterCount は末尾の段落
         # 区切りを1つ余分に数えるので、その分を引く)。
-        self._outline_pane.set_counts(
+        view.outline_pane.set_counts(
             document.blockCount(), max(0, document.characterCount() - 1))
 
     # ---------------------------------------------------------------
@@ -1508,8 +1990,10 @@ class EditorWindow(QMainWindow):
         self._outline_pattern_text = outline_text
         self._highlight_pattern_text = highlight_text
         self._outline_rx = outline.compile_pattern(outline_text)
-        self._highlighter.set_pattern(
-            outline.compile_pattern(highlight_text))
+        self._highlight_rx = outline.compile_pattern(highlight_text)
+        for view in self._views:
+            if view.highlighter is not None:
+                view.highlighter.set_pattern(self._highlight_rx)
         self._rebuild_outline()
         # 既定と同じ式は、文字列ではなく空で保存する(空 = 組み込み
         # 既定を使う、という決め)。こうしておくと、組み込み既定を
@@ -1572,56 +2056,99 @@ class EditorWindow(QMainWindow):
         self._pos_label.setText(text)
         self._outline_pane.set_cursor_position(line, column)
 
-    def _refresh_all(self):
-        self._refresh_title()
-        self._refresh_status_labels()
-        self._refresh_position()
-        self._update_markdown_highlight()
-        self._refresh_pane_info()
+    def _refresh_all(self, view=None):
+        """窓の表示を、今のタブ(または渡されたビュー)に合わせ直す。"""
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
+        if view is self._current_view():
+            self._refresh_title()
+            self._refresh_status_labels()
+            self._refresh_position()
+        self._update_markdown_highlight(view)
+        self._refresh_pane_info(view)
         # ここで同期的に作り直すので、編集の追随で予約された分は
         # 要らない(二重に走らせない)。
-        self._outline_timer.stop()
-        self._rebuild_outline()
+        view.outline_timer.stop()
+        self._rebuild_outline(view)
 
     # ---------------------------------------------------------------
     # 開く・新規
     # ---------------------------------------------------------------
     def open_path(self, path) -> bool:
-        """ファイルを開く。失敗したら理由をステータスに出して False。
+        """ファイルをタブとして開く。失敗したら理由をステータスに
+        出して False。
 
-        未保存の編集があるときは、先に確認する(黙って捨てない)。
-        __init__ からの初回は未編集なので、確認はそのまま通る。"""
-        if not self._confirm_discard():
-            return False
+        既にタブにあれば、そのタブを前に出すだけ(読み直さない)。
+        今のタブが手付かずの無題なら、そこへ読み込む(起動直後に
+        空のタブが残らないように)。それ以外は新しいタブを足す。
+        未保存の編集があっても確認は出さない(今のタブはそのまま
+        残るので、捨てることにはならない)。"""
+        existing = self.find_view_for_path(path)
+        if existing is not None:
+            self._activate_view(existing)
+            existing.edit.setFocus()
+            # 「最近使った」順は、タブを前に出したことも使うこと
+            # として数える(履歴の先頭へ繰り上がる)。
+            self._note_recent_file(existing.doc.path)
+            return True
         try:
             doc = docmod.load_document(path)
         except OSError as e:
             self.statusBar().showMessage(f"開けませんでした: {path} ({e})")
             return False
-        self._set_loaded_doc(doc)
+        current = self._current_view()
+        if current is not None and self._is_pristine(current):
+            view = current
+        else:
+            view = self._add_view()
+            self._activate_view(view)
+        self._apply_loaded_doc(view, doc)
+        self._show_load_notices(doc)
         self._note_recent_file(doc.path)
+        view.edit.setFocus()
         return True
 
-    def _set_loaded_doc(self, doc):
-        """読み込んだ文書を窓に据える(開く・再読み込みの共通処理)。
+    def _apply_loaded_doc(self, view, doc, *, text=None, modified=False,
+                          external_pending=False):
+        """読み込んだ(または控えから戻した)文書をビューへ据える。
 
-        監視の張り替えと、読み替え・改行混在の知らせもここで出す。"""
-        self._doc = doc
-        self._suppress_change_record = True
+        text を渡すと、文書モデルの本文ではなくその文字列を表示
+        する(控えの復元用。行ごとの改行種別の控えは使わず、文書の
+        改行設定で描く)。監視の張り替えもここで行う。"""
+        view.doc = doc
+        view.suppress_change_record = True
         try:
-            self._edit.setPlainText(doc.text)
+            view.edit.setPlainText(doc.text if text is None else text)
         finally:
-            self._suppress_change_record = False
-        # 行ごとの改行種別の控えを本文へ渡す(改行記号の描き分け用)。
-        self._edit.set_line_newlines(doc.line_newlines, doc.newline)
+            view.suppress_change_record = False
+        if text is None:
+            # 行ごとの改行種別の控えを本文へ渡す(改行記号の描き分け用)。
+            view.edit.set_line_newlines(doc.line_newlines, doc.newline)
+        else:
+            view.edit.set_line_newlines(None, doc.newline)
         # 読み込んだ内容が編集マークの基準になる。
-        self._edit.clear_edited_lines()
+        view.edit.clear_edited_lines()
         # ブックマークは前の文書の印なので、開き直したら消す。
-        self._edit.clear_bookmarks()
-        self._edit.document().setModified(False)
-        self._external_change_pending = False
-        self._refresh_all()
-        self._update_watcher()
+        view.edit.clear_bookmarks()
+        view.edit.document().setModified(modified)
+        view.external_change_pending = external_pending
+        self._update_tab_label(view)
+        self._update_watcher(view)
+        if view is self._current_view():
+            self._refresh_all()
+        else:
+            self._refresh_pane_info(view)
+            self._rebuild_outline(view)
+
+    def _set_loaded_doc(self, doc):
+        """読み込んだ文書を今のタブに据える(開く・再読み込みの
+        共通処理)。読み替え・改行混在の知らせもここで出す。"""
+        self._apply_loaded_doc(self._current_view(), doc)
+        self._show_load_notices(doc)
+
+    def _show_load_notices(self, doc):
         notices = []
         if doc.lossy_decode:
             notices.append(
@@ -1660,21 +2187,12 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"開けませんでした ({e})")
 
     def new_document(self):
-        if not self._confirm_discard():
-            return
-        self._doc = docmod.TextDocument()
-        self._suppress_change_record = True
-        try:
-            self._edit.setPlainText("")
-        finally:
-            self._suppress_change_record = False
-        self._edit.set_line_newlines(None, self._doc.newline)
-        self._edit.clear_edited_lines()
-        self._edit.clear_bookmarks()
-        self._edit.document().setModified(False)
-        self._external_change_pending = False
-        self._refresh_all()
-        self._update_watcher()
+        """新しい無題のタブを開く。確認は出さない(今のタブは
+        そのまま残る)。"""
+        view = self._add_view()
+        self._activate_view(view)
+        view.edit.setFocus()
+        self._schedule_session_save()
 
     # ---------------------------------------------------------------
     # 最近使ったファイル
@@ -1712,64 +2230,81 @@ class EditorWindow(QMainWindow):
     def open_recent_file(self, path) -> bool:
         """履歴の項目から開く。
 
-        既に開いているファイルなら読み直さない(前面に出すのは
-        呼び側の作法で、窓の中では本文へフォーカスを戻すだけ)。
-        無くなっているファイルは、ダイアログを出さず静かに
-        失敗して、履歴からも外す。"""
+        既にタブに開いているファイルなら読み直さず、そのタブを
+        前に出す。無くなっているファイルは、ダイアログを出さず
+        静かに失敗して、履歴からも外す(タブに残っていても、
+        履歴の項目としては外す。文書そのものはタブに残る)。"""
         if not os.path.isfile(path):
             self._forget_recent_file(path)
             self.statusBar().showMessage(
                 f"ファイルが見つかりませんでした: {path}", 4000)
             return False
-        current = self._doc.path
-        if (current is not None
-                and os.path.normcase(os.path.abspath(current))
-                == os.path.normcase(os.path.abspath(path))):
-            self._edit.setFocus()
+        existing = self.find_view_for_path(path)
+        if existing is not None:
+            self._activate_view(existing)
+            existing.edit.setFocus()
+            self._note_recent_file(existing.doc.path)
             return True
         return self.open_path(path)
 
     # ---------------------------------------------------------------
     # 外部で変更されたファイルの監視
     # ---------------------------------------------------------------
-    def _update_watcher(self):
-        """監視対象を、いま開いているファイルに合わせる。"""
-        path = self._doc.path
-        if self._watched_path and self._watched_path != path:
-            self._watcher.removePath(self._watched_path)
-            self._watched_path = None
+    def _update_watcher(self, view=None):
+        """そのビューの監視対象を、その文書のファイルに合わせる。"""
+        if view is None:
+            view = self._current_view()
+        if view is None:
+            return
+        path = view.doc.path
+        if view.watched_path and view.watched_path != path:
+            view.watcher.removePath(view.watched_path)
+            view.watched_path = None
         if path and os.path.exists(path):
-            if path not in self._watcher.files():
-                self._watcher.addPath(path)
-            self._watched_path = path
+            if path not in view.watcher.files():
+                view.watcher.addPath(path)
+            view.watched_path = path
         else:
-            self._watched_path = None
+            view.watched_path = None
 
-    def _on_watched_file_changed(self, _path):
+    def _on_watched_file_changed(self, view, _path):
         # 自分の保存(原子的な置き換え)でも発火する。ディスクの印が
         # 控えと一致していれば自分の書き込みなので、監視を張り直す
         # だけ(置き換えで監視が外れるため)。
-        if not docmod.external_changed(self._doc):
-            self._update_watcher()
+        if not docmod.external_changed(view.doc):
+            self._update_watcher(view)
             return
-        self._handle_external_change()
+        if view is self._current_view():
+            self._handle_external_change(view)
+        else:
+            # 裏のタブは印だけ立てて、前に出たときに決着させる
+            # (_on_current_tab_changed が _handle_external_change を
+            # 呼ぶ)。編集中に裏でダイアログは出さない。
+            view.external_change_pending = True
 
-    def _handle_external_change(self):
-        """外部で変わったことへの反応。
+    def _handle_external_change(self, view=None):
+        """外部で変わったことへの反応(今のタブについて)。
 
         未保存の編集が無ければ再読み込みを提案する。編集中なら、
         打鍵の邪魔をしないよう知らせるだけに留め、上書きの可否は
         保存直前の確認(更新時刻のチェック)に任せる。"""
-        if self._doc.path is None:
+        if view is None:
+            view = self._current_view()
+        if view is None or view.doc.path is None:
             return
-        if not docmod.external_changed(self._doc):
+        if not docmod.external_changed(view.doc):
+            view.external_change_pending = False
             return
-        if self.is_dirty():
-            self._external_change_pending = True
+        if view.is_modified():
+            view.external_change_pending = True
             self.statusBar().showMessage(
                 "このファイルは外部で変更されました"
                 "（編集中の内容はそのままです。保存するときに確認します）", 0)
             return
+        # 未編集なら、ここで決着させる(再読み込みするかどうかは
+        # 利用者が決める)。印は落とすので、断っても次の外部変更
+        # までは聞き直さない。
+        view.external_change_pending = False
         if self._ask_reload_external():
             self.reload_from_disk()
 
@@ -1787,101 +2322,6 @@ class EditorWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes)
         return answer == QMessageBox.StandardButton.Yes
-
-    # ---------------------------------------------------------------
-    # 自動保存
-    # ---------------------------------------------------------------
-    def autosave_enabled(self) -> bool:
-        return self._autosave_enabled
-
-    def autosave_interval_sec(self) -> int:
-        return self._autosave_interval_sec
-
-    def set_autosave_enabled(self, enabled):
-        self._autosave_enabled = bool(enabled)
-        if self._act_autosave.isChecked() != self._autosave_enabled:
-            blocker = QSignalBlocker(self._act_autosave)
-            self._act_autosave.setChecked(self._autosave_enabled)
-        self._apply_autosave_timer()
-        self._persist_settings({AUTOSAVE_ENABLED_KEY: self._autosave_enabled})
-
-    def set_autosave_interval(self, seconds):
-        try:
-            seconds = int(seconds)
-        except (TypeError, ValueError):
-            return
-        if not AUTOSAVE_INTERVAL_MIN_SEC <= seconds <= AUTOSAVE_INTERVAL_MAX_SEC:
-            return
-        self._autosave_interval_sec = seconds
-        self._apply_autosave_timer()
-        self._persist_settings({AUTOSAVE_INTERVAL_KEY: seconds})
-
-    def _ask_autosave_interval(self):
-        try:
-            value, ok = QInputDialog.getInt(
-                self, APP_NAME, "自動保存の間隔（秒）",
-                self._autosave_interval_sec,
-                AUTOSAVE_INTERVAL_MIN_SEC, AUTOSAVE_INTERVAL_MAX_SEC, 10)
-            if ok:
-                self.set_autosave_interval(value)
-                # 間隔を決めたら、そのまま有効にもする(チェックを
-                # 付けに戻る手間を無くす。_ask_wrap_column が方式まで
-                # 切り替えるのと同じ作法)。
-                if not self._autosave_enabled:
-                    self.set_autosave_enabled(True)
-        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
-            self.statusBar().showMessage(f"設定できませんでした ({e})")
-
-    def _apply_autosave_timer(self):
-        """有効・間隔の設定をタイマーへ反映する。"""
-        if self._autosave_enabled:
-            self._autosave_timer.start(self._autosave_interval_sec * 1000)
-        else:
-            self._autosave_timer.stop()
-
-    def _on_autosave_timeout(self):
-        try:
-            self.autosave_now()
-        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
-            self.statusBar().showMessage(
-                f"自動保存できませんでした ({e})", 8000)
-
-    def autosave_now(self) -> bool:
-        """自動保存の1回分。タイマーから呼ばれ、テストからも直接呼べる。
-
-        保存したら True。次のどれかなら何もせず False:
-          - 自動保存がオフ
-          - 無題(保存先が無い)。勝手に名前は付けない
-          - 未保存の変更が無い
-          - ファイルが外部で変更されている。上書きの確認は手動保存
-            のときだけにして、ここでは見送ってステータスに残す
-          - 保存先の文字コードで書けない文字がある。手動保存では
-            承知の上で置換して書けるが、自動では黙って化けさせない
-        保存は通常の経路(_write → save_to)を通すので、文字コード・
-        改行の保持と .bak は手動保存と同じ。確認ダイアログは、外部
-        変更と書けない文字を先に確かめて見送るため出ない(編集中に
-        ダイアログでフォーカスを奪わない)。"""
-        if not self._autosave_enabled:
-            return False
-        if self._doc.path is None:
-            return False
-        if not self.is_dirty():
-            return False
-        if docmod.external_changed(self._doc):
-            self.statusBar().showMessage(
-                "自動保存を見送りました（ファイルが外部で変更されて"
-                "います。保存するときに確認します）", 8000)
-            return False
-        self._sync_text()
-        if docmod.find_unencodable(self._doc.text, self._doc.encoding):
-            self.statusBar().showMessage(
-                "自動保存を見送りました（保存先の文字コードで書けない"
-                "文字があります）", 8000)
-            return False
-        if not self._write():
-            return False
-        self.statusBar().showMessage("自動保存しました", 4000)
-        return True
 
     # ---------------------------------------------------------------
     # 保存
@@ -1996,50 +2436,29 @@ class EditorWindow(QMainWindow):
             return False
 
     # ---------------------------------------------------------------
-    # 閉じる前の確認
+    # 閉じる(確認は出さない。控えが内容を守る)
     # ---------------------------------------------------------------
-    def _confirm_discard(self) -> bool:
-        """未保存の変更を捨ててよいか。進めてよければ True。"""
-        if not self._edit.document().isModified():
-            return True
-        if self.ask_save_changes is not None:
-            answer = self.ask_save_changes()
-        else:
-            answer = self._ask_save_changes_dialog()
-        if answer == "save":
-            return self.save()
-        return answer == "discard"
-
-    def _ask_save_changes_dialog(self) -> str:
-        box = QMessageBox(self)
-        box.setWindowTitle(APP_NAME)
-        box.setText(f"「{self._doc.display_name}」への変更を保存しますか？")
-        save_button = box.addButton(
-            "保存", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("保存しない", QMessageBox.ButtonRole.DestructiveRole)
-        cancel_button = box.addButton(
-            "キャンセル", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(save_button)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is save_button:
-            return "save"
-        if clicked is cancel_button:
-            return "cancel"
-        return "discard"
-
     def closeEvent(self, event):  # noqa: N802  Qt の上書き
-        if not self._confirm_discard():
-            event.ignore()
-            return
-        # 遅延保存のたまりは、閉じる前に書き切る。
+        # 「保存しますか」は出さない。控えはここで書き切るので、
+        # 未保存の内容も次に開いたときにタブとして戻る。
+        # 遅延保存のたまりも、閉じる前に書き切る。
         self._flush_pending_font_size()
+        self._flush_session()
+        # セッションのスロットは手放す(中身はファイルに残り、
+        # 次に開く窓が引き取ってタブを戻す)。
+        if self._session_path is not None and self._session_slot is not None:
+            try:
+                sessionmod.release(self._session_path, self._session_slot)
+            except Exception:  # noqa: BLE001  閉じる処理は止めない
+                pass
+            self._session_slot = None
         # 監視はここで外す。窓の破棄後に監視イベントが届くと
         # (Linux の inotify では)壊れることがあるため。
-        watched = self._watcher.files()
-        if watched:
-            self._watcher.removePaths(watched)
-        self._watched_path = None
+        for view in self._views:
+            watched = view.watcher.files()
+            if watched:
+                view.watcher.removePaths(watched)
+            view.watched_path = None
         g = self.geometry()
         self.closed.emit([g.x(), g.y(), g.width(), g.height()])
         super().closeEvent(event)
@@ -2635,10 +3054,12 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     # マクロの記録(文書の変化と移動キーの切り分け)
     # ---------------------------------------------------------------
-    def _track_change_cache(self):
-        cursor = self._edit.textCursor()
-        self._change_cache = (cursor.selectionStart(),
-                              cursor.selectionEnd(), cursor.position())
+    def _track_change_cache(self, view=None):
+        """そのビューの「直前の選択・カーソル」の控えを取り直す。"""
+        if view is None:
+            view = self._current_view()
+        if view is not None:
+            view.track_change_cache()
 
     def _on_move_key(self, name, extend):
         # 移動は本文が標準で済ませている。ここでは「起きたこと」と
@@ -2660,12 +3081,12 @@ class EditorWindow(QMainWindow):
         self.statusBar().showMessage(
             f"● マクロ記録中（記録できない操作 {self._macro_skips} 件）", 0)
 
-    def _on_document_change_for_macro(self, pos, removed, added):
+    def _on_document_change_for_macro(self, view, pos, removed, added):
         try:
             if not (self._in_command or self._replaying
-                    or self._suppress_change_record):
-                doc = self._edit.document()
-                sel_start, sel_end, cursor_before = self._change_cache
+                    or view.suppress_change_record):
+                doc = view.edit.document()
+                sel_start, sel_end, cursor_before = view.change_cache
                 if (pos == 0 and added > 0
                         and added >= doc.characterCount() - 1
                         and (removed > 0 or added > 1)):
@@ -2708,7 +3129,7 @@ class EditorWindow(QMainWindow):
         except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
             pass
         finally:
-            self._track_change_cache()
+            self._track_change_cache(view)
 
     def _undo_edit(self):
         self._suppress_change_record = True
@@ -2940,11 +3361,12 @@ class EditorWindow(QMainWindow):
     def open_path_at_line(self, path, line) -> bool:
         """ファイルを開いて、行(1始まり)へ飛ぶ。grep の結果から使う。
 
-        既に同じファイルを開いていれば、読み直さずに飛ぶだけ。
-        別のファイルなら open_path の作法(未保存の確認)に従う。"""
-        if self._doc.path and os.path.normcase(os.path.abspath(path)) \
-                == os.path.normcase(os.path.abspath(self._doc.path)):
-            self._jump_to_line(max(0, line - 1))
+        既に同じファイルをタブに開いていれば、そのタブを前に
+        出して飛ぶだけ。別のファイルなら新しいタブで開く。"""
+        existing = self.find_view_for_path(path)
+        if existing is not None:
+            self._activate_view(existing)
+            self._jump_to_line(max(0, line - 1), existing)
             return True
         if not self.open_path(path):
             return False
@@ -3160,19 +3582,26 @@ class EditorWindow(QMainWindow):
 
         失敗(RegexFault)はステータスに出して on_done は呼ばない。
         新しい実行が始まったら古い結果は捨てる(検索や置換を連打
-        しても、古い結果が後の状態を上書きしない)。"""
-        self._rx_generation += 1
-        generation = self._rx_generation
-        self._rx_pending = (generation, on_done)
+        しても、古い結果が後の状態を上書きしない)。結果は発注した
+        タブについてのもので、そのタブが今のタブでなくなっていたら
+        捨てる(裏のタブの本文を、目を離した直後に差し替えない
+        ため)。世代と待ち受けはビューごとに持つ。"""
+        view = self._current_view()
+        if view is None:
+            return
+        view.rx_generation += 1
+        generation = view.rx_generation
+        view.rx_pending = (generation, on_done)
         bridge = self._rx_bridge
 
         def run():
             try:
-                payload = (generation, rxfind.run_operation(op, **kwargs))
+                payload = (view, generation,
+                           rxfind.run_operation(op, **kwargs))
             except rxfind.RegexFault as e:
-                payload = (generation, e)
+                payload = (view, generation, e)
             except Exception as e:  # noqa: BLE001  理由は利用者への文にする
-                payload = (generation, rxfind.RegexFault(
+                payload = (view, generation, rxfind.RegexFault(
                     f"検索を実行できませんでした（{e}）"))
             bridge.finished.emit(payload)
 
@@ -3180,11 +3609,13 @@ class EditorWindow(QMainWindow):
                          name="editor-rxfind").start()
 
     def _on_rx_finished(self, payload):
-        generation, result = payload
-        pending = self._rx_pending
+        view, generation, result = payload
+        pending = view.rx_pending
         if pending is None or pending[0] != generation:
             return  # 新しい実行が始まっている。古い結果は捨てる
-        self._rx_pending = None
+        view.rx_pending = None
+        if view is not self._current_view():
+            return  # 発注したタブは裏に回った。結果は捨てる
         if isinstance(result, rxfind.RegexFault):
             self.statusBar().showMessage(str(result), 8000)
             return
@@ -3350,9 +3781,44 @@ class EditorWindow(QMainWindow):
     # テスト・呼び側からの参照
     # ---------------------------------------------------------------
     def is_dirty(self) -> bool:
-        """未保存の変更があるか。再起動・終了の巻き添え判定
-        (feature_screen.restart_blockers、filer.confirm_losses)から呼ばれる。"""
-        return self._edit.document().isModified()
+        """どれかのタブに未保存の変更があるか。再起動・終了の
+        巻き添え判定(feature_screen.restart_blockers、
+        filer.confirm_losses)から呼ばれる。"""
+        return any(view.is_modified() for view in self._views)
+
+    def restart_loss_count(self) -> int:
+        """窓を閉じたら失われる未保存の内容の件数。
+
+        セッション(控え)が有効な窓は、閉じても控えから戻るので
+        常に 0(= EDDy のために再起動を止めない)。セッションが
+        無効な窓(テスト等)は、未保存のタブの数を返す
+        (dirty_window_state がこれを使う)。"""
+        if self._session_path is not None:
+            return 0
+        return sum(1 for view in self._views if view.is_modified())
+
+    def tab_count(self) -> int:
+        """開いているタブの数。"""
+        return len(self._views)
+
+    def open_paths(self) -> list:
+        """タブで開いているファイルのパス(無題は除く)。"""
+        return [view.doc.path for view in self._views if view.doc.path]
+
+    def contains_path(self, path) -> bool:
+        """そのファイルがタブに開いているか。"""
+        return self.find_view_for_path(path) is not None
+
+    def activate_path(self, path) -> bool:
+        """そのファイルのタブを前に出す。開いていなければ False。
+
+        外部から「ファイルを開く」要求が来たときに、呼び側
+        (feature_screen・filer の単一インスタンス経路)が使う。"""
+        view = self.find_view_for_path(path)
+        if view is None:
+            return False
+        self._activate_view(view)
+        return True
 
     def current_document(self) -> docmod.TextDocument:
         self._sync_text()

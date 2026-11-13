@@ -20,10 +20,16 @@
 #                   ＋矩形選択は rect_edit.py の共用部品)
 #   outline_pane.py 左ペイン(アウトラインのツリー＋下部のファイル情報)
 #   highlighter.py  星印の行などを強調表示する QSyntaxHighlighter
-#   window.py       窓(QMainWindow。リボン風ツールバー付き)
+#   document_view.py 文書1つ分のビュー(本文・左ペイン・文書状態)。
+#                   タブの実体。窓はこれを並べて管理する
+#   session.py      タブと控え(ドラフト)の置き場と持ち回し(Qt 非依存。
+#                   置き場はリポジトリ外の %LOCALAPPDATA%\traytools\)
+#   window.py       窓(QMainWindow。リボン風ツールバー付き。タブで
+#                   複数の文書を開く)
 #
 # 既存のビューワー(filer_viewer)は「見る」ための作りなので拡張しない。
 # 文字コードの判定だけ text_encoding.py に切り出して共用している。
+from editor.session import default_session_path
 from editor.window import (
     EditorWindow,
     dirty_window_state,
@@ -40,6 +46,7 @@ def create_window(path=None, **kwargs) -> EditorWindow:
 __all__ = [
     "EditorWindow",
     "create_window",
+    "default_session_path",
     "dirty_window_state",
     "find_window_for_path",
 ]

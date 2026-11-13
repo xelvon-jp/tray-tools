@@ -4389,6 +4389,10 @@ class FilerWindow(QWidget):
         existing = editor_module.find_window_for_path(
             self._text_editors, path)
         if existing is not None:
+            # そのファイルのタブを前に出す(窓の中のタブ切り替え)。
+            activate = getattr(existing, "activate_path", None)
+            if activate is not None:
+                activate(path)
             existing.show()
             existing.raise_()
             existing.activateWindow()
@@ -4411,7 +4415,8 @@ class FilerWindow(QWidget):
             path, geometry=geometry,
             keymap_overrides=editor_section.get("keymap"),
             editor_settings=editor_section,
-            on_settings_change=self._save_editor_settings)
+            on_settings_change=self._save_editor_settings,
+            session_path=editor_module.default_session_path())
         window.closed.connect(
             lambda geo, w=window: self._on_text_editor_closed(w, geo))
         self._text_editors.append(window)

@@ -44,14 +44,11 @@ from editor.highlighter import (  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
 from editor.keymap_dialog import KeymapSettingsDialog  # noqa: E402
 from editor.window import (  # noqa: E402
-    AUTOSAVE_ENABLED_KEY,
-    AUTOSAVE_INTERVAL_KEY,
     INCREMENTAL_SEARCH_DELAY_MS,
     PATTERN_APPLYING_KEY,
     RECENT_FILES_KEY,
     PatternSettingsDialog,
     remember_recent_file,
-    sanitize_autosave_interval,
     sanitize_recent_files,
     trial_patterns,
 )
@@ -74,7 +71,8 @@ def make_window(path=None, **kwargs):
 
 
 def discard_close(window):
-    window.ask_save_changes = lambda: "discard"
+    # メモ帳式では閉じる確認が無いので、ただ閉じるだけ(旧作法の
+    # 「保存しますか」の差し替え口は窓に残っていない)。
     window.close()
     window.deleteLater()
     app().processEvents()
@@ -181,16 +179,15 @@ def test_find_case_sensitivity():
         discard_close(window)
 
 
-def test_close_confirmation():
+def test_close_never_asks():
+    """メモ帳式: 未保存の変更があっても、閉じるときに「保存しますか」
+    は出ない。窓はそのまま閉じて、closed が1回出る(ジオメトリ付き)。"""
     window = make_window()
     emitted = []
     window.closed.connect(emitted.append)
     try:
         type_text(window, "x")
-        window.ask_save_changes = lambda: "cancel"
-        window.close()
-        assert window.isVisible() and emitted == []   # キャンセルで閉じない
-        window.ask_save_changes = lambda: "discard"
+        assert window.is_dirty()
         window.close()
         assert not window.isVisible()
         assert len(emitted) == 1 and len(emitted[0]) == 4  # ジオメトリ [x,y,w,h]
@@ -266,15 +263,17 @@ def test_keymap_shortcuts_and_override():
         discard_close(window2)
 
 
-def test_new_document_after_discard():
+def test_new_document_opens_tab():
+    """新規は新しいタブ。編集中のタブは確認なしでそのまま残る。"""
     window = make_window()
     try:
         type_text(window, "何か")
-        window.ask_save_changes = lambda: "discard"
         window.new_document()
+        assert window.tab_count() == 2
         assert window.text() == ""
         assert "無題" in window.windowTitle()
         assert "*" not in window.windowTitle()
+        assert window.is_dirty()  # 元のタブの編集は残っている
     finally:
         discard_close(window)
 
@@ -300,9 +299,10 @@ def test_window_title_shows_app_name_eddy():
         dialog.close()
 
 
-def test_open_path_asks_before_discarding():
-    """未保存の編集があるときに別のファイルを開く経路(重大1)。
-    確認でキャンセルしたら内容が残り、破棄を選んだら開ける。"""
+def test_open_path_opens_new_tab_without_asking():
+    """未保存の編集があるときに別のファイルを開くと、新しいタブで
+    開く。確認は出ず、元のタブの編集はそのまま残る(旧作法の
+    「開く前に確認」はタブ化で不要になった)。"""
     with tempfile.TemporaryDirectory() as tmp:
         first = os.path.join(tmp, "first.txt")
         second = os.path.join(tmp, "second.txt")
@@ -312,21 +312,22 @@ def test_open_path_asks_before_discarding():
         try:
             type_text(window, "X")
             assert window.is_dirty()
-            window.ask_save_changes = lambda: "cancel"
-            assert window.open_path(second) is False
-            assert window.text().startswith("X")  # 編集はそのまま残る
-            assert window.current_document().path == first
-            assert window.is_dirty()
-            window.ask_save_changes = lambda: "discard"
             assert window.open_path(second) is True
+            assert window.tab_count() == 2
             assert window.text() == "次の文書\n"
-            assert not window.is_dirty()
+            assert window.current_document().path == second
+            assert window.is_dirty()  # 元のタブは未保存のまま
+            # 元のタブへ戻ると、編集がそのまま残っている。
+            assert window.activate_path(first)
+            assert window.text().startswith("X")
+            assert window.current_document().path == first
         finally:
             discard_close(window)
 
 
-def test_open_path_with_save_answer():
-    """確認で「保存」を選んだら、元のファイルを書いてから開く。"""
+def test_open_path_same_file_activates_tab():
+    """同じファイルをもう一度開いても、新しいタブは作らず既存の
+    タブを前に出す(編集中の内容は読み直されない)。"""
     with tempfile.TemporaryDirectory() as tmp:
         first = os.path.join(tmp, "first.txt")
         second = os.path.join(tmp, "second.txt")
@@ -335,10 +336,14 @@ def test_open_path_with_save_answer():
         window = make_window(first)
         try:
             type_text(window, "Y")
-            window.ask_save_changes = lambda: "save"
             assert window.open_path(second) is True
-            assert Path(first).read_bytes() == "Y前\n".encode("utf-8")
-            assert window.text() == "後\n"
+            assert window.tab_count() == 2
+            assert window.open_path(first) is True
+            assert window.tab_count() == 2
+            assert window.current_document().path == first
+            assert window.text().startswith("Y")  # 編集はそのまま
+            # ファイルはまだ書かれていない(明示保存まで書き換わらない)。
+            assert Path(first).read_bytes() == "前\n".encode("utf-8")
         finally:
             discard_close(window)
 
@@ -2454,10 +2459,13 @@ def test_recent_files_menu():
             window._edit.setPlainText("書きかけ")
             assert window.open_recent_file(b)
             assert window.text() == "書きかけ"
-            window.ask_save_changes = lambda: "discard"
+            # 別のファイルを履歴から選んでも、確認は出ずタブが
+            # 切り替わるだけ(b の書きかけはタブに残る)。
             assert window.open_recent_file(a)
             assert window.current_document().path == a
             assert window.recent_files() == [a, b]
+            assert window.open_recent_file(b)
+            assert window.text() == "書きかけ"
         finally:
             discard_close(window)
 
@@ -3051,179 +3059,20 @@ def test_color_overrides_reach_markdown_highlighter():
             discard_close(window)
 
 
-def test_autosave_saves_when_due():
-    # 間隔が来た(相当の autosave_now)ら、未保存の変更が通常の保存で
-    # 書かれ、変更印が消える。文字コード・改行・.bak は手動保存と同じ。
-    data = "元の文\r\n".encode("cp932")
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "a.txt")
-        Path(path).write_bytes(data)
-        window = make_window(
-            path, editor_settings={AUTOSAVE_ENABLED_KEY: True})
-        try:
-            assert window.autosave_enabled()
-            assert window._autosave_timer.isActive()
-            assert not window.autosave_now()  # 未変更なら書かない
-            type_text(window, "追")
-            assert window.is_dirty()
-            assert window.autosave_now()
-            assert not window.is_dirty()  # 保存後に変更印が消える
-            written = Path(path).read_bytes()
-            assert "追" in written.decode("cp932")
-            assert b"\r\n" in written  # 改行は CRLF のまま
-            assert Path(path + ".bak").read_bytes() == data
-            assert "自動保存しました" in window.statusBar().currentMessage()
-        finally:
-            discard_close(window)
-
-
-def test_autosave_keeps_cursor_and_selection():
-    # 自動保存が走っても、カーソル位置と選択は壊れない。
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "a.txt")
-        Path(path).write_bytes("あいうえお\nかきくけこ\n".encode("utf-8"))
-        window = make_window(
-            path, editor_settings={AUTOSAVE_ENABLED_KEY: True})
-        try:
-            type_text(window, "追")  # 未保存の変更を作る
-            cursor = window._edit.textCursor()
-            cursor.setPosition(2)
-            cursor.setPosition(5, QTextCursor.MoveMode.KeepAnchor)
-            window._edit.setTextCursor(cursor)
-            before = window._edit.textCursor()
-            assert window.autosave_now()
-            after = window._edit.textCursor()
-            assert (after.selectionStart(), after.selectionEnd(),
-                    after.position()) == (before.selectionStart(),
-                                          before.selectionEnd(),
-                                          before.position())
-            assert window.text().startswith("追")
-        finally:
-            discard_close(window)
-
-
-def test_autosave_off_by_default():
-    # 既定はオフ。オフの間は、間隔が来ても何も書かない。
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "a.txt")
-        data = "元の文\n".encode("utf-8")
-        Path(path).write_bytes(data)
-        window = make_window(path)
-        try:
-            assert not window.autosave_enabled()
-            assert not window._act_autosave.isChecked()
-            assert not window._autosave_timer.isActive()
-            type_text(window, "追")
-            assert window.is_dirty()
-            assert not window.autosave_now()
-            assert window.is_dirty()
-            assert Path(path).read_bytes() == data
-        finally:
-            discard_close(window)
-
-
-def test_autosave_skips_untitled():
-    # 無題は対象外(勝手に名前を付けて書いたりしない)。
-    window = make_window(editor_settings={AUTOSAVE_ENABLED_KEY: True})
+def test_interval_autosave_removed():
+    """間隔式の自動保存は、メモ帳式セッション(控え)に置き換えて
+    取り除いた。窓に口が残っておらず、ファイルメニューにも無い。"""
+    window = make_window()
     try:
-        type_text(window, "無題の文")
-        assert window.is_dirty()
-        assert not window.autosave_now()
-        assert window.is_dirty()
-        assert window.current_document().path is None
+        assert not hasattr(window, "autosave_now")
+        assert not hasattr(window, "set_autosave_enabled")
+        assert not hasattr(window, "autosave_enabled")
+        assert not hasattr(window, "_autosave_timer")
+        texts = [a.text() for a in window.findChildren(QAction)]
+        assert not any("自動保存" in t for t in texts)
     finally:
         discard_close(window)
 
-
-def test_autosave_skips_external_change():
-    # 外部で変更されたファイルは自動では上書きしない。確認ダイアログ
-    # も出さない(差し替えた確認が、承知(True)でも呼ばれない)。
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "a.txt")
-        Path(path).write_bytes("元の文\n".encode("utf-8"))
-        window = make_window(
-            path, editor_settings={AUTOSAVE_ENABLED_KEY: True})
-        try:
-            type_text(window, "追")
-            external = "外部の文（長い）\n".encode("utf-8")
-            _rewrite_externally(path, external)
-            calls = []
-            window.ask_external_overwrite = lambda: calls.append(1) or True
-            assert not window.autosave_now()
-            assert not calls
-            assert Path(path).read_bytes() == external
-            assert window.is_dirty()
-            assert "自動保存を見送りました" in (
-                window.statusBar().currentMessage())
-        finally:
-            discard_close(window)
-
-
-def test_autosave_skips_unencodable():
-    # 保存先の文字コードで書けない文字がある文書は、黙って化け
-    # させない(確認も出さずに見送る)。
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "a.txt")
-        data = "本文\n".encode("cp932")
-        Path(path).write_bytes(data)
-        window = make_window(
-            path, editor_settings={AUTOSAVE_ENABLED_KEY: True})
-        try:
-            type_text(window, "☃")  # cp932 では書けない文字
-            calls = []
-            window.ask_unencodable_save = (
-                lambda chars: calls.append(chars) or True)
-            assert not window.autosave_now()
-            assert not calls
-            assert Path(path).read_bytes() == data
-            assert window.is_dirty()
-            assert "自動保存を見送りました" in (
-                window.statusBar().currentMessage())
-        finally:
-            discard_close(window)
-
-
-def test_autosave_settings_persist_and_interval():
-    # オン・オフと間隔は editor 節へ差分で流れ、タイマーへ反映される。
-    # 範囲外の間隔は受け付けず、設定から読む壊れた値は既定に倒れる。
-    saved = []
-    window = make_window(on_settings_change=saved.append)
-    try:
-        assert window.autosave_interval_sec() == 60  # 既定
-        assert window._act_autosave.isCheckable()
-        window.set_autosave_interval(120)
-        assert window.autosave_interval_sec() == 120
-        assert saved[-1] == {AUTOSAVE_INTERVAL_KEY: 120}
-        window.set_autosave_interval(3)  # 範囲外は受け付けない
-        assert window.autosave_interval_sec() == 120
-        window.set_autosave_enabled(True)
-        assert saved[-1] == {AUTOSAVE_ENABLED_KEY: True}
-        assert window._act_autosave.isChecked()
-        assert window._autosave_timer.isActive()
-        assert window._autosave_timer.interval() == 120 * 1000
-        window.set_autosave_enabled(False)
-        assert saved[-1] == {AUTOSAVE_ENABLED_KEY: False}
-        assert not window._autosave_timer.isActive()
-    finally:
-        discard_close(window)
-    assert sanitize_autosave_interval(30) == 30
-    assert sanitize_autosave_interval(3600) == 3600
-    assert sanitize_autosave_interval("60") == 60  # 既定に倒れる
-    assert sanitize_autosave_interval(0) == 60
-    assert sanitize_autosave_interval(3601) == 60
-    assert sanitize_autosave_interval(True) == 60
-    window2 = make_window(editor_settings={
-        AUTOSAVE_ENABLED_KEY: True, AUTOSAVE_INTERVAL_KEY: 45})
-    try:
-        assert window2.autosave_interval_sec() == 45
-        assert window2._autosave_timer.interval() == 45 * 1000
-    finally:
-        discard_close(window2)
-    window3 = make_window(editor_settings={AUTOSAVE_INTERVAL_KEY: "壊れた値"})
-    try:
-        assert window3.autosave_interval_sec() == 60
-    finally:
-        discard_close(window3)
 
 
 def _action_by_text(window, prefix):

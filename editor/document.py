@@ -7,6 +7,19 @@
 # バイト列に戻す。本文は編集しやすいよう、改行を "\n" にそろえて持つ。
 #
 # 文字コードの判定は text_encoding(ビュアと共用)に任せる。
+#
+# 保存の安全策(第3段):
+#   - 書き込みは原子的(同じフォルダの一時ファイルに書いてから置き換える)。
+#     途中で落ちても元のファイルは壊れない
+#   - 上書きの前に、それまでの内容の控えを「元の名前 + .bak」に1つだけ
+#     残す(増え続けない形)
+#   - 開いたときと保存したときの、ディスク上の (更新時刻, 大きさ) を
+#     控えておく。外部で変わったかの判定(窓の監視と、保存直前の確認)
+#     はこれと比べる
+import os
+import shutil
+import stat
+import sys
 from dataclasses import dataclass
 
 import text_encoding
@@ -32,6 +45,9 @@ class TextDocument:
     newline: str = DEFAULT_NEWLINE
     text: str = ""              # 本文。改行は "\n" に正規化済み
     lossy_decode: bool = False  # 読み替え(置換文字)が発生したか
+    mixed_newlines: bool = False  # CRLF と LF が混在していたか
+    disk_mtime: float = None    # ディスク上の更新時刻(開いた/保存した時点)
+    disk_size: int = None       # ディスク上の大きさ(バイト数)
 
     @property
     def display_name(self) -> str:
@@ -54,6 +70,54 @@ def detect_newline(text: str) -> str:
     return LF
 
 
+def has_mixed_newlines(text: str) -> bool:
+    """CRLF と LF(CR を伴わない改行)が両方あるか。混在は、開いたときに
+    利用者へ一度知らせるための判定(保存すると doc.newline にそろう)。"""
+    crlf = text.count("\r\n")
+    lone_lf = text.count("\n") - crlf
+    return crlf > 0 and lone_lf > 0
+
+
+def _disk_stamp(path):
+    """(更新時刻, 大きさ)。読めなければ (None, None)。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, None
+    return st.st_mtime, st.st_size
+
+
+def external_changed(doc: TextDocument) -> bool:
+    """ディスク上のファイルが、開いた/保存した時点から変わったか。
+
+    控え(更新時刻と大きさ)が無い(無題・新規)なら「変わっていない」。
+    ファイルが消えている場合は「変わった」側に倒す。"""
+    if not doc.path or doc.disk_mtime is None:
+        return False
+    mtime, size = _disk_stamp(doc.path)
+    if mtime is None:
+        return True
+    return mtime != doc.disk_mtime or size != doc.disk_size
+
+
+def find_unencodable(text: str, encoding: str) -> list:
+    """text の中で encoding で書けない文字を、現れた順に重複なく返す。
+
+    保存の前に利用者へ確認するための材料。1文字ずつ試すので、対象は
+    「相異なる文字」の数だけ(本文の長さには比例しない)。"""
+    bad = []
+    seen = set()
+    for ch in text:
+        if ch in seen:
+            continue
+        seen.add(ch)
+        try:
+            ch.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            bad.append(ch)
+    return bad
+
+
 def load_document(path: str) -> TextDocument:
     """ファイルを読み、文字コードと改行を控えた TextDocument を返す。
 
@@ -71,6 +135,8 @@ def load_document(path: str) -> TextDocument:
         text = raw.decode(encoding, errors="replace")
         lossy = True
     newline = detect_newline(text)
+    mixed = has_mixed_newlines(text)
+    mtime, size = _disk_stamp(path)
     return TextDocument(
         path=path,
         encoding=encoding,
@@ -78,36 +144,211 @@ def load_document(path: str) -> TextDocument:
         newline=newline,
         text=text.replace("\r\n", "\n"),
         lossy_decode=lossy,
+        mixed_newlines=mixed,
+        disk_mtime=mtime,
+        disk_size=size,
     )
 
 
-def encode_document(doc: TextDocument, encoding=None, newline=None, bom=None) -> bytes:
+def encode_document(doc: TextDocument, encoding=None, newline=None, bom=None,
+                    errors="strict") -> bytes:
     """doc をバイト列に戻す。encoding / newline / bom を渡すと、その
     変換で書く(「名前を付けて保存」で利用者が選んだ場合だけ渡す)。
 
-    変換先の文字コードで書けない文字があると UnicodeEncodeError を
-    上げる。黙って置換文字にすると中身が壊れるので、呼び側が
-    利用者に伝える前提で隠さない。"""
+    変換先の文字コードで書けない文字があると、既定(errors="strict")
+    では UnicodeEncodeError を上げる。黙って置換文字にすると中身が
+    壊れるので、呼び側が利用者に伝える前提で隠さない。errors="replace"
+    は、利用者が確認した上で化けを承知で書くときだけ渡す。"""
     enc = encoding if encoding is not None else doc.encoding
     nl = newline if newline is not None else doc.newline
     use_bom = doc.bom if bom is None else bom
     text = doc.text
     if nl == CRLF:
         text = text.replace("\n", "\r\n")
-    body = text.encode(enc)
+    body = text.encode(enc, errors=errors)
     return (text_encoding.bom_bytes(enc) if use_bom else b"") + body
 
 
+# ---------------------------------------------------------------
+# ファイル属性の引き継ぎ(原子的な保存は新しいファイルになるため)
+# ---------------------------------------------------------------
+# os.replace は一時ファイルと差し替えるので、置き換えた後のファイルは
+# 「新しく作られたファイル」の属性になる: 隠し属性が外れ、作成日時が
+# 保存の時刻になり、アクセス権も既定に戻る(レビュー req-20261113-107
+# の指摘)。置き換えの前に元の属性を控え、後に引き継ぐ。
+# NTFS の ACL(セキュリティ記述子そのもの)はここでは扱わない
+# (引き継げるのは、アクセス権のビット・隠し等の属性・作成日時まで)。
+def _capture_file_attrs(path):
+    """置き換え前のファイルの属性の控え。読めなければ None。
+
+    形: {"mode": アクセス権のビット,
+         "windows": (属性ビット, 作成日時を表す整数) | None}"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    saved = {"mode": stat.S_IMODE(st.st_mode), "windows": None}
+    if sys.platform == "win32":
+        saved["windows"] = _windows_file_attrs(path)
+    return saved
+
+
+def _restore_file_attrs(path, saved):
+    """控えた属性を、置き換えた後のファイルへ引き継ぐ。
+
+    保存自体は済んでいるので、失敗しても例外は上げない(属性の
+    引き継ぎ損ないで保存を失敗扱いにしない)。"""
+    if not saved:
+        return
+    if saved.get("windows"):
+        try:
+            _apply_windows_file_attrs(path, saved["windows"])
+        except Exception:  # noqa: BLE001  引き継ぎは最善を尽くすだけ
+            pass
+    try:
+        os.chmod(path, saved["mode"])
+    except OSError:
+        pass
+
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _FILE_ATTRIBUTE_READONLY = 0x00000001
+    _FILE_ATTRIBUTE_HIDDEN = 0x00000002
+    _FILE_ATTRIBUTE_SYSTEM = 0x00000004
+    # 保存で引き継ぐ属性ビット(アーカイブ等は新しいファイルの
+    # 既定どおりに任せる)。
+    _CARRY_ATTRS = (_FILE_ATTRIBUTE_READONLY | _FILE_ATTRIBUTE_HIDDEN
+                    | _FILE_ATTRIBUTE_SYSTEM)
+    _INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+    _GENERIC_WRITE = 0x40000000
+    _FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+    _OPEN_EXISTING = 3
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
+    class _WIN32_FILE_ATTRIBUTE_DATA(ctypes.Structure):
+        _fields_ = [("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", _FILETIME),
+                    ("ftLastAccessTime", _FILETIME),
+                    ("ftLastWriteTime", _FILETIME),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD)]
+
+    def _kernel32():
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetFileAttributesW.restype = wintypes.DWORD
+        kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR,
+                                                wintypes.DWORD]
+        kernel32.SetFileAttributesW.restype = wintypes.BOOL
+        kernel32.GetFileAttributesExW.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_int,
+            ctypes.POINTER(_WIN32_FILE_ATTRIBUTE_DATA)]
+        kernel32.GetFileAttributesExW.restype = wintypes.BOOL
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+            wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.SetFileTime.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME), ctypes.POINTER(_FILETIME)]
+        kernel32.SetFileTime.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        return kernel32
+
+    def _windows_file_attrs(path):
+        """(属性ビット, 作成日時) を返す。取れなければ None。
+
+        作成日時は FILETIME(1601年からの 100 ナノ秒単位)を1つの
+        整数にして持つ。"""
+        kernel32 = _kernel32()
+        attrs = kernel32.GetFileAttributesW(path)
+        if attrs == _INVALID_FILE_ATTRIBUTES:
+            return None
+        data = _WIN32_FILE_ATTRIBUTE_DATA()
+        if not kernel32.GetFileAttributesExW(path, 0, ctypes.byref(data)):
+            return None
+        created = data.ftCreationTime
+        creation = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return attrs, creation
+
+    def _apply_windows_file_attrs(path, saved):
+        """属性ビット(隠し・システム・読み取り専用)と作成日時を
+        引き継ぐ。"""
+        attrs, creation = saved
+        kernel32 = _kernel32()
+        current = kernel32.GetFileAttributesW(path)
+        if current != _INVALID_FILE_ATTRIBUTES:
+            merged = (current & ~_CARRY_ATTRS) | (attrs & _CARRY_ATTRS)
+            if merged != current:
+                kernel32.SetFileAttributesW(path, merged)
+        handle = kernel32.CreateFileW(
+            path, _GENERIC_WRITE, _FILE_SHARE_ALL, None,
+            _OPEN_EXISTING, 0, None)
+        invalid = ctypes.c_void_p(-1).value
+        if handle and handle != invalid:
+            try:
+                filetime = _FILETIME(creation & 0xFFFFFFFF,
+                                     (creation >> 32) & 0xFFFFFFFF)
+                kernel32.SetFileTime(handle, ctypes.byref(filetime),
+                                     None, None)
+            finally:
+                kernel32.CloseHandle(handle)
+
+
+def _atomic_write(target: str, data: bytes):
+    """target と同じフォルダの一時ファイルに書いてから置き換える。
+
+    書き込みの途中で落ちても、元のファイルは無傷のまま残る
+    (置き換えは os.replace で一気に行う)。失敗したら一時ファイルを
+    消して例外を上げる。置き換えで新しいファイルになるぶん、
+    元のファイルの属性(アクセス権・隠し属性・作成日時)は引き継ぐ。"""
+    folder = os.path.dirname(os.path.abspath(target))
+    tmp = os.path.join(
+        folder, f".{os.path.basename(target)}.tmp{os.getpid()}")
+    saved = _capture_file_attrs(target) if os.path.exists(target) else None
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _restore_file_attrs(target, saved)
+
+
 def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
-                  bom=None) -> str:
+                  bom=None, backup=True, errors="strict") -> str:
     """doc をファイルへ書く。成功したら doc 側の控え(保存先・文字コード・
-    改行・BOM)を、実際に書いた内容に合わせて更新して、書いたパスを返す。"""
+    改行・BOM・ディスク上の印)を、実際に書いた内容に合わせて更新して、
+    書いたパスを返す。
+
+    backup が真で、保存先に既存のファイルがあれば、上書きの前に
+    それまでの内容を「保存先 + .bak」へ控える(控えは常に1つ)。
+    書き込み自体は原子的に行う(_atomic_write)。"""
     target = path if path is not None else doc.path
     if not target:
         raise ValueError("保存先が決まっていません")
-    data = encode_document(doc, encoding=encoding, newline=newline, bom=bom)
-    with open(target, "wb") as f:
-        f.write(data)
+    data = encode_document(doc, encoding=encoding, newline=newline, bom=bom,
+                           errors=errors)
+    if backup and os.path.exists(target):
+        try:
+            shutil.copyfile(target, target + ".bak")
+        except OSError:
+            pass  # 控えが作れなくても保存自体は止めない
+    _atomic_write(target, data)
     doc.path = target
     if encoding is not None:
         doc.encoding = encoding
@@ -115,6 +356,9 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
         doc.newline = newline
     if bom is not None:
         doc.bom = bom
+    # 保存で改行は doc.newline にそろったので、混在の控えは落とす。
+    doc.mixed_newlines = False
+    doc.disk_mtime, doc.disk_size = _disk_stamp(target)
     return target
 
 

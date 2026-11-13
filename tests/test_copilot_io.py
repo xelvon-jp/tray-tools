@@ -174,6 +174,44 @@ def test_send_ignores_blank_input():
     assert result.ok and fake.sent == ["質問です"]
 
 
+def test_loop_transport_input_unreadable_fails_closed():
+    """入力欄が読めないときは、空と誤認して送らず失敗で止める。
+
+    CopilotLoopTransport.input_text は、read_input が None(入力欄が
+    見つからない)を返したら例外にする。セッションはそれを失敗の
+    結果に畳み、send_prompt は呼ばれない。"""
+    transport = copilot_io.CopilotLoopTransport()
+
+    class FakeCp:
+        def __init__(self):
+            self.sent = []
+
+        def snapshot_length(self):
+            return 100
+
+        def read_input(self):
+            return None  # 入力欄が見つからない = 読めない
+
+        def send_prompt(self, text):
+            self.sent.append(text)
+            return True
+
+        def close(self):
+            pass
+
+    fake_cp = FakeCp()
+    transport._cp = fake_cp
+    try:
+        transport.input_text()
+    except RuntimeError as e:
+        assert "入力欄" in str(e)
+    else:
+        raise AssertionError("RuntimeError になるはず")
+    result = copilot_io.CopilotSession(transport).send("質問です")
+    assert not result.ok and "入力欄" in result.message
+    assert fake_cp.sent == []  # 送っていない
+
+
 # ---------------------------------------------------------------------------
 # SubprocessTransport(fake の裏方実行役)
 # ---------------------------------------------------------------------------

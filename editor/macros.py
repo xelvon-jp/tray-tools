@@ -14,8 +14,11 @@
 #   delete_selection {}         選択範囲の削除
 #   cut_to_end {}               行末まで切り取り
 #   delete_line {}              行の削除
-#   find_next {text, case}      次を検索(使った語と区別を控える)
-#   find_prev {text, case}      前を検索
+#   find_next {text, case, regex}   次を検索(使った語と区別と
+#                                   正規表現かどうかを控える)
+#   find_prev {text, case, regex}   前を検索
+#   replace_next {text, repl, case, regex}  次の1件を置換
+#   replace_all {text, repl, case, regex}   全部置換
 #   move_line_start {extend}    行頭へ
 #   move_line_end {extend}      行末へ
 #   move_line_up {count, extend}    上の行へ
@@ -45,6 +48,8 @@ KNOWN_COMMANDS = frozenset({
     "delete_line",
     "find_next",
     "find_prev",
+    "replace_next",
+    "replace_all",
     "move_line_start",
     "move_line_end",
     "move_line_up",
@@ -146,6 +151,13 @@ class MacroRecorder:
         あとで呼ぶ)。"""
         self._insert_end = None
 
+    def clear_last_command(self):
+        """F4 の控えを消す。記録できない操作(矩形編集・選択の上書き・
+        マウスでの移動など)が起きたら呼ぶ。その操作自体が「直前の
+        操作」なので、それより前の命令を F4 で繰り返すと、見た目と
+        違う結果になる。"""
+        self.last_command = None
+
     # ---------------------------------------------------------------
     def note_command(self, name, args=None):
         """命令層を通った操作を控える。"""
@@ -172,7 +184,13 @@ class MacroRecorder:
         pos / removed / added は contentsChange の値。inserted_text
         は追加された文字列(窓が文書から切り出す)。sel_start /
         sel_end は変化の直前の選択範囲、cursor_before は変化の
-        直前のカーソル位置(削除の向きの判定に使う)。"""
+        直前のカーソル位置(削除の向きの判定に使う)。
+
+        記録できる操作として切り分けたら True、記録できない変化
+        (置き換え、分類できない削除など)なら False を返す。窓は
+        False のときに「記録できない操作」として扱う(件数の知らせ
+        と、F4 の控えの消去)。記録中でなくても last_command の更新
+        と、この成否は同じに返す(F4 は記録と無関係に効くため)。"""
         if added > 0 and removed == 0:
             # 純粋な挿入。直前の挿入と地続きなら1つの命令にまとめる。
             self.last_command = ("insert_text", {"text": inserted_text})
@@ -184,7 +202,7 @@ class MacroRecorder:
                     self.commands.append(
                         {"cmd": "insert_text", "args": {"text": inserted_text}})
                 self._insert_end = pos + added
-            return
+            return True
         self._insert_end = None
         if removed > 0 and added == 0:
             # 純粋な削除。選択範囲の削除か、BS か、Del か。
@@ -192,10 +210,14 @@ class MacroRecorder:
                     and sel_end > sel_start
                     and sel_start == pos and sel_end == pos + removed):
                 self.note_command("delete_selection", {})
-            elif cursor_before == pos + removed:
+                return True
+            if cursor_before == pos + removed:
                 self.note_command("delete_backward", {"count": removed})
-            elif cursor_before == pos:
+                return True
+            if cursor_before == pos:
                 self.note_command("delete_forward", {"count": removed})
+                return True
             # どれでもない削除(他所の範囲が消えた等)は記録しない。
-            return
+            return False
         # 置き換え(削除+挿入)や複合の変化は記録しない。
+        return False

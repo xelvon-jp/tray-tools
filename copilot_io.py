@@ -190,8 +190,16 @@ class CopilotLoopTransport:
         return self._ensure().snapshot_length()
 
     def input_text(self):
-        """入力欄にいま入っている文。取れなければ None。"""
-        return self._ensure().read_input()
+        """入力欄にいま入っている文。
+
+        読めない(入力欄や ValuePattern が見つからない)ときは None を
+        返さず RuntimeError を上げる。「空だった」と誤認したまま
+        送信すると、書きかけの文を黙って上書きしかねないためで、
+        CopilotSession.send は例外を失敗の結果に畳む(送らない)。"""
+        value = self._ensure().read_input()
+        if value is None:
+            raise RuntimeError("Copilot の入力欄が読めませんでした")
+        return value
 
     def send_prompt(self, text):
         return self._ensure().send_prompt(text)

@@ -64,7 +64,7 @@ LOCAL_TEMPLATE = (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class MenuLine:
     key: str = ""
     label: str = ""

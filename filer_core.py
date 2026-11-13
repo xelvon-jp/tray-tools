@@ -63,6 +63,8 @@ DEFAULT_KEYMAP = {
     "1013": "open_in_other",      # Shift+Enter フォルダは反対窓で開く/ファイルはエディタ
     "0069": "edit",               # E
     "0086": "edit",               # V (AFXW.key 0086 &MENU edit.txt の代わり)
+    "2069": "text_editor",        # Ctrl+E 内蔵テキストエディタで開く(E=外のエディタ、
+                                  # Shift+E=新規テキスト。対象はテキストとして開けるものだけ)
     # --- マーク ---
     "0032": "mark_down",          # Space
     "1032": "mark_up",            # Shift+Space

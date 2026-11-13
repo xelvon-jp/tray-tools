@@ -709,6 +709,17 @@ class FileView(QTableView):
             _log_exception("wheel")
 
     def contextMenuEvent(self, event):
+        # 右クリックでは、一覧側に内蔵エディタで開ける対象があるときだけ
+        # 小さなメニューを出す(「エディタで開く」)。カーソル行は動かさない
+        # (マウスでは行を選ばない作法のまま)。対象は F7 と同じく
+        # マーク(無ければカーソル行)。シェルのメニューは従来どおり F7。
+        try:
+            self.pane.window_.activate(self.pane.side)
+            menu = self.pane.window_.build_editor_context_menu(self.pane)
+            if menu is not None:
+                menu.exec(event.globalPos())
+        except Exception:  # noqa: BLE001
+            _log_exception("contextMenu")
         event.accept()
 
     def focusInEvent(self, event):
@@ -4340,6 +4351,7 @@ class FilerWindow(QWidget):
             viewer = filer_viewer.TextViewer(
                 path, title_name=title or path, font=self.active.pane_font, colors=colors,
                 editor_callback=lambda p: self._open_in_editor([p]),
+                text_editor_callback=self.open_text_editor,
                 nav_callback=self._viewer_nav_callback(path), geometry=geometry)
         except OSError as e:
             self.log(f"ビュアで開けません: {path}  ({e})")
@@ -4368,8 +4380,20 @@ class FilerWindow(QWidget):
     # --- 内蔵テキストエディタ ---
     def open_text_editor(self, path: str):
         """内蔵テキストエディタ(editor/)の窓を開く(モードレス。いくつ開いても
-        よい)。開いた窓を返す。Ctrl+Enter の &TEDIT から来る。"""
+        よい)。開いた窓を返す。Ctrl+Enter の &TEDIT から来る。
+
+        同じファイルを既に開いている窓があれば、新しく作らずそちらを
+        前に出す(二重に開くと、別々の編集が上書きし合うため)。"""
         import editor as editor_module  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        existing = editor_module.find_window_for_path(
+            self._text_editors, path)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            self.log(f"エディタ(開いています): {path}")
+            return existing
 
         section = _section(self.app_settings)
         geometry = section.get("editor_geometry")
@@ -4530,6 +4554,56 @@ class FilerWindow(QWidget):
             self._extract_to_temp(files, self._open_in_editor)
             return
         self._open_in_editor([os.path.join(self.active.path, e.name) for e in files])
+
+    # --- 内蔵テキストエディタで開く(Ctrl+E / 右クリック / プレビュー中も同じ) ---
+    def _text_editor_entries(self, pane) -> list:
+        """内蔵エディタで開ける対象(マーク、無ければカーソル行のうち、
+        フォルダでなく、テキストとして開けるもの)。テキストの判定は
+        ビュアと同じ拡張子の表(opens_in_viewer)。画像・バイナリは
+        対象にしない(無理に開くと文字化けした文書として編集・保存
+        されてしまうため)。"""
+        return [e for e in pane.targets()
+                if not e.is_dir
+                and core.opens_in_viewer(e.name, self.viewer_extensions)]
+
+    def cmd_text_editor(self):
+        self._open_targets_in_text_editor(self.active)
+
+    def _open_targets_in_text_editor(self, pane) -> None:
+        """Ctrl+E: 対象を内蔵テキストエディタ(editor/)で開く。
+
+        書庫の中は &TEDIT と同じく、一時フォルダへ取り出してから
+        開く(保存は取り出した側に書かれる)。同じファイルを二重に
+        開かないのは open_text_editor の側の作法。"""
+        files = [e for e in pane.targets() if not e.is_dir]
+        texts = self._text_editor_entries(pane)
+        if not texts:
+            if files:
+                self.log("エディタ: テキストとして開けるファイルがありません")
+            return
+        skipped = len(files) - len(texts)
+        if skipped:
+            self.log(f"エディタ: テキストでない {skipped} 件は除きました")
+        if pane.archive is not None:
+            self._extract_to_temp(
+                texts,
+                lambda taken: [self.open_text_editor(p) for p in taken],
+                pane=pane)
+            return
+        for e in texts:
+            self.open_text_editor(os.path.join(pane.path, e.name))
+
+    def build_editor_context_menu(self, pane):
+        """一覧の右クリックメニュー。内蔵エディタで開ける対象がある
+        ときだけ「エディタで開く」を持つ QMenu を返す。無ければ None
+        (従来どおり何も出さない)。"""
+        if not self._text_editor_entries(pane):
+            return None
+        menu = QMenu()
+        action = menu.addAction("エディタで開く")
+        action.triggered.connect(
+            lambda _checked=False, p=pane: self._open_targets_in_text_editor(p))
+        return menu
 
     def _open_in_editor(self, paths) -> None:
         # 1ファイルずつ起こす。メモ帳は引数を1つしか受け取らないので、まとめて渡すと
@@ -6035,9 +6109,16 @@ class FilerWindow(QWidget):
                     ("Explorer（直前アクティブに新規タブ）", ("open_dest", "explorer_tab")),
                     ("Explorer（新規窓）", ("open_dest", "explorer_new"))):
                 items.append((free_key("LRTEWN"), label, value))
-        elif self._launcher_registerable(path):
-            items.append((free_key("LKR"), "ランチャ登録する",
-                          ("register_launcher", path)))
+        else:
+            # ファイルの行では、テキストとして開けるものに限り内蔵
+            # エディタの入口を足す(一覧の Ctrl+E と同じ作法)。
+            if core.opens_in_viewer(os.path.basename(path),
+                                    self.viewer_extensions):
+                items.append((free_key("T"), "エディタで開く",
+                              ("text_editor", path)))
+            if self._launcher_registerable(path):
+                items.append((free_key("LKR"), "ランチャ登録する",
+                              ("register_launcher", path)))
         items.append(("M", "メニューを編集", ("edit",)))
         menu, chosen = self.build_menu(kind, items)
         view = picker.list
@@ -6046,6 +6127,10 @@ class FilerWindow(QWidget):
             rect.bottomLeft() if rect.isValid() else view.rect().center())
         choice = chosen.get(menu.exec(pos))
         if choice is None:
+            return
+        if isinstance(choice, tuple) and len(choice) == 2 \
+                and choice[0] == "text_editor":
+            self.open_text_editor(choice[1])
             return
         if isinstance(choice, tuple) and len(choice) == 2 \
                 and choice[0] == "open_dest":

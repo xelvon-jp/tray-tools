@@ -7478,6 +7478,23 @@ def test_extmenu_parse_and_format():
     assert m.menu_kind(F("d", is_dir=True)) == "folder" and m.menu_kind(F("x.Md")) == "md"
 
 
+def test_extmenu_lines_are_hashable():
+    # ピッカーの Ctrl+Enter は、メニュー項目の値(MenuLine)を集めて
+    # 照合する。MenuLine が set に入らない(unhashable)と TypeError で
+    # 落ちる(レビュー req-20261113-108 の指摘)。値が同じ行は同じ物
+    # として扱えることも含めて確かめる。
+    import filer_extmenu as m
+    items = m.parse_menu_text(
+        '"I:IrfanView" C:\\soft\\i_view64.exe $MF\n'
+        '"-----"\n'
+        '"9:キャンセル" &NOP\n')
+    values = {line for line in items}
+    assert len(values) == 3, values
+    same = m.parse_line('"I:IrfanView" C:\\soft\\i_view64.exe $MF')
+    assert same in values
+    assert m.SEPARATOR in values
+
+
 def test_extmenu_split_command():
     import filer_extmenu as m
     assert m.split_command('"C:\\a b\\x.exe" -m "日本 語" x') == ["C:\\a b\\x.exe", "-m", "日本 語", "x"]
@@ -11928,6 +11945,231 @@ def test_photo_pick():
                 pick_cache.close()
 
 
+def test_text_editor_keymap_entry():
+    """Ctrl+E が内蔵テキストエディタ(text_editor)に割り当てられている。"""
+    assert core.build_keymap()["2069"] == "text_editor"
+    assert "text_editor" in core.COMMANDS
+
+
+def _close_editor_windows(w):
+    for editor_window in list(w._text_editors):
+        editor_window.ask_save_changes = lambda: "discard"
+        editor_window.close()
+        editor_window.deleteLater()
+
+
+def test_text_editor_ctrl_e_targets():
+    """Ctrl+E: カーソル行・マークのテキストファイルを内蔵エディタで開く。
+
+    画像は対象にしない。同じファイルは二重に開かない。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        try:
+            L.set_cursor(L._row_of("alpha.txt"))
+            QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
+            assert len(w._text_editors) == 1, w._text_editors
+            assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
+            # もう一度押しても二重に開かない(既存の窓が前に出るだけ)
+            QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
+            assert len(w._text_editors) == 1
+            _close_editor_windows(w)
+            assert w._text_editors == []
+            # 画像は対象にしない
+            L.set_cursor(L._row_of("photo.JPG"))
+            QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
+            assert w._text_editors == []
+            # マーク: テキストだけが開き、画像は除かれる
+            L.marks.update({"alpha.txt", "beta.md", "photo.JPG"})
+            w.run_command("text_editor")
+            opened = sorted(Path(e.current_document().path).name for e in w._text_editors)
+            assert opened == ["alpha.txt", "beta.md"], opened
+            _close_editor_windows(w)
+        finally:
+            _close_editor_windows(w)
+            w.close()
+            w.deleteLater()
+
+
+def test_text_editor_context_menu():
+    """右クリックメニュー: テキストを開ける対象があるときだけ出る。"""
+    import filer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        try:
+            L.set_cursor(L._row_of("alpha.txt"))
+            menu = w.build_editor_context_menu(L)
+            assert menu is not None
+            labels = [a.text() for a in menu.actions()]
+            assert labels == ["エディタで開く"], labels
+            menu.actions()[0].trigger()
+            assert len(w._text_editors) == 1
+            assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
+            _close_editor_windows(w)
+            # 画像だけのときはメニュー自体を出さない
+            L.set_cursor(L._row_of("photo.JPG"))
+            assert w.build_editor_context_menu(L) is None
+            # フォルダも対象ではない
+            L.set_cursor(L._row_of("sub1"))
+            assert w.build_editor_context_menu(L) is None
+        finally:
+            _close_editor_windows(w)
+            w.close()
+            w.deleteLater()
+
+
+def test_text_editor_ctrl_e_in_preview():
+    """プレビュー(F3)表示中でも Ctrl+E は効く(キーはファイル窓のまま)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        L = w.left
+        try:
+            L.set_cursor(L._row_of("alpha.txt"))
+            QTest.keyClick(L.view, Qt.Key_F3)
+            assert w.preview_on
+            result = _wait_preview(w, "alpha.txt")
+            assert result["kind"] == "text"
+            QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
+            assert len(w._text_editors) == 1
+            assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
+            assert w.preview_on   # プレビューは開いたまま
+            _close_editor_windows(w)
+        finally:
+            _close_editor_windows(w)
+            w.close()
+            w.deleteLater()
+
+
+def test_picker_ctrl_enter_text_editor_item():
+    """統合ピッカーの Ctrl+Enter: テキストのファイル行に「エディタで開く」。"""
+    import filer
+    from PySide6.QtWidgets import QListWidget
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            captured = {}
+            sentinel = object()
+
+            class FakeMenu:
+                def exec(self, _pos):
+                    return sentinel
+
+            def fake_build_menu(title, items):
+                captured["items"] = items
+                values = {item[2] for item in items if item}
+                assert ("text_editor", str(left / "alpha.txt")) in values
+                return FakeMenu(), {sentinel: ("text_editor",
+                                               str(left / "alpha.txt"))}
+
+            opened = []
+            w.build_menu = fake_build_menu
+            w.open_text_editor = lambda p: opened.append(p)
+            picker = type("P", (), {"list": QListWidget()})()
+            w._picker_ctrl_enter(picker, "alpha.txt",
+                                 {"kind": "file",
+                                  "path": str(left / "alpha.txt")})
+            labels = [item[1] for item in captured["items"] if item]
+            assert "エディタで開く" in labels, labels
+            assert opened == [str(left / "alpha.txt")], opened
+            # 画像の行には項目が無い
+            captured.clear()
+            opened.clear()
+
+            def fake_build_menu_image(title, items):
+                captured["items"] = items
+                return FakeMenu(), {sentinel: None}
+
+            w.build_menu = fake_build_menu_image
+            w._picker_ctrl_enter(picker, "photo.JPG",
+                                 {"kind": "file",
+                                  "path": str(left / "photo.JPG")})
+            labels = [item[1] for item in captured["items"] if item]
+            assert "エディタで開く" not in labels, labels
+            assert opened == []
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_viewer_ctrl_e_opens_text_editor():
+    """ビュアの Ctrl+E は内蔵エディタ(E は外のエディタのまま)。"""
+    import filer_viewer as fv
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "a.txt")
+        path.write_text("hello\n", encoding="utf-8")
+        calls = []
+        v = fv.TextViewer(
+            str(path),
+            editor_callback=lambda p: calls.append(("external", p)),
+            text_editor_callback=lambda p: calls.append(("builtin", p)))
+        v.resize(800, 600)
+        v.show()
+        try:
+            _wait_viewer(v, lambda: v.index.done)
+            QTest.keyClick(v.area, Qt.Key_E, Qt.ControlModifier)
+            assert calls == [("builtin", str(path))], calls
+            QTest.keyClick(v.area, Qt.Key_E)
+            assert calls[-1] == ("external", str(path)), calls
+        finally:
+            v.close()
+            v.deleteLater()
+
+
 # 窓を立てる重いテストのうち、中核（FULL_ONLY に無い窓テスト）以外は普段回さない。
 # CI（GITHUB_ACTIONS）と --full のときだけ全部回す。守る対象は変えず、手元の確認を
 # 軽くするための仕分け（2026-11-03 Nagato の「最低限にして」による）。
@@ -11946,6 +12188,10 @@ FULL_ONLY = frozenset({
     "test_log_selection_ctrl_c",
     "test_menu_selected_row_color",
     "test_open_shell_and_explorer",
+    "test_picker_ctrl_enter_text_editor_item",
+    "test_text_editor_context_menu",
+    "test_text_editor_ctrl_e_in_preview",
+    "test_text_editor_ctrl_e_targets",
     "test_photo_mode_judgement",
     "test_photo_mode_window_and_rating_column",
     "test_photo_no_extra_entries",

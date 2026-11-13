@@ -20,6 +20,19 @@
 #   ファイル情報)、フォントの既定(MS Gothic)と Ctrl+ホイールでの
 #   大きさ変更、星印の行の強調表示、アウトライン・強調の正規表現の
 #   設定ダイアログ、行末まで切り取り(Ctrl+K、命令 cut_to_end)。
+#
+# 第3段で足したもの:
+#   正規表現の検索・置換(命令 replace_next / replace_all。実処理は
+#   editor/rxfind.py が別プロセスで回す。固まる式でも窓は止まらない)、
+#   フォルダ内の横断検索(grep。editor/grep.py と grep_dialog.py)、
+#   不可視文字の表示・現在行の強調・太いカーソル・配色プリセット
+#   (editor/colors.py。「秀丸風」あり)、外部で変更されたファイルの
+#   監視(QFileSystemWatcher)と再読み込みの提案。
+# 保存まわりの安全策(同じく第3段):
+#   書き込みは原子的で、直前の内容は .bak に控える(document.py)。
+#   開いた後に外部で変わっていたら、上書きの前に確認する。保存先の
+#   文字コードで書けない文字があれば、化けを承知で書くか確認する。
+#   改行が混在する文書は、開いたときに知らせる。
 # 表示の状態とフォントと正規表現は settings の editor 節に保存され、
 # 呼び側が on_settings_change で受けて update_settings_section する。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
@@ -42,9 +55,17 @@ import subprocess
 import sys
 import threading
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QFileSystemWatcher,
+    QObject,
+    QSignalBlocker,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QFont,
     QGuiApplication,
     QKeySequence,
@@ -60,10 +81,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QToolBar,
     QVBoxLayout,
@@ -72,11 +95,15 @@ from PySide6.QtWidgets import (
 
 import copilot_io
 import text_encoding
+from editor import colors as colormod
 from editor import convert as convmod
 from editor import document as docmod
 from editor import macros as macmod
 from editor import outline
-from editor.highlighter import LineHighlighter
+from editor import editor_icon
+from editor import rxfind
+from editor.grep_dialog import GrepDialog
+from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor.keymap import merge_keymap
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
@@ -100,6 +127,19 @@ FONT_SAVE_DELAY_MS = 600
 # 起動したときに True のまま残っていたら、前回は適用の途中で固まった
 # 疑いがあるので、保存済みの式は使わず既定に戻して開く(起動時の保険)。
 PATTERN_APPLYING_KEY = "pattern_applying"
+
+# 折り返しの方式(settings の editor 節 wrap_mode の値)。
+#   column … 指定の桁数で折り返す / window … 窓の幅で折り返す /
+#   none … 折り返さない。いずれも見た目だけで、文書は変えない。
+WRAP_MODE_COLUMN = "column"
+WRAP_MODE_WINDOW = "window"
+WRAP_MODE_NONE = "none"
+WRAP_MODES = (WRAP_MODE_COLUMN, WRAP_MODE_WINDOW, WRAP_MODE_NONE)
+DEFAULT_WRAP_MODE = WRAP_MODE_WINDOW
+DEFAULT_WRAP_COLUMN = 80
+# 「桁数」の実体は QPlainTextEdit に無い(FixedColumnWidth は
+# QTextEdit のもの)。本文の右に余白を取って見える幅を桁数ぶんに
+# 狭める形で実現する(editor/text_edit.py の set_wrap_column)。
 
 # 設定ダイアログの試験を別プロセスで待つ上限(秒)。試験自体の制限
 # (outline.TRIAL_TIME_LIMIT_SEC)に、子プロセスの起動のぶんを足したもの。
@@ -153,6 +193,17 @@ class _SendBridge(QObject):
     finished = Signal(object)
 
 
+class _RxBridge(QObject):
+    """正規表現の処理スレッド → 窓への結果の受け渡し。
+
+    rxfind.run_operation は別プロセスの完了を待つ(上限5秒)。GUI の
+    スレッドで待つと、その間窓が固まる(レビュー req-20261113-107
+    の指摘)。送信(_SendBridge)と同じく、裏スレッドで待って結果
+    だけをシグナルで戻す。"""
+
+    finished = Signal(object)
+
+
 def dirty_window_state(windows):
     """エディタの窓の並びから、未保存の (件数, 状態を読めなかった件数) を返す。
 
@@ -170,6 +221,27 @@ def dirty_window_state(windows):
         except Exception:  # noqa: BLE001  読めない窓は「あるかも」側に倒す
             unreadable += 1
     return dirty, unreadable
+
+
+def find_window_for_path(windows, path):
+    """窓の並びから、path を開いている窓を探す。無ければ None。
+
+    同じファイルを二重に開かないために、呼び側(ファイラ)が窓を
+    作る前に使う。パスの比べは、大文字小文字と表記の揺れを吸収する
+    ため normcase + abspath でそろえる。"""
+    if not path:
+        return None
+    target = os.path.normcase(os.path.abspath(path))
+    for window in windows or []:
+        if window is None:
+            continue
+        try:
+            opened = window.current_document().path
+        except Exception:  # noqa: BLE001  読めない窓は飛ばす
+            continue
+        if opened and os.path.normcase(os.path.abspath(opened)) == target:
+            return window
+    return None
 
 
 def _compile_or_default(text, default_rx, default_text):
@@ -335,6 +407,10 @@ class EditorWindow(QMainWindow):
                  sender=None, font=None, editor_settings=None,
                  on_settings_change=None, parent=None):
         super().__init__(parent)
+        # 窓のアイコンはテキストエディタ用(常駐の Rapture と区別する)。
+        # 入口(feature_screen / ファイラ)はすべてこの窓を通るので、
+        # ここで付ければ全部に付く。
+        self.setWindowIcon(editor_icon.qicon())
         self._doc = docmod.TextDocument()
         self._keymap = merge_keymap(keymap_overrides)
         # 送信の実体は差し替えられる(テストは fake を入れる)。
@@ -342,6 +418,11 @@ class EditorWindow(QMainWindow):
         self._send_thread = None
         self._bridge = _SendBridge(self)
         self._bridge.finished.connect(self._on_send_finished)
+        # 正規表現の非同期実行(結果は世代で切り分ける)。
+        self._rx_bridge = _RxBridge(self)
+        self._rx_bridge.finished.connect(self._on_rx_finished)
+        self._rx_generation = 0
+        self._rx_pending = None
         # 未保存で閉じる/新規にするときの確認は差し替えられる
         # (テストは QMessageBox を出さずにここを差す)。
         # 戻り値は "save" / "discard" / "cancel"。
@@ -349,6 +430,17 @@ class EditorWindow(QMainWindow):
         # Copilot の入力欄に書きかけの文があるとき、上書きして送って
         # よいかの確認も差し替えられる(戻り値は bool)。
         self.ask_overwrite_input = None
+        # 保存・外部変更まわりの確認も差し替えられる。
+        # ask_external_overwrite: 開いた後に外部で変わったファイルを
+        #   上書きしてよいか(戻り値は bool)
+        # ask_external_reload: 外部で変わったファイルを再読み込み
+        #   してよいか(戻り値は bool)
+        # ask_unencodable_save: 保存先の文字コードで書けない文字が
+        #   あるとき、置換文字で書いてよいか(引数は書けない文字の
+        #   並び。戻り値は bool)
+        self.ask_external_overwrite = None
+        self.ask_external_reload = None
+        self.ask_unencodable_save = None
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
@@ -387,6 +479,8 @@ class EditorWindow(QMainWindow):
             "convert_fullwidth": self._cmd_convert_fullwidth,
             "convert_lower": self._cmd_convert_lower,
             "convert_upper": self._cmd_convert_upper,
+            "replace_next": self._cmd_replace_next,
+            "replace_all": self._cmd_replace_all,
         }
 
         self._edit = TextEdit()
@@ -430,6 +524,32 @@ class EditorWindow(QMainWindow):
             self._edit.document(), highlight_rx)
         self._pattern_guard_armed = False
 
+        # 表示の設定(第3段): 不可視文字・現在行の強調・太いカーソル・
+        # 配色。ここでは設定を読むだけ(保存は切り替えのときに流す)。
+        self._edit.set_show_invisibles(bool(section.get("show_invisibles")))
+        self._edit.set_current_line_enabled(
+            bool(section.get("highlight_current_line", True)))
+        self._edit.setCursorWidth(3 if section.get("wide_cursor") else 1)
+        scheme_name = section.get("color_scheme") or colormod.DEFAULT_SCHEME
+        if scheme_name not in colormod.COLOR_SCHEMES:
+            scheme_name = colormod.DEFAULT_SCHEME
+        self._color_scheme_name = scheme_name
+        scheme = colormod.get_scheme(scheme_name)
+        self._edit.apply_colors(scheme)
+        self._highlighter.set_background(QColor(scheme["star_background"]))
+
+        # 折り返し(方式と桁数)と、Markdown の色付けの希望。適用は
+        # ここ(保存は切り替えのときに流す)。Markdown が実際に効くかは
+        # 開いているファイルの拡張子で決まる(_update_markdown_highlight)。
+        wrap_mode = section.get("wrap_mode")
+        self._wrap_mode = (wrap_mode if wrap_mode in WRAP_MODES
+                           else DEFAULT_WRAP_MODE)
+        wrap_column = section.get("wrap_column")
+        self._wrap_column = (wrap_column if isinstance(wrap_column, int)
+                             and wrap_column > 0 else DEFAULT_WRAP_COLUMN)
+        self._apply_wrap_mode()
+        self._markdown_pref = bool(section.get("markdown_highlight", True))
+
         self._outline_pane = OutlinePane()
         self._outline_pane.jump_requested.connect(self._jump_to_line)
         if not section.get("show_outline_pane", True):
@@ -446,9 +566,17 @@ class EditorWindow(QMainWindow):
         self._font_save_timer.setInterval(FONT_SAVE_DELAY_MS)
         self._font_save_timer.timeout.connect(self._flush_pending_font_size)
 
+        # 開いているファイルの外部変更の監視(第3段)。自分の保存でも
+        # 発火するので、受けた側でディスクの印と比べて切り分ける。
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.fileChanged.connect(self._on_watched_file_changed)
+        self._watched_path = None
+        self._external_change_pending = False
+
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
+        self._edit.selectionChanged.connect(self._refresh_position)
         self._edit.cursorPositionChanged.connect(self._track_change_cache)
         self._edit.font_size_changed.connect(self._on_font_size_changed)
         self._edit.document().contentsChanged.connect(
@@ -587,6 +715,10 @@ class EditorWindow(QMainWindow):
                      "find_next", search_menu)
         self._action("前を検索(&P)", lambda: self.execute_command("find_prev"),
                      "find_prev", search_menu)
+        search_menu.addSeparator()
+        self._action("置換(&R)…", self.show_find_bar, None, search_menu)
+        self._action("フォルダ内を検索(&G)…", self.show_grep_dialog,
+                     None, search_menu)
 
         view_menu = self.menuBar().addMenu("表示(&V)")
         self._act_outline = QAction("アウトライン(&O)", self)
@@ -599,6 +731,53 @@ class EditorWindow(QMainWindow):
         self._act_line_numbers.setChecked(self._edit.line_numbers_visible())
         self._act_line_numbers.toggled.connect(self.set_line_numbers_visible)
         view_menu.addAction(self._act_line_numbers)
+        view_menu.addSeparator()
+        self._act_invisibles = QAction("不可視文字(&I)", self)
+        self._act_invisibles.setCheckable(True)
+        self._act_invisibles.setChecked(self._edit.show_invisibles())
+        self._act_invisibles.toggled.connect(self.set_invisibles_visible)
+        view_menu.addAction(self._act_invisibles)
+        self._act_current_line = QAction("現在行の強調(&C)", self)
+        self._act_current_line.setCheckable(True)
+        self._act_current_line.setChecked(self._edit.current_line_enabled())
+        self._act_current_line.toggled.connect(
+            self.set_current_line_highlight)
+        view_menu.addAction(self._act_current_line)
+        self._act_wide_cursor = QAction("太いカーソル(&W)", self)
+        self._act_wide_cursor.setCheckable(True)
+        self._act_wide_cursor.setChecked(self._edit.cursorWidth() > 1)
+        self._act_wide_cursor.toggled.connect(self.set_wide_cursor)
+        view_menu.addAction(self._act_wide_cursor)
+        scheme_menu = view_menu.addMenu("配色(&S)")
+        self._scheme_actions = {}
+        for name in colormod.scheme_names():
+            action = QAction(name, self)
+            action.setCheckable(True)
+            action.setChecked(name == self._color_scheme_name)
+            action.triggered.connect(
+                lambda _checked=False, n=name: self.apply_color_scheme(n))
+            scheme_menu.addAction(action)
+            self._scheme_actions[name] = action
+        wrap_menu = view_menu.addMenu("折り返し(&R)")
+        self._wrap_actions = {}
+        for mode, label in ((WRAP_MODE_COLUMN, "桁数で折り返す(&C)"),
+                            (WRAP_MODE_WINDOW, "ウィンドウ幅(&W)"),
+                            (WRAP_MODE_NONE, "折り返さない(&N)")):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(mode == self._wrap_mode)
+            action.triggered.connect(
+                lambda _checked=False, m=mode: self.set_wrap_mode(m))
+            wrap_menu.addAction(action)
+            self._wrap_actions[mode] = action
+        wrap_menu.addSeparator()
+        self._action("折り返し桁数の設定(&S)…", self._ask_wrap_column,
+                     None, wrap_menu)
+        self._act_markdown = QAction("Markdown の色付け(&M)", self)
+        self._act_markdown.setCheckable(True)
+        self._act_markdown.setChecked(self._markdown_pref)
+        self._act_markdown.toggled.connect(self.set_markdown_highlight)
+        view_menu.addAction(self._act_markdown)
         view_menu.addSeparator()
         self._action("アウトライン・強調の設定(&P)…",
                      self.show_pattern_settings, None, view_menu)
@@ -637,8 +816,10 @@ class EditorWindow(QMainWindow):
 
     def _build_find_bar(self):
         bar = QFrame()
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(6, 4, 6, 4)
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(4)
+        row = QHBoxLayout()
         row.addWidget(QLabel("検索"))
         self._find_edit = QLineEdit()
         self._find_edit.returnPressed.connect(
@@ -646,6 +827,8 @@ class EditorWindow(QMainWindow):
         row.addWidget(self._find_edit, 1)
         self._find_case = QCheckBox("大文字小文字を区別")
         row.addWidget(self._find_case)
+        self._find_regex = QCheckBox("正規表現")
+        row.addWidget(self._find_regex)
         next_button = QPushButton("次へ")
         next_button.clicked.connect(lambda: self.execute_command("find_next"))
         row.addWidget(next_button)
@@ -655,6 +838,20 @@ class EditorWindow(QMainWindow):
         close_button = QPushButton("閉じる")
         close_button.clicked.connect(self._hide_find_bar)
         row.addWidget(close_button)
+        outer.addLayout(row)
+        replace_row = QHBoxLayout()
+        replace_row.addWidget(QLabel("置換"))
+        self._replace_edit = QLineEdit()
+        replace_row.addWidget(self._replace_edit, 1)
+        replace_button = QPushButton("置換")
+        replace_button.clicked.connect(
+            lambda: self.execute_command("replace_next"))
+        replace_row.addWidget(replace_button)
+        replace_all_button = QPushButton("すべて置換")
+        replace_all_button.clicked.connect(
+            lambda: self.execute_command("replace_all"))
+        replace_row.addWidget(replace_all_button)
+        outer.addLayout(replace_row)
         escape = QShortcut(QKeySequence("Esc"), bar)
         escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         escape.activated.connect(self._hide_find_bar)
@@ -738,6 +935,148 @@ class EditorWindow(QMainWindow):
 
     def line_numbers_visible(self) -> bool:
         return self._edit.line_numbers_visible()
+
+    def set_invisibles_visible(self, visible):
+        visible = bool(visible)
+        self._edit.set_show_invisibles(visible)
+        if self._act_invisibles.isChecked() != visible:
+            blocker = QSignalBlocker(self._act_invisibles)
+            self._act_invisibles.setChecked(visible)
+        self._persist_settings({"show_invisibles": visible})
+
+    def invisibles_visible(self) -> bool:
+        return self._edit.show_invisibles()
+
+    def set_current_line_highlight(self, enabled):
+        enabled = bool(enabled)
+        self._edit.set_current_line_enabled(enabled)
+        if self._act_current_line.isChecked() != enabled:
+            blocker = QSignalBlocker(self._act_current_line)
+            self._act_current_line.setChecked(enabled)
+        self._persist_settings({"highlight_current_line": enabled})
+
+    def current_line_highlight(self) -> bool:
+        return self._edit.current_line_enabled()
+
+    def set_wide_cursor(self, wide):
+        wide = bool(wide)
+        self._edit.setCursorWidth(3 if wide else 1)
+        if self._act_wide_cursor.isChecked() != wide:
+            blocker = QSignalBlocker(self._act_wide_cursor)
+            self._act_wide_cursor.setChecked(wide)
+        self._persist_settings({"wide_cursor": wide})
+
+    def wide_cursor(self) -> bool:
+        return self._edit.cursorWidth() > 1
+
+    # ---------------------------------------------------------------
+    # 折り返し(見た目だけ。文書の内容は変えない)
+    # ---------------------------------------------------------------
+    def _apply_wrap_mode(self):
+        """今の方式・桁数を本文へ適用する(保存はしない)。"""
+        if self._wrap_mode == WRAP_MODE_NONE:
+            self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        else:
+            # 「桁数」も「ウィンドウ幅」も、折り返し自体は窓幅で
+            # 行う。「桁数」は右の余白で見える幅を狭めて実現する。
+            self._edit.setLineWrapMode(
+                QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._apply_wrap_column()
+
+    def _apply_wrap_column(self):
+        """桁数を本文へ伝える。方式が「桁数」のときだけ余白を取り、
+        それ以外の方式では余白を戻す(None を渡す)。"""
+        self._edit.set_wrap_column(
+            self._wrap_column
+            if self._wrap_mode == WRAP_MODE_COLUMN else None)
+
+    def set_wrap_mode(self, mode):
+        if mode not in WRAP_MODES:
+            mode = DEFAULT_WRAP_MODE
+        self._wrap_mode = mode
+        self._apply_wrap_mode()
+        for name, action in self._wrap_actions.items():
+            if action.isChecked() != (name == mode):
+                blocker = QSignalBlocker(action)
+                action.setChecked(name == mode)
+        self._persist_settings({"wrap_mode": mode})
+
+    def wrap_mode(self) -> str:
+        return self._wrap_mode
+
+    def set_wrap_column(self, column):
+        try:
+            column = int(column)
+        except (TypeError, ValueError):
+            return
+        if column <= 0:
+            return
+        self._wrap_column = column
+        if self._wrap_mode == WRAP_MODE_COLUMN:
+            self._apply_wrap_column()
+        self._persist_settings({"wrap_column": column})
+
+    def wrap_column(self) -> int:
+        return self._wrap_column
+
+    def _ask_wrap_column(self):
+        try:
+            value, ok = QInputDialog.getInt(
+                self, APP_NAME, "折り返しの桁数", self._wrap_column,
+                8, 1000, 1)
+            if ok:
+                self.set_wrap_column(value)
+                # 桁数を決めたら、その方式で見えるように切り替える。
+                if self._wrap_mode != WRAP_MODE_COLUMN:
+                    self.set_wrap_mode(WRAP_MODE_COLUMN)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"設定できませんでした ({e})")
+
+    # ---------------------------------------------------------------
+    # Markdown の色付け(拡張子で判定し、希望で切り替える)
+    # ---------------------------------------------------------------
+    def _update_markdown_highlight(self):
+        """開いているファイルが Markdown なら色付けを効かせる。
+
+        効くのは、利用者の希望(設定 markdown_highlight)が入っていて、
+        かつ拡張子が .md / .markdown のときだけ。"""
+        path = self._doc.path if self._doc else None
+        enabled = False
+        if path and self._markdown_pref:
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            enabled = ext in MARKDOWN_EXTENSIONS
+        self._highlighter.set_markdown_enabled(enabled)
+
+    def set_markdown_highlight(self, enabled):
+        enabled = bool(enabled)
+        self._markdown_pref = enabled
+        if self._act_markdown.isChecked() != enabled:
+            blocker = QSignalBlocker(self._act_markdown)
+            self._act_markdown.setChecked(enabled)
+        self._update_markdown_highlight()
+        self._persist_settings({"markdown_highlight": enabled})
+
+    def markdown_highlight(self) -> bool:
+        """利用者の希望(設定値)。実際に効いているかは拡張子にも
+        よるので、ハイライタ側の markdown_enabled を見ること。"""
+        return self._markdown_pref
+
+    def apply_color_scheme(self, name):
+        """配色プリセット(editor/colors.py)を適用して保存する。"""
+        if name not in colormod.COLOR_SCHEMES:
+            name = colormod.DEFAULT_SCHEME
+        self._color_scheme_name = name
+        scheme = colormod.get_scheme(name)
+        self._edit.apply_colors(scheme)
+        self._highlighter.set_background(QColor(scheme["star_background"]))
+        for scheme_name, action in self._scheme_actions.items():
+            if action.isChecked() != (scheme_name == name):
+                blocker = QSignalBlocker(action)
+                action.setChecked(scheme_name == name)
+        self._persist_settings({"color_scheme": name})
+
+    def color_scheme_name(self) -> str:
+        return self._color_scheme_name
 
     def font_size(self) -> int:
         return self._edit.font_size()
@@ -876,13 +1215,29 @@ class EditorWindow(QMainWindow):
         cursor = self._edit.textCursor()
         line = cursor.blockNumber() + 1
         column = cursor.positionInBlock() + 1
-        self._pos_label.setText(f"{line} 行 {column} 桁")
+        text = f"{line} 行 {column} 桁"
+        if cursor.hasSelection():
+            # 選択範囲の文字数と行数。改行は1文字に数える(選択文字列
+            # では段落の区切りが U+2029 で、そのまま1文字)。
+            # 行数は、選択の文字がまたがっている行の数(末尾が次の
+            # 行頭ちょうどのときは、その行は数えない)。
+            chars = len(cursor.selectedText())
+            document = self._edit.document()
+            start_block = document.findBlock(
+                cursor.selectionStart()).blockNumber()
+            end_pos = cursor.selectionEnd()
+            if end_pos > cursor.selectionStart():
+                end_pos -= 1
+            end_block = document.findBlock(end_pos).blockNumber()
+            text += f"（選択 {chars} 文字 / {end_block - start_block + 1} 行）"
+        self._pos_label.setText(text)
         self._outline_pane.set_cursor_position(line, column)
 
     def _refresh_all(self):
         self._refresh_title()
         self._refresh_status_labels()
         self._refresh_position()
+        self._update_markdown_highlight()
         self._refresh_pane_info()
         # ここで同期的に作り直すので、編集の追随で予約された分は
         # 要らない(二重に走らせない)。
@@ -904,6 +1259,13 @@ class EditorWindow(QMainWindow):
         except OSError as e:
             self.statusBar().showMessage(f"開けませんでした: {path} ({e})")
             return False
+        self._set_loaded_doc(doc)
+        return True
+
+    def _set_loaded_doc(self, doc):
+        """読み込んだ文書を窓に据える(開く・再読み込みの共通処理)。
+
+        監視の張り替えと、読み替え・改行混在の知らせもここで出す。"""
         self._doc = doc
         self._suppress_change_record = True
         try:
@@ -911,10 +1273,34 @@ class EditorWindow(QMainWindow):
         finally:
             self._suppress_change_record = False
         self._edit.document().setModified(False)
+        self._external_change_pending = False
         self._refresh_all()
+        self._update_watcher()
+        notices = []
         if doc.lossy_decode:
-            self.statusBar().showMessage(
+            notices.append(
                 "一部の文字を読み替えました（保存すると置換文字で書かれます）")
+        if doc.mixed_newlines:
+            label = docmod.NEWLINE_LABELS.get(doc.newline, "")
+            notices.append(
+                f"改行コードが混在しています（保存すると {label} にそろいます）")
+        if notices:
+            self.statusBar().showMessage("。".join(notices))
+
+    def reload_from_disk(self) -> bool:
+        """ディスクの内容で読み直す(外部変更の再読み込み)。
+
+        未保存の編集があるときは呼ばない前提(呼び側で切り分ける)。"""
+        path = self._doc.path
+        if not path:
+            return False
+        try:
+            doc = docmod.load_document(path)
+        except OSError as e:
+            self.statusBar().showMessage(f"再読み込みできませんでした ({e})")
+            return False
+        self._set_loaded_doc(doc)
+        self.statusBar().showMessage("再読み込みしました", 4000)
         return True
 
     def open_dialog(self):
@@ -937,7 +1323,68 @@ class EditorWindow(QMainWindow):
         finally:
             self._suppress_change_record = False
         self._edit.document().setModified(False)
+        self._external_change_pending = False
         self._refresh_all()
+        self._update_watcher()
+
+    # ---------------------------------------------------------------
+    # 外部で変更されたファイルの監視
+    # ---------------------------------------------------------------
+    def _update_watcher(self):
+        """監視対象を、いま開いているファイルに合わせる。"""
+        path = self._doc.path
+        if self._watched_path and self._watched_path != path:
+            self._watcher.removePath(self._watched_path)
+            self._watched_path = None
+        if path and os.path.exists(path):
+            if path not in self._watcher.files():
+                self._watcher.addPath(path)
+            self._watched_path = path
+        else:
+            self._watched_path = None
+
+    def _on_watched_file_changed(self, _path):
+        # 自分の保存(原子的な置き換え)でも発火する。ディスクの印が
+        # 控えと一致していれば自分の書き込みなので、監視を張り直す
+        # だけ(置き換えで監視が外れるため)。
+        if not docmod.external_changed(self._doc):
+            self._update_watcher()
+            return
+        self._handle_external_change()
+
+    def _handle_external_change(self):
+        """外部で変わったことへの反応。
+
+        未保存の編集が無ければ再読み込みを提案する。編集中なら、
+        打鍵の邪魔をしないよう知らせるだけに留め、上書きの可否は
+        保存直前の確認(更新時刻のチェック)に任せる。"""
+        if self._doc.path is None:
+            return
+        if not docmod.external_changed(self._doc):
+            return
+        if self.is_dirty():
+            self._external_change_pending = True
+            self.statusBar().showMessage(
+                "このファイルは外部で変更されました"
+                "（編集中の内容はそのままです。保存するときに確認します）", 0)
+            return
+        if self._ask_reload_external():
+            self.reload_from_disk()
+
+    @property
+    def external_change_pending(self) -> bool:
+        """外部変更があり、まだ決着していない(編集中に知らされた)か。"""
+        return self._external_change_pending
+
+    def _ask_reload_external(self) -> bool:
+        if self.ask_external_reload is not None:
+            return bool(self.ask_external_reload())
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            "このファイルは外部で変更されました。\n再読み込みしますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        return answer == QMessageBox.StandardButton.Yes
 
     # ---------------------------------------------------------------
     # 保存
@@ -952,18 +1399,75 @@ class EditorWindow(QMainWindow):
         return self._write()
 
     def save_to(self, path, encoding=None, newline=None, bom=None) -> bool:
-        """ダイアログ無しで、指定の形式で書く(呼び側・テスト用)。"""
+        """ダイアログ無しで、指定の形式で書く(呼び側・テスト用)。
+
+        保存の前の確認が2つある(どちらも黙って進めない):
+          - 上書き先が開いているファイル自身で、開いた後に外部で
+            変わっていたら、上書きしてよいか確かめる
+          - 保存先の文字コードで書けない文字があれば、置換文字に
+            化けるのを承知で書くか確かめる"""
         self._sync_text()
+        if (path is not None and self._doc.path is not None
+                and os.path.normcase(os.path.abspath(path))
+                == os.path.normcase(os.path.abspath(self._doc.path))
+                and docmod.external_changed(self._doc)):
+            if not self._confirm_external_overwrite():
+                self.statusBar().showMessage(
+                    "保存をやめました（ファイルが外部で変更されています）",
+                    8000)
+                return False
+        enc = encoding if encoding is not None else self._doc.encoding
+        bad = docmod.find_unencodable(self._doc.text, enc)
+        errors = "strict"
+        if bad:
+            if not self._confirm_unencodable_save(bad, enc):
+                self.statusBar().showMessage(
+                    "保存をやめました（書けない文字があります）", 8000)
+                return False
+            errors = "replace"
         try:
             docmod.save_document(self._doc, path=path, encoding=encoding,
-                                 newline=newline, bom=bom)
+                                 newline=newline, bom=bom, errors=errors)
         except (OSError, UnicodeEncodeError, ValueError) as e:
             self.statusBar().showMessage(f"保存できませんでした: {e}")
             return False
         self._edit.document().setModified(False)
+        self._external_change_pending = False
         self._refresh_all()
+        self._update_watcher()
         self.statusBar().showMessage("保存しました", 4000)
         return True
+
+    def _confirm_external_overwrite(self) -> bool:
+        """開いた後に外部で変わったファイルを上書きしてよいか。"""
+        if self.ask_external_overwrite is not None:
+            return bool(self.ask_external_overwrite())
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            "このファイルは、開いた後に外部で変更されています。\n"
+            "そのまま保存すると、外部での変更は上書きされて消えます。"
+            "保存しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _confirm_unencodable_save(self, chars, encoding) -> bool:
+        """書けない文字を置換文字にして書いてよいか。"""
+        if self.ask_unencodable_save is not None:
+            return bool(self.ask_unencodable_save(list(chars)))
+        preview = "、".join(chars[:10])
+        if len(chars) > 10:
+            preview += " …"
+        label = text_encoding.ENCODING_LABELS.get(encoding, encoding)
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"保存先の文字コード（{label}）では書けない文字があります"
+            f"（{preview}）。\n"
+            "そのまま保存すると、それらの文字は置換文字に化けます。"
+            "保存しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     def _write(self) -> bool:
         return self.save_to(self._doc.path)
@@ -1025,6 +1529,12 @@ class EditorWindow(QMainWindow):
             return
         # 遅延保存のたまりは、閉じる前に書き切る。
         self._flush_pending_font_size()
+        # 監視はここで外す。窓の破棄後に監視イベントが届くと
+        # (Linux の inotify では)壊れることがあるため。
+        watched = self._watcher.files()
+        if watched:
+            self._watcher.removePaths(watched)
+        self._watched_path = None
         g = self.geometry()
         self.closed.emit([g.x(), g.y(), g.width(), g.height()])
         super().closeEvent(event)
@@ -1081,7 +1591,9 @@ class EditorWindow(QMainWindow):
         return True
 
     def repeat_last(self):
-        """F4: 直前の命令をもう一度実行する(命令が無ければ何もしない)。"""
+        """F4: 直前の命令をもう一度実行する(命令が無ければ何もしない)。
+        記録できない操作(矩形編集・マウス移動など)が間に起きていたら、
+        控えは消えているので何もしない(_note_macro_skip が消す)。"""
         last = self._recorder.last_command
         if last is None:
             return
@@ -1302,8 +1814,214 @@ class EditorWindow(QMainWindow):
             return None
         case = args.get("case")
         case = self._find_case.isChecked() if case is None else bool(case)
-        self._do_find(forward, word, case)
-        return {"text": word, "case": case}
+        regex = args.get("regex")
+        regex = self._find_regex.isChecked() if regex is None else bool(regex)
+        self._do_find(forward, word, case, regex)
+        return {"text": word, "case": case, "regex": regex}
+
+    # ---------------------------------------------------------------
+    # 置換(検索バーとマクロが同じ命令を通る)
+    # ---------------------------------------------------------------
+    def _cmd_replace_next(self, args):
+        return self._replace_command(args, replace_all=False)
+
+    def _cmd_replace_all(self, args):
+        return self._replace_command(args, replace_all=True)
+
+    def _replace_options(self, args):
+        """置換の材料(検索語・置換語・大小区別・正規表現か)。
+
+        引数で渡ってこなかった分は検索バーの今の値を使う(記録には、
+        実際に使った値が全部残る)。"""
+        word = args.get("text")
+        word = self._find_edit.text() if word is None else str(word)
+        repl = args.get("repl")
+        repl = self._replace_edit.text() if repl is None else str(repl)
+        case = args.get("case")
+        case = self._find_case.isChecked() if case is None else bool(case)
+        regex = args.get("regex")
+        regex = self._find_regex.isChecked() if regex is None else bool(regex)
+        return word, repl, case, regex
+
+    def _replace_command(self, args, replace_all):
+        word, repl, case, regex = self._replace_options(args)
+        if not word:
+            return None
+        text = self._edit.toPlainText()
+        if regex and not self._replaying:
+            # 正規表現の置換は裏スレッドで回す。結果が返る前に材料は
+            # 記録する(見つからなかった回も記録に残るが、再生のとき
+            # 見つからなければ何も起きない)。マクロ再生中は、命令の
+            # 順序を守るため同期で処理する。
+            if replace_all:
+                self._start_replace_all_regex(text, word, repl, case)
+            else:
+                self._start_replace_next_regex(text, word, repl, case)
+            return {"text": word, "repl": repl, "case": case, "regex": regex}
+        try:
+            if replace_all:
+                done = self._apply_replace_all(text, word, repl, case, regex)
+            else:
+                done = self._apply_replace_next(text, word, repl, case, regex)
+        except rxfind.RegexFault as e:
+            self.statusBar().showMessage(str(e), 8000)
+            return None
+        if not done:
+            self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
+            return None
+        return {"text": word, "repl": repl, "case": case, "regex": regex}
+
+    def _start_replace_all_regex(self, text, word, repl, case):
+        """正規表現の全部置換(非同期)。結果が返るまでに文書が
+        変わっていたら、古い結果で上書きしないよう置換をやめる。"""
+        revision = self._edit.document().revision()
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                self.statusBar().showMessage(
+                    "文書が変わったため、置換をやめました", 4000)
+                return
+            new_text, count = result["text"], result["count"]
+            if not count:
+                self.statusBar().showMessage(
+                    f"「{word}」は見つかりません", 4000)
+                return
+            self._suppress_change_record = True
+            try:
+                cursor = self._edit.textCursor()
+                cursor.beginEditBlock()
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                cursor.movePosition(QTextCursor.MoveOperation.End,
+                                    QTextCursor.MoveMode.KeepAnchor)
+                cursor.insertText(new_text)
+                cursor.endEditBlock()
+                self._edit.setTextCursor(cursor)
+            finally:
+                self._suppress_change_record = False
+            self._track_change_cache()
+            self.statusBar().showMessage(f"{count} 件置換しました", 4000)
+
+        self._run_rx_async("replace_all", done, text=text, pattern=word,
+                           repl=repl, regex=True, case_sensitive=case)
+
+    def _start_replace_next_regex(self, text, word, repl, case):
+        """正規表現の次置換(非同期)。守りは全部置換と同じ。"""
+        cursor = self._edit.textCursor()
+        start = self._py_index(cursor.selectionStart(), text)
+        revision = self._edit.document().revision()
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                self.statusBar().showMessage(
+                    "文書が変わったため、置換をやめました", 4000)
+                return
+            if result["span"] is None:
+                self.statusBar().showMessage(
+                    f"「{word}」は見つかりません", 4000)
+                return
+            span = result["span"]
+            expanded = result["replacement"]
+            begin16 = self._utf16_index(span[0], text)
+            end16 = self._utf16_index(span[1], text)
+            self._suppress_change_record = True
+            try:
+                cursor2 = self._edit.textCursor()
+                cursor2.setPosition(begin16)
+                cursor2.setPosition(end16, QTextCursor.MoveMode.KeepAnchor)
+                cursor2.beginEditBlock()
+                cursor2.insertText(expanded)
+                cursor2.endEditBlock()
+                cursor2.setPosition(begin16)
+                cursor2.setPosition(begin16 + self._utf16_len(expanded),
+                                    QTextCursor.MoveMode.KeepAnchor)
+                self._edit.setTextCursor(cursor2)
+            finally:
+                self._suppress_change_record = False
+            self._track_change_cache()
+
+        self._run_rx_async("replace_one", done, text=text, pattern=word,
+                           repl=repl, start=start, regex=True,
+                           case_sensitive=case)
+
+    def _apply_replace_all(self, text, word, repl, case, regex):
+        """全部置換して、文書へ一括で反映する。置換したら True。"""
+        if regex:
+            result = rxfind.run_operation(
+                "replace_all", text=text, pattern=word, repl=repl,
+                regex=True, case_sensitive=case)
+            new_text, count = result["text"], result["count"]
+        else:
+            rx = rxfind.compile_search(word, regex=False,
+                                       case_sensitive=case)
+            new_text, count = rxfind.replace_all_text(
+                text, rx, repl, regex=False)
+        if not count:
+            return False
+        cursor = self._edit.textCursor()
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.movePosition(QTextCursor.MoveOperation.End,
+                            QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(new_text)
+        cursor.endEditBlock()
+        self._edit.setTextCursor(cursor)
+        self.statusBar().showMessage(f"{count} 件置換しました", 4000)
+        return True
+
+    def _apply_replace_next(self, text, word, repl, case, regex):
+        """カーソル(選択の開始)以後の最初のマッチを1件だけ置換する。
+        置換したら True。置き換えた箇所を選択状態にする。"""
+        cursor = self._edit.textCursor()
+        start = self._py_index(cursor.selectionStart(), text)
+        if regex:
+            result = rxfind.run_operation(
+                "replace_one", text=text, pattern=word, repl=repl,
+                start=start, regex=True, case_sensitive=case)
+            if result["span"] is None:
+                return False
+            span = result["span"]
+            expanded = result["replacement"]
+        else:
+            rx = rxfind.compile_search(word, regex=False,
+                                       case_sensitive=case)
+            span = rxfind.find_span_next(text, rx, start)
+            if span is None:
+                return False
+            match = rx.match(text, span[0])
+            expanded = rxfind.expand_replacement(match, repl, regex=False)
+        begin16 = self._utf16_index(span[0], text)
+        end16 = self._utf16_index(span[1], text)
+        cursor.setPosition(begin16)
+        cursor.setPosition(end16, QTextCursor.MoveMode.KeepAnchor)
+        cursor.beginEditBlock()
+        cursor.insertText(expanded)
+        cursor.endEditBlock()
+        cursor.setPosition(begin16)
+        cursor.setPosition(begin16 + self._utf16_len(expanded),
+                           QTextCursor.MoveMode.KeepAnchor)
+        self._edit.setTextCursor(cursor)
+        return True
+
+    # ---------------------------------------------------------------
+    # 位置の単位の変換(Python の文字列の位置 ⇔ QTextCursor の位置)
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _utf16_len(text):
+        """QTextCursor の単位(UTF-16 のコード単位)での長さ。"""
+        return len(text.encode("utf-16-le")) // 2
+
+    def _utf16_index(self, py_index, text):
+        """Python の文字列の位置を、QTextCursor の位置へ。
+
+        絵文字(サロゲートペア)があると両者はずれる。第2段のマクロ
+        記録と同じ理由で、正規表現の結果( Python 側の位置)を本文へ
+        戻すときに要る。"""
+        return self._utf16_len(text[:py_index])
+
+    def _py_index(self, utf16_index, text):
+        """QTextCursor の位置を、Python の文字列の位置へ。"""
+        data = text.encode("utf-16-le")
+        return len(data[:utf16_index * 2].decode("utf-16-le"))
 
     # ---------------------------------------------------------------
     # マクロの記録(文書の変化と移動キーの切り分け)
@@ -1319,9 +2037,14 @@ class EditorWindow(QMainWindow):
         self._recorder.note_command(name, {"count": 1, "extend": bool(extend)})
 
     def _note_macro_skip(self):
-        """記録できない操作が記録中に起きたら、数えて知らせる。
-        黙って記録から外すと、再生結果が実物と違うことに利用者が
-        気づけないため。"""
+        """記録できない操作が起きたときの共通の口。
+
+        その操作が「直前の操作」になるので、F4 の控えは記録中か
+        どうかによらず消す(残すと、F4 がその前の命令を繰り返して
+        見た目と違う結果になる。第2段レビューの残件)。
+        件数を数えて知らせるのは記録中だけ(再生結果が実物と違う
+        ことに利用者が気づけるように)。"""
+        self._recorder.clear_last_command()
         if not self._recorder.recording:
             return
         self._macro_skips += 1
@@ -1364,26 +2087,14 @@ class EditorWindow(QMainWindow):
                             pos + added, QTextCursor.MoveMode.KeepAnchor)
                         inserted = cursor.selectedText().replace(
                             "\u2029", "\n")
-                    commands = self._recorder.commands
-                    before_len = len(commands)
-                    before_last = None
-                    if commands:
-                        last = commands[-1]
-                        before_last = (last["cmd"],
-                                       dict(last.get("args") or {}))
-                    self._recorder.feed_change(
+                    recorded = self._recorder.feed_change(
                         pos, removed, added, inserted,
                         sel_start, sel_end, cursor_before)
-                    recorded = len(commands) > before_len
-                    if not recorded and before_last is not None and commands:
-                        last = commands[-1]
-                        recorded = (
-                            (last["cmd"], dict(last.get("args") or {}))
-                            != before_last)
                     if not recorded:
                         # 選択範囲を打って上書きする入力、矩形選択での
                         # 編集など、命令に切り分けられなかった変化。
-                        # 黙って外さず、記録中なら知らせる。
+                        # 黙って外さず知らせる(記録中は件数。F4 の
+                        # 控えは記録中でなくても消える)。
                         self._note_macro_skip()
         except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
             pass
@@ -1522,15 +2233,56 @@ class EditorWindow(QMainWindow):
         self._find_bar.hide()
         self._edit.setFocus()
 
-    def _do_find(self, forward: bool, word=None, case_sensitive=None) -> bool:
-        """検索の実体。word / case_sensitive が None なら検索欄の値を使う
-        (命令層からは、記録・再生のために使った値を渡してくる)。"""
+    # ---------------------------------------------------------------
+    # フォルダ内の横断検索(grep)
+    # ---------------------------------------------------------------
+    def show_grep_dialog(self):
+        try:
+            folder = (os.path.dirname(self._doc.path)
+                      if self._doc.path else "")
+            word = self._find_edit.text()
+            if not word:
+                cursor = self._edit.textCursor()
+                if cursor.hasSelection():
+                    word = cursor.selectedText().replace("\u2029", "\n")
+                    if "\n" in word:
+                        word = ""
+            dialog = GrepDialog(
+                self, folder=folder, word=word,
+                case_sensitive=self._find_case.isChecked(),
+                on_jump=self.open_path_at_line)
+            dialog.exec()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"検索を開けませんでした ({e})")
+
+    def open_path_at_line(self, path, line) -> bool:
+        """ファイルを開いて、行(1始まり)へ飛ぶ。grep の結果から使う。
+
+        既に同じファイルを開いていれば、読み直さずに飛ぶだけ。
+        別のファイルなら open_path の作法(未保存の確認)に従う。"""
+        if self._doc.path and os.path.normcase(os.path.abspath(path)) \
+                == os.path.normcase(os.path.abspath(self._doc.path)):
+            self._jump_to_line(max(0, line - 1))
+            return True
+        if not self.open_path(path):
+            return False
+        self._jump_to_line(max(0, line - 1))
+        return True
+
+    def _do_find(self, forward: bool, word=None, case_sensitive=None,
+                 regex=None) -> bool:
+        """検索の実体。word / case_sensitive / regex が None なら検索欄の
+        値を使う(命令層からは、記録・再生のために使った値を渡してくる)。"""
         if word is None:
             word = self._find_edit.text()
         if not word:
             return False
         if case_sensitive is None:
             case_sensitive = self._find_case.isChecked()
+        if regex is None:
+            regex = self._find_regex.isChecked()
+        if regex:
+            return self._do_find_regex(forward, word, case_sensitive)
         text = self._edit.toPlainText()
         cursor = self._edit.textCursor()
         if forward:
@@ -1550,6 +2302,136 @@ class EditorWindow(QMainWindow):
             return False
         cursor.setPosition(index)
         cursor.setPosition(index + len(word), QTextCursor.MoveMode.KeepAnchor)
+        self._edit.setTextCursor(cursor)
+        self._edit.centerCursor()
+        return True
+
+    # ---------------------------------------------------------------
+    # 正規表現の非同期実行(待ちは裏スレッド、適用は GUI スレッド)
+    # ---------------------------------------------------------------
+    def _run_rx_async(self, op, on_done, **kwargs):
+        """rxfind.run_operation を裏スレッドで回し、結果を on_done
+        (結果の辞書)へ GUI スレッドで渡す。
+
+        失敗(RegexFault)はステータスに出して on_done は呼ばない。
+        新しい実行が始まったら古い結果は捨てる(検索や置換を連打
+        しても、古い結果が後の状態を上書きしない)。"""
+        self._rx_generation += 1
+        generation = self._rx_generation
+        self._rx_pending = (generation, on_done)
+        bridge = self._rx_bridge
+
+        def run():
+            try:
+                payload = (generation, rxfind.run_operation(op, **kwargs))
+            except rxfind.RegexFault as e:
+                payload = (generation, e)
+            except Exception as e:  # noqa: BLE001  理由は利用者への文にする
+                payload = (generation, rxfind.RegexFault(
+                    f"検索を実行できませんでした（{e}）"))
+            bridge.finished.emit(payload)
+
+        threading.Thread(target=run, daemon=True,
+                         name="editor-rxfind").start()
+
+    def _on_rx_finished(self, payload):
+        generation, result = payload
+        pending = self._rx_pending
+        if pending is None or pending[0] != generation:
+            return  # 新しい実行が始まっている。古い結果は捨てる
+        self._rx_pending = None
+        if isinstance(result, rxfind.RegexFault):
+            self.statusBar().showMessage(str(result), 8000)
+            return
+        pending[1](result)
+
+    def _do_find_regex(self, forward: bool, word, case_sensitive) -> bool:
+        """正規表現の検索(対話操作)。実処理は別プロセスで、待ちは
+        裏スレッド(_run_rx_async)なので、遅い式でも窓は固まらない。
+        マクロ再生中は、命令の順序を守るため同期版を使う。"""
+        if self._replaying:
+            return self._do_find_regex_sync(forward, word, case_sensitive)
+        text = self._edit.toPlainText()
+        cursor = self._edit.textCursor()
+        if forward:
+            start16 = (cursor.selectionEnd() if cursor.hasSelection()
+                       else cursor.position())
+        else:
+            start16 = (cursor.selectionStart() if cursor.hasSelection()
+                       else cursor.position())
+        start = self._py_index(start16, text)
+        revision = self._edit.document().revision()
+        op = "find_next" if forward else "find_prev"
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                return  # 検索の間に文書が変わった。結果は古いので捨てる
+            span = result["span"]
+            if span is not None:
+                self._apply_find_span(span, text)
+                return
+            wrap_start = 0 if forward else len(text)
+
+            def wrapped(result2):
+                if self._edit.document().revision() != revision:
+                    return
+                span2 = result2["span"]
+                if span2 is None:
+                    self.statusBar().showMessage(
+                        f"「{word}」は見つかりません", 4000)
+                    return
+                self._apply_find_span(span2, text)
+
+            self._run_rx_async(op, wrapped, text=text, pattern=word,
+                               start=wrap_start, regex=True,
+                               case_sensitive=case_sensitive)
+
+        self._run_rx_async(op, done, text=text, pattern=word, start=start,
+                           regex=True, case_sensitive=case_sensitive)
+        return True
+
+    def _apply_find_span(self, span, text):
+        """検索で得た (開始, 終了) を選択にする。text は検索時点の
+        本文(位置の単位の変換に使う)。"""
+        cursor = self._edit.textCursor()
+        cursor.setPosition(self._utf16_index(span[0], text))
+        cursor.setPosition(self._utf16_index(span[1], text),
+                           QTextCursor.MoveMode.KeepAnchor)
+        self._edit.setTextCursor(cursor)
+        self._edit.centerCursor()
+
+    def _do_find_regex_sync(self, forward: bool, word, case_sensitive) -> bool:
+        """正規表現の検索の同期版(マクロ再生専用)。実処理は
+        rxfind が別プロセスで回すので、不正な式はエラー表示に、
+        固まる式は時間切れの失敗になる。"""
+        text = self._edit.toPlainText()
+        cursor = self._edit.textCursor()
+        if forward:
+            start16 = (cursor.selectionEnd() if cursor.hasSelection()
+                       else cursor.position())
+        else:
+            start16 = (cursor.selectionStart() if cursor.hasSelection()
+                       else cursor.position())
+        start = self._py_index(start16, text)
+        op = "find_next" if forward else "find_prev"
+        try:
+            span = rxfind.run_operation(
+                op, text=text, pattern=word, start=start,
+                regex=True, case_sensitive=case_sensitive)["span"]
+            if span is None:
+                wrap_start = 0 if forward else len(text)
+                span = rxfind.run_operation(
+                    op, text=text, pattern=word, start=wrap_start,
+                    regex=True, case_sensitive=case_sensitive)["span"]
+        except rxfind.RegexFault as e:
+            self.statusBar().showMessage(str(e), 8000)
+            return False
+        if span is None:
+            self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
+            return False
+        cursor.setPosition(self._utf16_index(span[0], text))
+        cursor.setPosition(self._utf16_index(span[1], text),
+                           QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
         return True

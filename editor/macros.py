@@ -34,6 +34,13 @@
 #   move_line_down {count, extend}  下の行へ
 #   move_char_left {count, extend}  左へ
 #   move_char_right {count, extend} 右へ
+#   move_word_left {count, extend}  単語の頭へ(Ctrl+左)
+#   move_word_right {count, extend} 次の単語の頭へ(Ctrl+右)
+#   move_document_start {extend}    文書の先頭へ(Ctrl+Home)
+#   move_document_end {extend}      文書の末尾へ(Ctrl+End)
+#   move_page_up {count, extend}    1画面分上へ(PageUp)
+#   move_page_down {count, extend}  1画面分下へ(PageDown)
+#   select_all {}                   すべて選択(Ctrl+A)
 #   sort_lines {order}          行の並べ替え(order は "asc" / "desc")
 #   remove_duplicate_lines {}   重複行の削除
 #   reformat_text {}            整形(句点で改行、読点は桁数を超えるとき)
@@ -45,8 +52,11 @@
 # 記録から外しているもの(窓側の作法と合わせて):
 #   ファイル操作(開く・保存・新規)、Copilot への送信、表示の切り替え、
 #   矩形選択での編集(複数行にまたがる変化は切り分けられない)、
-#   選択範囲を打って上書きする入力(置き換えの変化)、
-#   元に戻す・やり直しの最中の変化、マウスでのカーソル移動。
+#   元に戻す・やり直しの最中の変化(再生時点の履歴の状態に依存する)、
+#   マウスでのカーソル移動(座標では再現できない)。
+#   選択範囲を打って上書きする入力は、選択範囲の削除 + 挿入として
+#   記録する(選択がキーボードで作られた流れなら再生でも一致する。
+#   選択範囲と変わった範囲が一致しない置き換えは記録しない)。
 #
 # テキスト形式(言語化。commands_to_text / commands_from_text):
 #   1行1命令で、人が読んで直せる形にする。文法は単純に保つ:
@@ -63,6 +73,9 @@
 #   {名前: {"commands": [...], "key": "Ctrl+Alt+1"}} の形で持つ。
 #   値は JSON の形のまま(命令の列の検証は _checked_commands を共用)。
 #   値が命令の列そのもの([..])なら、キーなしの登録として受ける。
+#   Python 形式の登録は {"python": "ソース", "key": "..."} で、
+#   commands の代わりに python を持つ(整えた形でもそのまま。
+#   構文が読めないものは落とす。検証は editor/macro_py.py)。
 import json
 import re
 
@@ -89,6 +102,13 @@ KNOWN_COMMANDS = frozenset({
     "move_line_down",
     "move_char_left",
     "move_char_right",
+    "move_word_left",
+    "move_word_right",
+    "move_document_start",
+    "move_document_end",
+    "move_page_up",
+    "move_page_down",
+    "select_all",
     "sort_lines",
     "remove_duplicate_lines",
     "reformat_text",
@@ -106,6 +126,10 @@ _COALESCE_COUNT = frozenset({
     "move_line_down",
     "move_char_left",
     "move_char_right",
+    "move_word_left",
+    "move_word_right",
+    "move_page_up",
+    "move_page_down",
 })
 
 
@@ -280,12 +304,25 @@ def sanitize_registered(raw):
         if not name:
             continue
         if isinstance(entry, list):
-            commands_raw, key = entry, ""
+            commands_raw, key, source = entry, "", None
         elif isinstance(entry, dict):
             commands_raw = entry.get("commands")
             key = entry.get("key")
             key = key.strip() if isinstance(key, str) else ""
+            source = entry.get("python")
         else:
+            continue
+        if isinstance(source, str) and source.strip():
+            # Python 形式の登録。構文が読めないものは落とす
+            # (検証は macro_py。import はここだけ遅らせる)。
+            try:
+                from editor import macro_py
+                invalid = macro_py.validate_python(source)
+            except Exception:
+                invalid = "検証できませんでした"
+            if invalid is not None:
+                continue
+            clean[name] = {"python": source, "key": key}
             continue
         try:
             commands = _checked_commands(commands_raw)
@@ -299,11 +336,16 @@ def sanitize_registered(raw):
 
 def copy_registered(mapping):
     """登録マクロの対応(整えた形)の写し。"""
-    return {
-        name: {"commands": copy_commands(entry["commands"]),
-               "key": entry.get("key") or ""}
-        for name, entry in (mapping or {}).items()
-    }
+    copied = {}
+    for name, entry in (mapping or {}).items():
+        if "python" in entry:
+            copied[name] = {"python": entry["python"],
+                            "key": entry.get("key") or ""}
+        else:
+            copied[name] = {
+                "commands": copy_commands(entry["commands"]),
+                "key": entry.get("key") or ""}
+    return copied
 
 
 class MacroRecorder:
@@ -409,5 +451,17 @@ class MacroRecorder:
                 return True
             # どれでもない削除(他所の範囲が消えた等)は記録しない。
             return False
-        # 置き換え(削除+挿入)や複合の変化は記録しない。
+        if added > 0 and removed > 0:
+            # 選択範囲を打鍵で上書きした置き換えは、「選択範囲の
+            # 削除 + 挿入」に切り分けられる(選択がキーボードで
+            # 作られた流れなら、再生でも同じ結果になる)。
+            if (sel_start is not None and sel_end is not None
+                    and sel_start == pos and sel_end == pos + removed):
+                self.note_command("delete_selection", {})
+                self.note_command("insert_text", {"text": inserted_text})
+                if self.recording:
+                    self._insert_end = pos + added
+                return True
+            return False
+        # それ以外の複合の変化は記録しない。
         return False

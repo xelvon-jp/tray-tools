@@ -280,6 +280,34 @@ def test_dialog_reset_all():
         dialog.close()
 
 
+def test_dialog_conflict_display_persists_until_resolved():
+    # 重なりの表示は専用の欄と行の印で持ち、別の編集で知らせが
+    # 書き換わっても消えない(件C)。付け直せばその場で消える。
+    table = dict(keymapmod.DEFAULT_KEYMAP)
+    table["save"] = "Ctrl+X"
+    table["open"] = "Ctrl+X"
+    dialog = make_dialog(keymap=table)
+    try:
+        assert "重なり" in dialog._conflict_label.text()
+        assert dialog._name_labels["save"].text().endswith("（重なり）")
+        assert dialog._name_labels["open"].text().endswith("（重なり）")
+        # 関係ない編集をしても(知らせは書き換わる)、重なりの表示は
+        # 残る。
+        dialog.set_command_key("find", "Ctrl+Alt+F")
+        assert "重なり" in dialog._conflict_label.text()
+        assert dialog._name_labels["save"].text().endswith("（重なり）")
+        # 片方を付け直せば、欄も印も消える。
+        dialog.set_command_key("save", "Ctrl+Alt+S")
+        assert dialog.conflicts() == {}
+        assert dialog._conflict_label.text() == ""
+        assert dialog._name_labels["save"].text() == \
+            keymapmod.command_label("save")
+        assert dialog._name_labels["open"].text() == \
+            keymapmod.command_label("open")
+    finally:
+        dialog.close()
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

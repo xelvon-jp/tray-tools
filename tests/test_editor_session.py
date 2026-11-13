@@ -474,6 +474,103 @@ def test_close_without_edits_does_not_ask_when_save_fails():
             app().processEvents()
 
 
+def _two_tab_window(d):
+    """ファイル2つのタブを開いた窓を返す(2つ目は未保存の編集つき)。"""
+    a = os.path.join(d, "a.txt")
+    b = os.path.join(d, "b.txt")
+    Path(a).write_bytes("あ\n".encode("utf-8"))
+    Path(b).write_bytes("い\n".encode("utf-8"))
+    window = make_window(d, a)
+    assert window.open_path(b)
+    type_text(window, "追")
+    return window, a, b
+
+
+def test_close_tab_asks_when_session_save_fails_and_cancel_keeps_tab():
+    """タブを閉じるときも、控えが書けなければ無言で消さず、
+    「閉じない」でタブと編集が残る(窓を閉じるときと対)。"""
+    with tempfile.TemporaryDirectory() as d:
+        window, _a, b = _two_tab_window(d)
+        original = _break_session_save()
+        try:
+            window.ask_session_save_failed = lambda: "cancel"
+            window.close_tab()
+            assert window.tab_count() == 2
+            assert window.current_document().path == b
+            assert window.text() == "追い\n"
+        finally:
+            sessionmod.save = original
+        close_window(window)
+
+
+def test_close_tab_discards_only_when_user_chooses():
+    """タブを閉じるときも、「そのまま閉じる」を選べば閉じられる。"""
+    with tempfile.TemporaryDirectory() as d:
+        window, a, _b = _two_tab_window(d)
+        original = _break_session_save()
+        try:
+            window.ask_session_save_failed = lambda: "discard"
+            window.close_tab()
+            assert window.tab_count() == 1
+            assert window.open_paths() == [a]
+        finally:
+            sessionmod.save = original
+        close_window(window)
+
+
+def test_close_tab_retry_writes_session_and_closes():
+    """タブを閉じるときも、「もう一度試す」で控えが書ければ閉じ
+    られる(閉じたタブは控えからも外れる)。"""
+    with tempfile.TemporaryDirectory() as d:
+        window, a, _b = _two_tab_window(d)
+        original = sessionmod.save
+        attempts = {"count": 0}
+
+        def flaky(path):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise OSError("一時的に書けない(テスト)")
+            return original(path)
+
+        sessionmod.save = flaky
+        try:
+            window.ask_session_save_failed = lambda: "retry"
+            window.close_tab()
+            assert window.tab_count() == 1
+            assert window.open_paths() == [a]
+        finally:
+            sessionmod.save = original
+        close_window(window)
+        window2 = make_window(d)
+        try:
+            assert window2.open_paths() == [a]
+        finally:
+            close_window(window2)
+
+
+def test_close_tab_without_edits_does_not_ask_when_save_fails():
+    """未保存の編集が無いタブは、控えが書けなくても聞かずに閉じる。"""
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.txt")
+        b = os.path.join(d, "b.txt")
+        Path(a).write_bytes("あ\n".encode("utf-8"))
+        Path(b).write_bytes("い\n".encode("utf-8"))
+        window = make_window(d, a)
+        assert window.open_path(b)   # b は編集していない
+        original = _break_session_save()
+        try:
+            def forbidden():
+                raise AssertionError("聞かれてはいけない")
+
+            window.ask_session_save_failed = forbidden
+            window.close_tab()
+            assert window.tab_count() == 1
+            assert window.open_paths() == [a]
+        finally:
+            sessionmod.save = original
+        close_window(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

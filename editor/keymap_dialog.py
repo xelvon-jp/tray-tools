@@ -15,8 +15,12 @@
 # 保存すると Qt のショートカットがどちらも効かなくなるため、その
 # 場で解消する。外したことは画面下の知らせに残すので、その場で
 # 分かる。開いた時点で既に重なっている表(設定を手で書き換えた
-# 場合など)は、そのまま出して知らせにも出す。どちらかの割り当てを
-# 変えれば、上記の作法で直る。
+# 場合や、保存済みの上書き分が新しい既定キーと重なった場合)は、
+# そのまま出す。重なりの表示は知らせとは別の専用の欄
+# (_conflict_label)と行の印（重なり）で持ち、編集のたびに
+# 付け直す(知らせは次の操作で書き換わるので、重なりだけが
+# 静かに消えないように。レビュー req-20261114-07 の件C)。
+# どちらかの割り当てを変えれば、上記の作法で直る。
 #
 # テストでは set_command_key / clear_command_key / reset_command /
 # reset_all を直接呼べる。
@@ -89,6 +93,8 @@ class KeymapSettingsDialog(QDialog):
 
         self._edits = {}
         self._reset_buttons = {}
+        self._name_labels = {}
+        self._base_labels = {}
         rows_widget = QWidget()
         rows = QVBoxLayout(rows_widget)
         rows.setContentsMargins(0, 0, 0, 0)
@@ -97,6 +103,8 @@ class KeymapSettingsDialog(QDialog):
             name_label = QLabel(label)
             name_label.setMinimumWidth(220)
             row.addWidget(name_label)
+            self._name_labels[name] = name_label
+            self._base_labels[name] = label
             edit = QKeySequenceEdit()
             edit.setFixedWidth(180)
             if hasattr(edit, "setClearButtonEnabled"):
@@ -120,6 +128,10 @@ class KeymapSettingsDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(rows_widget)
         layout.addWidget(scroll, 1)
+
+        self._conflict_label = QLabel("")
+        self._conflict_label.setWordWrap(True)
+        layout.addWidget(self._conflict_label)
 
         self._note_label = QLabel("")
         self._note_label.setWordWrap(True)
@@ -148,6 +160,7 @@ class KeymapSettingsDialog(QDialog):
             self._note_label.setText(
                 f"重なりがあります：{detail}。どちらかの割り当てを"
                 "変えると直ります。")
+        self._refresh_conflicts()
 
     # ---------------------------------------------------------------
     # 状態の読み書き(テストと呼び側から使う)
@@ -212,6 +225,7 @@ class KeymapSettingsDialog(QDialog):
                 f"『{keymapmod.command_label(name)}』へ付けました。")
         else:
             self._note_label.setText("")
+        self._refresh_conflicts()
         self._notify()
 
     def clear_command_key(self, name):
@@ -232,6 +246,7 @@ class KeymapSettingsDialog(QDialog):
             self._table[name] = self._defaults[name]
             self._refresh_row(name)
         self._note_label.setText("")
+        self._refresh_conflicts()
         self._notify()
 
     # ---------------------------------------------------------------
@@ -253,3 +268,28 @@ class KeymapSettingsDialog(QDialog):
         edit.setKeySequence(QKeySequence(self._table[name]))
         del blocker
         self._reset_buttons[name].setEnabled(not self.is_default(name))
+
+    def _refresh_conflicts(self):
+        """重なりの表示(専用の欄と、関係する行の印)を付け直す。
+
+        知らせ(_note_label)は次の操作で書き換わるので、重なりの
+        有無はこちらで持ち続ける。編集のたびに呼ぶ。"""
+        conflicts = self.conflicts()
+        conflicted = set()
+        for names in conflicts.values():
+            conflicted.update(names)
+        for name, label_widget in self._name_labels.items():
+            base = self._base_labels[name]
+            label_widget.setText(
+                base + "（重なり）" if name in conflicted else base)
+        if conflicts:
+            parts = []
+            for keys, names in conflicts.items():
+                labels = "・".join(
+                    keymapmod.command_label(n) for n in names)
+                parts.append(f"『{keys}』（{labels}）")
+            self._conflict_label.setText(
+                "重なりがあります：" + "、".join(parts)
+                + "。どちらかの割り当てを変えると直ります。")
+        else:
+            self._conflict_label.setText("")

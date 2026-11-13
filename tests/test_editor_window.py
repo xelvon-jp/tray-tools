@@ -3643,6 +3643,162 @@ def test_paint_invisibles_erases_behind_block_end_marks():
         discard_close(window)
 
 
+# ---------------------------------------------------------------
+# 矩形選択と F7 / F8 / F9(レビュー req-20261114-07 の件A)
+# ---------------------------------------------------------------
+def _block_window():
+    """3行の文書に矩形(行0〜1・桁1〜3 = "bc" / "fg")を作った窓。"""
+    window = make_window()
+    window._edit.setPlainText("abcd\nefgh\nijkl")
+    window._edit.setFocus()
+    window._edit.set_block_selection((0, 1), (1, 3))
+    assert window._edit.has_block_selection()
+    return window
+
+
+def test_block_selection_f8_copies_block():
+    window = _block_window()
+    try:
+        QGuiApplication.clipboard().setText("前のもの")
+        QTest.keyClick(window._edit, Qt.Key.Key_F8)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "bc\nfg"
+        # コピーでは矩形は解けず、本文も変わらない。
+        assert window._edit.has_block_selection()
+        assert window.text() == "abcd\nefgh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_f7_cuts_block():
+    window = _block_window()
+    try:
+        QGuiApplication.clipboard().setText("前のもの")
+        QTest.keyClick(window._edit, Qt.Key.Key_F7)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "bc\nfg"
+        assert window.text() == "ad\neh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_f9_pastes_as_block():
+    window = _block_window()
+    try:
+        QGuiApplication.clipboard().setText("XY\nZW")
+        QTest.keyClick(window._edit, Qt.Key.Key_F9)
+        app().processEvents()
+        assert window.text() == "aXYd\neZWh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_shift_f8_appends_block():
+    # Shift の押下だけで矩形が解けないことも含めて確かめる
+    # (組み合わせの最初の Shift で解けると、永遠に効かない)。
+    window = _block_window()
+    try:
+        QGuiApplication.clipboard().setText("前のもの")
+        QTest.keyClick(window._edit, Qt.Key.Key_F8,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "前のものbc\nfg"
+        assert window._edit.has_block_selection()
+        assert window.text() == "abcd\nefgh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_shift_f7_cut_appends_block():
+    window = _block_window()
+    try:
+        QGuiApplication.clipboard().setText("前のもの")
+        QTest.keyClick(window._edit, Qt.Key.Key_F7,
+                       Qt.KeyboardModifier.ShiftModifier)
+        app().processEvents()
+        assert QGuiApplication.clipboard().text() == "前のものbc\nfg"
+        assert window.text() == "ad\neh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_actions_cut_copy_paste():
+    # メニューやボタンからアクション経由で呼ばれても、矩形として
+    # 扱う(キー経路と同じ)。
+    window = _block_window()
+    try:
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText("前のもの")
+        window._keymap_actions["copy"][0].trigger()
+        assert clipboard.text() == "bc\nfg"
+        assert window._edit.has_block_selection()
+        window._keymap_actions["cut"][0].trigger()
+        assert clipboard.text() == "bc\nfg"
+        assert window.text() == "ad\neh\nijkl"
+        window._edit.setPlainText("abcd\nefgh\nijkl")
+        window._edit.set_block_selection((0, 1), (1, 3))
+        clipboard.setText("XY\nZW")
+        window._keymap_actions["paste"][0].trigger()
+        assert window.text() == "aXYd\neZWh\nijkl"
+        window._edit.set_block_selection((0, 1), (1, 3))
+        clipboard.setText("前のもの")
+        window._keymap_actions["copy_append"][0].trigger()
+        assert clipboard.text() == "前のものXY\nZW"
+        window._keymap_actions["cut_append"][0].trigger()
+        assert clipboard.text() == "前のものXY\nZWXY\nZW"
+        assert window.text() == "ad\neh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_block_selection_ctrl_keys_still_work():
+    # Ctrl+C / X / V の矩形の扱い(block_key)は従来どおり。
+    window = _block_window()
+    try:
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText("前のもの")
+        QTest.keyClick(window._edit, Qt.Key.Key_C,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert clipboard.text() == "bc\nfg"
+        QTest.keyClick(window._edit, Qt.Key.Key_X,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert clipboard.text() == "bc\nfg"
+        assert window.text() == "ad\neh\nijkl"
+    finally:
+        discard_close(window)
+
+
+def test_keymap_collision_first_command_wins_at_runtime():
+    # 保存済みの上書きが新しい既定と重なった場合(件C):表は変えず、
+    # 実行時は並びで先の命令だけにキーを付ける(両方に付けると
+    # どちらも効かなくなる)。重なりは keymap_conflicts() と
+    # 起動時のステータス表示で分かる。
+    window = make_window(keymap_overrides={"copy": "F7"})
+    try:
+        assert window.keymap()["copy"] == "F7"  # 表はそのまま
+        assert window.keymap_conflicts() == {"F7": ["cut", "copy"]}
+        cut = window._keymap_actions["cut"][0]
+        copy = window._keymap_actions["copy"][0]
+        assert cut.shortcut().toString() == "F7"
+        assert copy.shortcut().isEmpty()
+        assert "重なり" in window.statusBar().currentMessage()
+        # 画面経由の付け直し(apply_keymap_settings)でも同じ扱い。
+        window.apply_keymap_settings({"paste": "F7"})
+        assert window.keymap_conflicts() == {"F7": ["cut", "paste"]}
+        assert window._keymap_actions["cut"][0].shortcut().toString() \
+            == "F7"
+        assert window._keymap_actions["paste"][0].shortcut().isEmpty()
+        # 重なりを解消すれば、両方にキーが付く。
+        window.apply_keymap_settings({})
+        assert window.keymap_conflicts() == {}
+        assert window._keymap_actions["copy"][0].shortcut().toString() \
+            == "F8"
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

@@ -35,6 +35,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QKeySequence,
     QPainter,
     QPalette,
@@ -56,6 +57,29 @@ _MOVE_KEYS = {
     Qt.Key.Key_Left: "move_char_left",
     Qt.Key.Key_Right: "move_char_right",
 }
+
+# Ctrl と組の移動キー → 命令名。Qt の標準の動き(単語単位・文書の
+# 端)は、再生側の QTextCursor の動き(WordLeft / WordRight /
+# Start / End)と一致するので、_MOVE_KEYS と同じ作法(控えだけ
+# 残して、動きは標準に任せる)が使える。
+_CTRL_MOVE_KEYS = {
+    Qt.Key.Key_Left: "move_word_left",
+    Qt.Key.Key_Right: "move_word_right",
+    Qt.Key.Key_Home: "move_document_start",
+    Qt.Key.Key_End: "move_document_end",
+}
+
+# 修飾キーそのもの。矩形選択が生きている間は、単独の押下で矩形を
+# 解かない(Shift+F7 のように、組み合わせの最初の Shift だけで
+# 矩形が消えてしまうため。block_key は修飾キー単独でも矩形を
+# 解く作りなので、EDDy 側で先に受ける)。
+_MODIFIER_KEYS = frozenset({
+    Qt.Key.Key_Shift,
+    Qt.Key.Key_Control,
+    Qt.Key.Key_Alt,
+    Qt.Key.Key_Meta,
+    Qt.Key.Key_AltGr,
+})
 
 FONT_SIZE_MIN = 7
 FONT_SIZE_MAX = 32
@@ -159,10 +183,14 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     など命令で表せない移動が起きた合図。mouse_pressed はマウスが
     押された合図(どちらも、記録中に起きたら窓側が利用者へ知らせる)。
     focused は、フォーカスが入った合図(分割表示で「現在のペイン」
-    を切り替えるために、ビューが受ける)。"""
+    を切り替えるために、ビューが受ける)。command_key には、
+    命令層で実行すべきキーの命令名と「選択を広げるか」が流れる
+    (PageUp / PageDown / Ctrl+A。行数や選択の扱いが命令側にある
+    ため、標準には任せず窓が実行する)。"""
 
     font_size_changed = Signal(int)
     move_key = Signal(str, bool)
+    command_key = Signal(str, bool)
     unrecorded_move = Signal()
     mouse_pressed = Signal()
     undo_redo_started = Signal()
@@ -806,6 +834,81 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     draw_mark(rect, mark, metrics)
             block = block.next()
 
+    # ---------------------------------------------------------------
+    # クリップボード操作(矩形選択のときは矩形として扱う)
+    # ---------------------------------------------------------------
+    # 窓のアクション(F7 切り取り / F8 コピー / F9 貼り付けと
+    # Shift+F7 / F8 の追加系)はこのメソッドを呼ぶ。矩形選択が
+    # 生きていれば、Ctrl+C / X / V を矩形で受ける block_key と
+    # 同じ扱いにする(レビュー req-20261114-07 の件A: 以前は
+    # block_key が矩形を解いただけで、F7 等は空振りしていた)。
+    def cut(self):
+        if self.has_block_selection():
+            QGuiApplication.clipboard().setText(self.block_text())
+            self.block_delete(backward=True)
+            return
+        super().cut()
+
+    def copy(self):
+        if self.has_block_selection():
+            QGuiApplication.clipboard().setText(self.block_text())
+            return
+        super().copy()
+
+    def paste(self):
+        if self.has_block_selection():
+            text = QGuiApplication.clipboard().text()
+            if text:
+                self.block_paste(text)
+            return
+        super().paste()
+
+    def copy_append(self) -> bool:
+        """追加コピー(Shift+F8)。矩形選択なら矩形の内容をクリップ
+        ボードの末尾へ足して True。矩形でなければ False(呼び側が
+        通常の選択範囲で処理する)。"""
+        if not self.has_block_selection():
+            return False
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setText(clipboard.text() + self.block_text())
+        return True
+
+    def cut_append(self) -> bool:
+        """追加切り抜き(Shift+F7)。矩形選択なら矩形を切り取って
+        クリップボードの末尾へ足して True。矩形でなければ False。"""
+        if not self.has_block_selection():
+            return False
+        clipboard = QGuiApplication.clipboard()
+        combined = clipboard.text() + self.block_text()
+        self.block_delete(backward=True)
+        clipboard.setText(combined)
+        return True
+
+    def _block_clipboard_key(self, event) -> bool:
+        """矩形選択中のクリップボード系キー。処理したら True。
+
+        F7 等のファンクションキーは block_key が矩形を解いて
+        しまうので、こちらで先に受ける。どのキーがどの操作かは、
+        本文に登録されたアクションの objectName(キー割り当ての
+        命令名)とショートカットで照合する(キーを変えた場合も
+        追随する)。Ctrl+C / X / V は、割り当ての対象でなければ
+        ここには引っかからず、従来どおり block_key が受ける。"""
+        sequence = QKeySequence(
+            int(event.key()) | event.modifiers().value)
+        ops = {
+            "cut": self.cut,
+            "copy": self.copy,
+            "paste": self.paste,
+            "cut_append": lambda: self.cut_append(),
+            "copy_append": lambda: self.copy_append(),
+        }
+        for action in self.actions():
+            op = ops.get(action.objectName())
+            if op is not None and action.shortcut() == sequence:
+                op()
+                return True
+        return False
+
     def keyPressEvent(self, event):  # noqa: N802  Qt の上書き
         if (event.matches(QKeySequence.StandardKey.Undo)
                 or event.matches(QKeySequence.StandardKey.Redo)):
@@ -816,6 +919,12 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 super().keyPressEvent(event)
             finally:
                 self.undo_redo_finished.emit()
+            return
+        if (self.has_block_selection()
+                and event.key() in _MODIFIER_KEYS):
+            return
+        if (self.has_block_selection()
+                and self._block_clipboard_key(event)):
             return
         if self.has_block_selection() and self.block_key(event):
             return
@@ -829,13 +938,44 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                             | Qt.KeyboardModifier.AltModifier
                             | Qt.KeyboardModifier.MetaModifier)
             if extra:
-                # Ctrl+矢印の単語移動・Ctrl+Home の文書頭などは、
-                # 1文字・1行の移動の命令では表せない。記録には入れず、
-                # 窓側へ知らせる(黙って1文字移動として記録しない)。
-                self.unrecorded_move.emit()
+                ctrl_name = None
+                if (mods & Qt.KeyboardModifier.ControlModifier) and not (
+                        mods & (Qt.KeyboardModifier.AltModifier
+                                | Qt.KeyboardModifier.MetaModifier)):
+                    ctrl_name = _CTRL_MOVE_KEYS.get(event.key())
+                if ctrl_name is not None:
+                    # 単語単位・文書の端への移動は命令で表せる
+                    # (控えだけ残し、動きは標準に任せる)。
+                    self.move_key.emit(
+                        ctrl_name,
+                        bool(mods & Qt.KeyboardModifier.ShiftModifier))
+                else:
+                    # Ctrl+上下など、命令で表せない移動は記録に
+                    # 入れず、窓側へ知らせる(黙って1文字・1行の
+                    # 移動として記録しない)。
+                    self.unrecorded_move.emit()
             else:
                 self.move_key.emit(
                     name, bool(mods & Qt.KeyboardModifier.ShiftModifier))
+            super().keyPressEvent(event)
+            return
+        # PageUp / PageDown と Ctrl+A は、動く行数や選択の扱いが
+        # 命令層の側にあるので、窓の命令として実行してもらう
+        # (標準には任せない)。
+        mods = event.modifiers()
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if event.key() == Qt.Key.Key_PageUp:
+            self.command_key.emit("move_page_up", shift)
+            return
+        if event.key() == Qt.Key.Key_PageDown:
+            self.command_key.emit("move_page_down", shift)
+            return
+        if (event.key() == Qt.Key.Key_A
+                and (mods & Qt.KeyboardModifier.ControlModifier)
+                and not (mods & (Qt.KeyboardModifier.AltModifier
+                                | Qt.KeyboardModifier.MetaModifier))):
+            self.command_key.emit("select_all", False)
+            return
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event):  # noqa: N802  Qt の上書き
@@ -843,6 +983,12 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         # 窓側が知らせるために合図する。
         self.mouse_pressed.emit()
         super().mousePressEvent(event)
+
+    def page_step_lines(self):
+        """PageUp / PageDown で動く行数(見えている範囲の高さぶん)。"""
+        height = self.viewport().height()
+        line_height = max(1, self.fontMetrics().height())
+        return max(1, height // line_height)
 
     # ---------------------------------------------------------------
     # 行番号

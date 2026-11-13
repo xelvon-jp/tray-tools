@@ -15,6 +15,10 @@
 #     ない(組み込みを優先する。知らせに出す)
 # 実際にショートカットとして効かせるのは窓側の仕事で、設定を手で
 # 書き換えて重なった場合は、窓側が組み込み優先・先勝ちで付け直す。
+# その場合も黙って外れたままにせず、この画面で「効いていない」こと
+# と理由(組み込みと重なった／別のマクロと重なった)を選んだマクロに
+# ついて表示する(macro_key_state)。キーを付け直せばその場で直る
+# (レビュー req-20261114-07 の件B)。
 #
 # テキストで編集は、editor/macros.py のテキスト形式(1行1命令)を
 # 小さな窓で開く。保存のときに解釈し、壊れた行があれば行番号つき
@@ -99,7 +103,11 @@ class MacroLibraryDialog(QDialog):
     キー。current_commands は「いまのマクロ」を返す関数(登録ボタン
     用)。on_change は変更のたびに登録マクロの対応の写しを受ける。
     実行ボタンを押すと run_requested に名前が入り、窓が閉じる
-    (呼び側が閉じたあとに再生する)。"""
+    (呼び側が閉じたあとに再生する)。「Python で開く」を押すと
+    python_requested に名前が入って窓が閉じ、呼び側が Python の
+    別窓(editor/macro_py_dialog.py)を開く。Python の登録
+    ({"python": ...})はテキスト編集の対象外で、キー割り当て・
+    実行・名前の変更・削除は命令の列の登録と同じに扱う。"""
 
     def __init__(self, parent=None, *, macros=None, reserved_keys=None,
                  current_commands=None, on_change=None):
@@ -112,6 +120,7 @@ class MacroLibraryDialog(QDialog):
         self._on_change = on_change
         self._current_commands = current_commands
         self.run_requested = None
+        self.python_requested = None
         self._reserved = {}
         for keys, label in (reserved_keys or {}).items():
             normalized = normalize_keys(keys)
@@ -152,15 +161,21 @@ class MacroLibraryDialog(QDialog):
         key_row.addWidget(self._key_edit)
         key_row.addStretch(1)
         right.addLayout(key_row)
+        self._key_state_label = QLabel("")
+        self._key_state_label.setWordWrap(True)
+        right.addWidget(self._key_state_label)
         run_button = QPushButton("実行")
         run_button.clicked.connect(self._on_run_clicked)
         right.addWidget(run_button)
         rename_button = QPushButton("名前を変更…")
         rename_button.clicked.connect(self._on_rename_clicked)
         right.addWidget(rename_button)
-        edit_button = QPushButton("テキストで編集…")
-        edit_button.clicked.connect(self._on_edit_text_clicked)
-        right.addWidget(edit_button)
+        self._edit_button = QPushButton("テキストで編集…")
+        self._edit_button.clicked.connect(self._on_edit_text_clicked)
+        right.addWidget(self._edit_button)
+        self._python_button = QPushButton("Python で開く…")
+        self._python_button.clicked.connect(self._on_python_clicked)
+        right.addWidget(self._python_button)
         right.addStretch(1)
         self._note_label = QLabel("")
         self._note_label.setWordWrap(True)
@@ -191,10 +206,48 @@ class MacroLibraryDialog(QDialog):
         entry = self._macros.get(name)
         return entry["key"] if entry is not None else ""
 
+    def macro_key_state(self, name):
+        """登録マクロのキーが実際に効くかどうか。
+
+        戻り値は (状態, 相手) の組。状態は:
+          "none"      キーが付いていない(相手は "")
+          "ok"        効く(相手は "")
+          "reserved"  組み込みの命令と重なっていて効かない
+                      (相手はその命令の表示名)
+          "duplicate" 別の登録マクロと重なっていて効かない
+                      (相手はそのマクロの名前。窓側の付け直しは
+                      先の登録が優先なので、後ろの方が外れる)
+        付けるとき(_assign_key)は重なりを作らないが、設定を手で
+        書き換えた場合や、組み込みの既定キーが後から変わった
+        場合は重なりが入り込む。その場合の判定がここ。"""
+        entry = self._macros.get(name)
+        if entry is None or not entry["key"]:
+            return ("none", "")
+        keys = entry["key"]
+        if keys in self._reserved:
+            return ("reserved", self._reserved[keys])
+        for other, other_entry in self._macros.items():
+            if other == name:
+                break
+            if other_entry["key"] == keys:
+                return ("duplicate", other)
+        return ("ok", "")
+
     def macro_text(self, name):
-        """登録マクロをテキスト形式にしたもの。"""
+        """登録マクロをテキスト形式にしたもの。
+
+        Python のマクロはテキスト形式にはならないので ValueError
+        (Python の別窓で開く)。"""
         entry = self._macros[name]
+        if "python" in entry:
+            raise ValueError(
+                "Python のマクロです（「Python で開く」から開いてください）")
         return macmod.commands_to_text(entry["commands"], name)
+
+    def is_python_macro(self, name):
+        """その登録が Python のマクロかどうか。"""
+        entry = self._macros.get(name)
+        return entry is not None and "python" in entry
 
     # ---------------------------------------------------------------
     # 変更(すべて on_change へ流れる。不正な操作は ValueError)
@@ -268,6 +321,9 @@ class MacroLibraryDialog(QDialog):
         変更は rename_macro の仕事)。"""
         if name not in self._macros:
             raise ValueError(f"マクロがありません（{name}）")
+        if "python" in self._macros[name]:
+            raise ValueError(
+                "Python のマクロです（「Python で開く」から開いてください）")
         _parsed_name, commands = macmod.commands_from_text(text)
         if not commands:
             raise ValueError("マクロの内容が空です")
@@ -319,11 +375,32 @@ class MacroLibraryDialog(QDialog):
 
     def _refresh_detail(self):
         name = self.selected_name()
-        self._name_label.setText(name or "（登録したマクロはありません）")
+        is_python = bool(name) and self.is_python_macro(name)
+        label = name or "（登録したマクロはありません）"
+        if is_python:
+            label += "（Python）"
+        self._name_label.setText(label)
+        # Python のマクロはテキスト形式では編集できない(別窓で開く)。
+        self._edit_button.setEnabled(bool(name) and not is_python)
+        self._python_button.setEnabled(bool(name))
         keys = self.macro_key(name) if name else ""
         blocker = QSignalBlocker(self._key_edit)
         self._key_edit.setKeySequence(QKeySequence(keys))
         del blocker
+        state, other = self.macro_key_state(name) if name else ("none", "")
+        if state == "reserved":
+            self._key_state_label.setText(
+                f"『{keys}』は組み込みの『{other}』と重なっているため、"
+                "このマクロのキーとしては効いていません。"
+                "別のキーを付けてください。")
+        elif state == "duplicate":
+            self._key_state_label.setText(
+                f"『{keys}』は『{other}』も使っているため、"
+                "このマクロのキーとしては効いていません"
+                "（先に登録した方が優先されます）。"
+                "別のキーを付けてください。")
+        else:
+            self._key_state_label.setText("")
 
     def _on_selection_changed(self, _text):
         self._refresh_detail()
@@ -341,6 +418,12 @@ class MacroLibraryDialog(QDialog):
         name = self.selected_name()
         if name is not None:
             self.run_requested = name
+            self.accept()
+
+    def _on_python_clicked(self):
+        name = self.selected_name()
+        if name is not None:
+            self.python_requested = name
             self.accept()
 
     def _on_delete_clicked(self):

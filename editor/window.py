@@ -225,6 +225,7 @@ from editor import colors as colormod
 from editor import convert as convmod
 from editor import document as docmod
 from editor import ext_settings as extmod
+from editor import macro_py
 from editor import macros as macmod
 from editor import outline
 from editor import editor_icon
@@ -242,6 +243,7 @@ from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor import keymap as keymapmod
 from editor.keymap_dialog import KeymapSettingsDialog
 from editor.macro_dialog import MacroLibraryDialog
+from editor.macro_py_dialog import MacroPythonDialog
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
@@ -657,6 +659,58 @@ class PatternSettingsDialog(QDialog):
         return (self._outline_edit.text(), self._highlight_edit.text())
 
 
+class _EdObject:
+    """ed の受け物(属性に関数を動的に付けるだけの空の型)。"""
+
+
+class _EditorPyApi:
+    """Python マクロの API(ed)を、窓の命令層へつなぐ橋。
+
+    名前の一覧と引数の形は editor/macro_py.py の API_SPEC と
+    QUERY_NAMES が正本。ここは「ed の関数 → 窓の命令」の対応と、
+    問い合わせ(本文・選択・カーソル位置の読み取り)だけを持つ。
+    ファイルや OS へ触れる口は、API の側にもこちらにも無い。"""
+
+    def __init__(self, window):
+        self._window = window
+
+    def api_object(self):
+        """ed として渡すオブジェクト(属性が API の関数)。"""
+        api = _EdObject()
+        for name, params in macro_py.API_SPEC.items():
+            setattr(api, name, self._make_handler(name, params))
+        for query in macro_py.QUERY_NAMES:
+            setattr(api, query, getattr(self, "_query_" + query))
+        return api
+
+    def _make_handler(self, name, params):
+        window = self._window
+
+        def call(*args, **kwargs):
+            bound = {}
+            for index, (param, _default) in enumerate(params):
+                if index < len(args):
+                    bound[param] = args[index]
+            for key, value in kwargs.items():
+                bound[key] = value
+            return window.execute_command(name, bound, _note=False)
+
+        return call
+
+    # 問い合わせ(読み取りだけ)
+    def _query_text(self):
+        return self._window.text()
+
+    def _query_selected_text(self):
+        return self._window._edit.textCursor().selectedText()
+
+    def _query_cursor_line(self):
+        return self._window._edit.textCursor().blockNumber() + 1
+
+    def _query_line_count(self):
+        return self._window._edit.document().blockCount()
+
+
 class EditorWindow(QMainWindow):
     """テキストエディタの窓。ファイルはタブとして開き、文書ごとの
     表示と状態は DocumentView(editor/document_view.py)が持つ。窓は
@@ -777,6 +831,10 @@ class EditorWindow(QMainWindow):
         self._macro_skips = 0
         self._current_macro = []
         self._current_macro_name = ""
+        # いまのマクロが Python のとき、そのソース(命令の列の
+        # マクロでは None)。読み込み・登録マクロの再生で切り替わる。
+        self._current_python_source = None
+        self._python_block_cursor = None
         # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
         # (_build_menus)でアクションにし、変更のたびに付け直す。
         self._registered_macros = macmod.sanitize_registered(
@@ -810,6 +868,13 @@ class EditorWindow(QMainWindow):
             "move_line_down": self._cmd_move_line_down,
             "move_char_left": self._cmd_move_char_left,
             "move_char_right": self._cmd_move_char_right,
+            "move_word_left": self._cmd_move_word_left,
+            "move_word_right": self._cmd_move_word_right,
+            "move_document_start": self._cmd_move_document_start,
+            "move_document_end": self._cmd_move_document_end,
+            "move_page_up": self._cmd_move_page_up,
+            "move_page_down": self._cmd_move_page_down,
+            "select_all": self._cmd_select_all,
             "sort_lines": self._cmd_sort_lines,
             "remove_duplicate_lines": self._cmd_remove_duplicate_lines,
             "reformat_text": self._cmd_reformat_text,
@@ -977,6 +1042,18 @@ class EditorWindow(QMainWindow):
             app = QGuiApplication.instance()
             if app is not None:
                 app.aboutToQuit.connect(self._flush_session)
+        # キーの重なりがあれば、起動時にステータスバーで知らせる
+        # (黙ってどちらかを落とさない。付け方は _shortcut_keys_for
+        # の先勝ちで、表そのものは変えない)。
+        conflicts = self.keymap_conflicts()
+        if conflicts:
+            detail = "、".join(
+                f"『{keys}』（{'・'.join(
+                    keymapmod.command_label(n) for n in names)}）"
+                for keys, names in conflicts.items())
+            self.statusBar().showMessage(
+                f"キー割り当てに重なりがあります：{detail}。"
+                "キー割り当ての設定で直せます。", 15000)
         # 開いた直後は本文にフォーカスを置く(ショートカットは本文に
         # フォーカスがあるときだけ効く作りなので)。
         self._edit.setFocus()
@@ -1143,6 +1220,7 @@ class EditorWindow(QMainWindow):
         edit.font_size_changed.connect(
             lambda size, v=view: self._on_font_size_changed(size, v))
         edit.move_key.connect(self._on_move_key)
+        edit.command_key.connect(self._on_command_key)
         edit.unrecorded_move.connect(self._note_macro_skip)
         edit.mouse_pressed.connect(self._note_macro_skip)
         edit.undo_redo_started.connect(
@@ -1163,6 +1241,11 @@ class EditorWindow(QMainWindow):
         self._schedule_session_save()
 
     def _on_view_selection_changed(self, view):
+        # 選択だけが変わったときも、マクロ記録の材料(直前の選択)を
+        # 取り直す。カーソル位置が動かない全選択(selectAll で末尾に
+        # いた場合など)では cursorPositionChanged が出ないため、
+        # ここで取り直さないと古い選択で切り分けてしまう。
+        view.track_change_cache()
         if view is self._current_view() and hasattr(self, "_pos_label"):
             self._refresh_position()
 
@@ -1239,18 +1322,42 @@ class EditorWindow(QMainWindow):
             self._add_view()
 
     def close_tab(self, index=None):
-        """タブを閉じる。確認は出さない。
+        """タブを閉じる。確認は出さない(控えが書ける限り)。
 
         閉じたタブはセッションからも外れる(次に開いても戻らない。
         メモ帳と同じ)。窓を閉じた場合は、開いているタブが全部
         そのまま戻る。最後のタブを閉じたら、新しい無題のタブに
-        置き換わる(窓は閉じない)。"""
+        置き換わる(窓は閉じない)。
+
+        ただし、そのタブに未保存の編集があり、控えが書けないとき
+        は、窓を閉じるときと同じ3択で聞く(もう一度書く／そのまま
+        閉じる／閉じない。既定は閉じない)。黙って閉じると、タブが
+        控えからも外れて編集がどこにも残らないため。未保存の編集
+        が無いタブは、控えが書けなくても聞かずに閉じる。"""
         if index is None:
             index = self._tabs.currentIndex()
         if not 0 <= index < len(self._views):
             return
-        self._remove_view(self._views[index])
+        view = self._views[index]
+        if view.is_modified() and not self._flush_session():
+            if not self._confirm_tab_close_without_session():
+                return
+        self._remove_view(view)
         self._flush_session()
+
+    def _confirm_tab_close_without_session(self) -> bool:
+        """控えが書けないままタブを閉じてよいか、利用者と決める。
+
+        閉じてよければ True。窓を閉じるときの
+        _confirm_close_without_session と同じ3択で、違いは
+        「閉じない」がイベントでなく戻り値で伝わることだけ。"""
+        while True:
+            choice = self._ask_session_save_failed_choice()
+            if choice == "retry":
+                if self._flush_session():
+                    return True
+                continue
+            return choice == "discard"
 
     def close_current_tab_or_window(self):
         """「閉じる」(Ctrl+W)。タブが複数あれば今のタブを閉じ、
@@ -1640,7 +1747,11 @@ class EditorWindow(QMainWindow):
     def _action(self, label, slot, keymap_name=None, menu=None):
         action = QAction(label, self)
         if keymap_name:
-            keys = self._keymap.get(keymap_name)
+            # 命令名を objectName にも残す。本文側が、矩形選択中の
+            # キーを「どの命令のキーか」で照合するために使う
+            # (text_edit の _block_clipboard_key)。
+            action.setObjectName(keymap_name)
+            keys = self._shortcut_keys_for(keymap_name)
             if keys:
                 action.setShortcut(QKeySequence(keys))
             # ショートカットは本文にフォーカスがあるときだけ効かせる。
@@ -1878,7 +1989,7 @@ class EditorWindow(QMainWindow):
         # 記録の開始／終了にもキー割り当て(既定は Shift+F1)を付ける。
         # _action で作るアクションと同じ作法(本文にフォーカスがある
         # ときだけ効く・付け直しと新しい本文への登録の対象にする)。
-        record_keys = self._keymap.get("macro_record")
+        record_keys = self._shortcut_keys_for("macro_record")
         if record_keys:
             self._act_macro_record.setShortcut(QKeySequence(record_keys))
         self._act_macro_record.setShortcutContext(
@@ -1891,6 +2002,9 @@ class EditorWindow(QMainWindow):
         # 「マクロなし」として伝わり、再生できなくなる)。
         self._action("再生(&P)", lambda: self.play_macro(),
                      "macro_play", macro_menu)
+        self._action("Python で開く(&Y)…",
+                     lambda: self.show_python_macro_dialog(),
+                     None, macro_menu)
         macro_menu.addSeparator()
         self._action("マクロを保存(&S)…", self.save_macro_dialog,
                      None, macro_menu)
@@ -2405,14 +2519,14 @@ class EditorWindow(QMainWindow):
         """実効のキー割り当てを、_action で登録したアクションと
         検索バーの次・前へのショートカットへ付け直す。"""
         for name, actions in self._keymap_actions.items():
-            keys = self._keymap.get(name) or ""
+            keys = self._shortcut_keys_for(name)
             sequence = QKeySequence(keys) if keys else QKeySequence()
             for action in actions:
                 action.setShortcut(sequence)
         for name, shortcut in (("find_next", self._find_next_shortcut),
                                ("find_prev", self._find_prev_shortcut)):
             if shortcut is not None:
-                keys = self._keymap.get(name) or ""
+                keys = self._shortcut_keys_for(name)
                 shortcut.setKey(
                     QKeySequence(keys) if keys else QKeySequence())
 
@@ -2429,6 +2543,43 @@ class EditorWindow(QMainWindow):
     def keymap(self) -> dict:
         """実効のキー割り当て(命令名 → キー)の写し。"""
         return dict(self._keymap)
+
+    def keymap_conflicts(self):
+        """重なっているキー → 命令名の並び(COMMAND_LABELS の順)。
+
+        表(と保存される上書き分)はそのままにして、実行時の
+        付け方だけ _shortcut_keys_for が先勝ちで決める。"""
+        by_key = {}
+        for name, _label in keymapmod.COMMAND_LABELS:
+            keys = self._keymap.get(name) or ""
+            if keys:
+                normalized = QKeySequence(keys).toString(
+                    QKeySequence.SequenceFormat.PortableText)
+                by_key.setdefault(normalized, []).append(name)
+        return {keys: names for keys, names in by_key.items()
+                if len(names) > 1}
+
+    def _shortcut_keys_for(self, name, table=None):
+        """その命令に実際に付けるキー。
+
+        重なりがあるキーは、並び(COMMAND_LABELS)で先の命令が
+        持ち、後ろの命令には付けない。両方に付けると Qt の
+        ショートカットの競合でどちらも効かなくなるため。表は
+        変えないので、重なりはキー割り当ての画面で見て直せる。"""
+        table = self._keymap if table is None else table
+        keys = table.get(name) or ""
+        if not keys:
+            return ""
+        normalized = QKeySequence(keys).toString(
+            QKeySequence.SequenceFormat.PortableText)
+        for other, _label in keymapmod.COMMAND_LABELS:
+            if other == name:
+                break
+            other_keys = table.get(other) or ""
+            if other_keys and QKeySequence(other_keys).toString(
+                    QKeySequence.SequenceFormat.PortableText) == normalized:
+                return ""
+        return keys
 
     def keymap_overrides(self) -> dict:
         """設定へ保存している上書き分(既定と違う項目だけ)の写し。"""
@@ -3260,7 +3411,10 @@ class EditorWindow(QMainWindow):
     def copy_append_selection(self):
         """追加コピー(キー割り当ての命令 copy_append、既定は
         Shift+F8)。選択範囲を、クリップボードの今の中身の末尾へ
-        足してコピーする。選択が無ければ何もしない。"""
+        足してコピーする。選択が無ければ何もしない。矩形選択の
+        ときは矩形の内容を足す(本文側の copy_append が受ける)。"""
+        if self._edit.copy_append():
+            return
         cursor = self._edit.textCursor()
         if not cursor.hasSelection():
             return
@@ -3272,7 +3426,10 @@ class EditorWindow(QMainWindow):
         """追加切り抜き(キー割り当ての命令 cut_append、既定は
         Shift+F7)。選択範囲を切り取り、クリップボードの今の中身の
         末尾へ足す。選択が無ければ何もしない。切り取りは1回の
-        undo で戻せる単位にする。"""
+        undo で戻せる単位にする。矩形選択のときは矩形を切り取って
+        足す(本文側の cut_append が受ける)。"""
+        if self._edit.cut_append():
+            return
         cursor = self._edit.textCursor()
         if not cursor.hasSelection():
             return
@@ -3440,6 +3597,49 @@ class EditorWindow(QMainWindow):
 
     def _cmd_move_char_right(self, args):
         return self._move_cursor(QTextCursor.MoveOperation.Right, args)
+
+    def _cmd_move_word_left(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.WordLeft, args)
+
+    def _cmd_move_word_right(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.WordRight, args)
+
+    def _cmd_move_document_start(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.Start, args)
+
+    def _cmd_move_document_end(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.End, args)
+
+    def _cmd_move_page_up(self, args):
+        return self._move_page(args, forward=False)
+
+    def _cmd_move_page_down(self, args):
+        return self._move_page(args, forward=True)
+
+    def _move_page(self, args, forward):
+        """1画面分(見えている行数ぶん)の移動。count は画面の数。
+        本文の page_step_lines で数えるので、再生時も押したときと
+        同じ行数ぶん動く(窓の大きさが変われば行数も変わる)。"""
+        count = args.get("count", 1)
+        try:
+            count = max(1, int(count))
+        except (TypeError, ValueError):
+            count = 1
+        extend = bool(args.get("extend"))
+        mode = (QTextCursor.MoveMode.KeepAnchor if extend
+                else QTextCursor.MoveMode.MoveAnchor)
+        operation = (QTextCursor.MoveOperation.Down if forward
+                     else QTextCursor.MoveOperation.Up)
+        cursor = self._edit.textCursor()
+        for _ in range(self._edit.page_step_lines() * count):
+            cursor.movePosition(operation, mode)
+        self._edit.setTextCursor(cursor)
+        self._edit.ensureCursorVisible()
+        return {"count": count, "extend": extend}
+
+    def _cmd_select_all(self, args):
+        self._edit.selectAll()
+        return {}
 
     def _cmd_insert_text(self, args):
         text = str(args.get("text") or "")
@@ -3868,6 +4068,11 @@ class EditorWindow(QMainWindow):
         # して記録係へ渡すだけ(実行はしない)。
         self._recorder.note_command(name, {"count": 1, "extend": bool(extend)})
 
+    def _on_command_key(self, name, extend):
+        # PageUp / PageDown / Ctrl+A は、命令層で実行する(本文の
+        # keyPressEvent が command_key で寄せてくる)。
+        self.execute_command(name, {"extend": bool(extend)})
+
     def _note_macro_skip(self):
         """記録できない操作が起きたときの共通の口。
 
@@ -3889,14 +4094,22 @@ class EditorWindow(QMainWindow):
                     or view.suppress_change_record):
                 doc = view.edit.document()
                 sel_start, sel_end, cursor_before = view.change_cache
-                if (pos == 0 and added > 0
+                selection_replaced = (
+                    removed > 0
+                    and sel_start is not None and sel_end is not None
+                    and sel_start == pos and sel_end == pos + removed)
+                if (not selection_replaced
+                        and pos == 0 and added > 0
                         and added >= doc.characterCount() - 1
                         and (removed > 0 or added > 1)):
                     # 文書の丸ごと差し替え(ファイルの読み込み等)は
-                    # 編集の記録にしない。ただし記録中に起きたら
-                    # (全選択して打ち直す等)、知らせる対象にする。
-                    # 条件の最後の節は、空の文書への最初の打鍵
-                    # (removed=0, added=1)を差し替えと間違えないため。
+                    # 編集の記録にしない。ただし記録中に起きたら、
+                    # 知らせる対象にする。条件の最後の節は、空の文書
+                    # への最初の打鍵(removed=0, added=1)を差し替えと
+                    # 間違えないため。選択範囲の上書き(全選択して
+                    # 打ち直す等)は、選択が変わった範囲と一致する
+                    # のでここには入れず、下の切り分けで「選択範囲の
+                    # 削除 + 挿入」として記録する。
                     self._recorder.break_insert_chain()
                     self._note_macro_skip()
                 elif (added == 0 and removed == 1 and pos == 0
@@ -3974,6 +4187,7 @@ class EditorWindow(QMainWindow):
             self._recorder.stop()
             self._current_macro = self.recorded_commands()
             self._current_macro_name = ""
+            self._current_python_source = None
             self._act_macro_record.setText("記録開始(&R)")
             message = (f"マクロの記録を終了しました"
                        f"（{len(self._current_macro)} 手）")
@@ -3989,6 +4203,8 @@ class EditorWindow(QMainWindow):
     def play_macro(self, commands=None) -> bool:
         """マクロを再生する。commands が無ければ、最後に記録・読み
         込みしたマクロ。再生全体は1回の undo で戻せる単位にする。"""
+        if commands is None and self._current_python_source:
+            return self.play_python_macro(self._current_python_source)
         if commands is None:
             commands = self._current_macro
         if not commands:
@@ -4008,16 +4224,114 @@ class EditorWindow(QMainWindow):
             self._track_change_cache()
         return True
 
+    # ---------------------------------------------------------------
+    # Python マクロ(editor/macro_py.py)
+    # ---------------------------------------------------------------
+    def _make_python_session(self, source):
+        """Python マクロの実行セッションを作る。文法が読めなければ
+        ステータスに出して None。"""
+        try:
+            return macro_py.PythonStepper(
+                source, _EditorPyApi(self).api_object())
+        except macro_py.PythonMacroError as e:
+            self.statusBar().showMessage(
+                f"Python マクロのエラー: {e}", 8000)
+            return None
+
+    def _begin_python_run(self):
+        """Python マクロの実行区間の開始(undo の単位と、再生中の印)。"""
+        self._replaying = True
+        self._python_block_cursor = self._edit.textCursor()
+        self._python_block_cursor.beginEditBlock()
+
+    def _end_python_run(self):
+        if self._python_block_cursor is not None:
+            self._python_block_cursor.endEditBlock()
+            self._python_block_cursor = None
+        self._replaying = False
+        self._track_change_cache()
+
+    def play_python_macro(self, source) -> bool:
+        """Python のマクロを通しで実行する。
+
+        実行は EDDy の中だけで完結する(外部プロセスには投げない)。
+        全体は1回の undo で戻せる単位にする(play_macro と同じ)。
+        エラーは行番号つきでステータスに出す。"""
+        session = self._make_python_session(source)
+        if session is None:
+            return False
+        self._begin_python_run()
+        try:
+            session.run_all()
+        except macro_py.PythonMacroError as e:
+            self.statusBar().showMessage(
+                f"Python マクロのエラー: {e}", 8000)
+            return False
+        finally:
+            self._end_python_run()
+        if session.output:
+            self.statusBar().showMessage(
+                "print: " + " / ".join(session.output), 8000)
+        return True
+
+    def show_python_macro_dialog(self, source=None, name="",
+                                 on_save=None):
+        """マクロの Python を別窓で見て・直して・実行する画面を開く。
+
+        source が無ければ、いまのマクロ(記録した命令の列を Python
+        へ変換したもの)を開く。on_save は (名前, ソース) を受ける
+        登録の口で、渡されなければ「登録マクロとして新規に残す」
+        口を使う(登録マクロから開いたときは、呼び側がキーの
+        引き継ぎなどの都合を付けて渡す)。"""
+        if on_save is None:
+            def on_save(name, new_source):
+                self.register_python_macro(name, new_source)
+        if source is None:
+            if self._current_python_source:
+                source = self._current_python_source
+            else:
+                commands = (self.recorded_commands()
+                            if self._recorder.recording
+                            else self._current_macro)
+                source = macro_py.commands_to_python(
+                    commands, self._current_macro_name or "マクロ")
+        dialog = MacroPythonDialog(
+            self, source=source, name=name or self._current_macro_name,
+            session_factory=self._make_python_session,
+            begin_run=self._begin_python_run,
+            end_run=self._end_python_run,
+            on_save=on_save)
+        dialog.exec()
+
     def save_macro(self, path, name="") -> bool:
         """いまのマクロ(記録中なら記録中の列)を書く。
 
-        拡張子が .txt ならテキスト形式(1行1命令)、それ以外は
-        従来の JSON で書く。"""
+        拡張子が .py なら Python、.txt ならテキスト形式(1行1命令)、
+        それ以外は従来の JSON で書く。いまのマクロが Python の
+        ときは、.py にそのまま書く(Python → 命令の列への変換は
+        しないので、他の形式には書けない)。"""
+        lowered = str(path).lower()
+        if (not self._recorder.recording
+                and self._current_python_source):
+            if not lowered.endswith(".py"):
+                self.statusBar().showMessage(
+                    "Python のマクロは .py で保存してください", 6000)
+                return False
+            try:
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(self._current_python_source)
+            except OSError as e:
+                self.statusBar().showMessage(
+                    f"マクロを保存できませんでした: {e}")
+                return False
+            return True
         commands = (self.recorded_commands() if self._recorder.recording
                     else self._current_macro)
         try:
             with open(path, "w", encoding="utf-8", newline="") as f:
-                if str(path).lower().endswith(".txt"):
+                if lowered.endswith(".py"):
+                    f.write(macro_py.commands_to_python(commands, name))
+                elif lowered.endswith(".txt"):
                     f.write(macmod.commands_to_text(commands, name))
                 else:
                     f.write(macmod.macro_to_json(commands, name))
@@ -4028,17 +4342,33 @@ class EditorWindow(QMainWindow):
 
     def load_macro(self, path) -> list:
         """マクロのファイルを読み、いまのマクロにする。命令の列を
-        返す。形式は中身で見分ける({ か [ で始まれば JSON、それ
-        以外はテキスト形式)。読めなければ ValueError / OSError を
-        上げる(呼び側が伝える)。"""
+        返す(Python のマクロは命令の列が無いので空を返し、ソースは
+        _current_python_source に持つ)。形式は中身で見分ける
+        ({ か [ で始まれば JSON、それ以外はテキスト形式として
+        読んでみて、読めなければ Python として読む)。読めなければ
+        ValueError / OSError を上げる(呼び側が伝える)。"""
         with open(path, encoding="utf-8") as f:
             text = f.read()
         # 先頭の BOM と空白を除いて、{ か [ で始まれば JSON。
         head = text.lstrip("\ufeff \t\r\n")
         if head.startswith(("{", "[")):
             name, commands = macmod.macro_from_json(text)
+            self._current_python_source = None
         else:
-            name, commands = macmod.commands_from_text(text)
+            try:
+                name, commands = macmod.commands_from_text(text)
+            except ValueError:
+                # テキスト形式で読めなければ、Python として読む
+                # (文法が読めなければ、そちらのエラーを上げる)。
+                invalid = macro_py.validate_python(text)
+                if invalid is not None:
+                    raise ValueError(invalid)
+                self._current_macro = []
+                self._current_macro_name = (
+                    os.path.splitext(os.path.basename(str(path)))[0])
+                self._current_python_source = text
+                return []
+            self._current_python_source = None
         self._current_macro = commands
         self._current_macro_name = name
         return commands
@@ -4047,7 +4377,7 @@ class EditorWindow(QMainWindow):
         try:
             path, _ = QFileDialog.getSaveFileName(
                 self, "マクロを保存", "",
-                "マクロ (*.json *.txt);;すべてのファイル (*)")
+                "マクロ (*.json *.txt *.py);;すべてのファイル (*)")
             if not path:
                 return
             name = os.path.splitext(os.path.basename(path))[0]
@@ -4060,20 +4390,23 @@ class EditorWindow(QMainWindow):
         try:
             path, _ = QFileDialog.getOpenFileName(
                 self, "マクロを開く", "",
-                "マクロ (*.json *.txt);;すべてのファイル (*)")
+                "マクロ (*.json *.txt *.py);;すべてのファイル (*)")
             if not path:
                 return
             commands = self.load_macro(path)
         except Exception as e:  # noqa: BLE001  理由は利用者への文にする
             self.statusBar().showMessage(f"マクロを読めませんでした: {e}")
             return
-        self.play_macro(commands)
+        # Python のマクロは命令の列が空で返るので、その場合は
+        # 「いまのマクロ」の再生(play_macro の Python 振り分け)に任せる。
+        self.play_macro(commands if commands else None)
 
     # ---------------------------------------------------------------
     # 登録マクロ(名前を付けて設定に残し、メニューとキーで呼ぶ)
     # ---------------------------------------------------------------
     def registered_macros(self) -> dict:
-        """登録マクロの対応(名前 → {"commands", "key"})の写し。"""
+        """登録マクロの対応(名前 → {"commands", "key"} または
+        {"python", "key"})の写し。"""
         return macmod.copy_registered(self._registered_macros)
 
     def apply_registered_macros(self, mapping):
@@ -4094,6 +4427,12 @@ class EditorWindow(QMainWindow):
                               "key": key}
         self.apply_registered_macros(mapping)
 
+    def register_python_macro(self, name, source, key=""):
+        """Python のマクロを、名前を付けて登録する。"""
+        mapping = self.registered_macros()
+        mapping[str(name)] = {"python": source, "key": key}
+        self.apply_registered_macros(mapping)
+
     def play_registered_macro(self, name) -> bool:
         """登録マクロを再生する。無ければステータスに出して False。"""
         entry = self._registered_macros.get(name)
@@ -4101,6 +4440,11 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"登録マクロがありません（{name}）", 4000)
             return False
+        if "python" in entry:
+            self._current_python_source = entry["python"]
+            self._current_macro_name = name
+            return self.play_python_macro(entry["python"])
+        self._current_python_source = None
         self._current_macro = macmod.copy_commands(entry["commands"])
         self._current_macro_name = name
         return self.play_macro(self._current_macro)
@@ -4125,6 +4469,30 @@ class EditorWindow(QMainWindow):
         dialog.exec()
         if dialog.run_requested:
             self.play_registered_macro(dialog.run_requested)
+        if dialog.python_requested:
+            self._open_registered_macro_python(dialog.python_requested)
+
+    def _open_registered_macro_python(self, name):
+        """登録マクロを Python の別窓で開く。
+
+        Python の登録はそのソースを、命令の列の登録は Python へ
+        変換したものを開く。別窓で保存すると、Python の登録として
+        残る(キーは引き継ぐ)。"""
+        entry = self._registered_macros.get(name)
+        if entry is None:
+            return
+        key = entry.get("key") or ""
+        if "python" in entry:
+            source = entry["python"]
+        else:
+            source = macro_py.commands_to_python(
+                entry.get("commands") or [], name)
+
+        def save_python(new_name, new_source):
+            self.register_python_macro(new_name, new_source, key=key)
+
+        self.show_python_macro_dialog(
+            source=source, name=name, on_save=save_python)
 
     def _rebuild_registered_macro_menu(self):
         """登録マクロのメニュー項目とショートカットを作り直す。
@@ -4147,8 +4515,12 @@ class EditorWindow(QMainWindow):
         used = set()
         for keys in self._keymap.values():
             if keys:
-                used.add(QKeySequence(keys).toString(
-                    QKeySequence.SequenceFormat.PortableText))
+                normalized = QKeySequence(keys).toString(
+                    QKeySequence.SequenceFormat.PortableText)
+                if normalized:
+                    # 照合は正規化した形で(表記ゆれで重なりを
+                    # 見落とさないため)。
+                    used.add(normalized.split(", ")[0])
         for name, entry in self._registered_macros.items():
             action = QAction(name, self)
             keys = (entry.get("key") or "").strip()

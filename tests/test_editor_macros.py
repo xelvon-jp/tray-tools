@@ -114,11 +114,30 @@ def test_recorder_delete_classification():
 
 
 def test_recorder_replacement_is_not_recorded():
+    # 選択範囲と変わった範囲が一致しない置き換えは記録しない。
     rec = macmod.MacroRecorder()
     rec.start()
-    rec.feed_change(0, 2, 1, "x", 0, 2, 2)   # 置き換えは記録しない
+    assert rec.feed_change(0, 2, 1, "x", 0, 1, 1) is False
     assert rec.commands == []
     assert rec.last_command is None
+
+
+def test_recorder_replacement_over_selection_is_split():
+    # 選択範囲を打って上書きする置き換えは、「選択範囲の削除 +
+    # 挿入」に切り分けて記録する(マクロの Python 化で、キー操作を
+    # 一通り記録できるようにした分)。
+    rec = macmod.MacroRecorder()
+    rec.start()
+    assert rec.feed_change(0, 2, 1, "x", 0, 2, 2) is True
+    assert rec.commands == [
+        {"cmd": "delete_selection", "args": {}},
+        {"cmd": "insert_text", "args": {"text": "x"}},
+    ]
+    assert rec.last_command == ("insert_text", {"text": "x"})
+    # 続けて打った分は、挿入の連結でまとまる。
+    rec.feed_change(1, 0, 1, "y", 1, 1, 1)
+    assert rec.commands[-1] == {"cmd": "insert_text",
+                                 "args": {"text": "xy"}}
 
 
 def test_recorder_move_coalesces_counts():
@@ -353,24 +372,28 @@ def test_f4_cleared_by_mouse_click():
         discard_close(window)
 
 
-def test_f4_cleared_by_unrecorded_move():
-    # Ctrl+矢印(単語移動)も記録できない操作。F4 の控えは消える。
+def test_f4_ctrl_arrow_repeats_word_move():
+    # Ctrl+矢印(単語移動)は命令として記録できるようになった
+    # ので、F4 の控えは消えず、単語移動が控えになって繰り返せる。
     window = make_window("one two three", cursor_pos=0)
     try:
         QTest.keyClicks(window._edit, "x")
         assert window._recorder.last_command is not None
         QTest.keyClick(window._edit, Qt.Key.Key_Right,
                        Qt.KeyboardModifier.ControlModifier)
-        assert window._recorder.last_command is None
-        before = window.text()
+        assert window._recorder.last_command == (
+            "move_word_right", {"count": 1, "extend": False})
+        pos = window._edit.textCursor().position()
+        assert pos > 1  # 単語単位で動いた
         window.repeat_last()
-        assert window.text() == before
+        assert window._edit.textCursor().position() > pos
     finally:
         discard_close(window)
 
 
-def test_f4_cleared_by_typing_over_selection():
-    # 選択範囲を打って上書きする入力も、F4 の控えを消す。
+def test_f4_after_typing_over_selection_repeats_insert():
+    # 選択範囲を打って上書きする入力は「削除 + 挿入」として記録
+    # されるので、F4 の控えは最後の挿入になり、繰り返せる。
     window = make_window("hello world", cursor_pos=2)
     try:
         window._act_cut_eol.trigger()
@@ -378,9 +401,10 @@ def test_f4_cleared_by_typing_over_selection():
         assert window._recorder.last_command is not None
         window._edit.selectAll()
         QTest.keyClicks(window._edit, "x")
-        assert window._recorder.last_command is None
+        assert window._recorder.last_command == (
+            "insert_text", {"text": "x"})
         window.repeat_last()
-        assert window.text() == "x"
+        assert window.text() == "xx"
     finally:
         discard_close(window)
 
@@ -475,48 +499,51 @@ def test_recording_mid_document_after_emoji():
         discard_close(other)
 
 
-def test_ctrl_arrow_not_recorded_as_char_move():
-    # Ctrl+矢印の単語移動は、1文字移動として記録されない。記録から
-    # 外れたことは「記録できない操作」として数える。
+def test_ctrl_arrow_recorded_as_word_move():
+    # Ctrl+矢印の単語移動は、1文字移動としてではなく単語移動の
+    # 命令として記録される(記録できない操作には数えない)。
     window = make_window("one two three", cursor_pos=0)
     try:
         window.set_macro_recording(True)
         QTest.keyClick(window._edit, Qt.Key.Key_Right,
                        Qt.KeyboardModifier.ControlModifier)
         assert window._edit.textCursor().position() > 1  # 単語移動した
-        assert window.recorded_commands() == []
-        assert window._macro_skips == 1
+        kinds = [c["cmd"] for c in window.recorded_commands()]
+        assert kinds == ["move_word_right"], kinds
+        assert window._macro_skips == 0
         # 素の矢印は従来どおり記録される。
         QTest.keyClick(window._edit, Qt.Key.Key_Left)
         kinds = [c["cmd"] for c in window.recorded_commands()]
-        assert kinds == ["move_char_left"], kinds
-        assert window._macro_skips == 1
+        assert kinds == ["move_word_right", "move_char_left"], kinds
+        assert window._macro_skips == 0
         window.set_macro_recording(False)
     finally:
         discard_close(window)
 
 
-def test_typing_over_selection_flagged_unrecorded():
-    # 選択範囲を打って上書きする入力は記録に残らず、黙って外され
-    # ずに「記録できない操作」として知らされる。
+def test_typing_over_selection_recorded():
+    # 選択範囲を打って上書きする入力は、「選択範囲の削除 + 挿入」
+    # として記録される(記録できない操作には数えない)。
     window = make_window("hello", cursor_pos=0)
     try:
         window._edit.selectAll()
         window.set_macro_recording(True)
         QTest.keyClicks(window._edit, "x")
         assert window.text() == "x"
-        assert window.recorded_commands() == []
-        assert window._macro_skips >= 1
+        assert window.recorded_commands() == [
+            {"cmd": "delete_selection", "args": {}},
+            {"cmd": "insert_text", "args": {"text": "x"}},
+        ]
+        assert window._macro_skips == 0
         window.set_macro_recording(False)
-        message = window.statusBar().currentMessage()
-        assert "記録できない操作" in message, message
     finally:
         discard_close(window)
 
 
-def test_partial_replacement_and_block_edit_flagged():
-    # 部分的な上書きと、矩形選択での編集も、記録できない操作として
-    # 数えられる(記録の列だけ見ると起きなかったことに見える操作)。
+def test_selection_replacement_recorded_block_edit_flagged():
+    # 選択範囲への1文字ずつの上書きは記録される。矩形選択での
+    # 編集は今も記録できない操作として数えられる(記録の列だけ
+    # 見ると起きなかったことに見える操作なので)。
     window = make_window("hello world", cursor_pos=0)
     try:
         cursor = window._edit.textCursor()
@@ -526,7 +553,11 @@ def test_partial_replacement_and_block_edit_flagged():
         window.set_macro_recording(True)
         QTest.keyClicks(window._edit, "HELLO")
         assert window.text() == "HELLO world"
-        assert window._macro_skips >= 1
+        assert window.recorded_commands() == [
+            {"cmd": "delete_selection", "args": {}},
+            {"cmd": "insert_text", "args": {"text": "HELLO"}},
+        ]
+        assert window._macro_skips == 0
         window.set_macro_recording(False)
     finally:
         discard_close(window)

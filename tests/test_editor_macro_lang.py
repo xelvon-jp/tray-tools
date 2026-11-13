@@ -390,6 +390,48 @@ def test_recorded_macro_to_text_and_back_plays_same():
         discard_close(other)
 
 
+# ---------------------------------------------------------------
+# キーの重なりの可視化(レビュー req-20261114-07 の件B)
+# ---------------------------------------------------------------
+def test_dialog_key_state_reserved_collision_is_shown():
+    # 読み込み時点で組み込みと重なっているキー(既定キーの変更や
+    # 設定の手書きで入り込む)は、黙って外さず「効いていない」と
+    # 理由つきで出る。付け直せば解消する。
+    macros = {"甲": {"commands": SAMPLE[:1], "key": "F7"}}
+    dialog = make_dialog(macros=macros,
+                         reserved_keys={"F7": "切り取り"})
+    try:
+        assert dialog.macro_key_state("甲") == ("reserved", "切り取り")
+        dialog._list.setCurrentRow(0)
+        assert "効いていません" in dialog._key_state_label.text()
+        assert "切り取り" in dialog._key_state_label.text()
+        # 付け直せば効く状態になり、表示も消える。
+        assert dialog.set_macro_key("甲", "Ctrl+Alt+1")
+        assert dialog.macro_key_state("甲") == ("ok", "")
+        assert dialog._key_state_label.text() == ""
+    finally:
+        dialog.close()
+
+
+def test_dialog_key_state_duplicate_macros():
+    # 登録どうしの重なりは、先の登録が優先で後ろが効かない。
+    macros = {
+        "甲": {"commands": SAMPLE[:1], "key": "Ctrl+Alt+1"},
+        "乙": {"commands": SAMPLE[:1], "key": "Ctrl+Alt+1"},
+        "丙": {"commands": SAMPLE[:1], "key": ""},
+    }
+    dialog = make_dialog(macros=macros)
+    try:
+        assert dialog.macro_key_state("甲") == ("ok", "")
+        assert dialog.macro_key_state("乙") == ("duplicate", "甲")
+        assert dialog.macro_key_state("丙") == ("none", "")
+        dialog._list.setCurrentRow(1)
+        assert "効いていません" in dialog._key_state_label.text()
+        assert "甲" in dialog._key_state_label.text()
+    finally:
+        dialog.close()
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

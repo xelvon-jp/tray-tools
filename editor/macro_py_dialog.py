@@ -5,20 +5,28 @@
 #   - ソースの表示と編集(編集すると実行の途中状態は破棄される)
 #   - ステップ実行(1文ずつ。本文の窓で実際に編集が進む)
 #   - 通し実行(残りの文を全部)
+#   - 停止(実行側の子プロセスを終了する。無限ループでも効く)
 #   - 最初から(途中状態を捨てて、頭に戻す)
 #   - クリップボードへコピー(職場 Copilot など AI へ貼るため)
 #   - 登録として保存(on_save があるときだけ。名前とソースを渡す)
 #
-# 実行そのものは editor/macro_py.py の PythonStepper が持ち、
-# セッションは呼び側(窓)が session_factory で作って渡す(この
-# 画面は Qt の外の形を知らない)。実行区間の undo の単位は、
-# 呼び側の begin_run / end_run が面倒を見る(ステップをまたい
-# でも1回の実行は1つの単位)。
+# 開いただけでは何も実行しない。実行は「通し実行」「ステップ
+# 実行」を押したときだけ。実行そのものは editor/macro_py.py の
+# PythonStepper(子プロセスで実行)が持ち、セッションは呼び側
+# (窓)が session_factory で作って渡す(この画面は Qt の外の形を
+# 知らない)。実行区間の undo の単位は、呼び側の begin_run /
+# end_run が面倒を見る(ステップをまたいでも1回の実行は1つの
+# 単位)。
+#
+# 実行中は、イベントを回しながら待つ(子が純粋な計算で回って
+# いても画面が固まらないように)。その間は停止以外の操作を
+# 止め、閉じることも止める(実行中のセッションを抱えたまま
+# 画面が壊れるのを防ぐため)。
 #
 # 次に実行する文は背景色で示す。エラーは行番号つきで下の欄に
 # 出す(print の出力も同じ欄)。
-from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -28,6 +36,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
 )
+from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QTextCursor
 
 from editor import editor_icon
 from editor import macro_py
@@ -60,6 +69,7 @@ class MacroPythonDialog(QDialog):
         self._session = None
         self._run_begun = False
         self._output_shown = 0
+        self._running = False
 
         layout = QVBoxLayout(self)
         if on_save is not None:
@@ -84,20 +94,26 @@ class MacroPythonDialog(QDialog):
         self._step_button = QPushButton("ステップ実行")
         self._step_button.clicked.connect(self._on_step)
         buttons.addWidget(self._step_button)
+        self._stop_button = QPushButton("停止")
+        self._stop_button.clicked.connect(self._on_stop)
+        self._stop_button.setEnabled(False)
+        buttons.addWidget(self._stop_button)
         self._reset_button = QPushButton("最初から")
         self._reset_button.clicked.connect(self._on_reset)
         buttons.addWidget(self._reset_button)
-        copy_button = QPushButton("コピー")
-        copy_button.clicked.connect(self._on_copy)
-        buttons.addWidget(copy_button)
+        self._copy_button = QPushButton("コピー")
+        self._copy_button.clicked.connect(self._on_copy)
+        buttons.addWidget(self._copy_button)
         if on_save is not None:
-            save_button = QPushButton("登録として保存")
-            save_button.clicked.connect(self._on_save_clicked)
-            buttons.addWidget(save_button)
+            self._save_button = QPushButton("登録として保存")
+            self._save_button.clicked.connect(self._on_save_clicked)
+            buttons.addWidget(self._save_button)
+        else:
+            self._save_button = None
         buttons.addStretch(1)
-        close_button = QPushButton("閉じる")
-        close_button.clicked.connect(self.accept)
-        buttons.addWidget(close_button)
+        self._close_button = QPushButton("閉じる")
+        self._close_button.clicked.connect(self.accept)
+        buttons.addWidget(self._close_button)
         layout.addLayout(buttons)
 
         self._status_label = QLabel("")
@@ -116,12 +132,16 @@ class MacroPythonDialog(QDialog):
         """実行セッション(まだ作っていなければ None)。"""
         return self._session
 
+    def running(self):
+        """実行中(ステップ・通しの最中)か。"""
+        return self._running
+
     # ---------------------------------------------------------------
     # 実行
     # ---------------------------------------------------------------
     def _ensure_session(self):
         """セッションを用意する。用意できなければ理由を表示して
-        None(呼び側はそのまま戻る)。"""
+        None(呼び側はそのまま戻る)。作るだけでは実行しない。"""
         if self._session is not None:
             return self._session
         source = self.source()
@@ -136,7 +156,15 @@ class MacroPythonDialog(QDialog):
         self._output_shown = 0
         if self._session is None:
             self._refresh_state("セッションを作れませんでした")
+        else:
+            # 実行中も画面が固まらないよう、待ちの間にイベントを
+            # 回す口を渡す(停止ボタンを受け付けるため)。
+            self._session.pump = self._pump_events
         return self._session
+
+    @staticmethod
+    def _pump_events():
+        QApplication.processEvents()
 
     def _begin(self):
         if not self._run_begun and self._begin_run is not None:
@@ -148,22 +176,40 @@ class MacroPythonDialog(QDialog):
             self._end_run()
             self._run_begun = False
 
+    def _discard_session(self):
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def _set_running(self, running):
+        self._running = running
+        self._stop_button.setEnabled(running)
+        for widget in (self._run_button, self._step_button,
+                       self._reset_button, self._copy_button,
+                       self._save_button, self._close_button,
+                       self._name_edit, self._edit):
+            if widget is not None:
+                widget.setEnabled(not running)
+
     def step_once(self) -> bool:
         """次の1文を実行する。実行したら True。"""
         session = self._ensure_session()
         if session is None or session.done:
             return False
         self._begin()
+        self._set_running(True)
         try:
             session.step()
         except macro_py.PythonMacroError as e:
             self._finish()
             self._refresh_state(str(e))
             return False
+        finally:
+            self._set_running(False)
         if session.done:
             self._finish()
         self._refresh_state("")
-        return True
+        return not session.stopped
 
     def run_all(self) -> bool:
         """残りの文を通しで実行する。最後まで行ったら True。"""
@@ -171,20 +217,28 @@ class MacroPythonDialog(QDialog):
         if session is None or session.done:
             return False
         self._begin()
+        self._set_running(True)
         try:
             session.run_all()
         except macro_py.PythonMacroError as e:
             self._finish()
             self._refresh_state(str(e))
             return False
+        finally:
+            self._set_running(False)
         self._finish()
         self._refresh_state("")
-        return True
+        return not session.stopped
+
+    def stop_run(self):
+        """実行を止める(実行側の子プロセスを終了する)。"""
+        if self._session is not None:
+            self._session.stop()
 
     def reset_session(self):
         """実行の途中状態を捨てる(本文の変更は戻らない)。"""
         self._finish()
-        self._session = None
+        self._discard_session()
         self._refresh_state("")
 
     # ---------------------------------------------------------------
@@ -203,6 +257,9 @@ class MacroPythonDialog(QDialog):
         except Exception as e:  # noqa: BLE001
             self._finish()
             self._refresh_state(f"エラー: {e}")
+
+    def _on_stop(self):
+        self.stop_run()
 
     def _on_reset(self):
         self.reset_session()
@@ -248,6 +305,8 @@ class MacroPythonDialog(QDialog):
                 parts.append(f"print: {line}")
             if session.error is not None:
                 parts.append(str(session.error))
+            elif session.stopped:
+                parts.append("止めました")
             elif session.done:
                 parts.append("終わりました")
             else:
@@ -260,8 +319,8 @@ class MacroPythonDialog(QDialog):
         self._status_label.setText("\n".join(parts))
         self._highlight_next()
         can_run = session is None or not session.done
-        self._run_button.setEnabled(can_run)
-        self._step_button.setEnabled(can_run)
+        self._run_button.setEnabled(can_run and not self._running)
+        self._step_button.setEnabled(can_run and not self._running)
 
     def _highlight_next(self):
         selections = []
@@ -289,7 +348,18 @@ class MacroPythonDialog(QDialog):
                     self._edit.setTextCursor(caret)
         self._edit.setExtraSelections(selections)
 
+    def closeEvent(self, event):  # noqa: N802  Qt の上書き
+        # 実行中は閉じない(実行中のセッションを抱えたまま画面が
+        # 壊れるのを防ぐ)。先に停止してもらう。
+        if self._running:
+            event.ignore()
+            self._status_label.setText(
+                "実行中です。停止してから閉じてください")
+            return
+        super().closeEvent(event)
+
     def done(self, result):
         # 閉じるときに実行区間が開いたままなら、呼び側へ返す。
         self._finish()
+        self._discard_session()
         super().done(result)

@@ -2,12 +2,16 @@
 # マクロの Python 化(editor/macro_py.py と別窓・窓側の橋)を
 # offscreen で確かめる。記録 → Python 変換 → 再生で結果が同じに
 # なること、記録可能性の総点検(キー操作が一通り記録できる)、
-# ステップ実行、サンドボックスの約束、登録マクロの Python 形式。
+# ステップ実行、実行環境の約束(子プロセスで実行し、本体を
+# 巻き込まない・開いても実行しない・停止できる)、登録マクロの
+# Python 形式。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_editor_macro_py.py
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -20,10 +24,10 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 
 import editor  # noqa: E402
 from editor import macro_py  # noqa: E402
@@ -171,7 +175,7 @@ def test_stepper_errors_are_wrapped_with_line():
     assert stepper.done and stepper.error is not None
 
 
-def test_sandbox_blocks_builtins_and_imports():
+def test_execution_environment_blocks_builtins_and_imports():
     ed = _FakeEd()
     # open は builtins に無いので、名前として解決できない。
     stepper = macro_py.PythonStepper("open('x')\n", ed)
@@ -540,6 +544,161 @@ def test_python_current_macro_saves_only_as_py():
             assert Path(path).read_text(encoding="utf-8") == \
                 "ed.delete_line()\n"
     finally:
+        discard_close(window)
+
+
+# ---------------------------------------------------------------
+# 子プロセス化の固定(レビュー req-20261114-08 の指摘3件)
+# ---------------------------------------------------------------
+def test_ipc_carries_state_queries_and_print():
+    # 変数や繰り返しの状態は子の中で保たれ、ed の呼び出しと
+    # print は IPC 越しに親へ届く。
+    ed = _FakeEd()
+    stepper = macro_py.PythonStepper(
+        "n = 0\n"
+        "for i in range(5):\n"
+        "    n += i\n"
+        "ed.insert_text(str(n))\n"
+        "print('合計', n, ed.line_count())\n", ed)
+    try:
+        stepper.run_all()
+        assert stepper.done and stepper.error is None
+        assert ed.calls == [("insert_text", "10")]
+        assert stepper.output == ["合計 10 3"]
+    finally:
+        stepper.close()
+
+
+def test_frame_walk_escape_cannot_harm_parent():
+    # レビューの再現手順: ジェネレータの gi_frame → f_back を
+    # たどって本物の sys / os に届き、プロセスを落とす。子プロ
+    # セスで実行する今は、落ちるのは子だけで、本体の文書と
+    # プロセスは無事(このテスト自体が続くことが証拠)。
+    window = make_window("ab", cursor_pos=0)
+    try:
+        source = (
+            "def gen():\n"
+            "    frame = g.gi_frame\n"
+            "    found = None\n"
+            "    while frame is not None:\n"
+            "        if 'sys' in frame.f_globals:\n"
+            "            found = frame.f_globals['sys']\n"
+            "            break\n"
+            "        frame = frame.f_back\n"
+            "    if found is not None:\n"
+            "        found.modules['os'].abort()\n"
+            "    yield 1\n"
+            "g = gen()\n"
+            "for x in g:\n"
+            "    pass\n"
+            "ed.insert_text('X')\n"
+        )
+        assert macro_py.validate_python(source) is None
+        assert not window.play_python_macro(source)
+        assert window.text() == "ab"
+        assert "エラー" in window.statusBar().currentMessage()
+        # 本体は無事で、続けて普通のマクロも実行できる。
+        assert window.play_python_macro("ed.insert_text('Y')\n")
+        assert window.text() == "Yab"
+    finally:
+        discard_close(window)
+
+
+def test_infinite_loop_stopped_by_session_stop():
+    # 純粋な Python の無限ループは、stop() で子ごと止まる。
+    ed = _FakeEd()
+    stepper = macro_py.PythonStepper("while True:\n    pass\n", ed)
+    try:
+        worker = threading.Thread(target=stepper.run_all, daemon=True)
+        worker.start()
+        time.sleep(0.5)
+        assert worker.is_alive()
+        stepper.stop()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert stepper.stopped and stepper.done
+        assert stepper.error is None
+        assert stepper._proc.poll() is not None
+    finally:
+        stepper.close()
+
+
+def test_dialog_stop_button_stops_infinite_loop():
+    # 画面側でも、無限ループの最中に停止が効き、固まらない。
+    window = make_window("ab", cursor_pos=0)
+    dialog = MacroPythonDialog(
+        window,
+        source="while True:\n    pass\n",
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+    try:
+        dialog.show()
+        QTimer.singleShot(300, dialog.stop_run)
+        started = time.monotonic()
+        assert not dialog.run_all()
+        assert time.monotonic() - started < 5
+        session = dialog.session()
+        assert session is not None and session.stopped
+        assert "止めました" in dialog._status_label.text()
+        assert window.text() == "ab"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_python_dialog_does_not_run_until_pressed():
+    # 別窓を開いただけでは、セッションも作らず実行もしない。
+    window = make_window("ab", cursor_pos=0)
+    dialog = MacroPythonDialog(
+        window,
+        source="ed.insert_text('X')\n",
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+    try:
+        dialog.show()
+        app().processEvents()
+        assert dialog.session() is None
+        assert window.text() == "ab"
+        assert dialog.step_once()
+        assert window.text() == "Xab"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_load_macro_dialog_does_not_run():
+    # 「マクロを開く」は読み込むだけ。再生は利用者が「再生」を
+    # 押したときだけ(Python 形式・テキスト形式の両方)。
+    window = make_window("ab", cursor_pos=2)
+    original = QFileDialog.getOpenFileName
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            py_path = os.path.join(tmp, "m.py")
+            Path(py_path).write_text(
+                "ed.insert_text('X')\n", encoding="utf-8")
+            QFileDialog.getOpenFileName = staticmethod(
+                lambda *a, **k: (py_path, ""))
+            window.load_macro_dialog()
+            assert window._current_python_source is not None
+            assert window.text() == "ab"
+            # 明示の再生ではじめて動く。
+            assert window.play_macro()
+            assert window.text() == "abX"
+            # テキスト形式も、開いただけでは動かない。
+            txt_path = os.path.join(tmp, "m.txt")
+            Path(txt_path).write_text(
+                'insert_text "Z"\n', encoding="utf-8")
+            QFileDialog.getOpenFileName = staticmethod(
+                lambda *a, **k: (txt_path, ""))
+            window.load_macro_dialog()
+            assert window._current_python_source is None
+            assert window.text() == "abX"
+            assert window.play_macro()
+            assert window.text() == "abXZ"
+    finally:
+        QFileDialog.getOpenFileName = original
         discard_close(window)
 
 

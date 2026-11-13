@@ -7,31 +7,48 @@
 #   commands_to_python(commands, name) … 命令の列を Python の
 #     ソースへ変換する。API は ed という1つの名前だけで、命令名と
 #     同じ名前の関数を呼ぶ形にする(下の API_SPEC が表面の正本)。
-#   validate_python(source) … 構文と、実行環境の約束(下記)に反して
+#   validate_python(source) … 構文と、書き方の約束(下記)に反して
 #     いないかを確かめ、問題があれば理由の文を返す(無ければ None)。
-#   PythonStepper … ソースを文(statement)単位で実行する。通し
-#     実行と1文ずつのステップ実行の両方に使う(窓側のセッションが
-#     編集ブロックで包む)。
+#   PythonStepper … ソースを文(statement)単位で実行するセッション。
+#     通し実行と1文ずつのステップ実行の両方に使う(窓側が編集
+#     ブロックで包む)。
 #
 # 逆変換(Python → 命令の列)は作らない。Python は命令の列より表現
 # 力が広く(条件分岐・繰り返し・変数が書ける)、戻せる保証が無い
 # ため。登録マクロは、命令の列の形と Python の形のどちらでも
 # 持てる(editor/macros.py の sanitize_registered が両方受ける)。
 #
-# 実行環境の約束(サンドボックス寄り):
+# 実行の置き場所(2026-11-14 のレビュー req-20261114-08 で変更):
+#   Python マクロは「利用者が自分で書いたプログラム」として扱い、
+#   EDDy 本体とは別のプロセス(子プロセス)で実行する。本体の中で
+#   exec する作りはやめた(ジェネレータの gi_frame → f_back を
+#   たどると本体のモジュールに届き、本体ごと落とせたため)。
+#   子プロセスとの間は UTF-8 の JSON 行プロトコルで、ed の呼び
+#   出しは IPC で親へ届き、親が文書へ適用する。print の出力も
+#   IPC で戻す。子の中で何をしても(os に届く・重い計算・無限
+#   ループ・子が落ちる)本体は無事で、stop() で子を終了できる。
+#   rxfind の子プロセス方式が前例(ただしあちらは1回ごとの実行、
+#   こちらはセッションの間ずっと生きる子と往復する)。
+#
+# 書き方の約束(安全のためではなく、EDDy のマクロとして書く
+# ための決まり。実態は利用者のプログラムなので、これを破る
+# 方法が残っていても本体は別プロセスで守られる):
 #   - 名前として渡すのは ed(API)だけ。builtins は必要最小限の組
-#     (SAFE_BUILTINS)だけに絞る。open / eval / exec / compile /
-#     __import__ / getattr などは渡さない。
+#     だけに絞る。open / eval / exec / compile / __import__ /
+#     getattr などは渡さない。
 #   - import は書けない(検証で落とす)。
 #   - 属性は「_」で始まるものに触れない(検証で落とす)。
-#     __class__ などをたどる抜け道を塞ぐため。
 #   - ed の命令の呼び出し回数と、実行した行数に上限を設ける
-#     (無限ループで窓が固まらないため。純粋な計算だけの無限
-#     ループは行数の上限で止める)。
+#     (暴走したときに、子が黙って回り続けないため)。
 #   ファイルや OS へ直接触れる口は API に含めない(ed の読み取りは
 #   今の文書の内容だけ)。
 import ast
+import json
+import queue
+import subprocess
 import sys
+import threading
+import time
 
 # 引数が必須であることの印(API_SPEC の既定値の代わりに入れる)。
 REQUIRED = object()
@@ -88,21 +105,25 @@ QUERY_NAMES = ("text", "selected_text", "cursor_line", "line_count")
 # 生成コードで位置引数にする命令(先頭の引数だけを裸で書く)。
 _POSITIONAL = {"insert_text", "goto_line", "sort_lines"}
 
-# 実行に渡す builtins の最小限の組。print はセッション側が受け
-# 取れるよう、Stepper が自前の関数に差し替える。
-SAFE_BUILTINS = {
-    "range": range, "len": len, "str": str, "int": int,
-    "float": float, "bool": bool, "list": list, "dict": dict,
-    "tuple": tuple, "set": set, "enumerate": enumerate, "zip": zip,
-    "min": min, "max": max, "sum": sum, "abs": abs,
-    "sorted": sorted, "reversed": reversed,
-}
+# 子プロセスの中で実行に渡す builtins の最小限の組の名前(print は
+# 子側で IPC へ流す自前の関数に差し替える)。本体の守りは別
+# プロセスであることであって、この絞り込みは「EDDy のマクロ
+# として書くときの約束」をそろえるためのもの。
+SAFE_BUILTIN_NAMES = (
+    "range", "len", "str", "int", "float", "bool", "list", "dict",
+    "tuple", "set", "enumerate", "zip", "min", "max", "sum", "abs",
+    "sorted", "reversed",
+)
 
-# 暴走止めの上限。ed の呼び出し回数と、実行した行イベントの数。
+# 暴走止めの上限。ed の呼び出し回数と、実行した行イベントの数
+# (子側で数える。値はセッション開始時に子へ渡す)。
 API_CALL_LIMIT = 100_000
 LINE_EVENT_LIMIT = 5_000_000
 
 FILENAME = "<eddymacro>"
+
+# 子プロセスがソースを受けて ready を返すまでの待ち上限(秒)。
+_INIT_TIMEOUT_SEC = 15.0
 
 
 class PythonMacroError(Exception):
@@ -161,7 +182,7 @@ def _command_to_line(entry):
 
 
 # ---------------------------------------------------------------
-# 検証(構文 + 実行環境の約束)
+# 検証(構文 + 書き方の約束)
 # ---------------------------------------------------------------
 def validate_python(source):
     """ソースを検証し、問題があれば理由の文を、無ければ None を
@@ -181,142 +202,498 @@ def validate_python(source):
     return None
 
 
+
 # ---------------------------------------------------------------
-# 実行(文単位。通し実行とステップ実行の共通部)
+# 子プロセス(マクロの実行側)
 # ---------------------------------------------------------------
-class _ApiProxy:
-    """ed の包み。呼び出し回数を数えるために挟む。
+# rxfind と同じく、子は editor パッケージを import しない(パスの
+# 前提を作らないため)。検証と文単位の実行は、親側と同じ意味の
+# 処理を標準ライブラリだけで書き直したもの。
+#
+# 親 → 子: {"type": "init", "source", "api_limit", "line_limit"}
+#          {"type": "step"} / {"type": "run_all"} / {"type": "quit"}
+#          {"type": "result", "id", "value"} /
+#          {"type": "call_error", "id", "exc", "message"}
+# 子 → 親: {"type": "ready", "total", "statements": [[開始行, 終了行]]}
+#          {"type": "call", "id", "name", "args", "kwargs"}
+#          {"type": "print", "text"}
+#          {"type": "stepped", "lineno", "position", "done"} /
+#          {"type": "finished", "position"} /
+#          {"type": "error", "message", "lineno", "position"?}
+# 入出力はバイト列のまま読み書きし、UTF-8 と決め打ちする(rxfind
+# と同じ理由。OS 既定の文字コードに任せると日本語が化ける)。
+_CHILD_CODE = r"""
+import ast, builtins, json, sys
 
-    属性の読み取りは元のオブジェクトへそのまま通し、呼び出し
-    可能なら「数えてから呼ぶ」関数で包む。"""
+FILENAME = "<eddymacro>"
+SAFE_NAMES = ("range", "len", "str", "int", "float", "bool", "list",
+              "dict", "tuple", "set", "enumerate", "zip", "min",
+              "max", "sum", "abs", "sorted", "reversed")
 
-    def __init__(self, target, on_call):
-        object.__setattr__(self, "_target", target)
-        object.__setattr__(self, "_on_call", on_call)
 
+class Fail(Exception):
+    # 親へ error として返す失敗(親で組み立て直さず、この文を使う)。
+    def __init__(self, message, lineno):
+        super().__init__(message)
+        self.message = message
+        self.lineno = lineno
+
+
+class LimitError(Exception):
+    pass
+
+
+class RemoteError(Exception):
+    # 親側で ed の実体が上げた例外(型名と文だけを運ぶ)。
+    def __init__(self, exc, message):
+        super().__init__(message)
+        self.exc = exc
+        self.message = message
+
+
+def send(msg):
+    sys.stdout.buffer.write(
+        json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def read_msg():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        raise EOFError
+    return json.loads(line.decode("utf-8"))
+
+
+_state = {"api_calls": 0, "line_events": 0, "next_id": 0,
+          "api_limit": 100000, "line_limit": 5000000}
+
+
+def rpc_call(name, args, kwargs):
+    _state["api_calls"] += 1
+    if _state["api_calls"] > _state["api_limit"]:
+        raise LimitError(
+            "ed の呼び出し回数が上限を超えたため止めました"
+            "（無限ループの疑い）")
+    _state["next_id"] += 1
+    cid = _state["next_id"]
+    send({"type": "call", "id": cid, "name": name,
+          "args": args, "kwargs": kwargs})
+    while True:
+        msg = read_msg()
+        if msg.get("type") == "result" and msg.get("id") == cid:
+            return msg.get("value")
+        if msg.get("type") == "call_error" and msg.get("id") == cid:
+            raise RemoteError(msg.get("exc") or "Error",
+                              msg.get("message") or "")
+
+
+class Ed:
     def __getattr__(self, name):
-        target = object.__getattribute__(self, "_target")
-        value = getattr(target, name)
-        if not callable(value):
-            return value
-        on_call = object.__getattribute__(self, "_on_call")
+        if name.startswith("_"):
+            raise AttributeError(name)
 
-        def counted(*args, **kwargs):
-            on_call()
-            return value(*args, **kwargs)
+        def call(*args, **kwargs):
+            return rpc_call(name, list(args), kwargs)
 
-        return counted
+        return call
 
 
+def macro_print(*args, **_kwargs):
+    send({"type": "print",
+          "text": " ".join(str(arg) for arg in args)})
+
+
+def validate(source):
+    try:
+        tree = ast.parse(source, FILENAME)
+    except SyntaxError as e:
+        return (f"{e.lineno} 行目: 構文が読めません（{e.msg}）",
+                e.lineno)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return (f"{node.lineno} 行目: import は使えません"
+                    "（マクロで使えるのは ed の命令だけです）",
+                    node.lineno)
+        if isinstance(node, ast.Attribute) and \
+                node.attr.startswith("_"):
+            return (f"{node.lineno} 行目: 「_」で始まる属性"
+                    f"（{node.attr}）には触れません", node.lineno)
+    return None
+
+
+def exec_in_child(code, namespace):
+    # マクロ自身の行だけを行数上限の対象にする(子の内部は数えない)。
+    def tracer(frame, event, _arg):
+        if event == "line" and \
+                frame.f_code.co_filename == FILENAME:
+            _state["line_events"] += 1
+            if _state["line_events"] > _state["line_limit"]:
+                raise LimitError(
+                    "実行した行数が上限を超えたため止めました"
+                    "（無限ループの疑い）")
+        return tracer
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(tracer)
+        try:
+            exec(code, namespace)
+        finally:
+            sys.settrace(previous)
+    except LimitError:
+        raise
+
+
+def main():
+    init = read_msg()
+    if init.get("type") != "init":
+        return
+    _state["api_limit"] = int(init.get("api_limit")
+                              or _state["api_limit"])
+    _state["line_limit"] = int(init.get("line_limit")
+                               or _state["line_limit"])
+    source = str(init.get("source") or "")
+    problem = validate(source)
+    if problem is not None:
+        send({"type": "error", "message": problem[0],
+              "lineno": problem[1]})
+        return
+    tree = ast.parse(source, FILENAME)
+    statements = list(tree.body)
+    safe = {name: getattr(builtins, name) for name in SAFE_NAMES}
+    safe["print"] = macro_print
+    namespace = {"__builtins__": safe, "ed": Ed()}
+    position = [0]
+
+    def run_one():
+        node = statements[position[0]]
+        module = ast.Module(body=[node], type_ignores=[])
+        try:
+            code = compile(module, FILENAME, "exec")
+        except SyntaxError as e:
+            raise Fail(f"{node.lineno} 行目: 構文が読めません"
+                       f"（{e.msg}）", node.lineno)
+        try:
+            exec_in_child(code, namespace)
+        except LimitError as e:
+            # 上限の文は行番号を付けず、そのまま親へ返す。
+            raise Fail(str(e), node.lineno)
+        except RemoteError as e:
+            raise Fail(f"{node.lineno} 行目: {e.exc}: {e.message}",
+                       node.lineno)
+        except Fail:
+            raise
+        except Exception as e:  # 利用者のコードの失敗
+            raise Fail(f"{node.lineno} 行目: "
+                       f"{type(e).__name__}: {e}", node.lineno)
+        position[0] += 1
+        return node.lineno
+
+    send({"type": "ready", "total": len(statements),
+          "statements": [[node.lineno, node.end_lineno or node.lineno]
+                          for node in statements]})
+    while True:
+        msg = read_msg()
+        kind = msg.get("type")
+        if kind == "quit":
+            return
+        if kind == "step":
+            if position[0] >= len(statements):
+                send({"type": "stepped", "lineno": None,
+                      "position": position[0], "done": True})
+                continue
+            try:
+                lineno = run_one()
+            except Fail as f:
+                send({"type": "error", "message": f.message,
+                      "lineno": f.lineno, "position": position[0]})
+                continue
+            send({"type": "stepped", "lineno": lineno,
+                  "position": position[0],
+                  "done": position[0] >= len(statements)})
+        elif kind == "run_all":
+            try:
+                while position[0] < len(statements):
+                    run_one()
+            except Fail as f:
+                send({"type": "error", "message": f.message,
+                      "lineno": f.lineno, "position": position[0]})
+                continue
+            send({"type": "finished", "position": position[0]})
+
+
+try:
+    main()
+except EOFError:
+    pass
+"""
+
+
+# ---------------------------------------------------------------
+# 実行セッション(親側。実体は子プロセス)
+# ---------------------------------------------------------------
 class PythonStepper:
-    """Python マクロを文(statement)単位で実行する。
+    """Python マクロを文(statement)単位で実行するセッション。
 
-    api は ed として渡すオブジェクト(属性が API の関数)。1文が
-    複数行にまたがるとき(if 文や関数定義など)は、その文全体を
+    実体は子プロセス(上の _CHILD_CODE)で、このクラスは親側の
+    受け口。api は ed の実体(属性が API の関数であるオブジェ
+    クト)で、子からの呼び出しを親が受けて適用する。1文が複数
+    行にまたがるとき(if 文や関数定義など)は、その文全体を
     1ステップとして実行する。
 
-    状態: position(次に実行する文の番号)、done、error
-    (PythonMacroError か None)。step() は実行した文の開始行番号を
-    返し、もう文が無ければ None。実行で例外が出たら error に
-    入れて done にし、その例外を PythonMacroError に包んで上げる
-    (呼び側は error を見てもよい)。"""
+    状態: position(次に実行する文の番号)、done、stopped
+    (stop() で止めた)、error(PythonMacroError か None)。
+    step() は実行した文の開始行番号を返し、もう文が無ければ
+    None(止めたときも None で、error には入らない)。実行で
+    例外が出たら error に入れて done にし、その例外を
+    PythonMacroError に包んで上げる(呼び側は error を見ても
+    よい)。print の出力は output に溜まる。
 
-    def __init__(self, source, api):
+    pump は、子の応答を待つ間に繰り返し呼ばれる口(窓側が
+    イベント処理を渡す。画面を固まらせず、停止を受け付ける
+    ため)。スレッドから stop() を呼んでもよい。"""
+
+    def __init__(self, source, api, pump=None):
         error = validate_python(source)
         if error is not None:
             raise PythonMacroError(error)
-        self._tree = ast.parse(str(source), FILENAME)
-        self._statements = list(self._tree.body)
         self._api = api
+        self.pump = pump
         self.output = []          # print の受け取り先
         self.position = 0
         self.error = None
-        self._api_calls = 0
-        namespace = {"__builtins__": dict(SAFE_BUILTINS)}
-        namespace["__builtins__"]["print"] = self._print
-        namespace["ed"] = _ApiProxy(api, self._count_api_call)
-        self._namespace = namespace
-        self._line_events = 0
-
-    def _count_api_call(self):
-        self._api_calls += 1
-        if self._api_calls > API_CALL_LIMIT:
+        self.stopped = False
+        self._total = 0
+        self._statement_lines = []
+        self._queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._send_lock = threading.Lock()
+        self._closed = False
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, "-c", _CHILD_CODE],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
             raise PythonMacroError(
-                "ed の呼び出し回数が上限を超えたため止めました"
-                "（無限ループの疑い）")
+                f"マクロを実行できませんでした（{e}）") from None
+        self._reader = threading.Thread(
+            target=self._read_loop, name="eddymacro-reader",
+            daemon=True)
+        self._reader.start()
+        try:
+            self._send({"type": "init", "source": str(source),
+                        "api_limit": API_CALL_LIMIT,
+                        "line_limit": LINE_EVENT_LIMIT})
+            reply = self._serve({"ready", "error"},
+                                timeout=_INIT_TIMEOUT_SEC)
+        except PythonMacroError:
+            self.close()
+            raise
+        if reply is None:  # 開始前に止められた
+            self.close()
+            raise PythonMacroError("マクロの実行を止めました")
+        if reply.get("type") == "error":
+            message = reply.get("message") or "マクロを実行できません"
+            lineno = reply.get("lineno")
+            self.close()
+            raise PythonMacroError(message, lineno)
+        self._total = int(reply.get("total") or 0)
+        self._statement_lines = [
+            (int(pair[0]), int(pair[1]))
+            for pair in (reply.get("statements") or [])]
 
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # 子との往復
+    # ---------------------------------------------------------------
+    def _read_loop(self):
+        try:
+            for raw in self._proc.stdout:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if isinstance(msg, dict):
+                    self._queue.put(msg)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._queue.put(None)   # 終わり(EOF)の印
+
+    def _send(self, msg):
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+        data = (json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                + b"\n")
+        with self._send_lock:
+            try:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass    # 子が既に終わっている。受け側で検出する
+
+    def _answer_call(self, msg):
+        """子からの ed の呼び出しを、親の実体へ適用して返す。"""
+        cid = msg.get("id")
+        name = str(msg.get("name") or "")
+        fn = getattr(self._api, name, None)
+        if fn is None or not callable(fn):
+            self._send({"type": "call_error", "id": cid,
+                        "exc": "AttributeError",
+                        "message": f"ed に {name} はありません"})
+            return
+        args = msg.get("args") or []
+        kwargs = msg.get("kwargs") or {}
+        try:
+            value = fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001  型名と文だけ子へ返す
+            self._send({"type": "call_error", "id": cid,
+                        "exc": type(e).__name__, "message": str(e)})
+            return
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            value = None    # JSON で運べない戻り値は None に落とす
+        self._send({"type": "result", "id": cid, "value": value})
+
+    def _serve(self, kinds, timeout=None):
+        """kinds のどれかの消息が来るまで、call / print を捌く。
+
+        その消息を返す。stop() で止められたら None(呼び側が
+        stopped を立てる)。子が消息なく終わったら
+        PythonMacroError。timeout(秒)を過ぎても同じ。"""
+        deadline = None if timeout is None \
+            else time.monotonic() + timeout
+        while True:
+            if self._stop_event.is_set():
+                self._kill()
+                return None
+            wait = 0.01
+            if deadline is not None:
+                rest = deadline - time.monotonic()
+                if rest <= 0:
+                    raise PythonMacroError(
+                        "マクロの実行が時間内に始まりませんでした")
+                wait = min(wait, rest)
+            try:
+                msg = self._queue.get(timeout=wait)
+            except queue.Empty:
+                if self.pump is not None:
+                    self.pump()
+                continue
+            if msg is None:     # 子が終わった
+                if self._stop_event.is_set():
+                    return None
+                raise PythonMacroError(
+                    "マクロの実行が途中で終わりました"
+                    "（実行側のプロセスが終了しました）")
+            kind = msg.get("type")
+            if kind == "call":
+                self._answer_call(msg)
+                continue
+            if kind == "print":
+                self.output.append(str(msg.get("text") or ""))
+                continue
+            if kind in kinds:
+                return msg
+            # 想定外の消息は読み捨てる。
+
+    def _kill(self):
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    # ---------------------------------------------------------------
+    # 状態
+    # ---------------------------------------------------------------
     @property
     def done(self):
-        return self.error is not None or self.position >= len(self._statements)
+        return (self.error is not None or self.stopped
+                or self.position >= self._total)
 
     @property
     def total(self):
-        return len(self._statements)
+        return self._total
 
     def next_lineno(self):
         """次に実行する文の開始行番号。無ければ None。"""
-        if self.done:
+        if self.done or self.position >= len(self._statement_lines):
             return None
-        return self._statements[self.position].lineno
+        return self._statement_lines[self.position][0]
 
     def statement_lines(self):
         """(開始行, 終了行) の並び(窓側の現在行表示用)。"""
-        return [(node.lineno, node.end_lineno or node.lineno)
-                for node in self._statements]
+        return list(self._statement_lines)
 
-    # ------------------------------------------------------------------
-    def _print(self, *args, **_kwargs):
-        self.output.append(" ".join(str(arg) for arg in args))
-
-    def _count_lines(self, frame, event, _arg):
-        # マクロ自身の行だけを数える(API の中身は数えない)。
-        if event == "line" and frame.f_code.co_filename == FILENAME:
-            self._line_events += 1
-            if self._line_events > LINE_EVENT_LIMIT:
-                raise PythonMacroError(
-                    "実行した行数が上限を超えたため止めました"
-                    "（無限ループの疑い）")
-        return self._count_lines
-
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # 実行
+    # ---------------------------------------------------------------
     def step(self):
         """次の1文を実行する。実行した文の開始行番号を返す。"""
         if self.done:
             return None
-        node = self._statements[self.position]
-        module = ast.Module(body=[node], type_ignores=[])
-        try:
-            code = compile(module, FILENAME, "exec")
-        except SyntaxError as e:  # 解析で通っているので通常は無い
+        self._send({"type": "step"})
+        reply = self._serve({"stepped", "error"})
+        if reply is None:
+            self.stopped = True
+            return None
+        if reply.get("type") == "error":
             self.error = PythonMacroError(
-                f"{node.lineno} 行目: 構文が読めません（{e.msg}）",
-                node.lineno)
+                reply.get("message") or "マクロの実行に失敗しました",
+                reply.get("lineno"))
             raise self.error
-        previous_trace = sys.gettrace()
-        try:
-            sys.settrace(self._count_lines)
-            try:
-                exec(code, self._namespace)  # noqa: S102  検証済みの自前コード
-            finally:
-                sys.settrace(previous_trace)
-        except PythonMacroError as e:
-            if e.lineno is None:
-                e.lineno = node.lineno
-            self.error = e
-            raise
-        except Exception as e:  # noqa: BLE001  利用者のコードの失敗
-            self.error = PythonMacroError(
-                f"{node.lineno} 行目: {type(e).__name__}: {e}",
-                node.lineno)
-            raise self.error
-        self.position += 1
-        return node.lineno
+        self.position = int(reply.get("position") or 0)
+        return reply.get("lineno")
 
     def run_all(self):
         """残りの文を全部実行する。失敗したらそこで止まる。"""
-        while not self.done:
-            self.step()
+        if self.done:
+            return
+        self._send({"type": "run_all"})
+        reply = self._serve({"finished", "error"})
+        if reply is None:
+            self.stopped = True
+            return
+        if reply.get("type") == "error":
+            self.error = PythonMacroError(
+                reply.get("message") or "マクロの実行に失敗しました",
+                reply.get("lineno"))
+            raise self.error
+        self.position = int(reply.get("position") or 0)
+
+    def stop(self):
+        """実行を止める(子プロセスを終了する)。
+
+        無限ループの最中でも効く(子ごと落とすため)。実行待ちの
+        step / run_all は、例外ではなく stopped を立てて戻る。"""
+        self._stop_event.set()
+        self._kill()
+
+    def close(self):
+        """セッションを閉じ、子プロセスを残さない。"""
+        if self._closed:
+            return
+        self._closed = True
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            self._send({"type": "quit"})
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
 
 
 def api_names():

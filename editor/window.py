@@ -179,6 +179,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 
 from PySide6.QtCore import (
     QFileSystemWatcher,
@@ -2027,7 +2028,7 @@ class EditorWindow(QMainWindow):
         macro_menu.addSeparator()
         self._action("マクロを保存(&S)…", self.save_macro_dialog,
                      None, macro_menu)
-        self._action("マクロを開いて再生(&O)…", self.load_macro_dialog,
+        self._action("マクロを開く(&O)…", self.load_macro_dialog,
                      None, macro_menu)
         macro_menu.addSeparator()
         self._action("マクロの管理(&G)…", self.show_macro_library,
@@ -4246,12 +4247,13 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     # Python マクロ(editor/macro_py.py)
     # ---------------------------------------------------------------
-    def _make_python_session(self, source):
+    def _make_python_session(self, source, pump=None):
         """Python マクロの実行セッションを作る。文法が読めなければ
-        ステータスに出して None。"""
+        ステータスに出して None。作るだけでは実行しない(実行は
+        子プロセスで、step / run_all を呼んだときだけ)。"""
         try:
             return macro_py.PythonStepper(
-                source, _EditorPyApi(self).api_object())
+                source, _EditorPyApi(self).api_object(), pump=pump)
         except macro_py.PythonMacroError as e:
             self.statusBar().showMessage(
                 f"Python マクロのエラー: {e}", 8000)
@@ -4273,12 +4275,37 @@ class EditorWindow(QMainWindow):
     def play_python_macro(self, source) -> bool:
         """Python のマクロを通しで実行する。
 
-        実行は EDDy の中だけで完結する(外部プロセスには投げない)。
-        全体は1回の undo で戻せる単位にする(play_macro と同じ)。
-        エラーは行番号つきでステータスに出す。"""
-        session = self._make_python_session(source)
+        実行は本体とは別のプロセスで行う(利用者のプログラムと
+        して扱い、本体を巻き込まないため)。全体は1回の undo で
+        戻せる単位にする(play_macro と同じ)。エラーは行番号
+        つきでステータスに出す。実行が長引いたら「停止」の小さな
+        窓を出し、止められるようにする(子プロセスごと終了する
+        ので、無限ループでも本体は固まらない)。"""
+        session_box = {}
+        stop_dialog_box = {}
+        started = time.monotonic()
+
+        def pump():
+            QGuiApplication.processEvents()
+            session = session_box.get("session")
+            if (session is not None and "dialog" not in stop_dialog_box
+                    and not session.done
+                    and time.monotonic() - started > 0.3):
+                dialog = QDialog(self)
+                dialog.setWindowTitle("マクロ (Python) - EDDy")
+                dialog.setModal(True)
+                layout = QVBoxLayout(dialog)
+                layout.addWidget(QLabel("Python マクロを実行しています"))
+                stop_button = QPushButton("停止")
+                stop_button.clicked.connect(session.stop)
+                layout.addWidget(stop_button)
+                stop_dialog_box["dialog"] = dialog
+                dialog.show()
+
+        session = self._make_python_session(source, pump=pump)
         if session is None:
             return False
+        session_box["session"] = session
         self._begin_python_run()
         try:
             session.run_all()
@@ -4287,7 +4314,15 @@ class EditorWindow(QMainWindow):
                 f"Python マクロのエラー: {e}", 8000)
             return False
         finally:
+            dialog = stop_dialog_box.get("dialog")
+            if dialog is not None:
+                dialog.close()
+                dialog.deleteLater()
+            session.close()
             self._end_python_run()
+        if session.stopped:
+            self.statusBar().showMessage("Python マクロを止めました", 8000)
+            return False
         if session.output:
             self.statusBar().showMessage(
                 "print: " + " / ".join(session.output), 8000)
@@ -4416,9 +4451,16 @@ class EditorWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001  理由は利用者への文にする
             self.statusBar().showMessage(f"マクロを読めませんでした: {e}")
             return
-        # Python のマクロは命令の列が空で返るので、その場合は
-        # 「いまのマクロ」の再生(play_macro の Python 振り分け)に任せる。
-        self.play_macro(commands if commands else None)
+        # 開く・読み込むだけでは実行しない(実行は利用者が「再生」
+        # や Python の画面の実行ボタンを押したときだけ)。
+        if self._current_python_source:
+            self.statusBar().showMessage(
+                "Python マクロを読み込みました"
+                "（再生は「再生」から）", 6000)
+        else:
+            self.statusBar().showMessage(
+                f"マクロを読み込みました（{len(commands)} 手。"
+                "再生は「再生」から）", 6000)
 
     # ---------------------------------------------------------------
     # 登録マクロ(名前を付けて設定に残し、メニューとキーで呼ぶ)

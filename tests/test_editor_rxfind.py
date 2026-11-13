@@ -188,6 +188,31 @@ def test_run_operation_with_non_utf8_stdio():
             os.environ["PYTHONIOENCODING"] = old
 
 
+def test_find_all_spans_and_limit():
+    rx = rxfind.compile_search(r"\d+", regex=True)
+    spans, truncated = rxfind.find_all_spans("a1 b22 c333", rx, 100)
+    assert spans == [(1, 2), (4, 6), (8, 11)]
+    assert not truncated
+    spans, truncated = rxfind.find_all_spans("a1 b22 c333", rx, 2)
+    assert spans == [(1, 2), (4, 6)]
+    assert truncated
+    # ちょうど上限で終わるときは打ち切りではない。
+    spans, truncated = rxfind.find_all_spans("a1 b22", rx, 2)
+    assert spans == [(1, 2), (4, 6)]
+    assert not truncated
+
+
+def test_find_all_operation():
+    result = rxfind.run_operation("find_all", text="x1 y22 z333",
+                                  pattern=r"\d+", regex=True, limit=100)
+    assert result["spans"] == [(1, 2), (4, 6), (8, 11)]
+    assert result["truncated"] is False
+    result = rxfind.run_operation("find_all", text="x1 y22 z333",
+                                  pattern=r"\d+", regex=True, limit=1)
+    assert result["spans"] == [(1, 2)]
+    assert result["truncated"] is True
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

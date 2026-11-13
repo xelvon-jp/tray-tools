@@ -308,6 +308,172 @@ def test_sanitize_session_drops_garbage():
     assert good[0]["tabs"][0]["text"] == "文"
 
 
+def test_corrupt_session_file_is_evacuated_not_overwritten():
+    """壊れた控えは、次の保存で黙って上書きせず、別名へ退避する。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        path.write_bytes("{壊れた json".encode("utf-8"))
+        assert sessionmod.load_session_file(path) == []
+        # 元の場所からは退避され、壊れた中身がそのまま残る。
+        assert not path.exists()
+        backup = Path(str(path) + ".broken")
+        assert backup.read_bytes() == "{壊れた json".encode("utf-8")
+        # 知らせは1回だけ受け取れる。
+        notice = sessionmod.take_corrupt_notice(path)
+        assert notice is not None and notice["backup"] == str(backup)
+        assert sessionmod.take_corrupt_notice(path) is None
+        # 退避の後に書いた控えは、新しいファイルとして残る。
+        sessionmod.save_session_file(path, [{"tabs": [{
+            "path": None, "dirty": True, "text": "文",
+            "encoding": "utf-8", "bom": False, "newline": "\n",
+            "cursor": 1, "anchor": 1}], "active": 0}])
+        loaded = sessionmod.load_session_file(path)
+        assert loaded[0]["tabs"][0]["text"] == "文"
+        assert backup.exists()  # 退避した控えは消えていない
+
+
+def test_misshapen_session_file_is_evacuated_with_serial():
+    """JSON としては読めても形の崩れた控えも退避し、連番にする。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        assert sessionmod.load_session_file(path) == []
+        assert Path(str(path) + ".broken").exists()
+        sessionmod.take_corrupt_notice(path)
+        path.write_text('{"version": 1}', encoding="utf-8")
+        assert sessionmod.load_session_file(path) == []
+        # 2回目の退避は、最初の退避を上書きしない。
+        assert Path(str(path) + ".broken").read_text(
+            encoding="utf-8") == "[1, 2, 3]"
+        assert Path(str(path) + ".broken-2").read_text(
+            encoding="utf-8") == '{"version": 1}'
+
+
+def test_valid_session_file_is_not_evacuated():
+    """形の合った控え(空でも)は退避されず、知らせも出ない。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        path.write_text('{"version": 1, "windows": []}',
+                        encoding="utf-8")
+        assert sessionmod.load_session_file(path) == []
+        assert path.exists()
+        assert sessionmod.take_corrupt_notice(path) is None
+
+
+def test_window_reports_corrupt_session():
+    """壊れた控えで開いた窓は、退避したことをステータスに残す。"""
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "editor_session.json").write_bytes(b"not json")
+        window = make_window(d)
+        try:
+            message = window.statusBar().currentMessage()
+            assert "退避しました" in message
+            assert (Path(d) / "editor_session.json.broken").exists()
+        finally:
+            close_window(window)
+
+
+def _break_session_save():
+    """sessionmod.save を失敗させる差し替え。元を返す。"""
+    original = sessionmod.save
+
+    def broken(path):
+        raise OSError("書けない(テスト)")
+
+    sessionmod.save = broken
+    return original
+
+
+def test_close_asks_when_session_save_fails_and_cancel_keeps_window():
+    """控えが書けないとき、無言で閉じず「閉じない」で窓が残る。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        original = _break_session_save()
+        try:
+            type_text(window, "消えたら困る編集")
+            window.ask_session_save_failed = lambda: "cancel"
+            closed = []
+            window.closed.connect(closed.append)
+            window.close()
+            app().processEvents()
+            assert closed == []          # 閉じていない
+            assert window.isVisible()
+        finally:
+            sessionmod.save = original
+        close_window(window)
+
+
+def test_close_discards_only_when_user_chooses():
+    """控えが書けなくても、「そのまま閉じる」を選べば閉じられる。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        original = _break_session_save()
+        try:
+            type_text(window, "捨てる編集")
+            window.ask_session_save_failed = lambda: "discard"
+            closed = []
+            window.closed.connect(closed.append)
+            window.close()
+            app().processEvents()
+            assert len(closed) == 1
+        finally:
+            sessionmod.save = original
+            window.deleteLater()
+            app().processEvents()
+
+
+def test_close_retry_writes_session_and_closes():
+    """「もう一度試す」で控えが書ければ、内容を残して閉じられる。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        original = sessionmod.save
+        attempts = {"count": 0}
+
+        def flaky(path):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise OSError("一時的に書けない(テスト)")
+            return original(path)
+
+        sessionmod.save = flaky
+        try:
+            type_text(window, "残したい編集")
+            window.ask_session_save_failed = lambda: "retry"
+            closed = []
+            window.closed.connect(closed.append)
+            window.close()
+            app().processEvents()
+            assert len(closed) == 1
+        finally:
+            sessionmod.save = original
+            window.deleteLater()
+            app().processEvents()
+        loaded = sessionmod.load_session_file(
+            Path(d) / "editor_session.json")
+        assert loaded[0]["tabs"][0]["text"] == "残したい編集"
+
+
+def test_close_without_edits_does_not_ask_when_save_fails():
+    """未保存の編集が無ければ、控えが書けなくても聞かずに閉じる。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        original = _break_session_save()
+        try:
+            def forbidden():
+                raise AssertionError("聞かれてはいけない")
+
+            window.ask_session_save_failed = forbidden
+            closed = []
+            window.closed.connect(closed.append)
+            window.close()
+            app().processEvents()
+            assert len(closed) == 1
+        finally:
+            sessionmod.save = original
+            window.deleteLater()
+            app().processEvents()
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

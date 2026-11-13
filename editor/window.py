@@ -287,6 +287,12 @@ SESSION_SAVE_DELAY_MS = 500
 # 打つたびに別プロセスを起こさないための待ちで、通常の文字列の
 # ときは待たずにその場で探す。
 INCREMENTAL_SEARCH_DELAY_MS = 120
+# 検索の一致箇所すべての色付けの上限(件)。文書が大きく一致が
+# 膨大でも固まらないよう、先頭からこの件数までだけ色を付ける。
+SEARCH_HIGHLIGHT_LIMIT = 1000
+# 編集中に色付けを付け直すまでの間引き(ms)。打つたびに数え直さ
+# ないための待ち(セッションの控えの遅延と同じ考え方)。
+HIGHLIGHT_REFRESH_DELAY_MS = 300
 
 # キー割り当て(settings の editor 節 keymap のキー)。値は命令名 →
 # キーの上書き分(既定と違う項目だけ。割り当てを外した命令は空文字列)
@@ -714,6 +720,15 @@ class EditorWindow(QMainWindow):
         self._inc_timer = QTimer(self)
         self._inc_timer.setSingleShot(True)
         self._inc_timer.timeout.connect(self._do_incremental_search)
+        # 検索の一致箇所の色付けの付け直し(編集で古い位置に残さ
+        # ないため)。間引きして、止まってから付け直す。色を付け
+        # ているビューも控える(タブを切り替えたら前の分を消す)。
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.setInterval(HIGHLIGHT_REFRESH_DELAY_MS)
+        self._highlight_timer.timeout.connect(
+            self._refresh_match_highlights)
+        self._highlight_view = None
         # Copilot の入力欄に書きかけの文があるとき、上書きして送って
         # よいかの確認も差し替えられる(戻り値は bool)。
         self.ask_overwrite_input = None
@@ -732,6 +747,11 @@ class EditorWindow(QMainWindow):
         self.ask_external_reload = None
         self.ask_unencodable_save = None
         self.ask_mixed_newline = None
+        # ask_session_save_failed: 閉じるときに控えが書けなかった
+        #   場合の行き先(戻り値は "retry"=もう一度書く /
+        #   "discard"=そのまま閉じる(未保存の編集は失われる) /
+        #   "cancel"=閉じない)
+        self.ask_session_save_failed = None
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
@@ -1140,6 +1160,13 @@ class EditorWindow(QMainWindow):
         view.outline_timer.start()
         self._refresh_pane_counts(view)
         self._schedule_session_save()
+        # 検索の色付けは、編集で位置がずれる。検索バーが出ている
+        # 間は、少し待ってから付け直す(古い位置に残さない)。
+        if view is self._current_view() \
+                and getattr(self, "_find_bar", None) is not None \
+                and self._find_bar.isVisible() \
+                and self._find_edit.text():
+            self._highlight_timer.start()
 
     def _update_tab_label(self, view):
         """タブの見出しを、文書の名前(未保存なら *)に合わせる。"""
@@ -1177,6 +1204,10 @@ class EditorWindow(QMainWindow):
             return  # 組み立ての途中(タブだけ先にできる間)は何もしない
         self._reset_incremental_search()
         self._refresh_all()
+        # 検索の色付けは今のタブだけに付ける。切り替えたら、
+        # 前のタブの分を消して今のタブへ付け直す。
+        if hasattr(self, "_find_bar"):
+            self._refresh_match_highlights()
         if view.external_change_pending:
             # 裏のタブで起きた外部変更は、前に出たときに決着させる。
             self._handle_external_change(view)
@@ -1269,6 +1300,8 @@ class EditorWindow(QMainWindow):
         if second is not None:
             second.setFocus()
             self._schedule_session_save()
+            # 新しくできたペインにも、検索の色付けを付ける。
+            self._refresh_match_highlights()
 
     def unsplit_current_view(self):
         """今のタブの分割をやめる(メニュー・キー割り当ての受け口)。"""
@@ -1336,6 +1369,7 @@ class EditorWindow(QMainWindow):
         except Exception:  # noqa: BLE001  控えが読めなくても窓は開く
             self._session_slot = None
             return False
+        self._notify_corrupt_session()
         entries = list((self._session_slot or {}).get("tabs") or [])
         if not entries:
             return False
@@ -1508,9 +1542,10 @@ class EditorWindow(QMainWindow):
 
         スロットの中身をいまのタブで差し替えてから、ファイル全体
         (他の窓のスロットと未使用分を含む)を書く。失敗しても編集は
-        止めない(ステータスに残すだけ)。"""
+        止めない(ステータスに残すだけ)。書けたら True、失敗したら
+        False を返す(閉じる側が「無言で消えない」ための判断に使う)。"""
         if self._session_path is None or self._session_slot is None:
-            return
+            return True
         self._session_timer.stop()
         try:
             state = self._capture_session_state()
@@ -1519,6 +1554,75 @@ class EditorWindow(QMainWindow):
             sessionmod.save(self._session_path)
         except Exception:  # noqa: BLE001  控えの失敗で編集を止めない
             self.statusBar().showMessage("控えを保存できませんでした", 4000)
+            return False
+        return True
+
+    def _notify_corrupt_session(self):
+        """壊れた控えを退避していたら、ステータスで知らせる。
+
+        退避そのものは session.load_session_file が読み込みのときに
+        済ませている。ここでは記録を受け取って文にするだけ。"""
+        notice = sessionmod.take_corrupt_notice(self._session_path)
+        if notice is None:
+            return
+        backup = notice.get("backup")
+        if backup:
+            self.statusBar().showMessage(
+                "控えのファイルが壊れていたため、"
+                f"{os.path.basename(backup)} へ退避しました"
+                "（前回のタブは戻せませんでした）", 15000)
+        else:
+            self.statusBar().showMessage(
+                "控えのファイルが壊れていて読み直せませんでした"
+                "（前回のタブは戻せませんでした）", 15000)
+
+    def _ask_session_save_failed_choice(self):
+        """閉じるときに控えが書けなかった場合の行き先を聞く。
+
+        戻り値は "retry"(もう一度書く) / "discard"(そのまま閉じる。
+        未保存の編集は失われる) / "cancel"(閉じない)。
+        差し替え口(ask_session_save_failed)があればそちらを使う。"""
+        if self.ask_session_save_failed is not None:
+            return self.ask_session_save_failed()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(APP_NAME)
+        box.setText(
+            "控え（自動保存）を保存できませんでした。\n"
+            "このまま閉じると、未保存の編集が失われます。")
+        retry_button = box.addButton(
+            "もう一度試す", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = box.addButton(
+            "そのまま閉じる", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = box.addButton(
+            "閉じない", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is retry_button:
+            return "retry"
+        if clicked is discard_button:
+            return "discard"
+        return "cancel"
+
+    def _confirm_close_without_session(self, event) -> bool:
+        """控えが書けないまま閉じてよいか、利用者と決める。
+
+        閉じてよければ True(呼び側は閉じる処理を続ける)、閉じ
+        なければ event を ignore して False。未保存の編集が無い
+        ときは聞かない(失われるものが無い)。"""
+        if not any(view.is_modified() for view in self._views):
+            return True
+        while True:
+            choice = self._ask_session_save_failed_choice()
+            if choice == "retry":
+                if self._flush_session():
+                    return True
+                continue
+            if choice == "discard":
+                return True
+            event.ignore()
+            return False
 
     # ---------------------------------------------------------------
     # 組み立て
@@ -1649,7 +1753,11 @@ class EditorWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("表示(&V)")
         self._act_outline = QAction("アウトライン(&O)", self)
         self._act_outline.setCheckable(True)
-        self._act_outline.setChecked(self._outline_pane.isVisible())
+        # 初期値は設定(利用者の選択)から取る。窓がまだ表示されて
+        # いない組み立て中に isVisible() を見ると、ペインを表示に
+        # していても必ず False になり、ボタンの表示だけ OFF に
+        # ずれる(Nagato の実機報告、2026-11-14 の件2)。
+        self._act_outline.setChecked(self._outline_pane_pref)
         self._act_outline.toggled.connect(self.set_outline_pane_visible)
         view_menu.addAction(self._act_outline)
         self._act_line_numbers = QAction("行番号(&L)", self)
@@ -1905,7 +2013,9 @@ class EditorWindow(QMainWindow):
         self._persist_settings({"show_outline_pane": visible})
 
     def outline_pane_visible(self) -> bool:
-        return self._outline_pane.isVisible()
+        # 表示の実体ではなく設定(利用者の選択)を返す。組み立て中は
+        # isVisible() が常に False で、当てにならないため。
+        return self._outline_pane_pref
 
     def set_line_numbers_visible(self, visible):
         visible = bool(visible)
@@ -3011,8 +3121,13 @@ class EditorWindow(QMainWindow):
         # 「保存しますか」は出さない。控えはここで書き切るので、
         # 未保存の内容も次に開いたときにタブとして戻る。
         # 遅延保存のたまりも、閉じる前に書き切る。
+        # ただし控えが書けないときは別で、そのまま閉じると未保存の
+        # 編集が無言で消える。書けなかったら利用者に選ばせる
+        # (もう一度書く／そのまま閉じる／閉じない)。
         self._flush_pending_font_size()
-        self._flush_session()
+        if not self._flush_session() \
+                and not self._confirm_close_without_session(event):
+            return
         # セッションのスロットは手放す(中身はファイルに残り、
         # 次に開く窓が引き取ってタブを戻す)。
         if self._session_path is not None and self._session_slot is not None:
@@ -3951,10 +4066,12 @@ class EditorWindow(QMainWindow):
         self._find_bar.show()
         self._find_edit.setFocus()
         self._find_edit.selectAll()
+        self._refresh_match_highlights()
 
     def _hide_find_bar(self):
         self._reset_incremental_search()
         self._find_bar.hide()
+        self._clear_match_highlights()
         self._edit.setFocus()
 
     # ---------------------------------------------------------------
@@ -4104,6 +4221,106 @@ class EditorWindow(QMainWindow):
         self._jump_to_line(max(0, line - 1))
         return True
 
+    # ---------------------------------------------------------------
+    # 検索の一致箇所すべての色付け
+    # ---------------------------------------------------------------
+    def _refresh_match_highlights(self):
+        """いまの検索語に一致する箇所すべてへ色を付ける。
+
+        現在のヒットは選択の色で見分けるため、色付けからは除く
+        (_apply_match_highlights)。検索バーが出ていない・語が
+        空のときは消す。通常検索はその場で数え(文字列の走査は
+        速い)、正規表現は別プロセスの find_all に任せる(固まる
+        式はそちらの時間切れが守る)。件数の上限は
+        SEARCH_HIGHLIGHT_LIMIT で、超えたら先頭から上限まで。"""
+        view = self._current_view()
+        if view is None:
+            return
+        if not self._find_bar.isVisible() or not self._find_edit.text():
+            self._clear_match_highlights()
+            return
+        word = self._find_edit.text()
+        case_sensitive = self._find_case.isChecked()
+        text = view.edit.toPlainText()
+        if self._find_regex.isChecked():
+            try:
+                rxfind.compile_search(word, regex=True,
+                                      case_sensitive=case_sensitive)
+            except rxfind.RegexFault:
+                self._clear_match_highlights()
+                return
+            revision = view.edit.document().revision()
+
+            def done(result, view=view, word=word, text=text,
+                     revision=revision):
+                if self._current_view() is not view:
+                    return
+                if not self._find_bar.isVisible() \
+                        or self._find_edit.text() != word:
+                    return
+                if view.edit.document().revision() != revision:
+                    # 計算の間に編集された。付け直しは編集側の
+                    # 間引きタイマー(_highlight_timer)が担う。
+                    return
+                self._apply_match_highlights(
+                    view, self._spans_to_utf16(result["spans"], text))
+
+            self._run_rx_async(
+                "find_all", done, text=text, pattern=word,
+                regex=True, case_sensitive=case_sensitive,
+                limit=SEARCH_HIGHLIGHT_LIMIT)
+            return
+        spans = []
+        start = 0
+        while len(spans) < SEARCH_HIGHLIGHT_LIMIT:
+            index = docmod.find_next(text, word, start, case_sensitive)
+            if index < 0:
+                break
+            spans.append((index, index + len(word)))
+            start = index + max(1, len(word))
+        self._apply_match_highlights(
+            view, self._spans_to_utf16(spans, text))
+
+    def _spans_to_utf16(self, spans, text):
+        """(開始, 終了) の並びを Python の位置から QTextCursor の
+        位置へ。本文にサロゲートペアが無ければ両者は一致する
+        ので、その場合は変換しない(件数が多いときの節約)。"""
+        if self._utf16_len(text) == len(text):
+            return list(spans)
+        return [(self._utf16_index(start, text),
+                 self._utf16_index(end, text)) for start, end in spans]
+
+    def _apply_match_highlights(self, view, spans):
+        """色付けの範囲を、ビューの両ペインへ反映する。
+
+        前に別のビューへ付けていた分は消す(色は今のタブだけに
+        付ける)。現在のヒット(アクティブなペインで選択中の範囲
+        と一致するもの)は、選択の色で見分けるため除く。"""
+        if self._highlight_view is not None \
+                and self._highlight_view is not view:
+            for pane in self._highlight_view.panes():
+                pane.set_match_highlights([])
+        self._highlight_view = view
+        cursor = view.active_edit().textCursor()
+        if cursor.hasSelection():
+            current = (cursor.selectionStart(), cursor.selectionEnd())
+            if current in spans:
+                spans.remove(current)
+        for pane in view.panes():
+            pane.set_match_highlights(spans)
+
+    def _clear_match_highlights(self):
+        """色付けをすべて消す(検索バーを閉じたとき)。"""
+        self._highlight_timer.stop()
+        if self._highlight_view is not None:
+            for pane in self._highlight_view.panes():
+                pane.set_match_highlights([])
+            self._highlight_view = None
+        view = self._current_view()
+        if view is not None:
+            for pane in view.panes():
+                pane.set_match_highlights([])
+
     def _do_find(self, forward: bool, word=None, case_sensitive=None,
                  regex=None) -> bool:
         """検索の実体。word / case_sensitive / regex が None なら検索欄の
@@ -4138,11 +4355,13 @@ class EditorWindow(QMainWindow):
                 index = docmod.find_prev(text, word, len(text), case_sensitive)
         if index < 0:
             self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
+            self._refresh_match_highlights()
             return False
         cursor.setPosition(index)
         cursor.setPosition(index + len(word), QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
+        self._refresh_match_highlights()
         return True
 
     # ---------------------------------------------------------------
@@ -4166,6 +4385,8 @@ class EditorWindow(QMainWindow):
     def _mark_incremental_not_found(self, word):
         self._set_find_not_found(True)
         self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
+        # 一致が無いので、色付けも付け直して消す。
+        self._refresh_match_highlights()
 
     def _on_find_edited(self, _text):
         """検索欄への入力のたびに呼ばれる。textEdited は人が打った
@@ -4232,6 +4453,7 @@ class EditorWindow(QMainWindow):
         self._edit.centerCursor()
         self._inc_base = base
         self._inc_span = (start, end)
+        self._refresh_match_highlights()
 
     def _do_incremental_search(self):
         """検索欄の今の語で、起点から一番近いヒットへ飛ぶ。
@@ -4406,6 +4628,7 @@ class EditorWindow(QMainWindow):
                            QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
+        self._refresh_match_highlights()
 
     def _do_find_regex_sync(self, forward: bool, word, case_sensitive) -> bool:
         """正規表現の検索の同期版(マクロ再生専用)。実処理は
@@ -4441,6 +4664,7 @@ class EditorWindow(QMainWindow):
                            QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
+        self._refresh_match_highlights()
         return True
 
     # ---------------------------------------------------------------

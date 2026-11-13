@@ -355,6 +355,66 @@ def test_window_menu_has_grep_replace():
         app().processEvents()
 
 
+def test_execute_preserves_mixed_newlines_on_untouched_lines():
+    """混ざったファイルでも、置換していない行の改行を変えない。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "mixed.txt"
+        original = "aaa\r\nbbb\nccc\r\nddd\n".encode("utf-8")
+        path.write_bytes(original)
+        preview = replacemod.preview_replace(str(root), "bbb", "BBB")
+        result = replacemod.execute_replace(preview, "bbb", "BBB")
+        assert result.files_written == 1
+        # 置換した行は LF のまま、他の行も元の種別のまま。
+        assert path.read_bytes() == \
+            "aaa\r\nBBB\nccc\r\nddd\n".encode("utf-8")
+        # CRLF の行を置換しても、LF の行は LF のまま。
+        preview = replacemod.preview_replace(str(root), "ccc", "CCC")
+        result = replacemod.execute_replace(preview, "ccc", "CCC")
+        assert result.files_written == 1
+        assert path.read_bytes() == \
+            "aaa\r\nBBB\nCCC\r\nddd\n".encode("utf-8")
+
+
+def test_execute_replacement_spanning_lines_keeps_other_newlines():
+    """行をまたぐ置換でも、関係ない行の改行は変えない。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "span.txt"
+        path.write_bytes("one\ntwo\r\nthree\nfour\r\n".encode("utf-8"))
+        # 「two\r\nthree」(正規化後は "two\nthree")を1行に潰す。
+        preview = replacemod.preview_replace(
+            str(root), "two\nthree", "merged", regex=True)
+        result = replacemod.execute_replace(
+            preview, "two\nthree", "merged", regex=True)
+        assert result.files_written == 1
+        # 潰れた行の末尾に残るのは、取り込まれなかった側(three の
+        # 行)の改行(LF)。前後の置換していない行は元のまま。
+        assert path.read_bytes() == \
+            "one\nmerged\nfour\r\n".encode("utf-8")
+
+
+def test_second_execute_keeps_first_backup():
+    """2回目の置換でも、最初の .bak(置換前の内容)が残る。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "twice.txt"
+        original = "語1 と 語2\n".encode("utf-8")
+        path.write_bytes(original)
+        preview = replacemod.preview_replace(str(root), "語1", "置換1")
+        result = replacemod.execute_replace(preview, "語1", "置換1")
+        assert result.files_written == 1
+        after_first = path.read_bytes()
+        assert Path(str(path) + ".bak").read_bytes() == original
+        preview = replacemod.preview_replace(str(root), "語2", "置換2")
+        result = replacemod.execute_replace(preview, "語2", "置換2")
+        assert result.files_written == 1
+        # 最初の控えは潰れず、2回目の控えは連番へ。
+        assert Path(str(path) + ".bak").read_bytes() == original
+        assert Path(str(path) + ".bak2").read_bytes() == after_first
+        assert path.read_bytes() == "置換1 と 置換2\n".encode("utf-8")
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

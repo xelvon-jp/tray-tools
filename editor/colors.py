@@ -11,6 +11,7 @@
 #   background            本文の背景
 #   foreground            本文の文字
 #   selection_background  選択範囲の背景
+#   search_match          検索に一致した箇所(現在のヒット以外)の背景
 #   current_line          現在行の強調の背景
 #   invisible             不可視文字(タブ・スペース・改行)の色
 #   line_number_background / line_number_foreground  行番号エリア
@@ -59,6 +60,7 @@ COLOR_SCHEMES = {
         "background": "#ffffff",
         "foreground": "#000000",
         "selection_background": "#cce8ff",
+        "search_match": "#ffe98a",
         "current_line": "#eff6ff",
         "invisible": "#c0c0c0",
         "line_number_background": "#f2f2f2",
@@ -72,6 +74,7 @@ COLOR_SCHEMES = {
         "background": "#ffffff",
         "foreground": "#000000",
         "selection_background": "#b7dbff",
+        "search_match": "#ffff99",
         "current_line": "#ffffcc",
         "invisible": "#7fb3d5",
         "line_number_background": "#f0f0f0",
@@ -88,6 +91,7 @@ COLOR_ITEMS = (
     ("background", "本文の背景"),
     ("foreground", "本文の文字"),
     ("selection_background", "選択範囲の背景"),
+    ("search_match", "検索の一致箇所の背景"),
     ("current_line", "現在行の背景"),
     ("invisible", "不可視文字"),
     ("line_number_background", "行番号の背景"),

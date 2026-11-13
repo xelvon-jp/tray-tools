@@ -12,7 +12,9 @@
 #   - 書き込みは原子的(同じフォルダの一時ファイルに書いてから置き換える)。
 #     途中で落ちても元のファイルは壊れない
 #   - 上書きの前に、それまでの内容の控えを「元の名前 + .bak」に1つだけ
-#     残す(増え続けない形)
+#     残す(増え続けない形)。フォルダ内の横断置換だけは、最初の控えが
+#     後からの置換で潰れないよう、連番の別名に逃がす形も選べる
+#     (save_document の numbered_backup)
 #   - 開いたときと保存したときの、ディスク上の (更新時刻, 大きさ) を
 #     控えておく。外部で変わったかの判定(窓の監視と、保存直前の確認)
 #     はこれと比べる
@@ -113,6 +115,56 @@ def join_with_line_newlines(text: str, kinds, default: str) -> str:
         out.append(kind if kind in (CRLF, LF, CR) else default)
         out.append(lines[index])
     return "".join(out)
+
+
+def replaced_line_newlines(old_text, old_kinds, replacements, default):
+    """置換後の本文の、行ごとの改行種別の並び(line_endings の形)を作る。
+
+    replacements は (開始, 終了, 置き換えた文字列) の並びで、位置は
+    置換前の本文(old_text。改行は "\\n" にそろえてある)でのもの、
+    重ならず昇順に並んでいる前提。置換されなかった部分の改行は
+    元の種別をそのまま引き継ぐので、「置換していない行の改行は
+    変わらない」。置き換えた文字列の中に新しく生まれた改行は、
+    置換が元の改行を取り込んでいたときは取り込んだ種別を順に、
+    そうでなければ default(文書の改行設定)にする。
+
+    フォルダ内の横断置換(greplace)が、混在したファイルでも
+    対話の保存と同じ扱い(行ごとの改行を保つ)にするために使う。"""
+    kinds = []
+    cursor = 0   # 置換前の本文での走査位置
+    line = 0     # cursor がいる置換前の行の番号(old_kinds の添字)
+
+    def kind_at(index):
+        if old_kinds is not None and 0 <= index < len(old_kinds):
+            kind = old_kinds[index]
+            if kind in (CRLF, LF, CR):
+                return kind
+        return default
+
+    def copy_until(pos):
+        """cursor から pos までの、置換されなかった部分の改行を移す。"""
+        nonlocal cursor, line
+        for _ in range(old_text.count("\n", cursor, pos)):
+            kinds.append(kind_at(line))
+            line += 1
+        cursor = pos
+
+    for start, end, inserted in replacements:
+        copy_until(start)
+        consumed = [kind_at(line + offset)
+                    for offset in range(old_text.count("\n", start, end))]
+        for index in range(inserted.count("\n")):
+            if index < len(consumed):
+                kinds.append(consumed[index])
+            elif consumed:
+                kinds.append(consumed[-1])
+            else:
+                kinds.append(default)
+        line += len(consumed)
+        cursor = end
+    copy_until(len(old_text))
+    kinds.append(None)
+    return kinds
 
 
 # 改行の並びを切り出すための正規表現。CRLF を先に置くことで、"\r\n" が
@@ -397,9 +449,23 @@ def _atomic_write(target: str, data: bytes):
     _restore_file_attrs(target, saved)
 
 
+def _next_backup_path(target):
+    """上書きしない控えの置き場。
+
+    「保存先 + .bak」が空いていればそこ、既にあれば .bak2、.bak3…
+    の最初の空き(既にある控えはどれも潰さない)。"""
+    candidate = target + ".bak"
+    if not os.path.exists(candidate):
+        return candidate
+    serial = 2
+    while os.path.exists(f"{target}.bak{serial}"):
+        serial += 1
+    return f"{target}.bak{serial}"
+
+
 def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
                   bom=None, backup=True, errors="strict",
-                  line_newlines=None) -> str:
+                  line_newlines=None, numbered_backup=False) -> str:
     """doc をファイルへ書く。成功したら doc 側の控え(保存先・文字コード・
     改行・BOM・ディスク上の印)を、実際に書いた内容に合わせて更新して、
     書いたパスを返す。
@@ -409,6 +475,9 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
 
     backup が真で、保存先に既存のファイルがあれば、上書きの前に
     それまでの内容を「保存先 + .bak」へ控える(控えは常に1つ)。
+    numbered_backup が真なら、控えを上書きせず、.bak が既にあれば
+    .bak2、.bak3…と連番の別名にする(フォルダ内の横断置換用。
+    2回目以降の置換でも、最初の控えが残る形)。
     書き込み自体は原子的に行う(_atomic_write)。"""
     target = path if path is not None else doc.path
     if not target:
@@ -417,7 +486,9 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
                            errors=errors, line_newlines=line_newlines)
     if backup and os.path.exists(target):
         try:
-            shutil.copyfile(target, target + ".bak")
+            backup_path = _next_backup_path(target) \
+                if numbered_backup else target + ".bak"
+            shutil.copyfile(target, backup_path)
         except OSError:
             pass  # 控えが作れなくても保存自体は止めない
     _atomic_write(target, data)

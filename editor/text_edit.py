@@ -70,9 +70,13 @@ DEFAULT_TAB_STOP_DISTANCE = 80.0
 # 従来の (242,242,242) / (144,144,144) と同じにしてある。
 
 
-# 改行の種別 → 行末に描く記号。CR と LF を分けて出す(混在した文書
-# でも種類が見分けられること)。字形は MS Gothic にある矢印の範囲。
-NEWLINE_GLYPHS = {"\r\n": "←↓", "\n": "↓", "\r": "←"}
+# 改行の種別 → 行末に描く記号。どれも1文字で、CR と LF を分けて
+# 出す(混在した文書でも種類が見分けられること)。CRLF は以前
+# 「←↓」の2文字で幅を取って煩わしかったため、エンターキーの
+# 印として定番の ↵(U+21B5)に替えた。↓ と ← は MS Gothic に
+# ある矢印で、↵ は本文フォントに字形が無い場合、Qt のフォント
+# フォールバックで補われる。
+NEWLINE_GLYPHS = {"\r\n": "↵", "\n": "↓", "\r": "←"}
 # 文書の末尾(最後のブロックの末尾)に出す印。小さい字で描く。
 EOF_MARK = "EOF"
 
@@ -111,6 +115,12 @@ class LineNumberArea(QWidget):
 
     def paintEvent(self, event):  # noqa: N802  Qt の上書き
         self._edit.paint_line_number_area(event)
+
+    def wheelEvent(self, event):  # noqa: N802  Qt の上書き
+        # 行番号エリアの上のホイールも、本文と同じスクロールに
+        # する。エリアが受けたホイールは、親への伝播だけに任せる
+        # と届かないことがあるため、明示的に本文へ回す(件4と同系)。
+        self._edit.wheelEvent(event)
 
 
 class _TrackingState:
@@ -201,6 +211,11 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             self._scheme["line_number_edited_foreground"])
         self._bookmark_color = QColor(
             self._scheme["line_number_bookmark_foreground"])
+        # 検索の一致箇所の色付け(窓が範囲を渡す。現在のヒットは
+        # 選択の色で見分けるため、窓側で除いてある)。
+        self._match_color = QColor(self._scheme["search_match"])
+        self._match_spans = []
+        self._match_selections = []
         self.cursorPositionChanged.connect(self._refresh_extra_selections)
 
     def focusInEvent(self, event):  # noqa: N802  Qt の上書き
@@ -249,7 +264,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
 
     def _refresh_extra_selections(self):
         """extra selections の唯一の出口。矩形のハイライトと現在行の
-        強調を合わせて出し直す(片方の更新でもう片方が消えないよう)。"""
+        強調と検索の一致箇所を合わせて出し直す(片方の更新でもう
+        片方が消えないよう)。一致箇所は一番上(現在行の背景に
+        埋もれないよう、最後)に重ねる。"""
         selections = list(self.rect_extra_selections())
         if self._current_line_enabled:
             # ExtraSelection の型は QTextEdit 側にある(rect_edit と同じ)。
@@ -260,7 +277,46 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             selection.cursor = self.textCursor()
             selection.cursor.clearSelection()
             selections.append(selection)
+        selections.extend(self._match_selections)
         QPlainTextEdit.setExtraSelections(self, selections)
+
+    # ---------------------------------------------------------------
+    # 検索の一致箇所の色付け(範囲の計算は窓が持つ)
+    # ---------------------------------------------------------------
+    def set_match_highlights(self, spans):
+        """一致箇所の範囲 (開始, 終了) の並びを設定する。
+
+        位置は QTextCursor の単位(UTF-16)。幅の無い一致(空マッチ)
+        は色を付けられないので落とす。並びが変わらなければ何も
+        しない(カーソル移動のたびの出し直しで、作り直しが走ら
+        ないように)。"""
+        spans = [(int(start), int(end)) for start, end in spans
+                 if end > start]
+        if spans == self._match_spans:
+            return
+        self._match_spans = spans
+        self._rebuild_match_selections()
+        self._refresh_extra_selections()
+
+    def match_highlights(self):
+        """いま色を付けている範囲の並び(テスト・確認用)。"""
+        return list(self._match_spans)
+
+    def _rebuild_match_selections(self):
+        """範囲の並びから ExtraSelection の並びを作り直す。
+
+        カーソル移動のたびに _refresh_extra_selections が呼ばれる
+        ため、ここで作ったものを貯めて使い回す。"""
+        selections = []
+        for start, end in self._match_spans:
+            selection = QTextEdit.ExtraSelection()
+            selection.format.setBackground(self._match_color)
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            selection.cursor = cursor
+            selections.append(selection)
+        self._match_selections = selections
 
     # ---------------------------------------------------------------
     # 配色
@@ -279,6 +335,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                          QColor(scheme["foreground"]))
         self.setPalette(palette)
         self._current_line_color = QColor(scheme["current_line"])
+        self._match_color = QColor(scheme["search_match"])
+        self._rebuild_match_selections()
         self._invisible_color = QColor(scheme["invisible"])
         self._area_background = QColor(scheme["line_number_background"])
         self._area_foreground = QColor(scheme["line_number_foreground"])
@@ -660,7 +718,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         """見えている行のタブ・スペース・改行・末尾を記号で描く。
 
         タブは →、半角スペースは ·、全角スペースは □。行末には
-        改行の種別の記号(LF は ↓、CR は ←、CRLF は ←↓)を、文書の
+        改行の種別の記号(LF は ↓、CR は ←、CRLF は ↵)を、文書の
         最後の行には EOF の印を小さい字で描く。すべて配色の
         invisible の色(本文より薄い色)。位置は cursorRect で取る
         (折り返しやスクロールに追随する)。描くのは見えている
@@ -670,6 +728,37 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         painter.setFont(self.font())
         metrics = self.fontMetrics()
         eof_metrics = QFontMetrics(self._eof_font())
+        # 行末の印の最大幅。印を描く前に地を塗り直す範囲の計算に
+        # 使う(下の erase_mark 参照)。
+        max_mark_width = max(
+            [metrics.horizontalAdvance(mark)
+             for mark in NEWLINE_GLYPHS.values()]
+            + [eof_metrics.horizontalAdvance(EOF_MARK)]) + 4
+
+        def erase_mark(rect, block, position):
+            # 行末の印の後ろを、行の背景で塗り直す。印はこちらが
+            # 見えている行すべてに描く一方、行の地の塗り直しは
+            # Qt が「変わった行」だけに行う。印の種類だけが変わる
+            # 編集(末尾の行を消し、それまで改行だった印が EOF に
+            # なる等)では行の本文が変わらないため地が塗り直され
+            # ず、前の広い印が新しい印の横に残ってしまう(2026-11-14
+            # の件1)。描く直前に、印の範囲だけ地を塗り直して消す。
+            # 地の色は、その場所を Qt が塗る色に合わせる(選択の
+            # 中は選択の背景、現在行は現在行の背景、それ以外は地)。
+            strip = QRect(rect.x(), rect.y(),
+                          max_mark_width, rect.height())
+            cursor = self.textCursor()
+            if cursor.hasSelection() and \
+                    cursor.selectionStart() <= position \
+                    < cursor.selectionEnd():
+                color = self.palette().color(
+                    QPalette.ColorRole.Highlight)
+            elif self._current_line_enabled \
+                    and block == cursor.block():
+                color = self._current_line_color
+            else:
+                color = self.palette().color(QPalette.ColorRole.Base)
+            painter.fillRect(strip, color)
 
         def draw_mark(rect, mark, mark_metrics):
             # cursorRect の幅はカーソルの幅(1px。太いカーソルでも
@@ -708,6 +797,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 scratch.setPosition(base + len(text))
                 rect = self.cursorRect(scratch)
                 mark = self.block_end_mark(block)
+                erase_mark(rect, block, base + len(text))
                 if mark == EOF_MARK:
                     painter.setFont(self._eof_font())
                     draw_mark(rect, mark, eof_metrics)
@@ -962,6 +1052,20 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         font.setPointSize(size)
         self.setFont(font)
         self.font_size_changed.emit(size)
+
+    def event(self, event):  # noqa: N802  Qt の上書き
+        if event.type() == QEvent.Type.Wheel:
+            # ビューポート経由(viewportEvent → wheelEvent)ではなく、
+            # このウィジェット自身へ届いたホイールは、土台の
+            # QAbstractScrollArea の event が wheelEvent へ回さず、
+            # スクロールもしない。桁数折り返しの右の余白や枠の上が
+            # その範囲で、ポインタがそこにあるとホイールが無反応に
+            # なる(2026-11-14 の件4)。行番号エリアから伝播して来た
+            # 分も同じ経路に乗る。ここで受けて、wheelEvent の処理
+            # (スクロールと Ctrl+ホイールの拡大)へ流す。
+            self.wheelEvent(event)
+            return event.isAccepted()
+        return super().event(event)
 
     def wheelEvent(self, event):  # noqa: N802  Qt の上書き
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:

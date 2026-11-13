@@ -298,12 +298,14 @@ def test_save_as_with_keep_choice_preserves_mixed():
 
 
 # ---------------------------------------------------------------
-# 一括書き込み(grep して置換)では聞かない・従来どおり
+# 一括書き込み(grep して置換)では聞かないが、改行は保つ
 # ---------------------------------------------------------------
-def test_greplace_batch_write_does_not_preserve_or_ask():
+def test_greplace_batch_write_preserves_newlines_without_asking():
     # grep して置換の書き込みは文書モデルの直接呼び出しで、窓の
-    # 問い合わせは介在しない。混在ファイルも従来どおり、文書の
-    # 改行設定(最初の改行)でそろえて書かれる。
+    # 問い合わせは介在しない(聞かない)。ただし改行の扱いは対話の
+    # 保存で決めた方針に合わせ、混在ファイルでも置換していない
+    # 行の改行は変えず、置換した行も元の種別のままにする
+    # (レビュー req-20261114-05 の件8で変更)。
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")
         Path(path).write_bytes(MIXED)
@@ -312,7 +314,7 @@ def test_greplace_batch_write_does_not_preserve_or_ask():
         result = greplace.execute_replace(preview, "b", "B")
         assert result.files_written == 1
         assert Path(path).read_bytes() == \
-            "a\r\nB\r\nc\r\n".encode("utf-8")
+            "a\r\nB\nc\r\n".encode("utf-8")
 
 
 def main():

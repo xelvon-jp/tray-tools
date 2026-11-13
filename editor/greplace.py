@@ -12,8 +12,12 @@
 #
 # 対象ファイルの歩き方(拡張子・大きさ・歩かないフォルダ)は grep と
 # 共用(editor/grep.py)。読み書きは文書モデル(editor/document.py)に
-# 任せるので、文字コードと改行は保たれ、.bak と原子的な書き込みも
-# 手動保存と同じになる。
+# 任せるので、文字コードと改行は保たれ、原子的な書き込みも手動保存
+# と同じになる。改行は、混ざったファイルでも置換していない行の
+# 種別を変えない(対話の保存の「混在のまま」と同じ扱い。
+# document.replaced_line_newlines で置換後の種別の並びを作る)。
+# .bak は手動保存と違い、連番で逃がして上書きしない(同じファイル
+# への2回目の置換でも、最初の控えが残る形)。
 #
 # 対象から外すもの(理由は結果に分けて返す):
 #   - EDDy で開いているファイル(呼び側が exclude_paths で渡す。
@@ -99,6 +103,23 @@ class ReplaceRunResult:
 
     def by_status(self, status) -> list:
         return [o for o in self.outcomes if o.status == status]
+
+
+def _replace_all_collecting(text, rx, repl, regex):
+    """rxfind.replace_all_text と同じ置換をして、置換の並びも返す。
+
+    戻り値は (新しい本文, 件数, [(開始, 終了, 置き換えた文字列), …])
+    で、位置は置換前の本文でのもの。置換後の行ごとの改行種別を
+    組み立てる(document.replaced_line_newlines)ために集める。"""
+    spans = []
+
+    def _sub(match):
+        expanded = rxfind.expand_replacement(match, repl, regex=regex)
+        spans.append((match.start(), match.end(), expanded))
+        return expanded
+
+    new_text = rx.sub(_sub, text)
+    return new_text, len(spans), spans
 
 
 def _is_binary_like(doc) -> bool:
@@ -209,8 +230,8 @@ def execute_replace(preview, word, repl, *, case_sensitive=False,
                 detail="バイナリらしいため飛ばしました"))
             continue
         try:
-            new_text, count = rxfind.replace_all_text(
-                doc.text, rx, repl, regex=regex)
+            new_text, count, spans = _replace_all_collecting(
+                doc.text, rx, repl, regex)
         except rxfind.RegexFault as e:
             result.outcomes.append(ReplaceOutcome(
                 path, STATUS_FAILED, detail=str(e)))
@@ -232,9 +253,15 @@ def execute_replace(preview, word, repl, *, case_sensitive=False,
                 path, STATUS_UNCHANGED, count=count,
                 detail="内容は変わりませんでした"))
             continue
+        # 置換していない行の改行を変えないため、置換後の行ごとの
+        # 改行種別を作って渡す(渡さないと文書の改行設定で全体が
+        # そろってしまう)。控えは連番で逃がし、最初の .bak を守る。
+        new_kinds = docmod.replaced_line_newlines(
+            doc.text, doc.line_newlines, spans, doc.newline)
         doc.text = new_text
         try:
-            docmod.save_document(doc)
+            docmod.save_document(doc, line_newlines=new_kinds,
+                                 numbered_backup=True)
         except (OSError, UnicodeEncodeError) as e:
             result.outcomes.append(ReplaceOutcome(
                 path, STATUS_FAILED, detail=f"書けませんでした（{e}）"))

@@ -147,11 +147,64 @@ def sanitize_session(data):
     return windows
 
 
-def load_session_file(path):
-    """セッションファイルを読む。無い・壊れているときは空の並び。"""
+# 壊れた控えの退避先(セッションファイルのパス文字列 → 退避先の
+# パス文字列。退避できなかったときは空文字列)。読み込みのときに
+# 記録し、窓が take_corrupt_notice で受け取って利用者へ知らせる。
+_CORRUPT_NOTICES = {}
+
+
+def _evacuate_corrupt(path):
+    """壊れたセッションファイルを別名へ退避し、退避先を返す。
+
+    次の保存で黙って上書きして、壊れる前の控えごと消さないため。
+    退避先は「元の名前 + .broken」で、既にあれば .broken-2、…と
+    連番にする(前の退避も上書きしない)。退避できなければ None。"""
+    path = Path(path)
+    candidate = path.with_name(path.name + ".broken")
+    serial = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.broken-{serial}")
+        serial += 1
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        os.replace(path, candidate)
+    except OSError:
+        return None
+    return str(candidate)
+
+
+def take_corrupt_notice(path):
+    """壊れた控えの読み直し失敗を1回だけ受け取る。
+
+    戻り値は None(何も無い)か {"backup": 退避先のパス文字列
+    (退避できなかったときは None)}。"""
+    return _CORRUPT_NOTICES.pop(str(path), None)
+
+
+def load_session_file(path):
+    """セッションファイルを読む。無いときは空の並び。
+
+    ファイルはあるのに読めない・形が崩れているときは、壊れた
+    ファイルを別名へ退避してから空の並びを返す(次の保存で黙って
+    上書きしないため)。退避の記録は take_corrupt_notice で
+    受け取れる。形は合っているが中身の値が壊れているタブは、
+    sanitize_session が使えるものだけ残す(従来どおり)。"""
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raw = None
+    data = None
+    if raw is not None:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+    if not isinstance(data, dict) \
+            or not isinstance(data.get("windows"), list):
+        backup = _evacuate_corrupt(path)
+        _CORRUPT_NOTICES[str(path)] = {"backup": backup}
         return []
     return sanitize_session(data)
 

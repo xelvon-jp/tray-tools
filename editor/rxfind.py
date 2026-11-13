@@ -9,8 +9,8 @@
 #     (アウトラインの設定試験 trial_patterns と同じ作法)
 #
 # 子プロセスへは標準入力の JSON で {op, text, pattern, repl, start,
-# regex, case} を渡し、最後の JSON 行で結果を受ける。op は
-# find_next / find_prev / replace_one / replace_all。
+# regex, case, limit} を渡し、最後の JSON 行で結果を受ける。op は
+# find_next / find_prev / replace_one / replace_all / find_all。
 # 入出力の文字コードは UTF-8 と決め打ちする(子の標準入出力は
 # バイト列のまま読み書きする)。OS の既定(日本語 Windows では
 # cp932)に任せると、親が UTF-8 で送った日本語本文が化けて文字数が
@@ -92,6 +92,22 @@ def find_span_prev(text, rx, start):
     return found.start(), found.end()
 
 
+def find_all_spans(text, rx, limit):
+    """text の中のマッチすべての (開始, 終了) と、上限で打ち切ったか。
+
+    limit 件に達したら打ち切り、まだマッチが残っているときだけ
+    truncated を立てる(ちょうど limit 件で終わる場合は立てない)。
+    検索の一致箇所すべての色付け(窓)で使う。"""
+    spans = []
+    truncated = False
+    for match in rx.finditer(text):
+        if len(spans) >= limit:
+            truncated = True
+            break
+        spans.append((match.start(), match.end()))
+    return spans, truncated
+
+
 def replace_one_text(text, rx, repl, start, regex=True):
     """start 以後の最初のマッチを置換した (新しい本文, 開始, 終了)。
 
@@ -160,6 +176,16 @@ def span_prev(text, rx, start):
         return None
     return [found.start(), found.end()]
 
+def spans_all(text, rx, limit):
+    spans = []
+    truncated = False
+    for m in rx.finditer(text):
+        if len(spans) >= limit:
+            truncated = True
+            break
+        spans.append([m.start(), m.end()])
+    return spans, truncated
+
 def emit(result):
     # 結果はバイト列で UTF-8 と決め打ちして書く(読み込み側と同じ
     # 理由。print / sys.stdout の既定の文字コードに任せない)。
@@ -203,6 +229,11 @@ def main():
                 return expand(m, data.get("repl", ""), regex)
             new_text = rx.sub(sub, text)
             result = {"ok": True, "text": new_text, "count": count[0]}
+        elif op == "find_all":
+            spans, truncated = spans_all(
+                text, rx, int(data.get("limit", 1000)))
+            result = {"ok": True, "spans": spans,
+                      "truncated": truncated}
         else:
             result = {"ok": False, "error": "op", "detail": op}
     except (re.error, IndexError) as e:
@@ -214,7 +245,8 @@ main()
 
 
 def run_operation(op, *, text, pattern, repl="", start=0, regex=True,
-                  case_sensitive=False, timeout=DEFAULT_TIMEOUT_SEC):
+                  case_sensitive=False, timeout=DEFAULT_TIMEOUT_SEC,
+                  limit=0):
     """検索・置換を別プロセスで1回実行し、結果の辞書を返す。
 
     戻り値:
@@ -222,6 +254,9 @@ def run_operation(op, *, text, pattern, repl="", start=0, regex=True,
       replace_one          … {"span": (開始, 終了) | None,
                               "replacement": 置き換えた後の文字列}
       replace_all          … {"text": 新しい本文, "count": 件数}
+      find_all             … {"spans": [(開始, 終了), …],
+                              "truncated": 上限で打ち切ったか}
+                              (limit が件数の上限)
     不正な式・不正な置換文字列・時間切れ・子プロセスの異常は
     RegexFault(利用者向けの文)にする。"""
     if not pattern:
@@ -229,7 +264,7 @@ def run_operation(op, *, text, pattern, repl="", start=0, regex=True,
     payload = json.dumps({
         "op": op, "text": text, "pattern": pattern, "repl": repl,
         "start": int(start), "regex": bool(regex),
-        "case": bool(case_sensitive),
+        "case": bool(case_sensitive), "limit": int(limit),
     }, ensure_ascii=False)
     try:
         proc = subprocess.run(
@@ -266,4 +301,6 @@ def run_operation(op, *, text, pattern, repl="", start=0, regex=True,
         raise RegexFault(f"検索を実行できませんでした（{detail}）")
     if "span" in result and result["span"] is not None:
         result["span"] = tuple(result["span"])
+    if "spans" in result:
+        result["spans"] = [tuple(span) for span in result["spans"]]
     return result

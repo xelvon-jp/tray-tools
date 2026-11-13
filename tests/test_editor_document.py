@@ -371,6 +371,44 @@ def test_load_keeps_cr_line_endings():
             docmod.CRLF, docmod.LF, docmod.CR, None], doc.line_newlines
 
 
+def test_save_numbered_backup_never_overwrites():
+    """numbered_backup では、.bak を上書きせず連番に逃がす。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "v1\n".encode("utf-8"))
+        doc = docmod.load_document(path)
+        doc.text = "v2\n"
+        docmod.save_document(doc, numbered_backup=True)
+        assert Path(path + ".bak").read_text(encoding="utf-8") == "v1\n"
+        doc.text = "v3\n"
+        docmod.save_document(doc, numbered_backup=True)
+        # 最初の控えはそのまま、2つ目は .bak2 へ。
+        assert Path(path + ".bak").read_text(encoding="utf-8") == "v1\n"
+        assert Path(path + ".bak2").read_text(encoding="utf-8") == "v2\n"
+        assert Path(path).read_text(encoding="utf-8") == "v3\n"
+
+
+def test_replaced_line_newlines_keeps_untouched_kinds():
+    """置換後の改行種別: 置換していない行は元の種別を引き継ぐ。"""
+    old_text = "aaa\nbbb\nccc\nddd\n"
+    old_kinds = [docmod.CRLF, docmod.LF, docmod.CRLF, docmod.LF, None]
+    # 2行目だけの置換(改行は取り込まない)。
+    kinds = docmod.replaced_line_newlines(
+        old_text, old_kinds, [(4, 7, "BBB")], docmod.CRLF)
+    assert kinds == old_kinds
+    # 改行を含む置換文字列: 新しい改行は、取り込んだ種別が無ければ
+    # 既定(CRLF)。後ろの行の種別は元のまま。
+    kinds = docmod.replaced_line_newlines(
+        old_text, old_kinds, [(4, 7, "B\nB")], docmod.CRLF)
+    assert kinds == [docmod.CRLF, docmod.CRLF, docmod.LF,
+                     docmod.CRLF, docmod.LF, None]
+    # 行をまたぐ置換: 取り込んだ改行の種別が、置き換えた文字列の
+    # 改行に順に使われる。
+    kinds = docmod.replaced_line_newlines(
+        old_text, old_kinds, [(4, 12, "X\nY")], docmod.LF)
+    assert kinds == [docmod.CRLF, docmod.LF, docmod.LF, None]
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

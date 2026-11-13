@@ -2317,11 +2317,14 @@ def test_newline_glyphs_split_by_kind_and_eof():
     # 最後の行には EOF の印が付く。保存で統一を選ぶと記号もそろう。
     from editor.text_edit import EOF_MARK, NEWLINE_GLYPHS
 
-    # 記号は種別どうしで見分けられ、MS Gothic にある字の範囲。
+    # 記号は種別どうしで見分けられ、どれも1文字(幅を取らない)。
+    # CRLF は ↵(U+21B5、エンターの印。フォントに無い字形は
+    # Qt のフォールバックで補われる)。
     assert NEWLINE_GLYPHS["\n"] == "↓"
     assert NEWLINE_GLYPHS["\r"] == "←"
-    assert NEWLINE_GLYPHS["\r\n"] == "←↓"
+    assert NEWLINE_GLYPHS["\r\n"] == "↵"
     assert len(set(NEWLINE_GLYPHS.values())) == 3
+    assert all(len(glyph) == 1 for glyph in NEWLINE_GLYPHS.values())
     data = "a\r\nb\nc\rd".encode("utf-8")
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "mixed.txt")
@@ -2333,7 +2336,7 @@ def test_newline_glyphs_split_by_kind_and_eof():
             blocks = _all_blocks(window)
             assert len(blocks) == 4
             assert [edit.block_end_mark(b) for b in blocks] == [
-                "←↓", "↓", "←", EOF_MARK]
+                "↵", "↓", "←", EOF_MARK]
             # 不可視文字を描いても落ちない。
             edit.viewport().grab()
             # 保存で「CRLF に統一」を選ぶと、改行が CRLF にそろい、
@@ -2341,7 +2344,7 @@ def test_newline_glyphs_split_by_kind_and_eof():
             window.ask_mixed_newline = lambda: "crlf"
             assert window.save()
             assert [edit.block_end_mark(b) for b in _all_blocks(window)] == [
-                "←↓", "←↓", "←↓", EOF_MARK]
+                "↵", "↵", "↵", EOF_MARK]
             assert Path(path).read_bytes() == "a\r\nb\r\nc\r\nd".encode()
         finally:
             discard_close(window)
@@ -2385,7 +2388,7 @@ def test_newline_glyph_fallback_for_edited_lines():
             blocks = _all_blocks(window)
             assert len(blocks) == 3
             assert [edit.block_end_mark(b) for b in blocks] == [
-                "←↓", "←↓", EOF_MARK]
+                "↵", "↵", EOF_MARK]
         finally:
             discard_close(window)
 
@@ -2413,7 +2416,7 @@ def test_newline_glyphs_follow_line_insert_and_delete():
         window = make_window(path)
         try:
             edit = window._edit
-            assert _glyphs(window) == ["←↓", "↓", "←", EOF_MARK]
+            assert _glyphs(window) == ["↵", "↓", "←", EOF_MARK]
             # "c" の行の頭に打鍵で1行足す。足した行は文書の改行
             # 設定(CRLF)、元の行の記号はそのまま後ろへずれる。
             cursor = edit.textCursor()
@@ -2423,13 +2426,13 @@ def test_newline_glyphs_follow_line_insert_and_delete():
             assert edit.toPlainText() == "a\nb\nX\nc\nd"
             assert _kinds(window) == [
                 docmod.CRLF, docmod.LF, docmod.CRLF, docmod.CR, None]
-            assert _glyphs(window) == ["←↓", "↓", "←↓", "←", EOF_MARK]
+            assert _glyphs(window) == ["↵", "↓", "↵", "←", EOF_MARK]
             assert len(_kinds(window)) == edit.document().blockCount()
             # 元に戻すと、記号も元の並びに戻る。
             edit.undo()
             assert _kinds(window) == [
                 docmod.CRLF, docmod.LF, docmod.CR, None]
-            assert _glyphs(window) == ["←↓", "↓", "←", EOF_MARK]
+            assert _glyphs(window) == ["↵", "↓", "←", EOF_MARK]
             edit.redo()
             # "b" の行を改行ごと消す。後ろの行の記号は詰まるだけで、
             # 種別は変わらない。
@@ -2441,14 +2444,14 @@ def test_newline_glyphs_follow_line_insert_and_delete():
             assert edit.toPlainText() == "a\nX\nc\nd"
             assert _kinds(window) == [
                 docmod.CRLF, docmod.CRLF, docmod.CR, None]
-            assert _glyphs(window) == ["←↓", "←↓", "←", EOF_MARK]
+            assert _glyphs(window) == ["↵", "↵", "←", EOF_MARK]
             # "c" と "d" の間の改行だけを消して行をつなげる。
             cursor = edit.textCursor()
             cursor.setPosition(5)  # "a\nX\nc\nd" の "c" の次の改行
             cursor.deleteChar()
             assert edit.toPlainText() == "a\nX\ncd"
             assert _kinds(window) == [docmod.CRLF, docmod.CRLF, None]
-            assert _glyphs(window) == ["←↓", "←↓", EOF_MARK]
+            assert _glyphs(window) == ["↵", "↵", EOF_MARK]
             assert len(_kinds(window)) == edit.document().blockCount()
         finally:
             discard_close(window)
@@ -2478,7 +2481,7 @@ def test_newline_glyphs_follow_paste_of_mixed_text():
             # 貼った部分は LF・CR、つながった "z" の行は元の CRLF。
             assert _kinds(window) == [
                 docmod.LF, docmod.CR, docmod.CRLF, None]
-            assert _glyphs(window) == ["↓", "←", "←↓", EOF_MARK]
+            assert _glyphs(window) == ["↓", "←", "↵", EOF_MARK]
             assert len(_kinds(window)) == edit.document().blockCount()
         finally:
             discard_close(window)
@@ -2513,7 +2516,7 @@ def test_newline_glyphs_follow_cut_and_paste_reorder():
             edit.insertFromMimeData(mime)
             assert edit.toPlainText() == "b\nca\n"
             assert _kinds(window) == [docmod.LF, docmod.CRLF, None]
-            assert _glyphs(window) == ["↓", "←↓", EOF_MARK]
+            assert _glyphs(window) == ["↓", "↵", EOF_MARK]
             assert len(_kinds(window)) == edit.document().blockCount()
         finally:
             discard_close(window)
@@ -3340,6 +3343,137 @@ def test_taskbar_identity_applied_once_on_show():
 
             filer_shell.set_window_app_id(
                 int(window.winId()), windowmod.TASKBAR_APP_ID)
+    finally:
+        discard_close(window)
+
+
+def test_outline_button_and_pane_agree():
+    # アウトラインのボタンと左窓の表示が、起動直後から一致する
+    # こと。OFF のまま編集・新規作成しても勝手に出ないこと(件2)。
+    window = make_window(
+        None, editor_settings={"show_outline_pane": False})
+    try:
+        view = window._current_view()
+        assert not window._act_outline.isChecked()
+        assert not view.outline_pane.isVisible()
+        window._edit.textCursor().insertText("新しい文書\n2行目\n")
+        app().processEvents()
+        window.new_document()
+        app().processEvents()
+        assert not window._act_outline.isChecked()
+        assert not window._current_view().outline_pane.isVisible()
+        # ON にすれば出て、OFF で消える(従来どおり)。
+        window.set_outline_pane_visible(True)
+        assert window._act_outline.isChecked()
+        assert window._current_view().outline_pane.isVisible()
+        window.set_outline_pane_visible(False)
+        assert not window._act_outline.isChecked()
+        assert not window._current_view().outline_pane.isVisible()
+    finally:
+        discard_close(window)
+    # 既定(ON)でも、ボタンと表示が一致する。
+    window = make_window(None, editor_settings={})
+    try:
+        assert window._act_outline.isChecked()
+        assert window._current_view().outline_pane.isVisible()
+    finally:
+        discard_close(window)
+
+
+def test_wheel_scrolls_anywhere_in_editor_area():
+    # 桁数で折り返す設定のとき、折り返し位置より右の余白や
+    # 行番号エリアでもホイールでスクロールすること(件4)。
+    # イベントは、実際の届き方(ポインタの下の部品へ送る)で送る。
+    window = make_window(
+        None, editor_settings={"wrap_mode": "column", "wrap_column": 30})
+    try:
+        window.resize(760, 400)
+        app().processEvents()
+        edit = window._edit
+        edit.setPlainText("\n".join(f"行{i} あいうえお" for i in range(100)))
+        app().processEvents()
+        bar = edit.verticalScrollBar()
+
+        def wheel_at(edit_x):
+            bar.setValue(0)
+            app().processEvents()
+            global_pos = edit.mapToGlobal(QPoint(edit_x, 30))
+            target = app().widgetAt(global_pos)
+            local = target.mapFromGlobal(global_pos)
+            event = QWheelEvent(
+                QPointF(local), QPointF(global_pos), QPoint(0, 0),
+                QPoint(0, -120), Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase, False)
+            app().sendEvent(target, event)
+            app().processEvents()
+            return bar.value()
+
+        viewport = edit.viewport().geometry()
+        assert wheel_at(viewport.left() + 20) > 0    # 本文の上(従来)
+        assert wheel_at(viewport.right() + 60) > 0   # 折り返しの右の余白
+        assert wheel_at(10) > 0                      # 行番号エリア
+    finally:
+        discard_close(window)
+
+
+def test_paint_invisibles_erases_behind_block_end_marks():
+    # 行末の印を描く前に、その範囲の地を塗り直すこと。印の種類
+    # だけが変わる編集(末尾の行を消し、それまで改行だった印が
+    # EOF になる等)では行の本文が変わらないため、Qt は行の地を
+    # 塗り直さず、前の印が新しい印の横に残ってしまう(件1)。
+    # 塗り直しの範囲を、描画の呼び出し(fillRect が drawText より
+    # 先に、印の位置・幅を覆う範囲で来ること)で確かめる。
+    from PySide6.QtCore import QRect
+
+    from editor import text_edit as text_edit_mod
+    from editor.text_edit import EOF_MARK
+
+    window = make_window()
+    try:
+        edit = window._edit
+        edit.set_show_invisibles(True)
+        edit.setPlainText("あ\nい\nう")
+        app().processEvents()
+        calls = []
+
+        class FakePainter:
+            def __init__(self, _device):
+                pass
+
+            def setPen(self, _pen):
+                pass
+
+            def setFont(self, _font):
+                pass
+
+            def fillRect(self, rect, _color):
+                calls.append(("fill", QRect(rect)))
+
+            def drawText(self, rect, _flags, text):
+                calls.append(("draw", text, QRect(rect)))
+
+        original = text_edit_mod.QPainter
+        text_edit_mod.QPainter = FakePainter
+        try:
+            edit._paint_invisibles()
+        finally:
+            text_edit_mod.QPainter = original
+        fills = [(i, rest[0]) for i, (kind, *rest) in enumerate(calls)
+                 if kind == "fill"]
+        draws = [(i, rest[0], rest[1])
+                 for i, (kind, *rest) in enumerate(calls)
+                 if kind == "draw"]
+        # 3行ぶんの行末の印(改行2つと EOF)が描かれる。
+        assert len(draws) == 3
+        assert any(text == EOF_MARK for _i, text, _r in draws)
+        for i, _text, rect in draws:
+            # その印より前に、同じ位置から始まって印の幅以上を
+            # 覆う塗り直しがある。
+            assert any(j < i and fill.x() == rect.x()
+                       and fill.y() == rect.y()
+                       and fill.width() >= rect.width()
+                       for j, fill in fills), (i, _text, rect)
     finally:
         discard_close(window)
 

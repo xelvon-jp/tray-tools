@@ -1333,12 +1333,20 @@ class ScreenFeature:
             window.present_write()
         return window
 
-    def _show_unseen_tomorrow_memo(self):
-        """起動時: まだ見ていないメモがあれば表示用に出す。"""
+    def _show_unseen_tomorrow_memo(self, boot_time=None):
+        """起動時: まだ見ていないメモがあれば表示用に出す。
+
+        ただし、書いた時刻が今回の PC の起動時刻より前のメモだけを出す。
+        自動反映や再起動のたびに出ると、書いたばかりのメモが誰も見ていない
+        のに表示済みになってしまうため。boot_time はテスト用で、省略時は
+        実機の起動時刻を取る(取れない環境では出す側に倒れる)。"""
         try:
             if self.tomorrow_memo_window is not None:
                 return
-            if self._get_tomorrow_memo_store().has_unseen():
+            if boot_time is None:
+                boot_time = tomorrow_memo.system_boot_time()
+            store = self._get_tomorrow_memo_store()
+            if store.has_unseen_for_startup(boot_time):
                 self._show_tomorrow_memo("read")
         except Exception:  # noqa: BLE001  起動時のおまけ。本体は落とさない
             self._log_failure("明日の自分へメモの表示")

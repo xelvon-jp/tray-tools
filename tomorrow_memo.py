@@ -3,27 +3,73 @@
 # 昨日の自分から今日の自分への手紙のような機能。
 #
 # 仕様(Nagato と文章で合意済み):
-#   - メモは1件だけ。データは PC ローカル(このモジュールと同じフォルダの
-#     tomorrow_memo.json)に持つ。settings.json には混ぜない。
+#   - メモは1件だけ。データは PC ローカル(%LOCALAPPDATA%\traytools\
+#     tomorrow_memo.json)に持つ。settings.json には混ぜない。公開リポジトリの
+#     フォルダには置かない(移行前の置き場に残っていたら、読み込み時に
+#     新しい置き場へ取り込む)。
 #   - 書いた内容は入力のたびに自動保存する(保存ボタンは無い)。
 #   - 過去のメモは自動で履歴に残る。本文が失われる経路を作らない:
 #       * 起動時に表示したメモは、閉じた時点で履歴へ移す(reason="seen")
-#       * 書く窓で前の内容と違う内容に書き換えたら、窓を閉じた時点で
-#         書き換える前の内容を履歴へ移す(reason="replaced")
+#       * 書く窓で前の内容と違う内容に書き換えたら、最初の自動保存の時点で
+#         書き換える前の内容を履歴へ移す(reason="replaced")。窓を閉じるまで
+#         待たないので、書き換えの途中で PC が落ちても前の内容が残る
 #     保存は一時ファイル + os.replace の原子的書き換えで、途中で落ちても
 #     ファイルが半端な状態にはならない。
 #   - 起動時に、まだ見ていない(未表示の)メモがあれば窓で出す。空なら出さない。
+#     ただし、書いた時刻が今回の PC の起動時刻より前のものだけを出す。
+#     自動反映や再起動のたびに、書いたばかりのメモを誰も見ていないのに
+#     表示済みにしてしまわないため(起動時刻が取れない環境では出す側に倒す)。
 #   - 窓から過去のメモも読める(読み取り専用)。
 #
 # データの持ち方と窓をこのモジュールにまとめ、データ部分(TomorrowMemoStore)は
 # Qt に依存させない(テストと将来の使い回しのため)。
 import json
 import os
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DATA_FILENAME = "tomorrow_memo.json"
-DEFAULT_DATA_PATH = Path(__file__).resolve().parent / DATA_FILENAME
+# 移行前の置き場(モジュールと同じフォルダ)。公開リポジトリの中なので、
+# 今はここには置かない。残っていたら読み込み時に新しい置き場へ取り込む。
+LEGACY_DATA_PATH = Path(__file__).resolve().parent / DATA_FILENAME
+
+
+def data_dir() -> Path:
+    """アプリデータの置き場(%LOCALAPPDATA% の下の traytools フォルダ)。
+
+    photometa/config.py と同じ作法で、環境変数 TRAYTOOLS_DATA_DIR が
+    あればそこを使う(テストが一時フォルダへ向けるため)。"""
+    override = os.environ.get("TRAYTOOLS_DATA_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "traytools"
+
+
+def default_data_path() -> Path:
+    return data_dir() / DATA_FILENAME
+
+
+DEFAULT_DATA_PATH = default_data_path()
+
+
+def system_boot_time():
+    """PC の起動時刻(naive な datetime)。Windows の GetTickCount64 から逆算する。
+
+    取れない環境(Windows 以外・API の失敗)では None を返す。その場合、
+    起動時の表示は「出す」側に倒す(has_unseen_for_startup を参照)。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetTickCount64.argtypes = []
+        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        uptime_ms = int(kernel32.GetTickCount64())
+    except Exception:  # noqa: BLE001  取れなければ None(出す側に倒す)
+        return None
+    return datetime.now() - timedelta(milliseconds=uptime_ms)
 
 # 起動してから未表示メモを出すまでの待ち(ms)。トレイや他の起動処理が
 # 落ち着いてから出す(呼び出し側 feature_screen が使う)。
@@ -65,15 +111,47 @@ class TomorrowMemoStore:
     """
 
     def __init__(self, path=None):
-        self.path = Path(path) if path else DEFAULT_DATA_PATH
+        # path を省略したとき(既定の置き場を使うとき)だけ、移行前の
+        # 置き場からの取り込みを行う。テスト等が場所を指定した場合はしない。
+        self._using_default_path = path is None
+        self.path = Path(path) if path else default_data_path()
         self._state = None
+        self._legacy_checked = False
 
     # ---------------------------------------------------------------
     # 読み書き
     # ---------------------------------------------------------------
+    def _import_legacy(self) -> None:
+        """移行前の置き場(リポジトリのフォルダ)にデータが残っていたら、
+        新しい置き場へ取り込む。移したら元のファイルは消す(個人のメモを
+        公開リポジトリのフォルダに残さないため。消せなくても、新しい
+        置き場のほうを読むので支障は無い)。"""
+        if self._legacy_checked:
+            return
+        self._legacy_checked = True
+        try:
+            if self.path.exists():
+                return
+            legacy = LEGACY_DATA_PATH
+            if legacy == self.path or not legacy.exists():
+                return
+            raw = legacy.read_bytes()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_name(self.path.name + ".tmp")
+            tmp_path.write_bytes(raw)
+            os.replace(tmp_path, self.path)
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+        except OSError:
+            pass  # 取り込めなければ空から始める(従来どおり)
+
     def _load(self) -> dict:
         if self._state is not None:
             return self._state
+        if self._using_default_path:
+            self._import_legacy()
         state = _empty_state()
         try:
             raw = self.path.read_text(encoding="utf-8")
@@ -109,6 +187,7 @@ class TomorrowMemoStore:
     def _save(self) -> None:
         state = self._load()
         text = json.dumps(state, ensure_ascii=False, indent=2)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_name(self.path.name + ".tmp")
         with open(tmp_path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -132,6 +211,24 @@ class TomorrowMemoStore:
             and current["text"].strip()
             and not current["seen"]
         )
+
+    def has_unseen_for_startup(self, boot_time=None) -> bool:
+        """起動時に出すべき未表示メモがあるか(PC の起動時刻で絞る)。
+
+        未表示でも、書いた時刻が今回の PC の起動時刻(boot_time)より後の
+        メモは出さない(自動反映や再起動のたびに出て、誰も見ていないのに
+        表示済みになるのを防ぐ)。boot_time が None(取れない環境)なら
+        従来どおり未表示なら出す。書いた日時が読めない場合も出す側に倒す。"""
+        if not self.has_unseen():
+            return False
+        if boot_time is None:
+            return True
+        try:
+            written = datetime.fromisoformat(
+                self._load()["current"]["written_at"])
+        except (TypeError, ValueError):
+            return True
+        return written < boot_time
 
     def set_text(self, text: str, now: str = None) -> None:
         """自動保存。空(空白だけ)なら現在のメモは無しにする。
@@ -192,21 +289,27 @@ class TomorrowMemoStore:
             return None
         return {"text": current["text"], "written_at": current["written_at"]}
 
-    def finish_edit_session(self, snapshot, now: str = None) -> bool:
-        """書く窓を閉じたときの後始末。開いたときの内容と今の内容が違い、
-        開いたときの内容が空でなければ、古い方を履歴へ移す。移したら True。
+    def archive_snapshot(self, snapshot, now: str = None) -> bool:
+        """控え(書く窓を開いた時点の内容)を履歴へ移す。移したら True。
 
         窓が開いている間の自動保存は現在のメモを書き換え続けるので、古い内容は
         この控え(snapshot)からしか残せない。"""
+        if not snapshot or not snapshot["text"].strip():
+            return False
+        self._archive(snapshot, REASON_REPLACED, now)
+        self._save()
+        return True
+
+    def finish_edit_session(self, snapshot, now: str = None) -> bool:
+        """書く窓を閉じたときの後始末。開いたときの内容と今の内容が違い、
+        開いたときの内容が空でなければ、古い方を履歴へ移す。移したら True。"""
         if not snapshot or not snapshot["text"].strip():
             return False
         current = self._load()["current"]
         current_text = current["text"] if current else ""
         if current_text == snapshot["text"]:
             return False
-        self._archive(snapshot, REASON_REPLACED, now)
-        self._save()
-        return True
+        return self.archive_snapshot(snapshot, now)
 
 
 # ================================================================
@@ -271,6 +374,7 @@ class TomorrowMemoWindow(QWidget):
         self._store = store
         self._mode = "write"
         self._snapshot = None
+        self._snapshot_archived = False
         self.setWindowTitle("🌅 明日の自分へメモ")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.resize(460, 330)
@@ -305,10 +409,11 @@ class TomorrowMemoWindow(QWidget):
     # 表示の切り替え
     # ---------------------------------------------------------------
     def show_write(self) -> None:
-        """書く用に開く。開いた時点の内容を控え、閉じるときに変わっていたら
-        古い方を履歴へ移す(finish_edit_session)。"""
+        """書く用に開く。開いた時点の内容を控え、内容が変わったら最初の
+        自動保存の時点で古い方を履歴へ移す(_archive_snapshot_if_changed)。"""
         self._mode = "write"
         self._snapshot = self._store.snapshot()
+        self._snapshot_archived = False
         current = self._store.current()
         self._edit.blockSignals(True)
         self._edit.setPlainText(current["text"] if current else "")
@@ -367,9 +472,25 @@ class TomorrowMemoWindow(QWidget):
         if self._mode == "write":
             self._autosave_timer.start(AUTOSAVE_DELAY_MS)
 
+    def _archive_snapshot_if_changed(self) -> None:
+        """開いた時点の内容(控え)と今の内容が違えば、控えを履歴へ移す。
+
+        最初の自動保存の時点で移すのが肝で、窓を閉じるまで待つと、書き換えの
+        途中で PC が落ちたときに前のメモが失われる。一度移したら、閉じるときに
+        二重に移さないよう印を付ける。"""
+        if self._snapshot_archived or not self._snapshot:
+            return
+        if not self._snapshot["text"].strip():
+            return
+        if self._edit.toPlainText() == self._snapshot["text"]:
+            return
+        if self._store.archive_snapshot(self._snapshot):
+            self._snapshot_archived = True
+
     def _save_now(self) -> None:
         if self._mode != "write":
             return
+        self._archive_snapshot_if_changed()
         self._store.set_text(self._edit.toPlainText())
         current = self._store.current()
         if current:
@@ -402,7 +523,10 @@ class TomorrowMemoWindow(QWidget):
         self._autosave_timer.stop()
         if self._mode == "write":
             self._save_now()
-            self._store.finish_edit_session(self._snapshot)
+            if not self._snapshot_archived:
+                # 自動保存が一度も走らなかった場合の保険(開いてすぐ閉じた等)。
+                # 既に移してある場合は二重に移さない。
+                self._store.finish_edit_session(self._snapshot)
             self._snapshot = None
         elif self._mode == "read":
             # 表示して閉じたので履歴へ移す(次回は出ない)。

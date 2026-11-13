@@ -2,7 +2,10 @@
 # 「明日の自分へメモ」(tomorrow_memo.py)のテスト。
 #
 #   - データの保存と読み戻し(自動保存・書いた日時・表示済み)
+#   - データの置き場(アプリデータ)と、移行前の置き場からの取り込み
+#   - 起動時の表示は、書いた時刻が PC の起動時刻より前のときだけ
 #   - バックアップ(履歴)への移動: 表示して閉じたとき／書き換えたとき
+#     (最初の自動保存の時点で移る。閉じるときに二重に移らない)
 #   - 本文が失われる経路が無いこと(空にしても古い内容は履歴に残る)
 #   - 窓の自動保存と、起動時の表示→閉じると表示済みになること
 #   - feature_screen 側の接着(窓は1つだけ・閉じたら呼び出し側へ知らせる)
@@ -19,6 +22,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -155,6 +159,73 @@ def test_edit_session_clear_archives_old_text():
     tmp.cleanup()
 
 
+def test_default_path_uses_data_dir():
+    # 既定の置き場はリポジトリのフォルダではなく、アプリデータ
+    # (%LOCALAPPDATA%\traytools 相当。テストでは TRAYTOOLS_DATA_DIR で差す)。
+    tmp = tempfile.TemporaryDirectory()
+    old = os.environ.get("TRAYTOOLS_DATA_DIR")
+    os.environ["TRAYTOOLS_DATA_DIR"] = tmp.name
+    try:
+        store = tomorrow_memo.TomorrowMemoStore()
+        assert store.path == Path(tmp.name) / "tomorrow_memo.json"
+        store.set_text("アプリデータ側に書かれる", now="2026-11-13T19:20:00")
+        assert (Path(tmp.name) / "tomorrow_memo.json").exists()
+        assert not (ROOT / "tomorrow_memo.json").exists()
+    finally:
+        if old is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = old
+        tmp.cleanup()
+
+
+def test_legacy_file_imported_on_first_load():
+    # 移行前の置き場(リポジトリのフォルダ)に残っていたデータは、既定の
+    # 置き場を使う Store の最初の読み込みで新しい置き場へ取り込まれる。
+    new_tmp = tempfile.TemporaryDirectory()
+    legacy_tmp = tempfile.TemporaryDirectory()
+    legacy_path = Path(legacy_tmp.name) / "tomorrow_memo.json"
+    legacy_store = tomorrow_memo.TomorrowMemoStore(legacy_path)
+    legacy_store.set_text("移行前のメモ", now="2026-11-13T19:20:00")
+    old_env = os.environ.get("TRAYTOOLS_DATA_DIR")
+    old_legacy = tomorrow_memo.LEGACY_DATA_PATH
+    os.environ["TRAYTOOLS_DATA_DIR"] = new_tmp.name
+    tomorrow_memo.LEGACY_DATA_PATH = legacy_path
+    try:
+        store = tomorrow_memo.TomorrowMemoStore()
+        current = store.current()
+        assert current is not None
+        assert current["text"] == "移行前のメモ"
+        # 新しい置き場にファイルができ、元の場所からは消える
+        assert (Path(new_tmp.name) / "tomorrow_memo.json").exists()
+        assert not legacy_path.exists()
+    finally:
+        tomorrow_memo.LEGACY_DATA_PATH = old_legacy
+        if old_env is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = old_env
+        new_tmp.cleanup()
+        legacy_tmp.cleanup()
+
+
+def test_startup_visibility_depends_on_boot_time():
+    tmp, store = make_store()
+    store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
+    # PC の起動がメモより前(同じ PC セッションで書いた)なら出さない
+    assert store.has_unseen_for_startup(datetime(2026, 11, 13, 8, 0)) is False
+    # PC の起動がメモより後(翌朝の起動)なら出す
+    assert store.has_unseen_for_startup(datetime(2026, 11, 14, 8, 0)) is True
+    # 起動時刻が取れない環境では出す側に倒す
+    assert store.has_unseen_for_startup(None) is True
+    assert store.has_unseen_for_startup() is True
+    # 表示済みになったら、起動時刻によらず出さない
+    store.mark_seen()
+    assert store.has_unseen_for_startup(datetime(2026, 11, 14, 8, 0)) is False
+    assert store.has_unseen_for_startup(None) is False
+    tmp.cleanup()
+
+
 def test_broken_file_is_treated_as_empty():
     tmp = tempfile.TemporaryDirectory()
     path = Path(tmp.name) / "tomorrow_memo.json"
@@ -190,6 +261,31 @@ def test_window_write_autosaves():
     window.close()
     app().processEvents()
     assert closed == [True]
+    tmp.cleanup()
+
+
+def test_window_first_autosave_archives_previous():
+    # 書き換えたら、窓を閉じる前(最初の自動保存の時点)にもう前の内容が
+    # 履歴へ移っていること。途中で落ちても前のメモが残るための作り。
+    app()
+    tmp, store = make_store()
+    store.set_text("前のメモ", now="2026-11-13T19:20:00")
+    window = tomorrow_memo.TomorrowMemoWindow(store)
+    window.show_write()
+    window._edit.setPlainText("書き換え中のメモ")
+    assert store.history() == []  # まだ保存が走っていない
+    window._save_now()  # 自動保存(タイマーの代わりに直接呼ぶ)
+    history = store.history()
+    assert len(history) == 1
+    assert history[0]["text"] == "前のメモ"
+    assert history[0]["reason"] == "replaced"
+    assert store.current()["text"] == "書き換え中のメモ"
+    # さらに書き換えて閉じても、二重には移らない
+    window._edit.setPlainText("さらに書き換えた")
+    window.close()
+    app().processEvents()
+    assert len(store.history()) == 1
+    assert store.current()["text"] == "さらに書き換えた"
     tmp.cleanup()
 
 
@@ -266,6 +362,24 @@ def test_feature_startup_shows_only_unseen():
     tmp.cleanup()
 
 
+def test_feature_startup_respects_boot_time():
+    app()
+    tmp, store = make_store()
+    feature = make_feature(store)
+    store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
+    # 書いた時刻が今回の PC の起動より後(同じセッション)なら出さない
+    feature._show_unseen_tomorrow_memo(boot_time=datetime(2026, 11, 13, 8, 0))
+    assert feature.tomorrow_memo_window is None
+    # 起動より前に書かれたメモなら出す
+    feature._show_unseen_tomorrow_memo(boot_time=datetime(2026, 11, 14, 8, 0))
+    window = feature.tomorrow_memo_window
+    assert window is not None
+    assert window._edit.isReadOnly()
+    window.close()
+    app().processEvents()
+    tmp.cleanup()
+
+
 def test_command_registration_strings():
     main_text = (ROOT / "main.py").read_text(encoding="utf-8")
     assert '"tomorrow-memo"' in main_text
@@ -274,6 +388,13 @@ def test_command_registration_strings():
     assert '"tomorrow-memo": 3660.0' in send_text
     menu_text = (ROOT / "feature_screen.py").read_text(encoding="utf-8")
     assert "明日の自分へメモ" in menu_text
+
+
+def test_gitignore_lists_tomorrow_memo():
+    # 置き場はアプリデータへ移したが、移行前の置き場に残った場合の保険として
+    # .gitignore にも名前が入っていること(public リポジトリへの混入防止)。
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "tomorrow_memo.json" in gitignore
 
 
 if __name__ == "__main__":
@@ -286,12 +407,18 @@ if __name__ == "__main__":
         test_edit_session_no_change_keeps_history_empty,
         test_edit_session_clear_archives_old_text,
         test_broken_file_is_treated_as_empty,
+        test_default_path_uses_data_dir,
+        test_legacy_file_imported_on_first_load,
+        test_startup_visibility_depends_on_boot_time,
         test_window_write_autosaves,
+        test_window_first_autosave_archives_previous,
         test_window_read_close_marks_seen,
         test_window_switch_to_write_archives_read_memo,
         test_feature_opens_write_window_and_notifies_waiter,
         test_feature_startup_shows_only_unseen,
+        test_feature_startup_respects_boot_time,
         test_command_registration_strings,
+        test_gitignore_lists_tomorrow_memo,
     ]
     for test in tests:
         test()

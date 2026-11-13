@@ -107,6 +107,17 @@
 #   (trial_patterns)、適用の前に「適用中」の印を書いて起動時に
 #   残っていたら既定に戻す(pattern_applying、起動時の保険)。
 #
+# マクロの言語化・登録(2026-11-13): 記録したマクロは、1行1命令の
+# テキスト形式で書き出し・読み込みできる(editor/macros.py の
+# commands_to_text / commands_from_text。ファイル保存・読み込みは
+# .txt でテキスト形式、.json で従来の JSON。読み込みは中身でも
+# 見分ける)。名前を付けて登録したマクロは editor 節の macros に
+# 残り、マクロメニューから実行できる。登録ごとにキーも1つ付け
+# られ、組み込みの命令と重なるキーは効かない(組み込み優先。
+# 管理画面では組み込みと重なるキーは付けられない)。管理画面
+# (editor/macro_dialog.py)では、登録・名前の変更・削除・キー変更・
+# テキストでの編集ができる。
+#
 # 拡張子別の設定(2026-11-13): 折り返し(方式と桁数)、Markdown の
 # 色付け、フォント(名前と大きさ)、タブの幅を、ファイルの拡張子
 # ごとに変えられる。持ち方は色の設定と同じ「全体+上書き」で、
@@ -194,6 +205,7 @@ from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor import keymap as keymapmod
 from editor.keymap_dialog import KeymapSettingsDialog
+from editor.macro_dialog import MacroLibraryDialog
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
@@ -241,6 +253,13 @@ INCREMENTAL_SEARCH_DELAY_MS = 120
 # キー割り当ての画面(editor/keymap_dialog.py)から変えると、その場で
 # この窓のアクションへ付け直して、差分をこのキーで保存する。
 KEYMAP_KEY = "keymap"
+
+# 登録マクロ(settings の editor 節 macros のキー)。値は
+# {名前: {"commands": [...], "key": "..."}} で、整えは
+# editor/macros.py の sanitize_registered が行う。管理画面
+# (editor/macro_dialog.py)から変えると、その場でマクロメニューへ
+# 付け直して、差分をこのキーで保存する。
+MACROS_KEY = "macros"
 
 # 拡張子別の設定(settings の editor 節 extension_settings のキー)。
 # 値は拡張子 → 項目 → 値の対応(全体と違う項目だけの上書き分)で、
@@ -665,6 +684,13 @@ class EditorWindow(QMainWindow):
         self._macro_skips = 0
         self._current_macro = []
         self._current_macro_name = ""
+        # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
+        # (_build_menus)でアクションにし、変更のたびに付け直す。
+        self._registered_macros = macmod.sanitize_registered(
+            section.get(MACROS_KEY))
+        self._registered_macro_actions = {}
+        self._registered_menu_items = []
+        self._macro_menu = None
         self._in_command = False      # 命令の実行中(変化を二重に数えない)
         self._replaying = False       # マクロの再生中
         # 元に戻す・やり直しの最中かと、変化の直前の (選択の開始,
@@ -980,6 +1006,10 @@ class EditorWindow(QMainWindow):
         for actions in self._keymap_actions.values():
             for action in actions:
                 view.edit.addAction(action)
+        # 登録マクロのアクションも同じ作法(本文にフォーカスがある
+        # ときだけショートカットが効く)。
+        for action in self._registered_macro_actions.values():
+            view.edit.addAction(action)
         self._views.append(view)
         self._tabs.addTab(view, "")
         self._update_tab_label(view)
@@ -1489,6 +1519,7 @@ class EditorWindow(QMainWindow):
                      self.show_pattern_settings, None, view_menu)
 
         macro_menu = self.menuBar().addMenu("マクロ(&M)")
+        self._macro_menu = macro_menu
         self._act_macro_record = QAction("記録開始(&R)", self)
         self._act_macro_record.setCheckable(True)
         self._act_macro_record.toggled.connect(self.set_macro_recording)
@@ -1499,6 +1530,11 @@ class EditorWindow(QMainWindow):
                      None, macro_menu)
         self._action("マクロを開いて再生(&O)…", self.load_macro_dialog,
                      None, macro_menu)
+        macro_menu.addSeparator()
+        self._action("マクロの管理(&G)…", self.show_macro_library,
+                     None, macro_menu)
+        # 登録マクロの項目はこの後ろへ足す(変更のたびに付け直す)。
+        self._rebuild_registered_macro_menu()
 
         copilot_menu = self.menuBar().addMenu("Copilot(&C)")
         self._act_send = self._action(
@@ -1984,6 +2020,9 @@ class EditorWindow(QMainWindow):
         self._keymap_overrides = keymapmod.sanitize_overrides(overrides)
         self._keymap = keymapmod.merge_keymap(self._keymap_overrides)
         self._apply_keymap_to_actions()
+        # 登録マクロのショートカットは、組み込みとの重なりで付け
+        # 直しが要るので、こちらも作り直す。
+        self._rebuild_registered_macro_menu()
         self._persist_settings({KEYMAP_KEY: dict(self._keymap_overrides)})
 
     def _apply_keymap_to_actions(self):
@@ -3392,22 +3431,36 @@ class EditorWindow(QMainWindow):
         return True
 
     def save_macro(self, path, name="") -> bool:
-        """いまのマクロ(記録中なら記録中の列)を JSON で書く。"""
+        """いまのマクロ(記録中なら記録中の列)を書く。
+
+        拡張子が .txt ならテキスト形式(1行1命令)、それ以外は
+        従来の JSON で書く。"""
         commands = (self.recorded_commands() if self._recorder.recording
                     else self._current_macro)
         try:
             with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(macmod.macro_to_json(commands, name))
+                if str(path).lower().endswith(".txt"):
+                    f.write(macmod.commands_to_text(commands, name))
+                else:
+                    f.write(macmod.macro_to_json(commands, name))
         except OSError as e:
             self.statusBar().showMessage(f"マクロを保存できませんでした: {e}")
             return False
         return True
 
     def load_macro(self, path) -> list:
-        """マクロの JSON を読み、いまのマクロにする。命令の列を返す。
-        読めなければ ValueError / OSError を上げる(呼び側が伝える)。"""
+        """マクロのファイルを読み、いまのマクロにする。命令の列を
+        返す。形式は中身で見分ける({ か [ で始まれば JSON、それ
+        以外はテキスト形式)。読めなければ ValueError / OSError を
+        上げる(呼び側が伝える)。"""
         with open(path, encoding="utf-8") as f:
-            name, commands = macmod.macro_from_json(f.read())
+            text = f.read()
+        # 先頭の BOM と空白を除いて、{ か [ で始まれば JSON。
+        head = text.lstrip("\ufeff \t\r\n")
+        if head.startswith(("{", "[")):
+            name, commands = macmod.macro_from_json(text)
+        else:
+            name, commands = macmod.commands_from_text(text)
         self._current_macro = commands
         self._current_macro_name = name
         return commands
@@ -3415,7 +3468,8 @@ class EditorWindow(QMainWindow):
     def save_macro_dialog(self):
         try:
             path, _ = QFileDialog.getSaveFileName(
-                self, "マクロを保存", "", "マクロ (*.json);;すべてのファイル (*)")
+                self, "マクロを保存", "",
+                "マクロ (*.json *.txt);;すべてのファイル (*)")
             if not path:
                 return
             name = os.path.splitext(os.path.basename(path))[0]
@@ -3427,7 +3481,8 @@ class EditorWindow(QMainWindow):
     def load_macro_dialog(self):
         try:
             path, _ = QFileDialog.getOpenFileName(
-                self, "マクロを開く", "", "マクロ (*.json);;すべてのファイル (*)")
+                self, "マクロを開く", "",
+                "マクロ (*.json *.txt);;すべてのファイル (*)")
             if not path:
                 return
             commands = self.load_macro(path)
@@ -3435,6 +3490,105 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"マクロを読めませんでした: {e}")
             return
         self.play_macro(commands)
+
+    # ---------------------------------------------------------------
+    # 登録マクロ(名前を付けて設定に残し、メニューとキーで呼ぶ)
+    # ---------------------------------------------------------------
+    def registered_macros(self) -> dict:
+        """登録マクロの対応(名前 → {"commands", "key"})の写し。"""
+        return macmod.copy_registered(self._registered_macros)
+
+    def apply_registered_macros(self, mapping):
+        """登録マクロの変更を反映して保存する。
+
+        管理画面(editor/macro_dialog.py)からの変更を受ける口。
+        メニューの項目とショートカットを付け直し、保存は macros
+        キーへの差分のみ(丸ごと書き換えはしない)。"""
+        self._registered_macros = macmod.sanitize_registered(mapping)
+        self._rebuild_registered_macro_menu()
+        self._persist_settings(
+            {MACROS_KEY: macmod.copy_registered(self._registered_macros)})
+
+    def register_macro(self, name, commands, key=""):
+        """いまのマクロなどを、名前を付けて登録する。"""
+        mapping = self.registered_macros()
+        mapping[str(name)] = {"commands": macmod.copy_commands(commands),
+                              "key": key}
+        self.apply_registered_macros(mapping)
+
+    def play_registered_macro(self, name) -> bool:
+        """登録マクロを再生する。無ければステータスに出して False。"""
+        entry = self._registered_macros.get(name)
+        if entry is None:
+            self.statusBar().showMessage(
+                f"登録マクロがありません（{name}）", 4000)
+            return False
+        self._current_macro = macmod.copy_commands(entry["commands"])
+        self._current_macro_name = name
+        return self.play_macro(self._current_macro)
+
+    def show_macro_library(self):
+        """マクロの管理画面(editor/macro_dialog.py)を開く。
+
+        変更はその場でメニューへ反映され、設定へ保存される
+        (apply_registered_macros 経由)。画面で「実行」を押したら、
+        閉じたあとにそのマクロを再生する。"""
+        reserved = {}
+        for cmd_name, keys in self._keymap.items():
+            if keys:
+                reserved[keys] = keymapmod.command_label(cmd_name)
+        dialog = MacroLibraryDialog(
+            self, macros=self._registered_macros,
+            reserved_keys=reserved,
+            current_commands=lambda: (
+                self.recorded_commands() if self._recorder.recording
+                else macmod.copy_commands(self._current_macro)),
+            on_change=self.apply_registered_macros)
+        dialog.exec()
+        if dialog.run_requested:
+            self.play_registered_macro(dialog.run_requested)
+
+    def _rebuild_registered_macro_menu(self):
+        """登録マクロのメニュー項目とショートカットを作り直す。
+
+        ショートカットは、組み込みの命令が使っているキーとは付け
+        ない(組み込み優先)。登録どうしで重なったら先の登録が勝つ
+        (管理画面では後勝ちで解消されるので、重なりが残るのは
+        設定を手で書き換えた場合だけ)。"""
+        menu = self._macro_menu
+        for item in self._registered_menu_items:
+            if menu is not None:
+                menu.removeAction(item)
+            item.deleteLater()
+        self._registered_menu_items = []
+        self._registered_macro_actions = {}
+        if menu is None:
+            return
+        if self._registered_macros:
+            self._registered_menu_items.append(menu.addSeparator())
+        used = set()
+        for keys in self._keymap.values():
+            if keys:
+                used.add(QKeySequence(keys).toString(
+                    QKeySequence.SequenceFormat.PortableText))
+        for name, entry in self._registered_macros.items():
+            action = QAction(name, self)
+            keys = (entry.get("key") or "").strip()
+            normalized = (QKeySequence(keys).toString(
+                QKeySequence.SequenceFormat.PortableText) if keys else "")
+            if normalized and normalized not in used:
+                action.setShortcut(QKeySequence(normalized))
+                used.add(normalized)
+            action.setShortcutContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            for view in self._views:
+                view.edit.addAction(action)
+            action.triggered.connect(
+                lambda _checked=False, n=name:
+                self.play_registered_macro(n))
+            menu.addAction(action)
+            self._registered_menu_items.append(action)
+            self._registered_macro_actions[name] = action
 
     # ---------------------------------------------------------------
     # 検索

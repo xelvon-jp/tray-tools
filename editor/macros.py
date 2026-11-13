@@ -47,7 +47,24 @@
 #   矩形選択での編集(複数行にまたがる変化は切り分けられない)、
 #   選択範囲を打って上書きする入力(置き換えの変化)、
 #   元に戻す・やり直しの最中の変化、マウスでのカーソル移動。
+#
+# テキスト形式(言語化。commands_to_text / commands_from_text):
+#   1行1命令で、人が読んで直せる形にする。文法は単純に保つ:
+#     # name: 名前        マクロの名前(コメント行のうち、この形だけ拾う)
+#     # コメント          # で始まる行と空行は無視する
+#     命令名              引数の無い命令は名前だけ
+#     命令名 key=値 ...   引数は key=値 の並び。値は JSON のリテラル
+#                         (文字列は "…" でエスケープ可、数値、true/false)
+#     insert_text "文字列"  insert_text だけの簡便形(text="…" でもよい)
+#   壊れた行は「N 行目」と行番号つきで ValueError にする(黙って
+#   飛ばすと、書いたつもりの手順が欠けるため。JSON 版と同じ作法)。
+#
+# 登録マクロ(sanitize_registered): 設定の editor 節に
+#   {名前: {"commands": [...], "key": "Ctrl+Alt+1"}} の形で持つ。
+#   値は JSON の形のまま(命令の列の検証は _checked_commands を共用)。
+#   値が命令の列そのもの([..])なら、キーなしの登録として受ける。
 import json
+import re
 
 KNOWN_COMMANDS = frozenset({
     "insert_text",
@@ -104,6 +121,23 @@ def macro_to_json(commands, name="") -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _checked_commands(raw):
+    """命令の列(生の値)を検証して、{"cmd": ..., "args": {...}} の
+    並びにして返す。形が壊れていたら ValueError。"""
+    if not isinstance(raw, list):
+        raise ValueError("commands が命令の列になっていません")
+    commands = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict) or entry.get("cmd") not in KNOWN_COMMANDS:
+            bad = entry.get("cmd") if isinstance(entry, dict) else entry
+            raise ValueError(f"{i + 1} 件目の命令が不正です（{bad!r}）")
+        args = entry.get("args") or {}
+        if not isinstance(args, dict):
+            raise ValueError(f"{i + 1} 件目の args が辞書になっていません")
+        commands.append({"cmd": entry["cmd"], "args": dict(args)})
+    return commands
+
+
 def macro_from_json(text: str):
     """JSON 文字列から (名前, 命令の列) を返す。
 
@@ -119,18 +153,157 @@ def macro_from_json(text: str):
         raw = data.get("commands")
     else:
         raise ValueError("マクロの JSON は、命令の列か {\"commands\": [...]} の形にしてください")
-    if not isinstance(raw, list):
-        raise ValueError("commands が命令の列になっていません")
+    return name, _checked_commands(raw)
+
+
+# ---------------------------------------------------------------
+# テキスト形式(言語化)
+# ---------------------------------------------------------------
+_NAME_LINE = "# name:"
+_KEY_EQ_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+_DECODER = json.JSONDecoder()
+
+
+def commands_to_text(commands, name="") -> str:
+    """命令の列をテキスト形式(1行1命令)にする。
+
+    先頭に「# name: 名前」の行を置く(名前があるとき)。引数の値は
+    JSON リテラルで書くので、文字列の中の改行や引用符はエスケープ
+    されて1行に収まる。insert_text は text だけのときに簡便形
+    (insert_text "…")で書く。"""
+    lines = []
+    if name:
+        lines.append(f"{_NAME_LINE} {name}")
+    for entry in commands:
+        cmd = entry["cmd"]
+        args = dict(entry.get("args") or {})
+        if not args:
+            lines.append(cmd)
+        elif cmd == "insert_text" and set(args) == {"text"}:
+            lines.append(
+                "insert_text " + json.dumps(str(args["text"]),
+                                            ensure_ascii=False))
+        else:
+            parts = [cmd]
+            for key, value in args.items():
+                parts.append(
+                    f"{key}={json.dumps(value, ensure_ascii=False)}")
+            lines.append(" ".join(parts))
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _decode_value(text, pos, lineno):
+    """text の pos から JSON リテラルを1つ読む。(値, 終わり位置)。"""
+    try:
+        value, end = _DECODER.raw_decode(text, pos)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{lineno} 行目の値が読めません（{e.msg}）") from e
+    if not isinstance(value, (str, int, float, bool)):
+        raise ValueError(
+            f"{lineno} 行目の値には、文字列・数値・真偽だけが書けます")
+    return value, end
+
+
+def _parse_args(cmd, rest, lineno):
+    """命令名の後ろ(rest)を引数の辞書にする。"""
+    if cmd == "insert_text" and not _KEY_EQ_RE.match(rest):
+        # 簡便形: JSON 文字列そのものが text になる。
+        value, end = _decode_value(rest, 0, lineno)
+        if not isinstance(value, str) or rest[end:].strip():
+            raise ValueError(
+                f"{lineno} 行目: insert_text の後ろは文字列1つだけに"
+                "してください")
+        return {"text": value}
+    args = {}
+    pos = 0
+    while pos < len(rest):
+        match = _KEY_EQ_RE.match(rest, pos)
+        if match is None:
+            raise ValueError(
+                f"{lineno} 行目の引数が key=値 の形になっていません")
+        value, end = _decode_value(rest, match.end(), lineno)
+        args[match.group(1)] = value
+        pos = end
+        while pos < len(rest) and rest[pos] in " \t":
+            pos += 1
+    return args
+
+
+def commands_from_text(text: str):
+    """テキスト形式から (名前, 命令の列) を返す。
+
+    壊れた行があったら、その行番号つきで ValueError(黙って飛ばす
+    と、書いたつもりの手順が欠けるため)。"""
+    name = ""
     commands = []
-    for i, entry in enumerate(raw):
-        if not isinstance(entry, dict) or entry.get("cmd") not in KNOWN_COMMANDS:
-            bad = entry.get("cmd") if isinstance(entry, dict) else entry
-            raise ValueError(f"{i + 1} 件目の命令が不正です（{bad!r}）")
-        args = entry.get("args") or {}
-        if not isinstance(args, dict):
-            raise ValueError(f"{i + 1} 件目の args が辞書になっていません")
-        commands.append({"cmd": entry["cmd"], "args": dict(args)})
+    for lineno, raw_line in enumerate(str(text).splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if not name and line.startswith(_NAME_LINE):
+                name = line[len(_NAME_LINE):].strip()
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0]
+        if cmd not in KNOWN_COMMANDS:
+            raise ValueError(
+                f"{lineno} 行目の命令が不正です（{cmd!r}）")
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        args = _parse_args(cmd, rest, lineno) if rest else {}
+        commands.append({"cmd": cmd, "args": args})
     return name, commands
+
+
+# ---------------------------------------------------------------
+# 登録マクロ(設定に持つ形の整え)
+# ---------------------------------------------------------------
+def copy_commands(commands):
+    """命令の列の写し(args も含めて新しい辞書にする)。"""
+    return [{"cmd": entry["cmd"], "args": dict(entry.get("args") or {})}
+            for entry in commands]
+
+
+def sanitize_registered(raw):
+    """登録マクロの設定値を整える。
+
+    形は {名前: {"commands": [...], "key": "..."}}。値が命令の列
+    そのもの([..])なら、キーなしの登録として受ける。壊れた項目
+    (知らない命令を含む・命令が空など)は黙って落とす(設定ファイル
+    の書き間違いで窓が開かなくなるのを防ぐため。他の設定の整えと
+    同じ作法)。"""
+    clean = {}
+    if not isinstance(raw, dict):
+        return clean
+    for raw_name, entry in raw.items():
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        if isinstance(entry, list):
+            commands_raw, key = entry, ""
+        elif isinstance(entry, dict):
+            commands_raw = entry.get("commands")
+            key = entry.get("key")
+            key = key.strip() if isinstance(key, str) else ""
+        else:
+            continue
+        try:
+            commands = _checked_commands(commands_raw)
+        except ValueError:
+            continue
+        if not commands:
+            continue
+        clean[name] = {"commands": commands, "key": key}
+    return clean
+
+
+def copy_registered(mapping):
+    """登録マクロの対応(整えた形)の写し。"""
+    return {
+        name: {"commands": copy_commands(entry["commands"]),
+               "key": entry.get("key") or ""}
+        for name, entry in (mapping or {}).items()
+    }
 
 
 class MacroRecorder:

@@ -395,7 +395,7 @@ def cmd_post(args, message, muse_factory=None):
         s, refs = muse.scan()
         result["found"] = public_summary(s)
         # --chat でも、切り替え前に表示中のチャットの下書きを守る(同じ確認を使う)
-        reason = check_initial(s, True) if chat_arg else check_initial(s, args.current_chat)
+        reason = check_initial(s, True) if chat_arg else check_initial(s, args.current_chat, getattr(args, "interrupt", False))
 
         # 表示中のチャットに前回の依頼 id が見えていれば、それが目的のチャット。
         # 一覧を開かずにそのまま投稿する(窓口チャットは Muse の作業後もそのまま
@@ -495,7 +495,7 @@ def cmd_post(args, message, muse_factory=None):
                 return 1, result
 
         title_before = s["chat_title"]
-        reason = check_before_set(s)
+        reason = check_before_set(s, allow_busy=getattr(args, "interrupt", False))
         if reason:
             result["reason"] = reason + note_suffix()
             return 1, result
@@ -510,10 +510,11 @@ def cmd_post(args, message, muse_factory=None):
         muse.set_value(refs["input"][0], message)
         wrote = True
         steps.append("投稿欄に書いた")
-        s, refs, ok = muse.poll(lambda x: check_before_invoke(x, message) is None,
+        _ab = getattr(args, "interrupt", False)
+        s, refs, ok = muse.poll(lambda x: check_before_invoke(x, message, _ab) is None,
                                 SEND_APPEAR_TIMEOUT)
         if not ok:
-            result["reason"] = (check_before_invoke(s, message)
+            result["reason"] = (check_before_invoke(s, message, _ab)
                                 or "送信の準備を確かめられない") + note_suffix()
             if _restore_input(muse, refs, message):
                 steps.append("送らずに投稿欄を空に戻した")
@@ -1032,6 +1033,8 @@ def build_parser():
     post.add_argument("--dry-run", action="store_true", help="UI を一切変えずに計画だけ返す")
     post.add_argument("--allow-multiline", action="store_true",
                       help="改行入りの投稿文を許す(送信の挙動は未検証)")
+    post.add_argument("--interrupt", action="store_true",
+                      help="Muse が作業中でも投稿する(2026-11-13 陽太さん許可。送信ボタンが出なければ送らずに戻す)")
     desk = sub.add_parser("desk", help="窓口チャットの控えを見る / 直す")
     desk.add_argument("--set", help="この窓口(例: tray-tools)の控えを書き換える")
     desk.add_argument("--chat", help="--set で、窓口にするチャット名")

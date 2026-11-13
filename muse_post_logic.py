@@ -187,7 +187,7 @@ def _input_reason(s):
     return None
 
 
-def check_initial(s, current_chat):
+def check_initial(s, current_chat, allow_busy=False):
     """着手してよいか。よければ None、だめなら理由。何も押す前に呼ぶ。
 
     新しいチャットを作る場合でも投稿欄が空であることを求める。作ると画面が
@@ -198,7 +198,7 @@ def check_initial(s, current_chat):
     if reason:
         return reason
     if current_chat:
-        if s["busy"]:
+        if s["busy"] and not allow_busy:
             return "表示中のチャットは作業中(『停止』がある)"
         return None
     if s["new_chat"] == 0 and s["open_list"] == 0:
@@ -241,9 +241,10 @@ def check_new_chat_ready(s, before_sig=None):
     return _input_reason(s)
 
 
-def check_before_set(s):
-    """SetValue の直前。よければ None。"""
-    if s["busy"]:
+def check_before_set(s, allow_busy=False):
+    """SetValue の直前。よければ None。
+    allow_busy: 2026-11-13 陽太さん許可。やり取りが長く詰まったときは、作業中でも割り込んで投稿してよい。"""
+    if s["busy"] and not allow_busy:
         return "作業中(『停止』がある)"
     return _input_reason(s)
 
@@ -254,15 +255,15 @@ def _same_text(a, b):
     return a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
 
 
-def check_before_invoke(s, message):
+def check_before_invoke(s, message, allow_busy=False):
     """送信ボタンを押す直前。よければ None。
 
     読み戻した値が送った文字列と一致することを求める。React が SetValue を
     取りこぼしたり、陽太さんが同時に打鍵して混ざったりしたときに、意図と違う
     文面を送らないため。
     busy もここで見直す(20261105-01 #3)。SetValue の待ちの間に表示中の
-    チャットが作業中になったら、押さない。"""
-    if s["busy"]:
+    チャットが作業中になったら、押さない(allow_busy のときは押す。送信ボタンが出なければ押さない)。"""
+    if s["busy"] and not allow_busy:
         return "作業中(『停止』がある)"
     if s["inputs"] != 1:
         return "投稿欄を見失った"

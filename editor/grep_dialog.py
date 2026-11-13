@@ -44,7 +44,9 @@ class GrepDialog(QDialog):
                  case_sensitive=False, on_jump=None):
         super().__init__(parent)
         self.setWindowIcon(editor_icon.qicon())
-        self.setWindowTitle("フォルダ内を検索")
+        # 製品名は editor/window.py の APP_NAME = "EDDy"。ここは循環
+        # import を避けるため文字列で持つ。
+        self.setWindowTitle("フォルダ内を検索 - EDDy")
         self.resize(720, 480)
         self._on_jump = on_jump
         self._bridge = _GrepBridge(self)

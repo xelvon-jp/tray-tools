@@ -3690,9 +3690,9 @@ class FilerWindow(QWidget):
                 dirty, unreadable = 0, 1
             if dirty or unreadable:
                 if dirty:
-                    what = f"未保存のエディタが {dirty}窓"
+                    what = f"未保存のEDDyが {dirty}窓"
                 else:
-                    what = "状態の読めないエディタの窓"
+                    what = "状態の読めないEDDyの窓"
                 if not self.confirm(
                         "あっふ",
                         f"{what}あります。\n{verb}？",
@@ -4595,12 +4595,12 @@ class FilerWindow(QWidget):
 
     def build_editor_context_menu(self, pane):
         """一覧の右クリックメニュー。内蔵エディタで開ける対象がある
-        ときだけ「エディタで開く」を持つ QMenu を返す。無ければ None
+        ときだけ「EDDyで開く」を持つ QMenu を返す。無ければ None
         (従来どおり何も出さない)。"""
         if not self._text_editor_entries(pane):
             return None
         menu = QMenu()
-        action = menu.addAction("エディタで開く")
+        action = menu.addAction("EDDyで開く")
         action.triggered.connect(
             lambda _checked=False, p=pane: self._open_targets_in_text_editor(p))
         return menu
@@ -6114,7 +6114,7 @@ class FilerWindow(QWidget):
             # エディタの入口を足す(一覧の Ctrl+E と同じ作法)。
             if core.opens_in_viewer(os.path.basename(path),
                                     self.viewer_extensions):
-                items.append((free_key("T"), "エディタで開く",
+                items.append((free_key("T"), "EDDyで開く",
                               ("text_editor", path)))
             if self._launcher_registerable(path):
                 items.append((free_key("LKR"), "ランチャ登録する",

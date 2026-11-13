@@ -532,7 +532,7 @@ class ScreenFeature:
         self.menu.addAction("⌨ コマンドランチャ", lambda: self.start_launcher())
         # 内蔵テキストエディタ(秀丸の代替)。あっふの隣に置く(ファイルを開く
         # 行き来が近いため)。窓は1つだけ持ち回す(start_text_editor)。
-        self.menu.addAction("📝 テキストエディタ", self.start_text_editor)
+        self.menu.addAction("📝 EDDy", self.start_text_editor)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、
@@ -3781,11 +3781,11 @@ class ScreenFeature:
 
                 dirty, unreadable = editor_module.dirty_window_state([editor])
                 if dirty:
-                    blockers.append(f"未保存のエディタ {dirty}窓")
+                    blockers.append(f"未保存のEDDy {dirty}窓")
                 if unreadable:
-                    blockers.append("エディタ(状態を読めず)")
+                    blockers.append("EDDy(状態を読めず)")
             except Exception:  # noqa: BLE001  読めないなら「あるかも」に倒す
-                blockers.append("エディタ(状態を読めず)")
+                blockers.append("EDDy(状態を読めず)")
         return blockers
 
     def restart_from_ipc(self) -> str:
@@ -3831,7 +3831,7 @@ class ScreenFeature:
                 if dirty or unreadable:
                     answer = QMessageBox.question(
                         self.menu, "再起動",
-                        "未保存のエディタがあります。再起動すると編集中の"
+                        "未保存のEDDyがあります。再起動すると編集中の"
                         "内容が失われます。\nそれでも再起動しますか？",
                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                     if answer != QMessageBox.Yes:

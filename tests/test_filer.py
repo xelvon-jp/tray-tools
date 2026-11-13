@@ -12027,7 +12027,7 @@ def test_text_editor_context_menu():
             menu = w.build_editor_context_menu(L)
             assert menu is not None
             labels = [a.text() for a in menu.actions()]
-            assert labels == ["エディタで開く"], labels
+            assert labels == ["EDDyで開く"], labels
             menu.actions()[0].trigger()
             assert len(w._text_editors) == 1
             assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
@@ -12120,7 +12120,7 @@ def test_picker_ctrl_enter_text_editor_item():
                                  {"kind": "file",
                                   "path": str(left / "alpha.txt")})
             labels = [item[1] for item in captured["items"] if item]
-            assert "エディタで開く" in labels, labels
+            assert "EDDyで開く" in labels, labels
             assert opened == [str(left / "alpha.txt")], opened
             # 画像の行には項目が無い
             captured.clear()
@@ -12135,7 +12135,7 @@ def test_picker_ctrl_enter_text_editor_item():
                                  {"kind": "file",
                                   "path": str(left / "photo.JPG")})
             labels = [item[1] for item in captured["items"] if item]
-            assert "エディタで開く" not in labels, labels
+            assert "EDDyで開く" not in labels, labels
             assert opened == []
         finally:
             w.close()

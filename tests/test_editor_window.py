@@ -97,8 +97,7 @@ def test_open_sjis_crlf_and_save_roundtrip():
         try:
             assert window.text() == "1行目\n日本語です\n"
             assert window._enc_label.text().startswith("SJIS / CRLF")
-            assert "a.txt" in window.windowTitle()
-            assert "*" not in window.windowTitle()
+            assert window.windowTitle() == "a.txt - EDDy"
             assert window.save()  # 触らずに上書き保存 → バイト列は不変
             assert Path(path).read_bytes() == data
         finally:
@@ -270,6 +269,27 @@ def test_new_document_after_discard():
         assert "*" not in window.windowTitle()
     finally:
         discard_close(window)
+
+
+def test_window_title_shows_app_name_eddy():
+    """製品名は EDDy。窓のタイトルは「ファイル名 - EDDy」で、無題でも
+    EDDy が出る。変更印(*)は従来どおり名前の後ろに付く。"""
+    from editor.window import APP_NAME
+    assert APP_NAME == "EDDy"
+    window = make_window()
+    try:
+        assert window.windowTitle() == "無題 - EDDy"
+        type_text(window, "x")
+        assert window.windowTitle() == "無題 * - EDDy"
+    finally:
+        discard_close(window)
+    # 付随する窓(grep のダイアログ)も EDDy を名乗る。
+    from editor.grep_dialog import GrepDialog
+    dialog = GrepDialog()
+    try:
+        assert dialog.windowTitle() == "フォルダ内を検索 - EDDy"
+    finally:
+        dialog.close()
 
 
 def test_open_path_asks_before_discarding():

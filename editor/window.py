@@ -108,7 +108,9 @@ from editor.keymap import merge_keymap
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
-APP_NAME = "テキストエディタ"
+# 利用者の目に触れる製品名(2026-11-13 に Nagato が命名)。内部の
+# モジュール名(editor/ パッケージや settings の editor 節)は変えない。
+APP_NAME = "EDDy"
 ENCODING_ORDER = ["utf-8", "cp932", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
 # フォントの既定。settings の editor 節(font_family / font_size)で
 # 上書きできる。大きさは第1段までの既定(10pt)に合わせた。

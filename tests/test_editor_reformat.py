@@ -32,10 +32,36 @@ def test_sentence_breaks_at_kuten():
 
 
 def test_closers_stay_with_sentence():
-    # 句点の後ろの閉じ括弧は、句点と同じ行に残る。
+    # 句点の後ろの閉じ括弧(かっこの外にあるもの)は、句点と同じ行に残る。
+    assert fmt(["すごい！』次です。"], 80) == ["すごい！』", "次です。"]
+    # かっこの中の句点では改行しない(かっこの保護が優先)。
     assert fmt(["彼は「行きます。」と言った。次です。"], 80) == [
-        "彼は「行きます。」", "と言った。", "次です。"]
-    assert fmt(["（終わり。）次です。"], 80) == ["（終わり。）", "次です。"]
+        "彼は「行きます。」と言った。", "次です。"]
+    assert fmt(["（終わり。）次です。"], 80) == ["（終わり。）次です。"]
+
+
+def test_sentence_end_runs_stay_together():
+    # 文末の記号が続くあいだは同じ文に残し、記号だけの行を作らない。
+    assert fmt(["え？！すごい！？"], 80) == ["え？！", "すごい！？"]
+    assert fmt(["本当？！」次です。"], 80) == ["本当？！」", "次です。"]
+    assert fmt(["終わり。。次です。"], 80) == ["終わり。。", "次です。"]
+
+
+def test_brackets_are_protected():
+    # かっこの中の句点では改行しない。
+    assert fmt(["彼は（行きます。必ず。）と言った。次です。"], 80) == [
+        "彼は（行きます。必ず。）と言った。", "次です。"]
+    # 入れ子のかっこも内側まで守る。
+    assert fmt(["外（内「文。です」終わり。）次です。"], 80) == [
+        "外（内「文。です」終わり。）次です。"]
+    # 半角のかっこも同じ。
+    assert fmt(["彼は(行きます。必ず。)と言った。次です。"], 80) == [
+        "彼は(行きます。必ず。)と言った。", "次です。"]
+    # 閉じていないかっこは、末尾まで保護する側に倒す。
+    assert fmt(["彼は（行きます。次です。"], 80) == ["彼は（行きます。次です。"]
+    # かっこの中の読点では、桁数を超えても改行しない。
+    text = "（ああああ、ああああ、ああああ）です。"
+    assert fmt([text], 10) == [text]
 
 
 def test_paragraph_newlines_are_joined_first():
@@ -142,6 +168,72 @@ def test_no_leading_indent_on_paragraphs():
     # 段落の行頭に字下げは入らない(元の字下げも取り除かれる)。
     assert fmt(["  字下げされた文。次の文。"], 80) == [
         "字下げされた文。", "次の文。"]
+
+
+def test_front_matter_is_untouched():
+    # 文書の頭の YAML フロントマターは、壊れる前と同じ内容を保つ。
+    lines = ["---", "title: あ。い", "tags: [a, b]", "---", "本文。次。"]
+    assert fmt(lines, 80) == [
+        "---", "title: あ。い", "tags: [a, b]", "---", "本文。", "次。"]
+    # 閉じの区切りが無ければフロントマターとして扱わない。
+    assert fmt(["---", "本文。次。"], 80) == ["---", "本文。", "次。"]
+
+
+def test_link_definition_is_untouched():
+    # リンクの定義行はつなぎ直さず、そのまま保つ。
+    lines = ["[参照]: https://example.com/あ。い", "本文。次。"]
+    assert fmt(lines, 80) == [
+        "[参照]: https://example.com/あ。い", "本文。", "次。"]
+
+
+def test_table_without_leading_pipe_is_untouched():
+    # 先頭に | の無い表(次の行が区切りの罫線)は、行をそのまま保つ。
+    lines = ["名前 | 値段", "--- | ---", "りんご | 100円。税込", "みかん | 200円"]
+    assert fmt(lines, 80) == lines
+    # 区切りが | で始まる形でも同じ。
+    lines = ["名前 | 値段", "| --- | --- |", "りんご | 100円。"]
+    assert fmt(lines, 80) == lines
+    # 表の後ろの段落は通常どおり整う。
+    lines = ["名前 | 値段", "--- | ---", "りんご | 100円", "", "本文。次。"]
+    assert fmt(lines, 80) == [
+        "名前 | 値段", "--- | ---", "りんご | 100円", "", "本文。", "次。"]
+
+
+def test_html_block_is_untouched():
+    # タグで始まる HTML のブロックは、空行までをそのまま保つ。
+    lines = ['<div class="x">', "中。です、です。", "</div>", "", "本文。次。"]
+    assert fmt(lines, 80) == [
+        '<div class="x">', "中。です、です。", "</div>", "", "本文。", "次。"]
+    # コメントは、閉じの印がある行まででブロックが終わる。
+    lines = ["<!-- 注。釈 -->", "本文。次。"]
+    assert fmt(lines, 80) == ["<!-- 注。釈 -->", "本文。", "次。"]
+
+
+def test_idempotent():
+    # 句点の後ろの空白は、続きの行の頭に残らない。
+    assert fmt(["文です。 次です。"], 80) == ["文です。", "次です。"]
+    # 読点で改行した続きの行も同じ。
+    assert fmt(["ああああ、 次です。"], 10) == ["ああああ、", "次です。"]
+    # 混ぜものの文書でも、整形を2回かけると結果が変わらない。
+    lines = ["彼は「行きます。」と言った。 次です。",
+             "- 一文目。二文目、続きです。",
+             "> 引用です。 次です。",
+             "名前 | 値段", "--- | ---", "りんご | 100円。"]
+    once = fmt(lines, 20)
+    assert fmt(once, 20) == once
+
+
+def test_large_input_is_fast():
+    # 長い1文に読点が多くても、時間が二乗で伸びない(印は1回だけ
+    # 作る)。12万字・読点6万個で、旧実装は約98秒かかった。
+    import time
+    text = "あ、" * 60000 + "。"
+    start = time.perf_counter()
+    out = fmt([text], 80)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 10, f"整形に {elapsed:.1f} 秒かかった"
+    assert len(out) > 1000
+    assert all(line.endswith("、") for line in out[:-1])
 
 
 def test_display_width_counts_fullwidth_as_two():

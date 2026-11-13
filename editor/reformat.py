@@ -3,7 +3,7 @@
 # 改行はいったん取り除き、句点で文ごとに改行し直す。行が折り返し
 # の桁数を超えるときだけ、読点でも改行する。Markdown として壊れ
 # ないよう、コードフェンス・見出し・表・リンクと画像の記法・
-# インラインコードの中では改行しない。リストと引用は、続きの行が
+# インラインコード・かっこの中では改行しない。リストと引用は、続きの行が
 # そろう形(リストは内容の開始位置まで字下げ、引用は記号を付け直
 # す)で出す。段落の行頭に字下げは入れない(Markdown でコード
 # ブロック扱いになるため)。
@@ -16,6 +16,25 @@
 # 仕様に書き切れなかった分として決めたこと:
 #   - 文の終わりは「。」のほか「！」「？」も同じに扱う(日本語の
 #     文の終わりとして同格なため)。読点は「、」だけ。
+#   - 文末の記号(。！？)が続くときは、記号の並びとその後ろの閉じ
+#     括弧・引用符までを同じ文に残し、並びの後ろでだけ改行する
+#     (「え？！」が「え？／！」に割れない)。
+#   - 対応するかっこの内側は保護範囲とし、中の句点・読点では
+#     改行しない。入れ子にも対応し、閉じていないかっこは末尾
+#     まで保護する側に倒す。対応の付かない閉じかっこは無視する。
+#   - 文の頭に残った空白(句点の後ろの空白など)は取り除く。読点
+#     で改行した続きの行も同じ。整形を2回かけても結果が変わら
+#     ない(冪等)ための決め。
+#   - 文書の頭の YAML フロントマター(--- で囲まれた範囲)、リン
+#     クの定義行([ラベル]: URL)、先頭に | の無い表(次の行が区切
+#     りの罫線になっているもの)、HTML のブロック(ブロック要素
+#     のタグで始まるまとまり)は、壊れる前と同じ内容を保つため
+#     触らない。HTML のブロックの終わりは、コメント・処理命令・
+#     宣言と script / style / pre では閉じの印がある行まで、それ
+#     以外は CommonMark と同じく空行まで。
+#   - 性能: 保護範囲の印は対象の文字列ごとに1回だけ作り、読点
+#     の改行は1回の走査で決める(長い1文に読点が多くても時間が
+#     二乗に伸びない)。
 #   - 桁数は unicodedata の東アジア幅で数える(幅 W / F の文字は
 #     2桁、それ以外は1桁)。
 #   - 空行の並びは空行1つにそろえる。対象範囲の頭と末尾の空行は
@@ -35,6 +54,7 @@ _SENTENCE_ENDS = "。！？"
 # 句点の後ろに続けて同じ行に残す閉じ括弧・引用符。
 _CLOSERS = "」』】〕〉》）｝”’" + ")]}\"'"
 _COMMA = "、"
+_LEADING_SPACE = " \t　"
 
 _FENCE_RX = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)$")
 _HEADING_RX = re.compile(r"^\s{0,3}#{1,6}(\s|$)")
@@ -48,6 +68,30 @@ _LINK_RX = re.compile(
     r"|<[A-Za-z][A-Za-z0-9+.\-]*:[^<>\s]*>"     # <https://…> の自動リンク
     r"|<[^<>\s]+@[^<>\s]+>"                     # <メールアドレス>
 )
+# リンクの定義行 [ラベル]: URL(脚注の定義も同じ形なので一緒に守る)。
+_LINK_DEF_RX = re.compile(r"^\s{0,3}\[[^\]]+\]:[ \t]*\S")
+# YAML フロントマターの区切り行。
+_FRONT_MATTER_RX = re.compile(r"^(---|\.\.\.)[ \t]*$")
+# HTML のブロックの始まり(ブロック要素のタグ、コメント、宣言)。
+_HTML_START_RX = re.compile(
+    r"^\s{0,3}(<!--|<\?|<![A-Za-z]|</?([A-Za-z][A-Za-z0-9-]*)\b)")
+_HTML_BLOCK_TAGS = frozenset(
+    "address article aside base basefont blockquote body caption "
+    "center col colgroup dd details dialog dir div dl dt fieldset "
+    "figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 "
+    "head header hr html iframe legend li link main menu meta nav "
+    "noframes ol p pre script section style summary table tbody td "
+    "tfoot th thead title tr track ul".split())
+# 対応するかっこ(開き → 閉じ)。内側では改行しない。
+_BRACKET_PAIRS = {
+    "（": "）", "(": ")",
+    "「": "」", "『": "』",
+    "【": "】", "〔": "〕",
+    "〈": "〉", "《": "》",
+    "｛": "}", "{": "}",
+    "［": "］", "[": "]",
+}
+_BRACKET_CLOSES = frozenset(_BRACKET_PAIRS.values())
 
 
 def char_width(ch):
@@ -60,7 +104,7 @@ def display_width(text):
 
 
 # ---------------------------------------------------------------
-# 改行しない範囲(インラインコードとリンク)の保護
+# 改行しない範囲(インラインコード・リンク・かっこ)の保護
 # ---------------------------------------------------------------
 def _code_spans(text):
     """バッククォートの並びで囲まれた範囲 (開始, 終了) の列。
@@ -96,9 +140,30 @@ def _code_spans(text):
     return spans
 
 
+def _bracket_spans(text):
+    """対応するかっこで囲まれた範囲 (開始, 終了) の列。入れ子は
+    いちばん外側の範囲だけ返す(内側はその部分集合)。閉じて
+    いないかっこは、末尾までを1つの範囲として返す。対応の付か
+    ない閉じかっこは無視する。"""
+    spans = []
+    stack = []          # 開きかっこの位置の列
+    for i, ch in enumerate(text):
+        if ch in _BRACKET_PAIRS:
+            stack.append(i)
+        elif ch in _BRACKET_CLOSES:
+            if stack and _BRACKET_PAIRS[text[stack[-1]]] == ch:
+                start = stack.pop()
+                if not stack:
+                    spans.append((start, i + 1))
+    if stack:
+        spans.append((stack[0], len(text)))
+    return spans
+
+
 def _protected_mask(text):
     """文字ごとに「改行を入れてはいけない範囲か」の印(0/1)。
-    インラインコードの中と、リンク・画像の記法全体が対象。"""
+    インラインコードの中、リンク・画像の記法全体、対応するかっ
+    この内側が対象。対象の文字列ごとに1回だけ作る。"""
     mask = bytearray(len(text))
     spans = _code_spans(text)
     for m in _LINK_RX.finditer(text):
@@ -107,6 +172,7 @@ def _protected_mask(text):
         if any(start < c_end and c_start < end for c_start, c_end in spans):
             continue
         spans.append((start, end))
+    spans.extend(_bracket_spans(text))
     for start, end in spans:
         for i in range(start, end):
             mask[i] = 1
@@ -116,69 +182,91 @@ def _protected_mask(text):
 # ---------------------------------------------------------------
 # 文への分割と、読点での改行
 # ---------------------------------------------------------------
-def _split_sentences(text):
-    """句点(。！？)で文に分ける。句点の後ろに閉じ括弧や引用符が
-    続く場合は、それらも同じ文に残す。保護範囲の中の句点では
-    分けない。"""
-    mask = _protected_mask(text)
+def _split_sentences(text, mask):
+    """句点(。！？)で文に分けた (文, その範囲の印) の列。文末の
+    記号が続くあいだ(と、その後ろの閉じ括弧・引用符)は同じ文に
+    残す。保護範囲の中の句点では分けない。文の頭に残った空白は
+    取り除く。"""
     sentences = []
     start = 0
     i, n = 0, len(text)
     while i < n:
         if text[i] in _SENTENCE_ENDS and not mask[i]:
             j = i + 1
-            while j < n and text[j] in _CLOSERS and not mask[j]:
+            while j < n and not mask[j] \
+                    and (text[j] in _SENTENCE_ENDS or text[j] in _CLOSERS):
                 j += 1
-            sentences.append(text[start:j])
+            sentences.append((start, j))
             start = j
             i = j
         else:
             i += 1
     if start < n:
-        sentences.append(text[start:])
-    return [s for s in sentences if s]
+        sentences.append((start, n))
+    out = []
+    for first, last in sentences:
+        while first < last and text[first] in _LEADING_SPACE:
+            first += 1
+        if first < last:
+            out.append((text[first:last], mask[first:last]))
+    return out
 
 
-def _wrap_at_commas(sentence, budget):
+def _wrap_at_commas(sentence, budget, mask):
     """1文を、桁数(budget)を超えるときだけ読点で改行した行の列
     にする。budget 以内に読点が無ければ、最初の読点で改行する
     (読点自体が無ければ、そのまま1行)。「。」だけのような残り
-    しか生まれない位置では改行しない。"""
+    しか生まれない位置では改行しない。印は作り直さず、走査は
+    全体で1回に収める(長い文でも時間が二乗にならない)。"""
+    n = len(sentence)
     if budget <= 0 or display_width(sentence) <= budget:
         return [sentence]
     lines = []
-    rest = sentence
-    while display_width(rest) > budget:
-        mask = _protected_mask(rest)
-        cut = None
-        width = 0
-        for i, ch in enumerate(rest):
-            w = char_width(ch)
-            if width + w > budget:
+    start = 0           # 現在の行の開始位置
+    width = 0           # 現在の行の表示幅
+    last_comma = None   # 桁数に収まる最後の読点の直後の位置
+    i = 0
+    while i < n:
+        w = char_width(sentence[i])
+        if i > start and width + w > budget:
+            cut = last_comma
+            if cut is None:
+                # 収まる読点が無ければ、最初の読点で改行する。
+                j = i
+                while j < n:
+                    if sentence[j] == _COMMA and not mask[j]:
+                        cut = j + 1
+                        break
+                    j += 1
+            if cut is None:
                 break
-            width += w
-            if ch == _COMMA and not mask[i]:
-                cut = i + 1
-        if cut is None:
-            for i, ch in enumerate(rest):
-                if ch == _COMMA and not mask[i]:
-                    cut = i + 1
-                    break
-        if cut is None:
-            break
-        if not rest[cut:].strip(_SENTENCE_ENDS + _CLOSERS):
-            break
-        lines.append(rest[:cut])
-        rest = rest[cut:]
-    lines.append(rest)
+            if not sentence[cut:].strip(
+                    _SENTENCE_ENDS + _CLOSERS + _LEADING_SPACE):
+                break
+            lines.append(sentence[start:cut])
+            start = cut
+            while start < n and sentence[start] in _LEADING_SPACE:
+                start += 1
+            i = start
+            width = 0
+            last_comma = None
+            continue
+        width += w
+        if sentence[i] == _COMMA and not mask[i]:
+            last_comma = i + 1
+        i += 1
+    if start < n:
+        lines.append(sentence[start:])
     return lines
 
 
 def _break_text(text, budget):
-    """文字列を、文ごと(＋長ければ読点)の行の列にする。"""
+    """文字列を、文ごと(＋長ければ読点)の行の列にする。保護範囲
+    の印はここで1回だけ作る。"""
+    mask = _protected_mask(text)
     out = []
-    for sentence in _split_sentences(text):
-        out.extend(_wrap_at_commas(sentence, budget))
+    for sentence, smask in _split_sentences(text, mask):
+        out.extend(_wrap_at_commas(sentence, budget, smask))
     return out
 
 
@@ -200,6 +288,54 @@ def _join_lines(lines):
     return text
 
 
+def _is_table_delimiter(line):
+    """表の区切り行か。| と - と : と空白だけでできていて、セル
+    が2つ以上あるか、両端が | で囲まれた1セルの形。"""
+    s = line.strip()
+    if "-" not in s or "|" not in s:
+        return False
+    if re.fullmatch(r"\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?", s):
+        return True
+    return bool(re.fullmatch(r"\|\s*:?-+:?\s*\|", s))
+
+
+def _is_html_block_start(line):
+    """HTML のブロックの始まりの行か。ブロック要素のタグ(開き・
+    閉じ)、コメント、処理命令、宣言で始まる行。"""
+    m = _HTML_START_RX.match(line)
+    if not m:
+        return False
+    tag = m.group(2)
+    return tag is None or tag.lower() in _HTML_BLOCK_TAGS
+
+
+def _html_block_end(lines, i):
+    """HTML のブロックが終わる位置(その行を含まない)。コメント・
+    処理命令・宣言と script / style / pre は、閉じの印がある行
+    まで。それ以外のタグは CommonMark と同じく空行(＝この塊の
+    終わり)まで。"""
+    first = lines[i]
+    stripped = first.lstrip()
+    closer = None
+    if "<!--" in first:
+        closer = "-->"
+    elif stripped.startswith("<?"):
+        closer = "?>"
+    elif stripped.startswith("<!"):
+        closer = ">"
+    else:
+        m = _HTML_START_RX.match(first)
+        tag = m.group(2) if m else None
+        if tag and tag.lower() in ("script", "style", "pre"):
+            closer = "</" + tag.lower()
+    if closer is None:
+        return len(lines)
+    for j in range(i, len(lines)):
+        if closer in lines[j]:
+            return j + 1
+    return len(lines)
+
+
 def _group_units(lines):
     """空行で区切られた塊の行を、単位(段落・項目・引用・そのまま
     の行)の列に切り分ける。"""
@@ -212,7 +348,9 @@ def _group_units(lines):
             units.append(cur)
             cur = None
 
-    for line in lines:
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
         if _QUOTE_RX.match(line):
             inner = _QUOTE_RX.sub("", line, count=1)
             if cur is not None and cur["kind"] == "quote":
@@ -220,23 +358,45 @@ def _group_units(lines):
             else:
                 flush()
                 cur = {"kind": "quote", "lines": [inner]}
+            i += 1
             continue
         m = _LIST_RX.match(line)
         if m:
             flush()
             cur = {"kind": "item", "indent": m.group(1),
                    "marker": m.group(2), "lines": [m.group(4)]}
+            i += 1
+            continue
+        if _is_html_block_start(line):
+            # HTML のブロックは終わりの位置まで触らない。
+            flush()
+            end = _html_block_end(lines, i)
+            units.append({"kind": "raw", "lines": list(lines[i:end])})
+            i = end
             continue
         if _HEADING_RX.match(line) or _TABLE_RX.match(line) \
-                or _HR_RX.match(line):
+                or _HR_RX.match(line) or _LINK_DEF_RX.match(line):
             flush()
             units.append({"kind": "raw", "lines": [line]})
+            i += 1
+            continue
+        if i + 1 < n and _is_table_delimiter(lines[i + 1]):
+            # 先頭に | の無い表。見出し行＋区切り行＋ | を含む行が
+            # 続くあいだを行のまま保つ。
+            flush()
+            raw = [line, lines[i + 1]]
+            i += 2
+            while i < n and "|" in lines[i]:
+                raw.append(lines[i])
+                i += 1
+            units.append({"kind": "raw", "lines": raw})
             continue
         if cur is not None and cur["kind"] in ("para", "item"):
             cur["lines"].append(line)
         else:
             flush()
             cur = {"kind": "para", "lines": [line]}
+        i += 1
     flush()
     return units
 
@@ -306,11 +466,23 @@ def _is_fence_close(line, char, length):
     return bool(m) and len(m.group(1)) >= length
 
 
+def _front_matter_end(lines):
+    """文書の頭の YAML フロントマターの終わりの行番号(区切り行を
+    含む)。フロントマターでなければ None。"""
+    if not lines or not _FRONT_MATTER_RX.match(lines[0]) \
+            or lines[0].strip().startswith("..."):
+        return None
+    for j in range(1, len(lines)):
+        if _FRONT_MATTER_RX.match(lines[j]):
+            return j
+    return None
+
+
 def format_lines(lines, max_columns):
     """行の列(改行を含まない)を整形した行の列を返す。
 
-    コードフェンスの中身はそのまま。塊と塊の区切りは空行1つに
-    そろえ、頭と末尾の空行は落とす。"""
+    コードフェンスの中身と文書頭のフロントマターはそのまま。
+    塊と塊の区切りは空行1つにそろえ、頭と末尾の空行は落とす。"""
     out = []
     flow = []
     pending_sep = False     # 次の塊の前に空行を1つ置く
@@ -328,6 +500,11 @@ def format_lines(lines, max_columns):
         if flow:
             emit_block(_format_flow_block(flow, max_columns))
             flow.clear()
+
+    fm_end = _front_matter_end(lines)
+    if fm_end is not None:
+        emit_block(list(lines[:fm_end + 1]))
+        lines = lines[fm_end + 1:]
 
     fence = None            # [文字, 長さ, 行の列]
     for line in lines:

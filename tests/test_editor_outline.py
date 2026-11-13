@@ -184,6 +184,24 @@ def test_run_pattern_trial_with_benign_patterns():
         raise AssertionError("不正な正規表現で re.error が上がりませんでした")
 
 
+def test_extract_outline_limit_and_truncated_flag():
+    # 上限を超える分は拾わず、打ち切ったことが分かる。ちょうど
+    # 上限と一致するだけなら打ち切りではない。
+    text = "\n".join(f"■ 見出し{i}" for i in range(10))
+    entries, truncated = outline.extract_outline_ex(text, limit=3)
+    assert len(entries) == 3
+    assert [e.line for e in entries] == [0, 1, 2]
+    assert truncated is True
+    entries, truncated = outline.extract_outline_ex(text, limit=10)
+    assert len(entries) == 10
+    assert truncated is False
+    entries, truncated = outline.extract_outline_ex(text, limit=100)
+    assert len(entries) == 10
+    assert truncated is False
+    # 上限なし(extract_outline)は全部拾う。
+    assert len(outline.extract_outline(text)) == 10
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

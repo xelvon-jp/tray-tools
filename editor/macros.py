@@ -22,6 +22,12 @@
 #   move_line_down {count, extend}  下の行へ
 #   move_char_left {count, extend}  左へ
 #   move_char_right {count, extend} 右へ
+#   sort_lines {order}          行の並べ替え(order は "asc" / "desc")
+#   remove_duplicate_lines {}   重複行の削除
+#   convert_halfwidth {}        選択範囲を全角 → 半角
+#   convert_fullwidth {}        選択範囲を半角 → 全角
+#   convert_lower {}            選択範囲の英字を大文字 → 小文字
+#   convert_upper {}            選択範囲の英字を小文字 → 大文字
 #
 # 記録から外しているもの(窓側の作法と合わせて):
 #   ファイル操作(開く・保存・新規)、Copilot への送信、表示の切り替え、
@@ -45,6 +51,12 @@ KNOWN_COMMANDS = frozenset({
     "move_line_down",
     "move_char_left",
     "move_char_right",
+    "sort_lines",
+    "remove_duplicate_lines",
+    "convert_halfwidth",
+    "convert_fullwidth",
+    "convert_lower",
+    "convert_upper",
 })
 
 # count を合算してまとめられる命令(同じ動きの繰り返し)。

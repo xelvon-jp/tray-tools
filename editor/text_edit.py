@@ -57,10 +57,14 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     """エディタの本文。font_size_changed には、Ctrl+ホイールで変わった
     あとの大きさ(pt)が流れる(窓側が設定へ保存する)。move_key には
     移動キーの命令名と「選択を広げるか」が流れる(窓側がマクロ記録の
-    材料にする。本文は標準のまま動く)。"""
+    材料にする。本文は標準のまま動く)。unrecorded_move は、Ctrl+矢印
+    など命令で表せない移動が起きた合図。mouse_pressed はマウスが
+    押された合図(どちらも、記録中に起きたら窓側が利用者へ知らせる)。"""
 
     font_size_changed = Signal(int)
     move_key = Signal(str, bool)
+    unrecorded_move = Signal()
+    mouse_pressed = Signal()
     undo_redo_started = Signal()
     undo_redo_finished = Signal()
 
@@ -95,12 +99,27 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         name = _MOVE_KEYS.get(event.key())
         if name is not None:
             mods = event.modifiers()
-            plain = not (mods & ~Qt.KeyboardModifier.ShiftModifier
-                         & ~Qt.KeyboardModifier.KeypadModifier)
-            if plain:
+            # 素の移動か(Shift の選択拡張とキーパッドは素に含める)。
+            # 修飾キーを明示的に見る。~ の反転で計算すると、PySide6
+            # では Ctrl 等が付いていても素の扱いになってしまう。
+            extra = mods & (Qt.KeyboardModifier.ControlModifier
+                            | Qt.KeyboardModifier.AltModifier
+                            | Qt.KeyboardModifier.MetaModifier)
+            if extra:
+                # Ctrl+矢印の単語移動・Ctrl+Home の文書頭などは、
+                # 1文字・1行の移動の命令では表せない。記録には入れず、
+                # 窓側へ知らせる(黙って1文字移動として記録しない)。
+                self.unrecorded_move.emit()
+            else:
                 self.move_key.emit(
                     name, bool(mods & Qt.KeyboardModifier.ShiftModifier))
         super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):  # noqa: N802  Qt の上書き
+        # マウスでのカーソル移動はマクロに記録できない。記録中なら
+        # 窓側が知らせるために合図する。
+        self.mouse_pressed.emit()
+        super().mousePressEvent(event)
 
     # ---------------------------------------------------------------
     # 行番号

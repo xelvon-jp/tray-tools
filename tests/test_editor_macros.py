@@ -332,6 +332,139 @@ def test_macro_menu_and_record_action_exist():
         discard_close(window)
 
 
+# ---------------------------------------------------------------
+# レビュー req-20261113-105 の3件(絵文字・単語移動・知らせ)
+# ---------------------------------------------------------------
+def test_recording_with_emoji_replays_same():
+    # 絵文字(サロゲートペア)のある文書でも記録が空にならず、再生
+    # 結果が一致する。contentsChange の位置は UTF-16 単位なので、
+    # 挿入文字列を Python の文字列の位置で切ると壊れる。
+    window = make_window("😀ab", cursor_pos=4)  # 末尾は UTF-16 で 4
+    try:
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "x")
+        window.set_macro_recording(False)
+        recorded = window._current_macro
+        assert recorded == [
+            {"cmd": "insert_text", "args": {"text": "x"}}], recorded
+        assert window._macro_skips == 0
+    finally:
+        discard_close(window)
+    other = make_window("😀ab", cursor_pos=4)
+    try:
+        assert other.play_macro(recorded)
+        assert other.text() == "😀abx"
+    finally:
+        discard_close(other)
+
+
+def test_recording_mid_document_after_emoji():
+    # 絵文字の直後への入力も、挿入した文字そのものが記録される
+    # (ずれた位置の文字を拾わない)。
+    window = make_window("😀ab", cursor_pos=2)  # 絵文字の直後
+    try:
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "x")
+        window.set_macro_recording(False)
+        recorded = window._current_macro
+        assert recorded == [
+            {"cmd": "insert_text", "args": {"text": "x"}}], recorded
+        assert window.text() == "😀xab"
+    finally:
+        discard_close(window)
+    other = make_window("😀ab", cursor_pos=2)
+    try:
+        assert other.play_macro(recorded)
+        assert other.text() == "😀xab"
+    finally:
+        discard_close(other)
+
+
+def test_ctrl_arrow_not_recorded_as_char_move():
+    # Ctrl+矢印の単語移動は、1文字移動として記録されない。記録から
+    # 外れたことは「記録できない操作」として数える。
+    window = make_window("one two three", cursor_pos=0)
+    try:
+        window.set_macro_recording(True)
+        QTest.keyClick(window._edit, Qt.Key.Key_Right,
+                       Qt.KeyboardModifier.ControlModifier)
+        assert window._edit.textCursor().position() > 1  # 単語移動した
+        assert window.recorded_commands() == []
+        assert window._macro_skips == 1
+        # 素の矢印は従来どおり記録される。
+        QTest.keyClick(window._edit, Qt.Key.Key_Left)
+        kinds = [c["cmd"] for c in window.recorded_commands()]
+        assert kinds == ["move_char_left"], kinds
+        assert window._macro_skips == 1
+        window.set_macro_recording(False)
+    finally:
+        discard_close(window)
+
+
+def test_typing_over_selection_flagged_unrecorded():
+    # 選択範囲を打って上書きする入力は記録に残らず、黙って外され
+    # ずに「記録できない操作」として知らされる。
+    window = make_window("hello", cursor_pos=0)
+    try:
+        window._edit.selectAll()
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "x")
+        assert window.text() == "x"
+        assert window.recorded_commands() == []
+        assert window._macro_skips >= 1
+        window.set_macro_recording(False)
+        message = window.statusBar().currentMessage()
+        assert "記録できない操作" in message, message
+    finally:
+        discard_close(window)
+
+
+def test_partial_replacement_and_block_edit_flagged():
+    # 部分的な上書きと、矩形選択での編集も、記録できない操作として
+    # 数えられる(記録の列だけ見ると起きなかったことに見える操作)。
+    window = make_window("hello world", cursor_pos=0)
+    try:
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(5, QTextCursor.MoveMode.KeepAnchor)
+        window._edit.setTextCursor(cursor)
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "HELLO")
+        assert window.text() == "HELLO world"
+        assert window._macro_skips >= 1
+        window.set_macro_recording(False)
+    finally:
+        discard_close(window)
+
+    window = make_window("ab\ncd", cursor_pos=0)
+    try:
+        window._edit.set_block_selection((0, 1), (1, 1))
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "x")
+        assert window.text() == "axb\ncxd"
+        assert window._macro_skips >= 1
+        window.set_macro_recording(False)
+    finally:
+        discard_close(window)
+
+
+def test_mouse_click_during_recording_flagged():
+    # マウスでのカーソル移動は記録できない。記録中にクリックしたら
+    # 知らせる対象になる(記録中でなければ数えない)。
+    window = make_window("abcdef", cursor_pos=0)
+    try:
+        QTest.mouseClick(window._edit.viewport(),
+                         Qt.MouseButton.LeftButton)
+        assert window._macro_skips == 0
+        window.set_macro_recording(True)
+        QTest.mouseClick(window._edit.viewport(),
+                         Qt.MouseButton.LeftButton)
+        assert window._macro_skips == 1
+        window.set_macro_recording(False)
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

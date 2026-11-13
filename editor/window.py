@@ -12,6 +12,8 @@
 #   行を足せる)。マクロは「命令の列」の記録・再生(editor/macros.py)。
 #   編集の操作は命令層(execute_command)を通し、キー割り当てと
 #   マクロの再生が同じ命令を呼ぶ。F4 は直前の命令の繰り返し。
+#   行の並べ替え・重複行の削除・選んだ範囲の変換(全角・半角と
+#   大文字・小文字。editor/convert.py)も命令として載っている。
 #
 # 実機フィードバック(2026-11-13)で足したもの:
 #   行番号、リボン風ツールバー、左ペイン(アウトラインのツリー＋下部の
@@ -70,6 +72,7 @@ from PySide6.QtWidgets import (
 
 import copilot_io
 import text_encoding
+from editor import convert as convmod
 from editor import document as docmod
 from editor import macros as macmod
 from editor import outline
@@ -86,6 +89,11 @@ DEFAULT_FONT_FAMILY = "MS Gothic"
 DEFAULT_FONT_SIZE = 10
 # アウトラインの再構築を編集に追随させるときのまとめ待ち(ms)。
 OUTLINE_REBUILD_DELAY_MS = 300
+
+# フォントの大きさの保存のまとめ待ち(ms)。Ctrl+ホイールの1ノッチ
+# ごとに設定ファイルを書くと書き込みが嵐になるので、止まってから
+# まとめて1回だけ書く。
+FONT_SAVE_DELAY_MS = 600
 
 # 正規表現の「適用中」の印に使う、settings の editor 節のキー。
 # 式を適用する前に True を書き、正常に適用できたら False に戻す。
@@ -348,6 +356,8 @@ class EditorWindow(QMainWindow):
         # マクロ(命令の列の記録・再生)と命令層の状態。文書の変化の
         # 信号が流れ始める前に用意する。
         self._recorder = macmod.MacroRecorder()
+        # 記録中に起きた「記録できない操作」の件数(項目3の知らせ)。
+        self._macro_skips = 0
         self._current_macro = []
         self._current_macro_name = ""
         self._in_command = False      # 命令の実行中(変化を二重に数えない)
@@ -371,6 +381,12 @@ class EditorWindow(QMainWindow):
             "move_line_down": self._cmd_move_line_down,
             "move_char_left": self._cmd_move_char_left,
             "move_char_right": self._cmd_move_char_right,
+            "sort_lines": self._cmd_sort_lines,
+            "remove_duplicate_lines": self._cmd_remove_duplicate_lines,
+            "convert_halfwidth": self._cmd_convert_halfwidth,
+            "convert_fullwidth": self._cmd_convert_fullwidth,
+            "convert_lower": self._cmd_convert_lower,
+            "convert_upper": self._cmd_convert_upper,
         }
 
         self._edit = TextEdit()
@@ -423,6 +439,13 @@ class EditorWindow(QMainWindow):
         self._outline_timer.setInterval(OUTLINE_REBUILD_DELAY_MS)
         self._outline_timer.timeout.connect(self._rebuild_outline)
 
+        # フォントの大きさの遅延保存(Ctrl+ホイールの嵐対策)。
+        self._pending_font_size = None
+        self._font_save_timer = QTimer(self)
+        self._font_save_timer.setSingleShot(True)
+        self._font_save_timer.setInterval(FONT_SAVE_DELAY_MS)
+        self._font_save_timer.timeout.connect(self._flush_pending_font_size)
+
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
@@ -433,6 +456,8 @@ class EditorWindow(QMainWindow):
         self._edit.document().contentsChange.connect(
             self._on_document_change_for_macro)
         self._edit.move_key.connect(self._on_move_key)
+        self._edit.unrecorded_move.connect(self._note_macro_skip)
+        self._edit.mouse_pressed.connect(self._note_macro_skip)
         self._edit.undo_redo_started.connect(
             lambda: setattr(self, "_suppress_change_record", True))
         self._edit.undo_redo_finished.connect(
@@ -472,6 +497,9 @@ class EditorWindow(QMainWindow):
         if path:
             self.open_path(path)
         self._disarm_pattern_guard()
+        # 開いた直後は本文にフォーカスを置く(ショートカットは本文に
+        # フォーカスがあるときだけ効く作りなので)。
+        self._edit.setFocus()
 
     # ---------------------------------------------------------------
     # 組み立て
@@ -482,6 +510,12 @@ class EditorWindow(QMainWindow):
             keys = self._keymap.get(keymap_name)
             if keys:
                 action.setShortcut(QKeySequence(keys))
+            # ショートカットは本文にフォーカスがあるときだけ効かせる。
+            # 窓全体に効かせると、検索欄で打った Ctrl+K が本文の
+            # 行末まで切り取りとして動いてしまう(レビュー項目6)。
+            action.setShortcutContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            self._edit.addAction(action)
         action.triggered.connect(slot)
         if menu is not None:
             menu.addAction(action)
@@ -517,6 +551,31 @@ class EditorWindow(QMainWindow):
         self._action("行を削除(&D)",
                      lambda: self.execute_command("delete_line"),
                      "delete_line", edit_menu)
+        edit_menu.addSeparator()
+        self._action("行を並べ替え（昇順）(&S)",
+                     lambda: self.execute_command(
+                         "sort_lines", {"order": "asc"}),
+                     None, edit_menu)
+        self._action("行を並べ替え（降順）(&R)",
+                     lambda: self.execute_command(
+                         "sort_lines", {"order": "desc"}),
+                     None, edit_menu)
+        self._action("重複行を削除(&U)",
+                     lambda: self.execute_command("remove_duplicate_lines"),
+                     None, edit_menu)
+        convert_menu = edit_menu.addMenu("変換(&T)")
+        self._action("全角 → 半角(&H)",
+                     lambda: self.execute_command("convert_halfwidth"),
+                     None, convert_menu)
+        self._action("半角 → 全角(&F)",
+                     lambda: self.execute_command("convert_fullwidth"),
+                     None, convert_menu)
+        self._action("大文字 → 小文字(&L)",
+                     lambda: self.execute_command("convert_lower"),
+                     None, convert_menu)
+        self._action("小文字 → 大文字(&U)",
+                     lambda: self.execute_command("convert_upper"),
+                     None, convert_menu)
         edit_menu.addSeparator()
         self._action("直前の操作を繰り返す(&F)", self.repeat_last,
                      "repeat_last", edit_menu)
@@ -599,6 +658,23 @@ class EditorWindow(QMainWindow):
         escape = QShortcut(QKeySequence("Esc"), bar)
         escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         escape.activated.connect(self._hide_find_bar)
+        # 本文側のショートカットは本文にフォーカスがあるときだけ
+        # 効くので、検索欄にフォーカスがあっても次・前へ進めるよう、
+        # 検索バーにも同じキー(F3 等)を置く。
+        next_keys = self._keymap.get("find_next")
+        if next_keys:
+            next_shortcut = QShortcut(QKeySequence(next_keys), bar)
+            next_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            next_shortcut.activated.connect(
+                lambda: self.execute_command("find_next"))
+        prev_keys = self._keymap.get("find_prev")
+        if prev_keys:
+            prev_shortcut = QShortcut(QKeySequence(prev_keys), bar)
+            prev_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            prev_shortcut.activated.connect(
+                lambda: self.execute_command("find_prev"))
         return bar
 
     # ---------------------------------------------------------------
@@ -667,6 +743,18 @@ class EditorWindow(QMainWindow):
         return self._edit.font_size()
 
     def _on_font_size_changed(self, size):
+        # Ctrl+ホイールは連続して流れてくるので、その場では書かず、
+        # 止まってから最後の大きさを1回だけ書く(遅延保存)。
+        self._pending_font_size = size
+        self._font_save_timer.start()
+
+    def _flush_pending_font_size(self):
+        """たまっているフォントの大きさの保存を、いま書く。"""
+        if self._pending_font_size is None:
+            return
+        size = self._pending_font_size
+        self._pending_font_size = None
+        self._font_save_timer.stop()
         self._persist_settings({"font_size": size})
 
     # ---------------------------------------------------------------
@@ -677,9 +765,11 @@ class EditorWindow(QMainWindow):
         self._refresh_pane_counts()
 
     def _rebuild_outline(self):
-        entries = outline.extract_outline(
-            self._edit.toPlainText(), self._outline_rx)
-        self._outline_pane.set_outline(outline.build_outline_tree(entries))
+        entries, truncated = outline.extract_outline_ex(
+            self._edit.toPlainText(), self._outline_rx,
+            limit=outline.OUTLINE_ENTRY_LIMIT)
+        self._outline_pane.set_outline(
+            outline.build_outline_tree(entries), truncated=truncated)
 
     def _jump_to_line(self, line_number):
         document = self._edit.document()
@@ -716,9 +806,12 @@ class EditorWindow(QMainWindow):
         self._refresh_pane_counts()
 
     def _refresh_pane_counts(self):
+        document = self._edit.document()
+        # 文字数は characterCount で数える(toPlainText の全文コピーは
+        # 大きい文書で打鍵のたびに重い。characterCount は末尾の段落
+        # 区切りを1つ余分に数えるので、その分を引く)。
         self._outline_pane.set_counts(
-            self._edit.document().blockCount(),
-            len(self._edit.toPlainText()))
+            document.blockCount(), max(0, document.characterCount() - 1))
 
     # ---------------------------------------------------------------
     # アウトライン・強調の正規表現の設定
@@ -746,9 +839,16 @@ class EditorWindow(QMainWindow):
         self._highlighter.set_pattern(
             outline.compile_pattern(highlight_text))
         self._rebuild_outline()
+        # 既定と同じ式は、文字列ではなく空で保存する(空 = 組み込み
+        # 既定を使う、という決め)。こうしておくと、組み込み既定を
+        # あとで良くしたときに、保存済みの窓も追随する。
         updates = {
-            "outline_pattern": outline_text,
-            "highlight_pattern": highlight_text,
+            "outline_pattern": (
+                "" if outline_text == outline.DEFAULT_OUTLINE_PATTERN
+                else outline_text),
+            "highlight_pattern": (
+                "" if highlight_text == outline.DEFAULT_HIGHLIGHT_PATTERN
+                else highlight_text),
         }
         if self._pattern_guard_armed:
             # 適用が済んだので、印も同じ書き込みで消す。
@@ -784,6 +884,9 @@ class EditorWindow(QMainWindow):
         self._refresh_status_labels()
         self._refresh_position()
         self._refresh_pane_info()
+        # ここで同期的に作り直すので、編集の追随で予約された分は
+        # 要らない(二重に走らせない)。
+        self._outline_timer.stop()
         self._rebuild_outline()
 
     # ---------------------------------------------------------------
@@ -920,6 +1023,8 @@ class EditorWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        # 遅延保存のたまりは、閉じる前に書き切る。
+        self._flush_pending_font_size()
         g = self.geometry()
         self.closed.emit([g.x(), g.y(), g.width(), g.height()])
         super().closeEvent(event)
@@ -1077,6 +1182,103 @@ class EditorWindow(QMainWindow):
         self._edit.setTextCursor(cursor)
         return {}
 
+    # ---------------------------------------------------------------
+    # 行の並べ替え・重複行の削除・範囲の変換
+    # ---------------------------------------------------------------
+    def _target_line_range(self):
+        """並べ替え・重複削除の対象の (開始ブロック, 終了ブロック)。
+
+        複数行にまたがる選択があれば、その行の範囲(選択の終わりが
+        行頭ちょうどのときは、その行は含めない)。無ければ文書全体。"""
+        document = self._edit.document()
+        cursor = self._edit.textCursor()
+        if not cursor.hasSelection():
+            return 0, document.blockCount() - 1
+        start_block = document.findBlock(cursor.selectionStart())
+        end_block = document.findBlock(cursor.selectionEnd())
+        first = start_block.blockNumber()
+        last = end_block.blockNumber()
+        if last > first and cursor.selectionEnd() == end_block.position():
+            last -= 1
+        return first, last
+
+    def _replace_line_range(self, first, last, new_lines):
+        """first〜last ブロックの本文を new_lines で置き換える。
+        1回の undo で戻せる単位にし、カーソルは範囲の頭へ置く。"""
+        document = self._edit.document()
+        start_block = document.findBlockByNumber(first)
+        end_block = document.findBlockByNumber(last)
+        start = start_block.position()
+        end = end_block.position() + len(end_block.text())
+        cursor = self._edit.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.beginEditBlock()
+        cursor.insertText("\n".join(new_lines))
+        cursor.endEditBlock()
+        cursor.setPosition(start)
+        self._edit.setTextCursor(cursor)
+
+    def _cmd_sort_lines(self, args):
+        order = args.get("order")
+        order = "desc" if order == "desc" else "asc"
+        first, last = self._target_line_range()
+        if last - first < 1:
+            return None  # 1行以下では並べ替える意味が無い
+        document = self._edit.document()
+        lines = [document.findBlockByNumber(n).text()
+                 for n in range(first, last + 1)]
+        new_lines = sorted(lines, reverse=(order == "desc"))
+        if new_lines == lines:
+            return None  # 変わらないなら記録も undo も作らない
+        self._replace_line_range(first, last, new_lines)
+        return {"order": order}
+
+    def _cmd_remove_duplicate_lines(self, args):
+        first, last = self._target_line_range()
+        document = self._edit.document()
+        lines = [document.findBlockByNumber(n).text()
+                 for n in range(first, last + 1)]
+        seen = set()
+        new_lines = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                new_lines.append(line)
+        if len(new_lines) == len(lines):
+            return None  # 重複が無ければ何もしない
+        self._replace_line_range(first, last, new_lines)
+        return {}
+
+    def _convert_selection(self, func):
+        """選択範囲の文字列を func で変換して置き換える。選択が無い、
+        または変換で変わらなければ None(記録しない)。"""
+        cursor = self._edit.textCursor()
+        if not cursor.hasSelection():
+            return None
+        # 段落の区切りは U+2029 で返るので、変換の前に \n に戻す。
+        text = cursor.selectedText().replace("\u2029", "\n")
+        new_text = func(text)
+        if new_text == text:
+            return None
+        cursor.beginEditBlock()
+        cursor.insertText(new_text)
+        cursor.endEditBlock()
+        self._edit.setTextCursor(cursor)
+        return {}
+
+    def _cmd_convert_halfwidth(self, args):
+        return self._convert_selection(convmod.to_halfwidth)
+
+    def _cmd_convert_fullwidth(self, args):
+        return self._convert_selection(convmod.to_fullwidth)
+
+    def _cmd_convert_lower(self, args):
+        return self._convert_selection(convmod.to_lower)
+
+    def _cmd_convert_upper(self, args):
+        return self._convert_selection(convmod.to_upper)
+
     def _cmd_find_next(self, args):
         return self._find_command(args, forward=True)
 
@@ -1109,16 +1311,32 @@ class EditorWindow(QMainWindow):
         # して記録係へ渡すだけ(実行はしない)。
         self._recorder.note_command(name, {"count": 1, "extend": bool(extend)})
 
+    def _note_macro_skip(self):
+        """記録できない操作が記録中に起きたら、数えて知らせる。
+        黙って記録から外すと、再生結果が実物と違うことに利用者が
+        気づけないため。"""
+        if not self._recorder.recording:
+            return
+        self._macro_skips += 1
+        self.statusBar().showMessage(
+            f"● マクロ記録中（記録できない操作 {self._macro_skips} 件）", 0)
+
     def _on_document_change_for_macro(self, pos, removed, added):
         try:
             if not (self._in_command or self._replaying
                     or self._suppress_change_record):
                 doc = self._edit.document()
                 sel_start, sel_end, cursor_before = self._change_cache
-                if pos == 0 and added > 0 and added >= doc.characterCount() - 1:
+                if (pos == 0 and added > 0
+                        and added >= doc.characterCount() - 1
+                        and (removed > 0 or added > 1)):
                     # 文書の丸ごと差し替え(ファイルの読み込み等)は
-                    # 編集の記録にしない。
+                    # 編集の記録にしない。ただし記録中に起きたら
+                    # (全選択して打ち直す等)、知らせる対象にする。
+                    # 条件の最後の節は、空の文書への最初の打鍵
+                    # (removed=0, added=1)を差し替えと間違えないため。
                     self._recorder.break_insert_chain()
+                    self._note_macro_skip()
                 elif (added == 0 and removed == 1 and pos == 0
                         and sel_start == sel_end and cursor_before == 0
                         and doc.characterCount() <= 1):
@@ -1126,13 +1344,40 @@ class EditorWindow(QMainWindow):
                     # しない(実体は末尾の区切り文字だけ)。代償として、
                     # 1文字だけの文書での Del は記録に残らない。
                     self._recorder.break_insert_chain()
+                    self._note_macro_skip()
                 else:
                     inserted = ""
                     if added > 0:
-                        inserted = doc.toPlainText()[pos:pos + added]
+                        # pos / added は UTF-16 の単位。Python の文字列
+                        # の位置とは絵文字(サロゲートペア)でずれるので、
+                        # 挿入された文字列はカーソルで取る。
+                        cursor = QTextCursor(doc)
+                        cursor.setPosition(pos)
+                        cursor.setPosition(
+                            pos + added, QTextCursor.MoveMode.KeepAnchor)
+                        inserted = cursor.selectedText().replace(
+                            "\u2029", "\n")
+                    commands = self._recorder.commands
+                    before_len = len(commands)
+                    before_last = None
+                    if commands:
+                        last = commands[-1]
+                        before_last = (last["cmd"],
+                                       dict(last.get("args") or {}))
                     self._recorder.feed_change(
                         pos, removed, added, inserted,
                         sel_start, sel_end, cursor_before)
+                    recorded = len(commands) > before_len
+                    if not recorded and before_last is not None and commands:
+                        last = commands[-1]
+                        recorded = (
+                            (last["cmd"], dict(last.get("args") or {}))
+                            != before_last)
+                    if not recorded:
+                        # 選択範囲を打って上書きする入力、矩形選択での
+                        # 編集など、命令に切り分けられなかった変化。
+                        # 黙って外さず、記録中なら知らせる。
+                        self._note_macro_skip()
         except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
             pass
         finally:
@@ -1172,6 +1417,7 @@ class EditorWindow(QMainWindow):
             return
         if on:
             self._recorder.start()
+            self._macro_skips = 0
             self._act_macro_record.setText("記録終了(&R)")
             self.statusBar().showMessage("● マクロ記録中", 0)
         else:
@@ -1179,9 +1425,12 @@ class EditorWindow(QMainWindow):
             self._current_macro = self.recorded_commands()
             self._current_macro_name = ""
             self._act_macro_record.setText("記録開始(&R)")
-            self.statusBar().showMessage(
-                f"マクロの記録を終了しました（{len(self._current_macro)} 手）",
-                4000)
+            message = (f"マクロの記録を終了しました"
+                       f"（{len(self._current_macro)} 手）")
+            if self._macro_skips:
+                message += (f"。記録できない操作が {self._macro_skips} 件"
+                            "あり、再生結果が実物と違う場合があります")
+            self.statusBar().showMessage(message, 8000)
         action = getattr(self, "_act_macro_record", None)
         if action is not None and action.isChecked() != on:
             blocker = QSignalBlocker(action)

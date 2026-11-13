@@ -846,6 +846,11 @@ class EditorWindow(QMainWindow):
         #   "discard"=そのまま閉じる(未保存の編集は失われる) /
         #   "cancel"=閉じない)
         self.ask_session_save_failed = None
+        # ask_hardlink_save: 保存先がハードリンクのときの行き先
+        #   (引数は保存先。戻り値は "shared"=共有したまま上書き /
+        #   "separate"=このファイルだけ切り離して保存 /
+        #   "cancel"=保存しない)
+        self.ask_hardlink_save = None
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
@@ -1409,22 +1414,45 @@ class EditorWindow(QMainWindow):
     def _record_closed_tab(self, entry):
         """閉じたタブの記録を、控えの先頭へ足す。
 
-        直近 CLOSED_TABS_LIMIT 件まで残し、古いものから捨てる。
+        直近 CLOSED_TABS_LIMIT 件まで残し、古いものから捨てる
+        (大きさと期限の上限は、保存のときに session 側が当てる)。
+        変更していない空の無題タブは記録しない(戻しても意味が
+        無く、本物の未保存タブの控えを押し出すだけのため)。
         ファイルへの書き出しが失敗しても、閉じる操作は止めない
         (ステータスで知らせるだけ)。"""
+        if entry.get("path") is None and not entry.get("dirty"):
+            return
+        entry["closed_at"] = time.time()
         self._closed_tabs.insert(0, entry)
         del self._closed_tabs[sessionmod.CLOSED_TABS_LIMIT:]
         self._save_closed_tabs()
 
     def _save_closed_tabs(self):
-        """閉じたタブの控えをファイルへ書く。"""
+        """閉じたタブの控えをファイルへ書く。
+
+        よその新しい控えと重なって退避が起きたら、結果を受けて
+        ステータスで知らせる(黙って捨てない)。"""
         if self._closed_tabs_path is None:
             return
         try:
-            sessionmod.save_closed_tabs(self._closed_tabs_path)
+            notice = sessionmod.save_closed_tabs(self._closed_tabs_path)
         except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
             self.statusBar().showMessage(
                 "閉じたタブの記録を保存できませんでした", 4000)
+            return
+        if notice is not None:
+            self._notify_newer_closed_tabs(notice)
+
+    def clear_closed_tabs(self):
+        """閉じたタブの控えを全部消す(開き直しの履歴の消去)。"""
+        if not self._closed_tabs:
+            self.statusBar().showMessage(
+                "閉じたタブの履歴はありません", 4000)
+            return
+        del self._closed_tabs[:]
+        self._save_closed_tabs()
+        self.statusBar().showMessage(
+            "閉じたタブの履歴を消しました", 4000)
 
     def _move_view_to_index(self, view, index):
         """ビューを、タブの並びの指定位置へ移す。
@@ -1459,6 +1487,18 @@ class EditorWindow(QMainWindow):
             self._move_view_to_index(view, index)
         return view
 
+    def _try_reopen_entry(self, entry):
+        """記録1件の開き直しを試す。(成功したか, ビュー) を返す。
+
+        例外が出ても記録は呼び側に残る(開き直しが成功してから
+        記録を取り出す作法のため)。戻せない記録(変更の無いタブで
+        ファイルが消えている)なら (True, None): 記録は捨てて
+        よいことが確定している。"""
+        try:
+            return True, self._reopen_entry(entry)
+        except Exception:  # noqa: BLE001  失敗で記録を失わない
+            return False, None
+
     def reopen_closed_tab(self):
         """直近に閉じたタブを開き直す(Ctrl+Shift+T)。
 
@@ -1469,7 +1509,11 @@ class EditorWindow(QMainWindow):
         編集がある場合は、その内容を無題の文書として別タブに開き
         直す(ファイルへの紐付けはしない)。ファイルが外で消えて
         いて控えがあれば、無題の文書として開き直す。控えが無く
-        ファイルも無い場合は、その記録を捨てて知らせる。"""
+        ファイルも無い場合は、その記録を捨てて知らせる。
+
+        記録は、開き直しが成功してから取り出す(先に取り出すと、
+        開き直しで例外が出たときに記録まで失われるため)。失敗
+        したら記録は残し、知らせる。"""
         if not self._closed_tabs:
             self.statusBar().showMessage("開き直すタブがありません", 4000)
             return
@@ -1484,13 +1528,17 @@ class EditorWindow(QMainWindow):
                 # ので、控えの内容を無題の文書として開き直す。
                 untitled = dict(entry)
                 untitled["path"] = None
+                ok, view = self._try_reopen_entry(untitled)
+                if not ok or view is None:
+                    self.statusBar().showMessage(
+                        "開き直しに失敗しました"
+                        "（記録は残してあります）", 4000)
+                    return
                 self._closed_tabs.pop(0)
                 self._save_closed_tabs()
-                view = self._reopen_entry(untitled)
-                if view is not None:
-                    self._activate_view(view)
-                    view.active_edit().setFocus()
-                    self._flush_session()
+                self._activate_view(view)
+                view.active_edit().setFocus()
+                self._flush_session()
                 return
             self._activate_view(existing)
             existing.active_edit().setFocus()
@@ -1503,9 +1551,14 @@ class EditorWindow(QMainWindow):
             # して開き直す(ファイルへの紐付けはしない)。
             entry = dict(entry)
             entry["path"] = None
+        ok, view = self._try_reopen_entry(entry)
+        if not ok:
+            self.statusBar().showMessage(
+                "開き直しに失敗しました（記録は残してあります）",
+                4000)
+            return
         self._closed_tabs.pop(0)
         self._save_closed_tabs()
-        view = self._reopen_entry(entry)
         if view is None:
             self.statusBar().showMessage(
                 "ファイルが見つからないため開き直せませんでした", 4000)
@@ -1634,6 +1687,7 @@ class EditorWindow(QMainWindow):
             self._session_slot = None
             return False
         self._notify_corrupt_session()
+        self._notify_closed_tabs_notice()
         entries = list((self._session_slot or {}).get("tabs") or [])
         if not entries:
             return False
@@ -1849,11 +1903,26 @@ class EditorWindow(QMainWindow):
         """壊れた控えを退避していたら、ステータスで知らせる。
 
         退避そのものは session.load_session_file が読み込みのときに
-        済ませている。ここでは記録を受け取って文にするだけ。"""
+        済ませている。ここでは記録を受け取って文にするだけ。
+        新しい版の EDDy が書いた控え(version が大きい)も同じ口で
+        届くので、kind で文面を分ける。"""
         notice = sessionmod.take_corrupt_notice(self._session_path)
         if notice is None:
             return
         backup = notice.get("backup")
+        if notice.get("kind") == "newer":
+            if backup:
+                self.statusBar().showMessage(
+                    "新しい版の EDDy が書いた控えがあったため、"
+                    f"{os.path.basename(backup)} へ退避しました"
+                    "（この版では読み込めず、前回のタブは戻せません"
+                    "でした）", 15000)
+            else:
+                self.statusBar().showMessage(
+                    "新しい版の EDDy が書いた控えがありましたが、"
+                    "退避できませんでした"
+                    "（前回のタブは戻せませんでした）", 15000)
+            return
         if backup:
             self.statusBar().showMessage(
                 "控えのファイルが壊れていたため、"
@@ -1863,6 +1932,49 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(
                 "控えのファイルが壊れていて読み直せませんでした"
                 "（前回のタブは戻せませんでした）", 15000)
+
+    def _notify_closed_tabs_notice(self):
+        """新しい版が書いた「閉じたタブ」の控えを退避していたら、
+        ステータスで知らせる。
+
+        退避そのものは session.load_closed_tabs_file が読み込みの
+        ときに済ませている。ここでは記録を受け取って文にするだけ。"""
+        if self._closed_tabs_path is None:
+            return
+        notice = sessionmod.take_closed_tabs_notice(
+            self._closed_tabs_path)
+        if notice is None:
+            return
+        backup = notice.get("backup")
+        if backup:
+            self.statusBar().showMessage(
+                "新しい版の EDDy が書いた「閉じたタブ」の控えが"
+                f"あったため、{os.path.basename(backup)} へ退避"
+                "しました（閉じたタブの履歴は戻せませんでした）",
+                15000)
+        else:
+            self.statusBar().showMessage(
+                "新しい版の EDDy が書いた「閉じたタブ」の控えが"
+                "ありましたが、退避できませんでした"
+                "（閉じたタブの履歴は戻せませんでした）", 15000)
+
+    def _notify_newer_closed_tabs(self, notice):
+        """保存のときに、よその新しい「閉じたタブ」の控えを退避
+        していたら、ステータスで知らせる。
+
+        退避そのものは session.save_closed_tabs が済ませている。
+        ここでは結果を受け取って文にするだけ。"""
+        backup = notice.get("backup")
+        if backup:
+            self.statusBar().showMessage(
+                "他の EDDy が書いた新しい「閉じたタブ」の控えが"
+                f"あったため、{os.path.basename(backup)} へ退避"
+                "しました（この窓の履歴を優先しました）", 15000)
+        else:
+            self.statusBar().showMessage(
+                "他の EDDy が書いた新しい「閉じたタブ」の控えが"
+                "ありましたが、退避できませんでした"
+                "（この窓の履歴を優先しました）", 15000)
 
     def _notify_newer_session(self, notice):
         """新しい側の控えを退避していたら、ステータスで知らせる。
@@ -1974,6 +2086,8 @@ class EditorWindow(QMainWindow):
                      "close_window", file_menu)
         self._action("閉じたタブを開き直す(&T)", self.reopen_closed_tab,
                      "reopen_closed_tab", file_menu)
+        self._action("閉じたタブの履歴を消す(&H)", self.clear_closed_tabs,
+                     None, file_menu)
 
         edit_menu = self.menuBar().addMenu("編集(&E)")
         # 元に戻す等は QPlainTextEdit の標準キー(Ctrl+Z 等)が効く。
@@ -2965,6 +3079,10 @@ class EditorWindow(QMainWindow):
             # すれば mixed_newlines が落ち、表示も _refresh_all
             # 経由で一緒に消える。
             text += " / 改行混在（保存時に選びます）"
+        if docmod.link_kind(self._doc.path):
+            # 保存先がリンク(シンボリック／ハード)。保存でリンクを
+            # 保つ作法が効く相手だと分かるよう、印を出す。
+            text += " / リンク"
         self._enc_label.setText(text)
 
     def _refresh_position(self):
@@ -3389,7 +3507,13 @@ class EditorWindow(QMainWindow):
         try:
             docmod.save_document(self._doc, path=path, encoding=encoding,
                                  newline=newline, bom=bom, errors=errors,
-                                 line_newlines=line_newlines)
+                                 line_newlines=line_newlines,
+                                 ask_hardlink=self._ask_hardlink_save_choice)
+        except docmod.SaveCancelled:
+            self.statusBar().showMessage(
+                "保存をやめました（ハードリンクの扱いが選ばれて"
+                "いません）", 8000)
+            return False
         except (OSError, UnicodeEncodeError, ValueError) as e:
             self.statusBar().showMessage(f"保存できませんでした: {e}")
             return False
@@ -3414,6 +3538,38 @@ class EditorWindow(QMainWindow):
         self._note_recent_file(self._doc.path)
         self.statusBar().showMessage("保存しました", 4000)
         return True
+
+    def _ask_hardlink_save_choice(self, target):
+        """保存先がハードリンクのときの行き先を聞く。
+
+        戻り値は document 側の語("shared"=共有したまま上書きする
+        / "separate"=このファイルだけ切り離して保存する /
+        "cancel"=やめる)。差し替え口(ask_hardlink_save)があれば
+        そちらを使う。既定は「やめる」(黙って進めない作法に
+        合わせる)。"""
+        if self.ask_hardlink_save is not None:
+            return self.ask_hardlink_save(target)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(APP_NAME)
+        box.setText(
+            "このファイルは、ほかの名前と中身を共有しています"
+            "（ハードリンク）。\nどう保存しますか？")
+        shared_button = box.addButton(
+            "共有したまま上書きする", QMessageBox.ButtonRole.AcceptRole)
+        separate_button = box.addButton(
+            "このファイルだけ切り離して保存する",
+            QMessageBox.ButtonRole.ActionRole)
+        cancel_button = box.addButton(
+            "やめる", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is shared_button:
+            return "shared"
+        if clicked is separate_button:
+            return "separate"
+        return "cancel"
 
     def _confirm_external_overwrite(self) -> bool:
         """開いた後に外部で変わったファイルを上書きしてよいか。"""

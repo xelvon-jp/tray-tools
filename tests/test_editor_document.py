@@ -388,6 +388,121 @@ def test_save_numbered_backup_never_overwrites():
         assert Path(path).read_text(encoding="utf-8") == "v3\n"
 
 
+def test_link_kind():
+    """リンクの判定: シンボリック／ハード／通常／無いファイル。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        real = os.path.join(tmp, "real.txt")
+        _write(real, "中身\n".encode("utf-8"))
+        assert docmod.link_kind(real) is None
+        assert docmod.link_kind(os.path.join(tmp, "無い.txt")) is None
+        assert docmod.link_kind(None) is None
+        link = os.path.join(tmp, "link.txt")
+        os.symlink(real, link)
+        assert docmod.link_kind(link) == "symlink"
+        hard = os.path.join(tmp, "hard.txt")
+        os.link(real, hard)
+        assert docmod.link_kind(real) == "hardlink"
+        assert docmod.link_kind(hard) == "hardlink"
+
+
+def test_save_symlink_writes_real_file_and_keeps_link():
+    """シンボリックリンクを開いて保存すると、実体が書き換わり、
+    リンクは残る(置き換えでリンク自体が消えない)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        real = os.path.join(tmp, "real.txt")
+        _write(real, "古い内容\n".encode("utf-8"))
+        link = os.path.join(tmp, "link.txt")
+        os.symlink(real, link)
+        doc = docmod.load_document(link)
+        doc.text = "新しい内容\n"
+        written = docmod.save_document(doc)
+        assert written == link
+        assert doc.path == link  # 文書の紐付けはリンクのパスのまま
+        assert os.path.islink(link)
+        assert Path(real).read_text(encoding="utf-8") == "新しい内容\n"
+        assert Path(link).read_text(encoding="utf-8") == "新しい内容\n"
+        # 控えは実体の隣に、直前の内容で残る。
+        assert Path(real + ".bak").read_text(encoding="utf-8") == "古い内容\n"
+
+
+def test_save_hardlink_shared_writes_in_place():
+    """ハードリンクで「共有したまま」: その場で書き込み、リンクは
+    保たれて、ほかの名前からも新しい中身が見える。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        asked = []
+        docmod.save_document(
+            doc, ask_hardlink=lambda target: asked.append(target)
+            or "shared")
+        assert asked == [path]
+        assert os.stat(path).st_ino == ino  # 同じファイルのまま
+        assert os.stat(other).st_ino == ino
+        assert Path(other).read_text(encoding="utf-8") == "新しい内容\n"
+        # 原子的でない分、控えが頼り(.bak に直前の内容)。
+        assert Path(path + ".bak").read_text(encoding="utf-8") == "古い内容\n"
+
+
+def test_save_hardlink_separate_breaks_link():
+    """ハードリンクで「切り離して」: 従来どおり置き換え、この
+    名前だけ新しいファイルになり、ほかの名前は元のまま。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        docmod.save_document(doc, ask_hardlink=lambda target: "separate")
+        assert os.stat(path).st_ino != ino
+        assert Path(path).read_text(encoding="utf-8") == "新しい内容\n"
+        assert os.stat(other).st_ino == ino
+        assert Path(other).read_text(encoding="utf-8") == "古い内容\n"
+
+
+def test_save_hardlink_cancel_writes_nothing():
+    """ハードリンクで「やめる」: SaveCancelled が上がり、ファイル
+    は書かれない。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        try:
+            docmod.save_document(doc, ask_hardlink=lambda target: "cancel")
+        except docmod.SaveCancelled:
+            pass
+        else:
+            raise AssertionError("SaveCancelled が上がらなかった")
+        assert Path(path).read_text(encoding="utf-8") == "古い内容\n"
+        assert not os.path.exists(path + ".bak")
+
+
+def test_save_hardlink_without_seam_is_separate():
+    """差し替え口を渡さない経路(横断置換など)では、従来どおり
+    置き換える(聞く窓が無いので、黙って切り離す側に倒す)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        docmod.save_document(doc)
+        assert os.stat(path).st_ino != ino
+        assert Path(path).read_text(encoding="utf-8") == "新しい内容\n"
+        assert Path(other).read_text(encoding="utf-8") == "古い内容\n"
+
+
 def test_replaced_line_newlines_keeps_untouched_kinds():
     """置換後の改行種別: 置換していない行は元の種別を引き継ぐ。"""
     old_text = "aaa\nbbb\nccc\nddd\n"

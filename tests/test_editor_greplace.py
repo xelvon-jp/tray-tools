@@ -26,6 +26,19 @@ from editor import rxfind  # noqa: E402
 APP = None
 
 
+class SkipTest(Exception):
+    """この環境では確かめられないことの合図(失敗とは分ける)。"""
+
+
+def _symlink(target, link):
+    """シンボリックリンクを作る。作れない環境(Windows で権限が
+    無いと WinError 1314)では、そのテストを飛ばす。"""
+    try:
+        os.symlink(target, link)
+    except OSError as e:
+        raise SkipTest(f"シンボリックリンクを作れません: {e}") from e
+
+
 def app():
     global APP
     if APP is None:
@@ -517,7 +530,7 @@ def test_preview_skips_link_files():
         root = Path(tmp)
         (root / "plain.txt").write_text("探す語 あり\n", encoding="utf-8")
         (root / "orig.txt").write_text("探す語 あり\n", encoding="utf-8")
-        os.symlink(root / "plain.txt", root / "link.txt")
+        _symlink(root / "plain.txt", root / "link.txt")
         os.link(root / "orig.txt", root / "hard.txt")
         preview = replacemod.preview_replace(str(root), "探す語", "置換語")
         assert [os.path.basename(t.path) for t in preview.targets] == [
@@ -539,7 +552,7 @@ def test_execute_skips_link_created_after_preview():
         preview = replacemod.preview_replace(str(root), "探す語", "置換語")
         assert len(preview.targets) == 2
         target.unlink()
-        os.symlink(other, target)
+        _symlink(other, target)
         result = replacemod.execute_replace(preview, "探す語", "置換語")
         by_path = {os.path.basename(o.path): o for o in result.outcomes}
         assert by_path["a.txt"].status == replacemod.STATUS_LINK
@@ -579,7 +592,7 @@ def test_dialog_preview_reports_link_files():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "a.txt").write_text("探す語 あり\n", encoding="utf-8")
-        os.symlink(root / "a.txt", root / "link.txt")
+        _symlink(root / "a.txt", root / "link.txt")
         dialog = GrepReplaceDialog(
             None, folder=str(root), word="探す語", repl="置換語")
         try:
@@ -607,16 +620,21 @@ def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
     failed = 0
+    skipped = 0
     for name, fn in tests:
         try:
             fn()
             print(f"ok   {name}")
+        except SkipTest as e:
+            skipped += 1
+            print(f"skip {name}: {e}")
         except Exception as e:  # noqa: BLE001
             failed += 1
             import traceback
             traceback.print_exc()
             print(f"FAIL {name}: {e}")
-    print(f"{len(tests) - failed}/{len(tests)} passed")
+    print(f"{len(tests) - failed - skipped}/{len(tests)} passed"
+          + (f" ({skipped} skipped)" if skipped else ""))
     sys.stdout.flush()
     os._exit(1 if failed else 0)
 

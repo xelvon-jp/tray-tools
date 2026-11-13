@@ -16,7 +16,8 @@
 # ぶつかるうえ、本文が大きいときに設定全体が重くなるため)。
 #
 # 閉じたタブの控え(Ctrl+Shift+T で開き直す分)は、同じ場所に
-# editor_closed_tabs.json として別に小さく持つ(直近10件まで)。
+# editor_closed_tabs.json として別に小さく持つ(直近10件まで、
+# 1件ごとと合計の大きさの上限つき、7日より古いものは捨てる)。
 #
 # データの形:
 #   {"version": 1,
@@ -60,6 +61,7 @@
 # このモジュールは Qt に依存しない(テストのため)。
 import json
 import os
+import time
 from pathlib import Path
 
 DATA_FILENAME = "editor_session.json"
@@ -71,6 +73,22 @@ SESSION_VERSION = 1
 CLOSED_TABS_FILENAME = "editor_closed_tabs.json"
 CLOSED_TABS_LIMIT = 10
 CLOSED_TABS_VERSION = 1
+# 閉じたタブの控えの大きさの上限。未保存の全文を平文で持つので、
+# 無制限だと大きな文書を閉じるたびに控えのファイルが膨らみ、
+# 毎回まるごと書き直すことになる。大きさは、記録1件を JSON に
+# したときの UTF-8 のバイト数で数える(ファイルに書かれる姿
+# そのもの)。上限を超える記録は残さない(開き直しの控えを諦める)。
+CLOSED_TABS_ENTRY_MAX_BYTES = 2 * 1024 * 1024
+CLOSED_TABS_TOTAL_MAX_BYTES = 10 * 1024 * 1024
+# 閉じたタブの控えの期限。閉じた日(closed_at)からこれより古い
+# 記録は捨てる。closed_at の無い記録(古い版が書いたもの)は、
+# 期限では落とさない。
+CLOSED_TABS_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+# 退避ファイル(.newer / .broken)は読み戻す口が無く、放っておくと
+# 溜まる一方なので、控え1つにつき各この件数まで残し、古いもの
+# から消す。
+EVACUATION_KEEP = 3
 
 
 def data_dir() -> Path:
@@ -184,10 +202,45 @@ def _file_stamp(path):
     return (st.st_mtime_ns, st.st_size)
 
 
+def _prune_evacuations(path, suffix):
+    """退避ファイル(元の名前 + suffix、連番つき)が EVACUATION_KEEP
+    件を超えたら、古いものから消す。退避ファイルは誰も読み戻さ
+    ないので、溜め続けないための後始末。消すのに失敗しても、
+    退避そのものは済んでいるので呼び側へは響かせない。"""
+    path = Path(path)
+    prefix = path.name + suffix
+    try:
+        siblings = []
+        for item in path.parent.iterdir():
+            if item.name == prefix:
+                siblings.append(item)
+            elif item.name.startswith(prefix + "-") \
+                    and item.name[len(prefix) + 1:].isdigit():
+                siblings.append(item)
+    except OSError:
+        return
+    if len(siblings) <= EVACUATION_KEEP:
+        return
+
+    def _mtime(item):
+        try:
+            return item.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    siblings.sort(key=_mtime)
+    for item in siblings[:len(siblings) - EVACUATION_KEEP]:
+        try:
+            item.unlink()
+        except OSError:
+            pass
+
+
 def _evacuate_with_suffix(path, suffix):
     """セッションファイルを「元の名前 + suffix」の別名へ退避し、
     退避先を返す。既にあれば suffix-2、…と連番にする(前の退避も
-    上書きしない)。退避できなければ None。"""
+    上書きしない)。退避できなければ None。退避のたびに、古い
+    退避ファイルは EVACUATION_KEEP 件を超えた分を消す。"""
     path = Path(path)
     candidate = path.with_name(path.name + suffix)
     serial = 2
@@ -198,6 +251,7 @@ def _evacuate_with_suffix(path, suffix):
         os.replace(path, candidate)
     except OSError:
         return None
+    _prune_evacuations(path, suffix)
     return str(candidate)
 
 
@@ -227,9 +281,12 @@ def load_session_file(path):
 
     ファイルはあるのに読めない・形が崩れているときは、壊れた
     ファイルを別名へ退避してから空の並びを返す(次の保存で黙って
-    上書きしないため)。退避の記録は take_corrupt_notice で
-    受け取れる。形は合っているが中身の値が壊れているタブは、
-    sanitize_session が使えるものだけ残す(従来どおり)。"""
+    上書きしないため)。version がこの版より大きい(新しい版の
+    EDDy が書いた)控えも、知らないフィールドを落として上書き
+    しないよう、別名(.newer)へ退避して空の並びを返す。退避の
+    記録は take_corrupt_notice で受け取れる(新しい版の控えは
+    "kind": "newer" つき)。形は合っているが中身の値が壊れて
+    いるタブは、sanitize_session が使えるものだけ残す(従来どおり)。"""
     path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -247,6 +304,16 @@ def load_session_file(path):
             or not isinstance(data.get("windows"), list):
         backup = _evacuate_corrupt(path)
         _CORRUPT_NOTICES[str(path)] = {"backup": backup}
+        return []
+    version = data.get("version")
+    if isinstance(version, int) and version > SESSION_VERSION:
+        # 新しい版の EDDy が書いた控え。この版の知らないフィールド
+        # を落として読み、次の保存で version 1 として上書きすると、
+        # 新しい版の控えが黙って消える。壊れた控えと同じく退避し
+        # て空で始め、知らせは "kind": "newer" で区別する(窓が
+        # 文面を変えるため)。
+        backup = _evacuate_newer(path)
+        _CORRUPT_NOTICES[str(path)] = {"backup": backup, "kind": "newer"}
         return []
     return sanitize_session(data)
 
@@ -267,10 +334,12 @@ def save_session_file(path, windows):
 # データの形:
 #   {"version": 1,
 #    "tabs": [タブの記録(セッションのタブと同じ形に、閉じたときの
-#              タブの位置 "index" を足したもの), ...]}
+#              タブの位置 "index" と、閉じた時刻 "closed_at"
+#              (UNIX 時刻)を足したもの), ...]}
 # 並びは新しい順(先頭が直近に閉じたタブ)。Ctrl+Shift+T は先頭
 # から順に開き直す。直近 CLOSED_TABS_LIMIT 件まで残し、古いもの
-# から捨てる。
+# から捨てる。大きさの上限(1件ごと・合計)と期限(7日)も、
+# 読み書きのときに当てる(prune_closed_tabs)。
 #
 # セッションの控えと同じく、プロセス内では置き場1つ分の状態を
 # _ClosedTabsRegistry で共有する(窓が複数あっても、閉じたタブの
@@ -283,20 +352,64 @@ def _sanitize_closed_tab(value):
     """閉じたタブ1件分の記録を整える。形が違うものは None(捨てる)。
 
     タブの部分はセッションのタブと同じ(_sanitize_tab)。閉じた
-    ときのタブの位置 "index" を足して持つ。"""
+    ときのタブの位置 "index" と、閉じた時刻 "closed_at" を足して
+    持つ(closed_at は形の合った数値のときだけ残す)。"""
     tab = _sanitize_tab(value)
     if tab is None:
         return None
     index = value.get("index")
     tab["index"] = index if isinstance(index, int) and index >= 0 else 0
+    closed_at = value.get("closed_at")
+    if isinstance(closed_at, (int, float)) and closed_at > 0:
+        tab["closed_at"] = float(closed_at)
     return tab
+
+
+def _closed_tab_size(tab):
+    """閉じたタブの記録1件の大きさ(JSON にしたときの UTF-8 の
+    バイト数)。数えられない記録は、上限を超えたものとして扱う。"""
+    try:
+        return len(json.dumps(tab, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return CLOSED_TABS_ENTRY_MAX_BYTES + 1
+
+
+def prune_closed_tabs(tabs, now=None):
+    """閉じたタブの並び(新しい順)に、上限と期限を当てる。
+
+    - 件数: CLOSED_TABS_LIMIT 件まで
+    - 期限: closed_at が CLOSED_TABS_MAX_AGE_SECONDS より古い
+      記録は落とす(closed_at の無い記録は期限では落とさない)
+    - 大きさ: 1件が CLOSED_TABS_ENTRY_MAX_BYTES を超える記録は
+      落とし、合計が CLOSED_TABS_TOTAL_MAX_BYTES を超える分は
+      新しい方を優先して残す(収まらない記録は飛ばす)
+    並びの順は変えない。"""
+    if now is None:
+        now = time.time()
+    kept = []
+    total = 0
+    for tab in tabs:
+        if len(kept) >= CLOSED_TABS_LIMIT:
+            break
+        closed_at = tab.get("closed_at")
+        if isinstance(closed_at, (int, float)) \
+                and now - closed_at > CLOSED_TABS_MAX_AGE_SECONDS:
+            continue
+        size = _closed_tab_size(tab)
+        if size > CLOSED_TABS_ENTRY_MAX_BYTES:
+            continue
+        if total + size > CLOSED_TABS_TOTAL_MAX_BYTES:
+            continue
+        kept.append(tab)
+        total += size
+    return kept
 
 
 def sanitize_closed_tabs(data):
     """ファイルから読んだデータを、閉じたタブの並びに整える。
 
     戻り値は [記録, ...](新しい順)。想定外の要素は黙って捨てる。
-    直近 CLOSED_TABS_LIMIT 件まで。"""
+    件数・大きさ・期限の上限も当てる(prune_closed_tabs)。"""
     raw_tabs = None
     if isinstance(data, dict):
         raw_tabs = data.get("tabs")
@@ -309,7 +422,21 @@ def sanitize_closed_tabs(data):
         tab = _sanitize_closed_tab(item)
         if tab is not None:
             tabs.append(tab)
-    return tabs[:CLOSED_TABS_LIMIT]
+    return prune_closed_tabs(tabs)
+
+
+# 新しい版が書いた閉じたタブの控えを退避した記録(ファイルのパス
+# 文字列 → {"backup": 退避先のパス文字列})。窓が
+# take_closed_tabs_notice で受け取って利用者へ知らせる。
+_CLOSED_TABS_NOTICES = {}
+
+
+def take_closed_tabs_notice(path):
+    """閉じたタブの控えの退避を1回だけ受け取る。
+
+    戻り値は None(何も無い)か {"backup": 退避先のパス文字列
+    (退避できなかったときは None)}。"""
+    return _CLOSED_TABS_NOTICES.pop(str(path), None)
 
 
 def load_closed_tabs_file(path):
@@ -318,7 +445,10 @@ def load_closed_tabs_file(path):
     無いとき・読めないとき・形が崩れているときは空の並び
     (セッションと違って、壊れたファイルの退避はしない。閉じた
     タブの控えが壊れても、開いているタブの控えは別ファイルなので
-    巻き添えにならないため)。"""
+    巻き添えにならないため)。
+    ただし version がこの版より大きい(新しい版の EDDy が書いた)
+    控えは、セッションと同じく黙って上書きせず、別名(.newer)へ
+    退避して空の並びを返す(知らせは take_closed_tabs_notice)。"""
     path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -328,6 +458,12 @@ def load_closed_tabs_file(path):
         data = json.loads(raw)
     except ValueError:
         return []
+    if isinstance(data, dict):
+        version = data.get("version")
+        if isinstance(version, int) and version > CLOSED_TABS_VERSION:
+            backup = _evacuate_newer(path)
+            _CLOSED_TABS_NOTICES[str(path)] = {"backup": backup}
+            return []
     return sanitize_closed_tabs(data)
 
 
@@ -355,10 +491,11 @@ def _atomic_write_text(path, text):
 def save_closed_tabs_file(path, tabs):
     """閉じたタブの並びをファイルへ原子的に書く。
 
-    直近 CLOSED_TABS_LIMIT 件まで。セッションの控えとは別ファイル
-    なので、セッションの印(.newer の判定)には触れない。"""
+    件数・大きさ・期限の上限を当ててから書く(prune_closed_tabs)。
+    セッションの控えとは別ファイルなので、セッションの印(.newer
+    の判定)には触れない。"""
     payload = {"version": CLOSED_TABS_VERSION,
-               "tabs": list(tabs)[:CLOSED_TABS_LIMIT]}
+               "tabs": prune_closed_tabs(list(tabs))}
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
 
@@ -414,6 +551,9 @@ def save_closed_tabs(path):
     返す。"""
     registry = _closed_tabs_registry_for(path)
     registry.ensure_loaded(path)
+    # 期限切れや上限超えの記録は、メモリ上の並びからも落として、
+    # ファイルと中身をそろえる(落とした記録は開き直しにも出ない)。
+    registry.entries[:] = prune_closed_tabs(registry.entries)
     notice = None
     current = _file_stamp(path)
     if current is not None and current != registry.stamp:

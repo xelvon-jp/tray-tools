@@ -127,6 +127,59 @@ def test_edit_marks_dirty_and_save_keeps_format():
             discard_close(window)
 
 
+def test_save_symlink_keeps_link_and_shows_status():
+    """シンボリックリンクを開くと、ステータスに「リンク」と出て、
+    保存では実体が書き換わりリンクは残る。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        real = os.path.join(tmp, "real.txt")
+        Path(real).write_bytes("古い内容\n".encode("utf-8"))
+        link = os.path.join(tmp, "link.txt")
+        os.symlink(real, link)
+        window = make_window(link)
+        try:
+            assert "リンク" in window._enc_label.text(), \
+                window._enc_label.text()
+            type_text(window, "追記")
+            assert window.save()
+            assert os.path.islink(link)
+            assert Path(real).read_text(encoding="utf-8") == \
+                "追記古い内容\n"
+            assert window.current_document().path == link
+            assert "リンク" in window._enc_label.text()
+        finally:
+            discard_close(window)
+
+
+def test_save_hardlink_asks_and_follows_choice():
+    """ハードリンクの保存は、差し替え口で行き先を聞く。
+    「共有したまま」ならその場で書き、「やめる」なら書かない。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        Path(path).write_bytes("古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        window = make_window(path)
+        try:
+            assert "リンク" in window._enc_label.text(), \
+                window._enc_label.text()
+            asked = []
+            window.ask_hardlink_save = \
+                lambda target: asked.append(target) or "cancel"
+            type_text(window, "追記")
+            assert not window.save()
+            assert asked == [path]
+            assert Path(path).read_text(encoding="utf-8") == "古い内容\n"
+            assert "やめました" in window.statusBar().currentMessage()
+            window.ask_hardlink_save = lambda target: "shared"
+            assert window.save()
+            assert os.stat(path).st_ino == ino
+            assert Path(other).read_text(encoding="utf-8") == \
+                "追記古い内容\n"
+        finally:
+            discard_close(window)
+
+
 def test_save_to_converts_encoding():
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "c.txt")

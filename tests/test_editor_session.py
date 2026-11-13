@@ -432,6 +432,90 @@ def test_window_reports_corrupt_session():
             close_window(window)
 
 
+def test_newer_version_session_file_is_evacuated():
+    """起動する前に新しい版が書いた控え(version が大きい)は、
+    知らないフィールドを落として読み込まず、.newer へ退避する。
+    次の保存で version 1 として黙って上書きすることもない。"""
+    import json as jsonmod
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        payload = {"version": sessionmod.SESSION_VERSION + 1,
+                   "windows": [{"tabs": [{
+                       "path": None, "dirty": True, "text": "新しい版の控え",
+                       "encoding": "utf-8", "bom": False, "newline": "\n",
+                       "cursor": 0, "anchor": 0, "future_field": 1}],
+                       "active": 0}],
+                   "future_top": True}
+        path.write_text(jsonmod.dumps(payload, ensure_ascii=False),
+                        encoding="utf-8")
+        assert sessionmod.load_session_file(path) == []
+        assert not path.exists()
+        backup = Path(str(path) + ".newer")
+        assert backup.exists()
+        # 退避先には、新しい版の控えがそのまま残る。
+        kept = jsonmod.loads(backup.read_text(encoding="utf-8"))
+        assert kept["version"] == sessionmod.SESSION_VERSION + 1
+        assert kept["windows"][0]["tabs"][0]["text"] == "新しい版の控え"
+        # 知らせは kind つきで1回だけ受け取れる。
+        notice = sessionmod.take_corrupt_notice(path)
+        assert notice is not None and notice["kind"] == "newer"
+        assert notice["backup"] == str(backup)
+        assert sessionmod.take_corrupt_notice(path) is None
+
+
+def test_window_reports_newer_version_session():
+    """新しい版が書いた控えで開いた窓は、その旨をステータスに
+    残す(壊れた控えとは文面を分ける)。"""
+    import json as jsonmod
+
+    with tempfile.TemporaryDirectory() as d:
+        payload = {"version": sessionmod.SESSION_VERSION + 1,
+                   "windows": [{"tabs": [{
+                       "path": None, "dirty": True, "text": "新しい版の控え",
+                       "encoding": "utf-8", "bom": False, "newline": "\n",
+                       "cursor": 0, "anchor": 0}], "active": 0}]}
+        (Path(d) / "editor_session.json").write_text(
+            jsonmod.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        window = make_window(d)
+        try:
+            message = window.statusBar().currentMessage()
+            assert "新しい版の EDDy が書いた控え" in message, message
+            assert "退避しました" in message, message
+            assert (Path(d) / "editor_session.json.newer").exists()
+            # タブは戻らない(空の無題から始まる)。
+            assert window.open_paths() == []
+            assert window.text() == ""
+        finally:
+            close_window(window)
+
+
+def test_evacuations_are_pruned_to_keep_limit():
+    """退避ファイルは EVACUATION_KEEP 件まで残し、古いものから
+    消す(読み戻す口が無いので、溜め続けない)。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "editor_session.json"
+        base = 1_700_000_000_000_000_000
+        for i in range(sessionmod.EVACUATION_KEEP + 2):
+            path.write_bytes(f"壊れた控え{i}".encode("utf-8"))
+            assert sessionmod.load_session_file(path) == []
+            sessionmod.take_corrupt_notice(path)
+            # 今回退避されたファイルの時刻だけを決め打ちにする
+            # (古い順の並びを安定させる)。
+            for item in Path(d).glob("editor_session.json.broken*"):
+                if item.read_bytes() == f"壊れた控え{i}".encode("utf-8"):
+                    stamp = base + i * 1_000_000_000
+                    os.utime(item, ns=(stamp, stamp))
+        kept = sorted(Path(d).glob("editor_session.json.broken*"))
+        assert len(kept) == sessionmod.EVACUATION_KEEP, kept
+        contents = {item.read_bytes() for item in kept}
+        # 新しい方だけが残り、いちばん古い2件は消えている。
+        total = sessionmod.EVACUATION_KEEP + 2
+        assert contents == {
+            f"壊れた控え{i}".encode("utf-8")
+            for i in range(total - sessionmod.EVACUATION_KEEP, total)}, contents
+
+
 def _tab_record(text):
     """控えの要るタブ1件分の記録(session.save へ渡す形)。"""
     return {"path": None, "dirty": True, "text": text,

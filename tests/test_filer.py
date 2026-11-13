@@ -12258,8 +12258,112 @@ def test_text_editor_folder_does_nothing():
             w.deleteLater()
 
 
+def test_editor_open_state_matrix():
+    """EDDy で開く判定(_editor_open_state)は E キー・右クリック・
+    Ctrl+Enter で共通: ビュア表と覚えた「開く」は open、覚えた
+    「開かない」は never、未回答と拡張子なしは ask。"""
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, _settings = _editor_open_window(
+            tmp, {"data.dat": b"d", "memo.bin": b"b", "LICENSE": b"l"})
+        try:
+            w._editor_open_extensions = {"dat": True, "bin": False}
+            assert w._editor_open_state("alpha.txt") == "open"
+            assert w._editor_open_state("data.dat") == "open"
+            assert w._editor_open_state("memo.bin") == "never"
+            assert w._editor_open_state("what.xyz") == "ask"
+            assert w._editor_open_state("LICENSE") == "ask"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_settings_dialog_editor_open_extensions_list_and_delete():
+    """設定ダイアログ「拡張子とツール」下段: E キーで覚えた拡張子の
+    一覧(開く／開かない)と削除。削除は写しの上だけ。"""
+    import filer_extmenu as m
+    import filer_settings
+    from PySide6.QtWidgets import QWidget
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        shared, local = Path(tmp, "s"), Path(tmp, "l")
+        shared.mkdir()
+        local.mkdir()
+        (shared / "_aliases.txt").write_text("text: txt\n", encoding="utf-8")
+        (shared / "text.txt").write_text('"V:見る" &VIEW $MF\n', encoding="utf-8")
+        (shared / "common.txt").write_text('"O:関連付けで開く" &OPEN $MF\n',
+                                           encoding="utf-8")
+        ed = m.MenuEditor({}, shared, local)
+        parent = QWidget()
+        d = filer_settings.SettingsDialog(
+            parent, [], menu_editor=ed,
+            editor_open_extensions={"png": False, "dat": True})
+        try:
+            rows = [d.editor_open_list.item(i).text()
+                    for i in range(d.editor_open_list.count())]
+            assert rows == [".dat（開く）", ".png（開かない）"], rows
+            d.editor_open_list.setCurrentRow(0)
+            d.editor_open_delete()
+            assert d.editor_open_extensions == {"png": False}
+            rows = [d.editor_open_list.item(i).text()
+                    for i in range(d.editor_open_list.count())]
+            assert rows == [".png（開かない）"], rows
+            # 選んでいない状態の削除は何もしない
+            d.editor_open_list.setCurrentRow(-1)
+            d.editor_open_delete()
+            assert d.editor_open_extensions == {"png": False}
+        finally:
+            d.deleteLater()
+            parent.deleteLater()
+
+
+def test_settings_dialog_editor_open_extensions_commits_on_accept():
+    """決定で、削除した覚えが窓の側と settings へ反映される
+    (消えた拡張子は、次からまた聞くようになる)。"""
+    import filer
+    from PySide6.QtWidgets import QDialog
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, settings_path = _editor_open_window(tmp, {"data.dat": b"d"})
+        w._editor_open_extensions = {"dat": False, "xyz": True}
+        settings_path.write_text(
+            json.dumps({"filer": {"editor_open_extensions":
+                                  {"dat": False, "xyz": True}}}),
+            encoding="utf-8")
+        state = {}
+
+        def drive(dialog):
+            try:
+                rows = [dialog.editor_open_list.item(i).text()
+                        for i in range(dialog.editor_open_list.count())]
+                assert rows == [".dat（開かない）", ".xyz（開く）"], rows
+                dialog.editor_open_list.setCurrentRow(0)
+                dialog.editor_open_delete()
+            except BaseException as e:  # noqa: BLE001
+                state["error"] = e
+                return QDialog.Rejected
+            return QDialog.Accepted
+
+        w.exec_dialog = drive
+        try:
+            w.cmd_settings_dialog()
+            if "error" in state:
+                raise state["error"]
+            assert w._editor_open_extensions == {"xyz": True}
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert saved["filer"]["editor_open_extensions"] == {"xyz": True}
+            # 消えた .dat は、E キーでまた聞かれるようになる。
+            assert w._editor_open_state("data.dat") == "ask"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_text_editor_context_menu():
-    """右クリックメニュー: テキストを開ける対象があるときだけ出る。"""
+    """右クリックメニュー: EDDy で開く判定(E キーと共通)が「開かない」
+    でない対象があるときだけ出る。未回答の拡張子は、押すと聞く。"""
     import filer
 
     _qapp()
@@ -12285,8 +12389,18 @@ def test_text_editor_context_menu():
             assert len(w._text_editors) == 1
             assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
             _close_editor_windows(w)
-            # 画像だけのときはメニュー自体を出さない
+            # 画像(ビュア表に無く未回答)でもメニューが出る(E キーと
+            # 同じ判定)。押すと E キーと同じ確認が出て、「いいえ」
+            # なら開かず、以後はメニュー自体出ない。
+            asked = []
+            w.ask_open_in_editor = lambda ext, count: asked.append(
+                (ext, count)) or False
             L.set_cursor(L._row_of("photo.JPG"))
+            menu = w.build_editor_context_menu(L)
+            assert menu is not None
+            menu.actions()[0].trigger()
+            assert asked == [("jpg", 1)], asked
+            assert w._text_editors == []
             assert w.build_editor_context_menu(L) is None
             # フォルダも対象ではない
             L.set_cursor(L._row_of("sub1"))
@@ -12334,7 +12448,8 @@ def test_text_editor_ctrl_e_in_preview():
 
 
 def test_picker_ctrl_enter_text_editor_item():
-    """統合ピッカーの Ctrl+Enter: テキストのファイル行に「エディタで開く」。"""
+    """統合ピッカーの Ctrl+Enter: ファイル行に「EDDyで開く」(判定は
+    E キーと共通。未回答の拡張子は選ぶと聞く)。"""
     import filer
     from PySide6.QtWidgets import QListWidget
 
@@ -12375,15 +12490,35 @@ def test_picker_ctrl_enter_text_editor_item():
             labels = [item[1] for item in captured["items"] if item]
             assert "EDDyで開く" in labels, labels
             assert opened == [str(left / "alpha.txt")], opened
-            # 画像の行には項目が無い
+            # 画像の行にも項目が出る(ビュア表に無く未回答。E キーと
+            # 同じ判定)。選ぶと E キーと同じ確認が出て、「いいえ」
+            # なら開かず、以後は項目自体出ない。
             captured.clear()
             opened.clear()
+            asked = []
+            w.ask_open_in_editor = lambda ext, count: asked.append(
+                (ext, count)) or False
 
             def fake_build_menu_image(title, items):
                 captured["items"] = items
-                return FakeMenu(), {sentinel: None}
+                return FakeMenu(), {sentinel: ("text_editor",
+                                               str(left / "photo.JPG"))}
 
             w.build_menu = fake_build_menu_image
+            w._picker_ctrl_enter(picker, "photo.JPG",
+                                 {"kind": "file",
+                                  "path": str(left / "photo.JPG")})
+            labels = [item[1] for item in captured["items"] if item]
+            assert "EDDyで開く" in labels, labels
+            assert asked == [("jpg", 1)], asked
+            assert opened == []
+            captured.clear()
+
+            def fake_build_menu_remembered(title, items):
+                captured["items"] = items
+                return FakeMenu(), {sentinel: None}
+
+            w.build_menu = fake_build_menu_remembered
             w._picker_ctrl_enter(picker, "photo.JPG",
                                  {"kind": "file",
                                   "path": str(left / "photo.JPG")})
@@ -12441,7 +12576,10 @@ FULL_ONLY = frozenset({
     "test_log_selection_ctrl_c",
     "test_menu_selected_row_color",
     "test_open_shell_and_explorer",
+    "test_editor_open_state_matrix",
     "test_picker_ctrl_enter_text_editor_item",
+    "test_settings_dialog_editor_open_extensions_commits_on_accept",
+    "test_settings_dialog_editor_open_extensions_list_and_delete",
     "test_text_editor_context_menu",
     "test_text_editor_ctrl_e_in_preview",
     "test_text_editor_ctrl_e_targets",

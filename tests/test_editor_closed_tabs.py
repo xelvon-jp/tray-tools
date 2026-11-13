@@ -16,6 +16,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -306,6 +307,186 @@ def test_reopen_closed_tab_via_keypress():
                            | Qt.KeyboardModifier.ShiftModifier)
             app().processEvents()
             assert window.current_document().path == path
+        finally:
+            close_window(window)
+
+
+def test_closed_tab_skips_empty_untitled():
+    """変更していない空の無題タブは記録しない(戻しても意味が
+    無く、本物の未保存タブの控えを押し出すだけのため)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        window = make_window(tmp)
+        try:
+            assert window.tab_count() == 1
+            window.close_tab()
+            assert window._closed_tabs == []
+            stored = Path(tmp) / "editor_closed_tabs.json"
+            if stored.exists():
+                assert sessionmod.load_closed_tabs_file(stored) == []
+            # 変更した無題は従来どおり記録される。
+            type_text(window, "中身あり")
+            window.close_tab()
+            assert len(window._closed_tabs) == 1
+        finally:
+            close_window(window)
+
+
+def test_closed_at_is_recorded():
+    """閉じたタブの記録には、閉じた時刻(closed_at)が付く。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("あ\n".encode("utf-8"))
+        window = make_window(tmp, path)
+        try:
+            type_text(window, "追記")
+            before = time.time()
+            window.close_tab()
+            after = time.time()
+            entry = window._closed_tabs[0]
+            assert before <= entry["closed_at"] <= after, entry
+            stored = sessionmod.load_closed_tabs_file(
+                Path(tmp) / "editor_closed_tabs.json")
+            assert stored[0]["closed_at"] == entry["closed_at"]
+        finally:
+            close_window(window)
+
+
+def test_closed_tabs_entry_size_limit():
+    """1件が上限を超える記録は残さない(未保存の全文を無制限に
+    抱え込まないため)。"""
+    big = "x" * (sessionmod.CLOSED_TABS_ENTRY_MAX_BYTES + 1)
+    entry = {"path": None, "dirty": True, "text": big,
+             "encoding": "utf-8", "bom": False, "newline": "\n",
+             "cursor": 0, "anchor": 0, "index": 0}
+    assert sessionmod.sanitize_closed_tabs({"tabs": [entry]}) == []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "editor_closed_tabs.json"
+        sessionmod.save_closed_tabs_file(path, [entry])
+        assert sessionmod.load_closed_tabs_file(path) == []
+
+
+def test_closed_tabs_total_size_limit():
+    """合計の上限を超える分は、新しい方を優先して落とす。"""
+    text = "x" * 1_500_000  # 1件 約1.5MB(上限2MBには収まる)
+    entries = [{"path": None, "dirty": True, "text": text,
+                "encoding": "utf-8", "bom": False, "newline": "\n",
+                "cursor": 0, "anchor": 0, "index": i}
+               for i in range(10)]
+    kept = sessionmod.sanitize_closed_tabs({"tabs": entries})
+    # 6件で約9MB。7件目を足すと合計の上限(10MB)を超える。
+    assert len(kept) == 6, len(kept)
+    total = sum(sessionmod._closed_tab_size(e) for e in kept)
+    assert total <= sessionmod.CLOSED_TABS_TOTAL_MAX_BYTES
+
+
+def test_closed_tabs_expired_entries_dropped():
+    """期限(7日)より古い記録は捨てる。closed_at の無い記録は
+    期限では落とさない。"""
+    now = time.time()
+    old = {"path": "old.txt", "dirty": False, "cursor": 0, "anchor": 0,
+           "index": 0,
+           "closed_at": now - sessionmod.CLOSED_TABS_MAX_AGE_SECONDS - 60}
+    fresh = {"path": "fresh.txt", "dirty": False, "cursor": 0,
+             "anchor": 0, "index": 1, "closed_at": now}
+    legacy = {"path": "legacy.txt", "dirty": False, "cursor": 0,
+              "anchor": 0, "index": 2}
+    kept = sessionmod.sanitize_closed_tabs(
+        {"tabs": [fresh, old, legacy]})
+    assert [e["path"] for e in kept] == ["fresh.txt", "legacy.txt"], kept
+
+
+def test_closed_tabs_newer_version_file_is_evacuated():
+    """新しい版が書いた「閉じたタブ」の控え(version が大きい)は、
+    黙って上書きせず .newer へ退避し、知らせが残る。"""
+    import json as jsonmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "editor_closed_tabs.json"
+        payload = {"version": sessionmod.CLOSED_TABS_VERSION + 1,
+                   "tabs": [{"path": "a.txt", "dirty": False,
+                             "cursor": 0, "anchor": 0, "index": 0}]}
+        path.write_text(jsonmod.dumps(payload), encoding="utf-8")
+        assert sessionmod.load_closed_tabs_file(path) == []
+        assert not path.exists()
+        assert Path(str(path) + ".newer").exists()
+        notice = sessionmod.take_closed_tabs_notice(path)
+        assert notice is not None and notice["backup"]
+        assert sessionmod.take_closed_tabs_notice(path) is None
+
+
+def test_window_reports_newer_version_closed_tabs():
+    """新しい版が書いた「閉じたタブ」の控えで開いた窓は、退避
+    したことをステータスに残す(無言で捨てない)。"""
+    import json as jsonmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = {"version": sessionmod.CLOSED_TABS_VERSION + 1,
+                   "tabs": [{"path": "a.txt", "dirty": False,
+                             "cursor": 0, "anchor": 0, "index": 0}]}
+        (Path(tmp) / "editor_closed_tabs.json").write_text(
+            jsonmod.dumps(payload), encoding="utf-8")
+        window = make_window(tmp)
+        try:
+            message = window.statusBar().currentMessage()
+            assert "閉じたタブ" in message, message
+            assert "退避しました" in message, message
+            assert window._closed_tabs == []
+        finally:
+            close_window(window)
+
+
+def test_reopen_failure_keeps_record():
+    """開き直しで例外が出たら、記録は残る(先に取り出して失う
+    ことはない)。直してから開き直せば、記録は消費される。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("元の文です\n".encode("utf-8"))
+        window = make_window(tmp, path)
+        try:
+            type_text(window, "追記")
+            window.close_tab()
+            assert len(window._closed_tabs) == 1
+            original = window._restore_view
+
+            def broken(view, entry):
+                raise RuntimeError("テスト用の失敗")
+
+            window._restore_view = broken
+            window.reopen_closed_tab()
+            assert len(window._closed_tabs) == 1
+            assert "失敗しました" in window.statusBar().currentMessage()
+            window._restore_view = original
+            window.reopen_closed_tab()
+            assert window._closed_tabs == []
+            assert window.text() == "追記元の文です\n"
+        finally:
+            close_window(window)
+
+
+def test_clear_closed_tabs_history():
+    """閉じたタブの履歴を消す口(ファイルメニュー)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        window = make_window(tmp)
+        try:
+            type_text(window, "内容1")
+            window.new_document()
+            type_text(window, "内容2")
+            window.close_tab()
+            window.close_tab()
+            assert len(window._closed_tabs) == 2
+            window.clear_closed_tabs()
+            assert window._closed_tabs == []
+            assert sessionmod.load_closed_tabs_file(
+                Path(tmp) / "editor_closed_tabs.json") == []
+            assert "消しました" in window.statusBar().currentMessage()
+            # 消したあとは、開き直すものが無い。
+            window.reopen_closed_tab()
+            assert window.statusBar().currentMessage() == \
+                "開き直すタブがありません"
+            # メニューにも項目がある。
+            actions = window.findChildren(QAction)
+            assert any(action.text().startswith("閉じたタブの履歴を消す")
+                       for action in actions)
         finally:
             close_window(window)
 

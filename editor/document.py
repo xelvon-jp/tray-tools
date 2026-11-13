@@ -18,6 +18,10 @@
 #   - 開いたときと保存したときの、ディスク上の (更新時刻, 大きさ) を
 #     控えておく。外部で変わったかの判定(窓の監視と、保存直前の確認)
 #     はこれと比べる
+#   - 保存先がリンクのときはリンクを保つ。シンボリックリンクは
+#     実体を書き換え、ハードリンクは利用者に行き先を聞く
+#     (save_document の ask_hardlink。黙って置き換えてリンクを
+#     切ることはしない)
 import os
 import re
 import shutil
@@ -34,6 +38,32 @@ NEWLINE_LABELS = {CRLF: "CRLF", LF: "LF"}
 
 # 判定に使う先頭の長さ(filer_viewer.DETECT_BYTES と同じ)。
 DETECT_HEAD_BYTES = 4 * 1024 * 1024
+
+
+class SaveCancelled(Exception):
+    """保存先がハードリンクで、利用者が「やめる」を選んだための
+    中止。書き込みは行われていない。
+
+    OSError 等の失敗とは分けるため専用の例外にする(窓側はこれを
+    受けて「保存をやめました」と知らせる)。"""
+
+
+def link_kind(path):
+    """path がリンクならその種類、違えば None を返す。
+
+    シンボリックリンクは "symlink"(os.path.islink)、ハードリンク
+    は "hardlink"(リンク数 st_nlink が 2 以上)。存在しない・
+    読めないファイルは None。"""
+    if not path:
+        return None
+    if os.path.islink(path):
+        return "symlink"
+    try:
+        if os.stat(path).st_nlink > 1:
+            return "hardlink"
+    except OSError:
+        pass
+    return None
 
 # 新規文書の既定。相手は Windows の道具なので、文字コードは BOM 無し
 # UTF-8、改行は CRLF。
@@ -449,6 +479,19 @@ def _atomic_write(target: str, data: bytes):
     _restore_file_attrs(target, saved)
 
 
+def _in_place_write(target: str, data: bytes):
+    """target をその場で書き換える(ファイルそのものは同じまま、
+    中身だけ差し替える)。
+
+    ハードリンクを保ったまま保存するための書き方。原子的では
+    ない(途中で落ちると中身が混ざる)ので、呼び側で先に控え
+    (.bak)を取ること。"""
+    with open(target, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _next_backup_path(target):
     """上書きしない控えの置き場。
 
@@ -465,7 +508,8 @@ def _next_backup_path(target):
 
 def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
                   bom=None, backup=True, errors="strict",
-                  line_newlines=None, numbered_backup=False) -> str:
+                  line_newlines=None, numbered_backup=False,
+                  ask_hardlink=None) -> str:
     """doc をファイルへ書く。成功したら doc 側の控え(保存先・文字コード・
     改行・BOM・ディスク上の印)を、実際に書いた内容に合わせて更新して、
     書いたパスを返す。
@@ -478,20 +522,48 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
     numbered_backup が真なら、控えを上書きせず、.bak が既にあれば
     .bak2、.bak3…と連番の別名にする(フォルダ内の横断置換用。
     2回目以降の置換でも、最初の控えが残る形)。
-    書き込み自体は原子的に行う(_atomic_write)。"""
+    書き込み自体は原子的に行う(_atomic_write)。
+
+    保存先がリンクのときは、リンクを保つ(黙って切らない):
+      - シンボリックリンク: 実体(os.path.realpath)を原子的に
+        書き換える。リンクはそのまま残り、doc.path もリンクの
+        パスのまま。控えは実体の隣に作る
+      - ハードリンク(st_nlink > 1): 原子的な置き換えではリンク
+        が切れるので、ask_hardlink(保存先を受け取り、"shared" /
+        "separate" / "cancel" を返す差し替え口)で行き先を決める。
+        "shared" は控えを取ってからその場で書き込む(リンクは
+        保たれ、ほかの名前からも新しい中身が見える)。"separate"
+        は従来どおり置き換える(この名前だけ切り離れる)。"cancel"
+        は書かずに SaveCancelled を上げる。ask_hardlink を渡さ
+        なければ "separate"(従来の動き。横断置換など、窓を介さ
+        ない経路はこちら)"""
     target = path if path is not None else doc.path
     if not target:
         raise ValueError("保存先が決まっていません")
     data = encode_document(doc, encoding=encoding, newline=newline, bom=bom,
                            errors=errors, line_newlines=line_newlines)
-    if backup and os.path.exists(target):
+    write_target = target
+    in_place = False
+    kind = link_kind(target)
+    if kind == "symlink":
+        write_target = os.path.realpath(target)
+    elif kind == "hardlink":
+        choice = ask_hardlink(target) if ask_hardlink is not None \
+            else "separate"
+        if choice == "cancel":
+            raise SaveCancelled(target)
+        in_place = choice == "shared"
+    if backup and os.path.exists(write_target):
         try:
-            backup_path = _next_backup_path(target) \
-                if numbered_backup else target + ".bak"
-            shutil.copyfile(target, backup_path)
+            backup_path = _next_backup_path(write_target) \
+                if numbered_backup else write_target + ".bak"
+            shutil.copyfile(write_target, backup_path)
         except OSError:
             pass  # 控えが作れなくても保存自体は止めない
-    _atomic_write(target, data)
+    if in_place:
+        _in_place_write(write_target, data)
+    else:
+        _atomic_write(write_target, data)
     doc.path = target
     if encoding is not None:
         doc.encoding = encoding

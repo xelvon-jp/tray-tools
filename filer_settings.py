@@ -4,6 +4,8 @@
 # タブは「拡張子別表示色」と「拡張子とツール」(Ctrl+Enter の拡張子ごとのメニューの
 # この PC の分の編集。共有の分は読み取り専用で灰色に出す)と「ラベル」
 # (写真のキーワードの定義。共通設定 photo_ratings.json の写しを編集する)。
+# 「拡張子とツール」の下には、E キーで覚えた拡張子(filer.editor_open_extensions)の
+# 一覧と削除も置く(同じく写しを編集し、決定で filer.py が保存する)。
 # 配色は Windows 標準のまま(ファイラの濃紺には寄せない)。色の帯がそのままの色で
 # 見えることがいちばん大事な画面なので、地の色に引っ張られない白地の方が判断しやすい。
 #
@@ -267,7 +269,7 @@ class _MenuToolsMixin:
 
 class SettingsDialog(_MenuToolsMixin, QDialog):
     def __init__(self, parent, ext_rules, font=None, menu_editor=None, ask_tool=None,
-                 label_config=None):
+                 label_config=None, editor_open_extensions=None):
         super().__init__(parent)
         self.setWindowTitle("あっふの設定")
         if font is not None:
@@ -276,6 +278,13 @@ class SettingsDialog(_MenuToolsMixin, QDialog):
         self.rules = [dict(r, exts=list(r["exts"])) for r in ext_rules]
         # ラベル(キーワード)の編集用の写し(共通設定そのものの写し。決定で呼び出し側が保存)
         self.label_config = label_config
+        # E キーで覚えた拡張子(EDDy で開くかどうか)の編集用の写し。
+        # 「拡張子とツール」タブの下に一覧と削除を置く。決定で呼び
+        # 出し側が settings へ保存する(None は、この面を出さない)。
+        self.editor_open_extensions = (
+            dict(editor_open_extensions)
+            if editor_open_extensions is not None else None)
+        self._editor_open_exts = []
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -329,7 +338,15 @@ class SettingsDialog(_MenuToolsMixin, QDialog):
         self.menu_editor = menu_editor
         self.ask_tool_fn = ask_tool
         if menu_editor is not None:
-            self.tabs.addTab(self._build_tool_page(), "拡張子とツール(&T)")
+            tool_page = self._build_tool_page()
+            if self.editor_open_extensions is not None:
+                page = QWidget()
+                outer = QVBoxLayout(page)
+                outer.addWidget(tool_page)
+                outer.addWidget(self._build_editor_open_group())
+                self.tabs.addTab(page, "拡張子とツール(&T)")
+            else:
+                self.tabs.addTab(tool_page, "拡張子とツール(&T)")
         if label_config is not None:
             self.tabs.addTab(self._build_label_page(), "ラベル(&L)")
 
@@ -468,6 +485,49 @@ class SettingsDialog(_MenuToolsMixin, QDialog):
         if self.confirm("拡張子別表示色を初期値に戻しますか？"):
             self.rules = core.normalize_ext_colors(core.DEFAULT_EXT_COLORS)
             self.refresh(0)
+
+    # ---------------------------------------------------------------
+    # E キーで覚えた拡張子(EDDy で開くかどうか)の一覧と削除
+    # ---------------------------------------------------------------
+    def _build_editor_open_group(self) -> QWidget:
+        group = QGroupBox("EDDy で開く拡張子（E キーで覚えた答え）")
+        layout = QVBoxLayout(group)
+        note = QLabel("あっふで E キーを押したときに「EDDy で開きますか」と聞いて"
+                      "覚えた答えです。削除すると、その拡張子は次からまた聞くように"
+                      "なります（決定で保存されます）。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.editor_open_list = QListWidget()
+        layout.addWidget(self.editor_open_list)
+        row = QHBoxLayout()
+        self.editor_open_delete_button = QPushButton("削除(&D)")
+        self.editor_open_delete_button.setAutoDefault(False)
+        self.editor_open_delete_button.clicked.connect(self.editor_open_delete)
+        row.addWidget(self.editor_open_delete_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.editor_open_refresh()
+        return group
+
+    def editor_open_refresh(self, select: int = None) -> None:
+        self.editor_open_list.clear()
+        self._editor_open_exts = sorted(self.editor_open_extensions or {})
+        for ext in self._editor_open_exts:
+            mark = "開く" if self.editor_open_extensions[ext] else "開かない"
+            self.editor_open_list.addItem(f".{ext}（{mark}）")
+        if self._editor_open_exts:
+            row = 0 if select is None else max(
+                0, min(select, len(self._editor_open_exts) - 1))
+            self.editor_open_list.setCurrentRow(row)
+
+    def editor_open_delete(self) -> None:
+        """選んでいる拡張子の覚えを消す(写しの上だけ。決定で保存)。"""
+        row = self.editor_open_list.currentRow()
+        if not (0 <= row < len(self._editor_open_exts)):
+            return
+        ext = self._editor_open_exts[row]
+        del self.editor_open_extensions[ext]
+        self.editor_open_refresh(row)
 
     # ---------------------------------------------------------------
     # 「ラベル」タブ(写真のキーワードの定義)

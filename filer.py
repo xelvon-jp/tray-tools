@@ -4580,18 +4580,42 @@ class FilerWindow(QWidget):
         self._open_in_editor([os.path.join(self.active.path, e.name) for e in files])
 
     # --- 内蔵テキストエディタで開く(E / Ctrl+E / 右クリック / プレビュー中も同じ) ---
+    def _editor_open_state(self, name: str) -> str:
+        """ファイル名から、EDDy で開くかの判定を1つにまとめたもの。
+
+        戻り値は "open"(そのまま開く) / "ask"(開く前に聞く) /
+        "never"(開かない)。E キー・右クリックメニュー・Ctrl+Enter
+        の出し分けは、すべてここを通す(入口ごとに判定がずれると
+        「E では開くのに右クリックに出ない」が起きるため)。
+
+        - ビュア表にある、または E キーで「開く」と覚えた拡張子
+          → "open"
+        - E キーで「開かない」と覚えた拡張子 → "never"
+        - それ以外(表に無く未回答。拡張子の無いファイルを含む)
+          → "ask"(拡張子の無いファイルは覚える先が無いので、
+          毎回 "ask" のまま)"""
+        if core.opens_in_viewer(name, self.viewer_extensions):
+            return "open"
+        ext = os.path.splitext(name)[1].lstrip(".").lower()
+        if ext:
+            remembered = self._editor_open_extensions.get(ext)
+            if remembered is True:
+                return "open"
+            if remembered is False:
+                return "never"
+        return "ask"
+
     def _text_editor_entries(self, pane) -> list:
         """右クリックメニューに「EDDyで開く」を出すかどうかの判定に
         使う対象(マーク、無ければカーソル行のうち、フォルダでなく、
-        ビュア表にある拡張子のもの)。
+        EDDy で開く判定が "never" でないもの)。
 
-        E キー自体はこの絞り込みを使わない(表に無い拡張子でも
-        「EDDy で開きますか」と聞いて開ける。_open_targets_in_text_
-        editor)。メニューの出し分けだけが、従来の表による絞り込み
-        のままになっている。"""
+        判定は E キーと共通(_editor_open_state)。表に無い未回答の
+        拡張子も対象に入り、メニューを押したときに E キーと同じ
+        確認が出る(_open_targets_in_text_editor)。"""
         return [e for e in pane.targets()
                 if not e.is_dir
-                and core.opens_in_viewer(e.name, self.viewer_extensions)]
+                and self._editor_open_state(e.name) != "never"]
 
     def cmd_text_editor(self):
         self._open_targets_in_text_editor(self.active)
@@ -4612,10 +4636,12 @@ class FilerWindow(QWidget):
         差し替えられる。"""
         if ext:
             text = (f"「.{ext}」のファイル（{count} 件）を EDDy で開きますか？\n"
-                    "答えはこの拡張子について覚え、次からは聞きません。")
+                    "答えはこの拡張子について覚え、次からは聞きません。\n"
+                    "画像などのバイナリは、保存すると壊れます。")
         else:
             text = (f"拡張子の無いファイル（{count} 件）を EDDy で開きますか？\n"
-                    "拡張子が無いので、次も聞きます。")
+                    "拡張子が無いので、次も聞きます。\n"
+                    "画像などのバイナリは、保存すると壊れます。")
         answer = QMessageBox.question(
             self, "EDDyで開く", text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -4647,12 +4673,18 @@ class FilerWindow(QWidget):
             return
         to_open = []
         skipped = 0
-        # 表に無いものは拡張子ごとにまとめる(拡張子ごとに1回聞く)。
+        # 判定は _editor_open_state に一本化(E キー・右クリック・
+        # Ctrl+Enter で共通)。"ask" のものは拡張子ごとにまとめる
+        # (拡張子ごとに1回聞く)。
         by_ext = {}
         noext = []
         for e in files:
-            if core.opens_in_viewer(e.name, self.viewer_extensions):
+            state = self._editor_open_state(e.name)
+            if state == "open":
                 to_open.append(e)
+                continue
+            if state == "never":
+                skipped += 1
                 continue
             ext = os.path.splitext(e.name)[1].lstrip(".").lower()
             if ext:
@@ -4660,13 +4692,6 @@ class FilerWindow(QWidget):
             else:
                 noext.append(e)
         for ext, entries in by_ext.items():
-            remembered = self._editor_open_extensions.get(ext)
-            if remembered is True:
-                to_open.extend(entries)
-                continue
-            if remembered is False:
-                skipped += len(entries)
-                continue
             if self.ask_open_in_editor(ext, len(entries)):
                 self._remember_editor_open(ext, True)
                 to_open.extend(entries)
@@ -4691,6 +4716,27 @@ class FilerWindow(QWidget):
             return
         for e in to_open:
             self.open_text_editor(os.path.join(pane.path, e.name))
+
+    def _open_path_in_text_editor_asking(self, path: str) -> None:
+        """パス1件を EDDy で開く(Ctrl+Enter メニューの「EDDyで開く」用)。
+
+        判定は _editor_open_state(E キーと共通)。"ask"(表に無く
+        未回答)なら、E キーと同じ確認を出して答えを覚えてから
+        開く。"never" なら何もしない(出し分けで項目自体が出ない
+        はずだが、念のため)。"""
+        state = self._editor_open_state(os.path.basename(path))
+        if state == "never":
+            return
+        if state == "ask":
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if ext:
+                if not self.ask_open_in_editor(ext, 1):
+                    self._remember_editor_open(ext, False)
+                    return
+                self._remember_editor_open(ext, True)
+            elif not self.ask_open_in_editor("", 1):
+                return
+        self.open_text_editor(path)
 
     def build_editor_context_menu(self, pane):
         """一覧の右クリックメニュー。内蔵エディタで開ける対象がある
@@ -6209,10 +6255,11 @@ class FilerWindow(QWidget):
                     ("Explorer（新規窓）", ("open_dest", "explorer_new"))):
                 items.append((free_key("LRTEWN"), label, value))
         else:
-            # ファイルの行では、テキストとして開けるものに限り内蔵
-            # エディタの入口を足す(一覧の Ctrl+E と同じ作法)。
-            if core.opens_in_viewer(os.path.basename(path),
-                                    self.viewer_extensions):
+            # ファイルの行では、EDDy で開く判定が "never" でない
+            # ものに限り内蔵エディタの入口を足す(一覧の Ctrl+E・
+            # 右クリックと同じ判定 _editor_open_state。未回答の
+            # 拡張子は、押したときに E キーと同じ確認が出る)。
+            if self._editor_open_state(os.path.basename(path)) != "never":
                 items.append((free_key("T"), "EDDyで開く",
                               ("text_editor", path)))
             if self._launcher_registerable(path):
@@ -6229,7 +6276,7 @@ class FilerWindow(QWidget):
             return
         if isinstance(choice, tuple) and len(choice) == 2 \
                 and choice[0] == "text_editor":
-            self.open_text_editor(choice[1])
+            self._open_path_in_text_editor_asking(choice[1])
             return
         if isinstance(choice, tuple) and len(choice) == 2 \
                 and choice[0] == "open_dest":
@@ -7891,13 +7938,26 @@ class FilerWindow(QWidget):
         dialog = filer_settings.SettingsDialog(
             self, self.ext_rules, font=self.log_font, menu_editor=editor,
             ask_tool=lambda kind, initial=None: self.ask_add_tool(kind, editor, initial),
-            label_config=copy.deepcopy(self.photo_config))
+            label_config=copy.deepcopy(self.photo_config),
+            editor_open_extensions=dict(self._editor_open_extensions))
         accepted = self.exec_dialog(dialog) == QDialog.Accepted
         rules = dialog.rules
         new_keywords = dialog.label_config["keywords"] if dialog.label_config else None
+        new_open_extensions = dialog.editor_open_extensions
         dialog.deleteLater()
         if not accepted:
             return
+        if new_open_extensions is not None \
+                and new_open_extensions != self._editor_open_extensions:
+            # E キーで覚えた拡張子の一覧が変わった(削除された)。
+            # 次からは、消えた拡張子はまた聞くようになる。
+            self._editor_open_extensions = \
+                _normalize_editor_open_extensions(new_open_extensions)
+            save_values(self.app_settings, self.settings_path,
+                        {"editor_open_extensions":
+                         dict(self._editor_open_extensions)})
+            self.log("設定: EDDy で開く拡張子の覚えを保存しました（"
+                     f"{len(self._editor_open_extensions)}件）")
         if new_keywords is not None and new_keywords != (self.photo_config.get("keywords") or []):
             self.photo_config["keywords"] = new_keywords
             photo_config.save_config(self.photo_config)

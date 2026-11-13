@@ -6,6 +6,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -155,6 +156,28 @@ def test_preview_skips_unencodable():
 # ---------------------------------------------------------------
 # 実行(純粋部分)
 # ---------------------------------------------------------------
+def test_preview_skips_files_without_extension():
+    """拡張子の無いファイルは既定で対象から外れ、件数と理由が残る。
+    Makefile や LICENSE のような文章ファイルも、実行形式も同じ扱い。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "Makefile").write_text("探す語\n", encoding="utf-8")
+        (root / "LICENSE").write_text("探す語\n", encoding="utf-8")
+        (root / "run").write_bytes(b"\x7fELF" + "探す語".encode("utf-8"))
+        (root / "ok.txt").write_text("探す語\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        assert [os.path.basename(t.path) for t in preview.targets] == ["ok.txt"]
+        skipped = {os.path.basename(p)
+                   for p in preview.skipped_no_extension}
+        assert skipped == {"Makefile", "LICENSE", "run"}, skipped
+        assert preview.files_scanned == 4
+        # 外すのをやめれば、文章ファイルは対象に入る。
+        preview = replacemod.preview_replace(
+            str(root), "探す語", "置換語", exclude_no_extension=False)
+        names = {os.path.basename(t.path) for t in preview.targets}
+        assert names == {"Makefile", "LICENSE", "run", "ok.txt"}, names
+
+
 def test_execute_replaces_preserving_format_and_backup():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -266,6 +289,27 @@ def test_dialog_preview_lists_targets():
             dialog.deleteLater()
 
 
+def test_dialog_preview_reports_no_extension_files():
+    """プレビューの状態文に、拡張子が無いために外した件数が
+    他の除外と同じ扱いで出る。"""
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "Makefile").write_text("探す語\n", encoding="utf-8")
+        (root / "ok.txt").write_text("探す語\n", encoding="utf-8")
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        try:
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            assert [os.path.basename(t.path)
+                    for t in dialog._preview.targets] == ["ok.txt"]
+            assert "拡張子がない 1 件" in dialog._status_label.text()
+        finally:
+            dialog.deleteLater()
+
+
 def test_dialog_execute_replaces_and_refreshes():
     app()
     from editor.greplace_dialog import GrepReplaceDialog
@@ -289,6 +333,57 @@ def test_dialog_execute_replaces_and_refreshes():
             # 置換したファイルには .bak が残る。
             assert Path(str(root / "a.txt") + ".bak").exists()
         finally:
+            dialog.deleteLater()
+
+
+def test_dialog_cannot_close_while_executing():
+    """置換の実行中は、× も Esc も閉じない。終われば閉じられる。"""
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        dialog._confirm_execute = lambda preview: True
+        started = threading.Event()
+        release = threading.Event()
+        original = replacemod.execute_replace
+
+        def slow_execute(*args, **kwargs):
+            started.set()
+            release.wait(timeout=30)
+            return original(*args, **kwargs)
+
+        replacemod.execute_replace = slow_execute
+        try:
+            dialog.show()
+            app().processEvents()
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            dialog.start_execute()
+            assert started.wait(timeout=10)
+            app().processEvents()
+            assert dialog._busy == "execute"
+            # × は閉じない。
+            dialog.close()
+            app().processEvents()
+            assert dialog.isVisible()
+            assert "終わるまで閉じられません" in dialog._status_label.text()
+            # Esc も閉じない。
+            dialog.reject()
+            app().processEvents()
+            assert dialog.isVisible()
+            assert dialog._busy == "execute"
+            release.set()
+            _wait_dialog(dialog, lambda: (dialog._preview is not None
+                                          and not dialog._preview.targets))
+            # 終われば閉じられる。
+            dialog.close()
+            app().processEvents()
+            assert not dialog.isVisible()
+        finally:
+            replacemod.execute_replace = original
+            release.set()
             dialog.deleteLater()
 
 

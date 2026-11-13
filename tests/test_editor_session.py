@@ -17,6 +17,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -272,6 +273,64 @@ def test_session_window_is_not_restart_blocker():
         assert dirty_window_state([plain]) == (1, 0)
     finally:
         close_window(plain)
+
+
+def test_session_window_with_failed_save_is_restart_blocker():
+    """控えの書き込みが失敗している窓だけは、再起動の妨げに数える。
+    書けている間の未保存タブは、従来どおり数えない。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        try:
+            type_text(window, "控えが書けない編集")
+            assert window.restart_loss_count() == 0
+            assert dirty_window_state([window]) == (0, 0)
+            original = _break_session_save()
+            try:
+                assert window._flush_session() is False
+                assert window.restart_loss_count() == 1
+                assert dirty_window_state([window]) == (1, 0)
+            finally:
+                sessionmod.save = original
+            # 書けるようになれば、次に書けた時点で数えなくなる。
+            assert window._flush_session() is True
+            assert window.restart_loss_count() == 0
+            assert dirty_window_state([window]) == (0, 0)
+        finally:
+            close_window(window)
+
+
+def test_session_save_max_wait_after_three_seconds():
+    """入力が続いても、最初の変更から3秒で必ず控えを書く。静かな
+    場面では従来どおり 500ms で書く。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = make_window(d)
+        try:
+            clock = {"now": 1000.0}
+            original = time.monotonic
+            time.monotonic = lambda: clock["now"]
+            try:
+                window._schedule_session_save()
+                assert window._session_timer.interval() == 500
+                # 2.6秒後も、残りは 400ms に縮む。
+                clock["now"] = 1002.6
+                window._schedule_session_save()
+                assert window._session_timer.interval() == 400
+                clock["now"] = 1002.9
+                window._schedule_session_save()
+                assert window._session_timer.interval() == 100
+                # 3秒経ったら、止まるのを待たずにすぐ書く。
+                clock["now"] = 1003.0
+                window._schedule_session_save()
+                assert window._session_timer.interval() == 0
+                # 書き出したら、次の待ちはまた 500ms から。
+                window._flush_session()
+                clock["now"] = 1003.1
+                window._schedule_session_save()
+                assert window._session_timer.interval() == 500
+            finally:
+                time.monotonic = original
+        finally:
+            close_window(window)
 
 
 def test_session_file_is_written_outside_repo():

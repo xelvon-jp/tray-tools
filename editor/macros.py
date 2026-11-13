@@ -186,6 +186,21 @@ def macro_from_json(text: str):
 _NAME_LINE = "# name:"
 _KEY_EQ_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 _DECODER = json.JSONDecoder()
+# str.splitlines() が行の区切りとみなす文字のうち、JSON の文字列
+# としてそのまま書かれてしまうもの。json.dumps は U+0000〜U+001F
+# を \uXXXX に逃がすが、この3つは文字として残る。テキスト形式は
+# 1行1命令なので、書き出しでは \uXXXX に逃がし、読み込みでは
+# "\n" だけで割る(読み込み側は commands_from_text)。
+_LINE_BREAK_CHARS = ("\u2028", "\u2029", "\u0085")
+
+
+def _json_literal(value) -> str:
+    """値を JSON リテラルにする。行の区切りになる文字は、1行に
+    収まるよう \\uXXXX の形へ逃がす。"""
+    text = json.dumps(value, ensure_ascii=False)
+    for char in _LINE_BREAK_CHARS:
+        text = text.replace(char, "\\u%04x" % ord(char))
+    return text
 
 
 def commands_to_text(commands, name="") -> str:
@@ -193,7 +208,9 @@ def commands_to_text(commands, name="") -> str:
 
     先頭に「# name: 名前」の行を置く(名前があるとき)。引数の値は
     JSON リテラルで書くので、文字列の中の改行や引用符はエスケープ
-    されて1行に収まる。insert_text は text だけのときに簡便形
+    されて1行に収まる。U+2028 / U+2029 / U+0085 も \\uXXXX の形に
+    逃がす(そのまま書くと、読み込み時の行の切り分けがずれる)。
+    insert_text は text だけのときに簡便形
     (insert_text "…")で書く。"""
     lines = []
     if name:
@@ -204,14 +221,11 @@ def commands_to_text(commands, name="") -> str:
         if not args:
             lines.append(cmd)
         elif cmd == "insert_text" and set(args) == {"text"}:
-            lines.append(
-                "insert_text " + json.dumps(str(args["text"]),
-                                            ensure_ascii=False))
+            lines.append("insert_text " + _json_literal(str(args["text"])))
         else:
             parts = [cmd]
             for key, value in args.items():
-                parts.append(
-                    f"{key}={json.dumps(value, ensure_ascii=False)}")
+                parts.append(f"{key}={_json_literal(value)}")
             lines.append(" ".join(parts))
     return ("\n".join(lines) + "\n") if lines else ""
 
@@ -257,10 +271,13 @@ def commands_from_text(text: str):
     """テキスト形式から (名前, 命令の列) を返す。
 
     壊れた行があったら、その行番号つきで ValueError(黙って飛ばす
-    と、書いたつもりの手順が欠けるため)。"""
+    と、書いたつもりの手順が欠けるため)。行の切り分けは "\n" だけ
+    で行う(splitlines は U+2028 / U+2029 / U+0085 も行の区切りと
+    みなすため、insert_text の文字列にそれらが入ると行が切れて
+    再生できなくなる)。"""
     name = ""
     commands = []
-    for lineno, raw_line in enumerate(str(text).splitlines(), 1):
+    for lineno, raw_line in enumerate(str(text).split("\n"), 1):
         line = raw_line.strip()
         if not line:
             continue

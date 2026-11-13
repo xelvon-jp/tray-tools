@@ -314,6 +314,21 @@ def _section(app_settings) -> dict:
     return section if isinstance(section, dict) else {}
 
 
+def _normalize_editor_open_extensions(value) -> dict:
+    """settings の filer.editor_open_extensions を {拡張子: 開くか} に揃える。
+
+    キーは点なし・小文字。値が真偽でないものは捨てる(手で書き換えられた
+    設定でも、窓が開かなくならないため)。"""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for key, val in value.items():
+        ext = str(key).strip().lstrip(".").lower()
+        if ext and isinstance(val, bool):
+            clean[ext] = val
+    return clean
+
+
 def save_values(app_settings, settings_path, updates: dict) -> None:
     """filer セクションの該当キーだけを書き換える(bg_remove._save_values と同じ作法)。
 
@@ -3049,6 +3064,10 @@ class FilerWindow(QWidget):
         # Enter でビュアに回す拡張子(あふｗの拡張子判別実行)。開いているビュアの窓。
         self.viewer_extensions = core.normalize_viewer_extensions(
             section.get("viewer_extensions"))
+        # E キーで表に無い拡張子を開くか聞いた答え(拡張子 → 開くか)。
+        # settings の filer.editor_open_extensions から読む。
+        self._editor_open_extensions = _normalize_editor_open_extensions(
+            section.get("editor_open_extensions"))
         self._viewers = []
         self._text_editors = []
         # 拡張子ごとの既定アプリ(settings の filer.default_apps。関連付けの代わりに
@@ -4574,28 +4593,90 @@ class FilerWindow(QWidget):
     def cmd_text_editor(self):
         self._open_targets_in_text_editor(self.active)
 
+    def ask_open_in_editor(self, ext: str, count: int) -> bool:
+        """表に無い拡張子のファイルを EDDy で開くか聞く。ext は点なし・
+        小文字(空文字は拡張子なし)、count は件数。テストからは
+        差し替えられる。"""
+        if ext:
+            text = (f"「.{ext}」のファイル（{count} 件）を EDDy で開きますか？\n"
+                    "答えはこの拡張子について覚え、次からは聞きません。")
+        else:
+            text = (f"拡張子の無いファイル（{count} 件）を EDDy で開きますか？\n"
+                    "拡張子が無いので、次も聞きます。")
+        answer = QMessageBox.question(
+            self, "EDDyで開く", text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _remember_editor_open(self, ext: str, open_it: bool) -> None:
+        """E キーで聞いた答えを、拡張子ごとに settings へ覚える。
+        save_values の作法で、そのキーだけを書き換える。"""
+        self._editor_open_extensions[ext] = open_it
+        save_values(self.app_settings, self.settings_path,
+                    {"editor_open_extensions":
+                     dict(self._editor_open_extensions)})
+
     def _open_targets_in_text_editor(self, pane) -> None:
         """E / Ctrl+E: 対象を内蔵テキストエディタ(editor/)で開く。
 
         書庫の中は &TEDIT と同じく、一時フォルダへ取り出してから
         開く(保存は取り出した側に書かれる)。同じファイルを二重に
-        開かないのは open_text_editor の側の作法。"""
+        開かないのは open_text_editor の側の作法。
+
+        拡張子がビュア表にあるものはそのまま開く。表に無い拡張子は
+        「EDDy で開きますか」と一度だけ聞き、答えは拡張子ごとに
+        settings へ覚える(開く＝次から聞かずに開く、開かない＝次から
+        聞かずに開かない)。拡張子の無いファイルは覚える先が無いので
+        毎回聞く。フォルダは対象にしない。"""
         files = [e for e in pane.targets() if not e.is_dir]
-        texts = self._text_editor_entries(pane)
-        if not texts:
-            if files:
-                self.log("エディタ: テキストとして開けるファイルがありません")
+        if not files:
             return
-        skipped = len(files) - len(texts)
+        to_open = []
+        skipped = 0
+        # 表に無いものは拡張子ごとにまとめる(拡張子ごとに1回聞く)。
+        by_ext = {}
+        noext = []
+        for e in files:
+            if core.opens_in_viewer(e.name, self.viewer_extensions):
+                to_open.append(e)
+                continue
+            ext = os.path.splitext(e.name)[1].lstrip(".").lower()
+            if ext:
+                by_ext.setdefault(ext, []).append(e)
+            else:
+                noext.append(e)
+        for ext, entries in by_ext.items():
+            remembered = self._editor_open_extensions.get(ext)
+            if remembered is True:
+                to_open.extend(entries)
+                continue
+            if remembered is False:
+                skipped += len(entries)
+                continue
+            if self.ask_open_in_editor(ext, len(entries)):
+                self._remember_editor_open(ext, True)
+                to_open.extend(entries)
+            else:
+                self._remember_editor_open(ext, False)
+                skipped += len(entries)
+        if noext:
+            if self.ask_open_in_editor("", len(noext)):
+                to_open.extend(noext)
+            else:
+                skipped += len(noext)
+        if not to_open:
+            self.log("エディタ: 開くファイルがありません")
+            return
         if skipped:
-            self.log(f"エディタ: テキストでない {skipped} 件は除きました")
+            self.log(f"エディタ: 開かない {skipped} 件は除きました")
         if pane.archive is not None:
             self._extract_to_temp(
-                texts,
+                to_open,
                 lambda taken: [self.open_text_editor(p) for p in taken],
                 pane=pane)
             return
-        for e in texts:
+        for e in to_open:
             self.open_text_editor(os.path.join(pane.path, e.name))
 
     def build_editor_context_menu(self, pane):

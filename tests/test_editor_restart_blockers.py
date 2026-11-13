@@ -18,6 +18,7 @@
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_editor_restart_blockers.py
 import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import editor  # noqa: E402
 import feature_screen  # noqa: E402
+from editor import session as sessionmod  # noqa: E402
 
 APP = None
 
@@ -127,6 +129,34 @@ def test_restart_blockers_counts_dirty_editor():
         assert _editor_blockers(feature) == ["未保存のEDDy 1窓"]
     finally:
         close_window(window)
+
+
+def test_restart_blockers_counts_session_window_with_failed_save():
+    """控えの書き込みが失敗しているセッション窓だけは、再起動の
+    妨げに数える。書けている間の未保存タブは数えない。"""
+    with tempfile.TemporaryDirectory() as d:
+        window = editor.create_window(
+            session_path=str(Path(d) / "editor_session.json"))
+        window.show()
+        try:
+            feature = _make_feature(window)
+            type_text(window, "x")
+            assert _editor_blockers(feature) == []
+            original = sessionmod.save
+
+            def broken(path):
+                raise OSError("書けない(テスト)")
+
+            sessionmod.save = broken
+            try:
+                assert window._flush_session() is False
+                assert _editor_blockers(feature) == ["未保存のEDDy 1窓"]
+            finally:
+                sessionmod.save = original
+            assert window._flush_session() is True
+            assert _editor_blockers(feature) == []
+        finally:
+            close_window(window)
 
 
 def test_restart_blockers_without_editor():

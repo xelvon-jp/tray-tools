@@ -12036,7 +12036,8 @@ def _close_editor_windows(w):
 def test_text_editor_ctrl_e_targets():
     """Ctrl+E: カーソル行・マークのテキストファイルを内蔵エディタで開く。
 
-    画像は対象にしない。同じファイルは二重に開かない。"""
+    表に無い拡張子(画像など)は聞いてから開く。同じファイルは
+    二重に開かない。"""
     import filer
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
@@ -12054,6 +12055,9 @@ def test_text_editor_ctrl_e_targets():
         w.start()
         _wait(w)
         L = w.left
+        asked = []
+        w.ask_open_in_editor = lambda ext, count: asked.append(
+            (ext, count)) or False
         try:
             L.set_cursor(L._row_of("alpha.txt"))
             QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
@@ -12064,10 +12068,11 @@ def test_text_editor_ctrl_e_targets():
             assert len(w._text_editors) == 1
             _close_editor_windows(w)
             assert w._text_editors == []
-            # 画像は対象にしない
+            # 画像は聞かれて、「いいえ」なら開かない
             L.set_cursor(L._row_of("photo.JPG"))
             QTest.keyClick(L.view, Qt.Key_E, Qt.ControlModifier)
             assert w._text_editors == []
+            assert asked == [("jpg", 1)], asked
             # マーク: テキストだけが開き、画像は除かれる
             L.marks.update({"alpha.txt", "beta.md", "photo.JPG"})
             w.run_command("text_editor")
@@ -12076,6 +12081,179 @@ def test_text_editor_ctrl_e_targets():
             _close_editor_windows(w)
         finally:
             _close_editor_windows(w)
+            w.close()
+            w.deleteLater()
+
+
+def _editor_open_window(tmp, extra_files):
+    """E キーの聞いて覚えるテスト用の窓。extra_files は {名前: 中身} を
+    左へ足してから窓を作る。(窓, 左のパス, settings のパス) を返す。"""
+    import filer
+
+    left, right = _make_tree(tmp)
+    for name, data in extra_files.items():
+        Path(left, name).write_bytes(data)
+    settings_path = Path(tmp, "settings.json")
+    settings_path.write_text("{}", encoding="utf-8")
+    w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                     "editor": "x"}},
+                          str(settings_path))
+    w.resize(1000, 600)
+    w.show()
+    w.start()
+    _wait(w)
+    return w, left, settings_path
+
+
+def test_text_editor_unknown_extension_asks_once_and_remembers_open():
+    """表に無い拡張子: 一度だけ聞き、「はい」なら開いて、次からは
+    聞かずに開く。答えは settings に残り、窓を作り直しても効く。"""
+    import filer
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, settings_path = _editor_open_window(tmp, {"data.dat": b"dat"})
+        opened = []
+        asked = []
+        dummy = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy
+        w.ask_open_in_editor = lambda ext, count: asked.append(
+            (ext, count)) or True
+        try:
+            w.left.set_cursor(w.left._row_of("data.dat"))
+            w.run_command("text_editor")
+            assert asked == [("dat", 1)], asked
+            assert opened == [str(left / "data.dat")], opened
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert saved["filer"]["editor_open_extensions"] == {"dat": True}
+            # 次は聞かずに開く。
+            opened.clear()
+            w.run_command("text_editor")
+            assert asked == [("dat", 1)], asked
+            assert opened == [str(left / "data.dat")], opened
+        finally:
+            w.close()
+            w.deleteLater()
+        # 窓を作り直しても、settings から読んで聞かない。
+        app_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        app_settings["filer"].update(
+            {"left_path": str(left), "right_path": str(left), "editor": "x"})
+        w2 = filer.FilerWindow(app_settings, str(settings_path))
+        w2.resize(1000, 600)
+        w2.show()
+        w2.start()
+        _wait(w2)
+        opened2 = []
+
+        def must_not_ask(ext, count):
+            raise AssertionError(f"聞かれてはいけない: {ext} {count}件")
+
+        w2.open_text_editor = lambda path: opened2.append(path) or dummy
+        w2.ask_open_in_editor = must_not_ask
+        try:
+            w2.left.set_cursor(w2.left._row_of("data.dat"))
+            w2.run_command("text_editor")
+            assert opened2 == [str(left / "data.dat")], opened2
+        finally:
+            w2.close()
+            w2.deleteLater()
+
+
+def test_text_editor_unknown_extension_no_means_not_asked_again():
+    """表に無い拡張子: 「いいえ」なら開かず、次からも聞かない。
+    答えは settings に残る。"""
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, settings_path = _editor_open_window(tmp, {"data.dat": b"dat"})
+        opened = []
+        asked = []
+        dummy = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy
+        w.ask_open_in_editor = lambda ext, count: asked.append(
+            (ext, count)) or False
+        try:
+            w.left.set_cursor(w.left._row_of("data.dat"))
+            w.run_command("text_editor")
+            assert asked == [("dat", 1)], asked
+            assert opened == [], opened
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert saved["filer"]["editor_open_extensions"] == {"dat": False}
+            w.run_command("text_editor")
+            assert asked == [("dat", 1)], asked
+            assert opened == [], opened
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_text_editor_no_extension_asks_every_time():
+    """拡張子の無いファイル: 覚える先が無いので毎回聞く。"""
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, settings_path = _editor_open_window(
+            tmp, {"LICENSE": b"license"})
+        opened = []
+        asked = []
+        dummy = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy
+        w.ask_open_in_editor = lambda ext, count: asked.append(
+            (ext, count)) or True
+        try:
+            w.left.set_cursor(w.left._row_of("LICENSE"))
+            w.run_command("text_editor")
+            assert asked == [("", 1)], asked
+            assert opened == [str(left / "LICENSE")], opened
+            w.run_command("text_editor")
+            assert asked == [("", 1), ("", 1)], asked
+            assert len(opened) == 2
+            # 覚える先が無いので、settings には何も残らない。
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert "editor_open_extensions" not in saved.get("filer", {})
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_text_editor_known_extension_opens_without_asking():
+    """表にある拡張子: 聞かずに開く。"""
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, _settings = _editor_open_window(tmp, {})
+        opened = []
+        dummy = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy
+
+        def must_not_ask(ext, count):
+            raise AssertionError(f"聞かれてはいけない: {ext} {count}件")
+
+        w.ask_open_in_editor = must_not_ask
+        try:
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            w.run_command("text_editor")
+            assert opened == [str(left / "alpha.txt")], opened
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_text_editor_folder_does_nothing():
+    """フォルダ: E でも何もしない(聞く窓も出ない)。"""
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        w, left, _settings = _editor_open_window(tmp, {})
+        opened = []
+        dummy = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy
+
+        def must_not_ask(ext, count):
+            raise AssertionError(f"聞かれてはいけない: {ext} {count}件")
+
+        w.ask_open_in_editor = must_not_ask
+        try:
+            w.left.set_cursor(w.left._row_of("sub1"))
+            w.run_command("text_editor")
+            assert opened == [], opened
+        finally:
             w.close()
             w.deleteLater()
 
@@ -12267,6 +12445,11 @@ FULL_ONLY = frozenset({
     "test_text_editor_context_menu",
     "test_text_editor_ctrl_e_in_preview",
     "test_text_editor_ctrl_e_targets",
+    "test_text_editor_folder_does_nothing",
+    "test_text_editor_known_extension_opens_without_asking",
+    "test_text_editor_no_extension_asks_every_time",
+    "test_text_editor_unknown_extension_asks_once_and_remembers_open",
+    "test_text_editor_unknown_extension_no_means_not_asked_again",
     "test_photo_mode_judgement",
     "test_photo_mode_window_and_rating_column",
     "test_photo_no_extra_entries",

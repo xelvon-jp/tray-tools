@@ -97,6 +97,36 @@ def test_text_roundtrip_escapes_and_numbers():
     assert back == commands
 
 
+def test_text_roundtrip_line_separator_chars():
+    """U+2028 / U+2029 / U+0085 を含む insert_text が、往復で
+    行が切れずに残る。"""
+    commands = [
+        {"cmd": "insert_text", "args": {"text": "a\u2028b\u2029c\u0085d"}},
+        {"cmd": "find_next",
+         "args": {"text": "x\u2028y", "case": False, "regex": False}},
+        {"cmd": "delete_line", "args": {}},
+    ]
+    text = macmod.commands_to_text(commands)
+    # 書き出したテキストは、行の区切りになる文字をそのまま含まない。
+    assert "\u2028" not in text
+    assert "\u2029" not in text
+    assert "\u0085" not in text
+    assert len([ln for ln in text.splitlines() if ln.strip()]) == 3
+    _name, back = macmod.commands_from_text(text)
+    assert back == commands
+
+
+def test_text_reads_literal_line_separator_chars():
+    """以前に書き出されたファイルに U+2028 等が文字のまま残って
+    いても、1命令として読める。"""
+    text = 'insert_text "a\u2028b"\ndelete_line\n'
+    _name, commands = macmod.commands_from_text(text)
+    assert commands == [
+        {"cmd": "insert_text", "args": {"text": "a\u2028b"}},
+        {"cmd": "delete_line", "args": {}},
+    ]
+
+
 def test_text_accepts_key_value_form_for_insert_text():
     _name, commands = macmod.commands_from_text(
         'insert_text text="x y"\n')

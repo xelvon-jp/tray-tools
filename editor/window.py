@@ -287,6 +287,11 @@ RECENT_FILES_LIMIT = 20
 # まとめて1回だけ書く(フォントの大きさの遅延保存と同じ作法)。
 # 窓を閉じるときとアプリの終了時は、その場で書き切る。
 SESSION_SAVE_DELAY_MS = 500
+# 控えの書き出し待ちの上限(ms)。入力が続くとまとめ待ちが延び
+# 続けて控えがいつまでも残らないので、最初の変更からこの時間が
+# 経ったら、止まるのを待たずに必ず書く。静かな場面では従来どおり
+# SESSION_SAVE_DELAY_MS で書く。
+SESSION_SAVE_MAX_WAIT_MS = 3000
 # リアルタイム検索で、正規表現のときに探し始めるまでの間引き(ms)。
 # 打つたびに別プロセスを起こさないための待ちで、通常の文字列の
 # ときは待たずにその場で探す。
@@ -760,6 +765,12 @@ class EditorWindow(QMainWindow):
         self._session_timer.setSingleShot(True)
         self._session_timer.setInterval(SESSION_SAVE_DELAY_MS)
         self._session_timer.timeout.connect(self._flush_session)
+        # 控えの書き出し待ちの始まり(monotonic 秒。待ちが無いときは
+        # None)。まとめ待ちの上限(SESSION_SAVE_MAX_WAIT_MS)の起点。
+        self._session_pending_since = None
+        # 控えの書き込みが失敗しているか。失敗したままの窓は、再起動・
+        # 終了の巻き添え(restart_loss_count)に数える(成功したら戻る)。
+        self._session_save_failed = False
         self._keymap = keymapmod.merge_keymap(keymap_overrides)
         self._keymap_overrides = keymapmod.sanitize_overrides(
             keymap_overrides)
@@ -1651,9 +1662,23 @@ class EditorWindow(QMainWindow):
         return {"tabs": tabs, "active": max(0, index)}
 
     def _schedule_session_save(self):
-        """控えの書き出しを予約する(まとめ待ち。止まってから書く)。"""
+        """控えの書き出しを予約する(まとめ待ち。止まってから書く)。
+
+        入力が続いても、最初の変更から SESSION_SAVE_MAX_WAIT_MS
+        で必ず書く(待ちの上限)。静かな場面では従来どおり
+        SESSION_SAVE_DELAY_MS で書く。"""
         if self._session_path is not None and self._session_slot is not None:
-            self._session_timer.start()
+            now = time.monotonic()
+            if not self._session_timer.isActive():
+                self._session_pending_since = now
+            first = self._session_pending_since
+            if first is None:
+                first = now
+                self._session_pending_since = now
+            deadline = first + SESSION_SAVE_MAX_WAIT_MS / 1000.0
+            delay_ms = min(SESSION_SAVE_DELAY_MS,
+                           max(0, round((deadline - now) * 1000)))
+            self._session_timer.start(delay_ms)
 
     def _flush_session(self):
         """控えをいま書き出す。セッションが無ければ何もしない。
@@ -1661,18 +1686,23 @@ class EditorWindow(QMainWindow):
         スロットの中身をいまのタブで差し替えてから、ファイル全体
         (他の窓のスロットと未使用分を含む)を書く。失敗しても編集は
         止めない(ステータスに残すだけ)。書けたら True、失敗したら
-        False を返す(閉じる側が「無言で消えない」ための判断に使う)。"""
+        False を返す(閉じる側が「無言で消えない」ための判断に使う)。
+        失敗したことは _session_save_failed に残し、再起動・終了の
+        巻き添え判定が読む(次に書けたら戻る)。"""
         if self._session_path is None or self._session_slot is None:
             return True
         self._session_timer.stop()
+        self._session_pending_since = None
         try:
             state = self._capture_session_state()
             self._session_slot.clear()
             self._session_slot.update(state)
             notice = sessionmod.save(self._session_path)
         except Exception:  # noqa: BLE001  控えの失敗で編集を止めない
+            self._session_save_failed = True
             self.statusBar().showMessage("控えを保存できませんでした", 4000)
             return False
+        self._session_save_failed = False
         if notice is not None:
             self._notify_newer_session(notice)
         return True
@@ -5289,11 +5319,14 @@ class EditorWindow(QMainWindow):
         """窓を閉じたら失われる未保存の内容の件数。
 
         セッション(控え)が有効な窓は、閉じても控えから戻るので
-        常に 0(= EDDy のために再起動を止めない)。セッションが
-        無効な窓(テスト等)は、未保存のタブの数を返す
+        普段は 0(= EDDy のために再起動を止めない)。ただし控えの
+        書き込みが失敗している窓だけは 1 と数える(控えが無いまま
+        閉じると、未保存の内容がどこにも残らないため。通常の未保存
+        タブは、控えが書けている限り数えない)。セッションが無効な窓
+        (テスト等)は、未保存のタブの数を返す
         (dirty_window_state がこれを使う)。"""
         if self._session_path is not None:
-            return 0
+            return 1 if self._session_save_failed else 0
         return sum(1 for view in self._views if view.is_modified())
 
     def tab_count(self) -> int:

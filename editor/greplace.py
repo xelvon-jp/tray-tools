@@ -22,6 +22,9 @@
 # 対象から外すもの(理由は結果に分けて返す):
 #   - EDDy で開いているファイル(呼び側が exclude_paths で渡す。
 #     未保存の控えがあるタブと二重に書き換えないため)
+#   - 拡張子の無いファイル(既定。Makefile や LICENSE のような
+#     文章ファイルもあるが、実行形式まで入ってしまうため。
+#     プレビュー側の除外の扱いに揃えて件数と理由を返す)
 #   - 読めなかったファイル
 #   - バイナリらしいファイル(読み替えが発生したもの、本文に
 #     U+0000 を含むもの)
@@ -63,6 +66,7 @@ class ReplacePreview:
     files_scanned: int = 0          # 歩いて確かめたファイルの数
     total_count: int = 0            # 置換の合計件数
     skipped_open: list = field(default_factory=list)        # パス
+    skipped_no_extension: list = field(default_factory=list)  # パス
     skipped_unreadable: list = field(default_factory=list)  # パス
     skipped_binary: list = field(default_factory=list)      # パス
     skipped_unencodable: list = field(default_factory=list)  # (パス, 書けない文字)
@@ -133,13 +137,16 @@ def _is_binary_like(doc) -> bool:
 def preview_replace(root, word, repl, *, case_sensitive=False, regex=False,
                     exclude_paths=(), extensions=None,
                     max_bytes=grepmod.MAX_FILE_BYTES,
-                    max_files=MAX_PREVIEW_FILES, progress=None):
+                    max_files=MAX_PREVIEW_FILES, progress=None,
+                    exclude_no_extension=True):
     """root の下を word で探し、置換の対象と件数を ReplacePreview で返す。
 
     書くことは一切しない。不正な正規表現・置換文字列は
     rxfind.RegexFault(利用者向けの文)になる。progress は
     (調べたファイル数, パス) を受ける関数で、grep と同じ間隔で
-    呼ばれる(例外を上げても走査は止めない)。"""
+    呼ばれる(例外を上げても走査は止めない)。拡張子の無いファイルは
+    既定で対象から外し、skipped_no_extension に入れて返す
+    (exclude_no_extension=False で含める)。"""
     preview = ReplacePreview()
     if not word or not root or not os.path.isdir(root):
         return preview
@@ -156,6 +163,13 @@ def preview_replace(root, word, repl, *, case_sensitive=False, regex=False,
                 pass
         if normalize_path(path) in excluded:
             preview.skipped_open.append(path)
+            continue
+        if (exclude_no_extension
+                and not os.path.splitext(path)[1]):
+            # 拡張子の無いファイルは、文章ファイルも実行形式も
+            # 混ざっているので既定で対象から外す(読む前に外し、
+            # 他の除外と同じく件数と理由を残す)。
+            preview.skipped_no_extension.append(path)
             continue
         try:
             doc = docmod.load_document(path)

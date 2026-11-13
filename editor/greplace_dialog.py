@@ -174,6 +174,31 @@ class GrepReplaceDialog(QDialog):
             not busy and self._preview is not None)
 
     # ---------------------------------------------------------------
+    # 実行中の閉じ防止
+    # ---------------------------------------------------------------
+    def closeEvent(self, event):  # noqa: N802  Qt の上書き
+        # 置換を実行中に窓を閉じられると、書き込みは裏で続くのに
+        # 結果が見えなくなる。終わるまで閉じない(マクロの別窓と
+        # 同じ作法。確かめてから閉じる形ではなく止める形なのは、
+        # 「閉じる」を選んでも書き込みは裏で続いてしまい、聞く
+        # 意味が無いため)。
+        if self._busy == "execute":
+            event.ignore()
+            self._status_label.setText(
+                "置換を実行中です。終わるまで閉じられません")
+            return
+        super().closeEvent(event)
+
+    def reject(self):  # noqa: N802  Qt の上書き
+        # Esc は closeEvent を通らず reject に来るので、こちらも
+        # 同じく止める。
+        if self._busy == "execute":
+            self._status_label.setText(
+                "置換を実行中です。終わるまで閉じられません")
+            return
+        super().reject()
+
+    # ---------------------------------------------------------------
     # プレビュー(対象の確認)
     # ---------------------------------------------------------------
     def start_preview(self):
@@ -242,6 +267,8 @@ class GrepReplaceDialog(QDialog):
         parts = []
         if preview.skipped_open:
             parts.append(f"開いている {len(preview.skipped_open)} 件")
+        if preview.skipped_no_extension:
+            parts.append(f"拡張子がない {len(preview.skipped_no_extension)} 件")
         if preview.skipped_unreadable:
             parts.append(f"読めない {len(preview.skipped_unreadable)} 件")
         if preview.skipped_binary:
@@ -371,6 +398,10 @@ class GrepReplaceDialog(QDialog):
 
     # ---------------------------------------------------------------
     def _on_item_activated(self, item):
+        # 実行中は一覧の項目からも閉じない(accept で窓が閉じて、
+        # 実行の結果が見えなくなるため)。
+        if self._busy == "execute":
+            return
         data = item.data(Qt.ItemDataRole.UserRole)
         if data and self._on_jump is not None:
             path, line = data

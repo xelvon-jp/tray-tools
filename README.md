@@ -325,7 +325,16 @@ traytools_send.py sleep                  猶予のあとスリープ
 traytools_send.py sleep 1800             30分後にスリープ
 traytools_send.py sleep 1800 hibernate   30分後に休止状態
 traytools_send.py sleep cancel           予約を取り消す
+
+traytools_send.py tomorrow-memo          明日の自分へメモの窓を開き、閉じるまで待つ
+traytools_send.py tomorrow-memo nowait   窓を開いてすぐ返る
 ```
+
+### 明日の自分へメモ
+
+就業前に書いたメモが、次回の常駐起動時にポップアップする機能です（昨日の自分から今日の自分への手紙）。トレイの「🌅 明日の自分へメモ」からいつでも開けて、書いた内容は入力のたびに自動保存されます（保存ボタンはありません）。データは `tomorrow_memo.json`（このフォルダ）に持ち、過去のメモは自動で履歴に残ります（起動時に表示して閉じたもの・書き換える前のもの）。窓からは過去のメモも読めます。
+
+PC を落とすスクリプトからは `traytools_send.py tomorrow-memo` を呼んでください。メモの窓が開き、**窓が閉じるまで呼び出しは戻りません**。閉じたら終了コード 0 で返るので、スクリプトはその後でシャットダウンを続けられます。常駐が動いていなければ、他のコマンドと同じく自動で起動してから窓を開きます。待ちの上限は1時間で、超えると窓は開いたまま応答だけがエラーで返ります。
 
 **Claude Code からは MCP サーバー経由でも呼べます**（下の「Claude Code から道具として呼ぶ」）。
 

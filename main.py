@@ -372,6 +372,14 @@ def _build_command_handlers(features) -> dict:
         #
         #   traytools_send.py status
         "status": lambda args, reply: reply("OK\n" + screen.status_text()),
+        # 明日の自分へメモの書く窓を開く。PC を落とすスクリプトから呼ぶ想定で、
+        # 既定では窓が閉じるまで応答を返さない(スクリプトは応答が返ってから
+        # シャットダウンを続けられる)。nowait を付けると開いてすぐ返す。
+        # 窓を出すのは常駐のプロセスでなければできないので、この口に載せる。
+        #
+        #   traytools_send.py tomorrow-memo           窓を開き、閉じるまで待つ
+        #   traytools_send.py tomorrow-memo nowait    窓を開いてすぐ返す
+        "tomorrow-memo": lambda args, reply: _tomorrow_memo_command(screen, args, reply),
         # 操作ログの末尾を読む。既定20行、引数で行数を指定できる。
         #
         #   traytools_send.py log 50
@@ -439,6 +447,32 @@ def _build_command_handlers(features) -> dict:
         # ここを通って発覚した。他のコマンドと同じく引数で渡す。
         "agent-loop": lambda args, reply: _agent_loop_command(screen, args, reply),
     }
+
+
+# メモを書く窓が閉じるのを待つ上限(ms)。就業前に書く想定なので1時間あれば
+# 十分に足りる。超えたら窓は開いたまま、応答だけを打ち切って返す(スクリプトが
+# シャットダウンを止め続けないため)。
+TOMORROW_MEMO_WAIT_MS = 60 * 60 * 1000
+
+
+def _tomorrow_memo_command(screen, args, reply) -> None:
+    """tomorrow-memo の入口。既定は窓が閉じるまで応答を遅らせ、nowait の
+    ときだけ開いてすぐ返す(capture --select と同じ作法)。"""
+    nowait = any(str(a).strip().lower() == "nowait" for a in args)
+    if nowait:
+        if screen.open_tomorrow_memo():
+            reply("OK 明日の自分へメモを開きました")
+        else:
+            reply("ERR メモの窓を開けませんでした")
+        return
+    # 人が書く間、既定の応答期限(20秒)で切られないよう、待ちの上限まで延ばす。
+    reply.extend_deadline(TOMORROW_MEMO_WAIT_MS + 10000)
+
+    def done():
+        reply("OK メモの窓が閉じられました")
+
+    if not screen.open_tomorrow_memo_for_call(done):
+        reply("ERR メモの窓を開けませんでした")
 
 
 def _bookmark_command(screen, args, reply) -> None:

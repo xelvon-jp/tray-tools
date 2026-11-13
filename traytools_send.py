@@ -7,6 +7,8 @@
 #   python traytools_send.py notify "変換が終わりました"
 #   python traytools_send.py beep done
 #   python traytools_send.py pushover "変換が終わりました" --title 変換
+#   python traytools_send.py tomorrow-memo           メモの窓を開き、閉じるまで待つ
+#   python traytools_send.py tomorrow-memo nowait    メモの窓を開いてすぐ返る
 #
 # 【応答】以前この口は一方向で、送った側は「エラーが出ていないから多分成功」という
 # 確かめ方しかできなかった。いまは本体が1つ応答を返す。
@@ -60,7 +62,9 @@ RESPONSE_POLL_SLOW = 0.02
 RESPONSE_POLL_FAST_SECONDS = 0.3
 # 待ちの入るコマンドだけ長くする。pushover は外へ HTTP を投げるので数秒かかりうる
 # (本体側のタイムアウトは10秒、応答を諦めるのが20秒)。
-SLOW_RESPONSE_TIMEOUT = {"pushover": 25.0}
+# tomorrow-memo は人がメモを書いて窓を閉じるまで本体が応答を返さない
+# (本体側の上限は1時間)。それより少しだけ長く待つ。
+SLOW_RESPONSE_TIMEOUT = {"pushover": 25.0, "tomorrow-memo": 3660.0}
 
 
 def _response_timeout(command: str) -> float:

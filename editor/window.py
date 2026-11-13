@@ -75,6 +75,18 @@
 # が使っているキーを付けたら、前の命令は割り当てなしになる
 # (後勝ち。重なったままではショートカットがどちらも効かないため。
 # 画面に知らせが出る)。
+#
+# リアルタイム検索(2026-11-13): 検索欄に打っている途中から、起点
+# (打ち始めたときの本文カーソル位置)から一番近いヒットへその場で
+# 飛ぶ。条件は検索バーの大小区別・正規表現をそのまま使う。起点は
+# 直前のヒットが選択されている間は保たれるので、打ち進めても次々
+# と先のヒットへずれていかない。Enter の次検索は、選ばれたヒット
+# の後ろから続く。通常の文字列はその場で探し(str.find)、正規
+# 表現は式の文法だけ先に確かめてから、少し間引いて(タイマー)
+# 既存の非同期経路(_run_rx_async)で探す。ヒットが無ければ検索欄
+# の背景が薄い赤になる(ステータスにも従来どおり出す)。
+# 入力への反応は textEdited(人が打ったときだけ。setText では
+# 来ない)なので、マクロ再生やプログラムからの設定では走らない。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -191,6 +203,10 @@ AUTOSAVE_INTERVAL_KEY = "autosave_interval_sec"
 DEFAULT_AUTOSAVE_INTERVAL_SEC = 60
 AUTOSAVE_INTERVAL_MIN_SEC = 10
 AUTOSAVE_INTERVAL_MAX_SEC = 3600
+# リアルタイム検索で、正規表現のときに探し始めるまでの間引き(ms)。
+# 打つたびに別プロセスを起こさないための待ちで、通常の文字列の
+# ときは待たずにその場で探す。
+INCREMENTAL_SEARCH_DELAY_MS = 120
 
 # キー割り当て(settings の editor 節 keymap のキー)。値は命令名 →
 # キーの上書き分(既定と違う項目だけ。割り当てを外した命令は空文字列)
@@ -552,6 +568,15 @@ class EditorWindow(QMainWindow):
         self._rx_bridge.finished.connect(self._on_rx_finished)
         self._rx_generation = 0
         self._rx_pending = None
+        # リアルタイム検索の状態。_inc_base は打ち始めたときの本文
+        # カーソル位置(検索の起点)、_inc_span は直前に当てたヒット
+        # の範囲(どちらも本文の位置)。タイマーは正規表現のときの
+        # 間引き用で、timeout が _do_incremental_search を呼ぶ。
+        self._inc_base = None
+        self._inc_span = None
+        self._inc_timer = QTimer(self)
+        self._inc_timer.setSingleShot(True)
+        self._inc_timer.timeout.connect(self._do_incremental_search)
         # 未保存で閉じる/新規にするときの確認は差し替えられる
         # (テストは QMessageBox を出さずにここを差す)。
         # 戻り値は "save" / "discard" / "cancel"。
@@ -1041,10 +1066,16 @@ class EditorWindow(QMainWindow):
         self._find_edit = QLineEdit()
         self._find_edit.returnPressed.connect(
             lambda: self.execute_command("find_next"))
+        # リアルタイム検索: 人が打ったときだけ(textEdited)反応する。
+        # setText では来ないので、マクロ再生やテストの一括設定では
+        # 走らない。
+        self._find_edit.textEdited.connect(self._on_find_edited)
         row.addWidget(self._find_edit, 1)
         self._find_case = QCheckBox("大文字小文字を区別")
+        self._find_case.toggled.connect(self._on_find_condition_changed)
         row.addWidget(self._find_case)
         self._find_regex = QCheckBox("正規表現")
+        self._find_regex.toggled.connect(self._on_find_condition_changed)
         row.addWidget(self._find_regex)
         next_button = QPushButton("次へ")
         next_button.clicked.connect(lambda: self.execute_command("find_next"))
@@ -2422,6 +2453,9 @@ class EditorWindow(QMainWindow):
         word, repl, case, regex = self._replace_options(args)
         if not word:
             return None
+        # 置換の最中に、間引き待ちのリアルタイム検索が割り込んで
+        # 世代を進めてしまわないよう、先に止める(_do_find と同じ)。
+        self._inc_timer.stop()
         text = self._edit.toPlainText()
         if regex and not self._replaying:
             # 正規表現の置換は裏スレッドで回す。結果が返る前に材料は
@@ -2800,11 +2834,13 @@ class EditorWindow(QMainWindow):
     # 検索
     # ---------------------------------------------------------------
     def show_find_bar(self):
+        self._reset_incremental_search()
         self._find_bar.show()
         self._find_edit.setFocus()
         self._find_edit.selectAll()
 
     def _hide_find_bar(self):
+        self._reset_incremental_search()
         self._find_bar.hide()
         self._edit.setFocus()
 
@@ -2919,6 +2955,10 @@ class EditorWindow(QMainWindow):
                  regex=None) -> bool:
         """検索の実体。word / case_sensitive / regex が None なら検索欄の
         値を使う(命令層からは、記録・再生のために使った値を渡してくる)。"""
+        # 間引き待ちのリアルタイム検索が残っていたら止める(Enter を
+        # 押した直後に、遅れて来たリアルタイム検索が選択を戻して
+        # しまわないように)。
+        self._inc_timer.stop()
         if word is None:
             word = self._find_edit.text()
         if not word:
@@ -2951,6 +2991,165 @@ class EditorWindow(QMainWindow):
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
         return True
+
+    # ---------------------------------------------------------------
+    # リアルタイム検索(打っている途中からヒットへ飛ぶ)
+    # ---------------------------------------------------------------
+    def _reset_incremental_search(self):
+        """リアルタイム検索の状態を初期化する(検索バーを開く・
+        閉じるときと、検索語が空になったとき)。"""
+        self._inc_timer.stop()
+        self._inc_base = None
+        self._inc_span = None
+        self._set_find_not_found(False)
+
+    def _set_find_not_found(self, not_found):
+        """ヒットが無いときは検索欄の背景を薄い赤にする。見つ
+        かったとき・語が空のときは元の見た目に戻す(ステータス
+        バーの「見つかりません」と併用する、この窓の作法)。"""
+        self._find_edit.setStyleSheet(
+            "background-color: #ffd7d7;" if not_found else "")
+
+    def _mark_incremental_not_found(self, word):
+        self._set_find_not_found(True)
+        self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
+
+    def _on_find_edited(self, _text):
+        """検索欄への入力のたびに呼ばれる。textEdited は人が打った
+        ときだけ来る(setText では来ない)ので、マクロ再生やプロ
+        グラムからの設定では走らない。"""
+        self._request_incremental_search()
+
+    def _on_find_condition_changed(self, _checked):
+        """大小区別・正規表現の切り替えでも探し直す。検索バーが
+        出ていないときは何もしない(材料だけ先に設定される使い方
+        で、勝手に検索が走らないように)。"""
+        if self._find_bar.isVisible():
+            self._request_incremental_search()
+
+    def _request_incremental_search(self):
+        word = self._find_edit.text()
+        if not word:
+            self._reset_incremental_search()
+            return
+        if not self._find_regex.isChecked():
+            self._inc_timer.stop()
+            self._do_incremental_search()
+            return
+        # 正規表現: 式の文法だけ先に確かめる(コンパイル自体は固ま
+        # らない。破滅的な式の実行は別プロセス側が時間切れで守る)。
+        # 不正なら、その場で知らせて探さない(打ちかけの式で、別
+        # プロセスを起こし続けないためでもある)。
+        try:
+            rxfind.compile_search(
+                word, regex=True,
+                case_sensitive=self._find_case.isChecked())
+        except rxfind.RegexFault as e:
+            self._inc_timer.stop()
+            self._set_find_not_found(True)
+            self.statusBar().showMessage(str(e), 8000)
+            return
+        # 打つたびに別プロセスを起こさないよう、少し待ってから
+        # 探す(間引き)。新しい入力が来たらタイマーは数え直し。
+        self._inc_timer.start(INCREMENTAL_SEARCH_DELAY_MS)
+
+    def _incremental_base(self) -> int:
+        """リアルタイム検索の起点(本文の位置)。
+
+        直前のヒットがそのまま選択されている間は、打ち始めた
+        ときの起点を使い続ける(打つたびに次のヒットへずれていか
+        ないように)。選択が他へ移っていたら、そこを新しい起点
+        にする。"""
+        cursor = self._edit.textCursor()
+        if self._inc_span is not None and cursor.hasSelection() and \
+                (cursor.selectionStart(), cursor.selectionEnd()) \
+                == self._inc_span:
+            return self._inc_base
+        base = (cursor.selectionStart() if cursor.hasSelection()
+                else cursor.position())
+        self._inc_base = base
+        return base
+
+    def _apply_incremental_hit(self, start, end, base):
+        """ヒットを選択にして、起点とヒットの範囲を控える。"""
+        cursor = self._edit.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        self._edit.setTextCursor(cursor)
+        self._edit.centerCursor()
+        self._inc_base = base
+        self._inc_span = (start, end)
+
+    def _do_incremental_search(self):
+        """検索欄の今の語で、起点から一番近いヒットへ飛ぶ。
+
+        通常の文字列はその場で探す(str.find は大きな文書でも速く、
+        既存の次検索も同じ作法)。正規表現は _do_incremental_regex
+        (既存の非同期経路)に回す。"""
+        if not self._find_bar.isVisible():
+            return
+        word = self._find_edit.text()
+        if not word:
+            self._set_find_not_found(False)
+            return
+        case_sensitive = self._find_case.isChecked()
+        if self._find_regex.isChecked():
+            self._do_incremental_regex(word, case_sensitive)
+            return
+        text = self._edit.toPlainText()
+        base = self._incremental_base()
+        index = docmod.find_next(text, word, base, case_sensitive)
+        if index < 0 and base > 0:
+            index = docmod.find_next(text, word, 0, case_sensitive)
+        if index < 0:
+            self._mark_incremental_not_found(word)
+            return
+        self._set_find_not_found(False)
+        self._apply_incremental_hit(index, index + len(word), base)
+
+    def _do_incremental_regex(self, word, case_sensitive):
+        """リアルタイム検索の正規表現版。実処理は既存の非同期
+        経路(_run_rx_async。別プロセス＋世代管理で、古い結果は
+        捨てられる)に乗せ、起点より後ろに無ければ先頭から探す
+        (巻き戻しは1回だけ、次検索の作法と同じ)。"""
+        text = self._edit.toPlainText()
+        base16 = self._incremental_base()
+        base = self._py_index(base16, text)
+        revision = self._edit.document().revision()
+
+        def apply_span(span):
+            self._set_find_not_found(False)
+            self._apply_incremental_hit(
+                self._utf16_index(span[0], text),
+                self._utf16_index(span[1], text), base16)
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                return  # 検索の間に文書が変わった。結果は古い
+            span = result["span"]
+            if span is not None:
+                apply_span(span)
+                return
+            if base == 0:
+                self._mark_incremental_not_found(word)
+                return
+
+            def wrapped(result2):
+                if self._edit.document().revision() != revision:
+                    return
+                span2 = result2["span"]
+                if span2 is None:
+                    self._mark_incremental_not_found(word)
+                    return
+                apply_span(span2)
+
+            self._run_rx_async("find_next", wrapped, text=text,
+                               pattern=word, start=0, regex=True,
+                               case_sensitive=case_sensitive)
+
+        self._run_rx_async("find_next", done, text=text, pattern=word,
+                           start=base, regex=True,
+                           case_sensitive=case_sensitive)
 
     # ---------------------------------------------------------------
     # 正規表現の非同期実行(待ちは裏スレッド、適用は GUI スレッド)

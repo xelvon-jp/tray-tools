@@ -46,6 +46,7 @@ from editor.keymap_dialog import KeymapSettingsDialog  # noqa: E402
 from editor.window import (  # noqa: E402
     AUTOSAVE_ENABLED_KEY,
     AUTOSAVE_INTERVAL_KEY,
+    INCREMENTAL_SEARCH_DELAY_MS,
     PATTERN_APPLYING_KEY,
     RECENT_FILES_KEY,
     PatternSettingsDialog,
@@ -1347,6 +1348,149 @@ def test_regex_invalid_pattern_reports_error():
         wait_rx(window)   # 不正な式の知らせも非同期で返る
         assert "不正" in window.statusBar().currentMessage()
         assert window.text() == "abc"  # 本文は変わらない
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_moves_while_typing():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo bar foo baz foo")
+        cursor = window._edit.textCursor()
+        cursor.setPosition(5)
+        window._edit.setTextCursor(cursor)
+        window.show_find_bar()
+        QTest.keyClicks(window._find_edit, "foo")
+        # 打ち終えた時点で、起点(5)から一番近いヒットが選ばれる。
+        assert window._edit.textCursor().selectionStart() == 8
+        assert window._edit.textCursor().selectedText() == "foo"
+        # Enter の次検索は、そのヒットの後ろから自然に続く。
+        assert window.execute_command("find_next")
+        assert window._edit.textCursor().selectionStart() == 16
+        # 前検索も、選択の前から続く。
+        assert window.execute_command("find_prev")
+        assert window._edit.textCursor().selectionStart() == 8
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_keeps_anchor_while_typing():
+    window = make_window()
+    try:
+        window._edit.setPlainText("ab abc abd")
+        window.show_find_bar()
+        QTest.keyClicks(window._find_edit, "ab")
+        assert window._edit.textCursor().selectionStart() == 0
+        # 打ち進めても起点は保たれ、次のヒットへずれていかない。
+        # 語が伸びて起点のヒットが外れたら、起点から一番近い所へ。
+        QTest.keyClicks(window._find_edit, "c")
+        assert window._edit.textCursor().selectedText() == "abc"
+        assert window._edit.textCursor().selectionStart() == 3
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_not_found_marks_edit():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo bar")
+        window.show_find_bar()
+        QTest.keyClicks(window._find_edit, "fo")
+        assert window._find_edit.styleSheet() == ""
+        QTest.keyClicks(window._find_edit, "z")
+        # ヒットが無ければ、検索欄の背景で分かるようにする。
+        assert window._find_edit.styleSheet() != ""
+        assert "見つかりません" in window.statusBar().currentMessage()
+        # 1字消すと、ヒットする語に戻って印も消える。
+        QTest.keyClick(window._find_edit, Qt.Key.Key_Backspace)
+        assert window._find_edit.text() == "fo"
+        assert window._find_edit.styleSheet() == ""
+        assert window._edit.textCursor().selectedText() == "fo"
+        # 全部消せば印は消える。
+        QTest.keyClick(window._find_edit, Qt.Key.Key_Backspace)
+        QTest.keyClick(window._find_edit, Qt.Key.Key_Backspace)
+        assert window._find_edit.text() == ""
+        assert window._find_edit.styleSheet() == ""
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_not_triggered_by_set_text():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo bar foo")
+        window.show_find_bar()
+        window._find_edit.setText("foo")
+        # setText では探さない(人が打ったときだけ)。選択は動かない。
+        assert not window._edit.textCursor().hasSelection()
+        assert window._find_edit.styleSheet() == ""
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_case_toggle_researches():
+    window = make_window()
+    try:
+        window._edit.setPlainText("Foo foo")
+        window.show_find_bar()
+        QTest.keyClicks(window._find_edit, "foo")
+        # 既定は区別しないので、先頭の Foo に当たる。
+        assert window._edit.textCursor().selectionStart() == 0
+        window._find_case.setChecked(True)
+        # 区別すると、起点(0)から一番近いのは小文字の foo。
+        assert window._edit.textCursor().selectionStart() == 4
+        assert window._edit.textCursor().selectedText() == "foo"
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_regex_async():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo 123 bar 45")
+        window.show_find_bar()
+        window._find_regex.setChecked(True)
+        QTest.keyClicks(window._find_edit, r"\d+")
+        # 正規表現は間引いて(タイマー)から非同期で探す。到来を待つ。
+        QTest.qWait(INCREMENTAL_SEARCH_DELAY_MS + 100)
+        wait_rx(window)
+        assert window._edit.textCursor().selectedText() == "123"
+        assert window._find_edit.styleSheet() == ""
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_regex_not_found():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc def")
+        window.show_find_bar()
+        window._find_regex.setChecked(True)
+        QTest.keyClicks(window._find_edit, r"\d")
+        QTest.qWait(INCREMENTAL_SEARCH_DELAY_MS + 100)
+        wait_rx(window)
+        assert window._find_edit.styleSheet() != ""
+        assert "見つかりません" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
+def test_incremental_search_invalid_regex_marks_and_recovers():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc")
+        window.show_find_bar()
+        window._find_regex.setChecked(True)
+        QTest.keyClicks(window._find_edit, "[a")
+        # 不正な式は、その場で検索欄が赤くなり理由がステータスに出る。
+        assert window._find_edit.styleSheet() != ""
+        assert "不正" in window.statusBar().currentMessage()
+        # 式が正しくなれば、探し直されて印も消える。
+        QTest.keyClicks(window._find_edit, "]")
+        QTest.qWait(INCREMENTAL_SEARCH_DELAY_MS + 100)
+        wait_rx(window)
+        assert window._edit.textCursor().selectedText() == "a"
+        assert window._find_edit.styleSheet() == ""
     finally:
         discard_close(window)
 

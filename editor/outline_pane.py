@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from editor.outline import OUTLINE_ENTRY_LIMIT
+
 PANE_WIDTH = 220
 
 
@@ -34,6 +36,14 @@ class OutlinePane(QWidget):
         self._tree.setHeaderHidden(True)
         self._tree.itemClicked.connect(self._on_item_clicked)
         layout.addWidget(self._tree, 1)
+
+        # 項目数が上限に達して打ち切ったときだけ出す注意書き。
+        self._truncated_label = QLabel(
+            f"項目が多いため、先頭 {OUTLINE_ENTRY_LIMIT:,} 件まで"
+            "表示しています")
+        self._truncated_label.setWordWrap(True)
+        self._truncated_label.hide()
+        layout.addWidget(self._truncated_label)
 
         self._path_label = QLabel("—")
         self._path_label.setWordWrap(True)
@@ -55,13 +65,20 @@ class OutlinePane(QWidget):
     # ---------------------------------------------------------------
     # アウトライン
     # ---------------------------------------------------------------
-    def set_outline(self, roots):
+    def set_outline(self, roots, truncated=False):
         """build_outline_tree の結果(OutlineNode の並び)でツリーを
-        作り直す。全て展開した状態にする。"""
+        作り直す。展開は浅い階層(2段目まで)だけにする。全展開は
+        項目が多い文書で固まるため。truncated が真なら、打ち切った
+        ことの注意書きを出す。"""
         self._tree.clear()
         for node in roots:
             self._tree.addTopLevelItem(self._to_item(node))
-        self._tree.expandAll()
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            top.setExpanded(True)
+            for j in range(top.childCount()):
+                top.child(j).setExpanded(True)
+        self._truncated_label.setVisible(bool(truncated))
 
     def _to_item(self, node):
         item = QTreeWidgetItem([node.entry.text])

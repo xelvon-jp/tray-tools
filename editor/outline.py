@@ -50,6 +50,11 @@ TAB_COLUMNS = 2
 # 各行の match で見る先頭の長さ(遅い正規表現への制限)。
 MATCH_HEAD_CHARS = 200
 
+# アウトラインの項目数の上限。大きい文書(ログ等)で、拾う件数も
+# ツリーの構築も際限なく重くならないための打ち切り。超えたら
+# 呼び側が「打ち切った」ことを表示に出す。
+OUTLINE_ENTRY_LIMIT = 5000
+
 # 設定ダイアログの試験: この秒数を超えたら「遅すぎる」として保存しない。
 TRIAL_TIME_LIMIT_SEC = 1.0
 
@@ -109,13 +114,27 @@ def extract_outline(text: str, pattern=None) -> list:
 
     pattern は正規表現の文字列かコンパイル済み。None なら既定の拾い方。
     各行の先頭 MATCH_HEAD_CHARS 字で match するものだけを見出しとする。"""
+    entries, _truncated = extract_outline_ex(text, pattern)
+    return entries
+
+
+def extract_outline_ex(text: str, pattern=None, limit=None):
+    """extract_outline の拡張版。(見出しの並び, 打ち切ったか) を返す。
+
+    limit が正の数なら、その件数で拾うのを打ち切る。打ち切ったかは、
+    残りの行にもう1件でも見出しがあるかで正確に判定する(最後の
+    1件がたまたま上限と一致しただけなら打ち切りではない)。"""
     rx = _as_regex(pattern)
     entries = []
+    truncated = False
     last_heading_level = 0  # 直前に現れた見出し(#)の階層。0 = まだ無い
     for number, line in enumerate(text.split("\n")):
         match = rx.match(line[:MATCH_HEAD_CHARS])
         if match is None:
             continue
+        if limit is not None and len(entries) >= limit:
+            truncated = True
+            break
         groups = match.groupdict()
         marks = groups.get("marks")
         if marks:
@@ -134,7 +153,7 @@ def extract_outline(text: str, pattern=None) -> list:
             level = 1 + _indent_steps(indent)
         entries.append(OutlineEntry(
             line=number, level=level, text=line.strip()))
-    return entries
+    return entries, truncated
 
 
 def build_outline_tree(entries) -> list:

@@ -4379,12 +4379,15 @@ class FilerWindow(QWidget):
                         for s in QGuiApplication.screens())):
             geometry = None
         editor_section = self.app_settings.get("editor") or {}
+        # フォントは渡さない。エディタの設定(editor 節の family /
+        # size)が優先され、トレイから開いた窓と同じ見た目になる
+        # (レビュー項目4。以前は pane_font を渡していたため、あっふ
+        # 経由では MS Gothic 等の設定が効かなかった)。
         window = editor_module.create_window(
             path, geometry=geometry,
             keymap_overrides=editor_section.get("keymap"),
             editor_settings=editor_section,
-            on_settings_change=self._save_editor_settings,
-            font=self.active.pane_font)
+            on_settings_change=self._save_editor_settings)
         window.closed.connect(
             lambda geo, w=window: self._on_text_editor_closed(w, geo))
         self._text_editors.append(window)

@@ -27,10 +27,12 @@ from PySide6.QtGui import (  # noqa: E402
     QTextCursor,
     QWheelEvent,
 )
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QToolBar  # noqa: E402
 
 import copilot_io  # noqa: E402
 import editor  # noqa: E402
+from editor import macros as macmod  # noqa: E402
 from editor import outline  # noqa: E402
 from editor.highlighter import STAR_BACKGROUND  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
@@ -406,10 +408,15 @@ def test_ctrl_wheel_changes_font_size():
         edit.wheelEvent(_wheel_event(
             120, Qt.KeyboardModifier.ControlModifier))
         assert window.font_size() == base + 1
-        assert saved[-1] == {"font_size": base + 1}
+        # 遅延保存なので、その場ではまだ書かれない(書き込みの嵐対策)。
+        assert all("font_size" not in entry for entry in saved)
         edit.wheelEvent(_wheel_event(
             -120, Qt.KeyboardModifier.ControlModifier))
         assert window.font_size() == base
+        # 止まってから保存が流れると、最後の大きさが1回だけ書かれる。
+        window._flush_pending_font_size()
+        font_writes = [e for e in saved if "font_size" in e]
+        assert font_writes == [{"font_size": base}]
         # Ctrl 無しのホイールはスクロールで、大きさは変わらない。
         edit.wheelEvent(_wheel_event(
             120, Qt.KeyboardModifier.NoModifier))
@@ -737,6 +744,225 @@ def test_cut_to_end_keymap_default():
             a for a in window.findChildren(QAction)
             if a.text().startswith("行末まで切り取り"))
         assert action.shortcut().toString() == "Ctrl+K"
+    finally:
+        discard_close(window)
+
+
+def _select_blocks(window, first, last, to_line_start=False):
+    """first〜last ブロックを選択する。to_line_start が真なら選択の
+    終わりを last ブロックの行頭にする(その行を含めない形)。"""
+    document = window._edit.document()
+    start = document.findBlockByNumber(first).position()
+    end_block = document.findBlockByNumber(last)
+    end = end_block.position()
+    if not to_line_start:
+        end += len(end_block.text())
+    cursor = window._edit.textCursor()
+    cursor.setPosition(start)
+    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+    window._edit.setTextCursor(cursor)
+
+
+def test_sort_lines_whole_document_and_undo():
+    window = make_window()
+    try:
+        window._edit.setPlainText("c\na\nb")
+        assert window.execute_command("sort_lines", {"order": "asc"})
+        assert window.text() == "a\nb\nc"
+        # 全体が1回の undo で戻る。
+        window._edit.undo()
+        assert window.text() == "c\na\nb"
+        assert window.execute_command("sort_lines", {"order": "desc"})
+        assert window.text() == "c\nb\na"
+        # 既にそろっている文書では何も起きない。
+        assert window.execute_command("sort_lines", {"order": "desc"})
+        assert window.text() == "c\nb\na"
+    finally:
+        discard_close(window)
+
+
+def test_sort_lines_selection_range():
+    window = make_window()
+    try:
+        window._edit.setPlainText("b\na\nd\nc")
+        _select_blocks(window, 0, 1)
+        assert window.execute_command("sort_lines", {"order": "asc"})
+        # 対象は選択の2行だけ。残りは動かない。
+        assert window.text() == "a\nb\nd\nc"
+        # 選択の終わりが行頭ちょうどのときは、その行は含めない。
+        window._edit.setPlainText("b\na\nd\nc")
+        _select_blocks(window, 0, 2, to_line_start=True)
+        assert window.execute_command("sort_lines", {"order": "asc"})
+        assert window.text() == "a\nb\nd\nc"
+    finally:
+        discard_close(window)
+
+
+def test_remove_duplicate_lines():
+    window = make_window()
+    try:
+        window._edit.setPlainText("a\nb\na\nc\nb")
+        assert window.execute_command("remove_duplicate_lines")
+        # 最初の出現を残し、順番は保たれる。1回の undo で戻る。
+        assert window.text() == "a\nb\nc"
+        window._edit.undo()
+        assert window.text() == "a\nb\na\nc\nb"
+        # 範囲の中だけが対象(範囲外の重複は残る)。
+        _select_blocks(window, 0, 2)
+        assert window.execute_command("remove_duplicate_lines")
+        assert window.text() == "a\nb\nc\nb"
+        # 同じ範囲に重複が無ければ何も変わらない。
+        _select_blocks(window, 0, 2)
+        assert window.execute_command("remove_duplicate_lines")
+        assert window.text() == "a\nb\nc\nb"
+    finally:
+        discard_close(window)
+
+
+def test_sort_and_dedupe_keep_trailing_newline():
+    window = make_window()
+    try:
+        # 末尾の改行の後ろの空ブロックは対象から外す。含めると
+        # 並べ替えで末尾の改行が消え、空行が先頭へ来る(レビュー指摘)。
+        window._edit.setPlainText("b\na\n")
+        assert window.execute_command("sort_lines", {"order": "asc"})
+        assert window.text() == "a\nb\n"
+        window._edit.setPlainText("a\na\n")
+        assert window.execute_command("remove_duplicate_lines")
+        assert window.text() == "a\n"
+    finally:
+        discard_close(window)
+
+
+def test_convert_commands_on_selection():
+    window = make_window()
+    try:
+        window._edit.setPlainText("ＡＢＣ１２３ カタカナ ガ あ")
+        window._edit.selectAll()
+        assert window.execute_command("convert_halfwidth")
+        # 英数字・カタカナ(濁点は分解)・スペースが半角に。ひらがなは不変。
+        assert window.text() == "ABC123 ｶﾀｶﾅ ｶﾞ あ"
+        window._edit.undo()
+        assert window.text() == "ＡＢＣ１２３ カタカナ ガ あ"
+        window._edit.selectAll()
+        assert window.execute_command("convert_lower")
+        assert window.text() == "ＡＢＣ１２３ カタカナ ガ あ"  # 全角英字は対象外
+        window._edit.setPlainText("aBc ｱｲｳ")
+        window._edit.selectAll()
+        assert window.execute_command("convert_upper")
+        assert window.text() == "ABC ｱｲｳ"
+        window._edit.selectAll()
+        assert window.execute_command("convert_fullwidth")
+        assert window.text() == "ＡＢＣ　アイウ"
+        # 選択が無ければ何もしない。
+        window._edit.setPlainText("Ａ")
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        assert window.execute_command("convert_halfwidth")
+        assert window.text() == "Ａ"
+    finally:
+        discard_close(window)
+
+
+def test_sort_and_convert_are_recorded_and_replayed():
+    window = make_window()
+    try:
+        window._edit.setPlainText("b\na")
+        window.set_macro_recording(True)
+        window.execute_command("sort_lines", {"order": "asc"})
+        window.set_macro_recording(False)
+        commands = window.recorded_commands()
+        assert {"cmd": "sort_lines", "args": {"order": "asc"}} in commands
+        # JSON の往復でも新しい命令が通る(手書きマクロと同じ形)。
+        _name, parsed = macmod.macro_from_json(
+            macmod.macro_to_json(commands))
+        assert parsed == commands
+        other = make_window()
+        try:
+            other._edit.setPlainText("d\nc")
+            assert other.play_macro(parsed)
+            assert other.text() == "c\nd"
+            hand = [{"cmd": "convert_upper", "args": {}},
+                    {"cmd": "sort_lines", "args": {"order": "desc"}}]
+            other._edit.setPlainText("b\na")
+            other._edit.selectAll()
+            assert other.play_macro(hand)
+            assert other.text() == "B\nA"
+        finally:
+            discard_close(other)
+    finally:
+        discard_close(window)
+
+
+def test_ctrl_k_scoped_to_text_edit():
+    window = make_window()
+    try:
+        window._edit.setPlainText("hello world")
+        # 検索欄にフォーカスがあるとき、Ctrl+K は本文に効かない。
+        window.show_find_bar()
+        app().processEvents()
+        assert window._find_edit.hasFocus()
+        QTest.keyClick(window._find_edit, Qt.Key.Key_K,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert window.text() == "hello world"
+        # 本文にフォーカスがあれば、行頭からなら行全体が消える。
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        window._edit.setFocus()
+        app().processEvents()
+        QTest.keyClick(window._edit, Qt.Key.Key_K,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert window.text() == ""
+    finally:
+        discard_close(window)
+
+
+def _count_tree_items(item):
+    total = 1
+    for i in range(item.childCount()):
+        total += _count_tree_items(item.child(i))
+    return total
+
+
+def test_outline_truncates_at_limit():
+    window = make_window()
+    try:
+        total = outline.OUTLINE_ENTRY_LIMIT + 100
+        window._edit.setPlainText(
+            "\n".join(f"■ 見出し{i}" for i in range(total)))
+        window._rebuild_outline()
+        pane = window._outline_pane
+        count = sum(
+            _count_tree_items(pane.tree().topLevelItem(i))
+            for i in range(pane.tree().topLevelItemCount()))
+        assert count == outline.OUTLINE_ENTRY_LIMIT
+        assert pane._truncated_label.isVisibleTo(pane)
+        # 少ない文書では注意書きは出ない。
+        window._edit.setPlainText("■ 一つだけ")
+        window._rebuild_outline()
+        assert not pane._truncated_label.isVisibleTo(pane)
+    finally:
+        discard_close(window)
+
+
+def test_set_patterns_with_defaults_saves_empty():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        # 「既定に戻す」相当: 既定と同じ式は、文字列でなく空で保存する
+        # (空 = 組み込み既定を使う)。
+        window._set_patterns(outline.DEFAULT_OUTLINE_PATTERN,
+                             outline.DEFAULT_HIGHLIGHT_PATTERN)
+        assert saved[-1]["outline_pattern"] == ""
+        assert saved[-1]["highlight_pattern"] == ""
+        # 拾い方そのものは既定のまま変わらない。
+        window._edit.setPlainText("■ 見出し\n本文")
+        window._rebuild_outline()
+        assert window._outline_pane.tree().topLevelItemCount() == 1
     finally:
         discard_close(window)
 

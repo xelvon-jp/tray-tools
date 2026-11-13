@@ -1,13 +1,33 @@
 # editor/text_edit.py
 # エディタの本文ウィジェット。QPlainTextEdit に、行番号エリアと
-# Ctrl+ホイールでのフォントサイズ変更を足したもの。
+# Ctrl+ホイールでのフォントサイズ変更、矩形選択(rect_edit の共用
+# 部品。こちらの矩形は行を足せる)を足したもの。
 #
 # 行番号エリアは Qt の定番の作り(CodeEditor の例と同じ): エディタの
 # 左端に細い帯を置き、viewport の余白で本文をずらす。スクロールと
 # 再描画は updateRequest に追随する。
+#
+# キーの通知(窓側がマクロ記録と F4 のために受ける):
+#   move_key(命令名, 選択を広げるか) … Home / End / 矢印などの素の
+#     移動キー。本文の動き自体は Qt の標準のまま(こちらでは実行
+#     しない)。記録側は「起きたこと」として控えるだけ。
+#   undo_redo_started / undo_redo_finished … Ctrl+Z / Ctrl+Y の
+#     前後。文書の変化を記録から外すために、窓側が印を立てる。
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QKeySequence, QPainter
 from PySide6.QtWidgets import QPlainTextEdit, QWidget
+
+import rect_edit
+
+# 移動キー → 命令名(keymap・マクロと共通の命令層の名前)。
+_MOVE_KEYS = {
+    Qt.Key.Key_Home: "move_line_start",
+    Qt.Key.Key_End: "move_line_end",
+    Qt.Key.Key_Up: "move_line_up",
+    Qt.Key.Key_Down: "move_line_down",
+    Qt.Key.Key_Left: "move_char_left",
+    Qt.Key.Key_Right: "move_char_right",
+}
 
 FONT_SIZE_MIN = 7
 FONT_SIZE_MAX = 32
@@ -33,11 +53,20 @@ class LineNumberArea(QWidget):
         self._edit.paint_line_number_area(event)
 
 
-class TextEdit(QPlainTextEdit):
+class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     """エディタの本文。font_size_changed には、Ctrl+ホイールで変わった
-    あとの大きさ(pt)が流れる(窓側が設定へ保存する)。"""
+    あとの大きさ(pt)が流れる(窓側が設定へ保存する)。move_key には
+    移動キーの命令名と「選択を広げるか」が流れる(窓側がマクロ記録の
+    材料にする。本文は標準のまま動く)。unrecorded_move は、Ctrl+矢印
+    など命令で表せない移動が起きた合図。mouse_pressed はマウスが
+    押された合図(どちらも、記録中に起きたら窓側が利用者へ知らせる)。"""
 
     font_size_changed = Signal(int)
+    move_key = Signal(str, bool)
+    unrecorded_move = Signal()
+    mouse_pressed = Signal()
+    undo_redo_started = Signal()
+    undo_redo_finished = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,6 +76,50 @@ class TextEdit(QPlainTextEdit):
         self.blockCountChanged.connect(self._update_area_width)
         self.updateRequest.connect(self._on_update_request)
         self._update_area_width()
+        # エディタの矩形は、貼り付けで行が足りなければ足せる。
+        self.init_rect_selection(fixed_rows=False)
+
+    def _on_rect_changed(self) -> None:
+        QPlainTextEdit.setExtraSelections(
+            self, self.rect_extra_selections())
+
+    def keyPressEvent(self, event):  # noqa: N802  Qt の上書き
+        if (event.matches(QKeySequence.StandardKey.Undo)
+                or event.matches(QKeySequence.StandardKey.Redo)):
+            # 元に戻す・やり直しの最中の文書変化は、記録の材料に
+            # しない(窓側が印で受ける)。
+            self.undo_redo_started.emit()
+            try:
+                super().keyPressEvent(event)
+            finally:
+                self.undo_redo_finished.emit()
+            return
+        if self.has_block_selection() and self.block_key(event):
+            return
+        name = _MOVE_KEYS.get(event.key())
+        if name is not None:
+            mods = event.modifiers()
+            # 素の移動か(Shift の選択拡張とキーパッドは素に含める)。
+            # 修飾キーを明示的に見る。~ の反転で計算すると、PySide6
+            # では Ctrl 等が付いていても素の扱いになってしまう。
+            extra = mods & (Qt.KeyboardModifier.ControlModifier
+                            | Qt.KeyboardModifier.AltModifier
+                            | Qt.KeyboardModifier.MetaModifier)
+            if extra:
+                # Ctrl+矢印の単語移動・Ctrl+Home の文書頭などは、
+                # 1文字・1行の移動の命令では表せない。記録には入れず、
+                # 窓側へ知らせる(黙って1文字移動として記録しない)。
+                self.unrecorded_move.emit()
+            else:
+                self.move_key.emit(
+                    name, bool(mods & Qt.KeyboardModifier.ShiftModifier))
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):  # noqa: N802  Qt の上書き
+        # マウスでのカーソル移動はマクロに記録できない。記録中なら
+        # 窓側が知らせるために合図する。
+        self.mouse_pressed.emit()
+        super().mousePressEvent(event)
 
     # ---------------------------------------------------------------
     # 行番号

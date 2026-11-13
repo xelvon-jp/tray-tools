@@ -18,6 +18,8 @@ DEFAULT_KEYMAP = {
     "find_prev": "Shift+F3",
     "send_selection": "Ctrl+Shift+C",
     "cut_to_end": "Ctrl+K",
+    "delete_line": "Ctrl+Shift+K",
+    "repeat_last": "F4",
 }
 
 

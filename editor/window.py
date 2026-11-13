@@ -79,6 +79,14 @@
 # (restart_loss_count)。先にあった間隔式の自動保存(間隔が来たら
 # 実ファイルへ書く形)は、この方式に置き換えて取り除いた。
 #
+# 閉じたタブを開き直す(2026-11-14): タブを閉じると、そのタブの
+# 状態を直近10件まで別の小さな控え(editor_closed_tabs.json)に
+# 残し、Ctrl+Shift+T で直近に閉じたものから順に開き直せる。
+# 再起動しても残る。ファイルが外で消えていれば、控えの内容を
+# 無題の文書として開き直す。同じファイルが既に開いている場合は、
+# そのタブを前に出す(控えだけが持つ未保存の編集があるときは、
+# 無題の文書として別タブに開き直す)。
+#
 # 無題の保存では形式の画面を出さない(2026-11-13): 新規に作った
 # 文書を保存するとき、文字コード・改行・BOM を選ぶ画面
 # (SaveOptionsDialog)は出さず、ファイル名を付ける窓だけにする
@@ -761,6 +769,17 @@ class EditorWindow(QMainWindow):
         self._session_path = (str(session_path)
                               if session_path is not None else None)
         self._session_slot = None
+        # 閉じたタブの控え(Ctrl+Shift+T で開き直す分)。セッションの
+        # 控えと同じ場所に、セッションとは別の小さなファイルで持つ
+        # (editor_closed_tabs.json、直近10件まで)。セッションが無い
+        # 窓では、メモリの中だけで持つ(再起動では消える)。
+        self._closed_tabs_path = (
+            os.path.join(os.path.dirname(self._session_path),
+                         sessionmod.CLOSED_TABS_FILENAME)
+            if self._session_path is not None else None)
+        self._closed_tabs = (
+            sessionmod.closed_tabs(self._closed_tabs_path)
+            if self._closed_tabs_path is not None else [])
         self._session_timer = QTimer(self)
         self._session_timer.setSingleShot(True)
         self._session_timer.setInterval(SESSION_SAVE_DELAY_MS)
@@ -1351,10 +1370,16 @@ class EditorWindow(QMainWindow):
         if not 0 <= index < len(self._views):
             return
         view = self._views[index]
+        # 閉じたタブは「閉じたタブ」の控えとして残す(Ctrl+Shift+T
+        # で開き直せるように)。閉じたときのタブの位置も一緒に残す。
+        # 「閉じない」を選んだときは、残さない。
+        closed_entry = self._capture_view_entry(view)
+        closed_entry["index"] = index
         if view.is_modified() and not self._flush_session():
             if not self._confirm_tab_close_without_session():
                 return
         self._remove_view(view)
+        self._record_closed_tab(closed_entry)
         self._flush_session()
 
     def _confirm_tab_close_without_session(self) -> bool:
@@ -1378,6 +1403,117 @@ class EditorWindow(QMainWindow):
             self.close_tab(self._tabs.currentIndex())
         else:
             self.close()
+
+    # ---------------------------------------------------------------
+    # 閉じたタブを開き直す(Ctrl+Shift+T)
+    # ---------------------------------------------------------------
+    def _record_closed_tab(self, entry):
+        """閉じたタブの記録を、控えの先頭へ足す。
+
+        直近 CLOSED_TABS_LIMIT 件まで残し、古いものから捨てる。
+        ファイルへの書き出しが失敗しても、閉じる操作は止めない
+        (ステータスで知らせるだけ)。"""
+        self._closed_tabs.insert(0, entry)
+        del self._closed_tabs[sessionmod.CLOSED_TABS_LIMIT:]
+        self._save_closed_tabs()
+
+    def _save_closed_tabs(self):
+        """閉じたタブの控えをファイルへ書く。"""
+        if self._closed_tabs_path is None:
+            return
+        try:
+            sessionmod.save_closed_tabs(self._closed_tabs_path)
+        except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
+            self.statusBar().showMessage(
+                "閉じたタブの記録を保存できませんでした", 4000)
+
+    def _move_view_to_index(self, view, index):
+        """ビューを、タブの並びの指定位置へ移す。
+
+        _views とタブ欄の両方を動かす。閉じたときの位置へ開き
+        直すためのもの。"""
+        try:
+            current = self._views.index(view)
+        except ValueError:
+            return
+        index = max(0, min(int(index), len(self._views) - 1))
+        if current == index:
+            return
+        try:
+            self._tabs.tabBar().moveTab(current, index)
+        except Exception:  # noqa: BLE001  タブ欄だけ動かなくても致命傷ではない
+            return
+        self._views.pop(current)
+        self._views.insert(index, view)
+
+    def _reopen_entry(self, entry):
+        """記録1件を新しいタブへ戻す。戻せたらそのビュー、戻せな
+        ければ None(変更の無いタブで、ファイルが消えている場合)。
+
+        閉じたときの位置へ戻す。戻したタブは呼び側で前に出すこと。"""
+        view = self._add_view()
+        if not self._restore_view(view, entry):
+            self._remove_view(view)
+            return None
+        index = entry.get("index")
+        if isinstance(index, int):
+            self._move_view_to_index(view, index)
+        return view
+
+    def reopen_closed_tab(self):
+        """直近に閉じたタブを開き直す(Ctrl+Shift+T)。
+
+        直近に閉じたものから順に、1回で1つ開き直す。開き直した
+        タブは、閉じたときの内容とカーソル位置で戻る(分割の状態
+        も含む)。同じファイルが既に開いている場合は、そのタブを
+        前に出す(重ねて開かない)。ただし、控えだけが持つ未保存の
+        編集がある場合は、その内容を無題の文書として別タブに開き
+        直す(ファイルへの紐付けはしない)。ファイルが外で消えて
+        いて控えがあれば、無題の文書として開き直す。控えが無く
+        ファイルも無い場合は、その記録を捨てて知らせる。"""
+        if not self._closed_tabs:
+            self.statusBar().showMessage("開き直すタブがありません", 4000)
+            return
+        entry = self._closed_tabs[0]
+        path = entry.get("path")
+        existing = self.find_view_for_path(path) if path else None
+        if existing is not None:
+            if entry.get("dirty") and existing.edit.toPlainText() \
+                    != (entry.get("text") or ""):
+                # 開いているタブとは別の、控えだけが持つ未保存の
+                # 編集がある。同じファイルを重ねて開くことはしない
+                # ので、控えの内容を無題の文書として開き直す。
+                untitled = dict(entry)
+                untitled["path"] = None
+                self._closed_tabs.pop(0)
+                self._save_closed_tabs()
+                view = self._reopen_entry(untitled)
+                if view is not None:
+                    self._activate_view(view)
+                    view.active_edit().setFocus()
+                    self._flush_session()
+                return
+            self._activate_view(existing)
+            existing.active_edit().setFocus()
+            self._closed_tabs.pop(0)
+            self._save_closed_tabs()
+            return
+        if entry.get("dirty") and path is not None \
+                and not os.path.exists(path):
+            # ファイルが外で消えていた。控えの内容を無題の文書と
+            # して開き直す(ファイルへの紐付けはしない)。
+            entry = dict(entry)
+            entry["path"] = None
+        self._closed_tabs.pop(0)
+        self._save_closed_tabs()
+        view = self._reopen_entry(entry)
+        if view is None:
+            self.statusBar().showMessage(
+                "ファイルが見つからないため開き直せませんでした", 4000)
+            return
+        self._activate_view(view)
+        view.active_edit().setFocus()
+        self._flush_session()
 
     # ---------------------------------------------------------------
     # 分割表示(同じ文書を2ペインで見る)
@@ -1622,42 +1758,45 @@ class EditorWindow(QMainWindow):
                         for size in sizes)):
             view.splitter.setSizes(sizes)
 
-    def _capture_session_state(self):
-        """いまのタブの顔ぶれを、セッションの記録の形で返す。
+    def _capture_view_entry(self, view):
+        """ビュー1つ分の状態を、セッションの記録の形で返す。
 
         変更の無いタブはパスとカーソルだけ(戻すときはディスクから
         読み直す)。変更のあるタブは本文と形式とディスクの印まで
-        控える(ファイル自体は書き換わらない)。"""
-        tabs = []
-        for view in self._views:
-            view.sync_text()
-            doc = view.doc
-            cursor = view.edit.textCursor()
-            entry = {
-                "path": doc.path,
-                "dirty": bool(view.is_modified()),
-                "cursor": cursor.position(),
-                "anchor": cursor.anchor(),
-            }
-            if view.split_edit is not None:
-                # 分割の状態(向き・2枚目のカーソル・幅)も控える。
-                # 戻すときに、同じ文書を同じ眺めで開き直せる。
-                split_cursor = view.split_edit.textCursor()
-                entry["split"] = view.split_name()
-                entry["split_cursor"] = split_cursor.position()
-                entry["split_anchor"] = split_cursor.anchor()
-                entry["split_sizes"] = [
-                    int(size) for size in view.splitter.sizes()]
-            if entry["dirty"]:
-                entry.update({
-                    "text": doc.text,
-                    "encoding": doc.encoding,
-                    "bom": doc.bom,
-                    "newline": doc.newline,
-                    "disk_mtime": doc.disk_mtime,
-                    "disk_size": doc.disk_size,
-                })
-            tabs.append(entry)
+        控える(ファイル自体は書き換わらない)。閉じたタブの記録
+        (Ctrl+Shift+T 用)も同じ形で作る。"""
+        view.sync_text()
+        doc = view.doc
+        cursor = view.edit.textCursor()
+        entry = {
+            "path": doc.path,
+            "dirty": bool(view.is_modified()),
+            "cursor": cursor.position(),
+            "anchor": cursor.anchor(),
+        }
+        if view.split_edit is not None:
+            # 分割の状態(向き・2枚目のカーソル・幅)も控える。
+            # 戻すときに、同じ文書を同じ眺めで開き直せる。
+            split_cursor = view.split_edit.textCursor()
+            entry["split"] = view.split_name()
+            entry["split_cursor"] = split_cursor.position()
+            entry["split_anchor"] = split_cursor.anchor()
+            entry["split_sizes"] = [
+                int(size) for size in view.splitter.sizes()]
+        if entry["dirty"]:
+            entry.update({
+                "text": doc.text,
+                "encoding": doc.encoding,
+                "bom": doc.bom,
+                "newline": doc.newline,
+                "disk_mtime": doc.disk_mtime,
+                "disk_size": doc.disk_size,
+            })
+        return entry
+
+    def _capture_session_state(self):
+        """いまのタブの顔ぶれを、セッションの記録の形で返す。"""
+        tabs = [self._capture_view_entry(view) for view in self._views]
         index = self._tabs.currentIndex() if self._tabs is not None else 0
         return {"tabs": tabs, "active": max(0, index)}
 
@@ -1834,6 +1973,8 @@ class EditorWindow(QMainWindow):
         # 閉じる(close_current_tab_or_window)。
         self._action("閉じる(&C)", self.close_current_tab_or_window,
                      "close_window", file_menu)
+        self._action("閉じたタブを開き直す(&T)", self.reopen_closed_tab,
+                     "reopen_closed_tab", file_menu)
 
         edit_menu = self.menuBar().addMenu("編集(&E)")
         # 元に戻す等は QPlainTextEdit の標準キー(Ctrl+Z 等)が効く。

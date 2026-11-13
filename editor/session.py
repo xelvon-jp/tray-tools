@@ -15,6 +15,9 @@
 # (開いているタブの中身まで設定ファイルに書くと、差分保存の作法と
 # ぶつかるうえ、本文が大きいときに設定全体が重くなるため)。
 #
+# 閉じたタブの控え(Ctrl+Shift+T で開き直す分)は、同じ場所に
+# editor_closed_tabs.json として別に小さく持つ(直近10件まで)。
+#
 # データの形:
 #   {"version": 1,
 #    "windows": [{"active": タブの番号,
@@ -61,6 +64,13 @@ from pathlib import Path
 
 DATA_FILENAME = "editor_session.json"
 SESSION_VERSION = 1
+
+# 閉じたタブの控えの置き場。セッションの控えと同じ場所に、
+# セッションとは別に小さく持つ(editor_closed_tabs.json)。
+# Ctrl+Shift+T で開き直すためのもので、直近10件まで残す。
+CLOSED_TABS_FILENAME = "editor_closed_tabs.json"
+CLOSED_TABS_LIMIT = 10
+CLOSED_TABS_VERSION = 1
 
 
 def data_dir() -> Path:
@@ -249,6 +259,83 @@ def save_session_file(path, windows):
     path = Path(path)
     payload = {"version": SESSION_VERSION, "windows": windows}
     text = json.dumps(payload, ensure_ascii=False)
+    _atomic_write_text(path, text)
+
+
+# 閉じたタブの控えの置き場と、プロセス内での持ち回し。
+#
+# データの形:
+#   {"version": 1,
+#    "tabs": [タブの記録(セッションのタブと同じ形に、閉じたときの
+#              タブの位置 "index" を足したもの), ...]}
+# 並びは新しい順(先頭が直近に閉じたタブ)。Ctrl+Shift+T は先頭
+# から順に開き直す。直近 CLOSED_TABS_LIMIT 件まで残し、古いもの
+# から捨てる。
+#
+# セッションの控えと同じく、プロセス内では置き場1つ分の状態を
+# _ClosedTabsRegistry で共有する(窓が複数あっても、閉じたタブの
+# 並びが食い違わないため)。保存のときは、ディスクの控えが「この
+# プロセスが最後に見た印」と違うか確かめ、違えば新しい側を別名
+# (.newer、あれば連番)へ退避してから書く(セッションの save と
+# 同じ流儀。黙って上書きしないため)。
+
+def _sanitize_closed_tab(value):
+    """閉じたタブ1件分の記録を整える。形が違うものは None(捨てる)。
+
+    タブの部分はセッションのタブと同じ(_sanitize_tab)。閉じた
+    ときのタブの位置 "index" を足して持つ。"""
+    tab = _sanitize_tab(value)
+    if tab is None:
+        return None
+    index = value.get("index")
+    tab["index"] = index if isinstance(index, int) and index >= 0 else 0
+    return tab
+
+
+def sanitize_closed_tabs(data):
+    """ファイルから読んだデータを、閉じたタブの並びに整える。
+
+    戻り値は [記録, ...](新しい順)。想定外の要素は黙って捨てる。
+    直近 CLOSED_TABS_LIMIT 件まで。"""
+    raw_tabs = None
+    if isinstance(data, dict):
+        raw_tabs = data.get("tabs")
+    elif isinstance(data, list):
+        raw_tabs = data
+    if not isinstance(raw_tabs, list):
+        return []
+    tabs = []
+    for item in raw_tabs:
+        tab = _sanitize_closed_tab(item)
+        if tab is not None:
+            tabs.append(tab)
+    return tabs[:CLOSED_TABS_LIMIT]
+
+
+def load_closed_tabs_file(path):
+    """閉じたタブのファイルを読み、整えた並びを返す。
+
+    無いとき・読めないとき・形が崩れているときは空の並び
+    (セッションと違って、壊れたファイルの退避はしない。閉じた
+    タブの控えが壊れても、開いているタブの控えは別ファイルなので
+    巻き添えにならないため)。"""
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return sanitize_closed_tabs(data)
+
+
+def _atomic_write_text(path, text):
+    """テキストを一時ファイルに書いてから os.replace で置き換える
+    (途中で落ちても半端な状態にならないため。セッションと閉じた
+    タブの両方で使う)。"""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
     try:
@@ -263,6 +350,77 @@ def save_session_file(path, windows):
         except OSError:
             pass
         raise
+
+
+def save_closed_tabs_file(path, tabs):
+    """閉じたタブの並びをファイルへ原子的に書く。
+
+    直近 CLOSED_TABS_LIMIT 件まで。セッションの控えとは別ファイル
+    なので、セッションの印(.newer の判定)には触れない。"""
+    payload = {"version": CLOSED_TABS_VERSION,
+               "tabs": list(tabs)[:CLOSED_TABS_LIMIT]}
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
+
+
+class _ClosedTabsRegistry:
+    """閉じたタブのファイル1つ分の、プロセス内での状態。
+
+    entries は閉じたタブの並び(新しい順)。stamp は「このプロセス
+    が最後に見たディスクの控え」の印(_file_stamp)。読み込みの
+    ときと、自分の保存が成功したときに取り直す。保存のときに
+    ディスクの印がこれと違えば、よそが先に書いた新しい控えが
+    あると分かる。"""
+
+    def __init__(self):
+        self.entries = None     # None はまだ読んでいない
+        self.stamp = None
+
+    def ensure_loaded(self, path):
+        if self.entries is None:
+            self.entries = load_closed_tabs_file(path)
+            self.stamp = _file_stamp(path)
+
+
+_CLOSED_TABS_REGISTRIES = {}
+
+
+def _closed_tabs_registry_for(path):
+    key = str(path)
+    registry = _CLOSED_TABS_REGISTRIES.get(key)
+    if registry is None:
+        registry = _ClosedTabsRegistry()
+        _CLOSED_TABS_REGISTRIES[key] = registry
+    return registry
+
+
+def closed_tabs(path):
+    """閉じたタブの並び(新しい順)を、プロセス内で共有する並びで返す。
+
+    呼び側はこの並びを直接いじる(先頭へ足す・先頭から取る)。
+    変えたら save_closed_tabs でファイルへ書くこと。"""
+    registry = _closed_tabs_registry_for(path)
+    registry.ensure_loaded(path)
+    return registry.entries
+
+
+def save_closed_tabs(path):
+    """閉じたタブの並びをファイルへ書く。
+
+    書く前に、ディスクの控えの印が「このプロセスが最後に見た印」
+    と違うか確かめる。違えば、別の EDDy が先に書いた新しい控え
+    なので、黙って上書きせず、新しい側を別名(.newer、あれば連番)
+    へ退避してから書く。退避したら {"backup": 退避先のパス文字列
+    (退避できなかったときは None)} を返し、何も無ければ None を
+    返す。"""
+    registry = _closed_tabs_registry_for(path)
+    registry.ensure_loaded(path)
+    notice = None
+    current = _file_stamp(path)
+    if current is not None and current != registry.stamp:
+        notice = {"backup": _evacuate_newer(path)}
+    save_closed_tabs_file(path, registry.entries)
+    registry.stamp = _file_stamp(path)
+    return notice
 
 
 # ---------------------------------------------------------------

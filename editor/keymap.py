@@ -20,6 +20,7 @@ DEFAULT_KEYMAP = {
     "cut_to_end": "Ctrl+K",
     "delete_line": "Ctrl+Shift+K",
     "repeat_last": "F4",
+    "reformat_text": "Ctrl+Shift+F",
 }
 
 

@@ -1,0 +1,377 @@
+# tests/test_editor_greplace.py
+# フォルダ内の横断置換(editor/greplace.py の純粋部分と
+# greplace_dialog.py の窓)を確かめる。
+#
+#   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_editor_greplace.py
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+from editor import greplace as replacemod  # noqa: E402
+from editor import rxfind  # noqa: E402
+
+APP = None
+
+
+def app():
+    global APP
+    if APP is None:
+        from PySide6.QtWidgets import QApplication
+        APP = QApplication([])
+    return APP
+
+
+def _wait_dialog(dialog, done, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        app().processEvents()
+        if dialog._thread is None and done():
+            return
+        time.sleep(0.02)
+    app().processEvents()
+    raise AssertionError("ダイアログの処理が終わらない")
+
+
+def _tree(tmp):
+    root = Path(tmp)
+    (root / "a.txt").write_text("探す語 あり\nまた探す語 探す語\n3行目\n",
+                                encoding="utf-8")
+    sub = root / "sub"
+    sub.mkdir()
+    (sub / "b.py").write_text("# 探す語\nprint('x')\n", encoding="utf-8")
+    (root / "c.dat").write_text("探す語\n", encoding="utf-8")  # 対象外の拡張子
+    return root
+
+
+# ---------------------------------------------------------------
+# プレビュー(純粋部分)
+# ---------------------------------------------------------------
+def test_preview_counts_files_and_lines():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        by_name = {os.path.basename(t.path): t for t in preview.targets}
+        assert set(by_name) == {"a.txt", "b.py"}, by_name
+        assert by_name["a.txt"].count == 3        # 1行目1回 + 2行目2回
+        assert by_name["a.txt"].first_line == 1
+        assert by_name["b.py"].count == 1
+        assert preview.total_count == 4
+        assert preview.files_scanned == 2         # a.txt と b.py(c.dat は外)
+        assert not preview.truncated
+        assert preview.skipped_open == []
+        # プレビューでは何も書かれていない。
+        assert "探す語" in (root / "a.txt").read_text(encoding="utf-8")
+
+
+def test_preview_case_sensitive_and_literal():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "a.txt").write_text("Foo\nfoo\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "foo", "bar")
+        assert preview.targets[0].count == 2
+        preview = replacemod.preview_replace(
+            str(root), "foo", "bar", case_sensitive=True)
+        assert preview.targets[0].count == 1
+        # 文字どおりのときは、正規表現のメタ文字は効かない。
+        (root / "b.txt").write_text("a.c\naxc\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "a.c", "z")
+        names = {os.path.basename(t.path): t.count for t in preview.targets}
+        assert names["b.txt"] == 1
+
+
+def test_preview_regex_and_faults():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "a.txt").write_text("100円と200円\n", encoding="utf-8")
+        preview = replacemod.preview_replace(
+            str(root), r"(\d+)円", r"\1ドル", regex=True)
+        assert preview.targets[0].count == 2
+        # 不正な式は RegexFault(利用者向けの文)。
+        try:
+            replacemod.preview_replace(str(root), "([", "x", regex=True)
+        except rxfind.RegexFault:
+            pass
+        else:
+            raise AssertionError("不正な式で RegexFault にならない")
+        # 参照先の無いグループ参照も、ヒットするファイルがあれば表に出る。
+        try:
+            replacemod.preview_replace(str(root), r"(\d+)円", r"\2ドル",
+                                       regex=True)
+        except rxfind.RegexFault:
+            pass
+        else:
+            raise AssertionError("不正な置換文字列で RegexFault にならない")
+
+
+def test_preview_excludes_open_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        opened = str(root / "a.txt")
+        preview = replacemod.preview_replace(
+            str(root), "探す語", "置換語", exclude_paths=[opened])
+        assert [os.path.basename(t.path) for t in preview.targets] == ["b.py"]
+        assert preview.skipped_open == [opened]
+
+
+def test_preview_skips_binary_and_lossy():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # 本文に U+0000 を含む(バイナリらしい)。
+        (root / "nul.txt").write_bytes(
+            "探す語\x00探す語\n".encode("utf-8"))
+        # cp932 の末尾に孤立したリードバイトがあり、読み替えが起きる。
+        (root / "lossy.txt").write_bytes("探す語".encode("cp932") + b"\x82")
+        (root / "ok.txt").write_text("探す語\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        assert [os.path.basename(t.path) for t in preview.targets] == ["ok.txt"]
+        skipped = {os.path.basename(p) for p in preview.skipped_binary}
+        assert skipped == {"nul.txt", "lossy.txt"}, skipped
+
+
+def test_preview_skips_unencodable():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "e.txt"
+        path.write_bytes("あ abc abc\r\n".encode("cp932"))
+        preview = replacemod.preview_replace(str(root), "abc", "🦄")
+        assert preview.targets == []
+        assert len(preview.skipped_unencodable) == 1
+        skipped_path, bad = preview.skipped_unencodable[0]
+        assert skipped_path == str(path) and bad == "🦄"
+
+
+# ---------------------------------------------------------------
+# 実行(純粋部分)
+# ---------------------------------------------------------------
+def test_execute_replaces_preserving_format_and_backup():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "e.txt"
+        original = "探す語 あり\r\n次\r\n".encode("cp932")
+        path.write_bytes(original)
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        result = replacemod.execute_replace(preview, "探す語", "置換語")
+        assert result.files_written == 1
+        assert result.total_replaced == 1
+        outcome = result.outcomes[0]
+        assert outcome.status == replacemod.STATUS_DONE and outcome.count == 1
+        data = path.read_bytes()
+        assert "置換語 あり".encode("cp932") in data
+        assert b"\r\n" in data
+        assert b"\n" not in data.replace(b"\r\n", b"")   # 改行は CRLF のまま
+        # .bak に置換前の内容がそのまま残る。
+        assert Path(str(path) + ".bak").read_bytes() == original
+
+
+def test_execute_regex_with_group_reference():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "a.txt"
+        path.write_text("100円と200円\n", encoding="utf-8")
+        preview = replacemod.preview_replace(
+            str(root), r"(\d+)円", r"\1ドル", regex=True)
+        result = replacemod.execute_replace(
+            preview, r"(\d+)円", r"\1ドル", regex=True)
+        assert result.total_replaced == 2
+        assert path.read_text(encoding="utf-8") == "100ドルと200ドル\n"
+
+
+def test_execute_skips_file_changed_after_preview():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "a.txt"
+        path.write_text("探す語\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        # プレビューの後に、誰かが書き換えた(長さも変わる)。
+        path.write_text("探す語 と新しい内容が足された\n", encoding="utf-8")
+        result = replacemod.execute_replace(preview, "探す語", "置換語")
+        assert result.files_written == 0
+        assert result.outcomes[0].status == replacemod.STATUS_CHANGED
+        # 書き換えられた内容はそのまま(上書きしていない)。
+        assert path.read_text(encoding="utf-8") == "探す語 と新しい内容が足された\n"
+        assert not Path(str(path) + ".bak").exists()
+
+
+def test_execute_skips_newly_opened_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "a.txt"
+        path.write_text("探す語\n", encoding="utf-8")
+        preview = replacemod.preview_replace(str(root), "探す語", "置換語")
+        result = replacemod.execute_replace(
+            preview, "探す語", "置換語", exclude_paths=[str(path)])
+        assert result.files_written == 0
+        assert result.outcomes[0].status == replacemod.STATUS_OPEN
+        assert path.read_text(encoding="utf-8") == "探す語\n"
+
+
+def test_execute_skips_unencodable_without_writing():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "e.txt"
+        original = "あ abc\r\n".encode("cp932")
+        path.write_bytes(original)
+        # プレビューでは対象外になっているので、実行にも載らない。
+        preview = replacemod.preview_replace(str(root), "abc", "🦄")
+        result = replacemod.execute_replace(preview, "abc", "🦄")
+        assert result.outcomes == []
+        assert path.read_bytes() == original
+
+
+def test_no_hits_preview_and_execute():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        preview = replacemod.preview_replace(str(root), "無い語", "置換語")
+        assert preview.targets == [] and preview.total_count == 0
+        result = replacemod.execute_replace(preview, "無い語", "置換語")
+        assert result.outcomes == [] and result.files_written == 0
+        assert result.total_replaced == 0
+
+
+# ---------------------------------------------------------------
+# 窓
+# ---------------------------------------------------------------
+def test_dialog_preview_lists_targets():
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        try:
+            assert not dialog._execute_button.isEnabled()
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            assert dialog._results.count() == 2
+            status = dialog._status_label.text()
+            assert "対象 2 ファイル" in status and "合計 4 件" in status
+            assert dialog._execute_button.isEnabled()
+            # 条件を変えると、プレビューは古くなり実行は押せなくなる。
+            dialog._word_edit.setText("別の語")
+            assert dialog._preview is None
+            assert not dialog._execute_button.isEnabled()
+        finally:
+            dialog.deleteLater()
+
+
+def test_dialog_execute_replaces_and_refreshes():
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        dialog._confirm_execute = lambda preview: True
+        try:
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            dialog.start_execute()
+            # 実行のあと、一覧は自動で確認し直される(対象は無くなる)。
+            _wait_dialog(
+                dialog,
+                lambda: (dialog._preview is not None
+                         and not dialog._preview.targets))
+            assert "置換語" in (root / "a.txt").read_text(encoding="utf-8")
+            assert "置換しました" in dialog._status_label.text()
+            assert "見つかりませんでした" in dialog._status_label.text()
+            # 置換したファイルには .bak が残る。
+            assert Path(str(root / "a.txt") + ".bak").exists()
+        finally:
+            dialog.deleteLater()
+
+
+def test_dialog_execute_cancelled_by_confirmation():
+    app()
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        before = (root / "a.txt").read_bytes()
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語")
+        dialog._confirm_execute = lambda preview: False
+        try:
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            dialog.start_execute()
+            app().processEvents()
+            assert dialog._thread is None       # 実行は始まっていない
+            assert (root / "a.txt").read_bytes() == before
+        finally:
+            dialog.deleteLater()
+
+
+def test_dialog_excludes_window_open_files():
+    app()
+    import editor
+    from editor.greplace_dialog import GrepReplaceDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _tree(tmp)
+        window = editor.create_window(str(root / "a.txt"))
+        window.show()
+        dialog = GrepReplaceDialog(
+            None, folder=str(root), word="探す語", repl="置換語",
+            open_paths=window.open_paths)
+        try:
+            dialog.start_preview()
+            _wait_dialog(dialog, lambda: dialog._preview is not None)
+            names = [os.path.basename(t.path)
+                     for t in dialog._preview.targets]
+            assert names == ["b.py"], names
+            assert len(dialog._preview.skipped_open) == 1
+            assert "開いている 1 件" in dialog._status_label.text()
+        finally:
+            dialog.deleteLater()
+            window.close()
+            window.deleteLater()
+            app().processEvents()
+
+
+def test_window_menu_has_grep_replace():
+    app()
+    import editor
+    window = editor.create_window()
+    window.show()
+    try:
+        labels = []
+        from PySide6.QtWidgets import QMenu
+        for menu in window.findChildren(QMenu):
+            labels.extend(a.text() for a in menu.actions())
+        assert any("検索して置換" in label for label in labels), labels
+    finally:
+        window.close()
+        window.deleteLater()
+        app().processEvents()
+
+
+def main():
+    tests = [(name, fn) for name, fn in globals().items()
+             if name.startswith("test_") and callable(fn)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"ok   {name}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            import traceback
+            traceback.print_exc()
+            print(f"FAIL {name}: {e}")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    sys.stdout.flush()
+    os._exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

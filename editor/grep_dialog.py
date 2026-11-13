@@ -6,6 +6,9 @@
 # (ワーカースレッドから Qt を直接触らない。_SendBridge と同じ作法)。
 # 一覧の項目を選んで Enter かダブルクリックで、on_jump(パス, 行番号
 # 1始まり) が呼ばれ、この窓は閉じる。
+# on_replace が渡されていれば「置換…」ボタンが出て、押すと
+# on_replace(フォルダ, 検索語, 大小区別) が呼ばれて窓は閉じる
+# (置換の窓 greplace_dialog は呼び側が開く)。
 import os
 import threading
 
@@ -41,7 +44,7 @@ class GrepDialog(QDialog):
     呼ばれ、窓は閉じる。"""
 
     def __init__(self, parent=None, *, folder="", word="",
-                 case_sensitive=False, on_jump=None):
+                 case_sensitive=False, on_jump=None, on_replace=None):
         super().__init__(parent)
         self.setWindowIcon(editor_icon.qicon())
         # 製品名は editor/window.py の APP_NAME = "EDDy"。ここは循環
@@ -49,6 +52,7 @@ class GrepDialog(QDialog):
         self.setWindowTitle("フォルダ内を検索 - EDDy")
         self.resize(720, 480)
         self._on_jump = on_jump
+        self._on_replace = on_replace
         self._bridge = _GrepBridge(self)
         self._bridge.progress.connect(self._on_progress)
         self._bridge.finished.connect(self._on_finished)
@@ -75,6 +79,11 @@ class GrepDialog(QDialog):
         self._search_button = QPushButton("検索")
         self._search_button.clicked.connect(self.start_search)
         word_row.addWidget(self._search_button)
+        if on_replace is not None:
+            # 置換の窓(greplace_dialog)へ、いまの条件を引き継いで移る。
+            replace_button = QPushButton("置換…")
+            replace_button.clicked.connect(self._go_replace)
+            word_row.addWidget(replace_button)
         layout.addLayout(word_row)
 
         self._status_label = QLabel(
@@ -146,4 +155,12 @@ class GrepDialog(QDialog):
         if data and self._on_jump is not None:
             path, line = data
             self._on_jump(path, line)
+            self.accept()
+
+    def _go_replace(self):
+        """置換の窓へ移る(この窓は閉じ、呼び側が置換の窓を開く)。"""
+        if self._on_replace is not None:
+            self._on_replace(self._folder_edit.text().strip(),
+                             self._word_edit.text(),
+                             self._case_check.isChecked())
             self.accept()

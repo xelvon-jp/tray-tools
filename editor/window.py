@@ -131,6 +131,16 @@
 # いる大きさの出どころ(その拡張子の上書きか全体か)へ書き戻す。
 # タブキーでスペースを入れる類の扱いは無い(タブは常にタブ文字)。
 #
+# grep して置換(2026-11-13): フォルダ内の複数ファイルを対象に
+# 置換する(editor/greplace.py と greplace_dialog.py)。検索メニュー
+# と、grep の窓の「置換…」から開く。安全側の作り: まず対象ファイル
+# と件数のプレビューを出し(書かない)、条件を変えたら実行は押せ
+# なくなる。実行は確認のあとで、1ファイルごとにプレビュー時点の
+# ディスクの印と照合してから書く(変わっていたものは飛ばす)。
+# 開いているタブのファイルは対象から外す。書き込みは文書モデル
+# 経由なので、文字コードと改行は保たれ、.bak が残る。書けない
+# 文字コードのファイルはプレビューの時点で対象から外れる。
+#
 # 落ちないための作法(このリポジトリの決まり):
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
 #     スロットで投げ切るとプロセスごと終了する
@@ -202,6 +212,7 @@ from editor.color_dialog import ColorSettingsDialog
 from editor.ext_settings_dialog import ExtensionSettingsDialog
 from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
+from editor.greplace_dialog import GrepReplaceDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor import keymap as keymapmod
 from editor.keymap_dialog import KeymapSettingsDialog
@@ -1449,6 +1460,8 @@ class EditorWindow(QMainWindow):
                      "find_all", search_menu)
         self._action("フォルダ内を検索(&G)…", self.show_grep_dialog,
                      None, search_menu)
+        self._action("フォルダ内を検索して置換(&H)…",
+                     self.show_grep_replace_dialog, None, search_menu)
 
         view_menu = self.menuBar().addMenu("表示(&V)")
         self._act_outline = QAction("アウトライン(&O)", self)
@@ -3663,13 +3676,52 @@ class EditorWindow(QMainWindow):
                     word = cursor.selectedText().replace("\u2029", "\n")
                     if "\n" in word:
                         word = ""
+            pending = []
             dialog = GrepDialog(
                 self, folder=folder, word=word,
                 case_sensitive=self._find_case.isChecked(),
+                on_jump=self.open_path_at_line,
+                on_replace=lambda f, w, c: pending.append((f, w, c)))
+            dialog.exec()
+            if pending:
+                f, w, c = pending[0]
+                self.show_grep_replace_dialog(
+                    folder=f, word=w, case_sensitive=c)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"検索を開けませんでした ({e})")
+
+    def show_grep_replace_dialog(self, folder=None, word=None,
+                                 case_sensitive=None):
+        """フォルダ内の横断置換(grep して置換)の窓を開く。
+
+        条件の初期値は検索バーから引き継ぐ(フォルダは今の文書の
+        フォルダ、語が空なら選択中の文字列。grep の窓と同じ作法)。
+        開いているファイルは対象から外すため、開いているパスの
+        取得関数を渡す。"""
+        try:
+            if folder is None:
+                folder = (os.path.dirname(self._doc.path)
+                          if self._doc.path else "")
+            if word is None:
+                word = self._find_edit.text()
+                if not word:
+                    cursor = self._edit.textCursor()
+                    if cursor.hasSelection():
+                        word = cursor.selectedText().replace("\u2029", "\n")
+                        if "\n" in word:
+                            word = ""
+            if case_sensitive is None:
+                case_sensitive = self._find_case.isChecked()
+            dialog = GrepReplaceDialog(
+                self, folder=folder, word=word,
+                repl=self._replace_edit.text(),
+                case_sensitive=case_sensitive,
+                regex=self._find_regex.isChecked(),
+                open_paths=self.open_paths,
                 on_jump=self.open_path_at_line)
             dialog.exec()
         except Exception as e:  # noqa: BLE001  スロットで投げ切らない
-            self.statusBar().showMessage(f"検索を開けませんでした ({e})")
+            self.statusBar().showMessage(f"置換を開けませんでした ({e})")
 
     # ---------------------------------------------------------------
     # 文書内のすべて検索(ヒットした行の一覧)

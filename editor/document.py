@@ -47,7 +47,8 @@ class TextDocument:
     newline: str = DEFAULT_NEWLINE
     text: str = ""              # 本文。改行は "\n" に正規化済み
     line_newlines: list = None  # 行ごとの改行種別(CRLF/LF/CR、最終行は None)。
-                                # 読み込んだ元の並びの控え(表示専用)
+                                # 読み込んだ元の並びの控え(改行記号の描き
+                                # 分けと、「混在のまま」保存の材料)
     lossy_decode: bool = False  # 読み替え(置換文字)が発生したか
     mixed_newlines: bool = False  # CRLF と LF が混在していたか
     disk_mtime: float = None    # ディスク上の更新時刻(開いた/保存した時点)
@@ -64,8 +65,9 @@ class TextDocument:
 
 def detect_newline(text: str) -> str:
     """本文で最初に出てくる改行の種類。改行が無ければ CRLF(Windows の道具
-    としての既定)。混在していても最初のものに合わせる(保存で全体が
-    そろうのは、利用者が触った結果として自然な範囲に留める)。"""
+    としての既定)。混在していても、文書の「改行設定」としては最初の
+    ものに合わせる(ステータス表示と、新しく増えた行の改行の既定。
+    保存で混在をどう扱うかは、利用者が保存のときに選ぶ)。"""
     index = text.find("\n")
     if index > 0 and text[index - 1] == "\r":
         return CRLF
@@ -76,10 +78,41 @@ def detect_newline(text: str) -> str:
 
 def has_mixed_newlines(text: str) -> bool:
     """CRLF と LF(CR を伴わない改行)が両方あるか。混在は、開いたときに
-    利用者へ一度知らせるための判定(保存すると doc.newline にそろう)。"""
+    利用者へ一度知らせるための判定。保存でどう扱うか(混在のままか、
+    どちらかへ統一か)は、明示的な保存のときに窓が利用者へ聞く。"""
     crlf = text.count("\r\n")
     lone_lf = text.count("\n") - crlf
     return crlf > 0 and lone_lf > 0
+
+
+def kinds_are_mixed(kinds) -> bool:
+    """行ごとの改行種別の並び(line_endings の形)に、CRLF と LF が
+    両方あるか。編集中の文書の「いま混在しているか」は、読み込み
+    時点の控えではなく、本文が追随させている並びで判定する。"""
+    if not kinds:
+        return False
+    return CRLF in kinds and LF in kinds
+
+
+def join_with_line_newlines(text: str, kinds, default: str) -> str:
+    """本文(改行は "\\n" にそろえてある)を行ごとの改行種別で
+    つなぎ直す(「混在のまま」保存するための組み立て)。
+
+    kinds は line_endings の形(行数と同じ長さで、最終行は None)。
+    行数に足りない・余る場合は、足りないぶんを default(文書の改行
+    設定)で補い、余りは無視する。種別としてあり得ない値が入って
+    いた行も default に倒す(編集でずれた控えでも壊れない倒し方で、
+    text_edit の描画側の「控えが無い行は文書の改行で描く」と同じ)。"""
+    lines = text.split("\n")
+    if len(lines) == 1:
+        return text
+    out = [lines[0]]
+    for index in range(1, len(lines)):
+        prev = index - 1
+        kind = kinds[prev] if kinds is not None and prev < len(kinds) else None
+        out.append(kind if kind in (CRLF, LF, CR) else default)
+        out.append(lines[index])
+    return "".join(out)
 
 
 # 改行の並びを切り出すための正規表現。CRLF を先に置くことで、"\r\n" が
@@ -95,7 +128,7 @@ def line_endings(text: str) -> list:
     行数(改行の数 + 1)と一致する。本文ウィジェット(Qt も CR・LF・
     CRLF のどれでも段落を分ける)のブロックと、番号がそのまま対応
     する。不可視文字の表示で、行ごとに改行の種類を描き分けるための
-    控え(保存では doc.newline にそろうので、表示だけの話)。
+    控えで、「混在のまま」保存するときの材料でもある。
 
     大きなファイルでも目立って遅くならないよう、改行の切り出しは
     正規表現(C 側の走査)に任せる。"""
@@ -178,9 +211,15 @@ def load_document(path: str) -> TextDocument:
 
 
 def encode_document(doc: TextDocument, encoding=None, newline=None, bom=None,
-                    errors="strict") -> bytes:
+                    errors="strict", line_newlines=None) -> bytes:
     """doc をバイト列に戻す。encoding / newline / bom を渡すと、その
     変換で書く(「名前を付けて保存」で利用者が選んだ場合だけ渡す)。
+
+    line_newlines(行ごとの改行種別の並び)を渡すと、改行はそろえず
+    行ごとにその種別で書く(「混在のまま」の保存)。このとき newline
+    は使わない(つなぎ直しの補いに使う既定は doc.newline)。
+    渡さなければ、従来どおり doc.newline(または newline)で全体を
+    そろえる。
 
     変換先の文字コードで書けない文字があると、既定(errors="strict")
     では UnicodeEncodeError を上げる。黙って置換文字にすると中身が
@@ -190,7 +229,9 @@ def encode_document(doc: TextDocument, encoding=None, newline=None, bom=None,
     nl = newline if newline is not None else doc.newline
     use_bom = doc.bom if bom is None else bom
     text = doc.text
-    if nl == CRLF:
+    if line_newlines is not None:
+        text = join_with_line_newlines(text, line_newlines, doc.newline)
+    elif nl == CRLF:
         text = text.replace("\n", "\r\n")
     body = text.encode(enc, errors=errors)
     return (text_encoding.bom_bytes(enc) if use_bom else b"") + body
@@ -357,10 +398,14 @@ def _atomic_write(target: str, data: bytes):
 
 
 def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
-                  bom=None, backup=True, errors="strict") -> str:
+                  bom=None, backup=True, errors="strict",
+                  line_newlines=None) -> str:
     """doc をファイルへ書く。成功したら doc 側の控え(保存先・文字コード・
     改行・BOM・ディスク上の印)を、実際に書いた内容に合わせて更新して、
     書いたパスを返す。
+
+    line_newlines を渡すと、行ごとの改行を保って書く(「混在のまま」)。
+    渡さなければ全体を doc.newline(または newline)でそろえる。
 
     backup が真で、保存先に既存のファイルがあれば、上書きの前に
     それまでの内容を「保存先 + .bak」へ控える(控えは常に1つ)。
@@ -369,7 +414,7 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
     if not target:
         raise ValueError("保存先が決まっていません")
     data = encode_document(doc, encoding=encoding, newline=newline, bom=bom,
-                           errors=errors)
+                           errors=errors, line_newlines=line_newlines)
     if backup and os.path.exists(target):
         try:
             shutil.copyfile(target, target + ".bak")
@@ -383,13 +428,14 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
         doc.newline = newline
     if bom is not None:
         doc.bom = bom
-    # 保存で改行は doc.newline にそろったので、混在の控えは落とす。
-    doc.mixed_newlines = False
-    # 行ごとの種別の控えも、実際に書いた内容に合わせる(表示専用の
-    # 控え)。書いたバイト列を読み戻して数えるのが確実(本文に単独の
-    # CR が残っていると、改行の置き換えだけではそろわないため)。
+    # 行ごとの種別の控えと混在の控えは、実際に書いた内容に合わせる。
+    # 書いたバイト列を読み戻して数えるのが確実(本文に単独の CR が
+    # 残っていると、改行の置き換えだけではそろわないため)。統一して
+    # 書けば混在は落ち、混在のまま書けば混在のまま残る。
     enc = encoding if encoding is not None else doc.encoding
-    doc.line_newlines = line_endings(data.decode(enc, errors="replace"))
+    written = data.decode(enc, errors="replace")
+    doc.line_newlines = line_endings(written)
+    doc.mixed_newlines = has_mixed_newlines(written)
     doc.disk_mtime, doc.disk_size = _disk_stamp(target)
     return target
 

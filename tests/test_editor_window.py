@@ -1592,15 +1592,17 @@ def test_mixed_newline_notice_on_open():
 
 
 def test_mixed_newline_status_label_clears_on_save():
-    # 混在した改行の文書では、保存で1種類にそろう旨を
-    # ステータスバー(文字コード表示)に出し、保存したら消える。
+    # 混在した改行の文書では、保存時に選ぶ旨をステータスバー
+    # (文字コード表示)に出す。保存で「CRLF に統一」を選ぶと、
+    # 改行がそろって表示も消える。
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")
         Path(path).write_bytes("a\r\nb\nc\r\n".encode("utf-8"))
         window = make_window(path)
         try:
             assert window._enc_label.text() == (
-                "UTF-8 / CRLF / 改行混在→保存でCRLFにそろう")
+                "UTF-8 / CRLF / 改行混在（保存時に選びます）")
+            window.ask_mixed_newline = lambda: "crlf"
             assert window.save()
             assert window._enc_label.text() == "UTF-8 / CRLF"
             assert Path(path).read_bytes() == (
@@ -2247,7 +2249,7 @@ def test_save_as_existing_file_still_uses_options_dialog():
 
 def test_newline_glyphs_split_by_kind_and_eof():
     # CRLF・LF・CR が混在した文書では、行ごとに改行の記号が違い、
-    # 最後の行には EOF の印が付く。保存すると記号もそろう。
+    # 最後の行には EOF の印が付く。保存で統一を選ぶと記号もそろう。
     from editor.text_edit import EOF_MARK, NEWLINE_GLYPHS
 
     # 記号は種別どうしで見分けられ、MS Gothic にある字の範囲。
@@ -2269,7 +2271,9 @@ def test_newline_glyphs_split_by_kind_and_eof():
                 "←↓", "↓", "←", EOF_MARK]
             # 不可視文字を描いても落ちない。
             edit.viewport().grab()
-            # 保存すると改行が CRLF にそろい、記号もそろう。
+            # 保存で「CRLF に統一」を選ぶと、改行が CRLF にそろい、
+            # 記号もそろう。
+            window.ask_mixed_newline = lambda: "crlf"
             assert window.save()
             assert [edit.block_end_mark(b) for b in _all_blocks(window)] == [
                 "←↓", "←↓", "←↓", EOF_MARK]

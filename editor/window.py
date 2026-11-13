@@ -34,7 +34,12 @@
 #   書き込みは原子的で、直前の内容は .bak に控える(document.py)。
 #   開いた後に外部で変わっていたら、上書きの前に確認する。保存先の
 #   文字コードで書けない文字があれば、化けを承知で書くか確認する。
-#   改行が混在する文書は、開いたときに知らせる。
+#   改行が混在する文書は、開いたときに知らせる。混在していない文書
+#   はその改行のまま保存し、混在した文書は明示的な保存(上書き保存・
+#   名前を付けて保存)のときに3択(混在のまま／CRLF に統一／LF に
+#   統一)で聞く(Nagato の決定、2026-11-13)。ダイアログ無しの書き
+#   込み(save_to の直接呼び出し、grep して置換の一括書き込み、
+#   セッションの控え)では聞かない。
 # 表示の状態とフォントと正規表現は settings の editor 節に保存され、
 # 呼び側が on_settings_change で受けて update_settings_section する。
 #
@@ -463,7 +468,11 @@ class SaveOptionsDialog(QDialog):
 
     既定は文書が持っている今の値。ここで変えたときだけ変換が起きる。
     出るのは、既に名前のある文書を別名で保存するときだけ。無題の
-    文書の保存では出さない(形式は文書の既定でそのまま書く)。"""
+    文書の保存では出さない(形式は文書の既定でそのまま書く)。
+
+    改行が混在した文書では、改行の選択肢の先頭に「混在のまま」が
+    加わり、既定でそれが選ばれる(values() の改行は None になる。
+    呼び側はその場合、行ごとの改行を保って書く)。"""
 
     def __init__(self, doc, parent=None):
         super().__init__(parent)
@@ -476,9 +485,17 @@ class SaveOptionsDialog(QDialog):
             max(0, ENCODING_ORDER.index(doc.encoding))
             if doc.encoding in ENCODING_ORDER else 0)
         self._newline = QComboBox()
+        if doc.mixed_newlines:
+            # 混在した文書だけの選択肢。データは None(=改行を
+            # 指定しない)で、呼び側が「混在のまま」と解釈する。
+            self._newline.addItem("混在のまま", None)
         self._newline.addItem("CRLF", docmod.CRLF)
         self._newline.addItem("LF", docmod.LF)
-        self._newline.setCurrentIndex(0 if doc.newline == docmod.CRLF else 1)
+        if doc.mixed_newlines:
+            self._newline.setCurrentIndex(0)  # 混在のまま
+        else:
+            self._newline.setCurrentIndex(
+                0 if doc.newline == docmod.CRLF else 1)
         self._bom = QCheckBox("BOM を付ける")
         self._bom.setChecked(doc.bom)
         self._encoding.currentIndexChanged.connect(self._sync_bom_enabled)
@@ -502,7 +519,10 @@ class SaveOptionsDialog(QDialog):
             self._bom.setChecked(False)
 
     def values(self):
-        """(文字コード, 改行, BOM を付けるか)。"""
+        """(文字コード, 改行, BOM を付けるか)。
+
+        改行が混在した文書で「混在のまま」を選んだときだけ、改行は
+        None になる(行ごとの改行を保って書く合図)。"""
         return (self._encoding.currentData(),
                 self._newline.currentData(),
                 self._bom.isChecked())
@@ -677,9 +697,13 @@ class EditorWindow(QMainWindow):
         # ask_unencodable_save: 保存先の文字コードで書けない文字が
         #   あるとき、置換文字で書いてよいか(引数は書けない文字の
         #   並び。戻り値は bool)
+        # ask_mixed_newline: 改行が混在した文書を明示的に保存する
+        #   とき、どう保存するか(戻り値は "keep"=混在のまま /
+        #   "crlf"=CRLF に統一 / "lf"=LF に統一 / None=保存しない)
         self.ask_external_overwrite = None
         self.ask_external_reload = None
         self.ask_unencodable_save = None
+        self.ask_mixed_newline = None
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
@@ -2248,11 +2272,11 @@ class EditorWindow(QMainWindow):
         if self._doc.lossy_decode:
             text += " / 一部読み替えあり"
         if self._doc.mixed_newlines:
-            # 混在は保存で doc.newline にそろう(開いた直後の知らせと
-            # 同じ文言)。保存で mixed_newlines が落ちるので、表示も
-            # _refresh_all 経由で一緒に消える。
-            newline_label = docmod.NEWLINE_LABELS.get(self._doc.newline, "")
-            text += f" / 改行混在→保存で{newline_label}にそろう"
+            # 混在のままでは保存しない(明示的な保存のときに、混在
+            # のままか・どちらへ統一かを聞く)。統一を選んで保存
+            # すれば mixed_newlines が落ち、表示も _refresh_all
+            # 経由で一緒に消える。
+            text += " / 改行混在（保存時に選びます）"
         self._enc_label.setText(text)
 
     def _refresh_position(self):
@@ -2378,9 +2402,9 @@ class EditorWindow(QMainWindow):
             notices.append(
                 "一部の文字を読み替えました（保存すると置換文字で書かれます）")
         if doc.mixed_newlines:
-            label = docmod.NEWLINE_LABELS.get(doc.newline, "")
             notices.append(
-                f"改行コードが混在しています（保存すると {label} にそろいます）")
+                "改行コードが混在しています"
+                "（保存するときに、混在のままか統一かを聞きます）")
         if notices:
             self.statusBar().showMessage("。".join(notices))
 
@@ -2552,15 +2576,100 @@ class EditorWindow(QMainWindow):
     # ---------------------------------------------------------------
     def _sync_text(self):
         self._doc.text = self._edit.toPlainText()
+        # 行ごとの改行種別も、本文が追随させている今の並びへ合わせる
+        # (混在の判定は、読み込み時点の控えではなく今の状態でする)。
+        # 控えが無いビュー(控えから戻した下書き等)では、文書側の
+        # 控え(読み込み時の並び)をそのまま使う。
+        kinds = self._edit.line_newlines()
+        if kinds is not None:
+            self._doc.line_newlines = kinds
+            self._doc.mixed_newlines = docmod.kinds_are_mixed(kinds)
+
+    def _current_line_newline_kinds(self):
+        """「混在のまま」保存に使う、行ごとの改行種別の今の並び。
+
+        本文の控えがあればそれ、無ければ文書側の控え(読み込み時の
+        並び)。どちらも無ければ None(その場合は文書の改行設定で
+        補って書かれる)。"""
+        kinds = self._edit.line_newlines()
+        if kinds is not None:
+            return kinds
+        return self._doc.line_newlines
+
+    def _ask_mixed_newline_choice(self):
+        """改行が混在した文書を保存するときの3択。
+
+        戻り値は "keep"(混在のまま) / "crlf"(CRLF に統一) /
+        "lf"(LF に統一) / None(やめる。窓を閉じた場合もこちら)。
+        差し替え口(ask_mixed_newline)があればそちらを使う。"""
+        if self.ask_mixed_newline is not None:
+            return self.ask_mixed_newline()
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setText(
+            "改行コードが混在しています。\n"
+            "保存するときの改行をどうしますか？")
+        keep_button = box.addButton(
+            "混在のまま", QMessageBox.ButtonRole.AcceptRole)
+        crlf_button = box.addButton(
+            "CRLF に統一", QMessageBox.ButtonRole.AcceptRole)
+        lf_button = box.addButton(
+            "LF に統一", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is keep_button:
+            return "keep"
+        if clicked is crlf_button:
+            return "crlf"
+        if clicked is lf_button:
+            return "lf"
+        return None
+
+    def _mixed_newline_save_args(self):
+        """明示的な保存(上書き保存・名前を付けて保存)の前に、改行の
+        混在をどう扱うか決める。
+
+        混在していなければ {}(引数なし=従来どおり)。混在していれば
+        利用者に聞き、決まったら save_to へ渡す引数の dict、やめた
+        ら None を返す。ダイアログ無しで書く経路(save_to の直接の
+        呼び出しや、grep して置換の一括書き込み)では通らないので、
+        そちらでは聞かれない。"""
+        self._sync_text()
+        if not self._doc.mixed_newlines:
+            return {}
+        choice = self._ask_mixed_newline_choice()
+        if choice == "keep":
+            return {"line_newlines": self._current_line_newline_kinds()}
+        if choice == "crlf":
+            return {"newline": docmod.CRLF}
+        if choice == "lf":
+            return {"newline": docmod.LF}
+        self.statusBar().showMessage(
+            "保存をやめました（改行の扱いが選ばれていません）", 8000)
+        return None
 
     def save(self) -> bool:
-        """上書き保存。保存先が無ければ「名前を付けて保存」に回す。"""
+        """上書き保存。保存先が無ければ「名前を付けて保存」に回す。
+
+        改行が混在していれば、保存の前に3択で聞く(やめたら保存
+        しない)。"""
         if self._doc.path is None:
             return self.save_as()
-        return self._write()
+        args = self._mixed_newline_save_args()
+        if args is None:
+            return False
+        return self.save_to(self._doc.path, **args)
 
-    def save_to(self, path, encoding=None, newline=None, bom=None) -> bool:
+    def save_to(self, path, encoding=None, newline=None, bom=None,
+                line_newlines=None) -> bool:
         """ダイアログ無しで、指定の形式で書く(呼び側・テスト用)。
+
+        改行の混在の3択はここでは聞かない(聞くのは save /
+        save_as の仕事で、決まった結果を newline / line_newlines で
+        受け取る)。line_newlines を渡すと、行ごとの改行を保って
+        書く(「混在のまま」)。
 
         保存の前の確認が2つある(どちらも黙って進めない):
           - 上書き先が開いているファイル自身で、開いた後に外部で
@@ -2588,13 +2697,16 @@ class EditorWindow(QMainWindow):
             errors = "replace"
         try:
             docmod.save_document(self._doc, path=path, encoding=encoding,
-                                 newline=newline, bom=bom, errors=errors)
+                                 newline=newline, bom=bom, errors=errors,
+                                 line_newlines=line_newlines)
         except (OSError, UnicodeEncodeError, ValueError) as e:
             self.statusBar().showMessage(f"保存できませんでした: {e}")
             return False
         self._edit.document().setModified(False)
         self._external_change_pending = False
-        # 保存で改行はそろったので、描き分けの控えもそろった形にする。
+        # 描き分けの控えも、実際に書いた内容に合わせ直す
+        # (doc.line_newlines は save_document が書いたバイト列から
+        # 数え直してある。統一すればそろい、混在のままなら混在のまま)。
         self._edit.set_line_newlines(self._doc.line_newlines,
                                      self._doc.newline)
         # 保存した内容が編集マークの新しい基準になる。
@@ -2641,9 +2753,6 @@ class EditorWindow(QMainWindow):
             QMessageBox.StandardButton.No)
         return answer == QMessageBox.StandardButton.Yes
 
-    def _write(self) -> bool:
-        return self.save_to(self._doc.path)
-
     def save_as(self) -> bool:
         try:
             start = self._doc.path or ""
@@ -2656,13 +2765,24 @@ class EditorWindow(QMainWindow):
                 # という Nagato の指摘、2026-11-13)。文書が持って
                 # いる今の形式(新規文書の既定)でそのまま書く。
                 # 形式を変えたいときは、保存したあとにステータス
-                # バーの文字コード表示から変える。
-                return self.save_to(path)
+                # バーの文字コード表示から変える。ただし改行が
+                # 混在していれば(貼り付け等で混ざった場合)、3択は
+                # ここでも聞く。
+                args = self._mixed_newline_save_args()
+                if args is None:
+                    return False
+                return self.save_to(path, **args)
             self._sync_text()
             dialog = SaveOptionsDialog(self._doc, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return False
             encoding, newline, bom = dialog.values()
+            if newline is None:
+                # 混在した文書で「混在のまま」が選ばれた(形式の
+                # 画面にだけある選択)。行ごとの改行を保って書く。
+                return self.save_to(
+                    path, encoding=encoding, bom=bom,
+                    line_newlines=self._current_line_newline_kinds())
             return self.save_to(path, encoding=encoding, newline=newline,
                                 bom=bom)
         except Exception as e:  # noqa: BLE001  スロットで投げ切らない

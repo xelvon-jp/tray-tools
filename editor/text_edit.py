@@ -273,6 +273,16 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         if self._show_invisibles:
             self.viewport().update()
 
+    def line_newlines(self):
+        """行ごとの改行種別の控えの写し。控えが無ければ None。
+
+        編集への追随(_track_line_newlines)を受けた今の並びなので、
+        保存のときに「いま混在しているか」の判定と、「混在のまま」
+        書くときの材料に使う(窓が保存の直前に読み取る)。"""
+        if self._line_newlines is None:
+            return None
+        return list(self._line_newlines)
+
     def _track_line_newlines(self, position, chars_removed, chars_added):
         """文書の変化に、改行種別の控えを追随させる。
 

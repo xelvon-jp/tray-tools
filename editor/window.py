@@ -73,6 +73,15 @@
 # (restart_loss_count)。先にあった間隔式の自動保存(間隔が来たら
 # 実ファイルへ書く形)は、この方式に置き換えて取り除いた。
 #
+# 無題の保存では形式の画面を出さない(2026-11-13): 新規に作った
+# 文書を保存するとき、文字コード・改行・BOM を選ぶ画面
+# (SaveOptionsDialog)は出さず、ファイル名を付ける窓だけにする
+# (煩わしいという Nagato の指摘)。形式は文書が持っている今の値
+# (新規文書の既定 = UTF-8 / CRLF / BOM 無し)でそのまま書き、
+# 変えたいときは保存後にステータスバーの文字コード表示から
+# 変える。既に名前のある文書の「名前を付けて保存」では、従来
+# どおり形式の画面を出す。
+#
 # キー割り当ての画面(2026-11-13): 命令と現在の割り当てを一覧し、
 # その場でキーを押して変えられる(editor/keymap_dialog.py)。変更は
 # editor 節の keymap(既定と違う項目だけの上書き分)へ差分で保存
@@ -396,7 +405,9 @@ def _compile_or_default(text, default_rx, default_text):
 class SaveOptionsDialog(QDialog):
     """「名前を付けて保存」で、文字コード・改行・BOM を選ぶ小さな窓。
 
-    既定は文書が持っている今の値。ここで変えたときだけ変換が起きる。"""
+    既定は文書が持っている今の値。ここで変えたときだけ変換が起きる。
+    出るのは、既に名前のある文書を別名で保存するときだけ。無題の
+    文書の保存では出さない(形式は文書の既定でそのまま書く)。"""
 
     def __init__(self, doc, parent=None):
         super().__init__(parent)
@@ -2424,6 +2435,13 @@ class EditorWindow(QMainWindow):
                 self, "名前を付けて保存", start, "すべてのファイル (*)")
             if not path:
                 return False
+            if self._doc.path is None:
+                # 無題の文書は、形式を選ぶ画面を出さない(煩わしい
+                # という Nagato の指摘、2026-11-13)。文書が持って
+                # いる今の形式(新規文書の既定)でそのまま書く。
+                # 形式を変えたいときは、保存したあとにステータス
+                # バーの文字コード表示から変える。
+                return self.save_to(path)
             self._sync_text()
             dialog = SaveOptionsDialog(self._doc, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:

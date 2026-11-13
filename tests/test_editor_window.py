@@ -2151,6 +2151,100 @@ def test_save_as_f12_saves_with_current_format():
             discard_close(window)
 
 
+def test_save_as_untitled_saves_with_defaults_without_options_dialog():
+    # 無題の文書の保存では、形式を選ぶ画面(SaveOptionsDialog)は
+    # 出ない。ファイル名を付ける窓だけで、新規文書の既定
+    # (UTF-8 / CRLF / BOM 無し)でそのまま書かれる。
+    import editor.window as window_module
+    from editor import document as docmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = os.path.join(tmp, "new.txt")
+        window = make_window()
+        try:
+            assert window._doc.path is None
+            type_text(window, "あ\nい\n")
+
+            class FakeFileDialog:
+                @staticmethod
+                def getSaveFileName(*_args, **_kwargs):
+                    return dst, ""
+
+            class ExplodingOptionsDialog:
+                """作られたら失敗。無題の保存では出ないはずの画面。"""
+
+                def __init__(self, *_args, **_kwargs):
+                    raise AssertionError("形式の画面が出た")
+
+            orig_file = window_module.QFileDialog
+            orig_options = window_module.SaveOptionsDialog
+            window_module.QFileDialog = FakeFileDialog
+            window_module.SaveOptionsDialog = ExplodingOptionsDialog
+            try:
+                assert window.save_as()
+            finally:
+                window_module.QFileDialog = orig_file
+                window_module.SaveOptionsDialog = orig_options
+            assert Path(dst).read_bytes() == "あ\r\nい\r\n".encode("utf-8")
+            assert window._doc.path == dst
+            assert window._doc.encoding == docmod.DEFAULT_ENCODING
+            assert window._doc.newline == docmod.DEFAULT_NEWLINE
+            assert window._doc.bom is False
+            assert "new.txt" in window.windowTitle()
+        finally:
+            discard_close(window)
+
+
+def test_save_as_existing_file_still_uses_options_dialog():
+    # 既に名前のある文書の「名前を付けて保存」では、形式の画面が
+    # 従来どおり使われ、そこで選んだ形式で変換が起きる。
+    import editor.window as window_module
+    from editor import document as docmod
+
+    data = "あ\r\nい\r\n".encode("cp932")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src.txt")
+        dst = os.path.join(tmp, "dst.txt")
+        Path(src).write_bytes(data)
+        window = make_window(src)
+        try:
+            asked = []
+
+            class FakeFileDialog:
+                @staticmethod
+                def getSaveFileName(*_args, **_kwargs):
+                    return dst, ""
+
+            class FakeOptionsDialog:
+                """改行だけ LF に変えて返す差し替え。"""
+
+                def __init__(self, doc, parent=None):
+                    asked.append(doc)
+                    self._doc = doc
+
+                def exec(self):
+                    return QDialog.DialogCode.Accepted
+
+                def values(self):
+                    return self._doc.encoding, docmod.LF, self._doc.bom
+
+            orig_file = window_module.QFileDialog
+            orig_options = window_module.SaveOptionsDialog
+            window_module.QFileDialog = FakeFileDialog
+            window_module.SaveOptionsDialog = FakeOptionsDialog
+            try:
+                assert window.save_as()
+            finally:
+                window_module.QFileDialog = orig_file
+                window_module.SaveOptionsDialog = orig_options
+            assert asked  # 形式の画面が実際に使われた
+            assert Path(dst).read_bytes() == "あ\nい\n".encode("cp932")
+            assert window._doc.path == dst
+            assert window._doc.newline == docmod.LF
+        finally:
+            discard_close(window)
+
+
 def test_newline_glyphs_split_by_kind_and_eof():
     # CRLF・LF・CR が混在した文書では、行ごとに改行の記号が違い、
     # 最後の行には EOF の印が付く。保存すると記号もそろう。

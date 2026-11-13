@@ -257,6 +257,21 @@ def test_handwritten_macro_plays():
         discard_close(window)
 
 
+def test_goto_line_handwritten_macro():
+    window = make_window("a\nb\nc\nd", cursor_pos=0)
+    try:
+        text = json.dumps({"name": "手書き", "commands": [
+            {"cmd": "goto_line", "args": {"line": 3}},
+            {"cmd": "goto_line", "args": {"line": 99}},
+        ]})
+        _name, commands = macmod.macro_from_json(text)
+        assert window.play_macro(commands)
+        # 範囲外の行は最終行に収まる。
+        assert window._edit.textCursor().blockNumber() == 3
+    finally:
+        discard_close(window)
+
+
 def test_save_and_load_macro_file():
     window = make_window("ab", cursor_pos=0)
     try:

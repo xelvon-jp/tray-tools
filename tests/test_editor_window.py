@@ -1014,6 +1014,141 @@ def test_reformat_recorded_and_replayed():
         discard_close(window)
 
 
+def test_goto_line_moves_to_line_head():
+    window = make_window()
+    try:
+        window._edit.setPlainText("ab\n  cd\nef")
+        assert window.execute_command("goto_line", {"line": 2})
+        cursor = window._edit.textCursor()
+        assert cursor.blockNumber() == 1
+        # カーソルは行頭(字下げの前)。grep やアウトラインからの
+        # 移動(_jump_to_line)と同じ作法。
+        block = window._edit.document().findBlockByNumber(1)
+        assert cursor.position() == block.position()
+        assert not cursor.hasSelection()
+    finally:
+        discard_close(window)
+
+
+def test_goto_line_clamps_to_document():
+    window = make_window()
+    try:
+        window._edit.setPlainText("1\n2\n3\n4\n5")
+        window.execute_command("goto_line", {"line": 0})
+        assert window._edit.textCursor().blockNumber() == 0
+        window.execute_command("goto_line", {"line": -7})
+        assert window._edit.textCursor().blockNumber() == 0
+        window.execute_command("goto_line", {"line": 999})
+        assert window._edit.textCursor().blockNumber() == 4
+        # 記録に残るのは、収めたあとの行番号。
+        window.set_macro_recording(True)
+        window.execute_command("goto_line", {"line": 999})
+        window.set_macro_recording(False)
+        assert {"cmd": "goto_line", "args": {"line": 5}} \
+            in window.recorded_commands()
+    finally:
+        discard_close(window)
+
+
+def test_goto_line_rejects_non_numeric():
+    window = make_window()
+    try:
+        window._edit.setPlainText("1\n2\n3")
+        window.execute_command("goto_line", {"line": 2})
+        assert window._edit.textCursor().blockNumber() == 1
+        window.set_macro_recording(True)
+        window.execute_command("goto_line", {"line": "abc"})
+        window.execute_command("goto_line", {})
+        window.execute_command("goto_line", {"line": None})
+        window.set_macro_recording(False)
+        # 動かず、記録にも残らない。
+        assert window._edit.textCursor().blockNumber() == 1
+        assert window.recorded_commands() == []
+    finally:
+        discard_close(window)
+
+
+def test_goto_line_scrolls_into_view():
+    window = make_window()
+    try:
+        window.resize(500, 240)
+        window._edit.setPlainText(
+            "\n".join(f"line{i}" for i in range(1, 201)))
+        app().processEvents()
+        window.execute_command("goto_line", {"line": 150})
+        app().processEvents()
+        assert window._edit.textCursor().blockNumber() == 149
+        # 移動した行が画面の中に見えている(スクロールが付いてくる)。
+        rect = window._edit.cursorRect()
+        assert window._edit.viewport().rect().intersects(rect)
+    finally:
+        discard_close(window)
+
+
+def test_goto_line_dialog_enter_and_cancel():
+    from editor import window as winmod
+
+    class _StubInputDialog:
+        result = (1, False)
+        calls = []
+
+        @staticmethod
+        def getInt(*args, **kwargs):
+            _StubInputDialog.calls.append(args)
+            return _StubInputDialog.result
+
+    window = make_window()
+    original = winmod.QInputDialog
+    winmod.QInputDialog = _StubInputDialog
+    try:
+        window._edit.setPlainText("1\n2\n3\n4")
+        # Enter(確定)で移動する。
+        _StubInputDialog.result = (3, True)
+        window.ask_goto_line()
+        assert window._edit.textCursor().blockNumber() == 2
+        # Esc(取り消し)では動かない。
+        _StubInputDialog.result = (1, False)
+        window.ask_goto_line()
+        assert window._edit.textCursor().blockNumber() == 2
+        # Ctrl+G でも同じ入口が開く。
+        _StubInputDialog.calls = []
+        _StubInputDialog.result = (4, True)
+        window._edit.setFocus()
+        app().processEvents()
+        QTest.keyClick(window._edit, Qt.Key.Key_G,
+                       Qt.KeyboardModifier.ControlModifier)
+        app().processEvents()
+        assert _StubInputDialog.calls
+        assert window._edit.textCursor().blockNumber() == 3
+    finally:
+        winmod.QInputDialog = original
+        discard_close(window)
+
+
+def test_goto_line_recorded_and_replayed():
+    window = make_window()
+    try:
+        assert DEFAULT_KEYMAP["goto_line"] == "Ctrl+G"
+        window._edit.setPlainText("1\n2\n3\n4\n5")
+        window.set_macro_recording(True)
+        window.execute_command("goto_line", {"line": 4})
+        window.set_macro_recording(False)
+        commands = window.recorded_commands()
+        assert {"cmd": "goto_line", "args": {"line": 4}} in commands
+        _name, parsed = macmod.macro_from_json(
+            macmod.macro_to_json(commands))
+        assert parsed == commands
+        other = make_window()
+        try:
+            other._edit.setPlainText("a\nb\nc\nd\ne")
+            assert other.play_macro(parsed)
+            assert other._edit.textCursor().blockNumber() == 3
+        finally:
+            discard_close(other)
+    finally:
+        discard_close(window)
+
+
 def test_ctrl_k_scoped_to_text_edit():
     window = make_window()
     try:

@@ -21,6 +21,8 @@
 #   replace_all {text, repl, case, regex}   全部置換
 #   move_line_start {extend}    行頭へ
 #   move_line_end {extend}      行末へ
+#   goto_line {line}            指定行へ移動(line は1始まり。範囲外は
+#                               文書の範囲に収めてから記録される)
 #   move_line_up {count, extend}    上の行へ
 #   move_line_down {count, extend}  下の行へ
 #   move_char_left {count, extend}  左へ
@@ -53,6 +55,7 @@ KNOWN_COMMANDS = frozenset({
     "replace_all",
     "move_line_start",
     "move_line_end",
+    "goto_line",
     "move_line_up",
     "move_line_down",
     "move_char_left",

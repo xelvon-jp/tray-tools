@@ -472,6 +472,7 @@ class EditorWindow(QMainWindow):
             "find_prev": self._cmd_find_prev,
             "move_line_start": self._cmd_move_line_start,
             "move_line_end": self._cmd_move_line_end,
+            "goto_line": self._cmd_goto_line,
             "move_line_up": self._cmd_move_line_up,
             "move_line_down": self._cmd_move_line_down,
             "move_char_left": self._cmd_move_char_left,
@@ -711,6 +712,8 @@ class EditorWindow(QMainWindow):
         self._action("小文字 → 大文字(&U)",
                      lambda: self.execute_command("convert_upper"),
                      None, convert_menu)
+        self._action("指定行へ移動(&G)…", self.ask_goto_line,
+                     "goto_line", edit_menu)
         edit_menu.addSeparator()
         self._action("直前の操作を繰り返す(&F)", self.repeat_last,
                      "repeat_last", edit_menu)
@@ -1642,6 +1645,21 @@ class EditorWindow(QMainWindow):
         return self._move_cursor(
             QTextCursor.MoveOperation.EndOfBlock, args)
 
+    def _cmd_goto_line(self, args):
+        """指定行へ移動(命令 goto_line)。line は1始まりで、範囲外は
+        文書の範囲に収める。移動そのものは _jump_to_line(grep や
+        アウトラインからの移動と同じ作法: 行頭に置いて中央に寄せる)。
+        数字として読めない line は None(移動も記録もしない)。記録に
+        残るのは、収めたあとの行番号。"""
+        try:
+            line = int(args.get("line"))
+        except (TypeError, ValueError):
+            return None
+        block_count = self._edit.document().blockCount()
+        line = max(1, min(line, max(1, block_count)))
+        self._jump_to_line(line - 1)
+        return {"line": line}
+
     def _cmd_move_line_up(self, args):
         return self._move_cursor(QTextCursor.MoveOperation.Up, args)
 
@@ -2269,6 +2287,27 @@ class EditorWindow(QMainWindow):
     def _hide_find_bar(self):
         self._find_bar.hide()
         self._edit.setFocus()
+
+    # ---------------------------------------------------------------
+    # 指定行ジャンプ
+    # ---------------------------------------------------------------
+    def ask_goto_line(self):
+        """行番号を聞いて、その行へ移動する(編集メニューと Ctrl+G)。
+
+        入力は折り返し桁数の設定と同じ QInputDialog の小さな窓。
+        Enter で移動して閉じ、Esc では何もせず閉じる(数字でない
+        入力は、入力欄の検証で確定できない)。範囲は文書の行数まで
+        (命令側でも収めるので、再生時の範囲外はそちらで収まる)。"""
+        try:
+            block_count = self._edit.document().blockCount()
+            current = self._edit.textCursor().blockNumber() + 1
+            value, ok = QInputDialog.getInt(
+                self, APP_NAME, "移動する行", current,
+                1, max(1, block_count), 1)
+            if ok:
+                self.execute_command("goto_line", {"line": value})
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"移動できませんでした ({e})")
 
     # ---------------------------------------------------------------
     # フォルダ内の横断検索(grep)

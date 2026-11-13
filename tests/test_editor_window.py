@@ -44,7 +44,10 @@ from editor.highlighter import (  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
 from editor.window import (  # noqa: E402
     PATTERN_APPLYING_KEY,
+    RECENT_FILES_KEY,
     PatternSettingsDialog,
+    remember_recent_file,
+    sanitize_recent_files,
     trial_patterns,
 )
 
@@ -2110,6 +2113,150 @@ def test_newline_glyphs_paste_into_new_document():
         assert len(_kinds(window)) == edit.document().blockCount()
     finally:
         discard_close(window)
+
+
+def _recent_paths(tmp, *names):
+    paths = []
+    for name in names:
+        path = Path(tmp) / name
+        path.write_text(f"{name} の中身\n", encoding="utf-8")
+        paths.append(str(path))
+    return paths
+
+
+def test_recent_files_recorded_on_open():
+    # 開いたファイルが新しい順に履歴へ入り、開き直すと重複せず
+    # 先頭へ繰り上がる。保存は recent_files の差分として流れる。
+    saved = []
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b, c = _recent_paths(tmp, "a.txt", "b.txt", "c.txt")
+        window = make_window(on_settings_change=saved.append)
+        try:
+            assert window.recent_files() == []
+            assert window.open_path(a)
+            assert window.open_path(b)
+            assert window.open_path(c)
+            assert window.recent_files() == [c, b, a]
+            assert saved[-1] == {RECENT_FILES_KEY: [c, b, a]}
+            assert window.open_path(a)
+            assert window.recent_files() == [a, c, b]
+            assert saved[-1] == {RECENT_FILES_KEY: [a, c, b]}
+        finally:
+            discard_close(window)
+
+
+def test_recent_files_helpers():
+    # 純粋関数の側: 上限(20件)・繰り上げ・壊れた設定の整え。
+    base = Path(tempfile.gettempdir())
+    recent = []
+    for i in range(25):
+        recent = remember_recent_file(recent, str(base / f"f{i:02d}.txt"))
+    assert len(recent) == 20
+    assert recent[0] == str(base / "f24.txt")
+    assert recent[-1] == str(base / "f05.txt")
+    recent = remember_recent_file(recent, str(base / "f10.txt"))
+    assert recent[0] == str(base / "f10.txt")
+    assert recent.count(str(base / "f10.txt")) == 1
+    assert len(recent) == 20
+    # 壊れた値は黙って落とす(重複・空・文字列でないもの)。
+    assert sanitize_recent_files(None) == []
+    assert sanitize_recent_files("x") == []
+    a, b = str(base / "a.txt"), str(base / "b.txt")
+    assert sanitize_recent_files([a, 3, "", a, b, None]) == [a, b]
+
+
+def test_recent_files_read_from_settings():
+    # 起動時は editor 節の recent_files を読む。混ざった壊れた
+    # 値は、窓が開かなくならないよう整えてから使う。
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = _recent_paths(tmp, "a.txt", "b.txt")
+        window = make_window(editor_settings={
+            RECENT_FILES_KEY: [b, a, b, 42, ""]})
+        try:
+            assert window.recent_files() == [b, a]
+        finally:
+            discard_close(window)
+
+
+def test_recent_files_menu():
+    # サブメニューは履歴の順に並び、選ぶと開く。いま開いている
+    # ファイルを選んでも読み直さない(未保存の変更が残る)。
+    saved = []
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = _recent_paths(tmp, "a.txt", "b.txt")
+        window = make_window(on_settings_change=saved.append)
+        try:
+            assert window.open_path(a)
+            assert window.open_path(b)
+            window._rebuild_recent_menu()
+            labels = [act.text() for act in window._recent_menu.actions()
+                      if not act.isSeparator()]
+            assert labels == [b, a, "履歴を消す(&C)"]
+            window._edit.setPlainText("書きかけ")
+            assert window.open_recent_file(b)
+            assert window.text() == "書きかけ"
+            window.ask_save_changes = lambda: "discard"
+            assert window.open_recent_file(a)
+            assert window.current_document().path == a
+            assert window.recent_files() == [a, b]
+        finally:
+            discard_close(window)
+
+
+def test_recent_files_missing_file_removed():
+    # 無くなったファイルを選ぶと静かに失敗し、履歴から外れる
+    # (開いている文書はそのまま)。
+    saved = []
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = _recent_paths(tmp, "a.txt", "b.txt")
+        window = make_window(on_settings_change=saved.append)
+        try:
+            assert window.open_path(a)
+            assert window.open_path(b)
+            os.unlink(a)
+            assert not window.open_recent_file(a)
+            assert window.recent_files() == [b]
+            assert saved[-1] == {RECENT_FILES_KEY: [b]}
+            assert window.current_document().path == b
+        finally:
+            discard_close(window)
+
+
+def test_recent_files_clear():
+    # 「履歴を消す」で空になり、メニューは空の知らせだけになる。
+    saved = []
+    with tempfile.TemporaryDirectory() as tmp:
+        a, = _recent_paths(tmp, "a.txt")
+        window = make_window(on_settings_change=saved.append)
+        try:
+            assert window.open_path(a)
+            window.clear_recent_files()
+            assert window.recent_files() == []
+            assert saved[-1] == {RECENT_FILES_KEY: []}
+            window._rebuild_recent_menu()
+            actions = window._recent_menu.actions()
+            assert len(actions) == 1
+            assert actions[0].text() == "（履歴はありません）"
+            assert not actions[0].isEnabled()
+        finally:
+            discard_close(window)
+
+
+def test_recent_files_untitled_not_recorded_until_saved():
+    # 無題の新規文書は履歴に入らない。名前を付けて保存したら入る。
+    saved = []
+    with tempfile.TemporaryDirectory() as tmp:
+        target = str(Path(tmp) / "named.txt")
+        window = make_window(on_settings_change=saved.append)
+        try:
+            window._edit.setPlainText("下書き\n")
+            assert window.recent_files() == []
+            assert all(RECENT_FILES_KEY not in u for u in saved)
+            assert window.save_to(target)
+            assert window.recent_files() == [target]
+            assert saved[-1] == {RECENT_FILES_KEY: [target]}
+        finally:
+            discard_close(window)
 
 
 def main():

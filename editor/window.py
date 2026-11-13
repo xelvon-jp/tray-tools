@@ -35,6 +35,12 @@
 #   改行が混在する文書は、開いたときに知らせる。
 # 表示の状態とフォントと正規表現は settings の editor 節に保存され、
 # 呼び側が on_settings_change で受けて update_settings_section する。
+#
+# 最近使ったファイル(2026-11-13): 開いたファイルを editor 節の
+# recent_files に新しい順で最大20件覚え、ファイルメニューの
+# サブメニューから開き直せる。同じファイルは先頭へ繰り上げる。
+# 無くなったファイルは、選んだときに静かに失敗して履歴から外す。
+# 無題の新規文書は履歴に入れない(名前を付けて保存したら入る)。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -130,6 +136,46 @@ FONT_SAVE_DELAY_MS = 600
 # 起動したときに True のまま残っていたら、前回は適用の途中で固まった
 # 疑いがあるので、保存済みの式は使わず既定に戻して開く(起動時の保険)。
 PATTERN_APPLYING_KEY = "pattern_applying"
+
+# 最近使ったファイル(settings の editor 節 recent_files のキーと上限)。
+# 開いた順ではなく「最近開いた順」で持ち、同じファイルは先頭へ
+# 繰り上げる(remember_recent_file)。
+RECENT_FILES_KEY = "recent_files"
+RECENT_FILES_LIMIT = 20
+
+
+def sanitize_recent_files(value, limit=RECENT_FILES_LIMIT):
+    """設定から読んだ履歴を整える(文字列だけ・重複なし・上限まで)。
+
+    設定は手で書き換えられることもあるので、壊れた値が混ざって
+    いても窓が開かなくならないよう、ここで黙って落とす。"""
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            continue
+        key = os.path.normcase(os.path.abspath(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def remember_recent_file(recent, path, limit=RECENT_FILES_LIMIT):
+    """履歴の先頭に path を置いた新しい並びを返す。
+
+    既に載っているファイルは重複させず、先頭へ繰り上げる。
+    並びは最大で limit 件まで(古いものから落ちる)。"""
+    target = os.path.abspath(path)
+    key = os.path.normcase(target)
+    kept = [item for item in sanitize_recent_files(recent)
+            if os.path.normcase(os.path.abspath(item)) != key]
+    return ([target] + kept)[:limit]
 
 # 折り返しの方式(settings の editor 節 wrap_mode の値)。
 #   column … 指定の桁数で折り返す / window … 窓の幅で折り返す /
@@ -447,6 +493,10 @@ class EditorWindow(QMainWindow):
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
+        # 最近使ったファイル(新しい順)。開くたびに先頭へ繰り上げて
+        # _persist_settings で呼び側へ流す(保存は呼び側の流儀)。
+        self._recent_files = sanitize_recent_files(
+            section.get(RECENT_FILES_KEY))
 
         # マクロ(命令の列の記録・再生)と命令層の状態。文書の変化の
         # 信号が流れ始める前に用意する。
@@ -663,6 +713,10 @@ class EditorWindow(QMainWindow):
             "上書き保存(&S)", lambda: self.save(), "save", file_menu)
         self._act_save_as = self._action(
             "名前を付けて保存(&A)…", self.save_as, "save_as", file_menu)
+        # 中身は開くたびに作り直す(開いた直後の履歴とずれないため)。
+        self._recent_menu = file_menu.addMenu("最近使ったファイル(&R)")
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+        self._rebuild_recent_menu()
         file_menu.addSeparator()
         self._action("閉じる(&C)", self.close, "close_window", file_menu)
 
@@ -808,6 +862,26 @@ class EditorWindow(QMainWindow):
         self._act_send = self._action(
             "選択範囲を Copilot に投げる(&S)", self.send_selection,
             "send_selection", copilot_menu)
+
+    def _rebuild_recent_menu(self):
+        """最近使ったファイルのサブメニューを、いまの履歴で作り直す。
+
+        メニューを開くたびに呼ばれる(aboutToShow)ので、開いた
+        直後の状態ともずれない。履歴が無ければ、空と分かる
+        無効な項目だけを出す。"""
+        menu = self._recent_menu
+        menu.clear()
+        if not self._recent_files:
+            empty = menu.addAction("（履歴はありません）")
+            empty.setEnabled(False)
+            return
+        for path in self._recent_files:
+            action = menu.addAction(path)
+            action.triggered.connect(
+                lambda _checked=False, p=path: self.open_recent_file(p))
+        menu.addSeparator()
+        clear = menu.addAction("履歴を消す(&C)")
+        clear.triggered.connect(self.clear_recent_files)
 
     def _build_toolbar(self):
         """リボン風のツールバー。メニューと同じ QAction を並べるので、
@@ -1276,6 +1350,7 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"開けませんでした: {path} ({e})")
             return False
         self._set_loaded_doc(doc)
+        self._note_recent_file(doc.path)
         return True
 
     def _set_loaded_doc(self, doc):
@@ -1345,6 +1420,59 @@ class EditorWindow(QMainWindow):
         self._external_change_pending = False
         self._refresh_all()
         self._update_watcher()
+
+    # ---------------------------------------------------------------
+    # 最近使ったファイル
+    # ---------------------------------------------------------------
+    def recent_files(self):
+        """最近使ったファイルの並び(新しい順)。控えを返す。"""
+        return list(self._recent_files)
+
+    def _note_recent_file(self, path):
+        """開いた(または名前を付けて保存した)ファイルを履歴の
+        先頭へ。並びが変わったときだけ設定へ流す。"""
+        if not path:
+            return
+        updated = remember_recent_file(self._recent_files, path)
+        if updated != self._recent_files:
+            self._recent_files = updated
+            self._persist_settings({RECENT_FILES_KEY: list(updated)})
+
+    def _forget_recent_file(self, path):
+        """履歴から1件外す(無くなったファイルを選んだとき)。"""
+        key = os.path.normcase(os.path.abspath(path))
+        updated = [item for item in self._recent_files
+                   if os.path.normcase(os.path.abspath(item)) != key]
+        if updated != self._recent_files:
+            self._recent_files = updated
+            self._persist_settings({RECENT_FILES_KEY: list(updated)})
+
+    def clear_recent_files(self):
+        """履歴を全部消す(サブメニューの「履歴を消す」)。"""
+        if not self._recent_files:
+            return
+        self._recent_files = []
+        self._persist_settings({RECENT_FILES_KEY: []})
+
+    def open_recent_file(self, path) -> bool:
+        """履歴の項目から開く。
+
+        既に開いているファイルなら読み直さない(前面に出すのは
+        呼び側の作法で、窓の中では本文へフォーカスを戻すだけ)。
+        無くなっているファイルは、ダイアログを出さず静かに
+        失敗して、履歴からも外す。"""
+        if not os.path.isfile(path):
+            self._forget_recent_file(path)
+            self.statusBar().showMessage(
+                f"ファイルが見つかりませんでした: {path}", 4000)
+            return False
+        current = self._doc.path
+        if (current is not None
+                and os.path.normcase(os.path.abspath(current))
+                == os.path.normcase(os.path.abspath(path))):
+            self._edit.setFocus()
+            return True
+        return self.open_path(path)
 
     # ---------------------------------------------------------------
     # 外部で変更されたファイルの監視
@@ -1457,6 +1585,9 @@ class EditorWindow(QMainWindow):
                                      self._doc.newline)
         self._refresh_all()
         self._update_watcher()
+        # 名前を付けて保存したら、そのファイルも履歴に入れる
+        # (無題の新規文書は、名前が付くまでは入らない)。
+        self._note_recent_file(self._doc.path)
         self.statusBar().showMessage("保存しました", 4000)
         return True
 

@@ -20,8 +20,16 @@
 #     括弧・引用符までを同じ文に残し、並びの後ろでだけ改行する
 #     (「え？！」が「え？／！」に割れない)。
 #   - 対応するかっこの内側は保護範囲とし、中の句点・読点では
-#     改行しない。入れ子にも対応し、閉じていないかっこは末尾
-#     まで保護する側に倒す。対応の付かない閉じかっこは無視する。
+#     改行しない。入れ子にも対応する。ただし、対応する閉じが
+#     開きから300字以内に見つからないかっこは組にせず、ただの
+#     文字として扱う(閉じ忘れや、（「あ。）」のような種類の
+#     食い違いで、段落の残り全部が整形されなくなるのを防ぐ)。
+#     対応の付かない閉じかっこは無視する。
+#   - 段落の途中の行頭にある番号つきの印(「2)」「3.」など)は、
+#     リストの始まりと見なさず段落の続きとして扱う(CommonMark
+#     と同じく、段落を割り込めるのは「1」のときだけ)。整形で
+#     生まれた行が、2回目にリストとして字下げされて冪等で
+#     なくなるのを防ぐため。
 #   - 文の頭に残った空白(句点の後ろの空白など)は取り除く。読点
 #     で改行した続きの行も同じ。整形を2回かけても結果が変わら
 #     ない(冪等)ための決め。
@@ -140,23 +148,32 @@ def _code_spans(text):
     return spans
 
 
+# 対応する閉じを探す範囲(開きかっこからの字数)。この範囲に
+# 閉じが無い開きかっこは組にせず、ただの文字として扱う。
+_BRACKET_LIMIT = 300
+
+
 def _bracket_spans(text):
     """対応するかっこで囲まれた範囲 (開始, 終了) の列。入れ子は
-    いちばん外側の範囲だけ返す(内側はその部分集合)。閉じて
-    いないかっこは、末尾までを1つの範囲として返す。対応の付か
-    ない閉じかっこは無視する。"""
-    spans = []
+    いちばん外側の範囲だけ返す(内側はその部分集合)。対応の付か
+    ない閉じかっこは無視する。開きかっこから _BRACKET_LIMIT 字
+    以内に閉じが見つからない組は捨てる(開きかっこはただの文字
+    として扱われる)。遠い外側の組を捨てても、内側の組は残る。"""
+    pairs = []
     stack = []          # 開きかっこの位置の列
     for i, ch in enumerate(text):
         if ch in _BRACKET_PAIRS:
             stack.append(i)
         elif ch in _BRACKET_CLOSES:
             if stack and _BRACKET_PAIRS[text[stack[-1]]] == ch:
-                start = stack.pop()
-                if not stack:
-                    spans.append((start, i + 1))
-    if stack:
-        spans.append((stack[0], len(text)))
+                pairs.append((stack.pop(), i + 1))
+    pairs = [(s, e) for s, e in pairs if e - 1 - s <= _BRACKET_LIMIT]
+    pairs.sort(key=lambda pair: (pair[0], -pair[1]))
+    spans = []
+    for start, end in pairs:
+        if spans and spans[-1][0] <= start and end <= spans[-1][1]:
+            continue    # 外側の範囲に含まれている
+        spans.append((start, end))
     return spans
 
 
@@ -336,6 +353,18 @@ def _html_block_end(lines, i):
     return len(lines)
 
 
+def _interrupts_paragraph(cur, marker):
+    """段落の途中の行が、リストの始まりとして段落を割り込めるか。
+    番号つきの印は、CommonMark と同じく「1」のときだけ割り込め
+    る。それ以外の番号は段落の続きとして扱う。段落でないところ
+    (塊の頭、項目や引用の後ろ)では、従来どおり始まりになる。"""
+    if cur is None or cur["kind"] != "para":
+        return True
+    if not marker[0].isdigit():
+        return True
+    return int(marker[:-1]) == 1
+
+
 def _group_units(lines):
     """空行で区切られた塊の行を、単位(段落・項目・引用・そのまま
     の行)の列に切り分ける。"""
@@ -361,7 +390,7 @@ def _group_units(lines):
             i += 1
             continue
         m = _LIST_RX.match(line)
-        if m:
+        if m and _interrupts_paragraph(cur, m.group(2)):
             flush()
             cur = {"kind": "item", "indent": m.group(1),
                    "marker": m.group(2), "lines": [m.group(4)]}

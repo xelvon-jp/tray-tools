@@ -67,6 +67,14 @@
 # ステータスに残す(自動で上書き・化けはさせない)。無題は対象外。
 # 間隔が来たときの処理は autosave_now に寄せてあり、テストは
 # 実時間を待たずに直接呼べる。
+#
+# キー割り当ての画面(2026-11-13): 命令と現在の割り当てを一覧し、
+# その場でキーを押して変えられる(editor/keymap_dialog.py)。変更は
+# editor 節の keymap(既定と違う項目だけの上書き分)へ差分で保存
+# され、開いている窓のアクションへその場で付け直される。別の命令
+# が使っているキーを付けたら、前の命令は割り当てなしになる
+# (後勝ち。重なったままではショートカットがどちらも効かないため。
+# 画面に知らせが出る)。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -140,7 +148,8 @@ from editor.color_dialog import ColorSettingsDialog
 from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
-from editor.keymap import merge_keymap
+from editor import keymap as keymapmod
+from editor.keymap_dialog import KeymapSettingsDialog
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
@@ -182,6 +191,13 @@ AUTOSAVE_INTERVAL_KEY = "autosave_interval_sec"
 DEFAULT_AUTOSAVE_INTERVAL_SEC = 60
 AUTOSAVE_INTERVAL_MIN_SEC = 10
 AUTOSAVE_INTERVAL_MAX_SEC = 3600
+
+# キー割り当て(settings の editor 節 keymap のキー)。値は命令名 →
+# キーの上書き分(既定と違う項目だけ。割り当てを外した命令は空文字列)
+# で、実効の表は editor/keymap.py の merge_keymap で作る。
+# キー割り当ての画面(editor/keymap_dialog.py)から変えると、その場で
+# この窓のアクションへ付け直して、差分をこのキーで保存する。
+KEYMAP_KEY = "keymap"
 
 
 def sanitize_recent_files(value, limit=RECENT_FILES_LIMIT):
@@ -499,8 +515,9 @@ class EditorWindow(QMainWindow):
     editor_settings は settings の editor 節(辞書)。font_family /
     font_size / show_line_numbers / show_outline_pane / outline_pattern /
     highlight_pattern / pattern_applying(適用中の印。起動時の保険で
-    読む)/ autosave_enabled / autosave_interval_sec(自動保存)を
-    読み(無いキーは既定)、表示やフォントや正規表現が
+    読む)/ autosave_enabled / autosave_interval_sec(自動保存)/
+    keymap(キー割り当ての上書き分。コンストラクタの keymap_overrides
+    でも受ける)を読み(無いキーは既定)、表示やフォントや正規表現が
     変わったら、差分を on_settings_change(辞書を受ける関数)へ流すので、
     保存は呼び側の流儀(update_settings_section)に任せる。"""
 
@@ -515,7 +532,16 @@ class EditorWindow(QMainWindow):
         # ここで付ければ全部に付く。
         self.setWindowIcon(editor_icon.qicon())
         self._doc = docmod.TextDocument()
-        self._keymap = merge_keymap(keymap_overrides)
+        self._keymap = keymapmod.merge_keymap(keymap_overrides)
+        self._keymap_overrides = keymapmod.sanitize_overrides(
+            keymap_overrides)
+        # キー割り当てが付いたアクションの控え(命令名 → アクションの
+        # 並び)。_action が積み、キー割り当ての画面で変えたときに
+        # _apply_keymap_to_actions が付け直す。検索バーの次・前への
+        # ショートカットも同じく付け直すので、控えを持っておく。
+        self._keymap_actions = {}
+        self._find_next_shortcut = None
+        self._find_prev_shortcut = None
         # 送信の実体は差し替えられる(テストは fake を入れる)。
         self._sender = sender if sender is not None else copilot_io.send_text
         self._send_thread = None
@@ -773,6 +799,7 @@ class EditorWindow(QMainWindow):
             action.setShortcutContext(
                 Qt.ShortcutContext.WidgetWithChildrenShortcut)
             self._edit.addAction(action)
+            self._keymap_actions.setdefault(keymap_name, []).append(action)
         action.triggered.connect(slot)
         if menu is not None:
             menu.addAction(action)
@@ -926,6 +953,8 @@ class EditorWindow(QMainWindow):
             self._scheme_actions[name] = action
         self._action("色の設定(&E)…", self.show_color_settings,
                      None, view_menu)
+        self._action("キー割り当ての設定(&K)…", self.show_keymap_settings,
+                     None, view_menu)
         wrap_menu = view_menu.addMenu("折り返し(&R)")
         self._wrap_actions = {}
         for mode, label in ((WRAP_MODE_COLUMN, "桁数で折り返す(&C)"),
@@ -1046,20 +1075,22 @@ class EditorWindow(QMainWindow):
         # 本文側のショートカットは本文にフォーカスがあるときだけ
         # 効くので、検索欄にフォーカスがあっても次・前へ進めるよう、
         # 検索バーにも同じキー(F3 等)を置く。
-        next_keys = self._keymap.get("find_next")
-        if next_keys:
-            next_shortcut = QShortcut(QKeySequence(next_keys), bar)
-            next_shortcut.setContext(
-                Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            next_shortcut.activated.connect(
-                lambda: self.execute_command("find_next"))
-        prev_keys = self._keymap.get("find_prev")
-        if prev_keys:
-            prev_shortcut = QShortcut(QKeySequence(prev_keys), bar)
-            prev_shortcut.setContext(
-                Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            prev_shortcut.activated.connect(
-                lambda: self.execute_command("find_prev"))
+        # 割り当てが空でもオブジェクトは作っておく(あとからキー割り
+        # 当ての画面で付け直せるように。空のままでは発火しない)。
+        next_shortcut = QShortcut(
+            QKeySequence(self._keymap.get("find_next") or ""), bar)
+        next_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        next_shortcut.activated.connect(
+            lambda: self.execute_command("find_next"))
+        self._find_next_shortcut = next_shortcut
+        prev_shortcut = QShortcut(
+            QKeySequence(self._keymap.get("find_prev") or ""), bar)
+        prev_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        prev_shortcut.activated.connect(
+            lambda: self.execute_command("find_prev"))
+        self._find_prev_shortcut = prev_shortcut
         return bar
 
     # ---------------------------------------------------------------
@@ -1304,6 +1335,50 @@ class EditorWindow(QMainWindow):
 
     def color_overrides(self) -> dict:
         return dict(self._color_overrides)
+
+    def apply_keymap_settings(self, overrides):
+        """キー割り当ての画面からの変更(上書き分)を反映して保存する。
+
+        実効の表を作り直し、登録済みのアクションと検索バーの
+        ショートカットへ付け直す(開いているこの窓にその場で効く)。
+        保存は keymap キーへの差分(丸ごと書き換えはしない)。"""
+        self._keymap_overrides = keymapmod.sanitize_overrides(overrides)
+        self._keymap = keymapmod.merge_keymap(self._keymap_overrides)
+        self._apply_keymap_to_actions()
+        self._persist_settings({KEYMAP_KEY: dict(self._keymap_overrides)})
+
+    def _apply_keymap_to_actions(self):
+        """実効のキー割り当てを、_action で登録したアクションと
+        検索バーの次・前へのショートカットへ付け直す。"""
+        for name, actions in self._keymap_actions.items():
+            keys = self._keymap.get(name) or ""
+            sequence = QKeySequence(keys) if keys else QKeySequence()
+            for action in actions:
+                action.setShortcut(sequence)
+        for name, shortcut in (("find_next", self._find_next_shortcut),
+                               ("find_prev", self._find_prev_shortcut)):
+            if shortcut is not None:
+                keys = self._keymap.get(name) or ""
+                shortcut.setKey(
+                    QKeySequence(keys) if keys else QKeySequence())
+
+    def show_keymap_settings(self):
+        """キー割り当ての画面(editor/keymap_dialog.py)を開く。
+
+        変更はその場でこの窓へ反映され、設定へ保存される
+        (apply_keymap_settings 経由)。"""
+        dialog = KeymapSettingsDialog(
+            self, keymap=self._keymap,
+            on_change=self.apply_keymap_settings)
+        dialog.exec()
+
+    def keymap(self) -> dict:
+        """実効のキー割り当て(命令名 → キー)の写し。"""
+        return dict(self._keymap)
+
+    def keymap_overrides(self) -> dict:
+        """設定へ保存している上書き分(既定と違う項目だけ)の写し。"""
+        return dict(self._keymap_overrides)
 
     def font_size(self) -> int:
         return self._edit.font_size()

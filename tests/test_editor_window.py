@@ -42,6 +42,7 @@ from editor.highlighter import (  # noqa: E402
     STAR_BACKGROUND,
 )
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
+from editor.keymap_dialog import KeymapSettingsDialog  # noqa: E402
 from editor.window import (  # noqa: E402
     AUTOSAVE_ENABLED_KEY,
     AUTOSAVE_INTERVAL_KEY,
@@ -3079,6 +3080,76 @@ def test_autosave_settings_persist_and_interval():
         assert window3.autosave_interval_sec() == 60
     finally:
         discard_close(window3)
+
+
+def _action_by_text(window, prefix):
+    return next(
+        a for a in window.findChildren(QAction)
+        if a.text().startswith(prefix))
+
+
+def test_keymap_settings_apply_live_and_persist():
+    # 画面からの変更(上書き分)が、開いている窓のアクションへその場で
+    # 反映され、editor 節の keymap へ差分で流れる。外した命令は
+    # 空文字列で残り、ショートカットが消える。
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        assert window.keymap_overrides() == {}
+        window.apply_keymap_settings({"save": "Ctrl+Alt+S", "open": ""})
+        assert _action_by_text(
+            window, "上書き保存").shortcut().toString() == "Ctrl+Alt+S"
+        assert _action_by_text(window, "開く").shortcut().isEmpty()
+        assert window.keymap()["save"] == "Ctrl+Alt+S"
+        assert window.keymap()["open"] == ""
+        assert window.keymap_overrides() == \
+            {"save": "Ctrl+Alt+S", "open": ""}
+        assert saved[-1] == {"keymap": {"save": "Ctrl+Alt+S", "open": ""}}
+        # 検索バーの次・前へのショートカットも付け直される。
+        window.apply_keymap_settings({"find_next": "F6"})
+        assert window._find_next_shortcut.key().toString() == "F6"
+    finally:
+        discard_close(window)
+
+
+def test_keymap_dialog_drives_open_window():
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        # 表示メニューに入口がある。
+        assert _action_by_text(window, "キー割り当ての設定") is not None
+        dialog = KeymapSettingsDialog(
+            window, keymap=window.keymap(),
+            on_change=window.apply_keymap_settings)
+        try:
+            dialog.set_command_key("goto_line", "F9")
+            assert _action_by_text(
+                window, "指定行へ移動").shortcut().toString() == "F9"
+            assert saved[-1] == {"keymap": {"goto_line": "F9"}}
+            dialog.reset_all()
+            assert _action_by_text(
+                window, "指定行へ移動").shortcut().toString() == \
+                DEFAULT_KEYMAP["goto_line"]
+            assert saved[-1] == {"keymap": {}}
+        finally:
+            dialog.close()
+    finally:
+        discard_close(window)
+
+
+def test_keymap_readback_from_overrides():
+    # 設定(上書き分)から開いた窓は、その割り当てで始まる。
+    # 空文字列は割り当てなしとして効く。
+    window = make_window(
+        keymap_overrides={"save": "Ctrl+Alt+S", "open": ""})
+    try:
+        assert _action_by_text(
+            window, "上書き保存").shortcut().toString() == "Ctrl+Alt+S"
+        assert _action_by_text(window, "開く").shortcut().isEmpty()
+        assert window.keymap_overrides() == \
+            {"save": "Ctrl+Alt+S", "open": ""}
+    finally:
+        discard_close(window)
 
 
 def main():

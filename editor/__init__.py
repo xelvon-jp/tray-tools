@@ -7,6 +7,7 @@
 #   document.py     文書モデル(Qt 非依存)。文字コードと改行の保持、検索
 #   convert.py      全角・半角と英字の大文字・小文字の変換(Qt 非依存)
 #   keymap.py       キー割り当ての表(命令 → QKeySequence)
+#   keymap_dialog.py キー割り当ての設定画面(一覧・変更・既定に戻す)
 #   macros.py       マクロ(命令の列の記録の切り分けと JSON。Qt 非依存)
 #   outline.py      アウトラインの抽出と階層付け(Qt 非依存の純粋関数)
 #   rxfind.py       正規表現の検索・置換(Qt 非依存。別プロセスで実行)

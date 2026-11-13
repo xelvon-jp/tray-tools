@@ -23,6 +23,11 @@
 # 止め、閉じることも止める(実行中のセッションを抱えたまま
 # 画面が壊れるのを防ぐため)。
 #
+# セッションの後始末は、閉じる経路のどれでも行う(done だけで
+# なく closeEvent と destroyed でも)。EDDy の窓ごと閉じられた
+# ときなど、done を通らない経路で子プロセスが残るのを防ぐ
+# (req-20261114-09 の指摘)。
+#
 # 次に実行する文は背景色で示す。エラーは行番号つきで下の欄に
 # 出す(print の出力も同じ欄)。
 from PySide6.QtWidgets import (
@@ -70,6 +75,12 @@ class MacroPythonDialog(QDialog):
         self._run_begun = False
         self._output_shown = 0
         self._running = False
+        # 壊れるとき(EDDy の窓ごと閉じられたとき等)も、抱えて
+        # いるセッションの子を残さないための受け口。自分の
+        # メソッドをそのままつなぐと、親ごと壊れる経路では
+        # PySide が呼び出しを届けないことがある(実測)ため、
+        # クロージャ経由でつなぐ。
+        self.destroyed.connect(lambda *args: self._on_destroyed())
 
         layout = QVBoxLayout(self)
         if on_save is not None:
@@ -180,6 +191,23 @@ class MacroPythonDialog(QDialog):
         if self._session is not None:
             self._session.close()
             self._session = None
+
+    def _cleanup_session(self):
+        """閉じるときの後始末(実行区間を返し、セッションを捨てる)。
+
+        done・closeEvent のどちらから呼ばれてもよい(2回目以降は
+        何もしない)。"""
+        self._finish()
+        self._discard_session()
+
+    def _on_destroyed(self, *args):
+        # 画面が壊れる最中の受け口。窓側の後始末(_finish の先)は
+        # 親の窓ごと壊れている途中かもしれず触らない。ここでは
+        # セッションの子を終わらせることだけを確実に行う。
+        try:
+            self._discard_session()
+        except Exception:  # noqa: BLE001  壊れる最中で投げ切らない
+            pass
 
     def _set_running(self, running):
         self._running = running
@@ -356,10 +384,12 @@ class MacroPythonDialog(QDialog):
             self._status_label.setText(
                 "実行中です。停止してから閉じてください")
             return
+        # done を通らない閉じ方(窓の×・親の窓からの close 等)
+        # でも、セッションの子を残さない。
+        self._cleanup_session()
         super().closeEvent(event)
 
     def done(self, result):
         # 閉じるときに実行区間が開いたままなら、呼び側へ返す。
-        self._finish()
-        self._discard_session()
+        self._cleanup_session()
         super().done(result)

@@ -29,6 +29,10 @@
 #   ループ・子が落ちる)本体は無事で、stop() で子を終了できる。
 #   rxfind の子プロセス方式が前例(ただしあちらは1回ごとの実行、
 #   こちらはセッションの間ずっと生きる子と往復する)。
+#   親の受け口側でも、通してよい名前を API_SPEC と QUERY_NAMES
+#   に限り、呼び出し回数を数えて上限を超えたらセッションを
+#   止める(子の数えがどうあれ、親の側でも止められるように。
+#   req-20261114-09 の指摘)。
 #
 # 書き方の約束(安全のためではなく、EDDy のマクロとして書く
 # ための決まり。実態は利用者のプログラムなので、これを破る
@@ -101,6 +105,12 @@ API_SPEC = {
 # 読み取り専用の問い合わせ(命令ではない。記録もされない)。
 # AI に書いてもらうときに、文書の状態で条件を分けられるように。
 QUERY_NAMES = ("text", "selected_text", "cursor_line", "line_count")
+
+# 親の受け口が通してよい名前(命令 + 問い合わせ)。子がこれ以外の
+# 名前を送ってきても、実体へは渡さずエラーとして返す(受け口で
+# getattr を素通しすると、API の表面に無い名前まで届いてしまう
+# ため。req-20261114-09 の指摘)。
+ALLOWED_CALL_NAMES = frozenset(API_SPEC) | frozenset(QUERY_NAMES)
 
 # 生成コードで位置引数にする命令(先頭の引数だけを裸で書く)。
 _POSITIONAL = {"insert_text", "goto_line", "sort_lines"}
@@ -469,11 +479,23 @@ class PythonStepper:
         self._stop_event = threading.Event()
         self._send_lock = threading.Lock()
         self._closed = False
+        # 親側でも呼び出し回数を数える(上限は子へ渡す値と同じ。
+        # 構築の時点で読み、テストの定数の差し替えにも追随する)。
+        self._api_limit = API_CALL_LIMIT
+        self._api_calls = 0
+        self._limit_error = None
+        popen_kwargs = {}
+        if sys.platform == "win32":
+            # 本体が pythonw で動くとき、子にコンソール窓を
+            # 出さないための指定(Windows のみ。他の環境では
+            # 何もしない)。
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NO_WINDOW", 0)
         try:
             self._proc = subprocess.Popen(
                 [sys.executable, "-c", _CHILD_CODE],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
+                stderr=subprocess.DEVNULL, **popen_kwargs)
         except OSError as e:
             raise PythonMacroError(
                 f"マクロを実行できませんでした（{e}）") from None
@@ -483,7 +505,7 @@ class PythonStepper:
         self._reader.start()
         try:
             self._send({"type": "init", "source": str(source),
-                        "api_limit": API_CALL_LIMIT,
+                        "api_limit": self._api_limit,
                         "line_limit": LINE_EVENT_LIMIT})
             reply = self._serve({"ready", "error"},
                                 timeout=_INIT_TIMEOUT_SEC)
@@ -537,9 +559,28 @@ class PythonStepper:
                 pass    # 子が既に終わっている。受け側で検出する
 
     def _answer_call(self, msg):
-        """子からの ed の呼び出しを、親の実体へ適用して返す。"""
+        """子からの ed の呼び出しを、親の実体へ適用して返す。
+
+        通してよい名前は API_SPEC と QUERY_NAMES だけ。それ以外は
+        実体へ渡さず、無い名前としてエラーで返す。呼び出し回数は
+        親でも数え、上限を超えたらセッションを止める(子の側の
+        上限と同じ値。子が数えを誤魔化す形になっていても、親で
+        止められる)。"""
         cid = msg.get("id")
         name = str(msg.get("name") or "")
+        if name not in ALLOWED_CALL_NAMES:
+            self._send({"type": "call_error", "id": cid,
+                        "exc": "AttributeError",
+                        "message": f"ed に {name} はありません"})
+            return
+        self._api_calls += 1
+        if self._api_calls > self._api_limit:
+            self.error = PythonMacroError(
+                "ed の呼び出し回数が上限を超えたため止めました"
+                "（無限ループの疑い）")
+            self._limit_error = self.error
+            self.stop()
+            return
         fn = getattr(self._api, name, None)
         if fn is None or not callable(fn):
             self._send({"type": "call_error", "id": cid,
@@ -571,6 +612,8 @@ class PythonStepper:
         while True:
             if self._stop_event.is_set():
                 self._kill()
+                if self._limit_error is not None:
+                    raise self._limit_error
                 return None
             wait = 0.01
             if deadline is not None:
@@ -586,6 +629,8 @@ class PythonStepper:
                     self.pump()
                 continue
             if msg is None:     # 子が終わった
+                if self._limit_error is not None:
+                    raise self._limit_error
                 if self._stop_event.is_set():
                     return None
                 raise PythonMacroError(

@@ -3,8 +3,9 @@
 # offscreen で確かめる。記録 → Python 変換 → 再生で結果が同じに
 # なること、記録可能性の総点検(キー操作が一通り記録できる)、
 # ステップ実行、実行環境の約束(子プロセスで実行し、本体を
-# 巻き込まない・開いても実行しない・停止できる)、登録マクロの
-# Python 形式。
+# 巻き込まない・開いても実行しない・停止できる・閉じても子が
+# 残らない・親側でも名前の制限と呼び出し回数の上限を持つ)、
+# 登録マクロの Python 形式。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_editor_macro_py.py
 import os
@@ -24,7 +25,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-from PySide6.QtCore import QTimer, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
@@ -700,6 +701,127 @@ def test_load_macro_dialog_does_not_run():
     finally:
         QFileDialog.getOpenFileName = original
         discard_close(window)
+
+
+# ---------------------------------------------------------------
+# 再確認の残り2件(req-20261114-09)
+# ---------------------------------------------------------------
+def _wait_proc_exit(proc, timeout=5.0):
+    """子プロセスが終わるまで、イベントを回しながら待つ。"""
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None and time.monotonic() < deadline:
+        app().processEvents()
+        time.sleep(0.02)
+    return proc.poll() is not None
+
+
+def test_dialog_close_kills_child_session():
+    # 別窓を done を通らない経路(close)で閉じても、抱えている
+    # セッションの子が終わる。
+    window = make_window("ab", cursor_pos=0)
+    dialog = MacroPythonDialog(
+        window,
+        source="ed.insert_text('X')\ned.insert_text('Y')\n",
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        session = dialog.session()
+        assert session is not None
+        proc = session._proc
+        assert proc.poll() is None
+        dialog.close()
+        assert _wait_proc_exit(proc)
+        assert dialog.session() is None
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_parent_window_destroy_kills_dialog_child():
+    # レビューの再現: 別窓を開いたまま EDDy の窓ごと壊れても、
+    # 子プロセスが残らない(destroyed での後始末)。
+    window = make_window("ab", cursor_pos=0)
+    dialog = MacroPythonDialog(
+        window,
+        source="ed.insert_text('X')\ned.insert_text('Y')\n",
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+    dialog.show()
+    assert dialog.step_once()
+    session = dialog.session()
+    assert session is not None
+    proc = session._proc
+    assert proc.poll() is None
+    window.deleteLater()
+    app().sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert _wait_proc_exit(proc)
+    # 窓も別窓も壊れたあとなので、後始末はイベントを回すだけ。
+    app().processEvents()
+
+
+class _EdWithExtra:
+    """API の表面に無い名前も持つ ed の実体(親の制限の検証用)。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def insert_text(self, text):
+        self.calls.append(("insert_text", text))
+        return True
+
+    def wipe_all(self):
+        self.calls.append(("wipe_all",))
+        return True
+
+
+def test_parent_rejects_names_outside_api_spec():
+    # 親の受け口は API_SPEC と QUERY_NAMES 以外の名前を通さない
+    # (実体にその名前があっても、実体へは届かない)。
+    ed = _EdWithExtra()
+    stepper = macro_py.PythonStepper("ed.wipe_all()\n", ed)
+    try:
+        try:
+            stepper.step()
+        except macro_py.PythonMacroError as e:
+            assert "wipe_all" in str(e) and "ありません" in str(e)
+        else:
+            raise AssertionError("API_SPEC 外の名前が通ってしまった")
+        assert ed.calls == []
+        # 正規の名前は従来どおり通る。
+        ok = macro_py.PythonStepper("ed.insert_text('a')\n", ed)
+        try:
+            ok.run_all()
+            assert ed.calls == [("insert_text", "a")]
+        finally:
+            ok.close()
+    finally:
+        stepper.close()
+
+
+def test_parent_side_call_limit_stops_session():
+    # 子の上限は大きいままにして、親の数えだけで止まることを
+    # 確かめる(上限の値は子と同じ。親側の受け口でも数える)。
+    ed = _FakeEd()
+    stepper = macro_py.PythonStepper(
+        "for i in range(100):\n    ed.move_char_left()\n", ed)
+    try:
+        stepper._api_limit = 5    # 子へ渡した上限だけを差し替える
+        try:
+            stepper.run_all()
+        except macro_py.PythonMacroError as e:
+            assert "上限" in str(e)
+        else:
+            raise AssertionError("親側の上限で止まらない")
+        # 上限までの呼び出しだけが実体へ届き、セッションは止まる。
+        assert len(ed.calls) == 5
+        assert stepper.error is not None and stepper.done
+        assert _wait_proc_exit(stepper._proc)
+    finally:
+        stepper.close()
 
 
 def main():

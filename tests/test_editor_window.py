@@ -34,7 +34,11 @@ import editor  # noqa: E402
 from editor import outline  # noqa: E402
 from editor.highlighter import STAR_BACKGROUND  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
-from editor.window import PatternSettingsDialog  # noqa: E402
+from editor.window import (  # noqa: E402
+    PATTERN_APPLYING_KEY,
+    PatternSettingsDialog,
+    trial_patterns,
+)
 
 APP = None
 
@@ -467,6 +471,24 @@ def test_outline_pane_tree_and_jump():
         discard_close(window)
 
 
+def test_jump_to_line_with_wrapped_lines():
+    # 折り返しのある長い行が並ぶ文書でも、ブロック番号で飛ぶので
+    # 目標の行そのものへ着く(見た目の行で数えると別の行へ飛ぶ)。
+    window = make_window()
+    try:
+        window.resize(500, 400)
+        lines = ["あ" * 300] * 50
+        lines[19] = "■ 目標の見出し"
+        window._edit.setPlainText("\n".join(lines))
+        app().processEvents()
+        window._jump_to_line(19)
+        assert window._edit.textCursor().blockNumber() == 19
+        window._jump_to_line(0)
+        assert window._edit.textCursor().blockNumber() == 0
+    finally:
+        discard_close(window)
+
+
 def test_outline_pane_toggle_and_persist():
     saved = []
     window = make_window(on_settings_change=saved.append)
@@ -515,9 +537,12 @@ def test_window_set_patterns_reflects_immediately():
         window._edit.setPlainText("第一章 始まり\n本文\n第二章 続き")
         window._set_patterns(r"^第.+章", r"^!{3,}")
         assert window._outline_pane.tree().topLevelItemCount() == 2
+        # 適用の前に「適用中」の印が立ち、式と一緒に印が消える。
+        assert saved[0] == {PATTERN_APPLYING_KEY: True}
         assert saved[-1] == {
             "outline_pattern": r"^第.+章",
             "highlight_pattern": r"^!{3,}",
+            PATTERN_APPLYING_KEY: False,
         }
     finally:
         discard_close(window)
@@ -553,6 +578,83 @@ def test_pattern_dialog_reset_defaults():
     finally:
         dialog.deleteLater()
         app().processEvents()
+
+
+def test_pattern_guard_marks_and_clears_on_startup():
+    # 通常の起動では、適用の前に印が立ち、開けたら消えている。
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        assert saved[0] == {PATTERN_APPLYING_KEY: True}
+        assert saved[-1] == {PATTERN_APPLYING_KEY: False}
+    finally:
+        discard_close(window)
+
+
+def test_pattern_guard_leftover_marker_resets_to_defaults():
+    # 「適用中」の印が残った状態で開くと、前回固まった疑いとして、
+    # 保存済みの式は使わず既定に戻り、設定にも書き戻される。
+    saved = []
+    window = make_window(
+        editor_settings={
+            PATTERN_APPLYING_KEY: True,
+            "outline_pattern": r"^第.+章",
+            "highlight_pattern": r"^!{3,}",
+        },
+        on_settings_change=saved.append)
+    try:
+        assert window._outline_pattern_text == outline.DEFAULT_OUTLINE_PATTERN
+        assert (window._highlight_pattern_text
+                == outline.DEFAULT_HIGHLIGHT_PATTERN)
+        assert saved[0] == {
+            PATTERN_APPLYING_KEY: True,
+            "outline_pattern": "",
+            "highlight_pattern": "",
+        }
+        assert saved[-1] == {PATTERN_APPLYING_KEY: False}
+        # 既定の拾い方で動く(カスタムの「第…章」は拾わない)。
+        window._edit.setPlainText("第一章 始まり\n■ 見出し")
+        window._rebuild_outline()
+        assert window._outline_pane.tree().topLevelItemCount() == 1
+    finally:
+        discard_close(window)
+
+
+def test_pattern_dialog_rejects_slow_trial():
+    app()
+    dialog = PatternSettingsDialog(
+        outline.DEFAULT_OUTLINE_PATTERN, outline.DEFAULT_HIGHLIGHT_PATTERN,
+        trial_runner=lambda patterns: 5.0)
+    try:
+        dialog.accept()
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert "かかりすぎ" in dialog._error_label.text()
+    finally:
+        dialog.deleteLater()
+        app().processEvents()
+
+
+def test_pattern_dialog_rejects_evil_pattern():
+    # ^(a+)+$ は試験文字列で破滅的に遅くなるので、実際の試験
+    # (別プロセス)でも保存できない。子プロセスごと打ち切るため、
+    # このテスト自体は数秒で終わる。
+    app()
+    dialog = PatternSettingsDialog(
+        r"^(a+)+$", outline.DEFAULT_HIGHLIGHT_PATTERN)
+    try:
+        dialog.accept()
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert "かかりすぎ" in dialog._error_label.text()
+    finally:
+        dialog.deleteLater()
+        app().processEvents()
+
+
+def test_trial_patterns_benign_returns_seconds():
+    seconds = trial_patterns(
+        [outline.DEFAULT_OUTLINE_PATTERN, outline.DEFAULT_HIGHLIGHT_PATTERN])
+    assert seconds is not None
+    assert seconds < outline.TRIAL_TIME_LIMIT_SEC, seconds
 
 
 def test_star_line_highlight():

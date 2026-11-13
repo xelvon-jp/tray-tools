@@ -6,7 +6,12 @@
 # 編集に自動で追随するので、窓側はパターンを差し替えるだけでよい。
 # 背景色は文字の範囲にだけ付く(行の余白までは伸びない)が、選択や
 # カーソルの表示とは競合しない。
+#
+# 遅い正規表現への制限はアウトラインと共通で、各行は先頭
+# MATCH_HEAD_CHARS 字だけを match する(outline 側のコメント参照)。
 from PySide6.QtGui import QColor, QSyntaxHighlighter, QTextCharFormat
+
+from editor import outline
 
 STAR_BACKGROUND = QColor(255, 243, 176)
 
@@ -31,5 +36,7 @@ class LineHighlighter(QSyntaxHighlighter):
         self.rehighlight()
 
     def highlightBlock(self, text):  # noqa: N802  Qt の上書き
-        if self._pattern is not None and self._pattern.match(text):
+        if self._pattern is None:
+            return
+        if self._pattern.match(text[:outline.MATCH_HEAD_CHARS]):
             self.setFormat(0, len(text), self._format)

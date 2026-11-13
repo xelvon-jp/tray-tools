@@ -479,6 +479,10 @@ DEFAULT_SETTINGS = {
     #   outline_pattern / highlight_pattern … アウトラインとみなす行・
     #              強調表示する行の正規表現。空なら editor/outline.py の
     #              既定を使う。窓の設定ダイアログで変えると書き戻される
+    #   pattern_applying … 正規表現の「適用中」の印。適用の前に True、
+    #              正常に適用できたら False に戻る。True のまま残って
+    #              いたら前回は適用の途中で固まった疑いがあるので、
+    #              起動時に保存済みの式を使わず既定に戻す(起動時の保険)
     "editor": {
         "keymap": {},
         "font_family": "MS Gothic",
@@ -487,6 +491,7 @@ DEFAULT_SETTINGS = {
         "show_outline_pane": True,
         "outline_pattern": "",
         "highlight_pattern": "",
+        "pattern_applying": False,
     },
     # 写真のスライドショー(slideshow.py。全画面のフォトフレーム)。トレイの
     # 「🖼 スライドショー」から開始・設定する。窓は常駐とは別のプロセス。

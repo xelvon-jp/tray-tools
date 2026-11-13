@@ -15,6 +15,11 @@
 #   設定ダイアログ、行末まで切り取り(Ctrl+K、命令 cut_to_end)。
 # 表示の状態とフォントと正規表現は settings の editor 節に保存され、
 # 呼び側が on_settings_change で受けて update_settings_section する。
+# 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
+#   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
+#   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
+#   (trial_patterns)、適用の前に「適用中」の印を書いて起動時に
+#   残っていたら既定に戻す(pattern_applying、起動時の保険)。
 #
 # 落ちないための作法(このリポジトリの決まり):
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
@@ -23,8 +28,11 @@
 #     (ワーカースレッドから Qt を直接触らない。_AgentLoopBridge と同じ)。
 #     UIA の実体は copilot_io の裏方プロセスが持つ(常駐の中で UIA を
 #     動かすと pycaw と同居して即死するため。copilot_io 側の作法)
+import json
 import os
 import re
+import subprocess
+import sys
 import threading
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
@@ -72,6 +80,57 @@ DEFAULT_FONT_FAMILY = "MS Gothic"
 DEFAULT_FONT_SIZE = 10
 # アウトラインの再構築を編集に追随させるときのまとめ待ち(ms)。
 OUTLINE_REBUILD_DELAY_MS = 300
+
+# 正規表現の「適用中」の印に使う、settings の editor 節のキー。
+# 式を適用する前に True を書き、正常に適用できたら False に戻す。
+# 起動したときに True のまま残っていたら、前回は適用の途中で固まった
+# 疑いがあるので、保存済みの式は使わず既定に戻して開く(起動時の保険)。
+PATTERN_APPLYING_KEY = "pattern_applying"
+
+# 設定ダイアログの試験を別プロセスで待つ上限(秒)。試験自体の制限
+# (outline.TRIAL_TIME_LIMIT_SEC)に、子プロセスの起動のぶんを足したもの。
+# 上限を超えたら子プロセスごと止める(遅い式は呼び出し側では止められない)。
+TRIAL_SUBPROCESS_TIMEOUT_SEC = outline.TRIAL_TIME_LIMIT_SEC + 2.0
+
+# 試験の子プロセスで走らせるコード。標準入力の JSON
+# ({"patterns": [...], "samples": [...]})を読み、各式を各試験文字列に
+# match して、かかった秒数を標準出力へ1行で出す。Qt は読み込まない。
+_TRIAL_CHILD_CODE = (
+    "import json, re, sys, time\n"
+    "data = json.load(sys.stdin)\n"
+    "start = time.perf_counter()\n"
+    "for pattern in data['patterns']:\n"
+    "    rx = re.compile(pattern)\n"
+    "    for sample in data['samples']:\n"
+    "        rx.match(sample)\n"
+    "sys.stdout.write(repr(time.perf_counter() - start))\n"
+)
+
+
+def trial_patterns(patterns, timeout=TRIAL_SUBPROCESS_TIMEOUT_SEC):
+    """正規表現の並びが遅すぎないかを、別プロセスで試験する。
+
+    戻り値は match にかかった秒数。時間切れ・起動失敗・応答が読めない
+    ときは None(= 遅すぎるか、確かめられなかった。どちらも保存しない
+    側に倒す)。遅い式は同じプロセスでは止められないので、子プロセス
+    ごと打ち切れる形にしてある。"""
+    payload = json.dumps({
+        "patterns": [str(p) for p in patterns],
+        "samples": outline.adversarial_samples(),
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _TRIAL_CHILD_CODE],
+            input=payload, capture_output=True, text=True,
+            timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
 
 
 class _SendBridge(QObject):
@@ -160,10 +219,19 @@ class SaveOptionsDialog(QDialog):
 class PatternSettingsDialog(QDialog):
     """アウトラインとみなす行・強調表示する行の正規表現を編集する窓。
 
-    不正な正規表現はエラーを出して受け付けない(保存しない)。"""
+    不正な正規表現はエラーを出して受け付けない(保存しない)。文法が
+    通っても、遅すぎる式(破滅的なバックトラックで窓が固まるもの)は
+    試験してからでないと受け付けない。
 
-    def __init__(self, outline_pattern, highlight_pattern, parent=None):
+    trial_runner は「式の並び → かかった秒数(確かめられなければ
+    None)」の関数で、既定は別プロセスで試験する trial_patterns。
+    テストでは差し替えられる。"""
+
+    def __init__(self, outline_pattern, highlight_pattern, parent=None,
+                 trial_runner=None):
         super().__init__(parent)
+        self._trial_runner = (trial_runner if trial_runner is not None
+                              else trial_patterns)
         self.setWindowTitle("アウトライン・強調の設定")
         self._outline_edit = QLineEdit(outline_pattern)
         self._highlight_edit = QLineEdit(highlight_pattern)
@@ -206,8 +274,26 @@ class PatternSettingsDialog(QDialog):
                 return f"{label}の正規表現が不正です（{e}）"
         return None
 
+    def trial_error(self):
+        """遅すぎる式なら利用者向けの文を、問題なければ None を返す。
+
+        試験文字列は outline.adversarial_samples(意地の悪い並び)。
+        試験全体で outline.TRIAL_TIME_LIMIT_SEC を超える式と、試験
+        自体が確かめられなかった場合は、保存しない側に倒す。"""
+        outline_text, highlight_text = self.values()
+        try:
+            seconds = self._trial_runner([outline_text, highlight_text])
+        except Exception:  # noqa: BLE001  試験できないものは通さない
+            seconds = None
+        if seconds is None or seconds > outline.TRIAL_TIME_LIMIT_SEC:
+            return ("正規表現の判定に時間がかかりすぎます"
+                    "（窓が固まるおそれがあるため、保存しません）")
+        return None
+
     def accept(self):  # noqa: N802  Qt の上書きではないが名前は Qt 側に合わせる
         error = self.validation_error()
+        if error is None:
+            error = self.trial_error()
         if error is not None:
             self._error_label.setText(error)
             return
@@ -224,7 +310,8 @@ class EditorWindow(QMainWindow):
 
     editor_settings は settings の editor 節(辞書)。font_family /
     font_size / show_line_numbers / show_outline_pane / outline_pattern /
-    highlight_pattern を読む(無いキーは既定)。表示やフォントや正規表現が
+    highlight_pattern / pattern_applying(適用中の印。起動時の保険で
+    読む)を読み(無いキーは既定)、表示やフォントや正規表現が
     変わったら、差分を on_settings_change(辞書を受ける関数)へ流すので、
     保存は呼び側の流儀(update_settings_section)に任せる。"""
 
@@ -267,16 +354,31 @@ class EditorWindow(QMainWindow):
 
         # アウトライン・強調の正規表現(実効値)。設定が空なら既定、
         # 不正なら既定に倒す(窓が開かなくならないため)。
+        # 起動時の保険: 前回の適用で「適用中」の印(pattern_applying)が
+        # 残っていたら、前回は適用の途中で固まった疑いがある。保存済み
+        # の式は使わず既定に戻して開く(設定への書き戻しは、印を立てる
+        # ときに一緒に流す)。
+        self._pattern_reset_updates = None
+        if section.get(PATTERN_APPLYING_KEY):
+            outline_text = ""
+            highlight_text = ""
+            self._pattern_reset_updates = {
+                "outline_pattern": "",
+                "highlight_pattern": "",
+            }
+        else:
+            outline_text = section.get("outline_pattern") or ""
+            highlight_text = section.get("highlight_pattern") or ""
         outline_rx, self._outline_pattern_text = _compile_or_default(
-            section.get("outline_pattern") or outline.DEFAULT_OUTLINE_PATTERN,
+            outline_text or outline.DEFAULT_OUTLINE_PATTERN,
             outline.DEFAULT_OUTLINE_RX, outline.DEFAULT_OUTLINE_PATTERN)
         self._outline_rx = outline_rx
         highlight_rx, self._highlight_pattern_text = _compile_or_default(
-            section.get("highlight_pattern")
-            or outline.DEFAULT_HIGHLIGHT_PATTERN,
+            highlight_text or outline.DEFAULT_HIGHLIGHT_PATTERN,
             outline.DEFAULT_HIGHLIGHT_RX, outline.DEFAULT_HIGHLIGHT_PATTERN)
         self._highlighter = LineHighlighter(
             self._edit.document(), highlight_rx)
+        self._pattern_guard_armed = False
 
         self._outline_pane = OutlinePane()
         self._outline_pane.jump_requested.connect(self._jump_to_line)
@@ -320,9 +422,14 @@ class EditorWindow(QMainWindow):
             self.setGeometry(*geometry)
         else:
             self.resize(760, 560)
+        # ここから先で式が実際に走る(アウトライン抽出と強調の適用)。
+        # 適用の前に「適用中」の印を立て、無事に開けたら消す。途中で
+        # 固まれば印が残り、次回の起動で既定に戻る(起動時の保険)。
+        self._arm_pattern_guard()
         self._refresh_all()
         if path:
             self.open_path(path)
+        self._disarm_pattern_guard()
 
     # ---------------------------------------------------------------
     # 組み立て
@@ -446,6 +553,29 @@ class EditorWindow(QMainWindow):
         except Exception:  # noqa: BLE001  保存の失敗で編集を止めない
             self.statusBar().showMessage("設定を保存できませんでした", 4000)
 
+    def _arm_pattern_guard(self):
+        """正規表現の適用の前に「適用中」の印(PATTERN_APPLYING_KEY)を
+        設定へ書く。
+
+        保存の口が無い(呼び側が設定を持たない)ときは何もしない。
+        起動時の保険で既定に戻す場合は、その書き戻し(式を空にする)
+        も同じ書き込みで流す。"""
+        if self._on_settings_change is None:
+            return
+        updates = {PATTERN_APPLYING_KEY: True}
+        if self._pattern_reset_updates:
+            updates.update(self._pattern_reset_updates)
+            self._pattern_reset_updates = None
+        self._persist_settings(updates)
+        self._pattern_guard_armed = True
+
+    def _disarm_pattern_guard(self):
+        """適用が無事に済んだので「適用中」の印を消す。"""
+        if not self._pattern_guard_armed:
+            return
+        self._pattern_guard_armed = False
+        self._persist_settings({PATTERN_APPLYING_KEY: False})
+
     # ---------------------------------------------------------------
     # 表示の切り替え
     # ---------------------------------------------------------------
@@ -493,7 +623,9 @@ class EditorWindow(QMainWindow):
         document = self._edit.document()
         if line_number < 0 or line_number >= document.blockCount():
             return
-        block = document.findBlockByLineNumber(line_number)
+        # ブロック番号で引く。findBlockByLineNumber は折り返した
+        # 「見た目の行」で数えるので、長い行があると別の行へ飛ぶ。
+        block = document.findBlockByNumber(line_number)
         cursor = QTextCursor(block)
         self._edit.setTextCursor(cursor)
         self._edit.centerCursor()
@@ -541,17 +673,26 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"設定を開けませんでした ({e})")
 
     def _set_patterns(self, outline_text, highlight_text):
-        """正規表現を差し替え、開いている窓へ即反映して保存する。"""
+        """正規表現を差し替え、開いている窓へ即反映して保存する。
+
+        適用の前に「適用中」の印を立てる。適用の途中で固まれば印が
+        残り、次回の起動で既定に戻る(起動時の保険)。"""
+        self._arm_pattern_guard()
         self._outline_pattern_text = outline_text
         self._highlight_pattern_text = highlight_text
         self._outline_rx = outline.compile_pattern(outline_text)
         self._highlighter.set_pattern(
             outline.compile_pattern(highlight_text))
         self._rebuild_outline()
-        self._persist_settings({
+        updates = {
             "outline_pattern": outline_text,
             "highlight_pattern": highlight_text,
-        })
+        }
+        if self._pattern_guard_armed:
+            # 適用が済んだので、印も同じ書き込みで消す。
+            updates[PATTERN_APPLYING_KEY] = False
+            self._pattern_guard_armed = False
+        self._persist_settings(updates)
 
     # ---------------------------------------------------------------
     # 表示の更新

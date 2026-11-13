@@ -2396,7 +2396,7 @@ def _glyphs(window):
 
 
 def _kinds(window):
-    return list(window._edit._line_newlines)
+    return list(window._edit.line_newlines())
 
 
 def test_newline_glyphs_follow_line_insert_and_delete():
@@ -2530,7 +2530,7 @@ def test_newline_glyphs_paste_into_new_document():
     window = make_window()
     try:
         edit = window._edit
-        assert edit._line_newlines is None
+        assert edit.line_newlines() is None
         mime = QMimeData()
         mime.setText("a\nb\rc")
         edit.insertFromMimeData(mime)

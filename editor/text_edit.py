@@ -113,13 +113,43 @@ class LineNumberArea(QWidget):
         self._edit.paint_line_number_area(event)
 
 
+class _TrackingState:
+    """文書の変化に追随する控えの置き場(改行種別・編集マーク・
+    ブックマーク)。
+
+    本文ウィジェットではなくこちらに持つのは、分割表示で2つの本文
+    が1つの文書(QTextDocument)を見るときに、両方が同じ控えを
+    見て描けるようにするため。追随の計算(contentsChange への反応)
+    は文書に付いた1枚目の本文だけが行い(adopt_shared_document)、
+    2枚目は同じ置き場を読むだけにする。追随を両方が行うと、基準の
+    ブロック数を二重に進めてしまい、計算が壊れる。"""
+
+    def __init__(self):
+        # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
+        self.line_newlines = None
+        # 控えが無い・足りない行を描くときの改行(文書の改行設定)。
+        self.default_newline = "\r\n"
+        # 貼り付けの最中だけ置く、貼るテキストの改行種別の並び
+        # (追随が、挿入された改行の種別として拾う)。
+        self.paste_kinds = None
+        # 編集マーク(ブロック番号の組)と、直前の contentsChange
+        # 時点のブロック数(増減の切り分け用)。
+        self.edited_lines = set()
+        self.edited_base_count = 1
+        # ブックマーク(ブロック番号の組)と、同じくブロック数の控え。
+        self.bookmarks = set()
+        self.bookmarks_base_count = 1
+
+
 class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     """エディタの本文。font_size_changed には、Ctrl+ホイールで変わった
     あとの大きさ(pt)が流れる(窓側が設定へ保存する)。move_key には
     移動キーの命令名と「選択を広げるか」が流れる(窓側がマクロ記録の
     材料にする。本文は標準のまま動く)。unrecorded_move は、Ctrl+矢印
     など命令で表せない移動が起きた合図。mouse_pressed はマウスが
-    押された合図(どちらも、記録中に起きたら窓側が利用者へ知らせる)。"""
+    押された合図(どちらも、記録中に起きたら窓側が利用者へ知らせる)。
+    focused は、フォーカスが入った合図(分割表示で「現在のペイン」
+    を切り替えるために、ビューが受ける)。"""
 
     font_size_changed = Signal(int)
     move_key = Signal(str, bool)
@@ -127,6 +157,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     mouse_pressed = Signal()
     undo_redo_started = Signal()
     undo_redo_finished = Signal()
+    focused = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -136,27 +167,14 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         # 触らない(距離を設定しない)。
         self._tab_width = None
         self._updating_margins = False
-        # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
-        # 編集には _track_line_newlines が追随させ、控えが無い・
-        # 足りない行は _default_newline で描く。
-        self._line_newlines = None
-        self._default_newline = "\r\n"
-        # 貼り付けの最中だけ、貼るテキストの改行種別の並びをここに
-        # 置く(_track_line_newlines が挿入された改行の種別として拾う)。
-        self._paste_kinds = None
+        # 追随する控え(改行種別・編集マーク・ブックマーク)は置き場
+        # (_TrackingState)に持つ。分割表示の2枚目は、1枚目の置き場
+        # を共有する(adopt_shared_document)。
+        self._state = _TrackingState()
         self.document().contentsChange.connect(self._track_line_newlines)
-        # 編集マーク(ブロック番号の組)。開いた直後・保存した直後が
-        # 基準で、そこから変わった行に付く。_edited_base_count は
-        # 直前の contentsChange 時点のブロック数(増減の切り分け用)。
-        self._edited_lines = set()
-        self._edited_base_count = self.document().blockCount()
+        self._state.edited_base_count = self.document().blockCount()
         self.document().contentsChange.connect(self._track_edited_lines)
-        # ブックマーク(ブロック番号の組)。開いている間だけの印で、
-        # 追随は編集マークと同じ作法(_track_bookmarks)。
-        # _bookmarks_base_count は直前の contentsChange 時点の
-        # ブロック数(増減の切り分け用)。
-        self._bookmarks = set()
-        self._bookmarks_base_count = self.document().blockCount()
+        self._state.bookmarks_base_count = self.document().blockCount()
         self.document().contentsChange.connect(self._track_bookmarks)
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
@@ -184,6 +202,47 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._bookmark_color = QColor(
             self._scheme["line_number_bookmark_foreground"])
         self.cursorPositionChanged.connect(self._refresh_extra_selections)
+
+    def focusInEvent(self, event):  # noqa: N802  Qt の上書き
+        super().focusInEvent(event)
+        self.focused.emit()
+
+    # ---------------------------------------------------------------
+    # 分割表示(1つの文書を2つの本文で見る)
+    # ---------------------------------------------------------------
+    def tracking_state(self):
+        """追随する控えの置き場(_TrackingState)。分割表示の2枚目と
+        共有するために渡す。"""
+        return self._state
+
+    def adopt_shared_document(self, document, state):
+        """別の本文と文書(QTextDocument)と控えの置き場を共有する
+        (分割表示の2枚目として使うときに、ビューから呼ばれる)。
+
+        自分の文書は手放して、引数の文書を表示する。追随の計算は
+        文書に付いた1枚目が行うので、自分の追随(contentsChange への
+        接続)は外す。控えは引数の置き場に差し替えるので、行番号・
+        編集マーク・ブックマークの描画は1枚目とそろう。"""
+        old = self.document()
+        if old is not document:
+            for slot in (self._track_line_newlines,
+                         self._track_edited_lines,
+                         self._track_bookmarks):
+                try:
+                    old.contentsChange.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        self._state = state
+        if old is not document:
+            self.setDocument(document)
+
+    def refresh_line_number_area(self):
+        """行番号エリアを描き直す。
+
+        控えを共有する相手のペインで、文書を変えない操作(保存に
+        伴う編集マークの消去、ブックマークの付け外し)が起きたとき、
+        こちらの描画も合わせ直すためにビューから呼ばれる。"""
+        self._area.update()
 
     def _on_rect_changed(self) -> None:
         self._refresh_extra_selections()
@@ -268,9 +327,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         編集には _track_line_newlines が追随させる。それでも控えが
         無い行は default_newline(文書の改行設定)で描く。描画だけの
         話で、文書の内容には触らない。"""
-        self._line_newlines = list(kinds) if kinds is not None else None
+        self._state.line_newlines = list(kinds) if kinds is not None else None
         if default_newline:
-            self._default_newline = default_newline
+            self._state.default_newline = default_newline
         if self._show_invisibles:
             self.viewport().update()
 
@@ -280,9 +339,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         編集への追随(_track_line_newlines)を受けた今の並びなので、
         保存のときに「いま混在しているか」の判定と、「混在のまま」
         書くときの材料に使う(窓が保存の直前に読み取る)。"""
-        if self._line_newlines is None:
+        if self._state.line_newlines is None:
             return None
-        return list(self._line_newlines)
+        return list(self._state.line_newlines)
 
     def _track_line_newlines(self, position, chars_removed, chars_added):
         """文書の変化に、改行種別の控えを追随させる。
@@ -292,8 +351,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         (位置・削除文字数・追加文字数)から、変わった範囲のブロック
         だけを作り直す:
           - 挿入された改行で終わる行は、挿入テキスト自身の種別
-            (貼り付けのときだけ insertFromMimeData が _paste_kinds
-            に控えておく)か、無ければ文書の改行設定で描く。キー
+            (貼り付けのときだけ insertFromMimeData が置き場の
+            paste_kinds に控えておく)か、無ければ文書の改行設定で
+            描く。キー
             入力で増えた行は文書の改行設定になる
           - 範囲の最後の行は、元の並びで範囲の最後だった行の種別を
             引き継ぐ。範囲より後ろの行の種別は、そのまま後ろへ
@@ -302,7 +362,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         としては追随する。ただし、戻した行の改行種別そのものまでは
         復元できない(文書側に残っていない)ので、文書の改行設定で
         描く側に倒れる。"""
-        old = self._line_newlines
+        old = self._state.line_newlines
         if old is None or (chars_removed == 0 and chars_added == 0):
             return
         doc = self.document()
@@ -322,7 +382,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             span_old = 1
         if span_new == 1 and span_old == 1:
             return  # 行の出入りが無い変化。控えはそのまま合っている
-        paste = self._paste_kinds
+        paste = self._state.paste_kinds
         entries = []
         for j in range(span_new):
             if j < span_new - 1:
@@ -330,7 +390,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 if paste is not None and j < len(paste):
                     entries.append(paste[j])
                 else:
-                    entries.append(self._default_newline)
+                    entries.append(self._state.default_newline)
             else:
                 # 範囲の最後の行は、元の範囲の最後の行の種別を引き継ぐ。
                 idx = first + span_old - 1
@@ -343,11 +403,11 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 tail = new_kinds[-1:] or [None]
                 new_kinds = (
                     new_kinds[:-1]
-                    + [self._default_newline] * (new_count - len(new_kinds))
+                    + [self._state.default_newline] * (new_count - len(new_kinds))
                     + tail)
             else:
                 new_kinds = new_kinds[:new_count - 1] + [None]
-        self._line_newlines = new_kinds
+        self._state.line_newlines = new_kinds
         if self._show_invisibles:
             self.viewport().update()
 
@@ -359,25 +419,25 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         kinds = None
         if source is not None and source.hasText():
             kinds = docmod.line_endings(source.text())[:-1]
-        if self._line_newlines is None:
+        if self._state.line_newlines is None:
             count = self.document().blockCount()
-            self._line_newlines = (
-                [self._default_newline] * (count - 1) + [None])
-        self._paste_kinds = kinds
+            self._state.line_newlines = (
+                [self._state.default_newline] * (count - 1) + [None])
+        self._state.paste_kinds = kinds
         try:
             super().insertFromMimeData(source)
         finally:
-            self._paste_kinds = None
+            self._state.paste_kinds = None
 
     def newline_glyph(self, block_number) -> str:
         """ブロック(行)を終える改行の記号。控えから種別を引き、
         無ければ文書の改行設定で決める。"""
         kind = None
-        if (self._line_newlines is not None
-                and 0 <= block_number < len(self._line_newlines)):
-            kind = self._line_newlines[block_number]
+        if (self._state.line_newlines is not None
+                and 0 <= block_number < len(self._state.line_newlines)):
+            kind = self._state.line_newlines[block_number]
         if kind is None:
-            kind = self._default_newline
+            kind = self._state.default_newline
         return NEWLINE_GLYPHS.get(kind, NEWLINE_GLYPHS["\n"])
 
     def block_end_mark(self, block) -> str:
@@ -392,7 +452,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     # ---------------------------------------------------------------
     def edited_lines(self):
         """編集マークの付いた行のブロック番号(昇順のリスト)。"""
-        return sorted(self._edited_lines)
+        return sorted(self._state.edited_lines)
 
     def edited_line_color(self) -> QColor:
         """編集マークの行番号に使う色(配色の組から)。"""
@@ -404,8 +464,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         窓が、文書を開いた直後と保存した直後に呼ぶ。ブロック数の
         控えもいまの文書に合わせ直す(差し替えの最中の追随で残った
         ずれを、ここで断ち切る)。"""
-        self._edited_lines = set()
-        self._edited_base_count = self.document().blockCount()
+        self._state.edited_lines = set()
+        self._state.edited_base_count = self.document().blockCount()
         self._area.update()
 
     def _track_edited_lines(self, position, chars_removed, chars_added):
@@ -433,8 +493,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             return
         doc = self.document()
         new_count = doc.blockCount()
-        old_count = self._edited_base_count
-        self._edited_base_count = new_count
+        old_count = self._state.edited_base_count
+        self._state.edited_base_count = new_count
         last_pos = max(0, doc.characterCount() - 1)
         first_block = doc.findBlock(min(position, last_pos))
         if not first_block.isValid():
@@ -459,19 +519,19 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             chars_added == 0 and delta < 0
             and position == first_block.position())
         updated = set()
-        for line in self._edited_lines:
+        for line in self._state.edited_lines:
             if line < first:
                 updated.add(line)
             elif line >= first + span_old:
                 updated.add(line + delta)
         if pure_line_removal:
             # 範囲の最後に残った行のマークだけ引き継ぐ(例外2)。
-            if first + span_old - 1 in self._edited_lines:
+            if first + span_old - 1 in self._state.edited_lines:
                 updated.add(last)
         else:
             updated.update(range(first, last + 1))
-        if updated != self._edited_lines:
-            self._edited_lines = updated
+        if updated != self._state.edited_lines:
+            self._state.edited_lines = updated
             self._area.update()
 
     # ---------------------------------------------------------------
@@ -479,7 +539,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     # ---------------------------------------------------------------
     def bookmarks(self):
         """ブックマークの付いた行のブロック番号(昇順のリスト)。"""
-        return sorted(self._bookmarks)
+        return sorted(self._state.bookmarks)
 
     def bookmark_color(self) -> QColor:
         """ブックマークの印に使う色(配色の組から)。"""
@@ -489,12 +549,12 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         """行のブックマークを付け外しする。付けたら True、外したら
         False。範囲外の行番号は何もしない(戻り値は今の状態)。"""
         if not 0 <= block_number < self.document().blockCount():
-            return block_number in self._bookmarks
-        if block_number in self._bookmarks:
-            self._bookmarks.discard(block_number)
+            return block_number in self._state.bookmarks
+        if block_number in self._state.bookmarks:
+            self._state.bookmarks.discard(block_number)
             marked = False
         else:
-            self._bookmarks.add(block_number)
+            self._state.bookmarks.add(block_number)
             marked = True
         self._area.update()
         return marked
@@ -505,8 +565,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         窓が、文書を開いた直後と新規にした直後に呼ぶ(保存では
         呼ばない。編集マークと違い、保存しても印は残る)。ブロック数
         の控えもいまの文書に合わせ直す。"""
-        self._bookmarks = set()
-        self._bookmarks_base_count = self.document().blockCount()
+        self._state.bookmarks = set()
+        self._state.bookmarks_base_count = self.document().blockCount()
         self._area.update()
 
     def _track_bookmarks(self, position, chars_removed, chars_added):
@@ -527,8 +587,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             return
         doc = self.document()
         new_count = doc.blockCount()
-        old_count = self._bookmarks_base_count
-        self._bookmarks_base_count = new_count
+        old_count = self._state.bookmarks_base_count
+        self._state.bookmarks_base_count = new_count
         last_pos = max(0, doc.characterCount() - 1)
         first_block = doc.findBlock(min(position, last_pos))
         if not first_block.isValid():
@@ -553,7 +613,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             chars_added == 0 and delta < 0
             and position == first_block.position())
         updated = set()
-        for line in self._bookmarks:
+        for line in self._state.bookmarks:
             if line < first:
                 updated.add(line)
             elif line >= first + span_old:
@@ -568,8 +628,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 offset = line - first
                 if offset < span_new:
                     updated.add(first + offset)
-        if updated != self._bookmarks:
-            self._bookmarks = updated
+        if updated != self._state.bookmarks:
+            self._state.bookmarks = updated
             self._area.update()
 
     def _marker_font(self):
@@ -859,7 +919,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 marker_width = self._bookmark_marker_width()
-                if number in self._bookmarks:
+                if number in self._state.bookmarks:
                     # ブックマークの行は、行番号のわきに印を描く
                     # (編集マーク=行番号の文字色 とは別物の記号)。
                     painter.setPen(self._bookmark_color)
@@ -870,7 +930,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     painter.setFont(self.font())
                 # 編集マークの行は、行番号の色を変えて描く。
                 painter.setPen(
-                    self._edited_color if number in self._edited_lines
+                    self._edited_color if number in self._state.edited_lines
                     else self._area_foreground)
                 painter.drawText(
                     marker_width, int(top),

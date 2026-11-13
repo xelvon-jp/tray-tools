@@ -29,7 +29,8 @@
 #   outline_pane.py 左ペイン(アウトラインのツリー＋下部のファイル情報)
 #   highlighter.py  星印の行などを強調表示する QSyntaxHighlighter
 #   document_view.py 文書1つ分のビュー(本文・左ペイン・文書状態)。
-#                   タブの実体。窓はこれを並べて管理する
+#                   タブの実体。窓はこれを並べて管理する。分割表示
+#                   (同じ文書を2ペインで見る)もこちらが持つ
 #   session.py      タブと控え(ドラフト)の置き場と持ち回し(Qt 非依存。
 #                   置き場はリポジトリ外の %LOCALAPPDATA%\traytools\)
 #   window.py       窓(QMainWindow。リボン風ツールバー付き。タブで

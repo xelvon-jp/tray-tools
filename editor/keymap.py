@@ -35,6 +35,12 @@ DEFAULT_KEYMAP = {
     "delete_line": "Ctrl+Shift+K",
     "repeat_last": "F4",
     "reformat_text": "Ctrl+Shift+F",
+    # 分割表示。既定ではキーを付けない(利用者が割り当て画面で
+    # 付ける。秀丸では F6 が分割ウィンドウ切り替え)。
+    "split_horizontal": "",
+    "split_vertical": "",
+    "close_split": "",
+    "focus_next_pane": "",
 }
 
 
@@ -62,6 +68,10 @@ COMMAND_LABELS = [
     ("delete_line", "行を削除"),
     ("repeat_last", "直前の操作を繰り返す"),
     ("reformat_text", "整形"),
+    ("split_horizontal", "左右に分割"),
+    ("split_vertical", "上下に分割"),
+    ("close_split", "分割をやめる"),
+    ("focus_next_pane", "次のペインへ移動"),
 ]
 
 

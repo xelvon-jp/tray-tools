@@ -146,6 +146,19 @@
 # 経由なので、文字コードと改行は保たれ、.bak が残る。書けない
 # 文字コードのファイルはプレビューの時点で対象から外れる。
 #
+# 分割表示(2026-11-14): タブごとに、同じ文書を2ペインで同時に
+# 眺めて編集できる(表示メニューの「左右に分割」「上下に分割」)。
+# 2枚目は1枚目と QTextDocument を共有し、編集は即座にもう片方へ
+# 反映される。カーソルとスクロールはペインごとに独立で、フォーカス
+# のあるペインが「現在のペイン」として検索・保存・命令の対象になる
+# (窓の _edit はビューの active_edit を指す)。編集マーク・ブック
+# マーク・行ごとの改行種別の控えは、置き場(_TrackingState)を共有
+# するので両ペインでそろう。追随の計算は文書に付いた1枚目だけが
+# 行う。ペイン間の移動は命令 focus_next_pane(秀丸の F6 相当。
+# 既定ではキーなし、キー割り当ての画面で付けられる)。分割の状態
+# (向き・2枚目のカーソル・スプリッタの幅)はセッションの控えに残り、
+# 次に開いたときも戻る。
+#
 # タスクバーの身元(2026-11-14): 窓は常駐・あっふ と同じプロセスで
 # 開くので、そのままだとタスクバーで開いた側のアプリと同じボタン
 # にまとめられてしまう。初回表示時(showEvent)に、窓へ EDDy 専用の
@@ -217,7 +230,7 @@ from editor import editor_icon
 from editor import reformat as refmtmod
 from editor import rxfind
 from editor import session as sessionmod
-from editor.document_view import DocumentView
+from editor.document_view import SPLIT_ORIENTATIONS, DocumentView
 from editor.bookmark_dialog import BookmarkDialog
 from editor.color_dialog import ColorSettingsDialog
 from editor.ext_settings_dialog import ExtensionSettingsDialog
@@ -955,7 +968,9 @@ class EditorWindow(QMainWindow):
 
     @property
     def _edit(self):
-        return self._current_view().edit
+        # 今のタブの「現在のペイン」。分割していなければ1枚目で、
+        # 検索・保存・命令の対象はフォーカスのあるペインになる。
+        return self._current_view().active_edit()
 
     @_edit.setter
     def _edit(self, value):
@@ -1070,30 +1085,40 @@ class EditorWindow(QMainWindow):
         document = view.edit.document()
         document.modificationChanged.connect(
             lambda _modified, v=view: self._on_view_modified(v))
-        view.edit.cursorPositionChanged.connect(
-            lambda v=view: self._on_view_cursor_moved(v))
-        view.edit.selectionChanged.connect(
-            lambda v=view: self._on_view_selection_changed(v))
-        view.edit.font_size_changed.connect(
-            lambda size, v=view: self._on_font_size_changed(size, v))
         document.contentsChanged.connect(
             lambda v=view: self._on_view_contents_changed(v))
         document.contentsChange.connect(
             lambda pos, removed, added, v=view:
             self._on_document_change_for_macro(v, pos, removed, added))
-        view.edit.move_key.connect(self._on_move_key)
-        view.edit.unrecorded_move.connect(self._note_macro_skip)
-        view.edit.mouse_pressed.connect(self._note_macro_skip)
-        view.edit.undo_redo_started.connect(
-            lambda v=view: setattr(v, "suppress_change_record", True))
-        view.edit.undo_redo_finished.connect(
-            lambda v=view: setattr(v, "suppress_change_record", False))
+        self._connect_edit(view, view.edit)
         view.watcher.fileChanged.connect(
             lambda path, v=view: self._on_watched_file_changed(v, path))
         view.outline_timer.timeout.connect(
             lambda v=view: self._rebuild_outline(v))
         view.outline_pane.jump_requested.connect(
             lambda line, v=view: self._jump_to_line(line, v))
+
+    def _connect_edit(self, view, edit):
+        """本文1枚ぶんの信号を、窓の処理へつなぐ。
+
+        文書の信号は _connect_view が文書につなぐ(分割の2枚目と
+        文書を共有しても、文書の信号は1回だけつながる)。こちらは
+        ペインごとの信号だけ: カーソル・選択・フォントの大きさ・
+        マクロ記録のためのキー通知。分割の2枚目にも同じようにつなぐ
+        (_split_view)。"""
+        edit.cursorPositionChanged.connect(
+            lambda v=view: self._on_view_cursor_moved(v))
+        edit.selectionChanged.connect(
+            lambda v=view: self._on_view_selection_changed(v))
+        edit.font_size_changed.connect(
+            lambda size, v=view: self._on_font_size_changed(size, v))
+        edit.move_key.connect(self._on_move_key)
+        edit.unrecorded_move.connect(self._note_macro_skip)
+        edit.mouse_pressed.connect(self._note_macro_skip)
+        edit.undo_redo_started.connect(
+            lambda v=view: setattr(v, "suppress_change_record", True))
+        edit.undo_redo_finished.connect(
+            lambda v=view: setattr(v, "suppress_change_record", False))
 
     def _on_view_modified(self, view):
         self._update_tab_label(view)
@@ -1194,6 +1219,87 @@ class EditorWindow(QMainWindow):
         else:
             self.close()
 
+    # ---------------------------------------------------------------
+    # 分割表示(同じ文書を2ペインで見る)
+    # ---------------------------------------------------------------
+    def _split_view(self, view, orientation_name):
+        """そのタブを分割表示にする。2枚目の本文を返す。
+
+        orientation_name は "horizontal"(左右) / "vertical"(上下)。
+        既に分割していれば向きだけ変わる。新しい2枚目には、1枚目と
+        そろえた表示(フォント・配色・折り返し等)と信号の接続と
+        アクションの登録を行う(セッションからの復元でも使う)。"""
+        orientation = SPLIT_ORIENTATIONS.get(orientation_name)
+        if orientation is None or view is None:
+            return None
+        already = view.split_edit is not None
+        second = view.split(orientation)
+        if not already:
+            self._setup_pane(view, second)
+        return second
+
+    def _setup_pane(self, view, edit):
+        """新しく足したペイン(分割の2枚目)を、1枚目とそろえる。
+
+        表示の適用はビュー単位の口(_apply_font_to_view 等)が両
+        ペインへ行き渡るので、それを呼び直すのが本体。こちらの
+        ペイン固有の分は、行番号などの希望と、信号の接続と、
+        ショートカット付きアクションの登録。"""
+        self._apply_font_to_view(view)
+        if not self._line_numbers_pref:
+            edit.set_line_numbers_visible(False)
+        edit.set_show_invisibles(self._invisibles_pref)
+        edit.set_current_line_enabled(self._current_line_pref)
+        edit.setCursorWidth(3 if self._wide_cursor_pref else 1)
+        self._apply_color_scheme_to_view(view)
+        self._apply_wrap_to_view(view)
+        self._connect_edit(view, edit)
+        for actions in self._keymap_actions.values():
+            for action in actions:
+                edit.addAction(action)
+        for action in self._registered_macro_actions.values():
+            edit.addAction(action)
+
+    def split_current_view(self, orientation_name):
+        """今のタブを分割する(メニュー・キー割り当ての受け口)。"""
+        view = self._current_view()
+        if view is None:
+            return
+        second = self._split_view(view, orientation_name)
+        if second is not None:
+            second.setFocus()
+            self._schedule_session_save()
+
+    def unsplit_current_view(self):
+        """今のタブの分割をやめる(メニュー・キー割り当ての受け口)。"""
+        view = self._current_view()
+        if view is None or view.split_edit is None:
+            return
+        focused_second = view.active_edit() is view.split_edit
+        view.unsplit()
+        if focused_second:
+            view.edit.setFocus()
+        self._schedule_session_save()
+
+    def is_split(self, view=None) -> bool:
+        """そのタブ(既定は今のタブ)が分割表示かどうか。"""
+        if view is None:
+            view = self._current_view()
+        return view is not None and view.split_edit is not None
+
+    def focus_next_pane(self):
+        """もう片方のペインへフォーカスを移す(秀丸の F6 相当)。
+
+        分割していないタブでは何もしない。キー割り当ての命令
+        focus_next_pane として用意してあり、既定ではキーは付いて
+        いない(キー割り当ての画面で付けられる)。"""
+        view = self._current_view()
+        if view is None or view.split_edit is None:
+            return
+        target = (view.edit if view.active_edit() is view.split_edit
+                  else view.split_edit)
+        target.setFocus()
+
     @staticmethod
     def _same_path(a, b):
         return (a is not None and b is not None
@@ -1270,6 +1376,7 @@ class EditorWindow(QMainWindow):
                 return False  # 変更の無いタブでファイルが消えた
             self._apply_loaded_doc(view, doc)
             self._restore_cursor(view, entry)
+            self._restore_split(view, entry)
             return True
         text = entry.get("text") or ""
         doc = None
@@ -1301,6 +1408,7 @@ class EditorWindow(QMainWindow):
         self._apply_loaded_doc(view, doc, text=text, modified=True,
                                external_pending=external_pending)
         self._restore_cursor(view, entry)
+        self._restore_split(view, entry)
         if external_pending and view is self._current_view():
             self.statusBar().showMessage(
                 "このファイルは外部で変更されました"
@@ -1324,6 +1432,33 @@ class EditorWindow(QMainWindow):
             cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
         view.edit.setTextCursor(cursor)
 
+    def _restore_split(self, view, entry):
+        """記録しておいた分割の状態を、そのタブへ戻す。
+
+        向きが記録に無ければ何もしない。2枚目のカーソルと、
+        スプリッタの幅(高さ)も記録どおりに戻す。"""
+        name = entry.get("split")
+        if name not in SPLIT_ORIENTATIONS:
+            return
+        second = self._split_view(view, name)
+        if second is None:
+            return
+        try:
+            position = int(entry.get("split_cursor") or 0)
+            anchor = int(entry.get("split_anchor") or 0)
+        except (TypeError, ValueError):
+            position = anchor = 0
+        cursor = second.textCursor()
+        cursor.setPosition(anchor)
+        if position != anchor:
+            cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+        second.setTextCursor(cursor)
+        sizes = entry.get("split_sizes")
+        if (isinstance(sizes, list) and len(sizes) == 2
+                and all(isinstance(size, int) and size > 0
+                        for size in sizes)):
+            view.splitter.setSizes(sizes)
+
     def _capture_session_state(self):
         """いまのタブの顔ぶれを、セッションの記録の形で返す。
 
@@ -1341,6 +1476,15 @@ class EditorWindow(QMainWindow):
                 "cursor": cursor.position(),
                 "anchor": cursor.anchor(),
             }
+            if view.split_edit is not None:
+                # 分割の状態(向き・2枚目のカーソル・幅)も控える。
+                # 戻すときに、同じ文書を同じ眺めで開き直せる。
+                split_cursor = view.split_edit.textCursor()
+                entry["split"] = view.split_name()
+                entry["split_cursor"] = split_cursor.position()
+                entry["split_anchor"] = split_cursor.anchor()
+                entry["split_sizes"] = [
+                    int(size) for size in view.splitter.sizes()]
             if entry["dirty"]:
                 entry.update({
                     "text": doc.text,
@@ -1567,6 +1711,20 @@ class EditorWindow(QMainWindow):
         self._act_markdown.toggled.connect(self.set_markdown_highlight)
         view_menu.addAction(self._act_markdown)
         view_menu.addSeparator()
+        # 分割表示(同じ文書を2ペインで見る)。キーは既定では付けず、
+        # キー割り当ての画面で付けられる(命令 split_horizontal /
+        # split_vertical / close_split / focus_next_pane)。
+        self._action("左右に分割(&H)",
+                     lambda: self.split_current_view("horizontal"),
+                     "split_horizontal", view_menu)
+        self._action("上下に分割(&V)",
+                     lambda: self.split_current_view("vertical"),
+                     "split_vertical", view_menu)
+        self._action("分割をやめる(&U)", self.unsplit_current_view,
+                     "close_split", view_menu)
+        self._action("次のペインへ(&N)", self.focus_next_pane,
+                     "focus_next_pane", view_menu)
+        view_menu.addSeparator()
         self._action("アウトライン・強調の設定(&P)…",
                      self.show_pattern_settings, None, view_menu)
 
@@ -1753,7 +1911,8 @@ class EditorWindow(QMainWindow):
         visible = bool(visible)
         self._line_numbers_pref = visible
         for view in self._views:
-            view.edit.set_line_numbers_visible(visible)
+            for edit in view.panes():
+                edit.set_line_numbers_visible(visible)
         if self._act_line_numbers.isChecked() != visible:
             blocker = QSignalBlocker(self._act_line_numbers)
             self._act_line_numbers.setChecked(visible)
@@ -1766,7 +1925,8 @@ class EditorWindow(QMainWindow):
         visible = bool(visible)
         self._invisibles_pref = visible
         for view in self._views:
-            view.edit.set_show_invisibles(visible)
+            for edit in view.panes():
+                edit.set_show_invisibles(visible)
         if self._act_invisibles.isChecked() != visible:
             blocker = QSignalBlocker(self._act_invisibles)
             self._act_invisibles.setChecked(visible)
@@ -1779,7 +1939,8 @@ class EditorWindow(QMainWindow):
         enabled = bool(enabled)
         self._current_line_pref = enabled
         for view in self._views:
-            view.edit.set_current_line_enabled(enabled)
+            for edit in view.panes():
+                edit.set_current_line_enabled(enabled)
         if self._act_current_line.isChecked() != enabled:
             blocker = QSignalBlocker(self._act_current_line)
             self._act_current_line.setChecked(enabled)
@@ -1792,7 +1953,8 @@ class EditorWindow(QMainWindow):
         wide = bool(wide)
         self._wide_cursor_pref = wide
         for view in self._views:
-            view.edit.setCursorWidth(3 if wide else 1)
+            for edit in view.panes():
+                edit.setCursorWidth(3 if wide else 1)
         if self._act_wide_cursor.isChecked() != wide:
             blocker = QSignalBlocker(self._act_wide_cursor)
             self._act_wide_cursor.setChecked(wide)
@@ -1830,11 +1992,12 @@ class EditorWindow(QMainWindow):
 
     def _apply_font_to_view(self, view):
         """実効のフォントとタブ幅を、1つのビューの本文へ適用する
-        (保存はしない)。"""
+        (保存はしない)。分割していれば両ペインへ行き渡る。"""
         effective = self._effective_display(view)
-        view.edit.setFont(
-            QFont(effective["font_family"], effective["font_size"]))
-        view.edit.set_tab_width(effective["tab_width"])
+        for edit in view.panes():
+            edit.setFont(
+                QFont(effective["font_family"], effective["font_size"]))
+            edit.set_tab_width(effective["tab_width"])
 
     def _apply_view_display(self, view):
         """実効の表示設定(折り返し・Markdown・フォント・タブ幅)を、
@@ -1891,19 +2054,21 @@ class EditorWindow(QMainWindow):
     # 折り返し(見た目だけ。文書の内容は変えない)
     # ---------------------------------------------------------------
     def _apply_wrap_to_view(self, view):
-        """そのタブの実効の方式・桁数を、本文へ適用する(保存はしない)。"""
+        """そのタブの実効の方式・桁数を、本文へ適用する(保存はしない)。
+        分割していれば両ペインへ行き渡る。"""
         effective = self._effective_display(view)
         if effective["wrap_mode"] == WRAP_MODE_NONE:
-            view.edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            wrap_mode = QPlainTextEdit.LineWrapMode.NoWrap
         else:
             # 「桁数」も「ウィンドウ幅」も、折り返し自体は窓幅で
             # 行う。「桁数」は右の余白で見える幅を狭めて実現する。
-            view.edit.setLineWrapMode(
-                QPlainTextEdit.LineWrapMode.WidgetWidth)
+            wrap_mode = QPlainTextEdit.LineWrapMode.WidgetWidth
         # 桁数は、方式が「桁数」のときだけ余白を取る。
-        view.edit.set_wrap_column(
-            effective["wrap_column"]
-            if effective["wrap_mode"] == WRAP_MODE_COLUMN else None)
+        column = (effective["wrap_column"]
+                  if effective["wrap_mode"] == WRAP_MODE_COLUMN else None)
+        for edit in view.panes():
+            edit.setLineWrapMode(wrap_mode)
+            edit.set_wrap_column(column)
 
     def _apply_wrap_mode(self):
         """方式・桁数を、全部のタブへ適用する(保存はしない)。
@@ -2004,7 +2169,8 @@ class EditorWindow(QMainWindow):
         ハイライタへ反映する。"""
         scheme = colormod.resolve_scheme(
             self._color_scheme_name, self._color_overrides)
-        view.edit.apply_colors(scheme)
+        for edit in view.panes():
+            edit.apply_colors(scheme)
         if view.highlighter is not None:
             view.highlighter.set_background(
                 QColor(scheme["star_background"]))
@@ -2182,9 +2348,11 @@ class EditorWindow(QMainWindow):
         # 「見た目の行」で数えるので、長い行があると別の行へ飛ぶ。
         block = document.findBlockByNumber(line_number)
         cursor = QTextCursor(block)
-        view.edit.setTextCursor(cursor)
-        view.edit.centerCursor()
-        view.edit.setFocus()
+        # 飛ぶ先は、分割していれば現在のペイン(見ている側)。
+        target = view.active_edit()
+        target.setTextCursor(cursor)
+        target.centerCursor()
+        target.setFocus()
 
     def _file_size_text(self, view=None):
         if view is None:
@@ -2348,7 +2516,7 @@ class EditorWindow(QMainWindow):
         existing = self.find_view_for_path(path)
         if existing is not None:
             self._activate_view(existing)
-            existing.edit.setFocus()
+            existing.active_edit().setFocus()
             # 「最近使った」順は、タブを前に出したことも使うこと
             # として数える(履歴の先頭へ繰り上がる)。
             self._note_recent_file(existing.doc.path)
@@ -2367,7 +2535,7 @@ class EditorWindow(QMainWindow):
         self._apply_loaded_doc(view, doc)
         self._show_load_notices(doc)
         self._note_recent_file(doc.path)
-        view.edit.setFocus()
+        view.active_edit().setFocus()
         return True
 
     def _apply_loaded_doc(self, view, doc, *, text=None, modified=False,
@@ -2393,6 +2561,9 @@ class EditorWindow(QMainWindow):
         # ブックマークは前の文書の印なので、開き直したら消す。
         view.edit.clear_bookmarks()
         view.edit.document().setModified(modified)
+        # 分割していれば、控えの消去(編集マーク・ブックマーク)は
+        # 共有の置き場に効くので、もう片方の行番号も合わせ直す。
+        view.refresh_pane_areas()
         view.external_change_pending = external_pending
         self._update_tab_label(view)
         self._update_watcher(view)
@@ -2454,7 +2625,7 @@ class EditorWindow(QMainWindow):
         そのまま残る)。"""
         view = self._add_view()
         self._activate_view(view)
-        view.edit.setFocus()
+        view.active_edit().setFocus()
         self._schedule_session_save()
 
     # ---------------------------------------------------------------
@@ -2505,7 +2676,7 @@ class EditorWindow(QMainWindow):
         existing = self.find_view_for_path(path)
         if existing is not None:
             self._activate_view(existing)
-            existing.edit.setFocus()
+            existing.active_edit().setFocus()
             self._note_recent_file(existing.doc.path)
             return True
         return self.open_path(path)
@@ -2726,6 +2897,8 @@ class EditorWindow(QMainWindow):
                                      self._doc.newline)
         # 保存した内容が編集マークの新しい基準になる。
         self._edit.clear_edited_lines()
+        # 分割していれば、もう片方の行番号(編集マーク)も合わせ直す。
+        self._current_view().refresh_pane_areas()
         self._refresh_all()
         self._update_watcher()
         # 名前を付けて保存して拡張子が付いた(変わった)ら、表示
@@ -3000,6 +3173,10 @@ class EditorWindow(QMainWindow):
         """カーソル行のブックマークの付け外し(命令 toggle_bookmark)。"""
         line = self._edit.textCursor().blockNumber()
         self._edit.toggle_bookmark(line)
+        # 印はペイン間で共有なので、もう片方の行番号も合わせ直す。
+        view = self._current_view()
+        if view is not None:
+            view.refresh_pane_areas()
         return {}
 
     def _cmd_next_bookmark(self, args):
@@ -3757,7 +3934,8 @@ class EditorWindow(QMainWindow):
             action.setShortcutContext(
                 Qt.ShortcutContext.WidgetWithChildrenShortcut)
             for view in self._views:
-                view.edit.addAction(action)
+                for edit in view.panes():
+                    edit.addAction(action)
             action.triggered.connect(
                 lambda _checked=False, n=name:
                 self.play_registered_macro(n))

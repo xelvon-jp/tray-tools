@@ -27,7 +27,12 @@
 #                             時点でのディスクの印(dirty のときだけ。
 #                             戻したときに外部変更を見分けるため),
 #                           "cursor": カーソル位置(QTextCursor の位置),
-#                           "anchor": 選択の起点(カーソルと同じ単位)},
+#                           "anchor": 選択の起点(カーソルと同じ単位),
+#                           "split": 分割の向き("horizontal" は左右、
+#                             "vertical" は上下。分割していなければ無い),
+#                           "split_cursor" / "split_anchor": 2枚目の
+#                             ペインのカーソル位置と選択の起点,
+#                           "split_sizes": スプリッタの幅(高さ)の並び},
 #                          ...]},
 #                ...]}
 # 変更の無いタブは path とカーソルだけを持つ(戻すときはディスクから
@@ -82,6 +87,18 @@ def _sanitize_tab(value):
     anchor = value.get("anchor")
     tab["anchor"] = anchor if isinstance(anchor, int) and anchor >= 0 \
         else tab["cursor"]
+    split = value.get("split")
+    if split in ("horizontal", "vertical"):
+        tab["split"] = split
+        for key in ("split_cursor", "split_anchor"):
+            position = value.get(key)
+            tab[key] = position \
+                if isinstance(position, int) and position >= 0 else 0
+        sizes = value.get("split_sizes")
+        if (isinstance(sizes, list) and len(sizes) == 2
+                and all(isinstance(size, int) and size > 0
+                        for size in sizes)):
+            tab["split_sizes"] = list(sizes)
     if tab["dirty"]:
         text = value.get("text")
         if not isinstance(text, str):

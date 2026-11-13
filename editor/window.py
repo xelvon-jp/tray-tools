@@ -81,10 +81,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QToolBar,
     QVBoxLayout,
@@ -101,7 +103,7 @@ from editor import outline
 from editor import editor_icon
 from editor import rxfind
 from editor.grep_dialog import GrepDialog
-from editor.highlighter import LineHighlighter
+from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor.keymap import merge_keymap
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
@@ -125,6 +127,19 @@ FONT_SAVE_DELAY_MS = 600
 # 起動したときに True のまま残っていたら、前回は適用の途中で固まった
 # 疑いがあるので、保存済みの式は使わず既定に戻して開く(起動時の保険)。
 PATTERN_APPLYING_KEY = "pattern_applying"
+
+# 折り返しの方式(settings の editor 節 wrap_mode の値)。
+#   column … 指定の桁数で折り返す / window … 窓の幅で折り返す /
+#   none … 折り返さない。いずれも見た目だけで、文書は変えない。
+WRAP_MODE_COLUMN = "column"
+WRAP_MODE_WINDOW = "window"
+WRAP_MODE_NONE = "none"
+WRAP_MODES = (WRAP_MODE_COLUMN, WRAP_MODE_WINDOW, WRAP_MODE_NONE)
+DEFAULT_WRAP_MODE = WRAP_MODE_WINDOW
+DEFAULT_WRAP_COLUMN = 80
+# Qt の QPlainTextEdit.LineWrapMode.FixedColumnWidth(値 3)。
+# PySide6 では環境によってこの名前が列挙に現れないため、値で持つ。
+LINE_WRAP_FIXED_COLUMN = QPlainTextEdit.LineWrapMode(3)
 
 # 設定ダイアログの試験を別プロセスで待つ上限(秒)。試験自体の制限
 # (outline.TRIAL_TIME_LIMIT_SEC)に、子プロセスの起動のぶんを足したもの。
@@ -174,6 +189,17 @@ def trial_patterns(patterns, timeout=TRIAL_SUBPROCESS_TIMEOUT_SEC):
 
 class _SendBridge(QObject):
     """送信スレッド → 窓への結果の受け渡し(オブジェクトは使い回す)。"""
+
+    finished = Signal(object)
+
+
+class _RxBridge(QObject):
+    """正規表現の処理スレッド → 窓への結果の受け渡し。
+
+    rxfind.run_operation は別プロセスの完了を待つ(上限5秒)。GUI の
+    スレッドで待つと、その間窓が固まる(レビュー req-20261113-107
+    の指摘)。送信(_SendBridge)と同じく、裏スレッドで待って結果
+    だけをシグナルで戻す。"""
 
     finished = Signal(object)
 
@@ -392,6 +418,11 @@ class EditorWindow(QMainWindow):
         self._send_thread = None
         self._bridge = _SendBridge(self)
         self._bridge.finished.connect(self._on_send_finished)
+        # 正規表現の非同期実行(結果は世代で切り分ける)。
+        self._rx_bridge = _RxBridge(self)
+        self._rx_bridge.finished.connect(self._on_rx_finished)
+        self._rx_generation = 0
+        self._rx_pending = None
         # 未保存で閉じる/新規にするときの確認は差し替えられる
         # (テストは QMessageBox を出さずにここを差す)。
         # 戻り値は "save" / "discard" / "cancel"。
@@ -507,6 +538,18 @@ class EditorWindow(QMainWindow):
         self._edit.apply_colors(scheme)
         self._highlighter.set_background(QColor(scheme["star_background"]))
 
+        # 折り返し(方式と桁数)と、Markdown の色付けの希望。適用は
+        # ここ(保存は切り替えのときに流す)。Markdown が実際に効くかは
+        # 開いているファイルの拡張子で決まる(_update_markdown_highlight)。
+        wrap_mode = section.get("wrap_mode")
+        self._wrap_mode = (wrap_mode if wrap_mode in WRAP_MODES
+                           else DEFAULT_WRAP_MODE)
+        wrap_column = section.get("wrap_column")
+        self._wrap_column = (wrap_column if isinstance(wrap_column, int)
+                             and wrap_column > 0 else DEFAULT_WRAP_COLUMN)
+        self._apply_wrap_mode()
+        self._markdown_pref = bool(section.get("markdown_highlight", True))
+
         self._outline_pane = OutlinePane()
         self._outline_pane.jump_requested.connect(self._jump_to_line)
         if not section.get("show_outline_pane", True):
@@ -533,6 +576,7 @@ class EditorWindow(QMainWindow):
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
+        self._edit.selectionChanged.connect(self._refresh_position)
         self._edit.cursorPositionChanged.connect(self._track_change_cache)
         self._edit.font_size_changed.connect(self._on_font_size_changed)
         self._edit.document().contentsChanged.connect(
@@ -714,6 +758,26 @@ class EditorWindow(QMainWindow):
                 lambda _checked=False, n=name: self.apply_color_scheme(n))
             scheme_menu.addAction(action)
             self._scheme_actions[name] = action
+        wrap_menu = view_menu.addMenu("折り返し(&R)")
+        self._wrap_actions = {}
+        for mode, label in ((WRAP_MODE_COLUMN, "桁数で折り返す(&C)"),
+                            (WRAP_MODE_WINDOW, "ウィンドウ幅(&W)"),
+                            (WRAP_MODE_NONE, "折り返さない(&N)")):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(mode == self._wrap_mode)
+            action.triggered.connect(
+                lambda _checked=False, m=mode: self.set_wrap_mode(m))
+            wrap_menu.addAction(action)
+            self._wrap_actions[mode] = action
+        wrap_menu.addSeparator()
+        self._action("折り返し桁数の設定(&S)…", self._ask_wrap_column,
+                     None, wrap_menu)
+        self._act_markdown = QAction("Markdown の色付け(&M)", self)
+        self._act_markdown.setCheckable(True)
+        self._act_markdown.setChecked(self._markdown_pref)
+        self._act_markdown.toggled.connect(self.set_markdown_highlight)
+        view_menu.addAction(self._act_markdown)
         view_menu.addSeparator()
         self._action("アウトライン・強調の設定(&P)…",
                      self.show_pattern_settings, None, view_menu)
@@ -905,6 +969,99 @@ class EditorWindow(QMainWindow):
     def wide_cursor(self) -> bool:
         return self._edit.cursorWidth() > 1
 
+    # ---------------------------------------------------------------
+    # 折り返し(見た目だけ。文書の内容は変えない)
+    # ---------------------------------------------------------------
+    def _apply_wrap_mode(self):
+        """今の方式・桁数を本文へ適用する(保存はしない)。"""
+        if self._wrap_mode == WRAP_MODE_COLUMN:
+            self._edit.setLineWrapMode(LINE_WRAP_FIXED_COLUMN)
+            self._apply_wrap_column()
+        elif self._wrap_mode == WRAP_MODE_NONE:
+            self._edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        else:
+            self._edit.setLineWrapMode(
+                QPlainTextEdit.LineWrapMode.WidgetWidth)
+
+    def _apply_wrap_column(self):
+        """桁数を本文へ伝える。Qt の setLineWrapColumnOrWidth が
+        無い環境(この VM の Qt ビルドでは欠けている)では伝える口が
+        無いので飛ばす。方式と桁数の保持・保存は環境によらず効く。"""
+        setter = getattr(self._edit, "setLineWrapColumnOrWidth", None)
+        if setter is not None:
+            setter(self._wrap_column)
+
+    def set_wrap_mode(self, mode):
+        if mode not in WRAP_MODES:
+            mode = DEFAULT_WRAP_MODE
+        self._wrap_mode = mode
+        self._apply_wrap_mode()
+        for name, action in self._wrap_actions.items():
+            if action.isChecked() != (name == mode):
+                blocker = QSignalBlocker(action)
+                action.setChecked(name == mode)
+        self._persist_settings({"wrap_mode": mode})
+
+    def wrap_mode(self) -> str:
+        return self._wrap_mode
+
+    def set_wrap_column(self, column):
+        try:
+            column = int(column)
+        except (TypeError, ValueError):
+            return
+        if column <= 0:
+            return
+        self._wrap_column = column
+        if self._wrap_mode == WRAP_MODE_COLUMN:
+            self._apply_wrap_column()
+        self._persist_settings({"wrap_column": column})
+
+    def wrap_column(self) -> int:
+        return self._wrap_column
+
+    def _ask_wrap_column(self):
+        try:
+            value, ok = QInputDialog.getInt(
+                self, APP_NAME, "折り返しの桁数", self._wrap_column,
+                8, 1000, 1)
+            if ok:
+                self.set_wrap_column(value)
+                # 桁数を決めたら、その方式で見えるように切り替える。
+                if self._wrap_mode != WRAP_MODE_COLUMN:
+                    self.set_wrap_mode(WRAP_MODE_COLUMN)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"設定できませんでした ({e})")
+
+    # ---------------------------------------------------------------
+    # Markdown の色付け(拡張子で判定し、希望で切り替える)
+    # ---------------------------------------------------------------
+    def _update_markdown_highlight(self):
+        """開いているファイルが Markdown なら色付けを効かせる。
+
+        効くのは、利用者の希望(設定 markdown_highlight)が入っていて、
+        かつ拡張子が .md / .markdown のときだけ。"""
+        path = self._doc.path if self._doc else None
+        enabled = False
+        if path and self._markdown_pref:
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            enabled = ext in MARKDOWN_EXTENSIONS
+        self._highlighter.set_markdown_enabled(enabled)
+
+    def set_markdown_highlight(self, enabled):
+        enabled = bool(enabled)
+        self._markdown_pref = enabled
+        if self._act_markdown.isChecked() != enabled:
+            blocker = QSignalBlocker(self._act_markdown)
+            self._act_markdown.setChecked(enabled)
+        self._update_markdown_highlight()
+        self._persist_settings({"markdown_highlight": enabled})
+
+    def markdown_highlight(self) -> bool:
+        """利用者の希望(設定値)。実際に効いているかは拡張子にも
+        よるので、ハイライタ側の markdown_enabled を見ること。"""
+        return self._markdown_pref
+
     def apply_color_scheme(self, name):
         """配色プリセット(editor/colors.py)を適用して保存する。"""
         if name not in colormod.COLOR_SCHEMES:
@@ -1059,13 +1216,29 @@ class EditorWindow(QMainWindow):
         cursor = self._edit.textCursor()
         line = cursor.blockNumber() + 1
         column = cursor.positionInBlock() + 1
-        self._pos_label.setText(f"{line} 行 {column} 桁")
+        text = f"{line} 行 {column} 桁"
+        if cursor.hasSelection():
+            # 選択範囲の文字数と行数。改行は1文字に数える(選択文字列
+            # では段落の区切りが U+2029 で、そのまま1文字)。
+            # 行数は、選択の文字がまたがっている行の数(末尾が次の
+            # 行頭ちょうどのときは、その行は数えない)。
+            chars = len(cursor.selectedText())
+            document = self._edit.document()
+            start_block = document.findBlock(
+                cursor.selectionStart()).blockNumber()
+            end_pos = cursor.selectionEnd()
+            if end_pos > cursor.selectionStart():
+                end_pos -= 1
+            end_block = document.findBlock(end_pos).blockNumber()
+            text += f"（選択 {chars} 文字 / {end_block - start_block + 1} 行）"
+        self._pos_label.setText(text)
         self._outline_pane.set_cursor_position(line, column)
 
     def _refresh_all(self):
         self._refresh_title()
         self._refresh_status_labels()
         self._refresh_position()
+        self._update_markdown_highlight()
         self._refresh_pane_info()
         # ここで同期的に作り直すので、編集の追随で予約された分は
         # 要らない(二重に走らせない)。
@@ -1419,7 +1592,9 @@ class EditorWindow(QMainWindow):
         return True
 
     def repeat_last(self):
-        """F4: 直前の命令をもう一度実行する(命令が無ければ何もしない)。"""
+        """F4: 直前の命令をもう一度実行する(命令が無ければ何もしない)。
+        記録できない操作(矩形編集・マウス移動など)が間に起きていたら、
+        控えは消えているので何もしない(_note_macro_skip が消す)。"""
         last = self._recorder.last_command
         if last is None:
             return
@@ -1674,6 +1849,16 @@ class EditorWindow(QMainWindow):
         if not word:
             return None
         text = self._edit.toPlainText()
+        if regex and not self._replaying:
+            # 正規表現の置換は裏スレッドで回す。結果が返る前に材料は
+            # 記録する(見つからなかった回も記録に残るが、再生のとき
+            # 見つからなければ何も起きない)。マクロ再生中は、命令の
+            # 順序を守るため同期で処理する。
+            if replace_all:
+                self._start_replace_all_regex(text, word, repl, case)
+            else:
+                self._start_replace_next_regex(text, word, repl, case)
+            return {"text": word, "repl": repl, "case": case, "regex": regex}
         try:
             if replace_all:
                 done = self._apply_replace_all(text, word, repl, case, regex)
@@ -1686,6 +1871,78 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"「{word}」は見つかりません", 4000)
             return None
         return {"text": word, "repl": repl, "case": case, "regex": regex}
+
+    def _start_replace_all_regex(self, text, word, repl, case):
+        """正規表現の全部置換(非同期)。結果が返るまでに文書が
+        変わっていたら、古い結果で上書きしないよう置換をやめる。"""
+        revision = self._edit.document().revision()
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                self.statusBar().showMessage(
+                    "文書が変わったため、置換をやめました", 4000)
+                return
+            new_text, count = result["text"], result["count"]
+            if not count:
+                self.statusBar().showMessage(
+                    f"「{word}」は見つかりません", 4000)
+                return
+            self._suppress_change_record = True
+            try:
+                cursor = self._edit.textCursor()
+                cursor.beginEditBlock()
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+                cursor.movePosition(QTextCursor.MoveOperation.End,
+                                    QTextCursor.MoveMode.KeepAnchor)
+                cursor.insertText(new_text)
+                cursor.endEditBlock()
+                self._edit.setTextCursor(cursor)
+            finally:
+                self._suppress_change_record = False
+            self._track_change_cache()
+            self.statusBar().showMessage(f"{count} 件置換しました", 4000)
+
+        self._run_rx_async("replace_all", done, text=text, pattern=word,
+                           repl=repl, regex=True, case_sensitive=case)
+
+    def _start_replace_next_regex(self, text, word, repl, case):
+        """正規表現の次置換(非同期)。守りは全部置換と同じ。"""
+        cursor = self._edit.textCursor()
+        start = self._py_index(cursor.selectionStart(), text)
+        revision = self._edit.document().revision()
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                self.statusBar().showMessage(
+                    "文書が変わったため、置換をやめました", 4000)
+                return
+            if result["span"] is None:
+                self.statusBar().showMessage(
+                    f"「{word}」は見つかりません", 4000)
+                return
+            span = result["span"]
+            expanded = result["replacement"]
+            begin16 = self._utf16_index(span[0], text)
+            end16 = self._utf16_index(span[1], text)
+            self._suppress_change_record = True
+            try:
+                cursor2 = self._edit.textCursor()
+                cursor2.setPosition(begin16)
+                cursor2.setPosition(end16, QTextCursor.MoveMode.KeepAnchor)
+                cursor2.beginEditBlock()
+                cursor2.insertText(expanded)
+                cursor2.endEditBlock()
+                cursor2.setPosition(begin16)
+                cursor2.setPosition(begin16 + self._utf16_len(expanded),
+                                    QTextCursor.MoveMode.KeepAnchor)
+                self._edit.setTextCursor(cursor2)
+            finally:
+                self._suppress_change_record = False
+            self._track_change_cache()
+
+        self._run_rx_async("replace_one", done, text=text, pattern=word,
+                           repl=repl, start=start, regex=True,
+                           case_sensitive=case)
 
     def _apply_replace_all(self, text, word, repl, case, regex):
         """全部置換して、文書へ一括で反映する。置換したら True。"""
@@ -1781,9 +2038,14 @@ class EditorWindow(QMainWindow):
         self._recorder.note_command(name, {"count": 1, "extend": bool(extend)})
 
     def _note_macro_skip(self):
-        """記録できない操作が記録中に起きたら、数えて知らせる。
-        黙って記録から外すと、再生結果が実物と違うことに利用者が
-        気づけないため。"""
+        """記録できない操作が起きたときの共通の口。
+
+        その操作が「直前の操作」になるので、F4 の控えは記録中か
+        どうかによらず消す(残すと、F4 がその前の命令を繰り返して
+        見た目と違う結果になる。第2段レビューの残件)。
+        件数を数えて知らせるのは記録中だけ(再生結果が実物と違う
+        ことに利用者が気づけるように)。"""
+        self._recorder.clear_last_command()
         if not self._recorder.recording:
             return
         self._macro_skips += 1
@@ -1826,26 +2088,14 @@ class EditorWindow(QMainWindow):
                             pos + added, QTextCursor.MoveMode.KeepAnchor)
                         inserted = cursor.selectedText().replace(
                             "\u2029", "\n")
-                    commands = self._recorder.commands
-                    before_len = len(commands)
-                    before_last = None
-                    if commands:
-                        last = commands[-1]
-                        before_last = (last["cmd"],
-                                       dict(last.get("args") or {}))
-                    self._recorder.feed_change(
+                    recorded = self._recorder.feed_change(
                         pos, removed, added, inserted,
                         sel_start, sel_end, cursor_before)
-                    recorded = len(commands) > before_len
-                    if not recorded and before_last is not None and commands:
-                        last = commands[-1]
-                        recorded = (
-                            (last["cmd"], dict(last.get("args") or {}))
-                            != before_last)
                     if not recorded:
                         # 選択範囲を打って上書きする入力、矩形選択での
                         # 編集など、命令に切り分けられなかった変化。
-                        # 黙って外さず、記録中なら知らせる。
+                        # 黙って外さず知らせる(記録中は件数。F4 の
+                        # 控えは記録中でなくても消える)。
                         self._note_macro_skip()
         except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
             pass
@@ -2057,9 +2307,104 @@ class EditorWindow(QMainWindow):
         self._edit.centerCursor()
         return True
 
+    # ---------------------------------------------------------------
+    # 正規表現の非同期実行(待ちは裏スレッド、適用は GUI スレッド)
+    # ---------------------------------------------------------------
+    def _run_rx_async(self, op, on_done, **kwargs):
+        """rxfind.run_operation を裏スレッドで回し、結果を on_done
+        (結果の辞書)へ GUI スレッドで渡す。
+
+        失敗(RegexFault)はステータスに出して on_done は呼ばない。
+        新しい実行が始まったら古い結果は捨てる(検索や置換を連打
+        しても、古い結果が後の状態を上書きしない)。"""
+        self._rx_generation += 1
+        generation = self._rx_generation
+        self._rx_pending = (generation, on_done)
+        bridge = self._rx_bridge
+
+        def run():
+            try:
+                payload = (generation, rxfind.run_operation(op, **kwargs))
+            except rxfind.RegexFault as e:
+                payload = (generation, e)
+            except Exception as e:  # noqa: BLE001  理由は利用者への文にする
+                payload = (generation, rxfind.RegexFault(
+                    f"検索を実行できませんでした（{e}）"))
+            bridge.finished.emit(payload)
+
+        threading.Thread(target=run, daemon=True,
+                         name="editor-rxfind").start()
+
+    def _on_rx_finished(self, payload):
+        generation, result = payload
+        pending = self._rx_pending
+        if pending is None or pending[0] != generation:
+            return  # 新しい実行が始まっている。古い結果は捨てる
+        self._rx_pending = None
+        if isinstance(result, rxfind.RegexFault):
+            self.statusBar().showMessage(str(result), 8000)
+            return
+        pending[1](result)
+
     def _do_find_regex(self, forward: bool, word, case_sensitive) -> bool:
-        """正規表現の検索。実処理は rxfind が別プロセスで回すので、
-        不正な式はエラー表示に、固まる式は時間切れの失敗になる。"""
+        """正規表現の検索(対話操作)。実処理は別プロセスで、待ちは
+        裏スレッド(_run_rx_async)なので、遅い式でも窓は固まらない。
+        マクロ再生中は、命令の順序を守るため同期版を使う。"""
+        if self._replaying:
+            return self._do_find_regex_sync(forward, word, case_sensitive)
+        text = self._edit.toPlainText()
+        cursor = self._edit.textCursor()
+        if forward:
+            start16 = (cursor.selectionEnd() if cursor.hasSelection()
+                       else cursor.position())
+        else:
+            start16 = (cursor.selectionStart() if cursor.hasSelection()
+                       else cursor.position())
+        start = self._py_index(start16, text)
+        revision = self._edit.document().revision()
+        op = "find_next" if forward else "find_prev"
+
+        def done(result):
+            if self._edit.document().revision() != revision:
+                return  # 検索の間に文書が変わった。結果は古いので捨てる
+            span = result["span"]
+            if span is not None:
+                self._apply_find_span(span, text)
+                return
+            wrap_start = 0 if forward else len(text)
+
+            def wrapped(result2):
+                if self._edit.document().revision() != revision:
+                    return
+                span2 = result2["span"]
+                if span2 is None:
+                    self.statusBar().showMessage(
+                        f"「{word}」は見つかりません", 4000)
+                    return
+                self._apply_find_span(span2, text)
+
+            self._run_rx_async(op, wrapped, text=text, pattern=word,
+                               start=wrap_start, regex=True,
+                               case_sensitive=case_sensitive)
+
+        self._run_rx_async(op, done, text=text, pattern=word, start=start,
+                           regex=True, case_sensitive=case_sensitive)
+        return True
+
+    def _apply_find_span(self, span, text):
+        """検索で得た (開始, 終了) を選択にする。text は検索時点の
+        本文(位置の単位の変換に使う)。"""
+        cursor = self._edit.textCursor()
+        cursor.setPosition(self._utf16_index(span[0], text))
+        cursor.setPosition(self._utf16_index(span[1], text),
+                           QTextCursor.MoveMode.KeepAnchor)
+        self._edit.setTextCursor(cursor)
+        self._edit.centerCursor()
+
+    def _do_find_regex_sync(self, forward: bool, word, case_sensitive) -> bool:
+        """正規表現の検索の同期版(マクロ再生専用)。実処理は
+        rxfind が別プロセスで回すので、不正な式はエラー表示に、
+        固まる式は時間切れの失敗になる。"""
         text = self._edit.toPlainText()
         cursor = self._edit.textCursor()
         if forward:

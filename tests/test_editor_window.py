@@ -34,7 +34,13 @@ import copilot_io  # noqa: E402
 import editor  # noqa: E402
 from editor import macros as macmod  # noqa: E402
 from editor import outline  # noqa: E402
-from editor.highlighter import STAR_BACKGROUND  # noqa: E402
+from editor import rxfind  # noqa: E402
+from editor.highlighter import (  # noqa: E402
+    CODE_BLOCK_BACKGROUND,
+    HEADING_BACKGROUNDS,
+    INLINE_CODE_BACKGROUND,
+    STAR_BACKGROUND,
+)
 from editor.keymap import DEFAULT_KEYMAP  # noqa: E402
 from editor.window import (  # noqa: E402
     PATTERN_APPLYING_KEY,
@@ -64,6 +70,17 @@ def discard_close(window):
     window.close()
     window.deleteLater()
     app().processEvents()
+
+
+def wait_rx(window, timeout_ms=15000):
+    """正規表現の非同期処理が終わるまで待つ(結果が本文や選択や
+    ステータスに反映されるのは、裏スレッドからのシグナルの後)。"""
+    waited = 0
+    while window._rx_pending is not None and waited < timeout_ms:
+        QTest.qWait(20)
+        waited += 20
+    assert window._rx_pending is None, "正規表現の処理が終わらない"
+    QTest.qWait(10)
 
 
 def type_text(window, text):
@@ -987,8 +1004,10 @@ def test_regex_find_selects_matches():
         window._find_edit.setText(r"\d+")
         window._find_regex.setChecked(True)
         assert window.execute_command("find_next")
+        wait_rx(window)   # 正規表現の検索は非同期(裏スレッド)
         assert window._edit.textCursor().selectedText() == "123"
         assert window.execute_command("find_next")
+        wait_rx(window)
         assert window._edit.textCursor().selectedText() == "45"
         # 記録の引数には、正規表現で探したことが残る。
         name, args = window._recorder.last_command
@@ -1006,6 +1025,7 @@ def test_regex_replace_all_with_group_reference():
         window._replace_edit.setText(r"[\1]")
         window._find_regex.setChecked(True)
         assert window.execute_command("replace_all")
+        wait_rx(window)   # 正規表現の置換は非同期(裏スレッド)
         assert window.text() == "abc[123] def[456]"
         name, args = window._recorder.last_command
         assert name == "replace_all"
@@ -1038,8 +1058,38 @@ def test_replace_next_plain_and_regex():
         window._replace_edit.setText(r"<\1>")
         window._find_regex.setChecked(True)
         assert window.execute_command("replace_next")
+        wait_rx(window)   # 正規表現の置換は非同期(裏スレッド)
         assert window.text() == "a<1> a2"
     finally:
+        discard_close(window)
+
+
+def test_regex_replace_runs_off_gui_thread():
+    # 遅い正規表現でも、待ちは裏スレッド: execute_command は処理の
+    # 完了を待たずに戻り、結果は後から反映される(レビュー
+    # req-20261113-107 の指摘)。
+    window = make_window()
+    original = rxfind.run_operation
+
+    def slow_run(op, **kwargs):
+        time.sleep(0.4)
+        return original(op, **kwargs)
+
+    try:
+        window._edit.setPlainText("a1 b2")
+        window._find_edit.setText(r"(\d)")
+        window._replace_edit.setText(r"<\1>")
+        window._find_regex.setChecked(True)
+        rxfind.run_operation = slow_run
+        started = time.monotonic()
+        assert window.execute_command("replace_all")
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.3, elapsed      # GUI スレッドで待っていない
+        assert window.text() == "a1 b2"    # まだ反映されていない
+        wait_rx(window)
+        assert window.text() == "a<1> b<2>"
+    finally:
+        rxfind.run_operation = original
         discard_close(window)
 
 
@@ -1050,6 +1100,7 @@ def test_regex_invalid_pattern_reports_error():
         window._find_edit.setText("(")
         window._find_regex.setChecked(True)
         window.execute_command("find_next")
+        wait_rx(window)   # 不正な式の知らせも非同期で返る
         assert "不正" in window.statusBar().currentMessage()
         assert window.text() == "abc"  # 本文は変わらない
     finally:
@@ -1202,6 +1253,182 @@ def test_view_settings_read_at_open():
         assert window.color_scheme_name() == "秀丸風"
     finally:
         discard_close(window)
+
+
+def test_wrap_modes_switch_and_persist():
+    from PySide6.QtWidgets import QPlainTextEdit
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        window._edit.setPlainText("あ" * 100 + "\n短い行")
+        before = window.text()
+        # 既定はウィンドウ幅。
+        assert window.wrap_mode() == "window"
+        assert (window._edit.lineWrapMode()
+                == QPlainTextEdit.LineWrapMode.WidgetWidth)
+        window.set_wrap_mode("column")
+        assert window.wrap_mode() == "column"
+        assert (window._edit.lineWrapMode()
+                == QPlainTextEdit.LineWrapMode(3))   # FixedColumnWidth
+        assert window.wrap_column() == 80   # 既定は80桁
+        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
+            assert window._edit.lineWrapColumnOrWidth() == 80
+        assert saved[-1] == {"wrap_mode": "column"}
+        window.set_wrap_column(40)
+        assert window.wrap_column() == 40
+        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
+            assert window._edit.lineWrapColumnOrWidth() == 40
+        assert saved[-1] == {"wrap_column": 40}
+        window.set_wrap_mode("none")
+        assert (window._edit.lineWrapMode()
+                == QPlainTextEdit.LineWrapMode.NoWrap)
+        assert saved[-1] == {"wrap_mode": "none"}
+        window.set_wrap_mode("window")
+        assert (window._edit.lineWrapMode()
+                == QPlainTextEdit.LineWrapMode.WidgetWidth)
+        # 折り返しは見た目だけ: 文書は変わっていない。
+        assert window.text() == before
+        assert not window._edit.document().isModified()
+        assert window._wrap_actions["window"].isChecked()
+        assert not window._wrap_actions["none"].isChecked()
+    finally:
+        discard_close(window)
+
+
+def test_wrap_settings_read_at_open():
+    # 桁数の実反映(setLineWrapColumnOrWidth)は、この VM の Qt
+    # ビルドに API が無く未確認(実機確認待ち)。保持と復元は確かめる。
+    window = make_window(editor_settings={
+        "wrap_mode": "column", "wrap_column": 42})
+    try:
+        assert window.wrap_mode() == "column"
+        assert window.wrap_column() == 42
+        if hasattr(window._edit, "setLineWrapColumnOrWidth"):
+            assert window._edit.lineWrapColumnOrWidth() == 42
+    finally:
+        discard_close(window)
+
+
+def _select(window, start, end):
+    cursor = window._edit.textCursor()
+    cursor.setPosition(start)
+    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+    window._edit.setTextCursor(cursor)
+    window._refresh_position()
+    return window._pos_label.text()
+
+
+def test_selection_counts_in_status_bar():
+    window = make_window()
+    try:
+        window._edit.setPlainText("ab\ncd\nef")
+        # 選択が無いときは従来の表示のまま。
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        window._refresh_position()
+        assert window._pos_label.text() == "1 行 1 桁"
+        # 全文: 改行2つを含む8文字、3行。
+        assert _select(window, 0, 8) == "3 行 3 桁（選択 8 文字 / 3 行）"
+        # 1行の中の選択: 2文字、1行。
+        assert "（選択 2 文字 / 1 行）" in _select(window, 0, 2)
+        # 行末の改行まで含む選択: 3文字で、またがる行は1行。
+        assert "（選択 3 文字 / 1 行）" in _select(window, 0, 3)
+        # 改行をまたぐ選択: "b\nc" は3文字、2行。
+        assert "（選択 3 文字 / 2 行）" in _select(window, 1, 4)
+    finally:
+        discard_close(window)
+
+
+def _block_formats(window):
+    """各行(ブロック)の書式の並びを返す。"""
+    window._highlighter.rehighlight()
+    result = []
+    block = window._edit.document().firstBlock()
+    while block.isValid():
+        result.append(block.layout().formats())
+        block = block.next()
+    return result
+
+
+def test_markdown_heading_background():
+    # .md では見出し行全体に背景が付き、階層で濃さが変わる。
+    # .txt では効かない。切り替え(設定)でも消える。
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = os.path.join(tmp, "note.md")
+        Path(md_path).write_text(
+            "# 見出し1\n## 見出し2\n普通の行\n", encoding="utf-8")
+        txt_path = os.path.join(tmp, "note.txt")
+        Path(txt_path).write_text("# 見出し1\n", encoding="utf-8")
+        window = make_window(md_path)
+        try:
+            assert window._highlighter.markdown_enabled()
+            formats = _block_formats(window)
+            assert formats[0], "見出し1に書式が付いていません"
+            assert (formats[0][0].format.background().color()
+                    == HEADING_BACKGROUNDS[0])
+            assert (formats[1][0].format.background().color()
+                    == HEADING_BACKGROUNDS[1])
+            assert HEADING_BACKGROUNDS[0] != HEADING_BACKGROUNDS[1]
+            assert formats[2] == []
+            # 切り替えで消える(設定にも残る)。
+            window.set_markdown_highlight(False)
+            assert not window._highlighter.markdown_enabled()
+            assert _block_formats(window)[0] == []
+            window.set_markdown_highlight(True)
+            assert window._highlighter.markdown_enabled()
+        finally:
+            discard_close(window)
+        plain = make_window(txt_path)
+        try:
+            assert not plain._highlighter.markdown_enabled()
+            assert _block_formats(plain)[0] == []
+        finally:
+            discard_close(plain)
+
+
+def test_markdown_code_bold_link_quote_bullet():
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = os.path.join(tmp, "doc.markdown")
+        Path(md_path).write_text(
+            "太字は **強調** です\n"
+            "```\n"
+            "code **not bold**\n"
+            "```\n"
+            "[リンク](https://example.com) と `code`\n"
+            "> 引用の行\n"
+            "- 箇条書き\n",
+            encoding="utf-8")
+        window = make_window(md_path)
+        try:
+            formats = _block_formats(window)
+            # 太字の範囲に太字の書式が付く。
+            bold = [fr for fr in formats[0]
+                    if fr.format.fontWeight() >= 700]
+            assert bold, formats[0]
+            # コードブロックの内側は範囲の背景(太字にはならない)。
+            assert formats[2], "コードブロックに書式が付いていません"
+            assert (formats[2][0].format.background().color()
+                    == CODE_BLOCK_BACKGROUND)
+            assert not [fr for fr in formats[2]
+                        if fr.format.fontWeight() >= 700]
+            # 区切りの行(```)もコード側の背景。
+            assert (formats[1][0].format.background().color()
+                    == CODE_BLOCK_BACKGROUND)
+            assert (formats[3][0].format.background().color()
+                    == CODE_BLOCK_BACKGROUND)
+            # リンクには色と下線、行内コードには背景。
+            link = [fr for fr in formats[4] if fr.format.fontUnderline()]
+            assert link and link[0].format.foreground().color().isValid()
+            code = [fr for fr in formats[4]
+                    if fr.format.background().color()
+                    == INLINE_CODE_BACKGROUND]
+            assert code, formats[4]
+            # 引用と箇条書きの記号にも書式が付く。
+            assert formats[5], "引用に書式が付いていません"
+            assert formats[6], "箇条書きに書式が付いていません"
+        finally:
+            discard_close(window)
 
 
 def test_open_path_at_line():

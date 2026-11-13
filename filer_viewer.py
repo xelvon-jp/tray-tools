@@ -348,7 +348,7 @@ class TextViewer(QWidget):
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
                  colors: dict = None, editor_callback=None, nav_callback=None,
-                 geometry=None, parent=None):
+                 geometry=None, parent=None, text_editor_callback=None):
         super().__init__(parent, Qt.Window)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.path = path
@@ -357,6 +357,9 @@ class TextViewer(QWidget):
         if colors:
             self.colors.update({k: v for k, v in colors.items() if k in self.colors and v})
         self.editor_callback = editor_callback
+        # 内蔵テキストエディタで開く callback(Ctrl+E。一覧側の Ctrl+E と
+        # 同じ割り当て。E は外のエディタ、Shift+E は文字コードのため)。
+        self.text_editor_callback = text_editor_callback
         # ←→ の行き先(前・次のファイル)を返す callback。方向(-1/+1)を受けて
         # (パス, 表示名) か None を返す。ファイラが窓の並びから作る。
         self.nav_callback = nav_callback
@@ -776,6 +779,8 @@ class TextViewer(QWidget):
             self.show_numbers = not self.show_numbers
             self.area.update_ranges()
             self.area.viewport().update()
+        elif letter == "E" and ctrl:
+            self.open_text_editor()
         elif letter == "E" and not shift:
             self.open_editor()
         elif letter == "C" and ctrl:
@@ -802,6 +807,10 @@ class TextViewer(QWidget):
     def open_editor(self) -> None:
         if self.editor_callback is not None:
             self.editor_callback(self.path)
+
+    def open_text_editor(self) -> None:
+        if self.text_editor_callback is not None:
+            self.text_editor_callback(self.path)
 
     def visible_text(self) -> str:
         top = self.top_line()

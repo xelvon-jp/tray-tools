@@ -65,6 +65,16 @@ def set_cursor(window, pos):
     window._edit.setTextCursor(cursor)
 
 
+def wait_rx(window, timeout_ms=15000):
+    """正規表現の非同期処理が終わるまで待つ。"""
+    waited = 0
+    while window._rx_pending is not None and waited < timeout_ms:
+        QTest.qWait(20)
+        waited += 20
+    assert window._rx_pending is None, "正規表現の処理が終わらない"
+    QTest.qWait(10)
+
+
 # ---------------------------------------------------------------
 # 記録係(純粋な切り分け)
 # ---------------------------------------------------------------
@@ -310,6 +320,76 @@ def test_f4_without_last_command_does_nothing():
         discard_close(window)
 
 
+def test_f4_cleared_by_mouse_click():
+    # 記録できない操作(マウスでの移動)が起きたら、F4 はその前の
+    # 命令を繰り返さない。記録中でなくても同じ(第2段レビュー残件)。
+    window = make_window("hello world\nnext line", cursor_pos=2)
+    try:
+        window._act_cut_eol.trigger()
+        assert window.text() == "he\nnext line"
+        assert window._recorder.last_command is not None
+        QTest.mouseClick(window._edit.viewport(),
+                         Qt.MouseButton.LeftButton)
+        assert window._recorder.last_command is None
+        window.repeat_last()
+        assert window.text() == "he\nnext line"
+        assert window._macro_skips == 0   # 件数を数えるのは記録中だけ
+    finally:
+        discard_close(window)
+
+
+def test_f4_cleared_by_unrecorded_move():
+    # Ctrl+矢印(単語移動)も記録できない操作。F4 の控えは消える。
+    window = make_window("one two three", cursor_pos=0)
+    try:
+        QTest.keyClicks(window._edit, "x")
+        assert window._recorder.last_command is not None
+        QTest.keyClick(window._edit, Qt.Key.Key_Right,
+                       Qt.KeyboardModifier.ControlModifier)
+        assert window._recorder.last_command is None
+        before = window.text()
+        window.repeat_last()
+        assert window.text() == before
+    finally:
+        discard_close(window)
+
+
+def test_f4_cleared_by_typing_over_selection():
+    # 選択範囲を打って上書きする入力も、F4 の控えを消す。
+    window = make_window("hello world", cursor_pos=2)
+    try:
+        window._act_cut_eol.trigger()
+        assert window.text() == "he"
+        assert window._recorder.last_command is not None
+        window._edit.selectAll()
+        QTest.keyClicks(window._edit, "x")
+        assert window._recorder.last_command is None
+        window.repeat_last()
+        assert window.text() == "x"
+    finally:
+        discard_close(window)
+
+
+def test_f4_cleared_while_recording_and_counted():
+    # 記録中なら、控えが消えることに加えて「記録できない操作」と
+    # して数えられる(知らせる仕組みと矛盾しない)。
+    window = make_window("hello world", cursor_pos=2)
+    try:
+        window.set_macro_recording(True)
+        window._act_cut_eol.trigger()
+        assert window.text() == "he"
+        assert window._recorder.last_command is not None
+        QTest.mouseClick(window._edit.viewport(),
+                         Qt.MouseButton.LeftButton)
+        assert window._macro_skips == 1
+        assert window._recorder.last_command is None
+        window.repeat_last()
+        assert window.text() == "he"
+        window.set_macro_recording(False)
+    finally:
+        discard_close(window)
+
+
 def test_delete_line_middle_and_last():
     window = make_window("one\ntwo\nthree", cursor_pos=5)
     try:
@@ -463,6 +543,45 @@ def test_mouse_click_during_recording_flagged():
         window.set_macro_recording(False)
     finally:
         discard_close(window)
+
+
+def test_replace_macro_save_load_roundtrip():
+    # 置換を含むマクロは、保存(JSON 化)→読み直し→再生が往復できる
+    # (KNOWN_COMMANDS に replace_next / replace_all が要る。
+    # レビュー req-20261113-107 の指摘)。
+    window = make_window("a1 b2 a3", cursor_pos=0)
+    try:
+        window.set_macro_recording(True)
+        assert window.execute_command(
+            "replace_all",
+            {"text": "([a-z])(\\d)", "repl": "\\2\\1",
+             "case": False, "regex": True})
+        wait_rx(window)   # 正規表現の置換は非同期(裏スレッド)
+        window.set_macro_recording(False)
+        assert window.text() == "1a 2b 3a"
+        recorded = window._current_macro
+        assert [c["cmd"] for c in recorded] == ["replace_all"], recorded
+        text = macmod.macro_to_json(recorded, "置換の往復")
+        name, loaded = macmod.macro_from_json(text)
+        assert name == "置換の往復"
+        assert loaded == recorded
+    finally:
+        discard_close(window)
+    other = make_window("x9 y8", cursor_pos=0)
+    try:
+        assert other.play_macro(loaded)
+        assert other.text() == "9x 8y"
+        # replace_next も同じく往復できる。
+        one = [{"cmd": "replace_next",
+                "args": {"text": "9", "repl": "N",
+                         "case": False, "regex": False}}]
+        _name, loaded_one = macmod.macro_from_json(macmod.macro_to_json(one))
+        assert loaded_one == one
+        set_cursor(other, 0)   # 次置換はカーソル位置から探す
+        assert other.play_macro(loaded_one)
+        assert other.text() == "Nx 8y"
+    finally:
+        discard_close(other)
 
 
 def test_replace_commands_in_handwritten_macro():

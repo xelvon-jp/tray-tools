@@ -75,6 +75,26 @@ def test_plain_mode_is_literal():
     assert result["count"] == 2
 
 
+def test_replace_all_multiline_anchor():
+    # ^ と $ は行ごとに効く(MULTILINE)。文書全体にだけ効くと、
+    # 「行頭に > を付ける」が最初の行にしか効かない(レビュー
+    # req-20261113-107 の指摘)。子プロセス側・純粋関数側の両方。
+    result = rxfind.run_operation(
+        "replace_all", text="a\nb\nc", pattern="^", repl="> ")
+    assert result["text"] == "> a\n> b\n> c"
+    assert result["count"] == 3
+    result = rxfind.run_operation(
+        "replace_all", text="a\nb\nc", pattern="$", repl=";")
+    assert result["text"] == "a;\nb;\nc;"
+    rx = rxfind.compile_search("^", regex=True)
+    new_text, count = rxfind.replace_all_text("x\ny", rx, "# ")
+    assert new_text == "# x\n# y" and count == 2
+    # 行頭の検索も、2行目以降で当たる。
+    span = rxfind.run_operation(
+        "find_next", text="ab\ncd\nef", pattern="^e", start=0)["span"]
+    assert span == (6, 7), span
+
+
 def test_invalid_pattern_is_fault():
     try:
         rxfind.run_operation("find_next", text="abc", pattern="(", start=0)

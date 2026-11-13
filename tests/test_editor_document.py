@@ -151,7 +151,45 @@ def test_save_backup_and_no_temp_left():
         assert sorted(names) == ["a.txt", "a.txt.bak"], names
 
 
-def test_save_failure_keeps_original():
+def test_save_preserves_file_permissions():
+    # 原子的な保存(os.replace)で新しいファイルになっても、元の
+    # アクセス権は引き継がれる(レビュー req-20261113-107 の指摘)。
+    import stat as statmod
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "内容\n".encode("utf-8"))
+        os.chmod(path, 0o640)
+        doc = docmod.load_document(path)
+        doc.text = "書き換えた内容\n"
+        docmod.save_document(doc)
+        mode = statmod.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o640, oct(mode)
+        assert Path(path).read_text(encoding="utf-8") == "書き換えた内容\n"
+
+
+def test_capture_restore_file_attrs_units():
+    # 属性の控えと引き継ぎの単体: 控えが元のモードを持ち、別の
+    # ファイルへ適用できる。存在しないファイルの控えは None。
+    import stat as statmod
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src.txt")
+        dst = os.path.join(tmp, "dst.txt")
+        _write(src, "a".encode("utf-8"))
+        _write(dst, "b".encode("utf-8"))
+        os.chmod(src, 0o600)
+        os.chmod(dst, 0o644)
+        saved = docmod._capture_file_attrs(src)
+        assert saved is not None and saved["mode"] == 0o600
+        docmod._restore_file_attrs(dst, saved)
+        assert statmod.S_IMODE(os.stat(dst).st_mode) == 0o600
+        assert docmod._capture_file_attrs(
+            os.path.join(tmp, "無い.txt")) is None
+        docmod._restore_file_attrs(dst, None)   # 控え無しは無事に何もしない
+        if sys.platform == "win32":
+            # Windows 固有ぶん(隠し属性・作成日時)の控えが取れる。
+            assert saved["windows"] is not None
+        # Windows 以外では windows の控えは None(Linux の VM では
+        # 隠し属性・作成日時は未実施=実機確認待ち)。
     """書き込みの途中で失敗しても、元のファイルは壊れない(原子性)。"""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "a.txt")

@@ -35,9 +35,11 @@ class RegexFault(Exception):
 def compile_search(pattern, regex=True, case_sensitive=False):
     """検索パターンをコンパイルする。不正なら RegexFault。
 
-    regex=False なら pattern は文字どおりに探す文字列として扱う。"""
+    regex=False なら pattern は文字どおりに探す文字列として扱う。
+    ^ と $ は行の頭・末尾に効かせる(MULTILINE)。文書全体ではなく
+    行ごとに効くのが、テキストエディタの検索・置換の作法。"""
     source = pattern if regex else re.escape(pattern)
-    flags = 0 if case_sensitive else re.IGNORECASE
+    flags = re.MULTILINE | (0 if case_sensitive else re.IGNORECASE)
     try:
         return re.compile(source, flags)
     except re.error as e:
@@ -124,7 +126,7 @@ import json, re, sys
 
 def compile_search(pattern, regex, case):
     source = pattern if regex else re.escape(pattern)
-    flags = 0 if case else re.IGNORECASE
+    flags = re.MULTILINE | (0 if case else re.IGNORECASE)
     return re.compile(source, flags)
 
 def expand(match, repl, regex):

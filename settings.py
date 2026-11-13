@@ -472,8 +472,26 @@ DEFAULT_SETTINGS = {
     #   keymap   … キー割り当ての上書き(命令名 → QKeySequence の文字列)。
     #              既定は editor/keymap.py の DEFAULT_KEYMAP
     #   geometry … 窓の位置と大きさ [x, y, w, h]。エディタを閉じたときに書く
+    #   font_family / font_size … 編集エリアの字。Ctrl+ホイールで大きさを
+    #              変えると font_size がここへ書き戻される
+    #   show_line_numbers / show_outline_pane … 行番号と左ペイン(アウト
+    #              ライン)の表示。窓で切り替えるとここへ書き戻される
+    #   outline_pattern / highlight_pattern … アウトラインとみなす行・
+    #              強調表示する行の正規表現。空なら editor/outline.py の
+    #              既定を使う。窓の設定ダイアログで変えると書き戻される
+    #   pattern_applying … 正規表現の「適用中」の印。適用の前に True、
+    #              正常に適用できたら False に戻る。True のまま残って
+    #              いたら前回は適用の途中で固まった疑いがあるので、
+    #              起動時に保存済みの式を使わず既定に戻す(起動時の保険)
     "editor": {
         "keymap": {},
+        "font_family": "MS Gothic",
+        "font_size": 10,
+        "show_line_numbers": True,
+        "show_outline_pane": True,
+        "outline_pattern": "",
+        "highlight_pattern": "",
+        "pattern_applying": False,
     },
     # 写真のスライドショー(slideshow.py。全画面のフォトフレーム)。トレイの
     # 「🖼 スライドショー」から開始・設定する。窓は常駐とは別のプロセス。

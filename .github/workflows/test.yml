@@ -18,7 +18,7 @@ on:
 jobs:
   filer:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     # windows-latest の標準出力/標準エラーは cp1252 なので、テストが日本語を print した
     # 時点で UnicodeEncodeError になり、traceback の表示ごと落ちる(10/27 以降の全滅の原因)。
     env:
@@ -60,3 +60,12 @@ jobs:
         # 純ロジックとルール編集ダイアログ(ダイアログだけ offscreen の Qt)。自分で終了コードを返す。
         shell: cmd
         run: python -X faulthandler -u tests/test_folder_watch.py
+
+      - name: 残りのテスト全部(当面は報告のみ)
+        # 2026-11-13 の見直し討論(テーマ6): CI は tests/ の49ファイル中4つしか回していなかった。
+        # 上の4つ以外を run_all.py でまとめて回す。落ちるものの整理が済むまでは、失敗しても
+        # ジョブは落とさず結果だけ残す(continue-on-error)。整理が済んだら外す。
+        continue-on-error: true
+        timeout-minutes: 25
+        shell: cmd
+        run: python -X faulthandler -u tests/run_all.py --timeout 300 --exclude test_filer.py,test_slideshow.py,test_photometa.py,test_folder_watch.py

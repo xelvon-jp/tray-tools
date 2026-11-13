@@ -6,7 +6,7 @@
 #   - メモは1件だけ。データは PC ローカル(%LOCALAPPDATA%\traytools\
 #     tomorrow_memo.json)に持つ。settings.json には混ぜない。公開リポジトリの
 #     フォルダには置かない(移行前の置き場に残っていたら、読み込み時に
-#     新しい置き場へ取り込む)。
+#     新しい置き場へ取り込む。両方にあれば履歴を統合する)。
 #   - 書いた内容は入力のたびに自動保存する(保存ボタンは無い)。
 #   - 過去のメモは自動で履歴に残る。本文が失われる経路を作らない:
 #       * 起動時に表示したメモは、閉じた時点で履歴へ移す(reason="seen")
@@ -16,17 +16,18 @@
 #     保存は一時ファイル + os.replace の原子的書き換えで、途中で落ちても
 #     ファイルが半端な状態にはならない。
 #   - 起動時に、まだ見ていない(未表示の)メモがあれば窓で出す。空なら出さない。
-#     ただし、書いた時刻が今回の PC の起動時刻より前のものだけを出す。
-#     自動反映や再起動のたびに、書いたばかりのメモを誰も見ていないのに
-#     表示済みにしてしまわないため(起動時刻が取れない環境では出す側に倒す)。
+#     ただし出すのは「書いた日が今日より前」で「今日が最後に表示した日より
+#     後」のときだけ(最後に表示した日はデータに覚えておく)。同じ日の再起動や
+#     自動反映では出直さず、書いた当日にも出ない。判定は PC の起動時刻では
+#     しない(長期連続稼働・休止・高速スタートアップでは起動時刻が戻らず、
+#     当てにならないため)。
 #   - 窓から過去のメモも読める(読み取り専用)。
 #
 # データの持ち方と窓をこのモジュールにまとめ、データ部分(TomorrowMemoStore)は
 # Qt に依存させない(テストと将来の使い回しのため)。
 import json
 import os
-import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 DATA_FILENAME = "tomorrow_memo.json"
@@ -54,22 +55,20 @@ def default_data_path() -> Path:
 DEFAULT_DATA_PATH = default_data_path()
 
 
-def system_boot_time():
-    """PC の起動時刻(naive な datetime)。Windows の GetTickCount64 から逆算する。
+def _today_str() -> str:
+    return datetime.now().date().isoformat()
 
-    取れない環境(Windows 以外・API の失敗)では None を返す。その場合、
-    起動時の表示は「出す」側に倒す(has_unseen_for_startup を参照)。"""
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetTickCount64.argtypes = []
-        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
-        uptime_ms = int(kernel32.GetTickCount64())
-    except Exception:  # noqa: BLE001  取れなければ None(出す側に倒す)
-        return None
-    return datetime.now() - timedelta(milliseconds=uptime_ms)
+
+def _as_date_str(value) -> str:
+    """日付の指定を "YYYY-MM-DD" にそろえる。date / datetime / ISO 文字列
+    (日付だけでも日時でもよい)を受け、None なら今日。"""
+    if value is None:
+        return _today_str()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
 
 # 起動してから未表示メモを出すまでの待ち(ms)。トレイや他の起動処理が
 # 落ち着いてから出す(呼び出し側 feature_screen が使う)。
@@ -77,10 +76,12 @@ STARTUP_SHOW_DELAY_MS = 3000
 
 REASON_SEEN = "seen"        # 起動時に表示して閉じた
 REASON_REPLACED = "replaced"  # 書く窓で書き換えられた
+REASON_MERGED = "merged"    # 置き場の移行で統合された(古い方の現在のメモ)
 
 _REASON_LABELS = {
     REASON_SEEN: "表示済み",
     REASON_REPLACED: "書き換え前",
+    REASON_MERGED: "統合",
 }
 
 
@@ -97,7 +98,67 @@ def format_written_at(iso_text: str) -> str:
 
 
 def _empty_state() -> dict:
-    return {"version": 1, "current": None, "history": []}
+    return {"version": 1, "current": None, "history": [],
+            "last_shown_date": None}
+
+
+def _parse_state(data) -> dict:
+    """ファイルから読んだ dict を state の形に整える。想定外の要素は捨てる。"""
+    state = _empty_state()
+    if not isinstance(data, dict):
+        return state
+    current = data.get("current")
+    if isinstance(current, dict) and isinstance(current.get("text"), str):
+        state["current"] = {
+            "text": current["text"],
+            "written_at": str(current.get("written_at") or ""),
+            "seen": bool(current.get("seen")),
+        }
+    history = data.get("history")
+    if isinstance(history, list):
+        state["history"] = [
+            {
+                "text": item["text"],
+                "written_at": str(item.get("written_at") or ""),
+                "archived_at": str(item.get("archived_at") or ""),
+                "reason": str(item.get("reason") or ""),
+            }
+            for item in history
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+    last_shown = data.get("last_shown_date")
+    if isinstance(last_shown, str) and last_shown:
+        state["last_shown_date"] = last_shown
+    return state
+
+
+def _read_state_file(path):
+    """state ファイルを読む。無い・壊れている・dict でなければ None。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _parse_state(data)
+
+
+def _merge_histories(*histories):
+    """複数の履歴を1つに統合する。同じ記録は1つにし、新しい順に並べる。"""
+    seen_keys = set()
+    merged = []
+    for history in histories:
+        for item in history:
+            key = (item["text"], item["written_at"],
+                   item["archived_at"], item["reason"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(item)
+    merged.sort(
+        key=lambda item: (item["archived_at"], item["written_at"]),
+        reverse=True)
+    return merged
 
 
 class TomorrowMemoStore:
@@ -107,7 +168,8 @@ class TomorrowMemoStore:
       {"version": 1,
        "current": {"text": str, "written_at": ISO, "seen": bool} | None,
        "history": [{"text": str, "written_at": ISO, "archived_at": ISO,
-                    "reason": "seen" | "replaced"}, ...]}  # 新しい順
+                    "reason": "seen" | "replaced" | "merged"}, ...],  # 新しい順
+       "last_shown_date": "YYYY-MM-DD" | None}  # 起動時表示した最後の日
     """
 
     def __init__(self, path=None):
@@ -121,68 +183,89 @@ class TomorrowMemoStore:
     # ---------------------------------------------------------------
     # 読み書き
     # ---------------------------------------------------------------
-    def _import_legacy(self) -> None:
+    def _merge_legacy(self) -> None:
         """移行前の置き場(リポジトリのフォルダ)にデータが残っていたら、
-        新しい置き場へ取り込む。移したら元のファイルは消す(個人のメモを
-        公開リポジトリのフォルダに残さないため。消せなくても、新しい
-        置き場のほうを読むので支障は無い)。"""
+        新しい置き場へ取り込む。
+
+        新しい置き場にまだ何も無ければそのまま移る。両方にデータがある
+        場合は統合する(履歴は重複を除いてまとめ、現在のメモは書いた日時が
+        新しい方を残して、古い方は履歴へ移す)。本文が失われる経路を作ら
+        ないため。取り込み終えたら元のファイルは消す(個人のメモを公開
+        リポジトリのフォルダに残さないため。消せなくても、新しい置き場の
+        ほうを読むので支障は無い)。"""
         if self._legacy_checked:
             return
         self._legacy_checked = True
-        try:
-            if self.path.exists():
-                return
-            legacy = LEGACY_DATA_PATH
-            if legacy == self.path or not legacy.exists():
-                return
-            raw = legacy.read_bytes()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.path.with_name(self.path.name + ".tmp")
-            tmp_path.write_bytes(raw)
-            os.replace(tmp_path, self.path)
+        legacy_path = LEGACY_DATA_PATH
+        if legacy_path == self.path:
+            return
+        legacy = _read_state_file(legacy_path)
+        if legacy is None:
+            return
+        state = self._state
+        changed = False
+        # 現在のメモ: 書いた日時が新しい方を残し、古い方は履歴へ回す
+        loser = None
+        new_current = state["current"]
+        legacy_current = legacy["current"]
+        if legacy_current is not None:
+            if new_current is None:
+                state["current"] = legacy_current
+                changed = True
+            elif (new_current["text"] == legacy_current["text"]
+                    and new_current["written_at"]
+                    == legacy_current["written_at"]):
+                # 同じメモが両方にある。表示済みかどうかだけそろえる
+                if legacy_current["seen"] and not new_current["seen"]:
+                    new_current["seen"] = True
+                    changed = True
+            elif legacy_current["written_at"] > new_current["written_at"]:
+                loser = new_current
+                state["current"] = legacy_current
+                changed = True
+            else:
+                loser = legacy_current
+        extra = []
+        if loser is not None and loser["text"].strip():
+            extra.append({
+                "text": loser["text"],
+                "written_at": loser["written_at"],
+                "archived_at": _now_iso(),
+                "reason": REASON_MERGED,
+            })
+        # 履歴: 重複を除いて統合する
+        merged_history = _merge_histories(
+            state["history"], legacy["history"] + extra)
+        if merged_history != state["history"]:
+            state["history"] = merged_history
+            changed = True
+        # 最後に表示した日: 遅い方を残す
+        legacy_shown = legacy["last_shown_date"]
+        if legacy_shown and (not state["last_shown_date"]
+                             or legacy_shown > state["last_shown_date"]):
+            state["last_shown_date"] = legacy_shown
+            changed = True
+        if changed:
             try:
-                legacy.unlink()
+                self._save()
             except OSError:
-                pass
+                return  # 保存できなければ元のファイルも残す(次回また試す)
+        try:
+            legacy_path.unlink()
         except OSError:
-            pass  # 取り込めなければ空から始める(従来どおり)
+            pass
 
     def _load(self) -> dict:
         if self._state is not None:
             return self._state
+        # 無い・壊れている場合は空として扱う。壊れた元ファイルは、最初の
+        # 保存で丸ごと新しい状態に置き換わる(履歴も含めて失うのはこの場合
+        # だけだが、壊れた JSON からは復元できないので仕方がない)。
+        state = _read_state_file(self.path)
+        self._state = state if state is not None else _empty_state()
         if self._using_default_path:
-            self._import_legacy()
-        state = _empty_state()
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                current = data.get("current")
-                if isinstance(current, dict) and isinstance(current.get("text"), str):
-                    state["current"] = {
-                        "text": current["text"],
-                        "written_at": str(current.get("written_at") or ""),
-                        "seen": bool(current.get("seen")),
-                    }
-                history = data.get("history")
-                if isinstance(history, list):
-                    state["history"] = [
-                        {
-                            "text": item["text"],
-                            "written_at": str(item.get("written_at") or ""),
-                            "archived_at": str(item.get("archived_at") or ""),
-                            "reason": str(item.get("reason") or ""),
-                        }
-                        for item in history
-                        if isinstance(item, dict) and isinstance(item.get("text"), str)
-                    ]
-        except (OSError, ValueError):
-            # 無い・壊れている場合は空として扱う。壊れた元ファイルは、最初の
-            # 保存で丸ごと新しい状態に置き換わる(履歴も含めて失うのはこの場合
-            # だけだが、壊れた JSON からは復元できないので仕方がない)。
-            pass
-        self._state = state
-        return state
+            self._merge_legacy()
+        return self._state
 
     def _save(self) -> None:
         state = self._load()
@@ -212,23 +295,46 @@ class TomorrowMemoStore:
             and not current["seen"]
         )
 
-    def has_unseen_for_startup(self, boot_time=None) -> bool:
-        """起動時に出すべき未表示メモがあるか(PC の起動時刻で絞る)。
+    def has_unseen_for_startup(self, today=None) -> bool:
+        """起動時に出すべき未表示メモがあるか(日付で判定する)。
 
-        未表示でも、書いた時刻が今回の PC の起動時刻(boot_time)より後の
-        メモは出さない(自動反映や再起動のたびに出て、誰も見ていないのに
-        表示済みになるのを防ぐ)。boot_time が None(取れない環境)なら
-        従来どおり未表示なら出す。書いた日時が読めない場合も出す側に倒す。"""
+        出すのは次の両方を満たすときだけ:
+          - メモを書いた日が今日より前
+          - 今日が、最後に表示した日より後(まだ表示したことが無ければ満たす)
+        つまり「最後に表示した日より後の日付での、最初の起動」で1回だけ
+        出す。同じ日の再起動では出ないし、書いた当日にも出ないので、自動
+        反映や再起動のたびに、書いたばかりのメモが誰も見ていないのに
+        表示済みになることもない。
+        PC の起動時刻では判定しない(長期連続稼働や休止・高速スタート
+        アップでは起動時刻が戻らず、当てにならないため)。
+        書いた日時が読めない場合は出す側に倒す。
+        today はテスト用で、date / datetime / "YYYY-MM-DD" のどれでも
+        よく、省略時は今日。"""
         if not self.has_unseen():
             return False
-        if boot_time is None:
-            return True
+        today_str = _as_date_str(today)
+        last_shown = self._load()["last_shown_date"]
+        if last_shown and today_str <= last_shown:
+            return False
         try:
-            written = datetime.fromisoformat(
-                self._load()["current"]["written_at"])
+            written_day = datetime.fromisoformat(
+                self._load()["current"]["written_at"]).date().isoformat()
         except (TypeError, ValueError):
             return True
-        return written < boot_time
+        return written_day < today_str
+
+    def last_shown_date(self):
+        """最後に起動時表示した日("YYYY-MM-DD")。まだ無ければ None。"""
+        return self._load()["last_shown_date"]
+
+    def note_shown(self, today=None) -> None:
+        """起動時に表示したことを覚えておく(同じ日には二度出さないため)。
+        today はテスト用で、省略時は今日。"""
+        state = self._load()
+        day = _as_date_str(today)
+        if state["last_shown_date"] != day:
+            state["last_shown_date"] = day
+            self._save()
 
     def set_text(self, text: str, now: str = None) -> None:
         """自動保存。空(空白だけ)なら現在のメモは無しにする。

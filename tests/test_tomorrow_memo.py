@@ -3,7 +3,9 @@
 #
 #   - データの保存と読み戻し(自動保存・書いた日時・表示済み)
 #   - データの置き場(アプリデータ)と、移行前の置き場からの取り込み
-#   - 起動時の表示は、書いた時刻が PC の起動時刻より前のときだけ
+#     (両方にファイルがあるときは履歴を統合する)
+#   - 起動時の表示は日付で判定する(書いた日が今日より前で、最後に表示
+#     した日より後の日付での最初の起動だけ。同じ日の再起動では出ない)
 #   - バックアップ(履歴)への移動: 表示して閉じたとき／書き換えたとき
 #     (最初の自動保存の時点で移る。閉じるときに二重に移らない)
 #   - 本文が失われる経路が無いこと(空にしても古い内容は履歴に残る)
@@ -22,7 +24,7 @@ import sys
 import tempfile
 import time
 import types
-from datetime import datetime
+from datetime import date
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -209,21 +211,85 @@ def test_legacy_file_imported_on_first_load():
         legacy_tmp.cleanup()
 
 
-def test_startup_visibility_depends_on_boot_time():
+def test_startup_visibility_depends_on_dates():
     tmp, store = make_store()
     store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
-    # PC の起動がメモより前(同じ PC セッションで書いた)なら出さない
-    assert store.has_unseen_for_startup(datetime(2026, 11, 13, 8, 0)) is False
-    # PC の起動がメモより後(翌朝の起動)なら出す
-    assert store.has_unseen_for_startup(datetime(2026, 11, 14, 8, 0)) is True
-    # 起動時刻が取れない環境では出す側に倒す
-    assert store.has_unseen_for_startup(None) is True
-    assert store.has_unseen_for_startup() is True
-    # 表示済みになったら、起動時刻によらず出さない
+    # 書いた当日は出さない(その日のうちの再起動や自動反映で出直さない)
+    assert store.has_unseen_for_startup(date(2026, 11, 13)) is False
+    # 翌日なら出す(日付は文字列で渡してもよい)
+    assert store.has_unseen_for_startup("2026-11-14") is True
+    # 表示したことを覚えたら、その日はもう出ない(窓が閉じられずに
+    # 未表示のまま残っても)
+    store.note_shown("2026-11-14")
+    assert store.last_shown_date() == "2026-11-14"
+    assert store.has_unseen_for_startup(date(2026, 11, 14)) is False
+    # 表示した日はファイルに残り、読み直しても効く
+    reloaded = tomorrow_memo.TomorrowMemoStore(store.path)
+    assert reloaded.last_shown_date() == "2026-11-14"
+    assert reloaded.has_unseen_for_startup(date(2026, 11, 14)) is False
+    # さらに翌日なら、未表示のままならまた出す
+    assert store.has_unseen_for_startup(date(2026, 11, 15)) is True
+    # 表示済み(履歴へ移動)になったら、日付によらず出さない
     store.mark_seen()
-    assert store.has_unseen_for_startup(datetime(2026, 11, 14, 8, 0)) is False
-    assert store.has_unseen_for_startup(None) is False
+    assert store.has_unseen_for_startup(date(2026, 11, 15)) is False
+    assert store.has_unseen_for_startup() is False
     tmp.cleanup()
+
+
+def test_legacy_merged_when_both_files_exist():
+    # 新しい置き場にも移行前の置き場にもファイルがある場合は、履歴が
+    # 統合され(重複は1つに)、現在のメモは書いた日時が新しい方が残り、
+    # 古い方は履歴へ移る。移行前のファイルは消える。
+    new_tmp = tempfile.TemporaryDirectory()
+    legacy_tmp = tempfile.TemporaryDirectory()
+    legacy_path = Path(legacy_tmp.name) / "tomorrow_memo.json"
+    legacy_store = tomorrow_memo.TomorrowMemoStore(legacy_path)
+    legacy_store.set_text("共通のメモ", now="2026-11-09T19:00:00")
+    legacy_store.mark_seen(now="2026-11-10T08:00:00")
+    legacy_store.set_text("移行前の古いメモ", now="2026-11-10T19:00:00")
+    legacy_store.mark_seen(now="2026-11-11T08:00:00")
+    legacy_store.set_text("移行前の現在のメモ", now="2026-11-12T19:00:00")
+    new_path = Path(new_tmp.name) / "tomorrow_memo.json"
+    new_store = tomorrow_memo.TomorrowMemoStore(new_path)
+    new_store.set_text("共通のメモ", now="2026-11-09T19:00:00")
+    new_store.mark_seen(now="2026-11-10T08:00:00")
+    new_store.set_text("新しい側の古いメモ", now="2026-11-11T19:00:00")
+    new_store.mark_seen(now="2026-11-12T08:00:00")
+    new_store.set_text("新しい側の現在のメモ", now="2026-11-13T19:00:00")
+    old_env = os.environ.get("TRAYTOOLS_DATA_DIR")
+    old_legacy = tomorrow_memo.LEGACY_DATA_PATH
+    os.environ["TRAYTOOLS_DATA_DIR"] = new_tmp.name
+    tomorrow_memo.LEGACY_DATA_PATH = legacy_path
+    try:
+        store = tomorrow_memo.TomorrowMemoStore()
+        # 現在のメモは、新しい側(書いた日時が新しい方)が残る
+        current = store.current()
+        assert current is not None
+        assert current["text"] == "新しい側の現在のメモ"
+        history = store.history()
+        texts = [item["text"] for item in history]
+        # 両方の履歴が統合され、共通の記録は1つだけ
+        assert texts.count("共通のメモ") == 1
+        assert "移行前の古いメモ" in texts
+        assert "新しい側の古いメモ" in texts
+        # 負けた側の現在のメモも、履歴(reason=merged)に残る
+        merged = [item for item in history if item["reason"] == "merged"]
+        assert len(merged) == 1
+        assert merged[0]["text"] == "移行前の現在のメモ"
+        assert len(history) == 4
+        # 移行前のファイルは消え、読み直しても二重に統合されない
+        assert not legacy_path.exists()
+        reloaded = tomorrow_memo.TomorrowMemoStore()
+        assert len(reloaded.history()) == 4
+        assert reloaded.current()["text"] == "新しい側の現在のメモ"
+    finally:
+        tomorrow_memo.LEGACY_DATA_PATH = old_legacy
+        if old_env is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = old_env
+        new_tmp.cleanup()
+        legacy_tmp.cleanup()
 
 
 def test_broken_file_is_treated_as_empty():
@@ -349,10 +415,10 @@ def test_feature_startup_shows_only_unseen():
     app()
     tmp, store = make_store()
     feature = make_feature(store)
-    feature._show_unseen_tomorrow_memo()
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
     assert feature.tomorrow_memo_window is None  # 空なら出さない
     store.set_text("未表示のメモ", now="2026-11-13T19:20:00")
-    feature._show_unseen_tomorrow_memo()
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
     window = feature.tomorrow_memo_window
     assert window is not None
     assert window._edit.isReadOnly()  # 起動時は表示用
@@ -362,19 +428,25 @@ def test_feature_startup_shows_only_unseen():
     tmp.cleanup()
 
 
-def test_feature_startup_respects_boot_time():
+def test_feature_startup_respects_dates():
     app()
     tmp, store = make_store()
     feature = make_feature(store)
     store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
-    # 書いた時刻が今回の PC の起動より後(同じセッション)なら出さない
-    feature._show_unseen_tomorrow_memo(boot_time=datetime(2026, 11, 13, 8, 0))
+    # 書いた当日は出さない
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 13))
     assert feature.tomorrow_memo_window is None
-    # 起動より前に書かれたメモなら出す
-    feature._show_unseen_tomorrow_memo(boot_time=datetime(2026, 11, 14, 8, 0))
+    # 翌日なら出す
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
     window = feature.tomorrow_memo_window
     assert window is not None
     assert window._edit.isReadOnly()
+    # 表示した日が記録される。窓が閉じられないまま失われて、同じ日に
+    # 起動し直しても出直さない
+    assert store.last_shown_date() == "2026-11-14"
+    feature.tomorrow_memo_window = None  # 閉じずに窓が失われた状態を模す
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
+    assert feature.tomorrow_memo_window is None
     window.close()
     app().processEvents()
     tmp.cleanup()
@@ -409,14 +481,15 @@ if __name__ == "__main__":
         test_broken_file_is_treated_as_empty,
         test_default_path_uses_data_dir,
         test_legacy_file_imported_on_first_load,
-        test_startup_visibility_depends_on_boot_time,
+        test_legacy_merged_when_both_files_exist,
+        test_startup_visibility_depends_on_dates,
         test_window_write_autosaves,
         test_window_first_autosave_archives_previous,
         test_window_read_close_marks_seen,
         test_window_switch_to_write_archives_read_memo,
         test_feature_opens_write_window_and_notifies_waiter,
         test_feature_startup_shows_only_unseen,
-        test_feature_startup_respects_boot_time,
+        test_feature_startup_respects_dates,
         test_command_registration_strings,
         test_gitignore_lists_tomorrow_memo,
     ]

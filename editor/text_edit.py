@@ -7,6 +7,14 @@
 # 左端に細い帯を置き、viewport の余白で本文をずらす。スクロールと
 # 再描画は updateRequest に追随する。
 #
+# 第3段で足した表示:
+#   - 現在行の強調(薄い背景)。矩形のハイライトと同じ extra
+#     selections の口に相乗りする(矩形側の差し替えに消されないよう、
+#     まとめて出し直す _refresh_extra_selections が唯一の出口)
+#   - 不可視文字の表示(タブ・スペース・全角スペース・改行を記号で
+#     描く)。描画だけの話で、文書の内容は変えない
+#   - 配色(editor/colors.py の組)をパレットと各部の色へ反映する
+#
 # キーの通知(窓側がマクロ記録と F4 のために受ける):
 #   move_key(命令名, 選択を広げるか) … Home / End / 矢印などの素の
 #     移動キー。本文の動き自体は Qt の標準のまま(こちらでは実行
@@ -14,10 +22,18 @@
 #   undo_redo_started / undo_redo_finished … Ctrl+Z / Ctrl+Y の
 #     前後。文書の変化を記録から外すために、窓側が印を立てる。
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPainter
-from PySide6.QtWidgets import QPlainTextEdit, QWidget
+from PySide6.QtGui import (
+    QColor,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QTextCursor,
+    QTextFormat,
+)
+from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
 import rect_edit
+from editor import colors as colormod
 
 # 移動キー → 命令名(keymap・マクロと共通の命令層の名前)。
 _MOVE_KEYS = {
@@ -34,8 +50,8 @@ FONT_SIZE_MAX = 32
 # フォントの大きさが取れないとき(Pixel 指定等)の代わりの起点。
 FALLBACK_FONT_SIZE = 10
 
-_AREA_BACKGROUND = QColor(242, 242, 242)
-_AREA_FOREGROUND = QColor(144, 144, 144)
+# 行番号エリアの色は配色(editor/colors.py)が持つ。標準の組の値が
+# 従来の (242,242,242) / (144,144,144) と同じにしてある。
 
 
 class LineNumberArea(QWidget):
@@ -78,10 +94,133 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._update_area_width()
         # エディタの矩形は、貼り付けで行が足りなければ足せる。
         self.init_rect_selection(fixed_rows=False)
+        # 表示(第3段)。配色は既定(標準)で始め、窓が設定の組で上書きする。
+        self._show_invisibles = False
+        self._current_line_enabled = True
+        self._scheme = colormod.get_scheme(colormod.DEFAULT_SCHEME)
+        self._current_line_color = QColor(self._scheme["current_line"])
+        self._invisible_color = QColor(self._scheme["invisible"])
+        self._area_background = QColor(
+            self._scheme["line_number_background"])
+        self._area_foreground = QColor(
+            self._scheme["line_number_foreground"])
+        self.cursorPositionChanged.connect(self._refresh_extra_selections)
 
     def _on_rect_changed(self) -> None:
-        QPlainTextEdit.setExtraSelections(
-            self, self.rect_extra_selections())
+        self._refresh_extra_selections()
+
+    def _refresh_extra_selections(self):
+        """extra selections の唯一の出口。矩形のハイライトと現在行の
+        強調を合わせて出し直す(片方の更新でもう片方が消えないよう)。"""
+        selections = list(self.rect_extra_selections())
+        if self._current_line_enabled:
+            # ExtraSelection の型は QTextEdit 側にある(rect_edit と同じ)。
+            selection = QTextEdit.ExtraSelection()
+            selection.format.setBackground(self._current_line_color)
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection, True)
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            selections.append(selection)
+        QPlainTextEdit.setExtraSelections(self, selections)
+
+    # ---------------------------------------------------------------
+    # 配色
+    # ---------------------------------------------------------------
+    def apply_colors(self, scheme):
+        """editor/colors.py の配色の組を、パレットと各部の色へ反映する。"""
+        self._scheme = dict(scheme)
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Base,
+                         QColor(scheme["background"]))
+        palette.setColor(QPalette.ColorRole.Text,
+                         QColor(scheme["foreground"]))
+        palette.setColor(QPalette.ColorRole.Highlight,
+                         QColor(scheme["selection_background"]))
+        palette.setColor(QPalette.ColorRole.HighlightedText,
+                         QColor(scheme["foreground"]))
+        self.setPalette(palette)
+        self._current_line_color = QColor(scheme["current_line"])
+        self._invisible_color = QColor(scheme["invisible"])
+        self._area_background = QColor(scheme["line_number_background"])
+        self._area_foreground = QColor(scheme["line_number_foreground"])
+        self._refresh_extra_selections()
+        self._area.update()
+        self.viewport().update()
+
+    def color_scheme(self) -> dict:
+        return dict(self._scheme)
+
+    # ---------------------------------------------------------------
+    # 現在行の強調
+    # ---------------------------------------------------------------
+    def current_line_enabled(self) -> bool:
+        return self._current_line_enabled
+
+    def set_current_line_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self._current_line_enabled:
+            return
+        self._current_line_enabled = enabled
+        self._refresh_extra_selections()
+
+    # ---------------------------------------------------------------
+    # 不可視文字の表示(描画だけ。本文は変えない)
+    # ---------------------------------------------------------------
+    def show_invisibles(self) -> bool:
+        return self._show_invisibles
+
+    def set_show_invisibles(self, visible):
+        visible = bool(visible)
+        if visible == self._show_invisibles:
+            return
+        self._show_invisibles = visible
+        self.viewport().update()
+
+    def paintEvent(self, event):  # noqa: N802  Qt の上書き
+        super().paintEvent(event)
+        if self._show_invisibles:
+            self._paint_invisibles()
+
+    def _paint_invisibles(self):
+        """見えている行のタブ・スペース・改行を記号で描く。
+
+        タブは →、半角スペースは ・、全角スペースは □、改行は行末に
+        ↵。位置は cursorRect で取る(折り返しやスクロールに追随する)。
+        描くのは見えているブロックだけに絞る。"""
+        painter = QPainter(self.viewport())
+        painter.setPen(self._invisible_color)
+        painter.setFont(self.font())
+        scratch = QTextCursor(self.document())
+        block = self.firstVisibleBlock()
+        viewport_height = self.viewport().height()
+        while block.isValid():
+            geometry = self.blockBoundingGeometry(block).translated(
+                self.contentOffset())
+            if geometry.top() > viewport_height:
+                break
+            if block.isVisible():
+                text = block.text()
+                base = block.position()
+                for i, ch in enumerate(text):
+                    if ch == "\t":
+                        symbol = "→"
+                    elif ch == " ":
+                        symbol = "·"
+                    elif ch == "　":
+                        symbol = "□"
+                    else:
+                        continue
+                    scratch.setPosition(base + i)
+                    rect = self.cursorRect(scratch)
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
+                                     | Qt.AlignmentFlag.AlignVCenter, symbol)
+                if block.next().isValid():
+                    scratch.setPosition(base + len(text))
+                    rect = self.cursorRect(scratch)
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
+                                     | Qt.AlignmentFlag.AlignVCenter, "↵")
+            block = block.next()
 
     def keyPressEvent(self, event):  # noqa: N802  Qt の上書き
         if (event.matches(QKeySequence.StandardKey.Undo)
@@ -169,8 +308,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
 
     def paint_line_number_area(self, event):
         painter = QPainter(self._area)
-        painter.fillRect(event.rect(), _AREA_BACKGROUND)
-        painter.setPen(_AREA_FOREGROUND)
+        painter.fillRect(event.rect(), self._area_background)
+        painter.setPen(self._area_foreground)
         height = self.fontMetrics().height()
         block = self.firstVisibleBlock()
         number = block.blockNumber()

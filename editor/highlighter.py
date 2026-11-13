@@ -35,6 +35,11 @@ class LineHighlighter(QSyntaxHighlighter):
         self._pattern = pattern
         self.rehighlight()
 
+    def set_background(self, color):
+        """強調の背景色を差し替える(配色プリセットの適用)。"""
+        self._format.setBackground(QColor(color))
+        self.rehighlight()
+
     def highlightBlock(self, text):  # noqa: N802  Qt の上書き
         if self._pattern is None:
             return

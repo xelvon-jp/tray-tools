@@ -465,6 +465,42 @@ def test_mouse_click_during_recording_flagged():
         discard_close(window)
 
 
+def test_replace_commands_in_handwritten_macro():
+    # 手書きマクロ(JSON)でも置換の命令が使える。regex の有無や
+    # 置換文字列が引数で渡り、再生で同じ結果になる。
+    window = make_window("a1 b2 a3", cursor_pos=0)
+    try:
+        name, commands = macmod.macro_from_json(
+            '{"commands": [{"cmd": "replace_all", "args": '
+            '{"text": "([a-z])(\\\\d)", "repl": "\\\\2\\\\1", '
+            '"case": false, "regex": true}}]}')
+        assert name == ""
+        assert window.play_macro(commands)
+        assert window.text() == "1a 2b 3a"
+    finally:
+        discard_close(window)
+
+
+def test_replace_recorded_and_replayed():
+    # 検索バー経由の置換が記録され、別の内容へ再生できる。
+    window = make_window("foo foo", cursor_pos=0)
+    try:
+        window._find_edit.setText("foo")
+        window._replace_edit.setText("bar")
+        window.set_macro_recording(True)
+        assert window.execute_command("replace_all")
+        window.set_macro_recording(False)
+        assert window.text() == "bar bar"
+        recorded = window.recorded_commands()
+        assert [c["cmd"] for c in recorded] == ["replace_all"]
+        assert recorded[0]["args"]["repl"] == "bar"
+        window._edit.setPlainText("foo")
+        assert window.play_macro()
+        assert window.text() == "bar"
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

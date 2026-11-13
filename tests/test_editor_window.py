@@ -967,6 +967,286 @@ def test_set_patterns_with_defaults_saves_empty():
         discard_close(window)
 
 
+# ---------------------------------------------------------------
+# 第3段: アイコン・正規表現の検索/置換・外部変更・保存の確認・表示
+# ---------------------------------------------------------------
+def test_window_icon_is_editor_icon():
+    window = make_window()
+    try:
+        icon = window.windowIcon()
+        assert not icon.isNull()
+        assert icon.availableSizes()
+    finally:
+        discard_close(window)
+
+
+def test_regex_find_selects_matches():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo 123 bar 45")
+        window._find_edit.setText(r"\d+")
+        window._find_regex.setChecked(True)
+        assert window.execute_command("find_next")
+        assert window._edit.textCursor().selectedText() == "123"
+        assert window.execute_command("find_next")
+        assert window._edit.textCursor().selectedText() == "45"
+        # 記録の引数には、正規表現で探したことが残る。
+        name, args = window._recorder.last_command
+        assert name == "find_next"
+        assert args["text"] == r"\d+" and args["regex"] is True
+    finally:
+        discard_close(window)
+
+
+def test_regex_replace_all_with_group_reference():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc123 def456")
+        window._find_edit.setText(r"(\d+)")
+        window._replace_edit.setText(r"[\1]")
+        window._find_regex.setChecked(True)
+        assert window.execute_command("replace_all")
+        assert window.text() == "abc[123] def[456]"
+        name, args = window._recorder.last_command
+        assert name == "replace_all"
+        assert args == {"text": r"(\d+)", "repl": r"[\1]",
+                        "case": False, "regex": True}
+        # 全体が1回の undo で戻る。
+        window._edit.undo()
+        assert window.text() == "abc123 def456"
+    finally:
+        discard_close(window)
+
+
+def test_replace_next_plain_and_regex():
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo foo foo")
+        window._find_edit.setText("foo")
+        window._replace_edit.setText("bar")
+        assert window.execute_command("replace_next")
+        assert window.text() == "bar foo foo"
+        assert window._edit.textCursor().selectedText() == "bar"
+        assert window.execute_command("replace_next")
+        assert window.text() == "bar bar foo"
+        # 正規表現でも1件ずつ置ける。
+        window._edit.setPlainText("a1 a2")
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        window._find_edit.setText(r"(\d)")
+        window._replace_edit.setText(r"<\1>")
+        window._find_regex.setChecked(True)
+        assert window.execute_command("replace_next")
+        assert window.text() == "a<1> a2"
+    finally:
+        discard_close(window)
+
+
+def test_regex_invalid_pattern_reports_error():
+    window = make_window()
+    try:
+        window._edit.setPlainText("abc")
+        window._find_edit.setText("(")
+        window._find_regex.setChecked(True)
+        window.execute_command("find_next")
+        assert "不正" in window.statusBar().currentMessage()
+        assert window.text() == "abc"  # 本文は変わらない
+    finally:
+        discard_close(window)
+
+
+def _rewrite_externally(path, data: bytes):
+    """外部の道具が書き換えたふり(大きさと更新時刻を両方変える)。"""
+    Path(path).write_bytes(data)
+    st = os.stat(path)
+    os.utime(path, (st.st_atime, st.st_mtime + 10))
+
+
+def test_external_overwrite_needs_confirm():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("元の文\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _rewrite_externally(path, "外部の文（長い）\n".encode("utf-8"))
+            type_text(window, "X")
+            window.ask_external_overwrite = lambda: False
+            assert not window.save()  # 確認で断ると保存しない
+            assert Path(path).read_bytes() == "外部の文（長い）\n".encode("utf-8")
+            assert window.is_dirty()
+            window.ask_external_overwrite = lambda: True
+            assert window.save()      # 承知すれば上書きする
+            assert "X" in Path(path).read_text(encoding="utf-8")
+        finally:
+            discard_close(window)
+
+
+def test_external_change_reload_when_clean():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("前\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _rewrite_externally(path, "外部で変わった本文\n".encode("utf-8"))
+            window.ask_external_reload = lambda: True
+            window._handle_external_change()
+            assert window.text() == "外部で変わった本文\n"
+            assert not window.is_dirty()
+            assert not window.external_change_pending
+        finally:
+            discard_close(window)
+
+
+def test_external_change_pending_when_dirty():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("前\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            type_text(window, "編")
+            _rewrite_externally(path, "外部で変わった本文\n".encode("utf-8"))
+            window.ask_external_reload = lambda: True
+            window._handle_external_change()
+            # 編集中は読み直さず、知らせるだけ(編集は残る)。
+            assert window.external_change_pending
+            assert "編" in window.text()
+            assert "外部で変更" in window.statusBar().currentMessage()
+        finally:
+            discard_close(window)
+
+
+def test_unencodable_save_needs_confirm():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("本文\n".encode("cp932"))
+        window = make_window(path)
+        try:
+            type_text(window, "☃")  # cp932 では書けない文字
+            seen = []
+            window.ask_unencodable_save = (
+                lambda chars: seen.append(chars) or False)
+            assert not window.save()  # 断ると保存しない(黙って化けない)
+            assert seen and "☃" in seen[0]
+            assert Path(path).read_bytes() == "本文\n".encode("cp932")
+            window.ask_unencodable_save = lambda chars: True
+            assert window.save()      # 承知すれば置換文字で書く
+            assert b"?" in Path(path).read_bytes()
+        finally:
+            discard_close(window)
+
+
+def test_mixed_newline_notice_on_open():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("a\r\nb\nc\r\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            assert "混在" in window.statusBar().currentMessage()
+        finally:
+            discard_close(window)
+
+
+def test_find_window_for_path_helper():
+    from editor.window import find_window_for_path
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = os.path.join(tmp, "a.txt")
+        p2 = os.path.join(tmp, "b.txt")
+        Path(p1).write_text("a", encoding="utf-8")
+        Path(p2).write_text("b", encoding="utf-8")
+        window = make_window(p1)
+        try:
+            # 同じファイルを開いている窓が見つかる(二重に開かない)。
+            assert find_window_for_path([window], p1) is window
+            assert find_window_for_path([window], p2) is None
+            assert find_window_for_path([], p1) is None
+            assert find_window_for_path([window], None) is None
+        finally:
+            discard_close(window)
+
+
+def test_view_toggles_and_color_scheme():
+    from PySide6.QtGui import QColor, QPalette
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        window.set_invisibles_visible(True)
+        assert window.invisibles_visible()
+        assert saved[-1] == {"show_invisibles": True}
+        # 現在行の強調は extra selections に乗る(矩形と同居)。
+        assert len(window._edit.extraSelections()) == 1
+        window.set_current_line_highlight(False)
+        assert not window.current_line_highlight()
+        assert len(window._edit.extraSelections()) == 0
+        window.set_wide_cursor(True)
+        assert window.wide_cursor()
+        assert window._edit.cursorWidth() == 3
+        window.apply_color_scheme("秀丸風")
+        assert window.color_scheme_name() == "秀丸風"
+        assert window._edit.palette().color(
+            QPalette.ColorRole.Base) == QColor("#ffffff")
+        assert window._edit.color_scheme()["current_line"] == "#ffffcc"
+        assert saved[-1] == {"color_scheme": "秀丸風"}
+    finally:
+        discard_close(window)
+
+
+def test_view_settings_read_at_open():
+    window = make_window(editor_settings={
+        "show_invisibles": True, "highlight_current_line": False,
+        "wide_cursor": True, "color_scheme": "秀丸風"})
+    try:
+        assert window.invisibles_visible()
+        assert not window.current_line_highlight()
+        assert window.wide_cursor()
+        assert window.color_scheme_name() == "秀丸風"
+    finally:
+        discard_close(window)
+
+
+def test_open_path_at_line():
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = os.path.join(tmp, "a.txt")
+        p2 = os.path.join(tmp, "b.txt")
+        Path(p1).write_text("a1\na2\na3\n", encoding="utf-8")
+        Path(p2).write_text("b1\nb2\nb3\nb4\n", encoding="utf-8")
+        window = make_window(p1)
+        try:
+            assert window.open_path_at_line(p2, 3)
+            assert window.current_document().path == p2
+            assert window._edit.textCursor().blockNumber() == 2
+            # 同じファイルへは読み直さない(未保存の編集が残る)。
+            type_text(window, "X")
+            assert window.open_path_at_line(p2, 1)
+            assert "X" in window.text()
+            assert window._edit.textCursor().blockNumber() == 0
+        finally:
+            discard_close(window)
+
+
+def test_grep_dialog_lists_and_jumps():
+    from editor.grep_dialog import GrepDialog
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "a.txt")
+        Path(target).write_text("1行目\n探す語\n", encoding="utf-8")
+        jumped = []
+        dialog = GrepDialog(
+            None, folder=tmp, word="探す語",
+            on_jump=lambda p, line: jumped.append((p, line)))
+        dialog.start_search()
+        deadline = time.time() + 30
+        while dialog._thread is not None and time.time() < deadline:
+            app().processEvents()
+            time.sleep(0.02)
+        app().processEvents()
+        assert dialog._results.count() == 1
+        item = dialog._results.item(0)
+        assert "a.txt" in item.text() and "2" in item.text()
+        dialog._on_item_activated(item)
+        assert jumped == [(target, 2)]
+        dialog.deleteLater()
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

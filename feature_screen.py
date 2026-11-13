@@ -1231,7 +1231,18 @@ class ScreenFeature:
 
         if self.text_editor is not None:
             if path:
-                self.text_editor.open_path(path)
+                # 既に同じファイルを開いているなら、読み直さず
+                # 前に出すだけ(二重に開かない・未保存の確認も出ない)。
+                current = None
+                try:
+                    current = self.text_editor.current_document().path
+                except Exception:  # noqa: BLE001  読めなければ開き直す
+                    current = None
+                same = (current is not None
+                        and os.path.normcase(os.path.abspath(current))
+                        == os.path.normcase(os.path.abspath(path)))
+                if not same:
+                    self.text_editor.open_path(path)
             self.text_editor.raise_()
             self.text_editor.activateWindow()
             return

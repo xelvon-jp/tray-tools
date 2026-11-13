@@ -4368,8 +4368,20 @@ class FilerWindow(QWidget):
     # --- 内蔵テキストエディタ ---
     def open_text_editor(self, path: str):
         """内蔵テキストエディタ(editor/)の窓を開く(モードレス。いくつ開いても
-        よい)。開いた窓を返す。Ctrl+Enter の &TEDIT から来る。"""
+        よい)。開いた窓を返す。Ctrl+Enter の &TEDIT から来る。
+
+        同じファイルを既に開いている窓があれば、新しく作らずそちらを
+        前に出す(二重に開くと、別々の編集が上書きし合うため)。"""
         import editor as editor_module  # 使うときに読む(ファイラの起動を軽く保つ)
+
+        existing = editor_module.find_window_for_path(
+            self._text_editors, path)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            self.log(f"エディタ(開いています): {path}")
+            return existing
 
         section = _section(self.app_settings)
         geometry = section.get("editor_geometry")

@@ -132,6 +132,93 @@ def test_find_next_prev():
     assert docmod.find_prev(text, "", 5) == -1
 
 
+def test_save_backup_and_no_temp_left():
+    """上書き保存で、直前の内容が .bak に1つだけ残り、一時ファイルは
+    残らない。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        docmod.save_document(doc)
+        assert Path(path).read_text(encoding="utf-8") == "新しい内容\n"
+        assert Path(path + ".bak").read_text(encoding="utf-8") == "古い内容\n"
+        # 控えは常に1つ(増え続けない)。一時ファイルも残らない。
+        doc.text = "もっと新しい\n"
+        docmod.save_document(doc)
+        assert Path(path + ".bak").read_text(encoding="utf-8") == "新しい内容\n"
+        names = os.listdir(tmp)
+        assert sorted(names) == ["a.txt", "a.txt.bak"], names
+
+
+def test_save_failure_keeps_original():
+    """書き込みの途中で失敗しても、元のファイルは壊れない(原子性)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "元の内容\n".encode("utf-8"))
+        doc = docmod.load_document(path)
+        doc.text = "書き換えた内容\n"
+        real_replace = os.replace
+
+        def failing_replace(_src, _dst):
+            raise OSError("置き換えに失敗したふり")
+
+        docmod.os.replace = failing_replace
+        try:
+            try:
+                docmod.save_document(doc)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("OSError が上がるはず")
+        finally:
+            docmod.os.replace = real_replace
+        assert Path(path).read_text(encoding="utf-8") == "元の内容\n"
+        # 一時ファイルは残らない(控えの .bak は先に作られるので可)。
+        assert not any(".tmp" in name for name in os.listdir(tmp))
+
+
+def test_mixed_newlines_detected_and_cleared():
+    assert docmod.has_mixed_newlines("a\r\nb\nc")
+    assert not docmod.has_mixed_newlines("a\r\nb\r\n")
+    assert not docmod.has_mixed_newlines("a\nb\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "a\r\nb\nc\r\n".encode("utf-8"))
+        doc = docmod.load_document(path)
+        assert doc.mixed_newlines
+        assert doc.newline == docmod.CRLF  # 最初の改行で決める(従来どおり)
+        docmod.save_document(doc)
+        assert not doc.mixed_newlines  # 保存でそろったので控えは落ちる
+        assert Path(path).read_bytes() == "a\r\nb\r\nc\r\n".encode("utf-8")
+
+
+def test_find_unencodable():
+    assert docmod.find_unencodable("普通の文", "cp932") == []
+    assert docmod.find_unencodable("雪だるま ☃ と ♥", "cp932") == ["☃", "♥"]
+    assert docmod.find_unencodable("☃☃♥", "cp932") == ["☃", "♥"]  # 重複なし
+    assert docmod.find_unencodable("☃", "utf-8") == []
+
+
+def test_external_changed_stamp():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        _write(path, "内容1\n".encode("utf-8"))
+        doc = docmod.load_document(path)
+        assert not docmod.external_changed(doc)
+        # 外部で書き換える(大きさも更新時刻も変える)。
+        _write(path, "内容2は長い\n".encode("utf-8"))
+        st = os.stat(path)
+        os.utime(path, (st.st_atime, st.st_mtime + 10))
+        assert docmod.external_changed(doc)
+        # 自分で保存し直せば、印が更新されて「変わっていない」に戻る。
+        docmod.save_document(doc)
+        assert not docmod.external_changed(doc)
+        # ファイルが消えたら「変わった」側に倒す。
+        os.unlink(path)
+        assert docmod.external_changed(doc)
+
+
 def test_keymap_merge():
     table = merge_keymap()
     assert table == DEFAULT_KEYMAP and table is not DEFAULT_KEYMAP

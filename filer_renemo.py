@@ -23,7 +23,7 @@ import os
 import re
 import time
 
-from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QFileInfo, QRect, QSize, Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
 import filer_core as core
 import filer_rename as fr
 import filer_shell
+import rect_edit
 
 EDITED_COLOR = "#fff3b0"     # 編集した行
 ERROR_COLOR = "#ffc0c0"      # 確定前の検査で問題のある行
@@ -91,18 +92,19 @@ class _Gutter(QWidget):
         self.editor.paint_gutter(event)
 
 
-class RenameEdit(QPlainTextEdit):
+class RenameEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     """編集名の欄。1行が1ファイルで、行の数は変えさせない。
 
     Alt+ドラッグで矩形選択ができる(複数行の同じ桁をまとめて直す用)。
-    矩形が生きている間の入力・BS・Del・コピーは、全行に同じ操作をする。"""
+    矩形の実体は rect_edit.RectEditMixin(テキストエディタと共用)。
+    ここの矩形は行の数を変えない(fixed_rows=True)。矩形が生きている
+    間の入力・BS・Del・コピーは、全行に同じ操作をする。"""
 
     # ガター(行番号とアイコンの欄)の寸法。[左余白][番号][間][アイコン][右余白]
     _GUTTER_LEFT = 6
     _GUTTER_MID = 4
     _GUTTER_ICON = 16
     _GUTTER_RIGHT = 8
-    BLOCK_COLOR = "#b8d8f8"   # 矩形選択の地
 
     def __init__(self, window):
         super().__init__(window)
@@ -112,16 +114,8 @@ class RenameEdit(QPlainTextEdit):
         self.blockCountChanged.connect(lambda _n: self._update_margin())
         self.updateRequest.connect(self._update_gutter)
         self._update_margin()
-        # 矩形選択: [開始行, 開始桁, 現在行, 現在桁](桁は行内の文字位置)。
-        self._block = None
-        self._block_drag = False
         self._row_selections = []   # 窓側の行ハイライト(編集済み・問題あり)
-        # 矩形のドラッグが欄の外へ出たら、出た向きへ少しずつ送る(離すまで続ける)。
-        # マウスを止めていても送れるよう、移動のイベントではなくタイマーで回す。
-        self._drag_pos = None
-        self._scroll_timer = QTimer(self)
-        self._scroll_timer.setInterval(40)
-        self._scroll_timer.timeout.connect(self._auto_scroll)
+        self.init_rect_selection(fixed_rows=True)
 
     def gutter_width(self) -> int:
         digits = len(str(max(1, self.blockCount())))
@@ -184,267 +178,21 @@ class RenameEdit(QPlainTextEdit):
         finally:
             painter.end()
 
-    # --- 矩形選択 ---
+    # --- 矩形選択(rect_edit.RectEditMixin の受け皿) ---
     def setExtraSelections(self, selections) -> None:
         # 窓側は行ハイライトだけを渡す。矩形のハイライトはこちらで重ねる。
         self._row_selections = list(selections)
         self._apply_selections()
 
     def _apply_selections(self) -> None:
-        super().setExtraSelections(self._row_selections + self._block_selections())
+        super().setExtraSelections(self._row_selections + self.rect_extra_selections())
         # 矩形が変わると対象の行も変わる(窓の「対象」の行を追随させる)
         update = getattr(self.window_, "update_target", None)
         if update is not None:
             update()
 
-    def _block_range(self):
-        """正規化した (先頭行, 末行, 左桁, 右桁)。矩形が無ければ None。"""
-        if self._block is None:
-            return None
-        ab, ac, cb, cc = self._block
-        return min(ab, cb), max(ab, cb), min(ac, cc), max(ac, cc)
-
-    def _block_selections(self) -> list:
-        rng = self._block_range()
-        if rng is None:
-            return []
-        first, last, c0, c1 = rng
-        selections = []
-        doc = self.document()
-        for row in range(first, last + 1):
-            block = doc.findBlockByNumber(row)
-            if not block.isValid():
-                continue
-            cursor = QTextCursor(block)
-            cursor.setPosition(block.position() + min(c0, block.length() - 1))
-            cursor.setPosition(block.position() + min(c1, block.length() - 1),
-                               QTextCursor.KeepAnchor)
-            sel = QTextEdit.ExtraSelection()
-            fmt = QTextCharFormat()
-            fmt.setBackground(QColor(self.BLOCK_COLOR))
-            sel.format = fmt
-            sel.cursor = cursor
-            selections.append(sel)
-        return selections
-
-    def block_rows(self):
-        """矩形が選んでいる行の一覧。無ければ None(窓の _selected_rows 用)。"""
-        rng = self._block_range()
-        if rng is None:
-            return None
-        return list(range(rng[0], rng[1] + 1))
-
-    def set_block_selection(self, anchor, current) -> None:
-        """(行, 桁) の組で矩形を作る。マウス操作とテストの入口。"""
-        self._block = [anchor[0], anchor[1], current[0], current[1]]
+    def _on_rect_changed(self) -> None:
         self._apply_selections()
-
-    def clear_block_selection(self) -> None:
-        if self._block is not None:
-            self._block = None
-            self._apply_selections()
-
-    def block_text(self) -> str:
-        """矩形の中身(行ごとの切り取りを改行でつないだもの)。"""
-        rng = self._block_range()
-        if rng is None:
-            return ""
-        first, last, c0, c1 = rng
-        doc = self.document()
-        parts = []
-        for row in range(first, last + 1):
-            block = doc.findBlockByNumber(row)
-            parts.append(block.text()[c0:c1] if block.isValid() else "")
-        return "\n".join(parts)
-
-    def _block_edit_lines(self, make) -> None:
-        """矩形の各行を make(行文字列, 左桁, 右桁) -> 新しい行文字列 で差し替える。
-        全行分を1回の取り消しで戻せるようにする。"""
-        rng = self._block_range()
-        if rng is None:
-            return
-        first, last, c0, c1 = rng
-        doc = self.document()
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-        try:
-            for row in range(first, last + 1):
-                block = doc.findBlockByNumber(row)
-                if not block.isValid():
-                    continue
-                c = QTextCursor(block)
-                c.select(QTextCursor.LineUnderCursor)
-                c.insertText(make(block.text(), c0, c1))
-        finally:
-            cursor.endEditBlock()
-
-    def block_insert_text(self, text: str) -> None:
-        """矩形の範囲を text で置き換える(短い行は左桁まで空白で埋める)。
-        置き換えた後は、text の直後に幅0の矩形を残す(続けて打てる)。"""
-        if self._block_range() is None:
-            return
-        self._block_edit_lines(lambda line, c0, c1: line[:c0].ljust(c0) + text + line[c1:])
-        _first, _last, c0, _c1 = self._block_range()
-        self._block[1] = self._block[3] = c0 + len(text)
-        self._apply_selections()
-
-    def block_delete(self, backward: bool) -> None:
-        """矩形の範囲を消す。幅0なら BS/Del として桁の前後1文字を全行で消す
-        (行頭・行末を越えて行をつなぐことはしない)。"""
-        rng = self._block_range()
-        if rng is None:
-            return
-        _first, _last, c0, c1 = rng
-        if c0 != c1:
-            self._block_edit_lines(lambda line, a, b: line[:a] + line[b:])
-            self._block[1] = self._block[3] = c0
-        elif backward and c0 > 0:
-            self._block_edit_lines(
-                lambda line, a, b: line[:a - 1] + line[a:] if len(line) >= a else line)
-            self._block[1] = self._block[3] = c0 - 1
-        elif not backward:
-            self._block_edit_lines(
-                lambda line, a, b: line[:a] + line[a + 1:] if len(line) > a else line)
-        self._apply_selections()
-
-    def mousePressEvent(self, event):
-        if (event.button() == Qt.LeftButton
-                and event.modifiers() & Qt.AltModifier):
-            cursor = self.cursorForPosition(event.pos())
-            anchor = (cursor.blockNumber(), cursor.positionInBlock())
-            self._block = [anchor[0], anchor[1], anchor[0], anchor[1]]
-            self._block_drag = True
-            plain = QTextCursor(cursor)
-            plain.clearSelection()
-            self.setTextCursor(plain)
-            self._apply_selections()
-            event.accept()
-            return
-        if self._block is not None and not (event.modifiers() & Qt.AltModifier):
-            self.clear_block_selection()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._block_drag:
-            self._drag_pos = event.pos()
-            self._extend_block(self._drag_pos)
-            if self.viewport().rect().contains(self._drag_pos):
-                self._scroll_timer.stop()
-            elif not self._scroll_timer.isActive():
-                self._scroll_timer.start()
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self._block_drag:
-            self._block_drag = False
-            self._scroll_timer.stop()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def _extend_block(self, pos) -> None:
-        """矩形の端を pos(欄の座標)の文字へ。欄の外なら欄の縁で測る。"""
-        rect = self.viewport().rect()
-        inside = QPoint(min(max(pos.x(), rect.left()), rect.right()),
-                        min(max(pos.y(), rect.top()), rect.bottom()))
-        cursor = self.cursorForPosition(inside)
-        self._block[2] = cursor.blockNumber()
-        self._block[3] = cursor.positionInBlock()
-        self._apply_selections()
-
-    def _auto_scroll(self) -> None:
-        """矩形のドラッグ中にマウスが欄の外にあれば、その向きへ送って端を伸ばす。
-        離れているほど速く送る(縦は行、横はおよそ文字の幅の単位)。"""
-        if not self._block_drag or self._drag_pos is None or self._block is None:
-            self._scroll_timer.stop()
-            return
-        rect = self.viewport().rect()
-        pos = self._drag_pos
-        dy = (pos.y() - rect.bottom() if pos.y() > rect.bottom()
-              else pos.y() - rect.top() if pos.y() < rect.top() else 0)
-        dx = (pos.x() - rect.right() if pos.x() > rect.right()
-              else pos.x() - rect.left() if pos.x() < rect.left() else 0)
-        if not dx and not dy:
-            self._scroll_timer.stop()
-            return
-        if dy:
-            bar = self.verticalScrollBar()
-            bar.setValue(bar.value() + (1 + abs(dy) // 20) * (1 if dy > 0 else -1))
-        if dx:
-            bar = self.horizontalScrollBar()
-            step = QFontMetrics(self.font()).horizontalAdvance("0")
-            bar.setValue(bar.value() + step * (1 + abs(dx) // 20) * (1 if dx > 0 else -1))
-        self._extend_block(pos)
-
-    def _block_key(self, event) -> bool:
-        """矩形が生きている間のキー。処理したら True。
-
-        英数の直接入力は全行に行き渡る(IME の入力は通常のカーソル位置に
-        入るので、矩形の対象外)。矢印キーなどは矩形を解いて通常の動きへ。"""
-        key = event.key()
-        mods = event.modifiers()
-        if key == Qt.Key_Escape:
-            self.clear_block_selection()
-            return True
-        if key == Qt.Key_Backspace:
-            self.block_delete(backward=True)
-            return True
-        if key == Qt.Key_Delete:
-            self.block_delete(backward=False)
-            return True
-        if mods & Qt.ControlModifier:
-            if key == Qt.Key_C:
-                QGuiApplication.clipboard().setText(self.block_text())
-                return True
-            if key == Qt.Key_X:
-                QGuiApplication.clipboard().setText(self.block_text())
-                self.block_delete(backward=True)
-                return True
-            if key == Qt.Key_V:
-                text = QGuiApplication.clipboard().text()
-                if text:
-                    self._block_paste(text.replace("\r\n", "\n").replace("\r", "\n"))
-                return True
-            self.clear_block_selection()
-            return False
-        if mods & (Qt.AltModifier | Qt.MetaModifier):
-            self.clear_block_selection()
-            return False
-        text = event.text()
-        if text and text.isprintable():
-            self.block_insert_text(text)
-            return True
-        self.clear_block_selection()
-        return False
-
-    def _block_paste(self, text: str) -> None:
-        """矩形への貼り付け。1行なら全行へ、複数行なら行ごとに配る。"""
-        rng = self._block_range()
-        if rng is None:
-            return
-        parts = text.split("\n")
-        if len(parts) <= 1:
-            self.block_insert_text(text)
-            return
-        first, last, c0, c1 = rng
-        doc = self.document()
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-        try:
-            for i, row in enumerate(range(first, last + 1)):
-                block = doc.findBlockByNumber(row)
-                if not block.isValid():
-                    continue
-                piece = parts[i] if i < len(parts) else ""
-                c = QTextCursor(block)
-                c.select(QTextCursor.LineUnderCursor)
-                line = block.text()
-                c.insertText(line[:c0].ljust(c0) + piece + line[c1:])
-        finally:
-            cursor.endEditBlock()
-        self.clear_block_selection()
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -453,7 +201,7 @@ class RenameEdit(QPlainTextEdit):
             if mods & Qt.ControlModifier:
                 self.window_.execute()
             return          # 改行は入れない(行の数を変えない)
-        if self._block is not None and self._block_key(event):
+        if self.has_block_selection() and self.block_key(event):
             return
         cursor = self.textCursor()
         if not cursor.hasSelection():

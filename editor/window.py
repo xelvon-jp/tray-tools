@@ -6,7 +6,12 @@
 #   開く / 新規 / 上書き保存 / 名前を付けて保存(文字コードと改行は
 #   開いたときのものを守り、変換は利用者が選んだときだけ)、
 #   検索(次へ・前へ)、選択範囲を Copilot に投げる(copilot_io 経由)。
-# マクロは第2段なので、ここには無い。
+#
+# 第2段の土台(同じく案B):
+#   矩形選択は rect_edit の共用部品(text_edit 経由。こちらの矩形は
+#   行を足せる)。マクロは「命令の列」の記録・再生(editor/macros.py)。
+#   編集の操作は命令層(execute_command)を通し、キー割り当てと
+#   マクロの再生が同じ命令を呼ぶ。F4 は直前の命令の繰り返し。
 #
 # 実機フィードバック(2026-11-13)で足したもの:
 #   行番号、リボン風ツールバー、左ペイン(アウトラインのツリー＋下部の
@@ -66,6 +71,7 @@ from PySide6.QtWidgets import (
 import copilot_io
 import text_encoding
 from editor import document as docmod
+from editor import macros as macmod
 from editor import outline
 from editor.highlighter import LineHighlighter
 from editor.keymap import merge_keymap
@@ -339,6 +345,34 @@ class EditorWindow(QMainWindow):
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
 
+        # マクロ(命令の列の記録・再生)と命令層の状態。文書の変化の
+        # 信号が流れ始める前に用意する。
+        self._recorder = macmod.MacroRecorder()
+        self._current_macro = []
+        self._current_macro_name = ""
+        self._in_command = False      # 命令の実行中(変化を二重に数えない)
+        self._replaying = False       # マクロの再生中
+        self._suppress_change_record = False  # 元に戻す・やり直しの最中
+        # 変化の直前の (選択の開始, 選択の終了, カーソル位置)。削除の
+        # 向き(BS か Del か、選択の削除か)の判定に使う。
+        self._change_cache = (0, 0, 0)
+        self._command_impls = {
+            "insert_text": self._cmd_insert_text,
+            "delete_backward": self._cmd_delete_backward,
+            "delete_forward": self._cmd_delete_forward,
+            "delete_selection": self._cmd_delete_selection,
+            "cut_to_end": self._cmd_cut_to_end,
+            "delete_line": self._cmd_delete_line,
+            "find_next": self._cmd_find_next,
+            "find_prev": self._cmd_find_prev,
+            "move_line_start": self._cmd_move_line_start,
+            "move_line_end": self._cmd_move_line_end,
+            "move_line_up": self._cmd_move_line_up,
+            "move_line_down": self._cmd_move_line_down,
+            "move_char_left": self._cmd_move_char_left,
+            "move_char_right": self._cmd_move_char_right,
+        }
+
         self._edit = TextEdit()
         if font is not None:
             edit_font = font
@@ -392,9 +426,17 @@ class EditorWindow(QMainWindow):
         self._edit.document().modificationChanged.connect(
             lambda _modified: self._refresh_title())
         self._edit.cursorPositionChanged.connect(self._refresh_position)
+        self._edit.cursorPositionChanged.connect(self._track_change_cache)
         self._edit.font_size_changed.connect(self._on_font_size_changed)
         self._edit.document().contentsChanged.connect(
             self._on_contents_changed)
+        self._edit.document().contentsChange.connect(
+            self._on_document_change_for_macro)
+        self._edit.move_key.connect(self._on_move_key)
+        self._edit.undo_redo_started.connect(
+            lambda: setattr(self, "_suppress_change_record", True))
+        self._edit.undo_redo_finished.connect(
+            lambda: setattr(self, "_suppress_change_record", False))
 
         self._find_bar = self._build_find_bar()
         central = QWidget()
@@ -459,9 +501,9 @@ class EditorWindow(QMainWindow):
 
         edit_menu = self.menuBar().addMenu("編集(&E)")
         # 元に戻す等は QPlainTextEdit の標準キー(Ctrl+Z 等)が効く。
-        # メニューからは同じ槽を呼ぶだけ。
-        self._action("元に戻す(&U)", self._edit.undo, None, edit_menu)
-        self._action("やり直し(&R)", self._edit.redo, None, edit_menu)
+        # メニューからは同じ槽を呼ぶだけ(最中の変化は記録しない)。
+        self._action("元に戻す(&U)", self._undo_edit, None, edit_menu)
+        self._action("やり直し(&R)", self._redo_edit, None, edit_menu)
         edit_menu.addSeparator()
         self._action("切り取り(&T)", self._edit.cut, None, edit_menu)
         self._action("コピー(&C)", self._edit.copy, None, edit_menu)
@@ -469,15 +511,22 @@ class EditorWindow(QMainWindow):
         self._action("すべて選択(&A)", self._edit.selectAll, None, edit_menu)
         edit_menu.addSeparator()
         self._act_cut_eol = self._action(
-            "行末まで切り取り(&K)", self.cut_to_end_of_line,
+            "行末まで切り取り(&K)",
+            lambda: self.execute_command("cut_to_end"),
             "cut_to_end", edit_menu)
+        self._action("行を削除(&D)",
+                     lambda: self.execute_command("delete_line"),
+                     "delete_line", edit_menu)
+        edit_menu.addSeparator()
+        self._action("直前の操作を繰り返す(&F)", self.repeat_last,
+                     "repeat_last", edit_menu)
 
         search_menu = self.menuBar().addMenu("検索(&S)")
         self._act_find = self._action(
             "検索(&F)…", self.show_find_bar, "find", search_menu)
-        self._action("次を検索(&N)", lambda: self._do_find(True),
+        self._action("次を検索(&N)", lambda: self.execute_command("find_next"),
                      "find_next", search_menu)
-        self._action("前を検索(&P)", lambda: self._do_find(False),
+        self._action("前を検索(&P)", lambda: self.execute_command("find_prev"),
                      "find_prev", search_menu)
 
         view_menu = self.menuBar().addMenu("表示(&V)")
@@ -494,6 +543,18 @@ class EditorWindow(QMainWindow):
         view_menu.addSeparator()
         self._action("アウトライン・強調の設定(&P)…",
                      self.show_pattern_settings, None, view_menu)
+
+        macro_menu = self.menuBar().addMenu("マクロ(&M)")
+        self._act_macro_record = QAction("記録開始(&R)", self)
+        self._act_macro_record.setCheckable(True)
+        self._act_macro_record.toggled.connect(self.set_macro_recording)
+        macro_menu.addAction(self._act_macro_record)
+        self._action("再生(&P)", self.play_macro, None, macro_menu)
+        macro_menu.addSeparator()
+        self._action("マクロを保存(&S)…", self.save_macro_dialog,
+                     None, macro_menu)
+        self._action("マクロを開いて再生(&O)…", self.load_macro_dialog,
+                     None, macro_menu)
 
         copilot_menu = self.menuBar().addMenu("Copilot(&C)")
         self._act_send = self._action(
@@ -521,15 +582,16 @@ class EditorWindow(QMainWindow):
         row.setContentsMargins(6, 4, 6, 4)
         row.addWidget(QLabel("検索"))
         self._find_edit = QLineEdit()
-        self._find_edit.returnPressed.connect(lambda: self._do_find(True))
+        self._find_edit.returnPressed.connect(
+            lambda: self.execute_command("find_next"))
         row.addWidget(self._find_edit, 1)
         self._find_case = QCheckBox("大文字小文字を区別")
         row.addWidget(self._find_case)
         next_button = QPushButton("次へ")
-        next_button.clicked.connect(lambda: self._do_find(True))
+        next_button.clicked.connect(lambda: self.execute_command("find_next"))
         row.addWidget(next_button)
         prev_button = QPushButton("前へ")
-        prev_button.clicked.connect(lambda: self._do_find(False))
+        prev_button.clicked.connect(lambda: self.execute_command("find_prev"))
         row.addWidget(prev_button)
         close_button = QPushButton("閉じる")
         close_button.clicked.connect(self._hide_find_bar)
@@ -740,7 +802,11 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage(f"開けませんでした: {path} ({e})")
             return False
         self._doc = doc
-        self._edit.setPlainText(doc.text)
+        self._suppress_change_record = True
+        try:
+            self._edit.setPlainText(doc.text)
+        finally:
+            self._suppress_change_record = False
         self._edit.document().setModified(False)
         self._refresh_all()
         if doc.lossy_decode:
@@ -762,7 +828,11 @@ class EditorWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self._doc = docmod.TextDocument()
-        self._edit.setPlainText("")
+        self._suppress_change_record = True
+        try:
+            self._edit.setPlainText("")
+        finally:
+            self._suppress_change_record = False
         self._edit.document().setModified(False)
         self._refresh_all()
 
@@ -882,6 +952,309 @@ class EditorWindow(QMainWindow):
         self._edit.setTextCursor(cursor)
 
     # ---------------------------------------------------------------
+    # 命令層(キー割り当てとマクロの再生が同じ命令を呼ぶ)
+    # ---------------------------------------------------------------
+    def execute_command(self, name, args=None, _note=True) -> bool:
+        """名前つき命令を1つ実行する。
+
+        実行できたら True。実行した命令は記録係(MacroRecorder)へ
+        渡る(記録中なら列に残り、F4 の「直前の命令」にもなる)。
+        再生の最中は _note=False で呼ばれ、記録には混ざらない。
+        命令の実体(_cmd_*)は「記録に残す引数」を返し、None なら
+        その回は記録しない(空の検索など)。"""
+        impl = self._command_impls.get(name)
+        if impl is None:
+            return False
+        self._in_command = True
+        try:
+            effective = impl(args or {})
+        finally:
+            self._in_command = False
+            self._track_change_cache()
+        if _note and effective is not None:
+            self._recorder.note_command(name, effective)
+        return True
+
+    def repeat_last(self):
+        """F4: 直前の命令をもう一度実行する(命令が無ければ何もしない)。"""
+        last = self._recorder.last_command
+        if last is None:
+            return
+        name, args = last
+        self.execute_command(name, dict(args))
+
+    def _move_cursor(self, operation, args):
+        count = args.get("count", 1)
+        try:
+            count = max(1, int(count))
+        except (TypeError, ValueError):
+            count = 1
+        extend = bool(args.get("extend"))
+        mode = (QTextCursor.MoveMode.KeepAnchor if extend
+                else QTextCursor.MoveMode.MoveAnchor)
+        cursor = self._edit.textCursor()
+        for _ in range(count):
+            cursor.movePosition(operation, mode)
+        self._edit.setTextCursor(cursor)
+        return {"count": count, "extend": extend}
+
+    def _cmd_move_line_start(self, args):
+        return self._move_cursor(
+            QTextCursor.MoveOperation.StartOfBlock, args)
+
+    def _cmd_move_line_end(self, args):
+        return self._move_cursor(
+            QTextCursor.MoveOperation.EndOfBlock, args)
+
+    def _cmd_move_line_up(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.Up, args)
+
+    def _cmd_move_line_down(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.Down, args)
+
+    def _cmd_move_char_left(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.Left, args)
+
+    def _cmd_move_char_right(self, args):
+        return self._move_cursor(QTextCursor.MoveOperation.Right, args)
+
+    def _cmd_insert_text(self, args):
+        text = str(args.get("text") or "")
+        if not text:
+            return None
+        cursor = self._edit.textCursor()
+        cursor.insertText(text)
+        self._edit.setTextCursor(cursor)
+        return {"text": text}
+
+    def _cmd_delete_backward(self, args):
+        return self._delete_chars(args, forward=False)
+
+    def _cmd_delete_forward(self, args):
+        return self._delete_chars(args, forward=True)
+
+    def _delete_chars(self, args, forward):
+        count = args.get("count", 1)
+        try:
+            count = max(1, int(count))
+        except (TypeError, ValueError):
+            count = 1
+        cursor = self._edit.textCursor()
+        for _ in range(count):
+            if forward:
+                cursor.deleteChar()
+            else:
+                cursor.deletePreviousChar()
+        self._edit.setTextCursor(cursor)
+        return {"count": count}
+
+    def _cmd_delete_selection(self, args):
+        cursor = self._edit.textCursor()
+        if not cursor.hasSelection():
+            return None
+        cursor.removeSelectedText()
+        self._edit.setTextCursor(cursor)
+        return {}
+
+    def _cmd_cut_to_end(self, args):
+        self.cut_to_end_of_line()
+        return {}
+
+    def _cmd_delete_line(self, args):
+        cursor = self._edit.textCursor()
+        block = cursor.block()
+        pos = block.position()
+        text_len = len(block.text())
+        if block.next().isValid():
+            start, end = pos, pos + text_len + 1       # 改行ごと消す
+        elif pos > 0:
+            start, end = pos - 1, pos + text_len       # 前の改行ごと
+        else:
+            start, end = pos, pos + text_len           # 1行だけの文書
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        self._edit.setTextCursor(cursor)
+        return {}
+
+    def _cmd_find_next(self, args):
+        return self._find_command(args, forward=True)
+
+    def _cmd_find_prev(self, args):
+        return self._find_command(args, forward=False)
+
+    def _find_command(self, args, forward):
+        word = args.get("text")
+        if word is None:
+            word = self._find_edit.text()
+        else:
+            word = str(word)
+        if not word:
+            return None
+        case = args.get("case")
+        case = self._find_case.isChecked() if case is None else bool(case)
+        self._do_find(forward, word, case)
+        return {"text": word, "case": case}
+
+    # ---------------------------------------------------------------
+    # マクロの記録(文書の変化と移動キーの切り分け)
+    # ---------------------------------------------------------------
+    def _track_change_cache(self):
+        cursor = self._edit.textCursor()
+        self._change_cache = (cursor.selectionStart(),
+                              cursor.selectionEnd(), cursor.position())
+
+    def _on_move_key(self, name, extend):
+        # 移動は本文が標準で済ませている。ここでは「起きたこと」と
+        # して記録係へ渡すだけ(実行はしない)。
+        self._recorder.note_command(name, {"count": 1, "extend": bool(extend)})
+
+    def _on_document_change_for_macro(self, pos, removed, added):
+        try:
+            if not (self._in_command or self._replaying
+                    or self._suppress_change_record):
+                doc = self._edit.document()
+                sel_start, sel_end, cursor_before = self._change_cache
+                if pos == 0 and added > 0 and added >= doc.characterCount() - 1:
+                    # 文書の丸ごと差し替え(ファイルの読み込み等)は
+                    # 編集の記録にしない。
+                    self._recorder.break_insert_chain()
+                elif (added == 0 and removed == 1 and pos == 0
+                        and sel_start == sel_end and cursor_before == 0
+                        and doc.characterCount() <= 1):
+                    # 差し替えの前半で出る「空にする削除」も記録
+                    # しない(実体は末尾の区切り文字だけ)。代償として、
+                    # 1文字だけの文書での Del は記録に残らない。
+                    self._recorder.break_insert_chain()
+                else:
+                    inserted = ""
+                    if added > 0:
+                        inserted = doc.toPlainText()[pos:pos + added]
+                    self._recorder.feed_change(
+                        pos, removed, added, inserted,
+                        sel_start, sel_end, cursor_before)
+        except Exception:  # noqa: BLE001  記録の失敗で編集を止めない
+            pass
+        finally:
+            self._track_change_cache()
+
+    def _undo_edit(self):
+        self._suppress_change_record = True
+        try:
+            self._edit.undo()
+        finally:
+            self._suppress_change_record = False
+            self._track_change_cache()
+
+    def _redo_edit(self):
+        self._suppress_change_record = True
+        try:
+            self._edit.redo()
+        finally:
+            self._suppress_change_record = False
+            self._track_change_cache()
+
+    # ---------------------------------------------------------------
+    # マクロ(記録・再生・保存)
+    # ---------------------------------------------------------------
+    @property
+    def macro_recording(self) -> bool:
+        return self._recorder.recording
+
+    def recorded_commands(self) -> list:
+        """記録中の命令の列(写し)。"""
+        return [dict(entry, args=dict(entry.get("args") or {}))
+                for entry in self._recorder.commands]
+
+    def set_macro_recording(self, on):
+        on = bool(on)
+        if on == self._recorder.recording:
+            return
+        if on:
+            self._recorder.start()
+            self._act_macro_record.setText("記録終了(&R)")
+            self.statusBar().showMessage("● マクロ記録中", 0)
+        else:
+            self._recorder.stop()
+            self._current_macro = self.recorded_commands()
+            self._current_macro_name = ""
+            self._act_macro_record.setText("記録開始(&R)")
+            self.statusBar().showMessage(
+                f"マクロの記録を終了しました（{len(self._current_macro)} 手）",
+                4000)
+        action = getattr(self, "_act_macro_record", None)
+        if action is not None and action.isChecked() != on:
+            blocker = QSignalBlocker(action)
+            action.setChecked(on)
+
+    def play_macro(self, commands=None) -> bool:
+        """マクロを再生する。commands が無ければ、最後に記録・読み
+        込みしたマクロ。再生全体は1回の undo で戻せる単位にする。"""
+        if commands is None:
+            commands = self._current_macro
+        if not commands:
+            self.statusBar().showMessage("再生するマクロがありません", 4000)
+            return False
+        self._replaying = True
+        cursor = self._edit.textCursor()
+        cursor.beginEditBlock()
+        try:
+            for entry in commands:
+                self.execute_command(entry["cmd"],
+                                     dict(entry.get("args") or {}),
+                                     _note=False)
+        finally:
+            cursor.endEditBlock()
+            self._replaying = False
+            self._track_change_cache()
+        return True
+
+    def save_macro(self, path, name="") -> bool:
+        """いまのマクロ(記録中なら記録中の列)を JSON で書く。"""
+        commands = (self.recorded_commands() if self._recorder.recording
+                    else self._current_macro)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(macmod.macro_to_json(commands, name))
+        except OSError as e:
+            self.statusBar().showMessage(f"マクロを保存できませんでした: {e}")
+            return False
+        return True
+
+    def load_macro(self, path) -> list:
+        """マクロの JSON を読み、いまのマクロにする。命令の列を返す。
+        読めなければ ValueError / OSError を上げる(呼び側が伝える)。"""
+        with open(path, encoding="utf-8") as f:
+            name, commands = macmod.macro_from_json(f.read())
+        self._current_macro = commands
+        self._current_macro_name = name
+        return commands
+
+    def save_macro_dialog(self):
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "マクロを保存", "", "マクロ (*.json);;すべてのファイル (*)")
+            if not path:
+                return
+            name = os.path.splitext(os.path.basename(path))[0]
+            if self.save_macro(path, name):
+                self.statusBar().showMessage("マクロを保存しました", 4000)
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(f"マクロを保存できませんでした ({e})")
+
+    def load_macro_dialog(self):
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "マクロを開く", "", "マクロ (*.json);;すべてのファイル (*)")
+            if not path:
+                return
+            commands = self.load_macro(path)
+        except Exception as e:  # noqa: BLE001  理由は利用者への文にする
+            self.statusBar().showMessage(f"マクロを読めませんでした: {e}")
+            return
+        self.play_macro(commands)
+
+    # ---------------------------------------------------------------
     # 検索
     # ---------------------------------------------------------------
     def show_find_bar(self):
@@ -893,11 +1266,15 @@ class EditorWindow(QMainWindow):
         self._find_bar.hide()
         self._edit.setFocus()
 
-    def _do_find(self, forward: bool) -> bool:
-        word = self._find_edit.text()
+    def _do_find(self, forward: bool, word=None, case_sensitive=None) -> bool:
+        """検索の実体。word / case_sensitive が None なら検索欄の値を使う
+        (命令層からは、記録・再生のために使った値を渡してくる)。"""
+        if word is None:
+            word = self._find_edit.text()
         if not word:
             return False
-        case_sensitive = self._find_case.isChecked()
+        if case_sensitive is None:
+            case_sensitive = self._find_case.isChecked()
         text = self._edit.toPlainText()
         cursor = self._edit.textCursor()
         if forward:

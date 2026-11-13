@@ -16,6 +16,9 @@
 #   line_number_background / line_number_foreground  行番号エリア
 #   line_number_edited_foreground  編集マーク(開いて・保存してから
 #     編集した行)の行番号の色
+#   line_number_bookmark_foreground  ブックマーク(印を付けた行)の
+#     行番号わきの印の色。編集マーク(行番号の文字色)とは別物の
+#     記号(●)で出すので、色も別に持つ
 #   star_background       星印の行の強調(ハイライタ)の背景
 #   heading1_background 〜 heading6_background
 #                         Markdown 見出しの背景(階層が深いほど薄い)
@@ -61,6 +64,7 @@ COLOR_SCHEMES = {
         "line_number_background": "#f2f2f2",
         "line_number_foreground": "#909090",
         "line_number_edited_foreground": "#e07020",
+        "line_number_bookmark_foreground": "#2060c8",
         "star_background": "#fff3b0",
         **_MARKDOWN_COLORS,
     },
@@ -73,6 +77,7 @@ COLOR_SCHEMES = {
         "line_number_background": "#f0f0f0",
         "line_number_foreground": "#606060",
         "line_number_edited_foreground": "#d06000",
+        "line_number_bookmark_foreground": "#0057b8",
         "star_background": "#ffe699",
         **_MARKDOWN_COLORS,
     },
@@ -88,6 +93,7 @@ COLOR_ITEMS = (
     ("line_number_background", "行番号の背景"),
     ("line_number_foreground", "行番号の文字"),
     ("line_number_edited_foreground", "編集マーク（行番号）"),
+    ("line_number_bookmark_foreground", "ブックマーク（行番号わきの印）"),
     ("star_background", "星印行の背景"),
     ("heading1_background", "Markdown 見出し1の背景"),
     ("heading2_background", "Markdown 見出し2の背景"),

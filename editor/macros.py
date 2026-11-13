@@ -26,6 +26,10 @@
 #   next_edited_line {}         次の編集行へ移動(編集マークの行。
 #                               無ければ記録されない)
 #   prev_edited_line {}         前の編集行へ移動
+#   toggle_bookmark {}          カーソル行のブックマークの付け外し
+#   next_bookmark {}            次のブックマークへ移動(印が無ければ
+#                               記録されない)
+#   prev_bookmark {}            前のブックマークへ移動
 #   move_line_up {count, extend}    上の行へ
 #   move_line_down {count, extend}  下の行へ
 #   move_char_left {count, extend}  左へ
@@ -61,6 +65,9 @@ KNOWN_COMMANDS = frozenset({
     "goto_line",
     "next_edited_line",
     "prev_edited_line",
+    "toggle_bookmark",
+    "next_bookmark",
+    "prev_bookmark",
     "move_line_up",
     "move_line_down",
     "move_char_left",

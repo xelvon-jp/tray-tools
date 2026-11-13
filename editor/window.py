@@ -50,6 +50,15 @@
 # 保存した直後に消して基準にする。次の編集行・前の編集行への
 # 移動は命令(next_edited_line / prev_edited_line、既定は
 # F2 / Shift+F2)で、端では反対側へ回る。
+#
+# ブックマーク(2026-11-13): 行に印を付けると、行番号のわきに ● が
+# 出る(配色の line_number_bookmark_foreground)。印の保持と追随は
+# 本文(text_edit)が編集マークと同じ作法で行い、窓は文書を開いた
+# 直後と新規の直後だけ消す(保存では消えない。ファイルには保存
+# しない、開いている間だけの印)。付け外し・次・前への移動は命令
+# (toggle_bookmark / next_bookmark / prev_bookmark、既定は
+# F7 / F8 / Shift+F8)、一覧は bookmark_dialog の窓(既定は
+# Ctrl+Shift+B)から選んで飛ぶ。
 # 正規表現まわりには、遅い式で固まらないための仕掛けが3つある:
 #   各行は先頭200字だけ match する(outline.MATCH_HEAD_CHARS)、
 #   設定ダイアログは OK のときに別プロセスで試験して遅い式を断る
@@ -118,6 +127,7 @@ from editor import outline
 from editor import editor_icon
 from editor import reformat as refmtmod
 from editor import rxfind
+from editor.bookmark_dialog import BookmarkDialog
 from editor.color_dialog import ColorSettingsDialog
 from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
@@ -536,6 +546,9 @@ class EditorWindow(QMainWindow):
             "goto_line": self._cmd_goto_line,
             "next_edited_line": self._cmd_next_edited_line,
             "prev_edited_line": self._cmd_prev_edited_line,
+            "toggle_bookmark": self._cmd_toggle_bookmark,
+            "next_bookmark": self._cmd_next_bookmark,
+            "prev_bookmark": self._cmd_prev_bookmark,
             "move_line_up": self._cmd_move_line_up,
             "move_line_down": self._cmd_move_line_down,
             "move_char_left": self._cmd_move_char_left,
@@ -792,6 +805,18 @@ class EditorWindow(QMainWindow):
         self._action("前の編集行へ(&P)",
                      lambda: self.execute_command("prev_edited_line"),
                      "prev_edited_line", edit_menu)
+        edit_menu.addSeparator()
+        self._action("ブックマークの付け外し(&B)",
+                     lambda: self.execute_command("toggle_bookmark"),
+                     "toggle_bookmark", edit_menu)
+        self._action("次のブックマークへ(&J)",
+                     lambda: self.execute_command("next_bookmark"),
+                     "next_bookmark", edit_menu)
+        self._action("前のブックマークへ(&V)",
+                     lambda: self.execute_command("prev_bookmark"),
+                     "prev_bookmark", edit_menu)
+        self._action("ブックマーク一覧(&L)…", self.show_bookmark_dialog,
+                     "bookmark_list", edit_menu)
         edit_menu.addSeparator()
         self._action("直前の操作を繰り返す(&F)", self.repeat_last,
                      "repeat_last", edit_menu)
@@ -1434,6 +1459,8 @@ class EditorWindow(QMainWindow):
         self._edit.set_line_newlines(doc.line_newlines, doc.newline)
         # 読み込んだ内容が編集マークの基準になる。
         self._edit.clear_edited_lines()
+        # ブックマークは前の文書の印なので、開き直したら消す。
+        self._edit.clear_bookmarks()
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1486,6 +1513,7 @@ class EditorWindow(QMainWindow):
             self._suppress_change_record = False
         self._edit.set_line_newlines(None, self._doc.newline)
         self._edit.clear_edited_lines()
+        self._edit.clear_bookmarks()
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1883,6 +1911,43 @@ class EditorWindow(QMainWindow):
         None(移動も記録もしない)。移動そのものは _jump_to_line
         (行頭に置いて中央に寄せる)。"""
         marks = self._edit.edited_lines()
+        if not marks:
+            return None
+        current = self._edit.textCursor().blockNumber()
+        if forward:
+            target = next((n for n in marks if n > current), marks[0])
+        else:
+            target = next(
+                (n for n in reversed(marks) if n < current), marks[-1])
+        self._jump_to_line(target)
+        return {}
+
+    def bookmarks(self):
+        """ブックマークの付いた行(1始まり、昇順)。
+
+        開いている間だけの印。本文がブロック番号で持っているものを、
+        利用者向けの行番号に直して返す。"""
+        return [number + 1 for number in self._edit.bookmarks()]
+
+    def _cmd_toggle_bookmark(self, args):
+        """カーソル行のブックマークの付け外し(命令 toggle_bookmark)。"""
+        line = self._edit.textCursor().blockNumber()
+        self._edit.toggle_bookmark(line)
+        return {}
+
+    def _cmd_next_bookmark(self, args):
+        return self._move_to_bookmark(forward=True)
+
+    def _cmd_prev_bookmark(self, args):
+        return self._move_to_bookmark(forward=False)
+
+    def _move_to_bookmark(self, forward):
+        """ブックマークのある行へ順に移動する(命令 next_bookmark /
+        prev_bookmark)。カーソルより後ろ(前)の直近の印へ飛び、
+        端まで行ったら反対側の端に回る。印が無ければ None(移動も
+        記録もしない)。移動そのものは _jump_to_line(行頭に置いて
+        中央に寄せる)。"""
+        marks = self._edit.bookmarks()
         if not marks:
             return None
         current = self._edit.textCursor().blockNumber()
@@ -2542,6 +2607,30 @@ class EditorWindow(QMainWindow):
                 self.execute_command("goto_line", {"line": value})
         except Exception as e:  # noqa: BLE001  スロットで投げ切らない
             self.statusBar().showMessage(f"移動できませんでした ({e})")
+
+    # ---------------------------------------------------------------
+    # ブックマークの一覧
+    # ---------------------------------------------------------------
+    def show_bookmark_dialog(self):
+        """ブックマークの一覧の窓を開く。
+
+        項目は開いた時点の印と行の内容(この窓はモーダルなので、
+        開いている間に本文は変わらない)。選んだ行への移動は
+        _jump_to_line(行頭に置いて中央に寄せる)。"""
+        try:
+            document = self._edit.document()
+            entries = []
+            for number in self._edit.bookmarks():
+                block = document.findBlockByNumber(number)
+                entries.append(
+                    (number + 1, block.text() if block.isValid() else ""))
+            dialog = BookmarkDialog(
+                self, entries=entries,
+                on_jump=lambda line: self._jump_to_line(max(0, line - 1)))
+            dialog.exec()
+        except Exception as e:  # noqa: BLE001  スロットで投げ切らない
+            self.statusBar().showMessage(
+                f"ブックマークを開けませんでした ({e})")
 
     # ---------------------------------------------------------------
     # フォルダ内の横断検索(grep)

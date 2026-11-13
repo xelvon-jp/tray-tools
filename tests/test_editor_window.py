@@ -2553,6 +2553,249 @@ def test_edit_marks_navigation_recorded_and_replayed():
             discard_close(window)
 
 
+def _goto_block(window, block_number):
+    """カーソルを指定の行(ブロック番号)の頭へ置く。"""
+    block = window._edit.document().findBlockByNumber(block_number)
+    window._edit.setTextCursor(QTextCursor(block))
+
+
+def _toggle_bookmark_at(window, block_number):
+    _goto_block(window, block_number)
+    assert window.execute_command("toggle_bookmark")
+
+
+def test_bookmarks_toggle():
+    # 付け外し。キー割り当ての既定もここで固定する(F2 系は編集
+    # マーク、F3 系は検索で使用済みなので、ブックマークは空いて
+    # いる F7 / F8 と Ctrl+Shift+B)。
+    assert DEFAULT_KEYMAP["toggle_bookmark"] == "F7"
+    assert DEFAULT_KEYMAP["next_bookmark"] == "F8"
+    assert DEFAULT_KEYMAP["prev_bookmark"] == "Shift+F8"
+    assert DEFAULT_KEYMAP["bookmark_list"] == "Ctrl+Shift+B"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            assert window.bookmarks() == []
+            _toggle_bookmark_at(window, 2)
+            assert window.bookmarks() == [3]
+            _toggle_bookmark_at(window, 0)
+            assert window.bookmarks() == [1, 3]
+            # もう一度押すと外れる。
+            _toggle_bookmark_at(window, 2)
+            assert window.bookmarks() == [1]
+        finally:
+            discard_close(window)
+
+
+def test_bookmarks_survive_save():
+    # 保存しても消えない(編集マークとは違う)。ファイルには保存
+    # しないので、開き直した窓には印は無い。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _toggle_bookmark_at(window, 1)
+            _edit_block(window, 0)
+            assert window.edited_lines() == [1]
+            assert window.save()
+            # 編集マークは保存で基準化されて消えるが、
+            # ブックマークは残る。
+            assert window.edited_lines() == []
+            assert window.bookmarks() == [2]
+            _edit_block(window, 2)
+            assert window.bookmarks() == [2]
+        finally:
+            discard_close(window)
+        window = make_window(path)
+        try:
+            assert window.bookmarks() == []
+        finally:
+            discard_close(window)
+
+
+def test_bookmarks_follow_insert_and_delete_lines():
+    # 行の挿入・削除に印が追随する。消えた行の印は消える。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            _toggle_bookmark_at(window, 2)
+            assert window.bookmarks() == [3]
+            # 行の中で打っても、印はその行に残る。
+            _edit_block(window, 2)
+            assert window.bookmarks() == [3]
+            # 先頭に行を挿入すると、印は後ろへずれる(挿入した行には
+            # 付かない)。
+            cursor = QTextCursor(window._edit.document())
+            cursor.setPosition(0)
+            cursor.insertText("new\n")
+            assert window.text() == "new\nl1\nl2\nXl3\nl4\nl5\n"
+            assert window.bookmarks() == [4]
+            # 先頭の行を削除すると、印は前へ戻る。
+            _goto_block(window, 0)
+            assert window.execute_command("delete_line")
+            assert window.text() == "l1\nl2\nXl3\nl4\nl5\n"
+            assert window.bookmarks() == [3]
+            # 印の行の途中で改行すると、印は前半の行に残る。
+            block = window._edit.document().findBlockByNumber(2)
+            cursor = QTextCursor(block)
+            cursor.setPosition(block.position() + 1)
+            cursor.insertText("\n")
+            assert window.text() == "l1\nl2\nX\nl3\nl4\nl5\n"
+            assert window.bookmarks() == [3]
+            # 印の付いた行自体を削除すると、印も消える
+            # (次の行へ移らない)。
+            _goto_block(window, 2)
+            assert window.execute_command("delete_line")
+            assert window.text() == "l1\nl2\nl3\nl4\nl5\n"
+            assert window.bookmarks() == []
+        finally:
+            discard_close(window)
+
+
+def test_bookmarks_next_prev_navigation():
+    # 次のブックマーク・前のブックマークへの移動。端では反対側へ
+    # 回る。印が無ければ動かず、記録にも残らない。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        Path(path).write_bytes("l1\nl2\nl3\nl4\nl5\nl6\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            window.set_macro_recording(True)
+            window.execute_command("next_bookmark")
+            window.set_macro_recording(False)
+            assert window._edit.textCursor().blockNumber() == 0
+            assert window.recorded_commands() == []
+
+            _toggle_bookmark_at(window, 1)
+            _toggle_bookmark_at(window, 4)
+            assert window.bookmarks() == [2, 5]
+            _goto_block(window, 0)
+            window.execute_command("next_bookmark")
+            assert window._edit.textCursor().blockNumber() == 1
+            window.execute_command("next_bookmark")
+            assert window._edit.textCursor().blockNumber() == 4
+            # 最後の印の次は、先頭の印へ回る。
+            window.execute_command("next_bookmark")
+            assert window._edit.textCursor().blockNumber() == 1
+            # 先頭の印の前は、最後の印へ回る。
+            window.execute_command("prev_bookmark")
+            assert window._edit.textCursor().blockNumber() == 4
+            window.execute_command("prev_bookmark")
+            assert window._edit.textCursor().blockNumber() == 1
+            # 移動はマクロに記録できる。
+            _goto_block(window, 0)
+            window.set_macro_recording(True)
+            window.execute_command("next_bookmark")
+            window.set_macro_recording(False)
+            assert {"cmd": "next_bookmark", "args": {}} in \
+                window.recorded_commands()
+        finally:
+            discard_close(window)
+
+
+def test_bookmark_dialog_lists_and_jumps():
+    # 一覧の窓: 項目の並びと文言、選んだ行が on_jump へ渡ること。
+    from editor.bookmark_dialog import BookmarkDialog
+    jumped = []
+    dialog = BookmarkDialog(
+        None, entries=[(2, "l2"), (5, "l5")],
+        on_jump=lambda line: jumped.append(line))
+    try:
+        assert dialog._results.count() == 2
+        assert dialog._results.item(0).text() == "2: l2"
+        assert dialog._results.item(1).text() == "5: l5"
+        assert dialog._status_label.text() == \
+            "2 件のブックマークがあります"
+        dialog._on_item_activated(dialog._results.item(1))
+        assert jumped == [5]
+    finally:
+        dialog.deleteLater()
+    # 印が無いときは、無いことだけ出る。
+    dialog = BookmarkDialog(None, entries=[], on_jump=lambda line: None)
+    try:
+        assert dialog._results.count() == 0
+        assert dialog._status_label.text() == "ブックマークはありません"
+    finally:
+        dialog.deleteLater()
+
+
+def test_bookmark_window_dialog_entries_and_jump():
+    # 窓から開く一覧には、今の印と行の内容がそのまま渡り、選んだ
+    # 行へ行頭の作法(_jump_to_line)で移動する。
+    import editor.window as winmod
+    from PySide6.QtGui import QKeySequence
+
+    class _FakeBookmarkDialog:
+        seen = None
+
+        def __init__(self, parent=None, **kwargs):
+            _FakeBookmarkDialog.seen = kwargs
+
+        def exec(self):
+            _FakeBookmarkDialog.seen["on_jump"](3)
+            return 1
+
+    window = make_window()
+    original = winmod.BookmarkDialog
+    winmod.BookmarkDialog = _FakeBookmarkDialog
+    try:
+        window._edit.setPlainText("1\n2\n3\n4\n5")
+        _toggle_bookmark_at(window, 1)
+        _toggle_bookmark_at(window, 3)
+        window.show_bookmark_dialog()
+        seen = _FakeBookmarkDialog.seen
+        assert seen["entries"] == [(2, "2"), (4, "4")]
+        cursor = window._edit.textCursor()
+        assert cursor.blockNumber() == 2
+        block = window._edit.document().findBlockByNumber(2)
+        assert cursor.position() == block.position()
+        # 編集メニューの項目に、キー割り当てのキーが付いている。
+        found = None
+        for top in window.menuBar().actions():
+            menu = top.menu()
+            if menu is None:
+                continue
+            for action in menu.actions():
+                if "ブックマーク一覧" in action.text():
+                    found = action
+        assert found is not None
+        assert found.shortcut() == QKeySequence("Ctrl+Shift+B")
+    finally:
+        winmod.BookmarkDialog = original
+        discard_close(window)
+
+
+def test_bookmarks_color_per_scheme():
+    # ブックマークの色は配色の項目
+    # (line_number_bookmark_foreground)。編集マークの色とは別に
+    # 持ち、配色の切り替えで本文へ反映される。
+    from PySide6.QtGui import QColor
+
+    from editor import colors as colormod
+    for name in colormod.scheme_names():
+        scheme = colormod.get_scheme(name)
+        assert scheme["line_number_bookmark_foreground"], name
+        # 編集マークとは別の色であること(見分けが付く)。
+        assert (scheme["line_number_bookmark_foreground"]
+                != scheme["line_number_edited_foreground"]), name
+    window = make_window()
+    try:
+        standard = colormod.get_scheme("標準")
+        assert window._edit.bookmark_color() == QColor(
+            standard["line_number_bookmark_foreground"])
+        window.apply_color_scheme("秀丸風")
+        hidemaru = colormod.get_scheme("秀丸風")
+        assert window._edit.bookmark_color() == QColor(
+            hidemaru["line_number_bookmark_foreground"])
+    finally:
+        discard_close(window)
+
+
 def test_color_overrides_persist_and_read_back():
     # 色の設定(プリセット+上書き)は差分として流れ、開き直すと
     # 読み戻されて本文へ反映される。

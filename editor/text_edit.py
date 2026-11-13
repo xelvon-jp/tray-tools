@@ -18,6 +18,11 @@
 #     別の色で描く。マークの追随は改行種別の控えと同じく
 #     contentsChange で行い、基準化(開く・保存)は窓が
 #     clear_edited_lines で行う
+#   - ブックマーク: 印を付けた行の行番号のわきに ● を描く(編集
+#     マーク=行番号の文字色 とは別物の記号なので、両方付いた行でも
+#     見分けられる)。印の追随も contentsChange。編集マークと違い
+#     保存では消えず、文書を開き直す・新規にするときだけ窓が
+#     clear_bookmarks で消す(ファイルには保存しない)
 #
 # キーの通知(窓側がマクロ記録と F4 のために受ける):
 #   move_key(命令名, 選択を広げるか) … Home / End / 矢印などの素の
@@ -65,6 +70,9 @@ FALLBACK_FONT_SIZE = 10
 NEWLINE_GLYPHS = {"\r\n": "←↓", "\n": "↓", "\r": "←"}
 # 文書の末尾(最後のブロックの末尾)に出す印。小さい字で描く。
 EOF_MARK = "EOF"
+
+# ブックマークのある行に、行番号のわきへ描く印。
+BOOKMARK_GLYPH = "●"
 
 
 def wrap_right_margin(available_width, char_width, document_margin, column):
@@ -135,6 +143,13 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._edited_lines = set()
         self._edited_base_count = self.document().blockCount()
         self.document().contentsChange.connect(self._track_edited_lines)
+        # ブックマーク(ブロック番号の組)。開いている間だけの印で、
+        # 追随は編集マークと同じ作法(_track_bookmarks)。
+        # _bookmarks_base_count は直前の contentsChange 時点の
+        # ブロック数(増減の切り分け用)。
+        self._bookmarks = set()
+        self._bookmarks_base_count = self.document().blockCount()
+        self.document().contentsChange.connect(self._track_bookmarks)
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
@@ -158,6 +173,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             self._scheme["line_number_foreground"])
         self._edited_color = QColor(
             self._scheme["line_number_edited_foreground"])
+        self._bookmark_color = QColor(
+            self._scheme["line_number_bookmark_foreground"])
         self.cursorPositionChanged.connect(self._refresh_extra_selections)
 
     def _on_rect_changed(self) -> None:
@@ -200,6 +217,8 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._area_foreground = QColor(scheme["line_number_foreground"])
         self._edited_color = QColor(
             scheme["line_number_edited_foreground"])
+        self._bookmark_color = QColor(
+            scheme["line_number_bookmark_foreground"])
         self._refresh_extra_selections()
         self._area.update()
         self.viewport().update()
@@ -437,6 +456,114 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             self._edited_lines = updated
             self._area.update()
 
+    # ---------------------------------------------------------------
+    # ブックマーク(開いている間だけの行の印)
+    # ---------------------------------------------------------------
+    def bookmarks(self):
+        """ブックマークの付いた行のブロック番号(昇順のリスト)。"""
+        return sorted(self._bookmarks)
+
+    def bookmark_color(self) -> QColor:
+        """ブックマークの印に使う色(配色の組から)。"""
+        return QColor(self._bookmark_color)
+
+    def toggle_bookmark(self, block_number) -> bool:
+        """行のブックマークを付け外しする。付けたら True、外したら
+        False。範囲外の行番号は何もしない(戻り値は今の状態)。"""
+        if not 0 <= block_number < self.document().blockCount():
+            return block_number in self._bookmarks
+        if block_number in self._bookmarks:
+            self._bookmarks.discard(block_number)
+            marked = False
+        else:
+            self._bookmarks.add(block_number)
+            marked = True
+        self._area.update()
+        return marked
+
+    def clear_bookmarks(self):
+        """ブックマークを全部消す。
+
+        窓が、文書を開いた直後と新規にした直後に呼ぶ(保存では
+        呼ばない。編集マークと違い、保存しても印は残る)。ブロック数
+        の控えもいまの文書に合わせ直す。"""
+        self._bookmarks = set()
+        self._bookmarks_base_count = self.document().blockCount()
+        self._area.update()
+
+    def _track_bookmarks(self, position, chars_removed, chars_added):
+        """文書の変化に、ブックマークを追随させる。
+
+        変わった範囲(スパン)の切り分けは編集マーク
+        (_track_edited_lines)と同じで、行の境目で終わる追加の例外も
+        同じ。違うのは範囲の中の扱いだけ:
+          - 範囲より前の行はそのまま、後ろの行は増減ぶんずれる
+          - 範囲の中の行は、範囲の中での順番のまま残る(行の中で
+            打った・行を割った等では、印はその行に残る)。新しい
+            範囲の行数を超えた分は、行ごと消えたので印も消える
+          - 行ごとの削除(削除だけで行が減り、位置が行頭に来た
+            とき)は編集マークと同じ例外で、範囲の最後に残った行
+            だけが引き継ぐ。消えた行の印が次の行へ移ることはない
+        元に戻す・やり直しの変化も同じく追随する。"""
+        if chars_removed == 0 and chars_added == 0:
+            return
+        doc = self.document()
+        new_count = doc.blockCount()
+        old_count = self._bookmarks_base_count
+        self._bookmarks_base_count = new_count
+        last_pos = max(0, doc.characterCount() - 1)
+        first_block = doc.findBlock(min(position, last_pos))
+        if not first_block.isValid():
+            return
+        first = first_block.blockNumber()
+        end_block = doc.findBlock(min(position + chars_added, last_pos))
+        last = end_block.blockNumber() if end_block.isValid() else first
+        if chars_added > 0 and end_block.isValid() \
+                and position + chars_added == end_block.position() \
+                and position == first_block.position():
+            # 追加がちょうど行の境目で終わった。境目の先の行は
+            # 変化に含まれない(編集マークと同じ例外)。
+            last -= 1
+        if last < first:
+            last = first
+        span_new = last - first + 1
+        delta = new_count - old_count
+        span_old = span_new - delta
+        if span_old < 0:
+            span_old = 0
+        pure_line_removal = (
+            chars_added == 0 and delta < 0
+            and position == first_block.position())
+        updated = set()
+        for line in self._bookmarks:
+            if line < first:
+                updated.add(line)
+            elif line >= first + span_old:
+                updated.add(line + delta)
+            elif pure_line_removal:
+                # 範囲の最後に残った行だけ引き継ぐ。
+                if line == first + span_old - 1:
+                    updated.add(last)
+            else:
+                # 範囲の中の行は、順番のまま残る。新しい行数を
+                # 超えた分(行ごと消えた分)は印も消える。
+                offset = line - first
+                if offset < span_new:
+                    updated.add(first + offset)
+        if updated != self._bookmarks:
+            self._bookmarks = updated
+            self._area.update()
+
+    def _marker_font(self):
+        """ブックマークの印用の、本文より小さいフォント(EOF の印と
+        同じ割り切り)。"""
+        font = QFont(self.font())
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(6.0, font.pointSizeF() * 0.7))
+        elif font.pixelSize() > 0:
+            font.setPixelSize(max(6, round(font.pixelSize() * 0.7)))
+        return font
+
     def _eof_font(self):
         """EOF の印用の、本文より小さいフォント。"""
         font = QFont(self.font())
@@ -557,7 +684,13 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         if not self._line_numbers:
             return 0
         digits = len(str(max(1, self.blockCount())))
-        return self.fontMetrics().horizontalAdvance("9") * digits + 10
+        return (self.fontMetrics().horizontalAdvance("9") * digits + 10
+                + self._bookmark_marker_width())
+
+    def _bookmark_marker_width(self) -> int:
+        """ブックマークの印(●)を描く柱の幅。印が1つも無いときも
+        幅は確保したままにする(付け外しで本文が左右に動かない)。"""
+        return self.fontMetrics().horizontalAdvance(BOOKMARK_GLYPH) + 4
 
     def _update_area_width(self, *_args):
         # 左は行番号エリア、右は桁数折り返しの余白。両方ここで決める。
@@ -661,12 +794,23 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         bottom = top + self.blockBoundingRect(block).height()
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
+                marker_width = self._bookmark_marker_width()
+                if number in self._bookmarks:
+                    # ブックマークの行は、行番号のわきに印を描く
+                    # (編集マーク=行番号の文字色 とは別物の記号)。
+                    painter.setPen(self._bookmark_color)
+                    painter.setFont(self._marker_font())
+                    painter.drawText(
+                        0, int(top), marker_width, height,
+                        Qt.AlignmentFlag.AlignCenter, BOOKMARK_GLYPH)
+                    painter.setFont(self.font())
                 # 編集マークの行は、行番号の色を変えて描く。
                 painter.setPen(
                     self._edited_color if number in self._edited_lines
                     else self._area_foreground)
                 painter.drawText(
-                    0, int(top), self._area.width() - 4, height,
+                    marker_width, int(top),
+                    self._area.width() - marker_width - 4, height,
                     Qt.AlignmentFlag.AlignRight, str(number + 1))
             block = block.next()
             if not block.isValid():

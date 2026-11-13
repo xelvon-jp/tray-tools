@@ -937,7 +937,8 @@ def test_window_newtext_stamp():
             return answers.pop(0)
 
         w.ask_text = ask
-        w.open_text_editor = lambda path: opened.append(path)
+        dummy_window = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy_window
         try:
             before = set(os.listdir(left))
             # 拡張子なし → .txt
@@ -971,6 +972,20 @@ def test_window_newtext_stamp():
             w.cmd_newtext()
             assert set(os.listdir(left)) == files and len(opened) == n
             assert files - before == {"メモ.txt", "memo.md", prefix[:-1] + ".txt"}
+            # 開くのに失敗(例外) → 作ったばかりの空ファイルは残らない
+            def boom(path):
+                raise RuntimeError("開けない")
+
+            w.open_text_editor = boom
+            answers.append("失敗1")
+            w.cmd_newtext()
+            assert not (left / "失敗1.txt").exists()
+            # 開くのに失敗(None が返る) → 同じく残らない
+            w.open_text_editor = lambda path: None
+            answers.append("失敗2")
+            w.cmd_newtext()
+            assert not (left / "失敗2.txt").exists()
+            assert set(os.listdir(left)) == files
         finally:
             w.close()
             w.deleteLater()

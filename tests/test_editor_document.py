@@ -298,6 +298,51 @@ def test_line_endings_kinds():
     assert docmod.line_endings("a\r") == [docmod.CR, None]
 
 
+def _naive_line_endings(text):
+    """従来の1文字ずつ走査する形(結果の物差し)。"""
+    kinds = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            kinds.append(docmod.LF)
+            i += 1
+        elif ch == "\r":
+            if i + 1 < n and text[i + 1] == "\n":
+                kinds.append(docmod.CRLF)
+                i += 2
+            else:
+                kinds.append(docmod.CR)
+                i += 1
+        else:
+            i += 1
+    kinds.append(None)
+    return kinds
+
+
+def test_line_endings_matches_naive():
+    # 正規表現で数える今の形が、従来の走査と常に同じ結果になること
+    # (速くしただけで、種別の並びは変えない)。
+    import random
+
+    samples = ["", "abc", "\n", "\r", "\r\n", "\n\r", "\r\r\n", "a\r",
+               "a\n\nb", "\r\n\r\n", "あ\r\nい\nう\r"]
+    rng = random.Random(20261113)
+    tokens = ["a", "あ", " ", "\n", "\r", "\r\n", "xyz"]
+    for _ in range(200):
+        samples.append("".join(
+            rng.choice(tokens) for _ in range(rng.randrange(0, 40))))
+    for text in samples:
+        assert docmod.line_endings(text) == _naive_line_endings(text), text
+    # 大きな本文でも並びの長さと先頭・末尾が合う(行数 + 1)。
+    big = "行です\r\n" * 20000 + "尾\n"
+    kinds = docmod.line_endings(big)
+    assert len(kinds) == 20002
+    assert kinds[0] == docmod.CRLF and kinds[-2] == docmod.LF
+    assert kinds[-1] is None
+
+
 def test_load_keeps_line_endings_and_save_unifies():
     # CRLF と LF が混在したファイルは、行ごとの種別を控えて読み、
     # 保存すると doc.newline にそろい、控えもそろった形になる。

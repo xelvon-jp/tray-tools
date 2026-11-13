@@ -17,6 +17,7 @@
 #     控えておく。外部で変わったかの判定(窓の監視と、保存直前の確認)
 #     はこれと比べる
 import os
+import re
 import shutil
 import stat
 import sys
@@ -81,6 +82,11 @@ def has_mixed_newlines(text: str) -> bool:
     return crlf > 0 and lone_lf > 0
 
 
+# 改行の並びを切り出すための正規表現。CRLF を先に置くことで、"\r\n" が
+# CR と LF の2つに割れない(1文字ずつ走査する形と結果が一致する)。
+_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
+
+
 def line_endings(text: str) -> list:
     """行ごとの改行種別の並びを返す(正規化する前の本文から取る)。
 
@@ -89,24 +95,11 @@ def line_endings(text: str) -> list:
     行数(改行の数 + 1)と一致する。本文ウィジェット(Qt も CR・LF・
     CRLF のどれでも段落を分ける)のブロックと、番号がそのまま対応
     する。不可視文字の表示で、行ごとに改行の種類を描き分けるための
-    控え(保存では doc.newline にそろうので、表示だけの話)。"""
-    kinds = []
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\n":
-            kinds.append(LF)
-            i += 1
-        elif ch == "\r":
-            if i + 1 < n and text[i + 1] == "\n":
-                kinds.append(CRLF)
-                i += 2
-            else:
-                kinds.append(CR)
-                i += 1
-        else:
-            i += 1
+    控え(保存では doc.newline にそろうので、表示だけの話)。
+
+    大きなファイルでも目立って遅くならないよう、改行の切り出しは
+    正規表現(C 側の走査)に任せる。"""
+    kinds = _NEWLINE_RE.findall(text)
     kinds.append(None)
     return kinds
 

@@ -7623,7 +7623,22 @@ class FilerWindow(QWidget):
         self.log(f"テキスト作成: {path}")
         pane.reload(focus=name)
         # 開く先は Ctrl+E と同じ内蔵エディタ(以前は外のエディタだった)。
-        self.open_text_editor(path)
+        # 開けなかったら、作ったばかりの空ファイルは残さない。消すのは
+        # この場で作った(排他的に作れて、まだ空のままの)ファイルだけ
+        # で、もともとあったファイルがこの経路に来ることはない。
+        try:
+            opened = self.open_text_editor(path)
+        except Exception:  # noqa: BLE001  開く失敗。後始末して知らせる
+            _log_exception("newtextOpen")
+            opened = None
+        if opened is None:
+            try:
+                if os.path.getsize(path) == 0:
+                    os.remove(path)
+            except OSError:
+                pass
+            pane.reload()
+            self.log(f"テキスト作成: エディタで開けなかったので、作ったファイルを消しました: {path}")
 
     def cmd_rename(self):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更

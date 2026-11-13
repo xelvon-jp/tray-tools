@@ -35,6 +35,7 @@ from PySide6.QtWidgets import QPlainTextEdit, QStyle, QTextEdit, QWidget
 
 import rect_edit
 from editor import colors as colormod
+from editor import document as docmod
 
 # 移動キー → 命令名(keymap・マクロと共通の命令層の名前)。
 _MOVE_KEYS = {
@@ -116,9 +117,14 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._wrap_column = None
         self._updating_margins = False
         # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
-        # 控えが無い・足りない行は _default_newline で描く。
+        # 編集には _track_line_newlines が追随させ、控えが無い・
+        # 足りない行は _default_newline で描く。
         self._line_newlines = None
         self._default_newline = "\r\n"
+        # 貼り付けの最中だけ、貼るテキストの改行種別の並びをここに
+        # 置く(_track_line_newlines が挿入された改行の種別として拾う)。
+        self._paste_kinds = None
+        self.document().contentsChange.connect(self._track_line_newlines)
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
@@ -217,14 +223,100 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         """行ごとの改行種別の控えを据える(窓が開く・保存のたびに渡す)。
 
         kinds はブロック番号と同じ並びで、値は改行そのもの
-        ("\\r\\n" / "\\n" / "\\r")か、改行が無い行は None。控えが無い
-        行や、編集で増えた行は default_newline(文書の改行設定)で
-        描く。描画だけの話で、文書の内容には触らない。"""
+        ("\\r\\n" / "\\n" / "\\r")か、改行が無い行は None。据えた後の
+        編集には _track_line_newlines が追随させる。それでも控えが
+        無い行は default_newline(文書の改行設定)で描く。描画だけの
+        話で、文書の内容には触らない。"""
         self._line_newlines = list(kinds) if kinds is not None else None
         if default_newline:
             self._default_newline = default_newline
         if self._show_invisibles:
             self.viewport().update()
+
+    def _track_line_newlines(self, position, chars_removed, chars_added):
+        """文書の変化に、改行種別の控えを追随させる。
+
+        控えはブロック番号と対応する並びなので、行を足す・消す・
+        並べ替えると、そのままでは記号がずれる。contentsChange
+        (位置・削除文字数・追加文字数)から、変わった範囲のブロック
+        だけを作り直す:
+          - 挿入された改行で終わる行は、挿入テキスト自身の種別
+            (貼り付けのときだけ insertFromMimeData が _paste_kinds
+            に控えておく)か、無ければ文書の改行設定で描く。キー
+            入力で増えた行は文書の改行設定になる
+          - 範囲の最後の行は、元の並びで範囲の最後だった行の種別を
+            引き継ぐ。範囲より後ろの行の種別は、そのまま後ろへ
+            ずれる(削除で行が消えても、残りの行の記号は合う)
+        元に戻す・やり直しでも同じ信号が来るので、範囲の作り直し
+        としては追随する。ただし、戻した行の改行種別そのものまでは
+        復元できない(文書側に残っていない)ので、文書の改行設定で
+        描く側に倒れる。"""
+        old = self._line_newlines
+        if old is None or (chars_removed == 0 and chars_added == 0):
+            return
+        doc = self.document()
+        new_count = doc.blockCount()
+        last_pos = max(0, doc.characterCount() - 1)
+        first_block = doc.findBlock(min(position, last_pos))
+        if not first_block.isValid():
+            return
+        first = first_block.blockNumber()
+        end_block = doc.findBlock(min(position + chars_added, last_pos))
+        last = end_block.blockNumber() if end_block.isValid() else first
+        if last < first:
+            last = first
+        span_new = last - first + 1
+        span_old = span_new - (new_count - len(old))
+        if span_old < 1:
+            span_old = 1
+        if span_new == 1 and span_old == 1:
+            return  # 行の出入りが無い変化。控えはそのまま合っている
+        paste = self._paste_kinds
+        entries = []
+        for j in range(span_new):
+            if j < span_new - 1:
+                # 挿入された改行で終わる行。
+                if paste is not None and j < len(paste):
+                    entries.append(paste[j])
+                else:
+                    entries.append(self._default_newline)
+            else:
+                # 範囲の最後の行は、元の範囲の最後の行の種別を引き継ぐ。
+                idx = first + span_old - 1
+                entries.append(old[idx] if 0 <= idx < len(old) else None)
+        new_kinds = old[:first] + entries + old[first + span_old:]
+        if len(new_kinds) != new_count:
+            # 想定外の変化への保険。長さだけはブロック数に合わせ、
+            # 引き当てが壊れないことを優先する。
+            if len(new_kinds) < new_count:
+                tail = new_kinds[-1:] or [None]
+                new_kinds = (
+                    new_kinds[:-1]
+                    + [self._default_newline] * (new_count - len(new_kinds))
+                    + tail)
+            else:
+                new_kinds = new_kinds[:new_count - 1] + [None]
+        self._line_newlines = new_kinds
+        if self._show_invisibles:
+            self.viewport().update()
+
+    def insertFromMimeData(self, source):  # noqa: N802  Qt の上書き
+        """貼り付け・ドロップ。貼るテキスト自身の改行種別を、控えの
+        追随(_track_line_newlines)が拾えるよう、挿入の前に切り出して
+        おく。控え自体が無い(新規文書など)ときは、今ある行はすべて
+        文書の改行設定だという前提で控えを作り、追随を始める。"""
+        kinds = None
+        if source is not None and source.hasText():
+            kinds = docmod.line_endings(source.text())[:-1]
+        if self._line_newlines is None:
+            count = self.document().blockCount()
+            self._line_newlines = (
+                [self._default_newline] * (count - 1) + [None])
+        self._paste_kinds = kinds
+        try:
+            super().insertFromMimeData(source)
+        finally:
+            self._paste_kinds = None
 
     def newline_glyph(self, block_number) -> str:
         """ブロック(行)を終える改行の記号。控えから種別を引き、

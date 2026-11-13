@@ -24,6 +24,7 @@
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QKeySequence,
     QPainter,
     QPalette,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import QPlainTextEdit, QStyle, QTextEdit, QWidget
 
 import rect_edit
 from editor import colors as colormod
+from editor import document as docmod
 
 # 移動キー → 命令名(keymap・マクロと共通の命令層の名前)。
 _MOVE_KEYS = {
@@ -52,6 +54,13 @@ FALLBACK_FONT_SIZE = 10
 
 # 行番号エリアの色は配色(editor/colors.py)が持つ。標準の組の値が
 # 従来の (242,242,242) / (144,144,144) と同じにしてある。
+
+
+# 改行の種別 → 行末に描く記号。CR と LF を分けて出す(混在した文書
+# でも種類が見分けられること)。字形は MS Gothic にある矢印の範囲。
+NEWLINE_GLYPHS = {"\r\n": "←↓", "\n": "↓", "\r": "←"}
+# 文書の末尾(最後のブロックの末尾)に出す印。小さい字で描く。
+EOF_MARK = "EOF"
 
 
 def wrap_right_margin(available_width, char_width, document_margin, column):
@@ -107,6 +116,15 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._line_numbers = True
         self._wrap_column = None
         self._updating_margins = False
+        # 行ごとの改行種別の控え(開いた文書の元の並び。表示専用)。
+        # 編集には _track_line_newlines が追随させ、控えが無い・
+        # 足りない行は _default_newline で描く。
+        self._line_newlines = None
+        self._default_newline = "\r\n"
+        # 貼り付けの最中だけ、貼るテキストの改行種別の並びをここに
+        # 置く(_track_line_newlines が挿入された改行の種別として拾う)。
+        self._paste_kinds = None
+        self.document().contentsChange.connect(self._track_line_newlines)
         self._wheel_remainder = 0.0
         self._area = LineNumberArea(self)
         self.blockCountChanged.connect(self._update_area_width)
@@ -201,17 +219,146 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         self._show_invisibles = visible
         self.viewport().update()
 
+    def set_line_newlines(self, kinds, default_newline=None):
+        """行ごとの改行種別の控えを据える(窓が開く・保存のたびに渡す)。
+
+        kinds はブロック番号と同じ並びで、値は改行そのもの
+        ("\\r\\n" / "\\n" / "\\r")か、改行が無い行は None。据えた後の
+        編集には _track_line_newlines が追随させる。それでも控えが
+        無い行は default_newline(文書の改行設定)で描く。描画だけの
+        話で、文書の内容には触らない。"""
+        self._line_newlines = list(kinds) if kinds is not None else None
+        if default_newline:
+            self._default_newline = default_newline
+        if self._show_invisibles:
+            self.viewport().update()
+
+    def _track_line_newlines(self, position, chars_removed, chars_added):
+        """文書の変化に、改行種別の控えを追随させる。
+
+        控えはブロック番号と対応する並びなので、行を足す・消す・
+        並べ替えると、そのままでは記号がずれる。contentsChange
+        (位置・削除文字数・追加文字数)から、変わった範囲のブロック
+        だけを作り直す:
+          - 挿入された改行で終わる行は、挿入テキスト自身の種別
+            (貼り付けのときだけ insertFromMimeData が _paste_kinds
+            に控えておく)か、無ければ文書の改行設定で描く。キー
+            入力で増えた行は文書の改行設定になる
+          - 範囲の最後の行は、元の並びで範囲の最後だった行の種別を
+            引き継ぐ。範囲より後ろの行の種別は、そのまま後ろへ
+            ずれる(削除で行が消えても、残りの行の記号は合う)
+        元に戻す・やり直しでも同じ信号が来るので、範囲の作り直し
+        としては追随する。ただし、戻した行の改行種別そのものまでは
+        復元できない(文書側に残っていない)ので、文書の改行設定で
+        描く側に倒れる。"""
+        old = self._line_newlines
+        if old is None or (chars_removed == 0 and chars_added == 0):
+            return
+        doc = self.document()
+        new_count = doc.blockCount()
+        last_pos = max(0, doc.characterCount() - 1)
+        first_block = doc.findBlock(min(position, last_pos))
+        if not first_block.isValid():
+            return
+        first = first_block.blockNumber()
+        end_block = doc.findBlock(min(position + chars_added, last_pos))
+        last = end_block.blockNumber() if end_block.isValid() else first
+        if last < first:
+            last = first
+        span_new = last - first + 1
+        span_old = span_new - (new_count - len(old))
+        if span_old < 1:
+            span_old = 1
+        if span_new == 1 and span_old == 1:
+            return  # 行の出入りが無い変化。控えはそのまま合っている
+        paste = self._paste_kinds
+        entries = []
+        for j in range(span_new):
+            if j < span_new - 1:
+                # 挿入された改行で終わる行。
+                if paste is not None and j < len(paste):
+                    entries.append(paste[j])
+                else:
+                    entries.append(self._default_newline)
+            else:
+                # 範囲の最後の行は、元の範囲の最後の行の種別を引き継ぐ。
+                idx = first + span_old - 1
+                entries.append(old[idx] if 0 <= idx < len(old) else None)
+        new_kinds = old[:first] + entries + old[first + span_old:]
+        if len(new_kinds) != new_count:
+            # 想定外の変化への保険。長さだけはブロック数に合わせ、
+            # 引き当てが壊れないことを優先する。
+            if len(new_kinds) < new_count:
+                tail = new_kinds[-1:] or [None]
+                new_kinds = (
+                    new_kinds[:-1]
+                    + [self._default_newline] * (new_count - len(new_kinds))
+                    + tail)
+            else:
+                new_kinds = new_kinds[:new_count - 1] + [None]
+        self._line_newlines = new_kinds
+        if self._show_invisibles:
+            self.viewport().update()
+
+    def insertFromMimeData(self, source):  # noqa: N802  Qt の上書き
+        """貼り付け・ドロップ。貼るテキスト自身の改行種別を、控えの
+        追随(_track_line_newlines)が拾えるよう、挿入の前に切り出して
+        おく。控え自体が無い(新規文書など)ときは、今ある行はすべて
+        文書の改行設定だという前提で控えを作り、追随を始める。"""
+        kinds = None
+        if source is not None and source.hasText():
+            kinds = docmod.line_endings(source.text())[:-1]
+        if self._line_newlines is None:
+            count = self.document().blockCount()
+            self._line_newlines = (
+                [self._default_newline] * (count - 1) + [None])
+        self._paste_kinds = kinds
+        try:
+            super().insertFromMimeData(source)
+        finally:
+            self._paste_kinds = None
+
+    def newline_glyph(self, block_number) -> str:
+        """ブロック(行)を終える改行の記号。控えから種別を引き、
+        無ければ文書の改行設定で決める。"""
+        kind = None
+        if (self._line_newlines is not None
+                and 0 <= block_number < len(self._line_newlines)):
+            kind = self._line_newlines[block_number]
+        if kind is None:
+            kind = self._default_newline
+        return NEWLINE_GLYPHS.get(kind, NEWLINE_GLYPHS["\n"])
+
+    def block_end_mark(self, block) -> str:
+        """ブロックの末尾に描く印。改行があればその種別の記号、
+        文書の最後のブロックなら EOF_MARK。"""
+        if block.next().isValid():
+            return self.newline_glyph(block.blockNumber())
+        return EOF_MARK
+
+    def _eof_font(self):
+        """EOF の印用の、本文より小さいフォント。"""
+        font = QFont(self.font())
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(6.0, font.pointSizeF() * 0.7))
+        elif font.pixelSize() > 0:
+            font.setPixelSize(max(6, round(font.pixelSize() * 0.7)))
+        return font
+
     def paintEvent(self, event):  # noqa: N802  Qt の上書き
         super().paintEvent(event)
         if self._show_invisibles:
             self._paint_invisibles()
 
     def _paint_invisibles(self):
-        """見えている行のタブ・スペース・改行を記号で描く。
+        """見えている行のタブ・スペース・改行・末尾を記号で描く。
 
-        タブは →、半角スペースは ・、全角スペースは □、改行は行末に
-        ↵。位置は cursorRect で取る(折り返しやスクロールに追随する)。
-        描くのは見えているブロックだけに絞る。"""
+        タブは →、半角スペースは ·、全角スペースは □。行末には
+        改行の種別の記号(LF は ↓、CR は ←、CRLF は ←↓)を、文書の
+        最後の行には EOF の印を小さい字で描く。すべて配色の
+        invisible の色(本文より薄い色)。位置は cursorRect で取る
+        (折り返しやスクロールに追随する)。描くのは見えている
+        ブロックだけに絞る。"""
         painter = QPainter(self.viewport())
         painter.setPen(self._invisible_color)
         painter.setFont(self.font())
@@ -239,11 +386,17 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     rect = self.cursorRect(scratch)
                     painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
                                      | Qt.AlignmentFlag.AlignVCenter, symbol)
-                if block.next().isValid():
-                    scratch.setPosition(base + len(text))
-                    rect = self.cursorRect(scratch)
+                scratch.setPosition(base + len(text))
+                rect = self.cursorRect(scratch)
+                mark = self.block_end_mark(block)
+                if mark == EOF_MARK:
+                    painter.setFont(self._eof_font())
                     painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
-                                     | Qt.AlignmentFlag.AlignVCenter, "↵")
+                                     | Qt.AlignmentFlag.AlignVCenter, mark)
+                    painter.setFont(self.font())
+                else:
+                    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
+                                     | Qt.AlignmentFlag.AlignVCenter, mark)
             block = block.next()
 
     def keyPressEvent(self, event):  # noqa: N802  Qt の上書き

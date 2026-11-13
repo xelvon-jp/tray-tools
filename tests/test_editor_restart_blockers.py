@@ -115,7 +115,7 @@ def _make_feature(text_editor):
 
 
 def _editor_blockers(feature):
-    return [b for b in feature.restart_blockers() if "エディタ" in b]
+    return [b for b in feature.restart_blockers() if "EDDy" in b]
 
 
 def test_restart_blockers_counts_dirty_editor():
@@ -124,7 +124,7 @@ def test_restart_blockers_counts_dirty_editor():
         feature = _make_feature(window)
         assert _editor_blockers(feature) == []  # 未編集なら数えない
         type_text(window, "x")
-        assert _editor_blockers(feature) == ["未保存のエディタ 1窓"]
+        assert _editor_blockers(feature) == ["未保存のEDDy 1窓"]
     finally:
         close_window(window)
 
@@ -136,7 +136,7 @@ def test_restart_blockers_without_editor():
 
 def test_restart_blockers_unreadable_editor():
     feature = _make_feature(BrokenWindow())
-    assert _editor_blockers(feature) == ["エディタ(状態を読めず)"]
+    assert _editor_blockers(feature) == ["EDDy(状態を読めず)"]
 
 
 def main():

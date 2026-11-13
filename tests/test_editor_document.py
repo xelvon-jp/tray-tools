@@ -280,6 +280,97 @@ def test_keymap_merge():
     assert merge_keymap(None) == DEFAULT_KEYMAP
 
 
+def test_keymap_save_as_is_f12():
+    # 名前を付けて保存は F12(Nagato の指定)。
+    assert DEFAULT_KEYMAP["save_as"] == "F12"
+
+
+def test_line_endings_kinds():
+    # 行ごとの改行種別。最終行(改行で終わらない行)は None。
+    assert docmod.line_endings("") == [None]
+    assert docmod.line_endings("abc") == [None]
+    assert docmod.line_endings("a\nb\n") == [docmod.LF, docmod.LF, None]
+    assert docmod.line_endings("a\r\nb") == [docmod.CRLF, None]
+    assert docmod.line_endings("a\rb") == [docmod.CR, None]
+    assert docmod.line_endings("a\r\nb\nc\rd") == [
+        docmod.CRLF, docmod.LF, docmod.CR, None]
+    # 末尾が改行で終われば、最後の空行の分が付く。
+    assert docmod.line_endings("a\r") == [docmod.CR, None]
+
+
+def _naive_line_endings(text):
+    """従来の1文字ずつ走査する形(結果の物差し)。"""
+    kinds = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            kinds.append(docmod.LF)
+            i += 1
+        elif ch == "\r":
+            if i + 1 < n and text[i + 1] == "\n":
+                kinds.append(docmod.CRLF)
+                i += 2
+            else:
+                kinds.append(docmod.CR)
+                i += 1
+        else:
+            i += 1
+    kinds.append(None)
+    return kinds
+
+
+def test_line_endings_matches_naive():
+    # 正規表現で数える今の形が、従来の走査と常に同じ結果になること
+    # (速くしただけで、種別の並びは変えない)。
+    import random
+
+    samples = ["", "abc", "\n", "\r", "\r\n", "\n\r", "\r\r\n", "a\r",
+               "a\n\nb", "\r\n\r\n", "あ\r\nい\nう\r"]
+    rng = random.Random(20261113)
+    tokens = ["a", "あ", " ", "\n", "\r", "\r\n", "xyz"]
+    for _ in range(200):
+        samples.append("".join(
+            rng.choice(tokens) for _ in range(rng.randrange(0, 40))))
+    for text in samples:
+        assert docmod.line_endings(text) == _naive_line_endings(text), text
+    # 大きな本文でも並びの長さと先頭・末尾が合う(行数 + 1)。
+    big = "行です\r\n" * 20000 + "尾\n"
+    kinds = docmod.line_endings(big)
+    assert len(kinds) == 20002
+    assert kinds[0] == docmod.CRLF and kinds[-2] == docmod.LF
+    assert kinds[-1] is None
+
+
+def test_load_keeps_line_endings_and_save_unifies():
+    # CRLF と LF が混在したファイルは、行ごとの種別を控えて読み、
+    # 保存すると doc.newline にそろい、控えもそろった形になる。
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "mixed.txt")
+        _write(src, data)
+        doc = docmod.load_document(src)
+        assert doc.newline == docmod.CRLF
+        assert doc.line_newlines == [docmod.CRLF, docmod.LF, None]
+        docmod.save_document(doc, path=src)
+        assert doc.line_newlines == [docmod.CRLF, docmod.CRLF, None]
+        again = docmod.load_document(src)
+        assert again.line_newlines == [docmod.CRLF, docmod.CRLF, None]
+        assert Path(src).read_bytes() == "a\r\nb\r\nc".encode("utf-8")
+
+
+def test_load_keeps_cr_line_endings():
+    # 単独の CR で終わる行も、種別は CR として控える。
+    data = "a\r\nb\nc\rd".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "mixed.txt")
+        _write(src, data)
+        doc = docmod.load_document(src)
+        assert doc.line_newlines == [
+            docmod.CRLF, docmod.LF, docmod.CR, None], doc.line_newlines
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

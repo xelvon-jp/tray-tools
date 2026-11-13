@@ -937,7 +937,8 @@ def test_window_newtext_stamp():
             return answers.pop(0)
 
         w.ask_text = ask
-        w._open_in_editor = lambda paths: opened.append(list(paths))
+        dummy_window = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy_window
         try:
             before = set(os.listdir(left))
             # 拡張子なし → .txt
@@ -948,12 +949,12 @@ def test_window_newtext_stamp():
             assert seen["select"] == len(prefix)
             p = left / "メモ.txt"
             assert p.is_file() and p.read_bytes() == b""
-            assert opened == [[str(p)]], opened
+            assert opened == [str(p)], opened
             # 拡張子あり → そのまま
             answers.append("memo.md")
             w.cmd_newtext()
             assert (left / "memo.md").is_file() and not (left / "memo.md.txt").exists()
-            assert opened[-1] == [str(left / "memo.md")]
+            assert opened[-1] == str(left / "memo.md")
             # 日時だけ → 末尾の _ なし
             answers.append(prefix)
             w.cmd_newtext()
@@ -971,6 +972,20 @@ def test_window_newtext_stamp():
             w.cmd_newtext()
             assert set(os.listdir(left)) == files and len(opened) == n
             assert files - before == {"メモ.txt", "memo.md", prefix[:-1] + ".txt"}
+            # 開くのに失敗(例外) → 作ったばかりの空ファイルは残らない
+            def boom(path):
+                raise RuntimeError("開けない")
+
+            w.open_text_editor = boom
+            answers.append("失敗1")
+            w.cmd_newtext()
+            assert not (left / "失敗1.txt").exists()
+            # 開くのに失敗(None が返る) → 同じく残らない
+            w.open_text_editor = lambda path: None
+            answers.append("失敗2")
+            w.cmd_newtext()
+            assert not (left / "失敗2.txt").exists()
+            assert set(os.listdir(left)) == files
         finally:
             w.close()
             w.deleteLater()
@@ -12027,7 +12042,7 @@ def test_text_editor_context_menu():
             menu = w.build_editor_context_menu(L)
             assert menu is not None
             labels = [a.text() for a in menu.actions()]
-            assert labels == ["エディタで開く"], labels
+            assert labels == ["EDDyで開く"], labels
             menu.actions()[0].trigger()
             assert len(w._text_editors) == 1
             assert w._text_editors[0].current_document().path == str(left / "alpha.txt")
@@ -12120,7 +12135,7 @@ def test_picker_ctrl_enter_text_editor_item():
                                  {"kind": "file",
                                   "path": str(left / "alpha.txt")})
             labels = [item[1] for item in captured["items"] if item]
-            assert "エディタで開く" in labels, labels
+            assert "EDDyで開く" in labels, labels
             assert opened == [str(left / "alpha.txt")], opened
             # 画像の行には項目が無い
             captured.clear()
@@ -12135,7 +12150,7 @@ def test_picker_ctrl_enter_text_editor_item():
                                  {"kind": "file",
                                   "path": str(left / "photo.JPG")})
             labels = [item[1] for item in captured["items"] if item]
-            assert "エディタで開く" not in labels, labels
+            assert "EDDyで開く" not in labels, labels
             assert opened == []
         finally:
             w.close()

@@ -108,7 +108,9 @@ from editor.keymap import merge_keymap
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
-APP_NAME = "テキストエディタ"
+# 利用者の目に触れる製品名(2026-11-13 に Nagato が命名)。内部の
+# モジュール名(editor/ パッケージや settings の editor 節)は変えない。
+APP_NAME = "EDDy"
 ENCODING_ORDER = ["utf-8", "cp932", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
 # フォントの既定。settings の editor 節(font_family / font_size)で
 # 上書きできる。大きさは第1段までの既定(10pt)に合わせた。
@@ -1272,6 +1274,8 @@ class EditorWindow(QMainWindow):
             self._edit.setPlainText(doc.text)
         finally:
             self._suppress_change_record = False
+        # 行ごとの改行種別の控えを本文へ渡す(改行記号の描き分け用)。
+        self._edit.set_line_newlines(doc.line_newlines, doc.newline)
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1322,6 +1326,7 @@ class EditorWindow(QMainWindow):
             self._edit.setPlainText("")
         finally:
             self._suppress_change_record = False
+        self._edit.set_line_newlines(None, self._doc.newline)
         self._edit.document().setModified(False)
         self._external_change_pending = False
         self._refresh_all()
@@ -1433,6 +1438,9 @@ class EditorWindow(QMainWindow):
             return False
         self._edit.document().setModified(False)
         self._external_change_pending = False
+        # 保存で改行はそろったので、描き分けの控えもそろった形にする。
+        self._edit.set_line_newlines(self._doc.line_newlines,
+                                     self._doc.newline)
         self._refresh_all()
         self._update_watcher()
         self.statusBar().showMessage("保存しました", 4000)

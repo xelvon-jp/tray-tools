@@ -97,8 +97,7 @@ def test_open_sjis_crlf_and_save_roundtrip():
         try:
             assert window.text() == "1行目\n日本語です\n"
             assert window._enc_label.text().startswith("SJIS / CRLF")
-            assert "a.txt" in window.windowTitle()
-            assert "*" not in window.windowTitle()
+            assert window.windowTitle() == "a.txt - EDDy"
             assert window.save()  # 触らずに上書き保存 → バイト列は不変
             assert Path(path).read_bytes() == data
         finally:
@@ -270,6 +269,27 @@ def test_new_document_after_discard():
         assert "*" not in window.windowTitle()
     finally:
         discard_close(window)
+
+
+def test_window_title_shows_app_name_eddy():
+    """製品名は EDDy。窓のタイトルは「ファイル名 - EDDy」で、無題でも
+    EDDy が出る。変更印(*)は従来どおり名前の後ろに付く。"""
+    from editor.window import APP_NAME
+    assert APP_NAME == "EDDy"
+    window = make_window()
+    try:
+        assert window.windowTitle() == "無題 - EDDy"
+        type_text(window, "x")
+        assert window.windowTitle() == "無題 * - EDDy"
+    finally:
+        discard_close(window)
+    # 付随する窓(grep のダイアログ)も EDDy を名乗る。
+    from editor.grep_dialog import GrepDialog
+    dialog = GrepDialog()
+    try:
+        assert dialog.windowTitle() == "フォルダ内を検索 - EDDy"
+    finally:
+        dialog.close()
 
 
 def test_open_path_asks_before_discarding():
@@ -1569,6 +1589,292 @@ def test_grep_dialog_lists_and_jumps():
         dialog._on_item_activated(item)
         assert jumped == [(target, 2)]
         dialog.deleteLater()
+
+
+def _all_blocks(window):
+    blocks = []
+    block = window._edit.document().begin()
+    while block.isValid():
+        blocks.append(block)
+        block = block.next()
+    return blocks
+
+
+def test_save_as_f12_saves_with_current_format():
+    # F12 = 名前を付けて保存。保存先が現在の文書になり、文字コードと
+    # 改行は今の文書のものを引き継ぐ(形式ダイアログの既定のまま)。
+    import editor.window as window_module
+    from PySide6.QtGui import QKeySequence
+
+    data = "あ\r\nい\r\n".encode("cp932")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src.txt")
+        dst = os.path.join(tmp, "dst.txt")
+        Path(src).write_bytes(data)
+        window = make_window(src)
+        try:
+            assert window._act_save_as.shortcut() == QKeySequence("F12")
+
+            class FakeFileDialog:
+                @staticmethod
+                def getSaveFileName(*_args, **_kwargs):
+                    return dst, ""
+
+            class FakeOptionsDialog:
+                """形式ダイアログの既定(今の文書の値)をそのまま返す差し替え。"""
+
+                def __init__(self, doc, parent=None):
+                    self._doc = doc
+
+                def exec(self):
+                    return QDialog.DialogCode.Accepted
+
+                def values(self):
+                    doc = self._doc
+                    return doc.encoding, doc.newline, doc.bom
+
+            orig_file = window_module.QFileDialog
+            orig_options = window_module.SaveOptionsDialog
+            window_module.QFileDialog = FakeFileDialog
+            window_module.SaveOptionsDialog = FakeOptionsDialog
+            try:
+                assert window.save_as()
+            finally:
+                window_module.QFileDialog = orig_file
+                window_module.SaveOptionsDialog = orig_options
+            assert Path(dst).read_bytes() == data
+            assert window._doc.path == dst
+            assert "dst.txt" in window.windowTitle()
+        finally:
+            discard_close(window)
+
+
+def test_newline_glyphs_split_by_kind_and_eof():
+    # CRLF・LF・CR が混在した文書では、行ごとに改行の記号が違い、
+    # 最後の行には EOF の印が付く。保存すると記号もそろう。
+    from editor.text_edit import EOF_MARK, NEWLINE_GLYPHS
+
+    # 記号は種別どうしで見分けられ、MS Gothic にある字の範囲。
+    assert NEWLINE_GLYPHS["\n"] == "↓"
+    assert NEWLINE_GLYPHS["\r"] == "←"
+    assert NEWLINE_GLYPHS["\r\n"] == "←↓"
+    assert len(set(NEWLINE_GLYPHS.values())) == 3
+    data = "a\r\nb\nc\rd".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            window.set_invisibles_visible(True)
+            edit = window._edit
+            blocks = _all_blocks(window)
+            assert len(blocks) == 4
+            assert [edit.block_end_mark(b) for b in blocks] == [
+                "←↓", "↓", "←", EOF_MARK]
+            # 不可視文字を描いても落ちない。
+            edit.viewport().grab()
+            # 保存すると改行が CRLF にそろい、記号もそろう。
+            assert window.save()
+            assert [edit.block_end_mark(b) for b in _all_blocks(window)] == [
+                "←↓", "←↓", "←↓", EOF_MARK]
+            assert Path(path).read_bytes() == "a\r\nb\r\nc\r\nd".encode()
+        finally:
+            discard_close(window)
+
+
+def test_eof_mark_on_trailing_empty_line():
+    # 末尾が改行で終わる文書では、最後の空行の位置に EOF の印が付く。
+    from editor.text_edit import EOF_MARK
+
+    data = "a\nb\n".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "lf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            blocks = _all_blocks(window)
+            assert len(blocks) == 3
+            assert [edit.block_end_mark(b) for b in blocks] == [
+                "↓", "↓", EOF_MARK]
+        finally:
+            discard_close(window)
+
+
+def test_newline_glyph_fallback_for_edited_lines():
+    # 読み込んだ後に増えた行は、控えが無いので文書の改行設定(CRLF)
+    # の記号で描く。
+    from editor.text_edit import EOF_MARK
+
+    data = "a\r\n".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "crlf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            edit.setTextCursor(cursor)
+            type_text(window, "x\ny")
+            blocks = _all_blocks(window)
+            assert len(blocks) == 3
+            assert [edit.block_end_mark(b) for b in blocks] == [
+                "←↓", "←↓", EOF_MARK]
+        finally:
+            discard_close(window)
+
+
+def _glyphs(window):
+    edit = window._edit
+    return [edit.block_end_mark(b) for b in _all_blocks(window)]
+
+
+def _kinds(window):
+    return list(window._edit._line_newlines)
+
+
+def test_newline_glyphs_follow_line_insert_and_delete():
+    # 行を足す・消す・行をつなげても、元の行の改行記号がずれない
+    # (レビュー req-20261113-112 の必須指摘。控えはブロック番号で
+    # 引くので、編集に追随させる必要がある)。
+    from editor import document as docmod
+    from editor.text_edit import EOF_MARK
+
+    data = "a\r\nb\nc\rd".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            assert _glyphs(window) == ["←↓", "↓", "←", EOF_MARK]
+            # "c" の行の頭に打鍵で1行足す。足した行は文書の改行
+            # 設定(CRLF)、元の行の記号はそのまま後ろへずれる。
+            cursor = edit.textCursor()
+            cursor.setPosition(4)  # "a\nb\nc\nd" の "c" の頭
+            edit.setTextCursor(cursor)
+            type_text(window, "X\n")
+            assert edit.toPlainText() == "a\nb\nX\nc\nd"
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.LF, docmod.CRLF, docmod.CR, None]
+            assert _glyphs(window) == ["←↓", "↓", "←↓", "←", EOF_MARK]
+            assert len(_kinds(window)) == edit.document().blockCount()
+            # 元に戻すと、記号も元の並びに戻る。
+            edit.undo()
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.LF, docmod.CR, None]
+            assert _glyphs(window) == ["←↓", "↓", "←", EOF_MARK]
+            edit.redo()
+            # "b" の行を改行ごと消す。後ろの行の記号は詰まるだけで、
+            # 種別は変わらない。
+            cursor = edit.textCursor()
+            cursor.setPosition(2)  # "b" の頭
+            cursor.setPosition(4, QTextCursor.MoveMode.KeepAnchor)
+            edit.setTextCursor(cursor)
+            cursor.removeSelectedText()
+            assert edit.toPlainText() == "a\nX\nc\nd"
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.CRLF, docmod.CR, None]
+            assert _glyphs(window) == ["←↓", "←↓", "←", EOF_MARK]
+            # "c" と "d" の間の改行だけを消して行をつなげる。
+            cursor = edit.textCursor()
+            cursor.setPosition(5)  # "a\nX\nc\nd" の "c" の次の改行
+            cursor.deleteChar()
+            assert edit.toPlainText() == "a\nX\ncd"
+            assert _kinds(window) == [docmod.CRLF, docmod.CRLF, None]
+            assert _glyphs(window) == ["←↓", "←↓", EOF_MARK]
+            assert len(_kinds(window)) == edit.document().blockCount()
+        finally:
+            discard_close(window)
+
+
+def test_newline_glyphs_follow_paste_of_mixed_text():
+    # 貼り付けたテキストは、そのテキスト自身の改行種別で描く。
+    from PySide6.QtCore import QMimeData
+
+    from editor import document as docmod
+    from editor.text_edit import EOF_MARK
+
+    data = "p\r\nq".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "crlf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.setPosition(1)  # "p" の末尾
+            edit.setTextCursor(cursor)
+            mime = QMimeData()
+            mime.setText("x\ny\rz")
+            edit.insertFromMimeData(mime)
+            assert edit.toPlainText() == "px\ny\nz\nq"
+            # 貼った部分は LF・CR、つながった "z" の行は元の CRLF。
+            assert _kinds(window) == [
+                docmod.LF, docmod.CR, docmod.CRLF, None]
+            assert _glyphs(window) == ["↓", "←", "←↓", EOF_MARK]
+            assert len(_kinds(window)) == edit.document().blockCount()
+        finally:
+            discard_close(window)
+
+
+def test_newline_glyphs_follow_cut_and_paste_reorder():
+    # 行を切り取って別の場所へ貼る(並べ替え)と、貼った先では
+    # 貼ったテキストの種別になり、残りの行の記号は動かない。
+    from PySide6.QtCore import QMimeData
+
+    from editor import document as docmod
+    from editor.text_edit import EOF_MARK
+
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.setPosition(0)
+            cursor.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
+            edit.setTextCursor(cursor)
+            cursor.removeSelectedText()  # "a" とその改行を切り取る
+            assert edit.toPlainText() == "b\nc"
+            assert _kinds(window) == [docmod.LF, None]
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            edit.setTextCursor(cursor)
+            mime = QMimeData()
+            mime.setText("a\r\n")
+            edit.insertFromMimeData(mime)
+            assert edit.toPlainText() == "b\nca\n"
+            assert _kinds(window) == [docmod.LF, docmod.CRLF, None]
+            assert _glyphs(window) == ["↓", "←↓", EOF_MARK]
+            assert len(_kinds(window)) == edit.document().blockCount()
+        finally:
+            discard_close(window)
+
+
+def test_newline_glyphs_paste_into_new_document():
+    # 新規文書(控えが無い状態)への貼り付けでも、貼ったテキストの
+    # 改行種別で描く。
+    from PySide6.QtCore import QMimeData
+
+    from editor import document as docmod
+    from editor.text_edit import EOF_MARK
+
+    window = make_window()
+    try:
+        edit = window._edit
+        assert edit._line_newlines is None
+        mime = QMimeData()
+        mime.setText("a\nb\rc")
+        edit.insertFromMimeData(mime)
+        assert edit.toPlainText() == "a\nb\nc"
+        assert _kinds(window) == [docmod.LF, docmod.CR, None]
+        assert _glyphs(window) == ["↓", "←", EOF_MARK]
+        assert len(_kinds(window)) == edit.document().blockCount()
+    finally:
+        discard_close(window)
 
 
 def main():

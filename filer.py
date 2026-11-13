@@ -3690,9 +3690,9 @@ class FilerWindow(QWidget):
                 dirty, unreadable = 0, 1
             if dirty or unreadable:
                 if dirty:
-                    what = f"未保存のエディタが {dirty}窓"
+                    what = f"未保存のEDDyが {dirty}窓"
                 else:
-                    what = "状態の読めないエディタの窓"
+                    what = "状態の読めないEDDyの窓"
                 if not self.confirm(
                         "あっふ",
                         f"{what}あります。\n{verb}？",
@@ -4595,12 +4595,12 @@ class FilerWindow(QWidget):
 
     def build_editor_context_menu(self, pane):
         """一覧の右クリックメニュー。内蔵エディタで開ける対象がある
-        ときだけ「エディタで開く」を持つ QMenu を返す。無ければ None
+        ときだけ「EDDyで開く」を持つ QMenu を返す。無ければ None
         (従来どおり何も出さない)。"""
         if not self._text_editor_entries(pane):
             return None
         menu = QMenu()
-        action = menu.addAction("エディタで開く")
+        action = menu.addAction("EDDyで開く")
         action.triggered.connect(
             lambda _checked=False, p=pane: self._open_targets_in_text_editor(p))
         return menu
@@ -6114,7 +6114,7 @@ class FilerWindow(QWidget):
             # エディタの入口を足す(一覧の Ctrl+E と同じ作法)。
             if core.opens_in_viewer(os.path.basename(path),
                                     self.viewer_extensions):
-                items.append((free_key("T"), "エディタで開く",
+                items.append((free_key("T"), "EDDyで開く",
                               ("text_editor", path)))
             if self._launcher_registerable(path):
                 items.append((free_key("LKR"), "ランチャ登録する",
@@ -7588,7 +7588,7 @@ class FilerWindow(QWidget):
         pane.reload(focus=name)
 
     def cmd_newtext(self):
-        """Shift+E: 空のテキストファイルを作って、そのまま filer.editor で開く。
+        """Shift+E: 空のテキストファイルを作って、そのまま内蔵エディタで開く。
         K(フォルダ作成)と同じく日時プレフィックスを選択状態で入れる(打てば置き換わり、
         → で確定すれば日時付き)。拡張子が無ければ .txt を付ける。中身は空(BOM なし)。"""
         pane = self.active
@@ -7622,7 +7622,23 @@ class FilerWindow(QWidget):
             return
         self.log(f"テキスト作成: {path}")
         pane.reload(focus=name)
-        self._open_in_editor([path])
+        # 開く先は Ctrl+E と同じ内蔵エディタ(以前は外のエディタだった)。
+        # 開けなかったら、作ったばかりの空ファイルは残さない。消すのは
+        # この場で作った(排他的に作れて、まだ空のままの)ファイルだけ
+        # で、もともとあったファイルがこの経路に来ることはない。
+        try:
+            opened = self.open_text_editor(path)
+        except Exception:  # noqa: BLE001  開く失敗。後始末して知らせる
+            _log_exception("newtextOpen")
+            opened = None
+        if opened is None:
+            try:
+                if os.path.getsize(path) == 0:
+                    os.remove(path)
+            except OSError:
+                pass
+            pane.reload()
+            self.log(f"テキスト作成: エディタで開けなかったので、作ったファイルを消しました: {path}")
 
     def cmd_rename(self):
         """R: ファイル情報の編集(名前・大小の変換・更新日時・属性)。マークがあれば一括変更

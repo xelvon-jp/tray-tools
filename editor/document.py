@@ -17,6 +17,7 @@
 #     控えておく。外部で変わったかの判定(窓の監視と、保存直前の確認)
 #     はこれと比べる
 import os
+import re
 import shutil
 import stat
 import sys
@@ -26,6 +27,7 @@ import text_encoding
 
 CRLF = "\r\n"
 LF = "\n"
+CR = "\r"
 NEWLINE_LABELS = {CRLF: "CRLF", LF: "LF"}
 
 # 判定に使う先頭の長さ(filer_viewer.DETECT_BYTES と同じ)。
@@ -44,6 +46,8 @@ class TextDocument:
     bom: bool = False           # 開いたときに BOM が付いていたか
     newline: str = DEFAULT_NEWLINE
     text: str = ""              # 本文。改行は "\n" に正規化済み
+    line_newlines: list = None  # 行ごとの改行種別(CRLF/LF/CR、最終行は None)。
+                                # 読み込んだ元の並びの控え(表示専用)
     lossy_decode: bool = False  # 読み替え(置換文字)が発生したか
     mixed_newlines: bool = False  # CRLF と LF が混在していたか
     disk_mtime: float = None    # ディスク上の更新時刻(開いた/保存した時点)
@@ -76,6 +80,28 @@ def has_mixed_newlines(text: str) -> bool:
     crlf = text.count("\r\n")
     lone_lf = text.count("\n") - crlf
     return crlf > 0 and lone_lf > 0
+
+
+# 改行の並びを切り出すための正規表現。CRLF を先に置くことで、"\r\n" が
+# CR と LF の2つに割れない(1文字ずつ走査する形と結果が一致する)。
+_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
+
+
+def line_endings(text: str) -> list:
+    """行ごとの改行種別の並びを返す(正規化する前の本文から取る)。
+
+    値は CRLF / LF / CR のいずれかで、その行を終える改行が無い行
+    (最後の行)は None。並びの長さは、改行を "\\n" にそろえた本文の
+    行数(改行の数 + 1)と一致する。本文ウィジェット(Qt も CR・LF・
+    CRLF のどれでも段落を分ける)のブロックと、番号がそのまま対応
+    する。不可視文字の表示で、行ごとに改行の種類を描き分けるための
+    控え(保存では doc.newline にそろうので、表示だけの話)。
+
+    大きなファイルでも目立って遅くならないよう、改行の切り出しは
+    正規表現(C 側の走査)に任せる。"""
+    kinds = _NEWLINE_RE.findall(text)
+    kinds.append(None)
+    return kinds
 
 
 def _disk_stamp(path):
@@ -143,6 +169,7 @@ def load_document(path: str) -> TextDocument:
         bom=start > 0,
         newline=newline,
         text=text.replace("\r\n", "\n"),
+        line_newlines=line_endings(text),
         lossy_decode=lossy,
         mixed_newlines=mixed,
         disk_mtime=mtime,
@@ -358,6 +385,11 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
         doc.bom = bom
     # 保存で改行は doc.newline にそろったので、混在の控えは落とす。
     doc.mixed_newlines = False
+    # 行ごとの種別の控えも、実際に書いた内容に合わせる(表示専用の
+    # 控え)。書いたバイト列を読み戻して数えるのが確実(本文に単独の
+    # CR が残っていると、改行の置き換えだけではそろわないため)。
+    enc = encoding if encoding is not None else doc.encoding
+    doc.line_newlines = line_endings(data.decode(enc, errors="replace"))
     doc.disk_mtime, doc.disk_size = _disk_stamp(target)
     return target
 

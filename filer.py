@@ -4560,7 +4560,7 @@ class FilerWindow(QWidget):
             return
         self._open_in_editor([os.path.join(self.active.path, e.name) for e in files])
 
-    # --- 内蔵テキストエディタで開く(Ctrl+E / 右クリック / プレビュー中も同じ) ---
+    # --- 内蔵テキストエディタで開く(E / Ctrl+E / 右クリック / プレビュー中も同じ) ---
     def _text_editor_entries(self, pane) -> list:
         """内蔵エディタで開ける対象(マーク、無ければカーソル行のうち、
         フォルダでなく、テキストとして開けるもの)。テキストの判定は
@@ -4575,7 +4575,7 @@ class FilerWindow(QWidget):
         self._open_targets_in_text_editor(self.active)
 
     def _open_targets_in_text_editor(self, pane) -> None:
-        """Ctrl+E: 対象を内蔵テキストエディタ(editor/)で開く。
+        """E / Ctrl+E: 対象を内蔵テキストエディタ(editor/)で開く。
 
         書庫の中は &TEDIT と同じく、一時フォルダへ取り出してから
         開く(保存は取り出した側に書かれる)。同じファイルを二重に

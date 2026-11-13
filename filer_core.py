@@ -61,10 +61,14 @@ DEFAULT_KEYMAP = {
     "2013": "ext_menu",           # Ctrl+Enter 拡張子ごとのメニュー(あふｗの AfxExt。定義が
                                   # 無い拡張子は関連付けで開く。filer_extmenu.py)
     "1013": "open_in_other",      # Shift+Enter フォルダは反対窓で開く/ファイルはエディタ
-    "0069": "edit",               # E
-    "0086": "edit",               # V (AFXW.key 0086 &MENU edit.txt の代わり)
-    "2069": "text_editor",        # Ctrl+E 内蔵テキストエディタで開く(E=外のエディタ、
-                                  # Shift+E=新規テキスト。対象はテキストとして開けるものだけ)
+    "0069": "text_editor",        # E 内蔵テキストエディタ(EDDy)で開く(2026-11-14 Nagato
+                                  # 指示。対象はテキストとして開けるものだけ。以前は
+                                  # 外のエディタだった)
+    "0086": "edit",               # V 外のエディタ(filer.editor)で開く(AFXW.key 0086
+                                  # &MENU edit.txt の代わり。外のエディタは V と
+                                  # Shift+Enter に残る)
+    "2069": "text_editor",        # Ctrl+E E と同じく内蔵テキストエディタで開く
+                                  # (Shift+E=新規テキスト)
     # --- マーク ---
     "0032": "mark_down",          # Space
     "1032": "mark_up",            # Shift+Space
@@ -1237,6 +1241,7 @@ COMMAND_SHORT_NAMES = {
     "ext_menu": "ExtMenu",
     "update_restart": "更新",
     "edit": "Edit",
+    "text_editor": "EDDy",
     "open_in_other": "Open他",
     "copy_menu": "Copy",
     "copy_direct": "Copy",

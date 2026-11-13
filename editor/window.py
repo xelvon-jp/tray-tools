@@ -146,6 +146,12 @@
 # 経由なので、文字コードと改行は保たれ、.bak が残る。書けない
 # 文字コードのファイルはプレビューの時点で対象から外れる。
 #
+# タスクバーの身元(2026-11-14): 窓は常駐・あっふ と同じプロセスで
+# 開くので、そのままだとタスクバーで開いた側のアプリと同じボタン
+# にまとめられてしまう。初回表示時(showEvent)に、窓へ EDDy 専用の
+# AppUserModelID(TASKBAR_APP_ID)を書いて独立したボタンにする
+# (Windows のみ。filer_shell.set_window_app_id 経由)。
+#
 # 落ちないための作法(このリポジトリの決まり):
 #   - 外と触る入口(ファイル読み書き・送信)は例外を利用者への文にする。
 #     スロットで投げ切るとプロセスごと終了する
@@ -228,6 +234,12 @@ from editor.text_edit import TextEdit
 # 利用者の目に触れる製品名(2026-11-13 に Nagato が命名)。内部の
 # モジュール名(editor/ パッケージや settings の editor 節)は変えない。
 APP_NAME = "EDDy"
+# タスクバーで使う窓ごとのアプリID(AppUserModelID)。EDDy の窓は常駐や
+# あっふ と同じプロセスで開くので、プロセスのID(traytools.app.1 /
+# traytools.affx)のままだとタスクバーで同じアプリにまとめられてしまう。
+# 窓にこのIDを書くと、別のアプリとして独立したボタンになる(Windows
+# のみ。付け方は _apply_taskbar_identity)。
+TASKBAR_APP_ID = "traytools.eddy"
 ENCODING_ORDER = ["utf-8", "cp932", "utf-16-le", "utf-16-be", "euc_jp", "iso2022_jp"]
 # フォントの既定。settings の editor 節(font_family / font_size)で
 # 上書きできる。大きさは第1段までの既定(10pt)に合わせた。
@@ -648,6 +660,9 @@ class EditorWindow(QMainWindow):
         # 入口(feature_screen / ファイラ)はすべてこの窓を通るので、
         # ここで付ければ全部に付く。
         self.setWindowIcon(editor_icon.qicon())
+        # タスクバーのアプリIDは、窓が画面に出たとき(showEvent)に
+        # 1回だけ付ける。HWND が要るので作った直後には付けない。
+        self._taskbar_identity_applied = False
         # タブとビュー。プロパティ(_edit / _doc 等)はこの並びの
         # 「今のタブ」を見るので、他の初期化より先に用意する。
         self._views = []
@@ -2788,6 +2803,33 @@ class EditorWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001  スロットで投げ切らない
             self.statusBar().showMessage(f"保存できませんでした ({e})")
             return False
+
+    # ---------------------------------------------------------------
+    # タスクバーの身元(Windows のみ)
+    # ---------------------------------------------------------------
+    def showEvent(self, event):  # noqa: N802  Qt の上書き
+        super().showEvent(event)
+        if not self._taskbar_identity_applied:
+            self._taskbar_identity_applied = True
+            self._apply_taskbar_identity()
+
+    def _apply_taskbar_identity(self) -> None:
+        """窓に EDDy 専用の AppUserModelID を付ける(Windows のみ)。
+
+        EDDy の窓は常駐・あっふ と同じプロセスで開くため、付けないと
+        タスクバーで開いた側のアプリと同じボタンにまとめられてしまう。
+        窓ごとにIDを書けば、EDDy は独立したボタンとグループになる
+        (filer_shell.set_window_app_id。Relaunch* は書かないので、
+        ピン留めからの再起動は対象外)。Windows でなければ何もしない。
+        付けられなくても編集は止めない。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import filer_shell
+
+            filer_shell.set_window_app_id(int(self.winId()), TASKBAR_APP_ID)
+        except Exception:  # noqa: BLE001  身元が付かないだけ。操作は止めない
+            pass
 
     # ---------------------------------------------------------------
     # 閉じる(確認は出さない。控えが内容を守る)

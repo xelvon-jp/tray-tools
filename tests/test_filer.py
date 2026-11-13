@@ -917,7 +917,8 @@ def test_window_newtext_stamp():
 
     _qapp()
     assert core.DEFAULT_KEYMAP["1069"] == "newtext"
-    assert core.DEFAULT_KEYMAP["0069"] == "edit"  # E は従来どおり
+    assert core.DEFAULT_KEYMAP["0069"] == "text_editor"  # E は EDDy(2026-11-14)
+    assert core.DEFAULT_KEYMAP["0086"] == "edit"  # 外のエディタは V に残る
     with tempfile.TemporaryDirectory() as tmp:
         left, right = _make_tree(tmp)
         settings_path = Path(tmp, "settings.json")
@@ -2110,7 +2111,7 @@ def test_shift_enter_and_menu_select_only():
         key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
         try:
             assert core.DEFAULT_KEYMAP["1013"] == "open_in_other"
-            assert core.DEFAULT_KEYMAP["0069"] == "edit"  # E は従来どおりエディタ
+            assert core.DEFAULT_KEYMAP["0069"] == "text_editor"  # E は EDDy で開く
 
             # フォルダ: 反対窓で開く。自窓はそのまま、フォーカスも移らない
             L.set_cursor(L._row_of("sub1"))
@@ -2161,6 +2162,58 @@ def test_shift_enter_and_menu_select_only():
             assert fired == ["path"], fired
             assert not menu.isVisible()
         finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_window_e_key_opens_eddy():
+    """E: テキストは内蔵エディタ(EDDy)で開き、外のエディタは起こさない。
+    テキストでないファイルでは、どちらのエディタも開かない。
+    V は従来どおり外のエディタで開く(2026-11-14 Nagato 指示で E を変更)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "data.bin").write_bytes(b"\x00\x01\x02")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right),
+                                         "editor": "x"}},
+                              str(settings_path))
+        w.show()
+        w.start()
+        _wait(w)
+        opened = []
+        dummy_window = object()
+        w.open_text_editor = lambda path: opened.append(path) or dummy_window  # noqa: E731
+        calls = []
+        real_popen = filer.subprocess.Popen
+        filer.subprocess.Popen = lambda args, **kw: calls.append(args)  # noqa: E731
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        try:
+            # E: テキストは EDDy で開く。外のエディタ(Popen)は起きない
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            key(Qt.Key_E)
+            _wait(w)
+            assert opened == [str(left / "alpha.txt")], opened
+            assert calls == [], calls
+            # E: テキストでないファイルは何も開かない
+            w.left.set_cursor(w.left._row_of("data.bin"))
+            key(Qt.Key_E)
+            _wait(w)
+            assert opened == [str(left / "alpha.txt")], opened
+            assert calls == [], calls
+            # V: 従来どおり外のエディタで開く
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            key(Qt.Key_V)
+            _wait(w)
+            assert [os.path.basename(a[1]) for a in calls] == ["alpha.txt"], calls
+            assert opened == [str(left / "alpha.txt")], opened
+        finally:
+            filer.subprocess.Popen = real_popen
             w.close()
             w.deleteLater()
 
@@ -2927,15 +2980,14 @@ def test_window_archive():
         assert viewer.path.startswith(_TEST_TEMP) and viewer.title_name == str(zpath / JP_NAME)
         viewer.close()
         assert not w._viewers
-        calls = []
-        real_popen = filer.subprocess.Popen
-        filer.subprocess.Popen = lambda args, **kw: calls.append(args)
-        try:
-            key(Qt.Key_E)
-            _wait_extract(w)
-        finally:
-            filer.subprocess.Popen = real_popen
-        assert calls and calls[0][0] == "ed" and calls[0][1].endswith(JP_NAME)
+        # E: 内蔵エディタ(EDDy)で開く。書庫の中は &TEDIT と同じく
+        # 一時フォルダへ取り出してから(外のエディタは起こさない)
+        eddy = []
+        w.open_text_editor = lambda path: eddy.append(path)
+        key(Qt.Key_E)
+        _wait_extract(w)
+        assert len(eddy) == 1 and Path(eddy[0]).read_bytes() == b"jp", eddy
+        assert eddy[0].startswith(_TEST_TEMP) and eddy[0].endswith(JP_NAME)
 
         # O: 反対窓を書庫の中へ(Shift+O)。反対窓が書庫の中なら Alt+C は断る
         key(Qt.Key_O, Qt.ShiftModifier)
@@ -11472,15 +11524,16 @@ def test_edit_confirms_images():
         real_popen = filer.subprocess.Popen
         filer.subprocess.Popen = lambda args, **kw: calls.append(args)  # エディタは起こさない
         try:
-            # 画像を含むマーク + E: 確かめる(既定は「いいえ」)。いいえなら開かない
+            # 画像を含むマーク + V(外のエディタ): 確かめる(既定は「いいえ」)。
+            # いいえなら開かない
             L.marks.update({"alpha.txt", "photo.JPG"})
             answers.append(False)
-            key(Qt.Key_E)
+            key(Qt.Key_V)
             assert asked == [("画像 1 件を含む 2 件をエディタで開きますか？", False)], asked
             assert calls == []
             # はいなら全部開く
             answers.append(True)
-            key(Qt.Key_E)
+            key(Qt.Key_V)
             assert len(asked) == 2
             assert sorted(os.path.basename(a[1]) for a in calls) == ["alpha.txt", "photo.JPG"]
             # 画像を含まなければ確認なし(V も同じ)
@@ -11497,6 +11550,13 @@ def test_edit_confirms_images():
             key(Qt.Key_V)
             assert asked[-1] == ("画像 1 件を含む 1 件をエディタで開きますか？", False), asked
             assert calls == [] and not answers
+            # E は EDDy: 画像は対象から外れ、確認も出ない(テキストだけ開く)
+            eddy = []
+            w.open_text_editor = lambda path: eddy.append(path)
+            L.marks.update({"alpha.txt", "photo.JPG"})
+            key(Qt.Key_E)
+            assert len(asked) == 3 and eddy == [str(left / "alpha.txt")], (asked, eddy)
+            assert calls == []
         finally:
             filer.subprocess.Popen = real_popen
             w.close()

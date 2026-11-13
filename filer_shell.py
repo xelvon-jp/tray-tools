@@ -499,10 +499,10 @@ def _vtable_func(store, index, restype, *argtypes):
     return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(func_ptr)
 
 
-def set_taskbar_identity(hwnd: int, app_id: str, command: str,
-                         icon_path: str, display_name: str) -> None:
-    """ピン留め用の再起動情報(アプリID・起動コマンド・アイコン・表示名)を
-    窓に書く。失敗したら例外を上げる(呼び出し側で握る)。"""
+def _set_window_properties(hwnd: int, values) -> None:
+    """窓のプロパティストアへ、System.AppUserModel の文字列の組
+    ((propID, 文字列), ...)を書く。失敗したら例外を上げる
+    (呼び出し側で握る)。"""
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     shell32.SHGetPropertyStoreForWindow.argtypes = [
         wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p]
@@ -519,9 +519,6 @@ def set_taskbar_identity(hwnd: int, app_id: str, command: str,
             ctypes.POINTER(_PROPERTYKEY), ctypes.c_void_p)
         commit = _vtable_func(store, 7, ctypes.c_long)
         fmtid = _guid(_APPUSERMODEL_FMTID)
-        values = ((_PID_APP_ID, app_id), (_PID_RELAUNCH_COMMAND, command),
-                  (_PID_RELAUNCH_ICON, f"{icon_path},0"),
-                  (_PID_RELAUNCH_NAME, display_name))
         for pid, text in values:
             key = _PROPERTYKEY(fmtid, pid)
             buffer = ctypes.create_unicode_buffer(text)
@@ -535,3 +532,23 @@ def set_taskbar_identity(hwnd: int, app_id: str, command: str,
     finally:
         release = _vtable_func(store, 2, ctypes.c_ulong)
         release(store)
+
+
+def set_taskbar_identity(hwnd: int, app_id: str, command: str,
+                         icon_path: str, display_name: str) -> None:
+    """ピン留め用の再起動情報(アプリID・起動コマンド・アイコン・表示名)を
+    窓に書く。失敗したら例外を上げる(呼び出し側で握る)。"""
+    _set_window_properties(hwnd, (
+        (_PID_APP_ID, app_id), (_PID_RELAUNCH_COMMAND, command),
+        (_PID_RELAUNCH_ICON, f"{icon_path},0"),
+        (_PID_RELAUNCH_NAME, display_name)))
+
+
+def set_window_app_id(hwnd: int, app_id: str) -> None:
+    """窓に AppUserModelID だけを書く。
+
+    タスクバーはプロセスのアプリIDで窓をまとめるので、同じプロセスの
+    別の窓(EDDy など)を別アプリとして扱わせたいときに使う。
+    Relaunch* は書かないので、ピン留めからの再起動は対象にしない
+    (グループ分けだけが目的)。失敗したら例外を上げる(呼び出し側で握る)。"""
+    _set_window_properties(hwnd, ((_PID_APP_ID, app_id),))

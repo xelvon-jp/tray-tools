@@ -3308,6 +3308,42 @@ def test_keymap_readback_from_overrides():
         discard_close(window)
 
 
+def test_taskbar_identity_applied_once_on_show():
+    """タスクバーのアプリID付けは、初回の表示で1回だけ走る(再表示では
+    走らない)。実付けは Windows でのみ filer_shell へ届き、それ以外では
+    何もしない(例外も出ない)。付け先のIDは、常駐とあっふ のIDと違う。"""
+    import editor.window as windowmod
+
+    assert windowmod.TASKBAR_APP_ID not in ("traytools.app.1", "traytools.affx")
+    window = editor.create_window(None)
+    calls = []
+    window._apply_taskbar_identity = lambda: calls.append(1)
+    try:
+        window.show()
+        app().processEvents()
+        assert calls == [1], calls
+        window.hide()
+        window.show()
+        app().processEvents()
+        assert calls == [1], calls  # 再表示では付け直さない
+    finally:
+        discard_close(window)
+
+    # 実付け: この環境(Windows でない)では黙って何もしない
+    window = make_window()
+    try:
+        window._apply_taskbar_identity()
+        if sys.platform == "win32":
+            # Windows では filer_shell 側の呼び出しが例外なく通ること
+            # (実際のタスクバー表示は実機確認待ち)。
+            import filer_shell
+
+            filer_shell.set_window_app_id(
+                int(window.winId()), windowmod.TASKBAR_APP_ID)
+    finally:
+        discard_close(window)
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

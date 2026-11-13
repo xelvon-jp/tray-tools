@@ -12,7 +12,8 @@
 #   rxfind.py       正規表現の検索・置換(Qt 非依存。別プロセスで実行)
 #   grep.py         フォルダ内の横断検索の純粋部分(Qt 非依存)
 #   grep_dialog.py  横断検索の窓(入力・進捗・結果の一覧)
-#   colors.py       配色プリセット(標準・秀丸風)
+#   colors.py       配色プリセット(標準・秀丸風)と上書きの解決
+#   color_dialog.py 色の設定画面(プリセット+項目ごとの上書き)
 #   text_edit.py    本文(QPlainTextEdit＋行番号＋Ctrl+ホイールで大きさ
 #                   ＋矩形選択は rect_edit.py の共用部品)
 #   outline_pane.py 左ペイン(アウトラインのツリー＋下部のファイル情報)

@@ -1514,7 +1514,7 @@ def test_view_toggles_and_color_scheme():
         assert window._edit.palette().color(
             QPalette.ColorRole.Base) == QColor("#ffffff")
         assert window._edit.color_scheme()["current_line"] == "#ffffcc"
-        assert saved[-1] == {"color_scheme": "秀丸風"}
+        assert saved[-1] == {"color_preset": "秀丸風"}
     finally:
         discard_close(window)
 
@@ -2550,6 +2550,113 @@ def test_edit_marks_navigation_recorded_and_replayed():
         finally:
             if other is not None:
                 discard_close(other)
+            discard_close(window)
+
+
+def test_color_overrides_persist_and_read_back():
+    # 色の設定(プリセット+上書き)は差分として流れ、開き直すと
+    # 読み戻されて本文へ反映される。
+    from PySide6.QtGui import QColor, QPalette
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    try:
+        window.apply_color_settings("標準", {"background": "#123456"})
+        assert saved[-1] == {
+            "color_preset": "標準",
+            "color_overrides": {"background": "#123456"}}
+        assert window.color_overrides() == {"background": "#123456"}
+        assert window._edit.palette().color(
+            QPalette.ColorRole.Base) == QColor("#123456")
+        assert window._edit.color_scheme()["background"] == "#123456"
+        # 上書きしていない項目はプリセットのまま。
+        assert window._edit.color_scheme()["current_line"] == "#eff6ff"
+    finally:
+        discard_close(window)
+    window = make_window(editor_settings={
+        "color_preset": "標準",
+        "color_overrides": {"background": "#123456"}})
+    try:
+        assert window.color_scheme_name() == "標準"
+        assert window.color_overrides() == {"background": "#123456"}
+        assert window._edit.palette().color(
+            QPalette.ColorRole.Base) == QColor("#123456")
+    finally:
+        discard_close(window)
+    # 旧キー color_scheme だけの設定も読み続けられる(移行前の受け)。
+    window = make_window(editor_settings={"color_scheme": "秀丸風"})
+    try:
+        assert window.color_scheme_name() == "秀丸風"
+    finally:
+        discard_close(window)
+
+
+def test_color_preset_switch_follows_and_keeps_overrides():
+    # プリセットを切り替えると、上書きの無い項目は追随し、
+    # 上書きした項目はそのまま残る。
+    saved = []
+    window = make_window(
+        editor_settings={"color_overrides": {"current_line": "#010203"}},
+        on_settings_change=saved.append)
+    try:
+        assert window._edit.color_scheme()["current_line"] == "#010203"
+        window.apply_color_scheme("秀丸風")
+        scheme = window._edit.color_scheme()
+        assert scheme["current_line"] == "#010203"   # 上書きは残る
+        assert scheme["invisible"] == "#7fb3d5"      # 秀丸風に追随
+        assert window.color_overrides() == {"current_line": "#010203"}
+        assert saved[-1] == {"color_preset": "秀丸風"}
+    finally:
+        discard_close(window)
+
+
+def test_color_dialog_drives_window():
+    # 色の設定画面での変更・リセットが、その場で窓へ反映され保存される。
+    from PySide6.QtGui import QColor, QPalette
+
+    from editor.color_dialog import ColorSettingsDialog
+    saved = []
+    window = make_window(on_settings_change=saved.append)
+    dialog = ColorSettingsDialog(
+        window, preset_name=window.color_scheme_name(),
+        overrides=window.color_overrides(),
+        on_change=window.apply_color_settings)
+    try:
+        dialog.set_item_color("background", "#102030")
+        assert window._edit.palette().color(
+            QPalette.ColorRole.Base) == QColor("#102030")
+        assert saved[-1] == {
+            "color_preset": "標準",
+            "color_overrides": {"background": "#102030"}}
+        dialog.reset_item("background")
+        assert window._edit.palette().color(
+            QPalette.ColorRole.Base) == QColor("#ffffff")
+        assert saved[-1] == {"color_preset": "標準", "color_overrides": {}}
+        # 表示メニューに色の設定の入口がある。
+        from PySide6.QtGui import QAction
+        texts = [a.text() for a in window.findChildren(QAction)]
+        assert any(t.startswith("色の設定") for t in texts)
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_color_overrides_reach_markdown_highlighter():
+    # Markdown の項目の上書きは、開いている文書のハイライタへ届く。
+    from PySide6.QtGui import QColor
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.md")
+        Path(path).write_bytes("# 見出し\n本文\n".encode("utf-8"))
+        window = make_window(path)
+        try:
+            assert window._highlighter.markdown_enabled()
+            window.apply_color_settings(
+                "標準", {"heading1_background": "#0f0e0d"})
+            fmt = window._highlighter._heading_formats[0]
+            assert fmt.background().color() == QColor("#0f0e0d")
+            window.apply_color_settings("標準", {})
+            fmt = window._highlighter._heading_formats[0]
+            assert fmt.background().color() == QColor("#d9e2f3")
+        finally:
             discard_close(window)
 
 

@@ -118,6 +118,7 @@ from editor import outline
 from editor import editor_icon
 from editor import reformat as refmtmod
 from editor import rxfind
+from editor.color_dialog import ColorSettingsDialog
 from editor.findall_dialog import FindAllDialog
 from editor.grep_dialog import GrepDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
@@ -597,13 +598,18 @@ class EditorWindow(QMainWindow):
         self._edit.set_current_line_enabled(
             bool(section.get("highlight_current_line", True)))
         self._edit.setCursorWidth(3 if section.get("wide_cursor") else 1)
-        scheme_name = section.get("color_scheme") or colormod.DEFAULT_SCHEME
+        # 配色は「プリセット+上書き」(editor/colors.py)。プリセット名の
+        # 正本は color_preset で、旧キー color_scheme は移行前の設定を
+        # 読むための受け(書き込みは color_preset のみ)。
+        scheme_name = (section.get("color_preset")
+                       or section.get("color_scheme")
+                       or colormod.DEFAULT_SCHEME)
         if scheme_name not in colormod.COLOR_SCHEMES:
             scheme_name = colormod.DEFAULT_SCHEME
         self._color_scheme_name = scheme_name
-        scheme = colormod.get_scheme(scheme_name)
-        self._edit.apply_colors(scheme)
-        self._highlighter.set_background(QColor(scheme["star_background"]))
+        self._color_overrides = colormod.sanitize_overrides(
+            section.get("color_overrides"))
+        self._apply_color_scheme_to_views()
 
         # 折り返し(方式と桁数)と、Markdown の色付けの希望。適用は
         # ここ(保存は切り替えのときに流す)。Markdown が実際に効くかは
@@ -842,6 +848,8 @@ class EditorWindow(QMainWindow):
                 lambda _checked=False, n=name: self.apply_color_scheme(n))
             scheme_menu.addAction(action)
             self._scheme_actions[name] = action
+        self._action("色の設定(&E)…", self.show_color_settings,
+                     None, view_menu)
         wrap_menu = view_menu.addMenu("折り返し(&R)")
         self._wrap_actions = {}
         for mode, label in ((WRAP_MODE_COLUMN, "桁数で折り返す(&C)"),
@@ -1165,22 +1173,61 @@ class EditorWindow(QMainWindow):
         よるので、ハイライタ側の markdown_enabled を見ること。"""
         return self._markdown_pref
 
+    def _apply_color_scheme_to_views(self):
+        """実効の配色(プリセット+上書き)を本文とハイライタへ反映する。"""
+        scheme = colormod.resolve_scheme(
+            self._color_scheme_name, self._color_overrides)
+        self._edit.apply_colors(scheme)
+        self._highlighter.set_background(QColor(scheme["star_background"]))
+        self._highlighter.set_markdown_colors(scheme)
+
+    def _sync_scheme_actions(self):
+        for scheme_name, action in self._scheme_actions.items():
+            if action.isChecked() != (scheme_name == self._color_scheme_name):
+                blocker = QSignalBlocker(action)
+                action.setChecked(scheme_name == self._color_scheme_name)
+
     def apply_color_scheme(self, name):
-        """配色プリセット(editor/colors.py)を適用して保存する。"""
+        """配色プリセット(editor/colors.py)を切り替えて保存する。
+
+        上書きした項目はそのまま残り、上書きの無い項目は新しい
+        プリセットに追随する。"""
         if name not in colormod.COLOR_SCHEMES:
             name = colormod.DEFAULT_SCHEME
         self._color_scheme_name = name
-        scheme = colormod.get_scheme(name)
-        self._edit.apply_colors(scheme)
-        self._highlighter.set_background(QColor(scheme["star_background"]))
-        for scheme_name, action in self._scheme_actions.items():
-            if action.isChecked() != (scheme_name == name):
-                blocker = QSignalBlocker(action)
-                action.setChecked(scheme_name == name)
-        self._persist_settings({"color_scheme": name})
+        self._apply_color_scheme_to_views()
+        self._sync_scheme_actions()
+        self._persist_settings({"color_preset": name})
+
+    def apply_color_settings(self, name, overrides):
+        """色の設定画面からの変更(プリセットと上書き)を反映して保存する。"""
+        if name not in colormod.COLOR_SCHEMES:
+            name = colormod.DEFAULT_SCHEME
+        self._color_scheme_name = name
+        self._color_overrides = colormod.sanitize_overrides(overrides)
+        self._apply_color_scheme_to_views()
+        self._sync_scheme_actions()
+        self._persist_settings({
+            "color_preset": name,
+            "color_overrides": dict(self._color_overrides),
+        })
+
+    def show_color_settings(self):
+        """色の設定画面(editor/color_dialog.py)を開く。
+
+        変更はその場でこの窓へ反映され、設定へ保存される
+        (apply_color_settings 経由)。"""
+        dialog = ColorSettingsDialog(
+            self, preset_name=self._color_scheme_name,
+            overrides=self._color_overrides,
+            on_change=self.apply_color_settings)
+        dialog.exec()
 
     def color_scheme_name(self) -> str:
         return self._color_scheme_name
+
+    def color_overrides(self) -> dict:
+        return dict(self._color_overrides)
 
     def font_size(self) -> int:
         return self._edit.font_size()

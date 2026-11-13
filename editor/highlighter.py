@@ -25,8 +25,10 @@ STAR_BACKGROUND = QColor(255, 243, 176)
 # Markdown と判定する拡張子(ドット無し・小文字)。
 MARKDOWN_EXTENSIONS = frozenset({"md", "markdown"})
 
-# Markdown の配色(明るい背景前提の、落ち着いた色)。
-# 見出しは階層が深いほど背景を薄くする。
+# Markdown の配色の既定(明るい背景前提の、落ち着いた色)。
+# 見出しは階層が深いほど背景を薄くする。正本は editor/colors.py の
+# 配色の組で、窓が set_markdown_colors で渡す。ここの定数は、組が
+# 渡されなかったときの受けに使う(テストからの参照も残してある)。
 HEADING_BACKGROUNDS = (
     QColor(217, 226, 243),   # 見出し1
     QColor(226, 234, 246),   # 見出し2
@@ -102,6 +104,35 @@ class LineHighlighter(QSyntaxHighlighter):
     def set_background(self, color):
         """強調の背景色を差し替える(配色プリセットの適用)。"""
         self._format.setBackground(QColor(color))
+        self.rehighlight()
+
+    def set_markdown_colors(self, scheme):
+        """Markdown の書式を配色の組(editor/colors.py)で作り直す。
+
+        組に無い項目は、このモジュールの定数(従来の色)に倒す。
+        星印行の背景は set_background 側の担当なので、ここでは触らない。"""
+        def pick(key, default):
+            value = scheme.get(key) if isinstance(scheme, dict) else None
+            return QColor(value) if value else QColor(default)
+
+        self._heading_formats = [
+            _format(background=pick(f"heading{level}_background",
+                                    HEADING_BACKGROUNDS[level - 1]),
+                    bold=True)
+            for level in range(1, 7)]
+        self._code_block_format = _format(
+            background=pick("code_block_background", CODE_BLOCK_BACKGROUND))
+        self._inline_code_format = _format(
+            background=pick("inline_code_background",
+                            INLINE_CODE_BACKGROUND),
+            foreground=pick("inline_code_foreground",
+                            INLINE_CODE_FOREGROUND))
+        self._link_format = _format(
+            foreground=pick("link_foreground", LINK_COLOR), underline=True)
+        self._quote_format = _format(
+            foreground=pick("quote_foreground", QUOTE_COLOR))
+        self._bullet_format = _format(
+            foreground=pick("bullet_foreground", BULLET_COLOR), bold=True)
         self.rehighlight()
 
     def markdown_enabled(self) -> bool:

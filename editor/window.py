@@ -4500,9 +4500,9 @@ class EditorWindow(QMainWindow):
                 cursor2.beginEditBlock()
                 cursor2.insertText(expanded)
                 cursor2.endEditBlock()
-                cursor2.setPosition(begin16)
-                cursor2.setPosition(begin16 + self._utf16_len(expanded),
-                                    QTextCursor.MoveMode.KeepAnchor)
+                # 同期版と同じく、カーソルは置換した範囲の直後へ
+                # (連続押下で次のマッチへ進むように)。
+                cursor2.setPosition(begin16 + self._utf16_len(expanded))
                 self._edit.setTextCursor(cursor2)
             finally:
                 self._suppress_change_record = False
@@ -4539,7 +4539,9 @@ class EditorWindow(QMainWindow):
 
     def _apply_replace_next(self, text, word, repl, case, regex):
         """カーソル(選択の開始)以後の最初のマッチを1件だけ置換する。
-        置換したら True。置き換えた箇所を選択状態にする。"""
+        置換したら True。カーソルは置換した範囲の直後へ置く
+        (続けて置換を押すと、置換後の文字列自体には引っかから
+        ず、次のマッチへ進む)。"""
         cursor = self._edit.textCursor()
         start = self._py_index(cursor.selectionStart(), text)
         if regex:
@@ -4565,9 +4567,7 @@ class EditorWindow(QMainWindow):
         cursor.beginEditBlock()
         cursor.insertText(expanded)
         cursor.endEditBlock()
-        cursor.setPosition(begin16)
-        cursor.setPosition(begin16 + self._utf16_len(expanded),
-                           QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(begin16 + self._utf16_len(expanded))
         self._edit.setTextCursor(cursor)
         return True
 

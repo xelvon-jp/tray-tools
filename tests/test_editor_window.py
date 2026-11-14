@@ -1727,7 +1727,10 @@ def test_replace_next_plain_and_regex():
         window._replace_edit.setText("bar")
         assert window.execute_command("replace_next")
         assert window.text() == "bar foo foo"
-        assert window._edit.textCursor().selectedText() == "bar"
+        # カーソルは置換した範囲の直後 (選択は残らない)。
+        cursor = window._edit.textCursor()
+        assert not cursor.hasSelection()
+        assert cursor.position() == 3
         assert window.execute_command("replace_next")
         assert window.text() == "bar bar foo"
         # 正規表現でも1件ずつ置ける。
@@ -1741,6 +1744,39 @@ def test_replace_next_plain_and_regex():
         assert window.execute_command("replace_next")
         wait_rx(window)   # 正規表現の置換は非同期(裏スレッド)
         assert window.text() == "a<1> a2"
+    finally:
+        discard_close(window)
+
+
+def test_replace_next_repeated_matches_replace_all():
+    # 置換後の文字列に検索語が含まれていても、置換の連続押下が
+    # 置換した範囲の直後から探し直して次のマッチへ進み、すべて
+    # 置換と同じ結果になること (実機報告 2026-11-14)。
+    window = make_window()
+    try:
+        window._edit.setPlainText("foo foo foo")
+        window._find_edit.setText("foo")
+        window._replace_edit.setText("foobar")
+        for _ in range(3):
+            assert window.execute_command("replace_next")
+        assert window.text() == "foobar foobar foobar"
+        # もう無いので、次を押しても本文は変わらない。
+        window.execute_command("replace_next")
+        assert window.text() == "foobar foobar foobar"
+        # 正規表現でも同じ (非同期の経路)。
+        window._edit.setPlainText("a a")
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        window._find_edit.setText("a")
+        window._replace_edit.setText("aa")
+        window._find_regex.setChecked(True)
+        assert window.execute_command("replace_next")
+        wait_rx(window)
+        assert window.text() == "aa a"
+        assert window.execute_command("replace_next")
+        wait_rx(window)
+        assert window.text() == "aa aa"
     finally:
         discard_close(window)
 

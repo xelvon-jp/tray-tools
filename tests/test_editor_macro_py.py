@@ -544,7 +544,8 @@ def _make_pane(window, source, name=""):
         name=name,
         session_factory=window._make_python_session,
         begin_run=window._begin_python_run,
-        end_run=window._end_python_run)
+        end_run=window._end_python_run,
+        flush_run=window._flush_python_run)
 
 
 def _pane_cursor_to_line(dialog, lineno):
@@ -595,6 +596,38 @@ def test_pane_breakpoint_stops_and_continues():
         assert dialog.session().done
     finally:
         dialog.close()
+        discard_close(window)
+
+
+def test_recording_continues_after_pane_step():
+    # 記録開始 → 操作① → ペインでステップ実行 (セッションは
+    # 終わっていない) → 操作② → 記録終了、で操作②も記録に
+    # 残る (陽太さんの実機報告 2026-11-14: 「再生中」の印が
+    # セッション全体に残り、その間の手作業が記録から漏れた)。
+    # ステップ実行で本文へ入った編集自体は、記録に混ざらない。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(
+        window, "ed.insert_text('S')\ned.insert_text('T')\n")
+    try:
+        window.set_macro_recording(True)
+        QTest.keyClicks(window._edit, "X")          # 操作①
+        dialog.show()
+        assert dialog.step_once()
+        assert window.text() == "abXS"
+        assert dialog.session() is not None
+        assert not dialog.session().done    # セッションは継続中
+        QTest.keyClicks(window._edit, "Y")          # 操作②
+        window.set_macro_recording(False)
+        assert window.text() == "abXSY"
+        assert window._macro_skips == 0
+        assert window.recorded_commands() == [
+            {"cmd": "insert_text", "args": {"text": "X"}},
+            {"cmd": "insert_text", "args": {"text": "Y"}},
+        ]
+    finally:
+        dialog.close()
+        if window._python_dialog is not None:
+            window._python_dialog.close()
         discard_close(window)
 
 

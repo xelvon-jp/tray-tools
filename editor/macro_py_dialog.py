@@ -26,7 +26,10 @@
 # (窓)が session_factory で作って渡す(この画面は Qt の外の形を
 # 知らない)。実行区間の undo の単位は、呼び側の begin_run /
 # end_run が面倒を見る(ステップをまたいでも1回の実行は1つの
-# 単位)。
+# 単位)。ただし記録中は、ステップの合間に flush_run で編集
+# ブロックだけを閉じる(Qt がブロック内の変化を伏せてしまう
+# ため、そのままだと合間の手作業が記録へ届かない)。その場合
+# の undo はステップごとの単位になる。
 #
 # 実行中は、イベントを回しながら待つ(子が純粋な計算で回って
 # いても画面が固まらないように)。通し実行・ステップ実行・停止
@@ -211,17 +214,20 @@ class MacroPythonPane(QWidget):
     見出しにはマクロ名を出し、名前が無ければ「新規マクロ」と
     出す。session_factory はソースを受けて PythonStepper を返す
     関数(作れなければ None)。begin_run / end_run は実行区間の
-    開始と終了(呼び側が undo の単位と「再生中」の印を持つ)。
-    on_save は (名前, ソース) を受ける登録の口で、無ければ保存
-    ボタンは出ない。"""
+    開始と終了(呼び側が undo の単位と、実行中のタブの固定を
+    持つ)。flush_run は、ステップの合間に実行区間の編集
+    ブロックだけを閉じる口(区間は続く。合間の手作業が、窓側
+    の記録へ届くようにするため)。on_save は (名前, ソース)
+    を受ける登録の口で、無ければ保存ボタンは出ない。"""
 
     def __init__(self, parent=None, *, source="", name="",
                  session_factory=None, begin_run=None, end_run=None,
-                 on_save=None, live_source=None):
+                 flush_run=None, on_save=None, live_source=None):
         super().__init__(parent)
         self._session_factory = session_factory
         self._begin_run = begin_run
         self._end_run = end_run
+        self._flush_run = flush_run
         self._on_save = on_save
         self._session = None
         self._run_begun = False
@@ -475,9 +481,19 @@ class MacroPythonPane(QWidget):
         QApplication.processEvents()
 
     def _begin(self):
-        if not self._run_begun and self._begin_run is not None:
+        # 呼び側は冗長に呼ばれてもよい作り (タブの固定は最初の
+        # 1回だけ、編集ブロックは閉じていれば開き直す)。ステッ
+        # プのたびに呼んで、_flush で閉じたブロックを開き直す。
+        if self._begin_run is not None:
             self._begin_run()
             self._run_begun = True
+
+    def _flush(self):
+        """ステップの合間に、実行区間の編集ブロックだけを閉じる
+        (実行区間は続く)。閉じ方は呼び側に任せる (記録中でない
+        ときは閉じず、実行全体が1回の undo の単位のままになる)。"""
+        if self._run_begun and self._flush_run is not None:
+            self._flush_run()
 
     def _finish(self):
         if self._run_begun and self._end_run is not None:
@@ -539,6 +555,10 @@ class MacroPythonPane(QWidget):
             self._set_running(False)
         if session.done:
             self._finish()
+        else:
+            # 合間に利用者の手が入れるよう、編集ブロックだけ
+            # 閉じておく (次のステップで開き直す)。
+            self._flush()
         self._refresh_state("")
         return not session.stopped
 
@@ -600,6 +620,9 @@ class MacroPythonPane(QWidget):
             self._finish()
         else:
             self._paused_at_breakpoint = True
+            # ブレークポイントで止まっている間も、合間の手作業
+            # が記録へ届くよう、編集ブロックだけ閉じておく。
+            self._flush()
         self._refresh_state(seek_note)
         return finished and not session.stopped
 

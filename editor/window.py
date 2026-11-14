@@ -705,7 +705,17 @@ class _EditorPyApi:
                     bound[param] = args[index]
             for key, value in kwargs.items():
                 bound[key] = value
-            return window.execute_command(name, bound, _note=False)
+            # 「再生中」の印は、この命令の実行の間だけ立てる。
+            # セッション全体で立てっぱなしにすると、ステップ実行
+            # の合間に利用者が手で入れた編集まで、再生の変化と
+            # みなして記録から漏れてしまう。入れ子に備えて前の
+            # 値を戻す。
+            previous = window._replaying
+            window._replaying = True
+            try:
+                return window.execute_command(name, bound, _note=False)
+            finally:
+                window._replaying = previous
 
         return call
 
@@ -757,19 +767,6 @@ def _draw_toolbar_icon(kind):
             QPoint(4, 2), QPoint(4, 14), QPoint(14, 8)]))
     painter.end()
     return QIcon(pixmap)
-
-
-class _RecordLabel(QLabel):
-    """マクロ記録中の赤いラベル。クリックで記録を止める合図を出す
-    (記録中なのが一目で分かるように、リボンの中に常駐させる。
-    ステータスバーの一時表示は他のメッセージに上書きされて
-    消えてしまうため)。"""
-
-    clicked = Signal()
-
-    def mousePressEvent(self, event):  # noqa: N802  Qt の上書き
-        self.clicked.emit()
-        super().mousePressEvent(event)
 
 
 class EditorWindow(QMainWindow):
@@ -1119,16 +1116,6 @@ class EditorWindow(QMainWindow):
         self._find_bar.hide()
 
         self._build_menus()
-        # 記録中の赤いラベルは、リボン(ツールバー)の中に置く
-        # (_build_toolbar が差すので、先に作っておく)。
-        self._record_label = _RecordLabel("● マクロ記録中")
-        self._record_label.setStyleSheet(
-            "background-color: #c62828; color: white;"
-            " font-weight: bold; padding: 2px 10px; border-radius: 3px;")
-        self._record_label.setToolTip("クリックで記録を止めます")
-        self._record_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._record_label.clicked.connect(
-            lambda: self.set_macro_recording(False))
         self._build_toolbar()
         self._enc_label = QLabel()
         self._pos_label = QLabel()
@@ -2449,18 +2436,6 @@ class EditorWindow(QMainWindow):
         toolbar = QToolBar("操作", self)
         toolbar.setMovable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        # 記録中の赤いラベル (記録中でないときは隠れている) は、
-        # いちばん左に置く。「記録中は常に出続ける」のが要件で、
-        # 後ろの方に置くと、既定の窓幅 (760) でもツールバーの
-        # 溢れ (>>) に隠れて見えなくなる (アオイの実測
-        # req-20261114-26)。表示の切り替えは、このアクション
-        # 経由で行い、ラベル自身の表示も同期させる
-        # (_update_record_label)。ラベルを隠したまま addWidget
-        # すると、ツールバーのレイアウトに載らず配置されない
-        # 環境があるため、アクション経由にする。
-        self._record_label_action = toolbar.addWidget(self._record_label)
-        self._record_label_action.setVisible(False)
-        toolbar.addSeparator()
         for action in (self._act_open, self._act_save, self._act_save_as,
                        self._act_find, self._act_send):
             toolbar.addAction(action)
@@ -4744,28 +4719,26 @@ class EditorWindow(QMainWindow):
                 for entry in self._recorder.commands]
 
     def _update_record_label(self):
-        """記録中の赤いラベルの表示を、いまの状態に合わせる。"""
-        label = getattr(self, "_record_label", None)
-        if label is None:
+        """記録中の印を、いまの状態に合わせる。
+
+        印はリボンの記録ボタン自体の色で出す (記録中は赤くし、
+        終わったら戻す)。以前はツールバーの左端に赤いラベルを
+        常駐させていたが、Nagato の指示でボタンに寄せた。ツール
+        バーやボタンがまだ無いタイミングで呼ばれても、何もせず
+        戻る。"""
+        action = getattr(self, "_act_macro_record", None)
+        toolbar = getattr(self, "_toolbar", None)
+        if action is None or toolbar is None:
+            return
+        button = toolbar.widgetForAction(action)
+        if button is None:
             return
         if self._recorder.recording:
-            text = "● マクロ記録中"
-            if self._macro_skips:
-                text += f"（記録できない操作 {self._macro_skips} 件）"
-            label.setText(text)
-            visible = True
+            button.setStyleSheet(
+                "background-color: #c62828; color: white;"
+                " font-weight: bold;")
         else:
-            visible = False
-        # 表示の切り替えは、差してあるツールバーのアクション
-        # 経由が本筋 (ラベル単体の show / hide だけでは、ツール
-        # バーのレイアウトに載らないことがあるため)。アクション
-        # 側の切り替えはレイアウト経由で遅れて効くので、ラベル
-        # 自身の表示もその場で合わせておく (配置はレイアウトが
-        # 追いついた時点でそろう)。
-        action = getattr(self, "_record_label_action", None)
-        if action is not None:
-            action.setVisible(visible)
-        label.setVisible(visible)
+            button.setStyleSheet("")
 
     def set_macro_recording(self, on):
         on = bool(on)
@@ -4776,8 +4749,8 @@ class EditorWindow(QMainWindow):
             self._macro_skips = 0
             self._act_macro_record.setText("記録終了(&R)")
             self._update_record_label()
-            # 記録が始まったことに気づきやすくする合図(赤いラベルは
-            # 常駐表示、こちらは開始の瞬間の一時表示)。
+            # 記録が始まったことに気づきやすくする合図(赤くなる
+            # 記録ボタンが常駐の印、こちらは開始の瞬間の一時表示)。
             self.statusBar().showMessage("マクロの記録を始めました", 4000)
             # 記録の様子をその場で見られるよう、Python マクロの
             # ペインを自動で出す。記録のライブ表示は、記録用の
@@ -4857,21 +4830,57 @@ class EditorWindow(QMainWindow):
             return None
 
     def _begin_python_run(self):
-        """Python マクロの実行区間の開始(undo の単位と、再生中の印)。"""
-        self._replaying = True
+        """Python マクロの実行区間の開始(undo の単位と、実行中の
+        タブの固定)。「再生中」の印はここでは立てない (セッション
+        が生きている間の手作業まで再生扱いになるため。印は命令
+        ごとに _EditorPyApi の受け口で立てる)。
+
+        区間の途中で呼ばれてもよい (ステップの合間に編集ブロック
+        だけ閉じた _flush_python_run のあとで、開き直すため)。
+        タブの固定は最初の1回だけ、ブロックは閉じていれば開く。"""
         # 実行を始めたタブを覚える。途中でタブが切り替わったら、
         # 続きが切り替え先で実行されてしまうので止める (下の
         # _check_python_run_view)。
-        self._python_run_edit = self._edit
-        self._python_block_cursor = self._edit.textCursor()
-        self._python_block_cursor.beginEditBlock()
+        if self._python_run_edit is None:
+            self._python_run_edit = self._edit
+        if self._python_block_cursor is None:
+            self._python_block_cursor = \
+                self._python_run_edit.textCursor()
+            self._python_block_cursor.beginEditBlock()
+
+    def _end_python_block(self):
+        """実行区間の編集ブロックを閉じる。
+
+        ブロックを閉じると、中の変化がまとめて contentsChange
+        で届く。実行による変化を記録へ混ぜないよう、閉じる間
+        だけ「再生中」の印を立てる (まとめて届く変化は、記録の
+        切り分けの対象にしない)。"""
+        if self._python_block_cursor is None:
+            return
+        previous = self._replaying
+        self._replaying = True
+        try:
+            self._python_block_cursor.endEditBlock()
+        finally:
+            self._replaying = previous
+        self._python_block_cursor = None
+
+    def _flush_python_run(self):
+        """実行区間の編集ブロックだけを閉じる (タブの固定は保つ)。
+
+        ステップ実行の合間にペインから呼ばれる。Qt は編集
+        ブロックの中の変化を、ブロックを閉じるまでまとめて
+        伏せてしまうので、開けたままだと合間の手作業が記録係
+        へ届かない。記録中だけ閉じる (記録中でなければ、実行
+        全体を1回の undo で戻せる単位のままにする)。"""
+        if not self._recorder.recording:
+            return
+        self._end_python_block()
+        self._track_change_cache()
 
     def _end_python_run(self):
-        if self._python_block_cursor is not None:
-            self._python_block_cursor.endEditBlock()
-            self._python_block_cursor = None
+        self._end_python_block()
         self._python_run_edit = None
-        self._replaying = False
         self._track_change_cache()
 
     def _check_python_run_view(self):
@@ -5015,6 +5024,7 @@ class EditorWindow(QMainWindow):
             session_factory=self._make_python_session,
             begin_run=self._begin_python_run,
             end_run=self._end_python_run,
+            flush_run=self._flush_python_run,
             on_save=on_save,
             live_source=(self._recording_python_source
                          if live else None))

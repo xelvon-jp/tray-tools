@@ -155,35 +155,37 @@ def test_recorder_move_coalesces_counts():
         "move_char_left", {"count": 1, "extend": True})
 
 
-def test_recording_label_shows_and_click_stops():
-    # 記録中は赤いラベルが常に出ていて、クリックで止められる
-    # (陽太さんの要望 2026-11-14: 記録中なのが分かりづらい)。
-    # ラベルの置き場所はリボン (ツールバー) の中。
+def test_recording_button_turns_red_while_recording():
+    # 記録中は、リボンの記録ボタンが「記録終了」になって赤く
+    # なる (陽太さんの指示 2026-11-14: ツールバー左端の赤い
+    # ラベルは違和感があるので外し、ボタンの色で示す)。
     window = make_window("ab", cursor_pos=0)
     try:
-        assert window._record_label.parentWidget() is window._toolbar
-        # ラベルはリボンの先頭 (いちばん左)。後ろの方に置くと、
-        # 既定の窓幅ではツールバーの溢れ (>>) に隠れて見えなく
-        # なる (アオイの実測 req-20261114-26)。使用頻度の低い
-        # ボタン (アウトライン・行番号) は後ろへ回してある。
+        # ラベルはもう無い。
+        assert not hasattr(window, "_record_label")
+        assert not hasattr(window, "_record_label_action")
+        # 使用頻度の低いボタン (アウトライン・行番号) は後ろへ
+        # 回してある。
         actions = window._toolbar.actions()
-        assert actions[0] is window._record_label_action
         assert actions[-2:] == [window._act_outline,
                                 window._act_line_numbers]
-        assert not window._record_label.isVisible()
+        button = window._toolbar.widgetForAction(
+            window._act_macro_record)
+        assert button is not None
+        assert button.styleSheet() == ""
         window.set_macro_recording(True)
-        # ツールバーのレイアウトは、イベントを1回回すとそろう
-        # (ラベルの位置と大きさが決まってからクリックする)。
         app().processEvents()
-        assert window._record_label.isVisible()
-        assert "記録中" in window._record_label.text()
-        # 記録できない操作が起きると、件数がラベルに出る。
-        window._note_macro_skip()
-        assert "1 件" in window._record_label.text()
-        QTest.mouseClick(window._record_label, Qt.MouseButton.LeftButton)
+        assert window._act_macro_record.text() == "記録終了(&R)"
+        assert "記録終了" in button.text()
+        style = button.styleSheet()
+        assert "#c62828" in style
+        assert "color: white" in style
+        assert "bold" in style
+        window.set_macro_recording(False)
         app().processEvents()
-        assert not window._recorder.recording
-        assert not window._record_label.isVisible()
+        assert window._act_macro_record.text() == "記録開始(&R)"
+        assert "記録開始" in button.text()
+        assert button.styleSheet() == ""
     finally:
         discard_close(window)
 

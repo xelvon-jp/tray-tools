@@ -925,6 +925,11 @@ class EditorWindow(QMainWindow):
         self._python_block_cursor = None
         self._python_run_edit = None
         self._python_dialog_name = None
+        # いまのペインが「記録用」(記録のライブ表示が結びついた
+        # もの) かどうか。記録用でないペインには、記録を始めても
+        # ライブ表示を結びつけない (本文の差し替えで、登録
+        # マクロを保存のときに上書きできてしまうため)。
+        self._python_pane_live = False
         # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
         # (_build_menus)でアクションにし、変更のたびに付け直す。
         self._registered_macros = macmod.sanitize_registered(
@@ -2444,22 +2449,21 @@ class EditorWindow(QMainWindow):
         toolbar = QToolBar("操作", self)
         toolbar.setMovable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        for action in (self._act_open, self._act_save, self._act_save_as,
-                       self._act_find, self._act_send):
-            toolbar.addAction(action)
-        toolbar.addSeparator()
-        # 記録中の赤いラベル (記録中でないときは隠れている)。
-        # 「記録中は常に出続ける」のが要件なので、並びの前の方に
-        # 置く (窓が狭くてツールバーが溢れるときは、後ろの
-        # ボタン側から溢れさせる)。表示の切り替えは、この
-        # アクション経由で行う (_update_record_label)。ラベルを
-        # 隠したまま addWidget すると、ツールバーのレイアウトに
-        # 載らず配置されない環境があるため。
+        # 記録中の赤いラベル (記録中でないときは隠れている) は、
+        # いちばん左に置く。「記録中は常に出続ける」のが要件で、
+        # 後ろの方に置くと、既定の窓幅 (760) でもツールバーの
+        # 溢れ (>>) に隠れて見えなくなる (アオイの実測
+        # req-20261114-26)。表示の切り替えは、このアクション
+        # 経由で行い、ラベル自身の表示も同期させる
+        # (_update_record_label)。ラベルを隠したまま addWidget
+        # すると、ツールバーのレイアウトに載らず配置されない
+        # 環境があるため、アクション経由にする。
         self._record_label_action = toolbar.addWidget(self._record_label)
         self._record_label_action.setVisible(False)
         toolbar.addSeparator()
-        toolbar.addAction(self._act_outline)
-        toolbar.addAction(self._act_line_numbers)
+        for action in (self._act_open, self._act_save, self._act_save_as,
+                       self._act_find, self._act_send):
+            toolbar.addAction(action)
         toolbar.addSeparator()
         # 分割とマクロの4ボタンは、アイコン＋文字で出す (ツール
         # バー全体の既定は文字だけのまま)。
@@ -2479,6 +2483,11 @@ class EditorWindow(QMainWindow):
             if button is not None:
                 button.setToolButtonStyle(
                     Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.addSeparator()
+        # 使用頻度の低いボタンは後ろへ回す (窓が狭くて溢れる
+        # ときは、こちら側から溢れる)。
+        toolbar.addAction(self._act_outline)
+        toolbar.addAction(self._act_line_numbers)
         self.addToolBar(toolbar)
         self._toolbar = toolbar
 
@@ -3831,6 +3840,7 @@ class EditorWindow(QMainWindow):
                 pass
             self._python_dialog = None
             self._python_dialog_name = None
+            self._python_pane_live = False
         # セッションのスロットは手放す(中身はファイルに残り、
         # 次に開く窓が引き取ってタブを戻す)。
         if self._session_path is not None and self._session_slot is not None:
@@ -4770,11 +4780,23 @@ class EditorWindow(QMainWindow):
             # 常駐表示、こちらは開始の瞬間の一時表示)。
             self.statusBar().showMessage("マクロの記録を始めました", 4000)
             # 記録の様子をその場で見られるよう、Python マクロの
-            # ペインを自動で出す。既に別のマクロのペインが開いて
-            # いるときは、そちらを前に出すだけにする(編集中の
-            # ペインを取り替えない)。
+            # ペインを自動で出す。記録のライブ表示は、記録用の
+            # ペインにだけ結びつける。記録用でないペイン (登録
+            # マクロなど) が開いているときにライブ表示を結ぶと、
+            # 本文が記録の内容に差し替わり、見出しの登録名の
+            # まま保存して登録マクロを上書きできてしまう
+            # (アオイの指摘 req-20261114-26)。そのペインは
+            # 差し替えずに閉じて、記録用を新しく出す。閉じる
+            # のを断られたら (実行中)、そのペインを前に出す
+            # だけにする。
+            pane = self._python_dialog
+            if pane is not None and not self._python_pane_live:
+                if pane.try_close():
+                    self._python_dialog = None
+                    self._python_dialog_name = None
+                    self._python_pane_live = False
             if self._python_dialog is None:
-                self.show_python_macro_dialog()
+                self.show_python_macro_dialog(live=True)
             else:
                 self._python_dialog.show()
         else:
@@ -4924,8 +4946,19 @@ class EditorWindow(QMainWindow):
                 "print: " + " / ".join(session.output), 8000)
         return True
 
+    def _apply_pane_width(self, pane):
+        """右ペインの幅が PANE_WIDTH になるよう、スプリッタの
+        配分を合わせる。ペインが既に取り替えられていたら何も
+        しない。"""
+        if self._python_dialog is not pane:
+            return
+        total = self._main_splitter.width()
+        if total > PANE_WIDTH + 200:
+            self._main_splitter.setSizes(
+                [total - PANE_WIDTH, PANE_WIDTH])
+
     def show_python_macro_dialog(self, source=None, name="",
-                                 on_save=None):
+                                 on_save=None, live=False):
         """マクロの Python を右ペインで見て・直して・実行する画面
         を開く。
 
@@ -4933,7 +4966,10 @@ class EditorWindow(QMainWindow):
         へ変換したもの)を開く。on_save は (名前, ソース) を受ける
         登録の口で、渡されなければ「登録マクロとして新規に残す」
         口を使う(登録マクロから開いたときは、呼び側がキーの
-        引き継ぎなどの都合を付けて渡す)。"""
+        引き継ぎなどの都合を付けて渡す)。live は記録開始の経路
+        だけが渡す印で、このときだけ記録のライブ表示を結び
+        つける(記録用でないペインの本文を、記録の内容で差し
+        替えないため)。"""
         if on_save is None:
             def on_save(name, new_source):
                 self.register_python_macro(name, new_source)
@@ -4961,26 +4997,40 @@ class EditorWindow(QMainWindow):
                 existing = None
                 self._python_dialog = None
                 self._python_dialog_name = None
+                self._python_pane_live = False
         if existing is not None:
             if self._python_dialog_name == dialog_name:
                 existing.show()
                 return existing
-            existing.close()
+            if not existing.try_close():
+                # 実行中のペインは閉じられない。閉じたつもりで
+                # 新しいペインを作ると、古いペインへの参照を
+                # 失って子プロセスが残るおそれがあるので、作ら
+                # ずに既存のペインを前に出すだけにする
+                # (アオイの指摘 req-20261114-26)。
+                existing.show()
+                return existing
         pane = MacroPythonPane(
             None, source=source, name=dialog_name,
             session_factory=self._make_python_session,
             begin_run=self._begin_python_run,
             end_run=self._end_python_run,
             on_save=on_save,
-            live_source=self._recording_python_source)
+            live_source=(self._recording_python_source
+                         if live else None))
         pane.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self._main_splitter.addWidget(pane)
-        total = self._main_splitter.width()
-        if total > PANE_WIDTH + 200:
-            self._main_splitter.setSizes(
-                [total - PANE_WIDTH, PANE_WIDTH])
         self._python_dialog = pane
         self._python_dialog_name = dialog_name
+        self._python_pane_live = bool(live)
+        self._main_splitter.addWidget(pane)
+        self._apply_pane_width(pane)
+        # 初回表示のタイミングでもう一度合わせる (生成直後は
+        # スプリッタの幅がまだ確定していないことがあるため)。
+        # なお、既定幅が効かなかった主因はペイン側の最小幅の
+        # 方で、そちらはペインのボタン配置で解消してある
+        # (req-20261114-26)。
+        QTimer.singleShot(
+            0, lambda: self._apply_pane_width(pane))
 
         def _forget_pane(*args):
             # 別のマクロのペインに取り替えた直後に、古いペインの
@@ -4989,6 +5039,7 @@ class EditorWindow(QMainWindow):
             if self._python_dialog is pane:
                 self._python_dialog = None
                 self._python_dialog_name = None
+                self._python_pane_live = False
 
         pane.destroyed.connect(_forget_pane)
         pane.show()

@@ -497,6 +497,39 @@ def statement_index_for_line(lines, lineno):
     return None
 
 
+def statement_lines_for_source(source):
+    """ソースを文に分けた (開始行, 終了行) の並びを返す。
+    構文が読めなければ None。
+
+    実行セッションを作る前に、ブレークポイントの印を文の
+    開始行へ寄せるために使う(切り分けはセッション側の
+    statement_lines と同じ、トップレベルの文の並び)。"""
+    try:
+        tree = ast.parse(str(source), FILENAME)
+    except (SyntaxError, ValueError):
+        return None
+    return [(node.lineno, node.end_lineno or node.lineno)
+            for node in tree.body]
+
+
+def snap_breakpoints(lines, marks):
+    """ブレークポイントの行番号を、文の開始行へ寄せた並びを
+    返す。
+
+    lines は (開始行, 終了行) の並び。文の範囲(開始行〜終了行)
+    の中にある印は、その文の開始行になる。どの文の範囲にも
+    入らない印(空行・文の間のコメント行)は落とす。実行側
+    (run_until)は文の開始行しか見ないので、渡す前にここを
+    通す。"""
+    starts = set()
+    for mark in marks:
+        for start, end in lines:
+            if start <= mark <= end:
+                starts.add(start)
+                break
+    return sorted(starts)
+
+
 # ---------------------------------------------------------------
 # 実行セッション(親側。実体は子プロセス)
 # ---------------------------------------------------------------
@@ -533,6 +566,10 @@ class PythonStepper:
         self.pump = pump
         self.output = []          # print の受け取り先
         self.position = 0
+        # 直近の seek で前へ飛ばした文の数 (後ろへ戻したときは
+        # 0)。飛ばした文が作るはずだった変数が無いことを、窓側
+        # が知らせるために持つ。
+        self.seek_skipped = 0
         self.error = None
         self.stopped = False
         self._total = 0
@@ -807,16 +844,19 @@ class PythonStepper:
         実行はしない。移せたら True。エラー・停止で終わっている
         セッションや、閉じたセッションでは移せない(False)。
         index は文の数の範囲に丸める(末尾を指定すると、次に
-        実行する文は無くなる)。"""
+        実行する文は無くなる)。前へ飛んだときは、飛ばした文の
+        数を seek_skipped に残す。"""
         if self.error is not None or self.stopped or self._closed:
             return False
         index = max(0, min(int(index), self._total))
+        before = self.position
         self._send({"type": "seek", "index": index})
         reply = self._serve({"sought"})
         if reply is None:
             self.stopped = True
             return False
         self.position = int(reply.get("position") or 0)
+        self.seek_skipped = max(0, self.position - before)
         return True
 
     def stop(self):

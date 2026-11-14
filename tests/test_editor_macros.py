@@ -162,6 +162,14 @@ def test_recording_label_shows_and_click_stops():
     window = make_window("ab", cursor_pos=0)
     try:
         assert window._record_label.parentWidget() is window._toolbar
+        # ラベルはリボンの先頭 (いちばん左)。後ろの方に置くと、
+        # 既定の窓幅ではツールバーの溢れ (>>) に隠れて見えなく
+        # なる (アオイの実測 req-20261114-26)。使用頻度の低い
+        # ボタン (アウトライン・行番号) は後ろへ回してある。
+        actions = window._toolbar.actions()
+        assert actions[0] is window._record_label_action
+        assert actions[-2:] == [window._act_outline,
+                                window._act_line_numbers]
         assert not window._record_label.isVisible()
         window.set_macro_recording(True)
         # ツールバーのレイアウトは、イベントを1回回すとそろう

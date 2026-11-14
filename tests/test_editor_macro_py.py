@@ -34,7 +34,8 @@ import editor  # noqa: E402
 from editor import macro_py  # noqa: E402
 from editor import macros as macmod  # noqa: E402
 from editor.macro_dialog import MacroLibraryDialog  # noqa: E402
-from editor.macro_py_dialog import MacroPythonDialog  # noqa: E402
+from editor.macro_py_dialog import (  # noqa: E402
+    MacroPythonDialog, PANE_WIDTH)
 
 APP = None
 
@@ -689,6 +690,157 @@ def test_pane_buttons_enabled_while_running():
         assert seen == [(True, True, True, False, False)]
         session = dialog.session()
         assert session is not None and session.stopped
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_breakpoint_snaps_to_statement_start():
+    # 印は文の開始行に付く。複数行の文の途中行をクリックしたら
+    # 開始行へ寄せ、空行・文の間のコメント行には付けない
+    # (アオイの指摘 req-20261114-26: 開始行しか見ない実行側
+    # では、途中行の印は止まらなかった)。
+    window = make_window("ab", cursor_pos=0)
+    source = ("ed.insert_text('1')\n"       # 1行目
+              "# コメント\n"                # 2行目
+              "for ch in '23':\n"           # 3行目
+              "    ed.insert_text(ch)\n"    # 4行目
+              "\n"                          # 5行目
+              "ed.insert_text('6')\n")      # 6行目
+    dialog = _make_pane(window, source)
+    try:
+        dialog.show()
+        dialog._edit.breakpoint_toggled.emit(4)
+        assert dialog.breakpoints() == [3]
+        dialog._edit.breakpoint_toggled.emit(2)
+        assert dialog.breakpoints() == [3]
+        dialog._edit.breakpoint_toggled.emit(5)
+        assert dialog.breakpoints() == [3]
+        # 開始行をクリックすると外れる。
+        dialog._edit.breakpoint_toggled.emit(3)
+        assert dialog.breakpoints() == []
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_breakpoint_on_middle_line_stops_run():
+    # 複数行の文の途中行に置いた印でも、通し実行はその文の
+    # 手前で止まる。
+    window = make_window("ab", cursor_pos=2)
+    source = ("ed.insert_text('1')\n"
+              "for ch in '23':\n"
+              "    ed.insert_text(ch)\n"
+              "ed.insert_text('4')\n")
+    dialog = _make_pane(window, source)
+    try:
+        dialog.show()
+        dialog.toggle_breakpoint(3)
+        assert dialog.breakpoints() == [2]
+        assert not dialog.run_all()
+        assert window.text() == "ab1"
+        assert dialog.session().next_lineno() == 2
+        assert dialog.run_all()
+        assert window.text() == "ab1234"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_breakpoint_follows_inserted_line():
+    # 先頭に行を足すと、印がその分だけ下がる (アオイの指摘
+    # req-20261114-26: 編集すると印の行がずれたままだった)。
+    window = make_window("ab", cursor_pos=0)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        dialog.toggle_breakpoint(3)
+        assert dialog.breakpoints() == [3]
+        cursor = dialog._edit.textCursor()
+        cursor.setPosition(0)
+        cursor.insertText("ed.insert_text('0')\n")
+        assert dialog.breakpoints() == [4]
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_width_applies_at_first_show():
+    # ペインの既定幅 (PANE_WIDTH) が、初回表示でも効く (生成
+    # 直後はスプリッタの幅が未確定で、右が半分を超えていた。
+    # アオイの実測 req-20261114-26)。
+    window = make_window("ab", cursor_pos=0)
+    try:
+        window.resize(1000, 600)
+        app().processEvents()
+        window.show_python_macro_dialog(
+            source="ed.insert_text('1')\n", name="幅")
+        app().processEvents()
+        sizes = window._main_splitter.sizes()
+        assert abs(sizes[1] - PANE_WIDTH) <= 5, sizes
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_start_replaces_registered_pane():
+    # 登録マクロのペインを開いたまま記録を始めると、記録用の
+    # ペインに替わる。ライブ表示は記録用にだけ結びつくので、
+    # 登録マクロの本文が記録の内容に差し替わることはない
+    # (アオイの指摘 req-20261114-26: 見出しの登録名のまま
+    # 保存すると、登録マクロを上書きできた)。
+    window = make_window("ab", cursor_pos=0)
+    try:
+        window.register_python_macro(
+            "登録済み", "ed.insert_text('R')\n")
+        window._open_registered_macro_python("登録済み")
+        pane = window._python_dialog
+        assert pane is not None
+        assert pane.source() == "ed.insert_text('R')\n"
+        assert not window._python_pane_live
+        window.set_macro_recording(True)
+        live_pane = window._python_dialog
+        assert live_pane is not None and live_pane is not pane
+        assert window._python_pane_live
+        assert live_pane._live_source is not None
+        # 記録が進んでも、登録マクロの本文は変わらない。
+        QTest.keyClicks(window._edit, "Z")
+        app().processEvents()
+        live_pane._sync_live()
+        assert "Z" in live_pane.source()
+        entries = window.registered_macros()
+        assert entries["登録済み"]["python"] == \
+            "ed.insert_text('R')\n"
+        window.set_macro_recording(False)
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_open_other_macro_while_running_keeps_pane():
+    # 実行中のペインがあるときに別のマクロを開こうとしても、
+    # ペインは増えず、実行中のものが前に出るだけ (閉じた
+    # つもりで新しいものを作ると、実行中のペインへの参照を
+    # 失って子プロセスが残るおそれがある。アオイの指摘
+    # req-20261114-26)。
+    window = make_window("ab", cursor_pos=0)
+    dialog = window.show_python_macro_dialog(
+        source="while True:\n    pass\n", name="実行中")
+    try:
+        seen = []
+
+        def check():
+            other = window.show_python_macro_dialog(
+                source="ed.insert_text('X')\n", name="別の")
+            seen.append(other)
+            dialog.stop_run()
+
+        QTimer.singleShot(300, check)
+        assert not dialog.run_all()
+        assert seen == [dialog]
+        assert window._python_dialog is dialog
     finally:
         dialog.close()
         discard_close(window)

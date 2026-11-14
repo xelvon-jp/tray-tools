@@ -8,7 +8,10 @@
 #     か末尾まで続ける。そうでなければ、カーソルのある行の文
 #     から新しく始める)
 #   - ブレークポイント(行番号の横=ガターをクリックで付け外し。
-#     通し実行は、印のある行の手前で止まる)
+#     印は文の開始行にだけ付き、複数行の文の途中をクリック
+#     したら開始行へ寄せる。通し実行は、印のある文の手前で
+#     止まる。ソースを編集したら、印は行の増減に追随し、
+#     変更範囲の中にあった印は消える)
 #   - 実行位置の移動(ステップ実行の途中にソースの行をクリック
 #     すると、次に実行する文がその行の文になる。すでに実行した
 #     編集は取り消さない)
@@ -229,6 +232,10 @@ class MacroPythonPane(QWidget):
         self._name = name
         self._breakpoints = set()
         self._paused_at_breakpoint = False
+        # 閉じるのを断った (実行中) 印。try_close が確かめる。
+        self._close_refused = False
+        # ブレークポイントの追随用に覚える、文書のブロック数。
+        self._bp_doc_blocks = None
         # 記録のライブ表示 (live_source が渡されたとき)。記録中の
         # ソースを呼び側から受け取り、利用者が編集していなければ
         # そのまま差し替える。窓はモーダレスで開く前提 (EDDy の
@@ -275,6 +282,12 @@ class MacroPythonPane(QWidget):
         self._edit.setPlainText(source)
         self._edit.setFont(QFontDatabase.systemFont(
             QFontDatabase.SystemFont.FixedFont))
+        # ブレークポイントの印を編集に追随させる (行の増減で
+        # ずらし、変更範囲の中の印は消す)。数えの基準として、
+        # 直前のブロック数を覚えておく。
+        self._bp_doc_blocks = self._edit.blockCount()
+        self._edit.document().contentsChange.connect(
+            self._on_contents_change)
         self._edit.textChanged.connect(self._on_text_changed)
         self._edit.cursorPositionChanged.connect(
             lambda: self._refresh_highlights())
@@ -282,6 +295,11 @@ class MacroPythonPane(QWidget):
         self._edit.breakpoint_toggled.connect(self.toggle_breakpoint)
         layout.addWidget(self._edit, 1)
 
+        # ボタンは2段に分ける。1段に全部並べると、その最小幅
+        # (550px ほど) がペイン全体の最小幅になり、望ましい幅
+        # PANE_WIDTH (380) までスプリッタで狭められなくなる
+        # (アオイの実測 req-20261114-26: 既定幅が効かなかった
+        # 原因はこれ。スプリッタは最小幅より小さくできない)。
         buttons = QHBoxLayout()
         self._run_button = QPushButton("通し実行")
         self._run_button.clicked.connect(self._on_run_all)
@@ -292,20 +310,23 @@ class MacroPythonPane(QWidget):
         self._stop_button = QPushButton("停止")
         self._stop_button.clicked.connect(self._on_stop)
         buttons.addWidget(self._stop_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        buttons2 = QHBoxLayout()
         self._reset_button = QPushButton("最初から")
         self._reset_button.clicked.connect(self._on_reset)
-        buttons.addWidget(self._reset_button)
+        buttons2.addWidget(self._reset_button)
         self._copy_button = QPushButton("コピー")
         self._copy_button.clicked.connect(self._on_copy)
-        buttons.addWidget(self._copy_button)
+        buttons2.addWidget(self._copy_button)
         if on_save is not None:
             self._save_button = QPushButton("登録として保存")
             self._save_button.clicked.connect(self._on_save_clicked)
-            buttons.addWidget(self._save_button)
+            buttons2.addWidget(self._save_button)
         else:
             self._save_button = None
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+        buttons2.addStretch(1)
+        layout.addLayout(buttons2)
 
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
@@ -337,14 +358,93 @@ class MacroPythonPane(QWidget):
 
     def toggle_breakpoint(self, lineno):
         """行番号 lineno(1始まり)のブレークポイントを付け外し
-        する。行の範囲外なら何もしない。"""
+        する。
+
+        印は文の開始行にだけ付ける。クリックした行が文の範囲
+        (開始行〜終了行) の中なら、その文の開始行に付ける
+        (複数行の文の途中行でも止まるように。アオイの指摘
+        req-20261114-26: 開始行しか見ない実行側では、途中行の
+        印は止まらなかった)。どの文の範囲にも入らない行
+        (空行・文の間のコメント行) には付けない。行の範囲外
+        なら何もしない。ソースの構文が読めない間は文の切り
+        分けができないので、クリックした行そのもので付け外し
+        する(実行に渡すときは開始行へ寄せ直す)。"""
         if not 1 <= lineno <= self._edit.blockCount():
             return
         if lineno in self._breakpoints:
             self._breakpoints.discard(lineno)
+            self._edit.refresh_gutter()
+            return
+        lines = macro_py.statement_lines_for_source(self.source())
+        if lines is None:
+            target = lineno
         else:
-            self._breakpoints.add(lineno)
+            target = None
+            for start, end in lines:
+                if start <= lineno <= end:
+                    target = start
+                    break
+            if target is None:
+                return
+        if target in self._breakpoints:
+            self._breakpoints.discard(target)
+        else:
+            self._breakpoints.add(target)
         self._edit.refresh_gutter()
+
+    def _on_contents_change(self, position, chars_removed,
+                            chars_added):
+        """ブレークポイントの印を、ソースの編集に追随させる。
+
+        変更のあった範囲の中にあった印は消し、後ろの印は
+        増減した行数だけずらす(アオイの指摘 req-20261114-26:
+        編集すると印の行がずれたままだった)。変更の開始行は、
+        行の頭が残る編集なら印も残し、行頭への行の挿入なら
+        内容ごと押し下げ、行ごと消えたら印も消す。ライブ
+        表示の差し替えのときは、本文ごと入れ替わるので印は
+        そのままに、数えの基準だけ合わせ直す。"""
+        doc = self._edit.document()
+        new_blocks = doc.blockCount()
+        old_blocks = self._bp_doc_blocks
+        self._bp_doc_blocks = new_blocks
+        if self._syncing_live or not self._breakpoints \
+                or old_blocks is None:
+            return
+        # 変更の開始行 (0始まり)。変更より前は旧文書と共通
+        # なので、新文書での行番号がそのまま旧文書の行番号。
+        start_block = doc.findBlock(position).blockNumber()
+        if chars_added > 0:
+            added_lines = (doc.findBlock(position + chars_added)
+                           .blockNumber() - start_block)
+        else:
+            added_lines = 0
+        removed_lines = added_lines - (new_blocks - old_blocks)
+        at_line_head = (
+            position
+            == doc.findBlockByNumber(start_block).position())
+        delta = added_lines - removed_lines
+        kept = set()
+        for mark in self._breakpoints:
+            line = mark - 1     # 0始まりで考える
+            if line < start_block:
+                kept.add(mark)
+            elif line == start_block:
+                if at_line_head and removed_lines > 0:
+                    continue    # 行ごと消えた
+                if at_line_head and added_lines > 0:
+                    kept.add(mark + delta)  # 内容ごと押し下げる
+                else:
+                    kept.add(mark)          # 行の頭は残った
+            elif line <= start_block + removed_lines:
+                continue        # 変更範囲の中にあった (消す)
+            else:
+                kept.add(mark + delta)
+        if kept != self._breakpoints:
+            # 集合は編集欄と共有しているので、作り直さず中身を
+            # 入れ替える。
+            self._breakpoints.clear()
+            self._breakpoints.update(kept)
+            self._edit.refresh_gutter()
 
     # ---------------------------------------------------------------
     # 実行
@@ -430,9 +530,12 @@ class MacroPythonPane(QWidget):
         self._set_running(True)
         try:
             session.step()
-        except macro_py.PythonMacroError as e:
+        except macro_py.PythonMacroError:
             self._finish()
-            self._refresh_state(str(e))
+            # エラーの文は session.error に入っていて、状態表示
+            # がそちらから出す。ここで例外の文も渡すと二重に
+            # 出るので、渡さない。
+            self._refresh_state("")
             return False
         finally:
             self._set_running(False)
@@ -453,6 +556,7 @@ class MacroPythonPane(QWidget):
         if self._running:
             return False    # 実行中の押し直しは二重実行にしない
         session = self._session
+        seek_note = ""
         if session is not None and session.done:
             # 終わっているセッションは捨てて、新しく始める。
             self._discard_session()
@@ -474,14 +578,23 @@ class MacroPythonPane(QWidget):
             if index > 0 and not session.seek(index):
                 self._refresh_state("")
                 return False
+            if session.seek_skipped:
+                seek_note = (
+                    f"{session.seek_skipped} 文を飛ばしました"
+                    "（変数が無いことがあります）")
         self._paused_at_breakpoint = False
         self._begin()
         self._set_running(True)
         try:
-            finished = session.run_until(sorted(self._breakpoints))
-        except macro_py.PythonMacroError as e:
+            # 印は文の開始行へ寄せてから渡す(実行側は開始行しか
+            # 見ない。編集でずれた印や、構文が読めない間に付けた
+            # 印をここで直す)。
+            finished = session.run_until(macro_py.snap_breakpoints(
+                session.statement_lines(), self._breakpoints))
+        except macro_py.PythonMacroError:
             self._finish()
-            self._refresh_state(str(e))
+            # エラーの文は session.error から出る (二重に出さない)。
+            self._refresh_state("")
             return False
         finally:
             self._set_running(False)
@@ -489,7 +602,7 @@ class MacroPythonPane(QWidget):
             self._finish()
         else:
             self._paused_at_breakpoint = True
-        self._refresh_state("")
+        self._refresh_state(seek_note)
         return finished and not session.stopped
 
     def stop_run(self):
@@ -527,7 +640,13 @@ class MacroPythonPane(QWidget):
             self._paused_at_breakpoint = False
             if session.done:
                 self._finish()
-            self._refresh_state("")
+            note = ""
+            if session.seek_skipped:
+                # 前へ飛ばした文は実行されない。その文が作る
+                # はずだった変数が無いことを知らせる。
+                note = (f"{session.seek_skipped} 文を飛ばしました"
+                        "（変数が無いことがあります）")
+            self._refresh_state(note)
 
     # ---------------------------------------------------------------
     # ボタンの受け口
@@ -684,10 +803,23 @@ class MacroPythonPane(QWidget):
                         self._edit.setTextCursor(caret)
         self._edit.setExtraSelections(selections)
 
+    def try_close(self):
+        """閉じてみて、閉じたら True を返す。
+
+        実行中は閉じるのを断る (closeEvent) ので、その場合は
+        False。呼び側が「閉じたつもり」で新しいペインを作ると、
+        実行中のペインへの参照を失い、子プロセスが残るおそれ
+        があるため、確かめる口を用意する (アオイの指摘
+        req-20261114-26)。"""
+        self._close_refused = False
+        self.close()
+        return not self._close_refused
+
     def closeEvent(self, event):  # noqa: N802  Qt の上書き
         # 実行中は閉じない(実行中のセッションを抱えたまま画面が
         # 壊れるのを防ぐ)。先に停止してもらう。
         if self._running:
+            self._close_refused = True
             event.ignore()
             self._status_label.setText(
                 "実行中です。停止してから閉じてください")

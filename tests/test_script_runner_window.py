@@ -4,8 +4,9 @@
 # 一覧を作ってチェック結果を並べること、上書きで再チェックになること、
 # F5 の出し分け(問題なしは実行・エラーは実行不可・要確認は F5 では
 # 実行しない)、結果がクリップボード文の形で入ること、設定が窓の位置と
-# 前面固定を覚えること、入口(トレイ・外部コマンド・あっふ)の配線が
-# あることを見る。
+# 前面固定を覚えること、起動時に BOM 付け写しの残りが掃除されること、
+# 監視フォルダのパスが長くても窓幅が設計どおりに収まること、入口
+# (トレイ・外部コマンド・あっふ)の配線があることを見る。
 #
 # 設定は一時ファイル、見張りフォルダも一時フォルダ。実 settings.json には
 # 触らない。クリップボードは offscreen で不安定なので、窓の _set_clipboard
@@ -51,7 +52,7 @@ def pump_until(predicate, timeout=20.0):
 
 def make_window(tmp: Path):
     watch = tmp / "watch"
-    watch.mkdir()
+    watch.mkdir(exist_ok=True)
     settings_path = tmp / "settings.json"
     data = json.loads(json.dumps(settings_mod.DEFAULT_SETTINGS))
     data["script_runner"] = {
@@ -285,6 +286,52 @@ def test_window_settings_saved():
             window.close()
 
 
+def test_window_startup_cleans_bom_leftovers():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        watch = tmp / "watch"
+        watch.mkdir()
+        leftover = watch / (core.BOM_COPY_PREFIX + "old.ps1")
+        leftover.write_text("Write-Output 1\n", encoding="utf-8")
+        window, _watch, _sp, _copied = make_window(tmp)
+        try:
+            # 起動時に、前回残った BOM 付け写しが掃除される(低2)。
+            assert not leftover.exists()
+        finally:
+            window.close()
+
+
+def test_window_width_with_long_folder_path():
+    # 監視フォルダのパスが長いと、見出しラベルが窓の最小幅を押し
+    # 広げて設計幅(340)に縮められなかった(低3)。長いパスでも幅が
+    # 設計どおりに収まり、フルパスはツールチップで見られること。
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        watch = tmp / ("a" * 40 + "b" * 40) / ("c" * 40 + "d" * 40) \
+            / "watch"
+        watch.mkdir(parents=True)
+        settings_path = tmp / "settings.json"
+        data = json.loads(json.dumps(settings_mod.DEFAULT_SETTINGS))
+        data["script_runner"] = {
+            "watch_folder": str(watch),
+            "python": sys.executable,
+            "timeout_seconds": 10,
+        }
+        settings_path.write_text(json.dumps(data, ensure_ascii=False),
+                                 encoding="utf-8")
+        window = sr.ScriptRunnerWindow(str(settings_path))
+        try:
+            window.show()
+            QCoreApplication.processEvents()
+            assert window.minimumWidth() <= 340, window.minimumWidth()
+            window.resize(340, 560)
+            QCoreApplication.processEvents()
+            assert window.width() == 340, window.width()
+            assert str(watch) in window.folder_caption.toolTip()
+        finally:
+            window.close()
+
+
 def test_entry_wiring_strings():
     # main.py 本体は VM では読み込めないので、登録の文字列で確かめる
     # (test_tomorrow_memo と同じ流儀)。
@@ -314,6 +361,8 @@ if __name__ == "__main__":
         test_overwrite_rechecks_and_clears_ran,
         test_run_aborts_when_file_changed_after_check,
         test_window_settings_saved,
+        test_window_startup_cleans_bom_leftovers,
+        test_window_width_with_long_folder_path,
         test_entry_wiring_strings,
     ]
     for test in tests:

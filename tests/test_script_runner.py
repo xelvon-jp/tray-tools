@@ -753,6 +753,88 @@ def test_execute_timeout_keeps_partial_output_and_closes_job():
     assert elapsed < 25, elapsed
 
 
+# ---------------------------------------------------------------
+# レビュー req-20261114-14 の追加分
+# ---------------------------------------------------------------
+def test_check_python_builtin_modules_found():
+    # 組み込みモジュールだけの .py が「見つかりません」にならない
+    # (PathFinder は組み込みモジュールを見つけられない退行の対策)。
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = write(tmp, "builtins.py",
+                     "import sys\nimport time\nimport math\n"
+                     "import itertools\nprint(1)\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_OK, result
+        # from 形式と、標準ライブラリの .py モジュールとの混在でも通る。
+        path = write(tmp, "mixed.py",
+                     "from itertools import chain\nimport json\n"
+                     "import sys\nprint(list(chain([1], [2])))\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_OK, result
+        # 無いモジュールは相変わらず見つからない。
+        path = write(tmp, "missing.py", "import sr_no_such_module_zzz\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_ERROR, result
+        assert result.kind == "import"
+
+
+def test_run_handle_stop_closes_job():
+    original_close = core._job_close
+    closed = []
+    core._job_close = lambda job: closed.append(job)
+    try:
+        handle = core.RunHandle()
+        handle._attach_job("JOB")
+        handle.stop()
+        # 停止でジョブを閉じる(孫プロセスごと終わらせるため)。
+        assert closed == ["JOB"], closed
+        # もう一度止めても二重には閉じない。
+        handle.stop()
+        handle._close_job()
+        assert closed == ["JOB"], closed
+    finally:
+        core._job_close = original_close
+
+
+def test_execute_stop_closes_job_once():
+    original_assign, original_close = core._job_assign, core._job_close
+    closed = []
+    core._job_assign = lambda proc: "JOB"
+    core._job_close = lambda job: closed.append(job)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            path = write(Path(td), "slow.py",
+                         "import time\ntime.sleep(60)\n")
+            handle = core.RunHandle()
+            timer = threading.Timer(0.5, handle.stop)
+            timer.start()
+            run = core.execute_script(path, CONFIG, handle)
+            timer.cancel()
+    finally:
+        core._job_assign, core._job_close = \
+            original_assign, original_close
+    assert run.stopped
+    assert run.seconds < 20
+    # 停止のときに1回だけ閉じ、実行側の後始末で二重に閉じない。
+    assert closed == ["JOB"], closed
+
+
+def test_cleanup_bom_copies():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write(tmp, core.BOM_COPY_PREFIX + "a.ps1", "Write-Output 1\n")
+        write(tmp, core.BOM_COPY_PREFIX + "b.ps1", "Write-Output 1\n")
+        write(tmp, "keep.py", "print(1)\n")
+        write(tmp, "keep.ps1", "Write-Output 1\n")
+        removed = core.cleanup_bom_copies(tmp)
+        assert removed == 2, removed
+        names = sorted(p.name for p in tmp.iterdir())
+        assert names == ["keep.ps1", "keep.py"], names
+        # フォルダが無くても落ちない。
+        assert core.cleanup_bom_copies(tmp / "no_such_dir") == 0
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -796,6 +878,10 @@ if __name__ == "__main__":
         test_execute_powershell_bom_copy_failure_is_encoding_error,
         test_execute_expected_sha256,
         test_execute_timeout_keeps_partial_output_and_closes_job,
+        test_check_python_builtin_modules_found,
+        test_run_handle_stop_closes_job,
+        test_execute_stop_closes_job_once,
+        test_cleanup_bom_copies,
     ]
     for test in tests:
         test()

@@ -202,6 +202,29 @@ def list_candidates(folder, cutoff_ts: float, limit: int) -> list:
     return found[:limit]
 
 
+def cleanup_bom_copies(folder) -> int:
+    """フォルダに残った BOM 付け写し(.sr-bom-*)を消す(低2)。
+
+    写しは実行後に消す作りだが、本体が強制終了されると残る。
+    パネルの起動直後は実行中のものは無いので、残りは全部消して
+    よい。消せなかったものは無視して進む。戻り値は消せた数。"""
+    removed = 0
+    try:
+        entries = list(Path(folder).iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(BOM_COPY_PREFIX):
+            continue
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 # ---------------------------------------------------------------
 # チェック結果
 # ---------------------------------------------------------------
@@ -281,6 +304,7 @@ PYTHON_DANGER = {
 # find_spec で、最上位の名前だけを調べる)。
 _PY_CHECKER_SRC = r"""
 import ast
+import importlib.util
 import json
 import sys
 from importlib.machinery import PathFinder
@@ -295,6 +319,25 @@ def _dotted(node):
         parts.append(node.id)
         return ".".join(reversed(parts))
     return None
+
+
+# モジュールがあるかどうか(対象を読み込むことはしない)。
+# 組み込みモジュール(sys・time・math・itertools など)は、探す場所に
+# 実ファイルが無いため PathFinder では見つからない。名前で先に除く。
+# 次に探す場所(スクリプトのフォルダ+sys.path)を PathFinder で調べ、
+# 最後の保険にパス指定なしの find_spec でも試す(二段構え)。
+def _module_exists(name, search_path):
+    if name in sys.builtin_module_names:
+        return True
+    try:
+        if PathFinder.find_spec(name, search_path) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
 
 
 def main():
@@ -338,11 +381,7 @@ def main():
         if name in seen:
             continue
         seen.add(name)
-        try:
-            spec = PathFinder.find_spec(name, search_path)
-        except Exception:
-            spec = None
-        if spec is None:
+        if not _module_exists(name, search_path):
             out["missing"].append({"name": name, "line": line})
 
     danger_paths = danger["paths"]
@@ -876,13 +915,27 @@ class RunHandle:
 
     def __init__(self):
         self._proc = None
+        self._job = None
         self.stopped = False
 
     def _attach(self, proc):
         self._proc = proc
 
+    def _attach_job(self, job):
+        self._job = job
+
+    def _close_job(self):
+        """ジョブを閉じる(冪等)。先に持ち手を外してから閉じるので、
+        停止と時間切れ・後始末が重なっても二重には閉じない。"""
+        job, self._job = self._job, None
+        if job is not None:
+            _job_close(job)
+
     def stop(self):
         self.stopped = True
+        # 親が終わった後も孫がパイプを持っていると、親だけ止めても
+        # 終わらない。ジョブも閉じて木ごと終わらせる(低1)。
+        self._close_job()
         if self._proc is not None:
             kill_tree(self._proc)
 
@@ -1095,6 +1148,8 @@ def execute_script(path, config: dict, handle: RunHandle = None,
         try:
             if handle is not None:
                 handle._attach(proc)
+                handle._attach_job(job)
+                job = None  # 閉じる操作は handle 側へ一本化する
                 if handle.stopped:
                     kill_tree(proc)
             try:
@@ -1106,6 +1161,8 @@ def execute_script(path, config: dict, handle: RunHandle = None,
                 if job is not None:
                     _job_close(job)  # 孫プロセスごと終わらせる
                     job = None
+                if handle is not None:
+                    handle._close_job()
                 kill_tree(proc)
                 try:
                     out_raw, err_raw = proc.communicate(timeout=10)
@@ -1119,6 +1176,8 @@ def execute_script(path, config: dict, handle: RunHandle = None,
         finally:
             if job is not None:
                 _job_close(job)
+            if handle is not None:
+                handle._close_job()
     finally:
         if bom_copy is not None:
             try:

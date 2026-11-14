@@ -197,6 +197,9 @@ class ScriptRunnerWindow(QWidget):
         self.config = core.normalize_config(
             all_settings.get("script_runner"))
         self.watch_folder = core.resolve_watch_folder(self.config)
+        # 前回、強制終了などで残った BOM 付け写しを掃除する(低2)。
+        # 起動直後は実行中のものは無い。
+        core.cleanup_bom_copies(self.watch_folder)
 
         self.setWindowTitle("スクリプト実行")
         geometry = self.config.get("window_geometry") or [None, None, 340, 560]
@@ -260,7 +263,15 @@ class ScriptRunnerWindow(QWidget):
         caption = QLabel(f"{self.watch_folder} に届いたもの(新しい順)")
         caption.setStyleSheet("color: #5b665f; font-size: 11px;")
         caption.setWordWrap(True)
+        # フォルダのパスが長いと、折り返せない部分の幅のぶん窓の
+        # 最小幅が押し広がり、設計幅(340)に縮められなくなる(低3)。
+        # 横幅はレイアウトに任せ、ラベル自身の希望幅で窓幅を決め
+        # ない。全文はツールチップでも見られる。
+        caption.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        caption.setToolTip(f"{self.watch_folder} に届いたもの(新しい順)")
         layout.addWidget(caption)
+        self.folder_caption = caption
 
         self.list = QListWidget()
         self.list.currentRowChanged.connect(self._on_selection_changed)

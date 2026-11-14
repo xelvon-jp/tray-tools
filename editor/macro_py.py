@@ -564,6 +564,7 @@ class PythonStepper:
             raise PythonMacroError(error)
         self._api = api
         self.pump = pump
+        self._calls_since_pump = 0
         self.output = []          # print の受け取り先
         self.position = 0
         # 直近の seek で前へ飛ばした文の数 (後ろへ戻したときは
@@ -738,6 +739,15 @@ class PythonStepper:
             kind = msg.get("type")
             if kind == "call":
                 self._answer_call(msg)
+                # 呼び出しが続く間も画面の更新が進むよう、一定
+                # 回数ごとにイベントを回す (待ちが空のときだけ
+                # 回すと、ループを含む文の実行中は画面が止まって
+                # 見える)。
+                self._calls_since_pump += 1
+                if (self.pump is not None
+                        and self._calls_since_pump >= 16):
+                    self._calls_since_pump = 0
+                    self.pump()
                 continue
             if kind == "print":
                 self.output.append(str(msg.get("text") or ""))

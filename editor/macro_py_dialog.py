@@ -39,8 +39,8 @@
 # destroyed)。EDDy の窓ごと閉じられたときなど、子プロセスが
 # 残るのを防ぐ(req-20261114-09 の指摘)。
 #
-# 次に実行する文は背景色で示す。カーソルのある行も、本文と
-# 同じく薄くハイライトする。エラーは行番号つきで下の欄に出す
+# 次に実行する文は黄色の背景色で示す (色は1色だけにする)。
+# エラーは行番号つきで下の欄に出す
 # (print の出力も同じ欄)。
 from PySide6.QtWidgets import (
     QApplication,
@@ -60,14 +60,12 @@ from PySide6.QtGui import (
     QGuiApplication,
     QPainter,
     QTextCursor,
-    QTextFormat,
 )
 
 from editor import macro_py
 
 _NEXT_LINE_COLOR = QColor(255, 243, 176)
 # 本文の配色(既定)の現在行の背景と同じ色。本文と同じく薄く出す。
-_CURRENT_LINE_COLOR = QColor(239, 246, 255)
 _BREAKPOINT_COLOR = QColor(198, 40, 40)
 _GUTTER_BACK_COLOR = QColor(245, 245, 245)
 _GUTTER_TEXT_COLOR = QColor(120, 120, 120)
@@ -776,20 +774,14 @@ class MacroPythonPane(QWidget):
         self._refresh_highlights(move_caret=True)
 
     def _refresh_highlights(self, move_caret=False):
-        """現在行と、次に実行する文のハイライトを出し直す。
+        """次に実行する文のハイライトを出し直す。
 
-        現在行は本文と同じく薄く行全体に出す。次に実行する文は
-        従来の黄色。move_caret が真なら、次の文が見えるよう編集
-        欄のカーソルもその先頭へ寄せる(状態の更新のときだけ。
-        利用者のカーソル移動に追随するだけのときは寄せない)。"""
+        色は黄色だけにする (カーソル行の水色は、2色あると
+        分かりづらいという Nagato の指摘で外した)。move_caret
+        が真なら、次の文が見えるよう編集欄のカーソルもその
+        先頭へ寄せる(状態の更新のときだけ。利用者のカーソル
+        移動に追随するだけのときは寄せない)。"""
         selections = []
-        line = QTextEdit.ExtraSelection()
-        line.cursor = self._edit.textCursor()
-        line.cursor.clearSelection()
-        line.format.setBackground(_CURRENT_LINE_COLOR)
-        line.format.setProperty(
-            QTextFormat.Property.FullWidthSelection, True)
-        selections.append(line)
         session = self._session
         if session is not None and not session.done:
             lines = session.statement_lines()

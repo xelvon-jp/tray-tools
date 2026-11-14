@@ -165,6 +165,18 @@ def test_stepper_steps_and_queries():
     assert stepper.step() is None
 
 
+def test_stepper_pumps_during_long_statement():
+    # ループを含む文の実行中も、画面の更新 (pump) が進むこと。
+    ed = _FakeEd()
+    pumps = []
+    stepper = macro_py.PythonStepper(
+        "for i in range(40):\n    ed.insert_text('x')\n",
+        ed, pump=lambda: pumps.append(1))
+    assert stepper.step() == 1
+    assert len(ed.calls) == 40
+    assert len(pumps) >= 2
+
+
 def test_stepper_errors_are_wrapped_with_line():
     ed = _FakeEd()
     stepper = macro_py.PythonStepper("ed.bogus()\n", ed)
@@ -506,9 +518,10 @@ def test_python_dialog_run_all_and_reset():
         assert dialog.session().position == 0
         assert dialog.session().next_lineno() == 1
         assert "次は 1 行目" in dialog._status_label.text()
-        assert any(
-            sel.format.background() == _NEXT_LINE_COLOR
-            for sel in dialog._edit.extraSelections())
+        # ハイライトは黄色だけ (水色のカーソル行は出さない)。
+        selections = dialog._edit.extraSelections()
+        assert len(selections) == 1
+        assert selections[0].format.background() == _NEXT_LINE_COLOR
         # 通し実行はカーソルのある行から新しく始める。ステップ
         # 実行でペインのカーソルは次の文へ進んでいるので、先頭
         # へ戻してから押す。

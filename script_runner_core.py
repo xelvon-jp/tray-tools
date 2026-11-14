@@ -16,7 +16,9 @@
 import hashlib
 import io
 import json
+import locale
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -931,6 +933,190 @@ def write_phal_status(status: dict, status_path=None) -> bool:
     except OSError:
         return False
     return True
+
+
+# ---------------------------------------------------------------
+# 導入プロンプト (1.47)。「ループを始める」でクリップボードへ
+# 入れる文と、その PC の環境情報。環境は押した時点で集める
+# (ベストエフォートで、取れない項目は「不明」にする)。
+# ---------------------------------------------------------------
+INTRO_UNKNOWN = "不明"
+INTRO_MODULE_LIMIT = 12
+INTRO_COMMAND_TIMEOUT_SECONDS = 10
+
+
+def _run_intro_command(cmd, timeout=INTRO_COMMAND_TIMEOUT_SECONDS) -> str:
+    """環境を聞くための短いコマンドを1本走らせ、標準出力を返す。
+
+    失敗・時間切れ・0以外での終了は "" (呼ぶ側が「不明」にする)。
+    PowerShell が無い環境 (VM など) では FileNotFoundError が
+    出るが、ここで握りつぶす。"""
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=flags)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _summarize_execution_policy(raw: str) -> str:
+    """Get-ExecutionPolicy -List の出力を、要点だけの1行にする。
+
+    「Scope=Policy」の行から LocalMachine と CurrentUser を拾う。
+    どちらも無ければ先頭の2行まで。空なら "" (呼ぶ側が「不明」
+    にする)。"""
+    pairs = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        scope, _, policy = line.partition("=")
+        scope = scope.strip()
+        policy = policy.strip()
+        if scope and policy:
+            pairs.append((scope, policy))
+    if not pairs:
+        return ""
+    by_scope = dict(pairs)
+    picked = [(scope, by_scope[scope])
+              for scope in ("LocalMachine", "CurrentUser")
+              if scope in by_scope]
+    if not picked:
+        picked = pairs[:2]
+    return ", ".join(f"{scope}={policy}" for scope, policy in picked)
+
+
+def _intro_modules():
+    """入っているモジュール (名前と版) を集める。
+
+    戻り値は (先頭 INTRO_MODULE_LIMIT 件の ["名前 版", ...],
+    残りの件数)。標準ライブラリは配布物 (distribution) として
+    現れないので、ここに出るのは入れた物だけになる。読めなければ
+    (None, 0) (呼ぶ側が「不明」にする)。"""
+    try:
+        from importlib import metadata as _metadata
+
+        dists = sorted(
+            _metadata.distributions(),
+            key=lambda d: (d.metadata["Name"] or "").lower())
+    except Exception:  # noqa: BLE001  読めなければ「不明」
+        return None, 0
+    names = []
+    for dist in dists:
+        try:
+            name = (dist.metadata["Name"] or "").strip()
+            version = (dist.version or "").strip()
+        except Exception:  # noqa: BLE001  1件読めなくても続ける
+            continue
+        if not name:
+            continue
+        names.append(f"{name} {version}" if version else name)
+    return (names[:INTRO_MODULE_LIMIT],
+            max(0, len(names) - INTRO_MODULE_LIMIT))
+
+
+def collect_intro_environment(runner=None, watch_folder=None,
+                              python_exe=None) -> dict:
+    """導入プロンプトに入れる環境情報を集める。
+
+    runner は cmd (list[str]) と timeout を受けて標準出力を返す
+    呼び出し (既定は _run_intro_command)。差し替えられるのは
+    テストのためで、窓側は既定のまま使う。取れない項目は
+    INTRO_UNKNOWN (「不明」) にし、例外はここで止める (ボタンが
+    止まらない)。"""
+    run = runner if callable(runner) else _run_intro_command
+
+    def _call(cmd):
+        try:
+            return (run(cmd, timeout=INTRO_COMMAND_TIMEOUT_SECONDS)
+                    or "").strip()
+        except Exception:  # noqa: BLE001  取れない項目は「不明」
+            return ""
+
+    exe = python_exe or sys.executable
+    raw_python = _call([exe, "--version"])
+    python_version = raw_python.splitlines()[0].strip() \
+        if raw_python else ""
+    if python_version.startswith("Python "):
+        python_version = python_version[len("Python "):].strip()
+    raw_ps = _call(["powershell", "-NoProfile", "-Command",
+                    "$PSVersionTable.PSVersion.ToString()"])
+    powershell_version = raw_ps.splitlines()[0].strip() \
+        if raw_ps else ""
+    policy = _summarize_execution_policy(_call(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-ExecutionPolicy -List | ForEach-Object "
+         "{ $_.Scope + '=' + $_.ExecutionPolicy }"]))
+    try:
+        os_version = platform.platform() or ""
+    except Exception:  # noqa: BLE001  取れなければ「不明」
+        os_version = ""
+    try:
+        encoding = locale.getpreferredencoding(False) or ""
+    except Exception:  # noqa: BLE001  取れなければ「不明」
+        encoding = ""
+    lowered = encoding.lower()
+    if "utf-8" in lowered or "utf8" in lowered:
+        encoding = "UTF-8"
+    elif "932" in lowered:
+        encoding = "cp932"
+    folder = str(watch_folder or "").strip()
+    modules, modules_more = _intro_modules()
+    return {
+        "python_version": python_version or INTRO_UNKNOWN,
+        "powershell_version": powershell_version or INTRO_UNKNOWN,
+        "os_version": os_version or INTRO_UNKNOWN,
+        "execution_policy": policy or INTRO_UNKNOWN,
+        "watch_folder": folder or INTRO_UNKNOWN,
+        "encoding": encoding or INTRO_UNKNOWN,
+        "modules": modules,
+        "modules_more": modules_more,
+    }
+
+
+def build_intro_prompt(env: dict) -> str:
+    """導入プロンプトの文を組み立てる。
+
+    env は collect_intro_environment の戻り値 (欠けたキーは
+    「不明」にする)。短い日本語文と環境情報だけ。ネットに直接
+    出られないことは固定文で入れる。回答は短いスクリプトで返す
+    旨も入れる。"""
+    env = env if isinstance(env, dict) else {}
+
+    def item(key):
+        value = env.get(key)
+        return value if isinstance(value, str) and value.strip() \
+            else INTRO_UNKNOWN
+
+    modules = env.get("modules")
+    if modules is None:
+        modules_line = INTRO_UNKNOWN
+    elif not modules:
+        modules_line = "なし"
+    else:
+        modules_line = ", ".join(modules)
+        more = env.get("modules_more") or 0
+        if isinstance(more, int) and more > 0:
+            modules_line += f"（他 {more} 件）"
+    lines = [
+        "PHAL のループを始めます。",
+        "この PC の環境は次のとおりです。",
+        f"- Python: {item('python_version')}",
+        f"- PowerShell: {item('powershell_version')}",
+        f"- OS: {item('os_version')}",
+        f"- 実行ポリシー: {item('execution_policy')}",
+        f"- 作業フォルダ: {item('watch_folder')}",
+        f"- 文字コード: {item('encoding')}",
+        "- ネット: 直接出られません。",
+        f"- モジュール: {modules_line}",
+        "回答は短いスクリプト（.phal / .py / .ps1）で返してください。",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------

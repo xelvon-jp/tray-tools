@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "1.46"
+PHAL_VERSION = "1.47"
 
 import argparse
 import ctypes
@@ -920,6 +920,18 @@ class ScriptRunnerWindow(QWidget):
         self.table.customContextMenuRequested.connect(
             self._on_context_menu)
         layout.addWidget(self.table, stretch=3)
+
+        # 「ループを始める」は窓全体の入口。行の「AIへ回答」は実行
+        # が終わった行にだけ付くが、こちらは一覧の状態に関わらず
+        # いつでも押せる。表の直下に置く (1.47)。
+        intro_row = QHBoxLayout()
+        self.intro_button = QPushButton("ループを始める")
+        self.intro_button.setToolTip(
+            "導入プロンプトをクリップボードへ入れます")
+        self.intro_button.clicked.connect(self._copy_intro_prompt)
+        intro_row.addWidget(self.intro_button)
+        intro_row.addStretch(1)
+        layout.addLayout(intro_row)
 
         self.result_caption = QLabel("直前の結果")
         self.result_caption.setStyleSheet(
@@ -2202,6 +2214,28 @@ class ScriptRunnerWindow(QWidget):
         # 保留中の開き直しがあれば、連鎖が済んだこの時点で実行する
         # (送信が裏で始まっていたら、済むまで持ち越しになる)。
         self._fire_deferred_restart()
+
+    def _copy_intro_prompt(self):
+        """導入プロンプトをクリップボードへ入れる (1.47)。
+
+        環境は押した時点で集める。集められない項目は core 側が
+        「不明」にするので、ここでは止まらない。AI の投げ先の
+        設定は要らない (クリップボードへ入れるだけ。送信はしない)。"""
+        try:
+            env = core.collect_intro_environment(
+                watch_folder=self.watch_folder,
+                python_exe=self.config.get("python"))
+        except Exception:  # noqa: BLE001  集められなくても文は作る
+            env = {"watch_folder": str(self.watch_folder)}
+        text = core.build_intro_prompt(env)
+        try:
+            self._set_clipboard(text)
+        except Exception:  # noqa: BLE001
+            self._set_note("クリップボードへ入れませんでした", "error")
+            return
+        self._diag("ループを始める導入プロンプトをコピーしました")
+        self._set_note(
+            "クリップボードに入れました。Copilot に貼ってください", "ok")
 
     # ---------------- AI へ送信 ----------------
     def _send_to_ai(self, item: ScriptItem):

@@ -670,6 +670,65 @@ def test_recording_continues_after_pane_step():
         discard_close(window)
 
 
+def test_recording_live_pane_catches_up_at_stop():
+    # 実機の流れ: 記録開始で自動で開くライブ表示のペインで
+    # ステップ実行すると、実行が始まったセッションがある間は
+    # ライブ表示が止まる (req-20261114-22)。そのあとの操作は
+    # 記録には残るが画面に出ない。記録の終了で、ペインが最終
+    # 形へ寄って、その分が画面に出ること (実機報告 2026-11-14
+    # の再発: 操作②がマクロ画面に出なかった)。
+    window = make_window("ab\ncd", cursor_pos=2)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        assert pane is not None
+        QTest.keyClicks(window._edit, "X")
+        window.execute_command("move_line_down")
+        QTest.keyClicks(window._edit, "Z")
+        pane._sync_live()
+        assert "insert_text('Z')" in pane.source()
+        assert pane.step_once()
+        assert pane.session() is not None
+        assert not pane.session().done    # セッションは継続中
+        QTest.keyClicks(window._edit, "Y")          # 操作②
+        pane._sync_live()
+        # 実行中のセッションがある間は差し替えない。
+        assert "insert_text('Y')" not in pane.source()
+        window.set_macro_recording(False)
+        # 記録の終了で最終形へ寄り、Y が画面に出る。
+        assert "insert_text('Y')" in pane.source()
+        assert window.recorded_commands()[-1] == {
+            "cmd": "insert_text", "args": {"text": "Y"}}
+        # 先頭の文が次になるよう備え直されている。
+        assert pane.session() is not None
+        assert pane.session().position == 0
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_finish_keeps_user_edited_pane():
+    # 記録中にペインの本文を利用者が編集していたら、記録の
+    # 終了でもその本文は差し替えない (編集を勝手に消さない)。
+    window = make_window("ab", cursor_pos=2)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        assert pane is not None
+        QTest.keyClicks(window._edit, "X")
+        pane._sync_live()
+        pane._edit.setPlainText("ed.insert_text('Q')\n")
+        window.set_macro_recording(False)
+        assert pane.source() == "ed.insert_text('Q')\n"
+        assert window.recorded_commands() == [
+            {"cmd": "insert_text", "args": {"text": "X"}}]
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
 def test_pane_breakpoint_toggle_via_gutter_signal():
     # ガターのクリック (breakpoint_toggled) で付け外しでき、
     # 範囲外の行は無視される。

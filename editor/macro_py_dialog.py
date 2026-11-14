@@ -829,6 +829,35 @@ class MacroPythonPane(QWidget):
         if self._ensure_session() is not None:
             self._refresh_highlights(move_caret=True)
 
+    def finish_recording(self, source):
+        """記録の終了時に、ペインを記録の最終形へ寄せる。
+
+        実行が始まったセッションがある間はライブ表示が止まる
+        (req-20261114-22) ので、ステップ実行のあとに記録した
+        分が画面に出ないまま記録が終わることがある。記録が
+        終わったら、そのセッション (記録の途中の写しで実行
+        しているもの) は捨てて、最終形のソースに差し替える。
+        利用者が本文を編集していたら、その本文は差し替えない
+        (編集を勝手に消さない)。差し替えのあとは、先頭の文が
+        次になるよう備え直す。"""
+        if self._live_source is None:
+            return
+        self._finish()
+        self._discard_session()
+        self._paused_at_breakpoint = False
+        if not self._live_dirty and source != self._live_synced:
+            self._syncing_live = True
+            try:
+                self._edit.setPlainText(source)
+                cursor = self._edit.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self._edit.setTextCursor(cursor)
+            finally:
+                self._syncing_live = False
+            self._live_synced = source
+        if self._ensure_session() is not None:
+            self._refresh_state("")
+
     def _on_destroyed(self, *args):
         # 画面が壊れる最中の受け口。窓側の後始末(_finish の先)は
         # 親の窓ごと壊れている途中かもしれず触らない。ここでは

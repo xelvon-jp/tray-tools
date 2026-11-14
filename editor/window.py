@@ -4770,6 +4770,14 @@ class EditorWindow(QMainWindow):
             self._recorder.stop()
             self._update_record_label()
             self._current_macro = self.recorded_commands()
+            # 記録用のペインが開いていたら、記録の最終形へ寄せ
+            # る (ステップ実行のあとはライブ表示が止まったまま
+            # で、記録した分が画面に出ていないことがあるため)。
+            pane = self._python_dialog
+            if pane is not None and self._python_pane_live:
+                pane.finish_recording(macro_py.commands_to_python(
+                    self._current_macro,
+                    self._current_macro_name or "マクロ"))
             self._current_macro_name = ""
             self._current_python_source = None
             self._act_macro_record.setText("記録開始(&R)")

@@ -100,7 +100,7 @@ def acquire_single_instance() -> bool:
 
 
 class CommandServer(QObject):
-    """script_runner_launch から届く "show" を受ける口。"""
+    """script_runner_launch から届く "show" と "restart" を受ける口。"""
 
     def __init__(self, window):
         super().__init__(window)
@@ -121,6 +121,8 @@ class CommandServer(QObject):
     def _read(self, sock) -> None:
         try:
             data = bytes(sock.readAll()).decode("utf-8", errors="replace")
+            if "restart" in data:
+                self.window.restart()
             if "show" in data:
                 self.window.show()
                 self.window.raise_()
@@ -704,6 +706,25 @@ class ScriptRunnerWindow(QWidget):
                 "editor", {"geometry": geometry}, self.settings_path)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---------------- 再開(更新したコードへの乗り換え) ----------------
+    def restart(self) -> None:
+        """新しいコードで開き直す。
+
+        先に寝かせ役(script_runner_launch の respawn)を置いてから、通常の
+        閉じ方で終わる。寝かせ役が、このプロセスが消えたのを見て後継を
+        起こすので、後継はディスクの新しいコードで上がる。実行中の
+        スクリプトがあれば、通常の終了と同じく closeEvent が止める。
+
+        寝かせ役を置けなければ、閉じずに残って知らせる。古いコードの
+        ままではあるが、落とすだけになるのを避けるため。
+        """
+        try:
+            script_runner_launch.spawn_respawn_helper(self.settings_path)
+        except Exception:  # noqa: BLE001
+            self._set_note("再開の準備ができませんでした", "error")
+            return
+        self.close()
 
     # ---------------- 前面固定・終了 ----------------
     def _apply_on_top(self, on: bool, save: bool):

@@ -1763,6 +1763,19 @@ class ScreenFeature:
             self._log_failure("スクリプト実行パネルの開始")
             self._notify("スクリプト実行", f"起動できませんでした\n{e}")
 
+    def restart_script_runner(self):
+        """スクリプト実行パネルに、新しいコードでの再開を頼む。窓は別
+        プロセス(script_runner_launch)。動いていれば "sent"、動いて
+        いなければ起こして "spawned"。失敗したら None(外部コマンドの
+        応答文を組み立てるのに、結果を返す)。"""
+        try:
+            import script_runner_launch
+            return script_runner_launch.restart(self.settings_path)
+        except Exception as e:  # noqa: BLE001  メニューのスロットと同じ作法
+            self._log_failure("スクリプト実行パネルの再開")
+            self._notify("スクリプト実行", f"再開できませんでした\n{e}")
+            return None
+
     def start_slideshow(self, folders=None) -> None:
         """登録済みのフォルダで再生する。動いていれば、動いているものに再生し直してもらう
         (判定は slideshow_launch が名前付きミューテックスで行う)。"""

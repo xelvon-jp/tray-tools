@@ -6,7 +6,8 @@
 # 実行しない)、結果がクリップボード文の形で入ること、設定が窓の位置と
 # 前面固定を覚えること、起動時に BOM 付け写しの残りが掃除されること、
 # 監視フォルダのパスが長くても窓幅が設計どおりに収まること、入口
-# (トレイ・外部コマンド・あっふ)の配線があることを見る。
+# (トレイ・外部コマンド・あっふ)の配線があること、再開の命令が届くと
+# 寝かせ役を置いて通常の閉じ方で閉じることを見る。
 #
 # 設定は一時ファイル、見張りフォルダも一時フォルダ。実 settings.json には
 # 触らない。クリップボードは offscreen で不安定なので、窓の _set_clipboard
@@ -349,16 +350,59 @@ def test_window_width_with_long_folder_path():
             window.close()
 
 
+class _FakeSocket:
+    """CommandServer._read に渡す、読み取りだけの偽の受け口。"""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def readAll(self):
+        return self._data
+
+
+def test_restart_command_arranges_helper_and_closes():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        window, _watch, settings_path, _copied = make_window(tmp)
+        arranged = []
+        original = sr.script_runner_launch.spawn_respawn_helper
+
+        def fake_helper(path=None):
+            arranged.append(path)
+            return 777
+
+        sr.script_runner_launch.spawn_respawn_helper = fake_helper
+        try:
+            window.show()
+            QCoreApplication.processEvents()
+            server = sr.CommandServer(window)
+            server._read(_FakeSocket(b"restart\n"))
+            QCoreApplication.processEvents()
+            # 寝かせ役が(設定パス付きで)置かれ、窓は通常の閉じ方で閉じた。
+            assert arranged == [str(settings_path)], arranged
+            assert not window.isVisible()
+            # 閉じたときの設定保存が走っていること。
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            assert "window_geometry" in saved["script_runner"]
+        finally:
+            sr.script_runner_launch.spawn_respawn_helper = original
+            window.close()
+
+
 def test_entry_wiring_strings():
     # main.py 本体は VM では読み込めないので、登録の文字列で確かめる
     # (test_tomorrow_memo と同じ流儀)。
     main_text = (ROOT / "main.py").read_text(encoding="utf-8")
     assert '"script-runner"' in main_text
+    assert '"script-runner-restart"' in main_text
+    assert "_script_runner_restart_command" in main_text
     menu_text = (ROOT / "feature_screen.py").read_text(encoding="utf-8")
     assert "スクリプト実行" in menu_text
     assert "start_script_runner" in menu_text
+    assert "restart_script_runner" in menu_text
     send_text = (ROOT / "traytools_send.py").read_text(encoding="utf-8")
     assert "script-runner" in send_text
+    assert "script-runner-restart" in send_text
     filer_text = (ROOT / "filer.py").read_text(encoding="utf-8")
     assert "def cmd_script_runner" in filer_text
     core_text = (ROOT / "filer_core.py").read_text(encoding="utf-8")
@@ -366,6 +410,8 @@ def test_entry_wiring_strings():
     launch_text = (ROOT / "script_runner_launch.py").read_text(
         encoding="utf-8")
     assert "traytools.script_runner" in launch_text
+    assert "RESTART_COMMAND" in launch_text
+    assert "respawn_when_gone" in launch_text
     settings_text = (ROOT / "settings.py").read_text(encoding="utf-8")
     assert '"script_runner"' in settings_text
 
@@ -380,6 +426,7 @@ if __name__ == "__main__":
         test_window_settings_saved,
         test_window_startup_cleans_bom_leftovers,
         test_window_width_with_long_folder_path,
+        test_restart_command_arranges_helper_and_closes,
         test_entry_wiring_strings,
     ]
     for test in tests:

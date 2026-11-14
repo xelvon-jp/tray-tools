@@ -385,6 +385,13 @@ def _build_command_handlers(features) -> dict:
         #
         #   traytools_send.py script-runner
         "script-runner": lambda args, reply: reply(_script_runner_command(screen)),
+        # スクリプト実行パネルを、新しいコードで開き直してもらう。更新で
+        # ディスクのコードが新しくなっても、開いているパネルは古いコード
+        # のままなので、乗り換える口が要る。パネル側が寝かせ役を置いて
+        # 閉じ、後継が新しいコードで上がる(script_runner_launch)。
+        #
+        #   traytools_send.py script-runner-restart
+        "script-runner-restart": lambda args, reply: reply(_script_runner_restart_command(screen)),
         # 操作ログの末尾を読む。既定20行、引数で行数を指定できる。
         #
         #   traytools_send.py log 50
@@ -468,6 +475,20 @@ def _script_runner_command(screen) -> str:
     except Exception as e:  # noqa: BLE001
         return f"ERR スクリプト実行パネルを開けませんでした ({e})"
     return "OK スクリプト実行パネルを開きました"
+
+
+def _script_runner_restart_command(screen) -> str:
+    """script-runner-restart の入口。開いているパネルに、新しいコードへの
+    再開を頼む。開いていなければ普通に開いたことになる。"""
+    try:
+        result = screen.restart_script_runner()
+    except Exception as e:  # noqa: BLE001
+        return f"ERR スクリプト実行パネルを再開できませんでした ({e})"
+    if result == "sent":
+        return "OK スクリプト実行パネルの再開を頼みました"
+    if result == "spawned":
+        return "OK スクリプト実行パネルを開きました"
+    return "ERR スクリプト実行パネルを再開できませんでした"
 
 
 def _tomorrow_memo_command(screen, args, reply) -> None:

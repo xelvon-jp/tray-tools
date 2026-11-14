@@ -10,6 +10,7 @@
 #   python traytools_send.py tomorrow-memo           メモの窓を開き、閉じるまで待つ
 #   python traytools_send.py tomorrow-memo nowait    メモの窓を開いてすぐ返る
 #   python traytools_send.py script-runner           スクリプト実行パネルを開く
+#   python traytools_send.py script-runner-restart   スクリプト実行パネルを新しいコードで開き直す
 #
 # 【応答】以前この口は一方向で、送った側は「エラーが出ていないから多分成功」という
 # 確かめ方しかできなかった。いまは本体が1つ応答を返す。

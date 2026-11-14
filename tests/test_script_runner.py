@@ -28,6 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 import script_runner_core as core  # noqa: E402
+import script_runner_launch as launch  # noqa: E402
 
 PY = sys.executable
 CONFIG = {"python": PY, "timeout_seconds": 120}
@@ -835,6 +836,98 @@ def test_cleanup_bom_copies():
         assert core.cleanup_bom_copies(tmp / "no_such_dir") == 0
 
 
+# ---------------------------------------------------------------
+# 入口の再開(script_runner_launch。相手と時計は差し替えて確かめる)
+# ---------------------------------------------------------------
+def test_launch_restart_dispatch():
+    calls = []
+    originals = (launch.is_running, launch.send, launch.spawn)
+    send_ok = {"value": True}
+
+    def fake_send(payload, timeout_ms=1000):
+        calls.append(("send", payload))
+        return send_ok["value"]
+
+    def fake_spawn(settings_path=None):
+        calls.append(("spawn", settings_path))
+        return 4242
+
+    try:
+        launch.send = fake_send
+        launch.spawn = fake_spawn
+        # 動いている＋送れた → 再開を頼むだけ。後継はパネル側が用立てる。
+        launch.is_running = lambda: True
+        send_ok["value"] = True
+        assert launch.restart("s.json") == "sent"
+        assert calls == [("send", launch.RESTART_COMMAND)], calls
+        # 動いているが送れなかった → 起こし直す(start と同じ落ち方)。
+        calls.clear()
+        send_ok["value"] = False
+        assert launch.restart("s.json") == "spawned"
+        assert calls == [("send", launch.RESTART_COMMAND),
+                         ("spawn", "s.json")], calls
+        # 動いていない → 送らずに起こす。
+        calls.clear()
+        launch.is_running = lambda: False
+        assert launch.restart("s.json") == "spawned"
+        assert calls == [("spawn", "s.json")], calls
+        # start の分岐は従来どおり(show を送る)。
+        calls.clear()
+        launch.is_running = lambda: True
+        send_ok["value"] = True
+        assert launch.start("s.json") == "sent"
+        assert calls == [("send", launch.SHOW_COMMAND)], calls
+    finally:
+        launch.is_running, launch.send, launch.spawn = originals
+
+
+def test_respawn_when_gone_spawns_once_after_exit():
+    state = {"checks": 0, "spawned": 0, "now": 0.0}
+
+    def is_running():
+        state["checks"] += 1
+        return state["checks"] <= 3
+
+    def spawn():
+        state["spawned"] += 1
+
+    def sleep(seconds):
+        state["now"] += seconds
+
+    done = launch.respawn_when_gone(
+        is_running, spawn, timeout=15.0, interval=0.25,
+        sleep_fn=sleep, clock=lambda: state["now"])
+    assert done is True
+    # 消えるまでは起こさず、消えたら1度だけ。
+    assert state["checks"] == 4
+    assert state["spawned"] == 1
+
+
+def test_respawn_when_gone_already_gone_spawns_immediately():
+    spawned = []
+    done = launch.respawn_when_gone(
+        lambda: False, lambda: spawned.append(1), timeout=15.0,
+        interval=0.25, sleep_fn=lambda _s: None, clock=lambda: 0.0)
+    assert done is True
+    assert spawned == [1]
+
+
+def test_respawn_when_gone_gives_up_on_timeout():
+    state = {"spawned": 0, "now": 0.0}
+
+    def sleep(seconds):
+        state["now"] += seconds
+
+    done = launch.respawn_when_gone(
+        lambda: True,
+        lambda: state.__setitem__("spawned", state["spawned"] + 1),
+        timeout=1.0, interval=0.25, sleep_fn=sleep,
+        clock=lambda: state["now"])
+    # 上限を過ぎても消えなければ、起こさずに諦める。
+    assert done is False
+    assert state["spawned"] == 0
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -882,6 +975,10 @@ if __name__ == "__main__":
         test_run_handle_stop_closes_job,
         test_execute_stop_closes_job_once,
         test_cleanup_bom_copies,
+        test_launch_restart_dispatch,
+        test_respawn_when_gone_spawns_once_after_exit,
+        test_respawn_when_gone_already_gone_spawns_immediately,
+        test_respawn_when_gone_gives_up_on_timeout,
     ]
     for test in tests:
         test()

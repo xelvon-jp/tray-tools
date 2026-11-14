@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "1.45"
+PHAL_VERSION = "1.46"
 
 import argparse
 import ctypes
@@ -762,6 +762,13 @@ class ScriptRunnerWindow(QWidget):
         # 保留している印。設置スクリプトの開き直しは実行の終了と
         # ほぼ同時に届くので、そのまま閉じると回答・送信が飛ぶ。
         self._restart_deferred = False
+        # ARiA モニタ表示用の状態 (req-20261115-02)。_phal_step は
+        # 起動後の実行手数。_phal_command_id / _phal_item は、実行中
+        # または直近のスクリプトのコマンドIDと概要。_publish_phal_status
+        # が、状態が変わったときだけ phal_status.json へ書く。
+        self._phal_step = 0
+        self._phal_command_id = ""
+        self._phal_item = ""
         # テーマ (1-44)。_build_ui が色を引くので、先に決めておく。
         # _default_palette はライトへ戻すときの受け皿 (付ける前の
         # パレットの写し)。_note_kind はメモ欄の今の色付けの控えで、
@@ -793,6 +800,9 @@ class ScriptRunnerWindow(QWidget):
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start(POLL_INTERVAL_MS)
         self._poll()
+        # 起動時は待機。モニタ側は、このファイルがあれば PHAL が
+        # 動いていると分かる。
+        self._publish_phal_status("idle", "待機中")
 
     # ---------------- 画面 ----------------
     def _build_ui(self):
@@ -1012,6 +1022,39 @@ class ScriptRunnerWindow(QWidget):
         except Exception:  # noqa: BLE001  診断は本体を止めない
             pass
 
+    def _publish_phal_status(self, state, detail="",
+                             stopped_reason="", command_id=None,
+                             item=None):
+        """ARiA モニタ表示用の状態を手元ファイルへ出す (req-20261115-02)。
+
+        state は idle / dl / run / answer / send / stopped。command_id
+        と item を渡せば、実行中または直近のスクリプトの素性を
+        差し替える (渡さなければ今のまま)。書くのは状態が変わった
+        ときだけで、書き込みに失敗してもループは止めない (どちらも
+        core 側が受け持つ)。"""
+        try:
+            if command_id is not None:
+                self._phal_command_id = command_id
+            if item is not None:
+                self._phal_item = item
+            status = core.build_phal_status(
+                PHAL_VERSION, state,
+                command_id=self._phal_command_id,
+                detail=detail, stopped_reason=stopped_reason,
+                step=self._phal_step, item=self._phal_item)
+            core.write_phal_status(status)
+        except Exception:  # noqa: BLE001  状態の書き出しは本体を止めない
+            pass
+
+    def _publish_phal_idle(self, detail="待機中"):
+        """連鎖が何も動いていなければ待機に戻す。
+
+        実行・回答・送信の途中で呼ぶと、動いている段の表示を
+        待機で上書きしてしまうので、連鎖が空いているときだけ
+        書く。"""
+        if not self._chain_in_flight():
+            self._publish_phal_status("idle", detail)
+
     def _diag_status_label(self, status) -> str:
         """チェックの判定を、状態の列と同じ短い語にする。"""
         return {core.STATUS_OK: "OK", core.STATUS_WARN: "警告",
@@ -1118,6 +1161,10 @@ class ScriptRunnerWindow(QWidget):
                 # このダウンロードで開いたフライアウトを閉じる
                 # (次の押下の邪魔になるため、1-67)。
                 self._send_escape_to_ai()
+                # ダウンロードの段は終わり。自動実行が始まれば
+                # そちらが run を出す。
+                self._publish_phal_idle(
+                    f"ダウンロードの到着を確認: {item.name}")
             self._queue_check(item)
             return True
         if (mtime, size) != item.stat_key():
@@ -1246,6 +1293,8 @@ class ScriptRunnerWindow(QWidget):
             self._dl_awaiting = None
             self._diag(
                 f"DLの到着を確認できなかった: {label}")
+            self._publish_phal_idle(
+                "ダウンロードの到着を確認できませんでした")
         # チャットの見張りは間引いて回す (中では間隔を見ている)。
         self._maybe_check_chat()
         # 保留中の開き直しの保険: 連鎖の節目で拾い損ねても、見回り
@@ -1878,6 +1927,12 @@ class ScriptRunnerWindow(QWidget):
             return
         self._running_item = item
         self._diag(f"実行開始: {item.name}")
+        # 実行手数を数えて、モニタ表示用の状態を出す。
+        self._phal_step += 1
+        self._publish_phal_status(
+            "run", f"実行中: {item.name}",
+            command_id=core.parse_command_id(item.name) or "",
+            item=item.summary or item.name)
         # 走らせることが決まったら、開き直しをまたぐ対象の控えは
         # 役目を終える (自動でも手動でも。以後はこの項目の「実行
         # 済み」の印が受け持ち、開き直した後も二度は走らせない)。
@@ -1939,6 +1994,17 @@ class ScriptRunnerWindow(QWidget):
         self._diag(
             f"実行終了: {run.name} 終了コード {run.exit_code}"
             f"（{run.seconds:.1f}秒）{flags}")
+        if run.stopped or run.timed_out or run.policy_stop:
+            reason = ("停止されました" if run.stopped else
+                      "時間切れで止めました" if run.timed_out else
+                      "実行ポリシーで止めました")
+            self._publish_phal_status(
+                "stopped", f"実行が止まりました: {run.name}",
+                stopped_reason=reason)
+        elif not self._automation_flags()["auto_answer"]:
+            # 回答へ自動で進まない場合は、ここで待機に戻る。進む
+            # 場合は _answer_to_ai が answer を出す。
+            self._publish_phal_idle("実行が終わりました")
         text = core.build_result_text(
             run.name, run, self.config,
             command_id=core.parse_command_id(run.name))
@@ -2076,6 +2142,10 @@ class ScriptRunnerWindow(QWidget):
         self._ai_filling = True
         self._ai_answer_item = item
         self._refresh_list()
+        self._publish_phal_status(
+            "answer", f"AI へ回答を入れています: {item.name}",
+            command_id=core.parse_command_id(item.name) or "",
+            item=item.summary or item.name)
 
         import threading
 
@@ -2121,6 +2191,11 @@ class ScriptRunnerWindow(QWidget):
                 and self._ai_send_ready \
                 and self._automation_flags()["auto_send"]:
             self._send_to_ai(item)
+        elif getattr(result, "ok", False):
+            # 送信へ進まない場合は、ここで待機に戻る。
+            self._publish_phal_idle("AI の入力欄に結果を入れました")
+        else:
+            self._publish_phal_idle("AI への回答に失敗しました")
         # この項目の連鎖が一段落したら、自動実行の次を進める
         # (送信まで自動の場合は _on_ai_send_done でもう一度呼ぶ)。
         self._pump_auto_run()
@@ -2156,6 +2231,10 @@ class ScriptRunnerWindow(QWidget):
         self._ai_sending = True
         self._ai_send_item = item
         self._refresh_list()
+        self._publish_phal_status(
+            "send", f"送信中: {item.name}",
+            command_id=core.parse_command_id(item.name) or "",
+            item=item.summary or item.name)
 
         import threading
 
@@ -2187,6 +2266,10 @@ class ScriptRunnerWindow(QWidget):
             self._diag(f"AIへの送信に失敗: {message}")
             self._set_note(str(message), "error")
         self._refresh_list()
+        if getattr(result, "ok", False):
+            self._publish_phal_idle("送信しました")
+        else:
+            self._publish_phal_idle("送信に失敗しました")
         # 送信まで済んだので、自動実行の次を進める。
         self._pump_auto_run()
         # 保留中の開き直しがあれば、連鎖が済んだこの時点で実行する。
@@ -2298,6 +2381,7 @@ class ScriptRunnerWindow(QWidget):
                     f"{self._dl_holder.label}")
                 self._dl_holder = None
                 self._refresh_list()
+                self._publish_phal_idle("待機中")
             return
         holder = _DlCandidate(candidate)
         # 同じファイルが既に一覧にあるか (名前・概要での判定)。
@@ -2317,6 +2401,7 @@ class ScriptRunnerWindow(QWidget):
                     f"{self._dl_holder.label}")
                 self._dl_holder = None
                 self._refresh_list()
+                self._publish_phal_idle("待機中")
             return
         if self._dl_holder is not None \
                 and self._dl_holder.key == holder.key:
@@ -2325,6 +2410,9 @@ class ScriptRunnerWindow(QWidget):
         self._diag(
             f"DL候補を表示: {holder.summary or holder.label}")
         self._refresh_list()
+        self._publish_phal_status(
+            "dl", f"新着: {holder.summary or holder.label}",
+            command_id="", item=holder.summary or holder.label)
         # 自動化: 「DLを自動で押す」が入っていれば、新しく見つけた
         # 候補を1回だけ自動で押す。失敗しても繰り返さない (理由は
         # _on_dl_pressed が note に出す。次の新しい候補でまた試す)。
@@ -2359,6 +2447,9 @@ class ScriptRunnerWindow(QWidget):
         self._diag(
             f"DL押下を開始（{'自動' if auto else '手動'}）: "
             f"{holder.summary or holder.label}")
+        self._publish_phal_status(
+            "dl", f"ダウンロード中: {holder.summary or holder.label}",
+            command_id="", item=holder.summary or holder.label)
         # 押下を始めた候補は、開き直しをまたいで控える (手動でも
         # 自動でも)。開き直した先で同じ候補を見つけても、落とした
         # ファイルが一覧にある間は二度と出さない・押さない。
@@ -2401,6 +2492,8 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "自動でダウンロードしました" if self._dl_press_auto
                 else "ダウンロードしました", "ok")
+            self._publish_phal_status(
+                "dl", "ダウンロードしました（到着待ち）")
         else:
             message = getattr(result, "message", "") \
                 or "ダウンロードできませんでした"
@@ -2412,6 +2505,7 @@ class ScriptRunnerWindow(QWidget):
                 self._diag(
                     "フライアウト: 閉じきれず開いたままだった")
             self._set_note(str(message), "error")
+            self._publish_phal_idle("ダウンロードに失敗しました")
         self._dl_press_key = None
         self._refresh_list()
 
@@ -2550,6 +2644,8 @@ class ScriptRunnerWindow(QWidget):
         self._diag_sending = True
         self._diag_auto_mid = mid
         self._diag("診断の自動応答を開始")
+        # 診断の束の貼り付けも、モニタ上は回答の段に入れる。
+        self._publish_phal_status("answer", "診断を自動で送っています")
 
         import threading
 
@@ -2589,6 +2685,10 @@ class ScriptRunnerWindow(QWidget):
             self._diag(f"診断の自動応答に失敗: {message}")
             self._set_note(
                 f"診断を自動で送れませんでした（{message}）", "error")
+        if getattr(result, "ok", False):
+            self._publish_phal_idle("診断を自動で送りました")
+        else:
+            self._publish_phal_idle("診断の自動応答が終わりました")
         # 保留中の開き直しがあれば、連鎖が済んだこの時点で実行する。
         self._fire_deferred_restart()
 

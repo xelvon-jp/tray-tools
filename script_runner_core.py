@@ -849,6 +849,91 @@ def save_diag_auto(state: dict, state_path=None) -> None:
 
 
 # ---------------------------------------------------------------
+# PHAL の状態の書き出し (script_runner_status.json ではなく
+# phal_status.json。ARiA モニタ表示用、req-20261115-02)。
+# PHAL の今の段を、%LOCALAPPDATA%\traytools の下の小さな JSON
+# へ出す。見張り(アオイ側)がこれを読んで、モニタに PHAL の
+# カードを描く。書くのは状態が変わったときだけ。書き込みに
+# 失敗しても、ループは止めない (他の控えと同じ作法)。
+# ---------------------------------------------------------------
+PHAL_STATUS_FILENAME = "phal_status.json"
+PHAL_STATUS_STATES = ("idle", "dl", "run", "answer", "send", "stopped")
+_PHAL_STATUS_TEXT_LIMIT = 240  # detail / item の1行の長さの上限(文字)
+
+
+def phal_status_path() -> Path:
+    return data_dir() / PHAL_STATUS_FILENAME
+
+
+def _phal_status_one_line(text) -> str:
+    """detail / item 用に、1行に畳んで長さを切る。"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) > _PHAL_STATUS_TEXT_LIMIT:
+        flat = flat[:_PHAL_STATUS_TEXT_LIMIT - 1] + "…"
+    return flat
+
+
+def build_phal_status(version, state, command_id="", detail="",
+                      stopped_reason="", step=0, item="", at=None) -> dict:
+    """モニタ表示用の状態の辞書を作る。
+
+    state は idle(待機) / dl(ダウンロード・新着待ち) / run(実行中)
+    / answer(回答中) / send(送信中) / stopped(止まった) のどれか。
+    step は PHAL 起動後の実行手数。item は実行中または直近の
+    スクリプトの概要。updated は epoch 秒(整数)。知らない state
+    は ValueError (窓側は決まった段だけを渡す)。"""
+    if state not in PHAL_STATUS_STATES:
+        raise ValueError(f"unknown PHAL state: {state!r}")
+    return {
+        "schema": 1,
+        "version": str(version),
+        "state": state,
+        "command_id": str(command_id or ""),
+        "detail": _phal_status_one_line(detail),
+        "stopped_reason": _phal_status_one_line(stopped_reason),
+        "step": int(step),
+        "item": _phal_status_one_line(item),
+        "updated": int(at if at is not None else time.time()),
+    }
+
+
+def _phal_status_body(status: dict) -> dict:
+    """書き直すかどうかの比べる部分。updated は毎回変わる時刻
+    なので比べない (比べると、同じ状態でも毎回書き直すことに
+    なる)。"""
+    return {key: value for key, value in status.items()
+            if key != "updated"}
+
+
+def write_phal_status(status: dict, status_path=None) -> bool:
+    """状態を書き出す。変わったときだけ書き、書けたら True。
+
+    前回書いた内容(時刻を除く)と同じなら書かずに False を返す。
+    書きかけで壊さないよう、一度別名で書いてから置き換える
+    (他の控えと同じ作法)。書き込みに失敗しても例外は出さず
+    False を返す (ループを止めない)。"""
+    path = Path(status_path) if status_path is not None \
+        else phal_status_path()
+    body = _phal_status_body(status)
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = json.load(f)
+        if isinstance(prev, dict) and _phal_status_body(prev) == body:
+            return False
+    except (OSError, ValueError):
+        pass  # 読めない・壊れている場合は書き直す
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(status, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------
 # Python のチェック
 # ---------------------------------------------------------------
 # 要確認の名前の一覧(データ)。足すときはここへ1行足すだけでよい。

@@ -1297,6 +1297,133 @@ def test_reformat_recorded_and_replayed():
         discard_close(window)
 
 
+def test_convert_tab_to_space_command():
+    window = make_window(editor_settings={"tab_width": 4})
+    try:
+        # 選択が無ければ文書全体が対象。桁は表示幅で数える
+        # (タブ幅は全体設定の4)。全体が1回の undo で戻る。
+        window._edit.setPlainText("a\tb\nあ\tい\nxyz")
+        assert window.execute_command("convert_tab_to_space")
+        assert window.text() == "a   b\nあ  い\nxyz"
+        window._edit.undo()
+        assert window.text() == "a\tb\nあ\tい\nxyz"
+    finally:
+        discard_close(window)
+
+
+def test_convert_commands_no_change_no_record():
+    window = make_window(editor_settings={"tab_width": 4})
+    try:
+        # 変わらない文書では何も起きない(記録もされない)。
+        window._edit.setPlainText("abc")
+        window.set_macro_recording(True)
+        assert window.execute_command("convert_tab_to_space")
+        assert window.execute_command("convert_space_to_tab")
+        assert window.execute_command("convert_lead_half_to_full")
+        assert window.execute_command("convert_lead_full_to_half")
+        window.set_macro_recording(False)
+        assert window.recorded_commands() == []
+        assert window.text() == "abc"
+    finally:
+        discard_close(window)
+
+
+def test_convert_space_to_tab_selection_range():
+    window = make_window(editor_settings={"tab_width": 4})
+    try:
+        window._edit.setPlainText("    a\n    b\n    c")
+        _select_blocks(window, 0, 1)
+        assert window.execute_command("convert_space_to_tab")
+        # 対象は選択の2行だけ。残りは動かない。
+        assert window.text() == "\ta\n\tb\n    c"
+        # 選択の終わりが行頭ちょうどのときは、その行は含めない。
+        window._edit.setPlainText("\ta\n    b\n    c")
+        _select_blocks(window, 0, 2, to_line_start=True)
+        assert window.execute_command("convert_space_to_tab")
+        assert window.text() == "\ta\n\tb\n    c"
+    finally:
+        discard_close(window)
+
+
+def test_convert_lead_space_commands():
+    window = make_window()
+    try:
+        # 選択が無ければ文書全体が対象。行頭以外は動かない。
+        window._edit.setPlainText("    a\n　　b\nx  y")
+        assert window.execute_command("convert_lead_full_to_half")
+        assert window.text() == "    a\n    b\nx  y"
+        window._edit.undo()
+        assert window.text() == "    a\n　　b\nx  y"
+        assert window.execute_command("convert_lead_half_to_full")
+        assert window.text() == "　　a\n　　b\nx  y"
+        # 選択のある行だけが対象。
+        window._edit.setPlainText("    a\n    b")
+        _select_blocks(window, 1, 1)
+        assert window.execute_command("convert_lead_half_to_full")
+        assert window.text() == "    a\n　　b"
+    finally:
+        discard_close(window)
+
+
+def test_convert_tab_commands_use_effective_tab_width():
+    window = make_window(editor_settings={"tab_width": 2})
+    try:
+        window._edit.setPlainText("a\tb\n  c")
+        assert window.execute_command("convert_tab_to_space")
+        # タブ幅は全体設定の2で数える。
+        assert window.text() == "a b\n  c"
+        window._edit.undo()
+        assert window.execute_command("convert_space_to_tab")
+        assert window.text() == "a\tb\n\tc"
+    finally:
+        discard_close(window)
+
+
+def test_convert_tab_space_recorded_and_replayed():
+    window = make_window(editor_settings={"tab_width": 4})
+    try:
+        window._edit.setPlainText("    a")
+        window.set_macro_recording(True)
+        window.execute_command("convert_space_to_tab")
+        window.set_macro_recording(False)
+        commands = window.recorded_commands()
+        assert commands == [{"cmd": "convert_space_to_tab", "args": {}}]
+        # JSON の往復でも新しい命令が通る(手書きマクロと同じ形)。
+        _name, parsed = macmod.macro_from_json(
+            macmod.macro_to_json(commands))
+        assert parsed == commands
+        other = make_window(editor_settings={"tab_width": 4})
+        try:
+            other._edit.setPlainText("        b")
+            assert other.play_macro(parsed)
+            assert other.text() == "\t\tb"
+            # 手書きの列でも、残りの新しい命令が通る。
+            hand = [{"cmd": "convert_tab_to_space", "args": {}},
+                    {"cmd": "convert_lead_half_to_full", "args": {}},
+                    {"cmd": "convert_lead_full_to_half", "args": {}}]
+            other._edit.setPlainText("  \tc")
+            assert other.play_macro(hand)
+            assert other.text() == "    c"
+        finally:
+            discard_close(other)
+    finally:
+        discard_close(window)
+
+
+def test_macro_recording_start_message():
+    window = make_window()
+    try:
+        # 記録を始めたら、ステータスに開始の合図が出る(停止時の
+        # まとめ表示は従来どおり)。
+        window.set_macro_recording(True)
+        assert window.statusBar().currentMessage() == \
+            "マクロの記録を始めました"
+        window.set_macro_recording(False)
+        assert "記録を終了しました" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
 def test_goto_line_moves_to_line_head():
     window = make_window()
     try:

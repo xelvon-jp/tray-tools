@@ -100,6 +100,10 @@ API_SPEC = {
     "convert_fullwidth": [],
     "convert_lower": [],
     "convert_upper": [],
+    "convert_tab_to_space": [],
+    "convert_space_to_tab": [],
+    "convert_lead_half_to_full": [],
+    "convert_lead_full_to_half": [],
 }
 
 # 読み取り専用の問い合わせ(命令ではない。記録もされない)。

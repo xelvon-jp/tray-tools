@@ -48,6 +48,10 @@
 #   convert_fullwidth {}        選択範囲を半角 → 全角
 #   convert_lower {}            選択範囲の英字を大文字 → 小文字
 #   convert_upper {}            選択範囲の英字を小文字 → 大文字
+#   convert_tab_to_space {}     対象行範囲のタブをスペースに広げる
+#   convert_space_to_tab {}     対象行範囲の行頭のスペースをタブに直す
+#   convert_lead_half_to_full {}    行頭のスペースを全角優先に組み直す
+#   convert_lead_full_to_half {}    行頭のスペースを半角に組み直す
 #
 # 記録から外しているもの(窓側の作法と合わせて):
 #   ファイル操作(開く・保存・新規)、Copilot への送信、表示の切り替え、
@@ -116,6 +120,10 @@ KNOWN_COMMANDS = frozenset({
     "convert_fullwidth",
     "convert_lower",
     "convert_upper",
+    "convert_tab_to_space",
+    "convert_space_to_tab",
+    "convert_lead_half_to_full",
+    "convert_lead_full_to_half",
 })
 
 # count を合算してまとめられる命令(同じ動きの繰り返し)。

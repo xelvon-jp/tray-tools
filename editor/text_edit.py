@@ -811,7 +811,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     def _paint_invisibles(self):
         """見えている行のタブ・スペース・改行・末尾を記号で描く。
 
-        タブは →、半角スペースは ·、全角スペースは □。行末には
+        タブは →、半角スペースは ␣、全角スペースは □。行末には
         改行の種別の記号(LF は ↓、CR は ←、CRLF は ↵)を、文書の
         最後の行には EOF の印を小さい字で描く。すべて配色の
         invisible の色(本文より薄い色)。位置は cursorRect で取る
@@ -880,7 +880,7 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     if ch == "\t":
                         symbol = "→"
                     elif ch == " ":
-                        symbol = "·"
+                        symbol = "␣"
                     elif ch == "　":
                         symbol = "□"
                     else:

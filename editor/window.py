@@ -934,6 +934,12 @@ class EditorWindow(QMainWindow):
             "convert_fullwidth": self._cmd_convert_fullwidth,
             "convert_lower": self._cmd_convert_lower,
             "convert_upper": self._cmd_convert_upper,
+            "convert_tab_to_space": self._cmd_convert_tab_to_space,
+            "convert_space_to_tab": self._cmd_convert_space_to_tab,
+            "convert_lead_half_to_full":
+                self._cmd_convert_lead_half_to_full,
+            "convert_lead_full_to_half":
+                self._cmd_convert_lead_full_to_half,
             "replace_next": self._cmd_replace_next,
             "replace_all": self._cmd_replace_all,
         }
@@ -2183,6 +2189,20 @@ class EditorWindow(QMainWindow):
                      None, convert_menu)
         self._action("小文字 → 大文字(&U)",
                      lambda: self.execute_command("convert_upper"),
+                     None, convert_menu)
+        self._action("タブ → スペース(&T)",
+                     lambda: self.execute_command("convert_tab_to_space"),
+                     None, convert_menu)
+        self._action("スペース → タブ（行頭のみ）(&S)",
+                     lambda: self.execute_command("convert_space_to_tab"),
+                     None, convert_menu)
+        self._action("行頭の半角スペース → 全角スペース(&W)",
+                     lambda: self.execute_command(
+                         "convert_lead_half_to_full"),
+                     None, convert_menu)
+        self._action("行頭の全角スペース → 半角スペース(&N)",
+                     lambda: self.execute_command(
+                         "convert_lead_full_to_half"),
                      None, convert_menu)
         self._action("指定行へ移動(&G)…", self.ask_goto_line,
                      "goto_line", edit_menu)
@@ -4241,6 +4261,55 @@ class EditorWindow(QMainWindow):
     def _cmd_convert_upper(self, args):
         return self._convert_selection(convmod.to_upper)
 
+    def _convert_lines(self, func):
+        """対象の行範囲の各行を func で変換して置き換える。
+
+        対象は並べ替え・整形と同じ行範囲(選択があればその行、
+        無ければ文書全体)で、置き換えは1回の undo で戻る単位に
+        なる。変わらなければ None(記録も undo も作らない)。"""
+        first, last = self._target_line_range()
+        document = self._edit.document()
+        lines = [document.findBlockByNumber(n).text()
+                 for n in range(first, last + 1)]
+        new_lines = [func(line) for line in lines]
+        if new_lines == lines:
+            return None
+        self._replace_line_range(first, last, new_lines)
+        return {}
+
+    def _tab_width_for_convert(self):
+        """タブ・スペース変換で使うタブ幅。そのタブの実効値
+        (拡張子別の上書きがあればそれ)。全体の既定(Qt の既定)の
+        ときは 8 として数える。"""
+        width = self._effective_display(self._current_view())["tab_width"]
+        return 8 if width is None else width
+
+    def _cmd_convert_tab_to_space(self, args):
+        """タブ → スペース(命令 convert_tab_to_space)。対象の行範囲
+        のタブを、タブ幅で次のタブ位置までの半角スペースに広げる
+        (桁は表示幅で数える)。"""
+        width = self._tab_width_for_convert()
+        return self._convert_lines(
+            lambda line: convmod.tab_to_space(line, width))
+
+    def _cmd_convert_space_to_tab(self, args):
+        """スペース → タブ(命令 convert_space_to_tab)。対象の行範囲
+        の、行頭のスペースだけをタブに直す(文中の空白は触らない)。
+        """
+        width = self._tab_width_for_convert()
+        return self._convert_lines(
+            lambda line: convmod.space_to_tab(line, width))
+
+    def _cmd_convert_lead_half_to_full(self, args):
+        """行頭のスペースを全角優先に組み直す(命令
+        convert_lead_half_to_full)。幅は保たれる。"""
+        return self._convert_lines(convmod.lead_half_to_full)
+
+    def _cmd_convert_lead_full_to_half(self, args):
+        """行頭のスペースを全部半角に組み直す(命令
+        convert_lead_full_to_half)。幅は保たれる。"""
+        return self._convert_lines(convmod.lead_full_to_half)
+
     def _cmd_find_next(self, args):
         return self._find_command(args, forward=True)
 
@@ -4612,6 +4681,9 @@ class EditorWindow(QMainWindow):
             self._macro_skips = 0
             self._act_macro_record.setText("記録終了(&R)")
             self._update_record_label()
+            # 記録が始まったことに気づきやすくする合図(赤いラベルは
+            # 常駐表示、こちらは開始の瞬間の一時表示)。
+            self.statusBar().showMessage("マクロの記録を始めました", 4000)
         else:
             self._recorder.stop()
             self._update_record_label()

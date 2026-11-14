@@ -158,10 +158,15 @@ def test_recorder_move_coalesces_counts():
 def test_recording_label_shows_and_click_stops():
     # 記録中は赤いラベルが常に出ていて、クリックで止められる
     # (陽太さんの要望 2026-11-14: 記録中なのが分かりづらい)。
+    # ラベルの置き場所はリボン (ツールバー) の中。
     window = make_window("ab", cursor_pos=0)
     try:
+        assert window._record_label.parentWidget() is window._toolbar
         assert not window._record_label.isVisible()
         window.set_macro_recording(True)
+        # ツールバーのレイアウトは、イベントを1回回すとそろう
+        # (ラベルの位置と大きさが決まってからクリックする)。
+        app().processEvents()
         assert window._record_label.isVisible()
         assert "記録中" in window._record_label.text()
         # 記録できない操作が起きると、件数がラベルに出る。

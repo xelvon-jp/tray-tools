@@ -192,6 +192,7 @@ import time
 from PySide6.QtCore import (
     QFileSystemWatcher,
     QObject,
+    QPoint,
     QSignalBlocker,
     Qt,
     QTimer,
@@ -202,7 +203,11 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
+    QIcon,
     QKeySequence,
+    QPainter,
+    QPixmap,
+    QPolygon,
     QShortcut,
     QTextCursor,
 )
@@ -222,6 +227,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QToolBar,
     QVBoxLayout,
@@ -252,7 +258,7 @@ from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor import keymap as keymapmod
 from editor.keymap_dialog import KeymapSettingsDialog
 from editor.macro_dialog import MacroLibraryDialog
-from editor.macro_py_dialog import MacroPythonDialog
+from editor.macro_py_dialog import PANE_WIDTH, MacroPythonPane
 from editor.outline_pane import OutlinePane
 from editor.text_edit import TextEdit
 
@@ -721,11 +727,43 @@ class _EditorPyApi:
         return self._window._edit.document().blockCount()
 
 
+def _draw_toolbar_icon(kind):
+    """リボンのボタン用の小さいアイコン (16×16) を描いて返す。
+
+    kind は "split_vertical" (上下に分割: 四角を横線で割る) /
+    "split_horizontal" (左右に分割: 四角を縦線で割る) /
+    "record" (赤い丸) / "play" (三角)。
+    """
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if kind in ("split_vertical", "split_horizontal"):
+        painter.setPen(QColor(70, 70, 70))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(1, 1, 13, 13)
+        if kind == "split_vertical":
+            painter.drawLine(1, 8, 14, 8)
+        else:
+            painter.drawLine(8, 1, 8, 14)
+    elif kind == "record":
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(198, 40, 40))
+        painter.drawEllipse(2, 2, 12, 12)
+    elif kind == "play":
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(60, 60, 60))
+        painter.drawPolygon(QPolygon([
+            QPoint(4, 2), QPoint(4, 14), QPoint(14, 8)]))
+    painter.end()
+    return QIcon(pixmap)
+
+
 class _RecordLabel(QLabel):
     """マクロ記録中の赤いラベル。クリックで記録を止める合図を出す
-    (記録中なのが一目で分かるように。ステータスバーの一時表示は
-    他のメッセージに上書きされて消えてしまうため、常駐のラベルに
-    する)。"""
+    (記録中なのが一目で分かるように、リボンの中に常駐させる。
+    ステータスバーの一時表示は他のメッセージに上書きされて
+    消えてしまうため)。"""
 
     clicked = Signal()
 
@@ -1067,13 +1105,17 @@ class EditorWindow(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self._tabs)
         layout.addWidget(self._find_bar)
-        self.setCentralWidget(central)
+        # 右ペイン(Python マクロ)は、スプリッタの右側へあとから
+        # 差す。ペインが無い間は、中央は従来どおりの並びだけ。
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.addWidget(central)
+        self._main_splitter.setStretchFactor(0, 1)
+        self.setCentralWidget(self._main_splitter)
         self._find_bar.hide()
 
         self._build_menus()
-        self._build_toolbar()
-        self._enc_label = QLabel()
-        self._pos_label = QLabel()
+        # 記録中の赤いラベルは、リボン(ツールバー)の中に置く
+        # (_build_toolbar が差すので、先に作っておく)。
         self._record_label = _RecordLabel("● マクロ記録中")
         self._record_label.setStyleSheet(
             "background-color: #c62828; color: white;"
@@ -1082,8 +1124,9 @@ class EditorWindow(QMainWindow):
         self._record_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._record_label.clicked.connect(
             lambda: self.set_macro_recording(False))
-        self._record_label.hide()
-        self.statusBar().addPermanentWidget(self._record_label)
+        self._build_toolbar()
+        self._enc_label = QLabel()
+        self._pos_label = QLabel()
         self.statusBar().addPermanentWidget(self._enc_label)
         self.statusBar().addPermanentWidget(self._pos_label)
         if geometry and len(geometry) == 4:
@@ -2196,11 +2239,11 @@ class EditorWindow(QMainWindow):
         self._action("スペース → タブ（行頭のみ）(&S)",
                      lambda: self.execute_command("convert_space_to_tab"),
                      None, convert_menu)
-        self._action("行頭の半角スペース → 全角スペース(&W)",
+        self._action("行頭の半角スペース → 全角スペース（幅を保つ）(&W)",
                      lambda: self.execute_command(
                          "convert_lead_half_to_full"),
                      None, convert_menu)
-        self._action("行頭の全角スペース → 半角スペース(&N)",
+        self._action("行頭の全角スペース → 半角スペース（幅を保つ）(&N)",
                      lambda: self.execute_command(
                          "convert_lead_full_to_half"),
                      None, convert_menu)
@@ -2317,12 +2360,14 @@ class EditorWindow(QMainWindow):
         # 秀丸に合わせて既定で F6 を付け、分割そのものはキー割り
         # 当ての画面で付けられる(命令 split_horizontal /
         # split_vertical / close_split / focus_next_pane)。
-        self._action("左右に分割(&H)",
-                     lambda: self.split_current_view("horizontal"),
-                     "split_horizontal", view_menu)
-        self._action("上下に分割(&V)",
-                     lambda: self.split_current_view("vertical"),
-                     "split_vertical", view_menu)
+        self._act_split_horizontal = self._action(
+            "左右に分割(&H)",
+            lambda: self.split_current_view("horizontal"),
+            "split_horizontal", view_menu)
+        self._act_split_vertical = self._action(
+            "上下に分割(&V)",
+            lambda: self.split_current_view("vertical"),
+            "split_vertical", view_menu)
         self._action("分割をやめる(&U)", self.unsplit_current_view,
                      "close_split", view_menu)
         self._action("次のペインへ(&N)", self.focus_next_pane,
@@ -2351,8 +2396,9 @@ class EditorWindow(QMainWindow):
         # play_macro は引数 commands を取るので、QAction.triggered の
         # bool をそのまま渡さないよう lambda で受ける(False が
         # 「マクロなし」として伝わり、再生できなくなる)。
-        self._action("再生(&P)", lambda: self.play_macro(),
-                     "macro_play", macro_menu)
+        self._act_macro_play = self._action(
+            "再生(&P)", lambda: self.play_macro(),
+            "macro_play", macro_menu)
         self._action("Python で開く(&Y)…",
                      lambda: self.show_python_macro_dialog(),
                      None, macro_menu)
@@ -2402,8 +2448,37 @@ class EditorWindow(QMainWindow):
                        self._act_find, self._act_send):
             toolbar.addAction(action)
         toolbar.addSeparator()
+        # 記録中の赤いラベル (記録中でないときは隠れている)。
+        # 「記録中は常に出続ける」のが要件なので、並びの前の方に
+        # 置く (窓が狭くてツールバーが溢れるときは、後ろの
+        # ボタン側から溢れさせる)。表示の切り替えは、この
+        # アクション経由で行う (_update_record_label)。ラベルを
+        # 隠したまま addWidget すると、ツールバーのレイアウトに
+        # 載らず配置されない環境があるため。
+        self._record_label_action = toolbar.addWidget(self._record_label)
+        self._record_label_action.setVisible(False)
+        toolbar.addSeparator()
         toolbar.addAction(self._act_outline)
         toolbar.addAction(self._act_line_numbers)
+        toolbar.addSeparator()
+        # 分割とマクロの4ボタンは、アイコン＋文字で出す (ツール
+        # バー全体の既定は文字だけのまま)。
+        for action, icon_kind, tip in (
+                (self._act_split_vertical, "split_vertical",
+                 "上下に分割"),
+                (self._act_split_horizontal, "split_horizontal",
+                 "左右に分割"),
+                (self._act_macro_record, "record",
+                 "マクロの記録を開始／終了します"),
+                (self._act_macro_play, "play",
+                 "マクロを再生します")):
+            action.setIcon(_draw_toolbar_icon(icon_kind))
+            action.setToolTip(tip)
+            toolbar.addAction(action)
+            button = toolbar.widgetForAction(action)
+            if button is not None:
+                button.setToolButtonStyle(
+                    Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
         self._toolbar = toolbar
 
@@ -3746,7 +3821,7 @@ class EditorWindow(QMainWindow):
         if not self._flush_session() \
                 and not self._confirm_close_without_session(event):
             return
-        # Python マクロの窓が開いていたら一緒に閉じる (実行
+        # Python マクロのペインが出ていたら一緒に閉じる (実行
         # セッションの子プロセスを残さない。アオイの指摘
         # req-20261114-22)。
         if self._python_dialog is not None:
@@ -4668,9 +4743,19 @@ class EditorWindow(QMainWindow):
             if self._macro_skips:
                 text += f"（記録できない操作 {self._macro_skips} 件）"
             label.setText(text)
-            label.show()
+            visible = True
         else:
-            label.hide()
+            visible = False
+        # 表示の切り替えは、差してあるツールバーのアクション
+        # 経由が本筋 (ラベル単体の show / hide だけでは、ツール
+        # バーのレイアウトに載らないことがあるため)。アクション
+        # 側の切り替えはレイアウト経由で遅れて効くので、ラベル
+        # 自身の表示もその場で合わせておく (配置はレイアウトが
+        # 追いついた時点でそろう)。
+        action = getattr(self, "_record_label_action", None)
+        if action is not None:
+            action.setVisible(visible)
+        label.setVisible(visible)
 
     def set_macro_recording(self, on):
         on = bool(on)
@@ -4684,6 +4769,14 @@ class EditorWindow(QMainWindow):
             # 記録が始まったことに気づきやすくする合図(赤いラベルは
             # 常駐表示、こちらは開始の瞬間の一時表示)。
             self.statusBar().showMessage("マクロの記録を始めました", 4000)
+            # 記録の様子をその場で見られるよう、Python マクロの
+            # ペインを自動で出す。既に別のマクロのペインが開いて
+            # いるときは、そちらを前に出すだけにする(編集中の
+            # ペインを取り替えない)。
+            if self._python_dialog is None:
+                self.show_python_macro_dialog()
+            else:
+                self._python_dialog.show()
         else:
             self._recorder.stop()
             self._update_record_label()
@@ -4833,7 +4926,8 @@ class EditorWindow(QMainWindow):
 
     def show_python_macro_dialog(self, source=None, name="",
                                  on_save=None):
-        """マクロの Python を別窓で見て・直して・実行する画面を開く。
+        """マクロの Python を右ペインで見て・直して・実行する画面
+        を開く。
 
         source が無ければ、いまのマクロ(記録した命令の列を Python
         へ変換したもの)を開く。on_save は (名前, ソース) を受ける
@@ -4852,51 +4946,57 @@ class EditorWindow(QMainWindow):
                             else self._current_macro)
                 source = macro_py.commands_to_python(
                     commands, self._current_macro_name or "マクロ")
-        # モーダレスで開く (EDDy の画面を操作しながら、記録が
+        # 右ペインとして出す (EDDy の画面を操作しながら、記録が
         # 増えていくのを見たり、その場でステップ実行したりできる
-        # ように)。同じマクロの窓が開いていたら前面へ出すだけ。
-        # 別のマクロを開くときは、今の窓を閉じてから開き直す
+        # ように)。同じマクロのペインが出ていたら前面へ出すだけ。
+        # 別のマクロを開くときは、今のペインを閉じてから開き直す
         # (アオイの指摘 req-20261114-22: 別のマクロを編集しよう
-        # としても前の窓が出るだけだった)。
+        # としても前の画面が出るだけだった)。
         dialog_name = name or self._current_macro_name
         existing = self._python_dialog
         if existing is not None:
             try:
-                visible = existing.isVisible()
+                existing.isVisible()
             except RuntimeError:
-                visible = False
+                existing = None
                 self._python_dialog = None
-            if visible:
-                if self._python_dialog_name == dialog_name:
-                    existing.raise_()
-                    existing.activateWindow()
-                    return existing
-                existing.close()
-        dialog = MacroPythonDialog(
-            self, source=source, name=dialog_name,
+                self._python_dialog_name = None
+        if existing is not None:
+            if self._python_dialog_name == dialog_name:
+                existing.show()
+                return existing
+            existing.close()
+        pane = MacroPythonPane(
+            None, source=source, name=dialog_name,
             session_factory=self._make_python_session,
             begin_run=self._begin_python_run,
             end_run=self._end_python_run,
             on_save=on_save,
             live_source=self._recording_python_source)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self._python_dialog = dialog
+        pane.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._main_splitter.addWidget(pane)
+        total = self._main_splitter.width()
+        if total > PANE_WIDTH + 200:
+            self._main_splitter.setSizes(
+                [total - PANE_WIDTH, PANE_WIDTH])
+        self._python_dialog = pane
         self._python_dialog_name = dialog_name
 
-        def _forget_dialog(*args):
-            # 別のマクロの窓に取り替えた直後に、古い窓の destroyed が
-            # 遅れて届くことがある。今の窓でなければ触らない。
-            if self._python_dialog is dialog:
+        def _forget_pane(*args):
+            # 別のマクロのペインに取り替えた直後に、古いペインの
+            # destroyed が遅れて届くことがある。今のペインで
+            # なければ触らない。
+            if self._python_dialog is pane:
                 self._python_dialog = None
                 self._python_dialog_name = None
 
-        dialog.destroyed.connect(_forget_dialog)
-        dialog.show()
-        return dialog
+        pane.destroyed.connect(_forget_pane)
+        pane.show()
+        return pane
 
     def _recording_python_source(self):
         """記録中なら、いまの記録を Python にしたものを返す
-        (マクロ Python 窓のライブ表示用)。記録していなければ
+        (マクロ Python ペインのライブ表示用)。記録していなければ
         None。"""
         if not self._recorder.recording:
             return None
@@ -5081,11 +5181,11 @@ class EditorWindow(QMainWindow):
             self._open_registered_macro_python(dialog.python_requested)
 
     def _open_registered_macro_python(self, name):
-        """登録マクロを Python の別窓で開く。
+        """登録マクロを Python の右ペインで開く。
 
         Python の登録はそのソースを、命令の列の登録は Python へ
-        変換したものを開く。別窓で保存すると、Python の登録として
-        残る(キーは引き継ぐ)。"""
+        変換したものを開く。ペインで保存すると、Python の登録と
+        して残る(キーは引き継ぐ)。"""
         entry = self._registered_macros.get(name)
         if entry is None:
             return

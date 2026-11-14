@@ -3056,8 +3056,67 @@ def test_copy_current_line_uses_its_newline_kind():
             discard_close(window)
 
 
+def test_toolbar_icon_buttons_split_and_macro():
+    # リボンに、分割 (上下・左右) とマクロ記録・再生の4ボタンが
+    # アイコン＋文字で並び、押すと対応する操作が動く。ツール
+    # バー全体の既定 (文字だけ) は変えない。
+    window = make_window()
+    try:
+        toolbar = window._toolbar
+        actions = toolbar.actions()
+        expected = [window._act_split_vertical,
+                    window._act_split_horizontal,
+                    window._act_macro_record,
+                    window._act_macro_play]
+        positions = [actions.index(action) for action in expected]
+        assert positions == sorted(positions)   # この順に並ぶ
+        for action in expected:
+            button = toolbar.widgetForAction(action)
+            assert button is not None
+            assert not action.icon().isNull()
+            assert action.toolTip()
+            assert (button.toolButtonStyle()
+                    == Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        open_button = toolbar.widgetForAction(window._act_open)
+        assert (open_button.toolButtonStyle()
+                == Qt.ToolButtonStyle.ToolButtonTextOnly)
+
+        view = window._current_view()
+        assert view.split_edit is None
+        toolbar.widgetForAction(window._act_split_vertical).click()
+        assert view.split_edit is not None
+        assert (view.splitter.orientation()
+                == Qt.Orientation.Vertical)
+        toolbar.widgetForAction(window._act_split_horizontal).click()
+        assert (view.splitter.orientation()
+                == Qt.Orientation.Horizontal)
+
+        # 記録ボタンはチェック状態になり、記録が始まる／止まる。
+        record_button = toolbar.widgetForAction(
+            window._act_macro_record)
+        window._edit.setPlainText("ab")
+        record_button.click()
+        assert window._recorder.recording
+        assert window._act_macro_record.isChecked()
+        QTest.keyClicks(window._edit, "Z")
+        app().processEvents()
+        record_button.click()
+        assert not window._recorder.recording
+        assert not window._act_macro_record.isChecked()
+
+        # 再生ボタンで、いま記録したマクロが再生される。
+        cursor = window._edit.textCursor()
+        cursor.setPosition(0)
+        window._edit.setTextCursor(cursor)
+        toolbar.widgetForAction(window._act_macro_play).click()
+        app().processEvents()
+        assert window._edit.toPlainText() == "ZZab"
+    finally:
+        discard_close(window)
+
+
 def test_python_macro_dialog_modeless_and_live_recording():
-    # Python の窓はモーダレス (開いたまま EDDy を操作できる) で、
+    # Python の画面は右ペイン (開いたまま EDDy を操作できる) で、
     # 記録中は操作がその場でソースに増えていく。
     window = make_window()
     window._edit.setPlainText("ab\ncd")
@@ -3065,7 +3124,8 @@ def test_python_macro_dialog_modeless_and_live_recording():
         window.set_macro_recording(True)
         dialog = window.show_python_macro_dialog()
         assert dialog is not None and dialog.isVisible()
-        assert not dialog.isModal()
+        # ペインなのでモーダルという概念は無い (窓の一部)。
+        assert dialog.windowModality() == Qt.WindowModality.NonModal
         # 開いている間も本体は操作できる (モーダルなら無効になる)。
         assert window.isEnabled()
         before = dialog.source()

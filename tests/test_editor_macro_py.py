@@ -500,9 +500,195 @@ def test_python_dialog_run_all_and_reset():
         assert window.text() == "ab1"
         dialog.reset_session()
         assert dialog.session() is None
+        # 通し実行はカーソルのある行から新しく始める。ステップ
+        # 実行でペインのカーソルは次の文へ進んでいるので、先頭
+        # へ戻してから押す。
+        cursor = dialog._edit.textCursor()
+        cursor.setPosition(0)
+        dialog._edit.setTextCursor(cursor)
         assert dialog.run_all()
         assert window.text() == "ab112"
         assert dialog.session().done
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def _make_pane(window, source, name=""):
+    """右ペイン (Python マクロ画面) を作る。"""
+    return MacroPythonDialog(
+        window,
+        source=source,
+        name=name,
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+
+
+def _pane_cursor_to_line(dialog, lineno):
+    """ペインのソース欄のカーソルを、行番号 (1始まり) の行頭へ
+    移す。"""
+    block = dialog._edit.document().findBlockByNumber(lineno - 1)
+    cursor = dialog._edit.textCursor()
+    cursor.setPosition(block.position())
+    dialog._edit.setTextCursor(cursor)
+
+
+_THREE_STATEMENTS = ("ed.insert_text('1')\n"
+                     "ed.insert_text('2')\n"
+                     "ed.insert_text('3')\n")
+
+
+def test_pane_title_shows_name_or_new():
+    # 見出しはマクロ名。名前が無ければ「新規マクロ」。
+    window = make_window("ab", cursor_pos=0)
+    named = _make_pane(window, _THREE_STATEMENTS, name="印")
+    unnamed = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        assert named._title_label.text() == "印"
+        assert unnamed._title_label.text() == "新規マクロ"
+    finally:
+        named.close()
+        unnamed.close()
+        discard_close(window)
+
+
+def test_pane_breakpoint_stops_and_continues():
+    # 通し実行はブレークポイントのある行の手前で止まり (その
+    # 行はまだ実行しない)、もう一度押すと止まっている位置
+    # から続ける。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        dialog.toggle_breakpoint(3)
+        assert dialog.breakpoints() == [3]
+        assert not dialog.run_all()
+        assert window.text() == "ab12"
+        session = dialog.session()
+        assert session is not None and not session.done
+        assert session.next_lineno() == 3
+        assert dialog.run_all()
+        assert window.text() == "ab123"
+        assert dialog.session().done
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_breakpoint_toggle_via_gutter_signal():
+    # ガターのクリック (breakpoint_toggled) で付け外しでき、
+    # 範囲外の行は無視される。
+    window = make_window("ab", cursor_pos=0)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        dialog._edit.breakpoint_toggled.emit(2)
+        assert dialog.breakpoints() == [2]
+        dialog._edit.breakpoint_toggled.emit(2)
+        assert dialog.breakpoints() == []
+        dialog.toggle_breakpoint(99)
+        assert dialog.breakpoints() == []
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_run_all_starts_at_cursor_line():
+    # 通し実行は、カーソルのある行の文から新しく始める。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        _pane_cursor_to_line(dialog, 2)
+        assert dialog.run_all()
+        assert window.text() == "ab23"
+        assert dialog.session().done
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_run_all_cursor_inside_multiline_statement():
+    # 複数行にまたがる文の途中の行にカーソルがあるときは、
+    # その文の先頭から始める (文の途中からは始めない)。
+    window = make_window("ab", cursor_pos=2)
+    source = ("ed.insert_text('1')\n"
+              "for ch in '23':\n"
+              "    ed.insert_text(ch)\n")
+    dialog = _make_pane(window, source)
+    try:
+        dialog.show()
+        _pane_cursor_to_line(dialog, 3)
+        assert dialog.run_all()
+        # 1 行目は飛ばし、for 文 (2行目から) を実行する。
+        assert window.text() == "ab23"
+        assert dialog.session().done
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_click_moves_execution_point():
+    # ステップ実行の途中で行をクリックすると、実行位置が
+    # その行の文へ移る。すでに実行した編集は取り消さない。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        assert window.text() == "ab1"
+        dialog._edit.line_clicked.emit(3)
+        session = dialog.session()
+        assert session is not None
+        assert session.position == 2
+        assert session.next_lineno() == 3
+        assert dialog.step_once()
+        assert window.text() == "ab13"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_click_without_session_does_nothing():
+    # セッションが無いときのクリックは通常のカーソル移動。
+    # セッションは作られない。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        dialog._edit.line_clicked.emit(2)
+        assert dialog.session() is None
+        assert window.text() == "ab"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_buttons_enabled_while_running():
+    # 実行中も、通し実行・ステップ実行・停止は押せるまま。
+    # 実行中に通し実行・ステップ実行を押し直しても、二重実行
+    # にはならない (何もしない)。停止はいつでも効く。
+    window = make_window("ab", cursor_pos=0)
+    dialog = _make_pane(window, "while True:\n    pass\n")
+    try:
+        dialog.show()
+        seen = []
+
+        def check():
+            seen.append((
+                dialog._run_button.isEnabled(),
+                dialog._step_button.isEnabled(),
+                dialog._stop_button.isEnabled(),
+                dialog.run_all(),
+                dialog.step_once()))
+            dialog.stop_run()
+
+        QTimer.singleShot(300, check)
+        assert not dialog.run_all()
+        assert seen == [(True, True, True, False, False)]
+        session = dialog.session()
+        assert session is not None and session.stopped
     finally:
         dialog.close()
         discard_close(window)

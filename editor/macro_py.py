@@ -225,7 +225,9 @@ def validate_python(source):
 # 処理を標準ライブラリだけで書き直したもの。
 #
 # 親 → 子: {"type": "init", "source", "api_limit", "line_limit"}
-#          {"type": "step"} / {"type": "run_all"} / {"type": "quit"}
+#          {"type": "step"} / {"type": "run_all"} /
+#          {"type": "run_until", "breakpoints": [行番号, ...]} /
+#          {"type": "seek", "index"} / {"type": "quit"}
 #          {"type": "result", "id", "value"} /
 #          {"type": "call_error", "id", "exc", "message"}
 # 子 → 親: {"type": "ready", "total", "statements": [[開始行, 終了行]]}
@@ -233,6 +235,8 @@ def validate_python(source):
 #          {"type": "print", "text"}
 #          {"type": "stepped", "lineno", "position", "done"} /
 #          {"type": "finished", "position"} /
+#          {"type": "paused", "position"} /
+#          {"type": "sought", "position"} /
 #          {"type": "error", "message", "lineno", "position"?}
 # 入出力はバイト列のまま読み書きし、UTF-8 と決め打ちする(rxfind
 # と同じ理由。OS 既定の文字コードに任せると日本語が化ける)。
@@ -434,6 +438,43 @@ def main():
                       "lineno": f.lineno, "position": position[0]})
                 continue
             send({"type": "finished", "position": position[0]})
+        elif kind == "run_until":
+            marks = set()
+            for value in msg.get("breakpoints") or []:
+                try:
+                    marks.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            start = position[0]
+            paused = False
+            try:
+                while position[0] < len(statements):
+                    node = statements[position[0]]
+                    if position[0] != start and \
+                            node.lineno in marks:
+                        # 印のある文の手前で止まる (その文はまだ
+                        # 実行しない)。ただし、止まっている文
+                        # そのものは「続き」では実行する (開始
+                        # 位置の文は印があっても実行する。同じ
+                        # 場所で止まり続けないため)。
+                        paused = True
+                        break
+                    run_one()
+            except Fail as f:
+                send({"type": "error", "message": f.message,
+                      "lineno": f.lineno, "position": position[0]})
+                continue
+            if paused:
+                send({"type": "paused", "position": position[0]})
+            else:
+                send({"type": "finished", "position": position[0]})
+        elif kind == "seek":
+            try:
+                index = int(msg.get("index") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            position[0] = max(0, min(index, len(statements)))
+            send({"type": "sought", "position": position[0]})
 
 
 try:
@@ -441,6 +482,19 @@ try:
 except EOFError:
     pass
 """
+
+
+def statement_index_for_line(lines, lineno):
+    """行番号(1始まり)が属する文の番号(0始まり)を返す。
+
+    lines は PythonStepper.statement_lines() の (開始行, 終了行)
+    の並び。文の途中の行ならその文、文と文の間の行(空行や
+    コメントだけの行)なら次の文を返し、最後の文より後ろの行
+    なら None を返す。"""
+    for index, (_start, end) in enumerate(lines):
+        if lineno <= end:
+            return index
+    return None
 
 
 # ---------------------------------------------------------------
@@ -462,6 +516,10 @@ class PythonStepper:
     例外が出たら error に入れて done にし、その例外を
     PythonMacroError に包んで上げる(呼び側は error を見ても
     よい)。print の出力は output に溜まる。
+    run_until(行番号の集まり) はブレークポイントの手前で止まる
+    通し実行、seek(文の番号) は実行せずに位置だけを移す
+    (ペイン側の「カーソル行から実行」「クリックで実行位置を
+    移す」用)。
 
     pump は、子の応答を待つ間に繰り返し呼ばれる口(窓側が
     イベント処理を渡す。画面を固まらせず、停止を受け付ける
@@ -716,6 +774,50 @@ class PythonStepper:
                 reply.get("lineno"))
             raise self.error
         self.position = int(reply.get("position") or 0)
+
+    def run_until(self, breakpoints=()):
+        """次のブレークポイントの手前か、最後まで実行する。
+
+        breakpoints はソースの行番号(1始まり)の集まり。印のある
+        文の手前で止まったら False、最後まで行ったら True を
+        返す。ただし、実行を始める位置の文そのものに印があって
+        も、その文は実行して先へ進む(ブレークポイントで止まった
+        あとに「続き」を押したとき、同じ場所で止まり続けない
+        ため)。失敗したら run_all と同じく例外を上げる。止め
+        られたときは stopped が立ち、False を返す。"""
+        if self.done:
+            return self.error is None and self.position >= self._total
+        marks = sorted({int(b) for b in breakpoints})
+        self._send({"type": "run_until", "breakpoints": marks})
+        reply = self._serve({"finished", "paused", "error"})
+        if reply is None:
+            self.stopped = True
+            return False
+        if reply.get("type") == "error":
+            self.error = PythonMacroError(
+                reply.get("message") or "マクロの実行に失敗しました",
+                reply.get("lineno"))
+            raise self.error
+        self.position = int(reply.get("position") or 0)
+        return reply.get("type") == "finished"
+
+    def seek(self, index):
+        """次に実行する文を、index 番目(0始まり)の文へ移す。
+
+        実行はしない。移せたら True。エラー・停止で終わっている
+        セッションや、閉じたセッションでは移せない(False)。
+        index は文の数の範囲に丸める(末尾を指定すると、次に
+        実行する文は無くなる)。"""
+        if self.error is not None or self.stopped or self._closed:
+            return False
+        index = max(0, min(int(index), self._total))
+        self._send({"type": "seek", "index": index})
+        reply = self._serve({"sought"})
+        if reply is None:
+            self.stopped = True
+            return False
+        self.position = int(reply.get("position") or 0)
+        return True
 
     def stop(self):
         """実行を止める(子プロセスを終了する)。

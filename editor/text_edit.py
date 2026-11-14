@@ -811,7 +811,9 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
     def _paint_invisibles(self):
         """見えている行のタブ・スペース・改行・末尾を記号で描く。
 
-        タブは →、半角スペースは ␣、全角スペースは □。行末には
+        タブは →、半角スペースは ␣、全角スペースは □。半角
+        スペースの印は、文字の ␣ が日本語フォントでは全角幅に
+        なるため、半角の幅の中で線で形を描く。行末には
         改行の種別の記号(LF は ↓、CR は ←、CRLF は ↵)を、文書の
         最後の行には EOF の印を小さい字で描く。すべて配色の
         invisible の色(本文より薄い色)。位置は cursorRect で取る
@@ -865,6 +867,24 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             painter.drawText(rect, Qt.AlignmentFlag.AlignLeft
                              | Qt.AlignmentFlag.AlignVCenter, mark)
 
+        def draw_space_mark(rect):
+            # 半角スペースの印は、␣ の形を線で描く。文字の ␣
+            # (U+2423)は東アジア幅があいまいで、日本語フォント
+            # では全角の幅で描かれてしまううえ、フォントに字形が
+            # 無いこともあるため、文字では描かない。半角スペース
+            # 1桁の枠の中に、下の横線と両端の短い縦線で描けば、
+            # どのフォントでも半角に収まる。
+            cell = metrics.horizontalAdvance(" ")
+            if cell <= 0:
+                return
+            baseline = rect.y() + metrics.ascent()
+            rise = max(3, metrics.ascent() // 3)
+            x0 = rect.x()
+            x1 = rect.x() + cell - 1
+            painter.drawLine(x0, baseline, x1, baseline)
+            painter.drawLine(x0, baseline, x0, baseline - rise)
+            painter.drawLine(x1, baseline, x1, baseline - rise)
+
         scratch = QTextCursor(self.document())
         block = self.firstVisibleBlock()
         viewport_height = self.viewport().height()
@@ -877,17 +897,16 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 text = block.text()
                 base = block.position()
                 for i, ch in enumerate(text):
-                    if ch == "\t":
-                        symbol = "→"
-                    elif ch == " ":
-                        symbol = "␣"
-                    elif ch == "　":
-                        symbol = "□"
-                    else:
+                    if ch not in ("\t", " ", "　"):
                         continue
                     scratch.setPosition(base + i)
                     rect = self.cursorRect(scratch)
-                    draw_mark(rect, symbol, metrics)
+                    if ch == " ":
+                        draw_space_mark(rect)
+                    elif ch == "\t":
+                        draw_mark(rect, "→", metrics)
+                    else:
+                        draw_mark(rect, "□", metrics)
                 scratch.setPosition(base + len(text))
                 rect = self.cursorRect(scratch)
                 mark = self.block_end_mark(block)

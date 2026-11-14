@@ -110,6 +110,9 @@ DEFAULT_CONFIG = {
     "head_lines": 200,         # クリップボード文の切り詰め(先頭)
     "tail_lines": 50,          # クリップボード文の切り詰め(末尾)
     "max_chars": 20000,        # クリップボード文の切り詰め(全体の文字数)
+    "summary_mode": True,      # 長い出力は要約にして全文をファイルへ置く
+    "summary_lines": 100,      # 要約に切り替える行数(出力+エラー出力の合計)
+    "summary_chars": 8000,     # 要約に切り替える文字数(出力+エラー出力の合計)
     "window_geometry": None,   # [x, y, w, h]
     "always_on_top": False,    # 前面に固定
     "hide_no_id": True,        # ID が無いファイルを表示しない
@@ -144,6 +147,8 @@ def normalize_config(section) -> dict:
     config["head_lines"] = _int_or(config["head_lines"], 200, 0, 100000)
     config["tail_lines"] = _int_or(config["tail_lines"], 50, 0, 100000)
     config["max_chars"] = _int_or(config["max_chars"], 20000, 100, 1000000)
+    config["summary_lines"] = _int_or(config["summary_lines"], 100, 10, 100000)
+    config["summary_chars"] = _int_or(config["summary_chars"], 8000, 100, 1000000)
     geometry = config["window_geometry"]
     if not (isinstance(geometry, list) and len(geometry) == 4
             and all(isinstance(v, int) for v in geometry)):
@@ -151,6 +156,7 @@ def normalize_config(section) -> dict:
     config["always_on_top"] = bool(config["always_on_top"])
     config["hide_no_id"] = bool(config["hide_no_id"])
     config["dark_mode"] = bool(config["dark_mode"])
+    config["summary_mode"] = bool(config["summary_mode"])
     return config
 
 
@@ -1979,15 +1985,55 @@ def _section(title: str, body: str, config: dict) -> str:
     return f"--- {title} ---\n{body}"
 
 
-def build_result_text(name: str, run: RunResult, config: dict,
-                      command_id: str = None) -> str:
-    """実行したときにクリップボードへ入れる文。
+def _split_output_lines(text: str) -> list:
+    """出力を行に分ける(truncate_text と同じ数え方)。
 
-    command_id(ファイル名先頭のコマンドID)があるときは、1行目を
-    「[実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
-    ようにする。無いときの文は今までと完全に同じ。"""
-    config = normalize_config(config)
-    label = f"{command_id} {name}" if command_id else name
+    改行を \n にそろえ、末尾の改行を1つ外してから分ける。
+    空の出力は 0 行になる。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        return []
+    return text.split("\n")
+
+
+def _collapse_repeated_lines(lines: list) -> list:
+    """連続する同じ行を1行にまとめる。
+
+    2回以上続いた行は「（同じ行が N 回）」を末尾に付けて1行に
+    する。空行(空白だけの行)はまとめない(区切りが消えると
+    読みにくくなるため)。"""
+    collapsed = []
+    run_line = None
+    run_count = 0
+
+    def flush():
+        nonlocal run_line, run_count
+        if run_line is None:
+            return
+        if run_count >= 2:
+            collapsed.append(f"{run_line}（同じ行が {run_count} 回）")
+        else:
+            collapsed.append(run_line)
+        run_line = None
+        run_count = 0
+
+    for line in lines:
+        if line.strip() and line == run_line:
+            run_count += 1
+        else:
+            flush()
+            run_line = line
+            run_count = 1
+    flush()
+    return collapsed
+
+
+def _result_first_line(label: str, run: RunResult, config: dict,
+                       total_lines: int = None) -> str:
+    """結果文の1行目。total_lines があるときは末尾に「・全N行」を付ける
+    (要約モードで、行数を先に知らせるため)。"""
     if run.timed_out:
         timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
         first = f"[実行結果] {label}  時間切れで止めました({timeout}秒)"
@@ -1998,6 +2044,106 @@ def build_result_text(name: str, run: RunResult, config: dict,
         first = f"[実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
     if run.start_error:
         first += f"  起動エラー: {run.start_error}"
+    if total_lines is not None:
+        first += f"・全{total_lines}行"
+    return first
+
+
+def _summary_stdout_section(out_lines: list) -> str:
+    """要約文の出力の段。先頭15行と末尾10行だけ見せる。
+
+    合計25行以下なら全部見せる。見出しの行数は stdout の行数。"""
+    if not out_lines:
+        body = "(なし)"
+    elif len(out_lines) <= 25:
+        body = "\n".join(_collapse_repeated_lines(out_lines))
+    else:
+        head = _collapse_repeated_lines(out_lines[:15])
+        tail = _collapse_repeated_lines(out_lines[-10:])
+        omitted = len(out_lines) - 25
+        body = "\n".join(
+            head + [f"…（中略：{omitted}行）…"] + tail)
+    return f"--- 出力（要約・全{len(out_lines)}行） ---\n{body}"
+
+
+def _summary_stderr_section(err_lines: list) -> str:
+    """要約文のエラー出力の段。先頭10行だけ見せる。"""
+    if not err_lines:
+        body = "(なし)"
+    else:
+        shown = _collapse_repeated_lines(err_lines[:10])
+        body = "\n".join(shown)
+        if len(err_lines) > 10:
+            body += f"\n…あと{len(err_lines) - 10}行"
+    return f"--- エラー出力（先頭・全{len(err_lines)}行） ---\n{body}"
+
+
+def save_full_output(run: RunResult, config: dict,
+                     command_id: str = None) -> str | None:
+    """実行結果の全文を data_dir() の下へ保存し、パスを返す。
+
+    要約モードで、クリップボード文には要約だけを入れて全文は
+    このファイルに置くためのもの。中身は build_result_text と
+    同じ1行目に、出力とエラー出力の全文を続けたもの。LF・UTF-8
+    で書く。保存に失敗したら None(呼ぶ側は従来の切り詰め文に
+    落とす)。"""
+    config = normalize_config(config)
+    label = f"{command_id} {run.name}" if command_id else run.name
+    out_lines = _split_output_lines(run.stdout)
+    err_lines = _split_output_lines(run.stderr)
+    total_lines = len(out_lines) + len(err_lines)
+    first = _result_first_line(label, run, config, total_lines)
+    body = (first + "\n--- 出力 ---\n" + run.stdout
+            + "\n--- エラー出力 ---\n" + run.stderr)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    cid = command_id or "noid"
+    filename = f"{cid}_{stamp}_{digest}.txt"
+    try:
+        folder = data_dir() / "phal-outputs"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / filename
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        return str(path)
+    except OSError:
+        return None
+
+
+def build_result_text(name: str, run: RunResult, config: dict,
+                      command_id: str = None) -> str:
+    """実行したときにクリップボードへ入れる文。
+
+    command_id(ファイル名先頭のコマンドID)があるときは、1行目を
+    「[実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
+    ようにする。無いときの文は今までと完全に同じ。
+
+    要約モード(summary_mode が真)で、出力とエラー出力の合計が
+    summary_lines 行または summary_chars 文字を超えたら、全文は
+    ファイルへ置いて要約だけを返す。短い出力は今までと完全に
+    同じ文になる。全文の保存に失敗したら、従来の切り詰め文に
+    落とす(要約を諦めても実行結果は必ず返す)。"""
+    config = normalize_config(config)
+    label = f"{command_id} {name}" if command_id else name
+    out_lines = _split_output_lines(run.stdout)
+    err_lines = _split_output_lines(run.stderr)
+    total_lines = len(out_lines) + len(err_lines)
+    total_chars = len(run.stdout) + len(run.stderr)
+    if config["summary_mode"] and (
+            total_lines > config["summary_lines"]
+            or total_chars > config["summary_chars"]):
+        full_path = save_full_output(run, config, command_id)
+        if full_path is not None:
+            first = _result_first_line(label, run, config, total_lines)
+            parts = [first,
+                     _summary_stdout_section(out_lines),
+                     _summary_stderr_section(err_lines),
+                     f"全文: {full_path}",
+                     "「○行目付近を見せて」と頼めば取り出せます"]
+            if run.policy_stop:
+                parts.append(POLICY_NOTE)
+            return "\n".join(parts)
+    first = _result_first_line(label, run, config)
     parts = [first,
              _section("出力", run.stdout, config),
              _section("エラー出力", run.stderr, config)]

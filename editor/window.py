@@ -851,6 +851,11 @@ class EditorWindow(QMainWindow):
         #   "separate"=このファイルだけ切り離して保存 /
         #   "cancel"=保存しない)
         self.ask_hardlink_save = None
+        # ask_no_backup_save: ハードリンクを共有したまま上書きする
+        #   ときに控え(.bak)が作れなかった場合の行き先
+        #   (引数は書き込み先。戻り値は真=控えなしでそのまま書く /
+        #   偽=書かない)
+        self.ask_no_backup_save = None
         self._pending_send_text = None
         self._on_settings_change = on_settings_change
         section = editor_settings if isinstance(editor_settings, dict) else {}
@@ -3508,11 +3513,11 @@ class EditorWindow(QMainWindow):
             docmod.save_document(self._doc, path=path, encoding=encoding,
                                  newline=newline, bom=bom, errors=errors,
                                  line_newlines=line_newlines,
-                                 ask_hardlink=self._ask_hardlink_save_choice)
+                                 ask_hardlink=self._ask_hardlink_save_choice,
+                                 ask_no_backup=self._ask_no_backup_save_choice)
         except docmod.SaveCancelled:
             self.statusBar().showMessage(
-                "保存をやめました（ハードリンクの扱いが選ばれて"
-                "いません）", 8000)
+                "保存をやめました（確認でやめるが選ばれました）", 8000)
             return False
         except (OSError, UnicodeEncodeError, ValueError) as e:
             self.statusBar().showMessage(f"保存できませんでした: {e}")
@@ -3570,6 +3575,25 @@ class EditorWindow(QMainWindow):
         if clicked is separate_button:
             return "separate"
         return "cancel"
+
+    def _ask_no_backup_save_choice(self, target):
+        """控え(.bak)が作れなかったとき、そのまま書いてよいか聞く。
+
+        戻り値は真=控えなしでそのまま書く / 偽=書かない。
+        差し替え口(ask_no_backup_save)があればそちらを使う。
+        既定は「書かない」(共有したままの上書きは元に戻せない
+        ため、黙って進めない作法に合わせる)。"""
+        if self.ask_no_backup_save is not None:
+            return bool(self.ask_no_backup_save(target))
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            "控え（.bak）が作れませんでした。\n"
+            "このファイルはほかの名前と中身を共有していて、"
+            "そのまま上書きすると元に戻せません。\n"
+            "控えなしで上書きしますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     def _confirm_external_overwrite(self) -> bool:
         """開いた後に外部で変わったファイルを上書きしてよいか。"""

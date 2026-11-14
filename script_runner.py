@@ -576,7 +576,9 @@ class ScriptRunnerWindow(QWidget):
         import threading
 
         def work():
-            run = core.execute_script(item.path, self.config, self._run_handle)
+            run = core.execute_script(
+                item.path, self.config, self._run_handle,
+                expected_sha256=item.result.sha256)
             self._run_signals.done.emit(run)
 
         self._run_thread = threading.Thread(

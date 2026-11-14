@@ -10,15 +10,19 @@
 #     (パネル自身の Python と版が違うと判定がずれるため)。import の確認は
 #     最上位の名前だけ(find_spec("a.b") は親を読み込んでしまうため)。
 #   - 実行は呼ぶ側(窓)が F5 かボタンを押したときだけ。ここは実行の部品だけ。
-#   - 実行の直前に sha256 を取り直すのは窓側の仕事(ここの file_sha256 を使う)。
-#     記録の sha256 は実行したときのもの。
+#   - 実行の直前に sha256 を取り直すのは窓側の仕事。execute_script に
+#     expected_sha256 を渡せば、起動の直前にもここで取り直して比べる
+#     (低8)。記録の sha256 は実行したときのもの。
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import tokenize
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +39,11 @@ PS_ALLOWLIST_FILENAME = "script_runner_ps_allowlist.json"
 # ブラウザの書きかけなど、対象にしない末尾。
 PARTIAL_SUFFIXES = (".crdownload", ".part", ".tmp")
 TARGET_EXTENSIONS = (".py", ".ps1")
+
+# BOM 無し UTF-8 の .ps1 を PowerShell 5.1 に読ませるための写しの
+# 接頭辞(高1)。写しは元の隣に作って実行後に消す。一覧からは外す。
+BOM_COPY_PREFIX = ".sr-bom-"
+UTF8_BOM = b"\xef\xbb\xbf"
 
 CHECK_TIMEOUT_SECONDS = 20
 PS_CHECK_TIMEOUT_SECONDS = 30
@@ -175,6 +184,8 @@ def list_candidates(folder, cutoff_ts: float, limit: int) -> list:
         lowered = name.lower()
         if lowered.endswith(PARTIAL_SUFFIXES):
             continue
+        if name.startswith(BOM_COPY_PREFIX):
+            continue  # BOM 付け写し(実行中だけ隣に居る)は対象にしない
         if not lowered.endswith(TARGET_EXTENSIONS):
             continue
         try:
@@ -186,7 +197,8 @@ def list_candidates(folder, cutoff_ts: float, limit: int) -> list:
         if stat.st_mtime < cutoff_ts:
             continue
         found.append((entry, stat.st_mtime, stat.st_size))
-    found.sort(key=lambda item: item[1], reverse=True)
+    # 新しい順。同点はパスで並べて、順序が安定するようにする。
+    found.sort(key=lambda item: (-item[1], str(item[0])))
     return found[:limit]
 
 
@@ -228,10 +240,14 @@ PYTHON_DANGER = {
         "os.rename": "名前を変える呼び出し",
         "os.replace": "名前を変える呼び出し",
         "os.system": "外のコマンドを呼ぶ呼び出し",
+        "os.popen": "外のコマンドを呼ぶ呼び出し",
+        "os.startfile": "外のファイル・アプリを開く呼び出し",
+        "os.makedirs": "フォルダを作る呼び出し",
         "shutil.rmtree": "フォルダを丸ごと消す呼び出し",
         "shutil.move": "ファイルを動かす呼び出し",
         "shutil.copy": "ファイルをコピーする呼び出し(上書き先)",
         "shutil.copy2": "ファイルをコピーする呼び出し(上書き先)",
+        "shutil.copyfile": "ファイルをコピーする呼び出し(上書き先)",
         "shutil.copytree": "フォルダをコピーする呼び出し(上書き先)",
     },
     "attrs": {
@@ -242,6 +258,8 @@ PYTHON_DANGER = {
         "rename": "名前を変える呼び出し",
         "replace": "名前を変える呼び出し",
         "rmdir": "フォルダを消す呼び出し",
+        "touch": "ファイルを作る・更新する呼び出し",
+        "mkdir": "フォルダを作る呼び出し",
     },
     "names": {
         "exec": "動的に実行する呼び出し",
@@ -265,7 +283,7 @@ _PY_CHECKER_SRC = r"""
 import ast
 import json
 import sys
-from importlib.util import find_spec
+from importlib.machinery import PathFinder
 
 
 def _dotted(node):
@@ -312,12 +330,16 @@ def main():
             if stmt.module:
                 tops.append((stmt.module.split(".")[0], stmt.lineno))
     seen = set()
+    # スクリプトと同じフォルダの自作モジュールも「ある」扱いにする
+    # ため、探す場所の先頭にスクリプトのフォルダを足す(中4)。
+    search_path = [p for p in [payload.get("script_dir")] if p]
+    search_path += sys.path
     for name, line in tops:
         if name in seen:
             continue
         seen.add(name)
         try:
-            spec = find_spec(name)
+            spec = PathFinder.find_spec(name, search_path)
         except Exception:
             spec = None
         if spec is None:
@@ -333,6 +355,34 @@ def main():
     def add(line, name, label):
         found.append({"line": line, "name": name, "label": label,
                       "text": srcline(line)})
+
+    # import の別名と from 取り込みを、先に名前対応表へ直す(中3)。
+    #   import os as o        → o は os
+    #   from os import remove → remove は os.remove
+    # これで o.remove(...) や remove(...) も一覧と照らせる。
+    bindings = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bindings[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    bindings[top] = top
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                continue
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = \
+                    node.module + "." + alias.name
+
+    def resolve(path):
+        if not path:
+            return path
+        head, dot, rest = path.partition(".")
+        if head in bindings:
+            return bindings[head] + (dot + rest if dot else "")
+        return path
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -354,26 +404,38 @@ def main():
             elif isinstance(func, ast.Attribute):
                 called = func.attr
                 path = _dotted(func)
-            if path and path in danger_paths:
-                add(node.lineno, path, danger_paths[path])
+            if path and resolve(path) in danger_paths:
+                add(node.lineno, resolve(path),
+                    danger_paths[resolve(path)])
             elif isinstance(func, ast.Attribute) and func.attr in danger_attrs:
                 add(node.lineno, func.attr, danger_attrs[func.attr])
             if called in danger_names:
                 add(node.lineno, called, danger_names[called])
-            if called == "open" and (isinstance(func, ast.Name) or path == "io.open"):
+            if called == "open" and isinstance(
+                    func, (ast.Name, ast.Attribute)):
+                # 組み込みの open(ファイル, モード) と、Path.open
+                # (モード, …) ではモード引数の位置が違う。
+                builtin_style = isinstance(func, ast.Name) \
+                    or resolve(path) == "io.open"
                 mode = None
                 unreadable = False
-                if len(node.args) >= 2:
-                    arg = node.args[1]
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        mode = arg.value
+                mode_arg = None
+                if builtin_style and len(node.args) >= 2:
+                    mode_arg = node.args[1]
+                elif not builtin_style and len(node.args) >= 1:
+                    mode_arg = node.args[0]
+                if mode_arg is not None:
+                    if isinstance(mode_arg, ast.Constant) \
+                            and isinstance(mode_arg.value, str):
+                        mode = mode_arg.value
                     else:
                         unreadable = True
                 else:
                     for keyword in node.keywords:
                         if keyword.arg == "mode":
                             value = keyword.value
-                            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            if isinstance(value, ast.Constant) \
+                                    and isinstance(value.value, str):
                                 mode = value.value
                             else:
                                 unreadable = True
@@ -391,16 +453,24 @@ main()
 """
 
 
-def _run_checker(python_exe: str, source: str):
-    """検査役をサブプロセスで走らせ、結果の dict を返す。失敗したら None。"""
-    payload = json.dumps({"source": source, "danger": PYTHON_DANGER})
+def _run_checker(python_exe: str, source: str, script_dir: str = ""):
+    """検査役をサブプロセスで走らせ、結果の dict を返す。失敗したら None。
+
+    検査役の作業フォルダは空の一時フォルダにする(中4)。スクリプトの
+    フォルダで走らせると、隣のモジュールがチェック中に読み込まれて
+    実行されうるため。同フォルダのモジュールの有無は、探す場所に
+    スクリプトのフォルダを足すことで別に確かめる。"""
+    payload = json.dumps({"source": source, "danger": PYTHON_DANGER,
+                          "script_dir": script_dir})
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
-        proc = subprocess.run(
-            [python_exe, "-c", _PY_CHECKER_SRC],
-            input=payload.encode("utf-8"),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=CHECK_TIMEOUT_SECONDS, creationflags=flags)
+        with tempfile.TemporaryDirectory() as empty_cwd:
+            proc = subprocess.run(
+                [python_exe, "-c", _PY_CHECKER_SRC],
+                input=payload.encode("utf-8"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=CHECK_TIMEOUT_SECONDS, creationflags=flags,
+                cwd=empty_cwd)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
@@ -426,10 +496,17 @@ def check_python_script(path, python_exe: str) -> CheckResult:
         result.headline = "ファイルが読めません"
         return result
     result.sha256 = hashlib.sha256(raw).hexdigest()
-    has_bom = raw.startswith(b"\xef\xbb\xbf")
+    has_bom = raw.startswith(UTF8_BOM)
+    # 読み方は coding 宣言に従う(低9)。宣言が無ければ UTF-8
+    # (BOM があれば utf-8-sig として判定される)。
     try:
-        source = raw.decode("utf-8-sig" if has_bom else "utf-8")
-    except UnicodeDecodeError:
+        detected, _consumed = tokenize.detect_encoding(
+            io.BytesIO(raw).readline)
+    except (SyntaxError, UnicodeDecodeError, LookupError):
+        detected = None
+    try:
+        source = raw.decode(detected or "utf-8")
+    except (UnicodeDecodeError, LookupError):
         result.status = STATUS_ERROR
         result.kind = "encoding"
         result.issues = [CheckIssue(
@@ -437,7 +514,7 @@ def check_python_script(path, python_exe: str) -> CheckResult:
                     "(cp932 などで保存されている可能性があります)")]
         result.headline = "文字コードが UTF-8 ではありません"
         return result
-    checked = _run_checker(python_exe, source)
+    checked = _run_checker(python_exe, source, str(path.parent))
     if checked is None:
         result.status = STATUS_UNKNOWN
         result.kind = "no_python"
@@ -564,9 +641,12 @@ foreach ($r in $ast.FindAll(
 }
 $statics = @()
 $dynamics = @()
+$methods = @()
 foreach ($m in $ast.FindAll(
     { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] },
     $true)) {
+    $methods += @{ line = $m.Extent.StartLineNumber
+                   member = [string]$m.Member.Value }
     if ($m.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
         $statics += @{ line = $m.Extent.StartLineNumber
                        type = $m.Expression.TypeName.FullName
@@ -590,7 +670,8 @@ foreach ($c in $cmds) {
     }
 }
 @{ errors = $errList; commands = $cmds; redirections = $redirs
-   statics = $statics; dynamics = $dynamics; resolved = $resolved } |
+   statics = $statics; dynamics = $dynamics; methods = $methods
+   resolved = $resolved } |
     ConvertTo-Json -Compress -Depth 6
 """
 
@@ -603,6 +684,51 @@ def _ps_allowed(name: str, allowlist) -> bool:
         if fnmatch.fnmatchcase(lowered, str(pattern).lower()):
             return True
     return False
+
+
+# 要確認にするメソッド名(中2)。型名付きの静的呼び出しだけでなく、
+# (Get-Item x).Delete() のような受け手つきの呼び出しも拾うため、
+# InvokeMemberExpressionAst の全部と照らす。
+_PS_MEMBER_PATTERNS = ("delete", "move*", "copy*", "create*", "kill",
+                       "start", "invoke*", "write*", "set*")
+
+
+def _ps_member_warns(methods) -> list:
+    """メソッド呼び出しの一覧 [{line, member}] から、要確認の
+    (行, 文) を作る。窓の無い環境でも確かめられるよう分けてある。"""
+    import fnmatch
+
+    warns = []
+    for item in methods or []:
+        member = str(item.get("member") or "")
+        if not member:
+            continue
+        lowered = member.lower()
+        if any(fnmatch.fnmatchcase(lowered, pattern)
+               for pattern in _PS_MEMBER_PATTERNS):
+            warns.append((int(item.get("line") or 0),
+                          f"メソッド呼び出しがあります({member})"))
+    return warns
+
+
+def ps1_bom_copy_source(path):
+    """BOM を付けた写しが要る .ps1 なら元のバイト列、要らなければ
+    None(高1)。
+
+    PowerShell 5.1 は、BOM の無いファイルを cp932 として読む。
+    BOM 無しで ASCII 以外のバイトを含む UTF-8 の .ps1 は、そのまま
+    ではチェック(ParseFile)も実行(-File)も文法エラーになるため、
+    BOM 付きの写しで読ませる。BOM 付き・ASCII のみは従来どおり
+    元のファイルをそのまま使う。"""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if raw.startswith(UTF8_BOM):
+        return None
+    if all(byte < 0x80 for byte in raw):
+        return None
+    return raw
 
 
 def check_powershell_script(path, powershell_exe=None, allowlist=None) -> CheckResult:
@@ -620,11 +746,35 @@ def check_powershell_script(path, powershell_exe=None, allowlist=None) -> CheckR
         return result
     if allowlist is None:
         allowlist = load_ps_allowlist()
+    # 高1: BOM 無し UTF-8 の .ps1 は、そのままでは PowerShell 5.1 が
+    # cp932 として読んで文法エラーになる。BOM を付けた写しを一時
+    # フォルダに作ってチェックし、エラー表示に出る写しのパスは
+    # 元のファイル名へ置き換える。sha256 は常に元のファイルのもの。
+    bom_raw = ps1_bom_copy_source(path)
+    if bom_raw is None:
+        return _run_ps_checker(path, exe, allowlist, result)
+    with tempfile.TemporaryDirectory() as tmp:
+        copy_path = Path(tmp) / path.name
+        try:
+            copy_path.write_bytes(UTF8_BOM + bom_raw)
+        except OSError:
+            return _run_ps_checker(path, exe, allowlist, result)
+        checked_result = _run_ps_checker(copy_path, exe, allowlist, result)
+        for issue in checked_result.issues:
+            issue.message = issue.message.replace(
+                str(copy_path), str(path))
+            issue.text = issue.text.replace(str(copy_path), str(path))
+        return checked_result
+
+
+def _run_ps_checker(target, exe, allowlist, result) -> CheckResult:
+    """チェック役の PowerShell を走らせ、結果を result へ詰める。
+    target が実際に ParseFile するファイル(写しのこともある)。"""
     import base64
 
     encoded = base64.b64encode(_PS_CHECKER_SRC.encode("utf-16-le")).decode("ascii")
     env = dict(os.environ)
-    env["SCRIPT_RUNNER_TARGET"] = str(path)
+    env["SCRIPT_RUNNER_TARGET"] = str(target)
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         proc = subprocess.run(
@@ -678,6 +828,9 @@ def check_powershell_script(path, powershell_exe=None, allowlist=None) -> CheckR
                       f"([{static.get('type')}]::{static.get('member')})"))
     for dynamic in checked.get("dynamics") or []:
         warns.append((int(dynamic.get("line") or 0), "動的な呼び出しがあります"))
+    for line, message in _ps_member_warns(checked.get("methods")):
+        if (line, message) not in warns:
+            warns.append((line, message))
     if warns:
         warns.sort(key=lambda item: item[0])
         result.status = STATUS_WARN
@@ -769,19 +922,155 @@ def detect_policy_stop(text: str) -> bool:
     return any(marker.lower() in lowered for marker in _POLICY_MARKERS)
 
 
-def execute_script(path, config: dict, handle: RunHandle = None) -> RunResult:
+def detect_policy_stop(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in _POLICY_MARKERS)
+
+
+# ---------------------------------------------------------------
+# Job Object(Windows): 時間切れで孫プロセスごと止めるため(中5)
+# ---------------------------------------------------------------
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+
+def _job_assign(proc):
+    """子プロセスを Job Object(KILL_ON_JOB_CLOSE)へ入れる。
+
+    戻り値はジョブのハンドル。Windows でない・失敗したら None。
+    本体が終わっても孫プロセスがパイプを持っていると communicate
+    が待ち続けるため、時間切れ時はジョブを閉じて木ごと終わらせる。
+    テストで差し替えられる継ぎ目(VM では実測できない)。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID,
+                                              wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+            wintypes.DWORD]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE,
+                                                      wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount")]
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = \
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(job)
+            return None
+        if not kernel32.AssignProcessToJobObject(
+                job, wintypes.HANDLE(proc._handle)):
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:  # noqa: BLE001  入れられなくても実行は続ける
+        return None
+
+
+def _job_close(job) -> None:
+    """ジョブのハンドルを閉じる。KILL_ON_JOB_CLOSE のため、閉じる
+    だけで中のプロセスが全部終わる。テストで差し替えられる継ぎ目。"""
+    if job is None or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def execute_script(path, config: dict, handle: RunHandle = None,
+                   expected_sha256: str = None) -> RunResult:
     """スクリプトを1回実行する(ブロッキング。窓は別スレッドから呼ぶ)。
 
-    実行してよいかの判断(F5 かどうか、要確認かどうか、sha256 の
-    取り直し)は呼ぶ側の仕事。ここは言われたものを言われたとおり走らせる。"""
+    実行してよいかの判断(F5 かどうか、要確認かどうか)は呼ぶ側の
+    仕事。expected_sha256 を渡すと、起動の直前に取り直して比べ、
+    違えば実行しない(低8)。記録と結果の sha256 は常に元の
+    ファイルのもの。"""
     path = Path(path)
     result = RunResult(name=path.name, path=str(path),
                        sha256=file_sha256(path))
     timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
     is_ps = path.suffix.lower() == ".ps1"
+    started = time.monotonic()
+    if expected_sha256 is not None:
+        current = file_sha256(path)
+        result.sha256 = current
+        if current != expected_sha256:
+            result.seconds = time.monotonic() - started
+            result.start_error = \
+                "中身が変わっていたため、実行しませんでした"
+            result.stderr = result.start_error
+            return result
+    run_path = path
+    bom_copy = None
     if is_ps:
         exe = find_powershell() or "powershell.exe"
-        argv = [exe, "-NoProfile", "-File", str(path)]
+        # 高1: BOM 無し UTF-8 は、BOM 付きの写しで実行する。写しは
+        # 元と同じフォルダに作る($PSScriptRoot と相対パスが変わら
+        # ないため)。sha256 は元のファイルで取る(上で取得済み)。
+        bom_raw = ps1_bom_copy_source(path)
+        if bom_raw is not None:
+            bom_copy = path.parent / (BOM_COPY_PREFIX + path.name)
+            try:
+                bom_copy.write_bytes(UTF8_BOM + bom_raw)
+            except OSError:
+                result.seconds = time.monotonic() - started
+                result.start_error = (
+                    "文字コードの問題で実行できませんでした。"
+                    "BOM 付きの UTF-8 で保存してください")
+                result.stderr = result.start_error
+                return result
+            run_path = bom_copy
+        argv = [exe, "-NoProfile", "-File", str(run_path)]
         env = dict(os.environ)
     else:
         python = str(config.get("python") or "python")
@@ -790,31 +1079,52 @@ def execute_script(path, config: dict, handle: RunHandle = None) -> RunResult:
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    started = time.monotonic()
     try:
-        proc = subprocess.Popen(
-            argv, cwd=str(path.parent), env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=flags)
-    except OSError as e:
-        result.seconds = time.monotonic() - started
-        result.start_error = str(e)
-        result.stderr = f"起動できませんでした: {e}"
-        return result
-    if handle is not None:
-        handle._attach(proc)
-        if handle.stopped:
-            kill_tree(proc)
-    try:
-        out_raw, err_raw = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        result.timed_out = True
-        kill_tree(proc)
         try:
-            out_raw, err_raw = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            out_raw, err_raw = b"", b""
+            proc = subprocess.Popen(
+                argv, cwd=str(path.parent), env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=flags)
+        except OSError as e:
+            result.seconds = time.monotonic() - started
+            result.start_error = str(e)
+            result.stderr = f"起動できませんでした: {e}"
+            return result
+        job = _job_assign(proc)
+        try:
+            if handle is not None:
+                handle._attach(proc)
+                if handle.stopped:
+                    kill_tree(proc)
+            try:
+                out_raw, err_raw = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as first:
+                result.timed_out = True
+                out_raw = first.output or b""
+                err_raw = first.stderr or b""
+                if job is not None:
+                    _job_close(job)  # 孫プロセスごと終わらせる
+                    job = None
+                kill_tree(proc)
+                try:
+                    out_raw, err_raw = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired as second:
+                    # 孫がパイプを持ち続けて回収できなくても、途中
+                    # までの出力は捨てない(中5)。
+                    if second.output:
+                        out_raw = second.output
+                    if second.stderr:
+                        err_raw = second.stderr
+        finally:
+            if job is not None:
+                _job_close(job)
+    finally:
+        if bom_copy is not None:
+            try:
+                bom_copy.unlink()
+            except OSError:
+                pass
     result.seconds = time.monotonic() - started
     result.exit_code = proc.returncode
     if handle is not None and handle.stopped:
@@ -836,7 +1146,14 @@ def truncate_text(text: str, head_lines: int = 200, tail_lines: int = 50,
 
     行数が head+tail を超えたら間に「(中略 N 行)」を入れる。それでも
     全体の文字数が max_chars を超えたら、文字数でも先頭と末尾に切る。
-    ちょうど境目のときは何もしない。"""
+    ちょうど境目のときは何もしない。
+
+    行を数える前に、改行を \n にそろえ、末尾の改行を1つ外す(低7)。
+    末尾の改行で空行が1つ増えて数えると、ちょうど境目の行数でも
+    中略が入ってしまうため。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]
     lines = text.split("\n")
     if len(lines) > head_lines + tail_lines:
         omitted = len(lines) - head_lines - tail_lines
@@ -944,7 +1261,10 @@ def build_check_preview(result: CheckResult) -> str:
                 lines.append(" " * (4 + issue.offset - 1) + "^")
     if result.status == STATUS_ERROR and result.kind == "syntax":
         pass
-    elif result.status in (STATUS_WARN, STATUS_UNKNOWN):
+    elif result.status == STATUS_UNKNOWN:
+        # チェックできていないのに「文法エラーはありません」は嘘(低6)。
+        lines.append("チェックできていません")
+    elif result.status == STATUS_WARN:
         lines.append("文法エラーはありません")
     return "\n".join(lines)
 

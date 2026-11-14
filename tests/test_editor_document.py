@@ -26,6 +26,19 @@ import text_encoding  # noqa: E402
 from editor import document as docmod  # noqa: E402
 from editor.keymap import DEFAULT_KEYMAP, merge_keymap  # noqa: E402
 
+
+class SkipTest(Exception):
+    """この環境では確かめられないことの合図(失敗とは分ける)。"""
+
+
+def _symlink(target, link):
+    """シンボリックリンクを作る。作れない環境(Windows で権限が
+    無いと WinError 1314)では、そのテストを飛ばす。"""
+    try:
+        os.symlink(target, link)
+    except OSError as e:
+        raise SkipTest(f"シンボリックリンクを作れません: {e}") from e
+
 SAMPLE = "あいうえお\n日本語のテキストです。\n3行目、ABC。\n"
 
 
@@ -397,7 +410,7 @@ def test_link_kind():
         assert docmod.link_kind(os.path.join(tmp, "無い.txt")) is None
         assert docmod.link_kind(None) is None
         link = os.path.join(tmp, "link.txt")
-        os.symlink(real, link)
+        _symlink(real, link)
         assert docmod.link_kind(link) == "symlink"
         hard = os.path.join(tmp, "hard.txt")
         os.link(real, hard)
@@ -412,7 +425,7 @@ def test_save_symlink_writes_real_file_and_keeps_link():
         real = os.path.join(tmp, "real.txt")
         _write(real, "古い内容\n".encode("utf-8"))
         link = os.path.join(tmp, "link.txt")
-        os.symlink(real, link)
+        _symlink(real, link)
         doc = docmod.load_document(link)
         doc.text = "新しい内容\n"
         written = docmod.save_document(doc)
@@ -503,6 +516,101 @@ def test_save_hardlink_without_seam_is_separate():
         assert Path(other).read_text(encoding="utf-8") == "古い内容\n"
 
 
+def _fail_copyfile():
+    """控え作りを失敗させる差し替えを入れる(戻り値は元の関数)。"""
+    original = docmod.shutil.copyfile
+
+    def raising(src, dst):
+        raise OSError("控えを作れません")
+
+    docmod.shutil.copyfile = raising
+    return original
+
+
+def test_save_hardlink_shared_no_backup_stops_by_default():
+    """共有したままの上書きで控えが作れないとき、確認の差し替え口
+    が無ければ書かない(SaveCancelled で止まる)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        original = _fail_copyfile()
+        try:
+            try:
+                docmod.save_document(
+                    doc, ask_hardlink=lambda target: "shared")
+            except docmod.SaveCancelled:
+                pass
+            else:
+                raise AssertionError("SaveCancelled が上がらなかった")
+        finally:
+            docmod.shutil.copyfile = original
+        assert Path(path).read_text(encoding="utf-8") == "古い内容\n"
+        assert Path(other).read_text(encoding="utf-8") == "古い内容\n"
+        assert not os.path.exists(path + ".bak")
+
+
+def test_save_hardlink_shared_no_backup_asks_seam():
+    """控えが作れないときは差し替え口で行き先を決める。「書かない」
+    なら止まり、「書く」なら控えなしでその場書き込みする。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        original = _fail_copyfile()
+        try:
+            asked = []
+            try:
+                docmod.save_document(
+                    doc, ask_hardlink=lambda target: "shared",
+                    ask_no_backup=lambda target: asked.append(target)
+                    or False)
+            except docmod.SaveCancelled:
+                pass
+            else:
+                raise AssertionError("SaveCancelled が上がらなかった")
+            assert asked == [path]
+            assert Path(path).read_text(encoding="utf-8") == "古い内容\n"
+            docmod.save_document(
+                doc, ask_hardlink=lambda target: "shared",
+                ask_no_backup=lambda target: True)
+        finally:
+            docmod.shutil.copyfile = original
+        assert os.stat(path).st_ino == ino  # その場書き込み(リンク維持)
+        assert Path(other).read_text(encoding="utf-8") == "新しい内容\n"
+        assert not os.path.exists(path + ".bak")  # 控えは無いまま
+
+
+def test_save_hardlink_separate_backup_failure_still_saves():
+    """別ファイル化(原子的な置き換え)の経路では、控えが作れなく
+    ても従来どおり保存する(確認も出ない)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        _write(path, "古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        ino = os.stat(path).st_ino
+        doc = docmod.load_document(path)
+        doc.text = "新しい内容\n"
+        original = _fail_copyfile()
+        try:
+            docmod.save_document(
+                doc, ask_hardlink=lambda target: "separate",
+                ask_no_backup=lambda target: 1 / 0)  # 呼ばれないこと
+        finally:
+            docmod.shutil.copyfile = original
+        assert os.stat(path).st_ino != ino
+        assert Path(path).read_text(encoding="utf-8") == "新しい内容\n"
+        assert Path(other).read_text(encoding="utf-8") == "古い内容\n"
+
+
 def test_replaced_line_newlines_keeps_untouched_kinds():
     """置換後の改行種別: 置換していない行は元の種別を引き継ぐ。"""
     old_text = "aaa\nbbb\nccc\nddd\n"
@@ -528,16 +636,21 @@ def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
     failed = 0
+    skipped = 0
     for name, fn in tests:
         try:
             fn()
             print(f"ok   {name}")
+        except SkipTest as e:
+            skipped += 1
+            print(f"skip {name}: {e}")
         except Exception as e:  # noqa: BLE001
             failed += 1
             import traceback
             traceback.print_exc()
             print(f"FAIL {name}: {e}")
-    print(f"{len(tests) - failed}/{len(tests)} passed")
+    print(f"{len(tests) - failed - skipped}/{len(tests)} passed"
+          + (f" ({skipped} skipped)" if skipped else ""))
     sys.stdout.flush()
     os._exit(1 if failed else 0)
 

@@ -56,6 +56,19 @@ from editor.window import (  # noqa: E402
 APP = None
 
 
+class SkipTest(Exception):
+    """この環境では確かめられないことの合図(失敗とは分ける)。"""
+
+
+def _symlink(target, link):
+    """シンボリックリンクを作る。作れない環境(Windows で権限が
+    無いと WinError 1314)では、そのテストを飛ばす。"""
+    try:
+        os.symlink(target, link)
+    except OSError as e:
+        raise SkipTest(f"シンボリックリンクを作れません: {e}") from e
+
+
 def app():
     global APP
     if APP is None:
@@ -134,7 +147,7 @@ def test_save_symlink_keeps_link_and_shows_status():
         real = os.path.join(tmp, "real.txt")
         Path(real).write_bytes("古い内容\n".encode("utf-8"))
         link = os.path.join(tmp, "link.txt")
-        os.symlink(real, link)
+        _symlink(real, link)
         window = make_window(link)
         try:
             assert "リンク" in window._enc_label.text(), \
@@ -178,6 +191,44 @@ def test_save_hardlink_asks_and_follows_choice():
                 "追記古い内容\n"
         finally:
             discard_close(window)
+
+
+def test_save_hardlink_shared_no_backup_asks():
+    """共有したままの保存で控え(.bak)が作れないとき、窓の差し替え
+    口で行き先を聞く。「書かない」なら保存せず、「書く」なら控え
+    なしで保存する。"""
+    from editor import document as docmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.txt")
+        other = os.path.join(tmp, "b.txt")
+        Path(path).write_bytes("古い内容\n".encode("utf-8"))
+        os.link(path, other)
+        window = make_window(path)
+        original = docmod.shutil.copyfile
+
+        def raising(src, dst):
+            raise OSError("控えを作れません")
+
+        try:
+            window.ask_hardlink_save = lambda target: "shared"
+            asked = []
+            window.ask_no_backup_save = \
+                lambda target: asked.append(target) or False
+            docmod.shutil.copyfile = raising
+            type_text(window, "追記")
+            assert not window.save()
+            assert asked == [path]
+            assert Path(path).read_text(encoding="utf-8") == "古い内容\n"
+            assert "やめました" in window.statusBar().currentMessage()
+            window.ask_no_backup_save = lambda target: True
+            assert window.save()
+        finally:
+            docmod.shutil.copyfile = original
+            discard_close(window)
+        assert Path(other).read_text(encoding="utf-8") == \
+            "追記古い内容\n"
+        assert not os.path.exists(path + ".bak")
 
 
 def test_save_to_converts_encoding():
@@ -3860,16 +3911,21 @@ def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
     failed = 0
+    skipped = 0
     for name, fn in tests:
         try:
             fn()
             print(f"ok   {name}")
+        except SkipTest as e:
+            skipped += 1
+            print(f"skip {name}: {e}")
         except Exception as e:  # noqa: BLE001
             failed += 1
             import traceback
             traceback.print_exc()
             print(f"FAIL {name}: {e}")
-    print(f"{len(tests) - failed}/{len(tests)} passed")
+    print(f"{len(tests) - failed - skipped}/{len(tests)} passed"
+          + (f" ({skipped} skipped)" if skipped else ""))
     sys.stdout.flush()
     os._exit(1 if failed else 0)
 

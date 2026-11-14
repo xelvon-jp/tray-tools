@@ -448,6 +448,311 @@ def test_check_script_dispatch():
             assert result.status == core.STATUS_UNKNOWN, result
 
 
+# ---------------------------------------------------------------
+# レビュー req-20261114-13 の追加分
+# ---------------------------------------------------------------
+def test_list_candidates_excludes_bom_copies_and_stable_order():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        now = time.time()
+        write(tmp, core.BOM_COPY_PREFIX + "x.ps1", "Write-Output 1\n")
+        write(tmp, "b.py", "print(1)\n")
+        write(tmp, "a.py", "print(1)\n")
+        for name in ("b.py", "a.py", core.BOM_COPY_PREFIX + "x.ps1"):
+            os.utime(tmp / name, (now - 60, now - 60))
+        found = core.list_candidates(tmp, now - 3600, 20)
+        names = [p.name for p, _m, _s in found]
+        # 写しは出ない。同点は名前順で安定する。
+        assert names == ["a.py", "b.py"], names
+
+
+def test_check_python_danger_respects_import_aliases():
+    cases = [
+        ("from os import remove\nremove('x')\n", "os.remove"),
+        ("from shutil import rmtree\nrmtree('d')\n", "shutil.rmtree"),
+        ("import os as o\no.remove('x')\n", "os.remove"),
+        ("import os\nos.popen('x')\n", "os.popen"),
+        ("import os\nos.startfile('x')\n", "os.startfile"),
+        ("import os\nos.makedirs('d')\n", "os.makedirs"),
+        ("import shutil\nshutil.copyfile('a', 'b')\n", "shutil.copyfile"),
+        ("from pathlib import Path\nPath('x').open('w')\n", "open"),
+        ("from pathlib import Path\nPath('x').touch()\n", "touch"),
+        ("from pathlib import Path\nPath('x').mkdir()\n", "mkdir"),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        for i, (src, needle) in enumerate(cases):
+            path = write(Path(td), f"a{i}.py", src)
+            result = core.check_python_script(path, PY)
+            assert result.status == core.STATUS_WARN, (src, result)
+            assert any(needle in issue.message
+                       for issue in result.issues), (src, result)
+        negatives = [
+            "from os import getcwd\nprint(getcwd())\n",
+            "from pathlib import Path\nPath('x').open()\n",
+            "from pathlib import Path\nPath('x').open('r')\n",
+            "from pathlib import Path\nprint(Path('x').read_text())\n",
+        ]
+        for i, src in enumerate(negatives):
+            path = write(Path(td), f"n{i}.py", src)
+            result = core.check_python_script(path, PY)
+            assert result.status == core.STATUS_OK, (src, result)
+
+
+def test_check_python_same_folder_module_found():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write(tmp, "sr_local_helper_zzz.py", "VALUE = 1\n")
+        path = write(tmp, "uses.py",
+                     "import sr_local_helper_zzz\n"
+                     "print(sr_local_helper_zzz.VALUE)\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_OK, result
+        path = write(tmp, "uses2.py", "import sr_no_such_module_zzz\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_ERROR, result
+        assert result.kind == "import"
+
+
+def test_check_python_cp932_coding_declaration():
+    with tempfile.TemporaryDirectory() as td:
+        raw = "# -*- coding: cp932 -*-\nprint('あ')\n".encode("cp932")
+        path = write(Path(td), "declared.py", raw)
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_OK, result
+
+
+def test_truncate_trailing_newline_and_crlf():
+    exact = "\n".join(f"line{i}" for i in range(250))
+    # 末尾の改行は行数に数えない(ちょうど250行で中略が入らない)。
+    assert core.truncate_text(exact + "\n", 200, 50, 100000) == exact
+    # CRLF も \n にそろえて数える。
+    crlf = "\r\n".join(f"line{i}" for i in range(250)) + "\r\n"
+    assert core.truncate_text(crlf, 200, 50, 100000) == exact
+    over = "\n".join(f"line{i}" for i in range(251)) + "\n"
+    assert "(中略 1 行)" in core.truncate_text(over, 200, 50, 100000)
+
+
+def test_build_check_preview_unknown():
+    result = core.CheckResult(status=core.STATUS_UNKNOWN,
+                              kind="no_powershell")
+    preview = core.build_check_preview(result)
+    assert "チェックできていません" in preview
+    assert "文法エラーはありません" not in preview
+    warn = core.CheckResult(status=core.STATUS_WARN, kind="danger")
+    assert "文法エラーはありません" in core.build_check_preview(warn)
+
+
+def test_ps_member_warns_matching():
+    methods = [
+        {"line": 1, "member": "Delete"},
+        {"line": 2, "member": "MoveTo"},
+        {"line": 3, "member": "CopyFile"},
+        {"line": 4, "member": "CreateDirectory"},
+        {"line": 5, "member": "Kill"},
+        {"line": 6, "member": "Start"},
+        {"line": 7, "member": "InvokeScript"},
+        {"line": 8, "member": "WriteAllText"},
+        {"line": 9, "member": "SetContent"},
+        {"line": 10, "member": "Read"},
+        {"line": 11, "member": "ToString"},
+        {"line": 12, "member": "StartProcess"},  # Start は完全一致だけ
+        {"line": 13, "member": ""},
+    ]
+    warns = core._ps_member_warns(methods)
+    assert [line for line, _msg in warns] == [1, 2, 3, 4, 5, 6, 7, 8, 9], \
+        warns
+    assert "Delete" in warns[0][1]
+
+
+def test_ps1_bom_copy_source_cases():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        plain = write(tmp, "a.ps1", "Write-Output 1\n")
+        assert core.ps1_bom_copy_source(plain) is None  # ASCII のみ
+        bomed = write(tmp, "b.ps1",
+                      b"\xef\xbb\xbf" + "Write-Output 'あ'\n".encode("utf-8"))
+        assert core.ps1_bom_copy_source(bomed) is None  # BOM 付き
+        jp = write(tmp, "c.ps1", "Write-Output 'こんにちは'\n")
+        assert core.ps1_bom_copy_source(jp) == jp.read_bytes()
+        assert core.ps1_bom_copy_source(tmp / "none.ps1") is None
+
+
+_PS_STUB_RESULT = {"errors": [], "commands": [], "redirections": [],
+                   "statics": [], "dynamics": [], "methods": [],
+                   "resolved": {}}
+
+
+def _write_stub_ps(tmp: Path, payload: dict, record: Path) -> Path:
+    """powershell.exe の代わりに置く検査役もどき。
+
+    SCRIPT_RUNNER_TARGET のパスと先頭3バイトを record へ書き、
+    payload の JSON を標準出力へ返す。"""
+    src = (
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "target = os.environ['SCRIPT_RUNNER_TARGET']\n"
+        "data = open(target, 'rb').read()\n"
+        f"rec = open({str(record)!r}, 'w', encoding='utf-8')\n"
+        "rec.write(target + '\\n' + data[:3].hex())\n"
+        "rec.close()\n"
+        f"print(json.dumps({payload!r}))\n"
+    )
+    stub = tmp / "stub_ps.py"
+    stub.write_text(src, encoding="utf-8", newline="")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_check_powershell_bomless_utf8_uses_copy():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        record = tmp / "record.txt"
+        stub = _write_stub_ps(tmp, _PS_STUB_RESULT, record)
+        path = write(tmp, "jp.ps1", "Write-Output 'こんにちは'\n")
+        result = core.check_powershell_script(
+            path, powershell_exe=str(stub))
+        assert result.status == core.STATUS_OK, result
+        target, head = record.read_text(encoding="utf-8").splitlines()
+        assert target != str(path)             # 写しをチェックしている
+        assert Path(target).name == "jp.ps1"   # 名前は元のまま
+        assert Path(target).parent != tmp      # 一時フォルダ側
+        assert head == "efbbbf"                # BOM が付いている
+        assert result.sha256 == core.file_sha256(path)  # sha は元のもの
+        assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+        # BOM 付きは元のファイルをそのまま使う。
+        bomed = write(tmp, "b.ps1",
+                      b"\xef\xbb\xbf" + "Write-Output 'あ'\n".encode("utf-8"))
+        result = core.check_powershell_script(
+            bomed, powershell_exe=str(stub))
+        assert result.status == core.STATUS_OK, result
+        target, _head = record.read_text(encoding="utf-8").splitlines()
+        assert target == str(bomed)
+
+
+def test_check_powershell_member_warns_via_stub():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        payload = dict(_PS_STUB_RESULT, methods=[
+            {"line": 2, "member": "Delete"},
+            {"line": 3, "member": "Read"}])
+        stub = _write_stub_ps(tmp, payload, tmp / "record.txt")
+        path = write(tmp, "m.ps1",
+                     "Write-Output 1\n(Get-Item 'x').Delete()\n")
+        result = core.check_powershell_script(
+            path, powershell_exe=str(stub))
+        assert result.status == core.STATUS_WARN, result
+        assert any(issue.line == 2 and "Delete" in issue.message
+                   for issue in result.issues), result
+        assert all("Read" not in issue.message
+                   for issue in result.issues), result
+
+
+def _write_run_stub(tmp: Path, record: Path) -> Path:
+    """powershell.exe の代わりに置く実行もどき。-File の対象パスと
+    先頭3バイトを record へ書いて、正常終了する。"""
+    src = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "target = sys.argv[sys.argv.index('-File') + 1]\n"
+        "data = open(target, 'rb').read()\n"
+        f"rec = open({str(record)!r}, 'w', encoding='utf-8')\n"
+        "rec.write(target + '\\n' + data[:3].hex())\n"
+        "rec.close()\n"
+    )
+    stub = tmp / "stub_run.py"
+    stub.write_text(src, encoding="utf-8", newline="")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_execute_powershell_bomless_utf8_uses_copy_and_cleans_up():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        record = tmp / "run_record.txt"
+        stub = _write_run_stub(tmp, record)
+        path = write(tmp, "run.ps1", "Write-Output 'こんにちは'\n")
+        original = core.find_powershell
+        core.find_powershell = lambda: str(stub)
+        try:
+            run = core.execute_script(path, CONFIG)
+        finally:
+            core.find_powershell = original
+        assert run.exit_code == 0, run
+        target, head = record.read_text(encoding="utf-8").splitlines()
+        copy_path = tmp / (core.BOM_COPY_PREFIX + "run.ps1")
+        assert target == str(copy_path)  # 同じフォルダの写しで実行
+        assert head == "efbbbf"
+        assert not copy_path.exists()   # 終わったら消える
+        assert run.sha256 == core.file_sha256(path)
+        assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_execute_powershell_bom_copy_failure_is_encoding_error():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        record = tmp / "run_record.txt"
+        stub = _write_run_stub(tmp, record)
+        path = write(tmp, "run.ps1", "Write-Output 'こんにちは'\n")
+        original_find = core.find_powershell
+        original_write_bytes = Path.write_bytes
+
+        def flaky_write_bytes(self, data):
+            if self.name.startswith(core.BOM_COPY_PREFIX):
+                raise OSError("写しを作れません")
+            return original_write_bytes(self, data)
+
+        core.find_powershell = lambda: str(stub)
+        Path.write_bytes = flaky_write_bytes
+        try:
+            run = core.execute_script(path, CONFIG)
+        finally:
+            core.find_powershell = original_find
+            Path.write_bytes = original_write_bytes
+        assert run.exit_code is None
+        assert "BOM 付きの UTF-8 で保存してください" in run.start_error
+        assert not record.exists()  # 実行されていない
+
+
+def test_execute_expected_sha256():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        marker = tmp / "ran.txt"
+        path = write(tmp, "mark.py",
+                     f"open({str(marker)!r}, 'w').write('x')\n")
+        good = core.file_sha256(path)
+        run = core.execute_script(path, CONFIG, expected_sha256="0" * 64)
+        assert run.exit_code is None and run.start_error
+        assert not marker.exists()
+        run = core.execute_script(path, CONFIG, expected_sha256=good)
+        assert run.exit_code == 0 and marker.exists()
+
+
+def test_execute_timeout_keeps_partial_output_and_closes_job():
+    original_assign, original_close = core._job_assign, core._job_close
+    closed = []
+    core._job_assign = lambda proc: "JOB"
+    core._job_close = lambda job: closed.append(job)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            path = write(
+                Path(td), "family.py",
+                "import subprocess, sys, time\n"
+                "print('start', flush=True)\n"
+                "subprocess.Popen([sys.executable, '-c',"
+                " 'import time; time.sleep(30)'])\n"
+                "time.sleep(30)\n")
+            config = dict(CONFIG, timeout_seconds=1)
+            started = time.monotonic()
+            run = core.execute_script(path, config)
+            elapsed = time.monotonic() - started
+    finally:
+        core._job_assign, core._job_close = original_assign, original_close
+    assert run.timed_out
+    assert closed == ["JOB"], closed       # ジョブを閉じて止めた
+    assert "start" in run.stdout           # 部分出力を捨てない
+    assert elapsed < 25, elapsed
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -477,6 +782,20 @@ if __name__ == "__main__":
         test_execute_missing_python,
         test_append_run_log,
         test_check_script_dispatch,
+        test_list_candidates_excludes_bom_copies_and_stable_order,
+        test_check_python_danger_respects_import_aliases,
+        test_check_python_same_folder_module_found,
+        test_check_python_cp932_coding_declaration,
+        test_truncate_trailing_newline_and_crlf,
+        test_build_check_preview_unknown,
+        test_ps_member_warns_matching,
+        test_ps1_bom_copy_source_cases,
+        test_check_powershell_bomless_utf8_uses_copy,
+        test_check_powershell_member_warns_via_stub,
+        test_execute_powershell_bomless_utf8_uses_copy_and_cleans_up,
+        test_execute_powershell_bom_copy_failure_is_encoding_error,
+        test_execute_expected_sha256,
+        test_execute_timeout_keeps_partial_output_and_closes_job,
     ]
     for test in tests:
         test()

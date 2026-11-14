@@ -41,8 +41,9 @@ DETECT_HEAD_BYTES = 4 * 1024 * 1024
 
 
 class SaveCancelled(Exception):
-    """保存先がハードリンクで、利用者が「やめる」を選んだための
-    中止。書き込みは行われていない。
+    """保存の確認で利用者が「やめる」を選んだための中止
+    (ハードリンクの行き先、控えが作れなかったときの扱い)。
+    書き込みは行われていない。
 
     OSError 等の失敗とは分けるため専用の例外にする(窓側はこれを
     受けて「保存をやめました」と知らせる)。"""
@@ -509,7 +510,7 @@ def _next_backup_path(target):
 def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
                   bom=None, backup=True, errors="strict",
                   line_newlines=None, numbered_backup=False,
-                  ask_hardlink=None) -> str:
+                  ask_hardlink=None, ask_no_backup=None) -> str:
     """doc をファイルへ書く。成功したら doc 側の控え(保存先・文字コード・
     改行・BOM・ディスク上の印)を、実際に書いた内容に合わせて更新して、
     書いたパスを返す。
@@ -536,7 +537,16 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
         は従来どおり置き換える(この名前だけ切り離れる)。"cancel"
         は書かずに SaveCancelled を上げる。ask_hardlink を渡さ
         なければ "separate"(従来の動き。横断置換など、窓を介さ
-        ない経路はこちら)"""
+        ない経路はこちら)
+      - ハードリンクで "shared" のとき、その場書き込みは元に戻せ
+        ないので、控え(.bak)が作れなかったらそのままでは書かな
+        い。ask_no_backup(書き込み先を受け取り、真なら控えなしで
+        書く)で行き先を決め、偽なら SaveCancelled を上げる。
+        ask_no_backup を渡さなければ「書かない」(対話できない
+        経路の既定。黙って進めない)。別ファイル化(原子的な置き
+        換え)の経路と、シンボリックリンクの経路では、控えが作れ
+        なくても従来どおり保存する(置き換える前の実体は置き換え
+        が済むまで残るため)"""
     target = path if path is not None else doc.path
     if not target:
         raise ValueError("保存先が決まっていません")
@@ -553,13 +563,19 @@ def save_document(doc: TextDocument, path=None, encoding=None, newline=None,
         if choice == "cancel":
             raise SaveCancelled(target)
         in_place = choice == "shared"
+    backup_failed = False
     if backup and os.path.exists(write_target):
         try:
             backup_path = _next_backup_path(write_target) \
                 if numbered_backup else write_target + ".bak"
             shutil.copyfile(write_target, backup_path)
         except OSError:
-            pass  # 控えが作れなくても保存自体は止めない
+            backup_failed = True  # 控えが作れなかった印(直下で扱う)
+    if in_place and backup_failed:
+        proceed = ask_no_backup(write_target) \
+            if ask_no_backup is not None else False
+        if not proceed:
+            raise SaveCancelled(target)
     if in_place:
         _in_place_write(write_target, data)
     else:

@@ -347,9 +347,11 @@ def test_window_library_dialog_drives_registration():
     saved = []
     window = make_window("x", on_settings_change=saved.append)
     try:
-        # マクロメニューに入口がある。
+        # 管理の入口は Python マクロのペインへ統合され、マクロ
+        # メニューには無い (管理画面の窓自体は残し、ここでは
+        # 窓側の保存経路を直接確かめる)。
         labels = [a.text() for a in window._macro_menu.actions()]
-        assert any("マクロの管理" in label for label in labels)
+        assert not any("マクロの管理" in label for label in labels)
         dialog = MacroLibraryDialog(
             window, macros=window.registered_macros(),
             reserved_keys={"Ctrl+S": "上書き保存"},

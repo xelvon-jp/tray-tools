@@ -1038,7 +1038,7 @@ def test_ctrl_r_opens_find_bar():
         discard_close(window)
 
 
-def test_macro_record_and_play_keys():
+def test_macro_record_and_run_all_keys():
     window = make_window()
     try:
         window._edit.setPlainText("")
@@ -1052,6 +1052,9 @@ def test_macro_record_and_play_keys():
         assert window._act_macro_record.isChecked()
         QTest.keyClicks(window._edit, "ab")
         app().processEvents()
+        # 記録で自動で開いたペインのライブ表示を、その場で
+        # 同期しておく (実機ではタイマーが行う)。
+        window._python_dialog._sync_live()
         # Shift+F1: 記録終了
         QTest.keyClick(window._edit, Qt.Key.Key_F1,
                        Qt.KeyboardModifier.ShiftModifier)
@@ -1059,12 +1062,21 @@ def test_macro_record_and_play_keys():
         assert not window.macro_recording
         assert window.text() == "ab"
         window._edit.setPlainText("")
-        # Shift+F2: 再生
+        # 通し実行はペインのカーソルのある行から始まるので、
+        # 先頭へ戻しておく。
+        pane = window._python_dialog
+        assert pane is not None
+        cursor = pane._edit.textCursor()
+        cursor.setPosition(0)
+        pane._edit.setTextCursor(cursor)
+        # Shift+F2: 開いているペインで通し実行
         QTest.keyClick(window._edit, Qt.Key.Key_F2,
                        Qt.KeyboardModifier.ShiftModifier)
         app().processEvents()
         assert window.text() == "ab"
     finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
         discard_close(window)
 
 
@@ -3090,7 +3102,7 @@ def test_copy_current_line_uses_its_newline_kind():
 
 
 def test_toolbar_icon_buttons_split_and_macro():
-    # リボンに、分割 (上下・左右) とマクロ記録・再生の4ボタンが
+    # リボンに、分割 (上下・左右) とマクロ記録の3ボタンが
     # アイコン＋文字で並び、押すと対応する操作が動く。ツール
     # バー全体の既定 (文字だけ) は変えない。
     window = make_window()
@@ -3099,8 +3111,7 @@ def test_toolbar_icon_buttons_split_and_macro():
         actions = toolbar.actions()
         expected = [window._act_split_vertical,
                     window._act_split_horizontal,
-                    window._act_macro_record,
-                    window._act_macro_play]
+                    window._act_macro_record]
         positions = [actions.index(action) for action in expected]
         assert positions == sorted(positions)   # この順に並ぶ
         for action in expected:
@@ -3137,13 +3148,14 @@ def test_toolbar_icon_buttons_split_and_macro():
         assert not window._recorder.recording
         assert not window._act_macro_record.isChecked()
 
-        # 再生ボタンで、いま記録したマクロが再生される。
-        cursor = window._edit.textCursor()
-        cursor.setPosition(0)
-        window._edit.setTextCursor(cursor)
-        toolbar.widgetForAction(window._act_macro_play).click()
-        app().processEvents()
-        assert window._edit.toPlainText() == "ZZab"
+        # 「再生」の入口は無い (リボンにもマクロメニューにも)。
+        # 通し実行はメニュー (と Shift+F2) だけに置く。
+        assert not hasattr(window, "_act_macro_play")
+        assert window._act_macro_run_all not in toolbar.actions()
+        menu_texts = [action.text() for action
+                      in window._macro_menu.actions()]
+        assert any("通し実行" in text for text in menu_texts)
+        assert not any("再生" in text for text in menu_texts)
     finally:
         discard_close(window)
 

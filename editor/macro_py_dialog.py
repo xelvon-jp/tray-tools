@@ -16,9 +16,16 @@
 #     すると、次に実行する文がその行の文になる。すでに実行した
 #     編集は取り消さない)
 #   - 停止(実行側の子プロセスを終了する。無限ループでも効く)
+#   - 完了後の印(最後まで実行し終わったら、完了表示は残した
+#     まま、黄色い印は先頭の文へ戻る。次の実行に備えてセッ
+#     ションを用意し直すため。エラー・停止のときは戻らない)
 #   - 最初から(途中状態を捨てて頭に戻り、先頭の文を次として示す)
 #   - クリップボードへコピー(職場 Copilot など AI へ貼るため)
 #   - 登録として保存(on_save があるときだけ。名前とソースを渡す)
+#   - 登録マクロの読み込み・削除・名前の変更・キー割り当て
+#     (library が渡されたときだけ、管理画面と統合した段を上部
+#     に出す。読み書きは呼び側の口経由で、管理画面と同じ保存
+#     経路を使う。記録のライブ表示の間はこの段は使えない)
 #
 # 開いただけでは何も実行しない。実行は「通し実行」「ステップ
 # 実行」を押したときだけ。実行そのものは editor/macro_py.py の
@@ -47,20 +54,25 @@
 # (print の出力も同じ欄)。
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QKeySequenceEdit,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QRect, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QRect, QSize, QSignalBlocker, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFontDatabase,
     QGuiApplication,
+    QKeySequence,
     QPainter,
     QTextCursor,
 )
@@ -218,11 +230,21 @@ class MacroPythonPane(QWidget):
     持つ)。flush_run は、ステップの合間に実行区間の編集
     ブロックだけを閉じる口(区間は続く。合間の手作業が、窓側
     の記録へ届くようにするため)。on_save は (名前, ソース)
-    を受ける登録の口で、無ければ保存ボタンは出ない。"""
+    を受ける登録の口で、無ければ保存ボタンは出ない。library
+    は登録マクロの読み書きの口の集まり(names / load / delete /
+    rename / key_of / set_key。管理画面と同じ保存経路へつなが
+    るもので、渡されたときだけ上部に登録マクロの段を出す)。
+    loaded_name は、いま読み込んでいる登録マクロの名前。
+    confirm_discard は、編集済みの本文を捨てて別のマクロへ
+    切り替えてよいか聞く口(テストで差し替えられる。無ければ
+    ダイアログで聞く)。on_loaded は、読み込み・名前の変更・
+    保存で「いまのマクロ」の名前が変わったときに受ける口。"""
 
     def __init__(self, parent=None, *, source="", name="",
                  session_factory=None, begin_run=None, end_run=None,
-                 flush_run=None, on_save=None, live_source=None):
+                 flush_run=None, on_save=None, live_source=None,
+                 library=None, loaded_name=None, confirm_discard=None,
+                 on_loaded=None):
         super().__init__(parent)
         self._session_factory = session_factory
         self._begin_run = begin_run
@@ -249,6 +271,25 @@ class MacroPythonPane(QWidget):
         self._live_dirty = False
         self._syncing_live = False
         self._live_timer = None
+        # 登録マクロの段。_loaded_source は「読み込み・保存の
+        # 時点のソース」で、本文がそこから変わっていたら、別の
+        # マクロへ切り替えるときに捨ててよいか確認する。表示中
+        # のマクロを削除して名前なしに戻ったときは None にする
+        # (本文が残っていたら、次の切り替えで確認する)。
+        self._library = library
+        self._loaded_name = loaded_name
+        self._loaded_source = source
+        self._confirm_discard_fn = confirm_discard
+        self._on_loaded = on_loaded
+        self._loading = False
+        self._library_combo = None
+        self._library_delete_button = None
+        self._library_rename_button = None
+        self._library_key_row = None
+        self._library_key_edit = None
+        self._library_key_note = None
+        self._library_note = None
+        self._library_widgets = []
         if live_source is not None:
             self._live_timer = QTimer(self)
             self._live_timer.setInterval(300)
@@ -273,6 +314,49 @@ class MacroPythonPane(QWidget):
         self._close_button.clicked.connect(self.close)
         header.addWidget(self._close_button)
         layout.addLayout(header)
+        if library is not None:
+            lib_row = QHBoxLayout()
+            lib_row.addWidget(QLabel("登録マクロ"))
+            self._library_combo = QComboBox()
+            self._library_combo.currentTextChanged.connect(
+                self._on_library_combo_changed)
+            lib_row.addWidget(self._library_combo, 1)
+            self._library_delete_button = QPushButton("削除")
+            self._library_delete_button.clicked.connect(
+                self._on_library_delete_clicked)
+            lib_row.addWidget(self._library_delete_button)
+            self._library_rename_button = QPushButton("名前を変更")
+            self._library_rename_button.clicked.connect(
+                self._on_library_rename_clicked)
+            lib_row.addWidget(self._library_rename_button)
+            layout.addLayout(lib_row)
+            # キー割り当ての段は、登録マクロを読み込んでいる
+            # ときだけ出す (コンテナごと出し入れする)。
+            self._library_key_row = QWidget()
+            key_layout = QHBoxLayout(self._library_key_row)
+            key_layout.setContentsMargins(0, 0, 0, 0)
+            key_layout.addWidget(QLabel("キー割り当て"))
+            self._library_key_edit = QKeySequenceEdit()
+            self._library_key_edit.setFixedWidth(180)
+            if hasattr(self._library_key_edit,
+                       "setClearButtonEnabled"):
+                self._library_key_edit.setClearButtonEnabled(True)
+            if hasattr(self._library_key_edit,
+                       "setMaximumSequenceLength"):
+                self._library_key_edit.setMaximumSequenceLength(1)
+            self._library_key_edit.keySequenceChanged.connect(
+                self._on_library_key_changed)
+            key_layout.addWidget(self._library_key_edit)
+            self._library_key_note = QLabel("")
+            self._library_key_note.setWordWrap(True)
+            key_layout.addWidget(self._library_key_note, 1)
+            layout.addWidget(self._library_key_row)
+            self._library_note = QLabel("")
+            self._library_note.setWordWrap(True)
+            layout.addWidget(self._library_note)
+            self._library_widgets = [
+                self._library_combo, self._library_delete_button,
+                self._library_rename_button, self._library_key_edit]
         if on_save is not None:
             name_row = QHBoxLayout()
             name_row.addWidget(QLabel("名前"))
@@ -336,6 +420,7 @@ class MacroPythonPane(QWidget):
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
         self._refresh_state("")
+        self.refresh_library()
 
     # ---------------------------------------------------------------
     # 状態(テストと呼び側から使う)
@@ -451,6 +536,222 @@ class MacroPythonPane(QWidget):
             self._edit.refresh_gutter()
 
     # ---------------------------------------------------------------
+    # 登録マクロの段 (管理画面との統合)
+    # ---------------------------------------------------------------
+    def loaded_name(self):
+        """いま読み込んでいる登録マクロの名前 (無ければ None)。"""
+        return self._loaded_name
+
+    def refresh_library(self, select=None):
+        """登録マクロのプルダウンを作り直す。
+
+        組み直しの間は、選択の変更を読み込みとして扱わない。
+        選択は select (無ければ、いま読み込んでいるマクロ) に
+        合わせる。"""
+        if self._library is None or self._library_combo is None:
+            return
+        combo = self._library_combo
+        blocker = QSignalBlocker(combo)
+        combo.clear()
+        combo.addItem("")
+        for name in self._library.names():
+            combo.addItem(name)
+        del blocker
+        target = select if select is not None else self._loaded_name
+        index = combo.findText(target) if target else 0
+        blocker = QSignalBlocker(combo)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+        self._refresh_library_state()
+
+    def _refresh_library_state(self):
+        """登録マクロの段の使える／見えるを、いまの状態に合わせる。
+
+        記録のライブ表示の間と、実行中は使えない。キー割り当て
+        の段は、登録マクロを読み込んでいるときだけ出す。"""
+        if self._library is None or self._library_combo is None:
+            return
+        active = not self._running and self._live_source is None
+        selected = self._library_combo.currentText()
+        self._library_combo.setEnabled(active)
+        self._library_delete_button.setEnabled(
+            active and bool(selected))
+        self._library_rename_button.setEnabled(
+            active and bool(selected))
+        loaded = self._loaded_name
+        self._library_key_row.setVisible(loaded is not None)
+        if loaded is not None:
+            blocker = QSignalBlocker(self._library_key_edit)
+            self._library_key_edit.setKeySequence(
+                QKeySequence(self._library.key_of(loaded)))
+            del blocker
+            self._library_key_edit.setEnabled(active)
+
+    def _source_dirty(self):
+        """本文が、読み込み・保存の時点から変わっているか。"""
+        if self._loaded_source is None:
+            return bool(self.source())
+        return self.source() != self._loaded_source
+
+    def _confirm_discard(self):
+        """編集済みの本文を捨ててよいか聞く。"""
+        if self._confirm_discard_fn is not None:
+            return bool(self._confirm_discard_fn())
+        answer = QMessageBox.question(
+            self, "マクロの切り替え",
+            "編集中の内容を捨てて、別のマクロを開きますか？",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _set_loaded(self, name, source):
+        """「いま読み込んでいる登録マクロ」を name に合わせる。
+
+        見出し・名前欄・プルダウンの選択・キー割り当ての段を
+        追随させ、呼び側にも知らせる (on_loaded)。"""
+        self._loaded_name = name
+        self._loaded_source = source
+        self._name = name or ""
+        self._title_label.setText(self._title_text())
+        if self._name_edit is not None:
+            self._name_edit.setText(self._name)
+        self.refresh_library(select=name)
+        if self._on_loaded is not None:
+            self._on_loaded(name or "")
+
+    def select_macro(self, name):
+        """登録マクロ name を読み込む。読み込めたら True。
+
+        実行中は切り替えない。本文が、読み込み・保存の時点から
+        編集されていたら、捨ててよいか確認する (断られたら、
+        プルダウンの選択も元へ戻す)。テキスト形式の登録は、
+        呼び側の口が Python へ変換したソースで開く (この状態で
+        保存すれば Python 形式として登録される)。"""
+        if self._library is None or self._running:
+            return False
+        if name == self._loaded_name:
+            self.refresh_library()
+            return True
+        data = self._library.load(name)
+        if data is None:
+            self.refresh_library()
+            return False
+        if self._source_dirty() and not self._confirm_discard():
+            self.refresh_library()
+            return False
+        self._cleanup_session()
+        self._breakpoints.clear()
+        self._edit.refresh_gutter()
+        self._loading = True
+        try:
+            self._edit.setPlainText(data["source"])
+        finally:
+            self._loading = False
+        self._paused_at_breakpoint = False
+        self._set_loaded(name, data["source"])
+        self._refresh_state(f"『{name}』を読み込みました")
+        return True
+
+    def delete_macro(self, name):
+        """登録マクロを削除する (確認はしない。管理画面と同じ)。
+
+        表示中のマクロを消したら、名前なし (新規マクロ、本文は
+        残す) に戻る。"""
+        if self._library is None or self._running:
+            return False
+        try:
+            self._library.delete(name)
+        except ValueError as e:
+            if self._library_note is not None:
+                self._library_note.setText(str(e))
+            self.refresh_library()
+            return False
+        if name == self._loaded_name:
+            self._loaded_name = None
+            self._loaded_source = None
+            self._name = ""
+            self._title_label.setText(self._title_text())
+            if self._name_edit is not None:
+                self._name_edit.setText("")
+            if self._on_loaded is not None:
+                self._on_loaded("")
+        if self._library_note is not None:
+            self._library_note.setText(f"『{name}』を削除しました")
+        self.refresh_library()
+        return True
+
+    def rename_macro(self, old, new):
+        """登録マクロの名前を変える。
+
+        空・重複などの検証は、管理画面の rename_macro と同じ
+        (呼び側の口が行う)。表示中のマクロなら、見出しと名前欄
+        も追随する。"""
+        if self._library is None or self._running:
+            return False
+        try:
+            new = self._library.rename(old, new)
+        except ValueError as e:
+            if self._library_note is not None:
+                self._library_note.setText(str(e))
+            return False
+        if old == self._loaded_name:
+            self._loaded_name = new
+            self._name = new
+            self._title_label.setText(self._title_text())
+            if self._name_edit is not None:
+                self._name_edit.setText(new)
+            if self._on_loaded is not None:
+                self._on_loaded(new)
+        if self._library_note is not None:
+            self._library_note.setText("")
+        self.refresh_library(select=new)
+        return True
+
+    def set_macro_key(self, text):
+        """読み込んでいる登録マクロのキー割り当てを変える。
+
+        検証 (予約キーとの衝突など) と保存は管理画面と同じ経路
+        (呼び側の口)。付けられなかったときは知らせを出し、表示
+        は保存されている値へ戻す。"""
+        name = self._loaded_name
+        if self._library is None or name is None or self._running:
+            return False
+        if text == self._library.key_of(name):
+            return True
+        ok, message = self._library.set_key(name, text)
+        if self._library_key_note is not None:
+            self._library_key_note.setText(message or "")
+        self._refresh_library_state()
+        return ok
+
+    def _on_library_combo_changed(self, text):
+        if not text or self._loading:
+            return
+        self.select_macro(text)
+
+    def _on_library_delete_clicked(self):
+        name = self._library_combo.currentText()
+        if name:
+            self.delete_macro(name)
+
+    def _on_library_rename_clicked(self):
+        name = self._library_combo.currentText()
+        if not name:
+            return
+        new, ok = QInputDialog.getText(
+            self, "マクロの名前を変更", "新しい名前", text=name)
+        if ok:
+            self.rename_macro(name, new)
+
+    def _on_library_key_changed(self, _sequence):
+        if self._loaded_name is None:
+            return
+        text = self._library_key_edit.keySequence().toString(
+            QKeySequence.SequenceFormat.PortableText)
+        self.set_macro_key(text)
+
+    # ---------------------------------------------------------------
     # 実行
     # ---------------------------------------------------------------
     def _ensure_session(self):
@@ -512,6 +813,22 @@ class MacroPythonPane(QWidget):
         self._finish()
         self._discard_session()
 
+    def _reprepare_after_completion(self):
+        """最後まで実行し終わったあとの備え直し。
+
+        完了表示 (print 出力と「終わりました」) は終えたセッ
+        ションから出すので、呼び側は _refresh_state を済ませて
+        から呼ぶこと。終えたセッションを捨てて新しいセッション
+        を用意し直し、黄色い印が先頭の文に来るようにする
+        (「最初から」を押したときと同じ見え方。Nagato の確定
+        仕様 2026-11-14)。エラー・停止のときは呼ばない (位置を
+        見失わないため)。用意しただけのセッションは実行区間を
+        始めない (begin_run は呼ばない) ので、記録中の flush_run
+        の区切りとも競合しない。"""
+        self._discard_session()
+        if self._ensure_session() is not None:
+            self._refresh_highlights(move_caret=True)
+
     def _on_destroyed(self, *args):
         # 画面が壊れる最中の受け口。窓側の後始末(_finish の先)は
         # 親の窓ごと壊れている途中かもしれず触らない。ここでは
@@ -531,6 +848,8 @@ class MacroPythonPane(QWidget):
                        self._save_button, self._name_edit, self._edit):
             if widget is not None:
                 widget.setEnabled(not running)
+        # 登録マクロの段も、実行中は切り替えなどをさせない。
+        self._refresh_library_state()
 
     def step_once(self) -> bool:
         """次の1文を実行する。実行したら True。"""
@@ -553,6 +872,8 @@ class MacroPythonPane(QWidget):
             return False
         finally:
             self._set_running(False)
+        completed = (session.done and session.error is None
+                     and not session.stopped)
         if session.done:
             self._finish()
         else:
@@ -560,6 +881,9 @@ class MacroPythonPane(QWidget):
             # 閉じておく (次のステップで開き直す)。
             self._flush()
         self._refresh_state("")
+        if completed:
+            # 完了表示を出したあとで、印が先頭へ戻るよう備え直す。
+            self._reprepare_after_completion()
         return not session.stopped
 
     def run_all(self) -> bool:
@@ -616,6 +940,8 @@ class MacroPythonPane(QWidget):
             return False
         finally:
             self._set_running(False)
+        completed = (session.done and session.error is None
+                     and not session.stopped)
         if session.done:
             self._finish()
         else:
@@ -624,7 +950,11 @@ class MacroPythonPane(QWidget):
             # が記録へ届くよう、編集ブロックだけ閉じておく。
             self._flush()
         self._refresh_state(seek_note)
-        return finished and not session.stopped
+        result = finished and not session.stopped
+        if completed:
+            # 完了表示を出したあとで、印が先頭へ戻るよう備え直す。
+            self._reprepare_after_completion()
+        return result
 
     def stop_run(self):
         """実行を止める(実行側の子プロセスを終了する)。"""
@@ -725,13 +1055,18 @@ class MacroPythonPane(QWidget):
         except Exception as e:  # noqa: BLE001
             self._refresh_state(f"登録できませんでした: {e}")
             return
-        self._name = name
-        self._title_label.setText(self._title_text())
+        if self._library is not None:
+            # 登録できたので、その名前が読み込まれた状態にする
+            # (プルダウンも更新して、その名前を選んでおく)。
+            self._set_loaded(name, self.source())
+        else:
+            self._name = name
+            self._title_label.setText(self._title_text())
         self._refresh_state(f"『{name}』として登録しました")
 
     def _on_text_changed(self):
-        if self._syncing_live:
-            return  # ライブ表示の差し替えは「編集」として扱わない
+        if self._syncing_live or self._loading:
+            return  # ライブ表示の差し替えと登録マクロの読み込みは「編集」として扱わない
         self._live_dirty = True
         # 編集したら、実行の途中状態は意味を失うので捨てる。
         if self._session is not None or self._run_begun:
@@ -743,10 +1078,14 @@ class MacroPythonPane(QWidget):
         利用者が編集していないときに限り差し替える (編集した人の
         内容を勝手に消さない)。実行の途中 (セッションがある間) は
         差し替えない (アオイの指摘 req-20261114-22: ステップ実行の
-        途中でライブ表示が本文を書き換えた)。"""
+        途中でライブ表示が本文を書き換えた)。ただし、用意した
+        だけのセッション (「最初から」や、完了後の備え直しで
+        作った、まだ実行を始めていないもの) は差し替えの妨げに
+        しない (捨ててから差し替えを続ける)。実行が始まった
+        セッションは従来どおり守る。"""
         if self._live_source is None or self._running or self._live_dirty:
             return
-        if self._session is not None or self._run_begun:
+        if self._run_begun:
             return
         try:
             source = self._live_source()
@@ -754,6 +1093,15 @@ class MacroPythonPane(QWidget):
             return
         if source is None or source == self._live_synced:
             return
+        if self._session is not None:
+            session = self._session
+            prepared_only = (
+                session.position == 0
+                and session.error is None
+                and not session.stopped)
+            if not prepared_only:
+                return
+            self._discard_session()
         self._live_synced = source
         self._syncing_live = True
         try:
@@ -763,6 +1111,8 @@ class MacroPythonPane(QWidget):
             self._edit.setTextCursor(cursor)
         finally:
             self._syncing_live = False
+        # セッションを捨てたときは、残っていた印も消す。
+        self._refresh_highlights()
 
     # ---------------------------------------------------------------
     # 表示
@@ -842,6 +1192,12 @@ class MacroPythonPane(QWidget):
         self._close_refused = False
         self.close()
         return not self._close_refused
+
+    def showEvent(self, event):  # noqa: N802  Qt の上書き
+        super().showEvent(event)
+        # 登録はほかの経路でも変わるので、表示のたびにプルダウン
+        # を作り直す (選択は、いま読み込んでいるマクロに合わせる)。
+        self.refresh_library()
 
     def closeEvent(self, event):  # noqa: N802  Qt の上書き
         # 実行中は閉じない(実行中のセッションを抱えたまま画面が

@@ -99,7 +99,7 @@ def test_hidemaru_aligned_defaults():
     assert table["cut_append"] == "Shift+F7"   # 追加切り抜き
     assert table["copy_append"] == "Shift+F8"  # 追加コピー
     assert table["macro_record"] == "Shift+F1"  # 記録開始／終了
-    assert table["macro_play"] == "Shift+F2"   # 再生
+    assert table["macro_run_all"] == "Shift+F2"   # 通し実行
     assert table["delete_line"] == "Ctrl+Return"  # 行削除
     assert table["backspace"] == "Ctrl+H"      # バックスペース
     assert table["goto_line"] == "Ctrl+G"      # 指定行

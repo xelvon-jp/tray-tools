@@ -188,6 +188,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 from PySide6.QtCore import (
     QFileSystemWatcher,
@@ -256,7 +257,7 @@ from editor.grep_dialog import GrepDialog
 from editor.greplace_dialog import GrepReplaceDialog
 from editor.highlighter import MARKDOWN_EXTENSIONS, LineHighlighter
 from editor import keymap as keymapmod
-from editor.keymap_dialog import KeymapSettingsDialog
+from editor.keymap_dialog import KeymapSettingsDialog, normalize_keys
 from editor.macro_dialog import MacroLibraryDialog
 from editor.macro_py_dialog import PANE_WIDTH, MacroPythonPane
 from editor.outline_pane import OutlinePane
@@ -742,7 +743,7 @@ def _draw_toolbar_icon(kind):
 
     kind は "split_vertical" (上下に分割: 四角を横線で割る) /
     "split_horizontal" (左右に分割: 四角を縦線で割る) /
-    "record" (赤い丸) / "play" (三角)。
+    "record" (赤い丸)。
     """
     pixmap = QPixmap(16, 16)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -760,11 +761,6 @@ def _draw_toolbar_icon(kind):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(198, 40, 40))
         painter.drawEllipse(2, 2, 12, 12)
-    elif kind == "play":
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(60, 60, 60))
-        painter.drawPolygon(QPolygon([
-            QPoint(4, 2), QPoint(4, 14), QPoint(14, 8)]))
     painter.end()
     return QIcon(pixmap)
 
@@ -2385,12 +2381,12 @@ class EditorWindow(QMainWindow):
         self._edit.addAction(self._act_macro_record)
         self._keymap_actions.setdefault("macro_record", []).append(
             self._act_macro_record)
-        # play_macro は引数 commands を取るので、QAction.triggered の
-        # bool をそのまま渡さないよう lambda で受ける(False が
-        # 「マクロなし」として伝わり、再生できなくなる)。
-        self._act_macro_play = self._action(
-            "再生(&P)", lambda: self.play_macro(),
-            "macro_play", macro_menu)
+        # Shift+F2 は、Python マクロのペインの通し実行 (Nagato
+        # の指示 2026-11-14: マクロの操作は基本的にペインの下の
+        # ボタン群でするので、「再生」の入口は置かない)。
+        self._act_macro_run_all = self._action(
+            "通し実行(&T)", self.run_python_macro_all,
+            "macro_run_all", macro_menu)
         self._action("Python で開く(&Y)…",
                      lambda: self.show_python_macro_dialog(),
                      None, macro_menu)
@@ -2399,9 +2395,9 @@ class EditorWindow(QMainWindow):
                      None, macro_menu)
         self._action("マクロを開く(&O)…", self.load_macro_dialog,
                      None, macro_menu)
-        macro_menu.addSeparator()
-        self._action("マクロの管理(&G)…", self.show_macro_library,
-                     None, macro_menu)
+        # 登録マクロの管理 (読み込み・削除・名前の変更・キー
+        # 割り当て) は、Python マクロのペイン上部の段へ統合した
+        # (2026-11-14)。管理画面の窓はもう開かない。
         # 登録マクロの項目はこの後ろへ足す(変更のたびに付け直す)。
         self._rebuild_registered_macro_menu()
 
@@ -2440,7 +2436,7 @@ class EditorWindow(QMainWindow):
                        self._act_find, self._act_send):
             toolbar.addAction(action)
         toolbar.addSeparator()
-        # 分割とマクロの4ボタンは、アイコン＋文字で出す (ツール
+        # 分割とマクロの3ボタンは、アイコン＋文字で出す (ツール
         # バー全体の既定は文字だけのまま)。
         for action, icon_kind, tip in (
                 (self._act_split_vertical, "split_vertical",
@@ -2448,9 +2444,7 @@ class EditorWindow(QMainWindow):
                 (self._act_split_horizontal, "split_horizontal",
                  "左右に分割"),
                 (self._act_macro_record, "record",
-                 "マクロの記録を開始／終了します"),
-                (self._act_macro_play, "play",
-                 "マクロを再生します")):
+                 "マクロの記録を開始／終了します")):
             action.setIcon(_draw_toolbar_icon(icon_kind))
             action.setToolTip(tip)
             toolbar.addAction(action)
@@ -4966,22 +4960,52 @@ class EditorWindow(QMainWindow):
             self._main_splitter.setSizes(
                 [total - PANE_WIDTH, PANE_WIDTH])
 
+    def run_python_macro_all(self):
+        """Python マクロのペインを通し実行する (Shift+F2)。
+
+        ペインが開いていれば前面に出して、そのまま通し実行する。
+        開いていなければ開いてから通し実行する (実行するものが
+        無ければ、ペインが開いて状態表示に理由が出る)。"""
+        pane = self._python_dialog
+        if pane is not None:
+            try:
+                pane.isVisible()
+            except RuntimeError:
+                pane = None
+                self._python_dialog = None
+                self._python_dialog_name = None
+                self._python_pane_live = False
+        if pane is None:
+            pane = self.show_python_macro_dialog()
+        else:
+            pane.show()
+            pane.raise_()
+        if pane is not None:
+            pane.run_all()
+        return pane
+
     def show_python_macro_dialog(self, source=None, name="",
-                                 on_save=None, live=False):
+                                 on_save=None, live=False,
+                                 registered_name=None):
         """マクロの Python を右ペインで見て・直して・実行する画面
         を開く。
 
         source が無ければ、いまのマクロ(記録した命令の列を Python
         へ変換したもの)を開く。on_save は (名前, ソース) を受ける
-        登録の口で、渡されなければ「登録マクロとして新規に残す」
-        口を使う(登録マクロから開いたときは、呼び側がキーの
-        引き継ぎなどの都合を付けて渡す)。live は記録開始の経路
-        だけが渡す印で、このときだけ記録のライブ表示を結び
-        つける(記録用でないペインの本文を、記録の内容で差し
-        替えないため)。"""
+        登録の口で、渡されなければ「登録マクロとして残す」口を
+        使う(同じ名前の登録があれば、そのキー割り当ては引き
+        継ぐ)。live は記録開始の経路だけが渡す印で、このときだけ
+        記録のライブ表示を結びつける(記録用でないペインの本文を、
+        記録の内容で差し替えないため)。registered_name は、登録
+        マクロから開いたときのその名前 (ペインの登録マクロ段で
+        「読み込み中」として扱う)。"""
         if on_save is None:
             def on_save(name, new_source):
-                self.register_python_macro(name, new_source)
+                key = ""
+                entry = self._registered_macros.get(name)
+                if entry is not None:
+                    key = entry.get("key") or ""
+                self.register_python_macro(name, new_source, key=key)
         if source is None:
             if self._current_python_source:
                 source = self._current_python_source
@@ -5019,6 +5043,15 @@ class EditorWindow(QMainWindow):
                 # (アオイの指摘 req-20261114-26)。
                 existing.show()
                 return existing
+        pane_box = {}
+
+        def _note_loaded(new_name):
+            # ペインで読み込み・名前の変更・保存があったとき、
+            # 窓側の「いまのペインのマクロ名」も合わせておく
+            # (次に開くときの同名判定がずれないように)。
+            if self._python_dialog is pane_box.get("pane"):
+                self._python_dialog_name = new_name or ""
+
         pane = MacroPythonPane(
             None, source=source, name=dialog_name,
             session_factory=self._make_python_session,
@@ -5027,7 +5060,11 @@ class EditorWindow(QMainWindow):
             flush_run=self._flush_python_run,
             on_save=on_save,
             live_source=(self._recording_python_source
-                         if live else None))
+                         if live else None),
+            library=self._pane_library(),
+            loaded_name=registered_name,
+            on_loaded=_note_loaded)
+        pane_box["pane"] = pane
         pane.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._python_dialog = pane
         self._python_dialog_name = dialog_name
@@ -5159,16 +5196,16 @@ class EditorWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001  理由は利用者への文にする
             self.statusBar().showMessage(f"マクロを読めませんでした: {e}")
             return
-        # 開く・読み込むだけでは実行しない(実行は利用者が「再生」
-        # や Python の画面の実行ボタンを押したときだけ)。
+        # 開く・読み込むだけでは実行しない(実行は利用者が Python
+        # の画面の実行ボタンを押したときだけ)。
         if self._current_python_source:
             self.statusBar().showMessage(
                 "Python マクロを読み込みました"
-                "（再生は「再生」から）", 6000)
+                "（実行は Python マクロの画面から）", 6000)
         else:
             self.statusBar().showMessage(
                 f"マクロを読み込みました（{len(commands)} 手。"
-                "再生は「再生」から）", 6000)
+                "実行は Python マクロの画面から）", 6000)
 
     # ---------------------------------------------------------------
     # 登録マクロ(名前を付けて設定に残し、メニューとキーで呼ぶ)
@@ -5201,6 +5238,111 @@ class EditorWindow(QMainWindow):
         mapping = self.registered_macros()
         mapping[str(name)] = {"python": source, "key": key}
         self.apply_registered_macros(mapping)
+
+    # ---------------------------------------------------------------
+    # Python ペインの登録マクロ段への口 (管理画面と同じ保存経路)
+    # ---------------------------------------------------------------
+    def _pane_library(self):
+        """MacroPythonPane の登録マクロ段へ渡す口の集まり。
+
+        読み書きは管理画面 (MacroLibraryDialog) と同じ保存経路
+        (apply_registered_macros) を使い、名前とキーの検証も
+        管理画面の規則にそろえる。"""
+        return SimpleNamespace(
+            names=self._library_names,
+            load=self._library_load,
+            delete=self._library_delete,
+            rename=self._library_rename,
+            key_of=self._library_key_of,
+            set_key=self._library_set_key)
+
+    def _library_names(self):
+        return list(self._registered_macros)
+
+    def _library_load(self, name):
+        """登録マクロを Python のソースで返す。
+
+        Python の登録はソースそのまま、命令の列の登録は管理画面
+        の「Python で開く」と同じ変換で Python にする。無ければ
+        None。"""
+        entry = self._registered_macros.get(name)
+        if entry is None:
+            return None
+        if "python" in entry:
+            source = entry["python"]
+        else:
+            source = macro_py.commands_to_python(
+                entry.get("commands") or [], name)
+        return {"source": source, "key": entry.get("key") or ""}
+
+    def _library_delete(self, name):
+        if name not in self._registered_macros:
+            raise ValueError(f"マクロがありません（{name}）")
+        mapping = self.registered_macros()
+        del mapping[name]
+        self.apply_registered_macros(mapping)
+
+    def _library_rename(self, old, new):
+        """名前の変更。検証は管理画面の rename_macro と同じ。"""
+        new = macmod.validate_macro_name(new)
+        if old not in self._registered_macros:
+            raise ValueError(f"マクロがありません（{old}）")
+        if new != old and new in self._registered_macros:
+            raise ValueError(f"同じ名前のマクロが既にあります（{new}）")
+        if new != old:
+            mapping = self.registered_macros()
+            renamed = {}
+            for key_name, entry in mapping.items():
+                renamed[new if key_name == old else key_name] = entry
+            self.apply_registered_macros(renamed)
+        return new
+
+    def _library_key_of(self, name):
+        entry = self._registered_macros.get(name)
+        if entry is None:
+            return ""
+        return entry.get("key") or ""
+
+    def _library_set_key(self, name, text):
+        """キー割り当ての変更。管理画面の set_macro_key と同じ規則
+        (組み込みの命令と重なるキーは付けられない。登録どうしで
+        重なったら後勝ちで外す)。戻り値は (付けられたか, 知らせ
+        の文)。"""
+        if name not in self._registered_macros:
+            return (False, f"マクロがありません（{name}）")
+        normalized = normalize_keys(text)
+        if normalized is None:
+            return (False, "読めないキーです。")
+        reserved = {}
+        for cmd_name, keys in self._keymap.items():
+            if keys:
+                normalized_reserved = normalize_keys(keys)
+                if normalized_reserved:
+                    reserved[normalized_reserved] = \
+                        keymapmod.command_label(cmd_name)
+        if normalized and normalized in reserved:
+            return (False,
+                    f"『{normalized}』は組み込みの命令"
+                    f"（{reserved[normalized]}）が使っているので、"
+                    "マクロには付けられません。")
+        mapping = self.registered_macros()
+        displaced = []
+        if normalized:
+            for other, entry in mapping.items():
+                if other == name:
+                    continue
+                if (normalize_keys(entry.get("key") or "") or "") \
+                        == normalized:
+                    entry["key"] = ""
+                    displaced.append(other)
+        mapping[name]["key"] = normalized
+        self.apply_registered_macros(mapping)
+        if displaced:
+            names = "・".join(displaced)
+            return (True,
+                    f"『{normalized}』は『{names}』から外して"
+                    f"『{name}』へ付けました。")
+        return (True, "")
 
     def play_registered_macro(self, name) -> bool:
         """登録マクロを再生する。無ければステータスに出して False。"""
@@ -5250,18 +5392,13 @@ class EditorWindow(QMainWindow):
         entry = self._registered_macros.get(name)
         if entry is None:
             return
-        key = entry.get("key") or ""
         if "python" in entry:
             source = entry["python"]
         else:
             source = macro_py.commands_to_python(
                 entry.get("commands") or [], name)
-
-        def save_python(new_name, new_source):
-            self.register_python_macro(new_name, new_source, key=key)
-
         self.show_python_macro_dialog(
-            source=source, name=name, on_save=save_python)
+            source=source, name=name, registered_name=name)
 
     def _rebuild_registered_macro_menu(self):
         """登録マクロのメニュー項目とショートカットを作り直す。

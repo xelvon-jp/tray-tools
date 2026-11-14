@@ -437,7 +437,8 @@ def test_python_dialog_live_sync_pauses_during_session():
     # 実行の途中 (セッションがある間) は、ライブ表示が本文を
     # 書き換えない (アオイの指摘 req-20261114-22 低)。
     window = make_window("ab", cursor_pos=0)
-    state = {"source": "ed.insert_text('A')\n"}
+    original = "ed.insert_text('A')\ned.insert_text('B')\n"
+    state = {"source": original}
     dialog = MacroPythonDialog(
         window,
         source=state["source"],
@@ -448,9 +449,38 @@ def test_python_dialog_live_sync_pauses_during_session():
     try:
         dialog.show()
         assert dialog.step_once()
+        # セッションは継続中 (2文のうち1文だけ実行した)。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        state["source"] = original + "ed.insert_text('C')\n"
+        dialog._sync_live()
+        assert dialog.source() == original
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_python_dialog_live_sync_replaces_prepared_session():
+    # 用意しただけのセッション (「最初から」で備えたもの) は、
+    # ライブ表示の差し替えを妨げない (捨ててから差し替える)。
+    window = make_window("ab", cursor_pos=0)
+    state = {"source": "ed.insert_text('A')\n"}
+    dialog = MacroPythonDialog(
+        window,
+        source=state["source"],
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run,
+        live_source=lambda: state["source"])
+    try:
+        dialog.show()
+        dialog.reset_session()
+        assert dialog.session() is not None
+        assert dialog.session().position == 0
         state["source"] = "ed.insert_text('A')\ned.insert_text('B')\n"
         dialog._sync_live()
-        assert dialog.source() == "ed.insert_text('A')\n"
+        assert dialog.source() == state["source"]
+        assert dialog.session() is None
     finally:
         dialog.close()
         discard_close(window)
@@ -479,8 +509,11 @@ def test_python_dialog_step_edit_copy_save():
         assert window._edit.textCursor().blockNumber() == 1
         assert dialog.step_once()
         assert window.text() == "Xab\nYcd\nef"
-        assert dialog.session().done
-        assert not dialog.step_once()
+        # 最後まで終わると、完了したセッションは備え直され、
+        # 先頭の文が次になる (印も先頭へ戻る)。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        assert dialog.session().position == 0
         # ステップをまたいでも、実行全体が undo の1単位になる。
         window._edit.undo()
         assert window.text() == "ab\ncd\nef"
@@ -530,7 +563,10 @@ def test_python_dialog_run_all_and_reset():
         dialog._edit.setTextCursor(cursor)
         assert dialog.run_all()
         assert window.text() == "ab112"
-        assert dialog.session().done
+        # 最後まで終わると、完了したセッションは備え直される。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        assert dialog.session().position == 0
     finally:
         dialog.close()
         discard_close(window)
@@ -593,7 +629,10 @@ def test_pane_breakpoint_stops_and_continues():
         assert session.next_lineno() == 3
         assert dialog.run_all()
         assert window.text() == "ab123"
-        assert dialog.session().done
+        # 最後まで終わると、完了したセッションは備え直される。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        assert dialog.session().position == 0
     finally:
         dialog.close()
         discard_close(window)
@@ -658,7 +697,10 @@ def test_pane_run_all_starts_at_cursor_line():
         _pane_cursor_to_line(dialog, 2)
         assert dialog.run_all()
         assert window.text() == "ab23"
-        assert dialog.session().done
+        # 最後まで終わると、完了したセッションは備え直される。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        assert dialog.session().position == 0
     finally:
         dialog.close()
         discard_close(window)
@@ -678,7 +720,107 @@ def test_pane_run_all_cursor_inside_multiline_statement():
         assert dialog.run_all()
         # 1 行目は飛ばし、for 文 (2行目から) を実行する。
         assert window.text() == "ab23"
-        assert dialog.session().done
+        # 最後まで終わると、完了したセッションは備え直される。
+        assert dialog.session() is not None
+        assert not dialog.session().done
+        assert dialog.session().position == 0
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_step_completion_returns_marker_to_first_line():
+    # ステップ実行で最後まで終わると、完了表示 (「終わりま
+    # した」) を残したまま、黄色い印が先頭の文へ戻る (Nagato
+    # の確定仕様 2026-11-14)。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(
+        window, "ed.insert_text('1')\nprint('hello')\n"
+                "ed.insert_text('2')\n")
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        first_session = dialog.session()
+        assert dialog.step_once()
+        assert "print: hello" in dialog._status_label.text()
+        assert dialog.step_once()
+        assert window.text() == "ab12"
+        # 完了表示は、終えたセッションから出たものが残る。
+        assert "終わりました" in dialog._status_label.text()
+        # セッションは備え直され、印とカーソルは先頭の文にある。
+        assert dialog.session() is not first_session
+        assert dialog.session().position == 0
+        assert dialog.session().next_lineno() == 1
+        selections = dialog._edit.extraSelections()
+        assert len(selections) == 1
+        assert selections[0].format.background() == _NEXT_LINE_COLOR
+        assert selections[0].cursor.selectionStart() == 0
+        assert dialog._edit.textCursor().position() == 0
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_pane_run_all_completion_returns_marker_to_first_line():
+    # 通し実行で最後まで終わったときも、印は先頭へ戻る。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(window, _THREE_STATEMENTS)
+    try:
+        dialog.show()
+        assert dialog.run_all()
+        assert window.text() == "ab123"
+        assert "終わりました" in dialog._status_label.text()
+        assert dialog.session() is not None
+        assert dialog.session().position == 0
+        selections = dialog._edit.extraSelections()
+        assert len(selections) == 1
+        assert selections[0].cursor.selectionStart() == 0
+        # 備え直したセッションで、そのまま再実行もできる。
+        assert dialog.run_all()
+        assert window.text() == "ab123123"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_run_all_action_opens_pane_and_runs():
+    # 「通し実行」アクション (Shift+F2): ペインが開いていなけ
+    # れば開いてから、いまのマクロを通し実行する。開いている
+    # ペインに対しては、同じペインで通し実行する。
+    window = make_window("ab", cursor_pos=2)
+    try:
+        window._current_python_source = (
+            "ed.insert_text('1')\ned.insert_text('2')\n")
+        window._act_macro_run_all.trigger()
+        app().processEvents()
+        pane = window._python_dialog
+        assert pane is not None
+        assert window.text() == "ab12"
+        window._act_macro_run_all.trigger()
+        app().processEvents()
+        assert window._python_dialog is pane
+        assert window.text() == "ab1212"
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_pane_error_does_not_return_marker():
+    # エラーで終わったときは、印は戻らない (位置を見失わない
+    # ため)。終えたセッションも、備え直さずそのまま残る。
+    window = make_window("ab", cursor_pos=2)
+    dialog = _make_pane(
+        window, "ed.insert_text('1')\ned.bogus()\n")
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        session = dialog.session()
+        assert not dialog.step_once()
+        assert window.text() == "ab1"
+        assert dialog.session() is session
+        assert session.error is not None
+        assert dialog._edit.extraSelections() == []
     finally:
         dialog.close()
         discard_close(window)
@@ -1279,6 +1421,302 @@ def test_parent_side_call_limit_stops_session():
         assert _wait_proc_exit(stepper._proc)
     finally:
         stepper.close()
+
+
+# ---------------------------------------------------------------
+# 登録マクロの段 (管理画面との統合)
+# ---------------------------------------------------------------
+class _FakeLibrary:
+    """登録マクロの口の偽物。検証は、管理画面・窓側と同じ規則の
+    最小限 (名前の重複と予約キー) を写す。"""
+
+    def __init__(self):
+        self.macros = {}
+        self.reserved = {"Ctrl+F": "検索"}
+
+    def names(self):
+        return list(self.macros)
+
+    def load(self, name):
+        entry = self.macros.get(name)
+        if entry is None:
+            return None
+        if "python" in entry:
+            source = entry["python"]
+        else:
+            source = macro_py.commands_to_python(
+                entry["commands"], name)
+        return {"source": source, "key": entry.get("key") or ""}
+
+    def delete(self, name):
+        if name not in self.macros:
+            raise ValueError(f"マクロがありません（{name}）")
+        del self.macros[name]
+
+    def rename(self, old, new):
+        new = macmod.validate_macro_name(new)
+        if old not in self.macros:
+            raise ValueError(f"マクロがありません（{old}）")
+        if new != old and new in self.macros:
+            raise ValueError(f"同じ名前のマクロが既にあります（{new}）")
+        if new != old:
+            renamed = {}
+            for key_name, entry in self.macros.items():
+                renamed[new if key_name == old else key_name] = entry
+            self.macros = renamed
+        return new
+
+    def key_of(self, name):
+        entry = self.macros.get(name)
+        return (entry.get("key") or "") if entry is not None else ""
+
+    def set_key(self, name, text):
+        if name not in self.macros:
+            return (False, f"マクロがありません（{name}）")
+        if text and text in self.reserved:
+            return (False,
+                    f"『{text}』は組み込みの命令"
+                    f"（{self.reserved[text]}）が使っているので、"
+                    "マクロには付けられません。")
+        displaced = []
+        if text:
+            for other, entry in self.macros.items():
+                if other != name and entry.get("key") == text:
+                    entry["key"] = ""
+                    displaced.append(other)
+        self.macros[name]["key"] = text
+        if displaced:
+            names = "・".join(displaced)
+            return (True,
+                    f"『{text}』は『{names}』から外して"
+                    f"『{name}』へ付けました。")
+        return (True, "")
+
+
+def _library_with_two():
+    library = _FakeLibrary()
+    library.macros["甲"] = {"python": "ed.insert_text('A')\n",
+                            "key": ""}
+    library.macros["乙"] = {
+        "commands": [{"cmd": "insert_text", "args": {"text": "B"}}],
+        "key": ""}
+    return library
+
+
+def _make_library_pane(window, library, source="", name="",
+                       loaded_name=None, confirm_discard=None,
+                       on_save=None):
+    """登録マクロの段つきのペインを作る。"""
+    return MacroPythonDialog(
+        window,
+        source=source,
+        name=name,
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run,
+        flush_run=window._flush_python_run,
+        on_save=on_save,
+        library=library,
+        loaded_name=loaded_name,
+        confirm_discard=confirm_discard)
+
+
+def _combo_texts(pane):
+    combo = pane._library_combo
+    return [combo.itemText(i) for i in range(combo.count())]
+
+
+def test_pane_library_lists_and_loads():
+    # プルダウンに登録済みが出て、選ぶと読み込まれる。テキスト
+    # 形式は、管理画面の「Python で開く」と同じ変換で開く。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+    pane = _make_library_pane(window, library)
+    try:
+        pane.show()
+        assert _combo_texts(pane) == ["", "甲", "乙"]
+        assert pane._library_key_row.isHidden()
+        assert pane.select_macro("甲")
+        assert pane.source() == "ed.insert_text('A')\n"
+        assert pane.loaded_name() == "甲"
+        assert pane._title_label.text() == "甲"
+        assert not pane._library_key_row.isHidden()
+        assert pane.select_macro("乙")
+        expected = macro_py.commands_to_python(
+            [{"cmd": "insert_text", "args": {"text": "B"}}], "乙")
+        assert pane.source() == expected
+        assert "ed.insert_text('B')" in pane.source()
+        assert pane.loaded_name() == "乙"
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_pane_library_delete_loaded_returns_to_unnamed():
+    # 表示中のマクロを消したら、名前なし (本文は残す) に戻り、
+    # プルダウンからも消える。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+    pane = _make_library_pane(
+        window, library, source="ed.insert_text('A')\n",
+        name="甲", loaded_name="甲")
+    try:
+        pane.show()
+        assert pane.delete_macro("甲")
+        assert library.names() == ["乙"]
+        assert _combo_texts(pane) == ["", "乙"]
+        assert pane.loaded_name() is None
+        assert pane._title_label.text() == "新規マクロ"
+        assert pane.source() == "ed.insert_text('A')\n"
+        assert pane._library_key_row.isHidden()
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_pane_library_rename():
+    # 名前の変更が、登録とプルダウンと見出しに反映される。
+    # 空・重複は管理画面と同じに断られる。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+    pane = _make_library_pane(
+        window, library, source="ed.insert_text('A')\n",
+        name="甲", loaded_name="甲")
+    try:
+        pane.show()
+        assert pane.rename_macro("甲", "甲改")
+        assert library.names() == ["甲改", "乙"]
+        assert pane.loaded_name() == "甲改"
+        assert pane._title_label.text() == "甲改"
+        assert pane._library_combo.currentText() == "甲改"
+        assert not pane.rename_macro("甲改", "乙")
+        assert "既にあります" in pane._library_note.text()
+        assert not pane.rename_macro("甲改", "")
+        assert library.names() == ["甲改", "乙"]
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_pane_library_key_assignment():
+    # キー割り当てが見え、その場で変えられる。予約キーは付け
+    # られず、登録どうしの重なりは後勝ちで外れる (管理画面と
+    # 同じ)。保存先は呼び側の口 (＝管理画面と同じ経路)。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+    library.macros["乙"]["key"] = "F10"
+    pane = _make_library_pane(
+        window, library, source="ed.insert_text('A')\n",
+        name="甲", loaded_name="甲")
+    try:
+        pane.show()
+        assert pane._library_key_edit.keySequence().toString() == ""
+        # 予約キー (組み込みの検索) は付けられない。
+        assert not pane.set_macro_key("Ctrl+F")
+        assert library.key_of("甲") == ""
+        assert "組み込み" in pane._library_key_note.text()
+        # 乙の F10 を後勝ちで取る。
+        assert pane.set_macro_key("F10")
+        assert library.key_of("甲") == "F10"
+        assert library.key_of("乙") == ""
+        assert pane._library_key_edit.keySequence().toString() == "F10"
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_pane_library_switch_confirm():
+    # 本文が編集されていたら、切り替えのときに捨ててよいか
+    # 確認の口が呼ばれる。断られたら切り替わらない。編集され
+    # ていなければ、確認は呼ばれない。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+    calls = []
+    answers = {"ok": False}
+
+    def confirm():
+        calls.append(1)
+        return answers["ok"]
+
+    pane = _make_library_pane(
+        window, library, source="ed.insert_text('X')\n",
+        confirm_discard=confirm)
+    try:
+        pane.show()
+        # 未編集なら、確認なしで切り替わる。
+        assert pane.select_macro("甲")
+        assert calls == []
+        # 編集してから切り替えると、確認が呼ばれる。
+        pane._edit.setPlainText("ed.insert_text('Y')\n")
+        assert not pane.select_macro("乙")
+        assert calls == [1]
+        assert pane.loaded_name() == "甲"
+        assert pane.source() == "ed.insert_text('Y')\n"
+        assert pane._library_combo.currentText() == "甲"
+        # よければ切り替わる。
+        answers["ok"] = True
+        assert pane.select_macro("乙")
+        assert calls == [1, 1]
+        assert pane.loaded_name() == "乙"
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_pane_library_save_selects_saved_name():
+    # 「登録として保存」が成功したら、プルダウンが更新されて
+    # その名前が選ばれた状態になる。
+    window = make_window("ab", cursor_pos=2)
+    library = _library_with_two()
+
+    def save(name, source):
+        library.macros[name] = {"python": source, "key": ""}
+
+    pane = _make_library_pane(
+        window, library, source="ed.insert_text('N')\n",
+        on_save=save)
+    try:
+        pane.show()
+        pane._name_edit.setText("新規")
+        pane._on_save_clicked()
+        assert "新規" in library.names()
+        assert _combo_texts(pane) == ["", "甲", "乙", "新規"]
+        assert pane._library_combo.currentText() == "新規"
+        assert pane.loaded_name() == "新規"
+    finally:
+        pane.close()
+        discard_close(window)
+
+
+def test_window_pane_library_uses_registered_store():
+    # 窓のペインの段は、管理画面と同じ保存先 (登録マクロの
+    # ストア) を読み書きする。
+    window = make_window("ab", cursor_pos=2)
+    try:
+        window.register_python_macro(
+            "窓甲", "ed.insert_text('W')\n", key="F10")
+        window.register_macro(
+            "窓乙", [{"cmd": "insert_text", "args": {"text": "V"}}])
+        pane = window.show_python_macro_dialog()
+        assert pane is not None
+        texts = _combo_texts(pane)
+        assert "窓甲" in texts and "窓乙" in texts
+        assert pane.select_macro("窓甲")
+        assert pane.source() == "ed.insert_text('W')\n"
+        assert pane.set_macro_key("F11")
+        assert window.registered_macros()["窓甲"]["key"] == "F11"
+        assert pane.rename_macro("窓甲", "窓甲改")
+        assert "窓甲改" in window.registered_macros()
+        assert "窓甲" not in window.registered_macros()
+        # テキスト形式の登録も、変換して開ける。
+        assert pane.select_macro("窓乙")
+        assert "ed.insert_text('V')" in pane.source()
+        assert pane.delete_macro("窓乙")
+        assert "窓乙" not in window.registered_macros()
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
 
 
 def main():

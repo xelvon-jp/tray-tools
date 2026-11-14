@@ -56,7 +56,7 @@ DEFAULT_KEYMAP = {
     "repeat_last": "F4",
     "reformat_text": "Ctrl+Shift+F",
     "macro_record": "Shift+F1",
-    "macro_play": "Shift+F2",
+    "macro_run_all": "Shift+F2",
     # 分割表示。ペインの切り替えだけ秀丸に合わせて F6 を付け、
     # 分割そのものは既定ではキーを付けない(利用者が割り当て画面
     # で付ける)。
@@ -102,7 +102,7 @@ COMMAND_LABELS = [
     ("repeat_last", "直前の操作を繰り返す"),
     ("reformat_text", "整形"),
     ("macro_record", "マクロ記録の開始／終了"),
-    ("macro_play", "マクロ再生"),
+    ("macro_run_all", "マクロを通し実行"),
     ("split_horizontal", "左右に分割"),
     ("split_vertical", "上下に分割"),
     ("close_split", "分割をやめる"),

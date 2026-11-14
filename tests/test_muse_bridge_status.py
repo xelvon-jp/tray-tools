@@ -235,6 +235,21 @@ def test_request_rows_fractions():
     assert rows[0]["note"] == "だめでした"
 
 
+def test_request_rows_ack_watch_stages():
+    # 見張り v63 からの段階(req_ack.py)。知らない段階として行ごと捨てていた(2026-11-14)
+    cases = [
+        (_req(stage="woke", detected=12, saved=10, ack=8, woke=6), 0.83, "起床"),
+        (_req(stage="read", detected=12, saved=10, ack=8, read=6), 0.86, "読了"),
+        (_req(stage="accepted", detected=12, saved=10, ack=8, read=6, accepted=5), 0.9, "受付"),
+        (_req(stage="working", detected=12, saved=10, ack=8, accepted=5, working=3), 0.94, "作業中"),
+    ]
+    for entry, frac, label in cases:
+        rows = mbs.request_rows({"requests": [entry]}, NOW)
+        assert len(rows) == 1 and rows[0]["fraction"] == frac, entry["stage"]
+        assert rows[0]["stage_label"] == label
+        assert not rows[0]["finished"]
+
+
 def test_request_rows_warn_recorded_gaps():
     # 検知→保存が61秒(記録済み) → warn。60秒ちょうどは warn にしない
     e = _req(stage="ack", detected=200, saved=139, ack=100)

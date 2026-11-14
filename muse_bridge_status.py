@@ -349,9 +349,14 @@ def panel_view(data, now=None):
 # ---- 取り次ぎ依頼(requests)の進み具合 ----
 # バーは5段(送信→検知→保存→受領→完了)。送信はデータに無いので検知が
 # 2/5 から始まる。失敗は満タンで、色は描く側が失敗の色にする。
-REQ_FRACTIONS = {"detected": 0.4, "saved": 0.6, "ack": 0.8,
+# 見張り v63 から、受領のあとに起床・読了・受付・作業中が増えた(req_ack.py)。
+# 知らない段階は行ごと捨てていたので、v63 以降は進行中の依頼が見えなくなっていた(2026-11-14)。
+REQ_FRACTIONS = {"detected": 0.4, "saved": 0.6, "ack": 0.8, "woke": 0.83,
+                 "read": 0.86, "accepted": 0.9, "working": 0.94,
                  "done": 1.0, "failed": 1.0}
 REQ_STAGE_LABELS = {"detected": "検知", "saved": "保存", "ack": "受領",
+                    "woke": "起床", "read": "読了", "accepted": "受付",
+                    "working": "作業中",
                     "done": "完了", "failed": "失敗"}
 REQ_MAX_ACTIVE = 5      # 進行中は新しい順にこの数まで
 REQ_MAX_FINISHED = 3    # 終わったばかりの完了は新しい順にこの数まで
@@ -388,7 +393,8 @@ def _req_row(entry, now):
     if not isinstance(raw_times, dict):
         return None
     times = {}
-    for name in ("detected", "saved", "ack", "done"):
+    for name in ("detected", "saved", "ack", "woke", "read", "accepted",
+                 "working", "done"):
         v = raw_times.get(name)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             times[name] = v

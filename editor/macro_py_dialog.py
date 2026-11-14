@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
 )
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QTextCursor
 
 from editor import editor_icon
@@ -60,7 +61,7 @@ class MacroPythonDialog(QDialog):
 
     def __init__(self, parent=None, *, source="", name="",
                  session_factory=None, begin_run=None, end_run=None,
-                 on_save=None):
+                 on_save=None, live_source=None):
         super().__init__(parent)
         self.setWindowIcon(editor_icon.qicon())
         # 製品名は editor/window.py の APP_NAME = "EDDy"。循環 import を
@@ -75,6 +76,20 @@ class MacroPythonDialog(QDialog):
         self._run_begun = False
         self._output_shown = 0
         self._running = False
+        # 記録のライブ表示 (live_source が渡されたとき)。記録中の
+        # ソースを呼び側から受け取り、利用者が編集していなければ
+        # そのまま差し替える。窓はモーダレスで開く前提 (EDDy の
+        # 画面を操作しながら、記録が増えていくのを見られる)。
+        self._live_source = live_source
+        self._live_synced = source
+        self._live_dirty = False
+        self._syncing_live = False
+        self._live_timer = None
+        if live_source is not None:
+            self._live_timer = QTimer(self)
+            self._live_timer.setInterval(300)
+            self._live_timer.timeout.connect(self._sync_live)
+            self._live_timer.start()
         # 壊れるとき(EDDy の窓ごと閉じられたとき等)も、抱えて
         # いるセッションの子を残さないための受け口。自分の
         # メソッドをそのままつなぐと、親ごと壊れる経路では
@@ -315,10 +330,35 @@ class MacroPythonDialog(QDialog):
         self._refresh_state(f"『{name}』として登録しました")
 
     def _on_text_changed(self):
+        if self._syncing_live:
+            return  # ライブ表示の差し替えは「編集」として扱わない
+        self._live_dirty = True
         # 編集したら、実行の途中状態は意味を失うので捨てる。
         if self._session is not None or self._run_begun:
             self.reset_session()
             self._refresh_state("編集したので、実行は最初からになります")
+
+    def _sync_live(self):
+        """記録のライブ表示を進める。記録中のソースが増えていたら、
+        利用者が編集していないときに限り差し替える (編集した人の
+        内容を勝手に消さない)。"""
+        if self._live_source is None or self._running or self._live_dirty:
+            return
+        try:
+            source = self._live_source()
+        except Exception:  # noqa: BLE001  呼び側の都合で画面を落とさない
+            return
+        if source is None or source == self._live_synced:
+            return
+        self._live_synced = source
+        self._syncing_live = True
+        try:
+            self._edit.setPlainText(source)
+            cursor = self._edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._edit.setTextCursor(cursor)
+        finally:
+            self._syncing_live = False
 
     # ---------------------------------------------------------------
     # 表示

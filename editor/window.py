@@ -511,15 +511,6 @@ def _compile_or_default(text, default_rx, default_text):
         return default_rx, default_text
 
 
-def _clipboard_text(text):
-    """選択範囲の文字列を、クリップボードへ入れる形に直す。
-
-    QTextCursor.selectedText() は段落の区切りを U+2029 で返すので、
-    通常の改行 (LF) へ置き換える(通常のコピーがクリップボードへ
-    入れる形に合わせる)。"""
-    return text.replace("\u2029", "\n")
-
-
 class SaveOptionsDialog(QDialog):
     """「名前を付けて保存」で、文字コード・改行・BOM を選ぶ小さな窓。
 
@@ -874,6 +865,7 @@ class EditorWindow(QMainWindow):
         # いまのマクロが Python のとき、そのソース(命令の列の
         # マクロでは None)。読み込み・登録マクロの再生で切り替わる。
         self._current_python_source = None
+        self._python_dialog = None
         self._python_block_cursor = None
         # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
         # (_build_menus)でアクションにし、変更のたびに付け直す。
@@ -3782,7 +3774,13 @@ class EditorWindow(QMainWindow):
         block = cursor.block()
         text = block.text()
         if block.next().isValid():
-            text += "\n"
+            kinds = self._edit.line_newlines()
+            number = block.blockNumber()
+            kind = (kinds[number]
+                    if kinds is not None and 0 <= number < len(kinds)
+                    else None)
+            text += (kind if kind in (docmod.CRLF, docmod.LF, docmod.CR)
+                     else self._doc.newline)
         QGuiApplication.clipboard().setText(text)
 
     def copy_append_selection(self):
@@ -3797,7 +3795,8 @@ class EditorWindow(QMainWindow):
             return
         clipboard = QGuiApplication.clipboard()
         clipboard.setText(
-            clipboard.text() + _clipboard_text(cursor.selectedText()))
+            clipboard.text()
+            + self._edit.selection_text_with_newlines(cursor))
 
     def cut_append_selection(self):
         """追加切り抜き(キー割り当ての命令 cut_append、既定は
@@ -3811,8 +3810,8 @@ class EditorWindow(QMainWindow):
         if not cursor.hasSelection():
             return
         clipboard = QGuiApplication.clipboard()
-        combined = clipboard.text() + _clipboard_text(
-            cursor.selectedText())
+        combined = clipboard.text() + self._edit.selection_text_with_newlines(
+            cursor)
         cursor.beginEditBlock()
         cursor.removeSelectedText()
         cursor.endEditBlock()
@@ -4706,13 +4705,41 @@ class EditorWindow(QMainWindow):
                             else self._current_macro)
                 source = macro_py.commands_to_python(
                     commands, self._current_macro_name or "マクロ")
+        # モーダレスで開く (EDDy の画面を操作しながら、記録が
+        # 増えていくのを見たり、その場でステップ実行したりできる
+        # ように)。すでに開いていたら前面へ出すだけにする。
+        existing = self._python_dialog
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return existing
+            except RuntimeError:
+                self._python_dialog = None
         dialog = MacroPythonDialog(
             self, source=source, name=name or self._current_macro_name,
             session_factory=self._make_python_session,
             begin_run=self._begin_python_run,
             end_run=self._end_python_run,
-            on_save=on_save)
-        dialog.exec()
+            on_save=on_save,
+            live_source=self._recording_python_source)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._python_dialog = dialog
+        dialog.destroyed.connect(
+            lambda *args: setattr(self, "_python_dialog", None))
+        dialog.show()
+        return dialog
+
+    def _recording_python_source(self):
+        """記録中なら、いまの記録を Python にしたものを返す
+        (マクロ Python 窓のライブ表示用)。記録していなければ
+        None。"""
+        if not self._recorder.recording:
+            return None
+        return macro_py.commands_to_python(
+            self.recorded_commands(),
+            self._current_macro_name or "マクロ")
 
     def save_macro(self, path, name="") -> bool:
         """いまのマクロ(記録中なら記録中の列)を書く。

@@ -30,7 +30,7 @@
 #     しない)。記録側は「起きたこと」として控えるだけ。
 #   undo_redo_started / undo_redo_finished … Ctrl+Z / Ctrl+Y の
 #     前後。文書の変化を記録から外すために、窓側が印を立てる。
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -509,17 +509,74 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         おく。控え自体が無い(新規文書など)ときは、今ある行はすべて
         文書の改行設定だという前提で控えを作り、追随を始める。"""
         kinds = None
+        text = None
         if source is not None and source.hasText():
-            kinds = docmod.line_endings(source.text())[:-1]
+            text = source.text()
+            kinds = docmod.line_endings(text)[:-1]
         if self._state.line_newlines is None:
             count = self.document().blockCount()
             self._state.line_newlines = (
                 [self._state.default_newline] * (count - 1) + [None])
         self._state.paste_kinds = kinds
         try:
-            super().insertFromMimeData(source)
+            if text is not None and "\r" in text:
+                # Qt の挿入は "\r\n" を二重の改行として数えてしまう
+                # ことがある。本文は "\n" にそろえて入れ、改行の
+                # 種別は paste_kinds の側で保つ。
+                mime = QMimeData()
+                mime.setText(text.replace("\r\n", "\n").replace("\r", "\n"))
+                super().insertFromMimeData(mime)
+            else:
+                super().insertFromMimeData(source)
         finally:
             self._state.paste_kinds = None
+
+    def selection_text_with_newlines(self, cursor=None):
+        """選択範囲のテキストを、行ごとの改行種別でつないで返す。
+
+        素の Qt のコピーと QTextCursor.selectedText() は、段落の
+        区切りを "\n" にそろえてしまう。CRLF の文書からコピーすると
+        LF になり、貼り付け側が「テキスト自身の種別」を拾っても
+        LF でしか戻らない。控え (line_newlines) の種別でつなぎ
+        直すことで、コピー・貼り付けの往復でも改行が保たれる
+        (秀丸の「改行コードを区別する」に当たる動き)。
+        """
+        cur = cursor if cursor is not None else self.textCursor()
+        if not cur.hasSelection():
+            return ""
+        doc = self.document()
+        start = cur.selectionStart()
+        end = cur.selectionEnd()
+        kinds = self._state.line_newlines
+        default = self._state.default_newline
+        out = []
+        block = doc.findBlock(start)
+        while block.isValid():
+            bstart = block.position()
+            bend = bstart + len(block.text())
+            seg_from = max(start, bstart)
+            seg_to = min(end, bend)
+            if seg_to > seg_from:
+                out.append(block.text()[seg_from - bstart:seg_to - bstart])
+            if end <= bend:
+                break
+            number = block.blockNumber()
+            kind = (kinds[number]
+                    if kinds is not None and 0 <= number < len(kinds)
+                    else None)
+            out.append(kind if kind in (docmod.CRLF, docmod.LF, docmod.CR)
+                       else default)
+            block = block.next()
+        return "".join(out)
+
+    def _copy_selection_to_clipboard(self):
+        """選択範囲を、行ごとの改行種別を保ったテキストでコピー
+        する。素の copy は改行を "\n" にそろえてしまう (Qt の
+        createMimeDataFromSelection は PySide では差し替えが
+        効かないため、copy / cut の側で組み立てる)。"""
+        mime = QMimeData()
+        mime.setText(self.selection_text_with_newlines())
+        QGuiApplication.clipboard().setMimeData(mime)
 
     def newline_glyph(self, block_number) -> str:
         """ブロック(行)を終える改行の記号。控えから種別を引き、
@@ -853,11 +910,20 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             QGuiApplication.clipboard().setText(self.block_text())
             self.block_delete(backward=True)
             return
+        if self.textCursor().hasSelection():
+            self._copy_selection_to_clipboard()
+            cursor = self.textCursor()
+            cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+            return
         super().cut()
 
     def copy(self):
         if self.has_block_selection():
             QGuiApplication.clipboard().setText(self.block_text())
+            return
+        if self.textCursor().hasSelection():
+            self._copy_selection_to_clipboard()
             return
         super().copy()
 

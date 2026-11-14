@@ -378,6 +378,24 @@ def test_python_macro_error_goes_to_status():
 # ---------------------------------------------------------------
 # 別窓(ステップ実行・編集・コピー・保存)
 # ---------------------------------------------------------------
+def test_python_dialog_live_sync_and_user_edit_guard():
+    # ライブ表示: 記録側のソースが増えたら差し替わる。利用者が
+    # 編集した後は、ライブ側で上書きしない。
+    state = {"source": "ed.insert_text('A')\n"}
+    dialog = MacroPythonDialog(
+        None, source=state["source"], live_source=lambda: state["source"])
+    try:
+        state["source"] = "ed.insert_text('A')\ned.insert_text('B')\n"
+        dialog._sync_live()
+        assert dialog.source() == state["source"]
+        dialog._edit.setPlainText("ed.insert_text('自分の編集')\n")
+        state["source"] = "ed.insert_text('C')\n"
+        dialog._sync_live()
+        assert "自分の編集" in dialog.source()
+    finally:
+        dialog.close()
+
+
 def test_python_dialog_step_edit_copy_save():
     window = make_window("ab\ncd\nef", cursor_pos=0)
     saved = []

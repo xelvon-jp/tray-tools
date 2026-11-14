@@ -952,11 +952,12 @@ def test_copy_word_and_line_keys():
         assert QGuiApplication.clipboard().text() == "world"
         cursor = window._edit.textCursor()
         assert cursor.position() == 8 and not cursor.hasSelection()
-        # Shift+F5: 行をコピー(後ろの改行も含む)
+        # Shift+F5: 行をコピー(後ろの改行も含む)。新規文書の改行は
+        # CRLF (文書の既定) なので、行コピーも CRLF で終える。
         QTest.keyClick(window._edit, Qt.Key.Key_F5,
                        Qt.KeyboardModifier.ShiftModifier)
         app().processEvents()
-        assert QGuiApplication.clipboard().text() == "hello world\n"
+        assert QGuiApplication.clipboard().text() == "hello world\r\n"
         # 文書の最後の行は、後ろに改行が無いので行の文字だけ。
         cursor = window._edit.textCursor()
         cursor.setPosition(len("hello world\nsecond line\nlast"))
@@ -2812,6 +2813,165 @@ def test_newline_glyphs_paste_into_new_document():
         assert len(_kinds(window)) == edit.document().blockCount()
     finally:
         discard_close(window)
+
+
+def test_copy_keeps_crlf_newlines():
+    # CRLF の文書からコピーすると、クリップボードのテキストも
+    # CRLF のままになる (素の Qt は "\n" にそろえてしまう)。
+    from PySide6.QtGui import QGuiApplication
+
+    data = "one\r\ntwo\r\nthree\r\n".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "crlf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            edit.selectAll()
+            edit.copy()
+            assert QGuiApplication.clipboard().text() == \
+                "one\r\ntwo\r\nthree\r\n"
+        finally:
+            discard_close(window)
+
+
+def test_copy_keeps_mixed_newlines():
+    # 混在した文書のコピーは、行ごとの種別のまま出る。
+    from PySide6.QtGui import QGuiApplication
+
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            edit.selectAll()
+            edit.copy()
+            assert QGuiApplication.clipboard().text() == "a\r\nb\nc"
+        finally:
+            discard_close(window)
+
+
+def test_copy_partial_selection_keeps_newline_kind():
+    # 行の途中から途中までの選択でも、またいだ改行は元の種別で出る。
+    from PySide6.QtGui import QGuiApplication
+
+    data = "one\r\ntwo\r\nthree".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "crlf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.setPosition(1)
+            cursor.setPosition(5, QTextCursor.MoveMode.KeepAnchor)
+            edit.setTextCursor(cursor)
+            edit.copy()
+            assert QGuiApplication.clipboard().text() == "ne\r\nt"
+        finally:
+            discard_close(window)
+
+
+def test_copy_paste_roundtrip_keeps_crlf():
+    # CRLF の文書からコピーして別の CRLF の文書へ貼ると、貼った行も
+    # CRLF のままになる (以前は LF になっていた)。
+    # 貼るテキストが改行で終わるので、貼り付け位置の行 ("x") の
+    # 元の改行と合わせて空行が 1 つできる (文字単位の挿入として
+    # 正しい)。空行を終える改行は貼り先の元の行の種別 (CRLF)。
+    from editor import document as docmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "src.txt")
+        Path(src_path).write_bytes("one\r\ntwo\r\nthree\r\n".encode("utf-8"))
+        src = make_window(src_path)
+        dst_path = os.path.join(tmp, "dst.txt")
+        Path(dst_path).write_bytes("x\r\ny".encode("utf-8"))
+        dst = make_window(dst_path)
+        try:
+            src._edit.selectAll()
+            src._edit.copy()
+            edit = dst._edit
+            cursor = edit.textCursor()
+            cursor.setPosition(1)  # "x" の末尾
+            edit.setTextCursor(cursor)
+            edit.paste()
+            assert edit.toPlainText() == "xone\ntwo\nthree\n\ny"
+            assert _kinds(dst) == [
+                docmod.CRLF, docmod.CRLF, docmod.CRLF, docmod.CRLF, None]
+        finally:
+            discard_close(src)
+            discard_close(dst)
+
+
+def test_copy_current_line_uses_its_newline_kind():
+    # 行コピー (Shift+F5) も、その行を終える改行の種別でコピーする。
+    from PySide6.QtGui import QGuiApplication
+
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.setPosition(0)  # "a" の行 (CRLF で終わる)
+            edit.setTextCursor(cursor)
+            window.copy_current_line()
+            assert QGuiApplication.clipboard().text() == "a\r\n"
+            cursor.setPosition(3)  # "b" の行 (LF で終わる)
+            edit.setTextCursor(cursor)
+            window.copy_current_line()
+            assert QGuiApplication.clipboard().text() == "b\n"
+        finally:
+            discard_close(window)
+
+
+def test_python_macro_dialog_modeless_and_live_recording():
+    # Python の窓はモーダレス (開いたまま EDDy を操作できる) で、
+    # 記録中は操作がその場でソースに増えていく。
+    window = make_window()
+    window._edit.setPlainText("ab\ncd")
+    try:
+        window.set_macro_recording(True)
+        dialog = window.show_python_macro_dialog()
+        assert dialog is not None and dialog.isVisible()
+        assert not dialog.isModal()
+        # 開いている間も本体は操作できる (モーダルなら無効になる)。
+        assert window.isEnabled()
+        before = dialog.source()
+        QTest.keyClicks(window._edit, "Z")
+        app().processEvents()
+        dialog._sync_live()
+        after = dialog.source()
+        assert after != before and "Z" in after, (before, after)
+        # もう一度開いても、同じ窓が前面に出るだけ。
+        assert window.show_python_macro_dialog() is dialog
+        window.set_macro_recording(False)
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_cut_keeps_crlf_newlines():
+    # 切り取りもコピーと同じく、改行の種別を保つ。
+    data = "one\r\ntwo\r\nthree".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cut.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            edit.selectAll()
+            edit.cut()
+            assert QGuiApplication.clipboard().text() == \
+                "one\r\ntwo\r\nthree"
+            assert edit.toPlainText() == ""
+        finally:
+            discard_close(window)
 
 
 def _recent_paths(tmp, *names):

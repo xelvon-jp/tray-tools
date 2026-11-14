@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,7 +39,9 @@ PS_ALLOWLIST_FILENAME = "script_runner_ps_allowlist.json"
 
 # ブラウザの書きかけなど、対象にしない末尾。
 PARTIAL_SUFFIXES = (".crdownload", ".part", ".tmp")
-TARGET_EXTENSIONS = (".py", ".ps1")
+# .phal はループ用の独自拡張子。1行目の宣言(#!phal python /
+# #!phal powershell)で中身の言語を決める(phal_engine)。
+TARGET_EXTENSIONS = (".py", ".ps1", ".phal")
 
 # BOM 無し UTF-8 の .ps1 を PowerShell 5.1 に読ませるための写しの
 # 接頭辞(高1)。写しは元の隣に作って実行後に消す。一覧からは外す。
@@ -109,6 +112,8 @@ DEFAULT_CONFIG = {
     "max_chars": 20000,        # クリップボード文の切り詰め(全体の文字数)
     "window_geometry": None,   # [x, y, w, h]
     "always_on_top": False,    # 前面に固定
+    "hide_no_id": True,        # ID が無いファイルを表示しない
+    "dark_mode": False,        # ダークモード (窓の中の「ダーク」の切替)
 }
 
 
@@ -144,6 +149,8 @@ def normalize_config(section) -> dict:
             and all(isinstance(v, int) for v in geometry)):
         config["window_geometry"] = None
     config["always_on_top"] = bool(config["always_on_top"])
+    config["hide_no_id"] = bool(config["hide_no_id"])
+    config["dark_mode"] = bool(config["dark_mode"])
     return config
 
 
@@ -244,6 +251,595 @@ class CheckResult:
     headline: str = ""          # 一覧の行に出す1行
     jump_line: int = 0          # EDDy で開くときに飛ぶ行
     sha256: str = ""            # チェックした時点の中身
+
+    def to_dict(self) -> dict:
+        """キャッシュへ残すための辞書化。画面に出す欄は全部残す。"""
+        return {
+            "status": self.status,
+            "kind": self.kind,
+            "issues": [
+                {"line": issue.line, "message": issue.message,
+                 "text": issue.text, "offset": issue.offset}
+                for issue in self.issues],
+            "headline": self.headline,
+            "jump_line": self.jump_line,
+            "sha256": self.sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        issues = [
+            CheckIssue(line=int(entry.get("line", 0)),
+                       message=str(entry.get("message", "")),
+                       text=str(entry.get("text", "")),
+                       offset=int(entry.get("offset", 0)))
+            for entry in data.get("issues", [])
+            if isinstance(entry, dict)]
+        return cls(
+            status=str(data.get("status", STATUS_UNKNOWN)),
+            kind=str(data.get("kind", "")),
+            issues=issues,
+            headline=str(data.get("headline", "")),
+            jump_line=int(data.get("jump_line", 0)),
+            sha256=str(data.get("sha256", "")),
+        )
+
+
+# ---------------------------------------------------------------
+# チェック結果のキャッシュ (再起動をまたいで効かせる)
+# ---------------------------------------------------------------
+# 実行ログ (script_runner_log.jsonl) と同じ置き場に、チェック済みの
+# 結果を控える。キーは (パス, 更新時刻, 大きさ)。中身が変われば
+# 更新時刻か大きさが変わるので外れる。控えの sha256 はチェックした
+# 時点のもので、実行直前の取り直し (窓側) が最後の砦として残る。
+CHECK_CACHE_FILENAME = "script_runner_check_cache.json"
+CHECK_CACHE_LIMIT = 200
+
+
+def check_cache_path() -> Path:
+    return data_dir() / CHECK_CACHE_FILENAME
+
+
+def load_check_cache(cache_path=None) -> dict:
+    """キャッシュ {パス文字列: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (キャッシュが理由で
+    パネルが落ちることがあってはならない)。"""
+    path = Path(cache_path) if cache_path is not None else check_cache_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cache = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not isinstance(entry.get("result"), dict):
+            continue
+        cache[key] = entry
+    return cache
+
+
+def save_check_cache(cache: dict, cache_path=None) -> None:
+    """キャッシュを書き出す。失敗しても黙って諦める (次に開いたとき
+    チェックし直すだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(cache_path) if cache_path is not None else check_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def check_cache_get(cache: dict, path, mtime, size):
+    """(パス, 更新時刻, 大きさ) が一致すれば控えの結果を返す。
+
+    一致しなければ None (チェックし直す)。"""
+    entry = cache.get(str(path))
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("mtime") != mtime or entry.get("size") != size:
+        return None
+    try:
+        return CheckResult.from_dict(entry["result"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def check_cache_put(cache: dict, path, mtime, size,
+                    result: CheckResult) -> None:
+    """結果を控える。上限を超えたら古い控えから落とす。"""
+    cache[str(path)] = {
+        "mtime": mtime,
+        "size": size,
+        "saved_at": time.time(),
+        "result": result.to_dict(),
+    }
+    while len(cache) > CHECK_CACHE_LIMIT:
+        oldest = min(cache, key=lambda k: cache[k].get("saved_at", 0))
+        del cache[oldest]
+
+
+# ---------------------------------------------------------------
+# 自動実行の対象の控え (script_runner_pending_runs.json)。
+# チェックの控えと同じ置き場に、「自動実行の対象になったファイル」
+# の素性 (パス・更新時刻・大きさ・分かれば sha256) を残す。PHAL が
+# 開き直すと、起動スナップショットだけでは「起動後に届いた分」と
+# 分からなくなる (ダウンロード直後に開き直した場合に、その分が
+# 起動前からの滞留扱いになって自動で走らなくなる)。控えが今の
+# 中身と一致する間は、開き直した後も対象のままにする。控えが
+# 無い滞留分は、従来どおり決して対象にしない。
+PENDING_RUN_FILENAME = "script_runner_pending_runs.json"
+PENDING_RUN_TTL_SECONDS = 24 * 3600
+PENDING_RUN_LIMIT = 200
+
+
+def pending_run_path() -> Path:
+    return data_dir() / PENDING_RUN_FILENAME
+
+
+def _pending_run_expired(entry, now: float) -> bool:
+    saved_at = entry.get("saved_at") if isinstance(entry, dict) else None
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > PENDING_RUN_TTL_SECONDS
+
+
+def load_pending_runs(records_path=None) -> dict:
+    """控え {パス文字列: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (チェックの控えと
+    同じく、控えが理由でパネルが落ちてはならない)。古い控え
+    (24時間超) は、読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else pending_run_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not isinstance(entry.get("mtime"), (int, float)):
+            continue
+        if not isinstance(entry.get("size"), int):
+            continue
+        if _pending_run_expired(entry, now):
+            continue
+        records[key] = entry
+    return records
+
+
+def save_pending_runs(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    対象から外れるだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else pending_run_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def pending_run_put(records: dict, path, mtime, size,
+                    sha256: str = "") -> None:
+    """対象になったファイルの素性を控える。古い控えと上限超えは
+    ここで落とす (ファイルは小さく保つ)。"""
+    records[str(path)] = {
+        "mtime": mtime,
+        "size": size,
+        "sha256": sha256 or "",
+        "saved_at": time.time(),
+    }
+    now = time.time()
+    for key in [k for k, e in records.items()
+                if _pending_run_expired(e, now)]:
+        del records[key]
+    while len(records) > PENDING_RUN_LIMIT:
+        oldest = min(records, key=lambda k: records[k].get("saved_at", 0))
+        del records[oldest]
+
+
+def pending_run_get(records: dict, path, mtime, size):
+    """(パス, 更新時刻, 大きさ) が一致すれば控えを返す。
+
+    一致しない・古すぎる場合は None (対象にはしない)。"""
+    entry = records.get(str(path))
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("mtime") != mtime or entry.get("size") != size:
+        return None
+    if _pending_run_expired(entry, time.time()):
+        return None
+    return entry
+
+
+def pending_run_discard(records: dict, path) -> bool:
+    """パスの控えを捨てる。捨てた (保存が要る) なら True。"""
+    return records.pop(str(path), None) is not None
+
+
+# ---------------------------------------------------------------
+# DL 済み候補の控え (script_runner_dl_consumed.json)。
+# チャットで見つけたダウンロード候補を押した記録を、チェックの
+# 控えと同じ置き場に残す。パネルが開き直すと会話内の控え
+# (押下済みの集合) が消えるので、開き直した先でも「もう落とした
+# 候補」と分かるようにするため (1-27 の実機で、設置の開き直しの
+# たびに同じ候補を落とし直す無限ループになった)。キーは候補の
+# 同一判定 (名前 + クラス) で、概要も一緒に持つ。24時間を超えた
+# 控えは読み込み・追加の時点で落とす。
+DL_CONSUMED_FILENAME = "script_runner_dl_consumed.json"
+DL_CONSUMED_TTL_SECONDS = 24 * 3600
+DL_CONSUMED_LIMIT = 100
+
+
+def dl_consumed_path() -> Path:
+    return data_dir() / DL_CONSUMED_FILENAME
+
+
+def _dl_consumed_expired(entry, now: float) -> bool:
+    saved_at = entry.get("saved_at") if isinstance(entry, dict) else None
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > DL_CONSUMED_TTL_SECONDS
+
+
+def load_dl_consumed(records_path=None) -> dict:
+    """控え {候補の key: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (他の控えと同じく、
+    控えが理由でパネルが落ちてはならない)。古い控え (24時間超)
+    は、読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_consumed_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if _dl_consumed_expired(entry, now):
+            continue
+        records[key] = entry
+    return records
+
+
+def save_dl_consumed(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    候補が出直すだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_consumed_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def dl_consumed_key(name, class_name) -> str:
+    """候補の同一判定のキー (窓側の _DlCandidate.key と同じ形)。"""
+    return f"{name}\n{class_name}"
+
+
+def dl_consumed_put(records: dict, name, class_name,
+                    summary: str = "") -> None:
+    """押下を始めた候補を控える。古い控えと上限超えはここで落とす
+    (ファイルは小さく保つ)。"""
+    records[dl_consumed_key(name, class_name)] = {
+        "name": name or "",
+        "class_name": class_name or "",
+        "summary": summary or "",
+        "saved_at": time.time(),
+    }
+    now = time.time()
+    for key in [k for k, e in records.items()
+                if _dl_consumed_expired(e, now)]:
+        del records[key]
+    while len(records) > DL_CONSUMED_LIMIT:
+        oldest = min(records, key=lambda k: records[k].get("saved_at", 0))
+        del records[oldest]
+
+
+def dl_consumed_get(records: dict, name, class_name):
+    """候補が控えにあり、まだ新しい (24時間以内) なら控えを返す。
+
+    無ければ None。"""
+    entry = records.get(dl_consumed_key(name, class_name))
+    if not isinstance(entry, dict):
+        return None
+    if _dl_consumed_expired(entry, time.time()):
+        return None
+    return entry
+
+
+# ---------------------------------------------------------------
+# 実行済みハッシュの控え (script_runner_executed_hashes.json)。
+# 実行を始めたスクリプトの中身の sha256 を控える。自動実行は、
+# ここにある中身を二度は走らせない (1-29、Nagato の提案)。
+# ブラウザが同じファイルを (1) (2) と写しで落としても、写しは
+# 別ファイルでも中身が同じなので、この控えで止められる。
+# 実行ログ (script_runner_log.jsonl) にも sha256 は残るが、あちら
+# は監査用の積み上げで際限なく伸びる。自動実行の判定は毎回引く
+# ので、上限のある小さな控えを別に持つ (チェックの控え・対象の
+# 控えと同じ作法)。7日を超えた控えは読み込み・追加で落とす。
+EXECUTED_HASH_FILENAME = "script_runner_executed_hashes.json"
+EXECUTED_HASH_TTL_SECONDS = 7 * 24 * 3600
+EXECUTED_HASH_LIMIT = 200
+
+
+def executed_hash_path() -> Path:
+    return data_dir() / EXECUTED_HASH_FILENAME
+
+
+def _executed_hash_expired(saved_at, now: float) -> bool:
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > EXECUTED_HASH_TTL_SECONDS
+
+
+def load_executed_hashes(records_path=None) -> dict:
+    """控え {sha256: 実行した時刻} を読み込む。
+
+    壊れている・読めない場合は空として扱う。古い控え (7日超) は、
+    読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else executed_hash_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for sha, saved_at in raw.items():
+        if not isinstance(sha, str) or not sha:
+            continue
+        if _executed_hash_expired(saved_at, now):
+            continue
+        records[sha] = saved_at
+    return records
+
+
+def save_executed_hashes(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (自動実行の歯止めが
+    1回分緩むだけ)。書きかけで壊さないよう、一度別名で書いてから
+    置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else executed_hash_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def executed_hash_put(records: dict, sha256: str) -> None:
+    """実行を始めた中身の sha256 を控える。古い控えと上限超えは
+    ここで落とす。"""
+    if not sha256:
+        return
+    records[sha256] = time.time()
+    now = time.time()
+    for sha in [s for s, t in records.items()
+                if _executed_hash_expired(t, now)]:
+        del records[sha]
+    while len(records) > EXECUTED_HASH_LIMIT:
+        oldest = min(records, key=lambda s: records[s])
+        del records[oldest]
+
+
+def executed_hash_contains(records: dict, sha256: str) -> bool:
+    """その中身が実行済みの控えにあるか (7日以内)。"""
+    if not sha256:
+        return False
+    saved_at = records.get(sha256)
+    return not _executed_hash_expired(saved_at, time.time())
+
+
+# ---------------------------------------------------------------
+# 診断の控え (script_runner_diag.json)。
+# ループが止まったとき、画面の外からは「どの段で・なぜ」止まった
+# のかが見えない。PHAL 自身の直近の動き (DL の押下・チェック・
+# 実行・回答・送信・開き直し・自動実行の見送り) を短い文で控えて
+# おき、「AIの窓」の「診断をAIへ貼る」でまとめて AI の入力欄へ
+# 入れられるようにする (1-41、Nagato の提案)。控えるのは PHAL が
+# 既に画面に出している名前と結果の文だけで、ファイルの中身や
+# クリップボードは入れない。開き直しをまたいで残すため、他の
+# 控えと同じ置き場に小さな JSON で置く。
+DIAG_FILENAME = "script_runner_diag.json"
+DIAG_LIMIT = 60               # 控える件数の上限
+DIAG_TEXT_LIMIT = 240         # 1件の文の長さの上限 (文字)
+DIAG_BUNDLE_EVENT_COUNT = 25  # 束に入れる直近の件数
+DIAG_BUNDLE_LIMIT = 4000      # 束全体の長さの上限 (文字)
+
+
+def diag_path() -> Path:
+    return data_dir() / DIAG_FILENAME
+
+
+def load_diag_events(events_path=None) -> list:
+    """控え [{at: 時刻, text: 文}] を読み込む (古い順)。
+
+    壊れている・読めない場合は空として扱う (診断が理由でパネルが
+    落ちてはならない)。形の違う要素は読み飛ばし、上限を超えて
+    いれば新しい方だけ残す。"""
+    path = Path(events_path) if events_path is not None else diag_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    events = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        at = entry.get("at")
+        text = entry.get("text")
+        if not isinstance(at, (int, float)) \
+                or not isinstance(text, str) or not text:
+            continue
+        events.append({"at": float(at), "text": text})
+    return events[-DIAG_LIMIT:]
+
+
+def save_diag_events(events: list, events_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    診断が少し古いだけ)。書きかけで壊さないよう、一度別名で
+    書いてから置き換える。"""
+    path = Path(events_path) if events_path is not None else diag_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(events[-DIAG_LIMIT:], f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def diag_append(events: list, text: str, at=None) -> None:
+    """1件足す (その場で書き換える)。上限を超えたら古い方から
+    落とす。文は1行に畳んで長さを切る (押下の結果の文など、
+    そのままでは長いものがあるため)。"""
+    text = " ".join(str(text).split())
+    if not text:
+        return
+    if len(text) > DIAG_TEXT_LIMIT:
+        text = text[:DIAG_TEXT_LIMIT - 1] + "…"
+    events.append({
+        "at": float(at) if at is not None else time.time(),
+        "text": text,
+    })
+    del events[:-DIAG_LIMIT]
+
+
+def _diag_time_text(at: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(at))
+
+
+def build_diag_bundle(version: str, toggles: dict, profile_name: str,
+                      chain_lines, events, at=None) -> str:
+    """AI へ貼る診断の束を組み立てる。
+
+    見出し (PHAL の版と時刻)・自動化の切替・有効なプロファイル名・
+    今の連鎖の状態・直近の記録 (古い順) を、短い平文で並べる。
+    全体の上限を超える場合は、記録の古い方から落として収める
+    (見出しと状態は落とさない)。"""
+    now = float(at) if at is not None else time.time()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+    def on_off(key):
+        return "入" if (toggles or {}).get(key) else "切"
+
+    head = [
+        f"PHAL診断 Ver{version} {stamp}",
+        f"自動化: DL={on_off('auto_dl')} 実行={on_off('auto_run')} "
+        f"回答={on_off('auto_answer')} 送信={on_off('auto_send')} "
+        f"診断={on_off('auto_diag')}",
+        f"AIプロファイル: {profile_name or '(未設定)'}",
+        "状態:",
+    ]
+    head += [f"- {line}" for line in (chain_lines or [])]
+    head.append("直近の記録:")
+    recent = list(events or [])[-DIAG_BUNDLE_EVENT_COUNT:]
+    lines = [f"{_diag_time_text(e['at'])} {e['text']}" for e in recent]
+    while lines and len("\n".join(head + lines)) > DIAG_BUNDLE_LIMIT:
+        lines.pop(0)
+    bundle = "\n".join(head + lines)
+    if len(bundle) > DIAG_BUNDLE_LIMIT:
+        bundle = bundle[:DIAG_BUNDLE_LIMIT]
+    return bundle
+
+
+# ---------------------------------------------------------------
+# 診断の自動応答の控え (script_runner_diag_auto.json)。
+# AI の発言の中の目印の行 (copilot_loop.DIAG_REQUEST_MARKER) を
+# 見つけたら、診断の束を自動で入れて送る機能 (1-43) の歯止め。
+# 同じ発言で二度送らないための「消費済みの目印の ID」と、短時間
+# に繰り返さないための「直近に送った時刻」を、開き直しをまたいで
+# 残す。他の控えと同じ置き場・同じ作法 (壊れたら空に倒す)。
+DIAG_AUTO_FILENAME = "script_runner_diag_auto.json"
+DIAG_AUTO_COOLDOWN_SEC = 300.0  # 自動応答の間隔 (5分)
+
+
+def diag_auto_path() -> Path:
+    return data_dir() / DIAG_AUTO_FILENAME
+
+
+def load_diag_auto(state_path=None) -> dict:
+    """自動応答の控え {consumed_id, last_sent_at} を読み込む。
+
+    壊れている・読めない・形が違う場合は、消費した物は無く
+    送ったことも無い、として扱う (自動応答が理由でパネルが
+    落ちてはならない)。"""
+    path = Path(state_path) if state_path is not None \
+        else diag_auto_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"consumed_id": "", "last_sent_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "last_sent_at": 0.0}
+    consumed = raw.get("consumed_id")
+    sent_at = raw.get("last_sent_at")
+    return {
+        "consumed_id": consumed if isinstance(consumed, str) else "",
+        "last_sent_at": float(sent_at)
+        if isinstance(sent_at, (int, float)) else 0.0,
+    }
+
+
+def save_diag_auto(state: dict, state_path=None) -> None:
+    """自動応答の控えを書き出す。失敗しても黙って諦める (次に
+    開いたとき控えが少し古いだけ)。書きかけで壊さないよう、
+    一度別名で書いてから置き換える。"""
+    path = Path(state_path) if state_path is not None \
+        else diag_auto_path()
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "last_sent_at": float(state.get("last_sent_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------
@@ -715,6 +1311,26 @@ foreach ($c in $cmds) {
 """
 
 
+# PowerShell の警告対象 (実害のある命令だけ)。解決済みの名前
+# (エイリアスを直したもの)で引くので、rm や del も Remove-Item に
+# 集約される。許可リスト方式は 2026-11-14 の緩和でやめた。
+_PS_DANGER_COMMANDS = {
+    "remove-item": "ファイルを消す命令があります",
+    "rename-item": "ファイル名を変える命令があります",
+    "move-item": "ファイルを移す命令があります",
+    "set-content": "ファイルへ書き込む命令があります",
+    "add-content": "ファイルへ書き込む命令があります",
+    "clear-content": "ファイルの中身を消す命令があります",
+    "out-file": "ファイルへ書き込む命令があります",
+    "invoke-expression": "文字列を実行する命令があります",
+    "invoke-command": "動的に実行する命令があります",
+    "invoke-webrequest": "外部へ通信する命令があります",
+    "invoke-restmethod": "外部へ通信する命令があります",
+    "send-mailmessage": "メールを送る命令があります",
+    "stop-process": "プロセスを止める命令があります",
+}
+
+
 def _ps_allowed(name: str, allowlist) -> bool:
     import fnmatch
 
@@ -853,11 +1469,12 @@ def _run_ps_checker(target, exe, allowlist, result) -> CheckResult:
             warns.append((line, "動的な呼び出しがあります"))
             continue
         real = str(resolved.get(name) or name)
-        if not _ps_allowed(real, allowlist):
-            if real.lower() == "remove-item":
-                warns.append((line, "ファイルを消す命令があります(Remove-Item)"))
-            else:
-                warns.append((line, f"{real} は読むだけの許可リストにありません"))
+        # 警告は「実害のある命令」だけに絞る (2026-11-14、持ち主の
+        # 判断で緩和)。許可リストに無いというだけでは警告にしない
+        # (Set-Location のような日常の命令が要確認になっていた)。
+        danger = _PS_DANGER_COMMANDS.get(real.lower())
+        if danger is not None:
+            warns.append((line, f"{danger}({real})"))
     for redir in checked.get("redirections") or []:
         warns.append((int(redir.get("line") or 0),
                       "ファイルへの書き込み(リダイレクト)があります"))
@@ -884,10 +1501,46 @@ def _run_ps_checker(target, exe, allowlist, result) -> CheckResult:
     return result
 
 
+def phal_engine(path):
+    """.phal ファイルの1行目の宣言を読む。"python" / "powershell" /
+    None(宣言が無い・読めない)。
+
+    宣言は `#!phal python` または `#!phal powershell`。BOM・前後の
+    空白・大文字小文字は気にしない。読むのは1行目だけ。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.readline()
+    except OSError:
+        return None
+    line = raw.decode("utf-8-sig", errors="replace").strip().lower()
+    if line == "#!phal python":
+        return "python"
+    if line == "#!phal powershell":
+        return "powershell"
+    return None
+
+
 def check_script(path, config: dict) -> CheckResult:
-    """拡張子で振り分けるチェックの入口。"""
+    """拡張子で振り分けるチェックの入口。.phal は1行目の宣言で
+    振り分ける。"""
     path = Path(path)
-    if path.suffix.lower() == ".ps1":
+    suffix = path.suffix.lower()
+    if suffix == ".phal":
+        engine = phal_engine(path)
+        if engine == "powershell":
+            return check_powershell_script(path)
+        if engine == "python":
+            return check_python_script(
+                path, str(config.get("python") or "python"))
+        result = CheckResult(sha256=file_sha256(path))
+        result.status = STATUS_ERROR
+        result.kind = "syntax"
+        message = "1行目に #!phal python または #!phal powershell が必要です"
+        result.issues = [CheckIssue(line=1, message=message)]
+        result.jump_line = 1
+        result.headline = message
+        return result
+    if suffix == ".ps1":
         return check_powershell_script(path)
     return check_python_script(path, str(config.get("python") or "python"))
 
@@ -1092,7 +1745,13 @@ def execute_script(path, config: dict, handle: RunHandle = None,
     result = RunResult(name=path.name, path=str(path),
                        sha256=file_sha256(path))
     timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-    is_ps = path.suffix.lower() == ".ps1"
+    is_phal = path.suffix.lower() == ".phal"
+    if is_phal:
+        # .phal は1行目の宣言で言語を決める。宣言が無ければ Python
+        # 扱いで試す(チェックでエラーになるので通常はここへ来ない)。
+        is_ps = phal_engine(path) == "powershell"
+    else:
+        is_ps = path.suffix.lower() == ".ps1"
     started = time.monotonic()
     if expected_sha256 is not None:
         current = file_sha256(path)
@@ -1112,7 +1771,12 @@ def execute_script(path, config: dict, handle: RunHandle = None,
         # ないため)。sha256 は元のファイルで取る(上で取得済み)。
         bom_raw = ps1_bom_copy_source(path)
         if bom_raw is not None:
-            bom_copy = path.parent / (BOM_COPY_PREFIX + path.name)
+            copy_name = BOM_COPY_PREFIX + path.name
+            if is_phal:
+                # PowerShell の -File は .ps1 でないと受けないため、
+                # .phal の写しの末尾は .ps1 にする。
+                copy_name = BOM_COPY_PREFIX + path.stem + ".ps1"
+            bom_copy = path.parent / copy_name
             try:
                 bom_copy.write_bytes(UTF8_BOM + bom_raw)
             except OSError:
@@ -1123,6 +1787,16 @@ def execute_script(path, config: dict, handle: RunHandle = None,
                 result.stderr = result.start_error
                 return result
             run_path = bom_copy
+        elif is_phal:
+            # BOM の写しが要らない場合(BOM 付き・ASCII のみ)も、
+            # 拡張子 .phal のままでは -File で受けないので、
+            # .ps1 の写しで実行する。
+            bom_copy = path.parent / (BOM_COPY_PREFIX + path.stem + ".ps1")
+            try:
+                bom_copy.write_bytes(path.read_bytes())
+                run_path = bom_copy
+            except OSError:
+                bom_copy = None  # 写しが作れなければ元のまま試す
         argv = [exe, "-NoProfile", "-File", str(run_path)]
         env = dict(os.environ)
     else:
@@ -1197,6 +1871,71 @@ def execute_script(path, config: dict, handle: RunHandle = None,
 
 
 # ---------------------------------------------------------------
+# コマンドID(ファイル名の先頭に付ける「セッション番号-通番」)
+# ---------------------------------------------------------------
+# AI 側がスクリプトを管理するための ID。ファイル名の先頭に
+# 「12-03_check_db.py」のように付け、一覧の ID 列と実行結果の文に
+# 出すことで、結果を貼り返したときにどのスクリプトの結果か分かる。
+_COMMAND_ID_RE = re.compile(r"^(\d{1,3}-\d{1,3})_")
+
+
+def parse_command_id(name: str):
+    """ファイル名の先頭にあるコマンドIDを取り出す。無ければ None。
+
+    形は「セッション番号-通番」のあとに "_"、続けて名前。
+    例: "12-03_check_db.py" → "12-03"、"12-3_check_db.py" → "12-3"。
+    表示はファイル名に書かれたまま(0 埋めは残す)。
+    線引き:
+      - 区切りは "_" のみ。"-" まで許すと "26-11-14" のような
+        日付と区別がつかない。
+      - 各部は3桁まで。"2026-11-14_notes.py" のような4桁の年で
+        始まる日付を ID と取り違えないため。
+    """
+    match = _COMMAND_ID_RE.match(name)
+    return match.group(1) if match else None
+
+
+# 概要として見る先頭の行数。これより後ろのコメントは拾わない。
+_SUMMARY_SCAN_LINES = 10
+
+
+def extract_summary(path) -> str:
+    """スクリプトの先頭コメント(何をする物か)を返す。無ければ ""。
+
+    一覧の概要列に出すためのもの。読むのは先頭の数行だけ:
+      - 空行、shebang (#!...)、.phal の宣言行 (#!phal ...) は飛ばす。
+      - 最初に残った行が # で始まるコメントなら、# と前後の空白を
+        外した中身を返す。コードや docstring が先に来たら ""。
+      - コメントがファイル自身のコマンドID(「1-3:」「1-3 」)で
+        始まっていたら、その接頭辞も外す(ID は ID 列に出ている)。
+    文字コードは BOM を外し、読めない文字は置き換えて読み進める。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        return ""
+    text = raw.decode("utf-8-sig", errors="replace")
+    for line in text.splitlines()[:_SUMMARY_SCAN_LINES]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#!"):
+            continue  # shebang と .phal の宣言行
+        if not stripped.startswith("#"):
+            return ""
+        summary = stripped.lstrip("#").strip()
+        command_id = parse_command_id(Path(path).name)
+        if command_id and summary.startswith(command_id):
+            tail = summary[len(command_id):]
+            sep = re.match(r"\s*:\s*|\s+", tail)
+            if sep:
+                summary = tail[sep.end():]
+        return summary
+    return ""
+
+
+# ---------------------------------------------------------------
 # クリップボードに入れる文
 # ---------------------------------------------------------------
 def truncate_text(text: str, head_lines: int = 200, tail_lines: int = 50,
@@ -1240,17 +1979,23 @@ def _section(title: str, body: str, config: dict) -> str:
     return f"--- {title} ---\n{body}"
 
 
-def build_result_text(name: str, run: RunResult, config: dict) -> str:
-    """実行したときにクリップボードへ入れる文。"""
+def build_result_text(name: str, run: RunResult, config: dict,
+                      command_id: str = None) -> str:
+    """実行したときにクリップボードへ入れる文。
+
+    command_id(ファイル名先頭のコマンドID)があるときは、1行目を
+    「[実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
+    ようにする。無いときの文は今までと完全に同じ。"""
     config = normalize_config(config)
+    label = f"{command_id} {name}" if command_id else name
     if run.timed_out:
         timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-        first = f"[実行結果] {name}  時間切れで止めました({timeout}秒)"
+        first = f"[実行結果] {label}  時間切れで止めました({timeout}秒)"
     elif run.stopped:
-        first = f"[実行結果] {name}  停止しました"
+        first = f"[実行結果] {label}  停止しました"
     else:
         code = run.exit_code if run.exit_code is not None else "-"
-        first = f"[実行結果] {name}  終了コード {code}  {run.seconds:.1f}秒"
+        first = f"[実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
     if run.start_error:
         first += f"  起動エラー: {run.start_error}"
     parts = [first,
@@ -1259,6 +2004,69 @@ def build_result_text(name: str, run: RunResult, config: dict) -> str:
     if run.policy_stop:
         parts.append(POLICY_NOTE)
     return "\n".join(parts)
+
+
+def build_return_text(name: str, reason: str, run: RunResult = None,
+                      config: dict = None, script_text: str = "",
+                      command_id: str = None) -> str:
+    """「差し戻す」でクリップボードへ入れる文。
+
+    事前チェックを通ったのに実行時にエラーになったスクリプトを、
+    証拠(実行結果)と全文つきで AI へ返すためのもの。貼り返した側が
+    同じ ID で直した版を出せるよう、1行目は結果文と同じ対応付け
+    (ID + ファイル名)にする。実行結果の部分は build_result_text を
+    そのまま使う(二重に整えない)。"""
+    config = normalize_config(config or {})
+    label = f"{command_id} {name}" if command_id else name
+    parts = [f"[差し戻し] {label}"]
+    reason = (reason or "").strip()
+    if reason:
+        parts.append(f"理由: {reason}")
+    if run is not None:
+        parts.append("--- 実行結果 ---")
+        parts.append(build_result_text(name, run, config,
+                                       command_id=command_id))
+    parts.append("--- スクリプト ---")
+    parts.append(script_text)
+    return "\n".join(parts)
+
+
+def move_to_recycle_bin(path) -> bool:
+    """ファイルを Windows のゴミ箱へ移す。成功したら True。
+
+    戻せる消し方が要るので、shell32 の SHFileOperationW に
+    FOF_ALLOWUNDO を付けて頼む(確認ダイアログも出さない)。
+    Windows 以外と失敗時は False(呼ぶ側が失敗を伝えること)。"""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class _SHFileOpStructW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.WORD),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    fo_delete = 3
+    fof_allowundo = 0x0040
+    fof_noconfirmation = 0x0010
+    try:
+        op = _SHFileOpStructW()
+        op.wFunc = fo_delete
+        # pFrom は二重の終端(パス + "\0\0")が要る。
+        op.pFrom = str(Path(path)) + "\0\0"
+        op.fFlags = fof_allowundo | fof_noconfirmation
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    except (OSError, ValueError, AttributeError):
+        return False
+    return result == 0 and not op.fAnyOperationsAborted
 
 
 def build_check_text(name: str, result: CheckResult) -> str:

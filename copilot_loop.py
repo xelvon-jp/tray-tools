@@ -27,6 +27,7 @@
 # 窓の条件もボタン名も SELECTORS にまとめてある。別アプリに移すときはここだけ
 # 差し替える。コード側には日本語のボタン名を直書きしない。
 import ctypes
+import hashlib
 import re
 import sys
 import time
@@ -182,7 +183,44 @@ def profiles(app_settings=None):
 
 CONTROL_BUTTON, CONTROL_TEXT, CONTROL_DOCUMENT = 50000, 50020, 50030
 CONTROL_EDIT = 50004
+CONTROL_MENU = 50009
+CONTROL_MENU_ITEM, CONTROL_LIST_ITEM = 50011, 50008
+CONTROL_WINDOW, CONTROL_PANE, CONTROL_DIALOG = 50032, 50033, 50031
 VALUE_PATTERN, INVOKE_PATTERN, TEXT_PATTERN = 10002, 10000, 10014
+# 「開く」系のボタン用 (teams_meeting の EXPAND_PATTERN と同じ値)。
+EXPAND_COLLAPSE_PATTERN = 10005
+# DL の押下で、Invoke の次に試す仕組み (1-32)。実機では、同じ項目でも
+# 描画の状態で持っている仕組みが変わる。
+SELECTION_ITEM_PATTERN, TOGGLE_PATTERN = 10010, 10015
+LEGACY_ACCESSIBLE_PATTERN = 10018
+
+# 種類コード → 表示名 (調査画面で人に見せるため。無いものはコードで出す)。
+CONTROL_TYPE_NAMES = {
+    50000: "Button", 50001: "Calendar", 50002: "CheckBox",
+    50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
+    50006: "Image", 50007: "ListItem", 50008: "List", 50009: "Menu",
+    50010: "MenuBar", 50011: "MenuItem", 50012: "ProgressBar",
+    50013: "RadioButton", 50014: "ScrollBar", 50015: "Slider",
+    50016: "Spinner", 50017: "StatusBar", 50018: "Tab",
+    50019: "TabItem", 50020: "Text", 50021: "ToolBar",
+    50022: "ToolTip", 50023: "Tree", 50024: "TreeItem",
+    50025: "Custom", 50026: "Group", 50027: "Thumb",
+    50028: "DataGrid", 50029: "DataItem", 50030: "Document",
+    50032: "Window", 50033: "Pane",
+}
+
+# クラス名から「編集できそう」と見当を付けるための手掛かり (小文字の
+# 部分一致)。網頁の contenteditable は、フレームワークのクラス名
+# (ProseMirror 等) が付いていることが多い。
+EDITABLE_CLASS_HINTS = (
+    "prosemirror", "ql-editor", "codemirror", "monaco", "drafteditor",
+    "contenteditable", "richtext", "rich-text", "textinput",
+    "text-input", "inputarea", "input-area", "wysiwyg", "editor",
+)
+
+# 調査で拾う候補の上限 (木が大きい網頁でも、返事が際限なく大きく
+# ならないように)。
+SCAN_CANDIDATE_LIMIT = 300
 WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 
 # 埋め込みオブジェクト(ボタンや画像)の位置に入る文字。本文には要らない。
@@ -221,6 +259,119 @@ class _RECT(ctypes.Structure):
 if user32 is not None:
     user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
     user32.GetWindowRect.restype = ctypes.c_bool
+    # ESC の PostMessage 用 (1-67)。WPARAM は size_t、LPARAM は
+    # ssize_t (署名なしだと HWND と同じく 64bit で化ける)。
+    user32.PostMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+        ctypes.c_ssize_t]
+    user32.PostMessageW.restype = ctypes.c_bool
+
+
+# SendInput (マウス) の構造体。mouse_jiggler と同じ顔ぶれにしないと
+# INPUT の大きさがずれ、SendInput が何もせず 0 を返す (64bit では
+# INPUT 全体で40バイト)。使うのは mi だけ。
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_ulong), ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort)]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT),
+                ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_ulong), ("u", _INPUT_UNION)]
+
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN = 0x0001, 0x0002
+MOUSEEVENTF_LEFTUP, MOUSEEVENTF_ABSOLUTE = 0x0004, 0x8000
+SM_CXSCREEN, SM_CYSCREEN = 0, 1
+
+if user32 is not None:
+    user32.SendInput.argtypes = [
+        ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+
+
+def _click_at(x, y):
+    """画面座標 (物理px) を実際にクリックする。SendInput の絶対移動と
+    左ボタンの上げ下げを1組で送る。
+
+    DL の押下で、UIA の仕組みがどれも使えないときの最終手段 (1-32)。
+    それ以外の場所では使わないこと (この道具は原則 UIA だけで触る)。"""
+    if user32 is None:
+        raise RuntimeError("この環境ではマウス入力が使えません")
+    width = user32.GetSystemMetrics(SM_CXSCREEN)
+    height = user32.GetSystemMetrics(SM_CYSCREEN)
+    if width <= 0 or height <= 0:
+        raise RuntimeError("画面の大きさが分かりません")
+    # 絶対座標は画面全体を 0..65535 に写した値で渡す。
+    nx = int(x * 65535 / max(1, width - 1))
+    ny = int(y * 65535 / max(1, height - 1))
+
+    def _event(flags):
+        ev = _INPUT()
+        ev.type = INPUT_MOUSE
+        ev.mi.dx = nx
+        ev.mi.dy = ny
+        ev.mi.dwFlags = flags
+        return ev
+
+    events = (_INPUT * 3)(
+        _event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+        _event(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE),
+        _event(MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE))
+    sent = user32.SendInput(3, events, ctypes.sizeof(_INPUT))
+    if sent != 3:
+        raise RuntimeError(f"クリックを送れませんでした (SendInput={sent})")
+
+
+def _click_element(el):
+    """要素の外接矩形の中心をクリックする。位置が取れなければ
+    RuntimeError (_activate_element が理由として畳む)。"""
+    rect = _bounding_rect(el)
+    if rect is None:
+        raise RuntimeError("要素の位置が分かりません")
+    left, top, right, bottom = rect
+    _click_at((left + right) // 2, (top + bottom) // 2)
+
+
+def _post_escape(hwnd):
+    """窓へ ESC のキー消息 (WM_KEYDOWN → WM_KEYUP) を PostMessage
+    で投げる (1-67)。戻り値は短い状態語で、例外は出さない
+    (呼び側の本筋を止めないため)。
+
+    "sent" (2通とも投げた) / "no-hwnd" (宛先が無い、または
+    この環境では投げられない) / "failed" (投げるのに失敗)。
+    投げた先で本当に効いたかは、ここからは分からない。"""
+    if not hwnd or user32 is None:
+        return "no-hwnd"
+    try:
+        down = user32.PostMessageW(
+            ctypes.c_void_p(hwnd), WM_KEYDOWN, VK_ESCAPE, 0)
+        up = user32.PostMessageW(
+            ctypes.c_void_p(hwnd), WM_KEYUP, VK_ESCAPE, 0)
+    except Exception:  # noqa: BLE001  投げ損ねても本筋は続ける
+        return "failed"
+    return "sent" if down and up else "failed"
 
 
 def window_bounds(hwnd):
@@ -404,6 +555,176 @@ def find_window(profile):
     return main, _find_render_child(main, profile.get("render_class") or "")
 
 
+def _button_not_found_message(candidates):
+    """送信ボタンの「見つからない」段の文。候補の件数と名前(最大3件)。
+
+    入力欄の _input_not_found_message と同じ考え: 名前を添えると、
+    プロファイルの目印と実物がどうずれているか、その場で見比べられる。"""
+    names = []
+    for _el, name, _class_name, _aid, _has_invoke in candidates or []:
+        names.append((name or "").strip() or "(名前なし)")
+        if len(names) >= 3:
+            break
+    count = len(candidates or [])
+    if names:
+        return (f"送信ボタンが見つかりませんでした"
+                f"（ボタンは {count} 件ありました: "
+                f"{'、'.join(names)}）")
+    return f"送信ボタンが見つかりませんでした（ボタンは {count} 件でした）"
+
+
+class InputStageError(RuntimeError):
+    """入力欄まわりの失敗で、「どの段で落ちたか」が付いたもの。
+
+    stage は "not_found"(目印に合う要素が無い) / "unreadable"(見つけたが
+    中身が読めない) / "unwritable"(書き込む・押す段で失敗) のどれか。文は
+    そのまま利用者へ見せられる日本語にしておく。送信ボタンまわり
+    (press_send_button) でも同じ段分けで使う。
+
+    これまでは、どの段で落ちても「入力欄が読めませんでした」の一文に
+    畳まれていて、プロファイルの目印がずれているのか、要素の作りが
+    違うのかが画面から分からなかった(2026-11-14、Edge の中の Muse
+    へのテスト入力)。直し方が段ごとに違うので、分けて伝える。"""
+
+    def __init__(self, stage, message):
+        super().__init__(message)
+        self.stage = stage
+
+
+def _input_not_found_message(candidates):
+    """「見つからない」段の文。候補の件数と名前(最大3件)を添える。
+
+    名前を添えると、プロファイルの目印(名前)と実物がどうずれているか、
+    その場で見比べられる。"""
+    names = []
+    for _el, name, _class_name, _has_value in candidates or []:
+        names.append((name or "").strip() or "(名前なし)")
+        if len(names) >= 3:
+            break
+    count = len(candidates or [])
+    if names:
+        return (f"入力欄が見つかりませんでした"
+                f"（編集できそうな要素は {count} 件ありました: "
+                f"{'、'.join(names)}）")
+    return (f"入力欄が見つかりませんでした"
+            f"（編集できそうな要素は {count} 件でした）")
+
+
+# DL カードの名前が1行に潰れているとき、コメントの後ろにコードが
+# 同じ行で続く。その始まりとみなす目印 (前後に空白のある形)。
+_DOWNLOAD_CODE_STARTERS = (" import ", " from ", " def ", " class ")
+
+# DL は2段で押す (1-23、実機の観察): カード自体のクリックはアプリ内の
+# プレビューを開くだけで、ダウンロードは始まらない。本当の経路は、
+# その発言の「その他のオプション」(…) を開いて、メニューの
+# 「ダウンロード」を押すこと。名前は実機 (Edge の中の Muse) の
+# 表示そのまま。
+OPTIONS_BUTTON_NAME = "その他のオプション"
+DOWNLOAD_ITEM_NAME = "ダウンロード"
+# カードの後ろで「…」を探す上限 (要素数)。発言の中のボタン
+# (リアクション / 返信 / …) はカードのすぐ後ろに並ぶので、40 でも
+# 十分すぎるほど届く。次のカードに当たったら、そこで打ち切る
+# (そこから先は別の発言の持ち物)。
+OPTIONS_SEARCH_LIMIT = 40
+# 「…」を押してからメニューが出るまで待つ上限と間隔 (秒)。
+DOWNLOAD_MENU_TIMEOUT = 2.0
+DOWNLOAD_MENU_POLL = 0.15
+# 「ダウンロード」の押下が一通り失敗したとき、間を置いて
+# 見つけ直し+押下を1回だけやり直す (メニューの描画が落ち着く
+# のを待つ、1-32)。
+DOWNLOAD_PRESS_RETRY_WAIT = 0.6
+
+# Edge のダウンロード・フライアウト (パネル) の目印 (1-40)。
+# ダウンロードが始まるたびに自動で開き、開いている間は自動 DL の
+# 2段押下が実機で一度も成功していない (「…」メニューのあたりを
+# 覆い、探索も惑わせる)。Edge の設定で自動表示は切れるが、PHAL は
+# その設定に依存しない (入れている利用者もいる)。押下の前に、
+# 見つけたら閉じてから進む。
+FLYOUT_TITLE = "ダウンロード"
+FLYOUT_CLOSE_BUTTON_NAME = "閉じる"
+# パネルを探す深さの上限 (デスクトップ直下の要素から数えた段数)。
+# 木全体を歩くと重いし、チャットの本文まで降りると誤認の元に
+# なるので、浅い所だけを見る。
+FLYOUT_SEARCH_DEPTH = 2
+# 閉じる操作のあと、パネルが消えるのを待つ時間 (秒)。
+FLYOUT_DISMISS_WAIT = 0.3
+
+# ESC で閉じる (1-67、Nagato の案)。1-40 の UIA 解散は、実物の
+# パネルの形 (見分けの組) が当たらず実機で閉じられなかった。
+# こちらは要素を探さず、対象の窓へ ESC のキー消息を PostMessage
+# で投げる。DL の到着が確かめられた直後 (窓側から standalone で
+# 呼ばれる) と、押下の直前 (解散の手前の保険) の2か所だけで使う。
+# 前面化 (SetForegroundWindow) も SendInput もしない (フォーカスを
+# 奪わない原則は守る)。Chromium の Views バブルに届くかどうかは
+# 実機でしか確かめられない (設定 ON で1周が判定)。
+WM_KEYDOWN, WM_KEYUP, VK_ESCAPE = 0x0100, 0x0101, 0x1B
+
+# 診断リクエストの目印 (1-43、Nagato の案)。AI の最新の発言の中に
+# この行が単独で立っていたら、PHAL の窓側が「診断を送ってほしい」
+# という呼びかけとして扱う (自動応答の切替が入っているときだけ)。
+# 普段の文章に出てこない形にしてあり、前後の空白は許すが、行の
+# 中身はこの文字列ちょうどでなければならない。
+DIAG_REQUEST_MARKER = "PHAL:診断リクエスト"
+# 目印より後ろに続く本文の上限 (文字)。最新の発言の中の目印だけを
+# 相手にするため、後ろに会話が長く続いている (= 古い発言の中の
+# 目印) ものは数えない。同じ発言の続きと、入力欄まわりの UI の
+# 文字列が入る程度は見込んである。
+DIAG_MARKER_TAIL_LIMIT = 4000
+
+# 押下の仕組みの優先順 (DL の2段で共通に使う、1-32)。
+#   (パターンID, インタフェース名, メソッド名, 表示名)
+# 実機のループ試験サイクル2 (2026-11-15) で、「ダウンロード」の
+# 項目はあるのに InvokePattern が無く、押せずに止まった。サイクル1
+# では Invoke で押せており、同じ項目でも描画の状態で持っている
+# 仕組みが変わる。1つに決め打ちせず、持っている仕組みを順に使う。
+_ACTIVATION_CHAIN = (
+    (INVOKE_PATTERN, "IUIAutomationInvokePattern", "Invoke", "Invoke"),
+    (EXPAND_COLLAPSE_PATTERN, "IUIAutomationExpandCollapsePattern",
+     "Expand", "ExpandCollapse"),
+    (SELECTION_ITEM_PATTERN, "IUIAutomationSelectionItemPattern",
+     "Select", "SelectionItem"),
+    (TOGGLE_PATTERN, "IUIAutomationTogglePattern", "Toggle", "Toggle"),
+    (LEGACY_ACCESSIBLE_PATTERN, "IUIAutomationLegacyIAccessiblePattern",
+     "DoDefaultAction", "LegacyIAccessible"),
+)
+
+
+def _download_summary(name):
+    """添付カードの名前から、表示用の要約を取り出す。取れなければ ""。
+
+    カードの名前はファイルの中身の冒頭そのもの。"#!" で始まる
+    スクリプトは、shebang 行の後ろのコメントか、続くコメント行が
+    「何のファイルか」の一文になっている (例: 1行目が
+    "#!phal python # 1-21: チャット確認とDLの行..." の形、または
+    2行目が "# 1-21: ..." の形)。その一文を抜く。名前が1行に
+    潰れている場合は、コードの始まりらしき所で切る。"""
+    text = (name or "").lstrip()
+    if not text.startswith("#!"):
+        return ""
+    lines = text.splitlines()
+    segments = []
+    first = lines[0] if lines else ""
+    tail = first[2:]  # 冒頭の "#!" を落とす
+    mark = tail.find("#")
+    if mark >= 0:
+        segments.append(tail[mark + 1:])
+    for line in lines[1:4]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            segments.append(stripped.lstrip("#"))
+        elif stripped:
+            break
+    for segment in segments:
+        for starter in _DOWNLOAD_CODE_STARTERS:
+            cut = segment.find(starter)
+            if cut >= 0:
+                segment = segment[:cut]
+        summary = " ".join(segment.split())
+        if len(summary) >= 4:
+            return summary[:60]
+    return ""
+
+
 class Copilot:
     """Copilot アプリの窓を1つ掴んで、読み書きする。
 
@@ -497,20 +818,109 @@ class Copilot:
         return root, desc
 
     def _input_box(self, desc):
-        """入力欄の要素。プロファイルの aid のどれかに一致するものを返す。
+        """入力欄の要素。見つからなければ None。
 
-        aid をリストで受けるのはボタン名と同じ理由。加えて、業務PC の値は画面を
-        読み上げてもらって書き取ったもので、聞き取り違いの余地がある。候補を
-        並べておけば、一発勝負にならずに済む。"""
-        wanted = self._names("input_automation_id")
+        照合の本体は _find_input_box(理由付け用の候補も一緒に返す)。
+        こちらは要素だけ欲しい呼び側(状態判定など)のための薄い受け口。"""
+        box, _candidates = self._find_input_box(desc)
+        return box
+
+    def _editable_candidates(self, desc):
+        """編集できそうな要素の並び [(要素, 名前, クラス名, 値の読み書き可)]。
+
+        名前・クラスでの照合の母集団。種類が Edit か Document で、
+        キーボードでフォーカスできるものだけに絞る(調査 scan と同じ
+        入り口)。この外の要素まで名前で合わせに行くと、無関係な表示
+        部品を入力欄と取り違える。"""
+        found = []
         for i in range(desc.Length):
             el = desc.GetElement(i)
             try:
-                if (el.CurrentAutomationId or "") in wanted:
-                    return el
-            except Exception:
+                if el.CurrentControlType not in (CONTROL_EDIT,
+                                                 CONTROL_DOCUMENT):
+                    continue
+                if not el.CurrentIsKeyboardFocusable:
+                    continue
+                name = el.CurrentName or ""
+                class_name = el.CurrentClassName or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
                 continue
-        return None
+            try:
+                has_value = bool(el.GetCurrentPattern(VALUE_PATTERN))
+            except Exception:  # noqa: BLE001
+                has_value = False
+            found.append((el, name, class_name, has_value))
+        return found
+
+    @staticmethod
+    def _class_overlap(stored_class, class_name):
+        """保存したクラス文字列と要素のクラス名で、共通する token の数。
+
+        クラスは空白で区切られた token の列として比べる(順序は見ない)。"""
+        stored = set((stored_class or "").split())
+        if not stored:
+            return 0
+        return len(stored & set((class_name or "").split()))
+
+    def _find_input_box(self, desc):
+        """入力欄を探す。(要素, 候補の並び) を返す。無ければ (None, 候補)。
+
+        照合の優先順位:
+          1. AutomationId の完全一致(プロファイルに aid があるとき)。
+             aid をリストで受けるのはボタン名と同じ理由。加えて、業務PC の
+             値は画面を読み上げてもらって書き取ったもので、聞き取り違いの
+             余地がある。候補を並べておけば、一発勝負にならずに済む
+          2. 名前の一致(編集できそうな候補の中で)。網頁の中の入力欄は
+             AutomationId を持たないことが多く、その場合は PHAL の調査
+             画面(script_runner_ai)が拾った候補の名前とクラスを
+             プロファイルに持つ。同名が複数あれば、保存したクラスとの
+             token の重なりが多い物 → 値の読み書きができる物 → 木の
+             並び順、で1つに決める
+          3. クラスだけでの照合。token の重なりが、保存した token の
+             半分以上(最低1つ)ある物の中で、一番合う物
+
+        【なぜクラスを完全一致で見ないか】
+        網頁のテキストエリアのクラスは、フレームワーク(Tailwind 等)の
+        ユーティリティの列で、状態で付いたり外れたりする token が混ざる。
+        完全一致に賭けた旧実装は、実機(Edge の中の Muse、2026-11-14)
+        で「入力欄が読めませんでした」の一文だけを返して落ちた。名前は
+        利用者向けのラベルで安定しているので、名前を軸にして、クラスは
+        同名の切り分けと「半分以上合えば」の緩い条件に使う。
+
+        候補の並びは、見つからなかった理由(「編集できそうな要素は N 件、
+        名前は…」)を作る材料として一緒に返す。"""
+        wanted = [w for w in self._names("input_automation_id") if w]
+        if wanted:
+            for i in range(desc.Length):
+                el = desc.GetElement(i)
+                try:
+                    if (el.CurrentAutomationId or "") in wanted:
+                        return el, []
+                except Exception:
+                    continue
+        candidates = self._editable_candidates(desc)
+        want_name = self.profile.get("input_name") or ""
+        want_class = self.profile.get("input_class") or ""
+        if want_name:
+            named = [c for c in candidates if c[1] == want_name]
+            if named:
+                best = max(
+                    range(len(named)),
+                    key=lambda k: (
+                        self._class_overlap(want_class, named[k][2]),
+                        named[k][3], -k))
+                return named[best][0], candidates
+        if want_class:
+            stored = set(want_class.split())
+            scored = []
+            for pos, cand in enumerate(candidates):
+                overlap = self._class_overlap(want_class, cand[2])
+                # 保存した token の半分以上が実物にもあること(最低1つ)。
+                if overlap >= 1 and 2 * overlap >= len(stored):
+                    scored.append((overlap, cand[3], -pos, cand[0]))
+            if scored:
+                return max(scored)[3], candidates
+        return None, candidates
 
     def _composer_buttons(self, root, desc):
         """入力欄まわりのボタン名。送信・停止の判定はここに出る。
@@ -580,6 +990,58 @@ class Copilot:
         margin = int(self.profile.get("composer_margin_px") or COMPOSER_MARGIN_PX)
         return (r.top - margin, r.bottom + margin,
                 r.left - margin, r.right + margin)
+
+    def _composer_scope(self, root, desc):
+        """入力欄を含む composer の範囲(祖先要素)。絞れなければ None。
+
+        調査 (scan) の候補を絞るための範囲。入力欄から
+        RawViewWalker で親をたどり、ボタンを1つでも含む最初の
+        祖先を composer とみなす。その内側だけを見れば、会話本文の
+        発言ボタンやサイドバーの項目が候補に混ざらない (実機で
+        送信ボタンの候補が膨大になった。2026-11-14)。
+
+        窓の root 自身に行き着いたら、それは絞り込みにならない
+        ので None を返す (呼び側は窓全体に落ちる)。入力欄の目印が
+        無くて掴めないときも None。"""
+        box, _candidates = self._find_input_box(desc)
+        if box is None:
+            return None
+        try:
+            walker = self.uia.RawViewWalker
+        except Exception:  # noqa: BLE001  取れなければ絞らない
+            return None
+
+        def runtime_id(el):
+            try:
+                return tuple(el.GetRuntimeId())
+            except Exception:  # noqa: BLE001
+                return None
+
+        root_id = runtime_id(root)
+        current = box
+        for _depth in range(8):
+            try:
+                parent = walker.GetParentElement(current)
+            except Exception:  # noqa: BLE001
+                return None
+            if parent is None:
+                return None
+            if root_id is not None and runtime_id(parent) == root_id:
+                return None
+            try:
+                sub = parent.FindAll(
+                    UIA.TreeScope_Descendants, self.true_cond)
+            except Exception:  # noqa: BLE001
+                return None
+            for i in range(sub.Length):
+                try:
+                    if sub.GetElement(i).CurrentControlType \
+                            == CONTROL_BUTTON:
+                        return parent
+                except Exception:  # noqa: BLE001
+                    continue
+            current = parent
+        return None
 
     # -- 状態 --------------------------------------------------------------
     def state(self):
@@ -662,25 +1124,58 @@ class Copilot:
 
     # -- 書く --------------------------------------------------------------
     def set_input(self, text):
-        """入力欄に文字を入れる。送信はしない。"""
+        """入力欄に文字を入れる。送信はしない。
+
+        失敗は段つき(InputStageError)で上げる: 見つからない /
+        書き込む仕組みが無い / 書き込み自体の失敗。呼び側が理由を
+        一文に畳まなくて済むように。"""
         _root, desc = self._descendants()
-        box = self._input_box(desc)
+        box, candidates = self._find_input_box(desc)
         if box is None:
-            raise RuntimeError("入力欄が見つかりません")
+            raise InputStageError(
+                "not_found", _input_not_found_message(candidates))
         pattern = box.GetCurrentPattern(VALUE_PATTERN)
         if not pattern:
-            raise RuntimeError("入力欄に書き込めません（ValuePattern が無い）")
-        pattern.QueryInterface(UIA.IUIAutomationValuePattern).SetValue(text)
+            raise InputStageError(
+                "unwritable", "入力欄に書き込めません（ValuePattern が無い）")
+        try:
+            pattern.QueryInterface(
+                UIA.IUIAutomationValuePattern).SetValue(text)
+        except Exception as e:  # noqa: BLE001  理由は段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"入力欄に書き込めませんでした（{e}）") from e
 
     def read_input(self):
+        """入力欄の今の文を読む。読めなければ InputStageError を上げる。
+
+        【None を返す旧契約をやめた理由】
+        以前は「見つからない・読めない」をどちらも None で返し、呼び側
+        (copilot_io)が「読めませんでした」の一文に畳んでいた。だが
+        「目印に合う要素が無い」と「見つけた要素の中身が読めない」は
+        直し方が違う(前者はプロファイルの目印、後者は要素の作り)。
+        段の分かる文で上げる。None の受け口は copilot_io 側の
+        CopilotLoopTransport.input_text に残してある(テストの fake 等、
+        None を返す実装との互換のため)。"""
         _root, desc = self._descendants()
-        box = self._input_box(desc)
+        box, candidates = self._find_input_box(desc)
         if box is None:
-            return None
+            raise InputStageError(
+                "not_found", _input_not_found_message(candidates))
         pattern = box.GetCurrentPattern(VALUE_PATTERN)
         if not pattern:
-            return None
-        return pattern.QueryInterface(UIA.IUIAutomationValuePattern).CurrentValue
+            raise InputStageError(
+                "unreadable",
+                "入力欄は見つかりましたが、中身を読めませんでした"
+                "（ValuePattern が無い）")
+        try:
+            return pattern.QueryInterface(
+                UIA.IUIAutomationValuePattern).CurrentValue
+        except Exception as e:  # noqa: BLE001  理由は段つきの文に畳む
+            raise InputStageError(
+                "unreadable",
+                "入力欄は見つかりましたが、中身を読めませんでした"
+                f"（{e}）") from e
 
     def probe_input_candidates(self):
         """入力欄の候補を子孫から探して返す(プロファイル作りの下調べ用)。
@@ -711,6 +1206,756 @@ class Copilot:
             except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
                 continue
         return found
+
+    def scan_input_candidates(self):
+        """入力欄の候補を、プローブより深く探して返す (PHAL の調査用)。
+
+        probe_input_candidates は「Edit か Document で ValuePattern を
+        持つもの」だけを返す。網頁の中の入力欄 (contenteditable) は
+        種類が Edit でなかったり ValuePattern が無かったりして、その
+        網から漏れる。実測 (2026-11-14、Edge の中の Muse) では、
+        ページ全体の Document (RootWebArea) だけが拾われて「入力欄」
+        として失敗した。
+
+        こちらは「キーボードでフォーカスできて、編集できそうなもの」
+        を広く拾う: 種類が Edit か Document、またはクラス名から
+        contenteditable 系と見当が付くもの。合わせるための目印
+        (種類・名前・AutomationId・クラス・ValuePattern と
+        TextPattern の有無) を全部付けて返し、どれが本物かは人が
+        調査画面で選ぶ。木がまだ起きていないと候補が空になるので、
+        先に wait_awake で組み上がりを待つ。
+
+        入力欄の目印が既にあり、入力欄を含む composer の範囲が
+        絞れる場合は、その内側の候補だけを返す (送信ボタンの調査と
+        同じ絞り込み。_composer_scope を参照)。範囲で候補が
+        無ければ、従来どおり窓全体から拾う。"""
+        self.wait_awake(timeout=3.0)
+        root, desc = self._descendants()
+        scope = self._composer_scope(root, desc)
+        if scope is not None:
+            narrowed = self._input_candidate_dicts(
+                scope.FindAll(UIA.TreeScope_Descendants, self.true_cond))
+            if narrowed:
+                return narrowed
+        return self._input_candidate_dicts(desc)
+
+    def _input_candidate_dicts(self, desc):
+        """desc の中から、編集できそうな要素を候補の辞書で返す。"""
+        found = []
+        for i in range(desc.Length):
+            if len(found) >= SCAN_CANDIDATE_LIMIT:
+                break
+            el = desc.GetElement(i)
+            try:
+                if not el.CurrentIsKeyboardFocusable:
+                    continue
+                control_type = el.CurrentControlType
+                class_name = (el.CurrentClassName or "").strip()
+                if control_type not in (CONTROL_EDIT, CONTROL_DOCUMENT) \
+                        and not any(hint in class_name.lower()
+                                    for hint in EDITABLE_CLASS_HINTS):
+                    continue
+                found.append({
+                    "control_type": CONTROL_TYPE_NAMES.get(
+                        control_type, f"種類{control_type}"),
+                    "name": (el.CurrentName or "").strip()[:60],
+                    "automation_id": (el.CurrentAutomationId or "").strip(),
+                    "class_name": class_name,
+                    "value_pattern": bool(
+                        el.GetCurrentPattern(VALUE_PATTERN)),
+                    "text_pattern": bool(
+                        el.GetCurrentPattern(TEXT_PATTERN)),
+                })
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+        return found
+
+    # -- 送信ボタン (PHAL のプロファイルが目印を持つとき) --------------
+    def _button_candidates(self, desc):
+        """ボタンの並び [(要素, 名前, クラス名, AutomationId, 押せるか)]。
+
+        送信ボタンの照合の母集団。種類が Button のものだけに絞る
+        (名前だけで探しに行くと、同じ文言の表示部品まで拾ってしまう。
+        入力欄の _editable_candidates と同じ考え)。「押せるか」は
+        InvokePattern の有無で、押す段の理由付けにも使う。"""
+        found = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_BUTTON:
+                    continue
+                name = el.CurrentName or ""
+                class_name = el.CurrentClassName or ""
+                automation_id = el.CurrentAutomationId or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+            try:
+                has_invoke = bool(el.GetCurrentPattern(INVOKE_PATTERN))
+            except Exception:  # noqa: BLE001
+                has_invoke = False
+            found.append((el, name, class_name, automation_id,
+                          has_invoke))
+        return found
+
+    def _find_send_button(self, desc):
+        """送信ボタンを探す。(要素, 候補の並び) を返す。無ければ (None, 候補)。
+
+        照合の優先順位は入力欄 (_find_input_box) と同じ:
+          1. AutomationId の完全一致 (プロファイルに send_automation_id)
+          2. 名前の一致 (send_name)。同名が複数あれば、保存したクラス
+             との token の重なり → 押せる物 → 木の並び順で1つに決める
+          3. クラスだけ (send_class)。token の重なりが保存した token の
+             半分以上 (最低1つ) ある物の中で、一番合う物
+
+        目印は PHAL のプロファイルが持つ send_* の3点。組み込みの
+        send_button (名前の並び) とは別物で、そちらは click_send が
+        composer まわりで使う従来の経路のまま。"""
+        candidates = self._button_candidates(desc)
+        want_aid = (self.profile.get("send_automation_id") or "").strip()
+        want_name = (self.profile.get("send_name") or "").strip()
+        want_class = (self.profile.get("send_class") or "").strip()
+        if want_aid:
+            for cand in candidates:
+                if cand[3] == want_aid:
+                    return cand[0], candidates
+        if want_name:
+            named = [c for c in candidates
+                     if (c[1] or "").strip() == want_name]
+            if named:
+                best = max(
+                    range(len(named)),
+                    key=lambda k: (
+                        self._class_overlap(want_class, named[k][2]),
+                        named[k][4], -k))
+                return named[best][0], candidates
+        if want_class:
+            stored = set(want_class.split())
+            scored = []
+            for pos, cand in enumerate(candidates):
+                overlap = self._class_overlap(want_class, cand[2])
+                if overlap >= 1 and 2 * overlap >= len(stored):
+                    scored.append((overlap, cand[4], -pos, cand[0]))
+            if scored:
+                return max(scored)[3], candidates
+        return None, candidates
+
+    def press_send_button(self):
+        """プロファイルの目印 (send_*) で送信ボタンを探して押す。
+
+        押すのは UIA の InvokePattern だけ。キー送信はしない
+        (この道具はフォーカスを奪わない線引き)。失敗は段つき
+        (InputStageError) で上げる: 目印が無い / ボタンが見つから
+        ない (候補の件数と名前つき) / 押す仕組みが無い / 押す段で
+        失敗。押せたら True。"""
+        if not any((self.profile.get(key) or "").strip() for key in
+                   ("send_automation_id", "send_name", "send_class")):
+            raise InputStageError(
+                "not_found", "送信ボタンの目印が設定されていません")
+        _root, desc = self._descendants()
+        el, candidates = self._find_send_button(desc)
+        if el is None:
+            raise InputStageError(
+                "not_found", _button_not_found_message(candidates))
+        pattern = el.GetCurrentPattern(INVOKE_PATTERN)
+        if not pattern:
+            raise InputStageError(
+                "unwritable",
+                "送信ボタンは見つかりましたが、押す仕組み"
+                "（InvokePattern）がありません")
+        try:
+            pattern.QueryInterface(
+                UIA.IUIAutomationInvokePattern).Invoke()
+        except Exception as e:  # noqa: BLE001  理由は段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"送信ボタンを押せませんでした（{e}）") from e
+        return True
+
+    def scan_button_candidates(self):
+        """送信ボタンの候補を拾って返す (PHAL の調査用)。
+
+        種類が Button のものを全部拾い、合わせるための目印 (名前・
+        AutomationId・クラス) と「押せるか (InvokePattern の有無)」を
+        付けて返す。どれが送信ボタンかは人が調査画面で選ぶ。木が
+        まだ起きていないと候補が空になるので、先に wait_awake で
+        組み上がりを待つ (入力欄の調査と同じ作法)。
+
+        実機 (Edge の中の Muse) では、窓全体だと会話の発言ボタンや
+        サイドバーの項目まで全部入って候補が膨大になった
+        (2026-11-14)。入力欄の目印があり、入力欄を含む composer の
+        範囲が絞れる場合は、その内側のボタンだけを先に返す
+        (_composer_scope)。範囲で候補が無ければ窓全体に落ちる。"""
+        self.wait_awake(timeout=3.0)
+        root, desc = self._descendants()
+        scope = self._composer_scope(root, desc)
+        if scope is not None:
+            narrowed = self._button_candidate_dicts(
+                scope.FindAll(UIA.TreeScope_Descendants, self.true_cond))
+            if narrowed:
+                return narrowed
+        return self._button_candidate_dicts(desc)
+
+    def _button_candidate_dicts(self, desc):
+        """desc の中から、ボタンを候補の辞書で返す。"""
+        found = []
+        for el, name, class_name, automation_id, has_invoke in \
+                self._button_candidates(desc):
+            if len(found) >= SCAN_CANDIDATE_LIMIT:
+                break
+            try:
+                found.append({
+                    "control_type": CONTROL_TYPE_NAMES.get(
+                        CONTROL_BUTTON, "Button"),
+                    "name": (name or "").strip()[:60],
+                    "automation_id": (automation_id or "").strip(),
+                    "class_name": (class_name or "").strip(),
+                    "invoke_pattern": has_invoke,
+                    "value_pattern": bool(
+                        el.GetCurrentPattern(VALUE_PATTERN)),
+                    "text_pattern": bool(
+                        el.GetCurrentPattern(TEXT_PATTERN)),
+                })
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+        return found
+
+    # -- チャットのダウンロード候補 (PHAL の見張り用) ------------------
+    def _download_candidates(self, desc):
+        """添付カードのボタン [(位置, 要素, 名前, クラス)] (木の順のまま)。
+
+        位置は desc の中のインデックス。押す段で「カードの後ろ」を
+        起点に探すために持つ。
+
+        目印は、実機 (Edge の中の Muse、2026-11-14) の観察による:
+        添付ファイルのカードは種類が Button で、クラスに "group/card"
+        を含む (名前は中身の冒頭そのもので、"#!phal python ..." の
+        ように始まる)。候補はこのカードだけに限る。
+
+        【名前だけの照合は使わない】1-21 の実機で、名前に ".phal" を
+        含むサイドチャット一覧のスレッドボタンを「最新」と誤検出した
+        (木の順で後ろに居たため)。窓の中には、名前に拡張子や "#!" を
+        含む無関係なボタンがいくらでもある。"""
+        found = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_BUTTON:
+                    continue
+                name = el.CurrentName or ""
+                class_name = el.CurrentClassName or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+            if "group/card" in class_name:
+                found.append((i, el, name, class_name))
+        return found
+
+    def _pick_download_candidate(self, desc):
+        """ダウンロード候補から「最新」を1件選ぶ。無ければ None。
+
+        スクリプトらしいもの (名前が "#!" で始まる / 名前に拡張子
+        .phal・.py・.ps1 を含む) を優先し、その中では木の順の最後
+        (= 最新の発言のもの) を選ぶ。スクリプトらしいものが無ければ
+        カード全体の最後。検出 (latest_download_candidate) と押下
+        (press_download_candidate) で同じ選び方を使う。戻り値は
+        (位置, 要素, 名前, クラス)。"""
+        candidates = self._download_candidates(desc)
+        if not candidates:
+            return None
+        scripty = [
+            c for c in candidates
+            if c[2].lstrip().startswith("#!")
+            or any(ext in c[2].lower() for ext in (".phal", ".py", ".ps1"))]
+        return (scripty or candidates)[-1]
+
+    def _candidate_dict(self, desc):
+        """子孫の並びから、ダウンロード候補の辞書を作る。
+
+        latest_download_candidate と latest_chat_scan で同じ選び方を
+        使うための切り出し。候補が無ければ None。"""
+        picked = self._pick_download_candidate(desc)
+        if picked is None:
+            return None
+        _index, _el, name, class_name = picked
+        summary = _download_summary(name)
+        label = summary if summary else " ".join(name.split())[:60]
+        return {
+            "name": name,
+            "class_name": class_name,
+            "label": label,
+            "summary": summary,
+        }
+
+    def latest_download_candidate(self):
+        """最新の AI 発言にある、ダウンロード候補を1件返す。
+
+        戻り値は {"name", "class_name", "label", "summary"}。
+        name はボタンの名前そのまま (押す段で探し直すための目印)、
+        summary は名前が "#!" で始まるときにコメントから抜いた
+        「何のファイルか」の一文 (取れなければ空)、label は表示用で、
+        summary があればそれ、無ければ名前を空白で畳んで切ったもの。
+        候補が無ければ None。
+
+        【後ろの Text 要素は拾わない】旧実装は候補の後ろに続く Text を
+        発言の冒頭として拾っていたが、実機では文書自体の名前
+        ("Chat — Muse") が返ってきた。カードの名前にこそ中身の
+        冒頭が入っているので、要約はそこからだけ作る (1-22)。"""
+        _root, desc = self._descendants()
+        return self._candidate_dict(desc)
+
+    def _diag_marker_in(self, desc):
+        """診断リクエストの目印 (DIAG_REQUEST_MARKER) を探す (1-43)。
+
+        戻り値は {"id": 目印の同定子} か、無ければ None。同定子は
+        「目印の行までの本文」のハッシュで、同じ発言なら何度走査
+        しても同じ値になり、別の発言 (前に別の会話が積み上がって
+        いる) では違う値になる。窓側はこれで「同じ発言で二度
+        送らない」を判定する。
+
+        数えるのは、目印より後ろの本文が DIAG_MARKER_TAIL_LIMIT
+        以内のものだけ。会話のずっと前の発言に目印が残っていても、
+        後ろに本文が長く続くので対象にならない。本文の取り方は
+        document_text と同じ (Text 要素の名前を木の順に読む) だが、
+        行の判定が要るので、要素ごとに名前を改行で割って行の列に
+        してから見る。"""
+        lines = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_TEXT:
+                    continue
+                name = el.CurrentName or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+            lines.extend(name.replace(OBJECT_MARK, "").split("\n"))
+        marker_at = None
+        for index, line in enumerate(lines):
+            if line.strip() == DIAG_REQUEST_MARKER:
+                marker_at = index  # 最後の目印を相手にする
+        if marker_at is None:
+            return None
+        tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
+        if tail > DIAG_MARKER_TAIL_LIMIT:
+            return None  # 古い発言の中の目印。最新の呼びかけではない
+        prefix = "\n".join(lines[:marker_at + 1])
+        digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+        return {"id": digest}
+
+    def latest_chat_scan(self):
+        """チャットの見張りの1回分 (候補 + 診断の目印) を、同じ
+        子孫の並びから取る (1-43)。
+
+        戻り値は {"candidate": 候補の辞書か None, "marker":
+        {"id": ...} か None}。見張りはこの1回で両方を見る (走査を
+        2回に分けない)。"""
+        _root, desc = self._descendants()
+        return {
+            "candidate": self._candidate_dict(desc),
+            "marker": self._diag_marker_in(desc),
+        }
+
+    def _message_options_button(self, desc, start):
+        """カードの後ろにある、その発言の「その他のオプション」ボタン。
+
+        カードの位置 (start) から木の順に後ろを探す。次の添付カードに
+        当たったら、その発言は終わりなので打ち切る (そこから先の
+        「…」は別の発言のもの)。上限は OPTIONS_SEARCH_LIMIT 件。
+        見つからなければ None。"""
+        for step in range(1, OPTIONS_SEARCH_LIMIT + 1):
+            i = start + step
+            if i >= desc.Length:
+                break
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_BUTTON:
+                    continue
+                name = el.CurrentName or ""
+                class_name = el.CurrentClassName or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+            if "group/card" in class_name:
+                break  # 次の発言のカード。ここから先は別の発言
+            if name.strip() == OPTIONS_BUTTON_NAME:
+                return el
+        return None
+
+    def _activate_element(self, el):
+        """要素を「押す」。使える仕組みを _ACTIVATION_CHAIN の順に
+        試し、最後は座標クリックに落とす (1-32)。
+
+        戻り値は使えた手段の表示名。全部駄目なら RuntimeError
+        (試した手段と理由を畳んだ文) を投げる。段つき
+        (InputStageError) への包み直しは呼び側の役目。"""
+        errors = []
+        for pattern_id, iface_name, method_name, label in \
+                _ACTIVATION_CHAIN:
+            pattern = el.GetCurrentPattern(pattern_id)
+            if not pattern:
+                continue
+            try:
+                target = pattern.QueryInterface(
+                    getattr(UIA, iface_name))
+                getattr(target, method_name)()
+                return label
+            except Exception as e:  # noqa: BLE001  次の仕組みに進む
+                errors.append(f"{label}: {e}")
+        try:
+            _click_element(el)
+            return "Click"
+        except Exception as e:  # noqa: BLE001  理由は呼び側の文に畳む
+            errors.append(f"Click: {e}")
+        raise RuntimeError(
+            " / ".join(errors) if errors else "押す仕組みがありません")
+
+    def _activate_options_button(self, el):
+        """「その他のオプション」を開く。
+
+        実機 (2026-11-14 の全ボタン調査) では、このボタンに
+        InvokePattern が無いものが複数あった (「押下: 不可」)。
+        teams_meeting の「その他」も同じで、ExpandCollapse で開く。
+        押下そのものは「ダウンロード」の項目と共通の手順
+        (_activate_element) に寄せた (1-32)。"""
+        try:
+            self._activate_element(el)
+        except RuntimeError as e:
+            raise InputStageError(
+                "unwritable",
+                "その他のオプションボタンを押せませんでした"
+                f"（押す仕組みが無く、クリックも効きませんでした: {e}）"
+            ) from e
+
+    @staticmethod
+    def _find_download_item(desc):
+        """開いたメニューの「ダウンロード」項目。無ければ None。
+
+        種類は MenuItem が本命。作りによっては Button / ListItem で
+        出ることもあるので、その3種に限って名前の完全一致で探す。"""
+        if desc is None:
+            return None
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType not in (
+                        CONTROL_MENU_ITEM, CONTROL_BUTTON,
+                        CONTROL_LIST_ITEM):
+                    continue
+                if (el.CurrentName or "").strip() == DOWNLOAD_ITEM_NAME:
+                    return el
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+        return None
+
+    def _in_menu_context(self, el):
+        """要素がメニューの中にあるか。親を RawViewWalker でたどり、
+        Menu に当たれば True。
+
+        デスクトップ全体の探索で拾った要素の確認にだけ使う
+        (1-32)。Edge のダウンロード・フライアウトはダウンロードの
+        たびに自動で開くので、ループ中は開いているのが常態。その
+        中の要素 (ListItem 等) が名前だけで「ダウンロード」の項目に
+        化ける恐れがあるため、メニューの外にあるものは項目として
+        認めない。フライアウトを閉じに行く操作はしない (前提として
+        受け入れる)。"""
+        uia = getattr(self, "uia", None)
+        if uia is None:
+            return False
+        try:
+            walker = uia.RawViewWalker
+        except Exception:  # noqa: BLE001  取れなければ認めない
+            return False
+        node = el
+        for _depth in range(12):
+            try:
+                node = walker.GetParentElement(node)
+            except Exception:  # noqa: BLE001
+                return False
+            if node is None:
+                return False
+            try:
+                if node.CurrentControlType == CONTROL_MENU:
+                    return True
+            except Exception:  # noqa: BLE001  読めない親は辿り直せない
+                return False
+        return False
+
+    def _wait_download_item(self):
+        """「ダウンロード」項目が出るまで、少しだけ待って探す。
+
+        戻り値は (項目, 見つけた場所, 余所の同名要素があったか)。
+        場所は "window" (対象の窓の木) / "desktop" (デスクトップ
+        全体) のどちらか。項目が無ければ (None, "", 余所フラグ)。
+
+        探索は窓の木が本命。窓の外 (デスクトップ直下) にメニューを
+        出す作りのアプリもあるので最後にデスクトップ全体からも
+        1回探すが、そちらで拾ったものはメニューの中にあると
+        確かめられたものだけを使う (1-32、フライアウト対策)。
+        確かめられなかった同名要素は「余所」として呼び側に伝え、
+        項目が見つからない段の文に添える。"""
+        deadline = time.time() + DOWNLOAD_MENU_TIMEOUT
+        while True:
+            _root, desc = self._descendants(heal=False)
+            item = self._find_download_item(desc)
+            if item is not None:
+                return item, "window", False
+            if time.time() >= deadline:
+                break
+            time.sleep(DOWNLOAD_MENU_POLL)
+        uia = getattr(self, "uia", None)
+        true_cond = getattr(self, "true_cond", None)
+        if uia is not None and true_cond is not None:
+            try:
+                desktop = uia.GetRootElement()
+                desc = desktop.FindAll(
+                    UIA.TreeScope_Descendants, true_cond)
+                item = self._find_download_item(desc)
+            except Exception:  # noqa: BLE001  探し方の保険。無ければ無い
+                item = None
+            if item is not None:
+                if self._in_menu_context(item):
+                    return item, "desktop", False
+                return None, "", True
+        return None, "", False
+
+    def _target_process_id(self):
+        """対象の窓 (チャット窓) のプロセス ID。取れなければ 0。
+
+        ダウンロード・フライアウトの持ち主が「対象と同じブラウザ」
+        か確かめるために使う。UIA の root 要素の CurrentProcessId
+        で読む (窓ハンドル経由)。別アプリの同名パネルを閉じに行か
+        ないための門で、取れないときは 0 を返し、呼び側は
+        「確かめられないので触らない」に倒す。"""
+        uia = getattr(self, "uia", None)
+        hwnd = getattr(self, "hwnd_main", None)
+        if uia is None or not hwnd:
+            return 0
+        try:
+            root = uia.ElementFromHandle(ctypes.c_void_p(hwnd))
+            return int(root.CurrentProcessId or 0)
+        except Exception:  # noqa: BLE001  取れなければ触らない側に倒す
+            return 0
+
+    @staticmethod
+    def _element_children(el, cond):
+        """要素の子 (1段だけ) の並び。取れなければ空。"""
+        try:
+            found = el.FindAll(UIA.TreeScope_Children, cond)
+            return [found.GetElement(i) for i in range(found.Length)]
+        except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+            return []
+
+    def _flyout_close_button(self, panel):
+        """パネルの中 (2段まで) にある「閉じる」ボタン。無ければ None。"""
+        frontier = [panel]
+        for _depth in range(2):
+            children = []
+            for el in frontier:
+                children.extend(
+                    self._element_children(el, self.true_cond))
+            for child in children:
+                try:
+                    if child.CurrentControlType == CONTROL_BUTTON and \
+                            (child.CurrentName or "").strip() == \
+                            FLYOUT_CLOSE_BUTTON_NAME:
+                        return child
+                except Exception:  # noqa: BLE001  読めない要素は飛ばす
+                    continue
+            frontier = children
+        return None
+
+    def _flyout_at(self, el, pid, depth):
+        """el かその子孫 (深さ上限まで) にフライアウトがあれば
+        (パネル, 閉じるボタン) を返す。無ければ None。
+
+        【見分け方】対象と同じプロセスの持ち物で、種類が
+        Window / Pane / Dialog、名前がちょうど「ダウンロード」で、
+        中に「閉じる」ボタンがあるか、畳む仕組み (ExpandCollapse)
+        を持っているもの。名前だけで認めると「ダウンロード」の
+        項目や見出しまで拾うので、形 (閉じるボタンか畳む仕組み)
+        まで含めて1組にする。対象の窓そのものは、名前が一致して
+        もパネルとは認めない (中を探るだけにする)。プロセスが
+        違う要素は、その下も含めて相手にしない。"""
+        try:
+            if int(el.CurrentProcessId or 0) != pid:
+                return None
+            name = (el.CurrentName or "").strip()
+            control_type = el.CurrentControlType
+            handle = el.CurrentNativeWindowHandle
+        except Exception:  # noqa: BLE001  読めない要素は相手にしない
+            return None
+        own_window = bool(handle) and \
+            handle == getattr(self, "hwnd_main", None)
+        if name == FLYOUT_TITLE and not own_window and \
+                control_type in (CONTROL_WINDOW, CONTROL_PANE,
+                                 CONTROL_DIALOG):
+            close = self._flyout_close_button(el)
+            collapsible = False
+            if close is None:
+                try:
+                    collapsible = bool(el.GetCurrentPattern(
+                        EXPAND_COLLAPSE_PATTERN))
+                except Exception:  # noqa: BLE001
+                    collapsible = False
+            if close is not None or collapsible:
+                return el, close
+        if depth <= 0:
+            return None
+        for child in self._element_children(el, self.true_cond):
+            hit = self._flyout_at(child, pid, depth - 1)
+            if hit is not None:
+                return hit
+        return None
+
+    def _find_downloads_flyout(self):
+        """デスクトップ側からフライアウトを探す。無ければ None。
+
+        探索は、デスクトップ直下の要素と、その浅い子孫 (深さ
+        FLYOUT_SEARCH_DEPTH まで) だけ。木全体は歩かない。
+        対象のプロセスが取れなければ、持ち主を確かめようがない
+        ので無いものとして返す (触らない)。"""
+        uia = getattr(self, "uia", None)
+        cond = getattr(self, "true_cond", None)
+        if uia is None or cond is None:
+            return None
+        pid = self._target_process_id()
+        if not pid:
+            return None
+        try:
+            desktop = uia.GetRootElement()
+            tops = desktop.FindAll(UIA.TreeScope_Children, cond)
+        except Exception:  # noqa: BLE001  探せなければ無いものとする
+            return None
+        for i in range(tops.Length):
+            hit = self._flyout_at(
+                tops.GetElement(i), pid, FLYOUT_SEARCH_DEPTH)
+            if hit is not None:
+                return hit
+        return None
+
+    def send_escape(self):
+        """対象の窓へ ESC を送る (1-67)。状態語を返すだけで、
+        例外は出さない。
+
+        Edge のダウンロード・フライアウトを閉じるためのキー配送。
+        宛先は、自分が掴んでいる窓のトップレベル (hwnd_main)。
+        standalone の操作として窓側 (PHAL) からも呼ばれる (DL の
+        到着が確かめられた直後)。前面化も SendInput もしない。"""
+        return _post_escape(getattr(self, "hwnd_main", None))
+
+    def _dismiss_downloads_flyout(self):
+        """フライアウトが開いていれば閉じる。結果を短い語で返す。
+
+        戻り値: "closed" (閉じるボタンを押した) / "collapsed"
+        (畳んだ) / "absent" (無かった・探せなかった) / "left"
+        (閉じられなかった・残っている)。どの結果でも例外は
+        出さない。DL 押下の本筋は結果によらず続ける (既存の
+        代替手順と再試行が保険として残っている)。"""
+        found = self._find_downloads_flyout()
+        if found is None:
+            return "absent"
+        panel, close = found
+        acted = ""
+        try:
+            if close is not None:
+                self._activate_element(close)
+                acted = "closed"
+            else:
+                pattern = panel.GetCurrentPattern(
+                    EXPAND_COLLAPSE_PATTERN)
+                if pattern:
+                    pattern.QueryInterface(
+                        UIA.IUIAutomationExpandCollapsePattern
+                    ).Collapse()
+                    acted = "collapsed"
+        except Exception:  # noqa: BLE001  閉じ損ねても本筋は続ける
+            acted = ""
+        if not acted:
+            return "left"
+        time.sleep(FLYOUT_DISMISS_WAIT)
+        if self._find_downloads_flyout() is not None:
+            return "left"
+        return acted
+
+    def press_download_candidate(self):
+        """最新の添付をダウンロードする (2段で押す)。
+
+        【カード自体は押さない】1-22 までの実装はカードを Invoke
+        していたが、実機 (2026-11-15、持ち主の注釈つき画面) では、
+        カードのクリックはアプリ内のプレビューを開くだけで、
+        ダウンロードは始まらなかった。本当の経路は、その発言の
+        右上にある「その他のオプション」(…) を開いて、メニューの
+        「ダウンロード」を押すこと。
+
+        手順: 最初に、対象の窓へ ESC を投げ (1-67)、Edge の
+        ダウンロード・フライアウトが開いていれば閉じる
+        (_dismiss_downloads_flyout、1-40)。開いている間は
+        「…」の押下が実機で一度も成功していないため。
+        そのあと、検出から時間が経つと木は変わるので、保存した要素は
+        使わず、検出と同じ選び方 (_pick_download_candidate) で
+        カードを探し直す → カードの後ろにある、その発言の「…」を
+        押す → 「ダウンロード」の項目が出るのを少し待って押す。
+        押下は共通の代替手順 (_activate_element) で行い、項目の
+        押下が一通り失敗したら、間を置いて見つけ直し+押下を
+        1回だけやり直す (1-32)。
+        失敗は段つき (InputStageError): カードが無い / 「…」が
+        無い / 「…」を押せない / メニューが出ない / 項目を押す
+        仕組みが無くクリックも効かない。項目まわりの文には、
+        項目をどちらの探索 (窓の木 / デスクトップ) で見つけたかを
+        添える (次の切り分けのため)。押せたら True
+        (＝「ダウンロード」の項目を押した、までを完了とする)。"""
+        # フライアウトを閉じるのは最初にやる。まず ESC を投げ
+        # (1-67)、次に UIA の解散 (1-40) を試す。閉じきれなかった
+        # 場合は、そのことを項目まわりの失敗文に添える (次の
+        # 切り分けのため。それ以外の段の文には足さない)。
+        # ESC の結果も同じ文に短く添える (診断の控えに残る)。
+        self._esc_before_press = self.send_escape()
+        self._flyout_dismissal = self._dismiss_downloads_flyout()
+        stuck = ("（ダウンロードパネルが開いたままでした）"
+                 if self._flyout_dismissal == "left" else "")
+        stuck += f"（ESC送信: {self._esc_before_press}）"
+        _root, desc = self._descendants()
+        picked = self._pick_download_candidate(desc)
+        if picked is None:
+            raise InputStageError(
+                "not_found",
+                "ダウンロードできるものが見つかりませんでした"
+                "（チャットの内容が変わった可能性があります）")
+        index, _el, _name, _class_name = picked
+        options = self._message_options_button(desc, index)
+        if options is None:
+            raise InputStageError(
+                "not_found",
+                "その他のオプションボタンが見つかりませんでした"
+                "（カードの後ろに、その発言の「…」がありませんでした）")
+        self._activate_options_button(options)
+        last_failure = None
+        for attempt in range(2):
+            if attempt:
+                time.sleep(DOWNLOAD_PRESS_RETRY_WAIT)
+            item, source, stray = self._wait_download_item()
+            if item is None:
+                if stray:
+                    raise InputStageError(
+                        "not_found",
+                        "ダウンロードの項目が見つかりませんでした"
+                        "（デスクトップに同名の要素はありましたが、"
+                        "メニューの中とは確かめられませんでした）"
+                        + stuck)
+                raise InputStageError(
+                    "not_found",
+                    "ダウンロードの項目が見つかりませんでした"
+                    "（メニューが開かなかった可能性があります）"
+                    + stuck)
+            try:
+                self._activate_element(item)
+                return True
+            except RuntimeError as e:  # noqa: BLE001  1回だけやり直す
+                last_failure = (e, source)
+        error, source = last_failure
+        where = "窓の木" if source == "window" else "デスクトップ"
+        raise InputStageError(
+            "unwritable",
+            "ダウンロードの項目は見つかりましたが"
+            f"（{where}で発見）、押す仕組みが無く、"
+            f"クリックも効きませんでした（{error}）{stuck}") from error
 
     def send_prompt(self, text, attempts=2, wait=3.0):
         """入力欄に書いて送信する。送れたら True。

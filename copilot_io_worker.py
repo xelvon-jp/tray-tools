@@ -11,8 +11,10 @@
 # 使い方:
 #   標準入力に JSON を1つ渡す: {"op": "send", "text": "..."}
 #   標準出力に JSON を1行返す: {"ok": true, ...} / {"ok": false, "error": "…"}
-#   op は snapshot / input / send / fill / probe / profiles / wait /
-#   response / blocks。依頼に "profile" (辞書か組み込みの名前) が
+#   op は snapshot / input / send / fill / probe / scan / scan_buttons /
+#   press_send / latest_download / press_download / send_escape /
+#   profiles / wait / response / blocks。
+#   依頼に "profile" (辞書か組み込みの名前) が
 #   あれば、その投げ先で Copilot を作る (無ければ従来どおり自動選択)。
 #   診断は標準エラーへ。標準出力には応答の JSON だけを出す。
 import json
@@ -47,6 +49,25 @@ def _run(request):
             return {"ok": True, "filled": bool(transport.fill_prompt(request["text"]))}
         if op == "probe":
             return {"ok": True, "candidates": transport.probe_input()}
+        if op == "scan":
+            return {"ok": True, "candidates": transport.scan_input()}
+        if op == "scan_buttons":
+            return {"ok": True, "candidates": transport.scan_buttons()}
+        if op == "press_send":
+            return {"ok": True, "pressed": bool(transport.press_send())}
+        if op == "latest_download":
+            # 診断の目印 (1-43) も同じ走査で取る。scan を持たない
+            # transport (テストの fake 等) では候補だけ返す。
+            scanner = getattr(transport, "latest_scan", None)
+            if scanner is not None:
+                scan = scanner() or {}
+                return {"ok": True, "candidate": scan.get("candidate"),
+                        "marker": scan.get("marker")}
+            return {"ok": True, "candidate": transport.latest_download()}
+        if op == "press_download":
+            return {"ok": True, "pressed": bool(transport.press_download())}
+        if op == "send_escape":
+            return {"ok": True, "status": transport.send_escape()}
         if op == "wait":
             done, elapsed = transport.wait_until_idle(float(request["timeout"]))
             return {"ok": True, "done": bool(done), "elapsed": float(elapsed)}

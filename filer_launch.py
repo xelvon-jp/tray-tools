@@ -30,6 +30,7 @@ SCRIPT_PATH = Path(__file__).resolve().parent / "filer.py"
 MUTEX_NAME = "Local\\traytools.filer"
 SERVER_NAME = "traytools.filer"
 SHOW_COMMAND = b"show\n"
+NAVIGATE_COMMAND = b"navigate\n"
 
 SYNCHRONIZE = 0x00100000
 ASFW_ANY = 0xFFFFFFFF
@@ -88,6 +89,17 @@ def send_show(timeout_ms: int = 1000) -> bool:
     return send_command(SERVER_NAME, SHOW_COMMAND, timeout_ms)
 
 
+def navigate_command(path) -> bytes:
+    """「このフォルダへ移って」を運ぶデータ。1行目が命令、2行目がパス(UTF-8)。
+    解釈は filer.py の parse_command が持つ。"""
+    return NAVIGATE_COMMAND + str(path).encode("utf-8") + b"\n"
+
+
+def send_navigate(path, timeout_ms: int = 1000) -> bool:
+    """動いているファイラに「このフォルダへ移って、前面に出て」を送る。届いたら True。"""
+    return send_command(SERVER_NAME, navigate_command(path), timeout_ms)
+
+
 def send_command(server_name: str, payload: bytes, timeout_ms: int = 1000) -> bool:
     """動いている窓の待ち受け(QLocalServer)へ1行送る。届いたら True。
     スライドショー(slideshow_launch)も同じ口を使う。
@@ -121,11 +133,15 @@ def send_command(server_name: str, payload: bytes, timeout_ms: int = 1000) -> bo
         sock.abort()
 
 
-def spawn() -> int:
-    """filer.py を別プロセスで起こす。起こせなければ OSError(呼ぶ側で通知する)。"""
+def spawn(path=None) -> int:
+    """filer.py を別プロセスで起こす。path を渡すと、そのフォルダで開く
+    (filer.py が起動引数のフォルダへ寄せる)。起こせなければ OSError(呼ぶ側で通知する)。"""
     _allow_foreground()
+    argv = [pythonw_executable(), str(SCRIPT_PATH)]
+    if path:
+        argv.append(str(path))
     proc = subprocess.Popen(
-        [pythonw_executable(), str(SCRIPT_PATH)],
+        argv,
         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
@@ -140,4 +156,17 @@ def open_filer() -> str:
     if is_running():
         return "shown" if send_show() else "starting"
     spawn()
+    return "spawned"
+
+
+def open_or_navigate(path) -> str:
+    """フォルダを指定して開く。開いていればアクティブな窓をそのフォルダへ移して
+    前面へ、無ければそのフォルダで起こす。戻り値は open_filer と同じ
+    ("shown" / "spawned" / "starting")。
+
+    起こすときは待ち受けへ送り直すのではなく起動引数で渡す。起動した本人が
+    寄せるので、待ち受けが立つまでの時間に左右されず届け損ねが無い。"""
+    if is_running():
+        return "shown" if send_navigate(path) else "starting"
+    spawn(path)
     return "spawned"

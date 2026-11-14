@@ -52,15 +52,18 @@ def test_normalize_config_defaults_and_clamps():
     assert config["python"] == "python" and config["timeout_seconds"] == 120
     assert config["head_lines"] == 200 and config["tail_lines"] == 50
     assert config["max_chars"] == 20000 and config["always_on_top"] is False
+    assert config["dark_mode"] is False
     broken = core.normalize_config({
         "recent_hours": "x", "max_items": 0, "timeout_seconds": 99999,
-        "window_geometry": [1, 2], "python": "", "always_on_top": 1})
+        "window_geometry": [1, 2], "python": "", "always_on_top": 1,
+        "dark_mode": 1})
     assert broken["recent_hours"] == 24
     assert broken["max_items"] == 1
     assert broken["timeout_seconds"] == 3600
     assert broken["window_geometry"] is None
     assert broken["python"] == "python"
     assert broken["always_on_top"] is True
+    assert broken["dark_mode"] is True
 
 
 def test_list_candidates_filters_and_orders():
@@ -334,6 +337,99 @@ def test_build_result_text():
     assert core.POLICY_NOTE in core.build_result_text("x.ps1", run4, CONFIG)
 
 
+def test_parse_command_id():
+    # 先頭の「セッション番号-通番」+ "_" + 名前、だけを ID とする。
+    assert core.parse_command_id("12-03_check_db.py") == "12-03"
+    assert core.parse_command_id("12-3_check_db.py") == "12-3"
+    assert core.parse_command_id("1-1_a.py") == "1-1"
+    assert core.parse_command_id("123-456_x.ps1") == "123-456"
+    # ID が無い名前。
+    assert core.parse_command_id("check_db.py") is None
+    assert core.parse_command_id("x12-3_check.py") is None
+    # 日付で始まる名前は ID ではない(4桁の年・"-" 区切りの続き)。
+    assert core.parse_command_id("2026-11-14_notes.py") is None
+    assert core.parse_command_id("2026-11_notes.py") is None
+    # 区切りが "_" でない、桁が多すぎる、名前が続かないものも外す。
+    assert core.parse_command_id("12-3-check.py") is None
+    assert core.parse_command_id("1234-5_x.py") is None
+    assert core.parse_command_id("12-3456_x.py") is None
+    assert core.parse_command_id("12-3.py") is None
+
+
+def test_extract_summary():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        # 先頭コメントが概要。ID 付きなら「ID: 」の接頭辞は外す。
+        demo = write(tmp, "9-1_demo.py", "# 9-1: データを集める\nprint(1)\n")
+        assert core.extract_summary(demo) == "データを集める"
+        # 「ID 」(コロンなし)の接頭辞も外す。
+        bare = write(tmp, "9-2_b.py", "# 9-2 集計する\nprint(1)\n")
+        assert core.extract_summary(bare) == "集計する"
+        # ID 無しの先頭コメントはそのまま。
+        plain = write(tmp, "a.py", "# 掃除する\nprint(1)\n")
+        assert core.extract_summary(plain) == "掃除する"
+        # 空行と shebang を飛ばした先のコメント。
+        sh = write(tmp, "b.py", "\n#!/usr/bin/env python\n# 変換する\n")
+        assert core.extract_summary(sh) == "変換する"
+        # .phal の宣言行を飛ばした先のコメント。
+        ph = write(tmp, "9-3_c.phal", "#!phal python\n# 9-3: 送る\n")
+        assert core.extract_summary(ph) == "送る"
+        # コードが先なら概要なし。docstring も拾わない。
+        code = write(tmp, "c.py", "print(1)\n# 遅いコメント\n")
+        assert core.extract_summary(code) == ""
+        doc = write(tmp, "d.py", '"""説明"""\nprint(1)\n')
+        assert core.extract_summary(doc) == ""
+        # 読めないファイルは ""。
+        assert core.extract_summary(tmp / "none.py") == ""
+
+
+def test_build_result_text_with_command_id():
+    run = core.RunResult(name="12-3_check.py", exit_code=0, seconds=0.42,
+                         stdout="hello\n", stderr="")
+    text = core.build_result_text(
+        "12-3_check.py", run, CONFIG, command_id="12-3")
+    assert text.split("\n")[0] == \
+        "[実行結果] 12-3 12-3_check.py  終了コード 0  0.4秒"
+    # ID を渡さなければ今までと完全に同じ文になる。
+    plain = core.build_result_text("12-3_check.py", run, CONFIG)
+    assert plain.split("\n")[0] == \
+        "[実行結果] 12-3_check.py  終了コード 0  0.4秒"
+    # 時間切れ・停止の1行目にも ID が入る。
+    run2 = core.RunResult(name="12-3_slow.py", exit_code=-9, seconds=120.0,
+                          timed_out=True)
+    text2 = core.build_result_text(
+        "12-3_slow.py", run2, CONFIG, command_id="12-3")
+    assert text2.split("\n")[0].startswith("[実行結果] 12-3 12-3_slow.py")
+    run3 = core.RunResult(name="12-3_slow.py", exit_code=-9, seconds=3.0,
+                          stopped=True)
+    text3 = core.build_result_text(
+        "12-3_slow.py", run3, CONFIG, command_id="12-3")
+    assert text3.split("\n")[0] == "[実行結果] 12-3 12-3_slow.py  停止しました"
+
+
+def test_build_return_text():
+    run = core.RunResult(name="5-2_fix.py", exit_code=3, seconds=0.7,
+                         stdout="途中まで\n", stderr="Traceback: boom\n")
+    body = "import sys\nsys.exit(3)\n"
+    text = core.build_return_text(
+        "5-2_fix.py", "直っていません", run, CONFIG, body,
+        command_id="5-2")
+    lines = text.split("\n")
+    assert lines[0] == "[差し戻し] 5-2 5-2_fix.py", lines[0]
+    assert lines[1] == "理由: 直っていません"
+    assert "--- 実行結果 ---" in lines
+    assert "[実行結果] 5-2 5-2_fix.py  終了コード 3  0.7秒" in text
+    assert "--- エラー出力 ---\nTraceback: boom" in text
+    assert "--- スクリプト ---\nimport sys\nsys.exit(3)" in text
+    # 理由が空なら行ごと省く。実行結果が無ければその段も無い。
+    plain = core.build_return_text("plain.py", "", None, CONFIG, body)
+    assert plain.split("\n")[0] == "[差し戻し] plain.py"
+    assert "理由:" not in plain and "--- 実行結果 ---" not in plain
+    assert "--- スクリプト ---\nimport sys\nsys.exit(3)" in plain
+    # ゴミ箱は Windows 専用。ここ(VM)では常に False で、例外にもならない。
+    assert core.move_to_recycle_bin(Path("nope.py")) is False
+
+
 def test_build_check_text():
     result = core.CheckResult(
         status=core.STATUS_ERROR, kind="syntax",
@@ -384,6 +480,35 @@ def test_execute_japanese_output():
         run = core.execute_script(path, CONFIG)
         assert run.exit_code == 0
         assert "こんにちは世界" in run.stdout
+
+
+def test_phal_engine_check_and_execute():
+    # .phal は1行目の宣言で言語を決める。宣言の解釈(BOM・大文字
+    # 小文字・空白)、Python 宣言のチェックと実行、宣言なしの
+    # エラー、一覧への出現までをまとめて見る。
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = write(tmp, "9-1_hi.phal", "#!phal python\nprint('phal-ok')\n")
+        assert core.phal_engine(path) == "python"
+        ps = write(tmp, "9-2_a.phal", "#!phal powershell\nWrite-Output 1\n")
+        assert core.phal_engine(ps) == "powershell"
+        bom = tmp / "9-3_b.phal"
+        bom.write_bytes(b"\xef\xbb\xbf#!PHAL Python \nprint(1)\n")
+        assert core.phal_engine(bom) == "python"
+        # 一覧の対象にもなる。
+        names = [p.name for p, _m, _s in core.list_candidates(tmp, 0, 10)]
+        assert "9-1_hi.phal" in names
+        # Python 宣言: チェックが通って、そのまま実行できる。
+        assert core.check_script(path, CONFIG).status == core.STATUS_OK
+        run = core.execute_script(path, CONFIG)
+        assert run.exit_code == 0 and "phal-ok" in run.stdout
+        # 宣言なし: 専用の見出しでエラーになる。
+        bad = write(tmp, "9-4_bad.phal", "print('x')\n")
+        assert core.phal_engine(bad) is None
+        result = core.check_script(bad, CONFIG)
+        assert result.status == core.STATUS_ERROR
+        assert result.headline == \
+            "1行目に #!phal python または #!phal powershell が必要です"
 
 
 def test_execute_timeout_kills_tree():
@@ -928,6 +1053,103 @@ def test_respawn_when_gone_gives_up_on_timeout():
     assert state["spawned"] == 0
 
 
+def test_diag_events_roundtrip_and_corrupt():
+    """診断の控え: 追加・上限・保存と読み直し・壊れたファイル。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "diag.json"
+        events: list = []
+        core.diag_append(events, "1件目", at=1000.0)
+        core.diag_append(events, " 改行を\n含む 文 ", at=1001.0)
+        # 文は1行に畳まれる。
+        assert events[1]["text"] == "改行を 含む 文"
+        core.save_diag_events(events, path)
+        loaded = core.load_diag_events(path)
+        assert [e["text"] for e in loaded] == ["1件目", "改行を 含む 文"]
+        # 上限を超えたら古い方から落ちる。
+        many: list = []
+        for i in range(core.DIAG_LIMIT + 5):
+            core.diag_append(many, f"記録{i}", at=float(i))
+        assert len(many) == core.DIAG_LIMIT
+        assert many[0]["text"] == "記録5"
+        # 長い文は切られる。
+        long_events: list = []
+        core.diag_append(long_events, "あ" * 500, at=0.0)
+        assert len(long_events[0]["text"]) == core.DIAG_TEXT_LIMIT
+        # 壊れたファイル・形の違う中身は空として扱う。
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_diag_events(path) == []
+        path.write_text(json.dumps({"at": 1}), encoding="utf-8")
+        assert core.load_diag_events(path) == []
+        path.write_text(json.dumps(
+            [{"at": 1.0, "text": "よい"}, {"at": "x", "text": "だめ"},
+             {"text": "だめ"}, "だめ"]), encoding="utf-8")
+        assert [e["text"] for e in core.load_diag_events(path)] == ["よい"]
+        # 無いファイルも空。
+        assert core.load_diag_events(Path(td) / "none.json") == []
+
+
+def test_diag_bundle_composition_and_trim():
+    """診断の束: 見出し・切替・プロファイル名・状態・直近の記録。"""
+    events = [{"at": 1000.0 + i, "text": f"記録{i}"} for i in range(40)]
+    bundle = core.build_diag_bundle(
+        "1.42",
+        {"auto_dl": True, "auto_run": False,
+         "auto_answer": True, "auto_send": False},
+        "既定",
+        ["DL行: なし", "実行中: なし"],
+        events, at=2000.0)
+    lines = bundle.splitlines()
+    assert lines[0].startswith("PHAL診断 Ver1.42 ")
+    assert "自動化: DL=入 実行=切 回答=入 送信=切" in lines[1]
+    assert lines[2] == "AIプロファイル: 既定"
+    assert "- DL行: なし" in lines
+    # 記録は直近25件だけ、古い順。
+    record_lines = [ln for ln in lines if " 記録" in ln]
+    assert len(record_lines) == core.DIAG_BUNDLE_EVENT_COUNT
+    assert record_lines[0].endswith("記録15")
+    assert record_lines[-1].endswith("記録39")
+    assert len(bundle) <= core.DIAG_BUNDLE_LIMIT
+    # 1件が長い記録ばかりでも、上限に収めて古い方から落とす。
+    heavy = [{"at": float(i), "text": "あ" * 230} for i in range(25)]
+    bundle2 = core.build_diag_bundle(
+        "1.42", {}, "(未設定)", [], heavy, at=3000.0)
+    assert len(bundle2) <= core.DIAG_BUNDLE_LIMIT
+    assert bundle2.splitlines()[0].startswith("PHAL診断 Ver1.42 ")
+    kept = [ln for ln in bundle2.splitlines() if "あ" in ln]
+    assert 0 < len(kept) < 25
+    # 記録が無くても束は作れる。
+    bundle3 = core.build_diag_bundle("1.42", {}, "", [], [], at=0.0)
+    assert "AIプロファイル: (未設定)" in bundle3
+    # 診断の自動応答の切替も、自動化の行に出る (1-43)。
+    bundle4 = core.build_diag_bundle(
+        "1.43", {"auto_diag": True}, "既定", [], [], at=0.0)
+    assert "診断=入" in bundle4.splitlines()[1]
+
+
+def test_diag_auto_state_roundtrip_and_corrupt():
+    """診断の自動応答の控え (1-43): 保存と読み直し・壊れたファイル。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "diag_auto.json"
+        # 無いファイルは「消費した物は無く、送ったことも無い」。
+        assert core.load_diag_auto(path) == {
+            "consumed_id": "", "last_sent_at": 0.0}
+        core.save_diag_auto(
+            {"consumed_id": "id-1", "last_sent_at": 123.5}, path)
+        assert core.load_diag_auto(path) == {
+            "consumed_id": "id-1", "last_sent_at": 123.5}
+        # 壊れたファイル・形の違う中身は既定に倒す。
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_diag_auto(path) == {
+            "consumed_id": "", "last_sent_at": 0.0}
+        path.write_text(json.dumps(
+            {"consumed_id": 42, "last_sent_at": "x"}),
+            encoding="utf-8")
+        assert core.load_diag_auto(path) == {
+            "consumed_id": "", "last_sent_at": 0.0}
+        # 間隔は5分。
+        assert core.DIAG_AUTO_COOLDOWN_SEC == 300.0
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -948,6 +1170,10 @@ if __name__ == "__main__":
         test_truncate_lines_and_boundary,
         test_truncate_chars_and_boundary,
         test_build_result_text,
+        test_parse_command_id,
+        test_extract_summary,
+        test_build_result_text_with_command_id,
+        test_build_return_text,
         test_build_check_text,
         test_detect_policy_stop,
         test_execute_ok_and_nonzero_and_stderr_only,
@@ -979,6 +1205,10 @@ if __name__ == "__main__":
         test_respawn_when_gone_spawns_once_after_exit,
         test_respawn_when_gone_already_gone_spawns_immediately,
         test_respawn_when_gone_gives_up_on_timeout,
+        test_phal_engine_check_and_execute,
+        test_diag_events_roundtrip_and_corrupt,
+        test_diag_bundle_composition_and_trim,
+        test_diag_auto_state_roundtrip_and_corrupt,
     ]
     for test in tests:
         test()

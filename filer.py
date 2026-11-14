@@ -3046,6 +3046,28 @@ class _LinkPreview(QTextBrowser):
             QToolTip.hideText()
 
 
+def parse_command(data: bytes) -> tuple:
+    """待ち受け(filer_launch からの依頼)のデータを解釈する。
+
+    戻り値は (命令, パス)。命令は "show"(パスは None)か "navigate"(パスは
+    フォルダの文字列)。解釈できないデータは (None, None)で、受け側は無視する。
+    データの形は filer_launch 側が作る: 1行目が命令、navigate は2行目に
+    パス(UTF-8)が続く。"""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, None
+    lines = text.split("\n")
+    head = lines[0].strip()
+    if head == "show":
+        return "show", None
+    if head == "navigate" and len(lines) > 1:
+        path = lines[1].strip()
+        if path:
+            return "navigate", path
+    return None, None
+
+
 class FilerWindow(QWidget):
     def __init__(self, app_settings=None, settings_path=None):
         super().__init__()
@@ -4051,12 +4073,20 @@ class FilerWindow(QWidget):
     def _on_ready_read(self, sock) -> None:
         try:
             data = bytes(sock.readAll())
-            if b"show" in data:
-                # 受け取ったことを返す。送る側はこれを待ってから切るので、
-                # 読む前に切られて依頼が消える、が起きない。
-                sock.write(b"ok\n")
-                sock.flush()
-                self.bring_to_front()
+            command, path = parse_command(data)
+            if command is None:
+                return  # 知らない依頼は無視する(返事もしない)
+            if command == "navigate" and not os.path.isdir(path):
+                return  # フォルダでないものへは移らない(依頼ごと無視する)
+            # 受け取ったことを返す。送る側はこれを待ってから切るので、
+            # 読む前に切られて依頼が消える、が起きない。
+            sock.write(b"ok\n")
+            sock.flush()
+            if command == "navigate":
+                # アクティブな窓をそのフォルダへ(履歴に積む通常の移動。
+                # 入力やブックマークからの jump_to と同じ)。
+                self.jump_to(path)
+            self.bring_to_front()
         except Exception:  # noqa: BLE001
             _log_exception("readyRead")
 
@@ -9661,6 +9691,14 @@ def release_single_instance() -> None:
     _mutex_handle = None
 
 
+def _startup_path(argv) -> str | None:
+    """起動引数で渡されたフォルダ(filer_launch.spawn(path) から)。
+    フォルダでなければ None(＝前回の状態で開く)。"""
+    if argv and os.path.isdir(argv[0]):
+        return argv[0]
+    return None
+
+
 def _apply_taskbar_identity(window) -> None:
     """ピン留めされても、あっふ のアイコンと起動コマンドで戻れるように
     窓へ再起動情報を書く。icons/affx.ico はピンが参照する実ファイルで、
@@ -9691,10 +9729,15 @@ def main() -> int:
     app = QApplication(sys.argv)
     # 窓とタスクバーのアイコン(本家 AfxW 風のドット明朝。affx_icon が持つ)。
     app.setWindowIcon(affx_icon.qicon())
+    start_path = _startup_path(sys.argv[1:])
     if not acquire_single_instance():
-        # 先客が居る。前面に出してもらって引き返す。
+        # 先客が居る。前面に出してもらって引き返す。フォルダ指定があれば
+        # 前面化ではなく、そのフォルダへの移動として届ける。
         try:
-            filer_launch.send_show()
+            if start_path is not None:
+                filer_launch.send_navigate(start_path)
+            else:
+                filer_launch.send_show()
         except Exception:  # noqa: BLE001
             _log_exception("send_show")
         return 0
@@ -9707,6 +9750,10 @@ def main() -> int:
         else:
             window.show()
         window.start()
+        if start_path is not None:
+            # 復元の読み込みより後に始めるので、指定のフォルダが勝つ
+            # (古い読み込み結果は request の番号で捨てられる)。
+            window.jump_to(start_path)
         _apply_taskbar_identity(window)
         window.bring_to_front()
     except Exception:  # noqa: BLE001

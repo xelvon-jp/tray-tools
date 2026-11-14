@@ -237,6 +237,8 @@ class FakeRunner:
             return {"ok": True, "input_text": self._input_value}
         if op == "send":
             return {"ok": True, "sent": True}
+        if op == "send_escape":
+            return {"ok": True, "status": "sent"}
         if op == "wait":
             return {"ok": True, "done": True, "elapsed": 2.0}
         if op == "response":
@@ -259,6 +261,46 @@ def test_subprocess_session_flow():
     # 操作は全部裏方へ流れ、順番も往復のとおり
     assert runner.requests == ["snapshot", "input", "send",
                                "wait", "response", "blocks"]
+
+
+def test_send_escape_via_subprocess():
+    """ESC の standalone 操作が裏方へ流れ、状態語が文に残る
+    (1-67)。近道 (モジュール関数) でも同じ。"""
+    runner = FakeRunner()
+    transport = copilot_io.SubprocessTransport(runner)
+    result = copilot_io.CopilotSession(transport).send_escape()
+    assert result.ok and result.message == "ESC送信: sent"
+    assert runner.requests == ["send_escape"]
+    shortcut = copilot_io.send_escape(
+        transport=copilot_io.SubprocessTransport(runner))
+    assert shortcut.ok and shortcut.message == "ESC送信: sent"
+    assert runner.requests == ["send_escape", "send_escape"]
+
+
+def test_send_escape_status_not_sent_is_failure():
+    """状態語が sent でなければ失敗として返る (1-67)。
+    transport が操作を持たなければ、その旨の失敗になる。"""
+    fake = FakeTransport()  # send_escape を持たない
+    result = copilot_io.CopilotSession(fake).send_escape()
+    assert not result.ok and "ESC送信" in result.message
+
+
+def test_send_escape_via_loop_transport():
+    """CopilotLoopTransport は Copilot.send_escape の状態語を
+    そのまま返す (1-67)。"""
+    transport = copilot_io.CopilotLoopTransport()
+
+    class FakeCp:
+        def send_escape(self):
+            return "no-hwnd"
+
+        def close(self):
+            pass
+
+    transport._cp = FakeCp()
+    assert transport.send_escape() == "no-hwnd"
+    result = copilot_io.CopilotSession(transport).send_escape()
+    assert not result.ok and result.message == "ESC送信: no-hwnd"
 
 
 def test_subprocess_no_window():
@@ -524,6 +566,76 @@ def test_loop_transport_resolves_profile_name():
             raise AssertionError("見つからない名前は RuntimeError のはず")
     finally:
         copilot_loop.Copilot = real
+
+
+def test_latest_download_carries_diag_marker():
+    """見張りの走査 (1-43): 候補と診断の目印が1回の結果に両方
+    乗ること。scan を持たない transport では目印は None。"""
+    class ScanTransport:
+        def latest_scan(self):
+            return {"candidate": {"name": "x"}, "marker": {"id": "abc"}}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(ScanTransport())
+    result = session.latest_download()
+    assert result.ok
+    assert result.candidate == {"name": "x"}
+    assert result.marker == {"id": "abc"}
+
+    class PlainTransport:
+        def latest_download(self):
+            return None
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(PlainTransport())
+    result = session.latest_download()
+    assert result.ok and result.candidate is None
+    assert result.marker is None
+
+
+def test_worker_dispatch_latest_download_includes_marker():
+    """裏方の latest_download (1-43): scan があれば目印も返す。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        def __init__(self, profile=None):
+            pass
+
+        def latest_scan(self):
+            return {"candidate": None, "marker": {"id": "w1"}}
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        result = copilot_io_worker._run({"op": "latest_download"})
+        assert result == {"ok": True, "candidate": None,
+                          "marker": {"id": "w1"}}
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_subprocess_transport_latest_scan():
+    """裏方への依頼 (1-43): latest_download の応答から、候補と
+    目印の両方を取り出すこと。"""
+    seen = {}
+
+    def runner(request, _timeout):
+        seen.update(request)
+        return {"ok": True, "candidate": {"name": "y"},
+                "marker": {"id": "m1"}}
+
+    transport = copilot_io.SubprocessTransport(runner=runner)
+    scan = transport.latest_scan()
+    assert seen["op"] == "latest_download"
+    assert scan == {"candidate": {"name": "y"}, "marker": {"id": "m1"}}
+    assert transport.latest_download() == {"name": "y"}
 
 
 def main():

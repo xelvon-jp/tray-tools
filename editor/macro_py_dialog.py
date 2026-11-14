@@ -16,7 +16,7 @@
 #     すると、次に実行する文がその行の文になる。すでに実行した
 #     編集は取り消さない)
 #   - 停止(実行側の子プロセスを終了する。無限ループでも効く)
-#   - 最初から(途中状態を捨てて、頭に戻す)
+#   - 最初から(途中状態を捨てて頭に戻り、先頭の文を次として示す)
 #   - クリップボードへコピー(職場 Copilot など AI へ貼るため)
 #   - 登録として保存(on_save があるときだけ。名前とソースを渡す)
 #
@@ -610,12 +610,25 @@ class MacroPythonPane(QWidget):
         if self._session is not None:
             self._session.stop()
 
-    def reset_session(self):
-        """実行の途中状態を捨てる(本文の変更は戻らない)。"""
+    def reset_session(self, prepare=True):
+        """実行の途中状態を捨てる(本文の変更は戻らない)。
+
+        prepare が真(「最初から」ボタン)なら、先頭の文が次に
+        なるようセッションを作り直して備える(作るだけでは
+        実行しない)。偽なら捨てるだけにする(本文の編集から
+        呼ばれる経路。編集のたびに子プロセスを作り直さない
+        ため)。"""
         self._finish()
         self._discard_session()
         self._paused_at_breakpoint = False
-        self._refresh_state("")
+        if not prepare:
+            self._refresh_state("")
+            return
+        # 次に実行する文が先頭だと、黄色の印と状態表示で分かる
+        # ようにする。作れないときは、理由が表示されたままに
+        # なる。
+        if self._ensure_session() is not None:
+            self._refresh_state("")
 
     def _on_line_clicked(self, lineno):
         """ソースの行がクリックされたときの受け口。
@@ -701,7 +714,7 @@ class MacroPythonPane(QWidget):
         self._live_dirty = True
         # 編集したら、実行の途中状態は意味を失うので捨てる。
         if self._session is not None or self._run_begun:
-            self.reset_session()
+            self.reset_session(prepare=False)
             self._refresh_state("編集したので、実行は最初からになります")
 
     def _sync_live(self):

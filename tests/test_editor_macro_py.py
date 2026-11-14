@@ -35,7 +35,7 @@ from editor import macro_py  # noqa: E402
 from editor import macros as macmod  # noqa: E402
 from editor.macro_dialog import MacroLibraryDialog  # noqa: E402
 from editor.macro_py_dialog import (  # noqa: E402
-    MacroPythonDialog, PANE_WIDTH)
+    MacroPythonDialog, PANE_WIDTH, _NEXT_LINE_COLOR)
 
 APP = None
 
@@ -500,7 +500,15 @@ def test_python_dialog_run_all_and_reset():
         assert dialog.step_once()
         assert window.text() == "ab1"
         dialog.reset_session()
-        assert dialog.session() is None
+        # 「最初から」は、先頭の文が次になるよう備える (セッ
+        # ションが用意され、黄色の印と状態表示で次が分かる)。
+        assert dialog.session() is not None
+        assert dialog.session().position == 0
+        assert dialog.session().next_lineno() == 1
+        assert "次は 1 行目" in dialog._status_label.text()
+        assert any(
+            sel.format.background() == _NEXT_LINE_COLOR
+            for sel in dialog._edit.extraSelections())
         # 通し実行はカーソルのある行から新しく始める。ステップ
         # 実行でペインのカーソルは次の文へ進んでいるので、先頭
         # へ戻してから押す。

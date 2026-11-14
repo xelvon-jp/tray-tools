@@ -28,6 +28,8 @@
 #   ext_settings.py 拡張子別の設定(全体+拡張子ごとの上書きの解決)
 #   ext_settings_dialog.py 拡張子別の設定画面(拡張子を選んで上書き)
 #   bookmark_dialog.py ブックマークの一覧の窓(選んだ行へ飛ぶ)
+#   ai_target.py    AI の投げ先(プロファイル)の整え(Qt 非依存)
+#   ai_target_dialog.py 投げ先の設定画面と、窓を選ぶ小窓
 #   text_edit.py    本文(QPlainTextEdit＋行番号＋Ctrl+ホイールで大きさ
 #                   ＋矩形選択は rect_edit.py の共用部品)
 #   outline_pane.py 左ペイン(アウトラインのツリー＋下部のファイル情報)

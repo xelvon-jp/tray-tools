@@ -181,6 +181,7 @@ def profiles(app_settings=None):
     return extra + [p for p in BUILTIN_PROFILES if p["name"] not in overridden]
 
 CONTROL_BUTTON, CONTROL_TEXT, CONTROL_DOCUMENT = 50000, 50020, 50030
+CONTROL_EDIT = 50004
 VALUE_PATTERN, INVOKE_PATTERN, TEXT_PATTERN = 10002, 10000, 10014
 WM_GETOBJECT, OBJID_CLIENT, SMTO_ABORTIFHUNG = 0x003D, 0xFFFFFFFC, 0x0002
 
@@ -680,6 +681,36 @@ class Copilot:
         if not pattern:
             return None
         return pattern.QueryInterface(UIA.IUIAutomationValuePattern).CurrentValue
+
+    def probe_input_candidates(self):
+        """入力欄の候補を子孫から探して返す(プロファイル作りの下調べ用)。
+
+        返すのは [{"automation_id", "control_type", "name"}] の並び。
+        候補の条件は、種類が Edit か Document で、ValuePattern を
+        持っていること (値の読み書きができる要素だけが入力欄に
+        なりうる。tools/uia_probe の入力欄候補の拾い方と同じ考え)。
+        木がまだ起きていないと候補が空になるので、先に wait_awake で
+        組み上がりを待つ (待っても空なら、そのまま空を返す)。"""
+        self.wait_awake(timeout=3.0)
+        _root, desc = self._descendants()
+        found = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                control_type = el.CurrentControlType
+                if control_type not in (CONTROL_EDIT, CONTROL_DOCUMENT):
+                    continue
+                if not el.GetCurrentPattern(VALUE_PATTERN):
+                    continue
+                found.append({
+                    "automation_id": (el.CurrentAutomationId or "").strip(),
+                    "control_type": ("Edit" if control_type == CONTROL_EDIT
+                                     else "Document"),
+                    "name": (el.CurrentName or "").strip()[:60],
+                })
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+        return found
 
     def send_prompt(self, text, attempts=2, wait=3.0):
         """入力欄に書いて送信する。送れたら True。

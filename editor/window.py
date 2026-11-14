@@ -237,6 +237,7 @@ from PySide6.QtWidgets import (
 
 import copilot_io
 import text_encoding
+from editor import ai_target as aitmod
 from editor import colors as colormod
 from editor import convert as convmod
 from editor import document as docmod
@@ -250,6 +251,10 @@ from editor import reformat as refmtmod
 from editor import rxfind
 from editor import session as sessionmod
 from editor.document_view import SPLIT_ORIENTATIONS, DocumentView
+from editor.ai_target_dialog import (
+    AiTargetDialog,
+    enumerate_visible_windows,
+)
 from editor.bookmark_dialog import BookmarkDialog
 from editor.color_dialog import ColorSettingsDialog
 from editor.ext_settings_dialog import ExtensionSettingsDialog
@@ -270,7 +275,7 @@ APP_NAME = "EDDy"
 # EDDy の版。タイトルバーに出す(「ファイル名 - EDDy 1.0」)。
 # 利用者が「いまの版」を言えるようにするための目印で、機能の
 # まとまりが変わる節目で上げる。
-EDDY_VERSION = "1.0"
+EDDY_VERSION = "1.1"
 # タスクバーで使う窓ごとのアプリID(AppUserModelID)。EDDy の窓は常駐や
 # あっふ と同じプロセスで開くので、プロセスのID(traytools.app.1 /
 # traytools.affx)のままだとタスクバーで同じアプリにまとめられてしまう。
@@ -343,6 +348,15 @@ MACROS_KEY = "macros"
 # 「マクロ依頼文の編集…」から変えると、差分をこのキーで
 # 保存する。
 MACRO_PROMPT_KEY = "macro_prompt"
+
+# AI の投げ先(settings の editor 節 ai_target のキー)。値は
+# プロファイルの name で、未設定・空なら自動(いままでどおり、
+# 起きている窓に合うものを copilot_loop が選ぶ)。カスタムの
+# 辞書は AI_PROFILES_KEY (editor 節の copilot_profiles) に並びで
+# 持つ (形は copilot_loop.profiles が受けるものと同じ)。AI
+# メニューの「投げ先の設定…」から変えると、差分を保存する。
+AI_TARGET_KEY = "ai_target"
+AI_PROFILES_KEY = "copilot_profiles"
 
 # 拡張子別の設定(settings の editor 節 extension_settings のキー)。
 # 値は拡張子 → 項目 → 値の対応(全体と違う項目だけの上書き分)で、
@@ -447,6 +461,17 @@ def trial_patterns(patterns, timeout=TRIAL_SUBPROCESS_TIMEOUT_SEC):
         return float(proc.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
         return None
+
+
+def _default_sender(text, force=False, profile=None):
+    """copilot_io.send_text への既定の送信役。
+
+    窓の送信口は (text, force, profile) の形にそろえてある。
+    copilot_io.send_text の第2引数は transport なので、force と
+    profile はキーワードで渡す。位置で渡すと、force のつもりの
+    True が transport に化けて、書きかけ確認のあとの送り直しが
+    必ず失敗する (fake の sender では見えなかった不具合)。"""
+    return copilot_io.send_text(text, force=force, profile=profile)
 
 
 class _SendBridge(QObject):
@@ -827,8 +852,9 @@ class EditorWindow(QMainWindow):
     highlight_pattern / pattern_applying(適用中の印。起動時の保険で
     読む)/ keymap(キー割り当ての上書き分。コンストラクタの
     keymap_overrides でも受ける)/ extension_settings(拡張子別の
-    上書き分)/ tab_width(全体のタブ幅。無いときは Qt の既定)を
-    読み(無いキーは既定)、表示やフォントや正規表現が変わったら、
+    上書き分)/ tab_width(全体のタブ幅。無いときは Qt の既定)/
+    ai_target(AI の投げ先の選択)/ copilot_profiles(投げ先の
+    カスタム)を読み(無いキーは既定)、表示やフォントや正規表現が変わったら、
     差分を on_settings_change(辞書を受ける関数)へ流すので、保存は
     呼び側の流儀(update_settings_section)に任せる。
 
@@ -890,7 +916,8 @@ class EditorWindow(QMainWindow):
         self._find_next_shortcut = None
         self._find_prev_shortcut = None
         # 送信の実体は差し替えられる(テストは fake を入れる)。
-        self._sender = sender if sender is not None else copilot_io.send_text
+        # 既定は _default_sender (copilot_io.send_text へキーワードで渡す)。
+        self._sender = sender if sender is not None else _default_sender
         self._send_thread = None
         self._bridge = _SendBridge(self)
         self._bridge.finished.connect(self._on_send_finished)
@@ -984,6 +1011,11 @@ class EditorWindow(QMainWindow):
         self._macro_prompt = (prompt_setting
                               if isinstance(prompt_setting, str)
                               else None)
+        # AI の投げ先(プロファイルの選択と、カスタムの並び)。
+        self._ai_target = aitmod.sanitize_selection(
+            section.get(AI_TARGET_KEY))
+        self._ai_target_profiles = aitmod.sanitize_profiles(
+            section.get(AI_PROFILES_KEY))
         self._registered_macro_actions = {}
         self._registered_menu_items = []
         self._macro_menu = None
@@ -2467,6 +2499,8 @@ class EditorWindow(QMainWindow):
             "send_selection", ai_menu)
         ai_menu.addSeparator()
         self._action("マクロ依頼文の編集(&P)…", self.edit_macro_prompt,
+                     None, ai_menu)
+        self._action("投げ先の設定(&T)…", self.show_ai_target_settings,
                      None, ai_menu)
 
     def _rebuild_recent_menu(self):
@@ -5359,6 +5393,75 @@ class EditorWindow(QMainWindow):
         if dialog.exec():
             self.set_macro_prompt_text(dialog.value())
 
+    # ---------------------------------------------------------------
+    # AI の投げ先(プロファイルの選択とカスタム)
+    # ---------------------------------------------------------------
+    def ai_target_selection(self):
+        """いま選ばれている投げ先(プロファイル名。自動なら "")。"""
+        return self._ai_target
+
+    def ai_target_profile(self):
+        """送信へ渡す投げ先。自動なら None、組み込みなら名前、
+        カスタムなら辞書そのもの。カスタムが選ばれているのに
+        辞書が無ければ None(自動と同じ扱いに倒す)。"""
+        name = self._ai_target
+        if not name:
+            return None
+        if name == aitmod.CUSTOM_PROFILE_NAME:
+            return aitmod.find_profile(self._ai_target_profiles, name)
+        return name
+
+    def apply_ai_target(self, selection, custom_profile=None):
+        """投げ先の変更を反映して保存する(設定画面からの口)。
+
+        custom_profile が渡されたら、カスタムの並びへ差し替えて
+        一緒に保存する。変わった分だけ差分を流す。"""
+        updates = {}
+        selection = aitmod.sanitize_selection(selection)
+        if selection != self._ai_target:
+            self._ai_target = selection
+            updates[AI_TARGET_KEY] = selection
+        if custom_profile is not None:
+            profiles = aitmod.upsert_profile(
+                self._ai_target_profiles, custom_profile)
+            if profiles != self._ai_target_profiles:
+                self._ai_target_profiles = profiles
+                updates[AI_PROFILES_KEY] = profiles
+        if updates:
+            self._persist_settings(updates)
+
+    def show_ai_target_settings(self):
+        """「AI の投げ先」の設定画面を開く。
+
+        組み込みの一覧は copilot_io の裏方から取る(copilot_loop を
+        常駐の中で import しないため)。開くときに1回だけ裏方を
+        起こす。取れなければ名前だけの最小限に倒す(自動と
+        カスタムはそのまま使える)。"""
+        try:
+            builtins = copilot_io.list_profiles(timeout=15.0)
+        except Exception:  # noqa: BLE001  一覧が取れないだけ
+            builtins = [{"name": name}
+                        for name in ("mscopilot", "m365")]
+        custom = aitmod.find_profile(
+            self._ai_target_profiles, aitmod.CUSTOM_PROFILE_NAME)
+        dialog = AiTargetDialog(
+            builtins, self._ai_target, custom, self,
+            enumerate_windows=enumerate_visible_windows,
+            prober=lambda profile: copilot_io.probe_input(
+                profile=profile),
+            filler=lambda text, profile: copilot_io.fill_text(
+                text, profile=profile))
+        if dialog.exec():
+            custom_profile = None
+            if dialog.custom_dirty:
+                built = dialog.custom_profile()
+                if (built["process_name"] or built["window_class"]
+                        or built["app_id_prefix"]
+                        or built["input_automation_id"]):
+                    custom_profile = built
+            self.apply_ai_target(
+                dialog.selection_name(), custom_profile)
+
     def apply_registered_macros(self, mapping):
         """登録マクロの変更を反映して保存する。
 
@@ -6221,13 +6324,18 @@ class EditorWindow(QMainWindow):
     def _start_send(self, text, force):
         """送信を裏のスレッドで始める。sender の呼び方は
         sender(text) が通常、sender(text, True) が「入力欄の上書きを
-        承知で送る」再送(copilot_io.send_text の force 引数)。"""
+        承知で送る」再送(force)。投げ先のプロファイルが選ばれて
+        いるときだけ、キーワード profile= で併せて渡す(自動の
+        ときの呼び方は従来と1つも変えない)。"""
         self._pending_send_text = text
         self.statusBar().showMessage("AI へ送信しています…")
 
         def run():
             try:
-                if force:
+                profile = self.ai_target_profile()
+                if profile is not None:
+                    result = self._sender(text, force, profile=profile)
+                elif force:
                     result = self._sender(text, True)
                 else:
                     result = self._sender(text)

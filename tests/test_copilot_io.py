@@ -333,6 +333,199 @@ def test_worker_script_fails_cleanly_without_uia():
     session.close()
 
 
+class FillTransport(FakeTransport):
+    """fill_prompt / probe_input を持つ fake(CopilotLoopTransport の形)。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.filled = []
+
+    def fill_prompt(self, text):
+        self.filled.append(text)
+        return True
+
+    def probe_input(self):
+        return [{"automation_id": "userInput", "control_type": "Edit",
+                 "name": ""}]
+
+
+def test_fill_writes_without_sending():
+    transport = FillTransport()
+    result = copilot_io.fill_text("テストです", transport=transport)
+    assert result.ok and "送信はしていません" in result.message
+    assert transport.filled == ["テストです"]
+    assert transport.sent == []  # 送信の段は踏んでいない
+
+
+def test_fill_refuses_nonempty_draft():
+    # 入力欄に書きかけがあるときは、テストでも上書きしない。
+    transport = FillTransport(input_value="書きかけ")
+    result = copilot_io.fill_text("テストです", transport=transport)
+    assert not result.ok and result.needs_confirm
+    assert transport.filled == []
+
+
+def test_fill_force_overwrites():
+    transport = FillTransport(input_value="書きかけ")
+    result = copilot_io.fill_text(
+        "テストです", transport=transport, force=True)
+    assert result.ok and transport.filled == ["テストです"]
+
+
+def test_fill_without_fill_support_is_a_clean_failure():
+    result = copilot_io.fill_text("テストです", transport=FakeTransport())
+    assert not result.ok and not result.needs_confirm
+
+
+def test_probe_returns_candidates():
+    result = copilot_io.probe_input(transport=FillTransport())
+    assert result.ok
+    assert result.candidates[0]["automation_id"] == "userInput"
+
+
+def test_probe_without_candidates_fails_cleanly():
+    class EmptyTransport(FillTransport):
+        def probe_input(self):
+            return []
+
+    result = copilot_io.probe_input(transport=EmptyTransport())
+    assert not result.ok and result.candidates == []
+
+
+def test_subprocess_transport_passes_profile():
+    recorded = []
+    runner = FakeRunner()
+
+    def spy(request, timeout):
+        recorded.append(dict(request))
+        return runner(request, timeout)
+
+    session = copilot_io.CopilotSession(copilot_io.SubprocessTransport(
+        spy, profile={"name": "eddy-custom"}))
+    assert session.send("質問です").ok
+    assert recorded and all(
+        req.get("profile") == {"name": "eddy-custom"} for req in recorded)
+
+
+def test_subprocess_transport_without_profile_sends_no_key():
+    # プロファイル無しのとき、要求の形は従来と1つも変えない。
+    recorded = []
+    runner = FakeRunner()
+
+    def spy(request, timeout):
+        recorded.append(dict(request))
+        return runner(request, timeout)
+
+    session = copilot_io.CopilotSession(copilot_io.SubprocessTransport(spy))
+    assert session.send("質問です").ok
+    assert recorded and all("profile" not in req for req in recorded)
+
+
+def _fill_probe_runner(request, timeout):
+    op = request["op"]
+    if op == "snapshot":
+        return {"ok": True, "title": "Copilot", "text_length": 10}
+    if op == "input":
+        return {"ok": True, "input_text": ""}
+    if op == "fill":
+        return {"ok": True, "filled": True}
+    if op == "probe":
+        return {"ok": True, "candidates": [{"automation_id": "ai"}]}
+    return {"ok": True}
+
+
+def test_session_fill_and_probe_through_subprocess_transport():
+    session = copilot_io.CopilotSession(
+        copilot_io.SubprocessTransport(_fill_probe_runner))
+    assert session.fill("テスト").ok
+    probed = session.probe()
+    assert probed.ok and probed.candidates == [{"automation_id": "ai"}]
+
+
+def test_list_profiles_from_worker_reply():
+    def runner(request, timeout):
+        assert request["op"] == "profiles"
+        return {"ok": True, "profiles": [
+            {"name": "mscopilot"}, {"bad": 1}, {"name": "m365"}]}
+
+    names = [p["name"] for p in copilot_io.list_profiles(runner=runner)]
+    assert names == ["mscopilot", "m365"]
+
+
+def test_list_profiles_worker_error_raises():
+    def runner(request, timeout):
+        return {"ok": False, "error": "壊れています"}
+
+    try:
+        copilot_io.list_profiles(runner=runner)
+    except copilot_io.WorkerError:
+        return
+    raise AssertionError("WorkerError になるはず")
+
+
+def test_worker_dispatch_fill_probe_profiles():
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        last_profile = "unset"
+
+        def __init__(self, profile=None):
+            FakeLoopTransport.last_profile = profile
+
+        def fill_prompt(self, text):
+            return True
+
+        def probe_input(self):
+            return [{"automation_id": "in1"}]
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        filled = copilot_io_worker._run(
+            {"op": "fill", "text": "abc", "profile": "m365"})
+        assert filled == {"ok": True, "filled": True}
+        assert FakeLoopTransport.last_profile == "m365"
+        probed = copilot_io_worker._run({"op": "probe"})
+        assert probed == {"ok": True,
+                           "candidates": [{"automation_id": "in1"}]}
+        profiles = copilot_io_worker._run({"op": "profiles"})
+        assert profiles["ok"]
+        assert [p["name"] for p in profiles["profiles"]] == [
+            "mscopilot", "m365"]
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_loop_transport_resolves_profile_name():
+    import copilot_loop
+
+    seen = {}
+
+    class FakeCopilot:
+        def __init__(self, profile=None, app_settings=None):
+            seen["profile"] = profile
+
+    real = copilot_loop.Copilot
+    copilot_loop.Copilot = FakeCopilot
+    try:
+        transport = copilot_io.CopilotLoopTransport(profile="m365")
+        transport._ensure()
+        assert seen["profile"]["name"] == "m365"
+        assert seen["profile"]["process_name"] == "M365Copilot.exe"
+        bad = copilot_io.CopilotLoopTransport(profile="無い名前")
+        try:
+            bad._ensure()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("見つからない名前は RuntimeError のはず")
+    finally:
+        copilot_loop.Copilot = real
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

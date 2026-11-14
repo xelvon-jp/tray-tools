@@ -11,7 +11,9 @@
 # 使い方:
 #   標準入力に JSON を1つ渡す: {"op": "send", "text": "..."}
 #   標準出力に JSON を1行返す: {"ok": true, ...} / {"ok": false, "error": "…"}
-#   op は snapshot / input / send / wait / response / blocks。
+#   op は snapshot / input / send / fill / probe / profiles / wait /
+#   response / blocks。依頼に "profile" (辞書か組み込みの名前) が
+#   あれば、その投げ先で Copilot を作る (無ければ従来どおり自動選択)。
 #   診断は標準エラーへ。標準出力には応答の JSON だけを出す。
 import json
 import os
@@ -25,15 +27,26 @@ if _HERE not in sys.path:
 def _run(request):
     import copilot_io
 
-    transport = copilot_io.CopilotLoopTransport()
+    op = request.get("op")
+    if op == "profiles":
+        # プロファイルの並びは transport を作らずに返す (窓が無くても
+        # 一覧だけは返せる。設定画面の「組み込み」表示用)。
+        import copilot_loop
+
+        return {"ok": True, "profiles": copilot_loop.profiles()}
+    transport = copilot_io.CopilotLoopTransport(
+        profile=request.get("profile"))
     try:
-        op = request.get("op")
         if op == "snapshot":
             return {"ok": True, "length": transport.snapshot_length()}
         if op == "input":
             return {"ok": True, "input_text": transport.input_text()}
         if op == "send":
             return {"ok": True, "sent": bool(transport.send_prompt(request["text"]))}
+        if op == "fill":
+            return {"ok": True, "filled": bool(transport.fill_prompt(request["text"]))}
+        if op == "probe":
+            return {"ok": True, "candidates": transport.probe_input()}
         if op == "wait":
             done, elapsed = transport.wait_until_idle(float(request["timeout"]))
             return {"ok": True, "done": bool(done), "elapsed": float(elapsed)}

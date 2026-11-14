@@ -68,6 +68,15 @@ class ResponseResult:
     code_blocks: list = field(default_factory=list)
 
 
+@dataclass
+class ProbeResult:
+    """入力欄の検出(プローブ)の結果。candidates は
+    [{"automation_id", "control_type", "name"}] の並び。"""
+    ok: bool
+    message: str
+    candidates: list = field(default_factory=list)
+
+
 class WorkerError(RuntimeError):
     """裏方プロセスとのやり取りの失敗。文はそのまま利用者に見せられる
     日本語にしておく(CopilotSession が結果オブジェクトへ畳む)。"""
@@ -120,11 +129,18 @@ class SubprocessTransport:
     送る→待つ→取るを別々の裏方に分けてもつながる)。runner は
     テスト用の差し替え口で、(依頼の辞書, 上限秒) → 応答の辞書。"""
 
-    def __init__(self, runner=None, op_timeout=WORKER_OP_TIMEOUT):
+    def __init__(self, runner=None, op_timeout=WORKER_OP_TIMEOUT,
+                 profile=None):
         self._runner = runner if runner is not None else run_worker
         self._op_timeout = op_timeout
+        # 投げ先のプロファイル(辞書か、組み込みの名前)。None なら
+        # 依頼に含めない (裏方は従来どおり自動選択になる)。
+        self._profile = profile
 
     def _call(self, request, timeout=None):
+        if self._profile is not None:
+            request = dict(request)
+            request["profile"] = self._profile
         response = self._runner(
             request, self._op_timeout if timeout is None else timeout)
         if not isinstance(response, dict):
@@ -142,6 +158,12 @@ class SubprocessTransport:
 
     def send_prompt(self, text):
         return bool(self._call({"op": "send", "text": text})["sent"])
+
+    def fill_prompt(self, text):
+        return bool(self._call({"op": "fill", "text": text})["filled"])
+
+    def probe_input(self):
+        return list(self._call({"op": "probe"})["candidates"])
 
     def wait_until_idle(self, timeout):
         response = self._call({"op": "wait", "timeout": timeout},
@@ -176,14 +198,30 @@ class CopilotLoopTransport:
     スレッド間で渡すと落ちる(tray-tools で何度も踏んだ罠。agent_loop が
     ワーカースレッドの中で全部を完結させているのと同じ作法)。"""
 
-    def __init__(self):
+    def __init__(self, profile=None):
         self._cp = None
+        # 投げ先のプロファイル。辞書そのものか、組み込みの名前
+        # (文字列)。None なら Copilot 側の自動選択に従来どおり任せる。
+        self._profile = profile
 
     def _ensure(self):
         if self._cp is None:
             import copilot_loop  # 重く Windows 寄りなので使うときだけ読む
 
-            self._cp = copilot_loop.Copilot()
+            profile = self._profile
+            if isinstance(profile, str):
+                # 名前は copilot_loop.profiles() の並びから引く
+                # (settings の copilot_profiles が先勝ち、の作法も
+                # あちらに任せる。ここでは app_settings を渡さない
+                # ので、実質は組み込みの名前解決になる)。
+                for candidate in copilot_loop.profiles():
+                    if candidate.get("name") == profile:
+                        profile = candidate
+                        break
+                else:
+                    raise RuntimeError(
+                        f"投げ先のプロファイルが見つかりません: {profile}")
+            self._cp = copilot_loop.Copilot(profile=profile)
         return self._cp
 
     def snapshot_length(self):
@@ -203,6 +241,14 @@ class CopilotLoopTransport:
 
     def send_prompt(self, text):
         return self._ensure().send_prompt(text)
+
+    def fill_prompt(self, text):
+        """入力欄に入れるだけ (送信ボタンは押さない)。"""
+        self._ensure().set_input(text)
+        return True
+
+    def probe_input(self):
+        return self._ensure().probe_input_candidates()
 
     def wait_until_idle(self, timeout):
         return self._ensure().wait_until_idle(timeout=timeout)
@@ -228,16 +274,20 @@ class CopilotSession:
     (copilot_loop.new_response の作法。全文からマーカーで切る旧方式は
     会話が長くなると誤爆するので使わない)。"""
 
-    def __init__(self, transport=None):
+    def __init__(self, transport=None, profile=None):
         # transport はテスト用の差し替え口。通常は None で、初回利用時に
         # SubprocessTransport を作る(UIA は裏方プロセスの中だけ)。
+        # profile は投げ先の指定 (辞書か組み込みの名前)。transport を
+        # 自分で作るときだけ効く (差し替えられた transport は、その
+        # 中で解決済みとして扱う)。
         self._transport = transport
+        self._profile = profile
         self._previous_length = None
         self._sent_text = None
 
     def _tp(self):
         if self._transport is None:
-            self._transport = SubprocessTransport()
+            self._transport = SubprocessTransport(profile=self._profile)
         return self._transport
 
     # -- 送る -------------------------------------------------------------
@@ -278,6 +328,63 @@ class CopilotSession:
         self._sent_text = text
         return SendResult(True, "Copilot に送信しました")
 
+    # -- 入れるだけ -------------------------------------------------------
+    def fill(self, text, force=False) -> SendResult:
+        """入力欄に text を入れるだけ。送信はしない。
+
+        書きかけの扱いは send と同じ: force=False で入力欄に文が
+        あれば、上書きせず needs_confirm=True で返す (テスト入力でも
+        書きかけを消さない)。結果の形も send とそろえてある。"""
+        if not text or not text.strip():
+            return SendResult(False, "入れるテキストが空です")
+        if not force:
+            existing = None
+            getter = getattr(self._tp(), "input_text", None)
+            if getter is not None:
+                try:
+                    existing = getter()
+                except Exception as e:  # noqa: BLE001
+                    return SendResult(
+                        False, f"入力欄に入れられませんでした（{e}）")
+            if existing and existing.strip():
+                return SendResult(
+                    False,
+                    "入力欄に書きかけの文があります。"
+                    "テストでも上書きはしません",
+                    needs_confirm=True)
+        try:
+            filler = getattr(self._tp(), "fill_prompt", None)
+            if filler is None:
+                return SendResult(
+                    False, "この経路では入力欄に入れられません")
+            filled = filler(text)
+        except Exception as e:  # noqa: BLE001
+            return SendResult(
+                False, f"入力欄に入れられませんでした（{e}）")
+        if not filled:
+            return SendResult(False, "入力欄に入れられませんでした")
+        return SendResult(True, "入力欄に入れました（送信はしていません）")
+
+    # -- 検出 -------------------------------------------------------------
+    def probe(self) -> ProbeResult:
+        """入力欄の候補を検出する (プロファイル作りの下調べ)。"""
+        try:
+            prober = getattr(self._tp(), "probe_input", None)
+            if prober is None:
+                return ProbeResult(
+                    False, "この経路では入力欄を検出できません")
+            candidates = prober()
+        except Exception as e:  # noqa: BLE001
+            return ProbeResult(
+                False, f"入力欄を検出できませんでした（{e}）")
+        candidates = [c for c in (candidates or []) if isinstance(c, dict)]
+        if not candidates:
+            return ProbeResult(
+                False, "入力欄の候補が見つかりませんでした")
+        return ProbeResult(
+            True, f"入力欄の候補が {len(candidates)} 件見つかりました",
+            candidates)
+
     # -- 待つ -------------------------------------------------------------
     def wait(self, timeout=DEFAULT_WAIT_TIMEOUT) -> WaitResult:
         started = time.time()
@@ -315,13 +422,52 @@ class CopilotSession:
                 pass
 
 
-def send_text(text, transport=None, force=False) -> SendResult:
+def send_text(text, transport=None, force=False, profile=None) -> SendResult:
     """送信だけの近道。セッションを作って送って閉じる。
 
-    エディタの「選択範囲を Copilot に投げる」のような、応答をこちらで
-    読まない送り方のための入口。force の意味は CopilotSession.send と同じ。"""
-    session = CopilotSession(transport)
+    エディタの「選択範囲を AI に投げる」のような、応答をこちらで
+    読まない送り方のための入口。force の意味は CopilotSession.send と同じ。
+    profile は投げ先の指定 (辞書か組み込みの名前)。None なら従来どおり
+    自動選択。"""
+    session = CopilotSession(transport, profile=profile)
     try:
         return session.send(text, force=force)
     finally:
         session.close()
+
+
+def fill_text(text, transport=None, force=False, profile=None) -> SendResult:
+    """入力欄に入れるだけの近道 (送信はしない)。テスト入力用。
+
+    force の意味は CopilotSession.fill と同じ (書きかけがあっても
+    上書きする)。profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.fill(text, force=force)
+    finally:
+        session.close()
+
+
+def probe_input(profile=None, transport=None) -> ProbeResult:
+    """入力欄の候補を検出する近道。profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.probe()
+    finally:
+        session.close()
+
+
+def list_profiles(runner=None, timeout=WORKER_OP_TIMEOUT) -> list:
+    """使えるプロファイルの並びを裏方から取る (組み込み + 裏方の
+    解決順)。設定画面が「組み込み」の一覧を出すために使う。
+
+    取れなければ WorkerError (呼び側が「自動とカスタムだけ」に
+    倒せるように、結果オブジェクトではなく例外で返す)。"""
+    run = runner if runner is not None else run_worker
+    response = run({"op": "profiles"}, timeout)
+    if not isinstance(response, dict) or not response.get("ok"):
+        detail = (response.get("error") if isinstance(response, dict)
+                  else None) or "裏方から読めない応答が返りました"
+        raise WorkerError(str(detail))
+    return [p for p in (response.get("profiles") or [])
+            if isinstance(p, dict) and p.get("name")]

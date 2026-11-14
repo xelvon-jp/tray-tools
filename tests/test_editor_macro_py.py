@@ -391,24 +391,6 @@ def test_python_macro_error_goes_to_status():
 # ---------------------------------------------------------------
 # 別窓(ステップ実行・編集・コピー・保存)
 # ---------------------------------------------------------------
-def test_python_dialog_live_sync_and_user_edit_guard():
-    # ライブ表示: 記録側のソースが増えたら差し替わる。利用者が
-    # 編集した後は、ライブ側で上書きしない。
-    state = {"source": "ed.insert_text('A')\n"}
-    dialog = MacroPythonDialog(
-        None, source=state["source"], live_source=lambda: state["source"])
-    try:
-        state["source"] = "ed.insert_text('A')\ned.insert_text('B')\n"
-        dialog._sync_live()
-        assert dialog.source() == state["source"]
-        dialog._edit.setPlainText("ed.insert_text('自分の編集')\n")
-        state["source"] = "ed.insert_text('C')\n"
-        dialog._sync_live()
-        assert "自分の編集" in dialog.source()
-    finally:
-        dialog.close()
-
-
 def test_python_dialog_step_stops_when_tab_switched():
     # ステップ実行の合間にタブを切り替えると、続きは実行されずに
     # 止まる (アオイの実測 req-20261114-22: 2文目以降が切り替え
@@ -428,59 +410,6 @@ def test_python_dialog_step_stops_when_tab_switched():
         assert window.text() == ""
         assert not dialog.step_once()
         assert window.text() == ""  # 切り替え先は変わっていない
-    finally:
-        dialog.close()
-        discard_close(window)
-
-
-def test_python_dialog_live_sync_pauses_during_session():
-    # 実行の途中 (セッションがある間) は、ライブ表示が本文を
-    # 書き換えない (アオイの指摘 req-20261114-22 低)。
-    window = make_window("ab", cursor_pos=0)
-    original = "ed.insert_text('A')\ned.insert_text('B')\n"
-    state = {"source": original}
-    dialog = MacroPythonDialog(
-        window,
-        source=state["source"],
-        session_factory=window._make_python_session,
-        begin_run=window._begin_python_run,
-        end_run=window._end_python_run,
-        live_source=lambda: state["source"])
-    try:
-        dialog.show()
-        assert dialog.step_once()
-        # セッションは継続中 (2文のうち1文だけ実行した)。
-        assert dialog.session() is not None
-        assert not dialog.session().done
-        state["source"] = original + "ed.insert_text('C')\n"
-        dialog._sync_live()
-        assert dialog.source() == original
-    finally:
-        dialog.close()
-        discard_close(window)
-
-
-def test_python_dialog_live_sync_replaces_prepared_session():
-    # 用意しただけのセッション (「最初から」で備えたもの) は、
-    # ライブ表示の差し替えを妨げない (捨ててから差し替える)。
-    window = make_window("ab", cursor_pos=0)
-    state = {"source": "ed.insert_text('A')\n"}
-    dialog = MacroPythonDialog(
-        window,
-        source=state["source"],
-        session_factory=window._make_python_session,
-        begin_run=window._begin_python_run,
-        end_run=window._end_python_run,
-        live_source=lambda: state["source"])
-    try:
-        dialog.show()
-        dialog.reset_session()
-        assert dialog.session() is not None
-        assert dialog.session().position == 0
-        state["source"] = "ed.insert_text('A')\ned.insert_text('B')\n"
-        dialog._sync_live()
-        assert dialog.source() == state["source"]
-        assert dialog.session() is None
     finally:
         dialog.close()
         discard_close(window)
@@ -639,88 +568,260 @@ def test_pane_breakpoint_stops_and_continues():
 
 
 def test_recording_continues_after_pane_step():
-    # 記録開始 → 操作① → ペインでステップ実行 (セッションは
-    # 終わっていない) → 操作② → 記録終了、で操作②も記録に
-    # 残る (陽太さんの実機報告 2026-11-14: 「再生中」の印が
-    # セッション全体に残り、その間の手作業が記録から漏れた)。
-    # ステップ実行で本文へ入った編集自体は、記録に混ざらない。
+    # 記録開始 → 操作① → 記録用ペインでステップ実行 → 操作② →
+    # 記録終了、で操作②も記録に残り、ペインにも差し込まれる
+    # (陽太さんの実機報告 2026-11-14: 「再生中」の印がセッション
+    # 全体に残り、その間の手作業が記録から漏れた)。ステップ
+    # 実行で本文へ入った編集自体は、記録に混ざらない。ペインは
+    # 記録開始で自動で開く記録用ペイン (窓の実物) を使う。
     window = make_window("ab", cursor_pos=2)
-    dialog = _make_pane(
-        window, "ed.insert_text('S')\ned.insert_text('T')\n")
     try:
         window.set_macro_recording(True)
+        pane = window._python_dialog
+        assert pane is not None and window._python_pane_live
         QTest.keyClicks(window._edit, "X")          # 操作①
-        dialog.show()
-        assert dialog.step_once()
-        assert window.text() == "abXS"
-        assert dialog.session() is not None
-        assert not dialog.session().done    # セッションは継続中
+        assert "ed.insert_text('X')" in pane.source()
+        assert pane.step_once()     # 記録した文をそのまま実行する
+        assert window.text() == "abXX"
         QTest.keyClicks(window._edit, "Y")          # 操作②
         window.set_macro_recording(False)
-        assert window.text() == "abXSY"
+        assert window.text() == "abXXY"
         assert window._macro_skips == 0
         assert window.recorded_commands() == [
             {"cmd": "insert_text", "args": {"text": "X"}},
             {"cmd": "insert_text", "args": {"text": "Y"}},
         ]
+        assert "ed.insert_text('Y')" in pane.source()
     finally:
-        dialog.close()
         if window._python_dialog is not None:
             window._python_dialog.close()
         discard_close(window)
 
 
-def test_recording_live_pane_catches_up_at_stop():
-    # 実機の流れ: 記録開始で自動で開くライブ表示のペインで
-    # ステップ実行すると、実行が始まったセッションがある間は
-    # ライブ表示が止まる (req-20261114-22)。そのあとの操作は
-    # 記録には残るが画面に出ない。記録の終了で、ペインが最終
-    # 形へ寄って、その分が画面に出ること (実機報告 2026-11-14
-    # の再発: 操作②がマクロ画面に出なかった)。
-    window = make_window("ab\ncd", cursor_pos=2)
+def _statement_lines(source):
+    """ソースから、コメントでも空行でもない行 (文の行) を順に
+    取り出す。"""
+    return [line for line in source.split("\n")
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def test_recording_inserts_at_pane_cursor_full_sequence():
+    # 陽太さんの指定の流れ (2026-11-14): 記録中は、エディタの
+    # 操作が常にマクロ画面のカーソル位置へ差し込まれる。マクロ
+    # 画面を手で編集しても、その後の操作はそのカーソルの位置
+    # へ入り続ける。記録開始の前と記録終了の後の操作は入らない。
+    window = make_window("ab\ncd\nef", cursor_pos=0)
+    try:
+        QTest.keyClicks(window._edit, "0")          # 操作0 (記録前)
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        assert pane is not None and window._python_pane_live
+        # 操作1〜4
+        QTest.keyClicks(window._edit, "A")
+        window.execute_command("move_line_down")
+        QTest.keyClicks(window._edit, "B")
+        window.execute_command("move_line_up")
+        # マクロ編集1・2 (末尾へ手で足す)
+        cursor = pane._edit.textCursor()
+        cursor.setPosition(len(pane.source()))
+        pane._edit.setTextCursor(cursor)
+        cursor.insertText("ed.select_all()\n")
+        cursor.insertText("ed.delete_line()\n")
+        # 操作5〜8 (カーソルは末尾のままなので、後ろへ入る)
+        QTest.keyClicks(window._edit, "C")
+        window.execute_command("move_line_down")
+        QTest.keyClicks(window._edit, "D")
+        window.execute_command("move_line_up")
+        # マクロ編集3・4 (先頭の文の前へ手で足す)
+        _pane_cursor_to_line(pane, 3)
+        cursor = pane._edit.textCursor()
+        cursor.insertText("ed.cut_to_end()\n")
+        cursor.insertText("ed.toggle_bookmark()\n")
+        # 操作9〜12 (カーソルは先頭の文の直前にあるので、そこへ)
+        QTest.keyClicks(window._edit, "E")
+        window.execute_command("move_line_down")
+        QTest.keyClicks(window._edit, "F")
+        window.execute_command("move_line_up")
+        window.set_macro_recording(False)
+        QTest.keyClicks(window._edit, "G")          # 操作13 (記録後)
+
+        assert window.recorded_commands() == [
+            {"cmd": "insert_text", "args": {"text": "A"}},
+            {"cmd": "move_line_down",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "B"}},
+            {"cmd": "move_line_up",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "C"}},
+            {"cmd": "move_line_down",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "D"}},
+            {"cmd": "move_line_up",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "E"}},
+            {"cmd": "move_line_down",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "F"}},
+            {"cmd": "move_line_up",
+             "args": {"count": 1, "extend": False}},
+        ]
+        # 画面の文の並び: 手編集の行と、カーソル位置へ入った
+        # 操作の文が、起きた順に混ざる。
+        assert _statement_lines(pane.source()) == [
+            "ed.cut_to_end()",
+            "ed.toggle_bookmark()",
+            "ed.insert_text('E')",
+            "ed.move_line_down()",
+            "ed.insert_text('F')",
+            "ed.move_line_up()",
+            "ed.insert_text('A')",
+            "ed.move_line_down()",
+            "ed.insert_text('B')",
+            "ed.move_line_up()",
+            "ed.select_all()",
+            "ed.delete_line()",
+            "ed.insert_text('C')",
+            "ed.move_line_down()",
+            "ed.insert_text('D')",
+            "ed.move_line_up()",
+        ]
+        # 記録終了の時点で、いまの Python マクロは画面の本文
+        # (手編集を含む) と一致する。
+        assert window._current_python_source == pane.source()
+        assert "insert_text('0')" not in pane.source()
+        assert "insert_text('G')" not in pane.source()
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_insert_at_cursor_before_first_statement():
+    # マクロ画面のカーソルを先頭の文の行頭へ移してからエディタ
+    # を操作すると、その文は先頭の文の前へ入り、カーソルは
+    # 差し込んだ文の直後に来る。
+    window = make_window("ab\ncd", cursor_pos=0)
     try:
         window.set_macro_recording(True)
         pane = window._python_dialog
-        assert pane is not None
-        QTest.keyClicks(window._edit, "X")
+        QTest.keyClicks(window._edit, "A")
+        assert _statement_lines(pane.source()) == ["ed.insert_text('A')"]
+        _pane_cursor_to_line(pane, 3)   # 先頭の文の行頭
         window.execute_command("move_line_down")
-        QTest.keyClicks(window._edit, "Z")
-        pane._sync_live()
-        assert "insert_text('Z')" in pane.source()
-        assert pane.step_once()
-        assert pane.session() is not None
-        assert not pane.session().done    # セッションは継続中
-        QTest.keyClicks(window._edit, "Y")          # 操作②
-        pane._sync_live()
-        # 実行中のセッションがある間は差し替えない。
-        assert "insert_text('Y')" not in pane.source()
+        assert _statement_lines(pane.source()) == [
+            "ed.move_line_down()", "ed.insert_text('A')"]
+        source = pane.source()
+        caret = pane._edit.textCursor().position()
+        assert caret == (source.index("ed.move_line_down()")
+                         + len("ed.move_line_down()"))
         window.set_macro_recording(False)
-        # 記録の終了で最終形へ寄り、Y が画面に出る。
-        assert "insert_text('Y')" in pane.source()
-        assert window.recorded_commands()[-1] == {
-            "cmd": "insert_text", "args": {"text": "Y"}}
-        # 先頭の文が次になるよう備え直されている。
-        assert pane.session() is not None
-        assert pane.session().position == 0
     finally:
         if window._python_dialog is not None:
             window._python_dialog.close()
         discard_close(window)
 
 
-def test_recording_finish_keeps_user_edited_pane():
-    # 記録中にペインの本文を利用者が編集していたら、記録の
-    # 終了でもその本文は差し替えない (編集を勝手に消さない)。
+def test_recording_insert_midline_cursor_goes_to_next_line():
+    # マクロ画面のカーソルが文の行の途中にあるときは、その行を
+    # 割らずに、次の行へ新しい文が入る。
+    window = make_window("ab\ncd", cursor_pos=0)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        QTest.keyClicks(window._edit, "A")
+        block = pane._edit.document().findBlockByNumber(2)
+        cursor = pane._edit.textCursor()
+        cursor.setPosition(block.position() + 3)    # 文の行の途中
+        pane._edit.setTextCursor(cursor)
+        window.execute_command("move_line_down")
+        assert _statement_lines(pane.source()) == [
+            "ed.insert_text('A')", "ed.move_line_down()"]
+        window.set_macro_recording(False)
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_grow_replaces_line_in_place():
+    # 続けて打った文字は、記録では1つの insert_text にまとまり、
+    # マクロ画面でも行は増えずに、その行が伸びる。count を合算
+    # する命令 (Backspace) も同じく、その行が伸びる。
     window = make_window("ab", cursor_pos=2)
     try:
         window.set_macro_recording(True)
         pane = window._python_dialog
-        assert pane is not None
         QTest.keyClicks(window._edit, "X")
-        pane._sync_live()
-        pane._edit.setPlainText("ed.insert_text('Q')\n")
+        QTest.keyClicks(window._edit, "Y")
+        assert _statement_lines(pane.source()) == ["ed.insert_text('XY')"]
+        assert window.recorded_commands() == [
+            {"cmd": "insert_text", "args": {"text": "XY"}}]
         window.set_macro_recording(False)
-        assert pane.source() == "ed.insert_text('Q')\n"
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+    window = make_window("abcd", cursor_pos=4)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        QTest.keyClick(window._edit, Qt.Key.Key_Backspace)
+        QTest.keyClick(window._edit, Qt.Key.Key_Backspace)
+        assert _statement_lines(pane.source()) == [
+            "ed.delete_backward(count=2)"]
+        assert window.recorded_commands() == [
+            {"cmd": "delete_backward", "args": {"count": 2}}]
+        window.set_macro_recording(False)
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_insert_discards_live_session():
+    # 記録用ペインでステップ実行の途中 (セッションが生きて
+    # いる) にエディタを操作すると、その操作はカーソル位置へ
+    # 差し込まれ、実行の途中状態は捨てられる (本文がその下で
+    # 変わるため)。記録自体は続く。
+    window = make_window("ab\ncd", cursor_pos=0)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        QTest.keyClicks(window._edit, "A")
+        window.execute_command("move_line_down")
+        assert pane.step_once()
+        session = pane.session()
+        assert session is not None and not session.done
+        QTest.keyClicks(window._edit, "B")      # セッションの合間の操作
+        assert pane.session() is None           # 途中状態は捨てられた
+        assert "ed.insert_text('B')" in pane.source()
+        assert window.recorded_commands() == [
+            {"cmd": "insert_text", "args": {"text": "A"}},
+            {"cmd": "move_line_down",
+             "args": {"count": 1, "extend": False}},
+            {"cmd": "insert_text", "args": {"text": "B"}},
+        ]
+        window.set_macro_recording(False)
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_recording_stops_inserting_after_stop():
+    # 記録終了の後は、エディタを操作してもマクロ画面へは入ら
+    # ない (記録係の口が外れている)。
+    window = make_window("ab", cursor_pos=2)
+    try:
+        window.set_macro_recording(True)
+        pane = window._python_dialog
+        QTest.keyClicks(window._edit, "X")
+        window.set_macro_recording(False)
+        assert window._recorder.on_entry is None
+        before = pane.source()
+        QTest.keyClicks(window._edit, "Y")
+        assert pane.source() == before
         assert window.recorded_commands() == [
             {"cmd": "insert_text", "args": {"text": "X"}}]
     finally:
@@ -1041,8 +1142,8 @@ def test_pane_width_applies_at_first_show():
 
 def test_recording_start_replaces_registered_pane():
     # 登録マクロのペインを開いたまま記録を始めると、記録用の
-    # ペインに替わる。ライブ表示は記録用にだけ結びつくので、
-    # 登録マクロの本文が記録の内容に差し替わることはない
+    # ペインに替わる。記録の差し込みは記録用にだけ結びつくの
+    # で、登録マクロの本文へ記録が入り込むことはない
     # (アオイの指摘 req-20261114-26: 見出しの登録名のまま
     # 保存すると、登録マクロを上書きできた)。
     window = make_window("ab", cursor_pos=0)
@@ -1062,8 +1163,7 @@ def test_recording_start_replaces_registered_pane():
         # 記録が進んでも、登録マクロの本文は変わらない。
         QTest.keyClicks(window._edit, "Z")
         app().processEvents()
-        live_pane._sync_live()
-        assert "Z" in live_pane.source()
+        assert "ed.insert_text('Z')" in live_pane.source()
         entries = window.registered_macros()
         assert entries["登録済み"]["python"] == \
             "ed.insert_text('R')\n"

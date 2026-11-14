@@ -173,6 +173,13 @@ def commands_to_python(commands, name="") -> str:
     return "\n".join(lines) + "\n"
 
 
+def statement_line(entry):
+    """命令1件を Python の文1行にする (commands_to_python が使う
+    のと同じ字面)。記録用ペインが、記録で増えた命令をその場で
+    文として差し込むために使う。"""
+    return _command_to_line(entry)
+
+
 def _command_to_line(entry):
     cmd = entry["cmd"]
     spec = API_SPEC.get(cmd)

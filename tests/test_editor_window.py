@@ -1052,9 +1052,8 @@ def test_macro_record_and_run_all_keys():
         assert window._act_macro_record.isChecked()
         QTest.keyClicks(window._edit, "ab")
         app().processEvents()
-        # 記録で自動で開いたペインのライブ表示を、その場で
-        # 同期しておく (実機ではタイマーが行う)。
-        window._python_dialog._sync_live()
+        # 記録はその場でペインへ差し込まれる (差し込み式)。
+        assert "ed.insert_text('ab')" in window._python_dialog.source()
         # Shift+F1: 記録終了
         QTest.keyClick(window._edit, Qt.Key.Key_F1,
                        Qt.KeyboardModifier.ShiftModifier)
@@ -3212,7 +3211,6 @@ def test_python_macro_dialog_modeless_and_live_recording():
         before = dialog.source()
         QTest.keyClicks(window._edit, "Z")
         app().processEvents()
-        dialog._sync_live()
         after = dialog.source()
         assert after != before and "Z" in after, (before, after)
         # もう一度開いても、同じ窓が前面に出るだけ。

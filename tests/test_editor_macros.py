@@ -327,24 +327,30 @@ def test_goto_line_handwritten_macro():
 
 
 def test_save_and_load_macro_file():
+    # 記録したマクロは、記録用ペインの本文 (Python) がいまの
+    # マクロになるので、ファイルへの保存も .py で往復する
+    # (再生・保存は画面の内容と一致する。2026-11-14 の記録
+    # モデルの変更。命令の列そのものの JSON 往復は
+    # test_replace_macro_save_load_roundtrip などが見ている)。
     window = make_window("ab", cursor_pos=0)
     try:
         window.set_macro_recording(True)
         QTest.keyClicks(window._edit, "Q")
         window.set_macro_recording(False)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "m.json")
+            path = os.path.join(tmp, "m.py")
             assert window.save_macro(path, "名前")
+            with open(path, encoding="utf-8") as f:
+                saved = f.read()
+            assert "ed.insert_text('Q')" in saved
             other = make_window("ab", cursor_pos=0)
             try:
                 commands = other.load_macro(path)
-                assert other.play_macro(commands)
+                assert commands == []   # Python 形式は命令の列が無い
+                assert other.play_macro()
                 assert other.text() == "Qab"
             finally:
                 discard_close(other)
-            with open(path, encoding="utf-8") as f:
-                saved = json.load(f)
-            assert saved["name"] == "名前"
     finally:
         discard_close(window)
 

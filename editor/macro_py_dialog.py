@@ -25,7 +25,11 @@
 #   - 登録マクロの読み込み・削除・名前の変更・キー割り当て
 #     (library が渡されたときだけ、管理画面と統合した段を上部
 #     に出す。読み書きは呼び側の口経由で、管理画面と同じ保存
-#     経路を使う。記録のライブ表示の間はこの段は使えない)
+#     経路を使う。記録用ペインの間はこの段は使えない)
+#   - 記録の挿入(記録用ペインでは、記録で増えた命令がカーソル
+#     のある行の次へ文として差し込まれる。本文を手で直しても、
+#     その後の記録はカーソルの位置へ入り続ける。差し込みの
+#     とき、実行の途中状態があったら先に捨てる)
 #
 # 開いただけでは何も実行しない。実行は「通し実行」「ステップ
 # 実行」を押したときだけ。実行そのものは editor/macro_py.py の
@@ -67,7 +71,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt, QRect, QSize, QSignalBlocker, QTimer, Signal
+from PySide6.QtCore import Qt, QRect, QSize, QSignalBlocker, Signal
 from PySide6.QtGui import (
     QColor,
     QFontDatabase,
@@ -262,15 +266,20 @@ class MacroPythonPane(QWidget):
         self._close_refused = False
         # ブレークポイントの追随用に覚える、文書のブロック数。
         self._bp_doc_blocks = None
-        # 記録のライブ表示 (live_source が渡されたとき)。記録中の
-        # ソースを呼び側から受け取り、利用者が編集していなければ
-        # そのまま差し替える。窓はモーダレスで開く前提 (EDDy の
-        # 画面を操作しながら、記録が増えていくのを見られる)。
+        # 記録用ペインの印 (live_source が渡されたとき)。記録用
+        # ペインは「記録そのものの文書」で、記録で増えた命令は
+        # 窓から apply_recorded で受けて、カーソルの位置へ文と
+        # して差し込む。本文の手編集と記録の差し込みが同じ文書
+        # の中で混ざる (手編集しても、その後の記録は止まらない)。
         self._live_source = live_source
-        self._live_synced = source
-        self._live_dirty = False
-        self._syncing_live = False
-        self._live_timer = None
+        # 記録の差し込みの最中か (差し込みを「利用者の編集」と
+        # して扱わないための印。_on_text_changed が見る)。
+        self._applying_recording = False
+        # 直前に差し込んだ文の控え (開始位置, 終わり位置, その
+        # 時点の文書の長さ, 命令そのもの)。記録が同じ命令の
+        # 「伸び」として続いたとき、その文を新しい字面へ差し
+        # 替えるために使う。利用者が本文を触ったら捨てる。
+        self._rec_chain = None
         # 登録マクロの段。_loaded_source は「読み込み・保存の
         # 時点のソース」で、本文がそこから変わっていたら、別の
         # マクロへ切り替えるときに捨ててよいか確認する。表示中
@@ -290,11 +299,6 @@ class MacroPythonPane(QWidget):
         self._library_key_note = None
         self._library_note = None
         self._library_widgets = []
-        if live_source is not None:
-            self._live_timer = QTimer(self)
-            self._live_timer.setInterval(300)
-            self._live_timer.timeout.connect(self._sync_live)
-            self._live_timer.start()
         # 壊れるとき(EDDy の窓ごと閉じられたとき等)も、抱えて
         # いるセッションの子を残さないための受け口。自分の
         # メソッドをそのままつなぐと、親ごと壊れる経路では
@@ -368,6 +372,12 @@ class MacroPythonPane(QWidget):
         self._edit = _SourceEdit()
         self._edit.breakpoints = self._breakpoints
         self._edit.setPlainText(source)
+        if live_source is not None:
+            # 記録用ペインは、最初の記録がヘッダの後ろへ入る
+            # よう、カーソルを本文の末尾に置いておく。
+            cursor = self._edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._edit.setTextCursor(cursor)
         self._edit.setFont(QFontDatabase.systemFont(
             QFontDatabase.SystemFont.FixedFont))
         # ブレークポイントの印を編集に追随させる (行の増減で
@@ -489,15 +499,13 @@ class MacroPythonPane(QWidget):
         増減した行数だけずらす(アオイの指摘 req-20261114-26:
         編集すると印の行がずれたままだった)。変更の開始行は、
         行の頭が残る編集なら印も残し、行頭への行の挿入なら
-        内容ごと押し下げ、行ごと消えたら印も消す。ライブ
-        表示の差し替えのときは、本文ごと入れ替わるので印は
-        そのままに、数えの基準だけ合わせ直す。"""
+        内容ごと押し下げ、行ごと消えたら印も消す。記録の
+        差し込みも、ここを通して印に追随させる。"""
         doc = self._edit.document()
         new_blocks = doc.blockCount()
         old_blocks = self._bp_doc_blocks
         self._bp_doc_blocks = new_blocks
-        if self._syncing_live or not self._breakpoints \
-                or old_blocks is None:
+        if not self._breakpoints or old_blocks is None:
             return
         # 変更の開始行 (0始まり)。変更より前は旧文書と共通
         # なので、新文書での行番号がそのまま旧文書の行番号。
@@ -567,7 +575,7 @@ class MacroPythonPane(QWidget):
     def _refresh_library_state(self):
         """登録マクロの段の使える／見えるを、いまの状態に合わせる。
 
-        記録のライブ表示の間と、実行中は使えない。キー割り当て
+        記録用ペインの間と、実行中は使えない。キー割り当て
         の段は、登録マクロを読み込んでいるときだけ出す。"""
         if self._library is None or self._library_combo is None:
             return
@@ -829,35 +837,6 @@ class MacroPythonPane(QWidget):
         if self._ensure_session() is not None:
             self._refresh_highlights(move_caret=True)
 
-    def finish_recording(self, source):
-        """記録の終了時に、ペインを記録の最終形へ寄せる。
-
-        実行が始まったセッションがある間はライブ表示が止まる
-        (req-20261114-22) ので、ステップ実行のあとに記録した
-        分が画面に出ないまま記録が終わることがある。記録が
-        終わったら、そのセッション (記録の途中の写しで実行
-        しているもの) は捨てて、最終形のソースに差し替える。
-        利用者が本文を編集していたら、その本文は差し替えない
-        (編集を勝手に消さない)。差し替えのあとは、先頭の文が
-        次になるよう備え直す。"""
-        if self._live_source is None:
-            return
-        self._finish()
-        self._discard_session()
-        self._paused_at_breakpoint = False
-        if not self._live_dirty and source != self._live_synced:
-            self._syncing_live = True
-            try:
-                self._edit.setPlainText(source)
-                cursor = self._edit.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                self._edit.setTextCursor(cursor)
-            finally:
-                self._syncing_live = False
-            self._live_synced = source
-        if self._ensure_session() is not None:
-            self._refresh_state("")
-
     def _on_destroyed(self, *args):
         # 画面が壊れる最中の受け口。窓側の後始末(_finish の先)は
         # 親の窓ごと壊れている途中かもしれず触らない。ここでは
@@ -1094,54 +1073,111 @@ class MacroPythonPane(QWidget):
         self._refresh_state(f"『{name}』として登録しました")
 
     def _on_text_changed(self):
-        if self._syncing_live or self._loading:
-            return  # ライブ表示の差し替えと登録マクロの読み込みは「編集」として扱わない
-        self._live_dirty = True
+        if self._applying_recording:
+            return  # 記録の差し込みは「編集」として扱わない
+        # 利用者の編集 (や登録マクロの読み込みなどの差し替え) が
+        # あったら、記録の「伸び」の控えは古くなるので捨てる。
+        self._rec_chain = None
+        if self._loading:
+            return  # 登録マクロの読み込みは「編集」として扱わない
         # 編集したら、実行の途中状態は意味を失うので捨てる。
         if self._session is not None or self._run_begun:
             self.reset_session(prepare=False)
             self._refresh_state("編集したので、実行は最初からになります")
 
-    def _sync_live(self):
-        """記録のライブ表示を進める。記録中のソースが増えていたら、
-        利用者が編集していないときに限り差し替える (編集した人の
-        内容を勝手に消さない)。実行の途中 (セッションがある間) は
-        差し替えない (アオイの指摘 req-20261114-22: ステップ実行の
-        途中でライブ表示が本文を書き換えた)。ただし、用意した
-        だけのセッション (「最初から」や、完了後の備え直しで
-        作った、まだ実行を始めていないもの) は差し替えの妨げに
-        しない (捨ててから差し替えを続ける)。実行が始まった
-        セッションは従来どおり守る。"""
-        if self._live_source is None or self._running or self._live_dirty:
+    # ---------------------------------------------------------------
+    # 記録の差し込み (記録用ペイン)
+    # ---------------------------------------------------------------
+    def apply_recorded(self, kind, entry):
+        """記録で増えた命令を、カーソルの位置へ文として差し込む。
+
+        記録用ペイン (live_source あり) だけが、窓の記録係の口
+        から呼ばれる。kind は "append" (新しい命令) か "grow"
+        (直前の命令が伸びた: 挿入の連結や count の合算)。grow
+        で、差し込んだばかりの文がそのまま伸ばせるとき (同じ
+        命令が続き、カーソルがその文の直後にあり、間に編集が
+        無い) は、その文を新しい字面に差し替える。それ以外は、
+        カーソルのある行の次に新しい行として差し込む (行の頭
+        にカーソルがあれば、その位置へ)。実行の途中状態
+        (セッション) があったら、本文がその下で変わるので先に
+        捨てる (手編集のときと同じ扱いで、知らせも同じ文に
+        する)。差し込み自体は「編集」として扱わない (途中状態
+        の始末はここで済ませる)。"""
+        if self._live_source is None:
             return
-        if self._run_begun:
-            return
+        note = ""
+        if self._session is not None or self._run_begun:
+            self.reset_session(prepare=False)
+            note = "編集したので、実行は最初からになります"
+        line = macro_py.statement_line(entry)
+        self._applying_recording = True
         try:
-            source = self._live_source()
-        except Exception:  # noqa: BLE001  呼び側の都合で画面を落とさない
-            return
-        if source is None or source == self._live_synced:
-            return
-        if self._session is not None:
-            session = self._session
-            prepared_only = (
-                session.position == 0
-                and session.error is None
-                and not session.stopped)
-            if not prepared_only:
-                return
-            self._discard_session()
-        self._live_synced = source
-        self._syncing_live = True
-        try:
-            self._edit.setPlainText(source)
-            cursor = self._edit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self._edit.setTextCursor(cursor)
+            if kind != "grow" or not self._grow_chain(entry, line):
+                self._insert_statement_line(line, entry)
         finally:
-            self._syncing_live = False
-        # セッションを捨てたときは、残っていた印も消す。
-        self._refresh_highlights()
+            self._applying_recording = False
+        if note:
+            self._refresh_state(note)
+
+    def _grow_chain(self, entry, line):
+        """直前に差し込んだ文を、新しい字面へ差し替える。
+
+        差し替えられたら True。控え (範囲・文書の長さ・命令
+        そのもの) が今と合わなければ False (呼び側が新しい行
+        として差し込む)。"""
+        chain = self._rec_chain
+        if chain is None:
+            return False
+        start, end, doc_length, last_entry = chain
+        if last_entry is not entry:
+            return False
+        doc = self._edit.document()
+        if doc.characterCount() != doc_length:
+            return False
+        cursor = self._edit.textCursor()
+        if cursor.hasSelection() or cursor.position() != end:
+            return False
+        edit_cursor = QTextCursor(doc)
+        edit_cursor.setPosition(start)
+        edit_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        edit_cursor.insertText(line)
+        new_end = start + len(line)
+        caret = self._edit.textCursor()
+        caret.setPosition(new_end)
+        self._edit.setTextCursor(caret)
+        self._rec_chain = (start, new_end, doc.characterCount(), entry)
+        return True
+
+    def _insert_statement_line(self, line, entry):
+        """文1行を、カーソルの位置へ新しい行として差し込む。
+
+        カーソルが行の頭にあればその位置へ (行 + 改行)、そう
+        でなければカーソルのある行の行末の後ろへ (改行 + 行)
+        入れるので、差し込まれる文は必ず独立した行になる。
+        差し込んだあと、カーソルは差し込んだ文の直後 (その行
+        の行末) に置き、「伸び」の控えを更新する。選択があっ
+        たら、その先頭を位置とする (選択自体は消さない)。"""
+        doc = self._edit.document()
+        cursor = self._edit.textCursor()
+        pos = (cursor.selectionStart() if cursor.hasSelection()
+               else cursor.position())
+        block = doc.findBlock(pos)
+        line_start = block.position()
+        edit_cursor = QTextCursor(doc)
+        if pos == line_start:
+            edit_cursor.setPosition(pos)
+            edit_cursor.insertText(line + "\n")
+            start = pos
+        else:
+            line_end = line_start + len(block.text())
+            edit_cursor.setPosition(line_end)
+            edit_cursor.insertText("\n" + line)
+            start = line_end + 1
+        end = start + len(line)
+        caret = self._edit.textCursor()
+        caret.setPosition(end)
+        self._edit.setTextCursor(caret)
+        self._rec_chain = (start, end, doc.characterCount(), entry)
 
     # ---------------------------------------------------------------
     # 表示

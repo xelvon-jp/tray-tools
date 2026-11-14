@@ -918,10 +918,10 @@ class EditorWindow(QMainWindow):
         self._python_block_cursor = None
         self._python_run_edit = None
         self._python_dialog_name = None
-        # いまのペインが「記録用」(記録のライブ表示が結びついた
+        # いまのペインが「記録用」(記録の差し込みが結びついた
         # もの) かどうか。記録用でないペインには、記録を始めても
-        # ライブ表示を結びつけない (本文の差し替えで、登録
-        # マクロを保存のときに上書きできてしまうため)。
+        # 差し込みを結びつけない (登録マクロの本文へ記録が入り
+        # 込んでしまうため)。
         self._python_pane_live = False
         # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
         # (_build_menus)でアクションにし、変更のたびに付け直す。
@@ -4747,15 +4747,15 @@ class EditorWindow(QMainWindow):
             # 記録ボタンが常駐の印、こちらは開始の瞬間の一時表示)。
             self.statusBar().showMessage("マクロの記録を始めました", 4000)
             # 記録の様子をその場で見られるよう、Python マクロの
-            # ペインを自動で出す。記録のライブ表示は、記録用の
+            # ペインを自動で出す。記録の差し込みは、記録用の
             # ペインにだけ結びつける。記録用でないペイン (登録
-            # マクロなど) が開いているときにライブ表示を結ぶと、
-            # 本文が記録の内容に差し替わり、見出しの登録名の
-            # まま保存して登録マクロを上書きできてしまう
-            # (アオイの指摘 req-20261114-26)。そのペインは
-            # 差し替えずに閉じて、記録用を新しく出す。閉じる
-            # のを断られたら (実行中)、そのペインを前に出す
-            # だけにする。
+            # マクロなど) が開いているときに差し込みを結ぶと、
+            # 登録マクロの本文へ記録が入り込んでしまう (差し替え
+            # の形だった頃は、見出しの登録名のまま保存して登録
+            # マクロを上書きできた。アオイの指摘 req-20261114-26)。
+            # そのペインは差し替えずに閉じて、記録用を新しく
+            # 出す。閉じるのを断られたら (実行中)、そのペインを
+            # 前に出すだけにする。
             pane = self._python_dialog
             if pane is not None and not self._python_pane_live:
                 if pane.try_close():
@@ -4766,20 +4766,26 @@ class EditorWindow(QMainWindow):
                 self.show_python_macro_dialog(live=True)
             else:
                 self._python_dialog.show()
+            # 記録の増分を、記録用ペインへ文として差し込む口を
+            # 結ぶ (ペインが用意できてから)。
+            self._recorder.on_entry = self._on_recorded_entry
         else:
+            # 記録の差し込み口は先に外す (終了処理の途中の変化を
+            # ペインへ差し込まないため)。
+            self._recorder.on_entry = None
             self._recorder.stop()
             self._update_record_label()
             self._current_macro = self.recorded_commands()
-            # 記録用のペインが開いていたら、記録の最終形へ寄せ
-            # る (ステップ実行のあとはライブ表示が止まったまま
-            # で、記録した分が画面に出ていないことがあるため)。
+            # 記録用ペインが開いていたら、その本文をいまの
+            # Python マクロにする (手編集も含めて、再生と保存が
+            # 画面の内容と一致するように)。記録用ペインが無い
+            # ときは従来どおり、命令の列だけを残す。
             pane = self._python_dialog
             if pane is not None and self._python_pane_live:
-                pane.finish_recording(macro_py.commands_to_python(
-                    self._current_macro,
-                    self._current_macro_name or "マクロ"))
+                self._current_python_source = pane.source()
+            else:
+                self._current_python_source = None
             self._current_macro_name = ""
-            self._current_python_source = None
             self._act_macro_record.setText("記録開始(&R)")
             message = (f"マクロの記録を終了しました"
                        f"（{len(self._current_macro)} 手）")
@@ -4791,6 +4797,14 @@ class EditorWindow(QMainWindow):
         if action is not None and action.isChecked() != on:
             blocker = QSignalBlocker(action)
             action.setChecked(on)
+
+    def _on_recorded_entry(self, kind, entry):
+        """記録で命令が増えた・伸びたときに、記録用ペインへ文と
+        して差し込む (記録係の on_entry)。記録用ペインが開いて
+        いなければ何もしない。"""
+        pane = self._python_dialog
+        if pane is not None and self._python_pane_live:
+            pane.apply_recorded(kind, entry)
 
     def play_macro(self, commands=None) -> bool:
         """マクロを再生する。commands が無ければ、最後に記録・読み
@@ -5003,10 +5017,10 @@ class EditorWindow(QMainWindow):
         登録の口で、渡されなければ「登録マクロとして残す」口を
         使う(同じ名前の登録があれば、そのキー割り当ては引き
         継ぐ)。live は記録開始の経路だけが渡す印で、このときだけ
-        記録のライブ表示を結びつける(記録用でないペインの本文を、
-        記録の内容で差し替えないため)。registered_name は、登録
-        マクロから開いたときのその名前 (ペインの登録マクロ段で
-        「読み込み中」として扱う)。"""
+        ペインを記録用にする(記録の差し込みは記録用ペインにだけ
+        結びつけるため)。registered_name は、登録マクロから
+        開いたときのその名前 (ペインの登録マクロ段で「読み込み
+        中」として扱う)。"""
         if on_save is None:
             def on_save(name, new_source):
                 key = ""
@@ -5067,8 +5081,7 @@ class EditorWindow(QMainWindow):
             end_run=self._end_python_run,
             flush_run=self._flush_python_run,
             on_save=on_save,
-            live_source=(self._recording_python_source
-                         if live else None),
+            live_source=(True if live else None),
             library=self._pane_library(),
             loaded_name=registered_name,
             on_loaded=_note_loaded)
@@ -5099,16 +5112,6 @@ class EditorWindow(QMainWindow):
         pane.destroyed.connect(_forget_pane)
         pane.show()
         return pane
-
-    def _recording_python_source(self):
-        """記録中なら、いまの記録を Python にしたものを返す
-        (マクロ Python ペインのライブ表示用)。記録していなければ
-        None。"""
-        if not self._recorder.recording:
-            return None
-        return macro_py.commands_to_python(
-            self.recorded_commands(),
-            self._current_macro_name or "マクロ")
 
     def save_macro(self, path, name="") -> bool:
         """いまのマクロ(記録中なら記録中の列)を書く。

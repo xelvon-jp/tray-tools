@@ -452,6 +452,17 @@ class MacroRecorder:
         self.commands = []
         self.last_command = None
         self._insert_end = None    # 直近の挿入が終わった文書位置
+        # 記録に命令が増えた・伸びたときに受ける口 ((種類, 命令)
+        # を渡す。種類は "append" (新しい命令が増えた) か "grow"
+        # (直前の命令が伸びた: 挿入の連結や count の合算))。記録
+        # 用の Python ペインが、増えた命令をその場で文として
+        # 差し込むために使う。記録中でなければ呼ばれない。
+        self.on_entry = None
+
+    def _emit(self, kind, entry):
+        """記録の増分を on_entry へ知らせる (記録中だけ)。"""
+        if self.recording and self.on_entry is not None:
+            self.on_entry(kind, entry)
 
     def start(self):
         self.recording = True
@@ -490,8 +501,11 @@ class MacroRecorder:
                     for k, v in args.items() if k != "count"):
                 prev["args"]["count"] = (int(prev["args"].get("count", 1))
                                          + int(args.get("count", 1)))
+                self._emit("grow", prev)
                 return
-        self.commands.append({"cmd": name, "args": args})
+        entry = {"cmd": name, "args": args}
+        self.commands.append(entry)
+        self._emit("append", entry)
 
     def feed_change(self, pos, removed, added, inserted_text,
                     sel_start, sel_end, cursor_before):
@@ -514,9 +528,12 @@ class MacroRecorder:
                 if (self._insert_end == pos and self.commands
                         and self.commands[-1]["cmd"] == "insert_text"):
                     self.commands[-1]["args"]["text"] += inserted_text
+                    self._emit("grow", self.commands[-1])
                 else:
-                    self.commands.append(
-                        {"cmd": "insert_text", "args": {"text": inserted_text}})
+                    entry = {"cmd": "insert_text",
+                             "args": {"text": inserted_text}}
+                    self.commands.append(entry)
+                    self._emit("append", entry)
                 self._insert_end = pos + added
             return True
         self._insert_end = None

@@ -273,12 +273,14 @@ def test_window_settings_saved():
             window.show()
             QCoreApplication.processEvents()
             window.move(123, 45)
-            window.resize(333, 555)
+            # 幅は、最小幅(フォントなど環境で変わり、実機では349ほど)より
+            # 大きい360にして、保存と復元が一致することを確かめる。
+            window.resize(360, 555)
             window.on_top_box.setChecked(True)
             window.close()
             saved = json.loads(settings_path.read_text(encoding="utf-8"))
             section = saved["script_runner"]
-            assert section["window_geometry"] == [123, 45, 333, 555], section
+            assert section["window_geometry"] == [123, 45, 360, 555], section
             assert section["always_on_top"] is True
             # 他の節は壊れていない。
             assert "editor" in saved and "filer" in saved
@@ -303,14 +305,12 @@ def test_window_startup_cleans_bom_leftovers():
 
 def test_window_width_with_long_folder_path():
     # 監視フォルダのパスが長いと、見出しラベルが窓の最小幅を押し
-    # 広げて設計幅(340)に縮められなかった(低3)。長いパスでも幅が
-    # 設計どおりに収まり、フルパスはツールチップで見られること。
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        watch = tmp / ("a" * 40 + "b" * 40) / ("c" * 40 + "d" * 40) \
-            / "watch"
-        watch.mkdir(parents=True)
-        settings_path = tmp / "settings.json"
+    # 広げて設計幅に縮められなかった(低3)。最小幅そのものはフォント
+    # など環境で変わるので、短いパスの窓と比べて、長いパスでも最小幅
+    # が増えないことと、仕様の上限(360)に収まることを確かめる。
+    # フルパスはツールチップで見られること。
+    def build(tmp, watch, name):
+        settings_path = tmp / name
         data = json.loads(json.dumps(settings_mod.DEFAULT_SETTINGS))
         data["script_runner"] = {
             "watch_folder": str(watch),
@@ -319,14 +319,31 @@ def test_window_width_with_long_folder_path():
         }
         settings_path.write_text(json.dumps(data, ensure_ascii=False),
                                  encoding="utf-8")
-        window = sr.ScriptRunnerWindow(str(settings_path))
+        w = sr.ScriptRunnerWindow(str(settings_path))
+        w.show()
+        QCoreApplication.processEvents()
+        return w
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        short = tmp / "watch"
+        short.mkdir()
+        base = build(tmp, short, "settings_short.json")
         try:
-            window.show()
+            base_min = base.minimumWidth()
+        finally:
+            base.close()
+        watch = tmp / ("a" * 40 + "b" * 40) / ("c" * 40 + "d" * 40) \
+            / "watch"
+        watch.mkdir(parents=True)
+        window = build(tmp, watch, "settings_long.json")
+        try:
+            assert window.minimumWidth() <= base_min + 2, \
+                (base_min, window.minimumWidth())
+            assert window.minimumWidth() <= 360, window.minimumWidth()
+            window.resize(360, 560)
             QCoreApplication.processEvents()
-            assert window.minimumWidth() <= 340, window.minimumWidth()
-            window.resize(340, 560)
-            QCoreApplication.processEvents()
-            assert window.width() == 340, window.width()
+            assert window.width() == 360, window.width()
             assert str(watch) in window.folder_caption.toolTip()
         finally:
             window.close()

@@ -2956,6 +2956,72 @@ def test_python_macro_dialog_modeless_and_live_recording():
         discard_close(window)
 
 
+def test_python_macro_dialog_replaced_for_other_macro():
+    # 別のマクロを開くときは、前の窓を閉じて開き直す (アオイの
+    # 指摘 req-20261114-22)。同じマクロなら同じ窓が前面に出る。
+    window = make_window()
+    try:
+        first = window.show_python_macro_dialog(
+            source="ed.insert_text('A')\n", name="一つ目",
+            on_save=lambda n, s: None)
+        second = window.show_python_macro_dialog(
+            source="ed.insert_text('B')\n", name="二つ目",
+            on_save=lambda n, s: None)
+        assert second is not first
+        assert "B" in second.source()
+        assert window.show_python_macro_dialog(
+            source="ed.insert_text('B')\n", name="二つ目",
+            on_save=lambda n, s: None) is second
+    finally:
+        if window._python_dialog is not None:
+            window._python_dialog.close()
+        discard_close(window)
+
+
+def test_close_window_closes_python_macro_dialog():
+    # 本体の窓を閉じたら、マクロの窓も閉じる (アオイの指摘
+    # req-20261114-22: セッションの子を残さない)。
+    window = make_window()
+    dialog = window.show_python_macro_dialog()
+    assert dialog is not None and dialog.isVisible()
+    discard_close(window)
+    assert window._python_dialog is None
+    try:
+        assert not dialog.isVisible()
+    except RuntimeError:
+        pass  # 窓の C++ 側ごと消えている (それでよい)
+
+
+def test_ctrl_c_keeps_crlf_newlines():
+    # Ctrl+C は Qt が内部でコピーする経路。createMimeDataFromSelection
+    # の差し替えで、改行の種別が保たれる (アオイの実機指摘
+    # req-20261114-22: copy() の上書きだけでは Ctrl+C・Ctrl+X・
+    # Ctrl+Insert・右クリックのコピーを拾えなかった)。
+    data = "one\r\ntwo\r\nthree\r\n".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "ctrlc.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            edit.setFocus()
+            edit.selectAll()
+            QTest.keyClick(edit, Qt.Key.Key_C,
+                           Qt.KeyboardModifier.ControlModifier)
+            app().processEvents()
+            assert QGuiApplication.clipboard().text() == \
+                "one\r\ntwo\r\nthree\r\n"
+            # Ctrl+Insert も同じ経路。
+            QGuiApplication.clipboard().setText("")
+            QTest.keyClick(edit, Qt.Key.Key_Insert,
+                           Qt.KeyboardModifier.ControlModifier)
+            app().processEvents()
+            assert QGuiApplication.clipboard().text() == \
+                "one\r\ntwo\r\nthree\r\n"
+        finally:
+            discard_close(window)
+
+
 def test_cut_keeps_crlf_newlines():
     # 切り取りもコピーと同じく、改行の種別を保つ。
     data = "one\r\ntwo\r\nthree".encode("utf-8")

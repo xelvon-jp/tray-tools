@@ -569,14 +569,17 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             block = block.next()
         return "".join(out)
 
-    def _copy_selection_to_clipboard(self):
-        """選択範囲を、行ごとの改行種別を保ったテキストでコピー
-        する。素の copy は改行を "\n" にそろえてしまう (Qt の
-        createMimeDataFromSelection は PySide では差し替えが
-        効かないため、copy / cut の側で組み立てる)。"""
+    def createMimeDataFromSelection(self):  # noqa: N802  Qt の上書き
+        """コピー・切り取りで出すテキストは、行ごとの改行種別で
+        つないだものにする (selection_text_with_newlines)。
+        Ctrl+C・Ctrl+X・Ctrl+Insert・右クリックのコピーなど、
+        Qt が内部でコピーする経路もこの差し替えを通る (実機で
+        確認済み)。返すのは text だけを持つ新しい QMimeData で、
+        素の mime を書き換える形にはしない (差し替えが効かない
+        ことがあるため)。"""
         mime = QMimeData()
         mime.setText(self.selection_text_with_newlines())
-        QGuiApplication.clipboard().setMimeData(mime)
+        return mime
 
     def newline_glyph(self, block_number) -> str:
         """ブロック(行)を終える改行の記号。控えから種別を引き、
@@ -910,20 +913,14 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
             QGuiApplication.clipboard().setText(self.block_text())
             self.block_delete(backward=True)
             return
-        if self.textCursor().hasSelection():
-            self._copy_selection_to_clipboard()
-            cursor = self.textCursor()
-            cursor.removeSelectedText()
-            self.setTextCursor(cursor)
-            return
+        # 通常の選択は素の cut に任せる (クリップボードへ出す
+        # テキストは createMimeDataFromSelection の差し替えで
+        # 改行種別を保つ)。
         super().cut()
 
     def copy(self):
         if self.has_block_selection():
             QGuiApplication.clipboard().setText(self.block_text())
-            return
-        if self.textCursor().hasSelection():
-            self._copy_selection_to_clipboard()
             return
         super().copy()
 

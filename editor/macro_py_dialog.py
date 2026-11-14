@@ -341,8 +341,12 @@ class MacroPythonDialog(QDialog):
     def _sync_live(self):
         """記録のライブ表示を進める。記録中のソースが増えていたら、
         利用者が編集していないときに限り差し替える (編集した人の
-        内容を勝手に消さない)。"""
+        内容を勝手に消さない)。実行の途中 (セッションがある間) は
+        差し替えない (アオイの指摘 req-20261114-22: ステップ実行の
+        途中でライブ表示が本文を書き換えた)。"""
         if self._live_source is None or self._running or self._live_dirty:
+            return
+        if self._session is not None or self._run_begun:
             return
         try:
             source = self._live_source()

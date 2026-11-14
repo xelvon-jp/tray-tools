@@ -692,6 +692,7 @@ class _EditorPyApi:
         window = self._window
 
         def call(*args, **kwargs):
+            window._check_python_run_view()
             bound = {}
             for index, (param, _default) in enumerate(params):
                 if index < len(args):
@@ -704,15 +705,19 @@ class _EditorPyApi:
 
     # 問い合わせ(読み取りだけ)
     def _query_text(self):
+        self._window._check_python_run_view()
         return self._window.text()
 
     def _query_selected_text(self):
+        self._window._check_python_run_view()
         return self._window._edit.textCursor().selectedText()
 
     def _query_cursor_line(self):
+        self._window._check_python_run_view()
         return self._window._edit.textCursor().blockNumber() + 1
 
     def _query_line_count(self):
+        self._window._check_python_run_view()
         return self._window._edit.document().blockCount()
 
 
@@ -867,6 +872,8 @@ class EditorWindow(QMainWindow):
         self._current_python_source = None
         self._python_dialog = None
         self._python_block_cursor = None
+        self._python_run_edit = None
+        self._python_dialog_name = None
         # 登録マクロ(名前 → {"commands", "key"})。メニューの組み立て
         # (_build_menus)でアクションにし、変更のたびに付け直す。
         self._registered_macros = macmod.sanitize_registered(
@@ -3696,6 +3703,16 @@ class EditorWindow(QMainWindow):
         if not self._flush_session() \
                 and not self._confirm_close_without_session(event):
             return
+        # Python マクロの窓が開いていたら一緒に閉じる (実行
+        # セッションの子プロセスを残さない。アオイの指摘
+        # req-20261114-22)。
+        if self._python_dialog is not None:
+            try:
+                self._python_dialog.close()
+            except RuntimeError:
+                pass
+            self._python_dialog = None
+            self._python_dialog_name = None
         # セッションのスロットは手放す(中身はファイルに残り、
         # 次に開く窓が引き取ってタブを戻す)。
         if self._session_path is not None and self._session_slot is not None:
@@ -4618,6 +4635,10 @@ class EditorWindow(QMainWindow):
     def _begin_python_run(self):
         """Python マクロの実行区間の開始(undo の単位と、再生中の印)。"""
         self._replaying = True
+        # 実行を始めたタブを覚える。途中でタブが切り替わったら、
+        # 続きが切り替え先で実行されてしまうので止める (下の
+        # _check_python_run_view)。
+        self._python_run_edit = self._edit
         self._python_block_cursor = self._edit.textCursor()
         self._python_block_cursor.beginEditBlock()
 
@@ -4625,8 +4646,25 @@ class EditorWindow(QMainWindow):
         if self._python_block_cursor is not None:
             self._python_block_cursor.endEditBlock()
             self._python_block_cursor = None
+        self._python_run_edit = None
         self._replaying = False
         self._track_change_cache()
+
+    def _check_python_run_view(self):
+        """Python マクロの実行中に、実行を始めたタブと違うタブが
+        前面になっていたら、実行を止める (アオイの指摘 req-
+        20261114-22: ステップ実行の合間にタブを切り替えると、
+        2文目以降が切り替え先のタブで実行された)。"""
+        run_edit = self._python_run_edit
+        if run_edit is None:
+            return
+        try:
+            current = self._edit
+        except Exception:  # noqa: BLE001  ビューが壊れていたら止める
+            current = None
+        if current is not run_edit:
+            raise macro_py.PythonMacroError(
+                "タブが切り替わったため、マクロの実行を止めました")
 
     def play_python_macro(self, source) -> bool:
         """Python のマクロを通しで実行する。
@@ -4707,18 +4745,26 @@ class EditorWindow(QMainWindow):
                     commands, self._current_macro_name or "マクロ")
         # モーダレスで開く (EDDy の画面を操作しながら、記録が
         # 増えていくのを見たり、その場でステップ実行したりできる
-        # ように)。すでに開いていたら前面へ出すだけにする。
+        # ように)。同じマクロの窓が開いていたら前面へ出すだけ。
+        # 別のマクロを開くときは、今の窓を閉じてから開き直す
+        # (アオイの指摘 req-20261114-22: 別のマクロを編集しよう
+        # としても前の窓が出るだけだった)。
+        dialog_name = name or self._current_macro_name
         existing = self._python_dialog
         if existing is not None:
             try:
-                if existing.isVisible():
+                visible = existing.isVisible()
+            except RuntimeError:
+                visible = False
+                self._python_dialog = None
+            if visible:
+                if self._python_dialog_name == dialog_name:
                     existing.raise_()
                     existing.activateWindow()
                     return existing
-            except RuntimeError:
-                self._python_dialog = None
+                existing.close()
         dialog = MacroPythonDialog(
-            self, source=source, name=name or self._current_macro_name,
+            self, source=source, name=dialog_name,
             session_factory=self._make_python_session,
             begin_run=self._begin_python_run,
             end_run=self._end_python_run,
@@ -4726,8 +4772,16 @@ class EditorWindow(QMainWindow):
             live_source=self._recording_python_source)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._python_dialog = dialog
-        dialog.destroyed.connect(
-            lambda *args: setattr(self, "_python_dialog", None))
+        self._python_dialog_name = dialog_name
+
+        def _forget_dialog(*args):
+            # 別のマクロの窓に取り替えた直後に、古い窓の destroyed が
+            # 遅れて届くことがある。今の窓でなければ触らない。
+            if self._python_dialog is dialog:
+                self._python_dialog = None
+                self._python_dialog_name = None
+
+        dialog.destroyed.connect(_forget_dialog)
         dialog.show()
         return dialog
 

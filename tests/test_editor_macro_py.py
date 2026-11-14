@@ -396,6 +396,53 @@ def test_python_dialog_live_sync_and_user_edit_guard():
         dialog.close()
 
 
+def test_python_dialog_step_stops_when_tab_switched():
+    # ステップ実行の合間にタブを切り替えると、続きは実行されずに
+    # 止まる (アオイの実測 req-20261114-22: 2文目以降が切り替え
+    # 先のタブで実行された)。
+    window = make_window("ab\ncd\nef", cursor_pos=0)
+    dialog = MacroPythonDialog(
+        window,
+        source="ed.insert_text('X')\ned.insert_text('Y')\n",
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run)
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        assert window.text() == "Xab\ncd\nef"
+        window.new_document()
+        assert window.text() == ""
+        assert not dialog.step_once()
+        assert window.text() == ""  # 切り替え先は変わっていない
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
+def test_python_dialog_live_sync_pauses_during_session():
+    # 実行の途中 (セッションがある間) は、ライブ表示が本文を
+    # 書き換えない (アオイの指摘 req-20261114-22 低)。
+    window = make_window("ab", cursor_pos=0)
+    state = {"source": "ed.insert_text('A')\n"}
+    dialog = MacroPythonDialog(
+        window,
+        source=state["source"],
+        session_factory=window._make_python_session,
+        begin_run=window._begin_python_run,
+        end_run=window._end_python_run,
+        live_source=lambda: state["source"])
+    try:
+        dialog.show()
+        assert dialog.step_once()
+        state["source"] = "ed.insert_text('A')\ned.insert_text('B')\n"
+        dialog._sync_live()
+        assert dialog.source() == "ed.insert_text('A')\n"
+    finally:
+        dialog.close()
+        discard_close(window)
+
+
 def test_python_dialog_step_edit_copy_save():
     window = make_window("ab\ncd\nef", cursor_pos=0)
     saved = []

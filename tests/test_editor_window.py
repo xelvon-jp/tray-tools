@@ -2980,6 +2980,39 @@ def test_copy_keeps_mixed_newlines():
             discard_close(window)
 
 
+def test_block_copy_keeps_mixed_newlines():
+    # 矩形選択のコピーも、行ごとの改行種別でつなぐ(以前は "\n"
+    # 固定だった)。通常の貼り付けで貼っても、種別が保たれる。
+    from PySide6.QtGui import QGuiApplication
+
+    from editor import document as docmod
+
+    data = "aa\r\nbb\ncc\r\ndd".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            edit.set_block_selection((0, 0), (2, 2))
+            assert edit.block_text() == "aa\r\nbb\ncc"
+            edit.copy()
+            assert QGuiApplication.clipboard().text() == "aa\r\nbb\ncc"
+            # 矩形を解いて末尾へ通常の貼り付けをすると、貼った行の
+            # 改行もコピー元の種別のままになる。
+            edit.clear_block_selection()
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            edit.setTextCursor(cursor)
+            edit.paste()
+            assert edit.toPlainText() == "aa\nbb\ncc\nddaa\nbb\ncc"
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.LF, docmod.CRLF,
+                docmod.CRLF, docmod.LF, None]
+        finally:
+            discard_close(window)
+
+
 def test_copy_partial_selection_keeps_newline_kind():
     # 行の途中から途中までの選択でも、またいだ改行は元の種別で出る。
     from PySide6.QtGui import QGuiApplication
@@ -3223,6 +3256,103 @@ def test_cut_keeps_crlf_newlines():
             assert QGuiApplication.clipboard().text() == \
                 "one\r\ntwo\r\nthree"
             assert edit.toPlainText() == ""
+        finally:
+            discard_close(window)
+
+
+def test_cut_undo_restores_newline_kind():
+    # LF の行を切り取って元に戻すと、その行の改行種別も LF の
+    # まま戻る(以前は、履歴が種別を持っていないため、文書の
+    # 改行設定 CRLF にそろっていた)。やり直しと、再度の
+    # 元に戻しでも保たれる。
+    from editor import document as docmod
+
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            assert _kinds(window) == [docmod.CRLF, docmod.LF, None]
+            cursor = edit.textCursor()
+            cursor.setPosition(2)
+            cursor.setPosition(4, QTextCursor.MoveMode.KeepAnchor)
+            edit.setTextCursor(cursor)
+            edit.cut()   # "b" と、それを終える改行(LF)を切り取る
+            assert edit.toPlainText() == "a\nc"
+            assert _kinds(window) == [docmod.CRLF, None]
+            edit.undo()
+            assert edit.toPlainText() == "a\nb\nc"
+            assert _kinds(window) == [docmod.CRLF, docmod.LF, None]
+            edit.redo()
+            assert edit.toPlainText() == "a\nc"
+            assert _kinds(window) == [docmod.CRLF, None]
+            edit.undo()
+            assert edit.toPlainText() == "a\nb\nc"
+            assert _kinds(window) == [docmod.CRLF, docmod.LF, None]
+        finally:
+            discard_close(window)
+
+
+def test_paste_undo_redo_keeps_newline_kinds():
+    # LF のテキストを貼って、元に戻して、やり直しても、貼った
+    # 行の改行種別は LF のまま(以前は、やり直しで戻った行が
+    # 文書の改行設定 CRLF にそろっていた)。
+    from PySide6.QtCore import QMimeData
+
+    from editor import document as docmod
+
+    data = "x\r\ny".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "crlf.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            cursor = edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            edit.setTextCursor(cursor)
+            mime = QMimeData()
+            mime.setText("p\nq\n")
+            edit.insertFromMimeData(mime)
+            assert edit.toPlainText() == "x\nyp\nq\n"
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.LF, docmod.LF, None]
+            edit.undo()
+            assert edit.toPlainText() == "x\ny"
+            assert _kinds(window) == [docmod.CRLF, None]
+            edit.redo()
+            assert edit.toPlainText() == "x\nyp\nq\n"
+            assert _kinds(window) == [
+                docmod.CRLF, docmod.LF, docmod.LF, None]
+        finally:
+            discard_close(window)
+
+
+def test_join_lines_undo_restores_newline_kind():
+    # 行をつないで(行頭で前の改行を消して)元に戻すと、分かれた
+    # 行の改行種別も元に戻る。文書の改行設定は CRLF で、消す
+    # 改行は LF(追随の計算だと、戻した行が CRLF にそろって
+    # しまう並び)にする。
+    from editor import document as docmod
+
+    data = "a\r\nb\nc".encode("utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mixed.txt")
+        Path(path).write_bytes(data)
+        window = make_window(path)
+        try:
+            edit = window._edit
+            assert _kinds(window) == [docmod.CRLF, docmod.LF, None]
+            cursor = edit.textCursor()
+            cursor.setPosition(4)   # "c" の行頭
+            cursor.deletePreviousChar()
+            assert edit.toPlainText() == "a\nbc"
+            assert _kinds(window) == [docmod.CRLF, None]
+            edit.undo()
+            assert edit.toPlainText() == "a\nb\nc"
+            assert _kinds(window) == [docmod.CRLF, docmod.LF, None]
         finally:
             discard_close(window)
 

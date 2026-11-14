@@ -153,6 +153,13 @@ class LineNumberArea(QWidget):
         self._edit.wheelEvent(event)
 
 
+# 改行種別の履歴(_TrackingState の kinds_undo_stack)に積む上限。
+# 1要素が文書全体の種別の並びを2つ持つので、際限なく積むと大きな
+# 文書でメモリを食う。上限を越えた古い分は捨て、捨てた分の undo は
+# 追随の計算(従来の動き)に倒れる。
+_KINDS_HISTORY_LIMIT = 200
+
+
 class _TrackingState:
     """文書の変化に追随する控えの置き場(改行種別・編集マーク・
     ブックマーク)。
@@ -172,6 +179,13 @@ class _TrackingState:
         # 貼り付けの最中だけ置く、貼るテキストの改行種別の並び
         # (追随が、挿入された改行の種別として拾う)。
         self.paste_kinds = None
+        # 改行種別の並びの履歴(undo/redo で種別も元に戻すための
+        # 控え)。要素は (変更前の並び, 変更後の並び, 位置, 削除
+        # 文字数, 追加文字数)で、種別の並びが変わった編集のたびに
+        # undo 側へ積む。undo/redo の判定は _follow_kinds_history
+        # が変化の幾何の鏡写しで見る。
+        self.kinds_undo_stack = []
+        self.kinds_redo_stack = []
         # 編集マーク(ブロック番号の組)と、直前の contentsChange
         # 時点のブロック数(増減の切り分け用)。
         self.edited_lines = set()
@@ -420,6 +434,10 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
         無い行は default_newline(文書の改行設定)で描く。描画だけの
         話で、文書の内容には触らない。"""
         self._state.line_newlines = list(kinds) if kinds is not None else None
+        # 基準を作り直したら、種別の履歴は古い文書のものなので捨てる
+        # (据え直した並びを起点に、また積み直す)。
+        self._state.kinds_undo_stack.clear()
+        self._state.kinds_redo_stack.clear()
         if default_newline:
             self._state.default_newline = default_newline
         if self._show_invisibles:
@@ -450,10 +468,11 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
           - 範囲の最後の行は、元の並びで範囲の最後だった行の種別を
             引き継ぐ。範囲より後ろの行の種別は、そのまま後ろへ
             ずれる(削除で行が消えても、残りの行の記号は合う)
-        元に戻す・やり直しでも同じ信号が来るので、範囲の作り直し
-        としては追随する。ただし、戻した行の改行種別そのものまでは
-        復元できない(文書側に残っていない)ので、文書の改行設定で
-        描く側に倒れる。"""
+        元に戻す・やり直しのときは、この作り直しだけでは戻した行の
+        改行種別そのものまでは復元できない(文書側に残っていない)。
+        そこで、種別の並びが変わった編集は履歴に控えておき、
+        undo/redo と分かる変化では控えた並びをそのまま戻す
+        (_follow_kinds_history)。"""
         old = self._state.line_newlines
         if old is None or (chars_removed == 0 and chars_added == 0):
             return
@@ -499,9 +518,60 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                     + tail)
             else:
                 new_kinds = new_kinds[:new_count - 1] + [None]
-        self._state.line_newlines = new_kinds
+        self._state.line_newlines = self._follow_kinds_history(
+            old, new_kinds, new_count,
+            position, chars_removed, chars_added)
         if self._show_invisibles:
             self.viewport().update()
+
+    def _follow_kinds_history(self, old, new_kinds, new_count,
+                              position, chars_removed, chars_added):
+        """改行種別の並びの履歴をたどり、undo/redo なら控えた並びを返す。
+
+        文書(Qt)の undo/redo は、直前の編集と幾何(位置・削除文字数・
+        追加文字数)が鏡写しの contentsChange を起こす(実測: 編集
+        ブロックでまとめた操作でも、実行と undo でちょうど1回ずつ、
+        削除と追加が入れ替わって返る)。だから、変化の幾何が履歴の
+        先頭の逆向きと一致すれば元に戻す操作、その再適用と一致
+        すればやり直しと分かる。Ctrl+Z・メニュー・右クリックの
+        どの経路から undo しても、変化そのもので判定するので
+        同じく効く(呼び出し側に印を求めない)。
+
+        一致したときは、控えた並び(変更前 undo では、それに戻る
+        並び)をそのまま採用する。ただし長さ(ブロック数)が今の
+        文書と合う場合だけ(合わない控えは壊れているとみなし、
+        追随で作った並びのままにする)。鏡写しと一致しない通常の
+        編集は、変更前の並びを履歴へ積み、やり直しの控えは消す。
+        履歴は _KINDS_HISTORY_LIMIT までで、古い分から捨てる。"""
+        state = self._state
+        undo_top = (state.kinds_undo_stack[-1]
+                    if state.kinds_undo_stack else None)
+        if (undo_top is not None
+                and position == undo_top[2]
+                and chars_removed == undo_top[4]
+                and chars_added == undo_top[3]
+                and len(undo_top[0]) == new_count):
+            state.kinds_undo_stack.pop()
+            state.kinds_redo_stack.append(undo_top)
+            return list(undo_top[0])
+        redo_top = (state.kinds_redo_stack[-1]
+                    if state.kinds_redo_stack else None)
+        if (redo_top is not None
+                and position == redo_top[2]
+                and chars_removed == redo_top[3]
+                and chars_added == redo_top[4]
+                and len(redo_top[1]) == new_count):
+            state.kinds_redo_stack.pop()
+            state.kinds_undo_stack.append(redo_top)
+            return list(redo_top[1])
+        if new_kinds != old:
+            state.kinds_undo_stack.append(
+                (list(old), list(new_kinds), position,
+                 chars_removed, chars_added))
+            if len(state.kinds_undo_stack) > _KINDS_HISTORY_LIMIT:
+                del state.kinds_undo_stack[0]
+            state.kinds_redo_stack.clear()
+        return new_kinds
 
     def insertFromMimeData(self, source):  # noqa: N802  Qt の上書き
         """貼り付け・ドロップ。貼るテキスト自身の改行種別を、控えの
@@ -918,6 +988,36 @@ class TextEdit(rect_edit.RectEditMixin, QPlainTextEdit):
                 else:
                     draw_mark(rect, mark, metrics)
             block = block.next()
+
+    def block_text(self):
+        """矩形選択の中身(クリップボードへ出すテキスト)。
+
+        RectEditMixin の block_text は、行の切り取りを "\n" で固定
+        してつなぐ(ファイラと共用の部品なので、そちらはそのまま)。
+        エディタでは通常の選択(selection_text_with_newlines)と
+        同じく、行ごとの改行種別でつなぎ直す。矩形の各行の後ろに
+        来る改行は、その行自身の改行種別。控え(line_newlines)が
+        無い文書(新規など)では、従来どおり "\n" でつないだもの
+        をそのまま返す。"""
+        text = super().block_text()
+        kinds = self._state.line_newlines
+        if kinds is None or "\n" not in text:
+            return text
+        rows = self.block_rows()
+        if rows is None:
+            return text
+        segments = text.split("\n")
+        if len(segments) != len(rows):
+            return text
+        default = self._state.default_newline
+        out = [segments[0]]
+        for index in range(1, len(segments)):
+            kind = kinds[rows[index - 1]] \
+                if 0 <= rows[index - 1] < len(kinds) else None
+            out.append(kind if kind in (docmod.CRLF, docmod.LF, docmod.CR)
+                       else default)
+            out.append(segments[index])
+        return "".join(out)
 
     # ---------------------------------------------------------------
     # クリップボード操作(矩形選択のときは矩形として扱う)

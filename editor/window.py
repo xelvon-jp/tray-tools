@@ -5,7 +5,7 @@
 # 第1段の範囲(仕様 docs/work-tools/spec.md 案B):
 #   開く / 新規 / 上書き保存 / 名前を付けて保存(文字コードと改行は
 #   開いたときのものを守り、変換は利用者が選んだときだけ)、
-#   検索(次へ・前へ)、選択範囲を Copilot に投げる(copilot_io 経由)。
+#   検索(次へ・前へ)、選択範囲を AI に投げる(copilot_io 経由)。
 #
 # 第2段の土台(同じく案B):
 #   矩形選択は rect_edit の共用部品(text_edit 経由。こちらの矩形は
@@ -242,6 +242,7 @@ from editor import convert as convmod
 from editor import document as docmod
 from editor import ext_settings as extmod
 from editor import macro_py
+from editor import macro_spec
 from editor import macros as macmod
 from editor import outline
 from editor import editor_icon
@@ -266,6 +267,10 @@ from editor.text_edit import TextEdit
 # 利用者の目に触れる製品名(2026-11-13 に Nagato が命名)。内部の
 # モジュール名(editor/ パッケージや settings の editor 節)は変えない。
 APP_NAME = "EDDy"
+# EDDy の版。タイトルバーに出す(「ファイル名 - EDDy 1.0」)。
+# 利用者が「いまの版」を言えるようにするための目印で、機能の
+# まとまりが変わる節目で上げる。
+EDDY_VERSION = "1.0"
 # タスクバーで使う窓ごとのアプリID(AppUserModelID)。EDDy の窓は常駐や
 # あっふ と同じプロセスで開くので、プロセスのID(traytools.app.1 /
 # traytools.affx)のままだとタスクバーで同じアプリにまとめられてしまう。
@@ -331,6 +336,13 @@ KEYMAP_KEY = "keymap"
 # (editor/macro_dialog.py)から変えると、その場でマクロメニューへ
 # 付け直して、差分をこのキーで保存する。
 MACROS_KEY = "macros"
+
+# AI へのマクロ依頼文(settings の editor 節 macro_prompt の
+# キー)。値は依頼文の文字列で、未設定・空なら既定
+# (editor/macro_spec.py の PROMPT_TEXT)を使う。AI メニューの
+# 「マクロ依頼文の編集…」から変えると、差分をこのキーで
+# 保存する。
+MACRO_PROMPT_KEY = "macro_prompt"
 
 # 拡張子別の設定(settings の editor 節 extension_settings のキー)。
 # 値は拡張子 → 項目 → 値の対応(全体と違う項目だけの上書き分)で、
@@ -671,6 +683,44 @@ class PatternSettingsDialog(QDialog):
         return (self._outline_edit.text(), self._highlight_edit.text())
 
 
+class MacroPromptDialog(QDialog):
+    """AI へのマクロ依頼文を編集する窓。
+
+    欄には現在の依頼文(設定値か既定)が入る。「既定に戻す」は
+    欄を既定の文へ戻すだけで、保存は「保存」を押したとき
+    (呼び側が Accepted のときだけ value() を設定へ書く)。"""
+
+    def __init__(self, prompt, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("マクロ依頼文の編集")
+        self._edit = QPlainTextEdit(prompt)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "マクロペインの「AIへの依頼をコピー」で使う依頼文です。"
+            "コピーのとき、プレースホルダ行"
+            "「（仕様書の全文がここに入ります）」は"
+            "仕様書の全文に置き換わります。"))
+        layout.addWidget(self._edit, 1)
+        row = QHBoxLayout()
+        self._reset_button = QPushButton("既定に戻す")
+        self._reset_button.clicked.connect(
+            lambda: self._edit.setPlainText(macro_spec.PROMPT_TEXT))
+        row.addWidget(self._reset_button)
+        row.addStretch(1)
+        self._save_button = QPushButton("保存")
+        self._save_button.clicked.connect(self.accept)
+        row.addWidget(self._save_button)
+        cancel_button = QPushButton("キャンセル")
+        cancel_button.clicked.connect(self.reject)
+        row.addWidget(cancel_button)
+        layout.addLayout(row)
+        self.resize(560, 420)
+
+    def value(self):
+        """欄の依頼文。"""
+        return self._edit.toPlainText()
+
+
 class _EdObject:
     """ed の受け物(属性に関数を動的に付けるだけの空の型)。"""
 
@@ -927,6 +977,13 @@ class EditorWindow(QMainWindow):
         # (_build_menus)でアクションにし、変更のたびに付け直す。
         self._registered_macros = macmod.sanitize_registered(
             section.get(MACROS_KEY))
+        # AI へのマクロ依頼文の設定値(文字列でなければ未設定と
+        # して None。既定への置き換えは macro_prompt_text が
+        # 行う)。
+        prompt_setting = section.get(MACRO_PROMPT_KEY)
+        self._macro_prompt = (prompt_setting
+                              if isinstance(prompt_setting, str)
+                              else None)
         self._registered_macro_actions = {}
         self._registered_menu_items = []
         self._macro_menu = None
@@ -2401,10 +2458,16 @@ class EditorWindow(QMainWindow):
         # 登録マクロの項目はこの後ろへ足す(変更のたびに付け直す)。
         self._rebuild_registered_macro_menu()
 
-        copilot_menu = self.menuBar().addMenu("Copilot(&C)")
+        # 宛先は環境ごとに違う(Copilot / Muse / Claude)ため、
+        # メニューの名前は特定の AI に寄せない「AI」にする
+        # (2026-11-14)。中身の送信経路(copilot_io)は当面そのまま。
+        ai_menu = self.menuBar().addMenu("AI(&A)")
         self._act_send = self._action(
-            "選択範囲を Copilot に投げる(&S)", self.send_selection,
-            "send_selection", copilot_menu)
+            "選択範囲を AI に投げる(&S)", self.send_selection,
+            "send_selection", ai_menu)
+        ai_menu.addSeparator()
+        self._action("マクロ依頼文の編集(&P)…", self.edit_macro_prompt,
+                     None, ai_menu)
 
     def _rebuild_recent_menu(self):
         """最近使ったファイルのサブメニューを、いまの履歴で作り直す。
@@ -3053,6 +3116,21 @@ class EditorWindow(QMainWindow):
         view.outline_pane.set_outline(
             outline.build_outline_tree(entries), truncated=truncated)
 
+    def _center_cursor(self, target=None):
+        """カーソルが中央に来るようスクロールする。マクロの再生中
+        は行わない。
+
+        再生中は、命令の合間にイベント処理が入らないまま次の命令
+        が続く。文書全体の置換(replace_all)の直後はレイアウトが
+        大きく作り直される途中で、その状態で中央寄せを繰り返すと
+        Qt のレイアウトに触れて落ちる(実測: replace_all の後に
+        goto_line をループで呼ぶと落ちた。2026-11-14)。再生中の
+        スクロールは見た目だけの話なので、再生が終わってからの
+        利用者の操作に任せる。"""
+        if self._replaying:
+            return
+        (target if target is not None else self._edit).centerCursor()
+
     def _jump_to_line(self, line_number, view=None):
         if view is None:
             view = self._current_view()
@@ -3070,7 +3148,7 @@ class EditorWindow(QMainWindow):
         # 飛ぶ先は、分割していれば現在のペイン(見ている側)。
         target = view.active_edit()
         target.setTextCursor(cursor)
-        target.centerCursor()
+        self._center_cursor(target)
         target.setFocus()
 
     def _file_size_text(self, view=None):
@@ -3165,7 +3243,8 @@ class EditorWindow(QMainWindow):
     def _refresh_title(self):
         dirty = self._edit.document().isModified()
         name = self._doc.display_name
-        self.setWindowTitle(f"{name}{' *' if dirty else ''} - {APP_NAME}")
+        self.setWindowTitle(
+            f"{name}{' *' if dirty else ''} - {APP_NAME} {EDDY_VERSION}")
 
     def _refresh_status_labels(self):
         label = text_encoding.ENCODING_LABELS.get(self._doc.encoding,
@@ -4514,6 +4593,11 @@ class EditorWindow(QMainWindow):
 
     def _apply_replace_all(self, text, word, repl, case, regex):
         """全部置換して、文書へ一括で反映する。置換したら True。"""
+        if self._python_block_cursor is not None:
+            # Python マクロの実行区間の中では一括差し替えをしない
+            # (_apply_replace_all_in_run 参照)。
+            return self._apply_replace_all_in_run(
+                text, word, repl, case, regex)
         if regex:
             result = rxfind.run_operation(
                 "replace_all", text=text, pattern=word, repl=repl,
@@ -4535,6 +4619,34 @@ class EditorWindow(QMainWindow):
         cursor.endEditBlock()
         self._edit.setTextCursor(cursor)
         self.statusBar().showMessage(f"{count} 件置換しました", 4000)
+        return True
+
+    def _apply_replace_all_in_run(self, text, word, repl, case, regex):
+        """Python マクロの実行区間の中での全部置換。置換したら True。
+
+        実行区間の編集ブロックを開いたまま文書全体を一括で差し
+        替えると、文書のブロックがすべて作り直された状態で固まり、
+        その後のレイアウトを触る操作(ステップ実行中の描画や
+        行ジャンプのセンタリング)でプロセスが落ちることが実測で
+        分かった(2026-11-14。センタリング側は _center_cursor で
+        実行中は止めてある)。実行区間の1ブロックの中で完結する
+        よう、置換前の本文で数えた一致を後ろから1件ずつ置き換える
+        (置換後の文字列は再走査しないので、一括差し替えと同じ
+        意味になる)。undo も実行全体で1単位のままになる。"""
+        spans = rxfind.replace_spans(text, word, repl, regex=regex,
+                                      case_sensitive=case)
+        if not spans:
+            return False
+        edits = [(self._utf16_index(begin, text),
+                  self._utf16_index(end, text), expanded)
+                 for begin, end, expanded in spans]
+        cursor = self._edit.textCursor()
+        for begin, end, expanded in reversed(edits):
+            cursor.setPosition(begin)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText(expanded)
+        self._edit.setTextCursor(cursor)
+        self.statusBar().showMessage(f"{len(edits)} 件置換しました", 4000)
         return True
 
     def _apply_replace_next(self, text, word, repl, case, regex):
@@ -5084,6 +5196,7 @@ class EditorWindow(QMainWindow):
             live_source=(True if live else None),
             library=self._pane_library(),
             loaded_name=registered_name,
+            prompt_text=self.macro_prompt_text,
             on_loaded=_note_loaded)
         pane_box["pane"] = pane
         pane.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -5225,6 +5338,26 @@ class EditorWindow(QMainWindow):
         """登録マクロの対応(名前 → {"commands", "key"} または
         {"python", "key"})の写し。"""
         return macmod.copy_registered(self._registered_macros)
+
+    def macro_prompt_text(self):
+        """現在のマクロ依頼文(設定にあればそれ、無ければ既定)。
+
+        マクロペインの「AIへの依頼をコピー」が、仕様書と
+        組み合わせる前の依頼文として使う。"""
+        if self._macro_prompt:
+            return self._macro_prompt
+        return macro_spec.PROMPT_TEXT
+
+    def set_macro_prompt_text(self, text):
+        """マクロ依頼文を設定へ保存する(次回のコピーから効く)。"""
+        self._macro_prompt = text
+        self._persist_settings({MACRO_PROMPT_KEY: text})
+
+    def edit_macro_prompt(self):
+        """マクロ依頼文の編集窓を開き、保存されたら設定へ書く。"""
+        dialog = MacroPromptDialog(self.macro_prompt_text(), self)
+        if dialog.exec():
+            self.set_macro_prompt_text(dialog.value())
 
     def apply_registered_macros(self, mapping):
         """登録マクロの変更を反映して保存する。
@@ -5763,7 +5896,7 @@ class EditorWindow(QMainWindow):
         cursor.setPosition(index)
         cursor.setPosition(index + len(word), QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
-        self._edit.centerCursor()
+        self._center_cursor()
         self._refresh_match_highlights()
         return True
 
@@ -5853,7 +5986,7 @@ class EditorWindow(QMainWindow):
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
-        self._edit.centerCursor()
+        self._center_cursor()
         self._inc_base = base
         self._inc_span = (start, end)
         self._refresh_match_highlights()
@@ -6030,7 +6163,7 @@ class EditorWindow(QMainWindow):
         cursor.setPosition(self._utf16_index(span[1], text),
                            QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
-        self._edit.centerCursor()
+        self._center_cursor()
         self._refresh_match_highlights()
 
     def _do_find_regex_sync(self, forward: bool, word, case_sensitive) -> bool:
@@ -6066,12 +6199,12 @@ class EditorWindow(QMainWindow):
         cursor.setPosition(self._utf16_index(span[1], text),
                            QTextCursor.MoveMode.KeepAnchor)
         self._edit.setTextCursor(cursor)
-        self._edit.centerCursor()
+        self._center_cursor()
         self._refresh_match_highlights()
         return True
 
     # ---------------------------------------------------------------
-    # Copilot へ送る
+    # AI へ送る
     # ---------------------------------------------------------------
     def send_selection(self):
         cursor = self._edit.textCursor()
@@ -6079,7 +6212,7 @@ class EditorWindow(QMainWindow):
             self.statusBar().showMessage("選択範囲がありません")
             return
         if self._send_thread is not None:
-            self.statusBar().showMessage("Copilot へ送信中です")
+            self.statusBar().showMessage("AI へ送信中です")
             return
         # QPlainTextEdit の選択文字列は段落の区切りが U+2029 になる。
         text = cursor.selectedText().replace("\u2029", "\n")
@@ -6090,7 +6223,7 @@ class EditorWindow(QMainWindow):
         sender(text) が通常、sender(text, True) が「入力欄の上書きを
         承知で送る」再送(copilot_io.send_text の force 引数)。"""
         self._pending_send_text = text
-        self.statusBar().showMessage("Copilot へ送信しています…")
+        self.statusBar().showMessage("AI へ送信しています…")
 
         def run():
             try:
@@ -6100,7 +6233,7 @@ class EditorWindow(QMainWindow):
                     result = self._sender(text)
             except Exception as e:  # noqa: BLE001  理由は利用者への文にする
                 result = copilot_io.SendResult(
-                    False, f"Copilot に送れませんでした（{e}）")
+                    False, f"AI に送れませんでした（{e}）")
             self._bridge.finished.emit(result)
 
         self._send_thread = threading.Thread(
@@ -6123,12 +6256,12 @@ class EditorWindow(QMainWindow):
         self.statusBar().showMessage(result.message, 0 if not result.ok else 8000)
 
     def _confirm_overwrite_input(self) -> bool:
-        """Copilot の入力欄の書きかけを上書きして送ってよいか。"""
+        """AI の入力欄の書きかけを上書きして送ってよいか。"""
         if self.ask_overwrite_input is not None:
             return bool(self.ask_overwrite_input())
         answer = QMessageBox.question(
             self, APP_NAME,
-            "Copilot の入力欄に書きかけの文があります。\n"
+            "AI の入力欄に書きかけの文があります。\n"
             "そのまま送ると、選択している範囲で上書きされて、"
             "書きかけの文は消えます。送りますか？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

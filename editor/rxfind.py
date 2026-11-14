@@ -135,6 +135,28 @@ def replace_all_text(text, rx, repl, regex=True):
     return new_text, count
 
 
+def replace_spans(text, pattern, repl, *, regex, case_sensitive):
+    """全体置換の内訳 [(開始, 終了, 展開後の文字列), …] を返す。
+
+    置換前の本文の上で数えた一致と、その置き換え文字列
+    (replace_all_text と同じ意味で、置き換えた文字列は再走査
+    しない)。結果の本文を一括で差し替えず、文書へ少しずつ
+    当てたい呼び出し側(マクロ実行中の全体置換)のためにある。
+    正規表現のときは子プロセスで数える(暴走する式を同プロセス
+    で回さないため)。"""
+    if regex:
+        result = run_operation(
+            "replace_spans", text=text, pattern=pattern, repl=repl,
+            regex=True, case_sensitive=case_sensitive)
+        return [(int(begin), int(end), str(expanded))
+                for begin, end, expanded in result["spans"]]
+    rx = compile_search(pattern, regex=False,
+                        case_sensitive=case_sensitive)
+    return [(match.start(), match.end(),
+             expand_replacement(match, repl, regex=False))
+            for match in rx.finditer(text)]
+
+
 # ---------------------------------------------------------------
 # 別プロセスでの実行
 # ---------------------------------------------------------------
@@ -229,6 +251,12 @@ def main():
                 return expand(m, data.get("repl", ""), regex)
             new_text = rx.sub(sub, text)
             result = {"ok": True, "text": new_text, "count": count[0]}
+        elif op == "replace_spans":
+            spans = []
+            for m in rx.finditer(text):
+                spans.append([m.start(), m.end(),
+                              expand(m, data.get("repl", ""), regex)])
+            result = {"ok": True, "spans": spans}
         elif op == "find_all":
             spans, truncated = spans_all(
                 text, rx, int(data.get("limit", 1000)))
@@ -254,6 +282,8 @@ def run_operation(op, *, text, pattern, repl="", start=0, regex=True,
       replace_one          … {"span": (開始, 終了) | None,
                               "replacement": 置き換えた後の文字列}
       replace_all          … {"text": 新しい本文, "count": 件数}
+      replace_spans        … {"spans": [(開始, 終了, 展開後の文字列), …]}
+                              (replace_spans() のための内訳)
       find_all             … {"spans": [(開始, 終了), …],
                               "truncated": 上限で打ち切ったか}
                               (limit が件数の上限)

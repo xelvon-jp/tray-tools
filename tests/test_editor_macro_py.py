@@ -36,6 +36,10 @@ from editor import macros as macmod  # noqa: E402
 from editor.macro_dialog import MacroLibraryDialog  # noqa: E402
 from editor.macro_py_dialog import (  # noqa: E402
     MacroPythonDialog, PANE_WIDTH, _NEXT_LINE_COLOR)
+from editor import macro_spec  # noqa: E402
+from editor.window import (  # noqa: E402
+    MACRO_PROMPT_KEY, MacroPromptDialog)
+import editor.window as winmod  # noqa: E402
 
 APP = None
 
@@ -384,6 +388,79 @@ def test_python_macro_error_goes_to_status():
         assert "エラー" in message and "1 行目" in message, message
         assert not window.play_python_macro("import os\n")
         assert "エラー" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
+def test_python_macro_replace_all_regex_then_loop_edits():
+    # 全体置換(正規表現)のあとに行ジャンプと選択で続きを編集する
+    # マクロが、置換済みの本文の上で順番どおりに動くこと。以前は
+    # 実行区間のブロックを開いたまま文書全体を差し替えていたため、
+    # この形はプロセスごと落ちた(2026-11-14 実測)。
+    original = ("# 古い計画\nあいうえお \n\n## 3. 進め方\n本文です\n"
+                "\n\n\n### 資料\nメモ\t\n# 9.9 まとめ\n")
+    window = make_window(original)
+    try:
+        source = (
+            'ed.replace_all(r"[ \\t]+$", "", regex=True)\n'
+            "last = ed.line_count()\n"
+            'if ed.text().endswith("\\n"):\n'
+            "    last -= 1\n"
+            "for i in range(last, 0, -1):\n"
+            "    ed.goto_line(i)\n"
+            "    ed.move_line_start()\n"
+            "    ed.move_line_end(extend=True)\n"
+            '    if ed.selected_text() == "":\n'
+            "        ed.delete_line()\n"
+        )
+        assert window.play_python_macro(source)
+        assert window.text() == (
+            "# 古い計画\nあいうえお\n## 3. 進め方\n本文です\n"
+            "### 資料\nメモ\n# 9.9 まとめ\n")
+        # 実行全体が undo 1回で戻る単位のままであること。
+        window._edit.undo()
+        assert window.text() == original
+    finally:
+        discard_close(window)
+
+
+def test_python_macro_replace_all_plain_then_loop_edits():
+    # 正規表現でない全体置換も、実行区間の中では同じく置換して
+    # から続きの編集が効くこと。
+    original = "x=1\ny=2\n"
+    window = make_window(original)
+    try:
+        source = (
+            'ed.replace_all("=", ":=")\n'
+            "n = ed.line_count()\n"
+            'if ed.text().endswith("\\n"):\n'
+            "    n -= 1\n"
+            "for i in range(n, 0, -1):\n"
+            "    ed.goto_line(i)\n"
+            "    ed.move_line_end()\n"
+            '    ed.insert_text(";")\n'
+        )
+        assert window.play_python_macro(source)
+        assert window.text() == "x:=1;\ny:=2;\n"
+        window._edit.undo()
+        assert window.text() == original
+    finally:
+        discard_close(window)
+
+
+def test_python_macro_replace_next_regex_in_order():
+    # 次を置換(正規表現)を続けて呼ぶと、前の置換の続きから
+    # 順に当たること。
+    window = make_window("a1 b2 c3")
+    try:
+        source = (
+            'ed.replace_next(r"\\d", "#", regex=True)\n'
+            'ed.replace_next(r"\\d", "#", regex=True)\n'
+            "ed.move_document_end()\n"
+            'ed.insert_text("!")\n'
+        )
+        assert window.play_python_macro(source)
+        assert window.text() == "a# b# c3!"
     finally:
         discard_close(window)
 
@@ -1137,6 +1214,97 @@ def test_pane_width_applies_at_first_show():
     finally:
         if window._python_dialog is not None:
             window._python_dialog.close()
+        discard_close(window)
+
+
+# ---------------------------------------------------------------
+# AI への依頼(依頼文 + 仕様書のコピー、依頼文の編集)
+# ---------------------------------------------------------------
+def test_pane_ai_copy_button_copies_prompt_and_spec():
+    # 「AIへの依頼をコピー」で、依頼文(既定)のプレースホルダ
+    # 行が仕様書全文に置き換わった1つのテキストがクリップ
+    # ボードへ入る。
+    window = make_window("ab", cursor_pos=0)
+    try:
+        pane = window.show_python_macro_dialog()
+        pane._ai_copy_button.click()
+        text = QApplication.clipboard().text()
+        assert text.startswith(
+            "あなたはテキストエディタ EDDy のマクロ作成係です。")
+        assert "命令一覧" in text
+        assert macro_spec.PLACEHOLDER not in text
+        assert ("AIへの依頼文と仕様書をコピーしました"
+                in pane._status_label.text())
+    finally:
+        discard_close(window)
+
+
+def test_pane_ai_copy_uses_custom_prompt_from_settings():
+    # 設定に依頼文があれば、コピーの先頭はその文になる
+    # (プレースホルダが無いので、仕様書は末尾へ付く)。
+    app()
+    window = editor.create_window(
+        editor_settings={"macro_prompt": "独自の依頼文です"})
+    window.show()
+    try:
+        assert window.macro_prompt_text() == "独自の依頼文です"
+        pane = window.show_python_macro_dialog()
+        pane._ai_copy_button.click()
+        text = QApplication.clipboard().text()
+        assert text.startswith("独自の依頼文です")
+        assert "命令一覧" in text
+    finally:
+        discard_close(window)
+
+
+def test_macro_prompt_dialog_edit_and_reset():
+    # 依頼文の編集窓は現在の依頼文で開き、「既定に戻す」は
+    # 欄を既定へ戻す(保存は保存ボタンのときだけ)。
+    window = make_window()
+    try:
+        dialog = MacroPromptDialog(window.macro_prompt_text(), window)
+        try:
+            assert dialog.value() == macro_spec.PROMPT_TEXT
+            dialog._edit.setPlainText("書き換えた依頼文")
+            dialog._reset_button.click()
+            assert dialog.value() == macro_spec.PROMPT_TEXT
+            dialog._edit.setPlainText("書き換えた依頼文")
+            dialog.accept()
+            assert dialog.value() == "書き換えた依頼文"
+        finally:
+            dialog.close()
+    finally:
+        discard_close(window)
+
+
+def test_edit_macro_prompt_saves_to_settings():
+    # AI メニューの「マクロ依頼文の編集…」(edit_macro_prompt)
+    # で保存すると、設定へ差分が流れ、現在の依頼文が変わる。
+    app()
+    captured = []
+    window = editor.create_window(
+        on_settings_change=captured.append)
+    window.show()
+    try:
+        class _FakeDialog:
+            def __init__(self, prompt, parent=None):
+                self._prompt = prompt
+
+            def exec(self):
+                return 1  # QDialog.Accepted
+
+            def value(self):
+                return "書き換えた依頼文"
+
+        original = winmod.MacroPromptDialog
+        winmod.MacroPromptDialog = _FakeDialog
+        try:
+            window.edit_macro_prompt()
+        finally:
+            winmod.MacroPromptDialog = original
+        assert window.macro_prompt_text() == "書き換えた依頼文"
+        assert captured[-1][MACRO_PROMPT_KEY] == "書き換えた依頼文"
+    finally:
         discard_close(window)
 
 

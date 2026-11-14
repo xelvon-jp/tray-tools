@@ -1,6 +1,6 @@
 # tests/test_editor_window.py
 # テキストエディタの窓(editor/window.py)を offscreen で確かめる。
-# 開く・保存(文字コードと改行の保持)・検索・未保存の確認・Copilot へ
+# 開く・保存(文字コードと改行の保持)・検索・未保存の確認・AI へ
 # 送る(fake の sender)まで。実ファイルと実 Qt を使うが、画面は出さない。
 #
 #   & "$env:USERPROFILE\.venvs\tray-tools\Scripts\python.exe" tests\test_editor_window.py
@@ -116,7 +116,7 @@ def test_open_sjis_crlf_and_save_roundtrip():
         try:
             assert window.text() == "1行目\n日本語です\n"
             assert window._enc_label.text().startswith("SJIS / CRLF")
-            assert window.windowTitle() == "a.txt - EDDy"
+            assert window.windowTitle() == "a.txt - EDDy 1.0"
             assert window.save()  # 触らずに上書き保存 → バイト列は不変
             assert Path(path).read_bytes() == data
         finally:
@@ -383,15 +383,17 @@ def test_new_document_opens_tab():
 
 
 def test_window_title_shows_app_name_eddy():
-    """製品名は EDDy。窓のタイトルは「ファイル名 - EDDy」で、無題でも
-    EDDy が出る。変更印(*)は従来どおり名前の後ろに付く。"""
-    from editor.window import APP_NAME
+    """製品名は EDDy。窓のタイトルは「ファイル名 - EDDy 版」で、
+    無題でも EDDy と版が出る。変更印(*)は従来どおり名前の
+    後ろに付く。"""
+    from editor.window import APP_NAME, EDDY_VERSION
     assert APP_NAME == "EDDy"
+    assert EDDY_VERSION == "1.0"
     window = make_window()
     try:
-        assert window.windowTitle() == "無題 - EDDy"
+        assert window.windowTitle() == "無題 - EDDy 1.0"
         type_text(window, "x")
-        assert window.windowTitle() == "無題 * - EDDy"
+        assert window.windowTitle() == "無題 * - EDDy 1.0"
     finally:
         discard_close(window)
     # 付随する窓(grep のダイアログ)も EDDy を名乗る。
@@ -494,6 +496,27 @@ def test_send_selection_input_occupied_declined():
         _wait_send(window)
         assert calls == [False]  # 送り直していない
         assert "送信をやめました" in window.statusBar().currentMessage()
+    finally:
+        discard_close(window)
+
+
+def test_ai_menu_replaces_copilot_menu():
+    """送信の宛先のメニューは「AI」(宛先は環境ごとに違うため、
+    特定の AI の名前にしない)。項目は「選択範囲を AI に投げる」
+    と「マクロ依頼文の編集…」で、Copilot メニューは残らない。"""
+    window = make_window()
+    try:
+        menus = {}
+        for action in window.menuBar().actions():
+            menu = action.menu()
+            if menu is not None:
+                menus[action.text()] = [
+                    item.text() for item in menu.actions()]
+        assert not any("Copilot" in title for title in menus)
+        ai_items = next(items for title, items in menus.items()
+                        if title.startswith("AI"))
+        assert "選択範囲を AI に投げる(&S)" in ai_items
+        assert "マクロ依頼文の編集(&P)…" in ai_items
     finally:
         discard_close(window)
 

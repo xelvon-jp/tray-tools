@@ -710,9 +710,15 @@ class ScriptRunnerWindow(QWidget):
         self.config["always_on_top"] = bool(on)
         flag = Qt.WindowType.WindowStaysOnTopHint
         if bool(self.windowFlags() & flag) != bool(on):
+            # フラグを変えると窓はいったん隠れる。隠れた後では
+            # isVisible() が False になるので、見えていたかは
+            # 変える前に覚えておく (実機報告 2026-11-14: 前面に
+            # 固定のチェックで窓が消えた)。
+            was_visible = self.isVisible()
             self.setWindowFlag(flag, bool(on))
-            if self.isVisible():
+            if was_visible:
                 self.show()
+                self.raise_()
         if save:
             try:
                 settings_module.update_settings_section(

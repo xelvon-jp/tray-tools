@@ -96,7 +96,7 @@ COMMAND_LABELS = [
     ("next_bookmark", "次のブックマークへ"),
     ("prev_bookmark", "前のブックマークへ"),
     ("bookmark_list", "ブックマーク一覧"),
-    ("send_selection", "選択範囲を Copilot に投げる"),
+    ("send_selection", "選択範囲を AI に投げる"),
     ("cut_to_end", "行末まで切り取り"),
     ("delete_line", "行を削除"),
     ("repeat_last", "直前の操作を繰り返す"),

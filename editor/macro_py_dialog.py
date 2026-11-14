@@ -21,6 +21,9 @@
 #     ションを用意し直すため。エラー・停止のときは戻らない)
 #   - 最初から(途中状態を捨てて頭に戻り、先頭の文を次として示す)
 #   - クリップボードへコピー(職場 Copilot など AI へ貼るため)
+#   - AIへの依頼をコピー(依頼文と仕様書全文を1つのテキストに
+#     してクリップボードへ。依頼文は呼び側の prompt_text の口
+#     から受け、仕様書は editor/macro_spec.py の埋め込みを使う)
 #   - 登録として保存(on_save があるときだけ。名前とソースを渡す)
 #   - 登録マクロの読み込み・削除・名前の変更・キー割り当て
 #     (library が渡されたときだけ、管理画面と統合した段を上部
@@ -82,6 +85,7 @@ from PySide6.QtGui import (
 )
 
 from editor import macro_py
+from editor import macro_spec
 
 _NEXT_LINE_COLOR = QColor(255, 243, 176)
 # 本文の配色(既定)の現在行の背景と同じ色。本文と同じく薄く出す。
@@ -242,15 +246,19 @@ class MacroPythonPane(QWidget):
     confirm_discard は、編集済みの本文を捨てて別のマクロへ
     切り替えてよいか聞く口(テストで差し替えられる。無ければ
     ダイアログで聞く)。on_loaded は、読み込み・名前の変更・
-    保存で「いまのマクロ」の名前が変わったときに受ける口。"""
+    保存で「いまのマクロ」の名前が変わったときに受ける口。
+    prompt_text は「現在のマクロ依頼文」を返す口で、「AIへの
+    依頼をコピー」が仕様書と組み合わせる前の依頼文として使う
+    (無ければ既定の依頼文)。"""
 
     def __init__(self, parent=None, *, source="", name="",
                  session_factory=None, begin_run=None, end_run=None,
                  flush_run=None, on_save=None, live_source=None,
                  library=None, loaded_name=None, confirm_discard=None,
-                 on_loaded=None):
+                 on_loaded=None, prompt_text=None):
         super().__init__(parent)
         self._session_factory = session_factory
+        self._prompt_text_fn = prompt_text
         self._begin_run = begin_run
         self._end_run = end_run
         self._flush_run = flush_run
@@ -425,6 +433,15 @@ class MacroPythonPane(QWidget):
             self._save_button = None
         buttons2.addStretch(1)
         layout.addLayout(buttons2)
+        # 「AIへの依頼をコピー」は字数が多く、上の段へ足すと
+        # その段の最小幅が広がってしまうため、別の段にする
+        # (ボタン段を分ける理由は上のコメントと同じ)。
+        buttons3 = QHBoxLayout()
+        self._ai_copy_button = QPushButton("AIへの依頼をコピー")
+        self._ai_copy_button.clicked.connect(self._on_copy_ai_request)
+        buttons3.addWidget(self._ai_copy_button)
+        buttons3.addStretch(1)
+        layout.addLayout(buttons3)
 
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
@@ -1046,6 +1063,17 @@ class MacroPythonPane(QWidget):
     def _on_copy(self):
         QGuiApplication.clipboard().setText(self.source())
         self._refresh_state("クリップボードへコピーしました")
+
+    def _on_copy_ai_request(self):
+        # 依頼文(設定か既定)と仕様書全文を1つのテキストにして
+        # クリップボードへ入れる。どの AI へ貼ってもよい形
+        # (宛先を選ばない)なので、確認は挟まない(ボタンを
+        # 押すこと自体が利用者の操作)。
+        prompt = (self._prompt_text_fn()
+                  if self._prompt_text_fn is not None else None)
+        QGuiApplication.clipboard().setText(
+            macro_spec.build_ai_request(prompt))
+        self._refresh_state("AIへの依頼文と仕様書をコピーしました")
 
     def _on_save_clicked(self):
         if self._on_save is None:

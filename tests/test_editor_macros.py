@@ -155,6 +155,26 @@ def test_recorder_move_coalesces_counts():
         "move_char_left", {"count": 1, "extend": True})
 
 
+def test_recording_label_shows_and_click_stops():
+    # 記録中は赤いラベルが常に出ていて、クリックで止められる
+    # (陽太さんの要望 2026-11-14: 記録中なのが分かりづらい)。
+    window = make_window("ab", cursor_pos=0)
+    try:
+        assert not window._record_label.isVisible()
+        window.set_macro_recording(True)
+        assert window._record_label.isVisible()
+        assert "記録中" in window._record_label.text()
+        # 記録できない操作が起きると、件数がラベルに出る。
+        window._note_macro_skip()
+        assert "1 件" in window._record_label.text()
+        QTest.mouseClick(window._record_label, Qt.MouseButton.LeftButton)
+        app().processEvents()
+        assert not window._recorder.recording
+        assert not window._record_label.isVisible()
+    finally:
+        discard_close(window)
+
+
 def test_recorder_not_recording_keeps_only_last():
     rec = macmod.MacroRecorder()
     rec.note_command("cut_to_end", {})

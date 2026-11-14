@@ -721,6 +721,19 @@ class _EditorPyApi:
         return self._window._edit.document().blockCount()
 
 
+class _RecordLabel(QLabel):
+    """マクロ記録中の赤いラベル。クリックで記録を止める合図を出す
+    (記録中なのが一目で分かるように。ステータスバーの一時表示は
+    他のメッセージに上書きされて消えてしまうため、常駐のラベルに
+    する)。"""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event):  # noqa: N802  Qt の上書き
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class EditorWindow(QMainWindow):
     """テキストエディタの窓。ファイルはタブとして開き、文書ごとの
     表示と状態は DocumentView(editor/document_view.py)が持つ。窓は
@@ -1055,6 +1068,16 @@ class EditorWindow(QMainWindow):
         self._build_toolbar()
         self._enc_label = QLabel()
         self._pos_label = QLabel()
+        self._record_label = _RecordLabel("● マクロ記録中")
+        self._record_label.setStyleSheet(
+            "background-color: #c62828; color: white;"
+            " font-weight: bold; padding: 2px 10px; border-radius: 3px;")
+        self._record_label.setToolTip("クリックで記録を止めます")
+        self._record_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._record_label.clicked.connect(
+            lambda: self.set_macro_recording(False))
+        self._record_label.hide()
+        self.statusBar().addPermanentWidget(self._record_label)
         self.statusBar().addPermanentWidget(self._enc_label)
         self.statusBar().addPermanentWidget(self._pos_label)
         if geometry and len(geometry) == 4:
@@ -4478,8 +4501,7 @@ class EditorWindow(QMainWindow):
         if not self._recorder.recording:
             return
         self._macro_skips += 1
-        self.statusBar().showMessage(
-            f"● マクロ記録中（記録できない操作 {self._macro_skips} 件）", 0)
+        self._update_record_label()
 
     def _on_document_change_for_macro(self, view, pos, removed, added):
         try:
@@ -4567,6 +4589,20 @@ class EditorWindow(QMainWindow):
         return [dict(entry, args=dict(entry.get("args") or {}))
                 for entry in self._recorder.commands]
 
+    def _update_record_label(self):
+        """記録中の赤いラベルの表示を、いまの状態に合わせる。"""
+        label = getattr(self, "_record_label", None)
+        if label is None:
+            return
+        if self._recorder.recording:
+            text = "● マクロ記録中"
+            if self._macro_skips:
+                text += f"（記録できない操作 {self._macro_skips} 件）"
+            label.setText(text)
+            label.show()
+        else:
+            label.hide()
+
     def set_macro_recording(self, on):
         on = bool(on)
         if on == self._recorder.recording:
@@ -4575,9 +4611,10 @@ class EditorWindow(QMainWindow):
             self._recorder.start()
             self._macro_skips = 0
             self._act_macro_record.setText("記録終了(&R)")
-            self.statusBar().showMessage("● マクロ記録中", 0)
+            self._update_record_label()
         else:
             self._recorder.stop()
+            self._update_record_label()
             self._current_macro = self.recorded_commands()
             self._current_macro_name = ""
             self._current_python_source = None

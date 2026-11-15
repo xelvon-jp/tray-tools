@@ -543,7 +543,7 @@ class ScreenFeature:
         # スクリプト実行パネル(script_runner.py)。ダウンロードフォルダに
         # 届いたスクリプトをチェックして F5 で実行し、結果をクリップボード
         # へ入れる。窓は常駐とは別のプロセス(script_runner_launch)。
-        self.menu.addAction("🐍 スクリプト実行", self.start_script_runner)
+        self.menu.addAction("🐍 PHAL(擬似AL支援)", self.start_script_runner)
 
         # 画面に重ねるプレゼン支援は、メニューには出さない。画面ミラーを使うように
         # なってからは、レーザーもスポットも「手元のツールバー」から押すのが自然で、

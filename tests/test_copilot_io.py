@@ -237,6 +237,8 @@ class FakeRunner:
             return {"ok": True, "input_text": self._input_value}
         if op == "send":
             return {"ok": True, "sent": True}
+        if op == "send_escape":
+            return {"ok": True, "status": "sent"}
         if op == "wait":
             return {"ok": True, "done": True, "elapsed": 2.0}
         if op == "response":
@@ -259,6 +261,46 @@ def test_subprocess_session_flow():
     # 操作は全部裏方へ流れ、順番も往復のとおり
     assert runner.requests == ["snapshot", "input", "send",
                                "wait", "response", "blocks"]
+
+
+def test_send_escape_via_subprocess():
+    """ESC の standalone 操作が裏方へ流れ、状態語が文に残る
+    (1-67)。近道 (モジュール関数) でも同じ。"""
+    runner = FakeRunner()
+    transport = copilot_io.SubprocessTransport(runner)
+    result = copilot_io.CopilotSession(transport).send_escape()
+    assert result.ok and result.message == "ESC送信: sent"
+    assert runner.requests == ["send_escape"]
+    shortcut = copilot_io.send_escape(
+        transport=copilot_io.SubprocessTransport(runner))
+    assert shortcut.ok and shortcut.message == "ESC送信: sent"
+    assert runner.requests == ["send_escape", "send_escape"]
+
+
+def test_send_escape_status_not_sent_is_failure():
+    """状態語が sent でなければ失敗として返る (1-67)。
+    transport が操作を持たなければ、その旨の失敗になる。"""
+    fake = FakeTransport()  # send_escape を持たない
+    result = copilot_io.CopilotSession(fake).send_escape()
+    assert not result.ok and "ESC送信" in result.message
+
+
+def test_send_escape_via_loop_transport():
+    """CopilotLoopTransport は Copilot.send_escape の状態語を
+    そのまま返す (1-67)。"""
+    transport = copilot_io.CopilotLoopTransport()
+
+    class FakeCp:
+        def send_escape(self):
+            return "no-hwnd"
+
+        def close(self):
+            pass
+
+    transport._cp = FakeCp()
+    assert transport.send_escape() == "no-hwnd"
+    result = copilot_io.CopilotSession(transport).send_escape()
+    assert not result.ok and result.message == "ESC送信: no-hwnd"
 
 
 def test_subprocess_no_window():
@@ -486,7 +528,10 @@ def test_worker_dispatch_fill_probe_profiles():
     try:
         filled = copilot_io_worker._run(
             {"op": "fill", "text": "abc", "profile": "m365"})
-        assert filled == {"ok": True, "filled": True}
+        # 添付の結果のキー (1.58) が常に付く。添付を持たない
+        # transport では空になる。
+        assert filled == {"ok": True, "filled": True,
+                          "attach_done": [], "attach_failed": []}
         assert FakeLoopTransport.last_profile == "m365"
         probed = copilot_io_worker._run({"op": "probe"})
         assert probed == {"ok": True,
@@ -524,6 +569,401 @@ def test_loop_transport_resolves_profile_name():
             raise AssertionError("見つからない名前は RuntimeError のはず")
     finally:
         copilot_loop.Copilot = real
+
+
+def test_latest_download_carries_candidates():
+    """候補の全件 (1-57): session の latest_download は candidates
+    を運び、持たない経路では None のまま。"""
+    cand_a = {"name": "a", "class_name": "cls group/card"}
+    cand_b = {"name": "b", "class_name": "cls group/card"}
+
+    class ScanTransport:
+        def latest_scan(self):
+            return {"candidate": cand_b,
+                    "candidates": [cand_a, cand_b]}
+
+    session = copilot_io.CopilotSession(ScanTransport())
+    result = session.latest_download()
+    assert result.candidate == cand_b
+    assert result.candidates == [cand_a, cand_b]
+
+    class PlainTransport:
+        def latest_scan(self):
+            return {"candidate": cand_a}
+
+    result2 = copilot_io.CopilotSession(PlainTransport()) \
+        .latest_download()
+    assert result2.candidate == cand_a
+    assert result2.candidates is None
+
+
+def test_press_download_passes_key_through_layers():
+    """押下の key (1-57): worker の依頼に乗り、運び役の presser
+    まで届くこと。key が無ければ依頼に含めないこと。"""
+    import copilot_io_worker
+
+    seen = {}
+
+    class FakeLoopTransport:
+        def __init__(self, profile=None):
+            pass
+
+        def press_download(self, key=None):
+            seen["key"] = key
+            return True
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        key = {"name": "n", "class_name": "cls group/card"}
+        result = copilot_io_worker._run(
+            {"op": "press_download", "key": key})
+        assert result == {"ok": True, "pressed": True}
+        assert seen["key"] == key
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+    requests = []
+
+    def runner(request, _timeout):
+        requests.append(request)
+        return {"ok": True, "pressed": True}
+
+    transport = copilot_io.SubprocessTransport(runner=runner)
+    assert transport.press_download(
+        {"name": "n", "class_name": "c"}) is True
+    assert requests[-1]["key"] == {"name": "n", "class_name": "c"}
+    assert transport.press_download() is True
+    assert "key" not in requests[-1]
+
+
+def test_copilot_loop_transport_forwards_key():
+    """CopilotLoopTransport は key を press_download_candidate へ
+    そのまま渡す (1-57)。"""
+    seen = {}
+
+    class FakeCopilot:
+        def press_download_candidate(self, key=None):
+            seen["key"] = key
+            return True
+
+    transport = copilot_io.CopilotLoopTransport()
+    transport._cp = FakeCopilot()  # _ensure が作らずに返す差し込み
+    key = {"name": "n", "class_name": "cls group/card"}
+    assert transport.press_download(key) is True
+    assert seen["key"] == key
+
+
+def test_latest_download_carries_diag_marker():
+    """見張りの走査 (1-43): 候補と診断の目印が1回の結果に両方
+    乗ること。scan を持たない transport では目印は None。"""
+    class ScanTransport:
+        def latest_scan(self):
+            return {"candidate": {"name": "x"}, "marker": {"id": "abc"}}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(ScanTransport())
+    result = session.latest_download()
+    assert result.ok
+    assert result.candidate == {"name": "x"}
+    assert result.marker == {"id": "abc"}
+
+    class PlainTransport:
+        def latest_download(self):
+            return None
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(PlainTransport())
+    result = session.latest_download()
+    assert result.ok and result.candidate is None
+    assert result.marker is None
+
+
+def test_worker_dispatch_latest_download_includes_marker():
+    """裏方の latest_download (1-43、リセットは 1-52、候補の
+    全件は 1-57): scan があれば目印も候補の全件も返す。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        def __init__(self, profile=None):
+            pass
+
+        def latest_scan(self):
+            return {"candidate": None, "marker": {"id": "w1"},
+                    "reset_marker": {"id": "r1"}}
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        result = copilot_io_worker._run({"op": "latest_download"})
+        assert result == {"ok": True, "candidate": None,
+                          "candidates": None,
+                          "marker": {"id": "w1"},
+                          "reset_marker": {"id": "r1"}}
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_subprocess_transport_latest_scan():
+    """裏方への依頼 (1-43、リセットは 1-52、候補の全件は 1-57):
+    latest_download の応答から、候補と目印を取り出すこと。"""
+    seen = {}
+
+    def runner(request, _timeout):
+        seen.update(request)
+        return {"ok": True, "candidate": {"name": "y"},
+                "marker": {"id": "m1"}, "reset_marker": {"id": "r1"}}
+
+    transport = copilot_io.SubprocessTransport(runner=runner)
+    scan = transport.latest_scan()
+    assert seen["op"] == "latest_download"
+    assert scan == {"candidate": {"name": "y"}, "candidates": None,
+                    "marker": {"id": "m1"},
+                    "reset_marker": {"id": "r1"}}
+    assert transport.latest_download() == {"name": "y"}
+
+
+# ---------------------------------------------------------------------------
+# 添付 (1.58)
+# ---------------------------------------------------------------------------
+class AttachFakeCp:
+    """Copilot の代わり (CopilotLoopTransport 用)。
+
+    attach_files / set_input / send_prompt の呼ばれる順序と、
+    入った本文を記録する。fail_names にあるファイル名は、
+    attach_files が失敗として返す。"""
+
+    def __init__(self, fail_names=()):
+        self.calls = []
+        self.fail_names = set(fail_names)
+        self.draft = ""
+        self.input_text_value = None
+        self.sent_text = None
+
+    def read_input(self):
+        return self.draft
+
+    def attach_files(self, paths):
+        self.calls.append(("attach", list(paths)))
+        return [os.path.basename(p) for p in paths
+                if os.path.basename(p) in self.fail_names]
+
+    def attach_test_file(self, path):
+        self.calls.append(("attach_test", str(path)))
+        return True, "添付できました（方式: 貼り付け）。チップも外しました"
+
+    def set_input(self, text):
+        self.calls.append(("fill", text))
+        self.input_text_value = text
+
+    def send_prompt(self, text):
+        self.calls.append(("send", text))
+        self.sent_text = text
+        return True
+
+    def close(self):
+        pass
+
+
+def test_loop_transport_attaches_before_fill():
+    """添付は本文を入れる前に呼ばれる。失敗分は本文の末尾に
+    1行足され、できた・できなかった名前が transport に残る。"""
+    transport = copilot_io.CopilotLoopTransport()
+    cp = AttachFakeCp(fail_names={"bad.txt"})
+    transport._cp = cp
+    ok = transport.fill_prompt(
+        "結果です", attachments=["/out/ok.txt", "/out/bad.txt"])
+    assert ok
+    assert cp.calls[0] == ("attach", ["/out/ok.txt", "/out/bad.txt"])
+    assert cp.calls[1][0] == "fill"
+    assert cp.input_text_value == \
+        "結果です\n添付できませんでした：bad.txt"
+    assert transport.attach_done == ["ok.txt"]
+    assert transport.attach_failed == ["bad.txt"]
+
+
+def test_loop_transport_attaches_before_send():
+    """送信の経路でも、添付が先。失敗が無ければ本文はそのまま。
+    添付が無ければ attach_files は呼ばれない (従来どおり)。"""
+    transport = copilot_io.CopilotLoopTransport()
+    cp = AttachFakeCp()
+    transport._cp = cp
+    assert transport.send_prompt("本文", attachments=["/out/a.csv"])
+    assert [c[0] for c in cp.calls] == ["attach", "send"]
+    assert cp.sent_text == "本文"
+    assert transport.attach_done == ["a.csv"]
+    assert transport.attach_failed == []
+
+    transport2 = copilot_io.CopilotLoopTransport()
+    cp2 = AttachFakeCp()
+    transport2._cp = cp2
+    assert transport2.send_prompt("本文だけ")
+    assert cp2.calls == [("send", "本文だけ")]
+
+
+def test_session_fill_carries_attach_outcome():
+    """セッションの結果に、添付できた・できなかった名前が残る。"""
+    transport = copilot_io.CopilotLoopTransport()
+    transport._cp = AttachFakeCp(fail_names={"bad.txt"})
+    result = copilot_io.CopilotSession(transport).fill(
+        "結果です", attachments=["/out/ok.txt", "/out/bad.txt"])
+    assert result.ok
+    assert result.attach_done == ["ok.txt"]
+    assert result.attach_failed == ["bad.txt"]
+
+
+def test_attach_test_via_loop_transport_and_session():
+    """添付テスト (1.61): transport → セッション → 近道の順に、
+    (成功か, 文) が SendResult で返る。送信はしない。"""
+    transport = copilot_io.CopilotLoopTransport()
+    cp = AttachFakeCp()
+    transport._cp = cp
+    ok, message = transport.attach_test("/out/a.txt")
+    assert ok and "添付できました" in message
+    assert cp.calls == [("attach_test", "/out/a.txt")]
+
+    transport2 = copilot_io.CopilotLoopTransport()
+    transport2._cp = AttachFakeCp()
+    result = copilot_io.attach_test("/out/b.txt", transport=transport2)
+    assert result.ok
+    assert "チップも外しました" in result.message
+
+
+def test_attach_test_via_subprocess_transport():
+    """裏方経由の添付テスト: op と path が依頼に入り、応答の
+    attach_ok / message が戻る。"""
+    seen = {}
+
+    def runner(request, timeout):
+        seen.update(request)
+        return {"ok": True, "attach_ok": False,
+                "message": "添付できませんでした（段: not_found）: 出ず"}
+
+    transport = copilot_io.SubprocessTransport(runner=runner)
+    ok, message = transport.attach_test("/out/a.txt")
+    assert not ok
+    assert "not_found" in message
+    assert seen["op"] == "attach_test"
+    assert seen["path"] == "/out/a.txt"
+
+
+def test_worker_dispatch_attach_test():
+    """裏方の op "attach_test" が transport の結果を返す。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        def __init__(self, profile=None):
+            pass
+
+        def attach_test(self, path):
+            return True, f"添付できました: {path}"
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        result = copilot_io_worker._run(
+            {"op": "attach_test", "path": "/out/a.txt"})
+        assert result == {"ok": True, "attach_ok": True,
+                          "message": "添付できました: /out/a.txt"}
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_session_fill_with_draft_attaches_nothing():
+    """書きかけがあって確認待ちのときは、添付もまだしない
+    (fill 自体が走らないので、添付の段も踏まない)。"""
+    transport = copilot_io.CopilotLoopTransport()
+    cp = AttachFakeCp()
+    cp.draft = "書きかけの文"
+    transport._cp = cp
+    result = copilot_io.CopilotSession(transport).fill(
+        "結果です", attachments=["/out/a.txt"])
+    assert not result.ok and result.needs_confirm
+    assert cp.calls == []
+
+
+def test_subprocess_transport_passes_attachments():
+    """添付は裏方への依頼に乗り、結果がセッションの結果に残る。
+    添付が無ければ、依頼に attachments を含めない (形は従来どおり)。"""
+    recorded = []
+
+    def runner(request, timeout):
+        recorded.append(dict(request))
+        op = request["op"]
+        if op == "snapshot":
+            return {"ok": True, "length": 10}
+        if op == "input":
+            return {"ok": True, "input_text": ""}
+        if op == "fill":
+            if "attachments" in request:
+                return {"ok": True, "filled": True,
+                        "attach_done": ["a.txt"],
+                        "attach_failed": ["b.txt"]}
+            return {"ok": True, "filled": True}
+        raise AssertionError(op)
+
+    transport = copilot_io.SubprocessTransport(runner)
+    result = copilot_io.CopilotSession(transport).fill(
+        "結果です", attachments=["/out/a.txt", "/out/b.txt"])
+    assert result.ok
+    assert result.attach_done == ["a.txt"]
+    assert result.attach_failed == ["b.txt"]
+    fill_req = [r for r in recorded if r["op"] == "fill"][0]
+    assert fill_req["attachments"] == ["/out/a.txt", "/out/b.txt"]
+
+    recorded.clear()
+    result2 = copilot_io.CopilotSession(transport).fill("結果です")
+    assert result2.ok and result2.attach_done == []
+    fill_req2 = [r for r in recorded if r["op"] == "fill"][0]
+    assert "attachments" not in fill_req2
+
+
+def test_worker_dispatch_fill_with_attachments():
+    """裏方は attachments を transport へ渡し、添付の結果を
+    応答に含める (1.58)。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        last = None
+
+        def __init__(self, profile=None):
+            self.attach_done = ["a.txt"]
+            self.attach_failed = ["b.txt"]
+            FakeLoopTransport.last = self
+
+        def fill_prompt(self, text, attachments=None):
+            self.got = (text, attachments)
+            return True
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        filled = copilot_io_worker._run(
+            {"op": "fill", "text": "abc",
+             "attachments": ["/out/a.txt", "/out/b.txt"]})
+        assert filled == {"ok": True, "filled": True,
+                          "attach_done": ["a.txt"],
+                          "attach_failed": ["b.txt"]}
+        assert FakeLoopTransport.last.got == (
+            "abc", ["/out/a.txt", "/out/b.txt"])
+    finally:
+        copilot_io.CopilotLoopTransport = real
 
 
 def main():

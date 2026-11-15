@@ -16,7 +16,10 @@
 import hashlib
 import io
 import json
+import locale
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -38,7 +41,9 @@ PS_ALLOWLIST_FILENAME = "script_runner_ps_allowlist.json"
 
 # ブラウザの書きかけなど、対象にしない末尾。
 PARTIAL_SUFFIXES = (".crdownload", ".part", ".tmp")
-TARGET_EXTENSIONS = (".py", ".ps1")
+# .phal はループ用の独自拡張子。1行目の宣言(#!phal python /
+# #!phal powershell)で中身の言語を決める(phal_engine)。
+TARGET_EXTENSIONS = (".py", ".ps1", ".phal")
 
 # BOM 無し UTF-8 の .ps1 を PowerShell 5.1 に読ませるための写しの
 # 接頭辞(高1)。写しは元の隣に作って実行後に消す。一覧からは外す。
@@ -107,8 +112,13 @@ DEFAULT_CONFIG = {
     "head_lines": 200,         # クリップボード文の切り詰め(先頭)
     "tail_lines": 50,          # クリップボード文の切り詰め(末尾)
     "max_chars": 20000,        # クリップボード文の切り詰め(全体の文字数)
+    "summary_mode": True,      # 長い出力は要約にして全文をファイルへ置く
+    "summary_lines": 100,      # 要約に切り替える行数(出力+エラー出力の合計)
+    "summary_chars": 8000,     # 要約に切り替える文字数(出力+エラー出力の合計)
     "window_geometry": None,   # [x, y, w, h]
     "always_on_top": False,    # 前面に固定
+    "hide_no_id": True,        # ID が無いファイルを表示しない
+    "dark_mode": False,        # ダークモード (窓の中の「ダーク」の切替)
 }
 
 
@@ -139,11 +149,16 @@ def normalize_config(section) -> dict:
     config["head_lines"] = _int_or(config["head_lines"], 200, 0, 100000)
     config["tail_lines"] = _int_or(config["tail_lines"], 50, 0, 100000)
     config["max_chars"] = _int_or(config["max_chars"], 20000, 100, 1000000)
+    config["summary_lines"] = _int_or(config["summary_lines"], 100, 10, 100000)
+    config["summary_chars"] = _int_or(config["summary_chars"], 8000, 100, 1000000)
     geometry = config["window_geometry"]
     if not (isinstance(geometry, list) and len(geometry) == 4
             and all(isinstance(v, int) for v in geometry)):
         config["window_geometry"] = None
     config["always_on_top"] = bool(config["always_on_top"])
+    config["hide_no_id"] = bool(config["hide_no_id"])
+    config["dark_mode"] = bool(config["dark_mode"])
+    config["summary_mode"] = bool(config["summary_mode"])
     return config
 
 
@@ -244,6 +259,1129 @@ class CheckResult:
     headline: str = ""          # 一覧の行に出す1行
     jump_line: int = 0          # EDDy で開くときに飛ぶ行
     sha256: str = ""            # チェックした時点の中身
+
+    def to_dict(self) -> dict:
+        """キャッシュへ残すための辞書化。画面に出す欄は全部残す。"""
+        return {
+            "status": self.status,
+            "kind": self.kind,
+            "issues": [
+                {"line": issue.line, "message": issue.message,
+                 "text": issue.text, "offset": issue.offset}
+                for issue in self.issues],
+            "headline": self.headline,
+            "jump_line": self.jump_line,
+            "sha256": self.sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        issues = [
+            CheckIssue(line=int(entry.get("line", 0)),
+                       message=str(entry.get("message", "")),
+                       text=str(entry.get("text", "")),
+                       offset=int(entry.get("offset", 0)))
+            for entry in data.get("issues", [])
+            if isinstance(entry, dict)]
+        return cls(
+            status=str(data.get("status", STATUS_UNKNOWN)),
+            kind=str(data.get("kind", "")),
+            issues=issues,
+            headline=str(data.get("headline", "")),
+            jump_line=int(data.get("jump_line", 0)),
+            sha256=str(data.get("sha256", "")),
+        )
+
+
+# ---------------------------------------------------------------
+# チェック結果のキャッシュ (再起動をまたいで効かせる)
+# ---------------------------------------------------------------
+# 実行ログ (script_runner_log.jsonl) と同じ置き場に、チェック済みの
+# 結果を控える。キーは (パス, 更新時刻, 大きさ)。中身が変われば
+# 更新時刻か大きさが変わるので外れる。控えの sha256 はチェックした
+# 時点のもので、実行直前の取り直し (窓側) が最後の砦として残る。
+CHECK_CACHE_FILENAME = "script_runner_check_cache.json"
+CHECK_CACHE_LIMIT = 200
+
+
+def check_cache_path() -> Path:
+    return data_dir() / CHECK_CACHE_FILENAME
+
+
+def load_check_cache(cache_path=None) -> dict:
+    """キャッシュ {パス文字列: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (キャッシュが理由で
+    パネルが落ちることがあってはならない)。"""
+    path = Path(cache_path) if cache_path is not None else check_cache_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cache = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not isinstance(entry.get("result"), dict):
+            continue
+        cache[key] = entry
+    return cache
+
+
+def save_check_cache(cache: dict, cache_path=None) -> None:
+    """キャッシュを書き出す。失敗しても黙って諦める (次に開いたとき
+    チェックし直すだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(cache_path) if cache_path is not None else check_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def check_cache_get(cache: dict, path, mtime, size):
+    """(パス, 更新時刻, 大きさ) が一致すれば控えの結果を返す。
+
+    一致しなければ None (チェックし直す)。"""
+    entry = cache.get(str(path))
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("mtime") != mtime or entry.get("size") != size:
+        return None
+    try:
+        return CheckResult.from_dict(entry["result"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def check_cache_put(cache: dict, path, mtime, size,
+                    result: CheckResult) -> None:
+    """結果を控える。上限を超えたら古い控えから落とす。"""
+    cache[str(path)] = {
+        "mtime": mtime,
+        "size": size,
+        "saved_at": time.time(),
+        "result": result.to_dict(),
+    }
+    while len(cache) > CHECK_CACHE_LIMIT:
+        oldest = min(cache, key=lambda k: cache[k].get("saved_at", 0))
+        del cache[oldest]
+
+
+# ---------------------------------------------------------------
+# 自動実行の対象の控え (script_runner_pending_runs.json)。
+# チェックの控えと同じ置き場に、「自動実行の対象になったファイル」
+# の素性 (パス・更新時刻・大きさ・分かれば sha256) を残す。PHAL が
+# 開き直すと、起動スナップショットだけでは「起動後に届いた分」と
+# 分からなくなる (ダウンロード直後に開き直した場合に、その分が
+# 起動前からの滞留扱いになって自動で走らなくなる)。控えが今の
+# 中身と一致する間は、開き直した後も対象のままにする。控えが
+# 無い滞留分は、従来どおり決して対象にしない。
+PENDING_RUN_FILENAME = "script_runner_pending_runs.json"
+PENDING_RUN_TTL_SECONDS = 24 * 3600
+PENDING_RUN_LIMIT = 200
+
+
+def pending_run_path() -> Path:
+    return data_dir() / PENDING_RUN_FILENAME
+
+
+def _pending_run_expired(entry, now: float) -> bool:
+    saved_at = entry.get("saved_at") if isinstance(entry, dict) else None
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > PENDING_RUN_TTL_SECONDS
+
+
+def load_pending_runs(records_path=None) -> dict:
+    """控え {パス文字列: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (チェックの控えと
+    同じく、控えが理由でパネルが落ちてはならない)。古い控え
+    (24時間超) は、読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else pending_run_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not isinstance(entry.get("mtime"), (int, float)):
+            continue
+        if not isinstance(entry.get("size"), int):
+            continue
+        if _pending_run_expired(entry, now):
+            continue
+        records[key] = entry
+    return records
+
+
+def save_pending_runs(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    対象から外れるだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else pending_run_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def pending_run_put(records: dict, path, mtime, size,
+                    sha256: str = "") -> None:
+    """対象になったファイルの素性を控える。古い控えと上限超えは
+    ここで落とす (ファイルは小さく保つ)。"""
+    records[str(path)] = {
+        "mtime": mtime,
+        "size": size,
+        "sha256": sha256 or "",
+        "saved_at": time.time(),
+    }
+    now = time.time()
+    for key in [k for k, e in records.items()
+                if _pending_run_expired(e, now)]:
+        del records[key]
+    while len(records) > PENDING_RUN_LIMIT:
+        oldest = min(records, key=lambda k: records[k].get("saved_at", 0))
+        del records[oldest]
+
+
+def pending_run_get(records: dict, path, mtime, size):
+    """(パス, 更新時刻, 大きさ) が一致すれば控えを返す。
+
+    一致しない・古すぎる場合は None (対象にはしない)。"""
+    entry = records.get(str(path))
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("mtime") != mtime or entry.get("size") != size:
+        return None
+    if _pending_run_expired(entry, time.time()):
+        return None
+    return entry
+
+
+def pending_run_discard(records: dict, path) -> bool:
+    """パスの控えを捨てる。捨てた (保存が要る) なら True。"""
+    return records.pop(str(path), None) is not None
+
+
+# ---------------------------------------------------------------
+# DL 済み候補の控え (script_runner_dl_consumed.json)。
+# チャットで見つけたダウンロード候補を押した記録を、チェックの
+# 控えと同じ置き場に残す。パネルが開き直すと会話内の控え
+# (押下済みの集合) が消えるので、開き直した先でも「もう落とした
+# 候補」と分かるようにするため (1-27 の実機で、設置の開き直しの
+# たびに同じ候補を落とし直す無限ループになった)。キーは候補の
+# 同一判定 (名前 + クラス) で、概要も一緒に持つ。24時間を超えた
+# 控えは読み込み・追加の時点で落とす。
+DL_CONSUMED_FILENAME = "script_runner_dl_consumed.json"
+DL_CONSUMED_TTL_SECONDS = 24 * 3600
+DL_CONSUMED_LIMIT = 100
+
+
+def dl_consumed_path() -> Path:
+    return data_dir() / DL_CONSUMED_FILENAME
+
+
+def _dl_consumed_expired(entry, now: float) -> bool:
+    saved_at = entry.get("saved_at") if isinstance(entry, dict) else None
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > DL_CONSUMED_TTL_SECONDS
+
+
+def load_dl_consumed(records_path=None) -> dict:
+    """控え {候補の key: 控え} を読み込む。
+
+    壊れている・読めない場合は空として扱う (他の控えと同じく、
+    控えが理由でパネルが落ちてはならない)。古い控え (24時間超)
+    は、読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_consumed_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if _dl_consumed_expired(entry, now):
+            continue
+        records[key] = entry
+    return records
+
+
+def save_dl_consumed(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    候補が出直すだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_consumed_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def dl_consumed_key(name, class_name) -> str:
+    """候補の同一判定のキー (窓側の _DlCandidate.key と同じ形)。"""
+    return f"{name}\n{class_name}"
+
+
+def dl_consumed_put(records: dict, name, class_name,
+                    summary: str = "") -> None:
+    """押下を始めた候補を控える。古い控えと上限超えはここで落とす
+    (ファイルは小さく保つ)。"""
+    records[dl_consumed_key(name, class_name)] = {
+        "name": name or "",
+        "class_name": class_name or "",
+        "summary": summary or "",
+        "saved_at": time.time(),
+    }
+    now = time.time()
+    for key in [k for k, e in records.items()
+                if _dl_consumed_expired(e, now)]:
+        del records[key]
+    while len(records) > DL_CONSUMED_LIMIT:
+        oldest = min(records, key=lambda k: records[k].get("saved_at", 0))
+        del records[oldest]
+
+
+def dl_consumed_get(records: dict, name, class_name):
+    """候補が控えにあり、まだ新しい (24時間以内) なら控えを返す。
+
+    無ければ None。"""
+    entry = records.get(dl_consumed_key(name, class_name))
+    if not isinstance(entry, dict):
+        return None
+    if _dl_consumed_expired(entry, time.time()):
+        return None
+    return entry
+
+
+# ---------------------------------------------------------------
+# 実行済みハッシュの控え (script_runner_executed_hashes.json)。
+# 実行を始めたスクリプトの中身の sha256 を控える。自動実行は、
+# ここにある中身を二度は走らせない (1-29、Nagato の提案)。
+# ブラウザが同じファイルを (1) (2) と写しで落としても、写しは
+# 別ファイルでも中身が同じなので、この控えで止められる。
+# 実行ログ (script_runner_log.jsonl) にも sha256 は残るが、あちら
+# は監査用の積み上げで際限なく伸びる。自動実行の判定は毎回引く
+# ので、上限のある小さな控えを別に持つ (チェックの控え・対象の
+# 控えと同じ作法)。7日を超えた控えは読み込み・追加で落とす。
+EXECUTED_HASH_FILENAME = "script_runner_executed_hashes.json"
+EXECUTED_HASH_TTL_SECONDS = 7 * 24 * 3600
+EXECUTED_HASH_LIMIT = 200
+
+
+def executed_hash_path() -> Path:
+    return data_dir() / EXECUTED_HASH_FILENAME
+
+
+def _executed_hash_expired(saved_at, now: float) -> bool:
+    return not isinstance(saved_at, (int, float)) \
+        or now - saved_at > EXECUTED_HASH_TTL_SECONDS
+
+
+def load_executed_hashes(records_path=None) -> dict:
+    """控え {sha256: 実行した時刻} を読み込む。
+
+    壊れている・読めない場合は空として扱う。古い控え (7日超) は、
+    読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else executed_hash_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for sha, saved_at in raw.items():
+        if not isinstance(sha, str) or not sha:
+            continue
+        if _executed_hash_expired(saved_at, now):
+            continue
+        records[sha] = saved_at
+    return records
+
+
+def save_executed_hashes(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (自動実行の歯止めが
+    1回分緩むだけ)。書きかけで壊さないよう、一度別名で書いてから
+    置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else executed_hash_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def executed_hash_put(records: dict, sha256: str) -> None:
+    """実行を始めた中身の sha256 を控える。古い控えと上限超えは
+    ここで落とす。"""
+    if not sha256:
+        return
+    records[sha256] = time.time()
+    now = time.time()
+    for sha in [s for s, t in records.items()
+                if _executed_hash_expired(t, now)]:
+        del records[sha]
+    while len(records) > EXECUTED_HASH_LIMIT:
+        oldest = min(records, key=lambda s: records[s])
+        del records[oldest]
+
+
+def executed_hash_contains(records: dict, sha256: str) -> bool:
+    """その中身が実行済みの控えにあるか (7日以内)。"""
+    if not sha256:
+        return False
+    saved_at = records.get(sha256)
+    return not _executed_hash_expired(saved_at, time.time())
+
+
+# ---------------------------------------------------------------
+# 前回の実行結果の控え (1.56)。
+# 再実行の差分の相手。スクリプトのコマンドID (無ければファイル名)
+# ごとに直近1件の結果文 (差分の対象になる部分) を残す。開き直し
+# をまたぐ (phal_last_results.json)。実行済みハッシュの控えと
+# 同じ作法 (同じ置き場・壊れたら空に倒す・別名で書いてから置き
+# 換える)。結果テキストは各2万字で打ち切り、超えたらその旨を
+# 控えに残す。件数は最大20件。
+# ---------------------------------------------------------------
+LAST_RESULTS_FILENAME = "phal_last_results.json"
+LAST_RESULTS_LIMIT = 20
+LAST_RESULT_MAX_CHARS = 20000
+
+
+def last_results_path() -> Path:
+    return data_dir() / LAST_RESULTS_FILENAME
+
+
+def load_last_results(records_path=None) -> dict:
+    """控え {id: {"text": str, "truncated": bool}} を読み込む。
+
+    壊れている・読めない・形の違う項目は落とす (差分が出ない
+    だけで、実行そのものは止めない)。"""
+    path = Path(records_path) if records_path is not None \
+        else last_results_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("text")
+        if not isinstance(text, str):
+            continue
+        records[key] = {
+            "text": text,
+            "truncated": bool(entry.get("truncated", False)),
+        }
+    return records
+
+
+def save_last_results(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次回の再実行で
+    差分が出ないだけ)。書きかけで壊さないよう、一度別名で書いて
+    から置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else last_results_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def last_results_put(records: dict, key: str, text: str) -> None:
+    """直近1件として控える。2万字を超えたらそこで打ち切り、
+    truncated を立てる。20件を超えたら古いものから落とす
+    (入れた順)。同じ id があれば新しい方で置き換える。"""
+    if not key:
+        return
+    text = text or ""
+    truncated = len(text) > LAST_RESULT_MAX_CHARS
+    if truncated:
+        text = text[:LAST_RESULT_MAX_CHARS]
+    if key in records:
+        del records[key]
+    records[key] = {"text": text, "truncated": truncated}
+    while len(records) > LAST_RESULTS_LIMIT:
+        records.pop(next(iter(records)))
+
+
+# ---------------------------------------------------------------
+# チェックで止まった知らせの控え (1-53)。
+# 自動実行の対象ファイルがチェックで実行不可になったとき、同じ
+# 中身 (sha256) については知らせを1度だけ出すための控え。実行
+# 済みハッシュの控えと同じ作法 (同じ置き場・期限と上限つき・
+# 壊れたら空に倒す・別名で書いてから置き換える) で、ファイルは
+# 分ける (「実行済み」と「チェックで止まった」は意味が違うので
+# 混ぜない)。期限と上限の値は実行済みの控えとそろえる。
+# ---------------------------------------------------------------
+BLOCKED_NOTIFIED_FILENAME = "script_runner_blocked_notified.json"
+BLOCKED_NOTIFIED_TTL_SECONDS = EXECUTED_HASH_TTL_SECONDS
+BLOCKED_NOTIFIED_LIMIT = EXECUTED_HASH_LIMIT
+
+
+def blocked_notified_path() -> Path:
+    return data_dir() / BLOCKED_NOTIFIED_FILENAME
+
+
+def load_blocked_notified(records_path=None) -> dict:
+    """控え {sha256: 知らせた時刻} を読み込む。
+
+    壊れている・読めない場合は空として扱う。期限 (7日) を超えた
+    控えは、読み込みの時点で落とす。"""
+    path = Path(records_path) if records_path is not None \
+        else blocked_notified_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    records = {}
+    for sha, saved_at in raw.items():
+        if not isinstance(sha, str) or not sha:
+            continue
+        if not isinstance(saved_at, (int, float)) \
+                or now - saved_at > BLOCKED_NOTIFIED_TTL_SECONDS:
+            continue
+        records[sha] = saved_at
+    return records
+
+
+def save_blocked_notified(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (知らせがもう1度
+    出るだけ)。書きかけで壊さないよう、一度別名で書いてから
+    置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else blocked_notified_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def blocked_notified_put(records: dict, sha256: str) -> None:
+    """知らせた中身の sha256 を控える。期限切れと上限超えは
+    ここで落とす。"""
+    if not sha256:
+        return
+    records[sha256] = time.time()
+    now = time.time()
+    for sha in [s for s, t in records.items()
+                if not isinstance(t, (int, float))
+                or now - t > BLOCKED_NOTIFIED_TTL_SECONDS]:
+        del records[sha]
+    while len(records) > BLOCKED_NOTIFIED_LIMIT:
+        oldest = min(records, key=lambda s: records[s])
+        del records[oldest]
+
+
+def blocked_notified_contains(records: dict, sha256: str) -> bool:
+    """その中身が知らせ済みの控えにあるか (期限内)。"""
+    if not sha256:
+        return False
+    saved_at = records.get(sha256)
+    return isinstance(saved_at, (int, float)) \
+        and time.time() - saved_at <= BLOCKED_NOTIFIED_TTL_SECONDS
+
+
+# ---------------------------------------------------------------
+# 診断の控え (script_runner_diag.json)。
+# ループが止まったとき、画面の外からは「どの段で・なぜ」止まった
+# のかが見えない。PHAL 自身の直近の動き (DL の押下・チェック・
+# 実行・回答・送信・開き直し・自動実行の見送り) を短い文で控えて
+# おき、「AIの窓」の「診断をAIへ貼る」でまとめて AI の入力欄へ
+# 入れられるようにする (1-41、Nagato の提案)。控えるのは PHAL が
+# 既に画面に出している名前と結果の文だけで、ファイルの中身や
+# クリップボードは入れない。開き直しをまたいで残すため、他の
+# 控えと同じ置き場に小さな JSON で置く。
+DIAG_FILENAME = "script_runner_diag.json"
+DIAG_LIMIT = 60               # 控える件数の上限
+DIAG_TEXT_LIMIT = 240         # 1件の文の長さの上限 (文字)
+DIAG_BUNDLE_EVENT_COUNT = 25  # 束に入れる直近の件数
+DIAG_BUNDLE_LIMIT = 4000      # 束全体の長さの上限 (文字)
+
+
+def diag_path() -> Path:
+    return data_dir() / DIAG_FILENAME
+
+
+def load_diag_events(events_path=None) -> list:
+    """控え [{at: 時刻, text: 文}] を読み込む (古い順)。
+
+    壊れている・読めない場合は空として扱う (診断が理由でパネルが
+    落ちてはならない)。形の違う要素は読み飛ばし、上限を超えて
+    いれば新しい方だけ残す。"""
+    path = Path(events_path) if events_path is not None else diag_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    events = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        at = entry.get("at")
+        text = entry.get("text")
+        if not isinstance(at, (int, float)) \
+                or not isinstance(text, str) or not text:
+            continue
+        events.append({"at": float(at), "text": text})
+    return events[-DIAG_LIMIT:]
+
+
+def save_diag_events(events: list, events_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める (次に開いたとき
+    診断が少し古いだけ)。書きかけで壊さないよう、一度別名で
+    書いてから置き換える。"""
+    path = Path(events_path) if events_path is not None else diag_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(events[-DIAG_LIMIT:], f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def diag_append(events: list, text: str, at=None) -> None:
+    """1件足す (その場で書き換える)。上限を超えたら古い方から
+    落とす。文は1行に畳んで長さを切る (押下の結果の文など、
+    そのままでは長いものがあるため)。"""
+    text = " ".join(str(text).split())
+    if not text:
+        return
+    if len(text) > DIAG_TEXT_LIMIT:
+        text = text[:DIAG_TEXT_LIMIT - 1] + "…"
+    events.append({
+        "at": float(at) if at is not None else time.time(),
+        "text": text,
+    })
+    del events[:-DIAG_LIMIT]
+
+
+def _diag_time_text(at: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(at))
+
+
+def build_diag_bundle(version: str, toggles: dict, profile_name: str,
+                      chain_lines, events, at=None) -> str:
+    """AI へ貼る診断の束を組み立てる。
+
+    見出し (PHAL の版と時刻)・自動化の切替・有効なプロファイル名・
+    今の連鎖の状態・直近の記録 (古い順) を、短い平文で並べる。
+    全体の上限を超える場合は、記録の古い方から落として収める
+    (見出しと状態は落とさない)。"""
+    now = float(at) if at is not None else time.time()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+    def on_off(key):
+        return "入" if (toggles or {}).get(key) else "切"
+
+    head = [
+        f"PHAL診断 Ver{version} {stamp}",
+        f"自動化: DL={on_off('auto_dl')} 実行={on_off('auto_run')} "
+        f"回答={on_off('auto_answer')} 送信={on_off('auto_send')} "
+        f"診断={on_off('auto_diag')} 受領={on_off('auto_ack')} "
+        f"リセット={on_off('auto_reset')}",
+        f"AIプロファイル: {profile_name or '(未設定)'}",
+        "状態:",
+    ]
+    head += [f"- {line}" for line in (chain_lines or [])]
+    head.append("直近の記録:")
+    recent = list(events or [])[-DIAG_BUNDLE_EVENT_COUNT:]
+    lines = [f"{_diag_time_text(e['at'])} {e['text']}" for e in recent]
+    while lines and len("\n".join(head + lines)) > DIAG_BUNDLE_LIMIT:
+        lines.pop(0)
+    bundle = "\n".join(head + lines)
+    if len(bundle) > DIAG_BUNDLE_LIMIT:
+        bundle = bundle[:DIAG_BUNDLE_LIMIT]
+    return bundle
+
+
+# ---------------------------------------------------------------
+# 診断の自動応答の控え (script_runner_diag_auto.json)。
+# AI の発言の中の目印の行 (copilot_loop.DIAG_REQUEST_MARKER) を
+# 見つけたら、診断の束を自動で入れて送る機能 (1-43) の歯止め。
+# 同じ発言で二度送らないための「消費済みの目印の ID」と、会話の
+# 木のずれに強い「消費済みの第2の同定子 key」(1-49、目印を含む
+# 直近40行のハッシュ。どちらか一致すれば消費済み)、短時間に繰り
+# 返さないための「直近に送った時刻」を、開き直しをまたいで残す。
+# 他の控えと同じ置き場・同じ作法 (壊れたら空に倒す)。
+DIAG_AUTO_FILENAME = "script_runner_diag_auto.json"
+DIAG_AUTO_COOLDOWN_SEC = 300.0  # 自動応答の間隔 (5分)
+
+
+def diag_auto_path() -> Path:
+    return data_dir() / DIAG_AUTO_FILENAME
+
+
+def load_diag_auto(state_path=None) -> dict:
+    """自動応答の控え {consumed_id, consumed_key, last_sent_at}
+    を読み込む。
+
+    古い控えに consumed_key が無ければ "" として扱う。壊れて
+    いる・読めない・形が違う場合は、消費した物は無く送ったことも
+    無い、として扱う (自動応答が理由でパネルが落ちてはなら
+    ない)。"""
+    path = Path(state_path) if state_path is not None \
+        else diag_auto_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_sent_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_sent_at": 0.0}
+    consumed = raw.get("consumed_id")
+    key = raw.get("consumed_key")
+    sent_at = raw.get("last_sent_at")
+    return {
+        "consumed_id": consumed if isinstance(consumed, str) else "",
+        "consumed_key": key if isinstance(key, str) else "",
+        "last_sent_at": float(sent_at)
+        if isinstance(sent_at, (int, float)) else 0.0,
+    }
+
+
+def save_diag_auto(state: dict, state_path=None) -> None:
+    """自動応答の控えを書き出す。失敗しても黙って諦める (次に
+    開いたとき控えが少し古いだけ)。書きかけで壊さないよう、
+    一度別名で書いてから置き換える。"""
+    path = Path(state_path) if state_path is not None \
+        else diag_auto_path()
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "consumed_key": str(state.get("consumed_key") or ""),
+        "last_sent_at": float(state.get("last_sent_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------
+# リセットの合図の控え (1-52)。診断の自動応答 (上の diag_auto)
+# と同じ作法だが、控えは混ぜずに別ファイルで持つ。
+# AI の発言の中の目印の行 (copilot_loop.RESET_REQUEST_MARKER)
+# を見つけたら、切替 auto_reset が入っているときだけ開き直す。
+# 歯止めは、同じ発言で二度反応しないための「消費済みの目印の
+# ID」と第2の同定子 key (どちらか一致すれば消費済み)、自動リ
+# セット同士の間隔を最低10分空けるための「直近に開き直した
+# 時刻」。他の控えと同じ置き場・同じ作法 (壊れたら空に倒す)。
+# ---------------------------------------------------------------
+RESET_AUTO_FILENAME = "script_runner_reset_auto.json"
+RESET_AUTO_COOLDOWN_SEC = 600.0  # 自動リセット同士の最短間隔 (10分)
+
+
+def reset_auto_path() -> Path:
+    return data_dir() / RESET_AUTO_FILENAME
+
+
+def load_reset_auto(state_path=None) -> dict:
+    """リセットの控え {consumed_id, consumed_key, last_reset_at}
+    を読み込む。
+
+    古い控えに consumed_key が無ければ "" として扱う。壊れて
+    いる・読めない・形が違う場合は、消費した物は無く開き直した
+    ことも無い、として扱う (合図の判定が理由でパネルが落ちては
+    ならない)。"""
+    path = Path(state_path) if state_path is not None \
+        else reset_auto_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_reset_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_reset_at": 0.0}
+    consumed = raw.get("consumed_id")
+    key = raw.get("consumed_key")
+    reset_at = raw.get("last_reset_at")
+    return {
+        "consumed_id": consumed if isinstance(consumed, str) else "",
+        "consumed_key": key if isinstance(key, str) else "",
+        "last_reset_at": float(reset_at)
+        if isinstance(reset_at, (int, float)) else 0.0,
+    }
+
+
+def save_reset_auto(state: dict, state_path=None) -> None:
+    """リセットの控えを書き出す。失敗しても黙って諦める (次に
+    開いたとき控えが少し古いだけ)。書きかけで壊さないよう、
+    一度別名で書いてから置き換える。"""
+    path = Path(state_path) if state_path is not None \
+        else reset_auto_path()
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "consumed_key": str(state.get("consumed_key") or ""),
+        "last_reset_at": float(state.get("last_reset_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------
+# PHAL の状態の書き出し (script_runner_status.json ではなく
+# phal_status.json。ARiA モニタ表示用、req-20261115-02)。
+# PHAL の今の段を、%LOCALAPPDATA%\traytools の下の小さな JSON
+# へ出す。見張り(アオイ側)がこれを読んで、モニタに PHAL の
+# カードを描く。書くのは状態が変わったときだけ。書き込みに
+# 失敗しても、ループは止めない (他の控えと同じ作法)。
+# ---------------------------------------------------------------
+PHAL_STATUS_FILENAME = "phal_status.json"
+PHAL_STATUS_STATES = ("idle", "dl", "run", "answer", "send", "stopped")
+_PHAL_STATUS_TEXT_LIMIT = 240  # detail / item の1行の長さの上限(文字)
+
+
+def phal_status_path() -> Path:
+    return data_dir() / PHAL_STATUS_FILENAME
+
+
+def _phal_status_one_line(text) -> str:
+    """detail / item 用に、1行に畳んで長さを切る。"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) > _PHAL_STATUS_TEXT_LIMIT:
+        flat = flat[:_PHAL_STATUS_TEXT_LIMIT - 1] + "…"
+    return flat
+
+
+def build_phal_status(version, state, command_id="", detail="",
+                      stopped_reason="", step=0, item="", at=None) -> dict:
+    """モニタ表示用の状態の辞書を作る。
+
+    state は idle(待機) / dl(ダウンロード・新着待ち) / run(実行中)
+    / answer(回答中) / send(送信中) / stopped(止まった) のどれか。
+    step は PHAL 起動後の実行手数。item は実行中または直近の
+    スクリプトの概要。updated は epoch 秒(整数)。知らない state
+    は ValueError (窓側は決まった段だけを渡す)。"""
+    if state not in PHAL_STATUS_STATES:
+        raise ValueError(f"unknown PHAL state: {state!r}")
+    return {
+        "schema": 1,
+        "version": str(version),
+        "state": state,
+        "command_id": str(command_id or ""),
+        "detail": _phal_status_one_line(detail),
+        "stopped_reason": _phal_status_one_line(stopped_reason),
+        "step": int(step),
+        "item": _phal_status_one_line(item),
+        "updated": int(at if at is not None else time.time()),
+    }
+
+
+def _phal_status_body(status: dict) -> dict:
+    """書き直すかどうかの比べる部分。updated は毎回変わる時刻
+    なので比べない (比べると、同じ状態でも毎回書き直すことに
+    なる)。"""
+    return {key: value for key, value in status.items()
+            if key != "updated"}
+
+
+def write_phal_status(status: dict, status_path=None) -> bool:
+    """状態を書き出す。変わったときだけ書き、書けたら True。
+
+    前回書いた内容(時刻を除く)と同じなら書かずに False を返す。
+    書きかけで壊さないよう、一度別名で書いてから置き換える
+    (他の控えと同じ作法)。書き込みに失敗しても例外は出さず
+    False を返す (ループを止めない)。"""
+    path = Path(status_path) if status_path is not None \
+        else phal_status_path()
+    body = _phal_status_body(status)
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = json.load(f)
+        if isinstance(prev, dict) and _phal_status_body(prev) == body:
+            return False
+    except (OSError, ValueError):
+        pass  # 読めない・壊れている場合は書き直す
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(status, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def format_elapsed(seconds) -> str:
+    """経過・所要時間の表示 (窓の上の帯用、1.48)。
+
+    秒を「分:秒」(1時間以上は「時:分:秒」)にする。まだ一度も
+    実行していないときは None を渡し、「--:--」になる。小数
+    は切り捨て (帯は1秒ごとに付け直すので、表示が1秒ずつ
+    進む)。"""
+    if seconds is None:
+        return "--:--"
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+# ---------------------------------------------------------------
+# 導入プロンプト (1.47)。「ループを始める」でクリップボードへ
+# 入れる文と、その PC の環境情報。環境は押した時点で集める
+# (ベストエフォートで、取れない項目は「不明」にする)。
+# ---------------------------------------------------------------
+INTRO_UNKNOWN = "不明"
+INTRO_MODULE_LIMIT = 12
+INTRO_COMMAND_TIMEOUT_SECONDS = 10
+
+
+def _run_intro_command(cmd, timeout=INTRO_COMMAND_TIMEOUT_SECONDS) -> str:
+    """環境を聞くための短いコマンドを1本走らせ、標準出力を返す。
+
+    失敗・時間切れ・0以外での終了は "" (呼ぶ側が「不明」にする)。
+    PowerShell が無い環境 (VM など) では FileNotFoundError が
+    出るが、ここで握りつぶす。"""
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=flags)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _summarize_execution_policy(raw: str) -> str:
+    """Get-ExecutionPolicy -List の出力を、要点だけの1行にする。
+
+    「Scope=Policy」の行から LocalMachine と CurrentUser を拾う。
+    どちらも無ければ先頭の2行まで。空なら "" (呼ぶ側が「不明」
+    にする)。"""
+    pairs = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        scope, _, policy = line.partition("=")
+        scope = scope.strip()
+        policy = policy.strip()
+        if scope and policy:
+            pairs.append((scope, policy))
+    if not pairs:
+        return ""
+    by_scope = dict(pairs)
+    picked = [(scope, by_scope[scope])
+              for scope in ("LocalMachine", "CurrentUser")
+              if scope in by_scope]
+    if not picked:
+        picked = pairs[:2]
+    return ", ".join(f"{scope}={policy}" for scope, policy in picked)
+
+
+def _intro_modules():
+    """入っているモジュール (名前と版) を集める。
+
+    戻り値は (先頭 INTRO_MODULE_LIMIT 件の ["名前 版", ...],
+    残りの件数)。標準ライブラリは配布物 (distribution) として
+    現れないので、ここに出るのは入れた物だけになる。読めなければ
+    (None, 0) (呼ぶ側が「不明」にする)。"""
+    try:
+        from importlib import metadata as _metadata
+
+        dists = sorted(
+            _metadata.distributions(),
+            key=lambda d: (d.metadata["Name"] or "").lower())
+    except Exception:  # noqa: BLE001  読めなければ「不明」
+        return None, 0
+    names = []
+    for dist in dists:
+        try:
+            name = (dist.metadata["Name"] or "").strip()
+            version = (dist.version or "").strip()
+        except Exception:  # noqa: BLE001  1件読めなくても続ける
+            continue
+        if not name:
+            continue
+        names.append(f"{name} {version}" if version else name)
+    return (names[:INTRO_MODULE_LIMIT],
+            max(0, len(names) - INTRO_MODULE_LIMIT))
+
+
+def collect_intro_environment(runner=None, watch_folder=None,
+                              python_exe=None) -> dict:
+    """導入プロンプトに入れる環境情報を集める。
+
+    runner は cmd (list[str]) と timeout を受けて標準出力を返す
+    呼び出し (既定は _run_intro_command)。差し替えられるのは
+    テストのためで、窓側は既定のまま使う。取れない項目は
+    INTRO_UNKNOWN (「不明」) にし、例外はここで止める (ボタンが
+    止まらない)。"""
+    run = runner if callable(runner) else _run_intro_command
+
+    def _call(cmd):
+        try:
+            return (run(cmd, timeout=INTRO_COMMAND_TIMEOUT_SECONDS)
+                    or "").strip()
+        except Exception:  # noqa: BLE001  取れない項目は「不明」
+            return ""
+
+    exe = python_exe or sys.executable
+    raw_python = _call([exe, "--version"])
+    python_version = raw_python.splitlines()[0].strip() \
+        if raw_python else ""
+    if python_version.startswith("Python "):
+        python_version = python_version[len("Python "):].strip()
+    raw_ps = _call(["powershell", "-NoProfile", "-Command",
+                    "$PSVersionTable.PSVersion.ToString()"])
+    powershell_version = raw_ps.splitlines()[0].strip() \
+        if raw_ps else ""
+    policy = _summarize_execution_policy(_call(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-ExecutionPolicy -List | ForEach-Object "
+         "{ $_.Scope + '=' + $_.ExecutionPolicy }"]))
+    try:
+        os_version = platform.platform() or ""
+    except Exception:  # noqa: BLE001  取れなければ「不明」
+        os_version = ""
+    try:
+        encoding = locale.getpreferredencoding(False) or ""
+    except Exception:  # noqa: BLE001  取れなければ「不明」
+        encoding = ""
+    lowered = encoding.lower()
+    if "utf-8" in lowered or "utf8" in lowered:
+        encoding = "UTF-8"
+    elif "932" in lowered:
+        encoding = "cp932"
+    folder = str(watch_folder or "").strip()
+    modules, modules_more = _intro_modules()
+    return {
+        "python_version": python_version or INTRO_UNKNOWN,
+        "powershell_version": powershell_version or INTRO_UNKNOWN,
+        "os_version": os_version or INTRO_UNKNOWN,
+        "execution_policy": policy or INTRO_UNKNOWN,
+        "watch_folder": folder or INTRO_UNKNOWN,
+        "encoding": encoding or INTRO_UNKNOWN,
+        "modules": modules,
+        "modules_more": modules_more,
+    }
+
+
+def build_intro_prompt(env: dict) -> str:
+    """導入プロンプトの文を組み立てる。
+
+    env は collect_intro_environment の戻り値 (欠けたキーは
+    「不明」にする)。短い日本語文と環境情報だけ。ネットに直接
+    出られないことは固定文で入れる。回答は短いスクリプトで返す
+    旨も入れる。"""
+    env = env if isinstance(env, dict) else {}
+
+    def item(key):
+        value = env.get(key)
+        return value if isinstance(value, str) and value.strip() \
+            else INTRO_UNKNOWN
+
+    modules = env.get("modules")
+    if modules is None:
+        modules_line = INTRO_UNKNOWN
+    elif not modules:
+        modules_line = "なし"
+    else:
+        modules_line = ", ".join(modules)
+        more = env.get("modules_more") or 0
+        if isinstance(more, int) and more > 0:
+            modules_line += f"（他 {more} 件）"
+    lines = [
+        "PHAL のループを始めます。",
+        "この PC の環境は次のとおりです。",
+        f"- Python: {item('python_version')}",
+        f"- PowerShell: {item('powershell_version')}",
+        f"- OS: {item('os_version')}",
+        f"- 実行ポリシー: {item('execution_policy')}",
+        f"- 作業フォルダ: {item('watch_folder')}",
+        f"- 文字コード: {item('encoding')}",
+        "- ネット: 直接出られません。",
+        f"- モジュール: {modules_line}",
+        "- 実施済み試験ログの解析には共通モジュール phal_lib が使えます。",
+        "- phal_lib は `import phal_lib` で読み、文字コード判定つき読み・圧縮の透過読み・要点の部品（集計・抜粋）・回の比較があります。詳しくは AI 向けマニュアルの「解析用モジュール phal_lib」の節。",
+        "回答は短いスクリプト（.phal / .py / .ps1）で返してください。",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------
@@ -373,9 +1511,12 @@ def main():
             if stmt.module:
                 tops.append((stmt.module.split(".")[0], stmt.lineno))
     seen = set()
-    # スクリプトと同じフォルダの自作モジュールも「ある」扱いにする
-    # ため、探す場所の先頭にスクリプトのフォルダを足す(中4)。
-    search_path = [p for p in [payload.get("script_dir")] if p]
+    # 探す場所は、実行時の import 探索とそろえる (中4・1-53)。
+    # 先頭はスクリプトのフォルダ (実行時の sys.path[0])、次に
+    # PHAL 本体のフォルダ (実行時に PYTHONPATH へ足す分。phal_lib
+    # など本体の隣にあるモジュール)、残りは sys.path。
+    search_path = [p for p in [payload.get("script_dir"),
+                               payload.get("app_dir")] if p]
     search_path += sys.path
     for name, line in tops:
         if name in seen:
@@ -498,9 +1639,11 @@ def _run_checker(python_exe: str, source: str, script_dir: str = ""):
     検査役の作業フォルダは空の一時フォルダにする(中4)。スクリプトの
     フォルダで走らせると、隣のモジュールがチェック中に読み込まれて
     実行されうるため。同フォルダのモジュールの有無は、探す場所に
-    スクリプトのフォルダを足すことで別に確かめる。"""
+    スクリプトのフォルダと PHAL 本体のフォルダ (実行時の探索と
+    そろえる、1-53) を足すことで別に確かめる。"""
     payload = json.dumps({"source": source, "danger": PYTHON_DANGER,
-                          "script_dir": script_dir})
+                          "script_dir": script_dir,
+                          "app_dir": str(Path(__file__).resolve().parent)})
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         with tempfile.TemporaryDirectory() as empty_cwd:
@@ -715,6 +1858,26 @@ foreach ($c in $cmds) {
 """
 
 
+# PowerShell の警告対象 (実害のある命令だけ)。解決済みの名前
+# (エイリアスを直したもの)で引くので、rm や del も Remove-Item に
+# 集約される。許可リスト方式は 2026-11-14 の緩和でやめた。
+_PS_DANGER_COMMANDS = {
+    "remove-item": "ファイルを消す命令があります",
+    "rename-item": "ファイル名を変える命令があります",
+    "move-item": "ファイルを移す命令があります",
+    "set-content": "ファイルへ書き込む命令があります",
+    "add-content": "ファイルへ書き込む命令があります",
+    "clear-content": "ファイルの中身を消す命令があります",
+    "out-file": "ファイルへ書き込む命令があります",
+    "invoke-expression": "文字列を実行する命令があります",
+    "invoke-command": "動的に実行する命令があります",
+    "invoke-webrequest": "外部へ通信する命令があります",
+    "invoke-restmethod": "外部へ通信する命令があります",
+    "send-mailmessage": "メールを送る命令があります",
+    "stop-process": "プロセスを止める命令があります",
+}
+
+
 def _ps_allowed(name: str, allowlist) -> bool:
     import fnmatch
 
@@ -853,11 +2016,12 @@ def _run_ps_checker(target, exe, allowlist, result) -> CheckResult:
             warns.append((line, "動的な呼び出しがあります"))
             continue
         real = str(resolved.get(name) or name)
-        if not _ps_allowed(real, allowlist):
-            if real.lower() == "remove-item":
-                warns.append((line, "ファイルを消す命令があります(Remove-Item)"))
-            else:
-                warns.append((line, f"{real} は読むだけの許可リストにありません"))
+        # 警告は「実害のある命令」だけに絞る (2026-11-14、持ち主の
+        # 判断で緩和)。許可リストに無いというだけでは警告にしない
+        # (Set-Location のような日常の命令が要確認になっていた)。
+        danger = _PS_DANGER_COMMANDS.get(real.lower())
+        if danger is not None:
+            warns.append((line, f"{danger}({real})"))
     for redir in checked.get("redirections") or []:
         warns.append((int(redir.get("line") or 0),
                       "ファイルへの書き込み(リダイレクト)があります"))
@@ -884,10 +2048,46 @@ def _run_ps_checker(target, exe, allowlist, result) -> CheckResult:
     return result
 
 
+def phal_engine(path):
+    """.phal ファイルの1行目の宣言を読む。"python" / "powershell" /
+    None(宣言が無い・読めない)。
+
+    宣言は `#!phal python` または `#!phal powershell`。BOM・前後の
+    空白・大文字小文字は気にしない。読むのは1行目だけ。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.readline()
+    except OSError:
+        return None
+    line = raw.decode("utf-8-sig", errors="replace").strip().lower()
+    if line == "#!phal python":
+        return "python"
+    if line == "#!phal powershell":
+        return "powershell"
+    return None
+
+
 def check_script(path, config: dict) -> CheckResult:
-    """拡張子で振り分けるチェックの入口。"""
+    """拡張子で振り分けるチェックの入口。.phal は1行目の宣言で
+    振り分ける。"""
     path = Path(path)
-    if path.suffix.lower() == ".ps1":
+    suffix = path.suffix.lower()
+    if suffix == ".phal":
+        engine = phal_engine(path)
+        if engine == "powershell":
+            return check_powershell_script(path)
+        if engine == "python":
+            return check_python_script(
+                path, str(config.get("python") or "python"))
+        result = CheckResult(sha256=file_sha256(path))
+        result.status = STATUS_ERROR
+        result.kind = "syntax"
+        message = "1行目に #!phal python または #!phal powershell が必要です"
+        result.issues = [CheckIssue(line=1, message=message)]
+        result.jump_line = 1
+        result.headline = message
+        return result
+    if suffix == ".ps1":
         return check_powershell_script(path)
     return check_python_script(path, str(config.get("python") or "python"))
 
@@ -1092,7 +2292,13 @@ def execute_script(path, config: dict, handle: RunHandle = None,
     result = RunResult(name=path.name, path=str(path),
                        sha256=file_sha256(path))
     timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-    is_ps = path.suffix.lower() == ".ps1"
+    is_phal = path.suffix.lower() == ".phal"
+    if is_phal:
+        # .phal は1行目の宣言で言語を決める。宣言が無ければ Python
+        # 扱いで試す(チェックでエラーになるので通常はここへ来ない)。
+        is_ps = phal_engine(path) == "powershell"
+    else:
+        is_ps = path.suffix.lower() == ".ps1"
     started = time.monotonic()
     if expected_sha256 is not None:
         current = file_sha256(path)
@@ -1112,7 +2318,12 @@ def execute_script(path, config: dict, handle: RunHandle = None,
         # ないため)。sha256 は元のファイルで取る(上で取得済み)。
         bom_raw = ps1_bom_copy_source(path)
         if bom_raw is not None:
-            bom_copy = path.parent / (BOM_COPY_PREFIX + path.name)
+            copy_name = BOM_COPY_PREFIX + path.name
+            if is_phal:
+                # PowerShell の -File は .ps1 でないと受けないため、
+                # .phal の写しの末尾は .ps1 にする。
+                copy_name = BOM_COPY_PREFIX + path.stem + ".ps1"
+            bom_copy = path.parent / copy_name
             try:
                 bom_copy.write_bytes(UTF8_BOM + bom_raw)
             except OSError:
@@ -1123,6 +2334,16 @@ def execute_script(path, config: dict, handle: RunHandle = None,
                 result.stderr = result.start_error
                 return result
             run_path = bom_copy
+        elif is_phal:
+            # BOM の写しが要らない場合(BOM 付き・ASCII のみ)も、
+            # 拡張子 .phal のままでは -File で受けないので、
+            # .ps1 の写しで実行する。
+            bom_copy = path.parent / (BOM_COPY_PREFIX + path.stem + ".ps1")
+            try:
+                bom_copy.write_bytes(path.read_bytes())
+                run_path = bom_copy
+            except OSError:
+                bom_copy = None  # 写しが作れなければ元のまま試す
         argv = [exe, "-NoProfile", "-File", str(run_path)]
         env = dict(os.environ)
     else:
@@ -1131,6 +2352,16 @@ def execute_script(path, config: dict, handle: RunHandle = None,
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        # PHAL 本体の置き場 (このファイルのあるフォルダ) を、子
+        # プロセスの import 探索にも入れる (1-53)。phal_lib など
+        # 本体の隣にあるモジュールを、スクリプトからそのまま
+        # import できるようにするため。チェック側の探す場所と
+        # そろえる。既存の PYTHONPATH があれば、その前へ足す。
+        app_dir = str(Path(__file__).resolve().parent)
+        existing = [p for p in (env.get("PYTHONPATH") or "").split(
+            os.pathsep) if p]
+        if app_dir not in existing:
+            env["PYTHONPATH"] = os.pathsep.join([app_dir] + existing)
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         try:
@@ -1197,6 +2428,71 @@ def execute_script(path, config: dict, handle: RunHandle = None,
 
 
 # ---------------------------------------------------------------
+# コマンドID(ファイル名の先頭に付ける「セッション番号-通番」)
+# ---------------------------------------------------------------
+# AI 側がスクリプトを管理するための ID。ファイル名の先頭に
+# 「12-03_check_db.py」のように付け、一覧の ID 列と実行結果の文に
+# 出すことで、結果を貼り返したときにどのスクリプトの結果か分かる。
+_COMMAND_ID_RE = re.compile(r"^(\d{1,3}-\d{1,3})_")
+
+
+def parse_command_id(name: str):
+    """ファイル名の先頭にあるコマンドIDを取り出す。無ければ None。
+
+    形は「セッション番号-通番」のあとに "_"、続けて名前。
+    例: "12-03_check_db.py" → "12-03"、"12-3_check_db.py" → "12-3"。
+    表示はファイル名に書かれたまま(0 埋めは残す)。
+    線引き:
+      - 区切りは "_" のみ。"-" まで許すと "26-11-14" のような
+        日付と区別がつかない。
+      - 各部は3桁まで。"2026-11-14_notes.py" のような4桁の年で
+        始まる日付を ID と取り違えないため。
+    """
+    match = _COMMAND_ID_RE.match(name)
+    return match.group(1) if match else None
+
+
+# 概要として見る先頭の行数。これより後ろのコメントは拾わない。
+_SUMMARY_SCAN_LINES = 10
+
+
+def extract_summary(path) -> str:
+    """スクリプトの先頭コメント(何をする物か)を返す。無ければ ""。
+
+    一覧の概要列に出すためのもの。読むのは先頭の数行だけ:
+      - 空行、shebang (#!...)、.phal の宣言行 (#!phal ...) は飛ばす。
+      - 最初に残った行が # で始まるコメントなら、# と前後の空白を
+        外した中身を返す。コードや docstring が先に来たら ""。
+      - コメントがファイル自身のコマンドID(「1-3:」「1-3 」)で
+        始まっていたら、その接頭辞も外す(ID は ID 列に出ている)。
+    文字コードは BOM を外し、読めない文字は置き換えて読み進める。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        return ""
+    text = raw.decode("utf-8-sig", errors="replace")
+    for line in text.splitlines()[:_SUMMARY_SCAN_LINES]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#!"):
+            continue  # shebang と .phal の宣言行
+        if not stripped.startswith("#"):
+            return ""
+        summary = stripped.lstrip("#").strip()
+        command_id = parse_command_id(Path(path).name)
+        if command_id and summary.startswith(command_id):
+            tail = summary[len(command_id):]
+            sep = re.match(r"\s*:\s*|\s+", tail)
+            if sep:
+                summary = tail[sep.end():]
+        return summary
+    return ""
+
+
+# ---------------------------------------------------------------
 # クリップボードに入れる文
 # ---------------------------------------------------------------
 def truncate_text(text: str, head_lines: int = 200, tail_lines: int = 50,
@@ -1240,25 +2536,615 @@ def _section(title: str, body: str, config: dict) -> str:
     return f"--- {title} ---\n{body}"
 
 
-def build_result_text(name: str, run: RunResult, config: dict) -> str:
-    """実行したときにクリップボードへ入れる文。"""
-    config = normalize_config(config)
+def _split_output_lines(text: str) -> list:
+    """出力を行に分ける(truncate_text と同じ数え方)。
+
+    改行を \n にそろえ、末尾の改行を1つ外してから分ける。
+    空の出力は 0 行になる。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        return []
+    return text.split("\n")
+
+
+def _collapse_repeated_lines(lines: list) -> list:
+    """連続する同じ行を1行にまとめる。
+
+    2回以上続いた行は「（同じ行が N 回）」を末尾に付けて1行に
+    する。空行(空白だけの行)はまとめない(区切りが消えると
+    読みにくくなるため)。"""
+    collapsed = []
+    run_line = None
+    run_count = 0
+
+    def flush():
+        nonlocal run_line, run_count
+        if run_line is None:
+            return
+        if run_count >= 2:
+            collapsed.append(f"{run_line}（同じ行が {run_count} 回）")
+        else:
+            collapsed.append(run_line)
+        run_line = None
+        run_count = 0
+
+    for line in lines:
+        if line.strip() and line == run_line:
+            run_count += 1
+        else:
+            flush()
+            run_line = line
+            run_count = 1
+    flush()
+    return collapsed
+
+
+def _result_first_line(label: str, run: RunResult, config: dict,
+                       total_lines: int = None) -> str:
+    """結果文の1行目。total_lines があるときは末尾に「・全N行」を付ける
+    (要約モードで、行数を先に知らせるため)。"""
     if run.timed_out:
         timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-        first = f"[実行結果] {name}  時間切れで止めました({timeout}秒)"
+        first = f"[実行結果] {label}  時間切れで止めました({timeout}秒)"
     elif run.stopped:
-        first = f"[実行結果] {name}  停止しました"
+        first = f"[実行結果] {label}  停止しました"
     else:
         code = run.exit_code if run.exit_code is not None else "-"
-        first = f"[実行結果] {name}  終了コード {code}  {run.seconds:.1f}秒"
+        first = f"[実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
     if run.start_error:
         first += f"  起動エラー: {run.start_error}"
+    if total_lines is not None:
+        first += f"・全{total_lines}行"
+    return first
+
+
+def _record_stdout_body(out_lines: list) -> str:
+    """出力の本文。25行以下なら全部、超えたら先頭15行と末尾10行だけ
+    見せる (要約文の出力の段とループ記録で同じ線引き)。"""
+    if not out_lines:
+        return "(なし)"
+    if len(out_lines) <= 25:
+        return "\n".join(_collapse_repeated_lines(out_lines))
+    head = _collapse_repeated_lines(out_lines[:15])
+    tail = _collapse_repeated_lines(out_lines[-10:])
+    omitted = len(out_lines) - 25
+    return "\n".join(
+        head + [f"…（中略：{omitted}行）…"] + tail)
+
+
+def _record_stderr_body(err_lines: list) -> str:
+    """エラー出力の本文。先頭10行だけ見せる (要約文のエラー出力の
+    段とループ記録で同じ線引き)。"""
+    if not err_lines:
+        return "(なし)"
+    shown = _collapse_repeated_lines(err_lines[:10])
+    body = "\n".join(shown)
+    if len(err_lines) > 10:
+        body += f"\n…あと{len(err_lines) - 10}行"
+    return body
+
+
+def _summary_stdout_section(out_lines: list) -> str:
+    """要約文の出力の段。先頭15行と末尾10行だけ見せる。
+
+    合計25行以下なら全部見せる。見出しの行数は stdout の行数。"""
+    return (f"--- 出力（要約・全{len(out_lines)}行） ---\n"
+            + _record_stdout_body(out_lines))
+
+
+def _summary_stderr_section(err_lines: list) -> str:
+    """要約文のエラー出力の段。先頭10行だけ見せる。"""
+    return (f"--- エラー出力（先頭・全{len(err_lines)}行） ---\n"
+            + _record_stderr_body(err_lines))
+
+
+def save_full_output(run: RunResult, config: dict,
+                     command_id: str = None) -> str | None:
+    """実行結果の全文を data_dir() の下へ保存し、パスを返す。
+
+    要約モードで、クリップボード文には要約だけを入れて全文は
+    このファイルに置くためのもの。中身は build_result_text と
+    同じ1行目に、出力とエラー出力の全文を続けたもの。LF・UTF-8
+    で書く。保存に失敗したら None(呼ぶ側は従来の切り詰め文に
+    落とす)。"""
+    config = normalize_config(config)
+    label = f"{command_id} {run.name}" if command_id else run.name
+    out_lines = _split_output_lines(run.stdout)
+    err_lines = _split_output_lines(run.stderr)
+    total_lines = len(out_lines) + len(err_lines)
+    first = _result_first_line(label, run, config, total_lines)
+    body = (first + "\n--- 出力 ---\n" + run.stdout
+            + "\n--- エラー出力 ---\n" + run.stderr)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    cid = command_id or "noid"
+    filename = f"{cid}_{stamp}_{digest}.txt"
+    try:
+        folder = data_dir() / "phal-outputs"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / filename
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        return str(path)
+    except OSError:
+        return None
+
+
+def _output_is_long(run: RunResult, config: dict) -> bool:
+    """要約モードで全文をファイルへ置く長さかどうか。
+
+    build_result_text と同じ線引き (summary_lines / summary_chars)。
+    出力とエラー出力の合計で見る。"""
+    out_lines = _split_output_lines(run.stdout)
+    err_lines = _split_output_lines(run.stderr)
+    total_lines = len(out_lines) + len(err_lines)
+    total_chars = len(run.stdout) + len(run.stderr)
+    return (total_lines > config["summary_lines"]
+            or total_chars > config["summary_chars"])
+
+
+def save_full_output_if_long(run: RunResult, config: dict,
+                             command_id: str = None) -> str | None:
+    """要約モードで全文の保存が必要なら保存してパスを返す。
+
+    短い出力なら何もせず None。ループ記録の控えに全文のパスを残す
+    ためのもの。保存に失敗しても None (build_result_text が従来
+    どおり切り詰め文へ落とす)。"""
+    config = normalize_config(config)
+    if not config["summary_mode"]:
+        return None
+    if not _output_is_long(run, config):
+        return None
+    return save_full_output(run, config, command_id)
+
+
+def build_ack_text(command_id: str, filename: str) -> str:
+    """自動実行の開始を AI へ先に知らせる受領応答 (Ack) の文 (1-51)。
+
+    結果が出る前に「受け取って実行を始める」ことだけを伝える1行。
+    command_id (ファイル名先頭のコマンドID) があれば
+    「受領：{id} {filename} の実行を始めます」、無ければ ID の
+    部分を省いて「受領：{filename} の実行を始めます」。結果が
+    遅いときに、届いていないのか実行中なのかを送り側が区別
+    できるようにするためのもの。"""
+    label = f"{command_id} {filename}" if command_id else filename
+    return f"受領：{label} の実行を始めます"
+
+
+def build_blocked_text(command_id: str, filename: str, reason: str) -> str:
+    """チェックで実行不可になったことを AI へ知らせる文 (1-53)。
+
+    自動実行の対象なのにチェックで止まったファイルは、受領も
+    結果も出ないため、放っておくとループが無言で止まる。その
+    埋め合わせに「止まりました：{id} {filename} はチェックで
+    実行不可（{理由}）」の1行を出す。理由はチェック結果の最初
+    の指摘 (無ければ見出し) を呼ぶ側が渡す。理由が空なら括弧の
+    部分を省く。"""
+    label = f"{command_id} {filename}" if command_id else filename
+    base = f"止まりました：{label} はチェックで実行不可"
+    return f"{base}（{reason}）" if reason else base
+
+
+# ---------------------------------------------------------------
+# 結果ファイルの添付 (1.58)
+# ---------------------------------------------------------------
+# スクリプトが成果ファイル (抜粋・CSV・圧縮したログ等) を AI へ
+# ファイルのまま渡すための約束。スクリプトはファイルを置き場
+# (outbox_dir) へ書き、標準出力に「添付：ファイル名」の行を出す。
+# 窓は結果文を組み立てる前に、その行を元の標準出力から取り出し
+# (extract_attach_lines)、実在するファイルだけを回答に添えて
+# copilot 側へ渡す (attach_file_paths)。添付行は、送る文章にも
+# 要約にも残さない。
+ATTACH_LINE_RE = re.compile(r"^添付\s*[:：]\s*(.+?)\s*$")
+
+
+def outbox_dir() -> Path:
+    """成果ファイルの置き場 (data_dir() の下の phal-outbox)。
+
+    全文ファイルの置き場 (phal-outputs) の隣。スクリプトが
+    ここへファイルを書き、「添付：ファイル名」で知らせる。"""
+    return data_dir() / "phal-outbox"
+
+
+def extract_attach_lines(text: str):
+    """標準出力から「添付：ファイル名」の行を取り出す。
+
+    戻り値は (添付行を除いたテキスト, ファイル名の並び)。
+    コロンは全角・半角どちらでもよい。行の前後の空白は許す。
+    ファイル名は名前だけのものだけを受け付ける: フォルダ区切り
+    (\\ と /) を含む名前や「.」「..」は受け付けず、名前の並び
+    には入れない (置き場の外を指す指定を黙って通さないため)。
+    ただし、その行自体は添付の指定の行として取り除く (指定の
+    行を結果文に残さない)。同じ名前が複数あれば、先の1回だけ
+    数える。改行は \\n にそろえて返す (呼び側は結果文の組み立て
+    に使うので、そろっていた方が扱いが一様になる)。"""
+    source = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    kept = []
+    names = []
+    for line in source.split("\n"):
+        match = ATTACH_LINE_RE.match(line.strip())
+        if match is None:
+            kept.append(line)
+            continue
+        name = match.group(1).strip()
+        if not name or name in (".", "..") \
+                or "\\" in name or "/" in name:
+            continue  # 受け付けない指定。行だけ取り除く
+        if name not in names:
+            names.append(name)
+    return "\n".join(kept), names
+
+
+def attach_file_paths(names):
+    """添付名の並びを、outbox の実ファイルへ解決する。
+
+    戻り値は (実在するファイルのフルパスの並び, 無かった名前の
+    並び)。窓が回答の段で使う: 実在するものだけを copilot 側へ
+    渡し、無いものは文章の末尾に1行足して伝える。"""
+    folder = outbox_dir()
+    paths = []
+    missing = []
+    for name in names or []:
+        candidate = folder / name
+        if candidate.is_file():
+            paths.append(str(candidate))
+        else:
+            missing.append(name)
+    return paths, missing
+
+
+# 結果文の末尾に付ける、受け取る AI への指示文 (1.55)。実行結果を
+# 受けた側が「次に何をするか」をその場で決めて動けるようにする
+# ためのもの。文面は陽太さんの指定 (2026-11-15) で固定。
+RESULT_AI_PROMPT = (
+    "AIへの指示：この結果を踏まえて、次にやる作業を明確にし、"
+    "即時着手できるものは直ちに着手すること。陽太さんの判断が"
+    "要るものは着手せず、報告に回すこと。")
+
+
+def with_result_ai_prompt(text: str) -> str:
+    """結果文の末尾に AI への指示文 (RESULT_AI_PROMPT) を付ける。
+
+    末尾の空白・改行は落としてから、指示文を最終行にする。既に
+    付いていたら二重に付けない (組み立て側と送信側の両方を
+    通っても1つだけになる)。"""
+    body = (text or "").rstrip()
+    if not body:
+        return RESULT_AI_PROMPT
+    if body.endswith(RESULT_AI_PROMPT):
+        return body
+    return body + "\n" + RESULT_AI_PROMPT
+
+
+# 再実行の結果文に付ける「前回との差分」(1.56)。同じファイルを
+# もう一度実行したとき、前回の出力と今回の出力を比べて、増えた
+# 行・消えた行だけを抜き出す。比べるのは標準出力＋エラー出力の
+# 本文で、行の集合として比べる (並び順と、同じ行の回数の違いは
+# 差分にしない)。それぞれ最大 RESULT_DIFF_LIMIT 行まで。
+RESULT_DIFF_LIMIT = 10
+
+
+def diff_output_lines(previous_lines, current_lines):
+    """出力の行同士の差分。(増えた行, 消えた行) を返す。
+
+    増えた行は今回 (current_lines) にだけある行、消えた行は
+    前回 (previous_lines) にだけある行。どちらも出てきた順に
+    並べ、同じ行の重複は畳む。並び順と、同じ行の回数の違いは
+    差分にしない (集合としての比べ方)。表示の打ち切りは呼ぶ側
+    (build_result_diff) が行う。"""
+    previous_set = set(previous_lines)
+    current_set = set(current_lines)
+    added = []
+    seen = set()
+    for line in current_lines:
+        if line not in previous_set and line not in seen:
+            seen.add(line)
+            added.append(line)
+    removed = []
+    seen = set()
+    for line in previous_lines:
+        if line not in current_set and line not in seen:
+            seen.add(line)
+            removed.append(line)
+    return added, removed
+
+
+def result_diff_source(text: str) -> str:
+    """結果文の本文から、差分の対象になる部分を返す。
+
+    先頭の見出し行 ([実行結果] ...) は実行のたびに秒数が変わる
+    ので除き、残りをそのまま返す。再実行の前回結果の控えに
+    入れるのも、この形 (見出し行なし)。"""
+    return (text or "").partition("\n")[2]
+
+
+def build_result_diff(previous_text, new_text,
+                      previous_truncated: bool = False) -> str:
+    """前回の結果文と今回の結果文の差分 (純粋関数、1.56)。
+
+    previous_text が None (前回の結果が無い) なら、今回の全文に
+    「前回結果なし」の注記を付けて返す。前回と同じなら
+    「差分なし（前回と同じ結果）」の1行だけ。違うときは見出し
+    「差分：追加 N行・削除 M行（前回比）」に続けて、増えた行
+    (+ 付き) と消えた行 (- 付き) だけを出す (それぞれ最大
+    RESULT_DIFF_LIMIT 行まで。超えた分は「ほか N行」とだけ書く)。
+    行の並びは _split_output_lines でそろえるので、末尾の改行の
+    有無や CRLF の違いだけでは差分にならない。前回が2万字で
+    打ち切られていたら、その旨を末尾に足す。"""
+    if previous_text is None:
+        body = (new_text or "").rstrip("\n")
+        if not body:
+            return "（前回結果なし）"
+        return body + "\n（前回結果なし）"
+    previous_lines = _split_output_lines(previous_text)
+    new_lines = _split_output_lines(new_text or "")
+    if previous_lines == new_lines:
+        return "差分なし（前回と同じ結果）"
+    added, removed = diff_output_lines(previous_lines, new_lines)
+    lines = [f"差分：追加 {len(added)}行・削除 {len(removed)}行"
+             f"（前回比）"]
+    for line in added[:RESULT_DIFF_LIMIT]:
+        lines.append(f"+ {line}")
+    if len(added) > RESULT_DIFF_LIMIT:
+        lines.append(f"（ほか {len(added) - RESULT_DIFF_LIMIT}行）")
+    for line in removed[:RESULT_DIFF_LIMIT]:
+        lines.append(f"- {line}")
+    if len(removed) > RESULT_DIFF_LIMIT:
+        lines.append(f"（ほか {len(removed) - RESULT_DIFF_LIMIT}行）")
+    if previous_truncated:
+        lines.append("（前回の結果は2万字で打ち切られています）")
+    return "\n".join(lines)
+
+
+def build_result_body(name: str, run: RunResult, config: dict,
+                      command_id: str = None,
+                      full_output_path: str = None) -> str:
+    """実行したときにクリップボードへ入れる文の本体 (AI への指示文
+    を除く)。build_result_text と build_rerun_result_text の
+    共通部分。
+
+    command_id(ファイル名先頭のコマンドID)があるときは、1行目を
+    「[実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
+    ようにする。無いときの文は今までと完全に同じ。
+
+    要約モード(summary_mode が真)で、出力とエラー出力の合計が
+    summary_lines 行または summary_chars 文字を超えたら、全文は
+    ファイルへ置いて要約だけを返す。短い出力は今までと完全に
+    同じ文になる。全文の保存に失敗したら、従来の切り詰め文に
+    落とす(要約を諦めても実行結果は必ず返す)。full_output_path を
+    渡すと、長い出力のときにそのパスを使い、保存を二重にしない
+    (ループ記録の控え用。渡さなければ従来どおり保存する)。"""
+    config = normalize_config(config)
+    label = f"{command_id} {name}" if command_id else name
+    out_lines = _split_output_lines(run.stdout)
+    err_lines = _split_output_lines(run.stderr)
+    total_lines = len(out_lines) + len(err_lines)
+    total_chars = len(run.stdout) + len(run.stderr)
+    if config["summary_mode"] and (
+            total_lines > config["summary_lines"]
+            or total_chars > config["summary_chars"]):
+        full_path = (full_output_path
+                     if full_output_path is not None
+                     else save_full_output(run, config, command_id))
+        if full_path is not None:
+            first = _result_first_line(label, run, config, total_lines)
+            parts = [first,
+                     _summary_stdout_section(out_lines),
+                     _summary_stderr_section(err_lines),
+                     f"全文: {full_path}",
+                     "「○行目付近を見せて」と頼めば取り出せます"]
+            if run.policy_stop:
+                parts.append(POLICY_NOTE)
+            return "\n".join(parts)
+    first = _result_first_line(label, run, config)
     parts = [first,
              _section("出力", run.stdout, config),
              _section("エラー出力", run.stderr, config)]
     if run.policy_stop:
         parts.append(POLICY_NOTE)
     return "\n".join(parts)
+
+
+def build_result_text(name: str, run: RunResult, config: dict,
+                      command_id: str = None,
+                      full_output_path: str = None) -> str:
+    """実行したときにクリップボードへ入れる文 (本体＋AI への指示文)。
+
+    末尾には AI への指示文 (RESULT_AI_PROMPT) が必ず付く (1.55)。
+    自動・手動のどちらの送信経路もこの関数を通るので、ここで
+    付ければ両経路に行き渡る。本体の組み立ては build_result_body。"""
+    return with_result_ai_prompt(
+        build_result_body(name, run, config,
+                          command_id=command_id,
+                          full_output_path=full_output_path))
+
+
+def build_rerun_result_text(name: str, run: RunResult, config: dict,
+                            command_id: str = None,
+                            previous_text: str = None,
+                            previous_truncated: bool = False,
+                            full_output_path: str = None) -> str:
+    """再実行のときにクリップボードへ入れる文 (1.56)。
+
+    1行目の見出し ([実行結果] ...) は通常の結果文と同じで、
+    その下は全文ではなく前回との差分だけ (build_result_diff)。
+    要約モードの長い出力は、従来どおり要約文が差分の対象になる
+    (全文比較はしない)。末尾には AI への指示文 (RESULT_AI_PROMPT)
+    が必ず付く。previous_text は前回の結果の控え (result_diff_source
+    の形)。無ければ全文＋「前回結果なし」の注記になる。"""
+    body = build_result_body(name, run, config,
+                             command_id=command_id,
+                             full_output_path=full_output_path)
+    first = body.partition("\n")[0]
+    diff = build_result_diff(previous_text, result_diff_source(body),
+                             previous_truncated)
+    return with_result_ai_prompt(first + "\n" + diff)
+
+
+def build_return_text(name: str, reason: str, run: RunResult = None,
+                      config: dict = None, script_text: str = "",
+                      command_id: str = None) -> str:
+    """「差し戻す」でクリップボードへ入れる文。
+
+    事前チェックを通ったのに実行時にエラーになったスクリプトを、
+    証拠(実行結果)と全文つきで AI へ返すためのもの。貼り返した側が
+    同じ ID で直した版を出せるよう、1行目は結果文と同じ対応付け
+    (ID + ファイル名)にする。実行結果の部分は build_result_text を
+    そのまま使う(二重に整えない)。"""
+    config = normalize_config(config or {})
+    label = f"{command_id} {name}" if command_id else name
+    parts = [f"[差し戻し] {label}"]
+    reason = (reason or "").strip()
+    if reason:
+        parts.append(f"理由: {reason}")
+    if run is not None:
+        parts.append("--- 実行結果 ---")
+        parts.append(build_result_text(name, run, config,
+                                       command_id=command_id))
+    parts.append("--- スクリプト ---")
+    parts.append(script_text)
+    return "\n".join(parts)
+
+
+def move_to_recycle_bin(path) -> bool:
+    """ファイルを Windows のゴミ箱へ移す。成功したら True。
+
+    戻せる消し方が要るので、shell32 の SHFileOperationW に
+    FOF_ALLOWUNDO を付けて頼む(確認ダイアログも出さない)。
+    Windows 以外と失敗時は False(呼ぶ側が失敗を伝えること)。"""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class _SHFileOpStructW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.WORD),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    fo_delete = 3
+    fof_allowundo = 0x0040
+    fof_noconfirmation = 0x0010
+    try:
+        op = _SHFileOpStructW()
+        op.wFunc = fo_delete
+        # pFrom は二重の終端(パス + "\0\0")が要る。
+        op.pFrom = str(Path(path)) + "\0\0"
+        op.fFlags = fof_allowundo | fof_noconfirmation
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    except (OSError, ValueError, AttributeError):
+        return False
+    return result == 0 and not op.fAnyOperationsAborted
+
+
+# ---------------------------------------------------------------
+# ループ記録の Markdown まとめ (1.51)
+# ---------------------------------------------------------------
+# 直近の実行を「手」ごとに並べた Markdown。窓が起動後の実行を
+# 控え (LoopRecord の列) に残し、「記録をコピー」でクリップボード
+# へ入れる。永続化はしない (開き直すと消える)。ねらいは表の概要
+# なので、実行の記録の JSONL だけでは作れない (そちらには概要も
+# エラー出力も全文のパスも無い)。長い出力の扱いは要約モードと
+# 同じ考え: summary_lines / summary_chars を超えたら先頭・末尾と
+# 行数だけにし、全文ファイルのパスを添える。
+@dataclass
+class LoopRecord:
+    at: str = ""              # 実行が終わった時刻 "YYYY-MM-DD HH:MM:SS"
+    command_id: str = ""      # ファイル名先頭のコマンドID。無ければ ""
+    name: str = ""            # ファイル名
+    summary: str = ""         # ねらい (表の概要)。無ければ ""
+    run: RunResult = None     # 実行結果
+    full_output_path: str = ""  # 要約モードで全文を置いたパス。無ければ ""
+
+
+def _record_result_line(run: RunResult, config: dict) -> str:
+    """1手の「結果」の行。_result_first_line の対応付け無しの版。
+
+    終了コードと所要時間、時間切れ・停止・起動エラー・実行ポリシー
+    の印を1行にする。"""
+    if run.timed_out:
+        timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
+        line = f"時間切れで止めました（{timeout}秒）"
+    elif run.stopped:
+        line = "停止しました"
+    else:
+        code = run.exit_code if run.exit_code is not None else "-"
+        line = f"終了コード {code}・{run.seconds:.1f}秒"
+    if run.start_error:
+        line += f"・起動エラー: {run.start_error}"
+    if run.policy_stop:
+        line += "・実行ポリシーで停止"
+    return line
+
+
+def _md_fence(text: str) -> str:
+    """Markdown のコード囲み。文中にある一番長い ` の連なりより
+    1つ長くする (出力に ``` が混ざっても囲みが壊れない)。"""
+    longest = 0
+    run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
+
+
+def build_loop_record_markdown(records, config=None, limit=20) -> str:
+    """直近の実行履歴を Markdown にする。
+
+    records は LoopRecord の列 (古い順)。直近 limit 件だけを古い順
+    に並べる。1手ごとにコマンドIDと時刻の見出し、ねらい、スクリプト、
+    結果 (終了コード・所要時間・出力の要点) を出す。出力が長いときは
+    要約モードと同じ考えで先頭・末尾と行数だけにし、全文ファイルの
+    パスを添える。空なら "" (空の Markdown は作らない)。"""
+    config = normalize_config(config or {})
+    kept = [r for r in (records or [])
+            if r is not None and r.run is not None]
+    kept = kept[-limit:] if limit > 0 else []
+    if not kept:
+        return ""
+    lines = [f"# PHAL ループ記録（直近{len(kept)}手）", ""]
+    for record in kept:
+        run = record.run
+        heading = record.command_id or record.name
+        lines.append(f"## {heading} {record.at}".rstrip())
+        summary = (record.summary or "").strip()
+        lines.append(f"- ねらい：{summary if summary else '（なし）'}")
+        lines.append(f"- スクリプト：{record.name}")
+        lines.append(f"- 結果：{_record_result_line(run, config)}")
+        out_lines = _split_output_lines(run.stdout)
+        err_lines = _split_output_lines(run.stderr)
+        if out_lines:
+            lines.append(f"- 出力（全{len(out_lines)}行）：")
+            body = _record_stdout_body(out_lines)
+            fence = _md_fence(body)
+            lines.append(fence)
+            lines.append(body)
+            lines.append(fence)
+        else:
+            lines.append("- 出力：（なし）")
+        if err_lines:
+            lines.append(f"- エラー出力（全{len(err_lines)}行）：")
+            err_body = _record_stderr_body(err_lines)
+            err_fence = _md_fence(err_body)
+            lines.append(err_fence)
+            lines.append(err_body)
+            lines.append(err_fence)
+        if record.full_output_path:
+            lines.append(f"- 全文：{record.full_output_path}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def build_check_text(name: str, result: CheckResult) -> str:

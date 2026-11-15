@@ -539,6 +539,7 @@ DEFAULT_SETTINGS = {
     #   head_lines / tail_lines / max_chars … クリップボード文の切り詰め
     #   window_geometry … [x, y, w, h]。窓が覚える
     #   always_on_top   … 前面に固定。窓のチェックで切り替える
+    #   hide_no_id      … ID が無いファイルを表示しない。窓のチェックで切り替える
     "script_runner": {
         "watch_folder": "",
         "recent_hours": 24,
@@ -550,6 +551,7 @@ DEFAULT_SETTINGS = {
         "max_chars": 20000,
         "window_geometry": None,
         "always_on_top": False,
+        "hide_no_id": True,
     },
     # 窓の配置(window_layout.py)。画面アイコンの「🪟 窓の配置」から使う。
     #   presets … [{name, items: [{exe, title, rect: [l, t, r, b], zoomed}]}]

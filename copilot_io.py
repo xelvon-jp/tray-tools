@@ -51,6 +51,12 @@ class SendResult:
     # 入力欄に書きかけの文があり、まだ送っていない(利用者の確認待ち)。
     # True のときは、確かめてから force=True で送り直す。
     needs_confirm: bool = False
+    # 添付の結果 (1.58)。attachments を渡したとき、copilot 側で
+    # 添付できたファイル名 (名前だけ) と、できなかったファイル名。
+    # 添付は入力・送信の前に行われ、失敗しても配達自体は止まらない
+    # (失敗分は本文の末尾に1行足して伝える)。診断への記録用。
+    attach_done: list = field(default_factory=list)
+    attach_failed: list = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +81,50 @@ class ProbeResult:
     ok: bool
     message: str
     candidates: list = field(default_factory=list)
+
+
+@dataclass
+class ScanResult:
+    """入力欄の深い調査の結果。candidates は
+    [{"control_type", "name", "automation_id", "class_name",
+    "value_pattern", "text_pattern"}] の並び (copilot_loop の
+    scan_input_candidates が返す形そのまま)。送信ボタンの調査
+    (scan_buttons) も同じ形で、候補には "invoke_pattern" が付く。"""
+    ok: bool
+    message: str
+    candidates: list = field(default_factory=list)
+
+
+@dataclass
+class DownloadResult:
+    """チャットのダウンロード検出の結果。candidate は
+    {"name", "class_name", "label", "summary"} (copilot_loop の
+    latest_download_candidate が返す形) か、無ければ None。
+    candidates は、スクリプトらしいカード全件の辞書 (木の順、
+    1-57)。窓側が末尾の1件に固定されず未消費のものを選ぶための
+    材料で、持たない経路では None。
+    候補が無いのは通常の状態で ok=True。検出できない経路・窓が
+    無い場合は ok=False で、理由が message に入る。
+    marker は、同じ走査で見つけた診断リクエストの目印
+    {"id": 同定子} (1-43) か、無ければ None。reset_marker は、
+    同じ走査で見つけたリセットの目印 (1-52) で、形は marker と
+    同じ。"""
+    ok: bool
+    message: str
+    candidate: dict = None
+    marker: dict = None
+    reset_marker: dict = None
+    candidates: list = None
+
+
+@dataclass
+class ReadResult:
+    """入力欄の読み直しの結果。message は、読めなかった段の理由
+    (copilot_loop の段つきの文) をそのまま持つ。text は読めた文
+    (読めなければ空)。"""
+    ok: bool
+    message: str
+    text: str = ""
 
 
 class WorkerError(RuntimeError):
@@ -136,6 +186,11 @@ class SubprocessTransport:
         # 投げ先のプロファイル(辞書か、組み込みの名前)。None なら
         # 依頼に含めない (裏方は従来どおり自動選択になる)。
         self._profile = profile
+        # 直近の send / fill で添付できた・できなかったファイル名
+        # (1.58)。裏方の応答から受けて、CopilotSession が結果へ
+        # 写すための控え。
+        self.attach_done = []
+        self.attach_failed = []
 
     def _call(self, request, timeout=None):
         if self._profile is not None:
@@ -156,14 +211,63 @@ class SubprocessTransport:
     def input_text(self):
         return self._call({"op": "input"})["input_text"]
 
-    def send_prompt(self, text):
-        return bool(self._call({"op": "send", "text": text})["sent"])
+    def send_prompt(self, text, attachments=None):
+        request = {"op": "send", "text": text}
+        if attachments:
+            request["attachments"] = [str(p) for p in attachments]
+        response = self._call(request)
+        self.attach_done = list(response.get("attach_done") or [])
+        self.attach_failed = list(response.get("attach_failed") or [])
+        return bool(response["sent"])
 
-    def fill_prompt(self, text):
-        return bool(self._call({"op": "fill", "text": text})["filled"])
+    def fill_prompt(self, text, attachments=None):
+        request = {"op": "fill", "text": text}
+        if attachments:
+            request["attachments"] = [str(p) for p in attachments]
+        response = self._call(request)
+        self.attach_done = list(response.get("attach_done") or [])
+        self.attach_failed = list(response.get("attach_failed") or [])
+        return bool(response["filled"])
 
     def probe_input(self):
         return list(self._call({"op": "probe"})["candidates"])
+
+    def attach_test(self, path):
+        """添付テスト (1.61)。(成功か, 文) を返す。"""
+        response = self._call({"op": "attach_test", "path": str(path)})
+        return bool(response.get("attach_ok")), \
+            str(response.get("message") or "")
+
+    def scan_input(self):
+        return list(self._call({"op": "scan"})["candidates"])
+
+    def scan_buttons(self):
+        return list(self._call({"op": "scan_buttons"})["candidates"])
+
+    def press_send(self):
+        return bool(self._call({"op": "press_send"})["pressed"])
+
+    def latest_download(self):
+        return self.latest_scan().get("candidate")
+
+    def latest_scan(self):
+        response = self._call({"op": "latest_download"})
+        return {"candidate": response.get("candidate"),
+                "candidates": response.get("candidates"),
+                "marker": response.get("marker"),
+                "reset_marker": response.get("reset_marker")}
+
+    def press_download(self, key=None):
+        request = {"op": "press_download"}
+        if key is not None:
+            # 窓側が選んだ候補 (名前+クラス名) を裏方へ渡す (1-57)。
+            # 無ければ依頼は従来と同形 (裏方は最新の1件を選ぶ)。
+            request["key"] = key
+        return bool(self._call(request)["pressed"])
+
+    def send_escape(self):
+        return str(self._call({"op": "send_escape"}).get("status")
+                   or "failed")
 
     def wait_until_idle(self, timeout):
         response = self._call({"op": "wait", "timeout": timeout},
@@ -203,6 +307,10 @@ class CopilotLoopTransport:
         # 投げ先のプロファイル。辞書そのものか、組み込みの名前
         # (文字列)。None なら Copilot 側の自動選択に従来どおり任せる。
         self._profile = profile
+        # 直近の send / fill で添付できた・できなかったファイル名
+        # (1.58)。CopilotSession が結果へ写すための控え。
+        self.attach_done = []
+        self.attach_failed = []
 
     def _ensure(self):
         if self._cp is None:
@@ -233,22 +341,83 @@ class CopilotLoopTransport:
         読めない(入力欄や ValuePattern が見つからない)ときは None を
         返さず RuntimeError を上げる。「空だった」と誤認したまま
         送信すると、書きかけの文を黙って上書きしかねないためで、
-        CopilotSession.send は例外を失敗の結果に畳む(送らない)。"""
+        CopilotSession.send は例外を失敗の結果に畳む(送らない)。
+
+        copilot_loop 側が段つきの理由(InputStageError: 見つからない /
+        中身が読めない)で上げた場合は、その文がそのまま呼び側へ伝わる。
+        ここで一文に畳むのは、read_input が None を返す実装(テストの
+        fake 等)のときだけ。"""
         value = self._ensure().read_input()
         if value is None:
             raise RuntimeError("Copilot の入力欄が読めませんでした")
         return value
 
-    def send_prompt(self, text):
+    def _attach_first(self, text, attachments):
+        """本文を入れる前に添付を済ませ、本文を返す (1.58)。
+
+        添付できた・できなかったファイル名は self.attach_done /
+        attach_failed に残す。できなかった分は、本文の末尾に
+        「添付できませんでした：ファイル名」を1行ずつ足す
+        (配達自体は止めない)。"""
+        self.attach_done = []
+        self.attach_failed = []
+        if not attachments:
+            return text
+        cp = self._ensure()
+        failed = cp.attach_files([str(p) for p in attachments])
+        self.attach_failed = list(failed)
+        failed_names = set(failed)
+        self.attach_done = [
+            os.path.basename(str(p)) for p in attachments
+            if os.path.basename(str(p)) not in failed_names]
+        if failed:
+            text += "".join(
+                f"\n添付できませんでした：{name}" for name in failed)
+        return text
+
+    def send_prompt(self, text, attachments=None):
+        text = self._attach_first(text, attachments)
         return self._ensure().send_prompt(text)
 
-    def fill_prompt(self, text):
+    def fill_prompt(self, text, attachments=None):
         """入力欄に入れるだけ (送信ボタンは押さない)。"""
+        text = self._attach_first(text, attachments)
         self._ensure().set_input(text)
         return True
 
     def probe_input(self):
         return self._ensure().probe_input_candidates()
+
+    def attach_test(self, path):
+        """添付テスト (1.61): 添付してチップを外す。送信はしない。
+
+        (成功か, 結果の文) を返す。"""
+        return self._ensure().attach_test_file(str(path))
+
+    def scan_input(self):
+        return self._ensure().scan_input_candidates()
+
+    def scan_buttons(self):
+        return self._ensure().scan_button_candidates()
+
+    def press_send(self):
+        """プロファイルの目印 (send_*) の送信ボタンを Invoke で押す。
+
+        失敗は copilot_loop の段つきの例外 (InputStageError) がそのまま
+        上がる。CopilotSession.press_send が理由の文に畳む。"""
+        return self._ensure().press_send_button()
+
+    def latest_download(self):
+        return self._ensure().latest_download_candidate()
+
+    def latest_scan(self):
+        return self._ensure().latest_chat_scan()
+
+    def press_download(self, key=None):
+        return self._ensure().press_download_candidate(key)
+
+    def send_escape(self):
+        return self._ensure().send_escape()
 
     def wait_until_idle(self, timeout):
         return self._ensure().wait_until_idle(timeout=timeout)
@@ -291,10 +460,24 @@ class CopilotSession:
         return self._transport
 
     # -- 送る -------------------------------------------------------------
-    def send(self, text, force=False) -> SendResult:
+    def _attach_outcome(self):
+        """transport に残っている添付の結果 (できた名前, できなかった名前)。
+
+        添付を持たない transport (テストの fake 等) では空になる。"""
+        tp = self._tp()
+        done = list(getattr(tp, "attach_done", None) or [])
+        failed = list(getattr(tp, "attach_failed", None) or [])
+        return done, failed
+
+    def send(self, text, force=False, attachments=None) -> SendResult:
         """送る。force=False のとき、入力欄に書きかけの文があれば
         送らずに needs_confirm=True で返す(send_prompt は入力欄を
-        上書きして即送信するので、書きかけが黙って消えるのを防ぐ)。"""
+        上書きして即送信するので、書きかけが黙って消えるのを防ぐ)。
+
+        attachments (ファイルのフルパスの並び) を渡すと、本文を
+        入れる前に copilot 側で添付する (1.58)。添付の失敗は送信
+        を止めない (本文の末尾に1行足して伝わり、結果の
+        attach_done / attach_failed にも残る)。"""
         if not text or not text.strip():
             return SendResult(False, "送るテキストが空です")
         try:
@@ -319,22 +502,32 @@ class CopilotSession:
                     "そのまま送ると上書きされて消えます",
                     needs_confirm=True)
         try:
-            sent = self._tp().send_prompt(text)
+            # 添付が無いときは従来どおりの呼び方にする (添付を
+            # 知らない transport の差し替え口を壊さないため)。
+            if attachments:
+                sent = self._tp().send_prompt(
+                    text, attachments=attachments)
+            else:
+                sent = self._tp().send_prompt(text)
         except Exception as e:  # noqa: BLE001
             return SendResult(False, f"Copilot に送れませんでした（{e}）")
+        done, failed = self._attach_outcome()
         if not sent:
             return SendResult(
-                False, "Copilot に送信できませんでした（送信ボタンが見つからない等）")
+                False, "Copilot に送信できませんでした（送信ボタンが見つからない等）",
+                attach_done=done, attach_failed=failed)
         self._sent_text = text
-        return SendResult(True, "Copilot に送信しました")
+        return SendResult(True, "Copilot に送信しました",
+                          attach_done=done, attach_failed=failed)
 
     # -- 入れるだけ -------------------------------------------------------
-    def fill(self, text, force=False) -> SendResult:
+    def fill(self, text, force=False, attachments=None) -> SendResult:
         """入力欄に text を入れるだけ。送信はしない。
 
         書きかけの扱いは send と同じ: force=False で入力欄に文が
         あれば、上書きせず needs_confirm=True で返す (テスト入力でも
-        書きかけを消さない)。結果の形も send とそろえてある。"""
+        書きかけを消さない)。結果の形も send とそろえてある。
+        attachments の扱いも send と同じ (入れる前に添付する)。"""
         if not text or not text.strip():
             return SendResult(False, "入れるテキストが空です")
         if not force:
@@ -357,13 +550,37 @@ class CopilotSession:
             if filler is None:
                 return SendResult(
                     False, "この経路では入力欄に入れられません")
-            filled = filler(text)
+            if attachments:
+                filled = filler(text, attachments=attachments)
+            else:
+                filled = filler(text)
         except Exception as e:  # noqa: BLE001
             return SendResult(
                 False, f"入力欄に入れられませんでした（{e}）")
+        done, failed = self._attach_outcome()
         if not filled:
-            return SendResult(False, "入力欄に入れられませんでした")
-        return SendResult(True, "入力欄に入れました（送信はしていません）")
+            return SendResult(False, "入力欄に入れられませんでした",
+                              attach_done=done, attach_failed=failed)
+        return SendResult(True, "入力欄に入れました（送信はしていません）",
+                          attach_done=done, attach_failed=failed)
+
+    # -- 添付テスト -------------------------------------------------------
+    def attach_test(self, path) -> SendResult:
+        """添付テスト (1.61)。ファイルを添付して、チップを外す
+        ところまで。送信はしない。
+
+        設定画面の「添付テスト」が使う。方式はプロファイルの
+        attach_method に従う (copilot_loop 側の振り分け)。"""
+        try:
+            tester = getattr(self._tp(), "attach_test", None)
+            if tester is None:
+                return SendResult(
+                    False, "この経路では添付テストができません")
+            ok, message = tester(path)
+        except Exception as e:  # noqa: BLE001  理由は利用者への文にする
+            return SendResult(
+                False, f"添付テストができませんでした（{e}）")
+        return SendResult(bool(ok), str(message))
 
     # -- 検出 -------------------------------------------------------------
     def probe(self) -> ProbeResult:
@@ -384,6 +601,185 @@ class CopilotSession:
         return ProbeResult(
             True, f"入力欄の候補が {len(candidates)} 件見つかりました",
             candidates)
+
+    # -- 調査 -------------------------------------------------------------
+    def scan(self) -> ScanResult:
+        """入力欄の候補を深く調査する (PHAL の調査画面用)。
+
+        probe より広く拾い、合わせるための目印を全部付けて返す
+        (copilot_loop.scan_input_candidates)。窓が見つからなければ
+        裏方側の理由がそのまま失敗の文になる。"""
+        try:
+            scanner = getattr(self._tp(), "scan_input", None)
+            if scanner is None:
+                return ScanResult(
+                    False, "この経路では入力欄を調査できません")
+            candidates = scanner()
+        except Exception as e:  # noqa: BLE001
+            return ScanResult(
+                False, f"入力欄を調査できませんでした（{e}）")
+        candidates = [c for c in (candidates or []) if isinstance(c, dict)]
+        if not candidates:
+            return ScanResult(
+                False,
+                "編集できそうな要素が見つかりませんでした。"
+                "窓が開いているか、ページが読み込み終わっているか"
+                "確かめてください")
+        return ScanResult(
+            True, f"候補が {len(candidates)} 件見つかりました",
+            candidates)
+
+    # -- 読み直す ---------------------------------------------------------
+    def read_input(self) -> ReadResult:
+        """入力欄の今の文を読み直す (PHAL の送信前の確認用)。
+
+        読めなければ、段つきの理由 (見つからない / 中身が読めない) が
+        そのまま message になる。「空だった」と誤認したまま送信ボタン
+        を押さないよう、失敗と空は結果の形でも分けてある。"""
+        try:
+            getter = getattr(self._tp(), "input_text", None)
+            if getter is None:
+                return ReadResult(False, "この経路では入力欄を読めません")
+            value = getter()
+        except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+            return ReadResult(False, str(e) or "入力欄が読めませんでした")
+        if value is None:
+            return ReadResult(False, "入力欄が読めませんでした")
+        return ReadResult(True, "入力欄を読みました", str(value))
+
+    # -- 送信ボタンを押す ---------------------------------------------------
+    def press_send(self) -> SendResult:
+        """プロファイルの目印 (send_*) の送信ボタンを押す。
+
+        入力欄への投入 (fill) とは別の操作で、こちらは本当に送信する。
+        失敗は段つきの理由 (窓が無い / ボタンが見つからない・候補つき /
+        押す段で失敗) がそのまま message になる。"""
+        try:
+            presser = getattr(self._tp(), "press_send", None)
+            if presser is None:
+                return SendResult(
+                    False, "この経路では送信ボタンを押せません")
+            pressed = presser()
+        except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+            return SendResult(False, str(e) or "送信ボタンを押せませんでした")
+        if not pressed:
+            return SendResult(False, "送信ボタンを押せませんでした")
+        return SendResult(True, "送信ボタンを押しました")
+
+    # -- 送信ボタンの調査 ---------------------------------------------------
+    def scan_buttons(self) -> ScanResult:
+        """送信ボタンの候補を調査する (PHAL の調査画面用)。
+
+        入力欄の scan と同じ形で、種類が Button のものに「押せるか
+        (InvokePattern)」を付けて返す。"""
+        try:
+            scanner = getattr(self._tp(), "scan_buttons", None)
+            if scanner is None:
+                return ScanResult(
+                    False, "この経路では送信ボタンを調査できません")
+            candidates = scanner()
+        except Exception as e:  # noqa: BLE001
+            return ScanResult(
+                False, f"送信ボタンを調査できませんでした（{e}）")
+        candidates = [c for c in (candidates or []) if isinstance(c, dict)]
+        if not candidates:
+            return ScanResult(
+                False,
+                "ボタンが見つかりませんでした。"
+                "窓が開いているか、ページが読み込み終わっているか"
+                "確かめてください")
+        return ScanResult(
+            True, f"候補が {len(candidates)} 件見つかりました",
+            candidates)
+
+    # -- チャットの DL 検出・押下 ------------------------------------------
+    def latest_download(self) -> DownloadResult:
+        """最新の AI 発言にあるダウンロード候補を検出する
+        (PHAL の見張り用)。
+
+        候補が無ければ ok=True で candidate=None (窓はあるが落とす
+        ものが無い、という通常の状態)。窓が見つからない等の失敗は
+        ok=False で理由が message になる。呼ぶ側 (見張り) は
+        どちらでも黙って扱える。同じ走査で見つけた診断リクエスト
+        の目印 (1-43) は marker に、リセットの目印 (1-52) は
+        reset_marker に入れて返す (走査は1回だけ)。"""
+        try:
+            scanner = getattr(self._tp(), "latest_scan", None)
+            if scanner is not None:
+                scan = scanner() or {}
+                candidate = scan.get("candidate")
+                candidates = scan.get("candidates")
+                marker = scan.get("marker")
+                reset_marker = scan.get("reset_marker")
+            else:
+                getter = getattr(self._tp(), "latest_download", None)
+                if getter is None:
+                    return DownloadResult(
+                        False, "この経路ではダウンロードを検出できません")
+                candidate = getter()
+                candidates = None
+                marker = None
+                reset_marker = None
+        except Exception as e:  # noqa: BLE001
+            return DownloadResult(
+                False, str(e) or "ダウンロードを検出できませんでした")
+        if candidate is not None and not isinstance(candidate, dict):
+            candidate = None
+        if isinstance(candidates, list):
+            candidates = [c for c in candidates
+                          if isinstance(c, dict)]
+        else:
+            candidates = None
+        if marker is not None and not isinstance(marker, dict):
+            marker = None
+        if reset_marker is not None \
+                and not isinstance(reset_marker, dict):
+            reset_marker = None
+        if candidate is None:
+            return DownloadResult(
+                True, "ダウンロードできるものはありません", None,
+                marker, reset_marker, candidates)
+        return DownloadResult(
+            True, "ダウンロードできるものがあります", candidate,
+            marker, reset_marker, candidates)
+
+    def press_download(self, key=None) -> SendResult:
+        """最新のダウンロード候補を押す (本当に落とす)。
+
+        key ({"name", "class_name"}) が渡されたら、窓側が選んだ
+        その候補を押す (1-57)。失敗は段つきの理由 (窓が無い /
+        候補が消えた / 押す段で失敗) がそのまま message になる。"""
+        try:
+            presser = getattr(self._tp(), "press_download", None)
+            if presser is None:
+                return SendResult(
+                    False, "この経路ではダウンロードボタンを押せません")
+            pressed = presser(key)
+        except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+            return SendResult(
+                False, str(e) or "ダウンロードボタンを押せませんでした")
+        if not pressed:
+            return SendResult(False, "ダウンロードボタンを押せませんでした")
+        return SendResult(True, "ダウンロードボタンを押しました")
+
+    def send_escape(self) -> SendResult:
+        """対象の窓へ ESC を送る (1-67)。
+
+        DL の到着後に Edge のダウンロード・フライアウトを閉じる
+        ための standalone 操作。状態語 (sent / no-hwnd / failed)
+        は文にそのまま残す (PHAL の診断の控えに残るため)。
+        投げられたかどうかまでで、本当に閉じたかは分からない。"""
+        try:
+            sender = getattr(self._tp(), "send_escape", None)
+            if sender is None:
+                return SendResult(
+                    False, "ESC送信: この経路では送れません")
+            status = sender()
+        except Exception as e:  # noqa: BLE001  理由は文にして返す
+            return SendResult(False, f"ESC送信: failed（{e}）")
+        if status == "sent":
+            return SendResult(True, "ESC送信: sent")
+        return SendResult(False, f"ESC送信: {status or 'failed'}")
 
     # -- 待つ -------------------------------------------------------------
     def wait(self, timeout=DEFAULT_WAIT_TIMEOUT) -> WaitResult:
@@ -422,28 +818,43 @@ class CopilotSession:
                 pass
 
 
-def send_text(text, transport=None, force=False, profile=None) -> SendResult:
+def send_text(text, transport=None, force=False, profile=None,
+              attachments=None) -> SendResult:
     """送信だけの近道。セッションを作って送って閉じる。
 
     エディタの「選択範囲を AI に投げる」のような、応答をこちらで
     読まない送り方のための入口。force の意味は CopilotSession.send と同じ。
     profile は投げ先の指定 (辞書か組み込みの名前)。None なら従来どおり
-    自動選択。"""
+    自動選択。attachments の意味も CopilotSession.send と同じ。"""
     session = CopilotSession(transport, profile=profile)
     try:
-        return session.send(text, force=force)
+        return session.send(text, force=force, attachments=attachments)
     finally:
         session.close()
 
 
-def fill_text(text, transport=None, force=False, profile=None) -> SendResult:
+def fill_text(text, transport=None, force=False, profile=None,
+              attachments=None) -> SendResult:
     """入力欄に入れるだけの近道 (送信はしない)。テスト入力用。
 
     force の意味は CopilotSession.fill と同じ (書きかけがあっても
-    上書きする)。profile の意味は send_text と同じ。"""
+    上書きする)。profile の意味は send_text と同じ。attachments の
+    意味も CopilotSession.fill と同じ。"""
     session = CopilotSession(transport, profile=profile)
     try:
-        return session.fill(text, force=force)
+        return session.fill(text, force=force, attachments=attachments)
+    finally:
+        session.close()
+
+
+def attach_test(path, profile=None, transport=None) -> SendResult:
+    """添付テストの近道 (1.61)。profile の意味は send_text と同じ。
+
+    ファイルを添付してチップを外すところまでで、送信はしない。
+    設定画面の「添付テスト」が使う。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.attach_test(path)
     finally:
         session.close()
 
@@ -453,6 +864,85 @@ def probe_input(profile=None, transport=None) -> ProbeResult:
     session = CopilotSession(transport, profile=profile)
     try:
         return session.probe()
+    finally:
+        session.close()
+
+
+def scan_input(profile=None, transport=None) -> ScanResult:
+    """入力欄の候補を深く調査する近道。profile の意味は send_text
+    と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.scan()
+    finally:
+        session.close()
+
+
+def read_input_text(profile=None, transport=None) -> ReadResult:
+    """入力欄の今の文を読み直す近道。profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.read_input()
+    finally:
+        session.close()
+
+
+def press_send_button(profile=None, transport=None) -> SendResult:
+    """プロファイルの目印 (send_*) の送信ボタンを押す近道。
+
+    本当に送信する操作なので、呼ぶのは人の押下に応じるときだけ
+    (PHAL の「送信」ボタン)。profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.press_send()
+    finally:
+        session.close()
+
+
+def scan_send_buttons(profile=None, transport=None) -> ScanResult:
+    """送信ボタンの候補を調査する近道。profile の意味は send_text
+    と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.scan_buttons()
+    finally:
+        session.close()
+
+
+def latest_download(profile=None, transport=None) -> DownloadResult:
+    """チャットのダウンロード候補を検出する近道。profile の意味は
+    send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.latest_download()
+    finally:
+        session.close()
+
+
+def press_download_button(profile=None, transport=None,
+                          key=None) -> SendResult:
+    """最新のダウンロード候補を押す近道 (本当に落とす)。
+
+    key ({"name", "class_name"}) が渡されたら、窓側が選んだ
+    その候補を押す (1-57)。呼ぶのは人の押下 (PHAL の「DL」
+    ボタン) か、自動化の切替が入っているときだけ。profile の
+    意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.press_download(key)
+    finally:
+        session.close()
+
+
+def send_escape(profile=None, transport=None) -> SendResult:
+    """対象の窓へ ESC を送る近道 (1-67)。
+
+    DL の到着が確かめられた直後に、PHAL の窓側から呼ばれる
+    (Edge のダウンロード・フライアウトを閉じるため)。
+    profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.send_escape()
     finally:
         session.close()
 

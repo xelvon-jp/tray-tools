@@ -11,8 +11,11 @@
 # 使い方:
 #   標準入力に JSON を1つ渡す: {"op": "send", "text": "..."}
 #   標準出力に JSON を1行返す: {"ok": true, ...} / {"ok": false, "error": "…"}
-#   op は snapshot / input / send / fill / probe / profiles / wait /
-#   response / blocks。依頼に "profile" (辞書か組み込みの名前) が
+#   op は snapshot / input / send / fill / attach_test / probe /
+#   scan / scan_buttons / press_send / latest_download /
+#   press_download / send_escape / profiles / wait / response /
+#   blocks。
+#   依頼に "profile" (辞書か組み込みの名前) が
 #   あれば、その投げ先で Copilot を作る (無ければ従来どおり自動選択)。
 #   診断は標準エラーへ。標準出力には応答の JSON だけを出す。
 import json
@@ -42,11 +45,67 @@ def _run(request):
         if op == "input":
             return {"ok": True, "input_text": transport.input_text()}
         if op == "send":
-            return {"ok": True, "sent": bool(transport.send_prompt(request["text"]))}
+            # attachments (1.58) は、本文を入れる前に copilot 側で
+            # 添付するファイルのフルパス。結果 (できた・できな
+            # かったファイル名) も応答に含めて親へ返す。添付が
+            # 無いときは従来どおりの呼び方にする (添付を知らない
+            # transport の差し替え口を壊さないため)。
+            attachments = request.get("attachments")
+            if attachments:
+                sent = bool(transport.send_prompt(
+                    request["text"], attachments=attachments))
+            else:
+                sent = bool(transport.send_prompt(request["text"]))
+            return {"ok": True, "sent": sent,
+                    "attach_done": list(
+                        getattr(transport, "attach_done", []) or []),
+                    "attach_failed": list(
+                        getattr(transport, "attach_failed", []) or [])}
         if op == "fill":
-            return {"ok": True, "filled": bool(transport.fill_prompt(request["text"]))}
+            attachments = request.get("attachments")
+            if attachments:
+                filled = bool(transport.fill_prompt(
+                    request["text"], attachments=attachments))
+            else:
+                filled = bool(transport.fill_prompt(request["text"]))
+            return {"ok": True, "filled": filled,
+                    "attach_done": list(
+                        getattr(transport, "attach_done", []) or []),
+                    "attach_failed": list(
+                        getattr(transport, "attach_failed", []) or [])}
+        if op == "attach_test":
+            # 添付テスト (1.61): 添付してチップを外す。送信はしない。
+            attach_ok, message = transport.attach_test(request["path"])
+            return {"ok": True, "attach_ok": bool(attach_ok),
+                    "message": str(message)}
         if op == "probe":
             return {"ok": True, "candidates": transport.probe_input()}
+        if op == "scan":
+            return {"ok": True, "candidates": transport.scan_input()}
+        if op == "scan_buttons":
+            return {"ok": True, "candidates": transport.scan_buttons()}
+        if op == "press_send":
+            return {"ok": True, "pressed": bool(transport.press_send())}
+        if op == "latest_download":
+            # 診断の目印 (1-43) とリセットの目印 (1-52)、候補の
+            # 全件 (1-57) も同じ走査で取る。scan を持たない
+            # transport (テストの fake 等) では候補だけ返す。
+            scanner = getattr(transport, "latest_scan", None)
+            if scanner is not None:
+                scan = scanner() or {}
+                return {"ok": True, "candidate": scan.get("candidate"),
+                        "candidates": scan.get("candidates"),
+                        "marker": scan.get("marker"),
+                        "reset_marker": scan.get("reset_marker")}
+            return {"ok": True, "candidate": transport.latest_download()}
+        if op == "press_download":
+            # key は窓側が選んだ候補 (名前+クラス名、1-57)。
+            # 無ければ裏方は従来どおり最新の1件を選ぶ。
+            return {"ok": True,
+                    "pressed": bool(
+                        transport.press_download(request.get("key")))}
+        if op == "send_escape":
+            return {"ok": True, "status": transport.send_escape()}
         if op == "wait":
             done, elapsed = transport.wait_until_idle(float(request["timeout"]))
             return {"ok": True, "done": bool(done), "elapsed": float(elapsed)}

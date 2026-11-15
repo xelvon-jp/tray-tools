@@ -2424,6 +2424,52 @@ class Copilot:
             "fulltext_marker": self._fulltext_marker_in(desc),
         }
 
+    def chat_signature(self):
+        """チャットの変化を軽く見る署名 (2.07)。
+
+        本走査 (latest_chat_scan) の前に、変わったかどうかだけを
+        1回の走査で見る。返すのは [Text 要素の数, 最後の Text
+        要素の名前の長さ, 先頭64字のハッシュ, 末尾64字の
+        ハッシュ, スクリプトらしいカードの数, スクリプトらしい
+        リンクの数]。窓が無い・読めないときは None。
+
+        頭だけでは、同じ書き出しの発言が続いたときに変化を見
+        落とす。数・長さ・末尾も組み合わせる (Nagato の指摘、
+        2026-11-16)。それでもすり抜ける書き換えはあり得るので、
+        呼び側は定期的に本走査も挟む前提。"""
+        try:
+            _root, desc = self._descendants()
+        except Exception:  # noqa: BLE001  窓が無ければ署名も無い
+            return None
+        texts = 0
+        last_name = ""
+        cards = 0
+        links = 0
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                ctype = el.CurrentControlType
+                if ctype == CONTROL_TEXT:
+                    texts += 1
+                    last_name = el.CurrentName or ""
+                elif ctype == CONTROL_BUTTON:
+                    if "group/card" in (el.CurrentClassName or ""):
+                        cards += 1
+                elif ctype == CONTROL_HYPERLINK:
+                    name = (el.CurrentName or "").strip()
+                    if name and not any(
+                            ch.isspace() for ch in name) and \
+                            name.lower().endswith(
+                                (".phal", ".py", ".ps1")):
+                        links += 1
+            except Exception:  # noqa: BLE001  消えかけの要素は数えない
+                continue
+        head = hashlib.sha256(
+            last_name[:64].encode("utf-8")).hexdigest()
+        tail = hashlib.sha256(
+            last_name[-64:].encode("utf-8")).hexdigest()
+        return [texts, len(last_name), head, tail, cards, links]
+
     def _message_options_button(self, desc, start):
         """カードの後ろにある、その発言の「その他のオプション」ボタン。
 

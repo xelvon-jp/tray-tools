@@ -288,6 +288,9 @@ class SubprocessTransport:
                 "log_marker": response.get("log_marker"),
                 "tool_marker": response.get("tool_marker")}
 
+    def chat_signature(self):
+        return self._call({"op": "signature"}).get("signature")
+
     def press_download(self, key=None):
         request = {"op": "press_download"}
         if key is not None:
@@ -443,6 +446,9 @@ class CopilotLoopTransport:
 
     def latest_scan(self):
         return self._ensure().latest_chat_scan()
+
+    def chat_signature(self):
+        return self._ensure().chat_signature()
 
     def press_download(self, key=None):
         return self._ensure().press_download_candidate(key)
@@ -850,6 +856,18 @@ class CopilotSession:
             log_marker=log_marker,
             tool_marker=tool_marker)
 
+    def chat_signature(self):
+        """チャットの変化の署名 (2.07)。取れなければ None
+        (呼び側は本走査に倒す)。"""
+        try:
+            fn = getattr(self._tp(), "chat_signature", None)
+            if fn is None:
+                return None
+            sig = fn()
+            return list(sig) if sig else None
+        except Exception:  # noqa: BLE001  取れないだけ
+            return None
+
     def press_download(self, key=None) -> SendResult:
         """最新のダウンロード候補を押す (本当に落とす)。
 
@@ -1022,6 +1040,16 @@ def latest_download(profile=None, transport=None) -> DownloadResult:
     session = CopilotSession(transport, profile=profile)
     try:
         return session.latest_download()
+    finally:
+        session.close()
+
+
+def chat_signature(profile=None, transport=None):
+    """チャットの変化の署名を取る近道 (2.07)。取れなければ
+    None。profile の意味は send_text と同じ。"""
+    session = CopilotSession(transport, profile=profile)
+    try:
+        return session.chat_signature()
     finally:
         session.close()
 

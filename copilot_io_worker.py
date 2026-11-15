@@ -109,6 +109,12 @@ def _run(request):
                         "log_marker": scan.get("log_marker"),
                         "tool_marker": scan.get("tool_marker")}
             return {"ok": True, "candidate": transport.latest_download()}
+        if op == "signature":
+            # 変化の署名 (2.07)。持たない transport では None
+            # (窓側は本走査に倒れる)。
+            fn = getattr(transport, "chat_signature", None)
+            return {"ok": True,
+                    "signature": fn() if fn is not None else None}
         if op == "press_download":
             # key は窓側が選んだ候補 (名前+クラス名、1-57)。
             # 無ければ裏方は従来どおり最新の1件を選ぶ。

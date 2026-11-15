@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.06"
+PHAL_VERSION = "2.07"
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -46,6 +46,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QFont,
     QFontMetrics,
@@ -93,6 +94,16 @@ POLL_INTERVAL_MS = 1200
 # よりずっと間引く: 裏方の UIA 走査は軽くないのと、チャットの
 # 変化は人の操作の速度でしか起きないため。
 CHAT_POLL_INTERVAL_SEC = 10.0
+
+# 変化の署名と追いかけモード (2.07)。通常時は、本走査の前に
+# 署名だけを見て、変わっていなければ本走査を打ち切る。変化の
+# 気配がある間は「追いかけモード」で本走査を短い間隔で回す。
+# 署名がすり抜ける書き換えに備え、本走査は最大でもこの間隔で
+# 必ず挟む。
+SIGNATURE_INTERVAL_SEC = 5.0
+CHASE_INTERVAL_SEC = 1.5
+CHASE_WINDOW_SEC = 30.0
+FULL_SCAN_MAX_GAP_SEC = 60.0
 
 # DL 候補の名前 (中身の冒頭) から、ファイル名らしき部分を取る
 # ための目印。「既に一覧にあるファイルか」の判定に使う。
@@ -201,6 +212,7 @@ THEMES = {
         "link": "#1a5fb4",
         "dialog_error": "#c00000",
         "accent_style": "background: #1f6f5c; color: #ffffff;",
+        "detect_bg": "#d7f0e4",
         "selection_tint": (0, 120, 215, 70),
         "chrome": {
             "window": "#f2f3f5",
@@ -224,6 +236,7 @@ THEMES = {
         "link": "#58a6ff",
         "dialog_error": "#ff7b72",
         "accent_style": "background: #1f7a63; color: #ffffff;",
+        "detect_bg": "#17402f",
         "selection_tint": (88, 166, 255, 90),
         "chrome": {
             "window": "#2a2d33",
@@ -591,9 +604,13 @@ class _DlCheckResult:
                  settings_marker=None, manual_marker=None,
                  file_marker=None, fulltext_marker=None,
                  history_marker=None, stop_marker=None,
-                 log_marker=None):
+                 log_marker=None, kind="scan", signature=None):
         self.ok = ok
         self.message = message
+        # kind は "scan" (本走査) か "signature" (変化の署名だけ、
+        # 2.07)。signature は署名の並び (取れなければ None)。
+        self.kind = kind
+        self.signature = signature
         self.candidate = candidate
         self.marker = marker
         self.reset_marker = reset_marker
@@ -688,6 +705,16 @@ def _default_ai_downloader(profile):
     import copilot_io
 
     return copilot_io.latest_download(profile=profile)
+
+
+def _default_ai_signer(profile):
+    """チャットの変化の署名を取る役 (2.07)。
+
+    copilot_io.chat_signature を使う (裏方経由)。取れなければ
+    None で、窓側は本走査に倒れる。"""
+    import copilot_io
+
+    return copilot_io.chat_signature(profile=profile)
 
 
 def _default_ai_dl_presser(profile, key=None):
@@ -828,6 +855,14 @@ class ScriptRunnerWindow(QWidget):
         self._dl_session = core.load_dl_session()
         self._dl_checking = False
         self._dl_last_check = 0.0
+        # 変化の署名と追いかけモードの控え (2.07)。
+        self._chat_signature = None
+        self._sig_last_check = 0.0
+        self._last_full_scan = 0.0
+        self._chase_until = 0.0
+        # 到着した行の色付けの控え (2.07)。
+        self._highlight_name = ""
+        self._highlight_until = 0.0
         # AI の投げ先が設定済みか (_maybe_check_chat が解決の
         # たびに控える)。大きな進捗表示の明滅 (1.64) が、AI 窓の
         # 見張りが立っているかの判定に使う。
@@ -1014,6 +1049,7 @@ class ScriptRunnerWindow(QWidget):
         # チャットの検出役・DL 押下役 (テストで差し替える。None なら
         # 既定の _default_ai_downloader / _default_ai_dl_presser)。
         self.ai_downloader = None
+        self.ai_signer = None
         self.ai_dl_presser = None
         # DL 到着後に AI の窓へ ESC を送る役 (テストで差し替える。
         # None なら既定の _default_ai_esc_sender、1-67)。
@@ -1366,6 +1402,13 @@ class ScriptRunnerWindow(QWidget):
             self._on_ai_combo_changed)
         header.addWidget(self.ai_combo)
         self._refresh_ai_label()
+        # 追いかけモードの印 (2.07)。変化を追っている間だけ出す。
+        self.chase_label = QLabel(" 追いかけ中 ")
+        self.chase_label.setStyleSheet(
+            "font-size: 11px; padding: 2px 6px; "
+            + self._theme()["accent_style"])
+        self.chase_label.setVisible(False)
+        header.addWidget(self.chase_label)
         header.addStretch(1)
         self.ai_window_button = QPushButton("設定")
         self.ai_window_button.clicked.connect(self._open_ai_window)
@@ -1385,6 +1428,19 @@ class ScriptRunnerWindow(QWidget):
             lambda on: self._apply_on_top(on, save=True))
         header.addWidget(self.on_top_box)
         layout.addLayout(header)
+
+        # 検知の帯 (2.07)。ダウンロード候補を見つけたら、色付きで
+        # しばらく知らせる。消えるのはタイマ (出す側が秒数を決める)。
+        self._banner = QLabel("")
+        self._banner.setStyleSheet(
+            "font-size: 12px; padding: 4px 8px; "
+            + self._theme()["accent_style"])
+        self._banner.setVisible(False)
+        layout.addWidget(self._banner)
+        self._banner_timer = QTimer(self)
+        self._banner_timer.setSingleShot(True)
+        self._banner_timer.timeout.connect(
+            lambda: self._banner.setVisible(False))
 
         # 対象フォルダのパスはクリックできて、あっふ のアクティブな
         # 窓がそのフォルダを開く(届いた物をそのままファイラで見たい
@@ -2273,6 +2329,9 @@ class ScriptRunnerWindow(QWidget):
                     self._auto_downloaded_keys.add(key)
                 self._dl_awaiting = None
                 self._diag(f"DLの到着を確認: {item.name}")
+                # 到着した行をしばらく色付ける (2.07)。
+                self._highlight_name = item.name
+                self._highlight_until = time.monotonic() + 8.0
                 # このダウンロードで開いたフライアウトを閉じる
                 # (次の押下の邪魔になるため、1-67)。
                 self._send_escape_to_ai()
@@ -2357,6 +2416,12 @@ class ScriptRunnerWindow(QWidget):
 
     def _poll_inner(self):
         self.restart_button.setEnabled(self._running_item is None)
+        # 追いかけモードの印と、到着した行の色付けの期限 (2.07)。
+        self._refresh_chase_label()
+        if self._highlight_name and \
+                time.monotonic() > self._highlight_until:
+            self._highlight_name = ""
+            self._refresh_list()
         cutoff = time.time() - self.config["recent_hours"] * 3600
         candidates = core.list_candidates(
             self.watch_folder, cutoff, self.config["max_items"] * 3)
@@ -2770,6 +2835,16 @@ class ScriptRunnerWindow(QWidget):
                   == ("dark" if self._dark_mode else "light")):
             self.table.setCellWidget(row, COL_RUN,
                                      self._make_run_button(item))
+        # 到着したての行の色付け (2.07)。期限は _poll_inner が見て、
+        # 切れたら描き直して消す。
+        if self._highlight_name and \
+                item.name == self._highlight_name and \
+                time.monotonic() <= self._highlight_until:
+            brush = QBrush(QColor(self._theme()["detect_bg"]))
+            for col in range(self.table.columnCount()):
+                cell = self.table.item(row, col)
+                if cell is not None:
+                    cell.setBackground(brush)
 
     def _dl_button_enabled(self) -> bool:
         """DL の特別行のボタンを押せるか。実行・回答・送信・DL の
@@ -4110,8 +4185,11 @@ class ScriptRunnerWindow(QWidget):
     def _maybe_check_chat(self):
         """チャットの DL 候補の検出を、間引いて裏で回す。
 
-        フォルダの見回り (_poll_inner) の終わりに呼ばれる。間隔
-        (CHAT_POLL_INTERVAL_SEC) が空いていなければ何もしない。
+        フォルダの見回り (_poll_inner) の終わりに呼ばれる。
+        通常時は変化の署名だけを見て (SIGNATURE_INTERVAL_SEC)、
+        変わっていなければ本走査を打ち切る。変化の気配がある
+        間は追いかけモードで本走査を短い間隔で回す (2.07)。
+        本走査は最大でも FULL_SCAN_MAX_GAP_SEC に1回は挟む。
         投げ先が未設定なら見張る相手が居ないので回さない。検出は
         裏方 (UIA) 仕事なので別スレッドで回し、結果はシグナルで
         受ける。失敗は黙る (特別行が出ないだけ) ので、ここでも
@@ -4127,8 +4205,11 @@ class ScriptRunnerWindow(QWidget):
         if self._dl_checking:
             return
         now = time.monotonic()
-        if now - self._dl_last_check < CHAT_POLL_INTERVAL_SEC:
-            return
+        # 追いかけモード (2.07): 送信・実行・DL 待ちの途中は、
+        # 返事が来るはずの時間帯なので追いかけに入る。
+        if self._ai_busy_for_chase():
+            self._enter_chase()
+        chasing = now < self._chase_until
         try:
             configured, profile = self._resolve_ai_target()
         except Exception:  # noqa: BLE001  見張れないだけ
@@ -4139,21 +4220,98 @@ class ScriptRunnerWindow(QWidget):
         self._ai_configured = configured
         if not configured:
             return
+        if chasing:
+            if now - self._dl_last_check < CHASE_INTERVAL_SEC:
+                return
+            self._start_dl_check(profile, signature=False)
+        elif self._last_full_scan == 0.0 or \
+                now - self._last_full_scan >= FULL_SCAN_MAX_GAP_SEC:
+            # まだ本走査をしていない (初回) か、前回の本走査から
+            # 空きすぎたときは本走査。間隔は従来どおり。
+            if now - self._dl_last_check < CHAT_POLL_INTERVAL_SEC:
+                return
+            self._start_dl_check(profile, signature=False)
+        else:
+            if now - self._sig_last_check < SIGNATURE_INTERVAL_SEC:
+                return
+            self._start_dl_check(profile, signature=True)
+
+    def _start_dl_check(self, profile, signature):
+        """見張りの1回分を裏で回す (本走査か、署名だけか)。"""
         self._dl_checking = True
-        self._dl_last_check = now
-        downloader = self.ai_downloader or _default_ai_downloader
+        now = time.monotonic()
+        if signature:
+            self._sig_last_check = now
+            fn = self.ai_signer or _default_ai_signer
+        else:
+            self._dl_last_check = now
+            fn = self.ai_downloader or _default_ai_downloader
 
         import threading
 
         def work():
             try:
-                result = downloader(profile)
+                if signature:
+                    result = _DlCheckResult(
+                        True, "", kind="signature",
+                        signature=fn(profile))
+                else:
+                    result = fn(profile)
             except Exception as e:  # noqa: BLE001
-                result = _DlCheckResult(False, str(e), None)
+                result = _DlCheckResult(
+                    False, str(e),
+                    kind="signature" if signature else "scan")
             self._dl_signals.checked.emit(result)
 
         threading.Thread(
             target=work, daemon=True, name="phal-dl-watch").start()
+
+    def _enter_chase(self):
+        """追いかけモードに入る (期限を延ばす、2.07)。"""
+        self._chase_until = time.monotonic() + CHASE_WINDOW_SEC
+
+    def _ai_busy_for_chase(self):
+        """送信・実行・DL 待ちの途中か (追いかけの合図、2.07)。"""
+        return bool(
+            getattr(self, "_ai_filling", False)
+            or getattr(self, "_ai_sending", False)
+            or getattr(self, "_diag_sending", False)
+            or getattr(self, "_running_item", None) is not None
+            or getattr(self, "_dl_awaiting", None) is not None)
+
+    def _on_signature_checked(self, result):
+        """署名の結果を受ける (2.07)。
+
+        取れなければ控えを空に戻し、次回は本走査に倒れる。初回は
+        控えを作るだけ。変わっていたら追いかけモードに入り、
+        本走査をすぐ回す (間隔の控えを戻す)。"""
+        sig = getattr(result, "signature", None)
+        if not getattr(result, "ok", False) or sig is None:
+            self._chat_signature = None
+            return
+        sig = list(sig)
+        if self._chat_signature is None:
+            self._chat_signature = sig
+            return
+        if sig != self._chat_signature:
+            self._chat_signature = sig
+            self._enter_chase()
+            self._dl_last_check = 0.0
+
+    def _refresh_chase_label(self):
+        """追いかけモードの印の出入り (2.07)。"""
+        label = getattr(self, "chase_label", None)
+        if label is not None:
+            label.setVisible(time.monotonic() < self._chase_until)
+
+    def _show_banner(self, text, seconds=6):
+        """検知の帯を出す (2.07)。"""
+        banner = getattr(self, "_banner", None)
+        if banner is None:
+            return
+        banner.setText(text)
+        banner.setVisible(True)
+        self._banner_timer.start(int(seconds * 1000))
 
     def _note_dl_scan(self, line: str):
         """直近の走査の1行を差し替え、変わったときだけ診断の
@@ -4210,6 +4368,10 @@ class ScriptRunnerWindow(QWidget):
 
     def _on_dl_checked(self, result):
         self._dl_checking = False
+        if getattr(result, "kind", "scan") == "signature":
+            self._on_signature_checked(result)
+            return
+        self._last_full_scan = time.monotonic()
         if not getattr(result, "ok", False):
             # 失敗も形跡を残す (1-57)。行は出ないし、今の行も
             # そのまま。理由が変わらない間は1回だけ残る
@@ -4221,6 +4383,18 @@ class ScriptRunnerWindow(QWidget):
             self._note_dl_scan(
                 f"検出失敗（{message}）" if message else "検出失敗")
             return
+        # 候補か合図があれば、会話が動いている証拠なので追い
+        # かけモードを延ばす (2.07)。
+        _marker_names = (
+            "marker", "reset_marker", "rerun_marker",
+            "resend_marker", "settings_marker", "manual_marker",
+            "file_marker", "fulltext_marker", "history_marker",
+            "stop_marker", "log_marker", "tool_marker")
+        if getattr(result, "candidate", None) or \
+                getattr(result, "candidates", None) or \
+                any(getattr(result, name, None)
+                    for name in _marker_names):
+            self._enter_chase()
         # 診断リクエストの目印は、候補の有無と関係なく同じ走査の
         # 結果に乗ってくる (1-43)。候補の処理より先に見る (候補が
         # 無い結果では、この先で return してしまうため)。
@@ -4349,6 +4523,8 @@ class ScriptRunnerWindow(QWidget):
         self._dl_last_candidate_key = holder.key
         self._diag(
             f"DL候補を表示: {holder.summary or holder.label}")
+        self._show_banner(
+            f"ダウンロードを検知：{holder.summary or holder.label}")
         self._refresh_list()
         self._publish_phal_status(
             "dl", f"新着: {holder.summary or holder.label}",
@@ -4445,6 +4621,9 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "自動でダウンロードしました" if self._dl_press_auto
                 else "ダウンロードしました", "ok")
+            _banner_head = "自動でダウンロードしました：" \
+                if self._dl_press_auto else "ダウンロードしました："
+            self._show_banner(_banner_head + self._dl_awaiting[0])
             self._publish_phal_status(
                 "dl", "ダウンロードしました（到着待ち）")
         else:

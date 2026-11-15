@@ -1031,6 +1031,32 @@ def test_last_results_roundtrip_limit_and_truncation():
             "ok": {"text": "t", "truncated": False}}
 
 
+
+def test_dl_session_roundtrip_and_continuation():
+    # 開き直し引き継ぎ: 書き出しと読み込み、続き判定は閉じてから
+    # 180秒以内で key があるときだけ (1.70)。
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "script_runner_dl_session.json"
+        assert core.load_dl_session(path) == {}
+        assert core.dl_session_continuation_key({}) is None
+        core.save_dl_session("候補key", path)
+        session = core.load_dl_session(path)
+        assert session["candidate_key"] == "候補key", session
+        closed_at = session["closed_at"]
+        assert core.dl_session_continuation_key(
+            session, now=closed_at + 60) == "候補key"
+        assert core.dl_session_continuation_key(
+            session, now=closed_at + 181) is None
+        # key が空なら続き扱いにしない。
+        core.save_dl_session(None, path)
+        session = core.load_dl_session(path)
+        assert core.dl_session_continuation_key(
+            session, now=session["closed_at"] + 1) is None
+        # 壊れたファイルは空に倒す。
+        path.write_text("{壊れた", encoding="utf-8")
+        assert core.load_dl_session(path) == {}
+
+
 # ---------------------------------------------------------------
 # 実行
 # ---------------------------------------------------------------
@@ -1751,13 +1777,17 @@ def test_reset_auto_state_roundtrip_and_corrupt():
         # 無いファイルは「消費した物は無く、開き直したことも無い」。
         assert core.load_reset_auto(path) == {
             "consumed_id": "", "consumed_key": "",
-            "last_reset_at": 0.0}
+            "last_reset_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
         core.save_reset_auto(
             {"consumed_id": "id-1", "consumed_key": "key-1",
              "last_reset_at": 123.5}, path)
         assert core.load_reset_auto(path) == {
             "consumed_id": "id-1", "consumed_key": "key-1",
-            "last_reset_at": 123.5}
+            "last_reset_at": 123.5,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
         # 古い形 (consumed_key が無い) のファイルは、key だけ
         # 空として読める。
         path.write_text(json.dumps(
@@ -1765,19 +1795,25 @@ def test_reset_auto_state_roundtrip_and_corrupt():
             encoding="utf-8")
         assert core.load_reset_auto(path) == {
             "consumed_id": "id-0", "consumed_key": "",
-            "last_reset_at": 10.0}
+            "last_reset_at": 10.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
         # 壊れたファイル・形の違う中身は既定に倒す。
         path.write_text("{壊れている", encoding="utf-8")
         assert core.load_reset_auto(path) == {
             "consumed_id": "", "consumed_key": "",
-            "last_reset_at": 0.0}
+            "last_reset_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
         path.write_text(json.dumps(
             {"consumed_id": 42, "consumed_key": 7,
              "last_reset_at": "x"}),
             encoding="utf-8")
         assert core.load_reset_auto(path) == {
             "consumed_id": "", "consumed_key": "",
-            "last_reset_at": 0.0}
+            "last_reset_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
         # 間隔は10分。控えのファイル名は診断と別。
         assert core.RESET_AUTO_COOLDOWN_SEC == 600.0
         assert core.RESET_AUTO_FILENAME != core.DIAG_AUTO_FILENAME
@@ -1788,6 +1824,532 @@ def test_reset_auto_state_roundtrip_and_corrupt():
     off = core.build_diag_bundle(
         "1.52", {}, "既定", [], [], at=0.0)
     assert "リセット=切" in off.splitlines()[1]
+
+
+def test_rerun_auto_state_roundtrip_and_corrupt():
+    """再実行の合図の控え (1.63): 保存と読み直し・壊れたファ
+    イル・古い形のファイル。診断・リセットの控えとは別ファ
+    イルで、間隔は5分。診断の束の自動化の行にも状態が出る。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "rerun_auto.json"
+        # 無いファイルは「消費した物は無く、再実行したことも無い」。
+        assert core.load_rerun_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_rerun_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        core.save_rerun_auto(
+            {"consumed_id": "id-1", "consumed_key": "key-1",
+             "last_rerun_at": 123.5}, path)
+        assert core.load_rerun_auto(path) == {
+            "consumed_id": "id-1", "consumed_key": "key-1",
+            "last_rerun_at": 123.5,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        # 古い形 (consumed_key が無い) のファイルは、key だけ
+        # 空として読める。
+        path.write_text(json.dumps(
+            {"consumed_id": "id-0", "last_rerun_at": 10.0}),
+            encoding="utf-8")
+        assert core.load_rerun_auto(path) == {
+            "consumed_id": "id-0", "consumed_key": "",
+            "last_rerun_at": 10.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        # 壊れたファイル・形の違う中身は既定に倒す。
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_rerun_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_rerun_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        path.write_text(json.dumps(
+            {"consumed_id": 42, "consumed_key": 7,
+             "last_rerun_at": "x"}),
+            encoding="utf-8")
+        assert core.load_rerun_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_rerun_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        # 間隔は5分。控えのファイル名は診断・リセットと別。
+        assert core.RERUN_AUTO_COOLDOWN_SEC == 300.0
+        assert core.RERUN_AUTO_FILENAME != core.DIAG_AUTO_FILENAME
+        assert core.RERUN_AUTO_FILENAME != core.RESET_AUTO_FILENAME
+    # 診断の束の自動化の行に、再実行の状態も出る。
+    on = core.build_diag_bundle(
+        "1.63", {"auto_rerun": True}, "既定", [], [], at=0.0)
+    assert "再実行=入" in on.splitlines()[1]
+    off = core.build_diag_bundle(
+        "1.63", {}, "既定", [], [], at=0.0)
+    assert "再実行=切" in off.splitlines()[1]
+
+
+def test_settings_report_and_marker_auto_state():
+    # 設定の報告 (1.85): 節の値が平文に並び、プロファイルの
+    # ZIP 名前変えや添付方式、自動化の切替 (設定・マニュアルを
+    # 含む) が出ること。保存した開始プロンプトは字数だけ出る。
+    section = {
+        "watch_folder": "R:/Downloads",
+        "work_folder": "R:/work",
+        "dark_mode": True,
+        "summary_mode": True, "summary_lines": 50,
+        "summary_chars": 4000,
+        "timeout_seconds": 120,
+        "intro_prompt": "保存した文です",
+        "auto_dl": True, "auto_settings": True,
+        "ai_profiles": [{"name": "Muse", "target": {
+            "label": "Muse", "attach_method": "paste",
+            "zip_as_txt": True}}],
+        "ai_profile_active": 0,
+    }
+    text = core.build_settings_report(section, "1.85")
+    assert text.startswith("PHAL設定 Ver1.85")
+    assert "監視フォルダ: R:/Downloads" in text
+    assert "作業フォルダ: R:/work" in text
+    assert "ダークモード: 入" in text
+    assert "要約モード: 入（50行・4000字" in text
+    assert "実行の上限: 120秒" in text
+    assert "開始プロンプト: 保存した文を使う（7字）" in text
+    assert "DL=入" in text and "設定=入" in text
+    assert "マニュアル=切" in text
+    assert "Muse（有効）" in text
+    assert "添付方式=paste" in text and "ZIP名前変え=入" in text
+    empty = core.build_settings_report({}, "1.85")
+    assert "（既定のダウンロードフォルダ）" in empty
+    assert "AIプロファイル: (未設定)" in empty
+    assert "開始プロンプト: 自動生成" in empty
+    # 設定・マニュアルの控えは別ファイルで往復すること。
+    with tempfile.TemporaryDirectory() as td:
+        sp = Path(td) / "settings_auto.json"
+        mp = Path(td) / "manual_auto.json"
+        core.save_settings_auto(
+            {"consumed_id": "s1", "consumed_key": "k1",
+             "last_sent_at": 12.0}, sp)
+        got = core.load_settings_auto(sp)
+        assert got == {"consumed_id": "s1", "consumed_key": "k1",
+                       "last_sent_at": 12.0,
+                       "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        assert core.load_manual_auto(mp)["consumed_id"] == ""
+        core.save_manual_auto({"consumed_id": "m1"}, mp)
+        assert core.load_manual_auto(mp)["consumed_id"] == "m1"
+        assert core.load_settings_auto(sp)["consumed_id"] == "s1"
+
+
+def test_resolve_file_request_scope():
+    # ファイルリクエストの範囲 (1.88): ダウンロードフォルダと
+    # 作業フォルダの配下だけ。相対は両方から探し、絶対は配下
+    # のみ。「..」での抜け出しは見つからない扱い。
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        watch = base / "watch"; watch.mkdir()
+        work = base / "work"; work.mkdir()
+        (watch / "a.log").write_text("a", encoding="utf-8")
+        sub = work / "sub"; sub.mkdir()
+        (sub / "b.log").write_text("b", encoding="utf-8")
+        (base / "secret.txt").write_text("s", encoding="utf-8")
+        got, reason = core.resolve_file_request(
+            "a.log", str(watch), str(work))
+        assert got == (watch / "a.log").resolve() and reason == ""
+        got, reason = core.resolve_file_request(
+            "sub/b.log", str(watch), str(work))
+        assert got == (sub / "b.log").resolve() and reason == ""
+        got, reason = core.resolve_file_request(
+            str(sub / "b.log"), str(watch), str(work))
+        assert got == (sub / "b.log").resolve() and reason == ""
+        got, reason = core.resolve_file_request(
+            str(base / "secret.txt"), str(watch), str(work))
+        assert got is None and reason == "outside"
+        got, reason = core.resolve_file_request(
+            "../secret.txt", str(watch), str(work))
+        assert got is None and reason == "not_found"
+        got, reason = core.resolve_file_request(
+            "missing.log", str(watch), str(work))
+        assert got is None and reason == "not_found"
+        got, reason = core.resolve_file_request(
+            "a.log", str(watch), None)
+        assert got == (watch / "a.log").resolve()
+        got, reason = core.resolve_file_request(
+            "  ", str(watch), str(work))
+        assert got is None and reason == "empty"
+
+
+def test_find_full_output():
+    # 全文リクエストの対象探し (1.91): コマンド ID で始まる
+    # .txt のうち更新時刻が最新のものを返す。無い ID・不正な
+    # ID は None。控えは別ファイルで往復すること。
+    with tempfile.TemporaryDirectory() as td:
+        folder = Path(td) / "phal-outputs"; folder.mkdir()
+        old = folder / "1-123_20260101-000000_aaaaaaaa.txt"
+        old.write_text("old", encoding="utf-8")
+        new = folder / "1-123_20260102-000000_bbbbbbbb.txt"
+        new.write_text("new", encoding="utf-8")
+        other = folder / "1-124_20260103-000000_cccccccc.txt"
+        other.write_text("other", encoding="utf-8")
+        note = folder / "1-123_20260104-000000_dddddddd.md"
+        note.write_text("note", encoding="utf-8")
+        now = time.time()
+        os.utime(old, (now - 200, now - 200))
+        os.utime(new, (now - 100, now - 100))
+        os.utime(other, (now, now))
+        os.utime(note, (now + 100, now + 100))
+        assert core.find_full_output("1-123", folder) == new
+        assert core.find_full_output("1-124", folder) == other
+        assert core.find_full_output("9-999", folder) is None
+        assert core.find_full_output("", folder) is None
+        assert core.find_full_output("../1-123", folder) is None
+        assert core.find_full_output("1-123/x", folder) is None
+        assert core.find_full_output("1-123\\x", folder) is None
+        sp = Path(td) / "fulltext_auto.json"
+        core.save_fulltext_auto(
+            {"consumed_id": "f1", "consumed_key": "k1",
+             "last_sent_at": 5.0}, sp)
+        assert core.load_fulltext_auto(sp) == {
+            "consumed_id": "f1", "consumed_key": "k1",
+            "last_sent_at": 5.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        assert core.FULLTEXT_AUTO_COOLDOWN_SEC == 60.0
+
+
+def test_build_history_text():
+    # 実行一覧の文 (1.92、素材は実行ログ 1.94): 記録 (古い順)
+    # を新しい順に、時刻・ファイル名・終了コード・秒数・旗の
+    # 1行ずつにする。記録が無ければその旨の文。控えは往復。
+    assert core.build_history_text([]) \
+        == "実行の記録はまだありません。"
+    records = [
+        {"time": "2026-11-15T16:20:37", "file": "1-201_a.phal",
+         "exit_code": 0, "seconds": 1.3},
+        {"time": "2026-11-15T16:21:24", "file": "1-202_b.phal",
+         "exit_code": 1, "seconds": 0.1, "stopped": True},
+    ]
+    lines = core.build_history_text(records).splitlines()
+    assert lines[0] == "直近の実行一覧（新しい順）"
+    assert lines[1] == ("11-15 16:21 1-202_b.phal "
+                        "終了コード 1（0.1秒）・停止")
+    assert lines[2] == ("11-15 16:20 1-201_a.phal "
+                        "終了コード 0（1.3秒）")
+    assert len(lines) == 3
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "run.jsonl"
+        lp.write_text(
+            json.dumps(records[0], ensure_ascii=False) + "\n"
+            + "壊れた行\n"
+            + json.dumps(records[1], ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        got = core.load_run_log_records(20, lp)
+        assert [r["file"] for r in got] == [
+            "1-201_a.phal", "1-202_b.phal"]
+        assert core.load_run_log_records(1, lp)[0]["file"] \
+            == "1-202_b.phal"
+        sp = Path(td) / "history_auto.json"
+        core.save_history_auto(
+            {"consumed_id": "h1", "consumed_key": "k1",
+             "last_sent_at": 7.0}, sp)
+        assert core.load_history_auto(sp) == {
+            "consumed_id": "h1", "consumed_key": "k1",
+            "last_sent_at": 7.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+
+
+def test_log_request_parse_select_reply():
+    # ログリクエスト (1.96): 指定の解釈 (件数・日付・範囲・
+    # 合成・丸め・読めない指定は無視)、範囲での選び出し、
+    # 返信の見出し。控えは load_log_events と別ファイルで往復。
+    from datetime import datetime as _dt
+    now = _dt(2026, 11, 15, 17, 0, 0)
+    spec = core.parse_log_request("", now=now)
+    assert spec["date"] is None and spec["start_min"] is None
+    assert spec["count"] == 50 and spec["label"] == "直近50件"
+    spec = core.parse_log_request("100", now=now)
+    assert spec["count"] == 100 and spec["label"] == "直近100件"
+    spec = core.parse_log_request("9999", now=now)
+    assert spec["count"] == 500  # 上限に丸める
+    spec = core.parse_log_request("0", now=now)
+    assert spec["count"] == 1  # 下限に丸める
+    spec = core.parse_log_request("2026-11-15", now=now)
+    assert str(spec["date"]) == "2026-11-15"
+    assert spec["label"] == "2026-11-15"
+    spec = core.parse_log_request("16:00-16:30", now=now)
+    assert spec["start_min"] == 960 and spec["end_min"] == 990
+    assert spec["label"] == "16:00〜16:30"
+    spec = core.parse_log_request("16:00-16:30 2026-11-15", now=now)
+    assert spec["label"] == "2026-11-15 16:00〜16:30"
+    spec = core.parse_log_request("abc 25:00-26:00", now=now)
+    assert spec["date"] is None and spec["start_min"] is None
+    assert spec["count"] == 50
+
+    def at(y, mo, d, h, mi):
+        return _dt(y, mo, d, h, mi).timestamp()
+
+    events = [
+        {"at": at(2026, 11, 14, 16, 15), "text": "昨日の範囲内"},
+        {"at": at(2026, 11, 15, 15, 59), "text": "範囲の前"},
+        {"at": at(2026, 11, 15, 16, 0), "text": "範囲の始まり"},
+        {"at": at(2026, 11, 15, 16, 30), "text": "範囲の終わり"},
+        {"at": at(2026, 11, 15, 16, 31), "text": "範囲の後"},
+    ]
+    spec = core.parse_log_request("16:00-16:30", now=now)
+    got = core.select_log_events(events, spec, now=now)
+    assert [e["text"] for e in got] == ["範囲の始まり", "範囲の終わり"]
+    spec = core.parse_log_request("2026-11-14", now=now)
+    got = core.select_log_events(events, spec, now=now)
+    assert [e["text"] for e in got] == ["昨日の範囲内"]
+    spec = core.parse_log_request("2", now=now)
+    got = core.select_log_events(events, spec, now=now)
+    assert [e["text"] for e in got] == ["範囲の終わり", "範囲の後"]
+    spec = core.parse_log_request("16:00-16:30", now=now)
+    picked = core.select_log_events(events, spec, now=now)
+    lines = core.build_log_reply(picked, spec).splitlines()
+    assert lines[0] == "動作ログ（16:00〜16:30・2件）"
+    assert len(lines) == 3 and "範囲の始まり" in lines[1]
+    spec = core.parse_log_request("", now=now)
+    reply = core.build_log_reply(events[-2:], spec)
+    assert reply.splitlines()[0] == "動作ログ（直近50件）"
+    assert core.build_log_reply([], spec) == \
+        "動作ログ（直近50件）\n（記録はありません）"
+    with tempfile.TemporaryDirectory() as td:
+        sp = Path(td) / "log_auto.json"
+        core.save_log_auto(
+            {"consumed_id": "l1", "consumed_key": "k1",
+             "last_sent_at": 3.0}, sp)
+        assert core.load_log_auto(sp) == {
+            "consumed_id": "l1", "consumed_key": "k1",
+            "last_sent_at": 3.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        assert core.LOG_AUTO_FILENAME \
+            == "script_runner_log_auto.json"
+        assert core.LOG_AUTO_COOLDOWN_SEC == 60.0
+
+
+def test_log_events_roundtrip_and_cap():
+    # 動作ログ (1.89): 往復と上限 (1000件) と、ビューア用の
+    # 行の整形。診断の控え (60件) とは別ファイルで混ざらない。
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "log.json"
+        events = []
+        core.log_append(events, "一行目", at=1000.0)
+        core.log_append(events, "二行目", at=1001.0)
+        core.save_log_events(events, path)
+        got = core.load_log_events(path)
+        assert [e["text"] for e in got] == ["一行目", "二行目"]
+        lines = core.format_log_lines(got)
+        assert lines[0].endswith(" 一行目") and ":" in lines[0]
+        big = []
+        for i in range(core.LOG_LIMIT + 5):
+            core.log_append(big, f"行{i}", at=float(i))
+        assert len(big) == core.LOG_LIMIT
+        assert big[0]["text"] == "行5"
+        core.save_log_events(big, path)
+        assert len(core.load_log_events(path)) == core.LOG_LIMIT
+        assert core.load_diag_events(
+            Path(td) / "diag.json") == []
+
+
+def test_log_filenames_do_not_collide():
+    # 実行ログ (append_run_log) と動作ログ (1.89) のファイル名
+    # 衝突の回帰 (1.93): 1.89 で動作ログ側も LOG_FILENAME を
+    # 再定義してしまい、append_run_log が動作ログのファイル
+    # (.json) へ JSONL を追記して壊す状態だった。定数は
+    # LOG_FILENAME (.jsonl、実行ログ) と ACTIVITY_LOG_FILENAME
+    # (.json、動作ログ) に分かれていること。append_run_log の
+    # 既定の書き先が .jsonl で、動作ログへは書かないこと。
+    assert core.LOG_FILENAME == "script_runner_log.jsonl"
+    assert core.ACTIVITY_LOG_FILENAME == "script_runner_log.json"
+    assert core.log_path().name == "script_runner_log.json"
+    with tempfile.TemporaryDirectory() as td:
+        with _temp_data_dir(Path(td) / "data"):
+            events = []
+            core.log_append(events, "動作ログの一行", at=1000.0)
+            core.save_log_events(events)
+            run = core.RunResult(
+                name="a.py", path="C:/x/a.py", exit_code=0,
+                seconds=1.0, stdout="出力", sha256="ab12")
+            core.append_run_log(run)
+            run_log = Path(td) / "data" / core.LOG_FILENAME
+            lines = run_log.read_text(
+                encoding="utf-8").splitlines()
+            assert len(lines) == 1
+            assert json.loads(lines[0])["file"] == "a.py"
+            # 動作ログは壊れず、そのまま読める。
+            got = core.load_log_events()
+            assert [e["text"] for e in got] == ["動作ログの一行"]
+
+
+def test_stop_auto_state():
+    """停止リクエストの控え (1.93): 保存と読み直し・壊れた
+    ファイル。間隔は60秒、ファイルは他の合図と別。診断の束と
+    設定の報告の自動化の行にも状態が出る。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "stop_auto.json"
+        assert core.load_stop_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_sent_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        core.save_stop_auto(
+            {"consumed_id": "s-1", "consumed_key": "k-1",
+             "last_sent_at": 123.0,
+             "last_payload": "p-1", "last_answered_at": 42.0}, path)
+        assert core.load_stop_auto(path) == {
+            "consumed_id": "s-1", "consumed_key": "k-1",
+            "last_sent_at": 123.0,
+            "last_payload": "p-1", "last_answered_at": 42.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        assert core.STOP_AUTO_COOLDOWN_SEC == 60.0
+        assert core.STOP_AUTO_FILENAME \
+            == "script_runner_stop_auto.json"
+        bundle = core.build_diag_bundle(
+            "1.93", {"auto_stop": True}, "phal-ai", [], [])
+        assert "停止=入" in bundle
+        report = core.build_settings_report(
+            {"auto_stop": True}, "1.93")
+        assert "停止=入" in report
+
+
+def test_resend_auto_state_and_text():
+    """結果再送の合図の控えと再送文 (1.75): 保存と読み直し・
+    壊れたファイル。間隔は60秒、ファイルは他の合図と別。診
+    断の束の自動化の行にも状態が出る。再送文は見出しを付け
+    直し、末尾に AI への指示文が付く。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "resend_auto.json"
+        assert core.load_resend_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_sent_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        core.save_resend_auto(
+            {"consumed_id": "id-1", "consumed_key": "key-1",
+             "last_sent_at": 55.5}, path)
+        assert core.load_resend_auto(path) == {
+            "consumed_id": "id-1", "consumed_key": "key-1",
+            "last_sent_at": 55.5,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_resend_auto(path) == {
+            "consumed_id": "", "consumed_key": "",
+            "last_sent_at": 0.0,
+            "last_payload": "", "last_answered_at": 0.0,
+            "refire_notice_payload": "", "refire_notice_at": 0.0}
+        assert core.RESEND_AUTO_COOLDOWN_SEC == 60.0
+        assert core.RESEND_AUTO_FILENAME != core.RERUN_AUTO_FILENAME
+    on = core.build_diag_bundle(
+        "1.75", {"auto_resend": True}, "既定", [], [], at=0.0)
+    assert "再送=入" in on.splitlines()[1]
+    text = core.build_resend_text("1-100", "--- 出力 ---\nhello")
+    assert text.startswith("[実行結果] 1-100 （前回の結果の再送）")
+    assert "hello" in text
+    assert core.RESULT_AI_PROMPT in text
+    cut = core.build_resend_text("1-100", "x", truncated=True)
+    assert "打ち切られています" in cut.splitlines()[0]
+
+
+def test_auto_run_in_scope():
+    """自動実行の対象範囲 (案3、1.63): 対象は (a) この PHAL が
+    自動で落としたファイルか、(b) ファイル名にコマンド ID が
+    付いたファイルだけ。それ以外は範囲外。"""
+    # (b) ID つきは、自動で落としていなくても対象。
+    assert core.auto_run_in_scope("1-123_job.py", False) is True
+    assert core.auto_run_in_scope("12-03_check_db.py", False) is True
+    # (a) 自動で落とした分は、ID が無くても対象。
+    assert core.auto_run_in_scope("plain.py", True) is True
+    assert core.auto_run_in_scope("1-123_job.py", True) is True
+    # どちらでもない分は対象外。
+    assert core.auto_run_in_scope("plain.py", False) is False
+    assert core.auto_run_in_scope("notes.py", False) is False
+    # 日付で始まる名前は ID と取り違えない。
+    assert core.auto_run_in_scope(
+        "2026-11-14_notes.py", False) is False
+    # 区切りが "_" でないものは ID とみなさない。
+    assert core.auto_run_in_scope("1-123.py", False) is False
+
+
+def test_stage_color_ratio_and_color():
+    """段階表示の色 (1.63、案D): 物差しは段階ごと (実行は
+    2分→10分、他は30秒→3分)。黄ばみ始めまでは 0、赤で 1、
+    間は線形。色は緑 → 黄 → 赤。待機 (段階なし) や知らない
+    段階では進まない。"""
+    # 実行の物差し。
+    assert core.stage_color_ratio("run", 0) == 0.0
+    assert core.stage_color_ratio("run", 119.9) == 0.0
+    assert core.stage_color_ratio("run", 120) == 0.0
+    assert core.stage_color_ratio("run", 360) == 0.5
+    assert core.stage_color_ratio("run", 600) == 1.0
+    assert core.stage_color_ratio("run", 3600) == 1.0
+    # DL・回答・送信の物差し。
+    for stage in ("dl", "answer", "send"):
+        assert core.stage_color_ratio(stage, 30) == 0.0
+        assert core.stage_color_ratio(stage, 105) == 0.5
+        assert core.stage_color_ratio(stage, 180) == 1.0
+    # 知らない段階・負の経過は 0.0。
+    assert core.stage_color_ratio("bogus", 9999) == 0.0
+    assert core.stage_color_ratio(None, 9999) == 0.0
+    assert core.stage_color_ratio("run", -5) == 0.0
+    # 色の両端と中間。
+    assert core.stage_color("run", 0) == (40, 167, 69)
+    assert core.stage_color("run", 360) == (255, 193, 7)
+    assert core.stage_color("run", 600) == (220, 53, 69)
+    # 緑 → 黄の途中は両成分が混ざる。
+    red, green, blue = core.stage_color("dl", 67.5)
+    assert 40 < red < 255 and 167 < green < 193
+
+
+def test_parse_progress_line():
+    """進捗申告の行 (1.63): 「進捗：N/M」だけを拾う。"""
+    assert core.parse_progress_line("進捗：3/10") == (3, 10)
+    assert core.parse_progress_line("進捗: 3/10") == (3, 10)
+    assert core.parse_progress_line(" 進捗：0/5 ") == (0, 5)
+    assert core.parse_progress_line("進捗：3/0") is None
+    assert core.parse_progress_line("進捗：3/10 追加の文") is None
+    assert core.parse_progress_line("処理中：3/10") is None
+    assert core.parse_progress_line("普通の出力") is None
+    assert core.parse_progress_line("") is None
+    assert core.parse_progress_line(None) is None
+
+
+def test_execute_streaming_output():
+    """逐次取り込み (1.63): on_output へ行が順に届き、戻りの
+    stdout は全文のまま。持ち手 (handle.on_output) 経由でも
+    同じく届く。進捗申告の行も出力の1行として届く。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        path = write(
+            tmp, "stream.py",
+            "import sys\n"
+            "print('1行目')\n"
+            "print('進捗：1/2')\n"
+            "sys.stderr.write('エラー側\\n')\n"
+            "print('2行目')\n")
+        seen: list = []
+        run = core.execute_script(
+            path, CONFIG,
+            on_output=lambda kind, line: seen.append((kind, line)))
+        assert run.exit_code == 0
+        assert ("stdout", "1行目") in seen
+        assert ("stdout", "進捗：1/2") in seen
+        assert ("stderr", "エラー側") in seen
+        assert ("stdout", "2行目") in seen
+        # 標準出力の行は順序どおり。
+        out_lines = [line for kind, line in seen if kind == "stdout"]
+        assert out_lines == ["1行目", "進捗：1/2", "2行目"], out_lines
+        # 戻りの全文は従来どおり (進捗の行も残る)。
+        assert "1行目" in run.stdout and "2行目" in run.stdout
+        assert "進捗：1/2" in run.stdout
+        assert "エラー側" in run.stderr
+        # 持ち手経由でも届く (窓の経路)。
+        seen2: list = []
+        handle = core.RunHandle()
+        handle.on_output = lambda kind, line: seen2.append(
+            (kind, line))
+        run = core.execute_script(path, CONFIG, handle)
+        assert run.exit_code == 0
+        assert ("stdout", "1行目") in seen2
 
 
 def test_phal_status_build_and_write_only_on_change():
@@ -1936,6 +2498,24 @@ def test_collect_intro_modules_truncated():
     assert more == 20 - core.INTRO_MODULE_LIMIT, more
 
 
+def test_zip_as_txt_paths():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        z = folder / "data.zip"
+        z.write_bytes(b"PK-dummy")
+        t = folder / "note.txt"
+        t.write_text("x", encoding="utf-8")
+        paths, renamed = core.zip_as_txt_paths([z, t])
+        assert renamed == [("data.zip", "data.zip.txt")], renamed
+        assert paths[0].name == "data.zip.txt"
+        assert paths[0].read_bytes() == b"PK-dummy"
+        assert paths[1] == t
+        # ZIP でないものだけなら何も起きない
+        paths2, renamed2 = core.zip_as_txt_paths([t])
+        assert paths2 == [t] and renamed2 == []
+
+
 def test_build_intro_prompt():
     env = {
         "python_version": "3.11.9",
@@ -1953,10 +2533,28 @@ def test_build_intro_prompt():
                    "LocalMachine=RemoteSigned",
                    r"C:\Users\yotan\Downloads", "cp932",
                    "直接出られません",
-                   "回答は短いスクリプト（.phal / .py / .ps1）で返してください。"):
+                   "回答は短いスクリプトを .phal ファイルで返してください。"):
         assert needle in text, text
-    assert "pkg00 1.0" in text and "pkg11 1.0" in text, text
-    assert "他 2 件" in text, text
+    # モジュールの記載は 1.82 で廃止 (後半が省略され意味が無い)。
+    assert "pkg00 1.0" not in text, text
+    # マニュアルの添付は、env の印があるときだけ文に出る (1.78)。
+    assert "添付しています" not in text, text
+    # ZIP の行は、プロファイルで有効な相手にだけ出る (1.81)。
+    assert ".zip.txt" not in text, text
+    assert "開始プロンプト第7版" in text, text
+    # 作業フォルダの行は、選んだフォルダがあるときだけ出る (1.83)。
+    assert "- 作業フォルダ:" not in text, text
+    with_work = core.build_intro_prompt(
+        {**env, "work_folder": r"D:\work\job1"})
+    assert "- 作業フォルダ: D:\\work\\job1" in with_work, with_work
+    assert "- モジュール:" not in text, text
+    assert "- ダウンロードフォルダ（監視対象）:" in text, text
+    zipped = core.build_intro_prompt({**env, "zip_as_txt": True})
+    assert ".zip.txt に変えて渡します" in zipped, zipped
+    assert ".zip のままで構いません" in zipped, zipped
+    attached = core.build_intro_prompt({**env, "manual_attached": True})
+    assert "phal-ai-manual.md" in attached, attached
+    assert "最初に読んでください" in attached, attached
 
 
 def test_build_intro_prompt_unknowns():
@@ -1964,11 +2562,9 @@ def test_build_intro_prompt_unknowns():
     # 「不明」。空の辞書でも文は作れる。
     text = core.build_intro_prompt({})
     assert "PHAL のループを始めます。" in text
-    assert text.count(core.INTRO_UNKNOWN) >= 7, text
-    assert "- モジュール: 不明" in text, text
+    assert text.count(core.INTRO_UNKNOWN) >= 6, text
+    assert "- モジュール:" not in text, text
     assert "直接出られません" in text, text
-    empty = core.build_intro_prompt({"modules": [], "modules_more": 0})
-    assert "- モジュール: なし" in empty, empty
 
 
 def test_build_intro_prompt_mentions_phal_lib():
@@ -2100,6 +2696,210 @@ def test_attach_file_paths_and_outbox():
             assert core.attach_file_paths(None) == ([], [])
 
 
+def test_split_command_args():
+    # 引数文字列の分割 (1.97 / 1.98): 引用符で囲まれた空白は
+    # 1語になり、Windows のパス (バックスラッシュ) は壊れない。
+    assert core.split_command_args("") == []
+    assert core.split_command_args("--lines 20") == ["--lines", "20"]
+    assert core.split_command_args(
+        '-r "C:\\a b\\f.pcap" -Y sctp') == \
+        ["-r", "C:\\a b\\f.pcap", "-Y", "sctp"]
+    assert core.split_command_args("R:\\Downloads\\x.pcap") == \
+        ["R:\\Downloads\\x.pcap"]
+    try:
+        core.split_command_args('"閉じていない')
+        raise AssertionError("ValueError が出るはず")
+    except ValueError:
+        pass
+
+
+def test_execute_script_with_args():
+    # 引数つき実行 (1.97): スクリプトの sys.argv[1:] に入る。
+    with tempfile.TemporaryDirectory() as td:
+        path = write(Path(td), "args.py",
+                     "import sys\nprint(sys.argv[1:])\n")
+        run = core.execute_script(path, CONFIG,
+                                  args=["a b", "x"])
+        assert run.exit_code == 0, run.stderr
+        assert "['a b', 'x']" in run.stdout
+
+
+def test_cli_tools_sanitize_and_resolve():
+    # ツール実行の許可リスト (1.98): 既定・整形・許可外・実在。
+    assert core.sanitize_cli_tools(None) == \
+        list(core.DEFAULT_CLI_TOOLS)
+    assert core.sanitize_cli_tools("tshark") == \
+        list(core.DEFAULT_CLI_TOOLS)  # 並びでなければ既定
+    assert core.sanitize_cli_tools(
+        ["TShark.EXE", "tshark", "", "ipconfig"]) == \
+        ["tshark", "ipconfig"]
+    assert core.sanitize_cli_tools([]) == []  # 空は「何も許可しない」
+    path, why = core.resolve_cli_tool("evil", ["tshark"])
+    assert path is None and why == "not_allowed"
+    # 2.01: 実行時は登録パスが正で、許可リストにあるだけでは
+    # 探しに行かない (no_path)。探すのは設定の「探す」の役割。
+    stem = core.normalize_tool_name(Path(PY).name)
+    path, why = core.resolve_cli_tool(stem, [stem])
+    assert path is None and why == "no_path"
+    assert core.search_cli_tool(stem) is not None
+    path, why = core.resolve_cli_tool(
+        "definitely-not-a-real-tool-xyz", ["definitely-not-a-real-tool-xyz"])
+    assert path is None and why == "no_path"
+    assert core.search_cli_tool(
+        "definitely-not-a-real-tool-xyz") is None
+
+
+def test_cli_tool_registry():
+    # ツール登録 (2.00): 名前→パスの登録、使い方、ツール
+    # 置き場、Python ツールの実行コマンド。
+    assert core.sanitize_cli_tool_paths(None) == {}
+    assert core.sanitize_cli_tool_paths(
+        {"TShark.EXE": " C:\\x\\tshark.exe ", "bad": ""}) == \
+        {"tshark": "C:\\x\\tshark.exe"}
+    assert core.sanitize_cli_tool_usages(None) == {}
+    assert core.sanitize_cli_tool_usages(
+        {"MyTool": "  引数はファイル名  ", "bad": " "}) == \
+        {"mytool": "引数はファイル名"}
+    # .py のツールは Python で実行する形になる。
+    command = core.tool_command(Path("D:/tools/mytool.py"))
+    assert command[1] == "D:/tools/mytool.py"
+    assert command[0].lower().endswith(
+        ("python", "python.exe", "python3", "python3.exe"))
+    assert core.tool_command(Path("D:/tools/mytool.exe")) == \
+        ["D:/tools/mytool.exe"]
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exe = tmp / "mytool.exe"
+        exe.write_bytes(b"MZ")
+        # 登録のパスが実在すれば、許可リストに無くても
+        # 解決する。
+        path, why = core.resolve_cli_tool(
+            "mytool", [], {"mytool": str(exe)})
+        assert path == exe and why == ""
+        # 登録のパスが無ければ、別の実体を探しに行かず
+        # not_found (黙って別の物を実行しない)。
+        path, why = core.resolve_cli_tool(
+            "mytool", ["mytool"], {"mytool": str(tmp / "gone.exe")})
+        assert path is None and why == "not_found"
+        # ツール置き場の実行ファイルは、許可リストに無くても
+        # 名前で解決する (.py も対象)。
+        placed = tmp / "placed.exe"
+        placed.write_bytes(b"MZ")
+        path, why = core.resolve_cli_tool(
+            "placed", [], None, [tmp])
+        assert path == placed and why == ""
+        pytool = tmp / "pytool.py"
+        pytool.write_text("print(1)\n", encoding="utf-8")
+        path, why = core.resolve_cli_tool(
+            "pytool", [], None, [tmp])
+        assert path == pytool and why == ""
+        path, why = core.resolve_cli_tool("other", [], None, [tmp])
+        assert path is None and why == "not_allowed"
+        # 許可リストにあるだけでパスが未設定なら、実行時は
+        # 探しに行かず no_path (2.01)。探すのは設定の役割で、
+        # search_cli_tool が担う。
+        path, why = core.resolve_cli_tool(
+            "unregistered", ["unregistered"], None, [tmp])
+        assert path is None and why == "no_path"
+        seek = tmp / "seek.exe"
+        seek.write_bytes(b"MZ")
+        assert core.search_cli_tool("seek", [tmp]) == seek
+        assert core.search_cli_tool("other", [tmp]) is None
+    note = core.tool_not_found_note("mytool", {"mytool": "D:\\x.exe"})
+    assert "D:\\x.exe" in note
+
+
+def test_execute_command_and_result_text():
+    # ツール実行 (1.98): 任意のコマンドを1回実行し、結果文を
+    # スクリプトと同じ形に組み立てる。
+    run = core.execute_command(
+        [PY, "-c", "print('tool-hi')"], timeout_seconds=30)
+    assert run.exit_code == 0, run.stderr
+    assert "tool-hi" in run.stdout
+    text = core.build_tool_result_text(
+        "python -c print", run, CONFIG)
+    assert text.startswith("[ツール実行結果] python -c print")
+    assert "終了コード 0" in text and "tool-hi" in text
+    bad = core.execute_command(
+        [PY, "-c", "import sys; sys.exit(3)"], timeout_seconds=30)
+    assert bad.exit_code == 3
+    missing = core.execute_command(
+        ["definitely-not-a-real-tool-xyz"], timeout_seconds=30)
+    assert missing.start_error  # 起動できないことが理由つきで返る
+
+
+def test_tool_auto_state_roundtrip():
+    # ツール実行の控え (1.98) は他の合図と別ファイルで往復する。
+    with tempfile.TemporaryDirectory() as td:
+        sp = Path(td) / "tool_auto.json"
+        core.save_tool_auto(
+            {"consumed_id": "t1", "consumed_key": "k1",
+             "last_sent_at": 12.0, "last_payload": "tshark -v",
+             "last_answered_at": 13.0}, sp)
+        got = core.load_tool_auto(sp)
+        assert got["consumed_id"] == "t1"
+        assert got["last_payload"] == "tshark -v"
+        assert core.TOOL_AUTO_FILENAME == \
+            "script_runner_tool_auto.json"
+
+
+def test_parse_file_request_specs():
+    # ファイルリクエストの範囲指定 (1.99): 末尾の指定だけを
+    # 切り離し、パス (空白を含む) は残す。bytes が優先。
+    path, spec = core.parse_file_request("sub/data.log")
+    assert path == "sub/data.log" and spec is None
+    path, spec = core.parse_file_request("my logs/a.log lines:3-5")
+    assert path == "my logs/a.log"
+    assert spec == {"kind": "lines", "start": 3, "end": 5}
+    path, spec = core.parse_file_request("a.pcap bytes:100-200")
+    assert path == "a.pcap"
+    assert spec == {"kind": "bytes", "start": 100, "end": 200}
+    path, spec = core.parse_file_request("a.pcap bytes:100+50")
+    assert spec == {"kind": "bytes", "start": 100, "end": 150}
+    path, spec = core.parse_file_request("a.log lines:7-")
+    assert spec == {"kind": "lines", "start": 7, "end": None}
+    path, spec = core.parse_file_request(
+        "a.pcap lines:1-2 bytes:0-10")
+    assert spec["kind"] == "bytes"  # 両方あれば bytes
+    path, spec = core.parse_file_request("lines:1-2")
+    assert path == "" and spec["kind"] == "lines"
+
+
+def test_file_range_slicing():
+    # 範囲の切り出し (1.99): バイト範囲・行の範囲・文字コード
+    # 判定・バイナリ判定・送付ファイル名。
+    with tempfile.TemporaryDirectory() as td:
+        binpath = Path(td) / "data.bin"
+        binpath.write_bytes(bytes(range(256)))
+        data, truncated = core.read_byte_range(binpath, 10, 20)
+        assert data == bytes(range(10, 20)) and not truncated
+        data, truncated = core.read_byte_range(binpath, 200, 9999)
+        assert data == bytes(range(200, 256))  # 末尾で丸める
+        assert core.looks_binary(bytes(range(256)))
+        text = "\n".join(f"行{i}" for i in range(1, 11))
+        sliced, total = core.slice_text_lines(
+            text, {"kind": "lines", "start": 3, "end": 5})
+        assert total == 10 and sliced == "行3\n行4\n行5"
+        sliced, _ = core.slice_text_lines(
+            text, {"kind": "lines", "start": 9, "end": None})
+        assert sliced == "行9\n行10"
+        sliced, _ = core.slice_text_lines(
+            text, {"kind": "lines", "start": 99, "end": None})
+        assert sliced == ""
+        decoded, enc = core.decode_text_bytes("あ".encode("cp932"))
+        assert decoded == "あ" and enc == "cp932"
+        decoded, enc = core.decode_text_bytes(
+            "あ".encode("utf-16"))
+        assert decoded == "あ" and enc == "utf-16"
+        assert not core.looks_binary("ただの文".encode("utf-8"))
+        assert core.slice_file_name(
+            binpath, {"kind": "bytes", "start": 0, "end": 10}) == \
+            "data_bytes0-10.bin"
+        assert core.slice_file_name(
+            Path("a.log"), {"kind": "lines", "start": 3,
+                            "end": None}) == "a_lines3-end.log"
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -2186,6 +2986,11 @@ if __name__ == "__main__":
         test_diag_bundle_composition_and_trim,
         test_diag_auto_state_roundtrip_and_corrupt,
         test_reset_auto_state_roundtrip_and_corrupt,
+        test_rerun_auto_state_roundtrip_and_corrupt,
+        test_auto_run_in_scope,
+        test_stage_color_ratio_and_color,
+        test_parse_progress_line,
+        test_execute_streaming_output,
         test_phal_status_build_and_write_only_on_change,
         test_collect_intro_environment_with_fake_runner,
         test_collect_intro_environment_runner_missing_is_unknown,
@@ -2199,6 +3004,23 @@ if __name__ == "__main__":
         test_extract_attach_lines,
         test_extract_attach_lines_rejects_paths,
         test_attach_file_paths_and_outbox,
+        test_zip_as_txt_paths,
+        test_settings_report_and_marker_auto_state,
+        test_resolve_file_request_scope,
+        test_find_full_output,
+        test_build_history_text,
+        test_log_request_parse_select_reply,
+        test_log_events_roundtrip_and_cap,
+        test_log_filenames_do_not_collide,
+        test_stop_auto_state,
+        test_split_command_args,
+        test_execute_script_with_args,
+        test_cli_tools_sanitize_and_resolve,
+        test_cli_tool_registry,
+        test_execute_command_and_result_text,
+        test_tool_auto_state_roundtrip,
+        test_parse_file_request_specs,
+        test_file_range_slicing,
     ]
     for test in tests:
         test()

@@ -108,13 +108,34 @@ class DownloadResult:
     marker は、同じ走査で見つけた診断リクエストの目印
     {"id": 同定子} (1-43) か、無ければ None。reset_marker は、
     同じ走査で見つけたリセットの目印 (1-52) で、形は marker と
-    同じ。"""
+    同じ。rerun_marker は、同じ走査で見つけた再実行の目印
+    (1.63) で、形は marker に "command_id" を足したもの。
+    resend_marker は結果再送の目印 (1.75) で、形は同じ。
+    settings_marker / manual_marker は設定確認・マニュアル再送
+    の目印 (1.85) で、形は同じ。fulltext_marker は全文リクエスト
+    の目印 (1.91) で、形は rerun_marker と同じ。history_marker
+    は実行一覧の目印 (1.92) で、形は settings_marker と同じ。
+    stop_marker は停止の目印 (1.93) で、形は同じ。log_marker
+    は動作ログリクエストの目印 (1.96) で、形は marker に
+    "params" (指定の文字列) を足したもの。tool_marker は
+    ツール実行の目印 (1.98) で、形は marker に "command"
+    (ツール名＋引数の文字列) を足したもの。"""
     ok: bool
     message: str
     candidate: dict = None
     marker: dict = None
     reset_marker: dict = None
     candidates: list = None
+    rerun_marker: dict = None
+    resend_marker: dict = None
+    settings_marker: dict = None
+    manual_marker: dict = None
+    file_marker: dict = None
+    fulltext_marker: dict = None
+    history_marker: dict = None
+    stop_marker: dict = None
+    log_marker: dict = None
+    tool_marker: dict = None
 
 
 @dataclass
@@ -255,7 +276,17 @@ class SubprocessTransport:
         return {"candidate": response.get("candidate"),
                 "candidates": response.get("candidates"),
                 "marker": response.get("marker"),
-                "reset_marker": response.get("reset_marker")}
+                "reset_marker": response.get("reset_marker"),
+                "rerun_marker": response.get("rerun_marker"),
+                "resend_marker": response.get("resend_marker"),
+                "settings_marker": response.get("settings_marker"),
+                "manual_marker": response.get("manual_marker"),
+                "file_marker": response.get("file_marker"),
+                "fulltext_marker": response.get("fulltext_marker"),
+                "history_marker": response.get("history_marker"),
+                "stop_marker": response.get("stop_marker"),
+                "log_marker": response.get("log_marker"),
+                "tool_marker": response.get("tool_marker")}
 
     def press_download(self, key=None):
         request = {"op": "press_download"}
@@ -702,7 +733,13 @@ class CopilotSession:
         ok=False で理由が message になる。呼ぶ側 (見張り) は
         どちらでも黙って扱える。同じ走査で見つけた診断リクエスト
         の目印 (1-43) は marker に、リセットの目印 (1-52) は
-        reset_marker に入れて返す (走査は1回だけ)。"""
+        reset_marker に、再実行の目印 (1.63) は rerun_marker に、
+        結果再送の目印 (1.75) は resend_marker に、全文リクエスト
+        の目印 (1.91) は fulltext_marker に、実行一覧の目印
+        (1.92) は history_marker に、停止の目印 (1.93) は
+        stop_marker に、動作ログの目印 (1.96) は log_marker に、
+        ツール実行の目印 (1.98) は tool_marker に
+        入れて返す (走査は1回だけ)。"""
         try:
             scanner = getattr(self._tp(), "latest_scan", None)
             if scanner is not None:
@@ -711,6 +748,16 @@ class CopilotSession:
                 candidates = scan.get("candidates")
                 marker = scan.get("marker")
                 reset_marker = scan.get("reset_marker")
+                rerun_marker = scan.get("rerun_marker")
+                resend_marker = scan.get("resend_marker")
+                settings_marker = scan.get("settings_marker")
+                manual_marker = scan.get("manual_marker")
+                file_marker = scan.get("file_marker")
+                fulltext_marker = scan.get("fulltext_marker")
+                history_marker = scan.get("history_marker")
+                stop_marker = scan.get("stop_marker")
+                log_marker = scan.get("log_marker")
+                tool_marker = scan.get("tool_marker")
             else:
                 getter = getattr(self._tp(), "latest_download", None)
                 if getter is None:
@@ -720,6 +767,16 @@ class CopilotSession:
                 candidates = None
                 marker = None
                 reset_marker = None
+                rerun_marker = None
+                resend_marker = None
+                settings_marker = None
+                manual_marker = None
+                file_marker = None
+                fulltext_marker = None
+                history_marker = None
+                stop_marker = None
+                log_marker = None
+                tool_marker = None
         except Exception as e:  # noqa: BLE001
             return DownloadResult(
                 False, str(e) or "ダウンロードを検出できませんでした")
@@ -735,13 +792,63 @@ class CopilotSession:
         if reset_marker is not None \
                 and not isinstance(reset_marker, dict):
             reset_marker = None
+        if rerun_marker is not None \
+                and not isinstance(rerun_marker, dict):
+            rerun_marker = None
+        if resend_marker is not None \
+                and not isinstance(resend_marker, dict):
+            resend_marker = None
+        if settings_marker is not None \
+                and not isinstance(settings_marker, dict):
+            settings_marker = None
+        if manual_marker is not None \
+                and not isinstance(manual_marker, dict):
+            manual_marker = None
+        if file_marker is not None \
+                and not isinstance(file_marker, dict):
+            file_marker = None
+        if fulltext_marker is not None \
+                and not isinstance(fulltext_marker, dict):
+            fulltext_marker = None
+        if history_marker is not None \
+                and not isinstance(history_marker, dict):
+            history_marker = None
+        if stop_marker is not None \
+                and not isinstance(stop_marker, dict):
+            stop_marker = None
+        if log_marker is not None \
+                and not isinstance(log_marker, dict):
+            log_marker = None
+        if tool_marker is not None \
+                and not isinstance(tool_marker, dict):
+            tool_marker = None
         if candidate is None:
             return DownloadResult(
                 True, "ダウンロードできるものはありません", None,
-                marker, reset_marker, candidates)
+                marker, reset_marker, candidates,
+                rerun_marker=rerun_marker,
+                resend_marker=resend_marker,
+                settings_marker=settings_marker,
+                manual_marker=manual_marker,
+                file_marker=file_marker,
+                fulltext_marker=fulltext_marker,
+                history_marker=history_marker,
+                stop_marker=stop_marker,
+                log_marker=log_marker,
+                tool_marker=tool_marker)
         return DownloadResult(
             True, "ダウンロードできるものがあります", candidate,
-            marker, reset_marker, candidates)
+            marker, reset_marker, candidates,
+            rerun_marker=rerun_marker,
+            resend_marker=resend_marker,
+            settings_marker=settings_marker,
+            manual_marker=manual_marker,
+            file_marker=file_marker,
+            fulltext_marker=fulltext_marker,
+            history_marker=history_marker,
+            stop_marker=stop_marker,
+            log_marker=log_marker,
+            tool_marker=tool_marker)
 
     def press_download(self, key=None) -> SendResult:
         """最新のダウンロード候補を押す (本当に落とす)。

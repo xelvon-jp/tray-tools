@@ -34,16 +34,24 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 # PHAL のプロファイルの安定した名前 (設定の中で1つだけ持つ)。
@@ -88,6 +96,36 @@ AUTO_LABELS = (
     # 開き直す。通知ではなく動作なので、既定は他の切替に合わせて
     # 切 (sanitize_automation の通常の倒し方)。
     ("auto_reset", "合図で自動で開き直す"),
+    # 再実行の合図 (1.63): AI の発言の中の目印の行 (コマンド ID
+    # つき) を見つけたら、その ID のスクリプトを再実行して結果
+    # を差分で返す。実行そのものなので、既定は切。
+    ("auto_rerun", "合図で自動で再実行する"),
+    # 結果再送の合図 (1.75): AI の発言の中の目印の行 (コマンド
+    # ID つき) を見つけたら、その ID の直近の結果を投稿し直す。
+    # 再実行と違い、実行は伴わない。既定は切。
+    ("auto_resend", "合図で結果を自動で再送する"),
+    ("auto_settings", "合図で設定を自動で知らせる"),
+    ("auto_manual", "合図でマニュアルを自動で再送する"),
+    ("auto_file", "合図でファイルを自動で送る"),
+    ("auto_fulltext", "全文の自動返信（要約の全文ファイル）"),
+    # 実行一覧の合図 (1.92): AI の発言の中の目印の単独行を見つけ
+    # たら、直近の実行一覧 (結果の控えの1行目だけ) を送る。
+    # 実行は伴わない。既定は切。
+    ("auto_history", "実行一覧の自動返信"),
+    # 停止の合図 (1.93): AI の発言の中の目印の単独行を見つけ
+    # たら、実行中のスクリプトを止める。実行中でなければ、
+    # その旨を文で返す。既定は切。
+    ("auto_stop", "停止の自動応答（実行中を止める）"),
+    # 動作ログの合図 (1.96): AI の発言の中の目印の行 (指定
+    # つき) を見つけたら、動作ログ (ビューアと同じ中身) を
+    # 送る。件数・日付・時刻範囲の指定ができる。既定は切。
+    ("auto_log", "動作ログの自動返信"),
+    # ツール実行の合図 (1.98): AI の発言の中の目印の行
+    # (「PHAL:ツール実行 tshark ...」) を見つけたら、許可
+    # リスト (cli_tools) にあるコマンドラインツールを作業
+    # フォルダで実行して結果を送る。実行そのものなので、
+    # 既定は切。
+    ("auto_tool", "合図でコマンドラインツールを自動で実行する"),
 )
 AUTO_KEYS = tuple(key for key, _label in AUTO_LABELS)
 
@@ -108,6 +146,12 @@ ATTACH_METHOD_LABELS = (
     ("dialog", "ダイアログ"),
 )
 ATTACH_METHOD_KEYS = tuple(key for key, _label in ATTACH_METHOD_LABELS)
+
+
+def sanitize_zip_as_txt(value) -> bool:
+    """ZIP 添付を .zip.txt に変えて渡すか (1.81、プロファイル
+    ごと)。真とみなせる値だけを True にする。"""
+    return value is True or value == "true"
 
 
 def sanitize_attach_method(value) -> str:
@@ -163,7 +207,9 @@ def send_configured(fields) -> bool:
 
 def sanitize_automation(value) -> dict:
     """自動化の切替を整える。{auto_dl, auto_run, auto_answer,
-    auto_send, auto_diag, auto_ack} の真偽だけの辞書を返す。
+    auto_send, auto_diag, auto_ack, auto_reset, auto_rerun,
+    auto_resend} の
+    真偽だけの辞書を返す。
 
     value は settings.json の script_runner 節そのもの (キーは節の
     直下) か、切替だけの辞書。True のものだけ True で、それ以外
@@ -208,6 +254,8 @@ def _profile_entry(name, raw_target, fallback_source=None) -> dict:
     source = target if isinstance(target, dict) else {}
     cleaned["attach_method"] = sanitize_attach_method(
         source.get("attach_method"))
+    cleaned["zip_as_txt"] = sanitize_zip_as_txt(
+        source.get("zip_as_txt"))
     return {"name": _clean_profile_name(name),
             "target": cleaned}
 
@@ -291,6 +339,12 @@ def build_profile(fields) -> dict:
     attach_method = sanitize_attach_method(
         fields.get("attach_method") if isinstance(fields, dict)
         else None)
+    # ZIP の名前変え (1.81) も欄の外の項目。sanitize_fields で
+    # 落ちるので、attach_method と同じく先に取り出す (1.84 で
+    # 修正: 後から読むと常に False になっていた)。
+    zip_as_txt = sanitize_zip_as_txt(
+        fields.get("zip_as_txt") if isinstance(fields, dict)
+        else None)
     fields = sanitize_fields(fields)
     return {
         "name": PROFILE_NAME,
@@ -318,6 +372,8 @@ def build_profile(fields) -> dict:
         "input_band_px": _DEFAULT_INPUT_BAND_PX,
         # 添付方式 (1.61)。copilot_loop の振り分けが読む。
         "attach_method": attach_method,
+        # ZIP 添付を .zip.txt に変えて渡すか (1.81)。
+        "zip_as_txt": zip_as_txt,
     }
 
 
@@ -673,9 +729,74 @@ class ButtonCandidateDialog(QDialog):
         return candidate if isinstance(candidate, dict) else None
 
 
-class AiWindowDialog(QDialog):
-    """PHAL の「AI の窓」の設定・調査画面。
+class LogViewerPage(QWidget):
+    """動作ログのビューア (1.90、2.01 でタブのページ化)。
 
+    動作ログ (script_runner_log.json、開き直しをまたいで上限
+    1000件) を日付つきで古い順に並べて見せる。読み込み直しと
+    全文コピーができる。見るだけの部品で、ログ自体は変えない。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self._view = QPlainTextEdit()
+        self._view.setReadOnly(True)
+        layout.addWidget(self._view)
+        row = QHBoxLayout()
+        reload_button = QPushButton("再読み込み")
+        reload_button.clicked.connect(self.refresh)
+        row.addWidget(reload_button)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self._copy_all)
+        row.addWidget(copy_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        """置き場から読み直して表示する (末尾 = 直近に寄せる)。"""
+        import script_runner_core as core
+        events = core.load_log_events()
+        lines = core.format_log_lines(events, with_date=True)
+        self._view.setPlainText(
+            "\n".join(lines) if lines else "(記録はまだありません)")
+        cursor = self._view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._view.setTextCursor(cursor)
+
+    def _copy_all(self):
+        QApplication.clipboard().setText(self._view.toPlainText())
+
+
+class LogViewerDialog(QDialog):
+    """動作ログの単独窓 (LogViewerPage の包み)。
+
+    設定のタブ化 (2.01) で普段の入口はタブになったが、単独で
+    開く使い方のために残してある。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("動作ログ")
+        self.resize(760, 500)
+        layout = QVBoxLayout(self)
+        self._page = LogViewerPage(self)
+        self._view = self._page._view
+        layout.addWidget(self._page)
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(self.accept)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+    def refresh(self):
+        self._page.refresh()
+
+
+class AiProfilePage(QWidget):
+    """「AI別設定」タブのページ (投げ先プロファイル)。
+
+    旧 AiWindowDialog のプロファイル部分 (2.01 でタブ化)。
     enumerate_windows / scanner / filler / button_scanner /
     attach_tester は差し替え口で、scanner・button_scanner(profile)
     は .ok / .message / .candidates、filler(text, profile) は
@@ -688,14 +809,12 @@ class AiWindowDialog(QDialog):
     def __init__(self, fields, parent=None, *, enumerate_windows=None,
                  scanner=None, filler=None, button_scanner=None,
                  attach_tester=None,
-                 automation=None, profiles=None, active_index=0,
+                 profiles=None, active_index=0,
                  diag_text_provider=None, error_color="#c00000"):
         super().__init__(parent)
         # 状態ラベルのエラー色。窓側がテーマに合わせて渡す (1-44)。
         # 渡されなければ従来の色のまま。
         self._error_color = error_color
-        self.setWindowTitle("AI の窓 - PHAL")
-        self.resize(560, 720)
         self._enumerate_windows = (
             enumerate_windows or enumerate_visible_windows)
         self._scanner = scanner or _default_scanner
@@ -703,7 +822,7 @@ class AiWindowDialog(QDialog):
         self._button_scanner = button_scanner or _default_button_scanner
         self._attach_tester = attach_tester or _default_attach_tester
         # 診断の束を作る役 (窓側が渡す)。無ければ「診断をAIへ貼る」
-        # ボタンは出さない (この画面を単独で開く使い方との互換)。
+        # ボタンは出さない。
         self._diag_text_provider = diag_text_provider
         self._bridge = _OpBridge(self)
         self._bridge.finished.connect(self._on_op_finished)
@@ -765,6 +884,12 @@ class AiWindowDialog(QDialog):
             self._attach_method_combo.addItem(label, key)
         form.addRow("添付方式", self._attach_method_combo)
         layout.addLayout(form)
+        # ZIP 添付を .zip.txt に変えて渡す (1.81、プロファイル
+        # ごと。ユーザー → Copilot の向きは ZIP をそのまま
+        # 渡せない相手向け)。
+        self._zip_as_txt_box = QCheckBox(
+            "ZIP 添付を .zip.txt に変えて渡す")
+        layout.addWidget(self._zip_as_txt_box)
 
         row = QHBoxLayout()
         self._pick_button = QPushButton("窓の一覧…")
@@ -788,40 +913,20 @@ class AiWindowDialog(QDialog):
         # の入力欄へ入れる (入れるだけ。送信は人が押す。テスト入力
         # と同じ線引き)。ループが止まったとき、その理由を AI へ
         # そのまま渡すためのもの (1-41)。
+        diag_row = QHBoxLayout()
         if self._diag_text_provider is not None:
-            diag_row = QHBoxLayout()
             self._diag_button = QPushButton("診断をAIへ貼る")
             self._diag_button.clicked.connect(self._fill_diagnostics)
             diag_row.addWidget(self._diag_button)
-            diag_row.addStretch(1)
-            layout.addLayout(diag_row)
         else:
             self._diag_button = None
-
-        # 自動化の切替。ai_target の欄とは別の設定 (script_runner 節
-        # の auto_* キー) なので、枠を分けて出す。既定は全部手動。
-        auto_group = QGroupBox("自動化")
-        auto_layout = QVBoxLayout(auto_group)
-        self._auto_boxes = {}
-        auto_given = sanitize_automation(automation)
-        for key, label in AUTO_LABELS:
-            box = QCheckBox(label)
-            box.setChecked(auto_given[key])
-            self._auto_boxes[key] = box
-            auto_layout.addWidget(box)
-        layout.addWidget(auto_group)
+        diag_row.addStretch(1)
+        layout.addLayout(diag_row)
 
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
         layout.addStretch(1)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
 
         self._set_fields(self._profiles[self._current]["target"])
 
@@ -930,18 +1035,16 @@ class AiWindowDialog(QDialog):
         method = sanitize_attach_method(fields.get("attach_method"))
         index = self._attach_method_combo.findData(method)
         self._attach_method_combo.setCurrentIndex(max(index, 0))
+        self._zip_as_txt_box.setChecked(
+            sanitize_zip_as_txt(fields.get("zip_as_txt")))
 
     def fields(self) -> dict:
         result = sanitize_fields(
             {key: self._edits[key].text() for key in FIELD_KEYS})
         result["attach_method"] = sanitize_attach_method(
             self._attach_method_combo.currentData())
+        result["zip_as_txt"] = bool(self._zip_as_txt_box.isChecked())
         return result
-
-    def automation(self) -> dict:
-        """自動化の切替の今の値 (script_runner 節へ保存する形)。"""
-        return {key: bool(self._auto_boxes[key].isChecked())
-                for key in AUTO_KEYS}
 
     def _show_status(self, message, error=False):
         self._status_label.setStyleSheet(
@@ -1200,14 +1303,604 @@ class AiWindowDialog(QDialog):
                 error=not getattr(result, "ok", False)))
 
     # -- 保存の検証 ------------------------------------------------------
-    def accept(self):  # noqa: N802  Qt の上書き
+    def validate(self) -> bool:
+        """保存してよいか (設定ダイアログの OK から呼ばれる)。
+
+        窓を特定できないプロファイルは「最初の窓なら何でも」に
+        なってしまうので、保存させない。全部空なら未設定に戻す
+        操作として受け付ける。理由は状態ラベルに出す。"""
         fields = self.fields()
         if any(fields.values()) and not is_configured(fields):
-            # 窓を特定できないプロファイルは「最初の窓なら何でも」
-            # になってしまうので、保存させない。全部空なら未設定に
-            # 戻す操作として受け付ける。
             self._show_status(
                 "窓を特定するために、プロセス名・ウィンドウクラス・"
                 "アプリIDの頭のどれかが必要です", error=True)
+            return False
+        return True
+
+
+class ToolSettingsPage(QWidget):
+    """「ツール設定」タブのページ (2.00、2.01 でタブ化と
+    意味の変更)。
+
+    「ツール実行」の合図で呼べるツールの登録で、AI プロファイル
+    とは別の、PHAL 全体で共通の設定 (script_runner 節の
+    cli_tools / cli_tool_paths / cli_tool_usages)。表の列は
+    名前・パス・使い方。実行時は登録されたパスが正で、パスが
+    空のまま実行しようとするとエラーになる (2.01)。パスが空の
+    行には「探す」ボタンが出て、PATH と Wireshark の置き場を
+    探して実パスを記入できる。ツール置き場に入っているものも
+    行として出し、パスの欄には「ツール置き場」と表示する
+    (置き場の実在が許可になる)。使い方は設定の報告に載って
+    AI へ届く (AI が呼び方を知るための文)。実行ファイル
+    (.exe / .bat / .cmd / .py) を画面へドラッグ＆ドロップ
+    すると、その名前とパスで登録される。名前の整形 (小文字化・
+    拡張子の除去) と保存は窓側が core の sanitize で行う。"""
+
+    _DROP_EXTS = (".exe", ".bat", ".cmd", ".py")
+
+    def __init__(self, names, paths, usages, parent=None, *,
+                 tools_folder_opener=None, folder_tools=None,
+                 tool_searcher=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        # ツールを探す役 (名前 → Path か None)。窓側が core の
+        # search_cli_tool を渡す。無ければ「探す」ボタンは
+        # 「見つからない」扱いにする。
+        self._tool_searcher = tool_searcher
+        # ツール置き場に入っているツールの名前 (小文字で持つ)。
+        self._folder_names = {
+            str(n).strip().lower() for n in (folder_tools or [])}
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "「ツール実行」の合図で呼べるツールです"
+            "（全プロファイル共通）。実行ファイルをこの画面へ"
+            "ドラッグ＆ドロップすると登録できます。「名前を"
+            "追加」で名前だけの行も作れます。パスが空の"
+            "行は「探す」で探せます (空のまま実行するとエラーに"
+            "なります)。使い方は、設定の報告に載って AI へ"
+            "届きます。ツール置き場に置いた実行ファイルは、"
+            "パスの欄に「ツール置き場」と出て、名前で実行でき"
+            "ます。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(
+            ["名前", "パス", "使い方（AI向け）"])
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table, 1)
+        paths = paths if isinstance(paths, dict) else {}
+        usages = usages if isinstance(usages, dict) else {}
+        seen = set()
+        for name in names or []:
+            seen.add(name)
+            self._add_row(
+                name, paths.get(name, ""), usages.get(name, ""))
+        for name, path in paths.items():
+            if name not in seen:
+                seen.add(name)
+                self._add_row(name, path, usages.get(name, ""))
+        # ツール置き場の中身も行として出す (登録済みの名前と
+        # 重なるものは登録の行が正なので出さない)。
+        for name in sorted(self._folder_names):
+            if name not in {str(s).lower() for s in seen}:
+                self._add_row(name, "", usages.get(name, ""),
+                              folder=True)
+        self._table.itemChanged.connect(self._on_item_changed)
+        row = QHBoxLayout()
+        self._add_name_button = QPushButton("名前を追加")
+        self._add_name_button.clicked.connect(self._add_name_row)
+        row.addWidget(self._add_name_button)
+        self._add_button = QPushButton("ファイルを追加…")
+        self._add_button.clicked.connect(self._add_files)
+        row.addWidget(self._add_button)
+        self._remove_button = QPushButton("選んだ行を削除")
+        self._remove_button.clicked.connect(self._remove_selected)
+        row.addWidget(self._remove_button)
+        if tools_folder_opener is not None:
+            self._folder_button = QPushButton("ツール置き場を開く")
+            self._folder_button.clicked.connect(tools_folder_opener)
+            row.addWidget(self._folder_button)
+        else:
+            self._folder_button = None
+        row.addStretch(1)
+        layout.addLayout(row)
+        self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+
+    # -- 行の操作 --------------------------------------------------------
+    def _add_row(self, name, path, usage, folder=False):
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        self._table.setItem(row, 0, QTableWidgetItem(str(name or "")))
+        if folder:
+            # 置き場の行は、パスの欄に「ツール置き場」と出し、
+            # 編集はさせない (実パスは置き場が決める)。
+            path_item = QTableWidgetItem("ツール置き場")
+            path_item.setFlags(
+                path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table.setItem(row, 1, path_item)
+        else:
+            self._table.setItem(
+                row, 1, QTableWidgetItem(str(path or "")))
+        self._table.setItem(row, 2, QTableWidgetItem(str(usage or "")))
+        self._sync_search_button(row)
+
+    def _is_folder_row(self, row) -> bool:
+        return self._cell(row, 0).lower() in self._folder_names \
+            and self._cell(row, 1) == "ツール置き場"
+
+    def _sync_search_button(self, row):
+        """パスの欄の「探す」ボタンの付け外し (2.01)。
+
+        置き場の行と、パスが入っている行には出さない。パスが
+        空の行にだけ出す。"""
+        if row < 0 or row >= self._table.rowCount():
+            return
+        existing = self._table.cellWidget(row, 1)
+        if self._is_folder_row(row) or self._cell(row, 1):
+            if existing is not None:
+                self._table.setCellWidget(row, 1, None)
+            return
+        if existing is None:
+            button = QPushButton("探す")
+            button.clicked.connect(
+                lambda _checked=False, btn=button:
+                self._on_search_clicked(btn))
+            self._table.setCellWidget(row, 1, button)
+
+    def _on_item_changed(self, item):
+        if item.column() == 1:
+            self._sync_search_button(item.row())
+
+    def _on_search_clicked(self, button):
+        """「探す」: PATH と Wireshark の置き場を探し、見つか
+        ればその行のパスへ実パスを記入する (2.01)。"""
+        row = -1
+        for candidate in range(self._table.rowCount()):
+            if self._table.cellWidget(candidate, 1) is button:
+                row = candidate
+                break
+        if row < 0:
+            return
+        name = self._cell(row, 0)
+        found = None
+        if self._tool_searcher is not None and name:
+            try:
+                found = self._tool_searcher(name)
+            except Exception:  # noqa: BLE001  探せなければ未発見
+                found = None
+        if found:
+            self._table.setItem(
+                row, 1, QTableWidgetItem(str(found)))
+            self._status_label.setText(
+                f"「{name}」が見つかりました: {found}")
+        else:
+            self._status_label.setText(
+                f"「{name}」は PATH と Wireshark の置き場に"
+                "見つかりませんでした")
+
+    def _cell(self, row, col) -> str:
+        item = self._table.item(row, col)
+        return item.text().strip() if item is not None else ""
+
+    def _find_row(self, name) -> int:
+        target = str(name or "").strip().lower()
+        for row in range(self._table.rowCount()):
+            if self._cell(row, 0).lower() == target:
+                return row
+        return -1
+
+    def _add_tool_file(self, file_path):
+        """実行ファイル1件を登録する (D&D とファイル選択の
+        共通処理)。名前はファイル名から拡張子を除いたもの。
+        同じ名前の行があればパスだけ差し替える。"""
+        from pathlib import Path
+
+        path = Path(str(file_path))
+        if path.suffix.lower() not in self._DROP_EXTS:
+            self._status_label.setText(
+                f"実行ファイルではないため登録しませんでした: "
+                f"{path.name}")
+            return
+        name = path.stem
+        row = self._find_row(name)
+        if row >= 0:
+            # 置き場の行だった場合は、登録の行へ作り替える
+            # (明示の登録が置き場より優先する)。
+            self._folder_names.discard(name.lower())
+            self._table.setItem(
+                row, 1, QTableWidgetItem(str(path)))
+            self._sync_search_button(row)
+            self._status_label.setText(
+                f"「{name}」のパスを差し替えました")
+        else:
+            self._add_row(name, str(path), "")
+            self._status_label.setText(f"「{name}」を登録しました")
+
+    def _add_name_row(self):
+        """名前だけの空の行を足す (2.02)。
+
+        名前を入れてパスが空のままなら「探す」ボタンが出る。
+        パスを設定するまで、そのツールは実行時にエラーになる。"""
+        self._add_row("", "", "")
+        row = self._table.rowCount() - 1
+        self._table.setCurrentCell(row, 0)
+        item = self._table.item(row, 0)
+        if item is not None:
+            self._table.editItem(item)
+
+    def _add_files(self):
+        files, _selected = QFileDialog.getOpenFileNames(
+            self, "ツールの追加", "",
+            "実行ファイル (*.exe *.bat *.cmd *.py);;"
+            "すべてのファイル (*.*)")
+        for file_path in files or []:
+            self._add_tool_file(file_path)
+
+    def _remove_selected(self):
+        rows = sorted(
+            {index.row()
+             for index in self._table.selectedIndexes()},
+            reverse=True)
+        for row in rows:
+            self._table.removeRow(row)
+
+    # -- ドラッグ＆ドロップ ----------------------------------------------
+    def dragEnterEvent(self, event):  # noqa: N802  Qt の上書き
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # noqa: N802  Qt の上書き
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802  Qt の上書き
+        added = False
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                self._add_tool_file(url.toLocalFile())
+                added = True
+        if added:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # -- 結果 --------------------------------------------------------------
+    def tools(self):
+        """表の内容を (名前の並び, パス辞書, 使い方辞書) で
+        返す。空の名前の行は除く。ツール置き場の行は、名前と
+        パスには入れない (許可は置き場の実在が担う) が、使い方
+        は返す。整形は窓側の sanitize が担う。"""
+        names = []
+        paths = {}
+        usages = {}
+        for row in range(self._table.rowCount()):
+            name = self._cell(row, 0)
+            if not name:
+                continue
+            usage = self._cell(row, 2)
+            if usage:
+                usages[name] = usage
+            if self._is_folder_row(row):
+                continue
+            names.append(name)
+            path = self._cell(row, 1)
+            if path:
+                paths[name] = path
+        return names, paths, usages
+
+
+class AutomationPage(QWidget):
+    """「自動化設定」タブのページ (2.01)。
+
+    script_runner 節の auto_* キー (AI プロファイルとは別の
+    共通設定)。既定は全部手動。"""
+
+    def __init__(self, automation=None, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        given = sanitize_automation(automation)
+        self._auto_boxes = {}
+        for key, label in AUTO_LABELS:
+            box = QCheckBox(label)
+            box.setChecked(given[key])
+            self._auto_boxes[key] = box
+            layout.addWidget(box)
+        layout.addStretch(1)
+
+    def automation(self) -> dict:
+        """自動化の切替の今の値 (script_runner 節へ保存する形)。"""
+        return {key: bool(self._auto_boxes[key].isChecked())
+                for key in AUTO_KEYS}
+
+
+class CommonSettingsPage(QWidget):
+    """「共通設定」タブのページ (2.01、フォルダ変更は 2.02)。
+
+    プロファイルに依らない設定: 監視フォルダと作業フォルダ
+    (「変更…」でフォルダを選べる)、ダークモード、要約モード、
+    実行の上限、開始プロンプトの文 (1.77 の編集欄をここへ
+    移した)。開始プロンプトは script_runner 節の intro_prompt
+    に持つ (投げ先共通の文)。空のときは窓側が環境から
+    自動生成する。"""
+
+    def __init__(self, parent=None, *, watch_text="",
+                 watch_folder="", work_folder="",
+                 dark_mode=False, summary_mode=True,
+                 timeout_seconds=120, intro_prompt="",
+                 intro_text_provider=None, error_color="#c00000"):
+        super().__init__(parent)
+        self._error_color = error_color
+        self._intro_text_provider = intro_text_provider
+        self._watch_folder = watch_folder or ""
+        self._work_folder = work_folder or ""
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        # フォルダの行は「今の場所の表示＋変更ボタン」。
+        # 監視フォルダは、設定が空なら既定 (ダウンロード
+        # フォルダ) が実効値として表示される。
+        self._watch_label = QLabel(
+            self._watch_folder or watch_text or "")
+        watch_row = QWidget()
+        watch_layout = QHBoxLayout(watch_row)
+        watch_layout.setContentsMargins(0, 0, 0, 0)
+        watch_layout.addWidget(self._watch_label, 1)
+        self._watch_button = QPushButton("変更…")
+        self._watch_button.clicked.connect(
+            lambda: self._pick_folder("watch"))
+        watch_layout.addWidget(self._watch_button)
+        form.addRow("監視フォルダ", watch_row)
+        self._work_label = QLabel(
+            self._work_folder or "(未選択)")
+        work_row = QWidget()
+        work_layout = QHBoxLayout(work_row)
+        work_layout.setContentsMargins(0, 0, 0, 0)
+        work_layout.addWidget(self._work_label, 1)
+        self._work_button = QPushButton("変更…")
+        self._work_button.clicked.connect(
+            lambda: self._pick_folder("work"))
+        work_layout.addWidget(self._work_button)
+        form.addRow("作業フォルダ", work_row)
+        self._timeout_spin = QSpinBox()
+        self._timeout_spin.setRange(5, 3600)
+        try:
+            timeout_value = int(timeout_seconds)
+        except (TypeError, ValueError):
+            timeout_value = 120
+        self._timeout_spin.setValue(
+            min(max(timeout_value, 5), 3600))
+        self._timeout_spin.setSuffix(" 秒")
+        form.addRow("実行の上限", self._timeout_spin)
+        layout.addLayout(form)
+        self._dark_box = QCheckBox("ダークモード")
+        self._dark_box.setChecked(bool(dark_mode))
+        layout.addWidget(self._dark_box)
+        self._summary_box = QCheckBox("要約モード")
+        self._summary_box.setChecked(bool(summary_mode))
+        layout.addWidget(self._summary_box)
+
+        intro_group = QGroupBox("開始プロンプト")
+        intro_layout = QVBoxLayout(intro_group)
+        intro_hint = QLabel(
+            "「保存した文を使う」にチェックがあるときは、この文を"
+            "送ります。無ければ自動生成の文を送ります。")
+        intro_hint.setWordWrap(True)
+        intro_layout.addWidget(intro_hint)
+        # チェックが無ければ編集欄は使わない (1.80)。自動生成の
+        # 文を見ただけで保存され、古い文に固定されてしまう事故
+        # の対策 (1.77 の実地で発生)。
+        self._intro_use_box = QCheckBox(
+            "保存した文を使う（自動生成しない）")
+        self._intro_use_box.setChecked(bool(intro_prompt))
+        self._intro_use_box.toggled.connect(
+            self._on_intro_use_toggled)
+        intro_layout.addWidget(self._intro_use_box)
+        self._intro_edit = QPlainTextEdit()
+        self._intro_edit.setPlainText(intro_prompt or "")
+        self._intro_edit.setMaximumHeight(150)
+        self._intro_edit.setEnabled(bool(intro_prompt))
+        intro_layout.addWidget(self._intro_edit)
+        intro_row = QHBoxLayout()
+        self._intro_load_button = QPushButton("自動生成の文を入れる")
+        self._intro_load_button.clicked.connect(
+            self._load_intro_text)
+        self._intro_load_button.setEnabled(
+            intro_text_provider is not None)
+        intro_row.addWidget(self._intro_load_button)
+        intro_row.addStretch(1)
+        intro_layout.addLayout(intro_row)
+        layout.addWidget(intro_group)
+
+        self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+        layout.addStretch(1)
+
+    def _pick_folder(self, which):
+        """フォルダを選んで表示と控えを差し替える (2.02)。
+
+        やめたときは何も変えない。選んだ時点で控えが替わり、
+        保存はダイアログの OK でまとめて行われる。"""
+        if which == "watch":
+            start = self._watch_folder or self._watch_label.text()
+        else:
+            start = self._work_folder
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "監視フォルダの選択" if which == "watch"
+            else "作業フォルダの選択",
+            start or "")
+        if not chosen:
+            return
+        if which == "watch":
+            self._watch_folder = chosen
+            self._watch_label.setText(chosen)
+        else:
+            self._work_folder = chosen
+            self._work_label.setText(chosen)
+
+    def values(self) -> dict:
+        """共通設定の今の値 (script_runner 節へ保存する形)。"""
+        return {
+            "dark_mode": bool(self._dark_box.isChecked()),
+            "summary_mode": bool(self._summary_box.isChecked()),
+            "timeout_seconds": int(self._timeout_spin.value()),
+            "watch_folder": self._watch_folder,
+            "work_folder": self._work_folder,
+        }
+
+    def intro_prompt(self) -> str:
+        """開始プロンプトの保存内容。「保存した文を使う」に
+        チェックが無ければ空 (自動生成) を返す。"""
+        if not self._intro_use_box.isChecked():
+            return ""
+        return self._intro_edit.toPlainText()
+
+    def _on_intro_use_toggled(self, on):
+        self._intro_edit.setEnabled(bool(on))
+
+    def _load_intro_text(self):
+        """自動生成の文を編集欄へ入れる (編集の土台にする)。
+
+        入れたら「保存した文を使う」にもチェックを入れる
+        (土台として取り込んだ意思の明示)。"""
+        if self._intro_text_provider is None:
+            return
+        try:
+            text = self._intro_text_provider()
+        except Exception as e:  # noqa: BLE001  状態行で知らせる
+            self._show_status(
+                f"自動生成の文を作れませんでした（{e}）", error=True)
+            return
+        self._intro_edit.setPlainText(text or "")
+        self._intro_use_box.setChecked(True)
+        self._show_status("自動生成の文を入れました")
+
+    def _show_status(self, message, error=False):
+        self._status_label.setStyleSheet(
+            f"color: {self._error_color};" if error else "")
+        self._status_label.setText(message)
+
+
+class SettingsDialog(QDialog):
+    """PHAL の設定ウィンドウ (2.01 でタブ化)。
+
+    タブは 共通設定 / AI別設定 / 動作ログ / 自動化設定 /
+    ツール設定。入口のボタンによって初期タブだけが変わり、
+    OK で全タブ分をまとめて保存する (窓側が受け取る)。
+    AI別設定の検証が通らないときは、そのタブへ移して止める。"""
+
+    _TAB_DEFS = (
+        ("common", "共通設定"),
+        ("ai", "AI別設定"),
+        ("log", "動作ログ"),
+        ("auto", "自動化設定"),
+        ("tools", "ツール設定"),
+    )
+
+    def __init__(self, fields, parent=None, *, profiles=None,
+                 active_index=0, automation=None, common=None,
+                 tools_data=None, enumerate_windows=None,
+                 scanner=None, filler=None, button_scanner=None,
+                 attach_tester=None, diag_text_provider=None,
+                 error_color="#c00000", intro_text_provider=None,
+                 tools_folder_opener=None, tool_searcher=None,
+                 initial_tab="ai"):
+        super().__init__(parent)
+        self.setWindowTitle("設定 - PHAL")
+        self.resize(720, 800)
+        common = common or {}
+        tools_data = tools_data or {}
+        layout = QVBoxLayout(self)
+        self._tabs = QTabWidget()
+        self.common_page = CommonSettingsPage(
+            self,
+            watch_text=common.get("watch_text", ""),
+            watch_folder=common.get("watch_folder", ""),
+            work_folder=common.get("work_folder", ""),
+            dark_mode=common.get("dark_mode", False),
+            summary_mode=common.get("summary_mode", True),
+            timeout_seconds=common.get("timeout_seconds", 120),
+            intro_prompt=common.get("intro_prompt", ""),
+            intro_text_provider=intro_text_provider,
+            error_color=error_color)
+        self.ai_page = AiProfilePage(
+            fields, self,
+            enumerate_windows=enumerate_windows, scanner=scanner,
+            filler=filler, button_scanner=button_scanner,
+            attach_tester=attach_tester, profiles=profiles,
+            active_index=active_index,
+            diag_text_provider=diag_text_provider,
+            error_color=error_color)
+        self.log_page = LogViewerPage(self)
+        self.automation_page = AutomationPage(automation, self)
+        self.tools_page = ToolSettingsPage(
+            tools_data.get("names") or [],
+            tools_data.get("paths") or {},
+            tools_data.get("usages") or {},
+            self, tools_folder_opener=tools_folder_opener,
+            folder_tools=tools_data.get("folder_tools") or [],
+            tool_searcher=tool_searcher)
+        pages = {
+            "common": self.common_page,
+            "ai": self.ai_page,
+            "log": self.log_page,
+            "auto": self.automation_page,
+            "tools": self.tools_page,
+        }
+        self._tab_keys = []
+        for key, label in self._TAB_DEFS:
+            self._tabs.addTab(pages[key], label)
+            self._tab_keys.append(key)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self._tabs, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        if initial_tab in self._tab_keys:
+            self._tabs.setCurrentIndex(
+                self._tab_keys.index(initial_tab))
+
+    def _on_tab_changed(self, index):
+        if 0 <= index < len(self._tab_keys) \
+                and self._tab_keys[index] == "log":
+            self.log_page.refresh()
+
+    def accept(self):  # noqa: N802  Qt の上書き
+        if not self.ai_page.validate():
+            self._tabs.setCurrentIndex(self._tab_keys.index("ai"))
             return
         super().accept()
+
+    # -- 各ページへの委譲 --------------------------------------------
+    def profiles(self) -> list:
+        return self.ai_page.profiles()
+
+    def active_index(self) -> int:
+        return self.ai_page.active_index()
+
+    def automation(self) -> dict:
+        return self.automation_page.automation()
+
+    def intro_prompt(self) -> str:
+        return self.common_page.intro_prompt()
+
+    def common_values(self) -> dict:
+        return self.common_page.values()
+
+    def tools(self):
+        return self.tools_page.tools()

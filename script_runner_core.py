@@ -36,6 +36,8 @@ STATUS_ERROR = "error"      # 文法エラー・読めない import・文字コ�
 STATUS_WARN = "warn"        # 要確認(F5 では実行しない)
 STATUS_UNKNOWN = "unknown"  # チェック不能(Python / PowerShell が見つからない)
 
+# 実行ログ (append_run_log) のファイル名。動作ログ (1.89) の
+# ACTIVITY_LOG_FILENAME ("script_runner_log.json") とは別物。
 LOG_FILENAME = "script_runner_log.jsonl"
 PS_ALLOWLIST_FILENAME = "script_runner_ps_allowlist.json"
 
@@ -585,6 +587,69 @@ def dl_consumed_get(records: dict, name, class_name):
     return entry
 
 
+# DL の開き直し引き継ぎ (script_runner_dl_session.json)。
+# パネルが閉じるときに、その時点で表示していた DL 候補の key と
+# 閉じた時刻を残す。開き直した先では、閉じてから間もない場合に
+# 限り「再起動の続き」とみなし、起動時の候補スナップショットを
+# この key だけにする (1.70)。再起動の合間に届いた新しい候補を
+# 「起動時の既存分」として自動 DL から外してしまう問題への対処で、
+# 古い候補の落とし直し防止 (スナップショット自体) は、間が空いた
+# 開き直しでは従来どおり効く。
+DL_SESSION_FILENAME = "script_runner_dl_session.json"
+DL_SESSION_CONTINUATION_SECONDS = 180
+
+
+def dl_session_path() -> Path:
+    return data_dir() / DL_SESSION_FILENAME
+
+
+def save_dl_session(candidate_key, records_path=None) -> None:
+    """閉じる時点の引き継ぎを書き出す。失敗しても黙って諦める
+    (引き継ぎが無ければ通常のスナップショットに戻るだけ)。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_session_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump({"candidate_key": candidate_key or "",
+                       "closed_at": time.time()},
+                      f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_dl_session(records_path=None) -> dict:
+    """引き継ぎを読む。壊れている・読めない場合は空として扱う。"""
+    path = Path(records_path) if records_path is not None \
+        else dl_session_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def dl_session_continuation_key(session, now: float = None):
+    """引き継ぎが「続き」扱いなら直前の候補の key を返す。
+
+    閉じてからの経過が DL_SESSION_CONTINUATION_SECONDS 以内で、
+    候補の key が残っている場合だけ。"""
+    if not isinstance(session, dict):
+        return None
+    key = session.get("candidate_key")
+    closed_at = session.get("closed_at")
+    if not key or not isinstance(closed_at, (int, float)):
+        return None
+    if now is None:
+        now = time.time()
+    if now - closed_at > DL_SESSION_CONTINUATION_SECONDS:
+        return None
+    return key
+
+
 # ---------------------------------------------------------------
 # 実行済みハッシュの控え (script_runner_executed_hashes.json)。
 # 実行を始めたスクリプトの中身の sha256 を控える。自動実行は、
@@ -735,6 +800,82 @@ def save_last_results(records: dict, records_path=None) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+def load_run_log_records(limit: int = 20, log_path=None) -> list:
+    """実行ログ (script_runner_log.jsonl) の直近の記録を読む。
+
+    append_run_log が1行1件で足す JSONL。壊れた行は読み飛ば
+    す。戻り値は古い順で、最大 limit 件 (新しい方を残す)。
+    一覧の合図 (1.92、素材の変更 1.94) の材料。"""
+    path = Path(log_path) if log_path is not None \
+        else data_dir() / LOG_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    records = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records[-limit:] if limit > 0 else records
+
+
+def _history_line(record: dict) -> str:
+    """実行ログの1件を一覧の1行にする (1.94)。
+
+    形は「MM-DD HH:MM ファイル名 終了コード N（S秒）」で、
+    止まった・時間切れは後ろに添える。"""
+    stamp = ""
+    iso = record.get("time")
+    if isinstance(iso, str) and iso:
+        try:
+            stamp = datetime.fromisoformat(iso).strftime(
+                "%m-%d %H:%M")
+        except ValueError:
+            stamp = ""
+    name = str(record.get("file") or "(不明)")
+    code = record.get("exit_code")
+    code_text = f"終了コード {code}" if code is not None \
+        else "終了コード不明"
+    seconds = record.get("seconds")
+    sec_text = f"（{seconds}秒）" if isinstance(
+        seconds, (int, float)) else ""
+    flags = ""
+    if record.get("stopped"):
+        flags += "・停止"
+    if record.get("timed_out"):
+        flags += "・時間切れ"
+    head = f"{stamp} " if stamp else ""
+    return f"{head}{name} {code_text}{sec_text}{flags}"
+
+
+def build_history_text(records=None) -> str:
+    """実行一覧の合図への文を組み立てる (1.92、素材は実行ログ
+    へ変更 1.94)。
+
+    当初は結果の控え (phal_last_results) の1行目を並べていた
+    が、控えに残るのは見出しを除いた本文だったため「--- 出力
+    ---」の行が並ぶ実地の不具合になった。実行ログ
+    (append_run_log の JSONL) は時刻・ファイル名・終了コード
+    を構造で持つので、こちらから作る。新しい順に最大20件。
+    記録が無ければ、その旨の文を返す。"""
+    if records is None:
+        records = load_run_log_records(20)
+    if not isinstance(records, list):
+        records = []
+    lines = [_history_line(r) for r in reversed(records)
+             if isinstance(r, dict)]
+    if not lines:
+        return "実行の記録はまだありません。"
+    return "\n".join(["直近の実行一覧（新しい順）"] + lines)
 
 
 def last_results_put(records: dict, key: str, text: str) -> None:
@@ -918,6 +1059,140 @@ def diag_append(events: list, text: str, at=None) -> None:
     del events[:-DIAG_LIMIT]
 
 
+# ---------------------------------------------------------------
+# 動作ログ (script_runner_log.json、1.89)。診断の控え (60件) とは
+# 別に、開き直しをまたいで長く残すための記録。診断の束は直近を
+# AI へ渡すためのもので、開き直しのたびの「チェック（控え
+# から）」の列に押し流されてしまう。こちらは上限1000件で、
+# 控えからのチェックは窓側が件数だけに畳んで入れる (個別の行
+# は入れない)。ビューア (1.90) がこれを読む。
+# ---------------------------------------------------------------
+ACTIVITY_LOG_FILENAME = "script_runner_log.json"
+LOG_LIMIT = 1000              # 動作ログに残す件数の上限
+
+
+def log_path() -> Path:
+    return data_dir() / ACTIVITY_LOG_FILENAME
+
+
+# ファイルの出どころ (2.04)。ファイル名 → 届いたときに連携して
+# いた AI (プロファイル名) の控え。一覧の「AI」列に出す。起動
+# 前からあったファイルには付けない (どの AI からか分からない)。
+ITEM_AI_FILENAME = "phal_item_ai.json"
+
+
+def load_item_ai(path=None) -> dict:
+    """ファイルの出どころの控え {ファイル名: AI名} を読む。"""
+    target = Path(path) if path is not None \
+        else data_dir() / ITEM_AI_FILENAME
+    try:
+        with open(target, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()
+            if isinstance(v, str) and v}
+
+
+def save_item_ai(mapping: dict, path=None) -> None:
+    """ファイルの出どころの控えを書く。失敗しても黙る (表示用)。"""
+    target = Path(path) if path is not None \
+        else data_dir() / ITEM_AI_FILENAME
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(mapping or {}, f, ensure_ascii=False)
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
+def load_log_events(events_path=None) -> list:
+    """動作ログ [{at, text}] を読み込む (古い順)。読みの作りは
+    診断の控えと同じで、上限だけ違う。"""
+    path = Path(events_path) if events_path is not None \
+        else log_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    events = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        at = entry.get("at")
+        text = entry.get("text")
+        if not isinstance(at, (int, float)) \
+                or not isinstance(text, str) or not text:
+            continue
+        event = {"at": float(at), "text": text}
+        ai = entry.get("ai")
+        if isinstance(ai, str) and ai:
+            event["ai"] = ai
+        events.append(event)
+    return events[-LOG_LIMIT:]
+
+
+def save_log_events(events: list, events_path=None) -> None:
+    path = Path(events_path) if events_path is not None \
+        else log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(events[-LOG_LIMIT:], f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def log_append(events: list, text: str, at=None, ai=None) -> None:
+    """動作ログへ1件足す。文の畳み方と長さの上限は診断と同じ。
+
+    ai (2.04) は、その動きがどの AI との連携でのことか (有効な
+    プロファイルの名前)。表示側 (format_log_lines) が [名前] の
+    形で出す。無ければ付けない。"""
+    text = " ".join(str(text).split())
+    if not text:
+        return
+    if len(text) > DIAG_TEXT_LIMIT:
+        text = text[:DIAG_TEXT_LIMIT - 1] + "…"
+    event = {
+        "at": float(at) if at is not None else time.time(),
+        "text": text,
+    }
+    if isinstance(ai, str) and ai:
+        event["ai"] = ai
+    events.append(event)
+    del events[:-LOG_LIMIT]
+
+
+def format_log_lines(events, with_date: bool = False) -> list:
+    """動作ログを「時刻 + 文」の行の並びにする (ビューア用)。
+
+    ai が付いた記録 (2.04) は、時刻の後ろに [AI名] を出す。"""
+    lines = []
+    for e in events or []:
+        at = e.get("at") or 0
+        if with_date:
+            stamp = time.strftime(
+                "%m-%d %H:%M:%S", time.localtime(at))
+        else:
+            stamp = _diag_time_text(at)
+        ai = e.get("ai")
+        if isinstance(ai, str) and ai:
+            lines.append(f"{stamp} [{ai}] {e.get('text', '')}")
+        else:
+            lines.append(f"{stamp} {e.get('text', '')}")
+    return lines
+
+
 def _diag_time_text(at: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(at))
 
@@ -941,7 +1216,17 @@ def build_diag_bundle(version: str, toggles: dict, profile_name: str,
         f"自動化: DL={on_off('auto_dl')} 実行={on_off('auto_run')} "
         f"回答={on_off('auto_answer')} 送信={on_off('auto_send')} "
         f"診断={on_off('auto_diag')} 受領={on_off('auto_ack')} "
-        f"リセット={on_off('auto_reset')}",
+        f"リセット={on_off('auto_reset')} "
+        f"再実行={on_off('auto_rerun')} "
+        f"再送={on_off('auto_resend')} "
+        f"設定={on_off('auto_settings')} "
+        f"マニュアル={on_off('auto_manual')} "
+        f"ファイル={on_off('auto_file')} "
+        f"全文={on_off('auto_fulltext')} "
+        f"一覧={on_off('auto_history')} "
+        f"停止={on_off('auto_stop')} "
+        f"ログ={on_off('auto_log')} "
+        f"ツール={on_off('auto_tool')}",
         f"AIプロファイル: {profile_name or '(未設定)'}",
         "状態:",
     ]
@@ -1059,18 +1344,33 @@ def load_reset_auto(state_path=None) -> dict:
             raw = json.load(f)
     except (OSError, ValueError):
         return {"consumed_id": "", "consumed_key": "",
-                "last_reset_at": 0.0}
+                "last_reset_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
-                "last_reset_at": 0.0}
+                "last_reset_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     reset_at = raw.get("last_reset_at")
+    payload = raw.get("last_payload")
+    answered_at = raw.get("last_answered_at")
     return {
         "consumed_id": consumed if isinstance(consumed, str) else "",
         "consumed_key": key if isinstance(key, str) else "",
         "last_reset_at": float(reset_at)
         if isinstance(reset_at, (int, float)) else 0.0,
+        "last_payload": payload if isinstance(payload, str) else "",
+        "last_answered_at": float(answered_at)
+        if isinstance(answered_at, (int, float)) else 0.0,
+        "refire_notice_payload": raw.get("refire_notice_payload")
+        if isinstance(raw.get("refire_notice_payload"), str)
+        else "",
+        "refire_notice_at": float(raw.get("refire_notice_at"))
+        if isinstance(raw.get("refire_notice_at"), (int, float))
+        else 0.0,
     }
 
 
@@ -1085,6 +1385,13 @@ def save_reset_auto(state: dict, state_path=None) -> None:
         "consumed_id": str(state.get("consumed_id") or ""),
         "consumed_key": str(state.get("consumed_key") or ""),
         "last_reset_at": float(state.get("last_reset_at") or 0.0),
+        "last_payload": str(state.get("last_payload") or ""),
+        "last_answered_at": float(
+            state.get("last_answered_at") or 0.0),
+        "refire_notice_payload": str(
+            state.get("refire_notice_payload") or ""),
+        "refire_notice_at": float(
+            state.get("refire_notice_at") or 0.0),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1401,1047 @@ def save_reset_auto(state: dict, state_path=None) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------
+# 再実行の合図の控え (1.63)。診断・リセットと同じ作法で、控えは
+# 混ぜずに別ファイルで持つ。
+# AI の発言の中の目印の行 (copilot_loop.RERUN_REQUEST_MARKER +
+# コマンドID) を見つけたら、切替 auto_rerun が入っているとき
+# だけ、その ID のスクリプトを再実行する。歯止めは、同じ発言
+# で二度反応しないための「消費済みの目印の ID」と第2の同定子
+# key (どちらか一致すれば消費済み)、自動再実行同士の間隔を
+# 最低5分空けるための「直近に再実行した時刻」。
+# ---------------------------------------------------------------
+RERUN_AUTO_FILENAME = "script_runner_rerun_auto.json"
+RERUN_AUTO_COOLDOWN_SEC = 300.0  # 自動再実行同士の最短間隔 (5分)
+
+
+def rerun_auto_path() -> Path:
+    return data_dir() / RERUN_AUTO_FILENAME
+
+
+def load_rerun_auto(state_path=None) -> dict:
+    """再実行の控え {consumed_id, consumed_key, last_rerun_at}
+    を読み込む。
+
+    古い控えに consumed_key が無ければ "" として扱う。壊れて
+    いる・読めない・形が違う場合は、消費した物は無く再実行
+    したことも無い、として扱う (合図の判定が理由でパネルが
+    落ちてはならない)。"""
+    path = Path(state_path) if state_path is not None \
+        else rerun_auto_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_rerun_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_rerun_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
+    consumed = raw.get("consumed_id")
+    key = raw.get("consumed_key")
+    rerun_at = raw.get("last_rerun_at")
+    payload = raw.get("last_payload")
+    answered_at = raw.get("last_answered_at")
+    return {
+        "consumed_id": consumed if isinstance(consumed, str) else "",
+        "consumed_key": key if isinstance(key, str) else "",
+        "last_rerun_at": float(rerun_at)
+        if isinstance(rerun_at, (int, float)) else 0.0,
+        "last_payload": payload if isinstance(payload, str) else "",
+        "last_answered_at": float(answered_at)
+        if isinstance(answered_at, (int, float)) else 0.0,
+        "refire_notice_payload": raw.get("refire_notice_payload")
+        if isinstance(raw.get("refire_notice_payload"), str)
+        else "",
+        "refire_notice_at": float(raw.get("refire_notice_at"))
+        if isinstance(raw.get("refire_notice_at"), (int, float))
+        else 0.0,
+    }
+
+
+def save_rerun_auto(state: dict, state_path=None) -> None:
+    """再実行の控えを書き出す。失敗しても黙って諦める (次に
+    開いたとき控えが少し古いだけ)。書きかけで壊さないよう、
+    一度別名で書いてから置き換える。"""
+    path = Path(state_path) if state_path is not None \
+        else rerun_auto_path()
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "consumed_key": str(state.get("consumed_key") or ""),
+        "last_rerun_at": float(state.get("last_rerun_at") or 0.0),
+        "last_payload": str(state.get("last_payload") or ""),
+        "last_answered_at": float(
+            state.get("last_answered_at") or 0.0),
+        "refire_notice_payload": str(
+            state.get("refire_notice_payload") or ""),
+        "refire_notice_at": float(
+            state.get("refire_notice_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------
+# 結果再送の合図の控え (1.75)
+#
+# AI の発言の中の目印の行 (copilot_loop.RESEND_REQUEST_MARKER +
+# コマンドID) を見つけたら、切替 auto_resend が入っているとき
+# だけ、その ID の直近の結果 (last_results の控え) を投稿し直
+# す。歯止めは再実行と同じ作法: 同じ発言で二度反応しないため
+# の消費済みの同定子 (id と key) と、再送同士の間隔 (最短60秒)。
+# ---------------------------------------------------------------
+RESEND_AUTO_FILENAME = "script_runner_resend_auto.json"
+RESEND_AUTO_COOLDOWN_SEC = 60.0  # 自動再送同士の最短間隔 (60秒)
+
+
+def resend_auto_path() -> Path:
+    return data_dir() / RESEND_AUTO_FILENAME
+
+
+def load_resend_auto(state_path=None) -> dict:
+    """結果再送の控え {consumed_id, consumed_key, last_sent_at}
+    を読み込む。壊れている場合は「消費した物は無く、送った
+    ことも無い」として扱う (再実行の控えと同じ倒し方)。"""
+    path = Path(state_path) if state_path is not None \
+        else resend_auto_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_sent_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_sent_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
+    consumed = raw.get("consumed_id")
+    key = raw.get("consumed_key")
+    sent_at = raw.get("last_sent_at")
+    payload = raw.get("last_payload")
+    answered_at = raw.get("last_answered_at")
+    return {
+        "consumed_id": consumed if isinstance(consumed, str) else "",
+        "consumed_key": key if isinstance(key, str) else "",
+        "last_sent_at": float(sent_at)
+        if isinstance(sent_at, (int, float)) else 0.0,
+        "last_payload": payload if isinstance(payload, str) else "",
+        "last_answered_at": float(answered_at)
+        if isinstance(answered_at, (int, float)) else 0.0,
+        "refire_notice_payload": raw.get("refire_notice_payload")
+        if isinstance(raw.get("refire_notice_payload"), str)
+        else "",
+        "refire_notice_at": float(raw.get("refire_notice_at"))
+        if isinstance(raw.get("refire_notice_at"), (int, float))
+        else 0.0,
+    }
+
+
+def save_resend_auto(state: dict, state_path=None) -> None:
+    """結果再送の控えを書き出す (一時ファイルから置き換え)。"""
+    path = Path(state_path) if state_path is not None \
+        else resend_auto_path()
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "consumed_key": str(state.get("consumed_key") or ""),
+        "last_sent_at": float(state.get("last_sent_at") or 0.0),
+        "last_payload": str(state.get("last_payload") or ""),
+        "last_answered_at": float(
+            state.get("last_answered_at") or 0.0),
+        "refire_notice_payload": str(
+            state.get("refire_notice_payload") or ""),
+        "refire_notice_at": float(
+            state.get("refire_notice_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------
+# 設定確認・マニュアル再送の控え (1.85)。作りは結果再送の控えと
+# 同じで、ファイルだけ分ける (混ぜない)。
+# ---------------------------------------------------------------
+SETTINGS_AUTO_FILENAME = "script_runner_settings_auto.json"
+MANUAL_AUTO_FILENAME = "script_runner_manual_auto.json"
+SETTINGS_AUTO_COOLDOWN_SEC = 60.0  # 設定の自動応答同士の最短間隔
+MANUAL_AUTO_COOLDOWN_SEC = 60.0    # マニュアル再送同士の最短間隔
+
+
+def _load_marker_auto(path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = None
+    if not isinstance(raw, dict):
+        return {"consumed_id": "", "consumed_key": "",
+                "last_sent_at": 0.0,
+                "last_payload": "", "last_answered_at": 0.0,
+                "refire_notice_payload": "", "refire_notice_at": 0.0}
+    sent_at = raw.get("last_sent_at")
+    answered_at = raw.get("last_answered_at")
+    notice_at = raw.get("refire_notice_at")
+    return {
+        "consumed_id": raw.get("consumed_id")
+        if isinstance(raw.get("consumed_id"), str) else "",
+        "consumed_key": raw.get("consumed_key")
+        if isinstance(raw.get("consumed_key"), str) else "",
+        "last_sent_at": float(sent_at)
+        if isinstance(sent_at, (int, float)) else 0.0,
+        "last_payload": raw.get("last_payload")
+        if isinstance(raw.get("last_payload"), str) else "",
+        "last_answered_at": float(answered_at)
+        if isinstance(answered_at, (int, float)) else 0.0,
+        # 応答済みの知らせを送った控え (2.00)。
+        "refire_notice_payload": raw.get("refire_notice_payload")
+        if isinstance(raw.get("refire_notice_payload"), str)
+        else "",
+        "refire_notice_at": float(notice_at)
+        if isinstance(notice_at, (int, float)) else 0.0,
+    }
+
+
+def _save_marker_auto(state, path) -> None:
+    state = state if isinstance(state, dict) else {}
+    payload = {
+        "consumed_id": str(state.get("consumed_id") or ""),
+        "consumed_key": str(state.get("consumed_key") or ""),
+        "last_sent_at": float(state.get("last_sent_at") or 0.0),
+        "last_payload": str(state.get("last_payload") or ""),
+        "last_answered_at": float(
+            state.get("last_answered_at") or 0.0),
+        "refire_notice_payload": str(
+            state.get("refire_notice_payload") or ""),
+        "refire_notice_at": float(
+            state.get("refire_notice_at") or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_settings_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / SETTINGS_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_settings_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / SETTINGS_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+def load_manual_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / MANUAL_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_manual_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / MANUAL_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# 設定確認の報告に出す自動化の短い名前 (診断の束と同じ並び)。
+_SETTINGS_AUTO_LABELS = (
+    ("auto_dl", "DL"), ("auto_run", "実行"),
+    ("auto_answer", "回答"), ("auto_send", "送信"),
+    ("auto_diag", "診断"), ("auto_ack", "受領"),
+    ("auto_reset", "リセット"), ("auto_rerun", "再実行"),
+    ("auto_resend", "再送"), ("auto_settings", "設定"),
+    ("auto_manual", "マニュアル"), ("auto_file", "ファイル"),
+    ("auto_fulltext", "全文"),
+    ("auto_history", "一覧"),
+    ("auto_stop", "停止"),
+    ("auto_log", "ログ"),
+    ("auto_tool", "ツール"),
+)
+
+
+def build_settings_report(section, version) -> str:
+    """設定確認の合図への報告を組み立てる (1.85)。
+
+    script_runner 節 (設定ファイルの中身) から、AI がループを
+    回すのに要る値を平文で並べる。窓の見た目の細部や、投げ先の
+    窓一致の欄そのものは出さない (長いし、要らない)。"""
+    section = section if isinstance(section, dict) else {}
+
+    def on_off(value):
+        return "入" if value else "切"
+
+    lines = [f"PHAL設定 Ver{version}"]
+    # 監視フォルダは、設定が空なら実際に見張っている既定の場所
+    # (ダウンロードフォルダ) を出す (生の空文字は意味がない)。
+    watch = section.get("watch_folder")
+    if isinstance(watch, str) and watch.strip():
+        lines.append(f"- 監視フォルダ: {watch}")
+    else:
+        lines.append(
+            f"- 監視フォルダ: {resolve_watch_folder(section)}"
+            "（既定のダウンロードフォルダ）")
+    work = section.get("work_folder")
+    lines.append(
+        f"- 作業フォルダ: {work if isinstance(work, str) and work else '(未選択)'}")
+    lines.append(f"- ダークモード: {on_off(section.get('dark_mode'))}")
+    if section.get("summary_mode", True):
+        lines.append(
+            f"- 要約モード: 入（{section.get('summary_lines', 100)}行"
+            f"・{section.get('summary_chars', 8000)}字を超えたら要約）")
+    else:
+        lines.append("- 要約モード: 切")
+    timeout = section.get("timeout_seconds")
+    lines.append(
+        f"- 実行の上限: {timeout}秒"
+        if isinstance(timeout, (int, float)) else "- 実行の上限: (不明)")
+    saved_intro = section.get("intro_prompt")
+    if isinstance(saved_intro, str) and saved_intro.strip():
+        lines.append(
+            f"- 開始プロンプト: 保存した文を使う（{len(saved_intro)}字）")
+    else:
+        lines.append("- 開始プロンプト: 自動生成")
+    auto_text = " ".join(
+        f"{label}={on_off(section.get(key))}"
+        for key, label in _SETTINGS_AUTO_LABELS)
+    lines.append(f"自動化: {auto_text}")
+    tools = sanitize_cli_tools(section.get("cli_tools"))
+    tool_paths = sanitize_cli_tool_paths(section.get("cli_tool_paths"))
+    lines.append(
+        "- ツール実行の許可リスト: "
+        + (", ".join(tools) if tools else "(なし)"))
+    # 登録 (名前→パス) と解決の結果と使い方 (2.00)。解決は
+    # 実在を見るので、この報告を出した PC 上での答えになる。
+    tool_usages = sanitize_cli_tool_usages(
+        section.get("cli_tool_usages"))
+    folder = tools_folder()
+    placed = []
+    if folder.is_dir():
+        placed = sorted(
+            p.name for p in folder.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in TOOL_FOLDER_EXTS)
+    placed_names = {normalize_tool_name(n) for n in placed}
+    for name in sorted(
+            set(tools) | set(tool_paths) | placed_names):
+        found, why = resolve_cli_tool(
+            name, tools, tool_paths, [folder])
+        if name in tool_paths:
+            line = (
+                f"- ツール {name}: 登録 {tool_paths[name]}"
+                + ("" if found else "（見つかりません）"))
+        elif found:
+            line = f"- ツール {name}: ツール置き場 {found}"
+        elif why == "no_path":
+            line = f"- ツール {name}: （パス未設定）"
+        else:
+            line = f"- ツール {name}: （見つかりません）"
+        if name in tool_usages:
+            line += f"（使い方: {tool_usages[name]}）"
+        lines.append(line)
+    lines.append(
+        f"- ツール置き場: {folder}"
+        + (f"（中身: {', '.join(placed)}）" if placed
+           else "（空）"))
+    profiles = section.get("ai_profiles")
+    active = section.get("ai_profile_active")
+    if isinstance(profiles, list) and profiles:
+        lines.append("AIプロファイル:")
+        for i, entry in enumerate(profiles):
+            if not isinstance(entry, dict):
+                continue
+            target = entry.get("target") \
+                if isinstance(entry.get("target"), dict) else {}
+            mark = "（有効）" if i == active else ""
+            label = target.get("label") or ""
+            method = target.get("attach_method") or "auto"
+            lines.append(
+                f"- {entry.get('name') or ''}{mark}: ラベル={label}"
+                f" / 添付方式={method}"
+                f" / ZIP名前変え={on_off(target.get('zip_as_txt') is True)}")
+    else:
+        lines.append("AIプロファイル: (未設定)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------
+# ファイルリクエストの控えとパスの解決 (1.88)。控えの作りは
+# 設定・マニュアルと同じ (汎用の _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+FILE_AUTO_FILENAME = "script_runner_file_auto.json"
+FILE_AUTO_COOLDOWN_SEC = 60.0  # ファイル送信同士の最短間隔
+
+
+def load_file_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / FILE_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_file_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / FILE_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# 全文リクエストの控えと全文ファイル探し (1.91)。控えの作りは
+# ファイルリクエストと同じ (汎用の _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+FULLTEXT_AUTO_FILENAME = "script_runner_fulltext_auto.json"
+FULLTEXT_AUTO_COOLDOWN_SEC = 60.0  # 全文送信同士の最短間隔
+
+
+def load_fulltext_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / FULLTEXT_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_fulltext_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / FULLTEXT_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# 実行一覧リクエストの控え (1.92)。控えの作りは全文リクエストと
+# 同じ (汎用の _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+HISTORY_AUTO_FILENAME = "script_runner_history_auto.json"
+HISTORY_AUTO_COOLDOWN_SEC = 60.0  # 一覧の自動応答同士の最短間隔
+
+
+def load_history_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / HISTORY_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_history_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / HISTORY_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# 停止リクエストの控え (1.93)。控えの作りは実行一覧と同じ
+# (汎用の _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+STOP_AUTO_FILENAME = "script_runner_stop_auto.json"
+STOP_AUTO_COOLDOWN_SEC = 60.0  # 停止の自動応答同士の最短間隔
+
+# 合図の再応答の抑止 (1.95)。応答済みの合図が、開き直しをまた
+# いで同定子 (id・key) が外れた状態で再検出されることがある
+# ため、種類ごとの控えに「最後に応答した中身 (last_payload)」
+# と「応答した時刻 (last_answered_at)」を持ち、同じ中身への
+# 応答はこの秒数の間は繰り返さない。
+MARKER_REFIRE_SUPPRESS_SEC = 900.0  # 再検出を黙って見送る間隔 (15分)。これを過ぎた再検出は実行せず「応答済み」の知らせを1回だけ送る (2.00)
+
+
+def load_stop_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / STOP_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_stop_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / STOP_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# 動作ログリクエストの控えと、指定の解釈・選び出し (1.96)。
+# 控えの作りは停止リクエストと同じ (汎用の _load/_save_marker
+# _auto)。load_log_events (動作ログ本体の読み) とは別物なので
+# 混同しないこと。
+# ---------------------------------------------------------------
+LOG_AUTO_FILENAME = "script_runner_log_auto.json"
+LOG_AUTO_COOLDOWN_SEC = 60.0  # ログの自動応答同士の最短間隔
+
+LOG_REQUEST_DEFAULT_COUNT = 50   # 指定なしのときの件数
+LOG_REQUEST_MAX_COUNT = 500      # 件数指定の上限
+
+_LOG_DATE_TOKEN_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_LOG_RANGE_TOKEN_RE = re.compile(
+    r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$")
+_LOG_COUNT_TOKEN_RE = re.compile(r"^\d+$")
+
+
+def load_log_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / LOG_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_log_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / LOG_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# ツール実行リクエストの控えと、引数文字列の分割・許可リスト・
+# 実行 (1.98)。引数の分割 (split_command_args) は再実行の引数
+# (1.97) でも使う。控えの作りは他の合図と同じ (汎用の
+# _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+TOOL_AUTO_FILENAME = "script_runner_tool_auto.json"
+TOOL_AUTO_COOLDOWN_SEC = 60.0  # ツール実行の応答同士の最短間隔
+
+# 許可リストの既定 (設定 cli_tools が無いとき)。Wireshark の
+# コマンドライン一式と、Windows 標準の ipconfig。
+DEFAULT_CLI_TOOLS = (
+    "tshark", "capinfos", "editcap", "mergecap", "dumpcap",
+    "ipconfig",
+)
+
+
+def load_tool_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / TOOL_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_tool_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / TOOL_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+def split_command_args(text) -> list:
+    """引数文字列を引数の並びに分ける (1.97 / 1.98)。
+
+    Windows のパス (バックスラッシュ) を壊さないよう、引用符を
+    残す形 (posix=False) で分けてから、各語の前後の引用符を
+    外す。引用符で囲まれた空白は1語にまとまる。引用符が閉じて
+    いないときは ValueError (呼ぶ側が理由として返す)。"""
+    import shlex
+
+    args = []
+    for token in shlex.split(str(text or ""), posix=False):
+        if len(token) >= 2 and token[0] == token[-1] \
+                and token[0] in "\"'":
+            token = token[1:-1]
+        args.append(token)
+    return args
+
+
+def normalize_tool_name(name) -> str:
+    """ツール名を比べられる形に整える (小文字・拡張子なし・
+    パスが付いていれば末尾の名前だけ)。"""
+    base = str(name or "").strip().replace("/", "\\")
+    base = base.rsplit("\\", 1)[-1]
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base.lower()
+
+
+def sanitize_cli_tools(value) -> list:
+    """設定の許可リスト (cli_tools) を整える。
+
+    文字列の並びだけを残し、整えた名前の重複を除く。値が並び
+    で無ければ既定 (DEFAULT_CLI_TOOLS) を返す。空の並びは
+    「何も許可しない」として尊重する。"""
+    if not isinstance(value, list):
+        return list(DEFAULT_CLI_TOOLS)
+    result = []
+    for item in value:
+        name = normalize_tool_name(item)
+        if name and name not in result:
+            result.append(name)
+    return result
+
+
+def sanitize_cli_tool_paths(value) -> dict:
+    """設定のツール登録 (cli_tool_paths: 名前→パス) を整える
+    (2.00)。
+
+    辞書でなければ空。名前は normalize_tool_name で整え、
+    パスは空でない文字列だけを残す。"""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, raw in value.items():
+        name = normalize_tool_name(key)
+        path = str(raw or "").strip()
+        if name and path:
+            result[name] = path
+    return result
+
+
+def sanitize_cli_tool_usages(value) -> dict:
+    """設定のツールの使い方 (cli_tool_usages: 名前→説明) を
+    整える (2.00)。
+
+    使い方の文は、設定の報告に載って AI へ届く。辞書で
+    無ければ空。名前は整え、文は前後の空白を落として
+    空でないものだけを残す。"""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, raw in value.items():
+        name = normalize_tool_name(key)
+        text = str(raw or "").strip()
+        if name and text:
+            result[name] = text
+    return result
+
+
+# ツール置き場 (2.00): ここに入れた実行ファイル (.exe/.bat/
+# .cmd/.py) は、許可リストに無くても名前で実行できる。置く
+# 行為そのものが許可になる、自作ツール向けの置き場。
+TOOL_FOLDER_NAME = "phal_tools"
+TOOL_FOLDER_EXTS = (".exe", ".bat", ".cmd", ".py")
+
+
+def tools_folder() -> Path:
+    """ツール置き場のパス (data_dir の下)。"""
+    return data_dir() / TOOL_FOLDER_NAME
+
+
+def tool_command(exe_path) -> list:
+    """解決したツールの実行コマンドを作る (2.00)。
+
+    .py のツールは Python で実行する (PHAL 自身が動いている
+    インタプリタ。pythonw で動いているときは、同じ場所の
+    python.exe を使う)。それ以外はそのまま。"""
+    path = Path(exe_path)
+    if path.suffix.lower() != ".py":
+        return [str(path)]
+    python = Path(sys.executable)
+    if python.name.lower() == "pythonw.exe":
+        sibling = python.with_name("python.exe")
+        if sibling.is_file():
+            python = sibling
+    return [str(python), str(path)]
+
+
+def search_cli_tool(name, search_dirs=None):
+    """ツールを PATH と Wireshark の既定の置き場から探す
+    (2.01)。
+
+    「ツール設定」の「探す」ボタン用。実行時の解決
+    (resolve_cli_tool) は登録されたパスが正で、ここは使わ
+    ない (探すのは設定のときだけ)。search_dirs は Wireshark
+    フォルダの差し替え (テスト用)。"""
+    tool = normalize_tool_name(name)
+    if not tool:
+        return None
+    found = shutil.which(tool) or shutil.which(tool + ".exe")
+    if found:
+        return Path(found)
+    dirs = list(search_dirs or [])
+    if not dirs:
+        for env_key in ("ProgramFiles", "ProgramFiles(x86)"):
+            base = os.environ.get(env_key)
+            if base:
+                dirs.append(str(Path(base) / "Wireshark"))
+    for folder in dirs:
+        candidate = Path(folder) / (tool + ".exe")
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_cli_tool(name, allowed, paths=None, extra_dirs=None):
+    """ツール名を、許可と実在で解決する (1.98、2.00 で拡張、
+    2.01 で登録パスを正にした)。
+
+    戻り値は (Path, "") か (None, 理由)。理由は "not_allowed"
+    (許可が無い)、"no_path" (許可はあるがパスが未設定)、
+    "not_found" (登録されたパスに実在しない)。
+    許可になるのは: 許可リスト (allowed) にある、登録
+    (paths: 名前→パス) がある、ツール置き場 (extra_dirs)
+    に実行ファイルがある、のどれか。
+    実行時は登録されたパスが正で、PATH などは探しに行かな
+    い (2.01、ユーザーの指定)。パスが空なら "no_path" で
+    エラーにし、探して埋めるのは設定画面の「探す」の役割。
+    登録のパスがあればそれだけを見る (別の実体を黙って
+    実行しない)。ツール置き場の実在は従来どおり許可になる。"""
+    tool = normalize_tool_name(name)
+    if not tool:
+        return None, "not_allowed"
+    registered = sanitize_cli_tool_paths(paths)
+    if tool in registered:
+        candidate = Path(registered[tool])
+        if candidate.is_file():
+            return candidate, ""
+        return None, "not_found"
+    allowed_names = {normalize_tool_name(a) for a in (allowed or [])}
+    in_dirs = None
+    for folder in extra_dirs or []:
+        for ext in TOOL_FOLDER_EXTS:
+            candidate = Path(folder) / (tool + ext)
+            if candidate.is_file():
+                in_dirs = candidate
+                break
+        if in_dirs is not None:
+            break
+    if tool not in allowed_names and in_dirs is None:
+        return None, "not_allowed"
+    if in_dirs is not None:
+        return in_dirs, ""
+    return None, "no_path"
+
+
+def tool_not_found_note(name, paths=None, extra_dirs=None) -> str:
+    """ツールが見つからなかった返事に付ける、探した場所の
+    説明 (2.00、2.01 で実行時の探し方に合わせて更新)。"""
+    tool = normalize_tool_name(name)
+    registered = sanitize_cli_tool_paths(paths)
+    places = []
+    if tool in registered:
+        places.append(f"登録されたパス {registered[tool]}")
+    for folder in extra_dirs or []:
+        places.append(f"ツール置き場 {folder}")
+    return "（探した場所: " + " / ".join(places) + "）"
+
+
+def parse_log_request(params, now=None) -> dict:
+    """ログリクエストの指定を解釈する (1.96)。
+
+    params は目印の後ろの文字列 (空白区切り、順不同)。数字だけ
+    の語は件数、「YYYY-MM-DD」は日付、「HH:MM-HH:MM」は時刻
+    範囲として読む。認識できない語は無視する。戻り値は
+    {"date": date|None, "start_min": int|None,
+    "end_min": int|None, "count": int, "label": str}。
+    label は適用した範囲の表示 (「直近50件」／「2026-11-15」／
+    「16:00〜16:30」／日付と範囲の合成)。件数は
+    1〜LOG_REQUEST_MAX_COUNT に丸める。"""
+    now = now if now is not None else datetime.now()
+    date = None
+    start_min = None
+    end_min = None
+    count = LOG_REQUEST_DEFAULT_COUNT
+    for token in str(params or "").split():
+        m = _LOG_DATE_TOKEN_RE.match(token)
+        if m:
+            try:
+                date = datetime(
+                    int(m.group(1)), int(m.group(2)),
+                    int(m.group(3))).date()
+            except ValueError:
+                pass  # 形は合うが実在しない日付は無視する
+            continue
+        m = _LOG_RANGE_TOKEN_RE.match(token)
+        if m:
+            h1, m1, h2, m2 = (int(g) for g in m.groups())
+            if h1 <= 23 and h2 <= 23 and m1 <= 59 and m2 <= 59:
+                start_min = h1 * 60 + m1
+                end_min = h2 * 60 + m2
+            continue
+        if _LOG_COUNT_TOKEN_RE.match(token):
+            count = int(token)
+            continue
+        # 認識できない指定は無視する。
+    count = max(1, min(LOG_REQUEST_MAX_COUNT, count))
+    range_label = None
+    if start_min is not None:
+        range_label = (
+            f"{start_min // 60:02d}:{start_min % 60:02d}〜"
+            f"{end_min // 60:02d}:{end_min % 60:02d}")
+    if date is not None and range_label is not None:
+        label = f"{date.isoformat()} {range_label}"
+    elif date is not None:
+        label = date.isoformat()
+    elif range_label is not None:
+        label = range_label
+    else:
+        label = f"直近{count}件"
+    return {"date": date, "start_min": start_min,
+            "end_min": end_min, "count": count, "label": label}
+
+
+def select_log_events(events, spec, now=None) -> list:
+    """動作ログから、指定に合うものを選ぶ (1.96)。
+
+    日付があればその日の分だけ、時刻範囲があれば (日付または
+    今日の) その範囲内 (分単位・両端を含む) だけに絞り、
+    最後の count 件を返す (並びは古い順のまま)。"""
+    now = now if now is not None else datetime.now()
+    spec = spec if isinstance(spec, dict) else {}
+    date = spec.get("date")
+    start_min = spec.get("start_min")
+    end_min = spec.get("end_min")
+    count = spec.get("count") or LOG_REQUEST_DEFAULT_COUNT
+    range_date = date if date is not None else now.date()
+    picked = []
+    for e in events or []:
+        if not isinstance(e, dict):
+            continue
+        at = e.get("at")
+        if not isinstance(at, (int, float)):
+            continue
+        moment = datetime.fromtimestamp(float(at))
+        if date is not None and moment.date() != date:
+            continue
+        if start_min is not None:
+            if moment.date() != range_date:
+                continue
+            minute = moment.hour * 60 + moment.minute
+            if minute < start_min or minute > end_min:
+                continue
+        picked.append(e)
+    return picked[-count:] if count > 0 else picked
+
+
+def build_log_reply(events, spec) -> str:
+    """ログリクエストへの返信を組み立てる (1.96)。
+
+    見出しは「動作ログ ({label}・{n}件)」で、label が既に
+    件数で終わっている場合 (「直近50件」) は件数を重ねない。
+    中身はビューアと同じ日付つきの行。記録が無ければ
+    「(記録はありません)」を添える。"""
+    events = [e for e in (events or []) if isinstance(e, dict)]
+    spec = spec if isinstance(spec, dict) else {}
+    label = str(spec.get("label") or "")
+    if label.endswith("件"):
+        head = f"動作ログ（{label}）"
+    else:
+        head = f"動作ログ（{label}・{len(events)}件）"
+    if not events:
+        return head + "\n（記録はありません）"
+    return "\n".join(
+        [head] + format_log_lines(events, with_date=True))
+
+
+def find_full_output(command_id, outputs_dir=None):
+    """全文リクエストの対象ファイルを探す (1.91)。
+
+    要約モードで保存された全文 (phal-outputs の
+    {command_id}_{日時}_{digest}.txt、save_full_output の命名)
+    のうち、更新時刻が最新のものを返す。無ければ None。
+    command_id が空・パス区切りや「..」を含む不正な形なら
+    None (置き場の外は探さない)。"""
+    cid = str(command_id or "").strip()
+    if not cid or "/" in cid or "\\" in cid or ".." in cid:
+        return None
+    folder = Path(outputs_dir) if outputs_dir is not None \
+        else data_dir() / "phal-outputs"
+    try:
+        entries = [entry for entry in folder.iterdir()
+                   if entry.is_file()
+                   and entry.suffix == ".txt"
+                   and entry.name.startswith(cid + "_")]
+    except OSError:
+        return None
+    if not entries:
+        return None
+
+    def _mtime(entry):
+        try:
+            return entry.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return max(entries, key=_mtime)
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == resolved_root or \
+        resolved.is_relative_to(resolved_root)
+
+
+def resolve_file_request(request, watch_folder, work_folder):
+    """ファイルリクエストのパスを、許可されたフォルダの配下の
+    実ファイルへ解決する (1.88、Nagato の線引き)。
+
+    許可するのはダウンロードフォルダ (監視フォルダ) と作業
+    フォルダの配下だけ。相対パスは両方のフォルダから探し、
+    絶対パスは配下にあるときだけ認める。戻り値は
+    (Path, "") か (None, 理由) で、理由は "not_found" (配下に
+    無い) か "outside" (絶対パスが配下の外) か "empty"。
+    解決後の実パスで判定するので、「..」やリンクでの抜け出し
+    は not_found / outside になる。"""
+    req = str(request or "").strip()
+    if not req:
+        return None, "empty"
+    roots = [Path(root) for root in (watch_folder, work_folder)
+             if root]
+    candidate = Path(req)
+    if candidate.is_absolute():
+        for root in roots:
+            if _is_inside(candidate, root):
+                resolved = candidate.resolve()
+                if resolved.is_file():
+                    return resolved, ""
+                return None, "not_found"
+        return None, "outside"
+    for root in roots:
+        resolved = (root / req).resolve()
+        if _is_inside(resolved, root) and resolved.is_file():
+            return resolved, ""
+    return None, "not_found"
+
+
+# ---------------------------------------------------------------
+# ファイルリクエストの範囲指定 (1.99)。行の形は
+# 「PHAL:ファイルリクエスト <パス> [指定...]」で、末尾の語が
+# 指定の形に合う間だけ指定として切り離し、残りをパスとする
+# (パスに空白が含まれていてもよいための倒し方。パス自体が
+# 指定と同じ形で終わる名前のときは、指定として解釈される)。
+#   lines:A-B   テキストの A行目から B行目まで (1始まり、両端を含む)
+#   lines:A-    A行目から末尾まで
+#   bytes:A-B   バイトの A以上 B未満 (0始まり)
+#   bytes:A+N   Aから Nバイト
+# bytes と lines が両方あれば bytes を優先する。
+# ---------------------------------------------------------------
+_FILE_LINES_SPEC_RE = re.compile(r"^lines:(\d+)(?:-(\d*))?$")
+_FILE_BYTES_SPEC_RE = re.compile(r"^bytes:(\d+)(?:-(\d+)|\+(\d+))$")
+FILE_SLICE_MAX_BYTES = 4_000_000  # 範囲取得で送る大きさの上限
+
+
+def parse_file_request(rest):
+    """ファイルリクエストの残り (パス＋指定) を分ける (1.99)。
+
+    戻り値は (パス文字列, 指定の辞書か None)。指定の辞書は
+    {"kind": "lines", "start": A, "end": B|None} (行、1始まり、
+    end は含む) か {"kind": "bytes", "start": A, "end": B}
+    (バイト、0始まり、end は含まない)。"""
+    text = str(rest or "").strip()
+    if not text:
+        return "", None
+    tokens = text.split()
+    specs = {}
+    while tokens:
+        last = tokens[-1]
+        match = _FILE_LINES_SPEC_RE.match(last)
+        if match and "lines" not in specs:
+            specs["lines"] = {
+                "kind": "lines",
+                "start": int(match.group(1)),
+                "end": int(match.group(2)) if match.group(2)
+                else None,
+            }
+            tokens.pop()
+            continue
+        match = _FILE_BYTES_SPEC_RE.match(last)
+        if match and "bytes" not in specs:
+            start = int(match.group(1))
+            if match.group(3) is not None:
+                end = start + int(match.group(3))
+            else:
+                end = int(match.group(2))
+            specs["bytes"] = {
+                "kind": "bytes", "start": start, "end": end}
+            tokens.pop()
+            continue
+        break
+    spec = specs.get("bytes") or specs.get("lines")
+    return " ".join(tokens), spec
+
+
+def read_byte_range(path, start, end):
+    """ファイルのバイト範囲 [start, end) を読む (1.99)。
+
+    ファイルの大きさで丸め、上限 (FILE_SLICE_MAX_BYTES) で
+    切る。戻り値は (bytes, 上限で切ったか)。"""
+    size = Path(path).stat().st_size
+    end = min(end, size)
+    start = min(start, end)
+    truncated = False
+    if end - start > FILE_SLICE_MAX_BYTES:
+        end = start + FILE_SLICE_MAX_BYTES
+        truncated = True
+    with open(path, "rb") as f:
+        f.seek(start)
+        return f.read(end - start), truncated
+
+
+def decode_text_bytes(data: bytes):
+    """バイト列をテキストとして読む (1.99)。
+
+    BOM (UTF-8 / UTF-16) を見て、次に UTF-8、だめなら cp932。
+    戻り値は (text, 文字コード名)。"""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace"), "utf-8-sig"
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace"), "utf-16"
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode("cp932", errors="replace"), "cp932"
+
+
+def slice_text_lines(text, spec):
+    """行の範囲を取り出す (1.99)。
+
+    戻り値は (取り出した文, 全行数)。start は1始まりで、範囲が
+    全行数を超えていれば末尾までに丸める。start が全行数より
+    大きければ空になる。"""
+    lines = text.splitlines()
+    total = len(lines)
+    start = max(1, int(spec["start"]))
+    end = spec["end"] if spec["end"] is not None else total
+    end = min(int(end), total)
+    if start > total or end < start:
+        return "", total
+    return "\n".join(lines[start - 1:end]), total
+
+
+def looks_binary(data: bytes) -> bool:
+    """先頭に NUL を含むデータはバイナリとみなす (1.99、lines
+    指定の可否の判定)。"""
+    return b"\x00" in data[:8192]
+
+
+def slice_file_name(path, spec) -> str:
+    """範囲取得の送付ファイル名 (元の名前に範囲を付ける、1.99)。"""
+    target = Path(path)
+    if spec["kind"] == "lines":
+        end = spec["end"] if spec["end"] is not None else "end"
+        suffix = f"_lines{spec['start']}-{end}"
+    else:
+        suffix = f"_bytes{spec['start']}-{spec['end']}"
+    return target.stem + suffix + target.suffix
+
+
+def build_resend_text(command_id, stored_text,
+                      truncated: bool = False) -> str:
+    """前回の結果の再送文を組み立てる (1.75)。
+
+    控え (last_results) に残っているのは結果文の本文 (見出し行
+    を除いた形) なので、再送と分かる見出しを付け直し、通常の
+    結果と同じく末尾へ AI への指示文を付ける。"""
+    head = f"[実行結果] {command_id} （前回の結果の再送）"
+    if truncated:
+        head += " ※控えは2万字で打ち切られています"
+    return with_result_ai_prompt(head + "\n" + (stored_text or ""))
 
 
 # ---------------------------------------------------------------
@@ -1196,6 +2544,93 @@ def format_elapsed(seconds) -> str:
         hours, minutes = divmod(minutes, 60)
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+# ---------------------------------------------------------------
+# 段階表示 (1.63、案D)。窓の上の帯に DL → 実行 → 回答 → 送信
+# の段階を並べ、今の段階を光らせる。今の段階が長引くにつれて
+# 背景色が緑 → 黄 → 赤へ徐々に変わる。色の計算はここ (純粋
+# 関数) に寄せ、窓は段階と経過秒を渡して色を受け取るだけに
+# する。待機中は段階が無い (None) ので色は進まない。
+# 物差しは段階ごと: 実行は正規に長くかかるので一番長く
+# (2分あたりから黄ばみ始め、10分で赤)、他は短く (30秒あたり
+# から黄ばみ始め、3分で赤)。実行の経過は「滞在時間」では
+# なく「最後の出力からの時間 (無音の長さ)」を窓が渡す。
+# ---------------------------------------------------------------
+STAGE_ORDER = ("dl", "run", "answer", "send")
+STAGE_LABELS = {"dl": "DL", "run": "実行", "answer": "回答",
+                "send": "送信"}
+# 段階ごとの物差し (黄ばみ始める秒, 赤になる秒)。
+STAGE_RULERS = {
+    "dl": (30.0, 180.0),
+    "run": (120.0, 600.0),
+    "answer": (30.0, 180.0),
+    "send": (30.0, 180.0),
+}
+# 色の両端と中間 (RGB)。緑 → 黄 → 赤。
+_STAGE_GREEN = (40, 167, 69)
+_STAGE_YELLOW = (255, 193, 7)
+_STAGE_RED = (220, 53, 69)
+
+
+def stage_color_ratio(stage, elapsed) -> float:
+    """段階の「長引き具合」を 0.0〜1.0 で返す。
+
+    黄ばみ始める秒までは 0.0、赤になる秒で 1.0、その間は線形。
+    知らない段階・負の経過は 0.0 (色を進めない側に倒す)。"""
+    ruler = STAGE_RULERS.get(stage)
+    if ruler is None:
+        return 0.0
+    yellow_at, red_at = ruler
+    seconds = max(0.0, float(elapsed or 0.0))
+    if seconds <= yellow_at:
+        return 0.0
+    if seconds >= red_at:
+        return 1.0
+    return (seconds - yellow_at) / (red_at - yellow_at)
+
+
+def _stage_mix(a, b, ratio):
+    return tuple(
+        round(a[i] + (b[i] - a[i]) * ratio) for i in range(3))
+
+
+def stage_color(stage, elapsed):
+    """段階と経過秒から、帯のチップの背景色 (R, G, B) を返す。
+
+    比率 0.0〜0.5 は緑 → 黄、0.5〜1.0 は黄 → 赤の補間。"""
+    ratio = stage_color_ratio(stage, elapsed)
+    if ratio <= 0.5:
+        return _stage_mix(_STAGE_GREEN, _STAGE_YELLOW, ratio * 2.0)
+    return _stage_mix(_STAGE_YELLOW, _STAGE_RED,
+                      (ratio - 0.5) * 2.0)
+
+
+# ---------------------------------------------------------------
+# 進捗申告の行 (1.63)。スクリプトが phal_lib.progress(done,
+# total) を呼ぶと、標準出力へ「進捗：done/total」の行が出る。
+# PHAL の逐次取り込みがこの形の行を拾って帯に進捗として出し、
+# 通常の出力行数には数えない (結果文にはそのまま残る: 実行の
+# 記録として落とさない)。
+# ---------------------------------------------------------------
+_PROGRESS_LINE_RE = re.compile(
+    r"^進捗[:：]\s*(\d+)\s*/\s*(\d+)\s*$")
+
+
+def parse_progress_line(line):
+    """進捗申告の行なら (done, total) を、違えば None を返す。
+
+    形は「進捗：3/10」(コロンは全角・半角どちらでもよい)。
+    total が 0 の行は申告として扱わない。"""
+    if not isinstance(line, str):
+        return None
+    match = _PROGRESS_LINE_RE.match(line.strip())
+    if match is None:
+        return None
+    done, total = int(match.group(1)), int(match.group(2))
+    if total <= 0:
+        return None
+    return (done, total)
 
 
 # ---------------------------------------------------------------
@@ -1342,13 +2777,29 @@ def collect_intro_environment(runner=None, watch_folder=None,
     }
 
 
+# 開始プロンプトの版 (文面を変えたら上げる。履歴は AI 向け
+# マニュアルの「開始プロンプト」の節に残す)。
+#   第1版: 1.47 初版 / 第2版: 1.50 phal_lib の案内を追加
+#   第3版: 1.78 マニュアル添付の行と、回答は .phal 限定
+#   第4版: 1.79 ZIP の行 (方向が誤っていた)
+#   第5版: 1.81 ZIP の行を正しい方向に直し、プロファイルで
+#          有効なときだけ出す。版番号を文面に入れる。
+#   第6版: 1.82 モジュールの行を削除 (後半が省略され意味が
+#          無い)。フォルダの行は「ダウンロードフォルダ
+#          (監視対象)」に (作業フォルダとは別という明示)。
+#   第7版: 1.83 作業フォルダの行を追加 (ボタンを押したときに
+#          ダイアログで選んだフォルダが入る)。
+INTRO_PROMPT_VERSION = 7
+
+
 def build_intro_prompt(env: dict) -> str:
     """導入プロンプトの文を組み立てる。
 
     env は collect_intro_environment の戻り値 (欠けたキーは
     「不明」にする)。短い日本語文と環境情報だけ。ネットに直接
     出られないことは固定文で入れる。回答は短いスクリプトで返す
-    旨も入れる。"""
+    旨も入れる。env の manual_attached が真なら、マニュアルの
+    ファイルを添付している旨の1行も入れる (1.78)。"""
     env = env if isinstance(env, dict) else {}
 
     def item(key):
@@ -1367,20 +2818,42 @@ def build_intro_prompt(env: dict) -> str:
         if isinstance(more, int) and more > 0:
             modules_line += f"（他 {more} 件）"
     lines = [
-        "PHAL のループを始めます。",
+        f"PHAL のループを始めます。"
+        f"（開始プロンプト第{INTRO_PROMPT_VERSION}版）",
+    ]
+    if env.get("manual_attached"):
+        lines.append(
+            "このメッセージには連携マニュアル"
+            "（phal-ai-manual.md）を添付しています。"
+            "ループの作法はそちらにあります。最初に読んでください。")
+    lines += [
         "この PC の環境は次のとおりです。",
         f"- Python: {item('python_version')}",
         f"- PowerShell: {item('powershell_version')}",
         f"- OS: {item('os_version')}",
         f"- 実行ポリシー: {item('execution_policy')}",
-        f"- 作業フォルダ: {item('watch_folder')}",
+        f"- ダウンロードフォルダ（監視対象）: {item('watch_folder')}",
+    ]
+    # 作業フォルダは仕事ごとに変わるので、ボタンを押したとき
+    # にダイアログで選んだものだけが入る (1.83)。
+    if env.get("work_folder"):
+        lines.append(f"- 作業フォルダ: {env['work_folder']}")
+    lines += [
         f"- 文字コード: {item('encoding')}",
         "- ネット: 直接出られません。",
-        f"- モジュール: {modules_line}",
         "- 実施済み試験ログの解析には共通モジュール phal_lib が使えます。",
         "- phal_lib は `import phal_lib` で読み、文字コード判定つき読み・圧縮の透過読み・要点の部品（集計・抜粋）・回の比較があります。詳しくは AI 向けマニュアルの「解析用モジュール phal_lib」の節。",
-        "回答は短いスクリプト（.phal / .py / .ps1）で返してください。",
+        "回答は短いスクリプトを .phal ファイルで返してください。",
     ]
+    # ZIP の受け渡し (1.81 で方向を訂正)。渡せないのは
+    # ユーザー → Copilot の向きだけなので、その向きの約束を
+    # 伝える。プロファイルで zip_as_txt が有効な相手にだけ出す。
+    if env.get("zip_as_txt"):
+        lines.append(
+            "- ユーザーから ZIP ファイルを渡すときは、拡張子を "
+            ".zip.txt に変えて渡します。受け取ったら .txt を"
+            "外して ZIP として開いてください。あなたから"
+            "ユーザーへ渡すときは .zip のままで構いません。")
     return "\n".join(lines)
 
 
@@ -2117,6 +3590,11 @@ class RunHandle:
         self._proc = None
         self._job = None
         self.stopped = False
+        # 逐次取り込みのコールバック (1.63、execute_script の
+        # on_output と同じ形)。窓が実行の表示用に差し込む。
+        # execute_script の引数が優先で、無いときはこちらの
+        # 持ち手から取る (呼ぶ側の差し替え口を増やさないため)。
+        self.on_output = None
 
     def _attach(self, proc):
         self._proc = proc
@@ -2280,14 +3758,205 @@ def _job_close(job) -> None:
         pass
 
 
+def _read_stream_lines(stream, chunks, kind, on_output):
+    """パイプを1行ずつ読み、溜めながら逐次コールバックへ渡す。
+
+    実行の逐次取り込み (1.63) の読み役 (別スレッドで回す)。
+    行の区切りは \\n で、UTF-8 でも cp932 でもマルチバイト文字
+    の途中に \\n は現れないため、行単位の復号で文字は割れない。
+    コールバックの例外は飲む (表示の都合で実行を止めない)。"""
+    try:
+        while True:
+            raw = stream.readline()
+            if not raw:
+                break
+            chunks.append(raw)
+            line = _decode_output(raw).rstrip("\r\n")
+            try:
+                on_output(kind, line)
+            except Exception:  # noqa: BLE001  表示側の都合で止めない
+                pass
+    except (OSError, ValueError):
+        pass  # パイプが閉じたら終わり
+
+
+def _collect_streaming(proc, timeout, on_output, stop_tree):
+    """逐次取り込みつきで子プロセスの出力を集める (1.63)。
+
+    戻り値は (out_raw, err_raw, timed_out)。時間切れのときは
+    stop_tree (ジョブを閉じて木ごと止める呼び出し) を1回だけ
+    呼び、残りの出力はパイプが閉じるまで拾う。孫がパイプを
+    持ち続けても、読み役はデーモンスレッドなので本体は
+    待ち続けない (途中までの出力は捨てない、中5と同じ線)。"""
+    import threading
+
+    out_chunks, err_chunks = [], []
+    readers = [
+        threading.Thread(
+            target=_read_stream_lines,
+            args=(proc.stdout, out_chunks, "stdout", on_output),
+            daemon=True, name="phal-run-stdout"),
+        threading.Thread(
+            target=_read_stream_lines,
+            args=(proc.stderr, err_chunks, "stderr", on_output),
+            daemon=True, name="phal-run-stderr"),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stop_tree()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass  # 木ごと止める手は打った。回収は読み役に任せる
+    for reader in readers:
+        reader.join(timeout=2.0)
+    return b"".join(out_chunks), b"".join(err_chunks), timed_out
+
+
+# ---------------------------------------------------------------
+# ツールの実行と結果文 (1.98)。RunResult / RunHandle の
+# 定義より後ろでなければならないため、置き場はここ。
+# ---------------------------------------------------------------
+def execute_command(argv, cwd=None, timeout_seconds=120,
+                    handle: RunHandle = None,
+                    on_output=None) -> RunResult:
+    """コマンドラインツールを1回実行する (1.98、ブロッキング。
+
+    窓は別スレッドから呼ぶ)。
+
+    スクリプト実行 (execute_script) と同じ作法 (ジョブへの
+    割り当て、タイムアウトで木ごと停止、逐次取り込み) で、
+    任意の argv を実行する。戻り値の RunResult の name には
+    表示用のコマンドラインが入る。"""
+    argv = [str(a) for a in (argv or [])]
+    display = subprocess.list2cmdline(argv) if argv else ""
+    result = RunResult(name=display,
+                       path=argv[0] if argv else "")
+    if not argv:
+        result.start_error = "実行するコマンドがありません"
+        result.stderr = result.start_error
+        return result
+    timeout = _int_or(timeout_seconds, 120, 1, 3600)
+    if on_output is None and handle is not None:
+        on_output = getattr(handle, "on_output", None)
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    started = time.monotonic()
+    job = None
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=str(cwd) if cwd else None,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=flags)
+    except OSError as e:
+        result.seconds = time.monotonic() - started
+        result.start_error = str(e)
+        result.stderr = f"起動できませんでした: {e}"
+        return result
+    job = _job_assign(proc)
+    try:
+        if handle is not None:
+            handle._attach(proc)
+            handle._attach_job(job)
+            job = None  # 閉じる操作は handle 側へ一本化する
+            if handle.stopped:
+                kill_tree(proc)
+        if on_output is None:
+            try:
+                out_raw, err_raw = proc.communicate(
+                    timeout=timeout)
+            except subprocess.TimeoutExpired as first:
+                result.timed_out = True
+                out_raw = first.output or b""
+                err_raw = first.stderr or b""
+                if job is not None:
+                    _job_close(job)
+                    job = None
+                if handle is not None:
+                    handle._close_job()
+                kill_tree(proc)
+                try:
+                    out_raw, err_raw = proc.communicate(
+                        timeout=10)
+                except subprocess.TimeoutExpired as second:
+                    if second.output:
+                        out_raw = second.output
+                    if second.stderr:
+                        err_raw = second.stderr
+        else:
+            def stop_tree():
+                nonlocal job
+                if job is not None:
+                    _job_close(job)
+                    job = None
+                if handle is not None:
+                    handle._close_job()
+                kill_tree(proc)
+
+            out_raw, err_raw, timed_out = _collect_streaming(
+                proc, timeout, on_output, stop_tree)
+            if timed_out:
+                result.timed_out = True
+    finally:
+        if job is not None:
+            _job_close(job)
+        if handle is not None:
+            handle._close_job()
+    result.seconds = time.monotonic() - started
+    result.exit_code = proc.returncode if proc is not None else None
+    if handle is not None and handle.stopped:
+        result.stopped = True
+    result.stdout = _decode_output(out_raw or b"")
+    result.stderr = _decode_output(err_raw or b"")
+    return result
+
+
+def build_tool_result_text(display, run: RunResult,
+                           config: dict) -> str:
+    """ツール実行の結果文を組み立てる (1.98)。
+
+    スクリプトの結果文と同じ形 (見出し＋出力＋エラー出力＋
+    末尾の AI への指示文) で、見出しにはコマンドラインと
+    終了コード・秒数を入れる。"""
+    if run.start_error:
+        return with_result_ai_prompt(
+            f"[ツール実行結果] {display}  起動できませんでした\n"
+            f"{run.start_error}")
+    code = run.exit_code if run.exit_code is not None else "?"
+    head = (f"[ツール実行結果] {display}  終了コード {code}  "
+            f"{run.seconds:.1f}秒")
+    if run.stopped:
+        head += "  停止しました"
+    elif run.timed_out:
+        head += "  （時間切れで止めました）"
+    parts = [head, _section("出力", run.stdout, config),
+             _section("エラー出力", run.stderr, config)]
+    return with_result_ai_prompt("\n".join(parts))
+
+
 def execute_script(path, config: dict, handle: RunHandle = None,
-                   expected_sha256: str = None) -> RunResult:
+                   expected_sha256: str = None,
+                   on_output=None, args=None) -> RunResult:
     """スクリプトを1回実行する(ブロッキング。窓は別スレッドから呼ぶ)。
 
     実行してよいかの判断(F5 かどうか、要確認かどうか)は呼ぶ側の
     仕事。expected_sha256 を渡すと、起動の直前に取り直して比べ、
     違えば実行しない(低8)。記録と結果の sha256 は常に元の
-    ファイルのもの。"""
+    ファイルのもの。
+
+    on_output (1.63) は逐次取り込みのコールバック (kind, line)。
+    kind は "stdout" / "stderr"、line は改行を除いた1行。渡した
+    ときだけ読み方を行単位の逐次取り込みに切り替え、戻りの
+    RunResult の stdout / stderr は従来どおり全文になる。渡さ
+    なければ従来の communicate のまま (表示が要らない経路の
+    挙動は変えない)。"""
     path = Path(path)
     result = RunResult(name=path.name, path=str(path),
                        sha256=file_sha256(path))
@@ -2345,13 +4014,18 @@ def execute_script(path, config: dict, handle: RunHandle = None,
             except OSError:
                 bom_copy = None  # 写しが作れなければ元のまま試す
         argv = [exe, "-NoProfile", "-File", str(run_path)]
+        argv += [str(a) for a in (args or [])]
         env = dict(os.environ)
     else:
         python = str(config.get("python") or "python")
         argv = [python, str(path)]
+        argv += [str(a) for a in (args or [])]
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        # 逐次取り込み (1.63) で出力がその都度届くよう、バッファ
+        # リングを切る。出力の中身は変わらない (届く早さだけ)。
+        env["PYTHONUNBUFFERED"] = "1"
         # PHAL 本体の置き場 (このファイルのあるフォルダ) を、子
         # プロセスの import 探索にも入れる (1-53)。phal_lib など
         # 本体の隣にあるモジュールを、スクリプトからそのまま
@@ -2362,6 +4036,9 @@ def execute_script(path, config: dict, handle: RunHandle = None,
             os.pathsep) if p]
         if app_dir not in existing:
             env["PYTHONPATH"] = os.pathsep.join([app_dir] + existing)
+    if on_output is None and handle is not None:
+        # 持ち手に差し込まれた逐次取り込みを使う (窓の経路)。
+        on_output = getattr(handle, "on_output", None)
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         try:
@@ -2383,27 +4060,44 @@ def execute_script(path, config: dict, handle: RunHandle = None,
                 job = None  # 閉じる操作は handle 側へ一本化する
                 if handle.stopped:
                     kill_tree(proc)
-            try:
-                out_raw, err_raw = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as first:
-                result.timed_out = True
-                out_raw = first.output or b""
-                err_raw = first.stderr or b""
-                if job is not None:
-                    _job_close(job)  # 孫プロセスごと終わらせる
-                    job = None
-                if handle is not None:
-                    handle._close_job()
-                kill_tree(proc)
+            if on_output is None:
                 try:
-                    out_raw, err_raw = proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired as second:
-                    # 孫がパイプを持ち続けて回収できなくても、途中
-                    # までの出力は捨てない(中5)。
-                    if second.output:
-                        out_raw = second.output
-                    if second.stderr:
-                        err_raw = second.stderr
+                    out_raw, err_raw = proc.communicate(
+                        timeout=timeout)
+                except subprocess.TimeoutExpired as first:
+                    result.timed_out = True
+                    out_raw = first.output or b""
+                    err_raw = first.stderr or b""
+                    if job is not None:
+                        _job_close(job)  # 孫プロセスごと終わらせる
+                        job = None
+                    if handle is not None:
+                        handle._close_job()
+                    kill_tree(proc)
+                    try:
+                        out_raw, err_raw = proc.communicate(
+                            timeout=10)
+                    except subprocess.TimeoutExpired as second:
+                        # 孫がパイプを持ち続けて回収できなくても、
+                        # 途中までの出力は捨てない(中5)。
+                        if second.output:
+                            out_raw = second.output
+                        if second.stderr:
+                            err_raw = second.stderr
+            else:
+                def stop_tree():
+                    nonlocal job
+                    if job is not None:
+                        _job_close(job)  # 孫プロセスごと終わらせる
+                        job = None
+                    if handle is not None:
+                        handle._close_job()
+                    kill_tree(proc)
+
+                out_raw, err_raw, timed_out = _collect_streaming(
+                    proc, timeout, on_output, stop_tree)
+                if timed_out:
+                    result.timed_out = True
         finally:
             if job is not None:
                 _job_close(job)
@@ -2450,6 +4144,21 @@ def parse_command_id(name: str):
     """
     match = _COMMAND_ID_RE.match(name)
     return match.group(1) if match else None
+
+
+def auto_run_in_scope(name: str, auto_downloaded: bool) -> bool:
+    """自動実行の対象範囲 (案3、1.63) に入るかどうか。
+
+    対象は次のどちらかに当たるファイルだけ: (a) この PHAL が
+    自動ダウンロードしたファイル (auto_downloaded は窓側が
+    到着の経緯から決めて渡す)、(b) ファイル名にコマンド ID
+    (「1-123_」の形) が付いたファイル。無関係なファイルの
+    誤実行を防ぐための線引きで、起動前からあった分を対象に
+    しない等の従来の歯止め (窓側の auto_eligible) とは別に、
+    両方を満たしたものだけが自動で走る。"""
+    if auto_downloaded:
+        return True
+    return parse_command_id(name or "") is not None
 
 
 # 概要として見る先頭の行数。これより後ろのコメントは拾わない。
@@ -2797,10 +4506,12 @@ def attach_file_paths(names):
 
 # 結果文の末尾に付ける、受け取る AI への指示文 (1.55)。実行結果を
 # 受けた側が「次に何をするか」をその場で決めて動けるようにする
-# ためのもの。文面は陽太さんの指定 (2026-11-15) で固定。
+# ためのもの。文面はユーザーの指定 (2026-11-15) で固定。人名は
+# 入れない (他のチームメンバーにも使ってもらう可能性があるため、
+# 同日に「陽太さん」から「ユーザー」へ変更)。
 RESULT_AI_PROMPT = (
     "AIへの指示：この結果を踏まえて、次にやる作業を明確にし、"
-    "即時着手できるものは直ちに着手すること。陽太さんの判断が"
+    "即時着手できるものは直ちに着手すること。ユーザーの判断が"
     "要るものは着手せず、報告に回すこと。")
 
 
@@ -2945,6 +4656,32 @@ def build_result_body(name: str, run: RunResult, config: dict,
     if run.policy_stop:
         parts.append(POLICY_NOTE)
     return "\n".join(parts)
+
+
+def zip_as_txt_paths(paths):
+    """ZIP の添付を .zip.txt の写しに差し替える (1.81)。
+
+    ユーザー → Copilot の向きは ZIP をそのまま渡せないため、
+    プロファイルで有効なとき、回答の添付のうち .zip のものを
+    同じ置き場に「元の名前 + .txt」の写しを作って差し替える。
+    戻り値は (差し替え後のパスの並び, [(元の名前, 新しい名前)])
+    。ZIP でないものと、写しを作れなかったものは元のまま。"""
+    import shutil
+    result, renamed = [], []
+    for path in paths or []:
+        p = Path(path)
+        if p.suffix.lower() == ".zip":
+            copy = p.with_name(p.name + ".txt")
+            try:
+                shutil.copyfile(p, copy)
+            except OSError:
+                result.append(path)
+                continue
+            result.append(copy)
+            renamed.append((p.name, copy.name))
+        else:
+            result.append(path)
+    return result, renamed
 
 
 def build_result_text(name: str, run: RunResult, config: dict,

@@ -484,10 +484,14 @@ def test_window_settings_saved():
             # 大きい360にして、保存と復元が一致することを確かめる。
             window.resize(360, 555)
             window.on_top_box.setChecked(True)
+            frame = window.frameGeometry()
             window.close()
             saved = json.loads(settings_path.read_text(encoding="utf-8"))
             section = saved["script_runner"]
-            assert section["window_geometry"] == [123, 45, 360, 555], section
+            # 保存値は枠 (フレーム) の座標・大きさ (1.68)。
+            assert section["window_geometry"] == [
+                frame.x(), frame.y(), frame.width(),
+                frame.height()], section
             assert section["always_on_top"] is True
             # 他の節は壊れていない。
             assert "editor" in saved and "filer" in saved
@@ -831,6 +835,10 @@ def test_auto_run_only_after_launch_files():
     # 警告なら自動で (直列に) 走ること、文法エラーは走らないこと、
     # 切替が切なら起動後の分も走らないことを見る。実行そのものは
     # 控えの関数に差し替えて、実プロセスは起こさない。
+    # 1.63 の対象範囲 (案3) で、自動実行の対象は「自動で落とした
+    # ファイル」か「ID つきのファイル」だけになったため、ここは
+    # ID つきの名前で見る (範囲そのものは
+    # test_auto_run_scope_plan3 が見る)。
     # 控えの置き場は一時フォルダへ向ける (1-29 の実行済みハッシュ
     # の控えは中身で引くので、他のテストが同じ中身を走らせた記録
     # が残っていると、このテストの警告ファイルまで止まってしまう)。
@@ -881,21 +889,21 @@ def test_auto_run_only_after_launch_files():
                 assert backlog.auto_eligible is False
                 # 起動後に現れた分: 問題なし・警告は走り、エラーは
                 # 走らない。2件は直列 (同時に走らない)。
-                write_script(watch, "clean.py", "print('新しい分')\n")
-                write_script(watch, "warn.py",
+                write_script(watch, "1-01_clean.py", "print('新しい分')\n")
+                write_script(watch, "1-02_warn.py",
                              "import os\nos.remove('x')\n")
-                write_script(watch, "broken.py", "def broken(:\n")
+                write_script(watch, "1-03_broken.py", "def broken(:\n")
                 window._poll()
                 window._poll()
                 settle_checks(window,
-                              ["clean.py", "warn.py", "broken.py"])
+                              ["1-01_clean.py", "1-02_warn.py", "1-03_broken.py"])
                 assert pump_until(lambda: len(calls) == 2), calls
-                assert sorted(calls) == ["clean.py", "warn.py"], calls
+                assert sorted(calls) == ["1-01_clean.py", "1-02_warn.py"], calls
                 assert active["peak"] == 1, active
-                broken = item_of(window, "broken.py")
+                broken = item_of(window, "1-03_broken.py")
                 assert broken is not None and not broken.ran
                 assert broken.last_run is None
-                clean = item_of(window, "clean.py")
+                clean = item_of(window, "1-01_clean.py")
                 assert clean is not None and clean.ran
                 # 同じ中身は2度走らない (見回りが回っても)。
                 window._poll()
@@ -914,12 +922,12 @@ def test_auto_run_only_after_launch_files():
                 lambda text: setattr(window, "_last_clipboard_text",
                                      text))
             try:
-                write_script(watch, "late.py", "print('切替なし')\n")
+                write_script(watch, "1-04_late.py", "print('切替なし')\n")
                 window._poll()
                 window._poll()
-                settle_checks(window, ["late.py"])
+                settle_checks(window, ["1-04_late.py"])
                 assert pump_until(lambda: False, timeout=0.6) is False
-                late = item_of(window, "late.py")
+                late = item_of(window, "1-04_late.py")
                 assert late is not None and not late.ran
                 assert len(calls) == 2, calls  # 増えていない
             finally:
@@ -936,7 +944,8 @@ def test_loop_survives_restart():
     # 再開をまたぐループ (1-28):
     # (a) 起動後に現れたファイルは、対象の控えが残るので、再開
     #     (新しい窓) の後に起動時の滞留の姿でも対象のままで、
-    #     自動で走ること。
+    #     自動で走ること。(1.63 の対象範囲 (案3) に合わせ、
+    #     fresh は ID つきの名前にしてある。)
     # (b) 控えの無い滞留分は、再開後も自動では走らないこと。
     # (c) 連鎖の途中 (回答の投入中を装う) で届いた開き直しの
     #     頼みは、連鎖が済むまで実行されず、節目で実行される
@@ -974,16 +983,16 @@ def test_loop_survives_restart():
                 backlog_a = item_of(window_a, "backlog.py")
                 assert backlog_a is not None
                 assert backlog_a.auto_eligible is False
-                write_script(watch, "fresh.py", "print('新しい分')\n")
+                write_script(watch, "1-01_fresh.py", "print('新しい分')\n")
                 window_a._poll()
                 window_a._poll()
-                settle_checks(window_a, ["fresh.py"])
-                fresh_a = item_of(window_a, "fresh.py")
+                settle_checks(window_a, ["1-01_fresh.py"])
+                fresh_a = item_of(window_a, "1-01_fresh.py")
                 assert fresh_a is not None
                 assert fresh_a.auto_eligible is True
                 assert not fresh_a.ran and calls == [], calls
                 records = core.load_pending_runs()
-                assert str(watch / "fresh.py") in records, records
+                assert str(watch / "1-01_fresh.py") in records, records
                 assert str(watch / "backlog.py") not in records, records
             finally:
                 window_a.close()
@@ -997,18 +1006,18 @@ def test_loop_survives_restart():
                                      text))
             try:
                 window_b._poll()
-                settle_checks(window_b, ["backlog.py", "fresh.py"])
-                assert pump_until(lambda: calls == ["fresh.py"]), calls
+                settle_checks(window_b, ["backlog.py", "1-01_fresh.py"])
+                assert pump_until(lambda: calls == ["1-01_fresh.py"]), calls
                 assert pump_until(lambda: False, timeout=0.6) is False
-                assert calls == ["fresh.py"], calls
+                assert calls == ["1-01_fresh.py"], calls
                 backlog_b = item_of(window_b, "backlog.py")
                 assert backlog_b is not None and not backlog_b.ran
                 assert backlog_b.auto_eligible is False
-                fresh_b = item_of(window_b, "fresh.py")
+                fresh_b = item_of(window_b, "1-01_fresh.py")
                 assert fresh_b is not None and fresh_b.ran
                 assert fresh_b.auto_eligible is True
                 records = core.load_pending_runs()
-                assert str(watch / "fresh.py") not in records, records
+                assert str(watch / "1-01_fresh.py") not in records, records
             finally:
                 window_b.close()
         # --- (c) 開き直しの保留: 連鎖の途中では待たせ、節目で開く ---
@@ -1101,6 +1110,9 @@ def test_dl_loop_brakes():
     # (c) 実行済みの中身 (sha256) の写しが起動後に届いても自動
     #     では走らず、知らせが1度出ること。別の中身は自動で
     #     走ること。写しの手動実行は妨げないこと。
+    #     (1.63 の対象範囲 (案3) に合わせ、(c) のファイルは ID
+    #     つきの名前にしてある。範囲外のファイルは自動では
+    #     走らないので、歯止めの判定に届かないため。)
     # 控えの置き場は TRAYTOOLS_DATA_DIR で一時フォルダへ向ける。
     prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
     try:
@@ -1256,26 +1268,26 @@ def test_dl_loop_brakes():
                 try:
                     window._poll()  # 起動スナップショット (空)
                     content = "print('同じ中身です')\n"
-                    write_script(watch, "orig.py", content)
+                    write_script(watch, "1-01_orig.py", content)
                     window._poll()
                     window._poll()
-                    settle_checks(window, ["orig.py"])
+                    settle_checks(window, ["1-01_orig.py"])
                     assert pump_until(
-                        lambda: calls == ["orig.py"]), calls
+                        lambda: calls == ["1-01_orig.py"]), calls
                     assert pump_until(
                         lambda: window._running_item is None)
-                    sha = core.file_sha256(watch / "orig.py")
+                    sha = core.file_sha256(watch / "1-01_orig.py")
                     assert core.executed_hash_contains(
                         core.load_executed_hashes(), sha)
                     # 同じ中身の写しが届いても、自動では走らない。
-                    write_script(watch, "orig (2).py", content)
+                    write_script(watch, "1-01_orig (2).py", content)
                     window._poll()
                     window._poll()
-                    settle_checks(window, ["orig (2).py"])
+                    settle_checks(window, ["1-01_orig (2).py"])
                     assert pump_until(
                         lambda: False, timeout=0.6) is False
-                    assert calls == ["orig.py"], calls
-                    dup = item_of(window, "orig (2).py")
+                    assert calls == ["1-01_orig.py"], calls
+                    dup = item_of(window, "1-01_orig (2).py")
                     # 中身が実行済みなので、1-33 からは実行済みの
                     # 印が復元されて付く (状態は「OK・済」になる)。
                     # ただし写し自身はこの会話では走っていない
@@ -1286,19 +1298,19 @@ def test_dl_loop_brakes():
                     assert "同じ内容を実行済みのため" \
                         in window.note.text(), window.note.text()
                     # 別の中身は自動で走る。
-                    write_script(watch, "other.py",
+                    write_script(watch, "1-02_other.py",
                                  "print('別の中身です')\n")
                     window._poll()
                     window._poll()
-                    settle_checks(window, ["other.py"])
+                    settle_checks(window, ["1-02_other.py"])
                     assert pump_until(
-                        lambda: "other.py" in calls), calls
+                        lambda: "1-02_other.py" in calls), calls
                     assert pump_until(
                         lambda: window._running_item is None)
                     # 写しの手動実行は妨げない。
                     window._start_run(dup)
                     assert pump_until(
-                        lambda: "orig (2).py" in calls), calls
+                        lambda: "1-01_orig (2).py" in calls), calls
                 finally:
                     window.close()
         finally:
@@ -1751,22 +1763,22 @@ def test_diag_events_recorded_and_bundle_button():
             filled.append((text, profile))
             return sr._AiAnswerResult(True, "入力欄に入れました")
 
-        dialog = sr_ai.AiWindowDialog(
+        dialog = sr_ai.SettingsDialog(
             {"process_name": "dummy.exe"}, None,
             filler=fake_filler,
             diag_text_provider=lambda: "束のテキスト")
         try:
-            assert dialog._diag_button is not None
-            dialog._diag_button.click()
+            assert dialog.ai_page._diag_button is not None
+            dialog.ai_page._diag_button.click()
             assert pump_until(lambda: len(filled) == 1)
             assert filled[0][0] == "束のテキスト"
             assert isinstance(filled[0][1], dict)
         finally:
             dialog.close()
         # 作る役が無ければボタンは出ない。
-        plain = sr_ai.AiWindowDialog({"process_name": "dummy.exe"}, None)
+        plain = sr_ai.SettingsDialog({"process_name": "dummy.exe"}, None)
         try:
-            assert plain._diag_button is None
+            assert plain.ai_page._diag_button is None
         finally:
             plain.close()
     finally:
@@ -2298,7 +2310,8 @@ def test_dark_mode_toggle_and_startup():
     assert sr._SELECTION_TINT == QColor(0, 120, 215, 70)
     assert light["muted"] == "#5b665f" and light["link"] == "#1a5fb4"
     assert light["dialog_error"] == "#c00000"
-    assert light["chrome"] is None
+    assert light["chrome"]["window"] == "#f2f3f5"
+    assert light["chrome"]["base"] == "#ffffff"
     dark = sr.THEMES["dark"]
     # 意味のある色は、ダークでも互いに (とライトと) 区別できる。
     dark_semantics = {
@@ -2311,11 +2324,11 @@ def test_dark_mode_toggle_and_startup():
         tmp = Path(td)
         window, _watch, settings_path, _copied = make_window(tmp)
         try:
-            # 既定はライトで、今までどおり (地には何も付けない)。
+            # 既定はライトで、専用の明るい配色が当たる (1.78)。
             assert not window.dark_box.isChecked()
-            assert window.styleSheet() == ""
-            assert window.palette().color(window_role) == \
-                window._default_palette.color(window_role)
+            assert window.styleSheet() != ""
+            assert window.palette().color(window_role).name() == \
+                light["chrome"]["window"]
             assert not window.table.alternatingRowColors()
             # 切替を入れると、その場でダークになり設定にも残る。
             window.dark_box.setChecked(True)
@@ -2334,9 +2347,9 @@ def test_dark_mode_toggle_and_startup():
             window.dark_box.setChecked(False)
             saved = json.loads(settings_path.read_text(encoding="utf-8"))
             assert saved["script_runner"]["dark_mode"] is False
-            assert window.styleSheet() == ""
-            assert window.palette().color(window_role) == \
-                window._default_palette.color(window_role)
+            assert window.styleSheet() != ""
+            assert window.palette().color(window_role).name() == \
+                light["chrome"]["window"]
             assert not window.table.alternatingRowColors()
             window._set_note("試し", "error")
             assert window.note.styleSheet() == \
@@ -2371,11 +2384,11 @@ def test_dark_mode_toggle_and_startup():
             # パレットは子ダイアログへ受け継がれないので、窓の
             # スタイルシートが効いて地が暗くなっていることを、
             # 描画した画素で確かめる。
-            dialog = sr_ai.AiWindowDialog(
+            dialog = sr_ai.SettingsDialog(
                 {"process_name": "dummy.exe"}, window,
                 error_color=window._theme()["dialog_error"])
             try:
-                assert dialog._error_color == "#ff7b72"
+                assert dialog.ai_page._error_color == "#ff7b72"
                 dialog.show()
                 QCoreApplication.processEvents()
                 image = dialog.grab().toImage()
@@ -2387,33 +2400,130 @@ def test_dark_mode_toggle_and_startup():
             window.close()
 
 
-def test_intro_button_copies_prompt():
-    # 「ループを始める」(1.47): 表の直下にあるボタンで、押すと
-    # 導入プロンプトがクリップボードへ入る。AI の投げ先の設定が
-    # 無くても押せる (クリップボードへ入れるだけ)。VM では
-    # PowerShell が無いので、その項目は「不明」になる。
+def test_intro_button_falls_back_when_unconfigured():
+    # 「PHALループ開始プロンプトを入力」(1.82、旧「…を送信」1.77):
+    # 投げ先が未設定なら送らず、開始プロンプトをクリップボードへ
+    # 入れてダイアログで知らせる。VM では PowerShell が無いので、
+    # 環境のその項目は「不明」になる。
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         window, watch, _settings_path, copied = make_window(tmp)
+        dialogs = []
+
+        class _FakeBox:
+            @staticmethod
+            def information(parent, title, text):
+                dialogs.append(text)
+
+            @staticmethod
+            def warning(parent, title, text):
+                dialogs.append(text)
+
+        original_box = sr.QMessageBox
+        sr.QMessageBox = _FakeBox
+
+        class _FakeFileDialog:
+            @staticmethod
+            def getExistingDirectory(parent, title, start):
+                return str(watch)
+
+        original_fd = sr.QFileDialog
+        sr.QFileDialog = _FakeFileDialog
         try:
-            assert window.intro_button.text() == "ループを始める"
+            assert window.intro_button.text() == \
+                "PHALループ開始プロンプトを入力"
+            assert window.ai_window_button.text() == "設定"
             window.intro_button.click()
             QCoreApplication.processEvents()
             assert len(copied) == 1, copied
             text = copied[0]
             assert text.startswith("PHAL のループを始めます。"), text
+            # 作業フォルダの行に、ダイアログで選んだものが入る (1.83)
+            assert f"- 作業フォルダ: {watch}" in text, text
             assert "直接出られません" in text, text
             assert "短いスクリプト" in text, text
             assert str(watch) in text, text
             assert "- PowerShell: 不明" in text, text
-            assert "クリップボードに入れました。Copilot に貼ってください" \
+            assert dialogs and "クリップボード" in dialogs[0], dialogs
+            assert "開始プロンプトをクリップボードに入れました" \
                 in window.note.text(), window.note.text()
         finally:
+            sr.QMessageBox = original_box
+            sr.QFileDialog = original_fd
             window.close()
 
 
+def test_intro_button_cancelled_folder_dialog():
+    # 作業フォルダのダイアログをキャンセルしたら、開始プロンプト
+    # は入れない (1.83)。
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        window, watch, _settings_path, copied = make_window(tmp)
+
+        class _FakeFileDialog:
+            @staticmethod
+            def getExistingDirectory(parent, title, start):
+                return ""
+
+        original_fd = sr.QFileDialog
+        sr.QFileDialog = _FakeFileDialog
+        try:
+            window.intro_button.click()
+            QCoreApplication.processEvents()
+            assert copied == [], copied
+            assert "選ばれなかった" in window.note.text(), \
+                window.note.text()
+        finally:
+            sr.QFileDialog = original_fd
+            window.close()
+
+
+def test_intro_auto_text_zip_line_follows_profile():
+    # 開始プロンプトの ZIP の行は、有効なプロファイルで
+    # zip_as_txt が入っているときだけ出る (1.81 の配線を
+    # 実経路で確かめる。1.83 で発見した未配線の直し)。
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        window, watch, settings_path, copied = make_window(tmp)
+        assert ".zip.txt" not in window._intro_auto_text()
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        data["script_runner"]["ai_profiles"] = [{
+            "name": "copilot",
+            "target": {"label": "Copilot", "zip_as_txt": True}}]
+        settings_path.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        text = window._intro_auto_text()
+        assert ".zip.txt に変えて渡します" in text, text
+        window.close()
+
+
+def test_ai_dialog_intro_prompt_editor():
+    # 「設定」画面の開始プロンプト欄 (1.77、2.01 で共通設定
+    # タブへ移動): 保存済みの文が入り、「自動生成の文を入れる」
+    # で provider の文に替わり、そのまま intro_prompt() で
+    # 取り出せる。題は「設定 - PHAL」。
+    dialog = sr_ai.SettingsDialog(
+        {}, None, common={"intro_prompt": "保存した文"},
+        intro_text_provider=lambda: "自動生成の文")
+    try:
+        assert dialog.windowTitle() == "設定 - PHAL"
+        assert dialog.intro_prompt() == "保存した文"
+        dialog.common_page._intro_load_button.click()
+        assert dialog.intro_prompt() == "自動生成の文"
+        # 「保存した文を使う」を外すと、保存内容は空 (自動生成)
+        # になる (1.80)。
+        dialog.common_page._intro_use_box.setChecked(False)
+        assert dialog.intro_prompt() == ""
+        # ZIP の名前変え (1.81) はプロファイルの欄として往復する
+        assert dialog.ai_page.fields()["zip_as_txt"] is False
+        dialog.ai_page._zip_as_txt_box.setChecked(True)
+        assert dialog.ai_page.fields()["zip_as_txt"] is True
+    finally:
+        dialog.close()
+
+
 def test_record_button_copies_loop_record():
-    # 「記録をコピー」(1.51): 表の直下、「ループを始める」の隣。
+    # 「記録をコピー」(1.51): 表の直下、開始プロンプトの隣。
     # まだ記録が無ければ何も入れず「まだ記録がありません」だけ。
     # 実行が終わった後なら、直近の手を Markdown にして入れる。
     with tempfile.TemporaryDirectory() as td:
@@ -2648,6 +2758,832 @@ def test_answer_with_attachments():
                 os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
 
 
+def test_settings_manual_auto_response():
+    # 設定確認・マニュアル再送の自動応答 (1.85):
+    # - 切替が入っていて目印が来たら、設定の報告／マニュアルの
+    #   添付を入れて送信まで自動でやること。消費が控えに残り、
+    #   同じ目印では二度送らないこと。
+    # - 切替が切なら何も送らないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_settings=True, auto_manual=True,
+                ai_target={"process_name": "dummy.exe"})
+            fills: list = []
+            presses: list = []
+
+            def attach(window):
+                window._set_clipboard = (  # type: ignore[method-assign]
+                    lambda text: setattr(
+                        window, "_last_clipboard_text", text))
+                window.ai_downloader = (  # type: ignore[method-assign]
+                    lambda profile: sr._DlCheckResult(
+                        False, "なし", None))
+
+                def fake_sender(text, profile, attachments=None):
+                    fills.append((text, list(attachments or [])))
+                    return sr._AiAnswerResult(True, "入れました")
+
+                def fake_presser(profile):
+                    presses.append(profile)
+                    return sr._AiAnswerResult(True, "押しました")
+
+                window.ai_sender = fake_sender  # type: ignore
+                window.ai_presser = fake_presser  # type: ignore
+
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            attach(window)
+            try:
+                flags = window._automation_flags()
+                assert flags["auto_settings"] is True
+                assert flags["auto_manual"] is True
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-1"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert fills[0][0].startswith("PHAL設定 Ver")
+                assert "監視フォルダ:" in fills[0][0]
+                assert fills[0][1] == []
+                assert pump_until(
+                    lambda: core.load_settings_auto()[
+                        "consumed_id"] == "s-1")
+                # 同じ目印では二度送らない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-1"}))
+                settle()
+                assert len(fills) == 1
+                # マニュアル再送: 添付つきで送る。
+                manual = tmp / "phal-ai-manual.md"
+                manual.write_text("# manual\n", encoding="utf-8")
+                window._intro_manual_path = (  # type: ignore
+                    lambda: manual)
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, manual_marker={"id": "m-1"}))
+                assert pump_until(lambda: len(presses) == 2)
+                assert fills[1][1] == [str(manual)]
+                assert "再送します" in fills[1][0]
+                assert pump_until(
+                    lambda: core.load_manual_auto()[
+                        "consumed_id"] == "m-1")
+            finally:
+                window.close()
+        # 切替が切なら送らない。
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            fills2: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender2(text, profile, attachments=None):
+                fills2.append(text)
+                return sr._AiAnswerResult(True, "入れました")
+
+            window.ai_sender = fake_sender2  # type: ignore
+            window.ai_presser = (  # type: ignore[method-assign]
+                lambda profile: sr._AiAnswerResult(True, "押しました"))
+            try:
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-9"}))
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, manual_marker={"id": "m-9"}))
+                settle()
+                assert fills2 == []
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_file_auto_response():
+    # ファイルリクエストの自動応答 (1.88):
+    # - 配下のファイルは添付して送り、消費が控えに残ること。
+    # - 範囲外 (フォルダの外) は文だけで知らせること。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(
+                tmp, auto_file=True,
+                ai_target={"process_name": "dummy.exe"})
+            target_file = watch / "data.log"
+            target_file.write_text("log body\n", encoding="utf-8")
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                assert window._automation_flags()[
+                    "auto_file"] is True
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, file_marker={
+                        "id": "f-1", "path": "data.log"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert fills[0][1] == [str(target_file.resolve())]
+                assert "送ります" in fills[0][0]
+                assert pump_until(
+                    lambda: core.load_file_auto()[
+                        "consumed_id"] == "f-1")
+                # 範囲外は添付なしの文だけ (間隔の歯止めは
+                # テストでは外す)。
+                window._file_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, file_marker={
+                        "id": "f-2",
+                        "path": str(tmp / "outside.txt")}))
+                assert pump_until(lambda: len(presses) == 2)
+                assert fills[1][1] == []
+                assert "外なので送れません" in fills[1][0]
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_fulltext_auto_response():
+    # 全文リクエストの自動応答 (1.91):
+    # - phal-outputs にある全文ファイルは添付して送り、消費が
+    #   控えに残ること。
+    # - 見つからない ID は文だけで知らせること。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_fulltext=True,
+                ai_target={"process_name": "dummy.exe"})
+            outputs = tmp / "data" / "phal-outputs"
+            outputs.mkdir(parents=True)
+            full = outputs / "1-123_20260101-120000_deadbeef.txt"
+            full.write_text("全文です\n", encoding="utf-8")
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                assert window._automation_flags()[
+                    "auto_fulltext"] is True
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, fulltext_marker={
+                        "id": "ft-1", "command_id": "1-123"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert fills[0][1] == [str(full)]
+                assert "全文を送ります" in fills[0][0]
+                assert "1-123" in fills[0][0]
+                assert pump_until(
+                    lambda: core.load_fulltext_auto()[
+                        "consumed_id"] == "ft-1")
+                # 見つからない ID は添付なしの文だけ (間隔の
+                # 歯止めはテストでは外す)。
+                window._fulltext_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, fulltext_marker={
+                        "id": "ft-2", "command_id": "9-999"}))
+                assert pump_until(lambda: len(presses) == 2)
+                assert fills[1][1] == []
+                assert "見つかりませんでした" in fills[1][0]
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_settings_refire_suppression():
+    # 合図の再応答の抑止 (1.95、2.00 で作り替え、設定フロー):
+    # - 応答すると、控えに last_payload と last_answered_at が
+    #   残ること。
+    # - 同定子 (consumed_id/key) が外れた状態で同じ合図が再び
+    #   見えても、15分以内は二度送らないこと。
+    # - 15分を過ぎても繰り返しは送らず、「応答済み」の知らせ
+    #   が1回だけ届くこと。以後の再検出は何も送らないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_settings=True,
+                ai_target={"process_name": "dummy.exe"})
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-1"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert pump_until(
+                    lambda: core.load_settings_auto()[
+                        "last_answered_at"] > 0)
+                state = core.load_settings_auto()
+                assert state["last_payload"] == ""
+                assert state["consumed_id"] == "s-1"
+                # 同定子が外れた再検出を再現する (消費を消し、
+                # 60秒の間隔の歯止めも外す。止めるのは抑止だけ)。
+                window._settings_auto["consumed_id"] = ""
+                window._settings_auto["consumed_key"] = ""
+                window._settings_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-2"}))
+                settle()
+                assert len(fills) == 1
+                # 15分を過ぎても、同じ合図は繰り返し送らない
+                # (2.00)。代わりに「応答済み」の知らせが1回
+                # だけ届く。
+                window._settings_auto["last_answered_at"] = (
+                    time.time() - 901)
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-3"}))
+                assert pump_until(lambda: len(presses) == 2)
+                assert "応答済み" in fills[1][0]
+                assert "PHAL設定" not in fills[1][0]
+                assert pump_until(
+                    lambda: core.load_settings_auto().get(
+                        "refire_notice_at", 0) > 0)
+                # 知らせ済みの再検出は、もう何も送らない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    settings_marker={"id": "s-4"}))
+                settle()
+                assert len(fills) == 2
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_fulltext_refire_suppression():
+    # 合図の再応答の抑止 (1.95、全文フロー):
+    # - 応答すると、控えの last_payload にコマンド ID が残る
+    #   こと。
+    # - 同定子が外れても、同じ ID は15分以内は二度送らない
+    #   こと。違う ID は抑止されないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_fulltext=True,
+                ai_target={"process_name": "dummy.exe"})
+            outputs = tmp / "data" / "phal-outputs"
+            outputs.mkdir(parents=True)
+            full_a = outputs / "1-123_20260101-120000_deadbeef.txt"
+            full_a.write_text("全文A\n", encoding="utf-8")
+            full_b = outputs / "1-124_20260101-120000_beefdead.txt"
+            full_b.write_text("全文B\n", encoding="utf-8")
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, fulltext_marker={
+                        "id": "ft-1", "command_id": "1-123"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert fills[0][1] == [str(full_a)]
+                assert pump_until(
+                    lambda: core.load_fulltext_auto()[
+                        "last_payload"] == "1-123")
+                # 同定子が外れた再検出 (同じ ID) は抑止される。
+                window._fulltext_auto["consumed_id"] = ""
+                window._fulltext_auto["consumed_key"] = ""
+                window._fulltext_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, fulltext_marker={
+                        "id": "ft-2", "command_id": "1-123"}))
+                settle()
+                assert len(fills) == 1
+                # 違う ID は抑止されない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, fulltext_marker={
+                        "id": "ft-3", "command_id": "1-124"}))
+                assert pump_until(lambda: len(presses) == 2)
+                assert fills[1][1] == [str(full_b)]
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_history_auto_response():
+    # 実行一覧の自動応答 (1.92、素材は実行ログ 1.94):
+    # - 切替が入っていて目印が来たら、実行ログから作った
+    #   一覧 (新しい順) を送り、消費が控えに残る
+    #   こと。同じ目印では二度送らないこと。
+    # - 切替が切なら何も送らないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_history=True,
+                ai_target={"process_name": "dummy.exe"})
+            run_log = Path(os.environ["TRAYTOOLS_DATA_DIR"]) / \
+                core.LOG_FILENAME
+            run_log.parent.mkdir(parents=True, exist_ok=True)
+            run_log.write_text(
+                json.dumps(
+                    {"time": "2026-11-15T16:20:37",
+                     "file": "1-201_a.phal", "exit_code": 0,
+                     "seconds": 1.3}, ensure_ascii=False) + "\n"
+                + json.dumps(
+                    {"time": "2026-11-15T16:21:24",
+                     "file": "1-202_b.phal", "exit_code": 1,
+                     "seconds": 0.1}, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                assert window._automation_flags()[
+                    "auto_history"] is True
+                # 間隔の歯止めはテストでは外す。
+                window._history_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, history_marker={"id": "h-1"}))
+                assert pump_until(lambda: len(presses) == 1)
+                sent_lines = fills[0][0].splitlines()
+                assert sent_lines[0] == "直近の実行一覧（新しい順）"
+                assert "1-202_b.phal" in sent_lines[1]
+                assert "終了コード 1" in sent_lines[1]
+                assert "1-201_a.phal" in sent_lines[2]
+                assert len(sent_lines) == 3
+                assert fills[0][1] == []
+                assert pump_until(
+                    lambda: core.load_history_auto()[
+                        "consumed_id"] == "h-1")
+                # 同じ目印では二度送らない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, history_marker={"id": "h-1"}))
+                settle()
+                assert len(fills) == 1
+            finally:
+                window.close()
+        # 切替が切なら送らない。
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            fills2: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender2(text, profile, attachments=None):
+                fills2.append(text)
+                return sr._AiAnswerResult(True, "入れました")
+
+            window.ai_sender = fake_sender2  # type: ignore
+            window.ai_presser = (  # type: ignore[method-assign]
+                lambda profile: sr._AiAnswerResult(True, "押しました"))
+            try:
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, history_marker={"id": "h-9"}))
+                settle()
+                assert fills2 == []
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_log_auto_response():
+    # 動作ログリクエストの自動応答 (1.96):
+    # - 切替が入っていて目印 (指定つき) が来たら、動作ログ
+    #   から指定どおりに選んだ分だけを送り、消費が控えに
+    #   残ること。同じ目印では二度送らないこと。
+    # - 切替が切なら何も送らないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_log=True,
+                ai_target={"process_name": "dummy.exe"})
+            core.save_log_events([
+                {"at": 1000.0 + i * 60.0, "text": f"ログ{i + 1}"}
+                for i in range(5)])
+            fills: list = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                assert window._automation_flags()[
+                    "auto_log"] is True
+                # 間隔の歯止めはテストでは外す。
+                window._log_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    log_marker={"id": "lg-1", "params": "2"}))
+                assert pump_until(lambda: len(presses) == 1)
+                sent_lines = fills[0][0].splitlines()
+                assert sent_lines[0] == "動作ログ（直近2件）"
+                assert len(sent_lines) == 3
+                assert "ログ4" in sent_lines[1]
+                assert "ログ5" in sent_lines[2]
+                assert fills[0][1] == []
+                assert pump_until(
+                    lambda: core.load_log_auto()[
+                        "consumed_id"] == "lg-1")
+                # 同じ目印では二度送らない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None,
+                    log_marker={"id": "lg-1", "params": "2"}))
+                settle()
+                assert len(fills) == 1
+            finally:
+                window.close()
+        # 切替が切なら送らない。
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            fills2: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender2(text, profile, attachments=None):
+                fills2.append(text)
+                return sr._AiAnswerResult(True, "入れました")
+
+            window.ai_sender = fake_sender2  # type: ignore
+            window.ai_presser = (  # type: ignore[method-assign]
+                lambda profile: sr._AiAnswerResult(True, "押しました"))
+            try:
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, log_marker={"id": "lg-9"}))
+                settle()
+                assert fills2 == []
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_stop_auto_response():
+    # 停止リクエストの自動応答 (1.93):
+    # (a) 実行中なら、合図で実行が止まり (偽ハンドルの stop が
+    #   呼ばれる)、消費が控えに残ること。別途の送信はしない
+    #   こと (報告は止まった実行の結果文が担う)。
+    # (b) 実行中でなければ「実行中のスクリプトはありません。」
+    #   が送られ、消費が残ること。同じ目印では二度送らない。
+    # (c) 切替が切なら、実行中でも止めないこと。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def settle(seconds=0.5):
+        pump_until(lambda: False, timeout=seconds)
+
+    class _FakeHandle:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class _FakeItem:
+        def __init__(self, name):
+            self.name = name
+
+    try:
+        # --- (a) 実行中は止める ---
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_stop=True,
+                ai_target={"process_name": "dummy.exe"})
+            fills: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender(text, profile, attachments=None):
+                fills.append(text)
+                return sr._AiAnswerResult(True, "入れました")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = (  # type: ignore[method-assign]
+                lambda profile: sr._AiAnswerResult(True, "押しました"))
+            try:
+                assert window._automation_flags()[
+                    "auto_stop"] is True
+                # 間隔の歯止めはテストでは外す。
+                window._stop_auto["last_sent_at"] = 0.0
+                handle = _FakeHandle()
+                window._run_handle = handle
+                window._running_item = _FakeItem("1-999_long.phal")
+                window._maybe_auto_stop({"id": "s-1", "key": "k-1"})
+                assert handle.stopped is True
+                assert core.load_stop_auto()[
+                    "consumed_id"] == "s-1"
+                settle()
+                assert fills == []
+                window._run_handle = None
+                window._running_item = None
+            finally:
+                window.close()
+        # --- (b) 実行中でなければ文で返す ---
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_stop=True,
+                ai_target={"process_name": "dummy.exe"})
+            fills = []
+            presses: list = []
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_sender_b(text, profile, attachments=None):
+                fills.append((text, list(attachments or [])))
+                return sr._AiAnswerResult(True, "入れました")
+
+            def fake_presser_b(profile):
+                presses.append(profile)
+                return sr._AiAnswerResult(True, "押しました")
+
+            window.ai_sender = fake_sender_b  # type: ignore
+            window.ai_presser = fake_presser_b  # type: ignore
+            try:
+                window._stop_auto["last_sent_at"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, stop_marker={"id": "s-2"}))
+                assert pump_until(lambda: len(presses) == 1)
+                assert fills[0][0] == "実行中のスクリプトはありません。"
+                assert fills[0][1] == []
+                assert pump_until(
+                    lambda: core.load_stop_auto()[
+                        "consumed_id"] == "s-2")
+                # 同じ目印では二度送らない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, stop_marker={"id": "s-2"}))
+                settle()
+                assert len(fills) == 1
+            finally:
+                window.close()
+        # --- (c) 切替が切なら止めない ---
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: None)
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+            try:
+                assert window._automation_flags()[
+                    "auto_stop"] is False
+                handle = _FakeHandle()
+                window._run_handle = handle
+                window._running_item = _FakeItem("1-999_long.phal")
+                window._maybe_auto_stop({"id": "s-9"})
+                assert handle.stopped is False
+                window._run_handle = None
+                window._running_item = None
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_diag_writes_log_and_collapses_cached_checks():
+    # 動作ログ (1.89): _diag は診断の控えと動作ログの両方へ
+    # 書く。「チェック（控えから）」は個別に入らず、畳むと
+    # 1行 (件数) になること。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                window._diag("通常の記録です")
+                window._diag("チェック（控えから）: a.phal → OK")
+                window._diag("チェック（控えから）: b.phal → 警告")
+                texts = [e["text"] for e in core.load_log_events()]
+                assert texts == ["通常の記録です"]
+                assert window._cached_check_count == 2
+                window._flush_cached_check_log()
+                texts = [e["text"] for e in core.load_log_events()]
+                assert len(texts) == 2
+                assert "2件" in texts[1]
+                assert window._cached_check_count == 0
+                # 診断の控えには個別の行が残る (束の従来どおり)。
+                diag_texts = [
+                    e["text"] for e in core.load_diag_events()]
+                assert any("a.phal" in t for t in diag_texts)
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_log_viewer_dialog_shows_events():
+    # 動作ログビューア (1.90): 置き場の記録が日付つきで出る
+    # ことと、設定画面に「動作ログ」ボタンがあること。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            events = []
+            core.log_append(events, "ビューア確認の一行", at=1000.0)
+            core.save_log_events(events)
+            viewer = sr_ai.LogViewerDialog()
+            try:
+                assert "ビューア確認の一行" in \
+                    viewer._view.toPlainText()
+            finally:
+                viewer.close()
+            dialog = sr_ai.SettingsDialog(
+                {"process_name": "dummy.exe"}, None)
+            try:
+                labels = [dialog._tabs.tabText(i)
+                          for i in range(dialog._tabs.count())]
+                assert "動作ログ" in labels
+                assert "ツール設定" in labels
+            finally:
+                dialog.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 def test_ai_window_attach_method_and_test_button():
     # 添付方式 (1.61):
     # - プロファイルの target に attach_method が保存され、
@@ -2679,6 +3615,17 @@ def test_ai_window_attach_method_and_test_button():
             assert profiles[1]["target"]["attach_method"] == "auto"
             built = sr_ai.build_profile(profiles[0]["target"])
             assert built["attach_method"] == "dialog"
+            # ZIP の名前変え (1.81) も build_profile へ渡る。
+            # sanitize_fields を通る前に取り出すのが肝 (1.84)。
+            zprofiles, _zactive = sr_ai.sanitize_profiles({
+                "ai_profiles": [{"name": "Z", "target": {
+                    "process_name": "dummy.exe",
+                    "zip_as_txt": True}}],
+                "ai_profile_active": 0,
+            })
+            assert zprofiles[0]["target"]["zip_as_txt"] is True
+            assert sr_ai.build_profile(
+                zprofiles[0]["target"])["zip_as_txt"] is True
             saved = sr_ai.profiles_settings(profiles, active)
             assert saved["ai_profiles"][0]["target"][
                 "attach_method"] == "dialog"
@@ -2691,16 +3638,17 @@ def test_ai_window_attach_method_and_test_button():
                     True, "添付できました（方式: ダイアログ）。"
                           "チップも外しました")
 
-            dialog = sr_ai.AiWindowDialog(
+            dialog = sr_ai.SettingsDialog(
                 profiles[active]["target"], None,
                 profiles=profiles, active_index=active,
                 attach_tester=fake_tester)
             try:
+                page = dialog.ai_page
                 # 選択は保存済みの方式を指している。
-                assert dialog._attach_method_combo.currentData() \
+                assert page._attach_method_combo.currentData() \
                     == "dialog"
-                assert dialog.fields()["attach_method"] == "dialog"
-                dialog._attach_test_button.click()
+                assert page.fields()["attach_method"] == "dialog"
+                page._attach_test_button.click()
                 assert pump_until(lambda: len(tested) == 1)
                 path, profile = tested[0]
                 assert path.endswith("phal-attach-test.txt")
@@ -2710,11 +3658,11 @@ def test_ai_window_attach_method_and_test_button():
                         / "phal-attach-test.txt").exists()
                 assert pump_until(
                     lambda: "添付できました"
-                    in dialog._status_label.text())
+                    in page._status_label.text())
                 # 切り替えると fields にも反映される。
-                dialog._attach_method_combo.setCurrentIndex(
-                    dialog._attach_method_combo.findData("paste"))
-                assert dialog.fields()["attach_method"] == "paste"
+                page._attach_method_combo.setCurrentIndex(
+                    page._attach_method_combo.findData("paste"))
+                assert page.fields()["attach_method"] == "paste"
             finally:
                 dialog.close()
         finally:
@@ -2752,7 +3700,9 @@ if __name__ == "__main__":
         test_reset_auto_response,
         test_blocked_notice,
         test_dark_mode_toggle_and_startup,
-        test_intro_button_copies_prompt,
+        test_intro_button_falls_back_when_unconfigured,
+        test_intro_button_cancelled_folder_dialog,
+        test_intro_auto_text_zip_line_follows_profile,
         test_record_button_copies_loop_record,
         test_rerun_menu_and_diff,
         test_answer_with_attachments,

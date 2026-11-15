@@ -184,6 +184,7 @@ def profiles(app_settings=None):
 
 CONTROL_BUTTON, CONTROL_TEXT, CONTROL_DOCUMENT = 50000, 50020, 50030
 CONTROL_EDIT = 50004
+CONTROL_HYPERLINK = 50005
 CONTROL_MENU = 50009
 CONTROL_MENU_ITEM, CONTROL_LIST_ITEM = 50011, 50008
 CONTROL_WINDOW, CONTROL_PANE, CONTROL_DIALOG = 50032, 50033, 50031
@@ -708,6 +709,75 @@ DIAG_REQUEST_MARKER = "PHAL:診断リクエスト"
 # い」という合図として扱う (切替 auto_reset が入っているときだ
 # け)。走査と同定子の作りは診断の目印と共通 (_marker_in)。
 RESET_REQUEST_MARKER = "PHAL:リセットリクエスト"
+# 再実行の目印 (1.63、Nagato の案)。同じ流儀だが、この目印は
+# 行にコマンド ID を含める形にする: 「PHAL:再実行リクエスト
+# 1-123」のように、目印の後ろへ空白を空けて ID を書く。窓側が
+# その ID のスクリプトを探して再実行する (切替 auto_rerun が
+# 入っているときだけ)。同定子の作りは診断・リセットと共通
+# (_marker_scan)。ID の切り出しは _rerun_marker_in が持つ。
+# 1.97 で、ID の後ろに引数を付けられるようになった:
+# 「PHAL:再実行リクエスト 1-123 --lines 20」の形で、ID の後ろ
+# の残り全部が引数文字列になる (分け方は core.
+# split_command_args)。引数はスクリプトの sys.argv[1:] に
+# 入る。
+RERUN_REQUEST_MARKER = "PHAL:再実行リクエスト"
+# 結果再送の目印 (1.75)。再実行と同じ形 (目印 + 空白 + コマンド
+# ID) で、窓側がその ID の直近の結果を投稿し直す (切替
+# auto_resend が入っているときだけ)。ID の切り出しと同定子は
+# 再実行と共通 (_id_marker_in)。
+RESEND_REQUEST_MARKER = "PHAL:結果再送リクエスト"
+# 設定確認の目印 (1.85、Nagato の依頼)。単独行で立っていたら、
+# 窓側が PHAL の設定値の報告を送る (切替 auto_settings が入って
+# いるときだけ)。同定子の作りは診断・リセットと共通 (_marker_in)。
+SETTINGS_REQUEST_MARKER = "PHAL:設定リクエスト"
+# マニュアル再送の目印 (1.85、Nagato の依頼)。単独行で立って
+# いたら、窓側が連携マニュアルのファイルを添付して自動で送信
+# する (切替 auto_manual が入っているときだけ)。同定子は共通。
+MANUAL_REQUEST_MARKER = "PHAL:マニュアルリクエスト"
+# ファイルリクエストの目印 (1.88、Nagato の依頼)。行の形は
+# 「PHAL:ファイルリクエスト <パス>」で、窓側がダウンロード
+# フォルダと作業フォルダの配下にあるそのファイルを添付して
+# 送る (切替 auto_file が入っているときだけ)。パスの切り出しは
+# _file_marker_in、同定子は _marker_scan の共通の作り。
+FILE_REQUEST_MARKER = "PHAL:ファイルリクエスト"
+# 全文リクエストの目印 (1.91、Nagato の依頼)。行の形は
+# 「PHAL:全文リクエスト <コマンドID>」で、窓側が要約モードで
+# 保存したその ID の全文ファイルを添付して送る (切替
+# auto_fulltext が入っているときだけ)。ID の切り出しと同定子
+# は再実行・再送と共通 (_id_marker_in)。
+FULLTEXT_REQUEST_MARKER = "PHAL:全文リクエスト"
+# 実行一覧の目印 (1.92、Nagato の依頼)。単独行で立っていたら、
+# 窓側が直近の実行一覧 (結果の控えの1行目だけ) を送る (切替
+# auto_history が入っているときだけ)。同定子は共通 (_marker_in)。
+HISTORY_REQUEST_MARKER = "PHAL:一覧リクエスト"
+# 停止の目印 (1.93、Nagato の依頼)。単独行で立っていたら、窓側
+# が実行中のスクリプトを止める (切替 auto_stop が入っている
+# ときだけ)。実行中でなければ、その旨を文で返す。同定子は
+# 共通 (_marker_in)。
+STOP_REQUEST_MARKER = "PHAL:停止リクエスト"
+# 動作ログリクエストの目印 (1.96、Nagato の依頼)。行の形は
+# 「PHAL:ログリクエスト [指定...]」で、窓側が動作ログ
+# (script_runner_log.json、ビューアと同じ中身) を送る (切替
+# auto_log が入っているときだけ)。指定は空白区切りで、件数
+# (数字)・日付 (YYYY-MM-DD)・時刻範囲 (HH:MM-HH:MM) を付け
+# られる (解釈は core.parse_log_request)。指定が無くても目印
+# として数える (ファイルと違い、後ろは空でもよい)。切り出し
+# は _log_marker_in、同定子は _marker_scan の共通の作り。
+LOG_REQUEST_MARKER = "PHAL:ログリクエスト"
+# ツール実行の目印 (1.98、Nagato の依頼)。行の形は
+# 「PHAL:ツール実行 <ツール名> [引数...]」で、窓側が許可リスト
+# (設定 cli_tools) にあるコマンドラインツールを作業フォルダで
+# 実行し、結果を送る (切替 auto_tool が入っているときだけ)。
+# 切り出しは _tool_marker_in、同定子は _marker_scan の共通の
+# 作り。ツール名と引数の分け方・許可の判定は窓側 (core) が持つ。
+TOOL_REQUEST_MARKER = "PHAL:ツール実行"
+# 再実行の目印の行から ID を切り出す形。ファイル名のコマンド
+# ID と同じ「セッション番号-通番」(各3桁まで) で、後ろに "_"
+# (ファイル名の続き) や空白があっても ID の部分だけを取る。
+_RERUN_ID_RE = re.compile(r"^(\d{1,3}-\d{1,3})$")
+# 再実行の目印の行から ID と引数を切り出す形 (1.97)。ID の
+# 後ろに空白を空けて引数文字列を続けられる (引数は任意)。
+_RERUN_ARGS_RE = re.compile(r"^(\d{1,3}-\d{1,3})(?:\s+(.*))?$")
 # 目印より後ろに続く本文の上限 (文字)。最新の発言の中の目印だけを
 # 相手にするため、後ろに会話が長く続いている (= 古い発言の中の
 # 目印) ものは数えない。同じ発言の続きと、入力欄まわりの UI の
@@ -1524,7 +1594,17 @@ class Copilot:
 
         失敗は段つき(InputStageError)で上げる: 見つからない /
         書き込む仕組みが無い / 書き込み自体の失敗。呼び側が理由を
-        一文に畳まなくて済むように。"""
+        一文に畳まなくて済むように。
+
+        【書き込みは2段構え (2.03)】
+        まず ValuePattern.SetValue で書く (Edge の Muse では
+        これで入る)。ただしアプリによっては、SetValue が成功を
+        返しても編集欄が受け付けないことがある (実機 2026-11-15、
+        Copilot アプリ: 成功と出るのに入っていない。読み直しは
+        効くので、書き込みだけが黙って無視される)。書いた直後に
+        読み直して一致しなければ、添付と同じ貼り付け (前面化→
+        フォーカス→Ctrl+V) へ切り替える。貼り付けでも読み直し
+        が一致しなければ失敗として上げる。"""
         _root, desc = self._descendants()
         box, candidates = self._find_input_box(desc)
         if box is None:
@@ -1541,6 +1621,84 @@ class Copilot:
             raise InputStageError(
                 "unwritable",
                 f"入力欄に書き込めませんでした（{e}）") from e
+        if self._input_reflects(text, timeout=1.0):
+            return
+        saved_text = _clipboard_read_text()
+        try:
+            self._paste_input_text(text)
+            if not self._input_reflects(text, timeout=2.0):
+                raise InputStageError(
+                    "unwritable",
+                    "入力欄に書き込めませんでした"
+                    "（値の設定も貼り付けも反映されませんでした）")
+        finally:
+            if saved_text is not None:
+                try:
+                    _clipboard_write_text(saved_text)
+                except Exception:  # noqa: BLE001  復元は静かに試す
+                    pass
+
+    def _input_reflects(self, text, timeout=0.0):
+        """入力欄の今の文が text と (前後の空白を除いて) 一致するか。
+
+        timeout の間、0.2秒ごとに読み直す。要素は毎回探し直す
+        (アプリ側の再描画で手元の要素が古くなるため)。読めない
+        回は不一致として扱う。"""
+        deadline = time.time() + timeout
+        while True:
+            try:
+                _root, desc = self._descendants(heal=False)
+                box, _candidates = self._find_input_box(desc)
+                if box is not None:
+                    pattern = box.GetCurrentPattern(VALUE_PATTERN)
+                    if pattern:
+                        current = pattern.QueryInterface(
+                            UIA.IUIAutomationValuePattern).CurrentValue
+                        if current is not None and \
+                                current.strip() == str(text).strip():
+                            return True
+            except Exception:  # noqa: BLE001  読めない回は不一致扱い
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _paste_input_text(self, text):
+        """入力欄へクリップボード貼り付けで text を入れる (2.03)。
+
+        手順は添付の貼り付け (attach_file_paste) と同じ: text を
+        クリップボードへ置く → 窓を前面化して入力欄へフォーカス
+        → Ctrl+V。クリップボードの控えと復元は呼び側 (set_input)
+        が担う (貼った内容がアプリに届くまで戻さないため)。
+        成否の判定も呼び側の読み直しに任せ、ここでは手順の失敗
+        だけを段つきで上げる。"""
+        _root, desc = self._descendants()
+        box, candidates = self._find_input_box(desc)
+        if box is None:
+            raise InputStageError(
+                "not_found", _input_not_found_message(candidates))
+        try:
+            _clipboard_write_text(text)
+        except Exception as e:  # noqa: BLE001  段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"クリップボードへテキストを置けませんでした（{e}）"
+            ) from e
+        _bring_to_front(getattr(self, "hwnd_main", None))
+        time.sleep(ATTACH_FOREGROUND_WAIT)
+        try:
+            box.SetFocus()
+        except Exception as e:  # noqa: BLE001  段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"入力欄へフォーカスできませんでした（{e}）") from e
+        time.sleep(ATTACH_FOCUS_WAIT)
+        try:
+            _send_ctrl_v()
+        except Exception as e:  # noqa: BLE001  段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"貼り付けのキーを送れませんでした（{e}）") from e
 
     def read_input(self):
         """入力欄の今の文を読む。読めなければ InputStageError を上げる。
@@ -1738,11 +1896,18 @@ class Copilot:
     def press_send_button(self):
         """プロファイルの目印 (send_*) で送信ボタンを探して押す。
 
-        押すのは UIA の InvokePattern だけ。キー送信はしない
-        (この道具はフォーカスを奪わない線引き)。失敗は段つき
-        (InputStageError) で上げる: 目印が無い / ボタンが見つから
-        ない (候補の件数と名前つき) / 押す仕組みが無い / 押す段で
-        失敗。押せたら True。"""
+        まず UIA の InvokePattern で押す (キー送信はしない。この
+        道具はフォーカスを奪わない線引き)。ただしアプリによって
+        は、Invoke が成功を返しても送信されないことがある (実機
+        2026-11-15、Copilot アプリ: 「送信しました」となったが
+        入力欄に文が残り、相手は待ち続けていた)。押した後は入力
+        欄が空になったかで確かめ、空にならなければ、窓を前に
+        出して共通の押下 (座標クリックまで含む) でやり直す。
+        それでも送られなければ、成功とは言わず失敗で上げる。
+
+        失敗は段つき (InputStageError) で上げる: 目印が無い /
+        ボタンが見つからない (候補の件数と名前つき) / 押す仕組み
+        が無い / 押す段で失敗 / 押しても送信されなかった。"""
         if not any((self.profile.get(key) or "").strip() for key in
                    ("send_automation_id", "send_name", "send_class")):
             raise InputStageError(
@@ -1765,7 +1930,58 @@ class Copilot:
             raise InputStageError(
                 "unwritable",
                 f"送信ボタンを押せませんでした（{e}）") from e
-        return True
+        if self._input_is_empty(timeout=2.0):
+            return True
+        _root, desc = self._descendants()
+        el, _candidates = self._find_send_button(desc)
+        if el is None:
+            raise InputStageError(
+                "unwritable",
+                "送信ボタンを押しましたが、送信されませんでした"
+                "（ボタンが見つからなくなりました）")
+        _bring_to_front(getattr(self, "hwnd_main", None))
+        time.sleep(ATTACH_FOREGROUND_WAIT)
+        try:
+            self._activate_element(el)
+        except RuntimeError as e:
+            raise InputStageError(
+                "unwritable",
+                f"送信ボタンを押せませんでした（{e}）") from e
+        if self._input_is_empty(timeout=2.0):
+            return True
+        raise InputStageError(
+            "unwritable",
+            "送信ボタンを押しましたが、送信されませんでした"
+            "（入力欄に文が残っています）")
+
+    def _input_is_empty(self, timeout=0.0):
+        """入力欄が空か (送信できたかの確認用、2.06)。
+
+        timeout の間、0.2秒ごとに読み直す。要素は毎回探し直す。
+        空が読めたら True。文が残っているのが読めたら、期限まで
+        待って False。欄そのものが一度も見つからなければ、確かめ
+        ようが無いので True に倒す (Invoke の成功を信じる。入力
+        欄の目印を持たないプロファイル向け)。"""
+        deadline = time.time() + timeout
+        seen = False
+        while True:
+            try:
+                _root, desc = self._descendants(heal=False)
+                box, _candidates = self._find_input_box(desc)
+                if box is not None:
+                    pattern = box.GetCurrentPattern(VALUE_PATTERN)
+                    if pattern:
+                        current = pattern.QueryInterface(
+                            UIA.IUIAutomationValuePattern).CurrentValue
+                        if current is not None:
+                            seen = True
+                            if not current.strip():
+                                return True
+            except Exception:  # noqa: BLE001  読めない回は数えない
+                pass
+            if time.time() >= deadline:
+                return not seen
+            time.sleep(0.2)
 
     def scan_button_candidates(self):
         """送信ボタンの候補を拾って返す (PHAL の調査用)。
@@ -1857,19 +2073,53 @@ class Copilot:
             if c[2].lstrip().startswith("#!")
             or any(ext in c[2].lower() for ext in (".phal", ".py", ".ps1"))]
 
+    def _download_link_candidates(self, desc):
+        """ダウンロードのリンク [(位置, 要素, 名前, クラス)] (木の順)。
+
+        Copilot アプリ (実機 2026-11-15、調査 1-233) では、添付は
+        カードではなく、ファイル名そのままの名前を持つ Hyperlink
+        (Invoke あり) として出る。カード (group/card の Button) が
+        ある環境ではそちらが正で、リンクはカードのスクリプトが
+        無いときだけ使う (優先順位は _pick_download_candidate と
+        _candidate_dicts が持つ)。
+
+        名前は「空白を含まない1つのファイル名」で、末尾が
+        .phal / .py / .ps1 のものだけに限る。本文中の言及や
+        サイドバーの項目を誤って候補にしないため。"""
+        found = []
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_HYPERLINK:
+                    continue
+                name = (el.CurrentName or "").strip()
+                class_name = el.CurrentClassName or ""
+            except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
+                continue
+            if not name or any(ch.isspace() for ch in name):
+                continue
+            if name.lower().endswith((".phal", ".py", ".ps1")):
+                found.append((i, el, name, class_name))
+        return found
+
     def _pick_download_candidate(self, desc):
         """ダウンロード候補から「最新」を1件選ぶ。無ければ None。
 
         スクリプトらしいものを優先し、その中では木の順の最後
         (= 最新の発言のもの) を選ぶ。スクリプトらしいものが無ければ
-        カード全体の最後。検出 (latest_download_candidate) と押下
+        カード全体の最後。カードのスクリプトが無ければ、リンク
+        (Copilot アプリ型) のスクリプトを見る。検出
+        (latest_download_candidate) と押下
         (press_download_candidate) で同じ選び方を使う。戻り値は
         (位置, 要素, 名前, クラス)。"""
         candidates = self._download_candidates(desc)
-        if not candidates:
-            return None
         scripty = self._scripty_cards(candidates)
-        return (scripty or candidates)[-1]
+        if scripty:
+            return scripty[-1]
+        if candidates:
+            return candidates[-1]
+        links = self._scripty_cards(self._download_link_candidates(desc))
+        return links[-1] if links else None
 
     @staticmethod
     def _candidate_dict_of(picked):
@@ -1903,9 +2153,11 @@ class Copilot:
         ため、それが消費済みだと本命の新しいカードが浮上しな
         かった (1-76 の最有力の原因)。地のカードはここには入れ
         ない (従来の candidate でのみ扱う)。"""
-        return [
-            self._candidate_dict_of(c)
-            for c in self._scripty_cards(self._download_candidates(desc))]
+        scripty = self._scripty_cards(self._download_candidates(desc))
+        if not scripty:
+            scripty = self._scripty_cards(
+                self._download_link_candidates(desc))
+        return [self._candidate_dict_of(c) for c in scripty]
 
     def latest_download_candidate(self):
         """最新の AI 発言にある、ダウンロード候補を1件返す。
@@ -1937,19 +2189,157 @@ class Copilot:
         戻り値は {"id": 目印の同定子, "key": 第2の同定子} か、無け
         れば None。同定子 id は「目印の行までの本文」のハッシュで、
         同じ発言なら何度走査しても同じ値になり、別の発言 (前に別
-        の会話が積み上がっている) では違う値になる。key は目印の行
-        を含む直近40行のハッシュ (1-49) で、会話の木のずれで先頭
-        からの全文が漂っても、目印のある発言そのものが同じなら同じ
-        値になる。窓側はどちらか一致すれば「同じ発言で二度反応し
-        ない」と判定する。
+        の会話が積み上がっている) では違う値になる。key は目印の
+        ある発言 (要素) の中だけのハッシュ (1-49、範囲は 1.87 で
+        要素内に限定) で、会話の木のずれや再描画で周りが漂っても、
+        目印のある発言そのものが同じなら同じ値になる。窓側は
+        どちらか一致すれば「同じ発言で二度反応しない」と判定する。
 
         数えるのは、目印より後ろの本文が DIAG_MARKER_TAIL_LIMIT
         以内のものだけ。会話のずっと前の発言に目印が残っていても、
         後ろに本文が長く続くので対象にならない。本文の取り方は
         document_text と同じ (Text 要素の名前を木の順に読む) だが、
         行の判定が要るので、要素ごとに名前を改行で割って行の列に
-        してから見る。"""
+        してから見る。実体は _marker_scan (行の判定だけ差し替え
+        られる形) で、こちらは「行が目印ちょうど」の判定。"""
+        found = self._marker_scan(
+            desc,
+            lambda line: True if line == marker_text else None)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"]}
+
+    def _rerun_marker_in(self, desc):
+        """再実行リクエストの目印 (RERUN_REQUEST_MARKER) を探す
+        (1.63、引数は 1.97)。
+
+        行の形は「目印 + 空白 + コマンド ID [+ 空白 + 引数...]」。
+        ID の後ろの残り全部が引数文字列 (args) になる。戻り値は
+        {"id", "key", "command_id", "args"}。ID の無い行・ID の
+        形が違う行は目印として数えない。同定子の作りは
+        _marker_scan の共通の流儀で、引数も行の一部なので、
+        引数が違えば同定子も変わる。"""
+        def parse(line):
+            if not line.startswith(RERUN_REQUEST_MARKER):
+                return None
+            rest = line[len(RERUN_REQUEST_MARKER):].strip()
+            match = _RERUN_ARGS_RE.match(rest)
+            if not match:
+                return None
+            return {"command_id": match.group(1),
+                    "args": (match.group(2) or "").strip()}
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "command_id": found["value"]["command_id"],
+                "args": found["value"]["args"]}
+
+    def _tool_marker_in(self, desc):
+        """ツール実行の目印を探す (1.98)。
+
+        行の形は「目印 + 空白 + ツール名 [+ 空白 + 引数...]」で、
+        後ろの残り全部を command として返す (ツール名と引数の
+        分け方は窓側が持つ)。ツール名の無い行は目印として数え
+        ない。戻り値は {"id", "key", "command"}。"""
+        def parse(line):
+            if not line.startswith(TOOL_REQUEST_MARKER):
+                return None
+            rest = line[len(TOOL_REQUEST_MARKER):].strip()
+            return rest if rest else None
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "command": found["value"]}
+
+    def _resend_marker_in(self, desc):
+        """結果再送リクエストの目印 (RESEND_REQUEST_MARKER) を
+        探す (1.75)。実体は _id_marker_in。"""
+        return self._id_marker_in(desc, RESEND_REQUEST_MARKER)
+
+    def _fulltext_marker_in(self, desc):
+        """全文リクエストの目印 (FULLTEXT_REQUEST_MARKER) を
+        探す (1.91)。実体は _id_marker_in。"""
+        return self._id_marker_in(desc, FULLTEXT_REQUEST_MARKER)
+
+    def _file_marker_in(self, desc):
+        """ファイルリクエストの目印を探す (1.88)。
+
+        行の形は「目印 + 空白 + パス」で、パスは行の残り全部
+        (空白を含んでよい)。戻り値は {"id", "key", "path"}。
+        パスの無い行は目印として数えない。"""
+        def parse(line):
+            if not line.startswith(FILE_REQUEST_MARKER):
+                return None
+            rest = line[len(FILE_REQUEST_MARKER):].strip()
+            return rest if rest else None
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "path": found["value"]}
+
+    def _log_marker_in(self, desc):
+        """動作ログリクエストの目印を探す (1.96)。
+
+        行の形は「目印 + 空白 + 指定...」で、指定は行の残り全部
+        (解釈は core.parse_log_request)。ファイルと違い、指定が
+        無くても目印として数える (_marker_scan は None だけを
+        不一致として扱うので、空文字の payload でも一致になる)。
+        戻り値は {"id", "key", "params"}。"""
+        def parse(line):
+            if not line.startswith(LOG_REQUEST_MARKER):
+                return None
+            return line[len(LOG_REQUEST_MARKER):].strip()
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "params": found["value"]}
+
+    def _id_marker_in(self, desc, marker_text):
+        """コマンド ID つきの目印を探す共通の走査 (1.63、再送で
+        共通化 1.75)。
+
+        行の形は「目印 + 空白 + コマンド ID」で、ID は行の中に
+        含める (相手を ID で指定する必要があるため)。行は目印と
+        ID だけでできていること (診断・リセットの「単独行」と
+        同じ厳しさで、ID の後ろに余計な語が付いた行は数えな
+        い)。戻り値は _marker_in と同じ {"id", "key"} に、切り
+        出した "command_id" を足したもの。ID の無い行・ID の形
+        が違う行は目印として数えない。同定子の作りは
+        _marker_scan の共通の流儀 (id は目印の行までの全文、key
+        は直近40行)。目印の行そのものに ID が入るので、別の ID
+        を指す発言は別の同定子になる。"""
+        def parse(line):
+            if not line.startswith(marker_text):
+                return None
+            rest = line[len(marker_text):].strip()
+            match = _RERUN_ID_RE.match(rest)
+            return match.group(1) if match else None
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "command_id": found["value"]}
+
+    def _marker_scan(self, desc, parse):
+        """目印の行を探す走査の実体。
+
+        parse は「前後の空白を除いた行」を受けて、目印なら中身
+        (payload)、違えば None を返す関数。最後に一致した行を
+        相手にする。戻り値は {"id", "key", "value": payload} か、
+        無ければ None。同定子の意味は _marker_in の docstring
+        のとおり。"""
         lines = []
+        line_element = []  # 各行が属する要素の番号 (key の範囲用)
+        element_no = -1
         for i in range(desc.Length):
             el = desc.GetElement(i)
             try:
@@ -1958,11 +2348,17 @@ class Copilot:
                 name = el.CurrentName or ""
             except Exception:  # noqa: BLE001  消えかけの要素は読み飛ばす
                 continue
-            lines.extend(name.replace(OBJECT_MARK, "").split("\n"))
+            element_no += 1
+            parts = name.replace(OBJECT_MARK, "").split("\n")
+            lines.extend(parts)
+            line_element.extend([element_no] * len(parts))
         marker_at = None
+        payload = None
         for index, line in enumerate(lines):
-            if line.strip() == marker_text:
+            value = parse(line.strip())
+            if value is not None:
                 marker_at = index  # 最後の目印を相手にする
+                payload = value
         if marker_at is None:
             return None
         tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
@@ -1970,25 +2366,41 @@ class Copilot:
             return None  # 古い発言の中の目印。最新の呼びかけではない
         prefix = "\n".join(lines[:marker_at + 1])
         digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
-        # 第2の同定子 key: 目印の行を含む直近40行のハッシュ。会話
-        # の木がずれて先頭からの全文が変わっても、目印のある発言
-        # そのものが同じなら key は同じ。遠い過去の漂いは窓の外。
-        start = max(0, marker_at - DIAG_KEY_WINDOW_LINES + 1)
+        # 第2の同定子 key: 目印のある発言 (要素) の中だけを見る
+        # (1.87 で変更)。以前は目印の直近40行を見ていたが、窓が
+        # 前の発言にまたがると、画面の再描画で前の発言の行が
+        # 増減するたびに key が変わり、消費済みの判定が外れて
+        # 同じ合図に何度も応答してしまう事故が実地で起きた
+        # (設定・マニュアルの合図、2026-11-15)。発言の中身は
+        # 投稿後に変わらないので、要素の先頭 (最大で直近40行)
+        # から目印の行までを key にする。
+        element_start = marker_at
+        while element_start > 0 and \
+                line_element[element_start - 1] \
+                == line_element[marker_at]:
+            element_start -= 1
+        start = max(element_start,
+                    marker_at - DIAG_KEY_WINDOW_LINES + 1)
         key = hashlib.sha256(
             "\n".join(lines[start:marker_at + 1]).encode(
                 "utf-8")).hexdigest()
-        return {"id": digest, "key": key}
+        return {"id": digest, "key": key, "value": payload}
 
     def latest_chat_scan(self):
         """チャットの見張りの1回分 (候補 + 診断の目印 + リセット
-        の目印) を、同じ子孫の並びから取る (1-43、リセットは
-        1-52)。
+        の目印 + 再実行の目印 + 結果再送の目印 + 全文の目印 +
+        一覧の目印 + 停止の目印 + ログの目印) を、同じ子孫の
+        並びから取る (1-43、リセットは 1-52、再実行は 1.63、
+        再送は 1.75、全文は 1.91、一覧は 1.92、停止は 1.93、
+        ログは 1.96)。
 
         戻り値は {"candidate": 候補の辞書か None, "candidates":
         スクリプトらしいカード全件の辞書 (木の順、1-57),
         "marker": {"id": ..., "key": ...} か None, "reset_marker":
-        同じ形か None}。見張りはこの1回で全部を見る (走査を
-        分けない)。"""
+        同じ形か None, "rerun_marker": {"id": ..., "key": ...,
+        "command_id": ...} か None (1.63), "resend_marker":
+        同じ形か None (1.75)}。見張りはこの1回で
+        全部を見る (走査を分けない)。"""
         _root, desc = self._descendants()
         return {
             "candidate": self._candidate_dict(desc),
@@ -1996,6 +2408,20 @@ class Copilot:
             "marker": self._diag_marker_in(desc),
             "reset_marker": self._marker_in(
                 desc, RESET_REQUEST_MARKER),
+            "rerun_marker": self._rerun_marker_in(desc),
+            "resend_marker": self._resend_marker_in(desc),
+            "settings_marker": self._marker_in(
+                desc, SETTINGS_REQUEST_MARKER),
+            "history_marker": self._marker_in(
+                desc, HISTORY_REQUEST_MARKER),
+            "stop_marker": self._marker_in(
+                desc, STOP_REQUEST_MARKER),
+            "log_marker": self._log_marker_in(desc),
+            "tool_marker": self._tool_marker_in(desc),
+            "manual_marker": self._marker_in(
+                desc, MANUAL_REQUEST_MARKER),
+            "file_marker": self._file_marker_in(desc),
+            "fulltext_marker": self._fulltext_marker_in(desc),
         }
 
     def _message_options_button(self, desc, start):
@@ -2333,6 +2759,11 @@ class Copilot:
             c for c in self._download_candidates(desc)
             if c[2] == key["name"]
             and c[3] == (key.get("class_name") or "")]
+        if not matches:
+            matches = [
+                c for c in self._download_link_candidates(desc)
+                if c[2] == key["name"]
+                and c[3] == (key.get("class_name") or "")]
         return matches[-1] if matches else None
 
     def press_download_candidate(self, key=None):
@@ -2369,6 +2800,27 @@ class Copilot:
         項目をどちらの探索 (窓の木 / デスクトップ) で見つけたかを
         添える (次の切り分けのため)。押せたら True
         (＝「ダウンロード」の項目を押した、までを完了とする)。"""
+        # リンク型 (Copilot アプリ) はリンク自体を直接押す。ESC や
+        # フライアウトの後片付けは Edge の作法で、アプリには
+        # 関係ないので、リンクと分かったら即座に押して終わる。
+        _root, desc = self._descendants()
+        picked = self._pick_download_candidate_by_key(desc, key)
+        if picked is None:
+            picked = self._pick_download_candidate(desc)
+        if picked is not None:
+            try:
+                picked_type = picked[1].CurrentControlType
+            except Exception:  # noqa: BLE001  型が読めなければ従来経路
+                picked_type = None
+            if picked_type == CONTROL_HYPERLINK:
+                try:
+                    self._activate_element(picked[1])
+                except RuntimeError as e:
+                    raise InputStageError(
+                        "unwritable",
+                        "ダウンロードのリンクを押せませんでした"
+                        f"（{e}）") from e
+                return True
         # フライアウトを閉じるのは最初にやる。まず ESC を投げ
         # (1-67)、次に UIA の解散 (1-40) を試す。閉じきれなかった
         # 場合は、そのことを項目まわりの失敗文に添える (次の

@@ -87,8 +87,9 @@ def _run(request):
         if op == "press_send":
             return {"ok": True, "pressed": bool(transport.press_send())}
         if op == "latest_download":
-            # 診断の目印 (1-43) とリセットの目印 (1-52)、候補の
-            # 全件 (1-57) も同じ走査で取る。scan を持たない
+            # 診断の目印 (1-43) とリセットの目印 (1-52)、再実行
+            # の目印 (1.63)、候補の全件 (1-57) も同じ走査で取る。
+            # scan を持たない
             # transport (テストの fake 等) では候補だけ返す。
             scanner = getattr(transport, "latest_scan", None)
             if scanner is not None:
@@ -96,7 +97,17 @@ def _run(request):
                 return {"ok": True, "candidate": scan.get("candidate"),
                         "candidates": scan.get("candidates"),
                         "marker": scan.get("marker"),
-                        "reset_marker": scan.get("reset_marker")}
+                        "reset_marker": scan.get("reset_marker"),
+                        "rerun_marker": scan.get("rerun_marker"),
+                        "resend_marker": scan.get("resend_marker"),
+                        "settings_marker": scan.get("settings_marker"),
+                        "manual_marker": scan.get("manual_marker"),
+                        "file_marker": scan.get("file_marker"),
+                        "fulltext_marker": scan.get("fulltext_marker"),
+                        "history_marker": scan.get("history_marker"),
+                        "stop_marker": scan.get("stop_marker"),
+                        "log_marker": scan.get("log_marker"),
+                        "tool_marker": scan.get("tool_marker")}
             return {"ok": True, "candidate": transport.latest_download()}
         if op == "press_download":
             # key は窓側が選んだ候補 (名前+クラス名、1-57)。

@@ -686,9 +686,72 @@ def test_latest_download_carries_diag_marker():
     assert result.marker is None
 
 
+def test_latest_download_carries_rerun_marker():
+    """見張りの走査 (1.63): 再実行の目印 (command_id つき) が
+    1回の結果に乗ること。形が違う目印は None に倒れること。"""
+    class ScanTransport:
+        def latest_scan(self):
+            return {"candidate": None,
+                    "rerun_marker": {"id": "x1", "key": "k1",
+                                     "command_id": "1-99"}}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(ScanTransport())
+    result = session.latest_download()
+    assert result.ok
+    assert result.rerun_marker == {"id": "x1", "key": "k1",
+                                   "command_id": "1-99"}
+
+    class BadTransport:
+        def latest_scan(self):
+            return {"candidate": None, "rerun_marker": "文字列"}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(BadTransport())
+    result = session.latest_download()
+    assert result.ok and result.rerun_marker is None
+
+
+def test_latest_download_carries_tool_marker():
+    """見張りの走査 (1.98、受け渡しの欠落を 1.99.1 で修正):
+    ツール実行の目印 (command つき) が裏方→窓の全経路を
+    通って 1回の結果に乗ること。形が違う目印は None に
+    倒れること。"""
+    class ScanTransport:
+        def latest_scan(self):
+            return {"candidate": None,
+                    "tool_marker": {"id": "t1", "key": "k1",
+                                    "command": "ipconfig"}}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(ScanTransport())
+    result = session.latest_download()
+    assert result.ok
+    assert result.tool_marker == {"id": "t1", "key": "k1",
+                                  "command": "ipconfig"}
+
+    class BadTransport:
+        def latest_scan(self):
+            return {"candidate": None, "tool_marker": "文字列"}
+
+        def close(self):
+            pass
+
+    session = copilot_io.CopilotSession(BadTransport())
+    result = session.latest_download()
+    assert result.ok and result.tool_marker is None
+
+
 def test_worker_dispatch_latest_download_includes_marker():
     """裏方の latest_download (1-43、リセットは 1-52、候補の
-    全件は 1-57): scan があれば目印も候補の全件も返す。"""
+    全件は 1-57、再実行は 1.63): scan があれば目印も候補の
+    全件も返す。"""
     import copilot_io_worker
 
     class FakeLoopTransport:
@@ -697,7 +760,11 @@ def test_worker_dispatch_latest_download_includes_marker():
 
         def latest_scan(self):
             return {"candidate": None, "marker": {"id": "w1"},
-                    "reset_marker": {"id": "r1"}}
+                    "reset_marker": {"id": "r1"},
+                    "rerun_marker": {"id": "x1",
+                                     "command_id": "1-99"},
+                    "tool_marker": {"id": "t1",
+                                    "command": "ipconfig"}}
 
         def close(self):
             pass
@@ -709,27 +776,54 @@ def test_worker_dispatch_latest_download_includes_marker():
         assert result == {"ok": True, "candidate": None,
                           "candidates": None,
                           "marker": {"id": "w1"},
-                          "reset_marker": {"id": "r1"}}
+                          "reset_marker": {"id": "r1"},
+                          "rerun_marker": {"id": "x1",
+                                            "command_id": "1-99"},
+                          "resend_marker": None,
+                          "settings_marker": None,
+                          "manual_marker": None,
+                          "file_marker": None,
+                          "fulltext_marker": None,
+                          "history_marker": None,
+                          "stop_marker": None,
+                          "log_marker": None,
+                          "tool_marker": {"id": "t1",
+                                          "command": "ipconfig"}}
     finally:
         copilot_io.CopilotLoopTransport = real
 
 
 def test_subprocess_transport_latest_scan():
-    """裏方への依頼 (1-43、リセットは 1-52、候補の全件は 1-57):
-    latest_download の応答から、候補と目印を取り出すこと。"""
+    """裏方への依頼 (1-43、リセットは 1-52、候補の全件は 1-57、
+    再実行は 1.63): latest_download の応答から、候補と目印を
+    取り出すこと。"""
     seen = {}
 
     def runner(request, _timeout):
         seen.update(request)
         return {"ok": True, "candidate": {"name": "y"},
-                "marker": {"id": "m1"}, "reset_marker": {"id": "r1"}}
+                "marker": {"id": "m1"}, "reset_marker": {"id": "r1"},
+                "rerun_marker": {"id": "x1", "command_id": "1-99"},
+                "tool_marker": {"id": "t1", "command": "ipconfig"}}
 
     transport = copilot_io.SubprocessTransport(runner=runner)
     scan = transport.latest_scan()
     assert seen["op"] == "latest_download"
     assert scan == {"candidate": {"name": "y"}, "candidates": None,
                     "marker": {"id": "m1"},
-                    "reset_marker": {"id": "r1"}}
+                    "reset_marker": {"id": "r1"},
+                    "rerun_marker": {"id": "x1",
+                                     "command_id": "1-99"},
+                    "resend_marker": None,
+                    "settings_marker": None,
+                    "manual_marker": None,
+                    "file_marker": None,
+                    "fulltext_marker": None,
+                    "history_marker": None,
+                    "stop_marker": None,
+                    "log_marker": None,
+                    "tool_marker": {"id": "t1",
+                                    "command": "ipconfig"}}
     assert transport.latest_download() == {"name": "y"}
 
 

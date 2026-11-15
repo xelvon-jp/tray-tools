@@ -764,7 +764,8 @@ def test_worker_dispatch_latest_download_includes_marker():
                     "rerun_marker": {"id": "x1",
                                      "command_id": "1-99"},
                     "tool_marker": {"id": "t1",
-                                    "command": "ipconfig"}}
+                                    "command": "ipconfig"},
+                    "relay_marker": None}
 
         def close(self):
             pass
@@ -788,7 +789,8 @@ def test_worker_dispatch_latest_download_includes_marker():
                           "stop_marker": None,
                           "log_marker": None,
                           "tool_marker": {"id": "t1",
-                                          "command": "ipconfig"}}
+                                          "command": "ipconfig"},
+                          "relay_marker": None}
     finally:
         copilot_io.CopilotLoopTransport = real
 
@@ -823,7 +825,8 @@ def test_subprocess_transport_latest_scan():
                     "stop_marker": None,
                     "log_marker": None,
                     "tool_marker": {"id": "t1",
-                                    "command": "ipconfig"}}
+                                    "command": "ipconfig"},
+                    "relay_marker": None}
     assert transport.latest_download() == {"name": "y"}
 
 

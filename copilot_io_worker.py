@@ -107,7 +107,8 @@ def _run(request):
                         "history_marker": scan.get("history_marker"),
                         "stop_marker": scan.get("stop_marker"),
                         "log_marker": scan.get("log_marker"),
-                        "tool_marker": scan.get("tool_marker")}
+                        "tool_marker": scan.get("tool_marker"),
+                        "relay_marker": scan.get("relay_marker")}
             return {"ok": True, "candidate": transport.latest_download()}
         if op == "signature":
             # 変化の署名 (2.07)。持たない transport では None

@@ -601,6 +601,61 @@ def test_settings_manual_marker_scan():
     assert scan2["settings_marker"] is None
 
 
+def test_relay_marker_scan():
+    """中継リクエストの目印 (2.10): 目印の次の行から同じ発言の
+    末尾までが本文になり、同定子が安定すること。本文が空の
+    もの・目印の行に続きがあるものは数えないこと。"""
+    els = [
+        _text_el("Copilot へお願いがあります。\n"
+                 + copilot_loop.RELAY_REQUEST_MARKER + "\n"
+                 + "ファイルを1つ作ってください。\n"
+                 + "中身は print(123) です。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    cp = _copilot({"name": "phal-ai"}, els)
+    scan = cp.latest_chat_scan()
+    assert scan["relay_marker"] is not None
+    assert scan["relay_marker"]["body"] == \
+        "ファイルを1つ作ってください。\n中身は print(123) です。"
+    assert scan["relay_marker"]["id"]
+    assert cp.latest_chat_scan()["relay_marker"]["id"] \
+        == scan["relay_marker"]["id"]
+    els2 = [
+        _text_el("お願いだけ先に置きます。\n"
+                 + copilot_loop.RELAY_REQUEST_MARKER),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
+    assert scan2["relay_marker"] is None
+    els3 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " ついでに本文\n本文です"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
+    assert scan3["relay_marker"] is None
+    # Muse アプリの表示名が目印と同じ行に付いた形も拾う
+    # (2.11、実測の形)。
+    els4 = [
+        _text_el("アシスタントメッセージ: "
+                 + copilot_loop.RELAY_REQUEST_MARKER + "\n"
+                 + "表示名つきの本文です。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan4 = _copilot({"name": "phal-ai"}, els4).latest_chat_scan()
+    assert scan4["relay_marker"] is not None
+    assert scan4["relay_marker"]["body"] == "表示名つきの本文です。"
+    # 本文中の言及 (表示名の後ろ以外) は拾わない。
+    els5 = [
+        _text_el("アシスタントメッセージ: 合図は "
+                 + copilot_loop.RELAY_REQUEST_MARKER
+                 + " です。\n本文ではありません。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan5 = _copilot({"name": "phal-ai"}, els5).latest_chat_scan()
+    assert scan5["relay_marker"] is None
+
+
 def test_history_marker_scan():
     """実行一覧の目印 (1.92): 最新の発言の中の単独行を拾い、
     同定子が安定すること。"""

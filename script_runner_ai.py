@@ -126,6 +126,12 @@ AUTO_LABELS = (
     # フォルダで実行して結果を送る。実行そのものなので、
     # 既定は切。
     ("auto_tool", "合図でコマンドラインツールを自動で実行する"),
+    # 中継リクエストの合図 (2.10): 主の AI の発言の中の目印の
+    # 単独行を見つけたら、次の行から発言の末尾までを副の AI
+    # (二重待受の相手) のチャットへ送る。受け付けるのは主の
+    # 窓からの合図だけで、二重待受が切なら何もしない。
+    # 既定は切。
+    ("auto_relay", "合図で副のAIへ自動で中継する"),
 )
 AUTO_KEYS = tuple(key for key, _label in AUTO_LABELS)
 
@@ -225,6 +231,21 @@ def sanitize_automation(value) -> dict:
     ack = value.get("auto_ack")
     result["auto_ack"] = ack if isinstance(ack, bool) else True
     return result
+
+
+def sanitize_dual_watch(section) -> dict:
+    """二重待受の設定を整える (2.08)。
+
+    script_runner 節の ai_dual_watch (真偽) と
+    ai_secondary_profile (副のプロファイル名) を読む。入っている
+    と明示されたときだけ入にし、名前は文字列でなければ空にする
+    (壊れた値は「副は自動で選ぶ」に倒す)。"""
+    section = section if isinstance(section, dict) else {}
+    name = section.get("ai_secondary_profile")
+    return {
+        "enabled": section.get("ai_dual_watch") is True,
+        "secondary": name.strip() if isinstance(name, str) else "",
+    }
 
 
 # ---------------------------------------------------------------
@@ -810,8 +831,13 @@ class AiProfilePage(QWidget):
                  scanner=None, filler=None, button_scanner=None,
                  attach_tester=None,
                  profiles=None, active_index=0,
-                 diag_text_provider=None, error_color="#c00000"):
+                 diag_text_provider=None, error_color="#c00000",
+                 dual_watch=False, secondary_name=""):
         super().__init__(parent)
+        # 二重待受 (2.08) の初期値。副の名前は、候補の作り直しの
+        # ときに最初の選択として使う。
+        self._dual_initial = bool(dual_watch)
+        self._secondary_initial = secondary_name or ""
         # 状態ラベルのエラー色。窓側がテーマに合わせて渡す (1-44)。
         # 渡されなければ従来の色のまま。
         self._error_color = error_color
@@ -890,6 +916,20 @@ class AiProfilePage(QWidget):
         self._zip_as_txt_box = QCheckBox(
             "ZIP 添付を .zip.txt に変えて渡す")
         layout.addWidget(self._zip_as_txt_box)
+        # 二重待受 (2.08)。プロファイル全体への設定なので、欄の
+        # 下に置く。副の候補はプロファイル名の一覧で、プロファイル
+        # の追加・複写・名前変更・削除に合わせて作り直す
+        # (_rebuild_profile_combo から _rebuild_secondary_combo)。
+        self._dual_box = QCheckBox(
+            "二重待受（もう1つのプロファイルも見張る）")
+        self._dual_box.setChecked(self._dual_initial)
+        layout.addWidget(self._dual_box)
+        dual_row = QHBoxLayout()
+        dual_row.addWidget(QLabel("副のプロファイル"))
+        self._secondary_combo = QComboBox()
+        dual_row.addWidget(self._secondary_combo, 1)
+        layout.addLayout(dual_row)
+        self._rebuild_secondary_combo()
 
         row = QHBoxLayout()
         self._pick_button = QPushButton("窓の一覧…")
@@ -943,6 +983,10 @@ class AiProfilePage(QWidget):
         self._profile_combo.setCurrentIndex(self._current)
         self._profile_combo.blockSignals(False)
         self._sync_profile_buttons()
+        # 副の候補 (2.08) も名前の一覧なので一緒に作り直す。
+        # 初期化の途中 (まだ部品が無い) は飛ばす。
+        if getattr(self, "_secondary_combo", None) is not None:
+            self._rebuild_secondary_combo()
 
     def _sync_profile_buttons(self):
         # 最後の1件は消せない (投げ先が必ず1つは要る)。
@@ -971,6 +1015,31 @@ class AiProfilePage(QWidget):
     def active_index(self) -> int:
         """今選ばれているプロファイルの位置。"""
         return self._current
+
+    def _rebuild_secondary_combo(self):
+        """副のプロファイルの候補を作り直す (2.08)。
+
+        先頭は「（自動で選ぶ）」(名前は空)。今の選択 (無ければ
+        初期値) を保つ。"""
+        combo = self._secondary_combo
+        current = combo.currentData() or self._secondary_initial or ""
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("（自動で選ぶ）", "")
+        for entry in self._profiles:
+            combo.addItem(entry["name"], entry["name"])
+        index = combo.findData(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        self._secondary_initial = ""
+
+    def dual_watch(self) -> bool:
+        """二重待受が入っているか (2.08)。"""
+        return self._dual_box.isChecked()
+
+    def secondary_name(self) -> str:
+        """副のプロファイル名 (自動で選ぶなら空、2.08)。"""
+        return self._secondary_combo.currentData() or ""
 
     def _ask_profile_name(self, title, initial):
         """名前を聞く。やめた・空のときは None (空は理由を出す)。"""
@@ -1816,7 +1885,8 @@ class SettingsDialog(QDialog):
                  attach_tester=None, diag_text_provider=None,
                  error_color="#c00000", intro_text_provider=None,
                  tools_folder_opener=None, tool_searcher=None,
-                 initial_tab="ai"):
+                 initial_tab="ai", dual_watch=False,
+                 secondary_name=""):
         super().__init__(parent)
         self.setWindowTitle("設定 - PHAL")
         self.resize(720, 800)
@@ -1842,7 +1912,8 @@ class SettingsDialog(QDialog):
             attach_tester=attach_tester, profiles=profiles,
             active_index=active_index,
             diag_text_provider=diag_text_provider,
-            error_color=error_color)
+            error_color=error_color,
+            dual_watch=dual_watch, secondary_name=secondary_name)
         self.log_page = LogViewerPage(self)
         self.automation_page = AutomationPage(automation, self)
         self.tools_page = ToolSettingsPage(
@@ -1892,6 +1963,12 @@ class SettingsDialog(QDialog):
 
     def active_index(self) -> int:
         return self.ai_page.active_index()
+
+    def dual_watch(self) -> bool:
+        return self.ai_page.dual_watch()
+
+    def secondary_name(self) -> str:
+        return self.ai_page.secondary_name()
 
     def automation(self) -> dict:
         return self.automation_page.automation()

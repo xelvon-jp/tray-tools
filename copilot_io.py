@@ -119,7 +119,9 @@ class DownloadResult:
     は動作ログリクエストの目印 (1.96) で、形は marker に
     "params" (指定の文字列) を足したもの。tool_marker は
     ツール実行の目印 (1.98) で、形は marker に "command"
-    (ツール名＋引数の文字列) を足したもの。"""
+    (ツール名＋引数の文字列) を足したもの。relay_marker は
+    中継リクエストの目印 (2.10) で、形は marker に "body"
+    (中継する文) を足したもの。"""
     ok: bool
     message: str
     candidate: dict = None
@@ -136,6 +138,7 @@ class DownloadResult:
     stop_marker: dict = None
     log_marker: dict = None
     tool_marker: dict = None
+    relay_marker: dict = None
 
 
 @dataclass
@@ -286,7 +289,8 @@ class SubprocessTransport:
                 "history_marker": response.get("history_marker"),
                 "stop_marker": response.get("stop_marker"),
                 "log_marker": response.get("log_marker"),
-                "tool_marker": response.get("tool_marker")}
+                "tool_marker": response.get("tool_marker"),
+                "relay_marker": response.get("relay_marker")}
 
     def chat_signature(self):
         return self._call({"op": "signature"}).get("signature")
@@ -764,6 +768,7 @@ class CopilotSession:
                 stop_marker = scan.get("stop_marker")
                 log_marker = scan.get("log_marker")
                 tool_marker = scan.get("tool_marker")
+                relay_marker = scan.get("relay_marker")
             else:
                 getter = getattr(self._tp(), "latest_download", None)
                 if getter is None:
@@ -783,6 +788,7 @@ class CopilotSession:
                 stop_marker = None
                 log_marker = None
                 tool_marker = None
+                relay_marker = None
         except Exception as e:  # noqa: BLE001
             return DownloadResult(
                 False, str(e) or "ダウンロードを検出できませんでした")
@@ -828,6 +834,9 @@ class CopilotSession:
         if tool_marker is not None \
                 and not isinstance(tool_marker, dict):
             tool_marker = None
+        if relay_marker is not None \
+                and not isinstance(relay_marker, dict):
+            relay_marker = None
         if candidate is None:
             return DownloadResult(
                 True, "ダウンロードできるものはありません", None,
@@ -841,7 +850,8 @@ class CopilotSession:
                 history_marker=history_marker,
                 stop_marker=stop_marker,
                 log_marker=log_marker,
-                tool_marker=tool_marker)
+                tool_marker=tool_marker,
+                relay_marker=relay_marker)
         return DownloadResult(
             True, "ダウンロードできるものがあります", candidate,
             marker, reset_marker, candidates,
@@ -854,7 +864,8 @@ class CopilotSession:
             history_marker=history_marker,
             stop_marker=stop_marker,
             log_marker=log_marker,
-            tool_marker=tool_marker)
+            tool_marker=tool_marker,
+            relay_marker=relay_marker)
 
     def chat_signature(self):
         """チャットの変化の署名 (2.07)。取れなければ None

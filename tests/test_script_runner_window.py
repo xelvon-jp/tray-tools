@@ -1156,7 +1156,7 @@ def test_dl_loop_brakes():
                     sr._DlCheckResult(True, "", candidate))
                 QCoreApplication.processEvents()
                 # 概要が一致するので、行は出ず自動でも押さない。
-                assert window._dl_holder is None
+                assert window._watch_list[0].holder is None
                 assert presses == [], presses
                 # 概要の違う候補は従来どおり出て、自動で押せる。
                 other = {
@@ -1170,7 +1170,7 @@ def test_dl_loop_brakes():
                     sr._DlCheckResult(True, "", other))
                 assert pump_until(lambda: len(presses) == 1), presses
                 assert pump_until(
-                    lambda: window._dl_holder is None
+                    lambda: window._watch_list[0].holder is None
                     and not window._dl_pressing)
             finally:
                 window.close()
@@ -1199,11 +1199,11 @@ def test_dl_loop_brakes():
             try:
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", candidate))
-                assert window._dl_holder is not None
+                assert window._watch_list[0].holder is not None
                 window._press_download(auto=False)
                 assert pump_until(
                     lambda: not window._dl_pressing
-                    and window._dl_holder is None)
+                    and window._watch_list[0].holder is None)
                 # 押下を始めた時点で、控えがファイルに残っている。
                 records = core.load_dl_consumed()
                 key = core.dl_consumed_key(
@@ -1230,7 +1230,7 @@ def test_dl_loop_brakes():
                     sr._DlCheckResult(True, "", candidate))
                 QCoreApplication.processEvents()
                 # 控え + ファイル有り → 再び出ない。
-                assert window._dl_holder is None
+                assert window._watch_list[0].holder is None
                 # ファイルが消えたら、落とし直せるよう再び出る。
                 (watch / "9-2_install_phal.phal").unlink()
                 window._poll()
@@ -1240,7 +1240,7 @@ def test_dl_loop_brakes():
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", candidate))
                 QCoreApplication.processEvents()
-                assert window._dl_holder is not None
+                assert window._watch_list[0].holder is not None
             finally:
                 window.close()
         # --- (c) 実行済みの中身は自動で走らせない ---
@@ -1374,22 +1374,22 @@ def test_dl_launch_candidate_not_auto_downloaded():
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", candidate_a))
                 QCoreApplication.processEvents()
-                assert window._dl_holder is not None
-                assert window._dl_holder.key \
-                    in window._dl_launch_keys
+                assert window._watch_list[0].holder is not None
+                assert window._watch_list[0].holder.key \
+                    in window._watch_list[0].launch_keys
                 assert presses == [], presses
                 # 手動では押せる。
                 window._press_download(auto=False)
                 assert pump_until(
                     lambda: len(presses) == 1
-                    and window._dl_holder is None
+                    and window._watch_list[0].holder is None
                     and not window._dl_pressing), presses
                 # (b) その後に届いた新しい候補は自動で押す。
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", candidate_b))
                 assert pump_until(
                     lambda: len(presses) == 2
-                    and window._dl_holder is None
+                    and window._watch_list[0].holder is None
                     and not window._dl_pressing), presses
             finally:
                 window.close()
@@ -1413,12 +1413,12 @@ def test_dl_launch_candidate_not_auto_downloaded():
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None))
                 QCoreApplication.processEvents()
-                assert window._dl_launch_keys == set()
+                assert window._watch_list[0].launch_keys == set()
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", candidate_b))
                 assert pump_until(
                     lambda: len(presses) == 3
-                    and window._dl_holder is None
+                    and window._watch_list[0].holder is None
                     and not window._dl_pressing), presses
             finally:
                 window.close()
@@ -1476,11 +1476,11 @@ def test_dl_multiple_candidates_pick_unconsumed():
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", tail))
                 QCoreApplication.processEvents()
-                assert window._dl_holder is not None
+                assert window._watch_list[0].holder is not None
                 window._press_download(auto=False)
                 assert pump_until(
                     lambda: len(presses) == 1
-                    and window._dl_holder is None
+                    and window._watch_list[0].holder is None
                     and not window._dl_pressing)
                 # 押下役には、選んだ候補の key が渡っている。
                 assert presses[0] == {
@@ -1491,8 +1491,8 @@ def test_dl_multiple_candidates_pick_unconsumed():
                 window._on_dl_checked(sr._DlCheckResult(
                     True, "", tail, candidates=[honmei, tail]))
                 QCoreApplication.processEvents()
-                assert window._dl_holder is not None
-                assert window._dl_holder.summary \
+                assert window._watch_list[0].holder is not None
+                assert window._watch_list[0].holder.summary \
                     == honmei["summary"]
                 assert any(
                     "直近の走査: 候補あり（9-7: 本命のスクリプトです）"
@@ -1529,7 +1529,7 @@ def test_dl_multiple_candidates_pick_unconsumed():
                 window._on_dl_checked(sr._DlCheckResult(
                     True, "", tail, candidates=[honmei, tail]))
                 QCoreApplication.processEvents()
-                assert window._dl_holder is None
+                assert window._watch_list[0].holder is None
                 scans = [e["text"] for e in window._diag_events
                          if e["text"].startswith("直近の走査:")]
                 assert scans and "候補なし（抑制2件:" in scans[-1], \
@@ -1715,7 +1715,7 @@ def test_diag_events_recorded_and_bundle_button():
                 window._press_download(auto=False)
                 assert pump_until(
                     lambda: not window._dl_pressing
-                    and window._dl_holder is None)
+                    and window._watch_list[0].holder is None)
                 assert any("DL押下を開始（手動）" in t for t in texts())
                 assert any("DL押下に成功" in t for t in texts())
                 # 落としたファイルが届く → 到着の確認とチェック。
@@ -1824,7 +1824,7 @@ def test_escape_sent_after_dl_arrival():
                 window._press_download(auto=False)
                 assert pump_until(
                     lambda: not window._dl_pressing
-                    and window._dl_holder is None)
+                    and window._watch_list[0].holder is None)
                 # まだ届いていないので、ESC は送られていない。
                 assert esc_calls == []
                 write_script(
@@ -3672,6 +3672,468 @@ def test_ai_window_attach_method_and_test_button():
                 os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
 
 
+_DUAL_PROFILES = [
+    {"name": "Muse",
+     "target": {"process_name": "claude.exe", "label": "Muse"}},
+    {"name": "Copilot",
+     "target": {"process_name": "copilot.exe", "label": "Copilot"}},
+]
+
+
+def _make_dual_window(tmp: Path, **extra):
+    """二重待受の設定 (主 Muse / 副 Copilot) で窓の下ごしらえ。"""
+    section = {
+        "ai_profiles": _DUAL_PROFILES,
+        "ai_profile_active": 0,
+        "ai_dual_watch": True,
+        "ai_secondary_profile": "Copilot",
+    }
+    section.update(extra)
+    return _make_dl_window(tmp, **section)
+
+
+def _origin_item(watch: Path, ai_name: str):
+    """出どころを付けた、回答できる状態の項目を1つ作る。"""
+    path = write_script(watch, "9-6_origin.phal",
+                        "#!phal python\n# 9-6: 出どころのテスト\n"
+                        "print(1)\n")
+    stat = path.stat()
+    item = sr.ScriptItem(path, stat.st_mtime, stat.st_size)
+    item.ai = ai_name
+    item.last_result_text = "結果文"
+    item.last_run = object()  # 回答側は有無だけを見る
+    return item
+
+
+def test_dual_watch_settings_helpers():
+    # 二重待受の設定の整えと、設定確認の報告 (2.08)。
+    import script_runner_ai as sr_ai
+
+    assert sr_ai.sanitize_dual_watch(
+        {"ai_dual_watch": True,
+         "ai_secondary_profile": " Copilot "}) == \
+        {"enabled": True, "secondary": "Copilot"}
+    assert sr_ai.sanitize_dual_watch({}) == \
+        {"enabled": False, "secondary": ""}
+    assert sr_ai.sanitize_dual_watch(
+        {"ai_dual_watch": "yes"})["enabled"] is False
+    report = core.build_settings_report(
+        {"ai_dual_watch": True, "ai_secondary_profile": "Copilot"},
+        "2.08")
+    assert "二重待受: 入（副: Copilot）" in report, report
+    report_off = core.build_settings_report({}, "2.08")
+    assert "二重待受: 切" in report_off, report_off
+
+
+def test_dual_watch_second_window_candidate():
+    # 二重待受 (2.08): 副の窓の候補は副の状態に乗り、自動の押下は
+    # 副のプロファイルで押す。主の状態には乗らない。到着待ちには
+    # 副の窓の名前が残る (到着したファイルの出どころになる)。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp, auto_dl=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window._set_clipboard = (  # type: ignore[method-assign]
+                lambda text: setattr(window, "_last_clipboard_text",
+                                     text))
+            presses: list = []
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+
+            def fake_presser(profile, key=None, _p=presses):
+                _p.append(profile)
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_dl_presser = fake_presser  # type: ignore
+            try:
+                states = window._sync_watch_states()
+                assert [s.name for s in states] == \
+                    ["Muse", "Copilot"], [s.name for s in states]
+                assert states[0].profile["process_name"] == \
+                    "claude.exe"
+                assert states[1].profile["process_name"] == \
+                    "copilot.exe"
+                # 最初の走査 (候補なし) で起動時分の控えを確定する。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, watch="Copilot"))
+                candidate = {
+                    "name": "#!phal python\n# 9-5: 副の窓のテスト\n"
+                            "print(1)\n",
+                    "class_name": "cls group/card",
+                    "label": "9-5: 副の窓のテスト",
+                    "summary": "9-5: 副の窓のテスト",
+                }
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", candidate, watch="Copilot"))
+                assert window._watch_list[1].holder is not None
+                assert window._watch_list[0].holder is None
+                # 特別行は1行で、AI の列に副の名前が出る。
+                assert window.table.rowCount() == 1
+                assert window.table.item(0, sr.COL_AI).text() == \
+                    "Copilot"
+                # 自動の押下は副のプロファイルで押される。
+                assert pump_until(lambda: len(presses) == 1), presses
+                assert presses[0]["process_name"] == "copilot.exe", \
+                    presses
+                assert pump_until(
+                    lambda: window._watch_list[1].holder is None
+                    and not window._dl_pressing)
+                assert window._dl_awaiting is not None
+                assert window._dl_awaiting[2] == "Copilot"
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_answer_routes_to_origin():
+    # 回答は項目の出どころの窓へ入る (2.08)。出どころが無ければ
+    # 有効なプロファイル (主) へ入る。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            try:
+                configured, profile = window._resolve_item_target(
+                    _origin_item(watch, "Copilot"))
+                assert configured
+                assert profile["process_name"] == "copilot.exe"
+                window._answer_to_ai(_origin_item(watch, "Copilot"))
+                assert pump_until(lambda: len(sent) == 1), sent
+                assert sent[0][1]["process_name"] == "copilot.exe"
+                window._answer_to_ai(_origin_item(watch, ""))
+                assert pump_until(lambda: len(sent) == 2), sent
+                assert sent[1][1]["process_name"] == "claude.exe"
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_off_stays_single():
+    # 二重待受が切なら、見張る窓は主の1つだけ (従来どおり、2.08)。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(
+                tmp,
+                ai_profiles=_DUAL_PROFILES,
+                ai_profile_active=0)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                states = window._sync_watch_states()
+                assert [s.name for s in states] == ["Muse"], \
+                    [s.name for s in states]
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_relay_to_secondary():
+    # 中継リクエスト (2.10): 主の窓の合図の本文が副のプロファイル
+    # へ送られる。同じ合図の再検出では送り直さず、副の窓からの
+    # 合図は中継しない。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(
+                tmp, auto_relay=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+            pressed: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                pressed.append(profile)
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                marker = {"id": "relay-1", "key": "rk-1",
+                          "body": "副への文\n2行目"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                assert pump_until(lambda: len(sent) >= 1), sent
+                assert sent[0][0] == "副への文\n2行目", sent
+                assert sent[0][1]["process_name"] == "copilot.exe", \
+                    sent
+                assert pump_until(lambda: len(pressed) >= 1), pressed
+                assert pressed[0]["process_name"] == "copilot.exe"
+                # 成否の返事 (ACK) が主のプロファイルへ送られる
+                # (2.12)。
+                assert pump_until(lambda: len(sent) >= 2), sent
+                assert "中継しました" in sent[1][0], sent
+                assert sent[1][1]["process_name"] != "copilot.exe", \
+                    sent
+                # 同じ合図の再検出では送り直さない (消費済み)。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                assert not pump_until(
+                    lambda: len(sent) == 3, timeout=1.0), sent
+                # 副の窓からの合図は中継しない (見送りの ACK だけ
+                # 主へ返す)。
+                marker2 = {"id": "relay-2", "key": "rk-2",
+                           "body": "逆向きの文"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker2,
+                    watch="Copilot"))
+                assert pump_until(lambda: len(sent) == 3), sent
+                assert "主の窓" in sent[2][0], sent
+                assert all("逆向きの文" not in text
+                           for text, _profile in sent), sent
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_relay_flag_off():
+    # 中継の切替が切なら、本文は中継しない (2.10)。見送りの
+    # ACK だけが主へ返る (2.12)。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                marker = {"id": "relay-9", "key": "rk-9",
+                          "body": "送られない文"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                assert pump_until(lambda: len(sent) == 1), sent
+                assert "見送り" in sent[0][0], sent
+                assert sent[0][1]["process_name"] != "copilot.exe", \
+                    sent
+                assert all("送られない文" not in text
+                           for text, _profile in sent), sent
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_relay_pending_fires_from_stash():
+    # 中継の保留控え (2.13): 連鎖が詰まって見送られた中継は
+    # 本文ごと控えに残り、目印が走査から消えた後でも、連鎖が
+    # 空いた走査で控えから送られる。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(
+                tmp, auto_relay=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+            pressed: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                pressed.append(profile)
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                marker = {"id": "relay-p1", "key": "rk-p1",
+                          "body": "保留された文"}
+                # 連鎖が詰まっている間は送らず、控えに残る。
+                window._ai_sending = True
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                assert not pump_until(
+                    lambda: len(sent) >= 1, timeout=1.0), sent
+                pending = core.sanitize_relay_pending(
+                    core.load_relay_auto().get("pending"))
+                assert pending is not None, core.load_relay_auto()
+                assert pending["id"] == "relay-p1"
+                assert pending["body"] == "保留された文"
+                # 連鎖が空いて、目印の無い走査が来たら控えから
+                # 送る。
+                window._ai_sending = False
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=None,
+                    watch="Muse"))
+                assert pump_until(lambda: len(sent) >= 1), sent
+                assert sent[0][0] == "保留された文", sent
+                assert sent[0][1]["process_name"] == "copilot.exe"
+                assert pump_until(lambda: len(pressed) >= 1)
+                # 成功で消費され、控えも消える。ACK も主へ返る。
+                assert pump_until(lambda: len(sent) >= 2), sent
+                assert "中継しました" in sent[1][0], sent
+                state = core.load_relay_auto()
+                assert state["consumed_id"] == "relay-p1", state
+                assert state["pending"] is None, state
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_relay_retry_once_on_failure():
+    # 中継の送り直し (2.13): 送信に失敗したら消費せず、少し
+    # 置いて1回だけ送り直す。2回目も失敗したら消費して
+    # 終わる。書きかけ (needs_confirm) では送り直さない。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(
+                tmp, auto_relay=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            attempts: list = []
+
+            def failing_sender(text, profile, attachments=None):
+                attempts.append((text, profile))
+                if profile["process_name"] == "copilot.exe":
+                    return sr._AiAnswerResult(
+                        False, "入力欄に入れられませんでした")
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = failing_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                marker = {"id": "relay-r1", "key": "rk-r1",
+                          "body": "届けたい文"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                # 1回目が失敗し、送り直しの ACK が主へ返る。
+                # 消費はされない。
+                assert pump_until(lambda: len(attempts) == 2), \
+                    attempts
+                assert attempts[0][0] == "届けたい文", attempts
+                assert "送り直します" in attempts[1][0], attempts
+                state = core.load_relay_auto()
+                assert state["consumed_id"] == "", state
+                pending = core.sanitize_relay_pending(
+                    state.get("pending"))
+                assert pending is not None, state
+                assert pending["retries"] == 1, pending
+                # 待ち時間を過ぎたことにして、目印の無い走査で
+                # 送り直しを走らせる。
+                window._relay_auto["pending"]["not_before"] = 0.0
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=None,
+                    watch="Muse"))
+                assert pump_until(lambda: len(attempts) == 4), \
+                    attempts
+                assert attempts[2][0] == "届けたい文", attempts
+                assert "中継に失敗しました" in attempts[3][0], \
+                    attempts
+                assert "送り直します" not in attempts[3][0], \
+                    attempts
+                state = core.load_relay_auto()
+                assert state["consumed_id"] == "relay-r1", state
+                assert state["pending"] is None, state
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_status_qr_text_and_encoding():
+    # 状態QR (2.09): 窓の状態から中身が組め、二重待受の設定が
+    # 反映され、実際に QR へ符号化できる。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                text = window._status_qr_text()
+                assert "PHAL状態 Ver2.12" in text, text
+                assert "二重待受 入（副 Copilot）" in text, text
+                assert "状態 待機中（段階 なし）" in text, text
+                assert "手数 0" in text, text
+                import diagnostics
+
+                qr = diagnostics.make_qr(text)
+                assert len(qr.matrix) > 0
+                image = diagnostics.qr_to_qimage(qr, scale=2)
+                assert image.width() == image.height() > 0
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 if __name__ == "__main__":
     tests = [
         test_window_lists_and_checks,
@@ -3707,6 +4169,11 @@ if __name__ == "__main__":
         test_rerun_menu_and_diff,
         test_answer_with_attachments,
         test_ai_window_attach_method_and_test_button,
+        test_dual_watch_settings_helpers,
+        test_dual_watch_second_window_candidate,
+        test_dual_watch_answer_routes_to_origin,
+        test_dual_watch_off_stays_single,
+        test_status_qr_text_and_encoding,
     ]
     for test in tests:
         test()

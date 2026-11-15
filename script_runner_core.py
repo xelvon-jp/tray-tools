@@ -1226,7 +1226,8 @@ def build_diag_bundle(version: str, toggles: dict, profile_name: str,
         f"一覧={on_off('auto_history')} "
         f"停止={on_off('auto_stop')} "
         f"ログ={on_off('auto_log')} "
-        f"ツール={on_off('auto_tool')}",
+        f"ツール={on_off('auto_tool')} "
+        f"中継={on_off('auto_relay')}",
         f"AIプロファイル: {profile_name or '(未設定)'}",
         "状態:",
     ]
@@ -1586,8 +1587,13 @@ def save_resend_auto(state: dict, state_path=None) -> None:
 # ---------------------------------------------------------------
 SETTINGS_AUTO_FILENAME = "script_runner_settings_auto.json"
 MANUAL_AUTO_FILENAME = "script_runner_manual_auto.json"
+RELAY_AUTO_FILENAME = "script_runner_relay_auto.json"
 SETTINGS_AUTO_COOLDOWN_SEC = 60.0  # 設定の自動応答同士の最短間隔
 MANUAL_AUTO_COOLDOWN_SEC = 60.0    # マニュアル再送同士の最短間隔
+RELAY_AUTO_COOLDOWN_SEC = 60.0     # 中継同士の最短間隔
+RELAY_PENDING_TTL_SEC = 600.0      # 中継の保留控えの寿命 (2.13)
+RELAY_RETRY_DELAY_SEC = 20.0       # 中継の送り直しまでの待ち (2.13)
+RELAY_RETRY_MAX = 1                # 中継の送り直しの回数上限 (2.13)
 
 
 def _load_marker_auto(path) -> dict:
@@ -1624,7 +1630,7 @@ def _load_marker_auto(path) -> dict:
     }
 
 
-def _save_marker_auto(state, path) -> None:
+def _save_marker_auto(state, path, extra=None) -> None:
     state = state if isinstance(state, dict) else {}
     payload = {
         "consumed_id": str(state.get("consumed_id") or ""),
@@ -1638,6 +1644,8 @@ def _save_marker_auto(state, path) -> None:
         "refire_notice_at": float(
             state.get("refire_notice_at") or 0.0),
     }
+    if isinstance(extra, dict):
+        payload.update(extra)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
@@ -1672,6 +1680,61 @@ def save_manual_auto(state: dict, state_path=None) -> None:
     _save_marker_auto(state, path)
 
 
+def sanitize_relay_pending(raw):
+    """中継の保留控え (2.13) を検証して返す。
+
+    控えは {id, key, body, at, retries, not_before}。形が違う・
+    本文が空なら None (保留なしとして扱う)。"""
+    if not isinstance(raw, dict):
+        return None
+    mid = raw.get("id")
+    body = raw.get("body")
+    if not isinstance(mid, str) or not mid:
+        return None
+    if not isinstance(body, str) or not body:
+        return None
+    key = raw.get("key")
+    at = raw.get("at")
+    retries = raw.get("retries")
+    not_before = raw.get("not_before")
+    return {
+        "id": mid,
+        "key": key if isinstance(key, str) else "",
+        "body": body,
+        "at": float(at) if isinstance(at, (int, float)) else 0.0,
+        "retries": int(retries)
+        if isinstance(retries, int) else 0,
+        "not_before": float(not_before)
+        if isinstance(not_before, (int, float)) else 0.0,
+    }
+
+
+def load_relay_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / RELAY_AUTO_FILENAME
+    state = _load_marker_auto(path)
+    # 保留控えは中継専用の欄なので、共有の読み書きとは別に
+    # 生の JSON から拾う (2.13)。
+    pending = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = None
+    if isinstance(raw, dict):
+        pending = sanitize_relay_pending(raw.get("pending"))
+    state["pending"] = pending
+    return state
+
+
+def save_relay_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / RELAY_AUTO_FILENAME
+    state = state if isinstance(state, dict) else {}
+    pending = sanitize_relay_pending(state.get("pending"))
+    _save_marker_auto(state, path, extra={"pending": pending})
+
+
 # 設定確認の報告に出す自動化の短い名前 (診断の束と同じ並び)。
 _SETTINGS_AUTO_LABELS = (
     ("auto_dl", "DL"), ("auto_run", "実行"),
@@ -1685,6 +1748,7 @@ _SETTINGS_AUTO_LABELS = (
     ("auto_stop", "停止"),
     ("auto_log", "ログ"),
     ("auto_tool", "ツール"),
+    ("auto_relay", "中継"),
 )
 
 
@@ -1733,6 +1797,14 @@ def build_settings_report(section, version) -> str:
         f"{label}={on_off(section.get(key))}"
         for key, label in _SETTINGS_AUTO_LABELS)
     lines.append(f"自動化: {auto_text}")
+    if section.get("ai_dual_watch") is True:
+        secondary = section.get("ai_secondary_profile")
+        lines.append(
+            "- 二重待受: 入（副: "
+            + (secondary if isinstance(secondary, str) and secondary
+               else "自動で選ぶ") + "）")
+    else:
+        lines.append("- 二重待受: 切")
     tools = sanitize_cli_tools(section.get("cli_tools"))
     tool_paths = sanitize_cli_tool_paths(section.get("cli_tool_paths"))
     lines.append(
@@ -2467,6 +2539,37 @@ def _phal_status_one_line(text) -> str:
     if len(flat) > _PHAL_STATUS_TEXT_LIMIT:
         flat = flat[:_PHAL_STATUS_TEXT_LIMIT - 1] + "…"
     return flat
+
+
+def build_status_qr_text(version, state_label, stage_label, step,
+                         item_count, ran_count, error_count,
+                         last_failure, automation_flags, dual_label,
+                         active_name, emergency, at=None) -> str:
+    """状態QR の中身を組み立てる (2.09)。
+
+    外から見えない場所 (職場の環境3など) で、PHAL の機械として
+    の状態だけをスマホへ運ぶための短い文。版・状態・段階・
+    手数・件数・エラーの種別・設定の入り切りだけを入れ、仕事の
+    中身 (ファイル名・スクリプトの内容・ログ本文) は入れない。
+    automation_flags は窓の _automation_flags と同じ辞書。"""
+    at = at if at is not None else datetime.now()
+    auto_text = " ".join(
+        f"{label}={'入' if automation_flags.get(key) else '切'}"
+        for key, label in _SETTINGS_AUTO_LABELS)
+    lines = [
+        f"PHAL状態 Ver{version}",
+        "時刻 " + at.strftime("%Y-%m-%d %H:%M:%S"),
+        f"連携先 {active_name or '(未設定)'}",
+        f"二重待受 {dual_label}",
+        f"状態 {state_label}（段階 {stage_label}）",
+        f"手数 {step}",
+        f"一覧 {item_count}件（実行済み {ran_count}件・"
+        f"チェックエラー {error_count}件）",
+        f"直近の実行失敗 {last_failure or 'なし'}",
+        f"自動化 {auto_text}",
+        f"非常停止 {'入' if emergency else '切'}",
+    ]
+    return "\n".join(lines)
 
 
 def build_phal_status(version, state, command_id="", detail="",

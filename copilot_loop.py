@@ -771,6 +771,31 @@ LOG_REQUEST_MARKER = "PHAL:ログリクエスト"
 # 切り出しは _tool_marker_in、同定子は _marker_scan の共通の
 # 作り。ツール名と引数の分け方・許可の判定は窓側 (core) が持つ。
 TOOL_REQUEST_MARKER = "PHAL:ツール実行"
+# 中継リクエストの目印 (2.10、Nagato の提案)。主の AI の発言の
+# 中の目印の単独行を見つけたら、目印の次の行から同じ発言の
+# 末尾までを、副の AI (二重待受の相手) のチャットへそのまま
+# 送る。受け付けるのは主の窓からの合図だけ (窓側の判定)。
+# 切り出しは _relay_marker_in で、同定子は _marker_scan と
+# 同じ作り (本文が要るので走査は専用に持つ)。
+RELAY_REQUEST_MARKER = "PHAL:中継リクエスト"
+# 発言の要素の先頭に付く表示名 (Muse アプリの UIA 実測、
+# 2026-11-16)。中継の目印の行だけ、この表示名つきを許す。
+_RELAY_LINE_PREFIXES = (
+    "アシスタントメッセージ: ", "アシスタントメッセージ：",
+    "ユーザーメッセージ: ", "ユーザーメッセージ：")
+
+
+def _is_relay_marker_line(line):
+    """行が中継の目印か (表示名つきも数える、2.11)。"""
+    stripped = line.strip()
+    if stripped == RELAY_REQUEST_MARKER:
+        return True
+    for prefix in _RELAY_LINE_PREFIXES:
+        if stripped.startswith(prefix) and \
+                stripped[len(prefix):].strip() \
+                == RELAY_REQUEST_MARKER:
+            return True
+    return False
 # 再実行の目印の行から ID を切り出す形。ファイル名のコマンド
 # ID と同じ「セッション番号-通番」(各3桁まで) で、後ろに "_"
 # (ファイル名の続き) や空白があっても ID の部分だけを取る。
@@ -2255,6 +2280,69 @@ class Copilot:
         return {"id": found["id"], "key": found["key"],
                 "command": found["value"]}
 
+    def _relay_marker_in(self, desc):
+        """中継リクエストの目印を探す (2.10、頭の表示名は 2.11)。
+
+        目印の単独行の、次の行から同じ発言 (要素) の末尾までを
+        中継する文 (body) として返す。戻り値は {"id", "key",
+        "body"}。本文が空のものは目印として数えない。
+
+        _marker_scan は行単位の判定しかできない (本文が要る
+        ここでは使えない) ので、走査は専用に持つ。同定子 (id /
+        key) と「目印より後ろの本文が上限以内」の判定は
+        _marker_scan と同じ作りにそろえる。
+
+        Muse アプリ (主の窓) では、発言の要素の先頭に
+        「アシスタントメッセージ: 」のような表示名が付いて
+        目印と同じ行にくっつく (2026-11-16 実測)。中継の合図は
+        この窓が本拠なので、表示名つきの行も目印として数える。
+        表示名は決まった形だけを許す (本文中の言及は拾わない)。"""
+        lines = []
+        line_element = []
+        element_no = -1
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_TEXT:
+                    continue
+                name = el.CurrentName or ""
+            except Exception:  # noqa: BLE001  消えかけは読み飛ばす
+                continue
+            element_no += 1
+            parts = name.replace(OBJECT_MARK, "").split("\n")
+            lines.extend(parts)
+            line_element.extend([element_no] * len(parts))
+        marker_at = None
+        for index, line in enumerate(lines):
+            if _is_relay_marker_line(line):
+                marker_at = index  # 最後の目印を相手にする
+        if marker_at is None:
+            return None
+        tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
+        if tail > DIAG_MARKER_TAIL_LIMIT:
+            return None  # 古い発言の中の目印
+        body_lines = []
+        for index in range(marker_at + 1, len(lines)):
+            if line_element[index] != line_element[marker_at]:
+                break
+            body_lines.append(lines[index])
+        body = "\n".join(body_lines).strip()
+        if not body:
+            return None
+        prefix = "\n".join(lines[:marker_at + 1])
+        digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+        element_start = marker_at
+        while element_start > 0 and \
+                line_element[element_start - 1] \
+                == line_element[marker_at]:
+            element_start -= 1
+        start = max(element_start,
+                    marker_at - DIAG_KEY_WINDOW_LINES + 1)
+        key = hashlib.sha256(
+            "\n".join(lines[start:marker_at + 1]).encode(
+                "utf-8")).hexdigest()
+        return {"id": digest, "key": key, "body": body}
+
     def _resend_marker_in(self, desc):
         """結果再送リクエストの目印 (RESEND_REQUEST_MARKER) を
         探す (1.75)。実体は _id_marker_in。"""
@@ -2418,6 +2506,7 @@ class Copilot:
                 desc, STOP_REQUEST_MARKER),
             "log_marker": self._log_marker_in(desc),
             "tool_marker": self._tool_marker_in(desc),
+            "relay_marker": self._relay_marker_in(desc),
             "manual_marker": self._marker_in(
                 desc, MANUAL_REQUEST_MARKER),
             "file_marker": self._file_marker_in(desc),

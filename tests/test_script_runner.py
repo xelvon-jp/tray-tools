@@ -2865,6 +2865,38 @@ def test_parse_file_request_specs():
     assert path == "" and spec["kind"] == "lines"
 
 
+def test_status_qr_text():
+    # 状態QR の中身 (2.09): 機械の状態だけが短い行で並び、
+    # 仕事の中身 (ファイル名など) は入らない。
+    from datetime import datetime as _dt
+
+    text = core.build_status_qr_text(
+        "2.09", "実行中", "実行", 12,
+        3, 2, 1, "終了コード1",
+        {"auto_dl": True, "auto_run": False, "auto_answer": True},
+        "入（副 Copilot）", "Muse", False,
+        at=_dt(2026, 11, 16, 1, 25, 30))
+    lines = text.split("\n")
+    assert lines[0] == "PHAL状態 Ver2.09", lines
+    assert lines[1] == "時刻 2026-11-16 01:25:30", lines
+    assert "連携先 Muse" in text
+    assert "二重待受 入（副 Copilot）" in text
+    assert "状態 実行中（段階 実行）" in text
+    assert "手数 12" in text
+    assert "一覧 3件（実行済み 2件・チェックエラー 1件）" in text
+    assert "直近の実行失敗 終了コード1" in text
+    assert "DL=入" in text and "実行=切" in text
+    assert "非常停止 切" in text
+    # QR 1枚に収まる大きさ (数百バイト)。
+    assert len(text.encode("utf-8")) < 700, len(text.encode("utf-8"))
+    empty = core.build_status_qr_text(
+        "2.09", "待機中", "なし", 0, 0, 0, 0, "",
+        {}, "切", "", True, at=_dt(2026, 11, 16, 1, 25, 30))
+    assert "連携先 (未設定)" in empty
+    assert "直近の実行失敗 なし" in empty
+    assert "非常停止 入" in empty
+
+
 def test_file_range_slicing():
     # 範囲の切り出し (1.99): バイト範囲・行の範囲・文字コード
     # 判定・バイナリ判定・送付ファイル名。
@@ -3021,6 +3053,7 @@ if __name__ == "__main__":
         test_tool_auto_state_roundtrip,
         test_parse_file_request_specs,
         test_file_range_slicing,
+        test_status_qr_text,
     ]
     for test in tests:
         test()

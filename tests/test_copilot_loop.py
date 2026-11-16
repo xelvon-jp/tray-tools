@@ -223,6 +223,121 @@ def test_staged_errors_for_read_and_write():
         copilot_loop.UIA = saved_uia
 
 
+class DeafValuePattern:
+    """SetValue を黙って無視する ValuePattern の偽物。
+
+    実機の Copilot アプリの癖 (2.03): SetValue が成功を返しても
+    編集欄が受け付けない。読み直しは効く。"""
+
+    def __init__(self, element):
+        self._element = element
+
+    def QueryInterface(self, _interface):
+        return self
+
+    @property
+    def CurrentValue(self):
+        return self._element.value
+
+    def SetValue(self, _text):
+        pass
+
+
+class DeafElement(FakeElement):
+    """SetValue が効かない入力欄。貼り付けでしか入らない。"""
+
+    def GetCurrentPattern(self, _pattern_id):
+        if not self._has_value:
+            return None
+        return DeafValuePattern(self)
+
+
+def _shrunk_verify_windows():
+    """確認の窓 (2.26) をテスト用に縮める。元の値を返す。"""
+    saved = (copilot_loop.INPUT_VERIFY_BASIC_SECONDS,
+             copilot_loop.INPUT_VERIFY_MAX_SECONDS)
+    copilot_loop.INPUT_VERIFY_BASIC_SECONDS = 0.05
+    copilot_loop.INPUT_VERIFY_MAX_SECONDS = 0.6
+    return saved
+
+
+def _restore_verify_windows(saved):
+    (copilot_loop.INPUT_VERIFY_BASIC_SECONDS,
+     copilot_loop.INPUT_VERIFY_MAX_SECONDS) = saved
+
+
+def test_input_texts_equivalent_only_cosmetic_differences():
+    """実質同じの判定: 細部の違いだけなら同じ、別文は別物。"""
+    f = copilot_loop._input_texts_equivalent
+    assert f("a\r\nb\r\n", "a\nb")
+    assert f("a  \nb\t\n\n", "a\nb")
+    assert f("\n\na\nb", "a\nb")
+    assert not f("a\nc", "a\nb")
+    assert not f("a", "a\nb")
+    assert not f("", "a\nb")
+    assert not f("全然違う文", "a\nb")
+
+
+def test_set_input_retries_once_when_readback_only_cosmetically_differs():
+    """読み直しが細部の違いで一致しないとき、空にして再走する。
+
+    1回目の貼り付けでは改行が CRLF になって返り、厳密な照合は
+    落ちるが実質同じと判定される。再走の貼り付けでそのまま
+    入れば、set_input は成功する。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = types.SimpleNamespace(
+        IUIAutomationValuePattern=object())
+    saved = _shrunk_verify_windows()
+    try:
+        box = DeafElement(name="メッセージ", value="")
+        cp = _copilot({"name": "phal-ai", "input_name": "メッセージ"}, [box])
+        pastes = []
+
+        def fake_paste(text):
+            pastes.append(text)
+            if len(pastes) == 1:
+                box.value = text.replace("\n", "\r\n") + "\r\n"
+            else:
+                box.value = text
+
+        cp._paste_input_text = fake_paste
+        cp.set_input("1行目\n2行目")
+        assert box.value == "1行目\n2行目"
+        assert len(pastes) == 2  # 再走で貼り付けが2回目まで行った
+    finally:
+        _restore_verify_windows(saved)
+        copilot_loop.UIA = saved_uia
+
+
+def test_set_input_raises_without_retry_when_readback_is_different():
+    """読み直しが明らかに別物なら、再走せず失敗として上げる。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = types.SimpleNamespace(
+        IUIAutomationValuePattern=object())
+    saved = _shrunk_verify_windows()
+    try:
+        box = DeafElement(name="メッセージ", value="")
+        cp = _copilot({"name": "phal-ai", "input_name": "メッセージ"}, [box])
+        pastes = []
+
+        def fake_paste(_text):
+            pastes.append(_text)
+            box.value = "誰かの下書き"
+
+        cp._paste_input_text = fake_paste
+        try:
+            cp.set_input("送りたい文")
+        except copilot_loop.InputStageError as e:
+            assert e.stage == "unwritable"
+        else:
+            raise AssertionError("InputStageError になるはず")
+        assert len(pastes) == 1  # 再走していない
+        assert box.value == "誰かの下書き"  # 勝手に消していない
+    finally:
+        _restore_verify_windows(saved)
+        copilot_loop.UIA = saved_uia
+
+
 class FakeInvokePattern:
     """InvokePattern の偽物。Invoke の呼び出しを要素に記録する。"""
 

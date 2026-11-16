@@ -649,6 +649,24 @@ def _input_not_found_message(candidates):
             f"（編集できそうな要素は {count} 件でした）")
 
 
+def _input_texts_equivalent(read_back, intended):
+    """読み直した文が、送りたい文と実質同じか (2.26)。
+
+    改行コード (CRLF / CR)・行末の空白・先頭と末尾の空行の
+    違いだけなら同じとみなす。それ以外の違い (文の欠けや
+    別文) は別物として扱う。読み直した文が空なら常に別物。"""
+    def _norm(value):
+        lines = str(value or "").replace("\r\n", "\n") \
+            .replace("\r", "\n").split("\n")
+        lines = [line.rstrip() for line in lines]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+    return _norm(read_back) != "" and _norm(read_back) == _norm(intended)
+
+
 # DL カードの名前が1行に潰れているとき、コメントの後ろにコードが
 # 同じ行で続く。その始まりとみなす目印 (前後に空白のある形)。
 _DOWNLOAD_CODE_STARTERS = (" import ", " from ", " def ", " class ")
@@ -914,6 +932,12 @@ ATTACH_POLL = 0.2
 # 前面化してから・フォーカスしてから貼るまでの待ち (秒)。
 ATTACH_FOREGROUND_WAIT = 0.4
 ATTACH_FOCUS_WAIT = 0.3
+# 入力欄の書き込み確認の窓 (2.26): 基本は2秒まで読み直し、一致
+# しなければ最長10秒まで読み直しを続ける。時間を決め打ちで延ば
+# すのでなく上限だけを延ばすのは、反映が速いときは今までどおり
+# 速く進めるため。
+INPUT_VERIFY_BASIC_SECONDS = 2.0
+INPUT_VERIFY_MAX_SECONDS = 10.0
 
 # ダイアログ方式の目印と待ち (1.61)。
 ATTACH_BUTTON_NAME = "ファイルを添付"
@@ -1655,8 +1679,20 @@ class Copilot:
         Copilot アプリ: 成功と出るのに入っていない。読み直しは
         効くので、書き込みだけが黙って無視される)。書いた直後に
         読み直して一致しなければ、添付と同じ貼り付け (前面化→
-        フォーカス→Ctrl+V) へ切り替える。貼り付けでも読み直し
-        が一致しなければ失敗として上げる。"""
+        フォーカス→Ctrl+V) へ切り替える。
+
+        【確認のリトライと再走 (2.26)】
+        職場の Copilot アプリで、文は入っているのに読み直しが
+        一致せず「書き込めませんでした」になることが約1割あった
+        (実機 2026-11-16、文が残ったまま送信されない)。確認は
+        基本2秒まで読み直し、一致しなければ最長10秒まで読み
+        直しを続ける (一致した時点で進むので、速いときは速い
+        まま)。それでも完全一致しないときは、読み直した文との
+        一致度を見る: 空か明らかに別物なら失敗として上げ、
+        実質同じ (改行コード・行末の空白・空行だけの違い) なら、
+        入力欄を空にして書き込みを1回だけやり直す。再走でも
+        一致しなければ失敗として上げる。送信まで進むのは
+        完全一致したときだけ。"""
         _root, desc = self._descendants()
         box, candidates = self._find_input_box(desc)
         if box is None:
@@ -1666,6 +1702,25 @@ class Copilot:
         if not pattern:
             raise InputStageError(
                 "unwritable", "入力欄に書き込めません（ValuePattern が無い）")
+        if self._write_input_round(pattern, text):
+            return
+        last = self._read_input_quietly()
+        if last and _input_texts_equivalent(last, text):
+            self._clear_input(pattern)
+            if self._write_input_round(pattern, text):
+                return
+        raise InputStageError(
+            "unwritable",
+            "入力欄に書き込めませんでした"
+            "（値の設定も貼り付けも反映されませんでした）")
+
+    def _write_input_round(self, pattern, text):
+        """書き込み1回分: 値の設定→確認、ダメなら貼り付け→確認。
+
+        読み直しが完全一致したら True。値の設定自体の例外は
+        段つきにして上げる (従来どおり)。確認の窓は、値の設定
+        が基本の2秒、貼り付けが基本2秒から最長10秒まで読み
+        直しを続ける (2.26)。"""
         try:
             pattern.QueryInterface(
                 UIA.IUIAutomationValuePattern).SetValue(text)
@@ -1673,22 +1728,42 @@ class Copilot:
             raise InputStageError(
                 "unwritable",
                 f"入力欄に書き込めませんでした（{e}）") from e
-        if self._input_reflects(text, timeout=1.0):
-            return
+        if self._input_reflects(text, timeout=INPUT_VERIFY_BASIC_SECONDS):
+            return True
         saved_text = _clipboard_read_text()
         try:
             self._paste_input_text(text)
-            if not self._input_reflects(text, timeout=2.0):
-                raise InputStageError(
-                    "unwritable",
-                    "入力欄に書き込めませんでした"
-                    "（値の設定も貼り付けも反映されませんでした）")
+            return self._input_reflects(
+                text, timeout=INPUT_VERIFY_MAX_SECONDS)
         finally:
             if saved_text is not None:
                 try:
                     _clipboard_write_text(saved_text)
                 except Exception:  # noqa: BLE001  復元は静かに試す
                     pass
+
+    def _read_input_quietly(self):
+        """入力欄の今の文を1回だけ読む。読めなければ None。
+
+        2.26 の一致度判定の材料。失敗しても段つきで上げず、
+        判定できない=別物側に倒すため None に畳む。"""
+        try:
+            return self.read_input()
+        except Exception:  # noqa: BLE001  判定材料なので静かに
+            return None
+
+    def _clear_input(self, pattern):
+        """入力欄を空にする (2.26 の再走の前処理)。
+
+        失敗は静かに無視する。再走の値の設定が上書きするので
+        致命ではない (貼り付けの再走で残っていると二重になる
+        ことはあるが、その場合は読み直しが一致せず失敗として
+        上がるので、違う文が送られることはない)。"""
+        try:
+            pattern.QueryInterface(
+                UIA.IUIAutomationValuePattern).SetValue("")
+        except Exception:  # noqa: BLE001  前処理なので静かに
+            pass
 
     def _input_reflects(self, text, timeout=0.0):
         """入力欄の今の文が text と (前後の空白を除いて) 一致するか。

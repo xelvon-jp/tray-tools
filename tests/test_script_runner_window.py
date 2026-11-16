@@ -3705,6 +3705,67 @@ def _origin_item(watch: Path, ai_name: str):
     return item
 
 
+def test_dl_candidate_suppressed_by_id_and_ai():
+    # DL 済みの物と AI 名・コマンドID が一致する候補は、
+    # 特別行に出さない (2.25、Nagato の提案)。概要の ID
+    # 接頭辞にコロンが無い形 (実機の設置ファイルの形) でも
+    # 当たる。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            write_script(
+                watch, "9-9_install_phal.phal",
+                "#!phal python\n# 9-9 出さないスクリプトです\n"
+                "print('中身')\n")
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window.ai_downloader = (  # type: ignore[method-assign]
+                lambda profile: sr._DlCheckResult(False, "なし", None))
+            try:
+                window._poll()
+                settle_checks(window, ["9-9_install_phal.phal"])
+                state = window._watch_list[0]
+                item = next(
+                    i for i in window._items
+                    if i.name == "9-9_install_phal.phal")
+                item.ai = state.name  # DL の出どころを再現
+                cand = {
+                    "name": "#!phal python\n"
+                            "# 9-9 出さないスクリプトです\n"
+                            "WATCHDOG = 'x'\n",
+                    "class_name": "cls group/card",
+                    "label": "9-9 出さないスクリプトです",
+                    "summary": "9-9 出さないスクリプトです",
+                }
+                window._on_dl_checked(
+                    sr._DlCheckResult(True, "", cand))
+                QCoreApplication.processEvents()
+                assert state.holder is None
+                scans = [e["text"] for e in window._diag_events
+                         if e["text"].startswith("直近の走査:")]
+                assert any("ID・AI名一致" in s for s in scans), \
+                    scans
+                # ID が違えば出る。
+                other = dict(cand)
+                other["name"] = cand["name"].replace("9-9", "9-10")
+                other["summary"] = "9-10 別のスクリプトです"
+                other["label"] = other["summary"]
+                window._on_dl_checked(
+                    sr._DlCheckResult(True, "", other))
+                QCoreApplication.processEvents()
+                assert state.holder is not None
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 def test_dual_watch_settings_helpers():
     # 二重待受の設定の整えと、設定確認の報告 (2.08)。
     import script_runner_ai as sr_ai
@@ -3723,6 +3784,29 @@ def test_dual_watch_settings_helpers():
     assert "二重待受: 入（副: Copilot）" in report, report
     report_off = core.build_settings_report({}, "2.08")
     assert "二重待受: 切" in report_off, report_off
+    # 見張る窓の集合 (2.20): 新キーがあればそれが正、無ければ
+    # 旧キー (アクティブ + 二重待受の副) から導く。並びは
+    # プロファイル一覧の順で、一覧に無い名前は落ちる。
+    profiles = [
+        {"name": "Muse", "target": {}},
+        {"name": "Copilot", "target": {}},
+        {"name": "Third", "target": {}},
+    ]
+    base = {"ai_profiles": profiles, "ai_profile_active": 0}
+    assert sr_ai.sanitize_watch_profiles(base) == ["Muse"]
+    assert sr_ai.sanitize_watch_profiles(
+        {**base, "ai_dual_watch": True,
+         "ai_secondary_profile": "Copilot"}) == ["Muse", "Copilot"]
+    assert sr_ai.sanitize_watch_profiles(
+        {**base, "ai_dual_watch": True}) == ["Muse", "Copilot"]
+    assert sr_ai.sanitize_watch_profiles(
+        {**base, "ai_watch_profiles": ["Third", "Muse", "幽霊"]}
+    ) == ["Muse", "Third"]
+    assert sr_ai.sanitize_watch_profiles(
+        {**base, "ai_watch_profiles": []}) == []
+    report_set = core.build_settings_report(
+        {**base, "ai_watch_profiles": ["Muse", "Copilot"]}, "2.20")
+    assert "見張る窓: Muse、Copilot" in report_set, report_set
 
 
 def test_dual_watch_second_window_candidate():
@@ -3854,10 +3938,151 @@ def test_dual_watch_off_stays_single():
             os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
 
 
+def test_dual_watch_floor_checks_toggle():
+    # 階のチェック (2.14、置き場は 2.15 で大きな進捗表示の階へ、
+    # 集合化は 2.20): どの階のチェックも操作でき、付け外しが
+    # 見張る窓の集合 (ai_watch_profiles) として設定へ保存され
+    # る。主のチェックも外せる (見張りゼロも可)。階のチェック
+    # 表示も追随する。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(
+                tmp,
+                ai_profiles=_DUAL_PROFILES,
+                ai_profile_active=0)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                boxes = {name: floor["check"]
+                         for name, floor in window._floors.items()}
+                assert boxes["Muse"].isChecked()
+                assert boxes["Muse"].isEnabled()
+                assert not boxes["Copilot"].isChecked()
+                window._on_ai_check_toggled("Copilot", True)
+                saved = json.loads(
+                    settings_path.read_text(encoding="utf-8")
+                )["script_runner"]
+                assert saved["ai_watch_profiles"] == [
+                    "Muse", "Copilot"]
+                assert window._floors["Copilot"]["check"].isChecked()
+                window._on_ai_check_toggled("Copilot", False)
+                saved = json.loads(
+                    settings_path.read_text(encoding="utf-8")
+                )["script_runner"]
+                assert saved["ai_watch_profiles"] == ["Muse"]
+                assert not window._floors[
+                    "Copilot"]["check"].isChecked()
+                # 主も外せる (見張りゼロ)。
+                window._on_ai_check_toggled("Muse", False)
+                saved = json.loads(
+                    settings_path.read_text(encoding="utf-8")
+                )["script_runner"]
+                assert saved["ai_watch_profiles"] == []
+                assert not window._floors["Muse"]["check"].isChecked()
+                window._sync_watch_states()
+                assert window._watch_list == []
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_floors_grouped_aligned_and_pulse_per_floor():
+    # 階の見た目 (2.16): 階ごとに枠 (QFrame) で分かれ、名前の
+    # 欄の幅は階どうしで揃う。明滅は監視している側の階だけ
+    # (副は見張りが割り当たってから、非常停止中はどこも
+    # 明滅しない)。
+    from PySide6.QtWidgets import QFrame
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(
+                tmp,
+                ai_profiles=_DUAL_PROFILES,
+                ai_profile_active=0)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                floors = window._floors
+                assert all(isinstance(f["row"], QFrame)
+                           for f in floors.values())
+                widths = {f["check"].width()
+                          for f in floors.values()}
+                assert len(widths) == 1, widths
+                assert not window._floor_pulsing("Copilot")
+                window._on_ai_check_toggled("Copilot", True)
+                window._sync_watch_states()
+                state = next(
+                    s for s in window._watch_list
+                    if s.name == "Copilot")
+                assert window._floor_pulsing("Copilot") == (
+                    state.profile is not None)
+                # 明滅は背景の層だけ (2.25): 行自体に
+                # エフェクトは付かず、背景の層に付く。
+                assert floors["Copilot"]["row"].graphicsEffect() \
+                    is None
+                assert floors["Copilot"]["bg"].graphicsEffect() \
+                    is not None
+                # 待機の起点が立っていなくても、階の描き直しで
+                # 起点が立ってカウントアップが始まる (2.24)。
+                state.idle_since = None
+                window._render_floor_idle(
+                    "Copilot", floors["Copilot"])
+                assert state.idle_since is not None
+                assert floors["Copilot"]["number"].text() != "―"
+                # 見張りを外した階は明滅しない (2.23、実機報告)。
+                # 既定の階 (Muse) も同じ判定。
+                window._on_ai_check_toggled("Muse", False)
+                window._sync_watch_states()
+                assert not window._floor_pulsing("Muse")
+                assert window._floor_pulsing("Copilot") == (
+                    state.profile is not None)
+                window._emergency_stopped = True
+                assert not window._floor_pulsing("Copilot")
+                assert not window._floor_pulsing("Muse")
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_single_profile_floor_has_no_check():
+    # プロファイルが1つだけなら、階は1本だけでチェックは
+    # 出ない (2.15)。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dl_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                assert len(window._floors) == 1
+                floor = next(iter(window._floors.values()))
+                assert floor["check"] is None
+                assert floor["name_label"] is not None
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 def test_dual_watch_relay_to_secondary():
-    # 中継リクエスト (2.10): 主の窓の合図の本文が副のプロファイル
-    # へ送られる。同じ合図の再検出では送り直さず、副の窓からの
-    # 合図は中継しない。
+    # 中継リクエスト (2.10、経路は 2.17): 引数が無い目印は、
+    # 見つかった窓の「もう一方」のプロファイルへ送られる。
+    # 同じ合図の再検出では送り直さない。
     prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -3904,16 +4129,95 @@ def test_dual_watch_relay_to_secondary():
                     watch="Muse"))
                 assert not pump_until(
                     lambda: len(sent) == 3, timeout=1.0), sent
-                # 副の窓からの合図は中継しない (見送りの ACK だけ
-                # 主へ返す)。
+                # 副の窓からの合図も、引数が無ければ「もう一方」
+                # へ中継する (2.17、主副の区別なし)。間隔の歯止め
+                # は、時刻を進めたことにして外す。
+                window._relay_auto["last_sent_at"] = 0.0
                 marker2 = {"id": "relay-2", "key": "rk-2",
                            "body": "逆向きの文"}
                 window._on_dl_checked(sr._DlCheckResult(
                     True, "", None, relay_marker=marker2,
                     watch="Copilot"))
+                assert pump_until(lambda: len(sent) >= 3), sent
+                assert sent[2][0] == "逆向きの文", sent
+                assert sent[2][1]["process_name"] != "copilot.exe", \
+                    sent
+                # ACK は送り元 (Copilot) へ返る (2.17)。
+                assert pump_until(lambda: len(sent) >= 4), sent
+                assert "中継しました" in sent[3][0], sent
+                assert sent[3][1]["process_name"] == "copilot.exe", \
+                    sent
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_relay_route_arg():
+    # 中継の引数 (2.17): 「送り元2送り先」で経路が決まる。
+    # 送り元の窓で見つかったときだけ発火し、ACK は送り元へ
+    # 返る。送り元でない窓で見つけた目印は何も送らない。
+    # ほどけない引数は、送らずに理由だけ送り元へ返す。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(
+                tmp, auto_relay=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                # Copilot から Muse へ (引数つき)。
+                marker = {"id": "relay-a1", "key": "rk-a1",
+                          "body": "引数つきの文",
+                          "arg": "Copilot2Muse"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Copilot"))
+                assert pump_until(lambda: len(sent) >= 1), sent
+                assert sent[0][0] == "引数つきの文", sent
+                assert sent[0][1]["process_name"] != "copilot.exe", \
+                    sent
+                assert pump_until(lambda: len(sent) >= 2), sent
+                assert "中継しました" in sent[1][0], sent
+                assert sent[1][1]["process_name"] == "copilot.exe", \
+                    sent
+                # 送り元でない窓で見つけた目印は、何も送らない。
+                marker2 = {"id": "relay-a2", "key": "rk-a2",
+                           "body": "送られない文",
+                           "arg": "Muse2Copilot"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker2,
+                    watch="Copilot"))
+                assert not pump_until(
+                    lambda: len(sent) > 2, timeout=1.0), sent
+                # ほどけない引数は送らず、理由が送り元へ返る。
+                marker3 = {"id": "relay-a3", "key": "rk-a3",
+                           "body": "宛先不明の文",
+                           "arg": "Muse2Nowhere"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker3,
+                    watch="Muse"))
                 assert pump_until(lambda: len(sent) == 3), sent
-                assert "主の窓" in sent[2][0], sent
-                assert all("逆向きの文" not in text
+                assert "引数が分かりません" in sent[2][0], sent
+                assert sent[2][1]["process_name"] != "copilot.exe", \
+                    sent
+                assert all("宛先不明の文" not in text
                            for text, _profile in sent), sent
             finally:
                 window.close()
@@ -3926,7 +4230,7 @@ def test_dual_watch_relay_to_secondary():
 
 def test_dual_watch_relay_flag_off():
     # 中継の切替が切なら、本文は中継しない (2.10)。見送りの
-    # ACK だけが主へ返る (2.12)。
+    # NACK だけが主へ返る (2.12、NACK の形は 2.19)。
     prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -3953,11 +4257,54 @@ def test_dual_watch_relay_flag_off():
                     True, "", None, relay_marker=marker,
                     watch="Muse"))
                 assert pump_until(lambda: len(sent) == 1), sent
-                assert "見送り" in sent[0][0], sent
+                assert "中継NACK" in sent[0][0], sent
                 assert sent[0][1]["process_name"] != "copilot.exe", \
                     sent
                 assert all("送られない文" not in text
                            for text, _profile in sent), sent
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dual_watch_relay_empty_body_nack():
+    # 本文が無い目印は送らず、理由が NACK で送り元へ返る
+    # (2.19)。黙って見送ると、送り元は形式ミスに気づけない。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(
+                tmp, auto_relay=True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            sent: list = []
+
+            def fake_sender(text, profile, attachments=None):
+                sent.append((text, profile))
+                return sr._AiAnswerResult(True, "ok")
+
+            def fake_presser(profile):
+                return sr._AiAnswerResult(True, "ok")
+
+            window.ai_sender = fake_sender  # type: ignore
+            window.ai_presser = fake_presser  # type: ignore
+            try:
+                window._sync_watch_states()
+                marker = {"id": "relay-e1", "key": "rk-e1",
+                          "body": "", "arg": "Muse2Copilot"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, relay_marker=marker,
+                    watch="Muse"))
+                assert pump_until(lambda: len(sent) == 1), sent
+                assert "中継NACK" in sent[0][0], sent
+                assert "本文がありません" in sent[0][0], sent
+                assert sent[0][1]["process_name"] != "copilot.exe", \
+                    sent
             finally:
                 window.close()
     finally:
@@ -4104,7 +4451,7 @@ def test_dual_watch_relay_retry_once_on_failure():
 
 
 def test_status_qr_text_and_encoding():
-    # 状態QR (2.09): 窓の状態から中身が組め、二重待受の設定が
+    # 状態QR (2.09): 窓の状態から中身が組め、見張る窓の設定が
     # 反映され、実際に QR へ符号化できる。
     prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
     try:
@@ -4115,8 +4462,9 @@ def test_status_qr_text_and_encoding():
             window = sr.ScriptRunnerWindow(str(settings_path))
             try:
                 text = window._status_qr_text()
-                assert "PHAL状態 Ver2.12" in text, text
-                assert "二重待受 入（副 Copilot）" in text, text
+                assert f"PHAL状態 Ver{sr.PHAL_VERSION}" in text, text
+                assert "見張る窓 ☑Muse ☑Copilot" in text, text
+                assert "連携先" not in text, text
                 assert "状態 待機中（段階 なし）" in text, text
                 assert "手数 0" in text, text
                 import diagnostics

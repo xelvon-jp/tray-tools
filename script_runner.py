@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.13"
+PHAL_VERSION = "2.25"
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -77,6 +77,7 @@ from PySide6.QtWidgets import (
     QProxyStyle,
     QPushButton,
     QSizePolicy,
+    QStackedLayout,
     QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
@@ -112,11 +113,29 @@ FULL_SCAN_MAX_GAP_SEC = 60.0
 _DL_FILENAME_RE = re.compile(
     r"[\w.\-]+\.(?:phal|py|ps1)", re.IGNORECASE)
 
-# 概要の先頭にあるコマンドIDの接頭辞 (「1-29: 」の形)。候補側の
-# 概要 (カードのコメントそのまま) には残り、ファイル側の概要
-# (core.extract_summary) では外されているので、照合の前に両方
-# から外してそろえる。
-_SUMMARY_ID_PREFIX_RE = re.compile(r"^\d{1,3}-\d{1,3}\s*[:：]\s*")
+# 概要の先頭にあるコマンドIDの接頭辞 (「1-29: 」「1-29 」の形)。
+# 候補側の概要 (カードのコメントそのまま) には残り、ファイル側
+# の概要 (core.extract_summary) では外されているので、照合の
+# 前に両方から外してそろえる。コロンはあっても無くてもよい
+# (2.25。コロン無しの形で照合が外れ続け、DL 済みの候補が
+# 開き直しのたびに出直した実機報告への直し)。
+_SUMMARY_ID_PREFIX_RE = re.compile(r"^\d{1,3}-\d{1,3}\s*[:：]?\s*")
+
+
+def _holder_command_id(holder) -> str:
+    """DL 候補のコマンドID (「1-293」の形)。無ければ ""。
+
+    概要の先頭から取るのが本命。取れなければ、名前 (中身の
+    冒頭) の先頭数行のコメント行から取る。"""
+    summary = " ".join((holder.summary or "").split())
+    match = re.match(r"(\d{1,3}-\d{1,3})\b", summary)
+    if match is not None:
+        return match.group(1)
+    for line in (holder.name or "").splitlines()[:4]:
+        match = re.match(r"\s*#\s*(\d{1,3}-\d{1,3})\b", line)
+        if match is not None:
+            return match.group(1)
+    return ""
 
 
 def _summary_matches(candidate_summary, item_summary) -> bool:
@@ -687,6 +706,10 @@ class _WatchState:
         self.chase_until = 0.0
         # 直近の走査の1行 (診断の束に出す、1-57)。
         self.last_scan = "直近の走査: まだ無い"
+        # この窓の見張りが「何も無い」状態に入った時刻
+        # (monotonic、2.23)。階のカウントアップの起点で、
+        # 候補が浮かぶと None へ戻る。
+        self.idle_since = None
 
 
 class _AiAnswerResult:
@@ -879,9 +902,10 @@ class ScriptRunnerWindow(QWidget):
         self._dl_signals.pressed.connect(self._on_dl_pressed)
         self._dl_signals.escaped.connect(self._on_escape_sent)
         # 見張りの状態は窓ごと (_WatchState、2.08 の二重待受)。
-        # _watch_list は処理・表示の順 (主→副)、_watches は名前
-        # 引き。主の状態は最初から1つ用意し、設定との同期
-        # (_sync_watch_states) で名前と投げ先を差し替える。
+        # _watch_list は処理・表示の順 (見張る窓の並び)、
+        # _watches は名前引き。代表の状態は最初から1つ用意し、
+        # 設定との同期 (_sync_watch_states) で名前と投げ先を
+        # 差し替える。
         self._primary_state = _WatchState("")
         self._watches = {}
         self._watch_list = [self._primary_state]
@@ -894,9 +918,9 @@ class ScriptRunnerWindow(QWidget):
         # 控えは開き直しで消えるので、core の控えファイルから
         # 読み込んでおく (1-29)。
         self._dl_consumed_persisted = core.load_dl_consumed()
-        # 開き直し引き継ぎ (1.70) の控えは主の窓が持つ。閉じる
-        # ときに直近の候補の key を残し (closeEvent)、すぐ開き
-        # 直した場合は最初の検出で「続き」判定に使う。
+        # 開き直し引き継ぎ (1.70) の控えは代表の状態が持つ。
+        # 閉じるときに直近の候補の key を残し (closeEvent)、
+        # すぐ開き直した場合は最初の検出で「続き」判定に使う。
         self._primary_state.session = core.load_dl_session()
         # 到着した行の色付けの控え (2.07)。
         self._highlight_name = ""
@@ -1336,78 +1360,32 @@ class ScriptRunnerWindow(QWidget):
         title_row.addWidget(self.emergency_button)
         layout.addLayout(title_row)
 
-        # 大きな進捗表示 (1.64)。1.63 の小さい帯 (チップ＋情報
-        # 行) が「小さくて見づらい」との実機報告を受け、タイト
-        # ルの直下に横幅いっぱいのパネルとして置き直した。
-        # 監視ブロック＋段階ブロック4つ (監視 → DL → 実行 →
-        # 回答 → 送信) を大きく出し、右に進捗などの大きな
-        # 数字、下に対象行と小さい情報行 (手数・経過・ねらい。
-        # 1.48 の帯の文言そのまま) を置く。色と文言の付け直し
-        # は _refresh_status_strip が1秒ごとにやる。ループ
-        # 実施中 (AI 窓の見張りが動作中) は、このパネル全体が
-        # ゆっくり明滅する (_update_pulse / _tick_pulse)。
+        # 大きな進捗表示 (1.64、2.15 で階形式)。タイトルの直下に
+        # 横幅いっぱいのパネルとして置く。中身は AI ごとの「階」
+        # (細いバーの並び) で、階ごとに [チェック＋名前] [監視 →
+        # DL → 実行 → 回答 → 送信 の段階ブロック] [数字＋見出し]
+        # を出す。階はプロファイルの数だけあり (1つなら1階だけ)、
+        # チェックは2つ以上あるときだけ出す (2.14 の連携中チェッ
+        # クの置き場がここへ移った)。下に対象行と小さい情報行
+        # (手数・経過・ねらい。1.48 の帯の文言そのまま) を置く。
+        # 色と文言の付け直しは _refresh_status_strip が1秒ごとに
+        # やる。ループ実施中 (AI 窓の見張りが動作中) は、この
+        # 監視している階だけがゆっくり明滅する (_update_pulse /
+        # _tick_pulse)。
         panel = QFrame()
         panel.setStyleSheet(self._big_panel_style(False))
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setSpacing(6)
-        stage_row = QHBoxLayout()
-        stage_row.setSpacing(4)
-        self._stage_chips = {}
-        # 監視ブロック (1.65)。段階の並びの先頭 (DL の前) に
-        # 置く、待機のためのブロック。待機中 (AI 窓の見張り
-        # が回っていて連鎖が空いているとき) は青く光り、
-        # 非常停止中は赤く「停止」になる。待機中にどこも
-        # 光らず灰色だけになるのを避けるためのもので、判定
-        # は _watch_block_state、付け直しは段階ブロックと
-        # 同じく _refresh_status_strip がやる。
-        watch = QLabel("監視")
-        watch.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        watch.setMinimumHeight(54)
-        watch.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred)
-        watch.setStyleSheet(self._stage_block_style("idle"))
-        stage_row.addWidget(watch, stretch=1)
-        self._watch_chip = watch
-        for stage_key in core.STAGE_ORDER:
-            arrow = QLabel("›")
-            arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            arrow.setStyleSheet(
-                "font-size: 16px; font-weight: bold;"
-                f" color: {self._theme()['muted']};")
-            stage_row.addWidget(arrow)
-            block = QLabel(core.STAGE_LABELS[stage_key])
-            block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            block.setMinimumHeight(54)
-            block.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Preferred)
-            block.setStyleSheet(self._stage_block_style("idle"))
-            stage_row.addWidget(block, stretch=1)
-            self._stage_chips[stage_key] = block
-        # 大きな数字 (進捗 2/3・経過/所要・停止・―) と、その
-        # 小さい見出し (進捗/経過/所要/非常停止中/待機中)。
-        number_box = QVBoxLayout()
-        number_box.setSpacing(0)
-        self._big_number = QLabel("―")
-        self._big_number.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._big_number.setMinimumWidth(118)
-        self._big_number.setStyleSheet(
-            "font-size: 34px; font-weight: bold;")
-        number_box.addWidget(self._big_number)
-        self._big_number_caption = QLabel("待機中")
-        self._big_number_caption.setAlignment(
-            Qt.AlignmentFlag.AlignCenter)
-        self._big_number_caption.setStyleSheet(
-            f"font-size: 11px; color: {self._theme()['muted']};")
-        number_box.addWidget(self._big_number_caption)
-        stage_row.addLayout(number_box)
-        panel_layout.addLayout(stage_row)
+        panel_layout.setContentsMargins(8, 6, 8, 6)
+        panel_layout.setSpacing(4)
+        self._floors_layout = QVBoxLayout()
+        self._floors_layout.setContentsMargins(0, 0, 0, 0)
+        self._floors_layout.setSpacing(3)
+        panel_layout.addLayout(self._floors_layout)
+        self._floors = {}
         # 対象行: 実行中または直近のファイル名＋概要。実行中は
         # 最後の出力行も添える。横幅はレイアウトに任せる。
         self._big_item = QLabel("")
-        self._big_item.setStyleSheet("font-size: 13px;")
+        self._big_item.setStyleSheet("font-size: 12px;")
         self._big_item.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         panel_layout.addWidget(self._big_item)
@@ -1424,41 +1402,20 @@ class ScriptRunnerWindow(QWidget):
         self.status_strip = strip
         layout.addWidget(panel)
         self._big_panel = panel
-        # 明滅は不透明度の効果でやる。効果はパネルに付け、
-        # タイマはループ実施中だけ回す (出入りは _update_pulse
-        # が見る)。非常停止ボタンはパネルの外 (タイトル行) な
-        # ので明滅しない。
-        self._pulse_effect = QGraphicsOpacityEffect(panel)
-        self._pulse_effect.setOpacity(1.0)
-        panel.setGraphicsEffect(self._pulse_effect)
+        # 明滅は階ごとに付ける (2.16)。効果は階の枠へ付け
+        # (_rebuild_floors)、タイマはここで1つだけ持ち、回すか
+        # どうかは _update_pulse が決める。非常停止ボタンは
+        # パネルの外 (タイトル行) なので明滅しない。
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._tick_pulse)
         self._big_panel_emergency = False
         self._refresh_status_strip()
 
         header = QHBoxLayout()
-        ai_caption = QLabel("連携中：")
-        ai_caption.setStyleSheet(
-            f"color: {self._theme()['muted']}; font-size: 11px;")
-        header.addWidget(ai_caption)
-        self.ai_caption = ai_caption
-        # 連携先はトップ画面から切り替えられる (2.05)。二重待受
-        # までは排他 (選んだ1つだけが有効)。保存の形は設定画面と
-        # 同じ (profiles_settings) で、選んだ瞬間に効く。
-        self.ai_combo = QComboBox()
-        self.ai_combo.setMaximumWidth(160)
-        self.ai_combo.setStyleSheet("font-size: 11px;")
-        self.ai_combo.currentIndexChanged.connect(
-            self._on_ai_combo_changed)
-        header.addWidget(self.ai_combo)
+        # 連携先の表示と切替は、大きな進捗表示の階へ移した
+        # (2.15)。ここは窓全体のボタンの行で、階の作り直しは
+        # _refresh_ai_label が受け持つ。
         self._refresh_ai_label()
-        # 追いかけモードの印 (2.07)。変化を追っている間だけ出す。
-        self.chase_label = QLabel(" 追いかけ中 ")
-        self.chase_label.setStyleSheet(
-            "font-size: 11px; padding: 2px 6px; "
-            + self._theme()["accent_style"])
-        self.chase_label.setVisible(False)
-        header.addWidget(self.chase_label)
         header.addStretch(1)
         self.ai_window_button = QPushButton("設定")
         self.ai_window_button.clicked.connect(self._open_ai_window)
@@ -1656,6 +1613,7 @@ class ScriptRunnerWindow(QWidget):
         に呼び直す。読めなければ空にする (失敗しても窓は止め
         ない)。"""
         profiles, active, name = [], 0, ""
+        watch = []
         try:
             import script_runner_ai as sr_ai
 
@@ -1664,52 +1622,207 @@ class ScriptRunnerWindow(QWidget):
             section = all_settings.get("script_runner") or {}
             profiles, active = sr_ai.sanitize_profiles(section)
             name = profiles[active]["name"]
+            watch = sr_ai.sanitize_watch_profiles(section)
         except Exception:  # noqa: BLE001  静かに空へ
             profiles, active, name = [], 0, ""
+            watch = []
         self._ai_name = name
-        combo = getattr(self, "ai_combo", None)
-        if combo is not None:
-            with QSignalBlocker(combo):
-                combo.clear()
-                combo.addItems([p["name"] for p in profiles])
-                if profiles:
-                    combo.setCurrentIndex(active)
-            combo.setToolTip(
-                f"いま連携している AI は「{name}」です"
-                if name else "")
+        self._rebuild_floors(profiles, active, watch)
 
-    def _on_ai_combo_changed(self, index: int):
-        """トップ画面で連携先が選ばれた (2.05)。設定へ保存し、
-        その場で切り替える。保存の形は設定画面と同じ
-        (profiles_settings: ai_profiles / ai_profile_active /
-        ai_target の同期まで)。"""
-        if index < 0:
+    def _floor_block_style(self, kind, color=None, ratio=0.0):
+        """階の段階ブロックのスタイル (2.15)。
+
+        大きな進捗表示の段階ブロック (1.64) と同じ色使いで、
+        文字と余白だけ細いバー用に小さくしたもの。"""
+        return (self._stage_block_style(kind, color, ratio)
+                + " font-size: 11px; border-radius: 6px;"
+                + " padding: 1px 4px;")
+
+    def _floor_frame_style(self) -> str:
+        """階の枠のスタイル (2.16)。階ごとにグループを分ける。
+
+        枠の色は段階ブロックの沈んだ色と同じ系 (テーマ別)。
+        明滅は枠でなく背景の層が担う (2.25、_rebuild_floors)。"""
+        if self._dark_mode:
+            border = "rgba(128, 128, 128, 0.35)"
+        else:
+            border = "#c6cbd2"
+        return (f"QFrame {{ border: 1px solid {border};"
+                " border-radius: 6px; }")
+
+    def _floor_bg_color(self) -> str:
+        """階の背景の層の色 (2.25)。明滅で透け具合が変わる。
+
+        Nagato の希望で、沈んだグレーからグリーンへ寄る色。"""
+        return "#3f7d54" if self._dark_mode else "#a8d8b9"
+
+
+    def _rebuild_floors(self, profiles, active, watch):
+        """大きな進捗表示の階を作り直す (2.15)。
+
+        プロファイルごとに1階。[チェック＋名前] [監視＋段階
+        ブロック] [数字＋見出し] の細いバー。チェックはプロ
+        ファイルが2つ以上あるときだけ出す (見張る窓の集合に
+        入っている側だけチェック、どの階も操作できる。2.20
+        で主・副の区別をなくした)。付け外しは
+        _on_ai_check_toggled が設定へ保存する。1つだけなら、
+        チェック無しのバーが1本だけ出る。階ごとに枠で
+        グループを分け、名前の欄の幅は階どうしで揃える。
+        明滅の効果も階ごとに持つ (2.16)。"""
+        layout = getattr(self, "_floors_layout", None)
+        if layout is None:
             return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._floors = {}
+        show_checks = len(profiles) >= 2
+        # 名前の欄は階どうしで幅を揃える (2.16、監視ブロックの
+        # 左端が階ごとにずれないように)。部品を先に全部作り、
+        # いちばん広いものに合わせる。
+        name_widgets = []
+        for index, entry in enumerate(profiles):
+            name = entry["name"]
+            if show_checks:
+                box = QCheckBox(name)
+                box.setStyleSheet("font-size: 11px;")
+                box.setChecked(name in watch)
+                box.setToolTip("チェックでこの窓を見張ります")
+                box.toggled.connect(
+                    lambda checked, n=name:
+                        self._on_ai_check_toggled(n, checked))
+                name_widgets.append(box)
+            else:
+                name_label = QLabel(name)
+                name_label.setStyleSheet("font-size: 11px;")
+                name_widgets.append(name_label)
+        name_width = max(
+            (w.sizeHint().width() for w in name_widgets), default=0)
+        for index, entry in enumerate(profiles):
+            name = entry["name"]
+            # 階ごとに枠でグループを分ける (2.16)。
+            row = QFrame()
+            row.setStyleSheet(self._floor_frame_style())
+            # 背景の層と中身を重ねる (2.25)。明滅は背景の層
+            # だけ (不透明度で滑らかに)。ブロックや文字は
+            # 薄くならない。
+            stack = QStackedLayout(row)
+            stack.setStackingMode(
+                QStackedLayout.StackingMode.StackAll)
+            stack.setContentsMargins(0, 0, 0, 0)
+            bg = QWidget()
+            bg.setStyleSheet(
+                f"background-color: {self._floor_bg_color()};"
+                " border-radius: 6px;")
+            bg.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            effect = QGraphicsOpacityEffect(bg)
+            effect.setOpacity(0.0)
+            bg.setGraphicsEffect(effect)
+            stack.addWidget(bg)
+            content = QWidget()
+            stack.addWidget(content)
+            row_layout = QHBoxLayout(content)
+            row_layout.setContentsMargins(6, 3, 6, 3)
+            row_layout.setSpacing(4)
+            floor = {"row": row, "check": None, "name_label": None,
+                     "bg": bg, "effect": effect}
+            name_widget = name_widgets[index]
+            name_widget.setFixedWidth(name_width)
+            row_layout.addWidget(name_widget)
+            if show_checks:
+                floor["check"] = name_widget
+            else:
+                floor["name_label"] = name_widget
+
+            watch = QLabel("監視")
+            watch.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            watch.setMinimumHeight(22)
+            watch.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred)
+            watch.setStyleSheet(self._floor_block_style("idle"))
+            row_layout.addWidget(watch, stretch=1)
+            floor["watch"] = watch
+            chips = {}
+            for stage_key in core.STAGE_ORDER:
+                arrow = QLabel("›")
+                arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                arrow.setStyleSheet(
+                    "font-size: 12px; font-weight: bold;"
+                    f" color: {self._theme()['muted']};")
+                row_layout.addWidget(arrow)
+                block = QLabel(core.STAGE_LABELS[stage_key])
+                block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                block.setMinimumHeight(22)
+                block.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Preferred)
+                block.setStyleSheet(self._floor_block_style("idle"))
+                row_layout.addWidget(block, stretch=1)
+                chips[stage_key] = block
+            floor["chips"] = chips
+            number_box = QVBoxLayout()
+            number_box.setSpacing(0)
+            number = QLabel("―")
+            number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            number.setMinimumWidth(76)
+            number.setStyleSheet(
+                "font-size: 17px; font-weight: bold;")
+            number_box.addWidget(number)
+            caption = QLabel("待機中")
+            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            caption.setStyleSheet(
+                f"font-size: 10px; color: {self._theme()['muted']};")
+            number_box.addWidget(caption)
+            row_layout.addLayout(number_box)
+            floor["number"] = number
+            floor["caption"] = caption
+            layout.addWidget(row)
+            self._floors[name] = floor
+
+
+    def _on_ai_check_toggled(self, name: str, checked: bool):
+        """階のチェックで見張る窓の集合を入れ切りする (2.20、
+        置き場は 2.15 で階へ、元は二重待受の切替 2.14)。
+
+        どの階のチェックも操作でき、入れた窓が見張りに加わり、
+        外した窓が外れる (見張りゼロも可)。設定へすぐ保存し、
+        見張りは次の同期から新しい集合で動く。保存の形は他の
+        トップ画面の切替と同じく、該当キーだけ (新しいキー
+        ai_watch_profiles に集合全体を、プロファイル一覧の
+        順で書く)。"""
         try:
             import script_runner_ai as sr_ai
 
             all_settings = settings_module.load_settings(
                 self.settings_path)
             section = all_settings.get("script_runner") or {}
-            profiles, active = sr_ai.sanitize_profiles(section)
-            if index >= len(profiles) or index == active:
-                return
+            watch = sr_ai.sanitize_watch_profiles(section)
+            if checked and name not in watch:
+                watch.append(name)
+            if not checked and name in watch:
+                watch.remove(name)
+            profiles, _active = sr_ai.sanitize_profiles(section)
+            order = [entry["name"] for entry in profiles]
+            watch = [n for n in order if n in set(watch)]
             settings_module.update_settings_section(
-                "script_runner",
-                sr_ai.profiles_settings(profiles, index),
+                "script_runner", {"ai_watch_profiles": watch},
                 self.settings_path)
-            name = profiles[index]["name"]
         except Exception as e:  # noqa: BLE001  理由は注記で出す
-            self._set_note(f"連携先を切り替えられませんでした: {e}",
-                           "error")
+            self._set_note(
+                f"見張りを切り替えられませんでした: {e}", "error")
             self._refresh_ai_label()
             return
-        self._ai_name = name
-        self.ai_combo.setToolTip(
-            f"いま連携している AI は「{name}」です")
-        self._refresh_send_ready()
-        self._diag(f"連携先を切り替えました: {name}")
-        self._set_note(f"連携先を「{name}」に切り替えました", "ok")
+        if checked:
+            self._diag(f"見張りに追加しました: {name}")
+            self._set_note(f"{name} を見張りに追加しました", "ok")
+        else:
+            self._diag(f"見張りから外しました: {name}")
+            self._set_note(f"{name} の見張りを外しました", "ok")
+        self._refresh_ai_label()
 
     def _version_label(self) -> str:
         try:
@@ -1752,7 +1865,9 @@ class ScriptRunnerWindow(QWidget):
         self._delegate.tint = QColor(*theme["selection_tint"])
         muted_style = f"color: {theme['muted']}; font-size: 11px;"
         self.version_label.setStyleSheet(muted_style)
-        self.ai_caption.setStyleSheet(muted_style)
+        # 階の矢印や見出しはテーマ色で作るので、作り直して
+        # 当て直す (2.15)。
+        self._refresh_ai_label()
         self.result_caption.setStyleSheet(muted_style)
         self.folder_caption.setText(self._caption_html())
         self.note.setStyleSheet(
@@ -2003,43 +2118,22 @@ class ScriptRunnerWindow(QWidget):
                 elapsed = time.monotonic() - stage_since
             ratio = core.stage_color_ratio(stage, elapsed)
             color = core.stage_color(stage, elapsed)
-        blocks = getattr(self, "_stage_chips", None)
-        if blocks:
-            order = core.STAGE_ORDER
-            current = order.index(stage) if stage in order else -1
-            for index, key in enumerate(order):
-                block = blocks[key]
-                label = core.STAGE_LABELS[key]
-                if self._emergency_stopped or current < 0 \
-                        or index > current:
-                    block.setText(label)
-                    block.setStyleSheet(
-                        self._stage_block_style("idle"))
-                elif index < current:
-                    block.setText(label + " ✓")
-                    block.setStyleSheet(
-                        self._stage_block_style("done"))
+        floors = getattr(self, "_floors", None)
+        if floors:
+            # 段階が動いている間 (と非常停止中) だけ、既定の
+            # 投げ先の階へ段階と数字を描く。待機中は全部の階を
+            # 階ごとの描き方にする (2.23。見張っていない既定の
+            # 階にカウントアップが出る実機報告への直し)。
+            active_name = self._stage_floor_name() \
+                if stage is not None or self._emergency_stopped \
+                else None
+            for name, floor in floors.items():
+                if name == active_name:
+                    self._render_floor_active(
+                        floor, stage, color, ratio)
                 else:
-                    block.setText(label)
-                    block.setStyleSheet(self._stage_block_style(
-                        "now", color, ratio))
-        watch = getattr(self, "_watch_chip", None)
-        if watch is not None:
-            watch_state = self._watch_block_state()
-            if watch_state == "stopped":
-                watch.setText("停止")
-                watch.setStyleSheet(
-                    self._stage_block_style("stopped"))
-            elif watch_state == "lit":
-                watch.setText("監視")
-                watch.setStyleSheet(
-                    self._stage_block_style("watch"))
-            else:
-                watch.setText("監視")
-                watch.setStyleSheet(
-                    self._stage_block_style("idle"))
+                    self._render_floor_idle(name, floor)
         if getattr(self, "_big_panel", None) is not None:
-            self._refresh_big_number()
             item_text = self._big_item_text()
             self._big_item.setText(item_text)
             self._big_item.setToolTip(item_text)
@@ -2051,8 +2145,120 @@ class ScriptRunnerWindow(QWidget):
                     self._emergency_stopped))
             self._update_pulse()
 
-    def _refresh_big_number(self):
-        """大きな数字とその小さい見出しを付け直す (1.64)。
+    def _stage_floor_name(self) -> str:
+        """段階を描く階の名前 (2.15)。
+
+        段階や連鎖が動いている間は、動いている項目の出どころ
+        (item.ai) の階へ描く。合図だけの連鎖 (項目が無い) や
+        待機中は既定の投げ先の階 (2.21、元の「主の階」)。"""
+        floors = getattr(self, "_floors", None) or {}
+        if not floors:
+            return ""
+        if self._display_stage()[0] is not None \
+                or getattr(self, "_running_item", None) is not None \
+                or getattr(self, "_ai_filling", False) \
+                or getattr(self, "_ai_sending", False):
+            for item in (getattr(self, "_running_item", None),
+                         getattr(self, "_display_item", None),
+                         getattr(self, "_ack_pending_answer", None)):
+                ai = getattr(item, "ai", None)
+                if ai and ai in floors:
+                    return ai
+        if self._ai_name in floors:
+            return self._ai_name
+        return next(iter(floors))
+
+    def _render_floor_active(self, floor, stage, color, ratio):
+        """動いている側の階へ段階と数字を描く (2.15)。
+
+        段階ブロック・監視ブロック・数字の付け直しは、大きな
+        進捗表示 (1.64) の作法そのままを、その階の部品へ
+        当てる。"""
+        blocks = floor["chips"]
+        order = core.STAGE_ORDER
+        current = order.index(stage) if stage in order else -1
+        for index, key in enumerate(order):
+            block = blocks[key]
+            label = core.STAGE_LABELS[key]
+            if self._emergency_stopped or current < 0 \
+                    or index > current:
+                block.setText(label)
+                block.setStyleSheet(self._floor_block_style("idle"))
+            elif index < current:
+                block.setText(label + " ✓")
+                block.setStyleSheet(self._floor_block_style("done"))
+            else:
+                block.setText(label)
+                block.setStyleSheet(self._floor_block_style(
+                    "now", color, ratio))
+        watch = floor["watch"]
+        watch_state = self._watch_block_state()
+        if watch_state == "stopped":
+            watch.setText("停止")
+            watch.setStyleSheet(self._floor_block_style("stopped"))
+        elif watch_state == "lit":
+            watch.setText("監視")
+            watch.setStyleSheet(self._floor_block_style("watch"))
+        else:
+            watch.setText("監視")
+            watch.setStyleSheet(self._floor_block_style("idle"))
+        self._refresh_big_number(floor["number"], floor["caption"])
+
+    def _render_floor_idle(self, name, floor):
+        """動いていない側の階を描く (2.15)。
+
+        段階は全部沈める。見張っている階は監視ブロックを青く
+        光らせ、見出しは監視中 (追いかけ中ならその旨)。見張っ
+        ていない階は名前も薄くして、見出しに「待受なし」と
+        出す。"""
+        for key in core.STAGE_ORDER:
+            block = floor["chips"][key]
+            block.setText(core.STAGE_LABELS[key])
+            block.setStyleSheet(self._floor_block_style("idle"))
+        state = next(
+            (s for s in self._watch_list if s.name == name), None)
+        watching = state is not None and state.profile is not None
+        watch = floor["watch"]
+        watch.setText("監視")
+        if self._emergency_stopped:
+            watch.setStyleSheet(self._floor_block_style("idle"))
+            floor["number"].setText("―")
+            floor["caption"].setText("非常停止中")
+        elif watching:
+            watch.setStyleSheet(self._floor_block_style("watch"))
+            # この窓の待機のカウントアップ (2.23)。起点は
+            # 走査の適用で立てるのが本筋だが、起動直後は適用を
+            # 通らない窓があり起点が立たない (実機報告)。
+            # 候補が無く起点も無ければ、今を起点にする
+            # (1.76 の捕捉と同じ作法、2.24)。
+            if state.holder is not None:
+                floor["number"].setText("―")
+            else:
+                if state.idle_since is None:
+                    state.idle_since = time.monotonic()
+                floor["number"].setText(core.format_elapsed(
+                    time.monotonic() - state.idle_since))
+            if time.monotonic() < state.chase_until:
+                floor["caption"].setText("追いかけ中")
+            else:
+                floor["caption"].setText("監視中")
+        else:
+            watch.setStyleSheet(self._floor_block_style("idle"))
+            floor["number"].setText("―")
+            floor["caption"].setText("待受なし")
+        check = floor.get("check")
+        if check is not None:
+            check.setStyleSheet(
+                "font-size: 11px;" if watching else
+                f"font-size: 11px; color: {self._theme()['muted']};")
+        elif floor.get("name_label") is not None:
+            floor["name_label"].setStyleSheet(
+                "font-size: 11px;" if watching else
+                f"font-size: 11px; color: {self._theme()['muted']};")
+
+
+    def _refresh_big_number(self, number_label, caption_label):
+        """階の数字とその小さい見出しを付け直す (1.64、2.15 で階へ)。
 
         非常停止中は「停止」(赤、見出しは非常停止中)。実行中
         で進捗の申告があれば「2/3」(見出しは進捗)。実行中は
@@ -2071,43 +2277,44 @@ class ScriptRunnerWindow(QWidget):
             self._idle_since = time.monotonic()
         if self._emergency_stopped:
             value, caption = "停止", "非常停止中"
-            style = ("font-size: 34px; font-weight: bold;"
+            style = ("font-size: 17px; font-weight: bold;"
                      " color: #e03131;")
         elif self._run_started_at is not None \
                 and self._run_progress is not None:
             value = (f"{self._run_progress[0]}"
                      f"/{self._run_progress[1]}")
             caption = "進捗"
-            style = "font-size: 34px; font-weight: bold;"
+            style = "font-size: 17px; font-weight: bold;"
         elif self._run_started_at is not None:
             value = core.format_elapsed(
                 time.monotonic() - self._run_started_at)
             caption = "経過"
-            style = "font-size: 34px; font-weight: bold;"
+            style = "font-size: 17px; font-weight: bold;"
         elif self._display_stage()[0] is not None:
             _ds, _dss = self._display_stage()
             value = core.format_elapsed(
                 time.monotonic() - _dss)
             caption = core.STAGE_LABELS[_ds]
-            style = "font-size: 34px; font-weight: bold;"
+            style = "font-size: 17px; font-weight: bold;"
         elif self._watch_block_state() == "lit" \
                 and self._idle_since is not None:
             value = core.format_elapsed(
                 time.monotonic() - self._idle_since)
             caption = "監視中"
-            style = "font-size: 34px; font-weight: bold;"
+            style = "font-size: 17px; font-weight: bold;"
         elif self._last_run_seconds is not None:
             value = core.format_elapsed(self._last_run_seconds)
             caption = "所要"
-            style = "font-size: 34px; font-weight: bold;"
+            style = "font-size: 17px; font-weight: bold;"
         else:
             value = "―"
             caption = "監視中" \
                 if self._watch_block_state() == "lit" else "待機中"
-            style = "font-size: 34px; font-weight: bold;"
-        self._big_number.setText(value)
-        self._big_number.setStyleSheet(style)
-        self._big_number_caption.setText(caption)
+            style = "font-size: 17px; font-weight: bold;"
+        number_label.setText(value)
+        number_label.setStyleSheet(style)
+        caption_label.setText(caption)
+
 
     def _big_item_text(self) -> str:
         """大きな進捗表示の対象行 (1.64)。
@@ -2172,33 +2379,57 @@ class ScriptRunnerWindow(QWidget):
                     or flags.get("auto_reset")
                     or flags.get("auto_rerun"))
 
-    def _update_pulse(self):
-        """大きな進捗表示の明滅の出入り (1.64)。
+    def _floor_pulsing(self, name) -> bool:
+        """その階が明滅するか (2.16、2.23 で全階同じ判定に)。
 
-        ループ実施中だけタイマを回し、止まるときは不透明度を
-        1へ戻す。_refresh_status_strip (1秒ごと) から呼ばれ、
-        非常停止の付け替えもそちら経由でここへ届く。"""
+        非常停止中はどこも明滅しない。それ以外は、その階の
+        窓が見張りに入っている (状態があり、プロファイルが
+        割り当たっている) 間だけ明滅する。既定の投げ先の階
+        だけ別判定だった作りは 2.23 でやめた (見張りを外した
+        階が明滅し続ける実機報告への直し)。"""
+        if self._emergency_stopped:
+            return False
+        floors = getattr(self, "_floors", None) or {}
+        if not floors:
+            return False
+        state = next(
+            (s for s in self._watch_list if s.name == name), None)
+        return state is not None and state.profile is not None
+
+    def _update_pulse(self):
+        """階ごとの明滅の出入り (1.64、2.16 で階ごとへ)。
+
+        明滅する階が1つでもあればタイマを回し、無ければ止めて
+        全部の階の背景の層を透明へ戻す。_refresh_status_strip
+        (1秒ごと) から呼ばれ、非常停止の付け替えもそちら経由
+        でここへ届く。"""
         timer = getattr(self, "_pulse_timer", None)
-        effect = getattr(self, "_pulse_effect", None)
-        if timer is None or effect is None:
+        floors = getattr(self, "_floors", None)
+        if timer is None or not floors:
             return
-        if self._loop_watching():
+        if any(self._floor_pulsing(name) for name in floors):
             if not timer.isActive():
                 timer.start(50)
         else:
             if timer.isActive():
                 timer.stop()
-            effect.setOpacity(1.0)
+            for floor in floors.values():
+                floor["effect"].setOpacity(0.0)
 
     def _tick_pulse(self):
-        """明滅の1コマ (1.64)。周期 約3.4秒で、不透明度が
-        0.45〜1.0 の間を滑らかに往復する。"""
-        effect = getattr(self, "_pulse_effect", None)
-        if effect is None:
+        """明滅の1コマ (1.64、2.16 で階ごとへ、2.25 で背景の
+        層だけに)。周期 約3.4秒で、背景の層 (グリーン) の
+        不透明度が滑らかに往復する。明滅しない階は透明な
+        まま (背景なし)。"""
+        floors = getattr(self, "_floors", None)
+        if not floors:
             return
         phase = (time.monotonic() % 3.4) / 3.4
-        effect.setOpacity(
-            0.725 - 0.275 * math.cos(2.0 * math.pi * phase))
+        ratio = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+        for name, floor in floors.items():
+            floor["effect"].setOpacity(
+                ratio * 0.55 if self._floor_pulsing(name) else 0.0)
+
 
     def _toggle_emergency_stop(self):
         """非常停止ボタンの仕事 (1.63)。
@@ -2258,15 +2489,19 @@ class ScriptRunnerWindow(QWidget):
             "dl": "DL", "run": "実行", "answer": "回答",
             "send": "送信",
         }
-        dual_label = "切"
+        link_label = ""
         try:
             section = settings_module.load_settings(
                 self.settings_path).get("script_runner") or {}
-            dual = sr_ai.sanitize_dual_watch(section)
-            if dual["enabled"]:
-                dual_label = "入（副 " + (
-                    dual["secondary"] or "自動") + "）"
-        except Exception:  # noqa: BLE001  読めなければ切として出す
+            # 見張る窓の行は階のチェックと同じ並びにする
+            # (2.14 の連携先の行を 2.23 でこの行へ一本化)。
+            watch = sr_ai.sanitize_watch_profiles(section)
+            profiles, active = sr_ai.sanitize_profiles(section)
+            link_label = " ".join(
+                ("☑" if entry["name"] in watch else "☐")
+                + entry["name"]
+                for index, entry in enumerate(profiles))
+        except Exception:  # noqa: BLE001  読めなければなしとして出す
             pass
         last_failure = ""
         for item in self._items:
@@ -2293,9 +2528,9 @@ class ScriptRunnerWindow(QWidget):
                 if item.status == core.STATUS_ERROR),
             last_failure,
             self._automation_flags(),
-            dual_label,
             self._ai_name,
-            self._emergency_stopped)
+            self._emergency_stopped,
+            link_label=link_label)
 
     def _show_status_qr(self):
         """状態QR のダイアログを出す (2.09)。
@@ -3742,15 +3977,12 @@ class ScriptRunnerWindow(QWidget):
             tools_folder_opener=self._open_tools_folder,
             tool_searcher=core.search_cli_tool,
             initial_tab=initial_tab,
-            dual_watch=sr_ai.sanitize_dual_watch(section)["enabled"],
-            secondary_name=sr_ai.sanitize_dual_watch(
-                section)["secondary"])
+            watch_names=sr_ai.sanitize_watch_profiles(section))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updates = sr_ai.profiles_settings(
             dialog.profiles(), dialog.active_index())
-        updates["ai_dual_watch"] = dialog.dual_watch()
-        updates["ai_secondary_profile"] = dialog.secondary_name()
+        updates["ai_watch_profiles"] = dialog.watch_names()
         updates.update(dialog.automation())
         updates["intro_prompt"] = dialog.intro_prompt()
         updates.update(dialog.common_values())
@@ -4413,14 +4645,33 @@ class ScriptRunnerWindow(QWidget):
                 for item in self._items)
         return False
 
-    def _sync_watch_states(self):
-        """見張る窓の並びを、今の設定に合わせる (2.08)。
+    def _default_state(self):
+        """既定の投げ先の見張り状態 (2.21)。
 
-        先頭は有効なプロファイル (主)。二重待受が入っていれば
-        副を1つ足す (名前の指定があればそれ、無ければ有効でない
-        最初のプロファイル)。プロファイルの辞書は毎回作り直す
-        (設定の読み直しと同じ作法)。状態は名前で引き継ぎ、
-        並びから外れた窓の状態は捨てる (特別行も一緒に消える)。"""
+        出どころが決まらない操作 (出どころを付けられなかった
+        走査結果や応答、手動の押下など) の受け先は、設定で
+        選んだプロファイル (既定の投げ先) の見張り状態を
+        優先し、それが見張りに入っていなければ見張りの
+        先頭にする。見張りがゼロなら同期前の代表の状態。"""
+        state = (getattr(self, "_watches", None) or {}).get(
+            getattr(self, "_ai_name", "") or "")
+        if state is not None:
+            return state
+        watch_list = getattr(self, "_watch_list", None) or []
+        if watch_list:
+            return watch_list[0]
+        return self._primary_state
+
+    def _sync_watch_states(self):
+        """見張る窓の並びを、今の設定に合わせる (2.08、集合化は
+        2.20)。
+
+        見張る窓は名前の集合 (ai_watch_profiles、無ければ旧
+        キーから導く) で決まり、並びはプロファイル一覧の順。
+        個数の上限は無い (ゼロも可、その間は自動の検出・応答は
+        止まる)。プロファイルの辞書は毎回作り直す (設定の読み
+        直しと同じ作法)。状態は名前で引き継ぎ、並びから外れた
+        窓の状態は捨てる (特別行も一緒に消える)。"""
         import script_runner_ai as sr_ai
 
         try:
@@ -4428,27 +4679,12 @@ class ScriptRunnerWindow(QWidget):
                 self.settings_path)
             section = all_settings.get("script_runner") or {}
             profiles, active = sr_ai.sanitize_profiles(section)
-            dual = sr_ai.sanitize_dual_watch(section)
-        except Exception:  # noqa: BLE001  読めなければ主だけ
+            watch_names = sr_ai.sanitize_watch_profiles(section)
+        except Exception:  # noqa: BLE001  読めなければ見張りなし
             profiles, active = [], 0
-            dual = {"enabled": False, "secondary": ""}
-        desired = []
-        if profiles:
-            desired.append(profiles[active])
-            if dual["enabled"] and len(profiles) > 1:
-                secondary = None
-                for index, entry in enumerate(profiles):
-                    if index != active \
-                            and entry["name"] == dual["secondary"]:
-                        secondary = entry
-                        break
-                if secondary is None:
-                    for index, entry in enumerate(profiles):
-                        if index != active:
-                            secondary = entry
-                            break
-                if secondary is not None:
-                    desired.append(secondary)
+            watch_names = []
+        desired = [entry for entry in profiles
+                   if entry["name"] in watch_names]
         states = []
         for position, entry in enumerate(desired):
             name = entry["name"]
@@ -4469,13 +4705,14 @@ class ScriptRunnerWindow(QWidget):
         if states:
             self._primary_state = states[0]
         # 設定済みかは、大きな進捗表示の明滅 (1.64) が「AI 窓の
-        # 見張りが立っているか」の判定にも使う。
-        self._ai_configured = bool(
-            states and states[0].profile is not None)
+        # 見張りが立っているか」の判定にも使う。見張る窓の
+        # どれかに投げ先が設定されていればよい (2.20)。
+        self._ai_configured = any(
+            state.profile is not None for state in states)
         return states
 
     def _holders(self):
-        """表示中の DL 候補 (特別行) の並び (主→副の順)。"""
+        """表示中の DL 候補 (特別行) の並び (見張る窓の並び順)。"""
         return [state.holder for state in self._watch_list
                 if state.holder is not None]
 
@@ -4483,8 +4720,8 @@ class ScriptRunnerWindow(QWidget):
         """チャットの DL 候補の検出を、間引いて裏で回す。
 
         フォルダの見回り (_poll_inner) の終わりに呼ばれる。
-        見張る窓ごとに _maybe_check_one を回す (二重待受が入って
-        いれば2窓、切なら従来どおり主の1窓だけ)。"""
+        見張る窓ごとに _maybe_check_one を回す (2.20 で集合化、
+        窓の数はいくつでもよい)。"""
         for state in self._sync_watch_states():
             # 候補と同じファイルが一覧に来たら、その窓の特別行
             # は役目を終える (人が手で落とした場合など。検出の
@@ -4602,15 +4839,13 @@ class ScriptRunnerWindow(QWidget):
             state.last_check = 0.0
 
     def _refresh_chase_label(self):
-        """追いかけモードの印の出入り (2.07)。
+        """追いかけモードの印の付け直し (2.07、2.15 で階の見出しへ)。
 
-        どれか1つの窓でも追いかけ中なら印を出す (2.08)。"""
-        label = getattr(self, "chase_label", None)
-        if label is not None:
-            now = time.monotonic()
-            label.setVisible(any(
-                now < state.chase_until
-                for state in self._watch_list))
+        追いかけ中かどうかは階の見出しに出るので、進捗表示の
+        付け直しを呼ぶだけにする。"""
+        if getattr(self, "_floors", None):
+            self._refresh_status_strip()
+
 
     def _show_banner(self, text, seconds=6):
         """検知の帯を出す (2.07)。"""
@@ -4643,6 +4878,15 @@ class ScriptRunnerWindow(QWidget):
         消費済みの控えは、その候補を見つけた窓のもの (2.08)。"""
         if holder.key in state.consumed:
             return "消費済み"
+        # DL 済みの物と、AI 名 (この窓) とコマンドIDが一致
+        # したら出さない (2.25、Nagato の提案)。概要の照合
+        # より確実に当たるので先に見る。
+        holder_id = _holder_command_id(holder)
+        if holder_id and any(
+                core.parse_command_id(item.name) == holder_id
+                and item.ai == state.name
+                for item in self._items):
+            return "一覧に既にある（ID・AI名一致）"
         # 同じファイルが既に一覧にあるか (名前・概要での判定)。
         if not self._dl_holder_in_items(holder):
             return None
@@ -4677,9 +4921,10 @@ class ScriptRunnerWindow(QWidget):
 
     def _on_dl_checked(self, result):
         # どの窓の結果かで、その窓の状態へ処理する (2.08)。
-        # 付けられなかった結果は主の窓として受ける。
+        # 付けられなかった結果は既定の投げ先の窓として受ける
+        # (2.21)。
         watch_name = getattr(result, "watch", "") or ""
-        state = self._watches.get(watch_name) or self._primary_state
+        state = self._watches.get(watch_name) or self._default_state()
         state.checking = False
         if getattr(result, "kind", "scan") == "signature":
             self._on_signature_checked(result, state)
@@ -4827,6 +5072,10 @@ class ScriptRunnerWindow(QWidget):
                                len(holders)))
         if chosen is None:
             # 落とすものは無い (候補自体が無いか、全部が抑制)。
+            # この窓の待機の起点を立てる (2.23、階の
+            # カウントアップ用。既に立っていればそのまま)。
+            if state.idle_since is None:
+                state.idle_since = time.monotonic()
             # 特別行があれば下げる。
             if state.holder is not None:
                 if holders:
@@ -4847,6 +5096,7 @@ class ScriptRunnerWindow(QWidget):
             return  # 同じ候補のまま。検出時刻もそのままにする
         holder.watch = state.name
         state.holder = holder
+        state.idle_since = None
         state.last_candidate_key = holder.key
         self._diag(
             f"DL候補を表示: {holder.summary or holder.label}")
@@ -4877,9 +5127,10 @@ class ScriptRunnerWindow(QWidget):
         押下役 (既定は _default_ai_dl_presser) の中で、候補は
         探し直してから Invoke で押す。投入と同じく裏方仕事なので
         別スレッドで回し、終わりはシグナルで受ける。押す窓は
-        候補が出た窓 (state、2.08)。state が無ければ主の窓。"""
+        候補が出た窓 (state、2.08)。state が無ければ既定の
+        投げ先の窓 (2.21)。"""
         if state is None:
-            state = self._primary_state
+            state = self._default_state()
         holder = state.holder
         if holder is None or self._dl_pressing:
             return
@@ -4944,7 +5195,7 @@ class ScriptRunnerWindow(QWidget):
             # 到着の確認は、落としたファイルが一覧に現れた時点
             # (_poll_candidate) で残す。候補の表示名を控えておく。
             press_state = self._watches.get(
-                self._dl_press_watch or "") or self._primary_state
+                self._dl_press_watch or "") or self._default_state()
             holder = press_state.holder
             self._dl_awaiting = (
                 holder.label if holder is not None else "",
@@ -5920,22 +6171,24 @@ class ScriptRunnerWindow(QWidget):
         self._fire_deferred_restart()
 
     # ---------------- 中継リクエストの合図 (2.10) ----------------
-    def _post_relay_ack(self, text):
-        """中継の経過を、主のチャットへ短い返事 (ACK) で返す
-        (2.12)。
+    def _post_relay_ack(self, text, state=None):
+        """中継の経過を、送り元のチャットへ短い返事 (ACK) で
+        返す (2.12、宛先は 2.17 で送り元の窓へ)。
 
-        中継は一方通行で、成否が動作ログにしか残らず、主の
-        チャット側からは発火したかどうか見えなかった。発火・
-        見送り・成否を主の窓へ1件返して、見えるようにする。
-        返事は回答の連鎖と同じ役 (入れる役・押す役) で主の
+        中継は一方通行で、成否が動作ログにしか残らず、送り元
+        のチャット側からは発火したかどうか見えなかった。発火・
+        見送り・成否を送り元の窓へ1件返して、見えるようにする。
+        返事は回答の連鎖と同じ役 (入れる役・押す役) で送り元の
         プロファイルへ送る。連鎖の途中や送信中はログだけに
-        残す (割り込まない)。"""
+        残す (割り込まない)。state が無ければ既定の投げ先の
+        窓へ返す (2.21)。"""
         if self._relay_ack_sending or self._chain_in_flight():
             return
-        watch_list = getattr(self, "_watch_list", None) or []
         profile = None
-        if watch_list:
-            profile = getattr(watch_list[0], "profile", None)
+        if state is not None:
+            profile = getattr(state, "profile", None)
+        if profile is None:
+            profile = getattr(self._default_state(), "profile", None)
         if profile is None:
             try:
                 configured, profile = self._resolve_ai_target()
@@ -5965,14 +6218,17 @@ class ScriptRunnerWindow(QWidget):
     def _on_relay_ack_done(self, result):
         self._relay_ack_sending = False
         if getattr(result, "ok", False):
-            self._diag("中継の返事（ACK）を主のチャットへ送りました")
+            self._diag("中継の返事（ACK）を送り元のチャットへ送りました")
         else:
             message = str(getattr(result, "message", "") or "")
             self._diag(f"中継の返事（ACK）に失敗: {message}")
 
-    def _note_relay_once(self, mid: str, key: str, text: str):
+    def _note_relay_once(self, mid: str, key: str, text: str,
+                         state=None, ack=True):
         """見送りの理由を、同じ目印・同じ理由では1度だけ診断に
-        残す (他の合図と同じ作法)。"""
+        残し、送り元の窓へ ACK でも返す (他の合図と同じ作法)。
+        ack=False なら診断だけ (送り元でない窓で見つけた目印
+        など、返事を返す先が無い・返すべきでないとき)。"""
         if len(self._relay_noted) > 50:
             self._relay_noted.clear()
         stamp = (mid, key)
@@ -5980,10 +6236,11 @@ class ScriptRunnerWindow(QWidget):
             return
         self._relay_noted.add(stamp)
         self._diag(text)
-        self._post_relay_ack(text)
+        if ack:
+            self._post_relay_ack(text, state=state)
 
     def _stash_relay_pending(self, mid, key, body, retries=0,
-                             delay=0.0):
+                             delay=0.0, src="", dst=""):
         """中継の保留を本文ごとファイルの控えへ残す (2.13)。
 
         保留のまま目印が古くなって走査から消えても、控えから
@@ -5998,10 +6255,15 @@ class ScriptRunnerWindow(QWidget):
             at = existing["at"] or now
             if not retries:
                 retries = existing["retries"]
+            if not src:
+                src = existing.get("src") or ""
+            if not dst:
+                dst = existing.get("dst") or ""
         self._relay_auto["pending"] = {
             "id": mid, "key": key, "body": body, "at": at,
             "retries": int(retries),
             "not_before": now + delay if delay else 0.0,
+            "src": src, "dst": dst,
         }
         core.save_relay_auto(self._relay_auto)
 
@@ -6022,8 +6284,8 @@ class ScriptRunnerWindow(QWidget):
         """控えに残った中継の保留を、条件がそろえば送る
         (2.13)。
 
-        目印が走査から消えた後でも届けるための経路。主の窓の
-        走査結果からのみ呼ばれ、寿命切れ・消費済みは控えを
+        目印が走査から消えた後でも届けるための経路。送り元の
+        窓の走査結果からのみ呼ばれ、寿命切れ・消費済みは控えを
         片づける。条件がそろわない間は黙って控えを残す
         (見送りの理由は検出時に知らせ済み)。"""
         pending = core.sanitize_relay_pending(
@@ -6044,8 +6306,25 @@ class ScriptRunnerWindow(QWidget):
             return
         watch_list = getattr(self, "_watch_list", None) or []
         dispatch = getattr(self, "_dispatch_state", None)
-        if len(watch_list) < 2 or dispatch is not watch_list[0]:
-            return
+        src_name = pending.get("src") or ""
+        dst_name = pending.get("dst") or ""
+        if src_name and dst_name:
+            # 経路の記録がある控え (2.17): 送り元の窓の走査から
+            # だけ送り、送り先は記録のとおり。
+            if dispatch is None or dispatch.name != src_name:
+                return
+            target = self._watches.get(dst_name)
+            if target is None:
+                return
+        else:
+            # 2.13 までの控え (経路の記録なし) の互換経路。
+            # 見張りの先頭の窓の走査から、2番目へ送る (控えの
+            # 寿命は10分なので、2.17 以降に作られた控えには
+            # 必ず経路が入っており、ここへ来ることはほぼ無い)。
+            if len(watch_list) < 2 or dispatch is not watch_list[0]:
+                return
+            target = watch_list[1]
+            src_name = watch_list[0].name
         if not self._automation_flags()["auto_relay"]:
             return
         if self._emergency_stopped:
@@ -6061,19 +6340,48 @@ class ScriptRunnerWindow(QWidget):
         self._clear_relay_pending(pending["id"])
         self._diag("中継の保留を控えから送ります")
         self._fire_auto_relay(pending["id"], pending["key"],
-                              pending["body"], watch_list[1],
-                              retries=retries)
+                              pending["body"], target,
+                              retries=retries, source_name=src_name)
+
+    def _relay_route_for_arg(self, arg: str):
+        """中継の引数「送り元2送り先」をプロファイル名の組へ
+        ほどく (2.17)。
+
+        名前は設定のプロファイル一覧と照合する (組の全体が
+        一致するものを探すので、「2」を含む名前でも壊れない)。
+        ほどけなければ None。"""
+        try:
+            import script_runner_ai as sr_ai
+
+            section = settings_module.load_settings(
+                self.settings_path).get("script_runner") or {}
+            profiles, _active = sr_ai.sanitize_profiles(section)
+        except Exception:  # noqa: BLE001  ほどけないものとして扱う
+            return None
+        names = [p["name"] for p in profiles]
+        for src_name in names:
+            for dst_name in names:
+                if src_name != dst_name and \
+                        arg == f"{src_name}2{dst_name}":
+                    return src_name, dst_name
+        return None
 
     def _maybe_auto_relay(self, marker):
-        """中継リクエストの目印を判定する (2.10)。
+        """中継リクエストの目印を判定する (2.10、経路は 2.17)。
 
-        反応するのは、主の窓からの合図で、二重待受が入っていて
-        副の窓があり、切替「合図で副のAIへ自動で中継する」が
+        経路は目印の引数「送り元2送り先」で決まる (引数が
+        無ければ、見張りが2つのときだけ「もう一方」へ)。
+        引数つきは、送り元の窓からの合図のときだけ反応する。
+        あわせて、切替「合図で別のAIへ自動で中継する」が
         入っていて、同じ発言を消費済みでなく、直近の中継から
         60秒以上空いていて、回答・送信の連鎖が空いているとき
-        だけ。送る文は目印の次の行から発言の末尾まで (走査側が
-        body に入れて寄こす)。保留になった中継は本文ごと控え
-        に残し、目印が消えた後でも控えから送る (2.13)。"""
+        だけ送る。送る文は目印の次の行から発言の末尾まで
+        (走査側が body に入れて寄こす)。受け付けられない
+        目印 (引数がほどけない・本文が無い・自動中継がオフ
+        など) には、理由を「中継NACK: 」で送り元へ返す
+        (2.19)。保留になった中継は
+        本文と経路ごと控えに残し、目印が消えた後でも控えから
+        送る (2.13)。"""
         mid = ""
         key = ""
         body = ""
@@ -6081,7 +6389,7 @@ class ScriptRunnerWindow(QWidget):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
             body = str(marker.get("body") or "")
-        if not mid or not body:
+        if not mid:
             self._relay_marker_pending = None
             self._maybe_fire_relay_pending()
             return
@@ -6091,32 +6399,81 @@ class ScriptRunnerWindow(QWidget):
             self._relay_marker_pending = None
             self._clear_relay_pending(mid)
             return
+        watch_list = getattr(self, "_watch_list", None) or []
+        dispatch = getattr(self, "_dispatch_state", None)
         if self._refire_suppressed(self._relay_auto, body):
             self._relay_marker_pending = None
             self._note_relay_once(
                 mid, "refire",
                 "中継リクエストの再応答を抑止（同定子が外れた"
-                "再検出とみられる）")
+                "再検出とみられる）", state=dispatch)
             return
-        watch_list = getattr(self, "_watch_list", None) or []
-        dispatch = getattr(self, "_dispatch_state", None)
-        if not watch_list or dispatch is not watch_list[0]:
-            self._note_relay_once(
-                mid, "not-main",
-                "中継リクエストは主の窓からの合図だけ"
-                "受け付けます（副の窓からは中継しません）")
-            return
-        if len(watch_list) < 2:
-            self._note_relay_once(
-                mid, "no-dual",
-                "中継リクエストを検出（二重待受が切のため"
-                "中継しません）")
-            return
+        # 経路の解決 (2.17)。引数つきは送り元の窓からの合図
+        # だけを受け、送り先は引数のとおり。引数なしは、見張り
+        # が2つのときだけ「もう一方」へ送る。
+        arg = ""
+        if isinstance(marker, dict):
+            arg = str(marker.get("arg") or "")
+        dst_state = None
+        if arg:
+            pair = self._relay_route_for_arg(arg)
+            if pair is None:
+                self._note_relay_once(
+                    mid, "bad-arg",
+                    f"中継NACK: 引数が分かりません"
+                    f"（{arg}）", state=dispatch)
+                return
+            src_name, dst_name = pair
+            if dispatch is None or dispatch.name != src_name:
+                self._note_relay_once(
+                    mid, "wrong-src",
+                    f"中継リクエスト: 送り元（{src_name}）の"
+                    "窓でないため中継しません",
+                    state=dispatch, ack=False)
+                return
+            dst_state = self._watches.get(dst_name)
+            if dst_state is None:
+                self._note_relay_once(
+                    mid, "no-dst",
+                    f"中継NACK: 送り先（{dst_name}）を"
+                    "見張っていないため送れません", state=dispatch)
+                return
+        else:
+            if len(watch_list) < 2:
+                self._note_relay_once(
+                    mid, "no-dual",
+                    "中継NACK: 見張っている窓が"
+                    "1つだけのため送れません",
+                    state=dispatch)
+                return
+            if len(watch_list) > 2:
+                self._note_relay_once(
+                    mid, "need-arg",
+                    "中継NACK: 見張りが3つ以上あるため、"
+                    "引数で送り先を指定してください",
+                    state=dispatch)
+                return
+            if dispatch is None:
+                return
+            dst_state = watch_list[1] \
+                if dispatch is watch_list[0] else watch_list[0]
+        src_name = dispatch.name if dispatch is not None else ""
+        dst_name = dst_state.name
         if not self._automation_flags()["auto_relay"]:
             self._note_relay_once(
                 mid, "off",
-                "中継リクエストを検出（副のAIへ自動で中継する"
-                "は切のため見送り）")
+                "中継NACK: 自動中継がオフのため"
+                "送りませんでした", state=dispatch)
+            return
+        if not body:
+            # 本文が無い目印は受け付けず、理由を NACK で返す
+            # (2.19)。黙って見送ると、送り元は「まだ見えて
+            # いない」のか「形式ミス」なのか区別できない。
+            self._note_relay_once(
+                mid, "empty-body",
+                "中継NACK: 本文がありません（目印の次の行か、"
+                "目印の行の引数の後ろに本文を書いてください）",
+                state=dispatch)
             return
         if self._refire_answered_at(self._relay_auto, body) \
                 is not None:
@@ -6127,27 +6484,33 @@ class ScriptRunnerWindow(QWidget):
             return
         if self._emergency_stopped:
             self._relay_marker_pending = mid
-            self._stash_relay_pending(mid, key, body)
+            self._stash_relay_pending(
+                mid, key, body, src=src_name, dst=dst_name)
             self._note_relay_once(
                 mid, "emergency",
-                "中継リクエスト: 非常停止中のため見送り")
+                "中継リクエスト: 非常停止中のため見送り",
+                state=dispatch)
             return
         last = float(self._relay_auto.get("last_sent_at") or 0.0)
         if time.time() - last < core.RELAY_AUTO_COOLDOWN_SEC:
             self._relay_marker_pending = mid
-            self._stash_relay_pending(mid, key, body)
+            self._stash_relay_pending(
+                mid, key, body, src=src_name, dst=dst_name)
             self._note_relay_once(
                 mid, "cooldown",
                 "中継リクエスト: 直近に送ったばかりのため"
-                "見送り（間隔が空いてから送ります）")
+                "見送り（間隔が空いてから送ります）",
+                state=dispatch)
             return
         if self._relay_sending or self._chain_in_flight():
             self._relay_marker_pending = mid
-            self._stash_relay_pending(mid, key, body)
+            self._stash_relay_pending(
+                mid, key, body, src=src_name, dst=dst_name)
             self._note_relay_once(
                 mid, "busy",
                 "中継リクエスト: 回答・送信の連鎖の途中のため"
-                "見送り（空いてから送ります）")
+                "見送り（空いてから送ります）",
+                state=dispatch)
             return
         self._relay_marker_pending = None
         pending = core.sanitize_relay_pending(
@@ -6155,8 +6518,8 @@ class ScriptRunnerWindow(QWidget):
         retries = pending["retries"] if (
             pending is not None and pending["id"] == mid) else 0
         self._clear_relay_pending(mid)
-        self._fire_auto_relay(mid, key, body, watch_list[1],
-                              retries=retries)
+        self._fire_auto_relay(mid, key, body, dst_state,
+                              retries=retries, source_name=src_name)
 
     def _consume_relay_marker(self, mid, key=""):
         if not mid:
@@ -6171,11 +6534,13 @@ class ScriptRunnerWindow(QWidget):
         core.save_relay_auto(self._relay_auto)
 
     def _fire_auto_relay(self, mid, key, body, target_state,
-                         retries=0):
-        """中継の文を、副の窓の入力欄へ入れて送信まで一気に
-        やる (裏方仕事)。入れる役・押す役は他の自動応答と
-        同じで、投げ先だけ副のプロファイルに差し替える。
-        retries は送り直しの回数 (2.13、完了側で上限を見る)。"""
+                         retries=0, source_name=""):
+        """中継の文を、送り先の窓の入力欄へ入れて送信まで
+        一気にやる (裏方仕事)。入れる役・押す役は他の自動応答
+        と同じで、投げ先だけ送り先のプロファイルに差し替える。
+        retries は送り直しの回数 (2.13、完了側で上限を見る)。
+        source_name は送り元のプロファイル名 (2.17、ACK の
+        宛先に使う)。"""
         profile = getattr(target_state, "profile", None)
         name = getattr(target_state, "name", "") or ""
         if profile is None:
@@ -6187,27 +6552,30 @@ class ScriptRunnerWindow(QWidget):
                     f"中継に失敗: 投げ先を解決できません（{e}）")
                 self._consume_relay_marker(mid, key)
                 self._post_relay_ack(
-                    "中継に失敗しました: 投げ先を解決できません")
+                    "中継に失敗しました: 投げ先を解決できません",
+                    state=self._watches.get(source_name))
                 return
             if not configured:
                 profile = None
         if profile is None:
-            self._diag("中継に失敗: 副のAIの投げ先が未設定")
+            self._diag(f"中継に失敗: {name}の投げ先が未設定")
             self._consume_relay_marker(mid, key)
             self._set_note(
-                "中継: 副のAIの投げ先が設定されていません",
+                f"中継: {name}の投げ先が設定されていません",
                 "error")
             self._post_relay_ack(
-                "中継に失敗しました: 副のAIの投げ先が"
-                "設定されていません")
+                f"中継に失敗しました: {name}の投げ先が"
+                "設定されていません",
+                state=self._watches.get(source_name))
             return
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._relay_sending = True
-        self._relay_auto_mid = (mid, key, body, name, retries)
-        self._diag(f"副のAI（{name}）へ中継します")
+        self._relay_auto_mid = (mid, key, body, name, retries,
+                                source_name)
+        self._diag(f"{name}へ中継します")
         self._publish_phal_status(
-            "send", f"副のAI（{name}）へ中継しています")
+            "send", f"{name}へ中継しています")
 
         import threading
 
@@ -6227,35 +6595,40 @@ class ScriptRunnerWindow(QWidget):
     def _on_relay_auto_done(self, result):
         self._relay_sending = False
         saved, self._relay_auto_mid = self._relay_auto_mid, None
-        if isinstance(saved, tuple) and len(saved) == 5:
+        source_name = ""
+        if isinstance(saved, tuple) and len(saved) == 6:
+            mid, key, body, name, retries, source_name = saved
+        elif isinstance(saved, tuple) and len(saved) == 5:
             mid, key, body, name, retries = saved
         elif isinstance(saved, tuple) and len(saved) == 4:
             mid, key, body, name = saved
             retries = 0
         else:
             mid, key, body, name, retries = "", "", "", "", 0
+        ack_state = self._watches.get(source_name) \
+            if source_name else None
         message = str(getattr(result, "message", "") or "")
         if getattr(result, "ok", False):
             self._relay_auto["last_sent_at"] = time.time()
             self._record_answered(self._relay_auto, body)
             self._consume_relay_marker(mid, key)
             self._clear_relay_pending(mid)
-            self._diag(f"副のAI（{name}）へ中継しました")
-            self._set_note(
-                f"副のAI（{name}）へ中継しました", "ok")
+            self._diag(f"{name}へ中継しました")
+            self._set_note(f"{name}へ中継しました", "ok")
             self._post_relay_ack(
-                f"中継しました: 副のAI（{name}）へ送りました")
+                f"中継しました: {name}へ送りました",
+                state=ack_state)
         elif getattr(result, "needs_confirm", False):
             self._consume_relay_marker(mid, key)
             self._clear_relay_pending(mid)
             self._diag(
                 f"中継を見送り（入力欄に書きかけ）: {message}")
             self._set_note(
-                "中継: 副のAIの入力欄に書きかけがあるため"
+                f"中継: {name}の入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
             self._post_relay_ack(
-                "中継を見送りました: 副のAIの入力欄に"
-                "書きかけがあります")
+                f"中継を見送りました: {name}の入力欄に"
+                "書きかけがあります", state=ack_state)
         elif retries < core.RELAY_RETRY_MAX:
             # 失敗は消費せず、少し置いて1回だけ送り直す
             # (2.13)。主側の送信と取り合ったような一時的な
@@ -6263,27 +6636,30 @@ class ScriptRunnerWindow(QWidget):
             # (needs_confirm) は送り直さない (上の分岐)。
             self._stash_relay_pending(
                 mid, key, body, retries=retries + 1,
-                delay=core.RELAY_RETRY_DELAY_SEC)
+                delay=core.RELAY_RETRY_DELAY_SEC,
+                src=source_name, dst=name)
             self._diag(
                 f"中継に失敗: {message}"
                 "（少し置いて1回だけ送り直します）")
             self._set_note(
-                f"副のAIへ中継できませんでした（{message}）"
+                f"{name}へ中継できませんでした（{message}）"
                 "。少し置いて送り直します", "warn")
             self._post_relay_ack(
                 f"中継に失敗しました: {message}"
-                "。少し置いて1回だけ送り直します")
+                "。少し置いて1回だけ送り直します",
+                state=ack_state)
         else:
             self._consume_relay_marker(mid, key)
             self._clear_relay_pending(mid)
             self._diag(f"中継に失敗: {message}")
             self._set_note(
-                f"副のAIへ中継できませんでした（{message}）",
+                f"{name}へ中継できませんでした（{message}）",
                 "error")
             self._post_relay_ack(
-                f"中継に失敗しました: {message}")
+                f"中継に失敗しました: {message}",
+                state=ack_state)
         if getattr(result, "ok", False):
-            self._publish_phal_idle("副のAIへ中継しました")
+            self._publish_phal_idle(f"{name}へ中継しました")
         else:
             self._publish_phal_idle("中継が終わりました")
         # 中継の送信を待っていた回答があれば、ここで進める

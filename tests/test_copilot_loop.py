@@ -602,12 +602,14 @@ def test_settings_manual_marker_scan():
 
 
 def test_relay_marker_scan():
-    """中継リクエストの目印 (2.10): 目印の次の行から同じ発言の
-    末尾までが本文になり、同定子が安定すること。本文が空の
-    もの・目印の行に続きがあるものは数えないこと。"""
+    """中継リクエストの目印 (2.10、先頭行だけは 2.18、一行
+    形式は 2.19): 発言の先頭行の目印の、次の行から末尾まで
+    が本文になり、同定子が安定すること。目印の行の引数の
+    後ろに続く文も本文の1行目になること。本文が空のものは
+    空のまま返ること (窓側が NACK を返す)。目印が発言の
+    途中にあるものは数えないこと。"""
     els = [
-        _text_el("Copilot へお願いがあります。\n"
-                 + copilot_loop.RELAY_REQUEST_MARKER + "\n"
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER + "\n"
                  + "ファイルを1つ作ってください。\n"
                  + "中身は print(123) です。"),
         _text_el("Copilot へメッセージを送る"),
@@ -620,6 +622,15 @@ def test_relay_marker_scan():
     assert scan["relay_marker"]["id"]
     assert cp.latest_chat_scan()["relay_marker"]["id"] \
         == scan["relay_marker"]["id"]
+    # 目印が発言の途中にあるものは数えない (2.18、先頭だけ)。
+    els_mid = [
+        _text_el("Copilot へお願いがあります。\n"
+                 + copilot_loop.RELAY_REQUEST_MARKER + "\n"
+                 + "ファイルを1つ作ってください。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan_mid = _copilot({"name": "phal-ai"}, els_mid).latest_chat_scan()
+    assert scan_mid["relay_marker"] is None
     els2 = [
         _text_el("お願いだけ先に置きます。\n"
                  + copilot_loop.RELAY_REQUEST_MARKER),
@@ -633,7 +644,32 @@ def test_relay_marker_scan():
         _text_el("Copilot へメッセージを送る"),
     ]
     scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
-    assert scan3["relay_marker"] is None
+    # 一行形式 (2.19): 「2」を含まない続きは、裸の中継の
+    # 本文として目印の行から数える。
+    assert scan3["relay_marker"] is not None
+    assert scan3["relay_marker"]["arg"] is None
+    assert scan3["relay_marker"]["body"] == "ついでに本文\n本文です"
+    # 引数つきの一行形式 (2.19、Copilot の実際の返し方):
+    # 引数の後ろの文が本文になる。
+    els8 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " Copilot2Muse 往復テスト受領"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan8 = _copilot({"name": "phal-ai"}, els8).latest_chat_scan()
+    assert scan8["relay_marker"] is not None
+    assert scan8["relay_marker"]["arg"] == "Copilot2Muse"
+    assert scan8["relay_marker"]["body"] == "往復テスト受領"
+    # 本文が空の目印は、空のまま返る (窓側の NACK 用、2.19)。
+    els9 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " Copilot2Muse"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan9 = _copilot({"name": "phal-ai"}, els9).latest_chat_scan()
+    assert scan9["relay_marker"] is not None
+    assert scan9["relay_marker"]["arg"] == "Copilot2Muse"
+    assert scan9["relay_marker"]["body"] == ""
     # Muse アプリの表示名が目印と同じ行に付いた形も拾う
     # (2.11、実測の形)。
     els4 = [
@@ -645,6 +681,27 @@ def test_relay_marker_scan():
     scan4 = _copilot({"name": "phal-ai"}, els4).latest_chat_scan()
     assert scan4["relay_marker"] is not None
     assert scan4["relay_marker"]["body"] == "表示名つきの本文です。"
+    # 引数つきの目印 (2.17): 引数がそのまま返る。
+    els6 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " Copilot2Muse\n" + "引数つきの本文です。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan6 = _copilot({"name": "phal-ai"}, els6).latest_chat_scan()
+    assert scan6["relay_marker"] is not None
+    assert scan6["relay_marker"]["arg"] == "Copilot2Muse"
+    assert scan6["relay_marker"]["body"] == "引数つきの本文です。"
+    # 「2」を含む語は引数の試みとして数える (2.19)。ほどける
+    # かは窓側の判定で、ほどけなければ NACK が返る。
+    els7 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " Copilot2\n" + "本文です。"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan7 = _copilot({"name": "phal-ai"}, els7).latest_chat_scan()
+    assert scan7["relay_marker"] is not None
+    assert scan7["relay_marker"]["arg"] == "Copilot2"
+    assert scan7["relay_marker"]["body"] == "本文です。"
     # 本文中の言及 (表示名の後ろ以外) は拾わない。
     els5 = [
         _text_el("アシスタントメッセージ: 合図は "

@@ -771,12 +771,16 @@ LOG_REQUEST_MARKER = "PHAL:ログリクエスト"
 # 切り出しは _tool_marker_in、同定子は _marker_scan の共通の
 # 作り。ツール名と引数の分け方・許可の判定は窓側 (core) が持つ。
 TOOL_REQUEST_MARKER = "PHAL:ツール実行"
-# 中継リクエストの目印 (2.10、Nagato の提案)。主の AI の発言の
-# 中の目印の単独行を見つけたら、目印の次の行から同じ発言の
-# 末尾までを、副の AI (二重待受の相手) のチャットへそのまま
-# 送る。受け付けるのは主の窓からの合図だけ (窓側の判定)。
-# 切り出しは _relay_marker_in で、同定子は _marker_scan と
-# 同じ作り (本文が要るので走査は専用に持つ)。
+# 中継リクエストの目印 (2.10、Nagato の提案)。AI の発言の
+# 先頭行の目印を見つけたら、目印の次の行から同じ発言の末尾
+# までを、別の AI のチャットへそのまま送る (先頭行だけに
+# 限るのは 2.18、Nagato の決定。途中の引用では発火しない)。
+# 2.17 からは目印
+# の後ろに「送り元2送り先」の引数を付けられ、経路は引数で
+# 決まる (主・副の区別はしない)。引数が無いときの経路と、
+# 引数の名前の照合は窓側の判定。切り出しは _relay_marker_in
+# で、同定子は _marker_scan と同じ作り (本文が要るので走査
+# は専用に持つ)。
 RELAY_REQUEST_MARKER = "PHAL:中継リクエスト"
 # 発言の要素の先頭に付く表示名 (Muse アプリの UIA 実測、
 # 2026-11-16)。中継の目印の行だけ、この表示名つきを許す。
@@ -785,17 +789,40 @@ _RELAY_LINE_PREFIXES = (
     "ユーザーメッセージ: ", "ユーザーメッセージ：")
 
 
+def _relay_marker_arg(line):
+    """行が中継の目印なら (True, 引数または None, 同じ行の
+    本文) を返す (2.11 の表示名つき対応、2.17 の引数対応、
+    2.19 の一行形式対応)。
+
+    目印の後ろに空白を空けて続く文は、まず先頭の語を見る。
+    「2」を含む語は引数「送り元2送り先」の試みとして数え
+    (ほどけるかは窓側の判定)、その後ろの残りが同じ行の
+    本文になる。「2」を含まない続きは、引数なし (裸) の
+    中継の本文としてまるごと数える。"""
+    stripped = line.strip()
+    texts = [stripped]
+    for prefix in _RELAY_LINE_PREFIXES:
+        if stripped.startswith(prefix):
+            texts.append(stripped[len(prefix):].strip())
+    for text in texts:
+        if text == RELAY_REQUEST_MARKER:
+            return True, None, ""
+        if text.startswith(RELAY_REQUEST_MARKER):
+            rest = text[len(RELAY_REQUEST_MARKER):]
+            if rest[:1] in (" ", "　", "\t"):
+                rest = rest.strip()
+                parts = rest.split(None, 1)
+                token = parts[0] if parts else ""
+                inline = parts[1].strip() if len(parts) > 1 else ""
+                if "2" in token:
+                    return True, token, inline
+                return True, None, rest
+    return False, None, ""
+
+
 def _is_relay_marker_line(line):
     """行が中継の目印か (表示名つきも数える、2.11)。"""
-    stripped = line.strip()
-    if stripped == RELAY_REQUEST_MARKER:
-        return True
-    for prefix in _RELAY_LINE_PREFIXES:
-        if stripped.startswith(prefix) and \
-                stripped[len(prefix):].strip() \
-                == RELAY_REQUEST_MARKER:
-            return True
-    return False
+    return _relay_marker_arg(line)[0]
 # 再実行の目印の行から ID を切り出す形。ファイル名のコマンド
 # ID と同じ「セッション番号-通番」(各3桁まで) で、後ろに "_"
 # (ファイル名の続き) や空白があっても ID の部分だけを取る。
@@ -2283,9 +2310,13 @@ class Copilot:
     def _relay_marker_in(self, desc):
         """中継リクエストの目印を探す (2.10、頭の表示名は 2.11)。
 
-        目印の単独行の、次の行から同じ発言 (要素) の末尾までを
-        中継する文 (body) として返す。戻り値は {"id", "key",
-        "body"}。本文が空のものは目印として数えない。
+        目印の行 (発言の先頭行にあるものだけ、2.18) の、次の
+        行から同じ発言 (要素) の末尾までを中継する文 (body)
+        として返す。目印の行の引数の後ろに続く文も、本文の
+        1行目として数える (2.19 の一行形式)。戻り値は
+        {"id", "key", "body", "arg"} (arg は目印の引数、
+        無ければ None)。本文が空でも目印として返す (窓側が
+        NACK を返すため、2.19)。
 
         _marker_scan は行単位の判定しかできない (本文が要る
         ここでは使えない) ので、走査は専用に持つ。同定子 (id /
@@ -2313,22 +2344,32 @@ class Copilot:
             lines.extend(parts)
             line_element.extend([element_no] * len(parts))
         marker_at = None
+        marker_arg = None
+        marker_inline = ""
         for index, line in enumerate(lines):
-            if _is_relay_marker_line(line):
-                marker_at = index  # 最後の目印を相手にする
+            found, arg, inline = _relay_marker_arg(line)
+            if not found:
+                continue
+            # 目印は発言 (要素) の先頭行にあるときだけ数える
+            # (2.18、Nagato の決定)。発言の途中に置かれた目印や、
+            # 議論の中での引用では発火しない。
+            if index > 0 and \
+                    line_element[index] == line_element[index - 1]:
+                continue
+            marker_at = index  # 最後の目印を相手にする
+            marker_arg = arg
+            marker_inline = inline
         if marker_at is None:
             return None
         tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
         if tail > DIAG_MARKER_TAIL_LIMIT:
             return None  # 古い発言の中の目印
-        body_lines = []
+        body_lines = [marker_inline] if marker_inline else []
         for index in range(marker_at + 1, len(lines)):
             if line_element[index] != line_element[marker_at]:
                 break
             body_lines.append(lines[index])
         body = "\n".join(body_lines).strip()
-        if not body:
-            return None
         prefix = "\n".join(lines[:marker_at + 1])
         digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
         element_start = marker_at
@@ -2341,7 +2382,8 @@ class Copilot:
         key = hashlib.sha256(
             "\n".join(lines[start:marker_at + 1]).encode(
                 "utf-8")).hexdigest()
-        return {"id": digest, "key": key, "body": body}
+        return {"id": digest, "key": key, "body": body,
+                "arg": marker_arg}
 
     def _resend_marker_in(self, desc):
         """結果再送リクエストの目印 (RESEND_REQUEST_MARKER) を

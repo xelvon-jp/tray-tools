@@ -2874,13 +2874,13 @@ def test_status_qr_text():
         "2.09", "実行中", "実行", 12,
         3, 2, 1, "終了コード1",
         {"auto_dl": True, "auto_run": False, "auto_answer": True},
-        "入（副 Copilot）", "Muse", False,
+        "Muse", False,
         at=_dt(2026, 11, 16, 1, 25, 30))
     lines = text.split("\n")
     assert lines[0] == "PHAL状態 Ver2.09", lines
     assert lines[1] == "時刻 2026-11-16 01:25:30", lines
-    assert "連携先 Muse" in text
-    assert "二重待受 入（副 Copilot）" in text
+    assert "見張る窓 Muse" in text
+    assert "連携先" not in text
     assert "状態 実行中（段階 実行）" in text
     assert "手数 12" in text
     assert "一覧 3件（実行済み 2件・チェックエラー 1件）" in text
@@ -2891,10 +2891,25 @@ def test_status_qr_text():
     assert len(text.encode("utf-8")) < 700, len(text.encode("utf-8"))
     empty = core.build_status_qr_text(
         "2.09", "待機中", "なし", 0, 0, 0, 0, "",
-        {}, "切", "", True, at=_dt(2026, 11, 16, 1, 25, 30))
-    assert "連携先 (未設定)" in empty
+        {}, "", True, at=_dt(2026, 11, 16, 1, 25, 30))
+    assert "見張る窓 (未設定)" in empty
     assert "直近の実行失敗 なし" in empty
     assert "非常停止 入" in empty
+
+
+def test_status_qr_link_label():
+    # 見張る窓の表示 (2.14 の連携先を 2.23 で一本化):
+    # チェックつきの並びを渡すと、そのまま見張る窓の行に
+    # 出る。渡さなければ従来どおり名前だけ。
+    from datetime import datetime as _dt
+
+    text = core.build_status_qr_text(
+        "2.14", "待機中", "なし", 0, 0, 0, 0, "",
+        {}, "Muse", False,
+        at=_dt(2026, 11, 16, 9, 0, 0),
+        link_label="☑Muse ☑Copilot")
+    assert "見張る窓 ☑Muse ☑Copilot" in text, text
+    assert len(text.encode("utf-8")) < 700
 
 
 def test_file_range_slicing():

@@ -1683,8 +1683,8 @@ def save_manual_auto(state: dict, state_path=None) -> None:
 def sanitize_relay_pending(raw):
     """中継の保留控え (2.13) を検証して返す。
 
-    控えは {id, key, body, at, retries, not_before}。形が違う・
-    本文が空なら None (保留なしとして扱う)。"""
+    控えは {id, key, body, at, retries, not_before, src, dst}。
+    形が違う・本文が空なら None (保留なしとして扱う)。"""
     if not isinstance(raw, dict):
         return None
     mid = raw.get("id")
@@ -1697,6 +1697,8 @@ def sanitize_relay_pending(raw):
     at = raw.get("at")
     retries = raw.get("retries")
     not_before = raw.get("not_before")
+    src_name = raw.get("src")
+    dst_name = raw.get("dst")
     return {
         "id": mid,
         "key": key if isinstance(key, str) else "",
@@ -1706,6 +1708,10 @@ def sanitize_relay_pending(raw):
         if isinstance(retries, int) else 0,
         "not_before": float(not_before)
         if isinstance(not_before, (int, float)) else 0.0,
+        # 中継の経路 (2.17)。2.13 までの控えには無く、空のまま
+        # (窓側が従来の主→副として扱う)。
+        "src": src_name if isinstance(src_name, str) else "",
+        "dst": dst_name if isinstance(dst_name, str) else "",
     }
 
 
@@ -1797,7 +1803,15 @@ def build_settings_report(section, version) -> str:
         f"{label}={on_off(section.get(key))}"
         for key, label in _SETTINGS_AUTO_LABELS)
     lines.append(f"自動化: {auto_text}")
-    if section.get("ai_dual_watch") is True:
+    watch = section.get("ai_watch_profiles")
+    if isinstance(watch, list):
+        watch_names = [value for value in watch
+                       if isinstance(value, str) and value]
+        lines.append(
+            "- 見張る窓: "
+            + ("、".join(watch_names) if watch_names else "なし")
+            + "（2.20 の集合形式）")
+    elif section.get("ai_dual_watch") is True:
         secondary = section.get("ai_secondary_profile")
         lines.append(
             "- 二重待受: 入（副: "
@@ -2543,15 +2557,19 @@ def _phal_status_one_line(text) -> str:
 
 def build_status_qr_text(version, state_label, stage_label, step,
                          item_count, ran_count, error_count,
-                         last_failure, automation_flags, dual_label,
-                         active_name, emergency, at=None) -> str:
+                         last_failure, automation_flags,
+                         active_name, emergency, at=None,
+                         link_label="") -> str:
     """状態QR の中身を組み立てる (2.09)。
 
     外から見えない場所 (職場の環境3など) で、PHAL の機械として
     の状態だけをスマホへ運ぶための短い文。版・状態・段階・
     手数・件数・エラーの種別・設定の入り切りだけを入れ、仕事の
     中身 (ファイル名・スクリプトの内容・ログ本文) は入れない。
-    automation_flags は窓の _automation_flags と同じ辞書。"""
+    automation_flags は窓の _automation_flags と同じ辞書。
+    link_label は見張る窓の表示 (2.14 の連携先の行を 2.23 で
+    この行へ一本化、☑/☐ つきのプロファイル並び)。空なら
+    active_name だけを出す (従来どおり)。"""
     at = at if at is not None else datetime.now()
     auto_text = " ".join(
         f"{label}={'入' if automation_flags.get(key) else '切'}"
@@ -2559,8 +2577,7 @@ def build_status_qr_text(version, state_label, stage_label, step,
     lines = [
         f"PHAL状態 Ver{version}",
         "時刻 " + at.strftime("%Y-%m-%d %H:%M:%S"),
-        f"連携先 {active_name or '(未設定)'}",
-        f"二重待受 {dual_label}",
+        f"見張る窓 {link_label or active_name or '(未設定)'}",
         f"状態 {state_label}（段階 {stage_label}）",
         f"手数 {step}",
         f"一覧 {item_count}件（実行済み {ran_count}件・"

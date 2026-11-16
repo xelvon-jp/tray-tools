@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
     "always_on_top": False,    # 前面に固定
     "hide_no_id": True,        # ID が無いファイルを表示しない
     "dark_mode": False,        # ダークモード (窓の中の「ダーク」の切替)
+    "mini_mode": False,        # 小窓モード (上部だけ表示、2.27)
 }
 
 
@@ -160,6 +161,7 @@ def normalize_config(section) -> dict:
     config["always_on_top"] = bool(config["always_on_top"])
     config["hide_no_id"] = bool(config["hide_no_id"])
     config["dark_mode"] = bool(config["dark_mode"])
+    config["mini_mode"] = bool(config["mini_mode"])
     config["summary_mode"] = bool(config["summary_mode"])
     return config
 
@@ -875,7 +877,7 @@ def build_history_text(records=None) -> str:
              if isinstance(r, dict)]
     if not lines:
         return "実行の記録はまだありません。"
-    return "\n".join(["直近の実行一覧（新しい順）"] + lines)
+    return "\n".join(["[PHAL:実行一覧] 新しい順"] + lines)
 
 
 def last_results_put(records: dict, key: str, text: str) -> None:
@@ -1212,7 +1214,7 @@ def build_diag_bundle(version: str, toggles: dict, profile_name: str,
         return "入" if (toggles or {}).get(key) else "切"
 
     head = [
-        f"PHAL診断 Ver{version} {stamp}",
+        f"[PHAL:診断] Ver{version} {stamp}",
         f"自動化: DL={on_off('auto_dl')} 実行={on_off('auto_run')} "
         f"回答={on_off('auto_answer')} 送信={on_off('auto_send')} "
         f"診断={on_off('auto_diag')} 受領={on_off('auto_ack')} "
@@ -1347,12 +1349,12 @@ def load_reset_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_reset_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_reset_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     reset_at = raw.get("last_reset_at")
@@ -1372,6 +1374,8 @@ def load_reset_auto(state_path=None) -> dict:
         "refire_notice_at": float(raw.get("refire_notice_at"))
         if isinstance(raw.get("refire_notice_at"), (int, float))
         else 0.0,
+        "answered_map": _sanitize_answered_map(
+            raw.get("answered_map"), raw),
     }
 
 
@@ -1393,6 +1397,8 @@ def save_reset_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_payload") or ""),
         "refire_notice_at": float(
             state.get("refire_notice_at") or 0.0),
+        "answered_map": _sanitize_answered_map(
+            state.get("answered_map")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1439,12 +1445,12 @@ def load_rerun_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_rerun_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_rerun_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     rerun_at = raw.get("last_rerun_at")
@@ -1464,6 +1470,8 @@ def load_rerun_auto(state_path=None) -> dict:
         "refire_notice_at": float(raw.get("refire_notice_at"))
         if isinstance(raw.get("refire_notice_at"), (int, float))
         else 0.0,
+        "answered_map": _sanitize_answered_map(
+            raw.get("answered_map"), raw),
     }
 
 
@@ -1485,6 +1493,8 @@ def save_rerun_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_payload") or ""),
         "refire_notice_at": float(
             state.get("refire_notice_at") or 0.0),
+        "answered_map": _sanitize_answered_map(
+            state.get("answered_map")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1526,12 +1536,12 @@ def load_resend_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     sent_at = raw.get("last_sent_at")
@@ -1551,6 +1561,8 @@ def load_resend_auto(state_path=None) -> dict:
         "refire_notice_at": float(raw.get("refire_notice_at"))
         if isinstance(raw.get("refire_notice_at"), (int, float))
         else 0.0,
+        "answered_map": _sanitize_answered_map(
+            raw.get("answered_map"), raw),
     }
 
 
@@ -1570,6 +1582,8 @@ def save_resend_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_payload") or ""),
         "refire_notice_at": float(
             state.get("refire_notice_at") or 0.0),
+        "answered_map": _sanitize_answered_map(
+            state.get("answered_map")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1594,6 +1608,30 @@ RELAY_AUTO_COOLDOWN_SEC = 60.0     # 中継同士の最短間隔
 RELAY_PENDING_TTL_SEC = 600.0      # 中継の保留控えの寿命 (2.13)
 RELAY_RETRY_DELAY_SEC = 20.0       # 中継の送り直しまでの待ち (2.13)
 RELAY_RETRY_MAX = 1                # 中継の送り直しの回数上限 (2.13)
+RELAY_ACK_DELAY_SEC = 30.0         # 中継の成功ACKを保留する秒数 (2.27)
+
+
+def _sanitize_answered_map(raw_map, raw=None) -> dict:
+    """応答済みの履歴 (payload -> 応答時刻) を検証して返す
+    (2.34)。形の違う要素は落とし、直近16件までにする。
+    履歴が無い古い控えは last_payload/last_answered_at から
+    種を作る (移行)。"""
+    result = {}
+    if isinstance(raw_map, dict):
+        for k, v in raw_map.items():
+            if isinstance(k, str) and isinstance(v, (int, float)) \
+                    and v > 0:
+                result[k] = float(v)
+    if not result and isinstance(raw, dict):
+        payload = raw.get("last_payload")
+        at = raw.get("last_answered_at")
+        if isinstance(payload, str) and isinstance(at, (int, float)) \
+                and at > 0:
+            result[payload] = float(at)
+    if len(result) > 16:
+        keep = sorted(result.items(), key=lambda kv: kv[1])[-16:]
+        result = dict(keep)
+    return result
 
 
 def _load_marker_auto(path) -> dict:
@@ -1606,7 +1644,7 @@ def _load_marker_auto(path) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0}
+                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
     sent_at = raw.get("last_sent_at")
     answered_at = raw.get("last_answered_at")
     notice_at = raw.get("refire_notice_at")
@@ -1627,6 +1665,12 @@ def _load_marker_auto(path) -> dict:
         else "",
         "refire_notice_at": float(notice_at)
         if isinstance(notice_at, (int, float)) else 0.0,
+        # 応答済みの履歴 (2.34)。payload -> 応答時刻。単一の
+        # last_payload だけでは、応答済みの目印が複数残ると
+        # 交互に再検出されて抑止をすり抜けた (2026-11-16
+        # 実地) ため、直近分はまとめて持つ。
+        "answered_map": _sanitize_answered_map(
+            raw.get("answered_map"), raw),
     }
 
 
@@ -1643,6 +1687,8 @@ def _save_marker_auto(state, path, extra=None) -> None:
             state.get("refire_notice_payload") or ""),
         "refire_notice_at": float(
             state.get("refire_notice_at") or 0.0),
+        "answered_map": _sanitize_answered_map(
+            state.get("answered_map")),
     }
     if isinstance(extra, dict):
         payload.update(extra)
@@ -1769,7 +1815,7 @@ def build_settings_report(section, version) -> str:
     def on_off(value):
         return "入" if value else "切"
 
-    lines = [f"PHAL設定 Ver{version}"]
+    lines = [f"[PHAL:設定] Ver{version}"]
     # 監視フォルダは、設定が空なら実際に見張っている既定の場所
     # (ダウンロードフォルダ) を出す (生の空文字は意味がない)。
     watch = section.get("watch_folder")
@@ -2304,7 +2350,7 @@ def select_log_events(events, spec, now=None) -> list:
 def build_log_reply(events, spec) -> str:
     """ログリクエストへの返信を組み立てる (1.96)。
 
-    見出しは「動作ログ ({label}・{n}件)」で、label が既に
+    見出しは「[PHAL:動作ログ] {label}・{n}件」で、label が既に
     件数で終わっている場合 (「直近50件」) は件数を重ねない。
     中身はビューアと同じ日付つきの行。記録が無ければ
     「(記録はありません)」を添える。"""
@@ -2312,9 +2358,9 @@ def build_log_reply(events, spec) -> str:
     spec = spec if isinstance(spec, dict) else {}
     label = str(spec.get("label") or "")
     if label.endswith("件"):
-        head = f"動作ログ（{label}）"
+        head = f"[PHAL:動作ログ] {label}"
     else:
-        head = f"動作ログ（{label}・{len(events)}件）"
+        head = f"[PHAL:動作ログ] {label}・{len(events)}件"
     if not events:
         return head + "\n（記録はありません）"
     return "\n".join(
@@ -2524,7 +2570,7 @@ def build_resend_text(command_id, stored_text,
     控え (last_results) に残っているのは結果文の本文 (見出し行
     を除いた形) なので、再送と分かる見出しを付け直し、通常の
     結果と同じく末尾へ AI への指示文を付ける。"""
-    head = f"[実行結果] {command_id} （前回の結果の再送）"
+    head = f"[PHAL:結果再送] {command_id} （前回の結果を再送します）"
     if truncated:
         head += " ※控えは2万字で打ち切られています"
     return with_result_ai_prompt(head + "\n" + (stored_text or ""))
@@ -2575,7 +2621,7 @@ def build_status_qr_text(version, state_label, stage_label, step,
         f"{label}={'入' if automation_flags.get(key) else '切'}"
         for key, label in _SETTINGS_AUTO_LABELS)
     lines = [
-        f"PHAL状態 Ver{version}",
+        f"[PHAL:状態] Ver{version}",
         "時刻 " + at.strftime("%Y-%m-%d %H:%M:%S"),
         f"見張る窓 {link_label or active_name or '(未設定)'}",
         f"状態 {state_label}（段階 {stage_label}）",
@@ -3115,7 +3161,12 @@ def main():
         if name in seen:
             continue
         seen.add(name)
-        if not _module_exists(name, search_path):
+        # スクリプト自身が実行時に作るモジュール (本文に
+        # 「<名前>.py」への書き出しがある) は、検査時点では
+        # まだ存在しないため見つからなくて当然で、不足には
+        # 数えない (2.27、職場の Copilot の指摘)。
+        if not _module_exists(name, search_path) \
+                and (name + ".py") not in source:
             out["missing"].append({"name": name, "line": line})
 
     danger_paths = danger["paths"]
@@ -3968,10 +4019,20 @@ def execute_command(argv, cwd=None, timeout_seconds=120,
     started = time.monotonic()
     job = None
     proc = None
+    env = dict(os.environ)
+    # ツール (.py) からも phal_lib など本体の隣にあるモジュール
+    # を import できるよう、本体のフォルダを PYTHONPATH の先頭
+    # へ足す (2.27、スクリプト実行の env とそろえる。職場の
+    # Copilot の指摘)。
+    app_dir = str(Path(__file__).resolve().parent)
+    existing = [p for p in (env.get("PYTHONPATH") or "").split(
+        os.pathsep) if p]
+    if app_dir not in existing:
+        env["PYTHONPATH"] = os.pathsep.join([app_dir] + existing)
     try:
         proc = subprocess.Popen(
             argv, cwd=str(cwd) if cwd else None,
-            env=dict(os.environ),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=flags)
@@ -4047,10 +4108,10 @@ def build_tool_result_text(display, run: RunResult,
     終了コード・秒数を入れる。"""
     if run.start_error:
         return with_result_ai_prompt(
-            f"[ツール実行結果] {display}  起動できませんでした\n"
+            f"[PHAL:ツール実行結果] {display}  起動できませんでした\n"
             f"{run.start_error}")
     code = run.exit_code if run.exit_code is not None else "?"
-    head = (f"[ツール実行結果] {display}  終了コード {code}  "
+    head = (f"[PHAL:ツール実行結果] {display}  終了コード {code}  "
             f"{run.seconds:.1f}秒")
     if run.stopped:
         head += "  停止しました"
@@ -4416,12 +4477,12 @@ def _result_first_line(label: str, run: RunResult, config: dict,
     (要約モードで、行数を先に知らせるため)。"""
     if run.timed_out:
         timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-        first = f"[実行結果] {label}  時間切れで止めました({timeout}秒)"
+        first = f"[PHAL:実行結果] {label}  時間切れで止めました({timeout}秒)"
     elif run.stopped:
-        first = f"[実行結果] {label}  停止しました"
+        first = f"[PHAL:実行結果] {label}  停止しました"
     else:
         code = run.exit_code if run.exit_code is not None else "-"
-        first = f"[実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
+        first = f"[PHAL:実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
     if run.start_error:
         first += f"  起動エラー: {run.start_error}"
     if total_lines is not None:
@@ -4534,12 +4595,12 @@ def build_ack_text(command_id: str, filename: str) -> str:
 
     結果が出る前に「受け取って実行を始める」ことだけを伝える1行。
     command_id (ファイル名先頭のコマンドID) があれば
-    「受領：{id} {filename} の実行を始めます」、無ければ ID の
-    部分を省いて「受領：{filename} の実行を始めます」。結果が
+    「[PHAL:受領] {id} {filename} の実行を始めます」、無ければ ID の
+    部分を省いて「[PHAL:受領] {filename} の実行を始めます」。結果が
     遅いときに、届いていないのか実行中なのかを送り側が区別
     できるようにするためのもの。"""
     label = f"{command_id} {filename}" if command_id else filename
-    return f"受領：{label} の実行を始めます"
+    return f"[PHAL:受領] {label} の実行を始めます"
 
 
 def build_blocked_text(command_id: str, filename: str, reason: str) -> str:
@@ -4547,12 +4608,12 @@ def build_blocked_text(command_id: str, filename: str, reason: str) -> str:
 
     自動実行の対象なのにチェックで止まったファイルは、受領も
     結果も出ないため、放っておくとループが無言で止まる。その
-    埋め合わせに「止まりました：{id} {filename} はチェックで
+    埋め合わせに「[PHAL:実行不可] {id} {filename} はチェックで
     実行不可（{理由}）」の1行を出す。理由はチェック結果の最初
     の指摘 (無ければ見出し) を呼ぶ側が渡す。理由が空なら括弧の
     部分を省く。"""
     label = f"{command_id} {filename}" if command_id else filename
-    base = f"止まりました：{label} はチェックで実行不可"
+    base = f"[PHAL:実行不可] {label} はチェックで実行不可です"
     return f"{base}（{reason}）" if reason else base
 
 
@@ -4685,7 +4746,7 @@ def diff_output_lines(previous_lines, current_lines):
 def result_diff_source(text: str) -> str:
     """結果文の本文から、差分の対象になる部分を返す。
 
-    先頭の見出し行 ([実行結果] ...) は実行のたびに秒数が変わる
+    先頭の見出し行 ([PHAL:実行結果] ...) は実行のたびに秒数が変わる
     ので除き、残りをそのまま返す。再実行の前回結果の控えに
     入れるのも、この形 (見出し行なし)。"""
     return (text or "").partition("\n")[2]
@@ -4737,7 +4798,7 @@ def build_result_body(name: str, run: RunResult, config: dict,
     共通部分。
 
     command_id(ファイル名先頭のコマンドID)があるときは、1行目を
-    「[実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
+    「[PHAL:実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
     ようにする。無いときの文は今までと完全に同じ。
 
     要約モード(summary_mode が真)で、出力とエラー出力の合計が
@@ -4825,7 +4886,7 @@ def build_rerun_result_text(name: str, run: RunResult, config: dict,
                             full_output_path: str = None) -> str:
     """再実行のときにクリップボードへ入れる文 (1.56)。
 
-    1行目の見出し ([実行結果] ...) は通常の結果文と同じで、
+    1行目の見出し ([PHAL:実行結果] ...) は通常の結果文と同じで、
     その下は全文ではなく前回との差分だけ (build_result_diff)。
     要約モードの長い出力は、従来どおり要約文が差分の対象になる
     (全文比較はしない)。末尾には AI への指示文 (RESULT_AI_PROMPT)
@@ -4852,7 +4913,7 @@ def build_return_text(name: str, reason: str, run: RunResult = None,
     そのまま使う(二重に整えない)。"""
     config = normalize_config(config or {})
     label = f"{command_id} {name}" if command_id else name
-    parts = [f"[差し戻し] {label}"]
+    parts = [f"[PHAL:差し戻し] {label}"]
     reason = (reason or "").strip()
     if reason:
         parts.append(f"理由: {reason}")

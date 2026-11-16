@@ -801,7 +801,8 @@ TOOL_REQUEST_MARKER = "PHAL:ツール実行"
 # は専用に持つ)。
 RELAY_REQUEST_MARKER = "PHAL:中継リクエスト"
 # 発言の要素の先頭に付く表示名 (Muse アプリの UIA 実測、
-# 2026-11-16)。中継の目印の行だけ、この表示名つきを許す。
+# 2026-11-16)。中継の目印 (2.11) と、他の合図の目印
+# (2.32、_marker_scan の判定) で、この表示名つきを許す。
 _RELAY_LINE_PREFIXES = (
     "アシスタントメッセージ: ", "アシスタントメッセージ：",
     "ユーザーメッセージ: ", "ユーザーメッセージ：")
@@ -841,6 +842,21 @@ def _relay_marker_arg(line):
 def _is_relay_marker_line(line):
     """行が中継の目印か (表示名つきも数える、2.11)。"""
     return _relay_marker_arg(line)[0]
+
+
+def _strip_speaker_prefix(line):
+    """行の先頭の表示名を取り除いて返す (2.32)。
+
+    目印の判定 (_marker_scan) 用。発言の先頭行に表示名が
+    付くと、行の完全一致で見る合図 (診断・設定など) が
+    先頭行に置かれた目印を取りこぼす (2026-11-16 実地で
+    確定)。同定子は元の行から作るので、ここで変えるのは
+    判定に渡す文字列だけ。"""
+    stripped = line.strip()
+    for prefix in _RELAY_LINE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return stripped
 # 再実行の目印の行から ID を切り出す形。ファイル名のコマンド
 # ID と同じ「セッション番号-通番」(各3桁まで) で、後ろに "_"
 # (ファイル名の続き) や空白があっても ID の部分だけを取る。
@@ -1265,6 +1281,24 @@ def _download_summary(name):
         if len(summary) >= 4:
             return summary[:60]
     return ""
+
+
+_LOG_DATE_WORD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_request_id_word(word):
+    """依頼 ID らしい1語かどうか (2.36、ログ用)。
+
+    形は _request_id_in と同じ (半角英数字と -_#. だけ)。
+    ただしログの指定の語 (件数の数字・日付) は ID と
+    みなさない。時刻範囲は「:」を含むので形の時点で外れる。"""
+    if not word or not word.isascii():
+        return False
+    if word.isdigit():
+        return False
+    if _LOG_DATE_WORD_RE.match(word):
+        return False
+    return all(c.isalnum() or c in "-_#." for c in word)
 
 
 class Copilot:
@@ -2306,9 +2340,9 @@ class Copilot:
     def _diag_marker_in(self, desc):
         """診断リクエストの目印 (DIAG_REQUEST_MARKER) を探す (1-43)。
 
-        実体は _marker_in (目印の文字列を引数にした共通の走査)。
-        戻り値と同定子の意味はそちらに書いてある。"""
-        return self._marker_in(desc, DIAG_REQUEST_MARKER)
+        実体は _request_id_in (依頼 ID つきも数える共通の走査、
+        2.33)。戻り値と同定子の意味はそちらに書いてある。"""
+        return self._request_id_in(desc, DIAG_REQUEST_MARKER)
 
     def _marker_in(self, desc, marker_text):
         """目印の行 (marker_text ちょうど) を探す共通の走査。
@@ -2335,6 +2369,36 @@ class Copilot:
         if found is None:
             return None
         return {"id": found["id"], "key": found["key"]}
+
+    def _request_id_in(self, desc, marker_text):
+        """目印 + 任意の依頼 ID を探す共通の走査 (2.33)。
+
+        行の形は「目印」だけか「目印 + 空白 + 依頼 ID」。依頼
+        ID は半角英数字 (と -_#.) だけの1語 (合図ごとに頼む
+        側が付ける連番など) で、ID が違えば別の依頼として
+        扱える (応答済みの判定は ID 単位になる)。日本語の
+        続きは ID とみなさない (本文中の言及を拾わない)。
+        戻り値は {"id", "key", "request_id"} (ID が無ければ
+        request_id は空文字)。同定子の意味は _marker_in と
+        同じ。"""
+        def parse(line):
+            if line == marker_text:
+                return ""
+            if line.startswith(marker_text):
+                rest = line[len(marker_text):]
+                if rest[:1] in (" ", "　", "\t"):
+                    token = rest.strip()
+                    if token and token.isascii() and all(
+                            c.isalnum() or c in "-_#."
+                            for c in token):
+                        return token
+            return None
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "request_id": found["value"]}
 
     def _rerun_marker_in(self, desc):
         """再実行リクエストの目印 (RERUN_REQUEST_MARKER) を探す
@@ -2504,8 +2568,17 @@ class Copilot:
         found = self._marker_scan(desc, parse)
         if found is None:
             return None
+        params = found["value"]
+        request_id = ""
+        tokens = params.split()
+        if tokens and _is_request_id_word(tokens[0]):
+            # 先頭の語が依頼 ID の形なら ID として切り出す
+            # (2.36)。件数・日付・時刻範囲の語は ID とみなさ
+            # ない (_is_request_id_word が弾く)。
+            request_id = tokens[0]
+            params = " ".join(tokens[1:])
         return {"id": found["id"], "key": found["key"],
-                "params": found["value"]}
+                "params": params, "request_id": request_id}
 
     def _id_marker_in(self, desc, marker_text):
         """コマンド ID つきの目印を探す共通の走査 (1.63、再送で
@@ -2560,7 +2633,7 @@ class Copilot:
         marker_at = None
         payload = None
         for index, line in enumerate(lines):
-            value = parse(line.strip())
+            value = parse(_strip_speaker_prefix(line))
             if value is not None:
                 marker_at = index  # 最後の目印を相手にする
                 payload = value
@@ -2589,6 +2662,13 @@ class Copilot:
         key = hashlib.sha256(
             "\n".join(lines[start:marker_at + 1]).encode(
                 "utf-8")).hexdigest()
+        if start == marker_at:
+            # key の範囲が目印の行だけ (発言の先頭行の目印)。
+            # key が目印の文字列だけで決まってしまい、別の発言
+            # でも同じ値になり、消費済みと誤判定する
+            # (2026-11-16 実地で確定) ため、key は使わない
+            # (2.33。同定は id だけで行う)。
+            key = ""
         return {"id": digest, "key": key, "value": payload}
 
     def latest_chat_scan(self):
@@ -2611,20 +2691,20 @@ class Copilot:
             "candidate": self._candidate_dict(desc),
             "candidates": self._candidate_dicts(desc),
             "marker": self._diag_marker_in(desc),
-            "reset_marker": self._marker_in(
+            "reset_marker": self._request_id_in(
                 desc, RESET_REQUEST_MARKER),
             "rerun_marker": self._rerun_marker_in(desc),
             "resend_marker": self._resend_marker_in(desc),
-            "settings_marker": self._marker_in(
+            "settings_marker": self._request_id_in(
                 desc, SETTINGS_REQUEST_MARKER),
-            "history_marker": self._marker_in(
+            "history_marker": self._request_id_in(
                 desc, HISTORY_REQUEST_MARKER),
-            "stop_marker": self._marker_in(
+            "stop_marker": self._request_id_in(
                 desc, STOP_REQUEST_MARKER),
             "log_marker": self._log_marker_in(desc),
             "tool_marker": self._tool_marker_in(desc),
             "relay_marker": self._relay_marker_in(desc),
-            "manual_marker": self._marker_in(
+            "manual_marker": self._request_id_in(
                 desc, MANUAL_REQUEST_MARKER),
             "file_marker": self._file_marker_in(desc),
             "fulltext_marker": self._fulltext_marker_in(desc),

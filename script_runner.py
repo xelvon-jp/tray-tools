@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.26"
+PHAL_VERSION = "2.36"
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -1020,6 +1020,9 @@ class ScriptRunnerWindow(QWidget):
         self._relay_noted = set()
         self._relay_sending = False
         self._relay_auto_mid = None
+        # 中継の成功 ACK の保留 (2.27)。{src, dst, due, text,
+        # state} の列。期限が来たら _flush_due_relay_acks が送る。
+        self._relay_acks_pending = []
         self._relay_signals = _AiSignals()
         self._relay_signals.done.connect(self._on_relay_auto_done)
         self._relay_ack_signals = _AiSignals()
@@ -1085,6 +1088,15 @@ class ScriptRunnerWindow(QWidget):
         self._refire_sending = False
         self._refire_signals = _AiSignals()
         self._refire_signals.done.connect(self._on_refire_notice_done)
+        # 合図へのリアクション (2.33)。新しい目印には必ず
+        # チャットで反応する (応答そのものか、見送りの理由の
+        # 一行)。見送りの知らせの送信まわり。
+        self._react_sending = False
+        self._react_notes = []
+        self._react_noted = {}
+        self._log_calm = {}
+        self._react_signals = _AiSignals()
+        self._react_signals.done.connect(self._on_react_done)
         # 再実行の引数 (1.97)。_start_run が受けて控え、結果文の
         # 組み立て (_on_run_done) が見出しの後ろへ差し込む。
         self._running_args = []
@@ -1348,6 +1360,14 @@ class ScriptRunnerWindow(QWidget):
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         title_row.addWidget(title)
         title_row.addStretch(1)
+        # 小窓モードの切替 (2.27)。上部 (タイトル行と状態
+        # パネル) だけを残して下部を隠す。状態は設定に覚える。
+        self.mini_button = QPushButton("小窓")
+        self.mini_button.setCheckable(True)
+        self.mini_button.setToolTip(
+            "小窓モード (上部の状態パネルだけを表示) の切り替え")
+        self.mini_button.clicked.connect(self._toggle_mini_mode)
+        title_row.addWidget(self.mini_button)
         self.emergency_button = QPushButton("非常停止")
         self.emergency_button.setToolTip(
             "自動化（DL・実行・回答・送信）をすべて止めます。"
@@ -1402,6 +1422,11 @@ class ScriptRunnerWindow(QWidget):
         self.status_strip = strip
         layout.addWidget(panel)
         self._big_panel = panel
+        # 小窓モードで隠す範囲は、レイアウトのこの位置から
+        # 後ろ全部 (2.27)。
+        self._lower_start = layout.count()
+        self._mini_mode = False
+        self._normal_height = None
         # 明滅は階ごとに付ける (2.16)。効果は階の枠へ付け
         # (_rebuild_floors)、タイマはここで1つだけ持ち、回すか
         # どうかは _update_pulse が決める。非常停止ボタンは
@@ -1605,7 +1630,8 @@ class ScriptRunnerWindow(QWidget):
         self._refresh_log_view()
 
         QShortcut(QKeySequence("F5"), self, self._f5_pressed)
-        QShortcut(QKeySequence("Ctrl+C"), self, self._copy_last)
+        if bool(self.config.get("mini_mode")):
+            self._set_mini_mode(True, save=False)
 
     def _refresh_ai_label(self):
         """トップ画面の連携先の選択肢を、今の設定に合わせ直す
@@ -2104,6 +2130,7 @@ class ScriptRunnerWindow(QWidget):
         (見張りが回っていれば。1.65)。非常停止中はパネルが
         赤系になり、大きな数字が「停止」になり、監視ブロッ
         クも赤く「停止」になる。"""
+        self._flush_due_relay_acks()
         text = self._status_strip_text()
         self.status_strip.setText(text)
         self.status_strip.setToolTip(text)
@@ -5009,6 +5036,7 @@ class ScriptRunnerWindow(QWidget):
         # 他の合図の判定とは別に見る (控えも間隔も別)。
         self._maybe_auto_relay(
             getattr(result, "relay_marker", None))
+        self._flush_react_notes()
         self._dispatch_state = None
         # 候補の並び (木の順) を作る。candidates (1-57) を持た
         # ない経路では、従来の candidate 1件だけの並びにする。
@@ -5293,35 +5321,57 @@ class ScriptRunnerWindow(QWidget):
     # 本当に同じ中身がもう一度必要なときは、内容を変えて
     # 出し直す (payload が変われば別の合図として実行される)。
 
+    def _answered_at_for(self, state, payload):
+        """payload への応答時刻を返す (2.34)。履歴
+        (answered_map) を優先し、無ければ従来の last_payload
+        の組を見る。応答したことが無ければ None。"""
+        key = str(payload or "")
+        amap = state.get("answered_map")
+        if isinstance(amap, dict):
+            at = amap.get(key)
+            if isinstance(at, (int, float)) and at > 0:
+                return float(at)
+        last = float(state.get("last_answered_at") or 0.0)
+        if last <= 0:
+            return None
+        if str(state.get("last_payload") or "") != key:
+            return None
+        return last
+
     def _refire_suppressed(self, state, payload) -> bool:
         """同じ payload への応答が抑止時間内なら True (1.95)。
 
-        抑止時間 (15分) の中は黙って見送る。それを過ぎた再検出
-        は _refire_answered_at と _maybe_refire_notice が扱う。"""
-        if str(state.get("last_payload") or "") \
-                != str(payload or ""):
+        抑止時間 (15分) の中は見送る。判定は応答の履歴
+        (2.34) で行うので、応答済みの目印が複数残っていても
+        交互の再検出で抑止をすり抜けない。"""
+        last = self._answered_at_for(state, payload)
+        if last is None:
             return False
-        last = float(state.get("last_answered_at") or 0.0)
         return time.time() - last < core.MARKER_REFIRE_SUPPRESS_SEC
 
     def _refire_answered_at(self, state, payload):
         """同じ payload に応答済みなら、その応答時刻を返す
-        (2.00)。応答したことが無ければ None。"""
-        last = float(state.get("last_answered_at") or 0.0)
-        if last <= 0:
-            return None
-        if str(state.get("last_payload") or "") \
-                != str(payload or ""):
-            return None
-        return last
+        (2.00、2.34 で履歴対応)。応答したことが無ければ
+        None。"""
+        return self._answered_at_for(state, payload)
 
     def _record_answered(self, state, payload):
         """応答した中身と時刻を控えに残す (1.95)。保存は呼び
         出し側の既存の save (消費の保存) に相乗りする。別の
         payload に応答したら、知らせ済みの控えは古い payload
-        のものなので消す (2.00)。"""
+        のものなので消す (2.00)。応答の履歴 (2.34) にも残す
+        (抑止時間を過ぎた分は落とす)。"""
+        now = time.time()
         state["last_payload"] = str(payload or "")
-        state["last_answered_at"] = time.time()
+        state["last_answered_at"] = now
+        amap = state.get("answered_map")
+        if not isinstance(amap, dict):
+            amap = {}
+        amap[str(payload or "")] = now
+        cutoff = now - core.MARKER_REFIRE_SUPPRESS_SEC
+        state["answered_map"] = {
+            k: v for k, v in amap.items()
+            if isinstance(v, (int, float)) and v > cutoff}
         if str(state.get("refire_notice_payload") or "") \
                 != str(payload or ""):
             state.pop("refire_notice_payload", None)
@@ -5339,38 +5389,91 @@ class ScriptRunnerWindow(QWidget):
                 state.get("refire_notice_payload") or "") \
                 == str(payload or ""):
             return  # 知らせ済み。以後は黙って見送る
-        if self._refire_sending or self._chain_in_flight():
-            return  # 空いてから知らせる
-        try:
-            configured, profile = self._resolve_ai_target()
-        except Exception:  # noqa: BLE001  次の回で改めて判定する
-            return
-        if not configured:
-            return
-        answered_at = float(state.get("last_answered_at") or 0.0)
-        when = time.strftime(
-            "%H:%M", time.localtime(answered_at)) \
-            if answered_at else ""
-        summary = " ".join(str(payload or "").split())[:60]
-        text = (
-            f"その合図（{label}）には {when} に応答済みのため、"
-            "繰り返しはしません。もう一度必要なときは、内容を"
-            "変えて出し直してください。")
-        if summary:
-            text += f"（応答済みの内容: {summary}）"
-        # 知らせ済みの控えは先に残す (送る前に落ちても、実行
-        # だけは繰り返さないことが本体の約束のため)。
+        # 2.31 から、知らせはチャットへ出さず診断にだけ残す
+        # (Nagato 決定)。控えには残すので、以後は黙って見送る。
         state["refire_notice_payload"] = str(payload or "")
         state["refire_notice_at"] = time.time()
         try:
             save_fn(state)
         except Exception:  # noqa: BLE001  控えの保存失敗は黙る
             pass
+        self._diag(
+            f"応答済みの合図の再検出: {label}（知らせは送りません）")
+
+    def _on_refire_notice_done(self, result):
+        self._refire_sending = False
+        if getattr(result, "ok", False):
+            self._diag("応答済みの知らせを送りました")
+        else:
+            message = str(getattr(result, "message", "") or "")
+            self._diag(f"応答済みの知らせに失敗: {message}")
+        self._fire_deferred_restart()
+
+    def _note_calm(self, text: str):
+        """同じ文面の繰り返しログを畳む (2.35)。
+
+        再応答の抑止のように、同じ行が何度も出るものは
+        15分に1行だけ書き、間の分は件数だけ添える。同定子
+        (mid) で止めると、ずれのたびに初回扱いになって
+        畳めなかった (2026-11-16 実地)。"""
+        now = time.time()
+        entry = self._log_calm.get(text)
+        if entry is not None and now - entry[0] \
+                < core.MARKER_REFIRE_SUPPRESS_SEC:
+            entry[1] += 1
+            return
+        if len(self._log_calm) > 100:
+            self._log_calm.clear()
+            entry = None
+        skipped = entry[1] if entry is not None else 0
+        self._log_calm[text] = [now, 0]
+        if skipped:
+            text = f"{text}（間に{skipped}回省略）"
+        self._diag(text)
+
+    def _post_react_note_once(self, mid, reason, text):
+        """見送りの理由をチャットへ1行出す (2.33、同じ目印・
+        同じ理由では1度だけ)。
+
+        新しい目印には必ず何か反応する (Nagato 決定: だんまり
+        は NG)。応答そのものが反応になる場合は使わない。
+        連鎖が埋まっていれば、空いてから送る (キューに残す)。"""
+        # 重複止めは発言の同定子 (mid) では行わない (2.34)。
+        # mid は再描画でずれるため、ずれるたびに初回扱いに
+        # なって知らせが連発した (2026-11-16 実地)。同じ
+        # (理由, 文面) の知らせは、抑止時間 (15分) の中では
+        # 1回だけにする。文面には応答時刻が入るので、正規の
+        # 次の見送りは文面が変わって届く。
+        stamp = (reason, text)
+        now = time.time()
+        if now - self._react_noted.get(stamp, 0.0) \
+                < core.MARKER_REFIRE_SUPPRESS_SEC:
+            return
+        if len(self._react_noted) > 200:
+            self._react_noted.clear()
+        self._react_noted[stamp] = now
+        if text not in self._react_notes:
+            self._react_notes.append(text)
+        self._flush_react_notes()
+
+    def _flush_react_notes(self):
+        """リアクションのキューを、連鎖が空いていれば送る。"""
+        if self._react_sending or not self._react_notes:
+            return
+        if self._chain_in_flight():
+            return
+        try:
+            configured, profile = self._resolve_ai_target()
+        except Exception:  # noqa: BLE001  送れなければ諦める
+            self._react_notes.clear()
+            return
+        if not configured:
+            self._react_notes.clear()
+            return
+        text = self._react_notes.pop(0)
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
-        self._refire_sending = True
-        self._diag(
-            f"応答済みの合図の再検出: {label}（知らせを送ります）")
+        self._react_sending = True
 
         import threading
 
@@ -5381,21 +5484,30 @@ class ScriptRunnerWindow(QWidget):
                     result = presser(profile)
             except Exception as e:  # noqa: BLE001
                 result = _AiAnswerResult(
-                    False, f"知らせを送れませんでした（{e}）")
-            self._refire_signals.done.emit(result)
+                    False,
+                    f"リアクションを送れませんでした（{e}）")
+            self._react_signals.done.emit(result)
 
         threading.Thread(
             target=work, daemon=True,
-            name="phal-refire-notice").start()
+            name="phal-react-note").start()
 
-    def _on_refire_notice_done(self, result):
-        self._refire_sending = False
-        if getattr(result, "ok", False):
-            self._diag("応答済みの知らせを送りました")
-        else:
+    def _on_react_done(self, result):
+        self._react_sending = False
+        if not getattr(result, "ok", False):
             message = str(getattr(result, "message", "") or "")
-            self._diag(f"応答済みの知らせに失敗: {message}")
+            self._diag(f"リアクションの送信に失敗: {message}")
+        self._flush_react_notes()
         self._fire_deferred_restart()
+
+    def _suppressed_chat_text(self, label, state, payload):
+        """再応答の見送りをチャットへ出す文 (2.33)。"""
+        at = self._refire_answered_at(state, payload)
+        if at:
+            when = time.strftime("%H:%M", time.localtime(at))
+            return (f"[PHAL:{label}] {when} に応答済みのため"
+                    "見送ります")
+        return f"[PHAL:{label}] 応答済みのため見送ります"
 
     # ---------------- 診断の自動応答 (1-43) ----------------
     def _note_diag_once(self, mid: str, key: str, text: str):
@@ -5415,18 +5527,21 @@ class ScriptRunnerWindow(QWidget):
         """見張りの結果に乗ってきた診断リクエストの目印を判定する。
 
         送るのは、切替「診断の自動応答」が入っていて、同じ発言を
-        消費済みでなく、直近の送信から間隔が空いていて、回答・
-        送信の連鎖が空いているときだけ。同じ発言かどうかは、全文
-        の同定子 id か、目印を含む直近40行の第2の同定子 key の
-        どちらか一致すれば消費済みとする (1-49。会話の木のずれで
-        id が漂っても、key が同じなら二度送らない)。間隔と連鎖が
-        理由の間は見送りにして、見張りの次の回で改めて判定する
-        (目印が最新の発言に残っている限り、また届く)。"""
+        消費済みでなく、回答・送信の連鎖が空いているときだけ
+        (2.31 で送信間隔の見送りは廃止)。同じ発言かどうかは、
+        全文の同定子 id か、目印を含む直近40行の第2の同定子
+        key のどちらか一致すれば消費済みとする (1-49。会話の
+        木のずれで id が漂っても、key が同じなら二度送らない)。
+        連鎖が理由の間は見送りにして、見張りの次の回で改めて
+        判定する (目印が最新の発言に残っている限り、また届く)。
+        非常停止中の目印は消費して捨てる (遅れては送らない)。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._diag_marker_pending = None
             return
@@ -5434,29 +5549,42 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._diag_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._diag_marker_pending = None
+            self._note_diag_once(
+                mid, "consumed",
+                "診断の合図: 消費済みの発言のため見送り")
             return  # 消費済みの発言。二度は送らない
+        if not req:
+            self._diag_marker_pending = None
+            self._consume_diag_marker(mid, key)
+            self._note_diag_once(
+                mid, "no_id",
+                "診断の合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:診断] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
         if not self._automation_flags()["auto_diag"]:
             self._note_diag_once(
                 mid, "off",
                 "診断リクエストを検出（自動応答は切のため見送り）")
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:診断] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._diag_marker_pending = mid
+            self._diag_marker_pending = None
+            self._consume_diag_marker(mid, key)
             self._note_diag_once(
                 mid, "emergency",
                 "診断の自動応答: 非常停止中のため見送り"
-                "（解除後に送ります）")
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:診断] 非常停止中のため破棄しました")
             return
         if self._diag_sending:
             self._diag_marker_pending = mid
-            return
-        last = float(self._diag_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.DIAG_AUTO_COOLDOWN_SEC:
-            self._diag_marker_pending = mid
-            self._note_diag_once(
-                mid, "cooldown",
-                "診断の自動応答: 直近に送ったばかりのため見送り"
-                "（間隔が空いてから送ります）")
             return
         if self._chain_in_flight():
             self._diag_marker_pending = mid
@@ -5586,21 +5714,22 @@ class ScriptRunnerWindow(QWidget):
         """見張りの結果に乗ってきたリセットの目印を判定する。
 
         反応するのは、切替「合図で自動で開き直す」が入っていて、
-        同じ発言を消費済みでなく、直近の自動リセットから10分
-        以上空いているときだけ。同じ発言かどうかは診断の目印と
-        同じ同定 (id か key のどちらか一致で消費済み) で、控えは
-        リセット専用 (core の reset_auto) に持つ。間隔が理由の間
-        は見送りにして、見張りの次の回で改めて判定する (目印が
-        最新の発言に残っている限り、また届く)。
+        同じ発言を消費済みでないときだけ (2.31 で間隔の見送り
+        は廃止)。同じ発言かどうかは診断の目印と同じ同定
+        (id か key のどちらか一致で消費済み) で、控えは
+        リセット専用 (core の reset_auto) に持つ。非常停止中の
+        目印は消費して捨てる (遅れては開き直さない)。
 
         開き直しそのものは request_restart に任せる。実行や連鎖
         の途中なら、そちらが連鎖の終了まで保留するので、ここでは
         割り込まない。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._reset_marker_pending = None
             return
@@ -5608,44 +5737,52 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._reset_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._reset_marker_pending = None
-            return  # 消費済みの発言。二度は反応しない
-        if self._refire_suppressed(self._reset_auto, ""):
-            self._reset_marker_pending = None
             self._note_reset_once(
-                mid, "refire",
-                "リセットの合図の再応答を抑止（同定子が外れた"
+                mid, "consumed",
+                "リセットの合図: 消費済みの発言のため見送り")
+            return  # 消費済みの発言。二度は反応しない
+        if not req:
+            self._reset_marker_pending = None
+            self._consume_reset_marker(mid, key)
+            self._note_reset_once(
+                mid, "no_id",
+                "リセットの合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:リセット] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._reset_auto, req):
+            self._reset_marker_pending = None
+            self._note_calm("リセットの合図の再応答を抑止（同定子が外れた"
                 "再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "リセット", self._reset_auto, req))
             return
         if not self._automation_flags()["auto_reset"]:
             self._note_reset_once(
                 mid, "off",
                 "リセットの合図を検出（自動で開き直すは切のため"
                 "見送り）")
-            return
-        if self._refire_answered_at(self._reset_auto, "") \
-                is not None:
-            self._reset_marker_pending = None
-            self._maybe_refire_notice(
-                self._reset_auto, "", "リセット",
-                core.save_reset_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:リセット] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._reset_marker_pending = mid
+            self._reset_marker_pending = None
+            self._consume_reset_marker(mid, key)
             self._note_reset_once(
                 mid, "emergency",
                 "リセットの合図: 非常停止中のため見送り"
-                "（解除後に開き直します）")
-            return
-        last = float(self._reset_auto.get("last_reset_at") or 0.0)
-        if time.time() - last < core.RESET_AUTO_COOLDOWN_SEC:
-            self._reset_marker_pending = mid
-            self._note_reset_once(
-                mid, "cooldown",
-                "リセットの合図: 直近に開き直したばかりのため"
-                "見送り（間隔が空いてから開き直します）")
+                "（遅れては開き直しません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:リセット] 非常停止中のため破棄しました")
             return
         self._reset_marker_pending = None
-        self._record_answered(self._reset_auto, "")
+        self._record_answered(self._reset_auto, req)
         self._consume_reset_marker(mid, key)
         self._diag("リセットの合図を受けて開き直します")
         self.request_restart()
@@ -5724,45 +5861,38 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._rerun_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._rerun_marker_pending = None
+            self._note_rerun_once(
+                mid, "consumed",
+                "再実行の合図: 消費済みの発言のため見送り")
             return  # 消費済みの発言。二度は反応しない
         if self._refire_suppressed(self._rerun_auto, payload):
             self._rerun_marker_pending = None
-            self._note_rerun_once(
-                mid, "refire",
-                "再実行の合図の再応答を抑止（同定子が外れた"
+            self._note_calm("再実行の合図の再応答を抑止（同定子が外れた"
                 "再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "再実行", self._rerun_auto, payload))
             return
         if not self._automation_flags()["auto_rerun"]:
             self._note_rerun_once(
                 mid, "off",
                 "再実行の合図を検出（自動で再実行するは切のため"
                 "見送り）")
-            return
-        if self._refire_answered_at(self._rerun_auto, payload) \
-                is not None:
-            self._rerun_marker_pending = None
-            self._maybe_refire_notice(
-                self._rerun_auto, payload, "再実行",
-                core.save_rerun_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:再実行] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._rerun_marker_pending = mid
+            self._rerun_marker_pending = None
+            self._consume_rerun_marker(mid, key)
             self._note_rerun_once(
                 mid, "emergency",
                 "再実行の合図: 非常停止中のため見送り"
-                "（解除後に再実行します）")
-            return
-        last = float(self._rerun_auto.get("last_rerun_at") or 0.0)
-        if time.time() - last < core.RERUN_AUTO_COOLDOWN_SEC:
-            # 間隔内の合図は捨てる (1.73、Nagato 決定)。消費
-            # だけして、遅れて実行はしない。時刻は動かさない
-            # (間隔は実行同士の間で測る)。
-            self._rerun_marker_pending = None
-            self._discard_rerun_marker(mid, key)
-            self._note_rerun_once(
-                mid, "cooldown",
-                "再実行の合図: 直近に再実行したばかりのため"
-                "破棄（間隔内の合図は捨てます）")
+                "（遅れては再実行しません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:再実行] 非常停止中のため破棄しました")
             return
         item = self._find_item_by_command_id(command_id)
         if item is None:
@@ -5861,40 +5991,38 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._resend_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._resend_marker_pending = None
+            self._note_resend_once(
+                mid, "consumed",
+                "再送の合図: 消費済みの発言のため見送り")
             return  # 消費済みの発言。二度は反応しない
         if self._refire_suppressed(self._resend_auto, command_id):
             self._resend_marker_pending = None
-            self._note_resend_once(
-                mid, "refire",
-                "結果再送の合図の再応答を抑止（同定子が外れた"
+            self._note_calm("結果再送の合図の再応答を抑止（同定子が外れた"
                 "再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "再送", self._resend_auto, command_id))
             return
         if not self._automation_flags()["auto_resend"]:
             self._note_resend_once(
                 mid, "off",
                 "結果再送の合図を検出（結果を自動で再送するは"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(
-                self._resend_auto, command_id) is not None:
-            self._resend_marker_pending = None
-            self._maybe_refire_notice(
-                self._resend_auto, command_id, "結果再送",
-                core.save_resend_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:再送] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._resend_marker_pending = mid
+            self._resend_marker_pending = None
+            self._consume_resend_marker(mid, key)
             self._note_resend_once(
                 mid, "emergency",
-                "結果再送の合図: 非常停止中のため見送り")
-            return
-        last = float(self._resend_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.RESEND_AUTO_COOLDOWN_SEC:
-            self._resend_marker_pending = mid
-            self._note_resend_once(
-                mid, "cooldown",
-                "結果再送の合図: 直近に再送したばかりのため"
-                "見送り（間隔が空いてから送ります）")
+                "結果再送の合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:再送] 非常停止中のため破棄しました")
             return
         if self._resend_sending or self._chain_in_flight():
             self._resend_marker_pending = mid
@@ -6026,9 +6154,11 @@ class ScriptRunnerWindow(QWidget):
         ファイルから組み立てる (値は毎回取り直す)。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._settings_marker_pending = None
             return
@@ -6038,40 +6168,49 @@ class ScriptRunnerWindow(QWidget):
             self._settings_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._settings_marker_pending = None
-            return
-        if self._refire_suppressed(self._settings_auto, ""):
-            self._settings_marker_pending = None
             self._note_settings_once(
-                mid, "refire",
-                "設定確認の合図の再応答を抑止（同定子が外れた"
+                mid, "consumed",
+                "設定の合図: 消費済みの発言のため見送り")
+            return
+        if not req:
+            self._settings_marker_pending = None
+            self._consume_settings_marker(mid, key)
+            self._note_settings_once(
+                mid, "no_id",
+                "設定の合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:設定] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._settings_auto, req):
+            self._settings_marker_pending = None
+            self._note_calm("設定確認の合図の再応答を抑止（同定子が外れた"
                 "再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "設定", self._settings_auto, req))
             return
         if not self._automation_flags()["auto_settings"]:
             self._note_settings_once(
                 mid, "off",
                 "設定確認の合図を検出（設定を自動で知らせるは"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(self._settings_auto, "") \
-                is not None:
-            self._settings_marker_pending = None
-            self._maybe_refire_notice(
-                self._settings_auto, "", "設定",
-                core.save_settings_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:設定] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._settings_marker_pending = mid
+            self._settings_marker_pending = None
+            self._consume_settings_marker(mid, key)
             self._note_settings_once(
                 mid, "emergency",
-                "設定確認の合図: 非常停止中のため見送り")
-            return
-        last = float(self._settings_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.SETTINGS_AUTO_COOLDOWN_SEC:
-            self._settings_marker_pending = mid
-            self._note_settings_once(
-                mid, "cooldown",
-                "設定確認の合図: 直近に送ったばかりのため見送り"
-                "（間隔が空いてから送ります）")
+                "設定確認の合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:設定] 非常停止中のため破棄しました")
             return
         if self._settings_sending or self._chain_in_flight():
             self._settings_marker_pending = mid
@@ -6081,7 +6220,7 @@ class ScriptRunnerWindow(QWidget):
                 "見送り（空いてから送ります）")
             return
         self._settings_marker_pending = None
-        self._fire_auto_settings(mid, key)
+        self._fire_auto_settings(mid, key, req)
 
     def _consume_settings_marker(self, mid, key=""):
         if not mid:
@@ -6091,7 +6230,7 @@ class ScriptRunnerWindow(QWidget):
             self._settings_auto["consumed_key"] = key
         core.save_settings_auto(self._settings_auto)
 
-    def _fire_auto_settings(self, mid, key):
+    def _fire_auto_settings(self, mid, key, req=""):
         """設定の報告を、入力欄へ入れて送信まで一気にやる
         (裏方仕事)。入れる役・押す役は他の自動応答と同じ。"""
         try:
@@ -6117,7 +6256,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._settings_sending = True
-        self._settings_auto_mid = (mid, key)
+        self._settings_auto_mid = (mid, key, req)
         self._diag("設定を自動で知らせます")
         self._publish_phal_status("answer", "設定を自動で知らせています")
 
@@ -6144,10 +6283,12 @@ class ScriptRunnerWindow(QWidget):
             mid, key = pair[0], (pair[1] if len(pair) > 1 else "")
         else:
             mid, key = pair or "", ""
+        answered_req = (pair[2] if isinstance(pair, tuple)
+                        and len(pair) > 2 else "")
         message = str(getattr(result, "message", "") or "")
         if getattr(result, "ok", False):
             self._settings_auto["last_sent_at"] = time.time()
-            self._record_answered(self._settings_auto, "")
+            self._record_answered(self._settings_auto, answered_req)
             self._consume_settings_marker(mid, key)
             self._diag("設定を自動で知らせました")
             self._set_note("設定を自動で知らせました", "ok")
@@ -6171,6 +6312,60 @@ class ScriptRunnerWindow(QWidget):
         self._fire_deferred_restart()
 
     # ---------------- 中継リクエストの合図 (2.10) ----------------
+    def _defer_relay_ack(self, source_name, dst_name, state):
+        """中継の成功 ACK を保留する (2.27)。
+
+        成功の ACK は即送らず 30 秒 (core.RELAY_ACK_DELAY_SEC)
+        保留し、その間に送り先からの戻り (逆向きの中継の成功)
+        があれば送らない。戻りそのものが届いた証拠になるため。
+        保留の前に、今回の中継が「戻り」にあたる保留中の ACK
+        があれば取り消す。送り元が特定できないときは、従来ど
+        おりその場で送る。失敗と却下の知らせは保留しない。"""
+        if state is not None:
+            self._relay_acks_pending = [
+                e for e in self._relay_acks_pending
+                if not (e["dst"] == source_name
+                        and e["src"] == dst_name)]
+        if not source_name or state is None:
+            self._post_relay_ack(
+                f"[PHAL:中継受付] {dst_name}へ中継しました。"
+                "返事を待っています", state=state)
+            return
+        self._relay_acks_pending.append({
+            "src": source_name, "dst": dst_name,
+            "due": time.time() + core.RELAY_ACK_DELAY_SEC,
+            "text": (f"[PHAL:中継受付] {dst_name}へ"
+                     "中継しました。返事を待っています"),
+            "state": state})
+
+    def _flush_due_relay_acks(self):
+        """保留中の成功 ACK のうち、期限が来たものを送る
+        (2.27、1秒ごとの表示付け直しから呼ばれる)。
+
+        送る役が忙しい間は次回へ回す (割り込まない作法は
+        _post_relay_ack と同じ)。期限から 120 秒を過ぎても
+        送れなければ、古い知らせとして落とす。"""
+        pending = getattr(self, "_relay_acks_pending", None)
+        if not pending:
+            return
+        if self._emergency_stopped:
+            # 非常停止中は知らせを出さず、保留も捨てる (2.29)。
+            self._relay_acks_pending = []
+            return
+        now = time.time()
+        keep = []
+        for entry in pending:
+            if now < entry["due"]:
+                keep.append(entry)
+                continue
+            if self._relay_ack_sending or self._chain_in_flight():
+                if now - entry["due"] < 120:
+                    keep.append(entry)
+                continue
+            self._post_relay_ack(entry["text"],
+                                 state=entry["state"])
+        self._relay_acks_pending = keep
+
     def _post_relay_ack(self, text, state=None):
         """中継の経過を、送り元のチャットへ短い返事 (ACK) で
         返す (2.12、宛先は 2.17 で送り元の窓へ)。
@@ -6224,20 +6419,24 @@ class ScriptRunnerWindow(QWidget):
             self._diag(f"中継の返事（ACK）に失敗: {message}")
 
     def _note_relay_once(self, mid: str, key: str, text: str,
-                         state=None, ack=True):
+                         state=None, ack=True, elem: str = ""):
         """見送りの理由を、同じ目印・同じ理由では1度だけ診断に
-        残し、送り元の窓へ ACK でも返す (他の合図と同じ作法)。
-        ack=False なら診断だけ (送り元でない窓で見つけた目印
-        など、返事を返す先が無い・返すべきでないとき)。"""
-        if len(self._relay_noted) > 50:
+        残す (2.31 から、見送りの知らせはチャットへ出さない。
+        Nagato 決定: 中間の知らせは混乱の元)。
+        抑止の照合は、同定子 (mid) だけでなく要素の同定子
+        (elem) でも行う (2.29)。mid は木の先頭からの経路で
+        作るため、チャットの表示範囲がずれると同じ要素でも
+        変わってしまい、却下が連発した。非常停止中は、知らせ
+        自体を出さない (診断にだけ残す)。"""
+        if len(self._relay_noted) > 200:
             self._relay_noted.clear()
-        stamp = (mid, key)
-        if stamp in self._relay_noted:
+        stamps = {(mid, key)}
+        if elem:
+            stamps.add((elem, key))
+        if stamps & self._relay_noted:
             return
-        self._relay_noted.add(stamp)
+        self._relay_noted |= stamps
         self._diag(text)
-        if ack:
-            self._post_relay_ack(text, state=state)
 
     def _stash_relay_pending(self, mid, key, body, retries=0,
                              delay=0.0, src="", dst=""):
@@ -6331,9 +6530,6 @@ class ScriptRunnerWindow(QWidget):
             return
         if now < pending["not_before"]:
             return
-        last = float(self._relay_auto.get("last_sent_at") or 0.0)
-        if now - last < core.RELAY_AUTO_COOLDOWN_SEC:
-            return
         if self._relay_sending or self._chain_in_flight():
             return
         retries = pending["retries"]
@@ -6378,7 +6574,7 @@ class ScriptRunnerWindow(QWidget):
         だけ送る。送る文は目印の次の行から発言の末尾まで
         (走査側が body に入れて寄こす)。受け付けられない
         目印 (引数がほどけない・本文が無い・自動中継がオフ
-        など) には、理由を「中継NACK: 」で送り元へ返す
+        など) には、理由を「[PHAL:中継却下] 」で送り元へ返す
         (2.19)。保留になった中継は
         本文と経路ごと控えに残し、目印が消えた後でも控えから
         送る (2.13)。"""
@@ -6406,7 +6602,7 @@ class ScriptRunnerWindow(QWidget):
             self._note_relay_once(
                 mid, "refire",
                 "中継リクエストの再応答を抑止（同定子が外れた"
-                "再検出とみられる）", state=dispatch)
+                "再検出とみられる）", state=dispatch, elem=key)
             return
         # 経路の解決 (2.17)。引数つきは送り元の窓からの合図
         # だけを受け、送り先は引数のとおり。引数なしは、見張り
@@ -6418,10 +6614,13 @@ class ScriptRunnerWindow(QWidget):
         if arg:
             pair = self._relay_route_for_arg(arg)
             if pair is None:
+                # 引数の誤りは直らないので消費済みにし、再検出で
+                # 却下を繰り返さない (2.29)。
+                self._consume_relay_marker(mid, key)
                 self._note_relay_once(
                     mid, "bad-arg",
-                    f"中継NACK: 引数が分かりません"
-                    f"（{arg}）", state=dispatch)
+                    f"[PHAL:中継却下] 引数が分かりません"
+                    f"（{arg}）", state=dispatch, elem=key)
                 return
             src_name, dst_name = pair
             if dispatch is None or dispatch.name != src_name:
@@ -6429,29 +6628,29 @@ class ScriptRunnerWindow(QWidget):
                     mid, "wrong-src",
                     f"中継リクエスト: 送り元（{src_name}）の"
                     "窓でないため中継しません",
-                    state=dispatch, ack=False)
+                    state=dispatch, ack=False, elem=key)
                 return
             dst_state = self._watches.get(dst_name)
             if dst_state is None:
                 self._note_relay_once(
                     mid, "no-dst",
-                    f"中継NACK: 送り先（{dst_name}）を"
-                    "見張っていないため送れません", state=dispatch)
+                    f"[PHAL:中継却下] 送り先（{dst_name}）を"
+                    "見張っていないため送れません", state=dispatch, elem=key)
                 return
         else:
             if len(watch_list) < 2:
                 self._note_relay_once(
                     mid, "no-dual",
-                    "中継NACK: 見張っている窓が"
+                    "[PHAL:中継却下] 見張っている窓が"
                     "1つだけのため送れません",
-                    state=dispatch)
+                    state=dispatch, elem=key)
                 return
             if len(watch_list) > 2:
                 self._note_relay_once(
                     mid, "need-arg",
-                    "中継NACK: 見張りが3つ以上あるため、"
+                    "[PHAL:中継却下] 見張りが3つ以上あるため、"
                     "引数で送り先を指定してください",
-                    state=dispatch)
+                    state=dispatch, elem=key)
                 return
             if dispatch is None:
                 return
@@ -6462,18 +6661,21 @@ class ScriptRunnerWindow(QWidget):
         if not self._automation_flags()["auto_relay"]:
             self._note_relay_once(
                 mid, "off",
-                "中継NACK: 自動中継がオフのため"
-                "送りませんでした", state=dispatch)
+                "[PHAL:中継却下] 自動中継がオフのため"
+                "送りませんでした", state=dispatch, elem=key)
             return
         if not body:
             # 本文が無い目印は受け付けず、理由を NACK で返す
             # (2.19)。黙って見送ると、送り元は「まだ見えて
             # いない」のか「形式ミス」なのか区別できない。
+            # 形式の誤りは直らないので消費済みにし、再検出で
+            # 却下を繰り返さない (2.29)。
+            self._consume_relay_marker(mid, key)
             self._note_relay_once(
                 mid, "empty-body",
-                "中継NACK: 本文がありません（目印の次の行か、"
+                "[PHAL:中継却下] 本文がありません（目印の次の行か、"
                 "目印の行の引数の後ろに本文を書いてください）",
-                state=dispatch)
+                state=dispatch, elem=key)
             return
         if self._refire_answered_at(self._relay_auto, body) \
                 is not None:
@@ -6489,18 +6691,7 @@ class ScriptRunnerWindow(QWidget):
             self._note_relay_once(
                 mid, "emergency",
                 "中継リクエスト: 非常停止中のため見送り",
-                state=dispatch)
-            return
-        last = float(self._relay_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.RELAY_AUTO_COOLDOWN_SEC:
-            self._relay_marker_pending = mid
-            self._stash_relay_pending(
-                mid, key, body, src=src_name, dst=dst_name)
-            self._note_relay_once(
-                mid, "cooldown",
-                "中継リクエスト: 直近に送ったばかりのため"
-                "見送り（間隔が空いてから送ります）",
-                state=dispatch)
+                state=dispatch, elem=key)
             return
         if self._relay_sending or self._chain_in_flight():
             self._relay_marker_pending = mid
@@ -6510,7 +6701,7 @@ class ScriptRunnerWindow(QWidget):
                 mid, "busy",
                 "中継リクエスト: 回答・送信の連鎖の途中のため"
                 "見送り（空いてから送ります）",
-                state=dispatch)
+                state=dispatch, elem=key)
             return
         self._relay_marker_pending = None
         pending = core.sanitize_relay_pending(
@@ -6540,7 +6731,8 @@ class ScriptRunnerWindow(QWidget):
         と同じで、投げ先だけ送り先のプロファイルに差し替える。
         retries は送り直しの回数 (2.13、完了側で上限を見る)。
         source_name は送り元のプロファイル名 (2.17、ACK の
-        宛先に使う)。"""
+        宛先に使う)。届ける文には、送り元の表示を先頭に
+        付ける (2.30)。"""
         profile = getattr(target_state, "profile", None)
         name = getattr(target_state, "name", "") or ""
         if profile is None:
@@ -6552,7 +6744,7 @@ class ScriptRunnerWindow(QWidget):
                     f"中継に失敗: 投げ先を解決できません（{e}）")
                 self._consume_relay_marker(mid, key)
                 self._post_relay_ack(
-                    "中継に失敗しました: 投げ先を解決できません",
+                    "[PHAL:中継失敗] 投げ先を解決できません",
                     state=self._watches.get(source_name))
                 return
             if not configured:
@@ -6564,12 +6756,21 @@ class ScriptRunnerWindow(QWidget):
                 f"中継: {name}の投げ先が設定されていません",
                 "error")
             self._post_relay_ack(
-                f"中継に失敗しました: {name}の投げ先が"
+                f"[PHAL:中継失敗] {name}の投げ先が"
                 "設定されていません",
                 state=self._watches.get(source_name))
             return
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
+        # 届ける文の先頭に、送り元を示す一行を付ける (2.30)。
+        # 中継された文は、届け先では本人の発言と見分けが
+        # つかない、という Nagato の指摘から。控えや再検出の
+        # 照合は元の本文のままで、付けるのは送信のときだけ。
+        if source_name:
+            send_text = (f"[PHAL:中継] {source_name}"
+                         f" からのメッセージ\n{body}")
+        else:
+            send_text = body
         self._relay_sending = True
         self._relay_auto_mid = (mid, key, body, name, retries,
                                 source_name)
@@ -6581,7 +6782,7 @@ class ScriptRunnerWindow(QWidget):
 
         def work():
             try:
-                result = sender(body, profile)
+                result = sender(send_text, profile)
                 if getattr(result, "ok", False):
                     result = presser(profile)
             except Exception as e:  # noqa: BLE001
@@ -6615,9 +6816,7 @@ class ScriptRunnerWindow(QWidget):
             self._clear_relay_pending(mid)
             self._diag(f"{name}へ中継しました")
             self._set_note(f"{name}へ中継しました", "ok")
-            self._post_relay_ack(
-                f"中継しました: {name}へ送りました",
-                state=ack_state)
+            self._defer_relay_ack(source_name, name, ack_state)
         elif getattr(result, "needs_confirm", False):
             self._consume_relay_marker(mid, key)
             self._clear_relay_pending(mid)
@@ -6627,7 +6826,7 @@ class ScriptRunnerWindow(QWidget):
                 f"中継: {name}の入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
             self._post_relay_ack(
-                f"中継を見送りました: {name}の入力欄に"
+                f"[PHAL:中継見送り] {name}の入力欄に"
                 "書きかけがあります", state=ack_state)
         elif retries < core.RELAY_RETRY_MAX:
             # 失敗は消費せず、少し置いて1回だけ送り直す
@@ -6645,7 +6844,7 @@ class ScriptRunnerWindow(QWidget):
                 f"{name}へ中継できませんでした（{message}）"
                 "。少し置いて送り直します", "warn")
             self._post_relay_ack(
-                f"中継に失敗しました: {message}"
+                f"[PHAL:中継失敗] {message}"
                 "。少し置いて1回だけ送り直します",
                 state=ack_state)
         else:
@@ -6656,7 +6855,7 @@ class ScriptRunnerWindow(QWidget):
                 f"{name}へ中継できませんでした（{message}）",
                 "error")
             self._post_relay_ack(
-                f"中継に失敗しました: {message}",
+                f"[PHAL:中継失敗] {message}",
                 state=ack_state)
         if getattr(result, "ok", False):
             self._publish_phal_idle(f"{name}へ中継しました")
@@ -6693,9 +6892,11 @@ class ScriptRunnerWindow(QWidget):
         の決定)。ファイルが無ければ、その旨の文だけを送る。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._manual_marker_pending = None
             return
@@ -6703,40 +6904,49 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._manual_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._manual_marker_pending = None
-            return
-        if self._refire_suppressed(self._manual_auto, ""):
-            self._manual_marker_pending = None
             self._note_manual_once(
-                mid, "refire",
-                "マニュアル再送の合図の再応答を抑止（同定子が"
+                mid, "consumed",
+                "マニュアルの合図: 消費済みの発言のため見送り")
+            return
+        if not req:
+            self._manual_marker_pending = None
+            self._consume_manual_marker(mid, key)
+            self._note_manual_once(
+                mid, "no_id",
+                "マニュアルの合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:マニュアル] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._manual_auto, req):
+            self._manual_marker_pending = None
+            self._note_calm("マニュアル再送の合図の再応答を抑止（同定子が"
                 "外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "マニュアル", self._manual_auto, req))
             return
         if not self._automation_flags()["auto_manual"]:
             self._note_manual_once(
                 mid, "off",
                 "マニュアル再送の合図を検出（マニュアルを自動で"
                 "再送するは切のため見送り）")
-            return
-        if self._refire_answered_at(self._manual_auto, "") \
-                is not None:
-            self._manual_marker_pending = None
-            self._maybe_refire_notice(
-                self._manual_auto, "", "マニュアル再送",
-                core.save_manual_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:マニュアル] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._manual_marker_pending = mid
+            self._manual_marker_pending = None
+            self._consume_manual_marker(mid, key)
             self._note_manual_once(
                 mid, "emergency",
-                "マニュアル再送の合図: 非常停止中のため見送り")
-            return
-        last = float(self._manual_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.MANUAL_AUTO_COOLDOWN_SEC:
-            self._manual_marker_pending = mid
-            self._note_manual_once(
-                mid, "cooldown",
-                "マニュアル再送の合図: 直近に送ったばかりのため"
-                "見送り（間隔が空いてから送ります）")
+                "マニュアル再送の合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:マニュアル] 非常停止中のため破棄しました")
             return
         if self._manual_sending or self._chain_in_flight():
             self._manual_marker_pending = mid
@@ -6746,7 +6956,7 @@ class ScriptRunnerWindow(QWidget):
                 "ため見送り（空いてから送ります）")
             return
         self._manual_marker_pending = None
-        self._fire_auto_manual(mid, key)
+        self._fire_auto_manual(mid, key, req)
 
     def _consume_manual_marker(self, mid, key=""):
         if not mid:
@@ -6756,7 +6966,7 @@ class ScriptRunnerWindow(QWidget):
             self._manual_auto["consumed_key"] = key
         core.save_manual_auto(self._manual_auto)
 
-    def _fire_auto_manual(self, mid, key):
+    def _fire_auto_manual(self, mid, key, req=""):
         """マニュアルを添付して、入力欄へ入れて送信まで一気に
         やる (裏方仕事)。"""
         try:
@@ -6775,8 +6985,8 @@ class ScriptRunnerWindow(QWidget):
             return
         manual = self._intro_manual_path()
         if manual is not None:
-            text = ("連携マニュアル（phal-ai-manual.md）を"
-                    "再送します。")
+            text = ("[PHAL:マニュアル再送] 連携マニュアル"
+                    "（phal-ai-manual.md）を再送します。")
             attach = [str(manual)]
         else:
             text = ("マニュアルのファイル（phal-ai-manual.md）が"
@@ -6785,7 +6995,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._manual_sending = True
-        self._manual_auto_mid = (mid, key)
+        self._manual_auto_mid = (mid, key, req)
         self._diag("マニュアルを自動で再送します")
         self._publish_phal_status(
             "answer", "マニュアルを自動で再送しています")
@@ -6815,10 +7025,12 @@ class ScriptRunnerWindow(QWidget):
             mid, key = pair[0], (pair[1] if len(pair) > 1 else "")
         else:
             mid, key = pair or "", ""
+        answered_req = (pair[2] if isinstance(pair, tuple)
+                        and len(pair) > 2 else "")
         message = str(getattr(result, "message", "") or "")
         if getattr(result, "ok", False):
             self._manual_auto["last_sent_at"] = time.time()
-            self._record_answered(self._manual_auto, "")
+            self._record_answered(self._manual_auto, answered_req)
             self._consume_manual_marker(mid, key)
             self._diag("マニュアルを自動で再送しました")
             self._set_note("マニュアルを自動で再送しました", "ok")
@@ -6874,40 +7086,38 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._file_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._file_marker_pending = None
+            self._note_file_once(
+                mid, "consumed",
+                "ファイルの合図: 消費済みの発言のため見送り")
             return
         if self._refire_suppressed(self._file_auto, req):
             self._file_marker_pending = None
-            self._note_file_once(
-                mid, "refire",
-                "ファイルリクエストの合図の再応答を抑止"
+            self._note_calm("ファイルリクエストの合図の再応答を抑止"
                 "（同定子が外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "ファイル", self._file_auto, req))
             return
         if not self._automation_flags()["auto_file"]:
             self._note_file_once(
                 mid, "off",
                 "ファイルリクエストの合図を検出（ファイルを自動で"
                 "送るは切のため見送り）")
-            return
-        if self._refire_answered_at(self._file_auto, req) \
-                is not None:
-            self._file_marker_pending = None
-            self._maybe_refire_notice(
-                self._file_auto, req, "ファイル",
-                core.save_file_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:ファイル] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._file_marker_pending = mid
+            self._file_marker_pending = None
+            self._consume_file_marker(mid, key)
             self._note_file_once(
                 mid, "emergency",
-                "ファイルリクエストの合図: 非常停止中のため見送り")
-            return
-        last = float(self._file_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.FILE_AUTO_COOLDOWN_SEC:
-            self._file_marker_pending = mid
-            self._note_file_once(
-                mid, "cooldown",
-                "ファイルリクエストの合図: 直近に送ったばかりの"
-                "ため見送り（間隔が空いてから送ります）")
+                "ファイルリクエストの合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:ファイル] 非常停止中のため破棄しました")
             return
         if self._file_sending or self._chain_in_flight():
             self._file_marker_pending = mid
@@ -6953,7 +7163,7 @@ class ScriptRunnerWindow(QWidget):
                 out.write_bytes(data)
             except OSError as e:
                 return f"切り出したファイルを作れませんでした（{e}）", []
-            text = (f"ファイル（{path.name}）のバイト範囲 "
+            text = (f"[PHAL:ファイル送信] ファイル（{path.name}）のバイト範囲 "
                     f"{spec['start']}〜{spec['start'] + len(data)}"
                     f"（全{size}バイト、{len(data)}バイト分）を送ります。")
             if truncated:
@@ -6975,7 +7185,7 @@ class ScriptRunnerWindow(QWidget):
         sliced, total = core.slice_text_lines(body, spec)
         end = spec["end"] if spec["end"] is not None else total
         end = min(end, total)
-        head = (f"ファイル（{path.name}）の {spec['start']}〜{end}行目"
+        head = (f"[PHAL:ファイル送信] ファイル（{path.name}）の {spec['start']}〜{end}行目"
                 f"（全{total}行、{enc}）です。")
         if not sliced:
             return head + "\n（範囲に行がありません）", []
@@ -7021,7 +7231,7 @@ class ScriptRunnerWindow(QWidget):
         if path is not None and spec is not None:
             text, attach = self._prepare_file_slice(path, spec)
         elif path is not None:
-            text = f"ファイル（{path.name}）を送ります。"
+            text = f"[PHAL:ファイル送信] {path.name} を送ります。"
             attach = [str(path)]
         elif reason == "outside":
             text = ("そのファイルはダウンロードフォルダと作業"
@@ -7128,40 +7338,38 @@ class ScriptRunnerWindow(QWidget):
             self._fulltext_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._fulltext_marker_pending = None
+            self._note_fulltext_once(
+                mid, "consumed",
+                "全文の合図: 消費済みの発言のため見送り")
             return
         if self._refire_suppressed(self._fulltext_auto, cid):
             self._fulltext_marker_pending = None
-            self._note_fulltext_once(
-                mid, "refire",
-                "全文リクエストの合図の再応答を抑止（同定子が"
+            self._note_calm("全文リクエストの合図の再応答を抑止（同定子が"
                 "外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "全文", self._fulltext_auto, cid))
             return
         if not self._automation_flags()["auto_fulltext"]:
             self._note_fulltext_once(
                 mid, "off",
                 "全文リクエストの合図を検出（全文の自動返信は"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(self._fulltext_auto, cid) \
-                is not None:
-            self._fulltext_marker_pending = None
-            self._maybe_refire_notice(
-                self._fulltext_auto, cid, "全文",
-                core.save_fulltext_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:全文] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._fulltext_marker_pending = mid
+            self._fulltext_marker_pending = None
+            self._consume_fulltext_marker(mid, key)
             self._note_fulltext_once(
                 mid, "emergency",
-                "全文リクエストの合図: 非常停止中のため見送り")
-            return
-        last = float(self._fulltext_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.FULLTEXT_AUTO_COOLDOWN_SEC:
-            self._fulltext_marker_pending = mid
-            self._note_fulltext_once(
-                mid, "cooldown",
-                "全文リクエストの合図: 直近に送ったばかりの"
-                "ため見送り（間隔が空いてから送ります）")
+                "全文リクエストの合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:全文] 非常停止中のため破棄しました")
             return
         if self._fulltext_sending or self._chain_in_flight():
             self._fulltext_marker_pending = mid
@@ -7200,7 +7408,7 @@ class ScriptRunnerWindow(QWidget):
             return
         path = core.find_full_output(command_id)
         if path is not None:
-            text = (f"要約で送った結果（{command_id}）の"
+            text = (f"[PHAL:全文送信] 要約で送った結果（{command_id}）の"
                     "全文を送ります。")
             attach = [str(path)]
         else:
@@ -7292,9 +7500,11 @@ class ScriptRunnerWindow(QWidget):
         組み立てる (値は毎回取り直す)。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._history_marker_pending = None
             return
@@ -7304,40 +7514,49 @@ class ScriptRunnerWindow(QWidget):
             self._history_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._history_marker_pending = None
-            return
-        if self._refire_suppressed(self._history_auto, ""):
-            self._history_marker_pending = None
             self._note_history_once(
-                mid, "refire",
-                "一覧リクエストの合図の再応答を抑止（同定子が"
+                mid, "consumed",
+                "一覧の合図: 消費済みの発言のため見送り")
+            return
+        if not req:
+            self._history_marker_pending = None
+            self._consume_history_marker(mid, key)
+            self._note_history_once(
+                mid, "no_id",
+                "一覧の合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:一覧] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._history_auto, req):
+            self._history_marker_pending = None
+            self._note_calm("一覧リクエストの合図の再応答を抑止（同定子が"
                 "外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "一覧", self._history_auto, req))
             return
         if not self._automation_flags()["auto_history"]:
             self._note_history_once(
                 mid, "off",
                 "一覧リクエストの合図を検出（実行一覧の自動返信は"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(self._history_auto, "") \
-                is not None:
-            self._history_marker_pending = None
-            self._maybe_refire_notice(
-                self._history_auto, "", "一覧",
-                core.save_history_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:一覧] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._history_marker_pending = mid
+            self._history_marker_pending = None
+            self._consume_history_marker(mid, key)
             self._note_history_once(
                 mid, "emergency",
-                "一覧リクエストの合図: 非常停止中のため見送り")
-            return
-        last = float(self._history_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.HISTORY_AUTO_COOLDOWN_SEC:
-            self._history_marker_pending = mid
-            self._note_history_once(
-                mid, "cooldown",
-                "一覧リクエストの合図: 直近に送ったばかりのため"
-                "見送り（間隔が空いてから送ります）")
+                "一覧リクエストの合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:一覧] 非常停止中のため破棄しました")
             return
         if self._history_sending or self._chain_in_flight():
             self._history_marker_pending = mid
@@ -7347,7 +7566,7 @@ class ScriptRunnerWindow(QWidget):
                 "ため見送り（空いてから送ります）")
             return
         self._history_marker_pending = None
-        self._fire_auto_history(mid, key)
+        self._fire_auto_history(mid, key, req)
 
     def _consume_history_marker(self, mid, key=""):
         if not mid:
@@ -7357,7 +7576,7 @@ class ScriptRunnerWindow(QWidget):
             self._history_auto["consumed_key"] = key
         core.save_history_auto(self._history_auto)
 
-    def _fire_auto_history(self, mid, key):
+    def _fire_auto_history(self, mid, key, req=""):
         """実行一覧を、入力欄へ入れて送信まで一気にやる
         (裏方仕事)。入れる役・押す役は他の自動応答と同じ。"""
         try:
@@ -7378,7 +7597,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._history_sending = True
-        self._history_auto_mid = (mid, key)
+        self._history_auto_mid = (mid, key, req)
         self._diag("実行一覧を自動で送ります")
         self._publish_phal_status(
             "answer", "実行一覧を自動で送っています")
@@ -7406,10 +7625,12 @@ class ScriptRunnerWindow(QWidget):
             mid, key = pair[0], (pair[1] if len(pair) > 1 else "")
         else:
             mid, key = pair or "", ""
+        answered_req = (pair[2] if isinstance(pair, tuple)
+                        and len(pair) > 2 else "")
         message = str(getattr(result, "message", "") or "")
         if getattr(result, "ok", False):
             self._history_auto["last_sent_at"] = time.time()
-            self._record_answered(self._history_auto, "")
+            self._record_answered(self._history_auto, answered_req)
             self._consume_history_marker(mid, key)
             self._diag("実行一覧を自動で送りました")
             self._set_note("実行一覧を自動で送りました", "ok")
@@ -7456,9 +7677,11 @@ class ScriptRunnerWindow(QWidget):
         スクリプトはありません。」と文で返す。"""
         mid = ""
         key = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
+            req = str(marker.get("request_id") or "")
         if not mid:
             self._stop_marker_pending = None
             return
@@ -7467,40 +7690,49 @@ class ScriptRunnerWindow(QWidget):
             self._stop_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._stop_marker_pending = None
-            return
-        if self._refire_suppressed(self._stop_auto, ""):
-            self._stop_marker_pending = None
             self._note_stop_once(
-                mid, "refire",
-                "停止リクエストの合図の再応答を抑止（同定子が"
+                mid, "consumed",
+                "停止の合図: 消費済みの発言のため見送り")
+            return
+        if not req:
+            self._stop_marker_pending = None
+            self._consume_stop_marker(mid, key)
+            self._note_stop_once(
+                mid, "no_id",
+                "停止の合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:停止] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._stop_auto, req):
+            self._stop_marker_pending = None
+            self._note_calm("停止リクエストの合図の再応答を抑止（同定子が"
                 "外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "停止", self._stop_auto, req))
             return
         if not self._automation_flags()["auto_stop"]:
             self._note_stop_once(
                 mid, "off",
                 "停止リクエストの合図を検出（停止の自動応答は"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(self._stop_auto, "") \
-                is not None:
-            self._stop_marker_pending = None
-            self._maybe_refire_notice(
-                self._stop_auto, "", "停止",
-                core.save_stop_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:停止] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._stop_marker_pending = mid
+            self._stop_marker_pending = None
+            self._consume_stop_marker(mid, key)
             self._note_stop_once(
                 mid, "emergency",
-                "停止リクエストの合図: 非常停止中のため見送り")
-            return
-        last = float(self._stop_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.STOP_AUTO_COOLDOWN_SEC:
-            self._stop_marker_pending = mid
-            self._note_stop_once(
-                mid, "cooldown",
-                "停止リクエストの合図: 直近に応答したばかりの"
-                "ため見送り（間隔が空いてから応答します）")
+                "停止リクエストの合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:停止] 非常停止中のため破棄しました")
             return
         if self._run_handle is not None:
             # 実行中: 連鎖の空きは見ず、その場で止める。
@@ -7508,7 +7740,7 @@ class ScriptRunnerWindow(QWidget):
             item = self._running_item
             name = item.name if item is not None else "(不明)"
             self._stop_auto["last_sent_at"] = time.time()
-            self._record_answered(self._stop_auto, "")
+            self._record_answered(self._stop_auto, req)
             self._consume_stop_marker(mid, key)
             self._stop_run()
             self._diag(
@@ -7521,7 +7753,7 @@ class ScriptRunnerWindow(QWidget):
             # ツール実行の結果文 (停止しました) が担う。
             self._stop_marker_pending = None
             self._stop_auto["last_sent_at"] = time.time()
-            self._record_answered(self._stop_auto, "")
+            self._record_answered(self._stop_auto, req)
             self._consume_stop_marker(mid, key)
             self._tool_handle.stop()
             self._diag(
@@ -7538,7 +7770,7 @@ class ScriptRunnerWindow(QWidget):
                 "ため見送り（空いてから応答します）")
             return
         self._stop_marker_pending = None
-        self._fire_auto_stop(mid, key)
+        self._fire_auto_stop(mid, key, req)
 
     def _consume_stop_marker(self, mid, key=""):
         if not mid:
@@ -7548,7 +7780,7 @@ class ScriptRunnerWindow(QWidget):
             self._stop_auto["consumed_key"] = key
         core.save_stop_auto(self._stop_auto)
 
-    def _fire_auto_stop(self, mid, key):
+    def _fire_auto_stop(self, mid, key, req=""):
         """「実行中はない」旨を、入力欄へ入れて送信まで一気に
         やる (裏方仕事)。入れる役・押す役は他の自動応答と
         同じ。"""
@@ -7570,7 +7802,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._stop_sending = True
-        self._stop_auto_mid = (mid, key)
+        self._stop_auto_mid = (mid, key, req)
         self._diag("停止リクエストへ自動で応答します（実行中なし）")
         self._publish_phal_status(
             "answer", "停止リクエストへ自動で応答しています")
@@ -7598,10 +7830,12 @@ class ScriptRunnerWindow(QWidget):
             mid, key = pair[0], (pair[1] if len(pair) > 1 else "")
         else:
             mid, key = pair or "", ""
+        answered_req = (pair[2] if isinstance(pair, tuple)
+                        and len(pair) > 2 else "")
         message = str(getattr(result, "message", "") or "")
         if getattr(result, "ok", False):
             self._stop_auto["last_sent_at"] = time.time()
-            self._record_answered(self._stop_auto, "")
+            self._record_answered(self._stop_auto, answered_req)
             self._consume_stop_marker(mid, key)
             self._diag("停止リクエストへ自動で応答しました")
             self._set_note(
@@ -7650,10 +7884,13 @@ class ScriptRunnerWindow(QWidget):
         mid = ""
         key = ""
         params = ""
+        req = ""
         if isinstance(marker, dict):
             mid = str(marker.get("id") or "")
             key = str(marker.get("key") or "")
             params = str(marker.get("params") or "").strip()
+            req = str(marker.get("request_id") or "")
+        payload = req if req else params
         if not mid:
             self._log_marker_pending = None
             return
@@ -7661,40 +7898,49 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._log_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._log_marker_pending = None
-            return
-        if self._refire_suppressed(self._log_auto, params):
-            self._log_marker_pending = None
             self._note_log_once(
-                mid, "refire",
-                "ログリクエストの合図の再応答を抑止（同定子が"
+                mid, "consumed",
+                "ログの合図: 消費済みの発言のため見送り")
+            return
+        if not req:
+            self._log_marker_pending = None
+            self._consume_log_marker(mid, key)
+            self._note_log_once(
+                mid, "no_id",
+                "ログの合図: 依頼IDがないため見送り")
+            self._post_react_note_once(
+                mid, "no_id",
+                "[PHAL:ログ] 依頼IDがないため応答しません。"
+                "IDを付けて出し直してください")
+            return
+        if self._refire_suppressed(self._log_auto, payload):
+            self._log_marker_pending = None
+            self._note_calm("ログリクエストの合図の再応答を抑止（同定子が"
                 "外れた再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "ログ", self._log_auto, payload))
             return
         if not self._automation_flags()["auto_log"]:
             self._note_log_once(
                 mid, "off",
                 "ログリクエストの合図を検出（動作ログの自動返信は"
                 "切のため見送り）")
-            return
-        if self._refire_answered_at(self._log_auto, params) \
-                is not None:
-            self._log_marker_pending = None
-            self._maybe_refire_notice(
-                self._log_auto, params, "ログ",
-                core.save_log_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:ログ] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._log_marker_pending = mid
+            self._log_marker_pending = None
+            self._consume_log_marker(mid, key)
             self._note_log_once(
                 mid, "emergency",
-                "ログリクエストの合図: 非常停止中のため見送り")
-            return
-        last = float(self._log_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.LOG_AUTO_COOLDOWN_SEC:
-            self._log_marker_pending = mid
-            self._note_log_once(
-                mid, "cooldown",
-                "ログリクエストの合図: 直近に送ったばかりのため"
-                "見送り（間隔が空いてから送ります）")
+                "ログリクエストの合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:ログ] 非常停止中のため破棄しました")
             return
         if self._log_sending or self._chain_in_flight():
             self._log_marker_pending = mid
@@ -7704,7 +7950,7 @@ class ScriptRunnerWindow(QWidget):
                 "ため見送り（空いてから送ります）")
             return
         self._log_marker_pending = None
-        self._fire_auto_log(mid, key, params)
+        self._fire_auto_log(mid, key, params, payload)
 
     def _consume_log_marker(self, mid, key=""):
         if not mid:
@@ -7714,7 +7960,7 @@ class ScriptRunnerWindow(QWidget):
             self._log_auto["consumed_key"] = key
         core.save_log_auto(self._log_auto)
 
-    def _fire_auto_log(self, mid, key, params):
+    def _fire_auto_log(self, mid, key, params, payload):
         """動作ログを、入力欄へ入れて送信まで一気にやる
         (裏方仕事)。全文が長いときはファイルに書いて添付し、
         文は見出しだけにする。入れる役・押す役は他の自動応答
@@ -7754,7 +8000,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._log_sending = True
-        self._log_auto_mid = (mid, key, params)
+        self._log_auto_mid = (mid, key, payload)
         self._diag(f"動作ログを自動で送ります: {params or '(指定なし)'}")
         self._publish_phal_status(
             "answer", "動作ログを自動で送っています")
@@ -7844,40 +8090,38 @@ class ScriptRunnerWindow(QWidget):
         consumed_key = str(self._tool_auto.get("consumed_key") or "")
         if mid == consumed_id or (key and key == consumed_key):
             self._tool_marker_pending = None
+            self._note_tool_once(
+                mid, "consumed",
+                "ツールの合図: 消費済みの発言のため見送り")
             return
         if self._refire_suppressed(self._tool_auto, command):
             self._tool_marker_pending = None
-            self._note_tool_once(
-                mid, "refire",
-                "ツール実行の合図の再応答を抑止（同定子が外れた"
+            self._note_calm("ツール実行の合図の再応答を抑止（同定子が外れた"
                 "再検出とみられる）")
+            self._post_react_note_once(
+                mid, "refire",
+                self._suppressed_chat_text(
+                    "ツール", self._tool_auto, command))
             return
         if not self._automation_flags()["auto_tool"]:
             self._note_tool_once(
                 mid, "off",
                 "ツール実行の合図を検出（ツールを自動で実行する"
                 "は切のため見送り）")
-            return
-        if self._refire_answered_at(self._tool_auto, command) \
-                is not None:
-            self._tool_marker_pending = None
-            self._maybe_refire_notice(
-                self._tool_auto, command, "ツール実行",
-                core.save_tool_auto)
+            self._post_react_note_once(
+                mid, "off",
+                "[PHAL:ツール] 自動応答が切のため応答しません")
             return
         if self._emergency_stopped:
-            self._tool_marker_pending = mid
+            self._tool_marker_pending = None
+            self._consume_tool_marker(mid, key)
             self._note_tool_once(
                 mid, "emergency",
-                "ツール実行の合図: 非常停止中のため見送り")
-            return
-        last = float(self._tool_auto.get("last_sent_at") or 0.0)
-        if time.time() - last < core.TOOL_AUTO_COOLDOWN_SEC:
-            self._tool_marker_pending = mid
-            self._note_tool_once(
-                mid, "cooldown",
-                "ツール実行の合図: 直近に実行したばかりのため"
-                "見送り（間隔が空いてから実行します）")
+                "ツール実行の合図: 非常停止中のため見送り"
+                "（遅れては送りません）")
+            self._post_react_note_once(
+                mid, "emergency",
+                "[PHAL:ツール] 非常停止中のため破棄しました")
             return
         if self._tool_sending or self._running_item is not None \
                 or self._chain_in_flight():
@@ -8194,7 +8438,8 @@ class ScriptRunnerWindow(QWidget):
                 or self._file_sending or self._fulltext_sending \
                 or self._history_sending or self._stop_sending \
                 or self._log_sending or self._tool_sending \
-                or self._refire_sending or self._relay_sending:
+                or self._refire_sending or self._relay_sending \
+                or self._react_sending:
             return True
         return bool(self._auto_run_queue) \
             and self._automation_flags()["auto_run"]
@@ -8232,6 +8477,79 @@ class ScriptRunnerWindow(QWidget):
         self.close()
 
     # ---------------- 絞り込み・前面固定・終了 ----------------
+    def _toggle_mini_mode(self):
+        self._set_mini_mode(bool(self.mini_button.isChecked()),
+                            save=True)
+
+    def _set_item_visible(self, item, visible):
+        """レイアウトの要素 (部品か入れ子のレイアウト) を
+        まとめて出し入れする (2.27、小窓モード用)。"""
+        widget = item.widget()
+        if widget is not None:
+            widget.setVisible(visible)
+            return
+        sub = item.layout()
+        if sub is not None:
+            for i in range(sub.count()):
+                child = sub.itemAt(i)
+                if child is not None:
+                    self._set_item_visible(child, visible)
+
+    def _refit_mini_height(self):
+        """小窓モードの窓の高さを、表示中の上部だけの寸法に
+        合わせ直す (2.28)。
+
+        隠した直後はレイアウトの寸法計算が古いままのことが
+        あり、そのまま sizeHint を使うと大きな高さが残る
+        (2.27 の実機で発生)。先にレイアウトを再計算させて
+        から合わせる。"""
+        if not getattr(self, "_mini_mode", False):
+            return
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        self.resize(self.width(), self.sizeHint().height())
+
+    def _set_mini_mode(self, on, save=False):
+        """小窓モードの切り替え (2.27)。
+
+        上部 (タイトル行と状態パネル) だけを残し、下部を
+        隠して窓をその高さに縮める。戻すときは、入る前に
+        覚えた高さへ戻す。状態は設定に覚える (任意)。"""
+        on = bool(on)
+        self._mini_mode = on
+        if getattr(self, "mini_button", None) is not None:
+            self.mini_button.setChecked(on)
+        layout = self.layout()
+        if layout is None:
+            return
+        if on and not self._normal_height:
+            self._normal_height = self.height()
+        for i in range(getattr(self, "_lower_start", 0),
+                       layout.count()):
+            item = layout.itemAt(i)
+            if item is not None:
+                self._set_item_visible(item, not on)
+        if on:
+            self._refit_mini_height()
+            # 実機では枠やレイアウトの確定が遅れることがある
+            # ため、次の巡回でもう一度合わせる (2.28)。
+            QTimer.singleShot(0, self._refit_mini_height)
+        else:
+            height = self._normal_height or 0
+            self._normal_height = None
+            self.resize(self.width(),
+                        max(height, self.sizeHint().height()))
+        if save:
+            self.config["mini_mode"] = on
+            try:
+                settings_module.update_settings_section(
+                    "script_runner", {"mini_mode": on},
+                    self.settings_path)
+            except Exception:  # noqa: BLE001  覚えられないだけ
+                pass
+
     def _apply_hide_no_id(self, on: bool):
         self.config["hide_no_id"] = bool(on)
         try:
@@ -8310,6 +8628,19 @@ class ScriptRunnerWindow(QWidget):
             self.move(int(rect[0]), int(rect[1]))
         except Exception:  # noqa: BLE001  位置の復元で落とさない
             pass
+        if getattr(self, "_mini_mode", False):
+            # 小窓で開いたときは、保存枠 (通常時の大きさ) から
+            # 通常時の高さを覚え直し、窓は小窓の高さに合わせる
+            # (2.27)。
+            try:
+                frame = self.frameGeometry()
+                client = self.geometry()
+                self._normal_height = max(
+                    1, int(rect[3]) - (frame.height()
+                                       - client.height()))
+                self._refit_mini_height()
+            except Exception:  # noqa: BLE001
+                pass
 
     def closeEvent(self, event):
         try:
@@ -8320,6 +8651,11 @@ class ScriptRunnerWindow(QWidget):
             rect = self.frameGeometry()
             save_rect = [rect.x(), rect.y(),
                          rect.width(), rect.height()]
+            if getattr(self, "_mini_mode", False) \
+                    and getattr(self, "_normal_height", None):
+                save_rect[3] = (rect.height()
+                                + int(self._normal_height)
+                                - self.height())
             settings_module.update_settings_section(
                 "script_runner",
                 {"window_geometry": save_rect,

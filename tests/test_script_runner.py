@@ -163,6 +163,32 @@ def test_check_python_import_from_app_folder():
         assert "traytools_no_such_module_zzz" in result.issues[0].message
 
 
+def test_check_python_import_self_created_module():
+    # スクリプト自身が実行時に作るモジュール (本文に「<名前>.py」
+    # への書き出しがある) は、検査時点でまだ存在しなくても不足
+    # には数えない (2.27、職場の Copilot の指摘)。書き出しの
+    # 無い不足は従来どおり実行不可のまま。
+    with tempfile.TemporaryDirectory() as td:
+        path = write(Path(td), "makes.py",
+                     "from pathlib import Path\n"
+                     "Path('helper_self.py').write_text('X = 1\\n')\n"
+                     "import helper_self\n"
+                     "print(helper_self.X)\n")
+        result = core.check_python_script(path, PY)
+        # import は不足に数えられない (write_text の警告だけが
+        # 残る。実行不可にはならない)。
+        assert result.status != core.STATUS_ERROR, result
+        assert result.kind != "import", result
+        assert all("helper_self" not in i.message
+                   or "見つかりません" not in i.message
+                   for i in result.issues), result
+        path = write(Path(td), "plain_missing.py",
+                     "import helper_self\nprint(1)\n")
+        result = core.check_python_script(path, PY)
+        assert result.status == core.STATUS_ERROR, result
+        assert result.kind == "import"
+
+
 def test_execute_script_can_import_app_folder_module():
     # 実行側 (1-53): 本体フォルダのモジュールを、スクリプトの
     # 置き場 (一時フォルダ) に無くても import して実行できる。
@@ -349,14 +375,14 @@ def test_build_result_text():
                          stdout="hello\n", stderr="")
     text = core.build_result_text("check.py", run, CONFIG)
     lines = text.split("\n")
-    assert lines[0] == "[実行結果] check.py  終了コード 0  0.8秒"
+    assert lines[0] == "[PHAL:実行結果] check.py  終了コード 0  0.8秒"
     assert "--- 出力 ---\nhello\n" in text
     assert "--- エラー出力 ---\n(なし)" in text
     # 時間切れは1行目に明記。
     run2 = core.RunResult(name="slow.py", exit_code=-9, seconds=120.0,
                           stdout="途中まで\n", timed_out=True)
     text2 = core.build_result_text("slow.py", run2, CONFIG)
-    assert text2.split("\n")[0].startswith("[実行結果] slow.py  時間切れ")
+    assert text2.split("\n")[0].startswith("[PHAL:実行結果] slow.py  時間切れ")
     assert "途中まで" in text2
     # 停止も1行目に明記。
     run3 = core.RunResult(name="slow.py", exit_code=-9, seconds=3.0,
@@ -421,22 +447,22 @@ def test_build_result_text_with_command_id():
     text = core.build_result_text(
         "12-3_check.py", run, CONFIG, command_id="12-3")
     assert text.split("\n")[0] == \
-        "[実行結果] 12-3 12-3_check.py  終了コード 0  0.4秒"
+        "[PHAL:実行結果] 12-3 12-3_check.py  終了コード 0  0.4秒"
     # ID を渡さなければ今までと完全に同じ文になる。
     plain = core.build_result_text("12-3_check.py", run, CONFIG)
     assert plain.split("\n")[0] == \
-        "[実行結果] 12-3_check.py  終了コード 0  0.4秒"
+        "[PHAL:実行結果] 12-3_check.py  終了コード 0  0.4秒"
     # 時間切れ・停止の1行目にも ID が入る。
     run2 = core.RunResult(name="12-3_slow.py", exit_code=-9, seconds=120.0,
                           timed_out=True)
     text2 = core.build_result_text(
         "12-3_slow.py", run2, CONFIG, command_id="12-3")
-    assert text2.split("\n")[0].startswith("[実行結果] 12-3 12-3_slow.py")
+    assert text2.split("\n")[0].startswith("[PHAL:実行結果] 12-3 12-3_slow.py")
     run3 = core.RunResult(name="12-3_slow.py", exit_code=-9, seconds=3.0,
                           stopped=True)
     text3 = core.build_result_text(
         "12-3_slow.py", run3, CONFIG, command_id="12-3")
-    assert text3.split("\n")[0] == "[実行結果] 12-3 12-3_slow.py  停止しました"
+    assert text3.split("\n")[0] == "[PHAL:実行結果] 12-3 12-3_slow.py  停止しました"
 
 
 # ---------------------------------------------------------------
@@ -470,7 +496,7 @@ def test_summary_short_output_is_not_summarized():
     run = core.RunResult(name="check.py", exit_code=0, seconds=0.84,
                          stdout="hello\n", stderr="")
     text = core.build_result_text("check.py", run, CONFIG)
-    assert text == ("[実行結果] check.py  終了コード 0  0.8秒\n"
+    assert text == ("[PHAL:実行結果] check.py  終了コード 0  0.8秒\n"
                     "--- 出力 ---\nhello\n"
                     "--- エラー出力 ---\n(なし)\n"
                     + core.RESULT_AI_PROMPT)
@@ -497,7 +523,7 @@ def test_summary_long_output():
             text = core.build_result_text("long.py", run, CONFIG)
             lines = text.split("\n")
             assert lines[0] == \
-                "[実行結果] long.py  終了コード 0  1.0秒・全162行"
+                "[PHAL:実行結果] long.py  終了コード 0  1.0秒・全162行"
             assert "--- 出力（要約・全150行） ---" in text
             # 先頭15行と末尾10行が入り、中間は入らない。
             for i in list(range(15)) + list(range(140, 150)):
@@ -589,7 +615,7 @@ def test_save_full_output():
             raw = saved.read_bytes()
             assert b"\r" not in raw  # LF のまま
             body = raw.decode("utf-8")
-            assert body == ("[実行結果] 1-2 1-2_a.py  終了コード 0  "
+            assert body == ("[PHAL:実行結果] 1-2 1-2_a.py  終了コード 0  "
                             "1.2秒・全3行\n"
                             "--- 出力 ---\na\nb\n"
                             "\n--- エラー出力 ---\ne\n")
@@ -643,15 +669,15 @@ def test_build_return_text():
         "5-2_fix.py", "直っていません", run, CONFIG, body,
         command_id="5-2")
     lines = text.split("\n")
-    assert lines[0] == "[差し戻し] 5-2 5-2_fix.py", lines[0]
+    assert lines[0] == "[PHAL:差し戻し] 5-2 5-2_fix.py", lines[0]
     assert lines[1] == "理由: 直っていません"
     assert "--- 実行結果 ---" in lines
-    assert "[実行結果] 5-2 5-2_fix.py  終了コード 3  0.7秒" in text
+    assert "[PHAL:実行結果] 5-2 5-2_fix.py  終了コード 3  0.7秒" in text
     assert "--- エラー出力 ---\nTraceback: boom" in text
     assert "--- スクリプト ---\nimport sys\nsys.exit(3)" in text
     # 理由が空なら行ごと省く。実行結果が無ければその段も無い。
     plain = core.build_return_text("plain.py", "", None, CONFIG, body)
-    assert plain.split("\n")[0] == "[差し戻し] plain.py"
+    assert plain.split("\n")[0] == "[PHAL:差し戻し] plain.py"
     assert "理由:" not in plain and "--- 実行結果 ---" not in plain
     assert "--- スクリプト ---\nimport sys\nsys.exit(3)" in plain
     # ゴミ箱は Windows 専用。ここ(VM)では常に False で、例外にもならない。
@@ -946,7 +972,7 @@ def test_build_rerun_result_text():
     text = core.build_rerun_result_text(
         "check.py", run, CONFIG, previous_text=prev_text)
     lines = text.split("\n")
-    assert lines[0].startswith("[実行結果] check.py"), text
+    assert lines[0].startswith("[PHAL:実行結果] check.py"), text
     assert "差分：追加 2行・削除 2行（前回比）" in text, text
     assert "+ 増える行" in text and "+ 新しい警告" in text, text
     assert "- 消える行" in text and "- (なし)" in text, text
@@ -961,7 +987,7 @@ def test_build_rerun_result_text():
         "check.py", same, CONFIG, previous_text=prev_text)
     lines2 = text2.split("\n")
     assert len(lines2) == 3, text2
-    assert lines2[0].startswith("[実行結果] check.py"), text2
+    assert lines2[0].startswith("[PHAL:実行結果] check.py"), text2
     assert lines2[1] == "差分なし（前回と同じ結果）", text2
     assert lines2[2] == core.RESULT_AI_PROMPT, text2
     # 前回が無ければ全文＋「前回結果なし」の注記。
@@ -1702,7 +1728,7 @@ def test_diag_bundle_composition_and_trim():
         ["DL行: なし", "実行中: なし"],
         events, at=2000.0)
     lines = bundle.splitlines()
-    assert lines[0].startswith("PHAL診断 Ver1.42 ")
+    assert lines[0].startswith("[PHAL:診断] Ver1.42 ")
     assert "自動化: DL=入 実行=切 回答=入 送信=切" in lines[1]
     assert lines[2] == "AIプロファイル: 既定"
     assert "- DL行: なし" in lines
@@ -1717,7 +1743,7 @@ def test_diag_bundle_composition_and_trim():
     bundle2 = core.build_diag_bundle(
         "1.42", {}, "(未設定)", [], heavy, at=3000.0)
     assert len(bundle2) <= core.DIAG_BUNDLE_LIMIT
-    assert bundle2.splitlines()[0].startswith("PHAL診断 Ver1.42 ")
+    assert bundle2.splitlines()[0].startswith("[PHAL:診断] Ver1.42 ")
     kept = [ln for ln in bundle2.splitlines() if "あ" in ln]
     assert 0 < len(kept) < 25
     # 記録が無くても束は作れる。
@@ -1779,7 +1805,7 @@ def test_reset_auto_state_roundtrip_and_corrupt():
             "consumed_id": "", "consumed_key": "",
             "last_reset_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         core.save_reset_auto(
             {"consumed_id": "id-1", "consumed_key": "key-1",
              "last_reset_at": 123.5}, path)
@@ -1787,7 +1813,7 @@ def test_reset_auto_state_roundtrip_and_corrupt():
             "consumed_id": "id-1", "consumed_key": "key-1",
             "last_reset_at": 123.5,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 古い形 (consumed_key が無い) のファイルは、key だけ
         # 空として読める。
         path.write_text(json.dumps(
@@ -1797,14 +1823,14 @@ def test_reset_auto_state_roundtrip_and_corrupt():
             "consumed_id": "id-0", "consumed_key": "",
             "last_reset_at": 10.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 壊れたファイル・形の違う中身は既定に倒す。
         path.write_text("{壊れている", encoding="utf-8")
         assert core.load_reset_auto(path) == {
             "consumed_id": "", "consumed_key": "",
             "last_reset_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         path.write_text(json.dumps(
             {"consumed_id": 42, "consumed_key": 7,
              "last_reset_at": "x"}),
@@ -1813,7 +1839,7 @@ def test_reset_auto_state_roundtrip_and_corrupt():
             "consumed_id": "", "consumed_key": "",
             "last_reset_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 間隔は10分。控えのファイル名は診断と別。
         assert core.RESET_AUTO_COOLDOWN_SEC == 600.0
         assert core.RESET_AUTO_FILENAME != core.DIAG_AUTO_FILENAME
@@ -1837,7 +1863,7 @@ def test_rerun_auto_state_roundtrip_and_corrupt():
             "consumed_id": "", "consumed_key": "",
             "last_rerun_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         core.save_rerun_auto(
             {"consumed_id": "id-1", "consumed_key": "key-1",
              "last_rerun_at": 123.5}, path)
@@ -1845,7 +1871,7 @@ def test_rerun_auto_state_roundtrip_and_corrupt():
             "consumed_id": "id-1", "consumed_key": "key-1",
             "last_rerun_at": 123.5,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 古い形 (consumed_key が無い) のファイルは、key だけ
         # 空として読める。
         path.write_text(json.dumps(
@@ -1855,14 +1881,14 @@ def test_rerun_auto_state_roundtrip_and_corrupt():
             "consumed_id": "id-0", "consumed_key": "",
             "last_rerun_at": 10.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 壊れたファイル・形の違う中身は既定に倒す。
         path.write_text("{壊れている", encoding="utf-8")
         assert core.load_rerun_auto(path) == {
             "consumed_id": "", "consumed_key": "",
             "last_rerun_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         path.write_text(json.dumps(
             {"consumed_id": 42, "consumed_key": 7,
              "last_rerun_at": "x"}),
@@ -1871,7 +1897,7 @@ def test_rerun_auto_state_roundtrip_and_corrupt():
             "consumed_id": "", "consumed_key": "",
             "last_rerun_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         # 間隔は5分。控えのファイル名は診断・リセットと別。
         assert core.RERUN_AUTO_COOLDOWN_SEC == 300.0
         assert core.RERUN_AUTO_FILENAME != core.DIAG_AUTO_FILENAME
@@ -1904,7 +1930,7 @@ def test_settings_report_and_marker_auto_state():
         "ai_profile_active": 0,
     }
     text = core.build_settings_report(section, "1.85")
-    assert text.startswith("PHAL設定 Ver1.85")
+    assert text.startswith("[PHAL:設定] Ver1.85")
     assert "監視フォルダ: R:/Downloads" in text
     assert "作業フォルダ: R:/work" in text
     assert "ダークモード: 入" in text
@@ -1930,7 +1956,7 @@ def test_settings_report_and_marker_auto_state():
         assert got == {"consumed_id": "s1", "consumed_key": "k1",
                        "last_sent_at": 12.0,
                        "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         assert core.load_manual_auto(mp)["consumed_id"] == ""
         core.save_manual_auto({"consumed_id": "m1"}, mp)
         assert core.load_manual_auto(mp)["consumed_id"] == "m1"
@@ -2009,7 +2035,7 @@ def test_find_full_output():
             "consumed_id": "f1", "consumed_key": "k1",
             "last_sent_at": 5.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         assert core.FULLTEXT_AUTO_COOLDOWN_SEC == 60.0
 
 
@@ -2026,7 +2052,7 @@ def test_build_history_text():
          "exit_code": 1, "seconds": 0.1, "stopped": True},
     ]
     lines = core.build_history_text(records).splitlines()
-    assert lines[0] == "直近の実行一覧（新しい順）"
+    assert lines[0] == "[PHAL:実行一覧] 新しい順"
     assert lines[1] == ("11-15 16:21 1-202_b.phal "
                         "終了コード 1（0.1秒）・停止")
     assert lines[2] == ("11-15 16:20 1-201_a.phal "
@@ -2052,7 +2078,7 @@ def test_build_history_text():
             "consumed_id": "h1", "consumed_key": "k1",
             "last_sent_at": 7.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
 
 
 def test_log_request_parse_select_reply():
@@ -2104,13 +2130,13 @@ def test_log_request_parse_select_reply():
     spec = core.parse_log_request("16:00-16:30", now=now)
     picked = core.select_log_events(events, spec, now=now)
     lines = core.build_log_reply(picked, spec).splitlines()
-    assert lines[0] == "動作ログ（16:00〜16:30・2件）"
+    assert lines[0] == "[PHAL:動作ログ] 16:00〜16:30・2件"
     assert len(lines) == 3 and "範囲の始まり" in lines[1]
     spec = core.parse_log_request("", now=now)
     reply = core.build_log_reply(events[-2:], spec)
-    assert reply.splitlines()[0] == "動作ログ（直近50件）"
+    assert reply.splitlines()[0] == "[PHAL:動作ログ] 直近50件"
     assert core.build_log_reply([], spec) == \
-        "動作ログ（直近50件）\n（記録はありません）"
+        "[PHAL:動作ログ] 直近50件\n（記録はありません）"
     with tempfile.TemporaryDirectory() as td:
         sp = Path(td) / "log_auto.json"
         core.save_log_auto(
@@ -2120,7 +2146,7 @@ def test_log_request_parse_select_reply():
             "consumed_id": "l1", "consumed_key": "k1",
             "last_sent_at": 3.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         assert core.LOG_AUTO_FILENAME \
             == "script_runner_log_auto.json"
         assert core.LOG_AUTO_COOLDOWN_SEC == 60.0
@@ -2190,7 +2216,7 @@ def test_stop_auto_state():
             "consumed_id": "", "consumed_key": "",
             "last_sent_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         core.save_stop_auto(
             {"consumed_id": "s-1", "consumed_key": "k-1",
              "last_sent_at": 123.0,
@@ -2199,7 +2225,8 @@ def test_stop_auto_state():
             "consumed_id": "s-1", "consumed_key": "k-1",
             "last_sent_at": 123.0,
             "last_payload": "p-1", "last_answered_at": 42.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0,
+            "answered_map": {"p-1": 42.0}}
         assert core.STOP_AUTO_COOLDOWN_SEC == 60.0
         assert core.STOP_AUTO_FILENAME \
             == "script_runner_stop_auto.json"
@@ -2222,7 +2249,7 @@ def test_resend_auto_state_and_text():
             "consumed_id": "", "consumed_key": "",
             "last_sent_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         core.save_resend_auto(
             {"consumed_id": "id-1", "consumed_key": "key-1",
              "last_sent_at": 55.5}, path)
@@ -2230,20 +2257,20 @@ def test_resend_auto_state_and_text():
             "consumed_id": "id-1", "consumed_key": "key-1",
             "last_sent_at": 55.5,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         path.write_text("{壊れている", encoding="utf-8")
         assert core.load_resend_auto(path) == {
             "consumed_id": "", "consumed_key": "",
             "last_sent_at": 0.0,
             "last_payload": "", "last_answered_at": 0.0,
-            "refire_notice_payload": "", "refire_notice_at": 0.0}
+            "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
         assert core.RESEND_AUTO_COOLDOWN_SEC == 60.0
         assert core.RESEND_AUTO_FILENAME != core.RERUN_AUTO_FILENAME
     on = core.build_diag_bundle(
         "1.75", {"auto_resend": True}, "既定", [], [], at=0.0)
     assert "再送=入" in on.splitlines()[1]
     text = core.build_resend_text("1-100", "--- 出力 ---\nhello")
-    assert text.startswith("[実行結果] 1-100 （前回の結果の再送）")
+    assert text.startswith("[PHAL:結果再送] 1-100 （前回の結果を再送します）")
     assert "hello" in text
     assert core.RESULT_AI_PROMPT in text
     cut = core.build_resend_text("1-100", "x", truncated=True)
@@ -2579,11 +2606,11 @@ def test_build_ack_text():
     # 受領応答 (1-51): ID があれば「受領：{id} {ファイル名} の
     # 実行を始めます」、無ければ ID の部分を省く。
     assert core.build_ack_text("1-23", "1-23_install.phal") == \
-        "受領：1-23 1-23_install.phal の実行を始めます"
+        "[PHAL:受領] 1-23 1-23_install.phal の実行を始めます"
     assert core.build_ack_text("", "loop_test.phal") == \
-        "受領：loop_test.phal の実行を始めます"
+        "[PHAL:受領] loop_test.phal の実行を始めます"
     assert core.build_ack_text(None, "loop_test.phal") == \
-        "受領：loop_test.phal の実行を始めます"
+        "[PHAL:受領] loop_test.phal の実行を始めます"
     # 診断の束の自動化の行にも、受領の切替が出る。
     bundle = core.build_diag_bundle(
         "1.51", {"auto_ack": True}, "既定", [], [], at=0.0)
@@ -2595,16 +2622,16 @@ def test_build_ack_text():
 
 def test_build_blocked_text():
     # チェックで止まった知らせ (1-53): 「止まりました：{id}
-    # {ファイル名} はチェックで実行不可（{理由}）」。ID が無け
+    # {ファイル名} はチェックで実行不可です（{理由}）」。ID が無け
     # れば ID の部分を、理由が無ければ括弧の部分を省く。
     assert core.build_blocked_text(
         "1-80", "1-80_verify.phal", "モジュール 'phal_lib' が見つかりません") == \
-        "止まりました：1-80 1-80_verify.phal はチェックで実行不可" \
+        "[PHAL:実行不可] 1-80 1-80_verify.phal はチェックで実行不可です" \
         "（モジュール 'phal_lib' が見つかりません）"
     assert core.build_blocked_text("", "loop_test.phal", "文法エラー 1件") == \
-        "止まりました：loop_test.phal はチェックで実行不可（文法エラー 1件）"
+        "[PHAL:実行不可] loop_test.phal はチェックで実行不可です（文法エラー 1件）"
     assert core.build_blocked_text("1-80", "1-80_verify.phal", "") == \
-        "止まりました：1-80 1-80_verify.phal はチェックで実行不可"
+        "[PHAL:実行不可] 1-80 1-80_verify.phal はチェックで実行不可です"
 
 
 def test_blocked_notified_roundtrip_and_corrupt():
@@ -2818,7 +2845,7 @@ def test_execute_command_and_result_text():
     assert "tool-hi" in run.stdout
     text = core.build_tool_result_text(
         "python -c print", run, CONFIG)
-    assert text.startswith("[ツール実行結果] python -c print")
+    assert text.startswith("[PHAL:ツール実行結果] python -c print")
     assert "終了コード 0" in text and "tool-hi" in text
     bad = core.execute_command(
         [PY, "-c", "import sys; sys.exit(3)"], timeout_seconds=30)
@@ -2826,6 +2853,19 @@ def test_execute_command_and_result_text():
     missing = core.execute_command(
         ["definitely-not-a-real-tool-xyz"], timeout_seconds=30)
     assert missing.start_error  # 起動できないことが理由つきで返る
+
+
+def test_execute_command_can_import_app_folder_module():
+    # ツール実行 (2.27): .py のツールからも、本体フォルダの
+    # モジュール (phal_lib) を import できる。実行時の
+    # PYTHONPATH に本体フォルダを足したためのもので、作業
+    # フォルダがどこでも効く (職場の Copilot の指摘)。
+    with tempfile.TemporaryDirectory() as td:
+        run = core.execute_command(
+            [PY, "-c", "import phal_lib; print('lib-ok')"],
+            cwd=td, timeout_seconds=30)
+        assert run.exit_code == 0, run.stderr
+        assert "lib-ok" in run.stdout
 
 
 def test_tool_auto_state_roundtrip():
@@ -2877,7 +2917,7 @@ def test_status_qr_text():
         "Muse", False,
         at=_dt(2026, 11, 16, 1, 25, 30))
     lines = text.split("\n")
-    assert lines[0] == "PHAL状態 Ver2.09", lines
+    assert lines[0] == "[PHAL:状態] Ver2.09", lines
     assert lines[1] == "時刻 2026-11-16 01:25:30", lines
     assert "見張る窓 Muse" in text
     assert "連携先" not in text

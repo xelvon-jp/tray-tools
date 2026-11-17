@@ -666,22 +666,34 @@ def _input_not_found_message(candidates):
             f"（編集できそうな要素は {count} 件でした）")
 
 
+def _send_compare_lines(value):
+    """送信まわりの照合で比べる行の切り分け (2.26〜)。
+
+    改行コードをそろえ、各行の前後の空白を取り、先頭と末尾の
+    空行を落とす。行頭の空白まで取るのは 2.64 から: M365
+    Copilot の入力欄は、貼った文の行頭の空白を読み戻しで
+    落とすことがあり、字面だけの違いで送信を止めないため
+    (環境2の送信診断で実証)。"""
+    lines = str(value or "").replace("\r\n", "\n") \
+        .replace("\r", "\n").split("\n")
+    lines = [line.strip() for line in lines]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
 def _input_texts_equivalent(read_back, intended):
     """読み直した文が、送りたい文と実質同じか (2.26)。
 
-    改行コード (CRLF / CR)・行末の空白・先頭と末尾の空行の
-    違いだけなら同じとみなす。それ以外の違い (文の欠けや
-    別文) は別物として扱う。読み直した文が空なら常に別物。"""
-    def _norm(value):
-        lines = str(value or "").replace("\r\n", "\n") \
-            .replace("\r", "\n").split("\n")
-        lines = [line.rstrip() for line in lines]
-        while lines and not lines[0]:
-            lines.pop(0)
-        while lines and not lines[-1]:
-            lines.pop()
-        return "\n".join(lines)
-    return _norm(read_back) != "" and _norm(read_back) == _norm(intended)
+    改行コード (CRLF / CR)・行の前後の空白・先頭と末尾の
+    空行の違いだけなら同じとみなす (行頭の空白は 2.64 から)。
+    それ以外の違い (文の欠けや別文) は別物として扱う。
+    読み直した文が空なら常に別物。"""
+    read_norm = "\n".join(_send_compare_lines(read_back))
+    return read_norm != "" and \
+        read_norm == "\n".join(_send_compare_lines(intended))
 
 
 def _input_matches_for_send(read_back, intended):
@@ -695,18 +707,8 @@ def _input_matches_for_send(read_back, intended):
     if _input_texts_equivalent(read_back, intended):
         return True
 
-    def _lines(value):
-        lines = str(value or "").replace("\r\n", "\n") \
-            .replace("\r", "\n").split("\n")
-        lines = [line.rstrip() for line in lines]
-        while lines and not lines[0]:
-            lines.pop(0)
-        while lines and not lines[-1]:
-            lines.pop()
-        return lines
-
-    read_lines = _lines(read_back)
-    intended_lines = _lines(intended)
+    read_lines = _send_compare_lines(read_back)
+    intended_lines = _send_compare_lines(intended)
     if not intended_lines or len(read_lines) <= len(intended_lines):
         return False
     if read_lines[:len(intended_lines)] != intended_lines:
@@ -723,18 +725,8 @@ def _send_mismatch_detail(read_back, intended) -> str:
     内容を短く切ったもの) を1つにまとめる。行の切り分けは
     照合 (_input_texts_equivalent) と同じ。QR で共有する
     前提なので短く保つ (行の内容は各20字まで)。"""
-    def _lines(value):
-        lines = str(value or "").replace("\r\n", "\n") \
-            .replace("\r", "\n").split("\n")
-        lines = [line.rstrip() for line in lines]
-        while lines and not lines[0]:
-            lines.pop(0)
-        while lines and not lines[-1]:
-            lines.pop()
-        return lines
-
-    exp_lines = _lines(intended)
-    act_lines = _lines(read_back)
+    exp_lines = _send_compare_lines(intended)
+    act_lines = _send_compare_lines(read_back)
     head = (f"想定{len(str(intended or ''))}字{len(exp_lines)}行"
             f"／実際{len(str(read_back or ''))}字{len(act_lines)}行")
     for i in range(max(len(exp_lines), len(act_lines))):
@@ -756,18 +748,8 @@ def _send_match_ratio(read_back, intended) -> float:
     ための歯止め)。"""
     import difflib
 
-    def _lines(value):
-        lines = str(value or "").replace("\r\n", "\n") \
-            .replace("\r", "\n").split("\n")
-        lines = [line.rstrip() for line in lines]
-        while lines and not lines[0]:
-            lines.pop(0)
-        while lines and not lines[-1]:
-            lines.pop()
-        return lines
-
-    exp_lines = _lines(intended)
-    act_lines = _lines(read_back)
+    exp_lines = _send_compare_lines(intended)
+    act_lines = _send_compare_lines(read_back)
     if not exp_lines or not act_lines:
         return 0.0
     if exp_lines[0] not in act_lines:

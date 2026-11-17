@@ -272,6 +272,9 @@ def test_input_texts_equivalent_only_cosmetic_differences():
     assert f("a\r\nb\r\n", "a\nb")
     assert f("a  \nb\t\n\n", "a\nb")
     assert f("\n\na\nb", "a\nb")
+    # 行頭の空白の違いも細部として同じとみなす (2.64)。
+    assert f("a\nb", "a\n  b")
+    assert f("\ta\n b", "a\nb")
     assert not f("a\nc", "a\nb")
     assert not f("a", "a\nb")
     assert not f("", "a\nb")
@@ -3120,6 +3123,20 @@ def test_press_send_if_text_mismatch_message_has_detail():
         raise AssertionError("InputStageError になるはず")
 
 
+def test_press_send_if_text_presses_when_only_indentation_differs():
+    """行頭の空白が読み戻しで落ちただけなら送信する (2.64)。
+
+    環境2の実例: traceback の字下げ行が、M365 Copilot の
+    入力欄から読み戻すと行頭の空白を失っていた。"""
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._read_input_quietly = lambda: '結果です\nFile "x.py", line 1'
+    pressed = []
+    cp.press_send_button = lambda: pressed.append(1) or True
+    ok, ratio = cp.press_send_if_text(
+        '結果です\n  File "x.py", line 1', timeout=0.2, poll=0.05)
+    assert ok and ratio is None and pressed == [1]
+
+
 def test_send_match_ratio_rules():
     """方式3の一致率 (2.61): 行単位の比率と、別文への歯止め。"""
     f = copilot_loop._send_match_ratio
@@ -3136,6 +3153,9 @@ def test_send_match_ratio_rules():
     # 空は 0
     assert f("", ten) == 0.0
     assert f(ten, "") == 0.0
+    # 行頭の空白だけの違いは一致率に影響しない (2.64)
+    indented = "\n".join(f"  {i}行目" for i in range(10))
+    assert f(indented, ten) == 1.0
 
 
 def test_press_send_if_text_forces_when_mostly_matches():

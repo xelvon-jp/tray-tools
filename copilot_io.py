@@ -121,7 +121,9 @@ class DownloadResult:
     ツール実行の目印 (1.98) で、形は marker に "command"
     (ツール名＋引数の文字列) を足したもの。relay_marker は
     中継リクエストの目印 (2.10) で、形は marker に "body"
-    (中継する文) を足したもの。"""
+    (中継する文) を足したもの。capture_marker はキャプチャ
+    リクエストの目印 (2.54) で、形は marker に "target"
+    (撮る対象の語) を足したもの。"""
     ok: bool
     message: str
     candidate: dict = None
@@ -139,6 +141,12 @@ class DownloadResult:
     log_marker: dict = None
     tool_marker: dict = None
     relay_marker: dict = None
+    describe_marker: dict = None
+    eval_marker: dict = None
+    input_marker: dict = None
+    overwrite_marker: dict = None
+    force_marker: dict = None
+    capture_marker: dict = None
 
 
 @dataclass
@@ -235,19 +243,26 @@ class SubprocessTransport:
     def input_text(self):
         return self._call({"op": "input"})["input_text"]
 
-    def send_prompt(self, text, attachments=None):
+    def send_prompt(self, text, attachments=None, force=False):
         request = {"op": "send", "text": text}
         if attachments:
             request["attachments"] = [str(p) for p in attachments]
+        if force:
+            request["force"] = True
         response = self._call(request)
         self.attach_done = list(response.get("attach_done") or [])
         self.attach_failed = list(response.get("attach_failed") or [])
         return bool(response["sent"])
 
-    def fill_prompt(self, text, attachments=None):
+    def fill_prompt(self, text, attachments=None, force=False,
+                    image_paste=False):
         request = {"op": "fill", "text": text}
         if attachments:
             request["attachments"] = [str(p) for p in attachments]
+        if force:
+            request["force"] = True
+        if image_paste:
+            request["image_paste"] = True
         response = self._call(request)
         self.attach_done = list(response.get("attach_done") or [])
         self.attach_failed = list(response.get("attach_failed") or [])
@@ -290,7 +305,13 @@ class SubprocessTransport:
                 "stop_marker": response.get("stop_marker"),
                 "log_marker": response.get("log_marker"),
                 "tool_marker": response.get("tool_marker"),
-                "relay_marker": response.get("relay_marker")}
+                "relay_marker": response.get("relay_marker"),
+                "describe_marker": response.get("describe_marker"),
+                "eval_marker": response.get("eval_marker"),
+                "input_marker": response.get("input_marker"),
+                "overwrite_marker": response.get("overwrite_marker"),
+                "force_marker": response.get("force_marker"),
+                "capture_marker": response.get("capture_marker")}
 
     def chat_signature(self):
         return self._call({"op": "signature"}).get("signature")
@@ -390,37 +411,64 @@ class CopilotLoopTransport:
             raise RuntimeError("Copilot の入力欄が読めませんでした")
         return value
 
-    def _attach_first(self, text, attachments):
+    def _attach_first(self, text, attachments, image_paste=False):
         """本文を入れる前に添付を済ませ、本文を返す (1.58)。
 
         添付できた・できなかったファイル名は self.attach_done /
         attach_failed に残す。できなかった分は、本文の末尾に
         「添付できませんでした：ファイル名」を1行ずつ足す
-        (配達自体は止めない)。"""
+        (配達自体は止めない)。
+
+        image_paste (2.55) は、クリップボードに置いてある画像を
+        ファイルより先に貼る (キャプチャの配達)。貼れなければ
+        本文の末尾に「画像を貼れませんでした」を足して配達は
+        続ける (ファイルと同じ作法)。"""
         self.attach_done = []
         self.attach_failed = []
+        if image_paste:
+            cp = self._ensure()
+            try:
+                cp.attach_image_paste()
+                self.attach_done.append("画面の画像")
+            except Exception:  # noqa: BLE001  配達は止めない
+                self.attach_failed.append("画面の画像")
+                text += "\n画像を貼れませんでした"
         if not attachments:
             return text
         cp = self._ensure()
         failed = cp.attach_files([str(p) for p in attachments])
-        self.attach_failed = list(failed)
+        self.attach_failed.extend(failed)
         failed_names = set(failed)
-        self.attach_done = [
+        self.attach_done.extend(
             os.path.basename(str(p)) for p in attachments
-            if os.path.basename(str(p)) not in failed_names]
+            if os.path.basename(str(p)) not in failed_names)
         if failed:
             text += "".join(
                 f"\n添付できませんでした：{name}" for name in failed)
         return text
 
-    def send_prompt(self, text, attachments=None):
-        text = self._attach_first(text, attachments)
-        return self._ensure().send_prompt(text)
+    def send_prompt(self, text, attachments=None, force=False,
+                    image_paste=False):
+        text = self._attach_first(text, attachments, image_paste)
+        cp = self._ensure()
+        if force:
+            return cp.send_prompt(text, force=True)
+        return cp.send_prompt(text)
 
-    def fill_prompt(self, text, attachments=None):
-        """入力欄に入れるだけ (送信ボタンは押さない)。"""
-        text = self._attach_first(text, attachments)
-        self._ensure().set_input(text)
+    def fill_prompt(self, text, attachments=None, force=False,
+                    image_paste=False):
+        """入力欄に入れるだけ (送信ボタンは押さない)。
+
+        force は、通常の書き込みが反映されないときの打鍵まで
+        含む強制の段 (2.39、copilot_loop.set_input の force)。
+        force でなければ従来どおりの引数で呼ぶ (force を知ら
+        ない相手でも壊れないように)。"""
+        text = self._attach_first(text, attachments, image_paste)
+        cp = self._ensure()
+        if force:
+            cp.set_input(text, force=True)
+        else:
+            cp.set_input(text)
         return True
 
     def probe_input(self):
@@ -500,6 +548,32 @@ class CopilotSession:
             self._transport = SubprocessTransport(profile=self._profile)
         return self._transport
 
+    def _call_prompt(self, method_name, text, force, attachments,
+                     image_paste=False):
+        """transport の send_prompt / fill_prompt を呼ぶ (2.39)。
+
+        force は 2.39 で足した引数。付けずに呼ぶのが従来の形
+        で、force を知らない transport (テストの fake 等) には
+        付けない。force のときだけ付けて呼び、引数の TypeError
+        なら付けずに呼び直す (その経路では強制の段は効かない
+        が、通常の書き込みは従来どおり試せる)。image_paste
+        (2.55) も同じ作法で足す。"""
+        fn = getattr(self._tp(), method_name)
+        kwargs = {}
+        if attachments:
+            kwargs["attachments"] = attachments
+        extra = {}
+        if force:
+            extra["force"] = True
+        if image_paste:
+            extra["image_paste"] = True
+        if not extra:
+            return fn(text, **kwargs)
+        try:
+            return fn(text, **kwargs, **extra)
+        except TypeError:
+            return fn(text, **kwargs)
+
     # -- 送る -------------------------------------------------------------
     def _attach_outcome(self):
         """transport に残っている添付の結果 (できた名前, できなかった名前)。
@@ -543,13 +617,8 @@ class CopilotSession:
                     "そのまま送ると上書きされて消えます",
                     needs_confirm=True)
         try:
-            # 添付が無いときは従来どおりの呼び方にする (添付を
-            # 知らない transport の差し替え口を壊さないため)。
-            if attachments:
-                sent = self._tp().send_prompt(
-                    text, attachments=attachments)
-            else:
-                sent = self._tp().send_prompt(text)
+            sent = self._call_prompt(
+                "send_prompt", text, force, attachments)
         except Exception as e:  # noqa: BLE001
             return SendResult(False, f"Copilot に送れませんでした（{e}）")
         done, failed = self._attach_outcome()
@@ -562,13 +631,16 @@ class CopilotSession:
                           attach_done=done, attach_failed=failed)
 
     # -- 入れるだけ -------------------------------------------------------
-    def fill(self, text, force=False, attachments=None) -> SendResult:
+    def fill(self, text, force=False, attachments=None,
+             image_paste=False) -> SendResult:
         """入力欄に text を入れるだけ。送信はしない。
 
         書きかけの扱いは send と同じ: force=False で入力欄に文が
         あれば、上書きせず needs_confirm=True で返す (テスト入力でも
         書きかけを消さない)。結果の形も send とそろえてある。
-        attachments の扱いも send と同じ (入れる前に添付する)。"""
+        attachments の扱いも send と同じ (入れる前に添付する)。
+        image_paste (2.55) は、クリップボードの画像を入れる前に
+        貼る (キャプチャの配達)。"""
         if not text or not text.strip():
             return SendResult(False, "入れるテキストが空です")
         if not force:
@@ -591,10 +663,9 @@ class CopilotSession:
             if filler is None:
                 return SendResult(
                     False, "この経路では入力欄に入れられません")
-            if attachments:
-                filled = filler(text, attachments=attachments)
-            else:
-                filled = filler(text)
+            filled = self._call_prompt(
+                "fill_prompt", text, force, attachments,
+                image_paste=image_paste)
         except Exception as e:  # noqa: BLE001
             return SendResult(
                 False, f"入力欄に入れられませんでした（{e}）")
@@ -769,6 +840,12 @@ class CopilotSession:
                 log_marker = scan.get("log_marker")
                 tool_marker = scan.get("tool_marker")
                 relay_marker = scan.get("relay_marker")
+                describe_marker = scan.get("describe_marker")
+                eval_marker = scan.get("eval_marker")
+                input_marker = scan.get("input_marker")
+                overwrite_marker = scan.get("overwrite_marker")
+                force_marker = scan.get("force_marker")
+                capture_marker = scan.get("capture_marker")
             else:
                 getter = getattr(self._tp(), "latest_download", None)
                 if getter is None:
@@ -789,6 +866,12 @@ class CopilotSession:
                 log_marker = None
                 tool_marker = None
                 relay_marker = None
+                describe_marker = None
+                eval_marker = None
+                input_marker = None
+                overwrite_marker = None
+                force_marker = None
+                capture_marker = None
         except Exception as e:  # noqa: BLE001
             return DownloadResult(
                 False, str(e) or "ダウンロードを検出できませんでした")
@@ -837,6 +920,24 @@ class CopilotSession:
         if relay_marker is not None \
                 and not isinstance(relay_marker, dict):
             relay_marker = None
+        if describe_marker is not None \
+                and not isinstance(describe_marker, dict):
+            describe_marker = None
+        if eval_marker is not None \
+                and not isinstance(eval_marker, dict):
+            eval_marker = None
+        if input_marker is not None \
+                and not isinstance(input_marker, dict):
+            input_marker = None
+        if overwrite_marker is not None \
+                and not isinstance(overwrite_marker, dict):
+            overwrite_marker = None
+        if force_marker is not None \
+                and not isinstance(force_marker, dict):
+            force_marker = None
+        if capture_marker is not None \
+                and not isinstance(capture_marker, dict):
+            capture_marker = None
         if candidate is None:
             return DownloadResult(
                 True, "ダウンロードできるものはありません", None,
@@ -851,7 +952,13 @@ class CopilotSession:
                 stop_marker=stop_marker,
                 log_marker=log_marker,
                 tool_marker=tool_marker,
-                relay_marker=relay_marker)
+                relay_marker=relay_marker,
+                describe_marker=describe_marker,
+                eval_marker=eval_marker,
+                input_marker=input_marker,
+                overwrite_marker=overwrite_marker,
+                force_marker=force_marker,
+                capture_marker=capture_marker)
         return DownloadResult(
             True, "ダウンロードできるものがあります", candidate,
             marker, reset_marker, candidates,
@@ -865,7 +972,13 @@ class CopilotSession:
             stop_marker=stop_marker,
             log_marker=log_marker,
             tool_marker=tool_marker,
-            relay_marker=relay_marker)
+            relay_marker=relay_marker,
+            describe_marker=describe_marker,
+            eval_marker=eval_marker,
+            input_marker=input_marker,
+            overwrite_marker=overwrite_marker,
+            force_marker=force_marker,
+            capture_marker=capture_marker)
 
     def chat_signature(self):
         """チャットの変化の署名 (2.07)。取れなければ None
@@ -970,15 +1083,17 @@ def send_text(text, transport=None, force=False, profile=None,
 
 
 def fill_text(text, transport=None, force=False, profile=None,
-              attachments=None) -> SendResult:
+              attachments=None, image_paste=False) -> SendResult:
     """入力欄に入れるだけの近道 (送信はしない)。テスト入力用。
 
     force の意味は CopilotSession.fill と同じ (書きかけがあっても
     上書きする)。profile の意味は send_text と同じ。attachments の
-    意味も CopilotSession.fill と同じ。"""
+    意味も CopilotSession.fill と同じ。image_paste (2.55) は、
+    クリップボードの画像を入れる前に貼る (キャプチャの配達)。"""
     session = CopilotSession(transport, profile=profile)
     try:
-        return session.fill(text, force=force, attachments=attachments)
+        return session.fill(text, force=force, attachments=attachments,
+                            image_paste=image_paste)
     finally:
         session.close()
 

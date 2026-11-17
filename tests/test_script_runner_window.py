@@ -847,7 +847,8 @@ def test_auto_run_only_after_launch_files():
     original_execute = core.execute_script
     prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
 
-    def fake_execute(path, config, handle=None, expected_sha256=None):
+    def fake_execute(path, config, handle=None, expected_sha256=None,
+                     args=None):
         active["now"] += 1
         active["peak"] = max(active["peak"], active["now"])
         try:
@@ -893,6 +894,13 @@ def test_auto_run_only_after_launch_files():
                 write_script(watch, "1-02_warn.py",
                              "import os\nos.remove('x')\n")
                 write_script(watch, "1-03_broken.py", "def broken(:\n")
+                # 2.38: フォルダへ直接届いた分は、どこかの窓で
+                # カードとして見えていた分だけが自動実行の対象
+                # (出どころの取り違え防止)。この3件はチャットで
+                # 見えていた前提にする。
+                for seen_name in ("1-01_clean.py", "1-02_warn.py",
+                                  "1-03_broken.py"):
+                    window._record_card_seen(seen_name, "Muse")
                 window._poll()
                 window._poll()
                 settle_checks(window,
@@ -956,7 +964,8 @@ def test_loop_survives_restart():
     calls: list[str] = []
     original_execute = core.execute_script
 
-    def fake_execute(path, config, handle=None, expected_sha256=None):
+    def fake_execute(path, config, handle=None, expected_sha256=None,
+                     args=None):
         calls.append(Path(path).name)
         return core.RunResult(
             name=Path(path).name, path=str(path), exit_code=0,
@@ -1248,7 +1257,7 @@ def test_dl_loop_brakes():
         original_execute = core.execute_script
 
         def fake_execute(path, config, handle=None,
-                         expected_sha256=None):
+                         expected_sha256=None, args=None):
             calls.append(Path(path).name)
             return core.RunResult(
                 name=Path(path).name, path=str(path), exit_code=0,
@@ -1573,7 +1582,8 @@ def test_status_verdict_and_ran_survives_restart():
     calls: list[str] = []
     original_execute = core.execute_script
 
-    def fake_execute(path, config, handle=None, expected_sha256=None):
+    def fake_execute(path, config, handle=None, expected_sha256=None,
+                     args=None):
         calls.append(Path(path).name)
         return core.RunResult(
             name=Path(path).name, path=str(path), exit_code=0,
@@ -1910,7 +1920,7 @@ def test_diag_auto_response():
                 assert pump_until(lambda: len(presses) == 1)
                 assert len(fills) == 1
                 assert fills[0].startswith(
-                    f"[PHAL:診断] Ver{sr.PHAL_VERSION} ")
+                    f"[PHAL:診断 d1] Ver{sr.PHAL_VERSION} ")
                 # 完了の知らせは、裏方の完了シグナルが届いてから
                 # 出る (押下の記録だけ先に立つことがある)。
                 assert pump_until(
@@ -1926,6 +1936,19 @@ def test_diag_auto_response():
                     sr._DlCheckResult(True, "", None, marker=marker1))
                 settle()
                 assert len(fills) == 1 and len(presses) == 1
+                # (h) 同じ依頼IDのまま、同定子 (id) が外れ key も
+                #     無い再検出は、応答履歴で止まる (2.38。診断
+                #     だけこの歯止めが無く、実地で束が3回余分に
+                #     送られた)。束は増えず、見送りの1行だけ出る。
+                drifted1 = {"id": "marker-1-drifted", "key": "",
+                            "request_id": "d1"}
+                window._on_dl_checked(
+                    sr._DlCheckResult(True, "", None, marker=drifted1))
+                assert pump_until(lambda: len(fills) == 2)
+                assert fills[1].startswith("[PHAL:診断 d1] "), fills
+                assert "応答済みのため見送ります" in fills[1], fills
+                settle()
+                assert len(fills) == 2 and len(presses) == 2
             finally:
                 window.close()
             # 開き直しても消費が効く (控えはファイルに残っている)。
@@ -1935,32 +1958,32 @@ def test_diag_auto_response():
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=marker1))
                 settle()
-                assert len(fills) == 1 and len(presses) == 1
+                assert len(fills) == 2 and len(presses) == 2
                 # (b) 別の目印は、直前の送信からの間隔に関係なく
                 #     その場で送る (2.31)。
-                marker2 = {"id": "marker-2", "request_id": "d1"}
+                marker2 = {"id": "marker-2", "request_id": "d2"}
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=marker2))
-                assert pump_until(lambda: len(presses) == 2)
+                assert pump_until(lambda: len(presses) == 3)
                 # 消費の書き出しは完了シグナル側 (GUI スレッド) の
                 # 仕事なので、ファイルに残るまで待つ。
                 assert pump_until(
                     lambda: core.load_diag_auto()["consumed_id"]
                     == "marker-2")
                 # (c) 連鎖の途中では見送り、空いてから送る。
-                marker3 = {"id": "marker-3", "key": "key-3", "request_id": "d1"}
+                marker3 = {"id": "marker-3", "key": "key-3", "request_id": "d3"}
                 window._ai_filling = True
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=marker3))
                 settle()
-                assert len(fills) == 2
+                assert len(fills) == 3
                 assert window._diag_marker_pending == "marker-3"
                 assert any("連鎖の途中" in e["text"]
                            for e in window._diag_events)
                 window._ai_filling = False
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=marker3))
-                assert pump_until(lambda: len(presses) == 3)
+                assert pump_until(lambda: len(presses) == 4)
                 # 消費の書き出しは完了シグナル側 (GUI スレッド) の
                 # 仕事なので、ファイルに残るまで待つ。
                 assert pump_until(
@@ -1968,16 +1991,16 @@ def test_diag_auto_response():
                     == "key-3")
                 # (f) 同じ目印が会話の木のずれで id だけ変わって
                 #     再来しても、key が一致すれば二度送らない。
-                drifted = {"id": "marker-3-drifted", "key": "key-3", "request_id": "d1"}
+                drifted = {"id": "marker-3-drifted", "key": "key-3", "request_id": "d3"}
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=drifted))
                 settle()
-                assert len(fills) == 3 and len(presses) == 3
+                assert len(fills) == 4 and len(presses) == 4
                 # (g) 文言が違う別目印は従来どおり送る。
-                marker4 = {"id": "marker-4", "key": "key-4", "request_id": "d1"}
+                marker4 = {"id": "marker-4", "key": "key-4", "request_id": "d4"}
                 window._on_dl_checked(
                     sr._DlCheckResult(True, "", None, marker=marker4))
-                assert pump_until(lambda: len(presses) == 4)
+                assert pump_until(lambda: len(presses) == 5)
                 assert pump_until(
                     lambda: core.load_diag_auto()["consumed_key"]
                     == "key-4")
@@ -2000,7 +2023,7 @@ def test_diag_auto_response():
                     True, "", None, marker={"id": "marker-off", "request_id": "d1"}))
                 assert pump_until(lambda: len(fills2) == 1)
                 assert fills2[0] == \
-                    "[PHAL:診断] 自動応答が切のため応答しません"
+                    "[PHAL:診断 d1] 自動応答が切のため応答しません"
                 assert any("自動応答は切のため見送り" in e["text"]
                            for e in window._diag_events)
             finally:
@@ -2134,6 +2157,282 @@ def test_reset_auto_response():
                     reset_marker={"id": "reset-9", "key": "rkey-9"}))
                 assert restarts_off == []
                 assert core.load_reset_auto()["consumed_id"] == ""
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dl_name_matches_and_card_file_name():
+    # DL 到着の名前照合 (2.38): 完全一致、概要つきの候補名、
+    # ブラウザの重複連番は一致。別ファイル・空は不一致。
+    assert sr._dl_name_matches(
+        "1-325_install.phal", "1-325_install.phal")
+    assert sr._dl_name_matches(
+        "1-325_install.phal # 概要テキスト",
+        "1-325_install (1).phal")
+    assert sr._dl_name_matches("a.phal", "a (12).phal")
+    assert not sr._dl_name_matches(
+        "1-325_install.phal", "1-15_manual_update_ack.phal")
+    assert not sr._dl_name_matches("", "x.phal")
+    assert not sr._dl_name_matches("a.phal", "ab.phal")
+    # 候補名からファイル名の取り出し: 先頭の1語がスクリプトの
+    # 拡張子で終わるときだけ。
+    assert sr._card_file_name("1-325_install.phal # 概要") == \
+        "1-325_install.phal"
+    assert sr._card_file_name("tool.py") == "tool.py"
+    assert sr._card_file_name("#!phal python\nprint(1)") == ""
+    assert sr._card_file_name("") == ""
+
+
+def test_auto_run_origin_gate():
+    # 出どころゲート (2.38): IDつきでも、カードとして見えて
+    # いないファイルは自動実行しない (診断に理由が残る)。
+    # カード目撃を控えた後は、再判定で待ち列に入る。
+    calls: list[str] = []
+    original_execute = core.execute_script
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def fake_execute(path, config, handle=None, expected_sha256=None,
+                     args=None):
+        calls.append(Path(path).name)
+        return core.RunResult(
+            name=Path(path).name, path=str(path), exit_code=0,
+            seconds=0.1, stdout="done\n",
+            sha256=expected_sha256 or "")
+
+    core.execute_script = fake_execute
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_auto_window(tmp, True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                write_script(watch, "1-77_foreign.phal",
+                             "#!phal python\nprint('他所の分')\n")
+                window._poll()
+                window._poll()
+                settle_checks(window, ["1-77_foreign.phal"])
+                assert pump_until(lambda: False, timeout=0.6) is False
+                assert calls == [], calls
+                item = item_of(window, "1-77_foreign.phal")
+                assert item is not None and not item.ran
+                assert any("出どころ不明" in e["text"]
+                           for e in window._diag_events), \
+                    window._diag_events
+                # カードとして見えていたことにすると、出どころが
+                # その窓になり、再判定で実行される。
+                window._record_card_seen("1-77_foreign.phal", "Copilot")
+                window._admit_auto_run(item)
+                assert pump_until(lambda: len(calls) == 1), calls
+                assert item.ai == "Copilot", item.ai
+            finally:
+                window.close()
+    finally:
+        core.execute_script = original_execute
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_dl_expectation_fingerprint_match():
+    # DL 到着の指紋照合 (2.39): カード型の候補は期待名が中身の
+    # 冒頭でファイル名と一致しないが、先頭指紋が一致すれば
+    # 到着待ちを取り出せる。一致しなければ待ちは残る。
+    import types
+
+    card_name = "#!phal\n# phal-tool: file_info\n# phal-usage: x\n"
+    fake = types.SimpleNamespace(_dl_awaiting=[(
+        "ラベル", 0.0, "Muse", True, card_name,
+        sr.core.head_fingerprint(card_name))])
+    arrived_fp = sr.core.head_fingerprint(
+        "#!phal\n# phal-tool: file_info\nprint(1)\n")
+    entry = sr.ScriptRunnerWindow._take_dl_expectation(
+        fake, "2-109_register_file_info.phal", arrived_fp)
+    assert entry is not None and entry[2] == "Muse"
+    assert fake._dl_awaiting == []
+    # 指紋が違えば取り出さない (名前も一致しない前提)。
+    fake2 = types.SimpleNamespace(_dl_awaiting=[(
+        "ラベル", 0.0, "Muse", True, card_name,
+        sr.core.head_fingerprint(card_name))])
+    other_fp = sr.core.head_fingerprint("#!phal\n# 別物\n")
+    assert sr.ScriptRunnerWindow._take_dl_expectation(
+        fake2, "2-110_other.phal", other_fp) is None
+    assert len(fake2._dl_awaiting) == 1
+
+
+def test_auto_run_origin_gate_fingerprint():
+    # 出どころゲートの指紋版 (2.39): カード型の候補はファイル名
+    # で目撃を控えられない代わりに、先頭指紋の目撃で出どころが
+    # 認められ、再判定で実行される (2.38 の名前版と同じ作法)。
+    calls: list[str] = []
+    original_execute = core.execute_script
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+
+    def fake_execute(path, config, handle=None, expected_sha256=None,
+                     args=None):
+        calls.append(Path(path).name)
+        return core.RunResult(
+            name=Path(path).name, path=str(path), exit_code=0,
+            seconds=0.1, stdout="done\n",
+            sha256=expected_sha256 or "")
+
+    core.execute_script = fake_execute
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_auto_window(tmp, True)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                write_script(watch, "1-78_install_fp.phal",
+                             "#!phal python\n# 1-78: 指紋の確認\n"
+                             "print('設置')\n")
+                window._poll()
+                window._poll()
+                settle_checks(window, ["1-78_install_fp.phal"])
+                assert pump_until(lambda: False, timeout=0.6) is False
+                assert calls == [], calls
+                item = item_of(window, "1-78_install_fp.phal")
+                assert item is not None and not item.ran
+                fp = sr._file_head_fingerprint(item.path)
+                assert fp.startswith("#!phal")
+                window._record_card_seen_fp(fp, "Muse")
+                window._admit_auto_run(item)
+                assert pump_until(lambda: len(calls) == 1), calls
+                assert item.ai == "Muse", item.ai
+            finally:
+                window.close()
+    finally:
+        core.execute_script = original_execute
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_input_ops_auto_response():
+    # 入力欄まわりの合図 (2.39):
+    # (a) 入力欄リクエスト: 対象の窓の入力欄を読んで、文を
+    #     合図の窓へ返す。消費が控えに残り、同じ目印では
+    #     二度返さない。
+    # (b) 強制送信: 対象へ強制で入れて送信まで行き、結果を
+    #     合図の窓へ返す。
+    # (c) 入力上書き: 対象へ強制で入れるだけ (対象の送信は
+    #     押さない)。
+    import types
+
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, auto_input=True, auto_force=True,
+                ai_target={"process_name": "dummy.exe"})
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                assert window._automation_flags()["auto_input"] \
+                    is True
+                assert window._automation_flags()["auto_force"] \
+                    is True
+                window._set_clipboard = (  # type: ignore
+                    lambda text: setattr(
+                        window, "_last_clipboard_text", text))
+                window.ai_downloader = (  # type: ignore
+                    lambda profile: sr._DlCheckResult(
+                        False, "なし", None))
+                window._resolve_profile_by_name = (  # type: ignore
+                    lambda name: (True, {"name": name})
+                    if name == "Copilot" else (False, None))
+                reads: list = []
+                forces: list = []
+                fills: list = []
+                presses: list = []
+
+                def fake_reader(profile):
+                    reads.append(profile)
+                    return types.SimpleNamespace(
+                        ok=True, message="読みました",
+                        text="書きかけの文")
+
+                def fake_force(text, profile):
+                    forces.append((text, profile))
+                    return sr._AiAnswerResult(True, "入れました")
+
+                def fake_sender(text, profile):
+                    fills.append(text)
+                    return sr._AiAnswerResult(True, "入れました")
+
+                def fake_presser(profile):
+                    presses.append(profile)
+                    return sr._AiAnswerResult(True, "押しました")
+
+                window.ai_input_reader = fake_reader  # type: ignore
+                window.ai_force_sender = fake_force  # type: ignore
+                window.ai_sender = fake_sender  # type: ignore
+                window.ai_presser = fake_presser  # type: ignore
+
+                # (a) 入力欄リクエスト
+                marker = {"id": "im-1", "key": "",
+                          "request_id": "i1", "target": "Copilot"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, input_marker=marker))
+                assert pump_until(lambda: len(fills) == 1)
+                assert reads and reads[0].get("name") == "Copilot"
+                assert fills[0].startswith(
+                    "[PHAL:入力欄 i1] Copilot の入力欄（6文字）"), fills
+                assert "書きかけの文" in fills[0]
+                assert core.load_input_auto()["consumed_id"] == \
+                    "im-1"
+                # 同じ目印では二度返さない。
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, input_marker=marker))
+                assert pump_until(lambda: False, timeout=0.6) \
+                    is False
+                assert len(fills) == 1
+
+                # (b) 強制送信
+                fmarker = {"id": "fm-1", "key": "",
+                           "request_id": "f1", "target": "Copilot",
+                           "body": "短いテストです"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, force_marker=fmarker))
+                assert pump_until(lambda: len(fills) == 2)
+                assert forces[-1][0] == "短いテストです"
+                assert forces[-1][1].get("name") == "Copilot"
+                # 対象の送信ボタンが押されている (presses には
+                # 合図の窓への報告分も入るので、対象 profile の
+                # 押下が1回あることだけ見る)。
+                assert any(
+                    isinstance(p, dict)
+                    and p.get("name") == "Copilot"
+                    for p in presses), presses
+                assert fills[-1] == \
+                    "[PHAL:強制送信 f1] Copilot へ送信しました"
+
+                # (c) 入力上書き (対象の送信は押さない)
+                before = len(presses)
+                omarker = {"id": "om-1", "key": "",
+                           "request_id": "o1", "target": "Copilot",
+                           "body": "上書きする文"}
+                window._on_dl_checked(sr._DlCheckResult(
+                    True, "", None, overwrite_marker=omarker))
+                assert pump_until(lambda: len(fills) == 3)
+                assert forces[-1][0] == "上書きする文"
+                new_presses = presses[before:]
+                assert not any(
+                    isinstance(p, dict)
+                    and p.get("name") == "Copilot"
+                    for p in new_presses), new_presses
+                assert fills[-1] == (
+                    "[PHAL:入力上書き o1] Copilot の入力欄に"
+                    "上書きしました（送信はしていません）")
             finally:
                 window.close()
     finally:
@@ -2622,7 +2921,7 @@ def test_rerun_menu_and_diff():
                                   and window._running_item is None)
                 text = copied[-1]
                 assert text.startswith(
-                    "[PHAL:実行結果] 1-90 1-90_rerun.py"), text
+                    "[PHAL:実行結果 1-90] 1-90_rerun.py"), text
                 assert "差分：追加 1行・削除 1行（前回比）" in text, text
                 assert "+ three" in text, text
                 assert "- two" in text, text
@@ -2647,7 +2946,7 @@ def test_rerun_menu_and_diff():
                 lines = copied[-1].split("\n")
                 assert len(lines) == 3, copied[-1]
                 assert lines[0].startswith(
-                    "[PHAL:実行結果] 1-90 1-90_rerun.py"), copied[-1]
+                    "[PHAL:実行結果 1-90] 1-90_rerun.py"), copied[-1]
                 assert lines[1] == "差分なし（前回と同じ結果）", copied[-1]
                 assert lines[2] == core.RESULT_AI_PROMPT, copied[-1]
                 # ファイルが無くなった行: その旨を出して止まる。
@@ -2796,7 +3095,7 @@ def test_settings_manual_auto_response():
                     True, "", None,
                     settings_marker={"id": "s-1", "request_id": "a"}))
                 assert pump_until(lambda: len(presses) == 1)
-                assert fills[0][0].startswith("[PHAL:設定] Ver")
+                assert fills[0][0].startswith("[PHAL:設定 a] Ver")
                 assert "監視フォルダ:" in fills[0][0]
                 assert fills[0][1] == []
                 assert pump_until(
@@ -2852,8 +3151,8 @@ def test_settings_manual_auto_response():
                 # 2.33: 切でも、見送りの一行は種類ごとに出る。
                 assert pump_until(lambda: len(fills2) == 2)
                 assert fills2 == [
-                    "[PHAL:設定] 自動応答が切のため応答しません",
-                    "[PHAL:マニュアル] 自動応答が切のため"
+                    "[PHAL:設定 a] 自動応答が切のため応答しません",
+                    "[PHAL:マニュアル a] 自動応答が切のため"
                     "応答しません"]
             finally:
                 window.close()
@@ -3062,7 +3361,7 @@ def test_settings_refire_suppression():
                     settings_marker={"id": "s-2", "request_id": "a"}))
                 # 2.33: 本体は送らず、見送りの一行だけ届く。
                 assert pump_until(lambda: len(fills) == 2)
-                assert fills[1][0].startswith("[PHAL:設定] ")
+                assert fills[1][0].startswith("[PHAL:設定 a] ")
                 assert "応答済みのため見送ります" in fills[1][0]
                 assert fills[1][1] == []
                 # 15分を過ぎれば、同じ合図にも改めて応答する
@@ -3218,9 +3517,16 @@ def test_settings_answered_pingpong():
                 send_marker("pp-3", "a")
                 assert pump_until(lambda: len(fills) == 3)
                 assert "応答済みのため見送ります" in fills[2]
+                assert fills[2].startswith("[PHAL:設定 a] ")
                 send_marker("pp-4", "b")
-                pump_until(lambda: False, timeout=0.5)
-                assert len(fills) == 3 and len(presses) == 3
+                # 2.40: 知らせの見出しに依頼 ID が入るため、a と
+                # b の知らせは別の文面になり、それぞれ1回ずつ
+                # 届く (同じ ID の再検出は従来どおり文面で
+                # 1回に畳まれる)。本体はどちらも来ない。
+                assert pump_until(lambda: len(fills) == 4)
+                assert fills[3].startswith("[PHAL:設定 b] ")
+                assert "応答済みのため見送ります" in fills[3]
+                assert len(presses) == 4
                 # 抑止のログも、同じ文面は1行に畳まれる (2.35)。
                 suppressed_logs = [
                     e["text"] for e in window._diag_events
@@ -3344,7 +3650,7 @@ def test_fulltext_refire_suppression():
                         "id": "ft-2", "command_id": "1-123"}))
                 # 2.33: 抑止のときは、見送りの一行だけ届く。
                 assert pump_until(lambda: len(fills) == 2)
-                assert fills[1][0].startswith("[PHAL:全文] ")
+                assert fills[1][0].startswith("[PHAL:全文 1-123] ")
                 assert "応答済みのため見送ります" in fills[1][0]
                 assert fills[1][1] == []
                 # 違う ID は抑止されない。
@@ -3420,7 +3726,7 @@ def test_history_auto_response():
                     True, "", None, history_marker={"id": "h-1", "request_id": "a"}))
                 assert pump_until(lambda: len(presses) == 1)
                 sent_lines = fills[0][0].splitlines()
-                assert sent_lines[0] == "[PHAL:実行一覧] 新しい順"
+                assert sent_lines[0] == "[PHAL:実行一覧 a] 新しい順"
                 assert "1-202_b.phal" in sent_lines[1]
                 assert "終了コード 1" in sent_lines[1]
                 assert "1-201_a.phal" in sent_lines[2]
@@ -3462,7 +3768,7 @@ def test_history_auto_response():
                 # 2.33: 切でも、見送りの一行だけ出る。
                 assert pump_until(lambda: len(fills2) == 1)
                 assert fills2[0] == \
-                    "[PHAL:一覧] 自動応答が切のため応答しません"
+                    "[PHAL:一覧 a] 自動応答が切のため応答しません"
             finally:
                 window.close()
     finally:
@@ -3521,7 +3827,7 @@ def test_log_auto_response():
                     log_marker={"id": "lg-1", "params": "2", "request_id": "a"}))
                 assert pump_until(lambda: len(presses) == 1)
                 sent_lines = fills[0][0].splitlines()
-                assert sent_lines[0] == "[PHAL:動作ログ] 直近2件"
+                assert sent_lines[0] == "[PHAL:動作ログ a] 直近2件"
                 assert len(sent_lines) == 3
                 assert "ログ4" in sent_lines[1]
                 assert "ログ5" in sent_lines[2]
@@ -3563,7 +3869,7 @@ def test_log_auto_response():
                 # 2.33: 切でも、見送りの一行だけ出る。
                 assert pump_until(lambda: len(fills2) == 1)
                 assert fills2[0] == \
-                    "[PHAL:ログ] 自動応答が切のため応答しません"
+                    "[PHAL:ログ a] 自動応答が切のため応答しません"
             finally:
                 window.close()
     finally:
@@ -3668,7 +3974,8 @@ def test_stop_auto_response():
                 window._on_dl_checked(sr._DlCheckResult(
                     True, "", None, stop_marker={"id": "s-2", "request_id": "a"}))
                 assert pump_until(lambda: len(presses) == 1)
-                assert fills[0][0] == "実行中のスクリプトはありません。"
+                assert fills[0][0] == \
+                    "[PHAL:停止 a] 実行中のスクリプトはありません。"
                 assert fills[0][1] == []
                 assert pump_until(
                     lambda: core.load_stop_auto()[
@@ -4097,8 +4404,9 @@ def test_dual_watch_second_window_candidate():
                 assert pump_until(
                     lambda: window._watch_list[1].holder is None
                     and not window._dl_pressing)
-                assert window._dl_awaiting is not None
-                assert window._dl_awaiting[2] == "Copilot"
+                assert len(window._dl_awaiting) == 1
+                assert window._dl_awaiting[0][2] == "Copilot"
+                assert window._dl_awaiting[0][4] == candidate["name"]
             finally:
                 window.close()
     finally:

@@ -785,12 +785,18 @@ def test_worker_dispatch_latest_download_includes_marker():
                           "manual_marker": None,
                           "file_marker": None,
                           "fulltext_marker": None,
+                          "capture_marker": None,
                           "history_marker": None,
                           "stop_marker": None,
                           "log_marker": None,
                           "tool_marker": {"id": "t1",
                                           "command": "ipconfig"},
-                          "relay_marker": None}
+                          "relay_marker": None,
+                          "describe_marker": None,
+                          "eval_marker": None,
+                          "input_marker": None,
+                          "overwrite_marker": None,
+                          "force_marker": None}
     finally:
         copilot_io.CopilotLoopTransport = real
 
@@ -821,12 +827,18 @@ def test_subprocess_transport_latest_scan():
                     "manual_marker": None,
                     "file_marker": None,
                     "fulltext_marker": None,
+                    "capture_marker": None,
                     "history_marker": None,
                     "stop_marker": None,
                     "log_marker": None,
                     "tool_marker": {"id": "t1",
                                     "command": "ipconfig"},
-                    "relay_marker": None}
+                    "relay_marker": None,
+                    "describe_marker": None,
+                    "eval_marker": None,
+                    "input_marker": None,
+                    "overwrite_marker": None,
+                    "force_marker": None}
     assert transport.latest_download() == {"name": "y"}
 
 

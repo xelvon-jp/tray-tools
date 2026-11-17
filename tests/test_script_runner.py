@@ -441,13 +441,33 @@ def test_extract_summary():
         assert core.extract_summary(tmp / "none.py") == ""
 
 
+def test_head_fingerprint():
+    # 先頭2行の指紋 (2.39): 空行を飛ばし、空白の並びを畳む。
+    # カードの名前 (中身の冒頭) とファイルの先頭で同じ形になる。
+    card = "#!phal python\n# 2-39: 設置する\nPAYLOAD = {}\n"
+    body = "#!phal python\n# 2-39: 設置する\nPAYLOAD = {}\nprint(1)\n"
+    assert core.head_fingerprint(card) == core.head_fingerprint(body)
+    assert core.head_fingerprint(card) == \
+        "#!phal python\n# 2-39: 設置する"
+    # 空行と前後の空白は畳む。
+    assert core.head_fingerprint("\n\n  #!phal  \n#  a   b\n") == \
+        "#!phal\n# a b"
+    # 1行だけ・空・None はその範囲で。
+    assert core.head_fingerprint("only.phal") == "only.phal"
+    assert core.head_fingerprint("") == ""
+    assert core.head_fingerprint(None) == ""
+    # 2行目が違えば別の指紋。
+    assert core.head_fingerprint(card) != core.head_fingerprint(
+        "#!phal python\n# 2-40: 別物\n")
+
+
 def test_build_result_text_with_command_id():
     run = core.RunResult(name="12-3_check.py", exit_code=0, seconds=0.42,
                          stdout="hello\n", stderr="")
     text = core.build_result_text(
         "12-3_check.py", run, CONFIG, command_id="12-3")
     assert text.split("\n")[0] == \
-        "[PHAL:実行結果] 12-3 12-3_check.py  終了コード 0  0.4秒"
+        "[PHAL:実行結果 12-3] 12-3_check.py  終了コード 0  0.4秒"
     # ID を渡さなければ今までと完全に同じ文になる。
     plain = core.build_result_text("12-3_check.py", run, CONFIG)
     assert plain.split("\n")[0] == \
@@ -457,12 +477,12 @@ def test_build_result_text_with_command_id():
                           timed_out=True)
     text2 = core.build_result_text(
         "12-3_slow.py", run2, CONFIG, command_id="12-3")
-    assert text2.split("\n")[0].startswith("[PHAL:実行結果] 12-3 12-3_slow.py")
+    assert text2.split("\n")[0].startswith("[PHAL:実行結果 12-3] 12-3_slow.py")
     run3 = core.RunResult(name="12-3_slow.py", exit_code=-9, seconds=3.0,
                           stopped=True)
     text3 = core.build_result_text(
         "12-3_slow.py", run3, CONFIG, command_id="12-3")
-    assert text3.split("\n")[0] == "[PHAL:実行結果] 12-3 12-3_slow.py  停止しました"
+    assert text3.split("\n")[0] == "[PHAL:実行結果 12-3] 12-3_slow.py  停止しました"
 
 
 # ---------------------------------------------------------------
@@ -615,7 +635,7 @@ def test_save_full_output():
             raw = saved.read_bytes()
             assert b"\r" not in raw  # LF のまま
             body = raw.decode("utf-8")
-            assert body == ("[PHAL:実行結果] 1-2 1-2_a.py  終了コード 0  "
+            assert body == ("[PHAL:実行結果 1-2] 1-2_a.py  終了コード 0  "
                             "1.2秒・全3行\n"
                             "--- 出力 ---\na\nb\n"
                             "\n--- エラー出力 ---\ne\n")
@@ -672,7 +692,7 @@ def test_build_return_text():
     assert lines[0] == "[PHAL:差し戻し] 5-2 5-2_fix.py", lines[0]
     assert lines[1] == "理由: 直っていません"
     assert "--- 実行結果 ---" in lines
-    assert "[PHAL:実行結果] 5-2 5-2_fix.py  終了コード 3  0.7秒" in text
+    assert "[PHAL:実行結果 5-2] 5-2_fix.py  終了コード 3  0.7秒" in text
     assert "--- エラー出力 ---\nTraceback: boom" in text
     assert "--- スクリプト ---\nimport sys\nsys.exit(3)" in text
     # 理由が空なら行ごと省く。実行結果が無ければその段も無い。
@@ -2176,6 +2196,60 @@ def test_log_events_roundtrip_and_cap():
             Path(td) / "diag.json") == []
 
 
+def test_log_rid_roundtrip_and_format():
+    # 動作ログの依頼 ID (2.40): log_append の rid が保存・読み
+    # 戻しで残り、表示は [AI名] の後ろに「 (s241)」の形で出る。
+    # ai が無く rid だけでも時刻の後ろに出る。rid の無い旧形式
+    # の entry は従来表示のまま。
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "log.json"
+        events = []
+        core.log_append(events, "設定の合図を検出", at=1000.0,
+                        ai="Muse", rid="s241")
+        core.log_append(events, "IDだけの記録", at=1001.0,
+                        rid="1-100")
+        core.log_append(events, "旧形式の記録", at=1002.0,
+                        ai="Muse")
+        core.save_log_events(events, path)
+        got = core.load_log_events(path)
+        assert got[0]["rid"] == "s241"
+        assert got[1]["rid"] == "1-100"
+        assert "rid" not in got[2]
+        lines = core.format_log_lines(got)
+        assert "[Muse] (s241) 設定の合図を検出" in lines[0]
+        assert lines[1].endswith(" (1-100) IDだけの記録")
+        assert "[Muse] 旧形式の記録" in lines[2]
+        assert "(s241)" not in lines[2]
+
+
+def test_response_headers_carry_request_id():
+    # 応答の1行目に依頼 ID (2.40): ID を渡すと「[PHAL:種別
+    # ID]」の形になり、渡さなければ従来の見出しのまま。
+    bundle = core.build_diag_bundle(
+        "2.40", {}, "既定", [], [], at=2000.0, request_id="d7")
+    assert bundle.splitlines()[0].startswith("[PHAL:診断 d7] Ver2.40 ")
+    bundle_plain = core.build_diag_bundle(
+        "2.40", {}, "既定", [], [], at=2000.0)
+    assert bundle_plain.splitlines()[0].startswith(
+        "[PHAL:診断] Ver2.40 ")
+    report = core.build_settings_report({}, "2.40", request_id="s241")
+    assert report.startswith("[PHAL:設定 s241] Ver2.40")
+    report_plain = core.build_settings_report({}, "2.40")
+    assert report_plain.startswith("[PHAL:設定] Ver2.40")
+    records = [
+        {"time": "2026-11-15T16:20:37", "file": "1-201_a.phal",
+         "exit_code": 0, "seconds": 1.3},
+    ]
+    history = core.build_history_text(records, request_id="h3")
+    assert history.splitlines()[0] == "[PHAL:実行一覧 h3] 新しい順"
+    spec = core.parse_log_request("")
+    events = [{"at": 1000.0, "text": "記録", "ai": "Muse"}]
+    reply = core.build_log_reply(events, spec, request_id="l9")
+    assert reply.splitlines()[0].startswith("[PHAL:動作ログ l9] ")
+    reply_plain = core.build_log_reply(events, spec)
+    assert reply_plain.splitlines()[0].startswith("[PHAL:動作ログ] ")
+
+
 def test_log_filenames_do_not_collide():
     # 実行ログ (append_run_log) と動作ログ (1.89) のファイル名
     # 衝突の回帰 (1.93): 1.89 で動作ログ側も LOG_FILENAME を
@@ -2270,7 +2344,7 @@ def test_resend_auto_state_and_text():
         "1.75", {"auto_resend": True}, "既定", [], [], at=0.0)
     assert "再送=入" in on.splitlines()[1]
     text = core.build_resend_text("1-100", "--- 出力 ---\nhello")
-    assert text.startswith("[PHAL:結果再送] 1-100 （前回の結果を再送します）")
+    assert text.startswith("[PHAL:結果再送 1-100] （前回の結果を再送します）")
     assert "hello" in text
     assert core.RESULT_AI_PROMPT in text
     cut = core.build_resend_text("1-100", "x", truncated=True)
@@ -2987,6 +3061,321 @@ def test_file_range_slicing():
                             "end": None}) == "a_lines3-end.log"
 
 
+def test_relay_id_history_and_loop_rules():
+    """中継の ID 履歴とループ防止 (2.41): 記録の積み上がりと、
+    Nagato 承認の3ルールの判定。履歴は連鎖 (起点＋依頼 ID)
+    ごとに持つ。
+    (1) 同じ連鎖で同じ本文は二度と中継しない。
+    (2) その連鎖で送り先として現れた窓へは中継しない
+        (送り元としてだけ現れた窓は対象外)。
+    (3) 同じ連鎖の中継は合計3回まで。"""
+    h1 = core.relay_body_hash("本文A")
+    history = core.relay_history_record(
+        {}, "Muse", "r1", h1, "Muse", "Copilot", at=100.0)
+    entry = history["Muse"]["r1"]
+    assert entry["routes"] == [["Muse", "Copilot"]]
+    assert entry["hashes"] == [h1]
+    assert entry["count"] == 1 and entry["at"] == 100.0
+    # ルール1: 同じ本文は、宛先がどこでも断る。
+    assert core.relay_loop_reason(entry, h1, "Muse") is not None
+    assert core.relay_loop_reason(entry, h1, "Copilot") is not None
+    # ルール2: 送り先になった Copilot へは、別の本文でも断る。
+    assert core.relay_loop_reason(
+        entry, core.relay_body_hash("別の本文"), "Copilot") \
+        is not None
+    # 送り元としてだけ現れた Muse へは、別の本文なら通す
+    # (最初の送り元への返信は止めない)。
+    assert core.relay_loop_reason(
+        entry, core.relay_body_hash("別の本文"), "Muse") is None
+    # 履歴が無い連鎖は常に通す。
+    assert core.relay_loop_reason(None, h1, "Copilot") is None
+    assert core.relay_loop_reason({}, h1, "Copilot") is None
+    # ルール3: 宛先と本文を変えて3回まで。4回目は断る。
+    history = {}
+    for i, dst in enumerate(("窓B", "窓C", "窓D")):
+        body_hash = core.relay_body_hash(f"本文{i}")
+        entry = (history.get("窓A") or {}).get("r9")
+        assert core.relay_loop_reason(entry, body_hash, dst) \
+            is None
+        history = core.relay_history_record(
+            history, "窓A", "r9", body_hash, "窓A", dst,
+            at=200.0 + i)
+    assert history["窓A"]["r9"]["count"] == 3
+    assert core.relay_loop_reason(
+        history["窓A"]["r9"], core.relay_body_hash("本文4"),
+        "窓E") is not None
+    # sanitize: 形の違う要素は落ち、上限を超えたら古い連鎖
+    # から落とす。
+    dirty = core.sanitize_relay_id_history({
+        "Muse": {
+            "ok": {"routes": [["A", "B"], ["x"]],
+                   "hashes": ["h1", 5], "count": 2, "at": 3.0},
+            "bad": "文字列",
+            "no-count": {"routes": [["A", "B"]], "hashes": []},
+        },
+        "bad-origin": "文字列",
+        7: {"r1": {"routes": []}},
+    })
+    assert set(dirty) == {"Muse"}
+    assert set(dirty["Muse"]) == {"ok", "no-count"}
+    assert dirty["Muse"]["ok"]["routes"] == [["A", "B"]]
+    assert dirty["Muse"]["ok"]["hashes"] == ["h1"]
+    assert dirty["Muse"]["no-count"]["count"] == 1  # 経路の数で補う
+    many = {"Muse": {
+        f"id{i}": {"routes": [], "hashes": [], "count": 0,
+                   "at": float(i)} for i in range(40)}}
+    kept = core.sanitize_relay_id_history(many)
+    assert sum(len(b) for b in kept.values()) \
+        == core.RELAY_ID_HISTORY_LIMIT
+    assert "id39" in kept["Muse"] and "id0" not in kept["Muse"]
+    # 旧形式 (ID のみキー) は、最初の経路の送り元を起点に
+    # 移行する。経路が無いものは起点を特定できず読み捨てる。
+    old = core.sanitize_relay_id_history({
+        "r1": {"routes": [["Muse", "Copilot"]],
+               "hashes": ["h"], "count": 1, "at": 5.0},
+        "r2": {"routes": [], "hashes": [], "count": 0,
+               "at": 6.0},
+        "r3": "壊れている",
+    })
+    assert old == {"Muse": {"r1": {
+        "routes": [["Muse", "Copilot"]], "hashes": ["h"],
+        "count": 1, "at": 5.0}}}
+
+
+def test_relay_auto_state_with_id_history():
+    """中継の控えの往復 (2.41): ID 履歴と、保留控えの依頼 ID
+    (rid) が開き直しをまたいで残ること。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "relay_auto.json"
+        state = core.load_relay_auto(path)
+        assert state["pending"] is None
+        assert state["relay_ids"] == {}
+        history = core.relay_history_record(
+            {}, "Muse", "r1", core.relay_body_hash("本文"),
+            "Muse", "Copilot", at=100.0)
+        core.save_relay_auto({
+            "consumed_id": "m1", "relay_ids": history,
+            "pending": {"id": "m2", "key": "k2", "body": "保留の文",
+                        "at": 50.0, "retries": 1, "not_before": 0.0,
+                        "src": "Muse", "dst": "Copilot",
+                        "rid": "r1"}}, path)
+        got = core.load_relay_auto(path)
+        assert got["consumed_id"] == "m1"
+        assert got["relay_ids"]["Muse"]["r1"]["count"] == 1
+        assert got["relay_ids"]["Muse"]["r1"]["routes"] == [
+            ["Muse", "Copilot"]]
+        assert got["pending"]["rid"] == "r1"
+        assert got["pending"]["body"] == "保留の文"
+        # 壊れた ID 履歴は落とされ、他の欄は残る。
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["relay_ids"] = {"r1": "壊れている"}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        got2 = core.load_relay_auto(path)
+        assert got2["relay_ids"] == {}
+        assert got2["consumed_id"] == "m1"
+        # 旧形式 (ID のみキー) の控えは、最初の経路の送り元を
+        # 起点に移行して読み込まれる。
+        raw["relay_ids"] = {"r7": {
+            "routes": [["Copilot", "Muse"]], "hashes": [],
+            "count": 1, "at": 1.0}}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        got3 = core.load_relay_auto(path)
+        assert got3["relay_ids"]["Copilot"]["r7"]["count"] == 1
+        assert got3["relay_ids"]["Copilot"]["r7"]["routes"] == [
+            ["Copilot", "Muse"]]
+
+
+def test_relay_chain_keyed_by_origin():
+    """中継の連鎖は「起点の AI＋依頼 ID」がキー (2.41 差分、
+    Nagato の方針: 事故は防ぐ、無駄に厳しくしない)。
+    - 同じ ID を2つの AI が使っても記録は混ざらない。
+    - 続きの中継は、起点の記録へつながる (relay_find_chain)。
+    - 往復は1回通って、2回目から断られる (現行判定の固定)。"""
+    h_a = core.relay_body_hash("Muse からの本文")
+    h_b = core.relay_body_hash("Copilot からの本文")
+    # Muse 起点の r1 と、Copilot 起点の r1 は別の連鎖。
+    history = core.relay_history_record(
+        {}, "Muse", "r1", h_a, "Muse", "Copilot", at=100.0)
+    history = core.relay_history_record(
+        history, "Copilot", "r1", h_b, "Copilot", "Muse",
+        at=110.0)
+    assert history["Muse"]["r1"]["routes"] == [
+        ["Muse", "Copilot"]]
+    assert history["Muse"]["r1"]["count"] == 1
+    assert history["Muse"]["r1"]["hashes"] == [h_a]
+    assert history["Copilot"]["r1"]["routes"] == [
+        ["Copilot", "Muse"]]
+    assert history["Copilot"]["r1"]["count"] == 1
+    assert history["Copilot"]["r1"]["hashes"] == [h_b]
+    # (a) の優先: 本人の連鎖がある窓では、他の起点の連鎖
+    # (自分が送り先に現れるもの) より本人が優先される。
+    origin, entry = core.relay_find_chain(history, "Copilot", "r1")
+    assert origin == "Copilot"
+    assert entry["routes"] == [["Copilot", "Muse"]]
+    # 続きの特定と往復: Muse 起点の r1 が Copilot へ届いた
+    # あと、Copilot の窓で検出された r1 は Muse の連鎖の
+    # 続きになり、最初の返信 (Copilot → Muse) は通る。
+    history2 = core.relay_history_record(
+        {}, "Muse", "r1", h_a, "Muse", "Copilot", at=100.0)
+    origin, entry = core.relay_find_chain(
+        history2, "Copilot", "r1")
+    assert origin == "Muse"
+    assert entry["routes"] == [["Muse", "Copilot"]]
+    h_reply = core.relay_body_hash("返信の本文")
+    assert core.relay_loop_reason(entry, h_reply, "Muse") is None
+    history2 = core.relay_history_record(
+        history2, origin, "r1", h_reply, "Copilot", "Muse",
+        at=120.0)
+    entry2 = history2["Muse"]["r1"]
+    assert entry2["routes"] == [
+        ["Muse", "Copilot"], ["Copilot", "Muse"]]
+    assert entry2["count"] == 2
+    # 往復2回目: 両方の窓が送り先に現れたので、どちら向き
+    # でも断られる。
+    origin, entry = core.relay_find_chain(
+        history2, "Muse", "r1")
+    assert origin == "Muse"
+    h_new = core.relay_body_hash("また別の本文")
+    assert core.relay_loop_reason(entry, h_new, "Copilot") \
+        is not None
+    assert core.relay_loop_reason(entry, h_new, "Muse") \
+        is not None
+    # (b) の複数候補は、最後に中継した時刻が新しい連鎖を
+    # 決定的に選ぶ。
+    history3 = core.relay_history_record(
+        {}, "窓A", "r5", core.relay_body_hash("Aの本文"),
+        "窓A", "Copilot", at=100.0)
+    history3 = core.relay_history_record(
+        history3, "窓B", "r5", core.relay_body_hash("Bの本文"),
+        "窓B", "Copilot", at=200.0)
+    origin, entry = core.relay_find_chain(
+        history3, "Copilot", "r5")
+    assert origin == "窓B"
+    # (c) 新規: どの記録にも無い ID は、検出した窓が起点に
+    # なり、履歴は無い。
+    origin, entry = core.relay_find_chain(history, "Muse", "rX")
+    assert origin == "Muse" and entry is None
+    origin, entry = core.relay_find_chain({}, "Muse", "r1")
+    assert origin == "Muse" and entry is None
+
+
+def test_response_headings_with_request_id():
+    """応答の見出しの依頼 ID (2.41): 再送・ツール実行・実行
+    結果は、依頼 ID があるとき「[PHAL:種別 依頼ID …]」の形に
+    なり、依頼 ID を主・コマンド ID を併記にする。依頼 ID が
+    無ければ従来の形のまま。"""
+    text = core.build_resend_text("1-100", "body", request_id="rs1")
+    assert text.startswith(
+        "[PHAL:結果再送 rs1 1-100] （前回の結果を再送します）"), text
+    plain = core.build_resend_text("1-100", "body")
+    assert plain.startswith("[PHAL:結果再送 1-100] "), plain
+    run = core.RunResult(name="1-100_job.py", exit_code=0,
+                         seconds=0.5, stdout="hi\n", stderr="")
+    body = core.build_result_body(
+        "1-100_job.py", run, CONFIG, command_id="1-100",
+        request_id="rr1")
+    assert body.split("\n")[0].startswith(
+        "[PHAL:実行結果 rr1 1-100] 1-100_job.py"), body
+    body2 = core.build_result_body(
+        "1-100_job.py", run, CONFIG, command_id="1-100")
+    assert body2.split("\n")[0].startswith(
+        "[PHAL:実行結果 1-100] 1-100_job.py"), body2
+    rerun = core.build_rerun_result_text(
+        "1-100_job.py", run, CONFIG, command_id="1-100",
+        request_id="rr1")
+    assert rerun.split("\n")[0].startswith(
+        "[PHAL:実行結果 rr1 1-100] 1-100_job.py"), rerun
+    tool = core.build_tool_result_text(
+        "tshark -v", run, CONFIG, request_id="t1")
+    assert tool.startswith(
+        "[PHAL:ツール実行結果 t1] tshark -v"), tool
+    tool2 = core.build_tool_result_text("tshark -v", run, CONFIG)
+    assert tool2.startswith("[PHAL:ツール実行結果] tshark -v"), tool2
+    bad = core.RunResult(name="x", exit_code=None, seconds=0.0,
+                         stdout="", stderr="",
+                         start_error="起動エラー")
+    tool3 = core.build_tool_result_text(
+        "tshark -v", bad, CONFIG, request_id="t1")
+    assert tool3.startswith(
+        "[PHAL:ツール実行結果 t1] tshark -v"), tool3
+
+
+def test_command_history_record_and_cap():
+    """コマンド履歴 (2.42): 記録の整え方・上限100件・状態の
+    更新・応答文の切り詰め・保存と読み直し。"""
+    # 壊れた入力は捨てる。未知の状態は見送りに倒す。
+    assert core.sanitize_command_history("だめ") == []
+    assert core.sanitize_command_history([{"at": "x"}]) == []
+    cleaned = core.sanitize_command_history([
+        {"at": 100.0, "ai": "Muse", "kind": "settings",
+         "request_id": "s1", "summary": "  改行を\n含む  ",
+         "status": "変な状態", "reason": "", "response": "文",
+         "key": "k1"},
+    ])
+    assert len(cleaned) == 1
+    assert cleaned[0]["status"] == "skipped"
+    assert cleaned[0]["summary"] == "改行を 含む"
+    assert cleaned[0]["key"] == "k1"
+    # key が無い・重なる記録には、時刻由来の key を割り直す。
+    dup = core.sanitize_command_history([
+        {"at": 100.0, "kind": "diag"},
+        {"at": 100.0, "kind": "diag"},
+    ])
+    assert dup[0]["key"] and dup[0]["key"] != dup[1]["key"]
+    # 応答文の切り詰め: 上限内はそのまま、上限超は切って、
+    # 切ったことが分かる注記が付く。
+    short = "あ" * 10
+    assert core.truncate_command_response(short) == short
+    long_text = "あ" * (core.COMMAND_RESPONSE_LIMIT + 100)
+    cut = core.truncate_command_response(long_text)
+    assert len(cut) < len(long_text)
+    assert cut.startswith("あ" * 100)
+    assert "ここまでで切っています" in cut
+    # 新しい記録は保留で生まれ、同じ dict を更新すると状態が
+    # 確定する (窓側の begin → finish の使い方)。
+    records: list = []
+    record = core.command_history_new(
+        at=200.0, ai="Copilot", kind="tool", request_id="t1",
+        summary="ipconfig")
+    record["key"] = "c200"
+    records = core.command_history_append(records, record)
+    assert records[-1] is record
+    assert record["status"] == "pending"
+    record["status"] = "answered"
+    record["response"] = core.truncate_command_response("結果")
+    assert records[-1]["status"] == "answered"
+    # 上限100件: 古い方から落ちる。
+    many: list = []
+    for i in range(core.COMMAND_HISTORY_LIMIT + 5):
+        many = core.command_history_append(
+            many, core.command_history_new(
+                at=float(i + 1), kind="diag",
+                request_id=f"d{i}"))
+    assert len(many) == core.COMMAND_HISTORY_LIMIT
+    assert many[0]["request_id"] == "d5"
+    # 保留のまま残った記録は、開き直しの確定で見送りになる。
+    pending = [core.command_history_new(at=1.0, kind="relay"),
+               core.command_history_new(at=2.0, kind="diag")]
+    pending[1]["status"] = "answered"
+    assert core.command_history_settle_pending(pending) == 1
+    assert pending[0]["status"] == "skipped"
+    assert "開き直し" in pending[0]["reason"]
+    assert pending[1]["status"] == "answered"
+    # 保存と読み直し (壊れたファイルは空)。
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "commands.json"
+        core.save_command_history(records, path)
+        loaded = core.load_command_history(path)
+        assert len(loaded) == 1
+        assert loaded[0]["request_id"] == "t1"
+        assert loaded[0]["status"] == "answered"
+        assert loaded[0]["key"] == "c200"
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_command_history(path) == []
+        assert core.load_command_history(
+            Path(td) / "none.json") == []
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -3106,6 +3495,11 @@ if __name__ == "__main__":
         test_cli_tool_registry,
         test_execute_command_and_result_text,
         test_tool_auto_state_roundtrip,
+        test_relay_id_history_and_loop_rules,
+        test_relay_auto_state_with_id_history,
+        test_relay_chain_keyed_by_origin,
+        test_response_headings_with_request_id,
+        test_command_history_record_and_cap,
         test_parse_file_request_specs,
         test_file_range_slicing,
         test_status_qr_text,

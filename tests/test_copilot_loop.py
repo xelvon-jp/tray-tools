@@ -585,12 +585,12 @@ def _text_el(name):
 
 
 def test_diag_marker_scan_finds_latest_request():
-    """診断リクエストの目印 (1-43): 最新の発言の中の単独行を拾い、
-    同定子が安定すること。前の会話が変われば同定子も変わる。"""
+    """診断リクエストの目印 (1-43): 最新の発言の先頭行を拾い、
+    同定子が安定すること。前の会話が変われば同定子も変わる。
+    (2.40 で全合図を「発言の先頭行」に統一した。)"""
     els = [
         _text_el("前の発言の本文です"),
-        _text_el("了解です。状態を見ます。\n"
-                 + copilot_loop.DIAG_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.DIAG_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -608,13 +608,11 @@ def test_diag_marker_scan_finds_latest_request():
 
 
 def test_marker_key_stable_when_neighbour_drifts():
-    """key は目印のある発言 (要素) の中だけで決まる (1.87):
-    直近40行の窓に入る前の発言が、再描画で変わったり増えたり
-    しても key は同じ (id は変わってよい)。以前の作りでは
-    key まで変わり、消費済みの判定が外れて同じ合図へ何度も
-    応答した。"""
-    utter = _text_el("了解です。状態を見ます。\n"
-                     + copilot_loop.DIAG_REQUEST_MARKER + "\n")
+    """先頭行の目印は key を持たず、id だけで同定する (2.40):
+    目印が発言の先頭行にあるとき key は常に空 (2.33 の縮み
+    対策)。前の発言が再描画で変わったり増えたりしても、目印
+    は拾え、key は空のまま (id は変わってよい)。"""
+    utter = _text_el(copilot_loop.DIAG_REQUEST_MARKER + "\n")
     tail = _text_el("Copilot へメッセージを送る")
     first = _copilot({"name": "phal-ai"}, [
         _text_el("直前の発言です"), utter, tail,
@@ -624,45 +622,66 @@ def test_marker_key_stable_when_neighbour_drifts():
         _text_el("間に増えた短い発言"), utter, tail,
     ]).latest_chat_scan()["marker"]
     assert first is not None and second is not None
-    assert second["key"] == first["key"]
+    assert first["key"] == "" and second["key"] == ""
     assert second["id"] != first["id"]
 
 
 def test_file_marker_scan():
-    """ファイルリクエストの目印 (1.88): パスつきの行を拾い、
-    パスが切り出せること。パスの無い行は数えないこと。"""
+    """ファイルリクエストの目印 (1.88、依頼 ID は 2.41):
+    第1トークンが依頼 ID、残り全部がパスになること。目印
+    だけの行も数える (ID 無しの知らせ用)。第1トークンが
+    ID の形でない行は、ID 無しとして数えること。"""
     els = [
-        _text_el("そのログを見せてください。\n"
-                 + copilot_loop.FILE_REQUEST_MARKER
-                 + " sub/data.log\n"),
+        _text_el(copilot_loop.FILE_REQUEST_MARKER
+                 + " f1 sub/data.log\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan = _copilot({"name": "phal-ai"}, els).latest_chat_scan()
     assert scan["file_marker"] is not None
+    assert scan["file_marker"]["request_id"] == "f1"
     assert scan["file_marker"]["path"] == "sub/data.log"
+    # パスに空白が含まれても、残り全部がパスになる。
+    els_sp = [
+        _text_el(copilot_loop.FILE_REQUEST_MARKER
+                 + " f2 my dir/data log.txt\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan_sp = _copilot({"name": "phal-ai"}, els_sp).latest_chat_scan()
+    assert scan_sp["file_marker"]["request_id"] == "f2"
+    assert scan_sp["file_marker"]["path"] == "my dir/data log.txt"
     els2 = [
-        _text_el("お願いします。\n"
-                 + copilot_loop.FILE_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.FILE_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
-    assert scan2["file_marker"] is None
+    assert scan2["file_marker"] is not None
+    assert scan2["file_marker"]["request_id"] == ""
+    assert scan2["file_marker"]["path"] == ""
+    # 旧形式 (ID 無しでパスだけ) は、ID 無しとして数える
+    # (第1トークンのパスは "/" を含み ID の形にならない)。
+    els3 = [
+        _text_el(copilot_loop.FILE_REQUEST_MARKER
+                 + " sub/data.log\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
+    assert scan3["file_marker"] is not None
+    assert scan3["file_marker"]["request_id"] == ""
+    assert scan3["file_marker"]["path"] == ""
 
 
 def test_log_marker_scan():
     """動作ログリクエストの目印 (1.96): 指定なしでも拾い、
     指定が params に入ること。"""
     els = [
-        _text_el("ログを見せてください。\n"
-                 + copilot_loop.LOG_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.LOG_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan = _copilot({"name": "phal-ai"}, els).latest_chat_scan()
     assert scan["log_marker"] is not None
     assert scan["log_marker"]["params"] == ""
     els2 = [
-        _text_el("直近だけください。\n"
-                 + copilot_loop.LOG_REQUEST_MARKER + " 100\n"),
+        _text_el(copilot_loop.LOG_REQUEST_MARKER + " 100\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
@@ -670,8 +689,7 @@ def test_log_marker_scan():
     assert scan2["log_marker"]["params"] == "100"
     # 依頼 ID つき (2.36): 先頭の語が ID、残りが指定。
     els3 = [
-        _text_el("ID つきでください。\n"
-                 + copilot_loop.LOG_REQUEST_MARKER + " lg1 100\n"),
+        _text_el(copilot_loop.LOG_REQUEST_MARKER + " lg1 100\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
@@ -679,8 +697,7 @@ def test_log_marker_scan():
     assert scan3["log_marker"]["params"] == "100"
     # 日付の語は ID とみなさない。
     els4 = [
-        _text_el("日付指定です。\n"
-                 + copilot_loop.LOG_REQUEST_MARKER
+        _text_el(copilot_loop.LOG_REQUEST_MARKER
                  + " 2026-11-16\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
@@ -690,32 +707,69 @@ def test_log_marker_scan():
 
 
 def test_fulltext_marker_scan():
-    """全文リクエストの目印 (1.91): ID つきの行を拾い、コマンド
-    ID が切り出せること。ID の無い行は数えないこと。"""
+    """全文リクエストの目印 (1.91、依頼 ID は 2.41): 依頼 ID と
+    コマンド ID が位置で切り出せること。目印だけの行も数える
+    (ID 無しの知らせ用)。旧形式 (コマンド ID だけ) は第1
+    トークンが依頼 ID として読まれ、コマンド ID は空になる
+    こと (窓側が引数の知らせを返す)。"""
     els = [
-        _text_el("全文を見せてください。\n"
-                 + copilot_loop.FULLTEXT_REQUEST_MARKER
-                 + " 1-123\n"),
+        _text_el(copilot_loop.FULLTEXT_REQUEST_MARKER
+                 + " ft1 1-123\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan = _copilot({"name": "phal-ai"}, els).latest_chat_scan()
     assert scan["fulltext_marker"] is not None
+    assert scan["fulltext_marker"]["request_id"] == "ft1"
     assert scan["fulltext_marker"]["command_id"] == "1-123"
     els2 = [
-        _text_el("お願いします。\n"
-                 + copilot_loop.FULLTEXT_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.FULLTEXT_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
-    assert scan2["fulltext_marker"] is None
+    assert scan2["fulltext_marker"] is not None
+    assert scan2["fulltext_marker"]["request_id"] == ""
+    assert scan2["fulltext_marker"]["command_id"] == ""
+    els3 = [
+        _text_el(copilot_loop.FULLTEXT_REQUEST_MARKER
+                 + " 1-123\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
+    assert scan3["fulltext_marker"] is not None
+    assert scan3["fulltext_marker"]["request_id"] == "1-123"
+    assert scan3["fulltext_marker"]["command_id"] == ""
+
+
+def test_resend_marker_scan():
+    """結果再送の目印 (1.75、依頼 ID は 2.41): 全文と同じ
+    _id_marker_in で、依頼 ID とコマンド ID が位置で切り
+    出せること。余計な語が付いた行はコマンド ID が空に
+    なること。"""
+    els = [
+        _text_el(copilot_loop.RESEND_REQUEST_MARKER
+                 + " rs1 1-123\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan = _copilot({"name": "phal-ai"}, els).latest_chat_scan()
+    assert scan["resend_marker"] is not None
+    assert scan["resend_marker"]["request_id"] == "rs1"
+    assert scan["resend_marker"]["command_id"] == "1-123"
+    extra = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.RESEND_REQUEST_MARKER
+                 + " rs1 1-123 お願いします\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ])
+    extra_marker = extra.latest_chat_scan()["resend_marker"]
+    assert extra_marker is not None
+    assert extra_marker["request_id"] == "rs1"
+    assert extra_marker["command_id"] == ""
 
 
 def test_settings_manual_marker_scan():
-    """設定確認・マニュアル再送の目印 (1.85): 最新の発言の中の
-    単独行を拾い、同定子が安定すること。"""
+    """設定確認・マニュアル再送の目印 (1.85): 最新の発言の
+    先頭行を拾い、同定子が安定すること。"""
     els = [
-        _text_el("了解です。設定を見ます。\n"
-                 + copilot_loop.SETTINGS_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.SETTINGS_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -726,8 +780,7 @@ def test_settings_manual_marker_scan():
     assert cp.latest_chat_scan()["settings_marker"]["id"] \
         == scan["settings_marker"]["id"]
     els2 = [
-        _text_el("マニュアルをください。\n"
-                 + copilot_loop.MANUAL_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.MANUAL_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
@@ -761,20 +814,22 @@ def test_marker_scan_with_speaker_prefix():
     assert scan2["settings_marker"] is not None
     els3 = [
         _text_el("アシスタントメッセージ: "
-                 + copilot_loop.RERUN_REQUEST_MARKER + " 1-234"),
+                 + copilot_loop.RERUN_REQUEST_MARKER + " r9 1-234"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan3 = _copilot({"name": "phal-ai"}, els3).latest_chat_scan()
     assert scan3["rerun_marker"] is not None
+    assert scan3["rerun_marker"]["request_id"] == "r9"
     assert scan3["rerun_marker"]["command_id"] == "1-234"
     els4 = [
         _text_el("アシスタントメッセージ: "
                  + copilot_loop.TOOL_REQUEST_MARKER
-                 + " capinfos --version"),
+                 + " t9 capinfos --version"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan4 = _copilot({"name": "phal-ai"}, els4).latest_chat_scan()
     assert scan4["tool_marker"] is not None
+    assert scan4["tool_marker"]["request_id"] == "t9"
     assert scan4["tool_marker"]["command"] == "capinfos --version"
     els5 = [
         _text_el("目印は " + copilot_loop.DIAG_REQUEST_MARKER
@@ -798,8 +853,7 @@ def test_request_id_marker_scan():
     assert scan["settings_marker"] is not None
     assert scan["settings_marker"]["request_id"] == "12"
     els2 = [
-        _text_el("了解です。\n"
-                 + copilot_loop.SETTINGS_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.SETTINGS_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
@@ -826,8 +880,9 @@ def test_request_id_marker_scan():
 def test_marker_key_empty_when_marker_is_first_line():
     """key の縮み対策 (2.33): 目印が発言の先頭行にあると、key
     の範囲が目印の行だけになり、別の発言でも同じ値になって
-    しまうため、key は空になる (同定は id だけ)。目印が
-    2行目以降なら key は従来どおり付く。"""
+    しまうため、key は空になる (同定は id だけ)。2.40 からは
+    先頭行だけが対象なので、目印が2行目以降にある発言は
+    発火しない。"""
     els = [
         _text_el("アシスタントメッセージ: "
                  + copilot_loop.DIAG_REQUEST_MARKER),
@@ -843,17 +898,55 @@ def test_marker_key_empty_when_marker_is_first_line():
         _text_el("Copilot へメッセージを送る"),
     ]
     scan2 = _copilot({"name": "phal-ai"}, els2).latest_chat_scan()
-    assert scan2["marker"] is not None
-    assert scan2["marker"]["key"] != ""
+    assert scan2["marker"] is None
+
+
+def test_marker_scan_ignores_mid_element_markers():
+    """先頭行への統一 (2.40): 発言 (要素) の途中にある目印は、
+    どの合図でも発火しない。先頭行にあれば発火する。
+
+    動機は Copilot の例文拾い事故 (2026-11-17): 返事の中で
+    使い方の例として書かれた目印の行を、本物の合図として
+    拾ってしまった。"""
+    # 前置きの文の次の行にある診断の目印は拾わない。
+    mid = _copilot({"name": "phal-ai"}, [
+        _text_el("了解です。状態を見ます。\n"
+                 + copilot_loop.DIAG_REQUEST_MARKER + "\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ])
+    assert mid.latest_chat_scan()["marker"] is None
+    # 例文の形: 1行目が地の文で、2行目にツール実行の目印。
+    example = _copilot({"name": "phal-ai"}, [
+        _text_el("使い方は次のとおりです。\n"
+                 + copilot_loop.TOOL_REQUEST_MARKER
+                 + " text_head sample.log\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ])
+    assert example.latest_chat_scan()["tool_marker"] is None
+    # 3行目にある設定の目印も拾わない。
+    third = _copilot({"name": "phal-ai"}, [
+        _text_el("前置きです。\nもう一行あります。\n"
+                 + copilot_loop.SETTINGS_REQUEST_MARKER + " s1\n"),
+        _text_el("Copilot へメッセージを送る"),
+    ])
+    assert third.latest_chat_scan()["settings_marker"] is None
+    # 先頭行にあれば発火する (同じ目印・同じ続き)。
+    first = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.DIAG_REQUEST_MARKER + "\n"
+                 "この下は本文です。"),
+        _text_el("Copilot へメッセージを送る"),
+    ])
+    assert first.latest_chat_scan()["marker"] is not None
 
 
 def test_relay_marker_scan():
     """中継リクエストの目印 (2.10、先頭行だけは 2.18、一行
-    形式は 2.19): 発言の先頭行の目印の、次の行から末尾まで
-    が本文になり、同定子が安定すること。目印の行の引数の
-    後ろに続く文も本文の1行目になること。本文が空のものは
-    空のまま返ること (窓側が NACK を返す)。目印が発言の
-    途中にあるものは数えないこと。"""
+    形式は 2.19、依頼 ID は 2.41): 発言の先頭行の目印の、
+    次の行から末尾までが本文になり、同定子が安定すること。
+    目印の行の経路引数の後ろに続く文も本文の1行目になる
+    こと。第1トークンが依頼 ID として切り出せること。本文
+    が空のものは空のまま返ること (窓側が NACK を返す)。
+    目印が発言の途中にあるものは数えないこと。"""
     els = [
         _text_el(copilot_loop.RELAY_REQUEST_MARKER + "\n"
                  + "ファイルを1つ作ってください。\n"
@@ -865,6 +958,8 @@ def test_relay_marker_scan():
     assert scan["relay_marker"] is not None
     assert scan["relay_marker"]["body"] == \
         "ファイルを1つ作ってください。\n中身は print(123) です。"
+    # 依頼 ID が無い行は、空で返る (窓側が NACK を返す、2.41)。
+    assert scan["relay_marker"]["request_id"] == ""
     assert scan["relay_marker"]["id"]
     assert cp.latest_chat_scan()["relay_marker"]["id"] \
         == scan["relay_marker"]["id"]
@@ -895,25 +990,39 @@ def test_relay_marker_scan():
     assert scan3["relay_marker"] is not None
     assert scan3["relay_marker"]["arg"] is None
     assert scan3["relay_marker"]["body"] == "ついでに本文\n本文です"
-    # 引数つきの一行形式 (2.19、Copilot の実際の返し方):
-    # 引数の後ろの文が本文になる。
+    # 依頼 ID + 経路引数の一行形式 (2.41): ID の次の語が
+    # 経路引数、その後ろの文が本文になる。
     els8 = [
         _text_el(copilot_loop.RELAY_REQUEST_MARKER
-                 + " Copilot2Muse 往復テスト受領"),
+                 + " r8 Copilot2Muse 往復テスト受領"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan8 = _copilot({"name": "phal-ai"}, els8).latest_chat_scan()
     assert scan8["relay_marker"] is not None
+    assert scan8["relay_marker"]["request_id"] == "r8"
     assert scan8["relay_marker"]["arg"] == "Copilot2Muse"
     assert scan8["relay_marker"]["body"] == "往復テスト受領"
+    # 旧形式 (ID 無しで経路引数から書いた行) は、第1トークン
+    # が依頼 ID として読まれる (切り分けは位置、2.41)。
+    els8b = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " Copilot2Muse 往復テスト受領"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan8b = _copilot({"name": "phal-ai"}, els8b).latest_chat_scan()
+    assert scan8b["relay_marker"] is not None
+    assert scan8b["relay_marker"]["request_id"] == "Copilot2Muse"
+    assert scan8b["relay_marker"]["arg"] is None
+    assert scan8b["relay_marker"]["body"] == "往復テスト受領"
     # 本文が空の目印は、空のまま返る (窓側の NACK 用、2.19)。
     els9 = [
         _text_el(copilot_loop.RELAY_REQUEST_MARKER
-                 + " Copilot2Muse"),
+                 + " r9 Copilot2Muse"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan9 = _copilot({"name": "phal-ai"}, els9).latest_chat_scan()
     assert scan9["relay_marker"] is not None
+    assert scan9["relay_marker"]["request_id"] == "r9"
     assert scan9["relay_marker"]["arg"] == "Copilot2Muse"
     assert scan9["relay_marker"]["body"] == ""
     # Muse アプリの表示名が目印と同じ行に付いた形も拾う
@@ -927,27 +1036,43 @@ def test_relay_marker_scan():
     scan4 = _copilot({"name": "phal-ai"}, els4).latest_chat_scan()
     assert scan4["relay_marker"] is not None
     assert scan4["relay_marker"]["body"] == "表示名つきの本文です。"
-    # 引数つきの目印 (2.17): 引数がそのまま返る。
+    # 依頼 ID + 引数つきの目印 (2.17 の引数、2.41 の ID):
+    # ID と引数がそのまま返る。
     els6 = [
         _text_el(copilot_loop.RELAY_REQUEST_MARKER
-                 + " Copilot2Muse\n" + "引数つきの本文です。"),
+                 + " r6 Copilot2Muse\n" + "引数つきの本文です。"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan6 = _copilot({"name": "phal-ai"}, els6).latest_chat_scan()
     assert scan6["relay_marker"] is not None
+    assert scan6["relay_marker"]["request_id"] == "r6"
     assert scan6["relay_marker"]["arg"] == "Copilot2Muse"
     assert scan6["relay_marker"]["body"] == "引数つきの本文です。"
-    # 「2」を含む語は引数の試みとして数える (2.19)。ほどける
-    # かは窓側の判定で、ほどけなければ NACK が返る。
+    # ID の次の語に「2」が含まれれば経路引数の試みとして
+    # 数える。ほどけるかは窓側の判定で、ほどけなければ
+    # NACK が返る。
     els7 = [
         _text_el(copilot_loop.RELAY_REQUEST_MARKER
-                 + " Copilot2\n" + "本文です。"),
+                 + " r7 Copilot2\n" + "本文です。"),
         _text_el("Copilot へメッセージを送る"),
     ]
     scan7 = _copilot({"name": "phal-ai"}, els7).latest_chat_scan()
     assert scan7["relay_marker"] is not None
+    assert scan7["relay_marker"]["request_id"] == "r7"
     assert scan7["relay_marker"]["arg"] == "Copilot2"
     assert scan7["relay_marker"]["body"] == "本文です。"
+    # ID だけの一行形式 (経路引数なし): ID の後ろの文が
+    # 本文になる。
+    els10 = [
+        _text_el(copilot_loop.RELAY_REQUEST_MARKER
+                 + " r10 そのまま届けてください"),
+        _text_el("Copilot へメッセージを送る"),
+    ]
+    scan10 = _copilot({"name": "phal-ai"}, els10).latest_chat_scan()
+    assert scan10["relay_marker"] is not None
+    assert scan10["relay_marker"]["request_id"] == "r10"
+    assert scan10["relay_marker"]["arg"] is None
+    assert scan10["relay_marker"]["body"] == "そのまま届けてください"
     # 本文中の言及 (表示名の後ろ以外) は拾わない。
     els5 = [
         _text_el("アシスタントメッセージ: 合図は "
@@ -960,11 +1085,10 @@ def test_relay_marker_scan():
 
 
 def test_history_marker_scan():
-    """実行一覧の目印 (1.92): 最新の発言の中の単独行を拾い、
+    """実行一覧の目印 (1.92): 最新の発言の先頭行を拾い、
     同定子が安定すること。"""
     els = [
-        _text_el("直近の一覧を見せてください。\n"
-                 + copilot_loop.HISTORY_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.HISTORY_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -982,11 +1106,10 @@ def test_history_marker_scan():
 
 
 def test_stop_marker_scan():
-    """停止リクエストの目印 (1.93): 最新の発言の中の単独行を
+    """停止リクエストの目印 (1.93): 最新の発言の先頭行を
     拾い、同定子が安定すること。目印が無ければ None。"""
     els = [
-        _text_el("止めてください。\n"
-                 + copilot_loop.STOP_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.STOP_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -1004,29 +1127,24 @@ def test_stop_marker_scan():
 
 
 def test_diag_marker_key_stable_across_prefix_drift():
-    """第2の同定子 key (1-49): 目印より40行以上前に会話が積み
-    上がって id が変わっても、目印のある発言そのものが同じなら
-    key は同じ。発言の文言が違えば key も違う。"""
+    """先頭行の目印と同定子 (2.40): 2.40 以前は、目印が発言の
+    途中にあるとき第2の同定子 key が「発言そのもの」の同定を
+    担った。先頭行への統一後は key は常に空で、同定は id と
+    応答済みの控えが担う。ここでは、目印より40行以上前に
+    会話が積み上がって id が変わっても目印は拾えることと、
+    key が空のままであることを確かめる。"""
     filler = _text_el("\n".join(f"昔の会話{i}" for i in range(45)))
-    utter = _text_el("了解です。状態を見ます。\n"
-                     + copilot_loop.DIAG_REQUEST_MARKER + "\n")
+    utter = _text_el(copilot_loop.DIAG_REQUEST_MARKER + "\n")
     els = [filler, utter, _text_el("Copilot へメッセージを送る")]
     cp = _copilot({"name": "phal-ai"}, els)
     first = cp.latest_chat_scan()["marker"]
-    assert first is not None and first["id"] and first["key"]
+    assert first is not None and first["id"] and first["key"] == ""
     # 目印より前に別の会話が積み上がる (id は変わる。窓の外)。
     cp2 = _copilot({"name": "phal-ai"}, [_text_el("別の序文")] + els)
     second = cp2.latest_chat_scan()["marker"]
     assert second is not None
     assert second["id"] != first["id"]
-    assert second["key"] == first["key"]
-    # 目印のある発言の文言が違えば key も違う。
-    other = _copilot({"name": "phal-ai"}, [
-        filler,
-        _text_el("別の返事です。\n"
-                 + copilot_loop.DIAG_REQUEST_MARKER + "\n"),
-        _text_el("Copilot へメッセージを送る")])
-    assert other.latest_chat_scan()["marker"]["key"] != first["key"]
+    assert second["key"] == first["key"] == ""
 
 
 def test_diag_marker_scan_ignores_absent_partial_and_old():
@@ -1058,12 +1176,12 @@ def test_diag_marker_scan_alongside_candidate():
 
 def test_reset_marker_scan_finds_latest_request():
     """リセットの目印 (1-52): 診断の目印と同じ流儀で、最新の
-    発言の中の単独行を拾い、同定子 (id / key) が安定すること。
-    診断の目印とは独立に判定する (片方だけでは他方は立たない)。"""
+    発言の先頭行を拾い、同定子が安定すること。先頭行の目印は
+    key を持たない (2.40)。診断の目印とは独立に判定する
+    (片方だけでは他方は立たない)。"""
     els = [
         _text_el("前の発言の本文です"),
-        _text_el("了解です。開き直します。\n"
-                 + copilot_loop.RESET_REQUEST_MARKER + "\n"),
+        _text_el(copilot_loop.RESET_REQUEST_MARKER + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -1071,7 +1189,7 @@ def test_reset_marker_scan_finds_latest_request():
     assert scan["candidate"] is None
     assert scan["marker"] is None  # 診断の目印は立たない
     reset = scan["reset_marker"]
-    assert reset is not None and reset["id"] and reset["key"]
+    assert reset is not None and reset["id"] and reset["key"] == ""
     # 同じ木をもう一度走査しても、同定子は同じ (消費済みの判定が
     # 安定する根拠)。
     assert cp.latest_chat_scan()["reset_marker"] == reset
@@ -1079,12 +1197,10 @@ def test_reset_marker_scan_finds_latest_request():
     cp2 = _copilot({"name": "phal-ai"}, [_text_el("別の序文")] + els)
     assert cp2.latest_chat_scan()["reset_marker"]["id"] \
         != reset["id"]
-    # 第2の同定子 key (1-49 と同じ作り): 目印より40行以上前に
-    # 会話が積み上がって id が変わっても、目印のある発言そのも
-    # のが同じなら key は同じ。
+    # 目印より40行以上前に会話が積み上がって id が変わっても、
+    # 目印は拾える (key は先頭行の目印では常に空、2.40)。
     filler = _text_el("\n".join(f"昔の会話{i}" for i in range(45)))
-    utter = _text_el("了解です。開き直します。\n"
-                     + copilot_loop.RESET_REQUEST_MARKER + "\n")
+    utter = _text_el(copilot_loop.RESET_REQUEST_MARKER + "\n")
     base = [filler, utter, _text_el("Copilot へメッセージを送る")]
     first = _copilot({"name": "phal-ai"}, base) \
         .latest_chat_scan()["reset_marker"]
@@ -1093,11 +1209,10 @@ def test_reset_marker_scan_finds_latest_request():
         .latest_chat_scan()["reset_marker"]
     assert first is not None and drifted is not None
     assert drifted["id"] != first["id"]
-    assert drifted["key"] == first["key"]
+    assert drifted["key"] == first["key"] == ""
     # 診断の目印だけの発言では、リセットの目印は立たない。
     diag_only = _copilot({"name": "phal-ai"}, [
-        _text_el("状態を見ます。\n"
-                 + copilot_loop.DIAG_REQUEST_MARKER + "\n")])
+        _text_el(copilot_loop.DIAG_REQUEST_MARKER + "\n")])
     scan2 = diag_only.latest_chat_scan()
     assert scan2["marker"] is not None
     assert scan2["reset_marker"] is None
@@ -1119,14 +1234,16 @@ def test_reset_marker_scan_ignores_absent_partial_and_old():
 
 
 def test_rerun_marker_scan_finds_request_with_command_id():
-    """再実行の目印 (1.63): 診断・リセットの目印と同じ流儀で、
-    最新の発言の中の単独行を拾う。同定子 (id / key) に加えて、
-    目印の行に書かれたコマンド ID (command_id) を返すこと。
-    診断・リセットの目印とは独立に判定すること。"""
-    marker = copilot_loop.RERUN_REQUEST_MARKER + " 1-123"
+    """再実行の目印 (1.63、依頼 ID は 2.41): 診断・リセットの
+    目印と同じ流儀で、最新の発言の先頭行を拾う。同定子に
+    加えて、目印の行に書かれた依頼 ID (request_id) と
+    コマンド ID (command_id) を位置で切り分けて返すこと。
+    先頭行の目印は key を持たない (2.40)。診断・リセットの
+    目印とは独立に判定すること。"""
+    marker = copilot_loop.RERUN_REQUEST_MARKER + " rr1 1-123"
     els = [
         _text_el("前の発言の本文です"),
-        _text_el("了解です。もう一度実行します。\n" + marker + "\n"),
+        _text_el(marker + "\n"),
         _text_el("Copilot へメッセージを送る"),
     ]
     cp = _copilot({"name": "phal-ai"}, els)
@@ -1135,7 +1252,8 @@ def test_rerun_marker_scan_finds_request_with_command_id():
     assert scan["marker"] is None        # 診断の目印は立たない
     assert scan["reset_marker"] is None  # リセットも立たない
     rerun = scan["rerun_marker"]
-    assert rerun is not None and rerun["id"] and rerun["key"]
+    assert rerun is not None and rerun["id"] and rerun["key"] == ""
+    assert rerun["request_id"] == "rr1"
     assert rerun["command_id"] == "1-123"
     # 同じ木をもう一度走査しても、同定子は同じ (消費済みの判定が
     # 安定する根拠)。
@@ -1146,12 +1264,10 @@ def test_rerun_marker_scan_finds_request_with_command_id():
     rerun2 = cp2.latest_chat_scan()["rerun_marker"]
     assert rerun2["id"] != rerun["id"]
     assert rerun2["command_id"] == "1-123"
-    # 第2の同定子 key (診断・リセットと同じ作り): 目印より40行
-    # 以上前に会話が積み上がって id が変わっても、目印のある
-    # 発言そのものが同じなら key は同じ。
+    # 目印より40行以上前に会話が積み上がって id が変わっても、
+    # 目印は拾える (key は先頭行の目印では常に空、2.40)。
     filler = _text_el("\n".join(f"昔の会話{i}" for i in range(45)))
-    base = [filler, _text_el("了解です。もう一度実行します。\n"
-                             + marker + "\n"),
+    base = [filler, _text_el(marker + "\n"),
             _text_el("Copilot へメッセージを送る")]
     first = _copilot({"name": "phal-ai"}, base) \
         .latest_chat_scan()["rerun_marker"]
@@ -1160,73 +1276,194 @@ def test_rerun_marker_scan_finds_request_with_command_id():
         .latest_chat_scan()["rerun_marker"]
     assert first is not None and drifted is not None
     assert drifted["id"] != first["id"]
-    assert drifted["key"] == first["key"]
+    assert drifted["key"] == first["key"] == ""
     assert drifted["command_id"] == "1-123"
-    # ID の形は "12-3" でも拾う (parse_command_id と同じ形)。
+    # コマンド ID の形は "12-3" でも拾う (parse_command_id と
+    # 同じ形)。
     other = _copilot({"name": "phal-ai"}, [
-        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " 12-3")])
+        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " rr2 12-3")])
     assert other.latest_chat_scan()["rerun_marker"]["command_id"] \
         == "12-3"
+    # 旧形式 (コマンド ID だけ) は、第1トークンが依頼 ID と
+    # して読まれ、コマンド ID は空になる (窓側が引数の
+    # 知らせを返す)。
+    legacy = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " 1-123")])
+    legacy_marker = legacy.latest_chat_scan()["rerun_marker"]
+    assert legacy_marker is not None
+    assert legacy_marker["request_id"] == "1-123"
+    assert legacy_marker["command_id"] == ""
 
 
 def test_rerun_marker_scan_ignores_absent_partial_and_old():
-    """ID が無い・行の一部・古い発言の中、は数えない (1.63)。"""
+    """目印が無い・行の一部・古い発言の中、は数えない (1.63)。
+    目印だけの行は 2.41 から数える (ID 無しの知らせ用)。"""
     cp = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
     assert cp.latest_chat_scan()["rerun_marker"] is None
-    # ID の付いていない目印だけの行は数えない (対象が決まらない)。
+    # 目印だけの行は、ID 無しとして数える (窓側が知らせを
+    # 返して消費する)。
     no_id = _copilot({"name": "phal-ai"}, [
         _text_el(copilot_loop.RERUN_REQUEST_MARKER)])
-    assert no_id.latest_chat_scan()["rerun_marker"] is None
+    no_id_marker = no_id.latest_chat_scan()["rerun_marker"]
+    assert no_id_marker is not None
+    assert no_id_marker["request_id"] == ""
+    assert no_id_marker["command_id"] == ""
     # 行の途中に紛れたものは数えない。
     partial = _copilot({"name": "phal-ai"}, [
         _text_el("これは " + copilot_loop.RERUN_REQUEST_MARKER
-                 + " 1-123 の説明です")])
+                 + " rr1 1-123 の説明です")])
     assert partial.latest_chat_scan()["rerun_marker"] is None
     # 古い発言の中の目印は数えない (末尾の範囲の外)。
     long_tail = "あ" * (copilot_loop.DIAG_MARKER_TAIL_LIMIT + 100)
     old = _copilot({"name": "phal-ai"}, [
-        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " 1-123"),
+        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " rr1 1-123"),
         _text_el(long_tail)])
     assert old.latest_chat_scan()["rerun_marker"] is None
 
 
 def test_rerun_marker_scan_with_args():
-    """再実行の目印の引数 (1.97): ID の後ろの残りが args に
-    なる。引数が無ければ空。引数が違えば同定子も変わる。"""
+    """再実行の目印の引数 (1.97、依頼 ID は 2.41): コマンド ID
+    の後ろの残りが args になる。引数が無ければ空。引数が
+    違えば同定子も変わる。"""
     plain = _copilot({"name": "phal-ai"}, [
-        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " 1-123")])
+        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " rr1 1-123")])
     got = plain.latest_chat_scan()["rerun_marker"]
+    assert got["request_id"] == "rr1"
     assert got["command_id"] == "1-123" and got["args"] == ""
     with_args = _copilot({"name": "phal-ai"}, [
         _text_el(copilot_loop.RERUN_REQUEST_MARKER
-                 + ' 1-123 --lines 20 -Y "sctp"')])
+                 + ' rr1 1-123 --lines 20 -Y "sctp"')])
     got = with_args.latest_chat_scan()["rerun_marker"]
     assert got["command_id"] == "1-123"
     assert got["args"] == '--lines 20 -Y "sctp"'
     other_args = _copilot({"name": "phal-ai"}, [
         _text_el(copilot_loop.RERUN_REQUEST_MARKER
-                 + " 1-123 --lines 30")])
+                 + " rr1 1-123 --lines 30")])
     assert other_args.latest_chat_scan()["rerun_marker"]["id"] \
         != got["id"]
 
 
 def test_tool_marker_scan():
-    """ツール実行の目印 (1.98): 行の残り全部が command になる。
-    ツール名の無い行は数えない。"""
+    """ツール実行の目印 (1.98、依頼 ID は 2.41): 第1トークンが
+    依頼 ID、残り全部が command になる。目印だけの行も数える
+    (ID 無しの知らせ用)。"""
     cp = _copilot({"name": "phal-ai"}, [
-        _text_el("調べてください\n"
-                 + copilot_loop.TOOL_REQUEST_MARKER
-                 + " tshark -r a.pcap -Y sctp\n")])
+        _text_el(copilot_loop.TOOL_REQUEST_MARKER
+                 + " t1 tshark -r a.pcap -Y sctp\n")])
     scan = cp.latest_chat_scan()
     tool = scan["tool_marker"]
-    assert tool is not None and tool["id"] and tool["key"]
+    assert tool is not None and tool["id"] and tool["key"] == ""
+    assert tool["request_id"] == "t1"
     assert tool["command"] == "tshark -r a.pcap -Y sctp"
     assert scan["rerun_marker"] is None  # 他の目印は立たない
     bare = _copilot({"name": "phal-ai"}, [
         _text_el(copilot_loop.TOOL_REQUEST_MARKER)])
-    assert bare.latest_chat_scan()["tool_marker"] is None
+    bare_tool = bare.latest_chat_scan()["tool_marker"]
+    assert bare_tool is not None
+    assert bare_tool["request_id"] == ""
+    assert bare_tool["command"] == ""
     none = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
     assert none.latest_chat_scan()["tool_marker"] is None
+
+
+def test_describe_marker_scan():
+    """道具説明の目印 (2.37): 依頼 ID と道具名を分けて返す。
+    目印だけの行も数える (ID 無しの知らせ用)。ID の形でない
+    1語目は数えない。"""
+    cp = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.DESCRIBE_REQUEST_MARKER
+                 + " d1 log_repeat\n")])
+    scan = cp.latest_chat_scan()
+    marker = scan["describe_marker"]
+    assert marker is not None and marker["id"] and marker["key"] == ""
+    assert marker["request_id"] == "d1"
+    assert marker["tool_name"] == "log_repeat"
+    bare = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.DESCRIBE_REQUEST_MARKER)])
+    bare_marker = bare.latest_chat_scan()["describe_marker"]
+    assert bare_marker is not None
+    assert bare_marker["request_id"] == ""
+    assert bare_marker["tool_name"] == ""
+    prose = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.DESCRIBE_REQUEST_MARKER
+                 + " 道具の説明はこちら")])
+    assert prose.latest_chat_scan()["describe_marker"] is None
+    none = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
+    assert none.latest_chat_scan()["describe_marker"] is None
+
+
+def test_eval_marker_scan():
+    """道具評価の目印 (2.37、依頼 ID は 2.41): 第1トークンが
+    依頼 ID、残り全部が payload になる。目印だけの行も数える
+    (ID 無しの知らせ用)。"""
+    cp = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.EVAL_REQUEST_MARKER
+                 + " e1 log_repeat 4 5 4 使いやすかった\n")])
+    scan = cp.latest_chat_scan()
+    marker = scan["eval_marker"]
+    assert marker is not None and marker["id"] and marker["key"] == ""
+    assert marker["request_id"] == "e1"
+    assert marker["payload"] == "log_repeat 4 5 4 使いやすかった"
+    bare = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.EVAL_REQUEST_MARKER)])
+    bare_marker = bare.latest_chat_scan()["eval_marker"]
+    assert bare_marker is not None
+    assert bare_marker["request_id"] == ""
+    assert bare_marker["payload"] == ""
+    none = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
+    assert none.latest_chat_scan()["eval_marker"] is None
+
+
+def test_input_marker_scan():
+    """入力欄リクエストの目印 (2.39): 依頼 ID と窓名を分けて
+    返す。目印だけの行も数える (ID 無しの知らせ用)。"""
+    cp = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.INPUT_REQUEST_MARKER
+                 + " i1 Copilot\n")])
+    marker = cp.latest_chat_scan()["input_marker"]
+    assert marker is not None and marker["id"] and marker["key"] == ""
+    assert marker["request_id"] == "i1"
+    assert marker["target"] == "Copilot"
+    no_target = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.INPUT_REQUEST_MARKER + " i2")])
+    marker2 = no_target.latest_chat_scan()["input_marker"]
+    assert marker2 is not None and marker2["target"] == ""
+    bare = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.INPUT_REQUEST_MARKER)])
+    bare_marker = bare.latest_chat_scan()["input_marker"]
+    assert bare_marker is not None
+    assert bare_marker["request_id"] == ""
+    none = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
+    assert none.latest_chat_scan()["input_marker"] is None
+
+
+def test_force_body_marker_scan():
+    """入力上書き・強制送信の目印 (2.39): 発言の先頭行の目印
+    だけを数え、次の行から発言の末尾までが本文になる。"""
+    cp = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.OVERWRITE_REQUEST_MARKER
+                 + " o1 Copilot\n短い文です\n2行目です")])
+    marker = cp.latest_chat_scan()["overwrite_marker"]
+    assert marker is not None and marker["id"]
+    assert marker["request_id"] == "o1"
+    assert marker["target"] == "Copilot"
+    assert marker["body"] == "短い文です\n2行目です"
+    send = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.FORCE_SEND_REQUEST_MARKER
+                 + " f1 Copilot 送ってください")])
+    fmarker = send.latest_chat_scan()["force_marker"]
+    assert fmarker is not None
+    assert fmarker["request_id"] == "f1"
+    assert fmarker["target"] == "Copilot"
+    assert fmarker["body"] == "送ってください"
+    # 発言の途中に置かれた目印は数えない (先頭行だけ)。
+    mid = _copilot({"name": "phal-ai"}, [
+        _text_el("前置きの文\n"
+                 + copilot_loop.OVERWRITE_REQUEST_MARKER
+                 + " o2 Copilot\n本文")])
+    assert mid.latest_chat_scan()["overwrite_marker"] is None
+    none = _copilot({"name": "phal-ai"}, [_text_el("ただの本文")])
+    assert none.latest_chat_scan()["force_marker"] is None
 
 
 class FakeExpandPattern:

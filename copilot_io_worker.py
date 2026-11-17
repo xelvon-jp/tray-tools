@@ -51,11 +51,15 @@ def _run(request):
             # 無いときは従来どおりの呼び方にする (添付を知らない
             # transport の差し替え口を壊さないため)。
             attachments = request.get("attachments")
+            kwargs = {}
             if attachments:
-                sent = bool(transport.send_prompt(
-                    request["text"], attachments=attachments))
-            else:
-                sent = bool(transport.send_prompt(request["text"]))
+                kwargs["attachments"] = attachments
+            if request.get("force"):
+                kwargs["force"] = True
+            if request.get("image_paste"):
+                kwargs["image_paste"] = True
+            sent = bool(transport.send_prompt(
+                request["text"], **kwargs))
             return {"ok": True, "sent": sent,
                     "attach_done": list(
                         getattr(transport, "attach_done", []) or []),
@@ -63,11 +67,15 @@ def _run(request):
                         getattr(transport, "attach_failed", []) or [])}
         if op == "fill":
             attachments = request.get("attachments")
+            kwargs = {}
             if attachments:
-                filled = bool(transport.fill_prompt(
-                    request["text"], attachments=attachments))
-            else:
-                filled = bool(transport.fill_prompt(request["text"]))
+                kwargs["attachments"] = attachments
+            if request.get("force"):
+                kwargs["force"] = True
+            if request.get("image_paste"):
+                kwargs["image_paste"] = True
+            filled = bool(transport.fill_prompt(
+                request["text"], **kwargs))
             return {"ok": True, "filled": filled,
                     "attach_done": list(
                         getattr(transport, "attach_done", []) or []),
@@ -104,11 +112,18 @@ def _run(request):
                         "manual_marker": scan.get("manual_marker"),
                         "file_marker": scan.get("file_marker"),
                         "fulltext_marker": scan.get("fulltext_marker"),
+                        "capture_marker": scan.get("capture_marker"),
                         "history_marker": scan.get("history_marker"),
                         "stop_marker": scan.get("stop_marker"),
                         "log_marker": scan.get("log_marker"),
                         "tool_marker": scan.get("tool_marker"),
-                        "relay_marker": scan.get("relay_marker")}
+                        "relay_marker": scan.get("relay_marker"),
+                        "describe_marker": scan.get("describe_marker"),
+                        "eval_marker": scan.get("eval_marker"),
+                        "input_marker": scan.get("input_marker"),
+                        "overwrite_marker": scan.get(
+                            "overwrite_marker"),
+                        "force_marker": scan.get("force_marker")}
             return {"ok": True, "candidate": transport.latest_download()}
         if op == "signature":
             # 変化の署名 (2.07)。持たない transport では None

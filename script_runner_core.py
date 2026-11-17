@@ -859,7 +859,7 @@ def _history_line(record: dict) -> str:
     return f"{head}{name} {code_text}{sec_text}{flags}"
 
 
-def build_history_text(records=None) -> str:
+def build_history_text(records=None, request_id: str = "") -> str:
     """実行一覧の合図への文を組み立てる (1.92、素材は実行ログ
     へ変更 1.94)。
 
@@ -868,7 +868,10 @@ def build_history_text(records=None) -> str:
     ---」の行が並ぶ実地の不具合になった。実行ログ
     (append_run_log の JSONL) は時刻・ファイル名・終了コード
     を構造で持つので、こちらから作る。新しい順に最大20件。
-    記録が無ければ、その旨の文を返す。"""
+    記録が無ければ、その旨の文を返す。
+    request_id (2.40) は合図の依頼 ID で、見出しを
+    「[PHAL:実行一覧 ID]」の形にする。無ければ従来どおり
+    (記録が無いときは見出し無しの文のまま)。"""
     if records is None:
         records = load_run_log_records(20)
     if not isinstance(records, list):
@@ -877,7 +880,9 @@ def build_history_text(records=None) -> str:
              if isinstance(r, dict)]
     if not lines:
         return "実行の記録はまだありません。"
-    return "\n".join(["[PHAL:実行一覧] 新しい順"] + lines)
+    mark = f"[PHAL:実行一覧 {request_id}]" if request_id \
+        else "[PHAL:実行一覧]"
+    return "\n".join([f"{mark} 新しい順"] + lines)
 
 
 def last_results_put(records: dict, key: str, text: str) -> None:
@@ -1137,6 +1142,9 @@ def load_log_events(events_path=None) -> list:
         ai = entry.get("ai")
         if isinstance(ai, str) and ai:
             event["ai"] = ai
+        rid = entry.get("rid")
+        if isinstance(rid, str) and rid:
+            event["rid"] = rid
         events.append(event)
     return events[-LOG_LIMIT:]
 
@@ -1154,12 +1162,16 @@ def save_log_events(events: list, events_path=None) -> None:
         pass
 
 
-def log_append(events: list, text: str, at=None, ai=None) -> None:
+def log_append(events: list, text: str, at=None, ai=None,
+               rid=None) -> None:
     """動作ログへ1件足す。文の畳み方と長さの上限は診断と同じ。
 
     ai (2.04) は、その動きがどの AI との連携でのことか (有効な
     プロファイルの名前)。表示側 (format_log_lines) が [名前] の
-    形で出す。無ければ付けない。"""
+    形で出す。無ければ付けない。
+    rid (2.40) は、その動きがどの合図への応答か (合図の依頼
+    ID。再実行・再送はコマンド ID、ファイルはパス)。表示側が
+    [名前] の後ろに (ID) の形で出す。無ければ付けない。"""
     text = " ".join(str(text).split())
     if not text:
         return
@@ -1171,6 +1183,8 @@ def log_append(events: list, text: str, at=None, ai=None) -> None:
     }
     if isinstance(ai, str) and ai:
         event["ai"] = ai
+    if isinstance(rid, str) and rid:
+        event["rid"] = rid
     events.append(event)
     del events[:-LOG_LIMIT]
 
@@ -1178,7 +1192,9 @@ def log_append(events: list, text: str, at=None, ai=None) -> None:
 def format_log_lines(events, with_date: bool = False) -> list:
     """動作ログを「時刻 + 文」の行の並びにする (ビューア用)。
 
-    ai が付いた記録 (2.04) は、時刻の後ろに [AI名] を出す。"""
+    ai が付いた記録 (2.04) は、時刻の後ろに [AI名] を出す。
+    rid が付いた記録 (2.40) は、その後ろに (依頼ID) を出す
+    (ai が無く rid だけのときは時刻の後ろに出す)。"""
     lines = []
     for e in events or []:
         at = e.get("at") or 0
@@ -1187,11 +1203,14 @@ def format_log_lines(events, with_date: bool = False) -> list:
                 "%m-%d %H:%M:%S", time.localtime(at))
         else:
             stamp = _diag_time_text(at)
+        head = stamp
         ai = e.get("ai")
         if isinstance(ai, str) and ai:
-            lines.append(f"{stamp} [{ai}] {e.get('text', '')}")
-        else:
-            lines.append(f"{stamp} {e.get('text', '')}")
+            head += f" [{ai}]"
+        rid = e.get("rid")
+        if isinstance(rid, str) and rid:
+            head += f" ({rid})"
+        lines.append(f"{head} {e.get('text', '')}")
     return lines
 
 
@@ -1199,22 +1218,230 @@ def _diag_time_text(at: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(at))
 
 
+# ---------------------------------------------------------------
+# コマンド履歴 (2.42)
+#
+# AI からの合図 (コマンド) と PHAL の応答を、ファイルと混ぜて
+# 一覧に出すための記録。1件は {at, ai, kind, request_id,
+# summary, status, reason, response, key} で、status は
+# answered (応答済み) / skipped (見送り) / pending (保留)。
+# 応答文は PHAL が送った文そのもの (長い場合は
+# COMMAND_RESPONSE_LIMIT で切る)。控えは直近
+# COMMAND_HISTORY_LIMIT 件までで、開き直しをまたいで残る。
+# ---------------------------------------------------------------
+COMMAND_HISTORY_FILENAME = "script_runner_commands.json"
+COMMAND_HISTORY_LIMIT = 100
+COMMAND_RESPONSE_LIMIT = 4000
+COMMAND_SUMMARY_LIMIT = 120
+COMMAND_STATUSES = ("answered", "skipped", "pending")
+
+# 合図の種別 → 一覧の「ファイル名」列に出す表示名。
+COMMAND_KIND_LABELS = {
+    "diag": "診断リクエスト",
+    "settings": "設定リクエスト",
+    "manual": "マニュアル再送",
+    "history": "実行一覧リクエスト",
+    "log": "動作ログリクエスト",
+    "stop": "停止リクエスト",
+    "reset": "リセットリクエスト",
+    "rerun": "再実行リクエスト",
+    "resend": "結果再送リクエスト",
+    "file": "ファイルリクエスト",
+    "capture": "キャプチャリクエスト",
+    "fulltext": "全文リクエスト",
+    "tool": "ツール実行",
+    "describe": "道具説明リクエスト",
+    "eval": "道具評価",
+    "input": "入力欄リクエスト",
+    "overwrite": "入力上書きリクエスト",
+    "force": "強制送信リクエスト",
+    "relay": "中継リクエスト",
+}
+
+COMMAND_STATUS_LABELS = {
+    "answered": "応答済み",
+    "skipped": "見送り",
+    "pending": "保留",
+}
+
+
+def command_history_path() -> Path:
+    return data_dir() / COMMAND_HISTORY_FILENAME
+
+
+def truncate_command_response(text) -> str:
+    """応答文を1件あたりの上限で切る。切ったときは、その旨の
+    1行を末尾に足す (切ったことが分かるように)。"""
+    text = str(text or "")
+    if len(text) <= COMMAND_RESPONSE_LIMIT:
+        return text
+    return (text[:COMMAND_RESPONSE_LIMIT]
+            + "\n…（応答が長いため、ここまでで切っています）")
+
+
+def _truncate_command_summary(text) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= COMMAND_SUMMARY_LIMIT:
+        return text
+    return text[:COMMAND_SUMMARY_LIMIT - 1] + "…"
+
+
+def sanitize_command_record(raw):
+    """コマンド履歴の1件を整える。時刻が読めないものは None
+    (捨てる)。状態が未知のものは見送りに倒す。"""
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    if not isinstance(at, (int, float)) or at <= 0:
+        return None
+    status = raw.get("status")
+    if status not in COMMAND_STATUSES:
+        status = "skipped"
+    return {
+        "at": float(at),
+        "ai": str(raw.get("ai") or ""),
+        "kind": str(raw.get("kind") or ""),
+        "request_id": str(raw.get("request_id") or ""),
+        "summary": _truncate_command_summary(raw.get("summary")),
+        "status": status,
+        "reason": str(raw.get("reason") or ""),
+        "response": truncate_command_response(raw.get("response")),
+        "key": str(raw.get("key") or ""),
+    }
+
+
+def sanitize_command_history(raw) -> list:
+    """コマンド履歴の並びを整える (古い順、上限まで)。
+
+    選択の控えに使う key が無い・重なる記録には、時刻から
+    作った key を割り直す (重なりは連番で避ける)。"""
+    if not isinstance(raw, list):
+        return []
+    records = []
+    for entry in raw:
+        record = sanitize_command_record(entry)
+        if record is not None:
+            records.append(record)
+    records = records[-COMMAND_HISTORY_LIMIT:]
+    seen = set()
+    for record in records:
+        key = record["key"]
+        if not key or key in seen:
+            base = f"c{int(record['at'] * 1000000)}"
+            key = base
+            n = 2
+            while key in seen:
+                key = f"{base}-{n}"
+                n += 1
+            record["key"] = key
+        seen.add(record["key"])
+    return records
+
+
+def load_command_history(records_path=None) -> list:
+    """コマンド履歴を読み込む (古い順)。壊れていれば空。"""
+    path = Path(records_path) if records_path is not None \
+        else command_history_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return sanitize_command_history(raw)
+
+
+def save_command_history(records: list, records_path=None) -> None:
+    """コマンド履歴を書く。失敗しても黙る (表示用の記録)。"""
+    path = Path(records_path) if records_path is not None \
+        else command_history_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(sanitize_command_history(records),
+                      f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def command_history_new(at=None, ai="", kind="", request_id="",
+                        summary="", status="pending", reason="",
+                        response="") -> dict:
+    """コマンド履歴の新しい1件を作る (整えた形で返す)。
+
+    key は呼び側 (窓) が付ける。ここでは空にしておき、
+    sanitize のときに時刻から割り直される。"""
+    record = {
+        "at": float(at) if at is not None else time.time(),
+        "ai": str(ai or ""),
+        "kind": str(kind or ""),
+        "request_id": str(request_id or ""),
+        "summary": _truncate_command_summary(summary),
+        "status": status if status in COMMAND_STATUSES
+        else "pending",
+        "reason": str(reason or ""),
+        "response": truncate_command_response(response),
+        "key": "",
+    }
+    return record
+
+
+def command_history_append(records: list, record: dict) -> list:
+    """履歴へ1件足して、上限を超えた古い分を落とす。
+
+    戻り値は新しい並び (古い順)。record は整えた形に直して
+    から、その dict 自体を並びへ入れる (呼び側が同じ dict を
+    持って状態を更新する使い方のため)。"""
+    records = list(records or [])
+    clean = sanitize_command_record(record)
+    if clean is not None:
+        if record.get("key"):
+            clean["key"] = str(record["key"])
+        record.clear()
+        record.update(clean)
+        records.append(record)
+    return records[-COMMAND_HISTORY_LIMIT:]
+
+
+def command_history_settle_pending(records: list) -> int:
+    """「保留」のまま残った記録を見送りに確定させる。
+
+    開き直しのときに使う。前回の会話で送信中のまま終わった
+    記録は、結果が分からないので理由つきで確定させる。
+    変えた件数を返す。"""
+    changed = 0
+    for record in records or []:
+        if isinstance(record, dict) \
+                and record.get("status") == "pending":
+            record["status"] = "skipped"
+            record["reason"] = "開き直しのため結果不明"
+            changed += 1
+    return changed
+
+
 def build_diag_bundle(version: str, toggles: dict, profile_name: str,
-                      chain_lines, events, at=None) -> str:
+                      chain_lines, events, at=None,
+                      request_id: str = "") -> str:
     """AI へ貼る診断の束を組み立てる。
 
     見出し (PHAL の版と時刻)・自動化の切替・有効なプロファイル名・
     今の連鎖の状態・直近の記録 (古い順) を、短い平文で並べる。
     全体の上限を超える場合は、記録の古い方から落として収める
-    (見出しと状態は落とさない)。"""
+    (見出しと状態は落とさない)。
+    request_id (2.40) は合図の依頼 ID で、見出しを
+    「[PHAL:診断 ID]」の形にする (応答の対応づけは ID で行う)。
+    無ければ従来の「[PHAL:診断]」。"""
     now = float(at) if at is not None else time.time()
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
 
     def on_off(key):
         return "入" if (toggles or {}).get(key) else "切"
 
+    label = f"[PHAL:診断 {request_id}]" if request_id \
+        else "[PHAL:診断]"
     head = [
-        f"[PHAL:診断] Ver{version} {stamp}",
+        f"{label} Ver{version} {stamp}",
         f"自動化: DL={on_off('auto_dl')} 実行={on_off('auto_run')} "
         f"回答={on_off('auto_answer')} 送信={on_off('auto_send')} "
         f"診断={on_off('auto_diag')} 受領={on_off('auto_ack')} "
@@ -1289,6 +1516,8 @@ def load_diag_auto(state_path=None) -> dict:
         "consumed_key": key if isinstance(key, str) else "",
         "last_sent_at": float(sent_at)
         if isinstance(sent_at, (int, float)) else 0.0,
+        "answered_ids": _sanitize_answered_ids(
+            raw.get("answered_ids")),
     }
 
 
@@ -1303,6 +1532,8 @@ def save_diag_auto(state: dict, state_path=None) -> None:
         "consumed_id": str(state.get("consumed_id") or ""),
         "consumed_key": str(state.get("consumed_key") or ""),
         "last_sent_at": float(state.get("last_sent_at") or 0.0),
+        "answered_ids": _sanitize_answered_ids(
+            state.get("answered_ids")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1349,12 +1580,14 @@ def load_reset_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_reset_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_reset_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     reset_at = raw.get("last_reset_at")
@@ -1376,6 +1609,8 @@ def load_reset_auto(state_path=None) -> dict:
         else 0.0,
         "answered_map": _sanitize_answered_map(
             raw.get("answered_map"), raw),
+        "answered_ids": _sanitize_answered_ids(
+            raw.get("answered_ids")),
     }
 
 
@@ -1399,6 +1634,8 @@ def save_reset_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_at") or 0.0),
         "answered_map": _sanitize_answered_map(
             state.get("answered_map")),
+        "answered_ids": _sanitize_answered_ids(
+            state.get("answered_ids")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1445,12 +1682,14 @@ def load_rerun_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_rerun_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_rerun_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     rerun_at = raw.get("last_rerun_at")
@@ -1472,6 +1711,8 @@ def load_rerun_auto(state_path=None) -> dict:
         else 0.0,
         "answered_map": _sanitize_answered_map(
             raw.get("answered_map"), raw),
+        "answered_ids": _sanitize_answered_ids(
+            raw.get("answered_ids")),
     }
 
 
@@ -1495,6 +1736,8 @@ def save_rerun_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_at") or 0.0),
         "answered_map": _sanitize_answered_map(
             state.get("answered_map")),
+        "answered_ids": _sanitize_answered_ids(
+            state.get("answered_ids")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1536,12 +1779,14 @@ def load_resend_auto(state_path=None) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     if not isinstance(raw, dict):
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     consumed = raw.get("consumed_id")
     key = raw.get("consumed_key")
     sent_at = raw.get("last_sent_at")
@@ -1563,6 +1808,8 @@ def load_resend_auto(state_path=None) -> dict:
         else 0.0,
         "answered_map": _sanitize_answered_map(
             raw.get("answered_map"), raw),
+        "answered_ids": _sanitize_answered_ids(
+            raw.get("answered_ids")),
     }
 
 
@@ -1584,6 +1831,8 @@ def save_resend_auto(state: dict, state_path=None) -> None:
             state.get("refire_notice_at") or 0.0),
         "answered_map": _sanitize_answered_map(
             state.get("answered_map")),
+        "answered_ids": _sanitize_answered_ids(
+            state.get("answered_ids")),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1609,6 +1858,8 @@ RELAY_PENDING_TTL_SEC = 600.0      # 中継の保留控えの寿命 (2.13)
 RELAY_RETRY_DELAY_SEC = 20.0       # 中継の送り直しまでの待ち (2.13)
 RELAY_RETRY_MAX = 1                # 中継の送り直しの回数上限 (2.13)
 RELAY_ACK_DELAY_SEC = 30.0         # 中継の成功ACKを保留する秒数 (2.27)
+RELAY_ID_HISTORY_LIMIT = 32        # 中継の ID 履歴に残す連鎖 (起点+ID) の上限 (2.41)
+RELAY_ID_MAX_COUNT = 3             # 同じ連鎖で中継できる回数の上限 (2.41)
 
 
 def _sanitize_answered_map(raw_map, raw=None) -> dict:
@@ -1634,6 +1885,37 @@ def _sanitize_answered_map(raw_map, raw=None) -> dict:
     return result
 
 
+def _sanitize_answered_ids(raw) -> dict:
+    """依頼 ID ごとの応答済みの控え (2.46) を検証して返す。
+
+    形は {ID: {"at": 応答時刻, "payload": 応答した payload}}。
+    payload の抑止 (15分窓・直近分のみ) とは別に、ID の単位で
+    長く残すための控え。ID が同じ合図は内容が違っても再実行
+    しない (ID が同じなら同じ依頼として扱う)。形の違う要素は
+    落とし、新しい順に100件までにする。"""
+    result = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k:
+                continue
+            if isinstance(v, dict):
+                at = v.get("at")
+                payload = v.get("payload")
+                result[k] = {
+                    "at": float(at)
+                    if isinstance(at, (int, float)) else 0.0,
+                    "payload": payload
+                    if isinstance(payload, str) else "",
+                }
+            elif isinstance(v, (int, float)):
+                result[k] = {"at": float(v), "payload": ""}
+    if len(result) > 100:
+        keep = sorted(
+            result.items(), key=lambda kv: kv[1]["at"])[-100:]
+        result = dict(keep)
+    return result
+
+
 def _load_marker_auto(path) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -1644,7 +1926,8 @@ def _load_marker_auto(path) -> dict:
         return {"consumed_id": "", "consumed_key": "",
                 "last_sent_at": 0.0,
                 "last_payload": "", "last_answered_at": 0.0,
-                "refire_notice_payload": "", "refire_notice_at": 0.0, "answered_map": {}}
+                "refire_notice_payload": "", "refire_notice_at": 0.0,
+                "answered_map": {}, "answered_ids": {}}
     sent_at = raw.get("last_sent_at")
     answered_at = raw.get("last_answered_at")
     notice_at = raw.get("refire_notice_at")
@@ -1671,6 +1954,8 @@ def _load_marker_auto(path) -> dict:
         # 実地) ため、直近分はまとめて持つ。
         "answered_map": _sanitize_answered_map(
             raw.get("answered_map"), raw),
+        "answered_ids": _sanitize_answered_ids(
+            raw.get("answered_ids")),
     }
 
 
@@ -1689,6 +1974,8 @@ def _save_marker_auto(state, path, extra=None) -> None:
             state.get("refire_notice_at") or 0.0),
         "answered_map": _sanitize_answered_map(
             state.get("answered_map")),
+        "answered_ids": _sanitize_answered_ids(
+            state.get("answered_ids")),
     }
     if isinstance(extra, dict):
         payload.update(extra)
@@ -1726,11 +2013,61 @@ def save_manual_auto(state: dict, state_path=None) -> None:
     _save_marker_auto(state, path)
 
 
+# 道具説明・道具評価の合図の控え (2.37)。作りは設定・マニュアル
+# と同じ (汎用の _load/_save_marker_auto)。
+DESCRIBE_AUTO_FILENAME = "script_runner_describe_auto.json"
+EVAL_AUTO_FILENAME = "script_runner_eval_auto.json"
+
+
+def load_describe_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / DESCRIBE_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_describe_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / DESCRIBE_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+def load_eval_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / EVAL_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_eval_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / EVAL_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# 入力欄まわりの合図 (入力欄リクエスト・入力上書き・強制送信、
+# 2.39) の控え。3種で1つの控えを共有する (同定子は種別つきの
+# payload で分ける)。作りは他の合図と同じ。
+INPUT_AUTO_FILENAME = "script_runner_input_auto.json"
+
+
+def load_input_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / INPUT_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_input_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / INPUT_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
 def sanitize_relay_pending(raw):
     """中継の保留控え (2.13) を検証して返す。
 
-    控えは {id, key, body, at, retries, not_before, src, dst}。
-    形が違う・本文が空なら None (保留なしとして扱う)。"""
+    控えは {id, key, body, at, retries, not_before, src, dst,
+    rid}。形が違う・本文が空なら None (保留なしとして扱う)。
+    rid は中継の依頼 ID (2.41、控えから送るときも配達文と
+    ループ判定に使う)。2.40 までの控えには無く、空のまま。"""
     if not isinstance(raw, dict):
         return None
     mid = raw.get("id")
@@ -1745,6 +2082,7 @@ def sanitize_relay_pending(raw):
     not_before = raw.get("not_before")
     src_name = raw.get("src")
     dst_name = raw.get("dst")
+    rid = raw.get("rid")
     return {
         "id": mid,
         "key": key if isinstance(key, str) else "",
@@ -1758,16 +2096,222 @@ def sanitize_relay_pending(raw):
         # (窓側が従来の主→副として扱う)。
         "src": src_name if isinstance(src_name, str) else "",
         "dst": dst_name if isinstance(dst_name, str) else "",
+        "rid": rid if isinstance(rid, str) else "",
     }
+
+
+def _sanitize_relay_id_entry(raw) -> dict:
+    """中継の ID 履歴の1件分を検証して返す (2.41)。
+
+    1件は1つの連鎖 (起点＋依頼 ID) 分で、形は {"routes":
+    [[送り元, 送り先], ...], "hashes": [本文の sha256, ...],
+    "count": 中継した回数, "at": 最後に中継した時刻}。"""
+    routes = []
+    raw_routes = raw.get("routes")
+    if isinstance(raw_routes, list):
+        for pair in raw_routes:
+            if isinstance(pair, (list, tuple)) \
+                    and len(pair) == 2 \
+                    and all(isinstance(x, str) for x in pair):
+                routes.append([pair[0], pair[1]])
+    hashes = []
+    raw_hashes = raw.get("hashes")
+    if isinstance(raw_hashes, list):
+        hashes = [h for h in raw_hashes
+                  if isinstance(h, str) and h]
+    count = raw.get("count")
+    at = raw.get("at")
+    return {
+        "routes": routes,
+        "hashes": hashes,
+        "count": int(count)
+        if isinstance(count, int) and count >= 0
+        else len(routes),
+        "at": float(at)
+        if isinstance(at, (int, float)) else 0.0,
+    }
+
+
+def _relay_entry_shaped(value) -> bool:
+    """旧形式 (ID のみキー) の履歴1件らしい形かどうか。
+
+    旧形式の値は {"routes": [...], "hashes": [...], ...} で、
+    新形式の「起点ごとの入れ物」({依頼ID: 履歴}) とは、
+    routes / hashes がリスト・count が数であることで
+    見分ける (入れ物の値にその形は現れない)。"""
+    if not isinstance(value, dict):
+        return False
+    return isinstance(value.get("routes"), list) \
+        or isinstance(value.get("hashes"), list) \
+        or isinstance(value.get("count"), int)
+
+
+def sanitize_relay_id_history(raw) -> dict:
+    """中継の ID 履歴 (2.41) を検証して返す。
+
+    形は {起点の AI 名: {依頼 ID: 履歴1件}} で、1件の形は
+    _sanitize_relay_id_entry のとおり。キーを「起点＋ID」に
+    したのは、別々の AI が同じ ID を使っても記録が混ざら
+    ないようにするため (Nagato の方針: 事故は防ぐ、無駄に
+    厳しくしない)。ループ防止の判定 (relay_loop_reason)
+    の材料で、開き直しをまたいで残るよう中継の控えファイル
+    に一緒に保存する。形の違う要素は落とし、全体で直近
+    RELAY_ID_HISTORY_LIMIT 件 (最後に中継した時刻の新しい
+    順) までにする。
+    2.41 の最初の形 (ID のみキー) の控えが残っていたら、
+    最初の経路の送り元を起点として移行する (当時の記録は
+    ID が重なると混ざっていたため、それ以上には分けられ
+    ない)。経路が無く起点を特定できない旧形式の要素は
+    読み捨てる。旧形式と新形式が同じ (起点, ID) を指した
+    ら、新形式の方を正とする。"""
+    result = {}
+    if isinstance(raw, dict):
+        items = [(k, v) for k, v in raw.items()
+                 if isinstance(k, str) and k
+                 and isinstance(v, dict)]
+        # 旧形式 (キーが依頼 ID、値が履歴そのもの) の移行。
+        for key, value in items:
+            if not _relay_entry_shaped(value):
+                continue
+            entry = _sanitize_relay_id_entry(value)
+            origin = entry["routes"][0][0] \
+                if entry["routes"] else ""
+            if origin:
+                result.setdefault(origin, {})[key] = entry
+        # 新形式 (キーが起点、値が {依頼 ID: 履歴})。
+        for key, value in items:
+            if _relay_entry_shaped(value):
+                continue
+            bucket = {}
+            for rid, entry_raw in value.items():
+                if isinstance(rid, str) and rid \
+                        and isinstance(entry_raw, dict):
+                    bucket[rid] = _sanitize_relay_id_entry(
+                        entry_raw)
+            if bucket:
+                result.setdefault(key, {}).update(bucket)
+    flat = [(origin, rid, entry)
+            for origin, bucket in result.items()
+            for rid, entry in bucket.items()]
+    if len(flat) > RELAY_ID_HISTORY_LIMIT:
+        flat.sort(key=lambda item: (
+            item[2]["at"], item[0], item[1]))
+        result = {}
+        for origin, rid, entry in \
+                flat[-RELAY_ID_HISTORY_LIMIT:]:
+            result.setdefault(origin, {})[rid] = entry
+    return result
+
+
+def relay_find_chain(history, window_name, request_id):
+    """中継の連鎖を特定する (2.41)。
+
+    窓 window_name で、その窓から送る中継の合図が検出された
+    とき、その中継がどの連鎖 (起点＋依頼 ID) のものかを
+    決める。戻り値は (起点の AI 名, 履歴の1件または None)。
+    特定の順序:
+    (a) (window_name, ID) の記録があれば、それが本人の連鎖。
+    (b) 無ければ、他の起点の (起点, ID) の記録のうち、経路
+        履歴に window_name が送り先として現れるものを探し、
+        あればその連鎖の続きとする。複数当たれば、最後に
+        中継した時刻が新しいもの (同点なら起点名の大きい方)
+        を決定的に選ぶ。
+    (c) どちらも無ければ、起点＝window_name の新規連鎖
+        (履歴は None)。"""
+    rid = str(request_id or "")
+    win = str(window_name or "")
+    if not rid or not win:
+        return win, None
+    clean = sanitize_relay_id_history(history)
+    own = (clean.get(win) or {}).get(rid)
+    if own is not None:
+        return win, own
+    best = None
+    for origin, bucket in clean.items():
+        if origin == win:
+            continue
+        entry = bucket.get(rid)
+        if entry is None:
+            continue
+        destinations = {pair[1] for pair in entry["routes"]}
+        if win not in destinations:
+            continue
+        stamp = (entry["at"], origin)
+        if best is None or stamp > best[0]:
+            best = (stamp, origin, entry)
+    if best is not None:
+        return best[1], best[2]
+    return win, None
+
+
+def relay_body_hash(body) -> str:
+    """中継する本文の同定用のハッシュ (2.41)。"""
+    return hashlib.sha256(
+        str(body or "").encode("utf-8")).hexdigest()
+
+
+def relay_loop_reason(entry, body_hash, dst_name):
+    """中継のループ防止の判定 (2.41、Nagato 承認の3ルール)。
+
+    entry は連鎖 (起点＋依頼 ID) の履歴1件 (無ければ None)。
+    断る場合は理由の文を、通してよければ None を返す。
+    (1) 同じ連鎖で同じ本文は二度と中継しない。
+    (2) 同じ連鎖で、経路履歴に「送り先として現れた窓」への
+        中継は断る (送り元としてだけ現れた窓は対象外)。
+    (3) 同じ連鎖の中継は合計 RELAY_ID_MAX_COUNT 回まで。"""
+    if not isinstance(entry, dict):
+        return None
+    if body_hash and body_hash in (entry.get("hashes") or []):
+        return ("同じ依頼IDで同じ本文は二度中継しません"
+                "（ループ防止）")
+    destinations = {pair[1] for pair in (entry.get("routes") or [])
+                    if isinstance(pair, (list, tuple))
+                    and len(pair) == 2}
+    if dst_name and dst_name in destinations:
+        return (f"その依頼IDではすでに{dst_name}へ届いています"
+                "（ループ防止）")
+    if int(entry.get("count") or 0) >= RELAY_ID_MAX_COUNT:
+        return (f"同じ依頼IDの中継は{RELAY_ID_MAX_COUNT}回までです"
+                "（ループ防止）")
+    return None
+
+
+def relay_history_record(history, origin, request_id, body_hash,
+                         src_name, dst_name, at=None) -> dict:
+    """中継が成功したことを連鎖の履歴へ記録する (2.41)。
+
+    記録先は (起点, 依頼 ID) の連鎖で、起点は検出時に
+    relay_find_chain で特定したもの (新規連鎖なら送り元の
+    窓)。history は sanitize 済みでなくてよく、更新した
+    辞書を返す (呼び側が控えへ保存する)。起点か依頼 ID が
+    無ければ、帰属先が無いので記録しない。"""
+    result = sanitize_relay_id_history(history)
+    origin = str(origin or "")
+    rid = str(request_id or "")
+    if not origin or not rid:
+        return result
+    bucket = result.setdefault(origin, {})
+    entry = bucket.get(rid) or {
+        "routes": [], "hashes": [], "count": 0, "at": 0.0}
+    entry["routes"] = entry["routes"] + [
+        [str(src_name or ""), str(dst_name or "")]]
+    if body_hash and body_hash not in entry["hashes"]:
+        entry["hashes"] = entry["hashes"] + [body_hash]
+    entry["count"] = int(entry.get("count") or 0) + 1
+    entry["at"] = float(at) if isinstance(at, (int, float)) \
+        else time.time()
+    bucket[rid] = entry
+    return sanitize_relay_id_history(result)
 
 
 def load_relay_auto(state_path=None) -> dict:
     path = Path(state_path) if state_path is not None \
         else data_dir() / RELAY_AUTO_FILENAME
     state = _load_marker_auto(path)
-    # 保留控えは中継専用の欄なので、共有の読み書きとは別に
-    # 生の JSON から拾う (2.13)。
+    # 保留控えと ID 履歴は中継専用の欄なので、共有の読み書き
+    # とは別に生の JSON から拾う (2.13、ID 履歴は 2.41)。
     pending = None
+    relay_ids = {}
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
@@ -1775,7 +2319,9 @@ def load_relay_auto(state_path=None) -> dict:
         raw = None
     if isinstance(raw, dict):
         pending = sanitize_relay_pending(raw.get("pending"))
+        relay_ids = sanitize_relay_id_history(raw.get("relay_ids"))
     state["pending"] = pending
+    state["relay_ids"] = relay_ids
     return state
 
 
@@ -1784,7 +2330,9 @@ def save_relay_auto(state: dict, state_path=None) -> None:
         else data_dir() / RELAY_AUTO_FILENAME
     state = state if isinstance(state, dict) else {}
     pending = sanitize_relay_pending(state.get("pending"))
-    _save_marker_auto(state, path, extra={"pending": pending})
+    relay_ids = sanitize_relay_id_history(state.get("relay_ids"))
+    _save_marker_auto(state, path, extra={
+        "pending": pending, "relay_ids": relay_ids})
 
 
 # 設定確認の報告に出す自動化の短い名前 (診断の束と同じ並び)。
@@ -1804,18 +2352,63 @@ _SETTINGS_AUTO_LABELS = (
 )
 
 
-def build_settings_report(section, version) -> str:
+_ODOUGUBAKO_EVAL_LABELS = {
+    "usability": "使いやすさ", "findability": "選びやすさ",
+    "expectation": "期待どおりか"}
+
+
+def _odougubako_report_lines(tools) -> list:
+    """おどうぐばこの一覧を、設定の報告の行にする (2.37)。
+
+    並びは渡された順 (分類でまとまり、分類内は頻度順) を
+    そのまま使う。1道具2行: 名前・分類・版・頻度・成功率・
+    評価の平均・最終使用・印 (休眠/改善候補) と、説明。"""
+    lines = [f"- おどうぐばこ: {len(tools)}件"]
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        rate = tool.get("success_rate")
+        rate_text = f"{rate:.0%}" if rate is not None else "-"
+        averages = (tool.get("eval") or {}).get("averages") or {}
+        eval_text = ""
+        if averages:
+            eval_text = " 評価 " + " ".join(
+                f"{_ODOUGUBAKO_EVAL_LABELS.get(k, k)}{v:g}"
+                for k, v in averages.items())
+        marks = ""
+        if tool.get("dormant"):
+            marks += " 休眠"
+        if averages and min(averages.values()) < 3.0:
+            marks += " 改善候補"
+        last = (tool.get("last_used_at") or "")[:10] or "未使用"
+        lines.append(
+            f"  - {tool.get('name')} [{tool.get('category')}] "
+            f"v{tool.get('version')} 使用{tool.get('count')} "
+            f"成功率{rate_text}{eval_text} 最終使用 {last}{marks}")
+        lines.append(f"    {tool.get('description')}")
+    return lines
+
+
+def build_settings_report(section, version, odougubako_tools=None,
+                          request_id: str = "") -> str:
     """設定確認の合図への報告を組み立てる (1.85)。
 
     script_runner 節 (設定ファイルの中身) から、AI がループを
     回すのに要る値を平文で並べる。窓の見た目の細部や、投げ先の
-    窓一致の欄そのものは出さない (長いし、要らない)。"""
+    窓一致の欄そのものは出さない (長いし、要らない)。
+    odougubako_tools (2.37) は odougubako_core.list_tools の
+    結果で、渡されたときだけおどうぐばこの一覧を足す (core は
+    odougubako に依存しないので、窓側が渡す)。
+    request_id (2.40) は合図の依頼 ID で、見出しを
+    「[PHAL:設定 ID]」の形にする。無ければ従来の「[PHAL:設定]」。"""
     section = section if isinstance(section, dict) else {}
 
     def on_off(value):
         return "入" if value else "切"
 
-    lines = [f"[PHAL:設定] Ver{version}"]
+    label = f"[PHAL:設定 {request_id}]" if request_id \
+        else "[PHAL:設定]"
+    lines = [f"{label} Ver{version}"]
     # 監視フォルダは、設定が空なら実際に見張っている既定の場所
     # (ダウンロードフォルダ) を出す (生の空文字は意味がない)。
     watch = section.get("watch_folder")
@@ -1903,6 +2496,8 @@ def build_settings_report(section, version) -> str:
         f"- ツール置き場: {folder}"
         + (f"（中身: {', '.join(placed)}）" if placed
            else "（空）"))
+    if odougubako_tools is not None:
+        lines.extend(_odougubako_report_lines(odougubako_tools))
     profiles = section.get("ai_profiles")
     active = section.get("ai_profile_active")
     if isinstance(profiles, list) and profiles:
@@ -1941,6 +2536,25 @@ def load_file_auto(state_path=None) -> dict:
 def save_file_auto(state: dict, state_path=None) -> None:
     path = Path(state_path) if state_path is not None \
         else data_dir() / FILE_AUTO_FILENAME
+    _save_marker_auto(state, path)
+
+
+# ---------------------------------------------------------------
+# キャプチャリクエストの控え (2.54)。作りはファイルリクエスト
+# と同じ (汎用の _load/_save_marker_auto)。
+# ---------------------------------------------------------------
+CAPTURE_AUTO_FILENAME = "script_runner_capture_auto.json"
+
+
+def load_capture_auto(state_path=None) -> dict:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / CAPTURE_AUTO_FILENAME
+    return _load_marker_auto(path)
+
+
+def save_capture_auto(state: dict, state_path=None) -> None:
+    path = Path(state_path) if state_path is not None \
+        else data_dir() / CAPTURE_AUTO_FILENAME
     _save_marker_auto(state, path)
 
 
@@ -2347,20 +2961,24 @@ def select_log_events(events, spec, now=None) -> list:
     return picked[-count:] if count > 0 else picked
 
 
-def build_log_reply(events, spec) -> str:
+def build_log_reply(events, spec, request_id: str = "") -> str:
     """ログリクエストへの返信を組み立てる (1.96)。
 
     見出しは「[PHAL:動作ログ] {label}・{n}件」で、label が既に
     件数で終わっている場合 (「直近50件」) は件数を重ねない。
     中身はビューアと同じ日付つきの行。記録が無ければ
-    「(記録はありません)」を添える。"""
+    「(記録はありません)」を添える。
+    request_id (2.40) は合図の依頼 ID で、見出しを
+    「[PHAL:動作ログ ID]」の形にする。無ければ従来どおり。"""
     events = [e for e in (events or []) if isinstance(e, dict)]
     spec = spec if isinstance(spec, dict) else {}
     label = str(spec.get("label") or "")
+    mark = f"[PHAL:動作ログ {request_id}]" if request_id \
+        else "[PHAL:動作ログ]"
     if label.endswith("件"):
-        head = f"[PHAL:動作ログ] {label}"
+        head = f"{mark} {label}"
     else:
-        head = f"[PHAL:動作ログ] {label}・{len(events)}件"
+        head = f"{mark} {label}・{len(events)}件"
     if not events:
         return head + "\n（記録はありません）"
     return "\n".join(
@@ -2564,13 +3182,22 @@ def slice_file_name(path, spec) -> str:
 
 
 def build_resend_text(command_id, stored_text,
-                      truncated: bool = False) -> str:
+                      truncated: bool = False,
+                      request_id: str = "") -> str:
     """前回の結果の再送文を組み立てる (1.75)。
 
     控え (last_results) に残っているのは結果文の本文 (見出し行
     を除いた形) なので、再送と分かる見出しを付け直し、通常の
-    結果と同じく末尾へ AI への指示文を付ける。"""
-    head = f"[PHAL:結果再送] {command_id} （前回の結果を再送します）"
+    結果と同じく末尾へ AI への指示文を付ける。
+    見出しは 2.40 から「[PHAL:結果再送 ID]」の形。2.41 で
+    依頼 ID が付いた合図では「[PHAL:結果再送 依頼ID
+    コマンドID]」の形にし、依頼 ID を主・コマンド ID を
+    併記にする。"""
+    if request_id:
+        head = (f"[PHAL:結果再送 {request_id} {command_id}]"
+                " （前回の結果を再送します）")
+    else:
+        head = f"[PHAL:結果再送 {command_id}] （前回の結果を再送します）"
     if truncated:
         head += " ※控えは2万字で打ち切られています"
     return with_result_ai_prompt(head + "\n" + (stored_text or ""))
@@ -4100,18 +4727,23 @@ def execute_command(argv, cwd=None, timeout_seconds=120,
 
 
 def build_tool_result_text(display, run: RunResult,
-                           config: dict) -> str:
+                           config: dict,
+                           request_id: str = "") -> str:
     """ツール実行の結果文を組み立てる (1.98)。
 
     スクリプトの結果文と同じ形 (見出し＋出力＋エラー出力＋
     末尾の AI への指示文) で、見出しにはコマンドラインと
-    終了コード・秒数を入れる。"""
+    終了コード・秒数を入れる。2.41 で依頼 ID が付いた合図
+    では、見出しを「[PHAL:ツール実行結果 依頼ID]」の形に
+    する (他の応答と同じ位置)。"""
+    mark = f"[PHAL:ツール実行結果 {request_id}]" if request_id \
+        else "[PHAL:ツール実行結果]"
     if run.start_error:
         return with_result_ai_prompt(
-            f"[PHAL:ツール実行結果] {display}  起動できませんでした\n"
+            f"{mark} {display}  起動できませんでした\n"
             f"{run.start_error}")
     code = run.exit_code if run.exit_code is not None else "?"
-    head = (f"[PHAL:ツール実行結果] {display}  終了コード {code}  "
+    head = (f"{mark} {display}  終了コード {code}  "
             f"{run.seconds:.1f}秒")
     if run.stopped:
         head += "  停止しました"
@@ -4346,6 +4978,25 @@ def auto_run_in_scope(name: str, auto_downloaded: bool) -> bool:
 _SUMMARY_SCAN_LINES = 10
 
 
+def head_fingerprint(text) -> str:
+    """テキスト先頭2行の指紋 (2.39)。
+
+    チャットの添付カードの名前 (中身の冒頭そのもの) と、届いた
+    ファイルの先頭が同じものかを見分けるための控え。空行を
+    飛ばし、空白の並びを1つに畳んで、先頭2行を改行でつなぐ。
+    ファイル名しか分からない候補 (リンク型) では名前そのものが
+    1行の指紋になるが、ファイル側の指紋 (先頭は #! 行) とは
+    一致しないので、ファイル名の照合と併用する前提。"""
+    lines = []
+    for line in (text or "").splitlines():
+        stripped = " ".join(line.split())
+        if stripped:
+            lines.append(stripped)
+        if len(lines) >= 2:
+            break
+    return "\n".join(lines)
+
+
 def extract_summary(path) -> str:
     """スクリプトの先頭コメント(何をする物か)を返す。無ければ ""。
 
@@ -4471,18 +5122,34 @@ def _collapse_repeated_lines(lines: list) -> list:
     return collapsed
 
 
-def _result_first_line(label: str, run: RunResult, config: dict,
-                       total_lines: int = None) -> str:
+def _result_first_line(name: str, command_id: str, run: RunResult,
+                       config: dict, total_lines: int = None,
+                       request_id: str = "") -> str:
     """結果文の1行目。total_lines があるときは末尾に「・全N行」を付ける
-    (要約モードで、行数を先に知らせるため)。"""
+    (要約モードで、行数を先に知らせるため)。
+
+    コマンド ID があるときは見出しを「[PHAL:実行結果 ID] 名前」
+    の形にする (2.40、応答の対応づけは ID で行う。他の合図への
+    応答と同じ位置)。ID が無いときは従来の「[PHAL:実行結果]
+    名前」。2.41 で合図の依頼 ID があるとき (再実行の合図から
+    の実行) は「[PHAL:実行結果 依頼ID コマンドID]」の形にし、
+    依頼 ID を主・コマンド ID を併記にする。"""
+    if request_id and command_id:
+        mark = f"[PHAL:実行結果 {request_id} {command_id}]"
+    elif request_id:
+        mark = f"[PHAL:実行結果 {request_id}]"
+    elif command_id:
+        mark = f"[PHAL:実行結果 {command_id}]"
+    else:
+        mark = "[PHAL:実行結果]"
     if run.timed_out:
         timeout = _int_or(config.get("timeout_seconds"), 120, 1, 3600)
-        first = f"[PHAL:実行結果] {label}  時間切れで止めました({timeout}秒)"
+        first = f"{mark} {name}  時間切れで止めました({timeout}秒)"
     elif run.stopped:
-        first = f"[PHAL:実行結果] {label}  停止しました"
+        first = f"{mark} {name}  停止しました"
     else:
         code = run.exit_code if run.exit_code is not None else "-"
-        first = f"[PHAL:実行結果] {label}  終了コード {code}  {run.seconds:.1f}秒"
+        first = f"{mark} {name}  終了コード {code}  {run.seconds:.1f}秒"
     if run.start_error:
         first += f"  起動エラー: {run.start_error}"
     if total_lines is not None:
@@ -4531,20 +5198,23 @@ def _summary_stderr_section(err_lines: list) -> str:
 
 
 def save_full_output(run: RunResult, config: dict,
-                     command_id: str = None) -> str | None:
+                     command_id: str = None,
+                     request_id: str = "") -> str | None:
     """実行結果の全文を data_dir() の下へ保存し、パスを返す。
 
     要約モードで、クリップボード文には要約だけを入れて全文は
     このファイルに置くためのもの。中身は build_result_text と
     同じ1行目に、出力とエラー出力の全文を続けたもの。LF・UTF-8
     で書く。保存に失敗したら None(呼ぶ側は従来の切り詰め文に
-    落とす)。"""
+    落とす)。request_id は見出し用 (2.41、ファイル名は従来
+    どおりコマンド ID で作る)。"""
     config = normalize_config(config)
-    label = f"{command_id} {run.name}" if command_id else run.name
     out_lines = _split_output_lines(run.stdout)
     err_lines = _split_output_lines(run.stderr)
     total_lines = len(out_lines) + len(err_lines)
-    first = _result_first_line(label, run, config, total_lines)
+    first = _result_first_line(
+        run.name, command_id, run, config, total_lines,
+        request_id=request_id)
     body = (first + "\n--- 出力 ---\n" + run.stdout
             + "\n--- エラー出力 ---\n" + run.stderr)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
@@ -4576,7 +5246,8 @@ def _output_is_long(run: RunResult, config: dict) -> bool:
 
 
 def save_full_output_if_long(run: RunResult, config: dict,
-                             command_id: str = None) -> str | None:
+                             command_id: str = None,
+                             request_id: str = "") -> str | None:
     """要約モードで全文の保存が必要なら保存してパスを返す。
 
     短い出力なら何もせず None。ループ記録の控えに全文のパスを残す
@@ -4587,7 +5258,8 @@ def save_full_output_if_long(run: RunResult, config: dict,
         return None
     if not _output_is_long(run, config):
         return None
-    return save_full_output(run, config, command_id)
+    return save_full_output(run, config, command_id,
+                            request_id=request_id)
 
 
 def build_ack_text(command_id: str, filename: str) -> str:
@@ -4792,14 +5464,17 @@ def build_result_diff(previous_text, new_text,
 
 def build_result_body(name: str, run: RunResult, config: dict,
                       command_id: str = None,
-                      full_output_path: str = None) -> str:
+                      full_output_path: str = None,
+                      request_id: str = "") -> str:
     """実行したときにクリップボードへ入れる文の本体 (AI への指示文
     を除く)。build_result_text と build_rerun_result_text の
     共通部分。
 
     command_id(ファイル名先頭のコマンドID)があるときは、1行目を
-    「[PHAL:実行結果] 12-3 名前 …」にして、貼り返した側が対応付けられる
-    ようにする。無いときの文は今までと完全に同じ。
+    「[PHAL:実行結果 12-3] 名前 …」にして、貼り返した側が ID で
+    対応付けられるようにする (2.40)。無いときの文は今までと
+    完全に同じ。request_id (合図の依頼 ID、2.41) があるときは
+    見出しに依頼 ID を主として併記する (_result_first_line)。
 
     要約モード(summary_mode が真)で、出力とエラー出力の合計が
     summary_lines 行または summary_chars 文字を超えたら、全文は
@@ -4809,7 +5484,6 @@ def build_result_body(name: str, run: RunResult, config: dict,
     渡すと、長い出力のときにそのパスを使い、保存を二重にしない
     (ループ記録の控え用。渡さなければ従来どおり保存する)。"""
     config = normalize_config(config)
-    label = f"{command_id} {name}" if command_id else name
     out_lines = _split_output_lines(run.stdout)
     err_lines = _split_output_lines(run.stderr)
     total_lines = len(out_lines) + len(err_lines)
@@ -4819,9 +5493,12 @@ def build_result_body(name: str, run: RunResult, config: dict,
             or total_chars > config["summary_chars"]):
         full_path = (full_output_path
                      if full_output_path is not None
-                     else save_full_output(run, config, command_id))
+                     else save_full_output(run, config, command_id,
+                                           request_id=request_id))
         if full_path is not None:
-            first = _result_first_line(label, run, config, total_lines)
+            first = _result_first_line(
+                name, command_id, run, config, total_lines,
+                request_id=request_id)
             parts = [first,
                      _summary_stdout_section(out_lines),
                      _summary_stderr_section(err_lines),
@@ -4830,7 +5507,8 @@ def build_result_body(name: str, run: RunResult, config: dict,
             if run.policy_stop:
                 parts.append(POLICY_NOTE)
             return "\n".join(parts)
-    first = _result_first_line(label, run, config)
+    first = _result_first_line(name, command_id, run, config,
+                               request_id=request_id)
     parts = [first,
              _section("出力", run.stdout, config),
              _section("エラー出力", run.stderr, config)]
@@ -4867,23 +5545,27 @@ def zip_as_txt_paths(paths):
 
 def build_result_text(name: str, run: RunResult, config: dict,
                       command_id: str = None,
-                      full_output_path: str = None) -> str:
+                      full_output_path: str = None,
+                      request_id: str = "") -> str:
     """実行したときにクリップボードへ入れる文 (本体＋AI への指示文)。
 
     末尾には AI への指示文 (RESULT_AI_PROMPT) が必ず付く (1.55)。
     自動・手動のどちらの送信経路もこの関数を通るので、ここで
-    付ければ両経路に行き渡る。本体の組み立ては build_result_body。"""
+    付ければ両経路に行き渡る。本体の組み立ては build_result_body。
+    request_id は合図の依頼 ID (2.41、見出し用)。"""
     return with_result_ai_prompt(
         build_result_body(name, run, config,
                           command_id=command_id,
-                          full_output_path=full_output_path))
+                          full_output_path=full_output_path,
+                          request_id=request_id))
 
 
 def build_rerun_result_text(name: str, run: RunResult, config: dict,
                             command_id: str = None,
                             previous_text: str = None,
                             previous_truncated: bool = False,
-                            full_output_path: str = None) -> str:
+                            full_output_path: str = None,
+                            request_id: str = "") -> str:
     """再実行のときにクリップボードへ入れる文 (1.56)。
 
     1行目の見出し ([PHAL:実行結果] ...) は通常の結果文と同じで、
@@ -4891,10 +5573,12 @@ def build_rerun_result_text(name: str, run: RunResult, config: dict,
     要約モードの長い出力は、従来どおり要約文が差分の対象になる
     (全文比較はしない)。末尾には AI への指示文 (RESULT_AI_PROMPT)
     が必ず付く。previous_text は前回の結果の控え (result_diff_source
-    の形)。無ければ全文＋「前回結果なし」の注記になる。"""
+    の形)。無ければ全文＋「前回結果なし」の注記になる。
+    request_id は合図の依頼 ID (2.41、見出し用)。"""
     body = build_result_body(name, run, config,
                              command_id=command_id,
-                             full_output_path=full_output_path)
+                             full_output_path=full_output_path,
+                             request_id=request_id)
     first = body.partition("\n")[0]
     diff = build_result_diff(previous_text, result_diff_source(body),
                              previous_truncated)

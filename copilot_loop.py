@@ -304,6 +304,22 @@ if user32 is not None:
         ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
         ctypes.c_ssize_t]
     user32.PostMessageW.restype = ctypes.c_bool
+    # IME の開閉の指示用 (2.51)。戻りは LRESULT (ssize_t)。
+    user32.SendMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+        ctypes.c_ssize_t]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+
+
+try:
+    # 対象の窓の IME 窓を引く用 (2.51)。user32 と同じく専用に持つ。
+    imm32 = ctypes.WinDLL("imm32", use_last_error=True)
+except (AttributeError, OSError):
+    imm32 = None
+
+if imm32 is not None:
+    imm32.ImmGetDefaultIMEWnd.argtypes = [ctypes.c_void_p]
+    imm32.ImmGetDefaultIMEWnd.restype = ctypes.c_void_p
 
 
 # SendInput (マウス) の構造体。mouse_jiggler と同じ顔ぶれにしないと
@@ -338,6 +354,7 @@ class _INPUT(ctypes.Structure):
 
 
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN = 0x0001, 0x0002
 MOUSEEVENTF_LEFTUP, MOUSEEVENTF_ABSOLUTE = 0x0004, 0x8000
 SM_CXSCREEN, SM_CYSCREEN = 0, 1
@@ -738,11 +755,14 @@ RESET_REQUEST_MARKER = "PHAL:リセットリクエスト"
 # の残り全部が引数文字列になる (分け方は core.
 # split_command_args)。引数はスクリプトの sys.argv[1:] に
 # 入る。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# コマンド ID [+ 引数...]」になった (切り分けは位置)。
 RERUN_REQUEST_MARKER = "PHAL:再実行リクエスト"
-# 結果再送の目印 (1.75)。再実行と同じ形 (目印 + 空白 + コマンド
-# ID) で、窓側がその ID の直近の結果を投稿し直す (切替
-# auto_resend が入っているときだけ)。ID の切り出しと同定子は
-# 再実行と共通 (_id_marker_in)。
+# 結果再送の目印 (1.75)。再実行と同じ形で、窓側がその ID の
+# 直近の結果を投稿し直す (切替 auto_resend が入っているとき
+# だけ)。ID の切り出しと同定子は再実行と共通 (_id_marker_in)。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# コマンド ID」になった。
 RESEND_REQUEST_MARKER = "PHAL:結果再送リクエスト"
 # 設定確認の目印 (1.85、Nagato の依頼)。単独行で立っていたら、
 # 窓側が PHAL の設定値の報告を送る (切替 auto_settings が入って
@@ -757,12 +777,16 @@ MANUAL_REQUEST_MARKER = "PHAL:マニュアルリクエスト"
 # フォルダと作業フォルダの配下にあるそのファイルを添付して
 # 送る (切替 auto_file が入っているときだけ)。パスの切り出しは
 # _file_marker_in、同定子は _marker_scan の共通の作り。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# パス」になった (パスは第1トークンの後ろ全部)。
 FILE_REQUEST_MARKER = "PHAL:ファイルリクエスト"
 # 全文リクエストの目印 (1.91、Nagato の依頼)。行の形は
 # 「PHAL:全文リクエスト <コマンドID>」で、窓側が要約モードで
 # 保存したその ID の全文ファイルを添付して送る (切替
 # auto_fulltext が入っているときだけ)。ID の切り出しと同定子
 # は再実行・再送と共通 (_id_marker_in)。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# コマンド ID」になった。
 FULLTEXT_REQUEST_MARKER = "PHAL:全文リクエスト"
 # 実行一覧の目印 (1.92、Nagato の依頼)。単独行で立っていたら、
 # 窓側が直近の実行一覧 (結果の控えの1行目だけ) を送る (切替
@@ -782,12 +806,22 @@ STOP_REQUEST_MARKER = "PHAL:停止リクエスト"
 # として数える (ファイルと違い、後ろは空でもよい)。切り出し
 # は _log_marker_in、同定子は _marker_scan の共通の作り。
 LOG_REQUEST_MARKER = "PHAL:ログリクエスト"
+# キャプチャリクエストの目印 (2.54、Nagato の依頼)。行の形は
+# 「PHAL:キャプチャリクエスト <依頼 ID> [対象]」で、窓側が
+# 対象の窓の画面を PNG で撮って、合図が出た窓へ添付して送る
+# (切替 auto_capture が入っているときだけ)。対象は Muse /
+# Copilot / PHAL / 全画面 で、無ければ合図が出た窓自身。
+# 切り出しは _capture_marker_in、同定子は _marker_scan の
+# 共通の作り。依頼 ID は 2.41 の流儀で必須。
+CAPTURE_REQUEST_MARKER = "PHAL:キャプチャリクエスト"
 # ツール実行の目印 (1.98、Nagato の依頼)。行の形は
 # 「PHAL:ツール実行 <ツール名> [引数...]」で、窓側が許可リスト
 # (設定 cli_tools) にあるコマンドラインツールを作業フォルダで
 # 実行し、結果を送る (切替 auto_tool が入っているときだけ)。
 # 切り出しは _tool_marker_in、同定子は _marker_scan の共通の
 # 作り。ツール名と引数の分け方・許可の判定は窓側 (core) が持つ。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# コマンド行」になった (繰り返すときは新しい ID で出す)。
 TOOL_REQUEST_MARKER = "PHAL:ツール実行"
 # 中継リクエストの目印 (2.10、Nagato の提案)。AI の発言の
 # 先頭行の目印を見つけたら、目印の次の行から同じ発言の末尾
@@ -799,7 +833,44 @@ TOOL_REQUEST_MARKER = "PHAL:ツール実行"
 # 引数の名前の照合は窓側の判定。切り出しは _relay_marker_in
 # で、同定子は _marker_scan と同じ作り (本文が要るので走査
 # は専用に持つ)。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID
+# [+ 経路引数] [+ 本文]」になった。ID ごとの経路履歴で
+# ループ防止も行う (判定は窓側、core の relay 関数群)。
 RELAY_REQUEST_MARKER = "PHAL:中継リクエスト"
+# 道具説明の目印 (2.37)。行の形は
+# 「PHAL:道具説明リクエスト <依頼ID> <道具名>」で、おどうぐばこ
+# の道具の取説 (SKILL.md) を返す (切替 auto_describe が入って
+# いるときだけ)。依頼 ID は 2.36 の流儀で必須。切り出しは
+# _describe_marker_in。
+DESCRIBE_REQUEST_MARKER = "PHAL:道具説明リクエスト"
+# 道具評価の目印 (2.37)。行の形は
+# 「PHAL:道具評価 <道具名> <使いやすさ> <選びやすさ> <期待どおり>
+# [メモ]」で、おどうぐばこの頻度の記録へ AI の自己採点を足す
+# (切替 auto_eval が入っているときだけ)。同定子は本文 (ツール
+# 実行と同じ作り)。切り出しは _eval_marker_in、点とメモの
+# 解釈は窓側 (odougubako_core) が持つ。
+# 2.41 で依頼 ID が必須になり、行の形は「目印 + 依頼 ID +
+# 道具名 + 点...」になった。
+EVAL_REQUEST_MARKER = "PHAL:道具評価"
+# 入力欄リクエストの目印 (2.39、Nagato の依頼)。行の形は
+# 「PHAL:入力欄リクエスト <依頼ID> [窓名]」で、対象の窓の
+# 入力欄に今入っている文をそのまま返す (切替 auto_input が
+# 入っているときだけ)。依頼 ID は 2.36 の流儀で必須。窓名が
+# 無ければ、合図が出た窓自身の入力欄を見る。切り出しは
+# _input_marker_in。
+INPUT_REQUEST_MARKER = "PHAL:入力欄リクエスト"
+# 入力上書きリクエストの目印 (2.39、Nagato の依頼)。行の形は
+# 「PHAL:入力上書きリクエスト <依頼ID> <窓名>」で、目印の
+# 次の行から同じ発言の末尾までを、対象の窓の入力欄へ強制
+# 的に上書きする (送信はしない)。強制の段は、値の設定・
+# 貼り付けが反映されないときの打鍵まで含む (set_input の
+# force)。切替 auto_force が入っているときだけ。目印は
+# 中継と同じく発言の先頭行だけ。切り出しは
+# _force_body_marker_in。
+OVERWRITE_REQUEST_MARKER = "PHAL:入力上書きリクエスト"
+# 強制送信リクエストの目印 (2.39)。入力上書きと同じ形で、
+# 上書きに続けて送信ボタンまで押す。
+FORCE_SEND_REQUEST_MARKER = "PHAL:強制送信リクエスト"
 # 発言の要素の先頭に付く表示名 (Muse アプリの UIA 実測、
 # 2026-11-16)。中継の目印 (2.11) と、他の合図の目印
 # (2.32、_marker_scan の判定) で、この表示名つきを許す。
@@ -809,15 +880,18 @@ _RELAY_LINE_PREFIXES = (
 
 
 def _relay_marker_arg(line):
-    """行が中継の目印なら (True, 引数または None, 同じ行の
-    本文) を返す (2.11 の表示名つき対応、2.17 の引数対応、
-    2.19 の一行形式対応)。
+    """行が中継の目印なら (True, 依頼 ID, 引数または None,
+    同じ行の本文) を返す (2.11 の表示名つき対応、2.17 の
+    引数対応、2.19 の一行形式対応、2.41 の依頼 ID 対応)。
 
-    目印の後ろに空白を空けて続く文は、まず先頭の語を見る。
-    「2」を含む語は引数「送り元2送り先」の試みとして数え
-    (ほどけるかは窓側の判定)、その後ろの残りが同じ行の
-    本文になる。「2」を含まない続きは、引数なし (裸) の
-    中継の本文としてまるごと数える。"""
+    行の形は「目印 + 依頼 ID [+ 経路引数] [+ 本文]」。第1
+    トークンが依頼 ID (判定は _is_request_id_word)。その
+    次の語に「2」が含まれれば経路引数「送り元2送り先」の
+    試みとして数え (ほどけるかは窓側の判定)、その後ろの
+    残りが同じ行の本文になる。「2」を含まない続きは、引数
+    なし (裸) の中継の本文としてまるごと数える。第1トークン
+    が ID の形でなければ、依頼 ID は空で返し、後ろ全部を
+    本文として数える (窓側が ID 無しの NACK を返す)。"""
     stripped = line.strip()
     texts = [stripped]
     for prefix in _RELAY_LINE_PREFIXES:
@@ -825,18 +899,60 @@ def _relay_marker_arg(line):
             texts.append(stripped[len(prefix):].strip())
     for text in texts:
         if text == RELAY_REQUEST_MARKER:
-            return True, None, ""
+            return True, "", None, ""
         if text.startswith(RELAY_REQUEST_MARKER):
             rest = text[len(RELAY_REQUEST_MARKER):]
             if rest[:1] in (" ", "　", "\t"):
                 rest = rest.strip()
+                if not rest:
+                    return True, "", None, ""
                 parts = rest.split(None, 1)
-                token = parts[0] if parts else ""
-                inline = parts[1].strip() if len(parts) > 1 else ""
-                if "2" in token:
-                    return True, token, inline
-                return True, None, rest
-    return False, None, ""
+                token = parts[0]
+                tail = parts[1].strip() if len(parts) > 1 else ""
+                if not _is_request_id_word(token):
+                    return True, "", None, rest
+                if not tail:
+                    return True, token, None, ""
+                parts2 = tail.split(None, 1)
+                if "2" in parts2[0]:
+                    inline = parts2[1].strip() \
+                        if len(parts2) > 1 else ""
+                    return True, token, parts2[0], inline
+                return True, token, None, tail
+    return False, "", None, ""
+
+
+def _force_marker_line(line, marker_text):
+    """行が入力上書き・強制送信の目印なら (依頼ID, 窓名, 同じ
+    行の本文) を返す (2.39)。目印でなければ None。
+
+    表示名つきの行も数える (中継と同じ _RELAY_LINE_PREFIXES)。
+    目印の後ろの先頭の語が依頼 ID らしい形なら ID として
+    取り、次の語を窓名にする。ID らしい語が無ければ、ID
+    無しの目印として数え、後ろ全部を同じ行の本文にする
+    (窓側が ID 無しの知らせを返すため)。"""
+    stripped = line.strip()
+    texts = [stripped]
+    for prefix in _RELAY_LINE_PREFIXES:
+        if stripped.startswith(prefix):
+            texts.append(stripped[len(prefix):].strip())
+    for text in texts:
+        if text == marker_text:
+            return "", "", ""
+        if text.startswith(marker_text):
+            rest = text[len(marker_text):]
+            if rest[:1] not in (" ", "　", "\t"):
+                continue
+            rest = rest.strip()
+            if not rest:
+                return "", "", ""
+            parts = rest.split(None, 2)
+            if not _is_request_id_word(parts[0]):
+                return "", "", rest
+            target = parts[1] if len(parts) > 1 else ""
+            inline = parts[2].strip() if len(parts) > 2 else ""
+            return parts[0], target, inline
+    return None
 
 
 def _is_relay_marker_line(line):
@@ -979,9 +1095,15 @@ CF_HDROP = 15
 GMEM_MOVEABLE = 0x0002
 VK_CONTROL = 0x11
 VK_MENU = 0x12
+VK_RETURN = 0x0D
+VK_A = 0x41
 VK_O = 0x4F
 VK_V = 0x56
+VK_DELETE = 0x2E
 KEYEVENTF_KEYUP = 0x0002
+# Unicode のコードポイントをそのままキー入力として送る指定
+# (2.39、強制上書きの打鍵用)。SendInput でのみ有効。
+KEYEVENTF_UNICODE = 0x0004
 
 
 def build_dropfiles_data(path):
@@ -1195,6 +1317,110 @@ def _send_ctrl_v():
     user32.keybd_event(VK_V, 0, 0, 0)
     user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
     user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _send_ctrl_a():
+    """Ctrl+A のキー送信 (2.39、強制上書きで入力欄を全選択する)。"""
+    if user32 is None:
+        raise RuntimeError("この環境ではキー送信が使えません")
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(VK_A, 0, 0, 0)
+    user32.keybd_event(VK_A, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _send_delete():
+    """Delete のキー送信 (2.39、強制上書きで選択範囲を消す)。"""
+    if user32 is None:
+        raise RuntimeError("この環境ではキー送信が使えません")
+    user32.keybd_event(VK_DELETE, 0, 0, 0)
+    user32.keybd_event(VK_DELETE, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _type_unicode_text(text):
+    """文字列を SendInput の Unicode 打鍵でそのまま打つ (2.39)。
+
+    強制上書きの最終手段。ValuePattern の値の設定も貼り付けも
+    反映されない編集欄でも、フォーカスさえ合えば打鍵は届く。
+    改行は Enter キーとして送る (Unicode の改行コードを打つと
+    編集欄によってはそのまま文字化する)。少しずつ送る: 一度に
+    大量のイベントを流すと、受け側の処理が追いつかず取りこぼす
+    ことがあるため。送れた文字数が合わなければ RuntimeError。"""
+    if user32 is None:
+        raise RuntimeError("この環境ではキー送信が使えません")
+    events = []
+
+    def push(vk, scan, flags):
+        ev = _INPUT()
+        ev.type = INPUT_KEYBOARD
+        ev.ki.wVk = vk
+        ev.ki.wScan = scan
+        ev.ki.dwFlags = flags
+        events.append(ev)
+
+    for ch in str(text):
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            push(VK_RETURN, 0, 0)
+            push(VK_RETURN, 0, KEYEVENTF_KEYUP)
+        else:
+            push(0, ord(ch), KEYEVENTF_UNICODE)
+            push(0, ord(ch), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+    chunk = 64
+    for start in range(0, len(events), chunk):
+        part = events[start:start + chunk]
+        array = (_INPUT * len(part))(*part)
+        sent = user32.SendInput(
+            len(part), array, ctypes.sizeof(_INPUT))
+        if sent != len(part):
+            raise RuntimeError(
+                f"打鍵を送れませんでした (SendInput={sent})")
+        if start + chunk < len(events):
+            time.sleep(0.02)
+
+
+# IME (日本語入力) の開閉の指示 (2.51)。対象の窓の IME は
+# ImmGetDefaultIMEWnd で引き、WM_IME_CONTROL で開閉する。
+WM_IME_CONTROL = 0x0283
+IMC_GETOPENSTATUS = 0x0005
+IMC_SETOPENSTATUS = 0x0006
+
+
+def _suspend_ime(hwnd):
+    """対象の窓の IME を一時的に切り、IME 窓を返す (2.51)。
+
+    Unicode 打鍵でも、IME が入っていると変換が割り込んで文が
+    化けることがある (2026-11-17 実機、Copilot の入力欄で
+    「書きかけ」が「書機掛け」になった)。打鍵の間だけ切り、
+    _restore_ime で戻す。もともと切れている・引けない・
+    切れないときは None (そのまま打つ)。
+    """
+    try:
+        if user32 is None or imm32 is None or not hwnd:
+            return None
+        ime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+        if not ime_wnd:
+            return None
+        if not user32.SendMessageW(
+                ime_wnd, WM_IME_CONTROL, IMC_GETOPENSTATUS, 0):
+            return None  # もともと切れている
+        user32.SendMessageW(
+            ime_wnd, WM_IME_CONTROL, IMC_SETOPENSTATUS, 0)
+        return ime_wnd
+    except Exception:  # noqa: BLE001  切れなければそのまま打つ
+        return None
+
+
+def _restore_ime(ime_wnd):
+    """_suspend_ime で切った IME を戻す (2.51)。"""
+    if not ime_wnd or user32 is None:
+        return
+    try:
+        user32.SendMessageW(
+            ime_wnd, WM_IME_CONTROL, IMC_SETOPENSTATUS, 1)
+    except Exception:  # noqa: BLE001  戻しは静かに試す
+        pass
 
 
 def _send_alt_o():
@@ -1699,7 +1925,7 @@ class Copilot:
         return False, time.time() - start
 
     # -- 書く --------------------------------------------------------------
-    def set_input(self, text):
+    def set_input(self, text, force=False):
         """入力欄に文字を入れる。送信はしない。
 
         失敗は段つき(InputStageError)で上げる: 見つからない /
@@ -1736,6 +1962,14 @@ class Copilot:
         if not pattern:
             raise InputStageError(
                 "unwritable", "入力欄に書き込めません（ValuePattern が無い）")
+        if force:
+            # 強制のときは、先に入力欄を物理的に空にする (2.51)。
+            # 書きかけが残ったままだと、値の設定が黙って無視
+            # されるアプリでは貼り付けが書きかけと混ざり、読み
+            # 直しが一致しない (2026-11-17 実機、Copilot)。
+            # 空にしてから通常の書き込みをすれば、打鍵まで
+            # 行かずに済むことが多い。
+            self._clear_input_physically(box)
         if self._write_input_round(pattern, text):
             return
         last = self._read_input_quietly()
@@ -1743,10 +1977,57 @@ class Copilot:
             self._clear_input(pattern)
             if self._write_input_round(pattern, text):
                 return
+        if force and self._force_write_input(text):
+            return  # 強制の打鍵で入った (2.39)
         raise InputStageError(
             "unwritable",
             "入力欄に書き込めませんでした"
             "（値の設定も貼り付けも反映されませんでした）")
+
+    def _clear_input_physically(self, box):
+        """入力欄を前面化＋フォーカス＋全選択＋削除で空にする
+        (2.51)。
+
+        強制の書き込みの前処理 (set_input の強制の段と
+        _force_write_input で共用)。成否は呼び側の書き込みと
+        読み直しが判定するので、ここでの失敗は静かに畳む。
+        """
+        try:
+            _bring_to_front(getattr(self, "hwnd_main", None))
+            time.sleep(ATTACH_FOREGROUND_WAIT)
+            box.SetFocus()
+            time.sleep(ATTACH_FOCUS_WAIT)
+            _send_ctrl_a()
+            _send_delete()
+            time.sleep(0.1)
+        except Exception:  # noqa: BLE001  前処理なので静かに
+            pass
+
+    def _force_write_input(self, text):
+        """入力欄へ打鍵で強制的に書く (2.39、Nagato の依頼)。
+
+        値の設定・貼り付けがどちらも反映されないときの最終
+        手段: 窓を前面化して入力欄へフォーカスし、全選択して
+        消してから、本文を Unicode 打鍵で打つ。打鍵の間は
+        対象の窓の IME を切る (2.51、変換が割り込んで文が
+        化けるため)。成否は読み直しの一致で判定する (書けた
+        つもりで違う文が残る事故を防ぐため)。例外は静かに
+        畳んで False (呼び側が通常の失敗として上げる)。"""
+        try:
+            _root, desc = self._descendants()
+            box, _candidates = self._find_input_box(desc)
+            if box is None:
+                return False
+            self._clear_input_physically(box)
+            ime_wnd = _suspend_ime(getattr(self, "hwnd_main", None))
+            try:
+                _type_unicode_text(text)
+            finally:
+                _restore_ime(ime_wnd)
+            return self._input_reflects(
+                text, timeout=INPUT_VERIFY_MAX_SECONDS)
+        except Exception:  # noqa: BLE001  最終手段の失敗は False に畳む
+            return False
 
     def _write_input_round(self, pattern, text):
         """書き込み1回分: 値の設定→確認、ダメなら貼り付け→確認。
@@ -2402,49 +2683,258 @@ class Copilot:
 
     def _rerun_marker_in(self, desc):
         """再実行リクエストの目印 (RERUN_REQUEST_MARKER) を探す
-        (1.63、引数は 1.97)。
+        (1.63、引数は 1.97、依頼 ID は 2.41)。
 
-        行の形は「目印 + 空白 + コマンド ID [+ 空白 + 引数...]」。
-        ID の後ろの残り全部が引数文字列 (args) になる。戻り値は
-        {"id", "key", "command_id", "args"}。ID の無い行・ID の
-        形が違う行は目印として数えない。同定子の作りは
-        _marker_scan の共通の流儀で、引数も行の一部なので、
-        引数が違えば同定子も変わる。"""
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + コマンド ID
+        [+ 空白 + 引数...]」。切り分けは位置で決める (第1
+        トークン＝依頼 ID、第2トークン＝コマンド ID、残り全部
+        が引数)。依頼 ID の判定は _is_request_id_word。目印だけ
+        の行・第1トークンが ID の形でない行も目印として数え、
+        request_id は空で返す (窓側が ID 無しの知らせを返す)。
+        第2トークンがコマンド ID の形でなければ command_id は
+        空 (窓側が引数の知らせを返す)。戻り値は {"id", "key",
+        "request_id", "command_id", "args"}。同定子の作りは
+        _marker_scan の共通の流儀で、行全体が同定子に入るので、
+        ID や引数が違えば同定子も変わる。"""
         def parse(line):
+            if line == RERUN_REQUEST_MARKER:
+                return {"request_id": "", "command_id": "",
+                        "args": ""}
             if not line.startswith(RERUN_REQUEST_MARKER):
                 return None
-            rest = line[len(RERUN_REQUEST_MARKER):].strip()
-            match = _RERUN_ARGS_RE.match(rest)
-            if not match:
+            rest = line[len(RERUN_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
                 return None
-            return {"command_id": match.group(1),
-                    "args": (match.group(2) or "").strip()}
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "command_id": "",
+                        "args": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return {"request_id": "", "command_id": "",
+                        "args": ""}
+            result = {"request_id": parts[0], "command_id": "",
+                      "args": ""}
+            if len(parts) > 1:
+                match = _RERUN_ARGS_RE.match(parts[1].strip())
+                if match:
+                    result["command_id"] = match.group(1)
+                    result["args"] = (match.group(2) or "").strip()
+            return result
 
         found = self._marker_scan(desc, parse)
         if found is None:
             return None
         return {"id": found["id"], "key": found["key"],
+                "request_id": found["value"]["request_id"],
                 "command_id": found["value"]["command_id"],
                 "args": found["value"]["args"]}
 
     def _tool_marker_in(self, desc):
-        """ツール実行の目印を探す (1.98)。
+        """ツール実行の目印を探す (1.98、依頼 ID は 2.41)。
 
-        行の形は「目印 + 空白 + ツール名 [+ 空白 + 引数...]」で、
-        後ろの残り全部を command として返す (ツール名と引数の
-        分け方は窓側が持つ)。ツール名の無い行は目印として数え
-        ない。戻り値は {"id", "key", "command"}。"""
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + ツール名
+        [+ 空白 + 引数...]」で、第1トークンを依頼 ID として
+        切り、残り全部を command として返す (ツール名と引数の
+        分け方は窓側が持つ)。依頼 ID の判定は
+        _is_request_id_word。目印だけの行・第1トークンが ID の
+        形でない行も目印として数え、request_id と command は
+        空で返す (窓側が ID 無しの知らせを返す)。戻り値は
+        {"id", "key", "request_id", "command"}。"""
         def parse(line):
+            if line == TOOL_REQUEST_MARKER:
+                return {"request_id": "", "command": ""}
             if not line.startswith(TOOL_REQUEST_MARKER):
                 return None
-            rest = line[len(TOOL_REQUEST_MARKER):].strip()
-            return rest if rest else None
+            rest = line[len(TOOL_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "command": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return {"request_id": "", "command": ""}
+            return {"request_id": parts[0],
+                    "command": (parts[1].strip()
+                                if len(parts) > 1 else "")}
 
         found = self._marker_scan(desc, parse)
         if found is None:
             return None
         return {"id": found["id"], "key": found["key"],
-                "command": found["value"]}
+                "request_id": found["value"]["request_id"],
+                "command": found["value"]["command"]}
+
+    def _describe_marker_in(self, desc):
+        """道具説明の目印を探す (2.37)。
+
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + 道具名」。依頼
+        ID の判定は _is_request_id_word (半角英数字と -_#. の
+        1語、数字だけ・日付は除く)。道具名は残り全部。目印だけ
+        の行も数える (request_id は空で、窓側が ID 無しの知らせ
+        を返す)。戻り値は {"id", "key", "request_id",
+        "tool_name"}。"""
+        def parse(line):
+            if line == DESCRIBE_REQUEST_MARKER:
+                return {"request_id": "", "tool_name": ""}
+            if not line.startswith(DESCRIBE_REQUEST_MARKER):
+                return None
+            rest = line[len(DESCRIBE_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "tool_name": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return None
+            return {"request_id": parts[0],
+                    "tool_name": (parts[1].strip()
+                                  if len(parts) > 1 else "")}
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "request_id": found["value"]["request_id"],
+                "tool_name": found["value"]["tool_name"]}
+
+    def _eval_marker_in(self, desc):
+        """道具評価の目印を探す (2.37、依頼 ID は 2.41)。
+
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + 道具名 +
+        点...」で、第1トークンを依頼 ID として切り、残り全部
+        を payload として返す (点とメモの解釈は窓側が持つ)。
+        依頼 ID の判定は _is_request_id_word。目印だけの行・
+        第1トークンが ID の形でない行も目印として数え、
+        request_id と payload は空で返す (窓側が ID 無しの
+        知らせを返す)。戻り値は {"id", "key", "request_id",
+        "payload"}。"""
+        def parse(line):
+            if line == EVAL_REQUEST_MARKER:
+                return {"request_id": "", "payload": ""}
+            if not line.startswith(EVAL_REQUEST_MARKER):
+                return None
+            rest = line[len(EVAL_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "payload": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return {"request_id": "", "payload": ""}
+            return {"request_id": parts[0],
+                    "payload": (parts[1].strip()
+                                if len(parts) > 1 else "")}
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "request_id": found["value"]["request_id"],
+                "payload": found["value"]["payload"]}
+
+    def _input_marker_in(self, desc):
+        """入力欄リクエストの目印を探す (2.39)。
+
+        行の形は「目印 + 空白 + 依頼 ID [+ 空白 + 窓名]」。依頼
+        ID の判定は _is_request_id_word。窓名は残り全部 (無け
+        れば空で、窓側が合図の出た窓自身に倒す)。目印だけの
+        行も数える (request_id は空で、窓側が ID 無しの知らせ
+        を返す)。戻り値は {"id", "key", "request_id",
+        "target"}。"""
+        def parse(line):
+            if line == INPUT_REQUEST_MARKER:
+                return {"request_id": "", "target": ""}
+            if not line.startswith(INPUT_REQUEST_MARKER):
+                return None
+            rest = line[len(INPUT_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "target": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return None
+            return {"request_id": parts[0],
+                    "target": (parts[1].strip()
+                               if len(parts) > 1 else "")}
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        return {"id": found["id"], "key": found["key"],
+                "request_id": found["value"]["request_id"],
+                "target": found["value"]["target"]}
+
+    def _force_body_marker_in(self, desc, marker_text):
+        """入力上書き・強制送信の目印を探す (2.39)。
+
+        中継と同じ作り: 目印は発言 (要素) の先頭行だけ。目印の
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + 窓名」で、同じ
+        行の続きと次の行から発言の末尾までが上書きする文
+        (body)。依頼 ID らしい語が先頭に無ければ、ID 無しの
+        目印として数える (窓側が知らせを返す)。戻り値は
+        {"id", "key", "request_id", "target", "body"}。"""
+        lines = []
+        line_element = []
+        element_no = -1
+        for i in range(desc.Length):
+            el = desc.GetElement(i)
+            try:
+                if el.CurrentControlType != CONTROL_TEXT:
+                    continue
+                name = el.CurrentName or ""
+            except Exception:  # noqa: BLE001  消えかけは読み飛ばす
+                continue
+            element_no += 1
+            parts = name.replace(OBJECT_MARK, "").split("\n")
+            lines.extend(parts)
+            line_element.extend([element_no] * len(parts))
+        marker_at = None
+        request_id = ""
+        target = ""
+        inline = ""
+        for index, line in enumerate(lines):
+            parsed = _force_marker_line(line, marker_text)
+            if parsed is None:
+                continue
+            # 目印は発言 (要素) の先頭行にあるときだけ数える
+            # (中継と同じ、2.18)。
+            if index > 0 and \
+                    line_element[index] == line_element[index - 1]:
+                continue
+            marker_at = index  # 最後の目印を相手にする
+            request_id, target, inline = parsed
+        if marker_at is None:
+            return None
+        tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
+        if tail > DIAG_MARKER_TAIL_LIMIT:
+            return None  # 古い発言の中の目印
+        body_lines = [inline] if inline else []
+        for index in range(marker_at + 1, len(lines)):
+            if line_element[index] != line_element[marker_at]:
+                break
+            body_lines.append(lines[index])
+        body = "\n".join(body_lines).strip()
+        prefix = "\n".join(lines[:marker_at + 1])
+        digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+        element_start = marker_at
+        while element_start > 0 and \
+                line_element[element_start - 1] \
+                == line_element[marker_at]:
+            element_start -= 1
+        start = max(element_start,
+                    marker_at - DIAG_KEY_WINDOW_LINES + 1)
+        key = hashlib.sha256(
+            "\n".join(lines[start:marker_at + 1]).encode(
+                "utf-8")).hexdigest()
+        return {"id": digest, "key": key,
+                "request_id": request_id, "target": target,
+                "body": body}
 
     def _relay_marker_in(self, desc):
         """中継リクエストの目印を探す (2.10、頭の表示名は 2.11)。
@@ -2453,9 +2943,11 @@ class Copilot:
         行から同じ発言 (要素) の末尾までを中継する文 (body)
         として返す。目印の行の引数の後ろに続く文も、本文の
         1行目として数える (2.19 の一行形式)。戻り値は
-        {"id", "key", "body", "arg"} (arg は目印の引数、
-        無ければ None)。本文が空でも目印として返す (窓側が
-        NACK を返すため、2.19)。
+        {"id", "key", "body", "arg", "request_id"} (arg は
+        目印の経路引数、無ければ None。request_id は 2.41 で
+        必須になった依頼 ID で、形が違う・無いときは空)。
+        本文が空でも目印として返す (窓側が NACK を返すため、
+        2.19)。
 
         _marker_scan は行単位の判定しかできない (本文が要る
         ここでは使えない) ので、走査は専用に持つ。同定子 (id /
@@ -2485,8 +2977,9 @@ class Copilot:
         marker_at = None
         marker_arg = None
         marker_inline = ""
+        marker_rid = ""
         for index, line in enumerate(lines):
-            found, arg, inline = _relay_marker_arg(line)
+            found, rid, arg, inline = _relay_marker_arg(line)
             if not found:
                 continue
             # 目印は発言 (要素) の先頭行にあるときだけ数える
@@ -2498,6 +2991,7 @@ class Copilot:
             marker_at = index  # 最後の目印を相手にする
             marker_arg = arg
             marker_inline = inline
+            marker_rid = rid
         if marker_at is None:
             return None
         tail = sum(len(line) + 1 for line in lines[marker_at + 1:])
@@ -2522,7 +3016,7 @@ class Copilot:
             "\n".join(lines[start:marker_at + 1]).encode(
                 "utf-8")).hexdigest()
         return {"id": digest, "key": key, "body": body,
-                "arg": marker_arg}
+                "arg": marker_arg, "request_id": marker_rid}
 
     def _resend_marker_in(self, desc):
         """結果再送リクエストの目印 (RESEND_REQUEST_MARKER) を
@@ -2535,22 +3029,40 @@ class Copilot:
         return self._id_marker_in(desc, FULLTEXT_REQUEST_MARKER)
 
     def _file_marker_in(self, desc):
-        """ファイルリクエストの目印を探す (1.88)。
+        """ファイルリクエストの目印を探す (1.88、依頼 ID は
+        2.41)。
 
-        行の形は「目印 + 空白 + パス」で、パスは行の残り全部
-        (空白を含んでよい)。戻り値は {"id", "key", "path"}。
-        パスの無い行は目印として数えない。"""
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + パス」。パスは
+        空白を含んでよいので、第1トークンだけを依頼 ID として
+        切り、残り全部をパスにする。依頼 ID の判定は
+        _is_request_id_word。目印だけの行・第1トークンが ID の
+        形でない行も目印として数え、request_id と path は空で
+        返す (窓側が ID 無しの知らせを返す)。戻り値は {"id",
+        "key", "request_id", "path"}。"""
         def parse(line):
+            if line == FILE_REQUEST_MARKER:
+                return {"request_id": "", "path": ""}
             if not line.startswith(FILE_REQUEST_MARKER):
                 return None
-            rest = line[len(FILE_REQUEST_MARKER):].strip()
-            return rest if rest else None
+            rest = line[len(FILE_REQUEST_MARKER):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "path": ""}
+            parts = rest.split(None, 1)
+            if not _is_request_id_word(parts[0]):
+                return {"request_id": "", "path": ""}
+            return {"request_id": parts[0],
+                    "path": (parts[1].strip()
+                             if len(parts) > 1 else "")}
 
         found = self._marker_scan(desc, parse)
         if found is None:
             return None
         return {"id": found["id"], "key": found["key"],
-                "path": found["value"]}
+                "request_id": found["value"]["request_id"],
+                "path": found["value"]["path"]}
 
     def _log_marker_in(self, desc):
         """動作ログリクエストの目印を探す (1.96)。
@@ -2580,41 +3092,90 @@ class Copilot:
         return {"id": found["id"], "key": found["key"],
                 "params": params, "request_id": request_id}
 
-    def _id_marker_in(self, desc, marker_text):
-        """コマンド ID つきの目印を探す共通の走査 (1.63、再送で
-        共通化 1.75)。
+    def _capture_marker_in(self, desc):
+        """キャプチャリクエストの目印を探す (2.54)。
 
-        行の形は「目印 + 空白 + コマンド ID」で、ID は行の中に
-        含める (相手を ID で指定する必要があるため)。行は目印と
-        ID だけでできていること (診断・リセットの「単独行」と
-        同じ厳しさで、ID の後ろに余計な語が付いた行は数えな
-        い)。戻り値は _marker_in と同じ {"id", "key"} に、切り
-        出した "command_id" を足したもの。ID の無い行・ID の形
-        が違う行は目印として数えない。同定子の作りは
-        _marker_scan の共通の流儀 (id は目印の行までの全文、key
-        は直近40行)。目印の行そのものに ID が入るので、別の ID
-        を指す発言は別の同定子になる。"""
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + 対象」。対象は
+        1語 (Muse / Copilot / PHAL / 全画面) で、無ければ空
+        (窓側が「合図が出た窓」を撮る)。依頼 ID の切り出しは
+        ログと同じ作法 (先頭の語が ID の形なら ID として切り、
+        残りを対象にする)。対象が読めなくても目印として数え
+        る。戻り値は {"id", "key", "request_id", "target"}。"""
         def parse(line):
+            if not line.startswith(CAPTURE_REQUEST_MARKER):
+                return None
+            return line[len(CAPTURE_REQUEST_MARKER):].strip()
+
+        found = self._marker_scan(desc, parse)
+        if found is None:
+            return None
+        params = found["value"]
+        request_id = ""
+        target = params
+        tokens = params.split()
+        if tokens and _is_request_id_word(tokens[0]):
+            request_id = tokens[0]
+            # 対象は1語だけを見る (2.55)。ID の後ろに余計な語が
+            # 付いた行でも、対象の語だけを拾う (実地の初回で、
+            # 対象が合わずに撮れなかったための手当て)。
+            target = tokens[1] if len(tokens) > 1 else ""
+        return {"id": found["id"], "key": found["key"],
+                "request_id": request_id, "target": target}
+
+    def _id_marker_in(self, desc, marker_text):
+        """依頼 ID + コマンド ID つきの目印を探す共通の走査
+        (1.63、再送で共通化 1.75、依頼 ID は 2.41)。
+
+        行の形は「目印 + 空白 + 依頼 ID + 空白 + コマンド ID」
+        で、行はこの3語だけでできていること。切り分けは位置
+        で決める (第1トークン＝依頼 ID、第2トークン＝コマンド
+        ID)。依頼 ID の判定は _is_request_id_word、コマンド ID
+        の形は _RERUN_ID_RE。第2トークンが無い・形が違う・
+        余計な語が付いた行は、コマンド ID が読めないものとして
+        command_id を空で返す (窓側が引数の知らせを返す)。
+        目印だけの行・第1トークンが ID の形でない行も目印と
+        して数え、request_id は空で返す (窓側が ID 無しの知ら
+        せを返す)。戻り値は {"id", "key", "request_id",
+        "command_id"}。同定子の作りは _marker_scan の共通の
+        流儀。目印の行そのものに ID が入るので、別の ID を指す
+        発言は別の同定子になる。"""
+        def parse(line):
+            if line == marker_text:
+                return {"request_id": "", "command_id": ""}
             if not line.startswith(marker_text):
                 return None
-            rest = line[len(marker_text):].strip()
-            match = _RERUN_ID_RE.match(rest)
-            return match.group(1) if match else None
+            rest = line[len(marker_text):]
+            if rest[:1] not in (" ", "　", "\t"):
+                return None
+            rest = rest.strip()
+            if not rest:
+                return {"request_id": "", "command_id": ""}
+            tokens = rest.split()
+            if not _is_request_id_word(tokens[0]):
+                return {"request_id": "", "command_id": ""}
+            result = {"request_id": tokens[0], "command_id": ""}
+            if len(tokens) == 2 and _RERUN_ID_RE.match(tokens[1]):
+                result["command_id"] = tokens[1]
+            return result
 
         found = self._marker_scan(desc, parse)
         if found is None:
             return None
         return {"id": found["id"], "key": found["key"],
-                "command_id": found["value"]}
+                "request_id": found["value"]["request_id"],
+                "command_id": found["value"]["command_id"]}
 
     def _marker_scan(self, desc, parse):
         """目印の行を探す走査の実体。
 
         parse は「前後の空白を除いた行」を受けて、目印なら中身
-        (payload)、違えば None を返す関数。最後に一致した行を
-        相手にする。戻り値は {"id", "key", "value": payload} か、
-        無ければ None。同定子の意味は _marker_in の docstring
-        のとおり。"""
+        (payload)、違えば None を返す関数。数えるのは、発言
+        (Text 要素) の先頭行にある目印だけ (2.40 で全合図に
+        統一。中継・強制送信など本文系の目印と同じ規則)。
+        発言の途中にある目印や、例文として引用された目印では
+        発火しない。最後に一致した目印を相手にする。戻り値は
+        {"id", "key", "value": payload} か、無ければ None。
+        同定子の意味は _marker_in の docstring のとおり。"""
         lines = []
         line_element = []  # 各行が属する要素の番号 (key の範囲用)
         element_no = -1
@@ -2633,6 +3194,12 @@ class Copilot:
         marker_at = None
         payload = None
         for index, line in enumerate(lines):
+            # 発言 (要素) の先頭行だけを数える (2.40)。目印は
+            # 専用の発言の先頭に置くのが全合図の約束で、途中
+            # の行にある目印は本文中の言及・例文として扱う。
+            if index > 0 and \
+                    line_element[index] == line_element[index - 1]:
+                continue
             value = parse(_strip_speaker_prefix(line))
             if value is not None:
                 marker_at = index  # 最後の目印を相手にする
@@ -2703,11 +3270,19 @@ class Copilot:
                 desc, STOP_REQUEST_MARKER),
             "log_marker": self._log_marker_in(desc),
             "tool_marker": self._tool_marker_in(desc),
+            "describe_marker": self._describe_marker_in(desc),
+            "eval_marker": self._eval_marker_in(desc),
+            "input_marker": self._input_marker_in(desc),
+            "overwrite_marker": self._force_body_marker_in(
+                desc, OVERWRITE_REQUEST_MARKER),
+            "force_marker": self._force_body_marker_in(
+                desc, FORCE_SEND_REQUEST_MARKER),
             "relay_marker": self._relay_marker_in(desc),
             "manual_marker": self._request_id_in(
                 desc, MANUAL_REQUEST_MARKER),
             "file_marker": self._file_marker_in(desc),
             "fulltext_marker": self._fulltext_marker_in(desc),
+            "capture_marker": self._capture_marker_in(desc),
         }
 
     def chat_signature(self):
@@ -3309,6 +3884,60 @@ class Copilot:
                 except Exception:  # noqa: BLE001  復元は静かに試す
                     pass
 
+    def attach_image_paste(self):
+        """クリップボードにある画像を、入力欄へ貼って添付に
+        する (2.55、キャプチャの配達用)。
+
+        ファイルの貼り付け (attach_file_paste) との違いは、
+        クリップボードへ書かないことだけ: 画像は呼び側
+        (PHAL の窓) が先にクリップボードへ置いてあり、ここは
+        前面化 → 入力欄へフォーカス → Ctrl+V → チップの出現
+        で確認、までを行う。チップの印は「添付ファイルを
+        削除」の数の増加だけ (画像にはファイル名が無い)。
+        クリップボードの後始末 (元のテキストへ戻す) は呼び側
+        の仕事で、ここでは触らない。
+
+        失敗は段つき (InputStageError): 入力欄が無い /
+        フォーカスできない / キーを送れない / 付いたか確か
+        められない。"""
+        _root, desc = self._descendants()
+        box, candidates = self._find_input_box(desc)
+        if box is None:
+            raise InputStageError(
+                "not_found", _input_not_found_message(candidates))
+        before_names = _element_names(desc)
+        before_remove = self._attach_remove_count(desc)
+        _bring_to_front(getattr(self, "hwnd_main", None))
+        time.sleep(ATTACH_FOREGROUND_WAIT)
+        try:
+            box.SetFocus()
+        except Exception as e:  # noqa: BLE001  段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"入力欄へフォーカスできませんでした（{e}）") from e
+        time.sleep(ATTACH_FOCUS_WAIT)
+        try:
+            _send_ctrl_v()
+        except Exception as e:  # noqa: BLE001  段つきの文に畳む
+            raise InputStageError(
+                "unwritable",
+                f"貼り付けのキーを送れませんでした（{e}）") from e
+        deadline = time.time() + ATTACH_CONFIRM_TIMEOUT
+        while True:
+            _root, desc = self._descendants(heal=False)
+            if attach_appeared(
+                    before_names, _element_names(desc),
+                    before_remove,
+                    self._attach_remove_count(desc), ""):
+                return
+            if time.time() >= deadline:
+                break
+            time.sleep(ATTACH_POLL)
+        raise InputStageError(
+            "unwritable",
+            "画像を添付できたか確かめられませんでした"
+            "（チップが出ませんでした）")
+
     # -- 添付 (ダイアログ方式、1.61 で復活) ---------------------------
     def _find_attach_button(self, desc):
         """「ファイルを添付」ボタン。無ければ None。"""
@@ -3719,7 +4348,7 @@ class Copilot:
                 failed.append(_file_name_of(path))
         return failed
 
-    def send_prompt(self, text, attempts=2, wait=3.0):
+    def send_prompt(self, text, attempts=2, wait=3.0, force=False):
         """入力欄に書いて送信する。送れたら True。
 
         【この再試行が効くのは「出るのが遅れた」場合だけ】
@@ -3744,7 +4373,7 @@ class Copilot:
         last_composer_buttons に残す。次に起きたときに、また推測から始めないで済むように。"""
         self.last_composer_buttons = []
         for _attempt in range(max(1, attempts)):
-            self.set_input(text)
+            self.set_input(text, force=force)
             if self.click_send(wait=wait):
                 return True
             try:

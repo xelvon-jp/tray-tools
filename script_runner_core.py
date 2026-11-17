@@ -4957,7 +4957,7 @@ def execute_script(path, config: dict, handle: RunHandle = None,
 # AI 側がスクリプトを管理するための ID。ファイル名の先頭に
 # 「12-03_check_db.py」のように付け、一覧の ID 列と実行結果の文に
 # 出すことで、結果を貼り返したときにどのスクリプトの結果か分かる。
-_COMMAND_ID_RE = re.compile(r"^(\d{1,3}-\d{1,3})_")
+_COMMAND_ID_RE = re.compile(r"^([A-Za-z]?\d{1,3}-\d{1,3})_")
 
 
 def parse_command_id(name: str):
@@ -4966,6 +4966,8 @@ def parse_command_id(name: str):
     形は「セッション番号-通番」のあとに "_"、続けて名前。
     例: "12-03_check_db.py" → "12-03"、"12-3_check_db.py" → "12-3"。
     表示はファイル名に書かれたまま(0 埋めは残す)。
+    先頭に英字1文字を付けてもよい (2.63、例: "k12-34_x.py" →
+    "k12-34")。
     線引き:
       - 区切りは "_" のみ。"-" まで許すと "26-11-14" のような
         日付と区別がつかない。

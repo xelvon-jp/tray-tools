@@ -196,12 +196,15 @@ def sanitize_attach_method(value) -> str:
 SEND_METHOD_LABELS = (
     (1, "方式1（従来）"),
     (2, "方式2（送信時に文を確認）"),
+    (3, "方式3（文を確認＋大部分が合えば送信）"),
 )
 SEND_METHOD_KEYS = tuple(key for key, _label in SEND_METHOD_LABELS)
 
 
 def sanitize_send_method(value) -> int:
-    """入力・送信方式を整える。2 以外は 1 (従来) に倒す。"""
+    """入力・送信方式を整える。2・3 以外は 1 (従来) に倒す。"""
+    if value == 3 or value == "3":
+        return 3
     if value == 2 or value == "2":
         return 2
     return 1

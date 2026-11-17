@@ -747,6 +747,35 @@ def _send_mismatch_detail(read_back, intended) -> str:
     return head + "／違いの行は特定できません"
 
 
+def _send_match_ratio(read_back, intended) -> float:
+    """想定と実際の一致率 (2.61、方式3の「大部分」の判定)。
+
+    行単位 (切り分けは照合と同じ) で difflib の比率を取る。
+    想定が空・実際が空・想定の最初の行が実際に無いときは
+    0 を返す (まるごと別文を「大部分が一致」と誤らない
+    ための歯止め)。"""
+    import difflib
+
+    def _lines(value):
+        lines = str(value or "").replace("\r\n", "\n") \
+            .replace("\r", "\n").split("\n")
+        lines = [line.rstrip() for line in lines]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    exp_lines = _lines(intended)
+    act_lines = _lines(read_back)
+    if not exp_lines or not act_lines:
+        return 0.0
+    if exp_lines[0] not in act_lines:
+        return 0.0
+    return difflib.SequenceMatcher(
+        None, exp_lines, act_lines).ratio()
+
+
 # DL カードの名前が1行に潰れているとき、コメントの後ろにコードが
 # 同じ行で続く。その始まりとみなす目印 (前後に空白のある形)。
 _DOWNLOAD_CODE_STARTERS = (" import ", " from ", " def ", " class ")
@@ -1039,10 +1068,10 @@ def _strip_speaker_prefix(line):
 # 再実行の目印の行から ID を切り出す形。ファイル名のコマンド
 # ID と同じ「セッション番号-通番」(各3桁まで) で、後ろに "_"
 # (ファイル名の続き) や空白があっても ID の部分だけを取る。
-_RERUN_ID_RE = re.compile(r"^(\d{1,3}-\d{1,3})$")
+_RERUN_ID_RE = re.compile(r"^([A-Za-z]?\d{1,3}-\d{1,3})$")
 # 再実行の目印の行から ID と引数を切り出す形 (1.97)。ID の
 # 後ろに空白を空けて引数文字列を続けられる (引数は任意)。
-_RERUN_ARGS_RE = re.compile(r"^(\d{1,3}-\d{1,3})(?:\s+(.*))?$")
+_RERUN_ARGS_RE = re.compile(r"^([A-Za-z]?\d{1,3}-\d{1,3})(?:\s+(.*))?$")
 # 目印より後ろに続く本文の上限 (文字)。最新の発言の中の目印だけを
 # 相手にするため、後ろに会話が長く続いている (= 古い発言の中の
 # 目印) ものは数えない。同じ発言の続きと、入力欄まわりの UI の
@@ -2545,13 +2574,17 @@ class Copilot:
             "送信ボタンを押しましたが、送信されませんでした"
             "（入力欄に文が残っています）")
 
-    def press_send_if_text(self, expected, timeout=10, poll=0.5):
+    def press_send_if_text(self, expected, timeout=10, poll=0.5,
+                           force_threshold=None):
         """入力欄の文が想定どおりなら送信ボタンを押す (2.59、方式2)。
 
         読み直しを timeout まで繰り返し、想定と合った時点で
         press_send_button で押す。文の入りが遅い相手でも、入った
         時点で進める。合わないまま timeout を超えたら、押さずに
-        InputStageError (段は "mismatch") で上げる。"""
+        InputStageError (段は "mismatch") で上げる。
+        force_threshold (2.61、方式3) を渡すと、合わなかった
+        ときに一致率がその値以上なら押す。戻り値は
+        (押せたか, 強制送信の一致率または None) の組。"""
         start = time.time()
         last = None
         while True:
@@ -2562,12 +2595,16 @@ class Copilot:
                     current, expected):
                 break
             if time.time() - start >= timeout:
+                if force_threshold is not None:
+                    ratio = _send_match_ratio(last, expected)
+                    if ratio >= force_threshold:
+                        return self.press_send_button(), ratio
                 raise InputStageError(
                     "mismatch",
                     "入力欄の文が想定と違うため送信しませんでした（"
                     + _send_mismatch_detail(last, expected) + "）")
             time.sleep(poll)
-        return self.press_send_button()
+        return self.press_send_button(), None
 
     def _input_is_empty(self, timeout=0.0):
         """入力欄が空か (送信できたかの確認用、2.06)。

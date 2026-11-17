@@ -23,7 +23,12 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.60"
+PHAL_VERSION = "2.63"
+
+# 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
+# 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
+# 合わなくても送信する。
+SEND_FORCE_RATIO = 0.9
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -120,7 +125,8 @@ _DL_FILENAME_RE = re.compile(
 # 前に両方から外してそろえる。コロンはあっても無くてもよい
 # (2.25。コロン無しの形で照合が外れ続け、DL 済みの候補が
 # 開き直しのたびに出直した実機報告への直し)。
-_SUMMARY_ID_PREFIX_RE = re.compile(r"^\d{1,3}-\d{1,3}\s*[:：]?\s*")
+_SUMMARY_ID_PREFIX_RE = re.compile(
+    r"^[A-Za-z]?\d{1,3}-\d{1,3}\s*[:：]?\s*")
 
 
 def _holder_command_id(holder) -> str:
@@ -129,11 +135,11 @@ def _holder_command_id(holder) -> str:
     概要の先頭から取るのが本命。取れなければ、名前 (中身の
     冒頭) の先頭数行のコメント行から取る。"""
     summary = " ".join((holder.summary or "").split())
-    match = re.match(r"(\d{1,3}-\d{1,3})\b", summary)
+    match = re.match(r"([A-Za-z]?\d{1,3}-\d{1,3})\b", summary)
     if match is not None:
         return match.group(1)
     for line in (holder.name or "").splitlines()[:4]:
-        match = re.match(r"\s*#\s*(\d{1,3}-\d{1,3})\b", line)
+        match = re.match(r"\s*#\s*([A-Za-z]?\d{1,3}-\d{1,3})\b", line)
         if match is not None:
             return match.group(1)
     return ""
@@ -929,12 +935,14 @@ def _default_ai_sender(text, profile, attachments=None,
                                 lenient=lenient)
 
 
-def _default_ai_presser(profile, expected=None):
+def _default_ai_presser(profile, expected=None, force_threshold=None):
     """AI の送信ボタンを押す役。本当に送信する。
 
     expected (2.59、入力・送信方式2) を渡したときは、入力欄の
     文がその文と合うときだけ押す (copilot_io.press_send_button
     の文の確認つき)。合わなければ送らずに失敗で返る。
+    force_threshold (2.61、方式3) を渡すと、合わなくても
+    一致率がその値以上なら押す。
 
     従来の形では、押す前に、入力欄を読み直す (送信の直前の確認):
       - 読めなければ、その段の理由を失敗として返す (押さない)
@@ -947,7 +955,8 @@ def _default_ai_presser(profile, expected=None):
 
     if expected:
         return copilot_io.press_send_button(
-            profile=profile, expected=expected)
+            profile=profile, expected=expected,
+            force_threshold=force_threshold)
     read = copilot_io.read_input_text(profile=profile)
     if not read.ok:
         return read
@@ -2217,12 +2226,12 @@ class ScriptRunnerWindow(QWidget):
         """大きな進捗表示の階を作り直す (2.15)。
 
         プロファイルごとに1階。[チェック＋名前] [監視＋段階
-        ブロック] [数字＋見出し] の細いバー。チェックはプロ
-        ファイルが2つ以上あるときだけ出す (見張る窓の集合に
-        入っている側だけチェック、どの階も操作できる。2.20
-        で主・副の区別をなくした)。付け外しは
-        _on_ai_check_toggled が設定へ保存する。1つだけなら、
-        チェック無しのバーが1本だけ出る。階ごとに枠で
+        ブロック] [数字＋見出し] の細いバー。チェックは見張る
+        窓の集合に入っている側だけ入り、どの階も操作できる
+        (2.20 で主・副の区別をなくした)。プロファイルが1つ
+        でもチェックは出す (2.62、見張りの一時停止にも使う
+        ため。以前は2つ以上でだけ出していた)。付け外しは
+        _on_ai_check_toggled が設定へ保存する。階ごとに枠で
         グループを分け、名前の欄の幅は階どうしで揃える。
         明滅の効果も階ごとに持つ (2.16)。"""
         layout = getattr(self, "_floors_layout", None)
@@ -2234,26 +2243,20 @@ class ScriptRunnerWindow(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self._floors = {}
-        show_checks = len(profiles) >= 2
         # 名前の欄は階どうしで幅を揃える (2.16、監視ブロックの
         # 左端が階ごとにずれないように)。部品を先に全部作り、
         # いちばん広いものに合わせる。
         name_widgets = []
         for index, entry in enumerate(profiles):
             name = entry["name"]
-            if show_checks:
-                box = QCheckBox(name)
-                box.setStyleSheet("font-size: 11px;")
-                box.setChecked(name in watch)
-                box.setToolTip("チェックでこの窓を見張ります")
-                box.toggled.connect(
-                    lambda checked, n=name:
-                        self._on_ai_check_toggled(n, checked))
-                name_widgets.append(box)
-            else:
-                name_label = QLabel(name)
-                name_label.setStyleSheet("font-size: 11px;")
-                name_widgets.append(name_label)
+            box = QCheckBox(name)
+            box.setStyleSheet("font-size: 11px;")
+            box.setChecked(name in watch)
+            box.setToolTip("チェックでこの窓を見張ります")
+            box.toggled.connect(
+                lambda checked, n=name:
+                    self._on_ai_check_toggled(n, checked))
+            name_widgets.append(box)
         name_width = max(
             (w.sizeHint().width() for w in name_widgets), default=0)
         for index, entry in enumerate(profiles):
@@ -2288,10 +2291,7 @@ class ScriptRunnerWindow(QWidget):
             name_widget = name_widgets[index]
             name_widget.setFixedWidth(name_width)
             row_layout.addWidget(name_widget)
-            if show_checks:
-                floor["check"] = name_widget
-            else:
-                floor["name_label"] = name_widget
+            floor["check"] = name_widget
 
             watch = QLabel("監視")
             watch.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2842,10 +2842,6 @@ class ScriptRunnerWindow(QWidget):
         check = floor.get("check")
         if check is not None:
             check.setStyleSheet(
-                "font-size: 11px;" if watching else
-                f"font-size: 11px; color: {self._theme()['muted']};")
-        elif floor.get("name_label") is not None:
-            floor["name_label"].setStyleSheet(
                 "font-size: 11px;" if watching else
                 f"font-size: 11px; color: {self._theme()['muted']};")
 
@@ -5119,7 +5115,7 @@ class ScriptRunnerWindow(QWidget):
         item.answered_text = text
         self._refresh_send_ready()
         sender = self.ai_sender or _default_ai_sender
-        send_lenient = profile.get("send_method") == 2
+        send_lenient = profile.get("send_method") in (2, 3)
         self._ai_filling = True
         self._ai_answer_item = item
         self._refresh_list()
@@ -5442,12 +5438,17 @@ class ScriptRunnerWindow(QWidget):
                 "で設定してください", "error")
             return
         presser = self.ai_presser or _default_ai_presser
-        # 入力・送信方式2 (2.59): 回答で入れた文を渡し、送信の
-        # 段で入力欄と照合する。入れた文が残っていない (この版
-        # より前に回答した等) ときは従来の押下に倒す。
+        # 入力・送信方式2・3 (2.59、2.61): 回答で入れた文を
+        # 渡し、送信の段で入力欄と照合する。方式3 は、合わなく
+        # ても大部分が一致すれば送る (force_threshold つき)。
+        # 入れた文が残っていない (この版より前に回答した等)
+        # ときは従来の押下に倒す。
         expected = None
-        if profile.get("send_method") == 2:
+        force_threshold = None
+        if profile.get("send_method") in (2, 3):
             expected = getattr(item, "answered_text", "") or None
+            if expected and profile.get("send_method") == 3:
+                force_threshold = SEND_FORCE_RATIO
         self._ai_sending = True
         self._ai_send_item = item
         self._refresh_list()
@@ -5463,11 +5464,16 @@ class ScriptRunnerWindow(QWidget):
             try:
                 if expected:
                     try:
-                        result = presser(profile, expected)
+                        result = presser(
+                            profile, expected, force_threshold)
                     except TypeError:
-                        # 文の引数を知らない差し替え口 (テストの
-                        # fake 等) では従来の呼び方に倒す。
-                        result = presser(profile)
+                        try:
+                            result = presser(profile, expected)
+                        except TypeError:
+                            # 文の引数を知らない差し替え口
+                            # (テストの fake 等) では従来の
+                            # 呼び方に倒す。
+                            result = presser(profile)
                 else:
                     result = presser(profile)
             except Exception as e:  # noqa: BLE001
@@ -5489,7 +5495,16 @@ class ScriptRunnerWindow(QWidget):
                 # サイクル完了。last_run (差し戻しの証拠) と回答済みの
                 # 印は残し、ボタンだけ「実行」に戻る。
                 item.sent = True
-            self._set_note("送信しました", "ok")
+            message = getattr(result, "message", "") or ""
+            if "大部分が一致" in message:
+                # 方式3の強制送信 (2.61)。一致率つきで残す。
+                self._diag(
+                    f"AIへの送信: {message}",
+                    ai=(item.ai or None) if item is not None
+                    else None)
+                self._set_note(message, "ok")
+            else:
+                self._set_note("送信しました", "ok")
         else:
             message = getattr(result, "message", "") \
                 or "送信できませんでした"

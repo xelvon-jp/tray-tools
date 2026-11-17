@@ -291,12 +291,16 @@ class SubprocessTransport:
     def press_send(self):
         return bool(self._call({"op": "press_send"})["pressed"])
 
-    def press_send_if_text(self, expected, timeout=10.0):
+    def press_send_if_text(self, expected, timeout=10.0,
+                           force_threshold=None):
+        request = {"op": "press_match", "text": expected,
+                   "timeout": timeout}
+        if force_threshold is not None:
+            request["force_threshold"] = force_threshold
         response = self._call(
-            {"op": "press_match", "text": expected,
-             "timeout": timeout},
-            timeout=timeout + WORKER_WAIT_MARGIN)
-        return bool(response["pressed"])
+            request, timeout=timeout + WORKER_WAIT_MARGIN)
+        return bool(response["pressed"]), \
+            response.get("forced_ratio")
 
     def latest_download(self):
         return self.latest_scan().get("candidate")
@@ -514,12 +518,15 @@ class CopilotLoopTransport:
         上がる。CopilotSession.press_send が理由の文に畳む。"""
         return self._ensure().press_send_button()
 
-    def press_send_if_text(self, expected, timeout=10.0):
+    def press_send_if_text(self, expected, timeout=10.0,
+                           force_threshold=None):
         """入力欄の文が想定どおりなら送信ボタンを押す (2.59)。
 
-        失敗は press_send と同じく段つきの例外がそのまま上がる。"""
+        失敗は press_send と同じく段つきの例外がそのまま上がる。
+        戻り値は (押せたか, 強制送信の一致率または None)。"""
         return self._ensure().press_send_if_text(
-            expected, timeout=timeout)
+            expected, timeout=timeout,
+            force_threshold=force_threshold)
 
     def latest_download(self):
         return self._ensure().latest_download_candidate()
@@ -827,7 +834,8 @@ class CopilotSession:
         return ReadResult(True, "入力欄を読みました", str(value))
 
     # -- 送信ボタンを押す ---------------------------------------------------
-    def press_send(self, expected=None, timeout=10.0) -> SendResult:
+    def press_send(self, expected=None, timeout=10.0,
+                   force_threshold=None) -> SendResult:
         """プロファイルの目印 (send_*) の送信ボタンを押す。
 
         入力欄への投入 (fill) とは別の操作で、こちらは本当に送信する。
@@ -835,7 +843,9 @@ class CopilotSession:
         押す段で失敗) がそのまま message になる。
         expected (2.59、入力・送信方式2) を渡すと、入力欄の文が
         その文と合うときだけ押す (合うまで timeout 秒、読み直しを
-        繰り返す)。"""
+        繰り返す)。force_threshold (2.61、方式3) を渡すと、
+        合わなくても一致率がその値以上なら押し、結果の文に
+        一致率を添える。"""
         ok, reason = self._wait_sendable()
         if not ok:
             return SendResult(False, reason)
@@ -846,12 +856,26 @@ class CopilotSession:
                 if matcher is None:
                     return SendResult(
                         False, "この経路では文の確認つき送信ができません")
-                pressed = matcher(expected, timeout)
+                try:
+                    result = matcher(
+                        expected, timeout,
+                        force_threshold=force_threshold)
+                except TypeError:
+                    # force_threshold を知らない経路 (旧い裏方等)
+                    # では、方式2の形で呼ぶ。
+                    result = matcher(expected, timeout)
+                pressed, ratio = result \
+                    if isinstance(result, tuple) else (result, None)
             except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
                 return SendResult(
                     False, str(e) or "送信ボタンを押せませんでした")
             if not pressed:
                 return SendResult(False, "送信ボタンを押せませんでした")
+            if ratio is not None:
+                return SendResult(
+                    True,
+                    f"大部分が一致したため送信しました"
+                    f"（一致率{ratio:.0%}）")
             return SendResult(True, "送信ボタンを押しました")
         try:
             presser = getattr(self._tp(), "press_send", None)
@@ -1228,16 +1252,18 @@ def read_input_text(profile=None, transport=None) -> ReadResult:
 
 
 def press_send_button(profile=None, transport=None, expected=None,
-                      timeout=10.0) -> SendResult:
+                      timeout=10.0, force_threshold=None) -> SendResult:
     """プロファイルの目印 (send_*) の送信ボタンを押す近道。
 
     本当に送信する操作なので、呼ぶのは人の押下に応じるときだけ
     (PHAL の「送信」ボタン)。profile の意味は send_text と同じ。
     expected (2.59、入力・送信方式2) を渡すと、入力欄の文が
-    その文と合うときだけ押す。"""
+    その文と合うときだけ押す。force_threshold (2.61、方式3)
+    は、大部分が合えば押すための一致率の下限。"""
     session = CopilotSession(transport, profile=profile)
     try:
-        return session.press_send(expected=expected, timeout=timeout)
+        return session.press_send(expected=expected, timeout=timeout,
+                                  force_threshold=force_threshold)
     finally:
         session.close()
 

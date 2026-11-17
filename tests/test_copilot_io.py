@@ -244,7 +244,9 @@ class FakeRunner:
         if op == "wait_sendable":
             return {"ok": True, "done": True, "elapsed": 0.0}
         if op == "press_match":
-            return {"ok": True, "pressed": True}
+            return {"ok": True, "pressed": True,
+                    "forced_ratio": 0.95
+                    if "force_threshold" in request else None}
         if op == "response":
             assert request["previous_length"] == 777
             return {"ok": True, "text": "裏方からの応答"}
@@ -1141,8 +1143,53 @@ def test_worker_dispatch_press_match():
     try:
         result = copilot_io_worker._run(
             {"op": "press_match", "text": "想定の文", "timeout": 7})
-        assert result == {"ok": True, "pressed": True}
+        assert result == {"ok": True, "pressed": True,
+                          "forced_ratio": None}
         assert FakeLoopTransport.last.got == ("想定の文", 7.0)
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_session_press_send_forced_through_subprocess():
+    """方式3 (2.61): 一致率つきで押せたら、結果の文に残る。"""
+    runner = FakeRunner()
+    session = copilot_io.CopilotSession(
+        copilot_io.SubprocessTransport(runner))
+    result = session.press_send(
+        expected="想定の文", force_threshold=0.9)
+    assert result.ok
+    assert "大部分が一致したため送信しました" in result.message
+    assert "95%" in result.message
+    assert runner.requests == ["wait_sendable", "press_match"]
+
+
+def test_worker_dispatch_press_match_forced():
+    """裏方は force_threshold を渡し、一致率を返す (2.61)。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        last = None
+
+        def __init__(self, profile=None):
+            FakeLoopTransport.last = self
+
+        def press_send_if_text(self, expected, timeout,
+                               force_threshold=None):
+            self.got = (expected, timeout, force_threshold)
+            return True, 0.93
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        result = copilot_io_worker._run(
+            {"op": "press_match", "text": "想定の文",
+             "timeout": 7, "force_threshold": 0.9})
+        assert result == {"ok": True, "pressed": True,
+                          "forced_ratio": 0.93}
+        assert FakeLoopTransport.last.got == ("想定の文", 7.0, 0.9)
     finally:
         copilot_io.CopilotLoopTransport = real
 

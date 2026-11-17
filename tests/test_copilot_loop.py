@@ -1284,6 +1284,11 @@ def test_rerun_marker_scan_finds_request_with_command_id():
         _text_el(copilot_loop.RERUN_REQUEST_MARKER + " rr2 12-3")])
     assert other.latest_chat_scan()["rerun_marker"]["command_id"] \
         == "12-3"
+    # 英字1文字の接頭辞つきコマンド ID も拾う (2.63)。
+    lettered = _copilot({"name": "phal-ai"}, [
+        _text_el(copilot_loop.RERUN_REQUEST_MARKER + " rr3 k12-34")])
+    assert lettered.latest_chat_scan()["rerun_marker"]["command_id"] \
+        == "k12-34"
     # 旧形式 (コマンド ID だけ) は、第1トークンが依頼 ID と
     # して読まれ、コマンド ID は空になる (窓側が引数の
     # 知らせを返す)。
@@ -3111,6 +3116,50 @@ def test_press_send_if_text_mismatch_message_has_detail():
     except copilot_loop.InputStageError as e:
         assert "想定6字" in str(e), e
         assert "1行目" in str(e), e
+    else:
+        raise AssertionError("InputStageError になるはず")
+
+
+def test_send_match_ratio_rules():
+    """方式3の一致率 (2.61): 行単位の比率と、別文への歯止め。"""
+    f = copilot_loop._send_match_ratio
+    ten = "\n".join(f"{i}行目" for i in range(10))
+    assert f(ten, ten) == 1.0
+    nine = "\n".join(
+        f"{i}行目" if i != 5 else "違う行" for i in range(10))
+    assert abs(f(nine, ten) - 0.9) < 1e-9
+    # 最初の行が無い文は、似ていても 0 (別文の誤判定を防ぐ)
+    other = "\n".join(f"別{i}" for i in range(10))
+    assert f(other, ten) == 0.0
+    shifted = "\n".join(f"{i}行目" for i in range(1, 11))
+    assert f(shifted, ten) == 0.0
+    # 空は 0
+    assert f("", ten) == 0.0
+    assert f(ten, "") == 0.0
+
+
+def test_press_send_if_text_forces_when_mostly_matches():
+    """方式3 (2.61): 合わなくても一致率が下限以上なら押す。"""
+    ten = "\n".join(f"{i}行目" for i in range(10))
+    nine = "\n".join(
+        f"{i}行目" if i != 5 else "違う行" for i in range(10))
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._read_input_quietly = lambda: nine
+    pressed = []
+    cp.press_send_button = lambda: pressed.append(1) or True
+    ok, ratio = cp.press_send_if_text(
+        ten, timeout=0.2, poll=0.05, force_threshold=0.9)
+    assert ok and pressed == [1]
+    assert ratio is not None and abs(ratio - 0.9) < 1e-9
+    # 下限に届かなければ、押さずに上げる
+    cp2 = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp2._read_input_quietly = lambda: "全然違う文"
+    cp2.press_send_button = lambda: True
+    try:
+        cp2.press_send_if_text(
+            ten, timeout=0.2, poll=0.05, force_threshold=0.9)
+    except copilot_loop.InputStageError:
+        pass
     else:
         raise AssertionError("InputStageError になるはず")
 

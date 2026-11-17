@@ -98,10 +98,20 @@ def _run(request):
             return {"ok": True, "pressed": bool(transport.press_send())}
         if op == "press_match":
             # 入力・送信方式2 (2.59): 入力欄の文が想定どおりなら押す。
-            return {"ok": True,
-                    "pressed": bool(transport.press_send_if_text(
-                        request["text"],
-                        float(request.get("timeout") or 10)))}
+            # 方式3 (2.61) は force_threshold つきで、大部分が
+            # 合えば押し、一致率も返す (無いときは引数自体を
+            # 渡さない。旧い transport の形を壊さないため)。
+            kwargs = {}
+            if request.get("force_threshold") is not None:
+                kwargs["force_threshold"] = \
+                    request["force_threshold"]
+            result = transport.press_send_if_text(
+                request["text"],
+                float(request.get("timeout") or 10), **kwargs)
+            pressed, ratio = result \
+                if isinstance(result, tuple) else (result, None)
+            return {"ok": True, "pressed": bool(pressed),
+                    "forced_ratio": ratio}
         if op == "latest_download":
             # 診断の目印 (1-43) とリセットの目印 (1-52)、再実行
             # の目印 (1.63)、候補の全件 (1-57) も同じ走査で取る。

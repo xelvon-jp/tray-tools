@@ -401,9 +401,13 @@ def test_parse_command_id():
     assert core.parse_command_id("12-3_check_db.py") == "12-3"
     assert core.parse_command_id("1-1_a.py") == "1-1"
     assert core.parse_command_id("123-456_x.ps1") == "123-456"
+    # 英字1文字の接頭辞は ID の一部として扱う (2.63)。
+    assert core.parse_command_id("k12-34_x.py") == "k12-34"
+    assert core.parse_command_id("x12-3_check.py") == "x12-3"
     # ID が無い名前。
     assert core.parse_command_id("check_db.py") is None
-    assert core.parse_command_id("x12-3_check.py") is None
+    # 英字2文字の接頭辞は ID ではない。
+    assert core.parse_command_id("ab12-3_x.py") is None
     # 日付で始まる名前は ID ではない(4桁の年・"-" 区切りの続き)。
     assert core.parse_command_id("2026-11-14_notes.py") is None
     assert core.parse_command_id("2026-11_notes.py") is None

@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.55"
+PHAL_VERSION = "2.59"
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -908,7 +908,7 @@ class _AiAnswerResult:
 
 
 def _default_ai_sender(text, profile, attachments=None,
-                       image_paste=False):
+                       image_paste=False, lenient=False):
     """AI の入力欄へ入れるだけの送信役 (送信はしない)。
 
     copilot_io.fill_text を使う (EDDy のテスト入力と同じ経路)。
@@ -918,18 +918,25 @@ def _default_ai_sender(text, profile, attachments=None,
     attachments は、outbox に実在することが確かめられた成果
     ファイルのフルパス (1.58)。copilot 側が、入力欄へ入れる前に
     添付する。image_paste (2.55) は、クリップボードに置いてある
-    画像を入れる前に貼る (キャプチャの配達)。"""
+    画像を入れる前に貼る (キャプチャの配達)。lenient (2.59、
+    入力・送信方式2) は、書き込みの成否を読み直しの一致で
+    判定しない。"""
     import copilot_io
 
     return copilot_io.fill_text(text, profile=profile,
                                 attachments=attachments,
-                                image_paste=image_paste)
+                                image_paste=image_paste,
+                                lenient=lenient)
 
 
-def _default_ai_presser(profile):
+def _default_ai_presser(profile, expected=None):
     """AI の送信ボタンを押す役。本当に送信する。
 
-    押す前に、入力欄を読み直す (送信の直前の確認):
+    expected (2.59、入力・送信方式2) を渡したときは、入力欄の
+    文がその文と合うときだけ押す (copilot_io.press_send_button
+    の文の確認つき)。合わなければ送らずに失敗で返る。
+
+    従来の形では、押す前に、入力欄を読み直す (送信の直前の確認):
       - 読めなければ、その段の理由を失敗として返す (押さない)
       - 空なら「入力欄が空です」で断る (入れたはずの回答が消えて
         いたら、空のまま送ってしまう事故になるため)
@@ -938,6 +945,9 @@ def _default_ai_presser(profile):
     SendResult と同じ顔 (ok / message)。"""
     import copilot_io
 
+    if expected:
+        return copilot_io.press_send_button(
+            profile=profile, expected=expected)
     read = copilot_io.read_input_text(profile=profile)
     if not read.ok:
         return read
@@ -1012,24 +1022,31 @@ def _default_ai_esc_sender(profile):
     return copilot_io.send_escape(profile=profile)
 
 
-# キャプチャの対象の語に混ざりうる、画面では見えない書式文字
-# (ゼロ幅の空白など)。照合の前に取り除く (2.55)。
-_CAPTURE_WORD_FORMAT_CHARS = "".join(
-    chr(c) for c in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF,
-                     0x00AD, 0x180E))
+# キャプチャの対象の語に混ざりうる、画面では見えない書式文字を
+# 照合の前に取り除く (2.55、2.56 で区分 Cf 全体へ拡張)。
 
 
 def _normalize_capture_word(text):
-    """キャプチャの対象の語を照合用に整える (2.55)。
+    """キャプチャの対象の語を照合用に整える (2.55、2.56 で拡張)。
 
     窓の走査で取れた語には、画面表示では見えない書式文字が
-    混ざることがある (2.54 の実地の初回で、対象が Muse の
-    はずが合わずに撮れなかった)。前後の空白と書式文字を
-    取り除いてから照合する。"""
+    混ざることがある (2.54・2.55 の実地で、対象が Muse の
+    はずが合わずに撮れなかった)。前後の空白と、Unicode の
+    書式文字 (区分 Cf。ゼロ幅の空白、左右方向の印 U+200E /
+    U+200F、タグ文字など) と異体字セレクタを取り除いてから
+    照合する。"""
+    import unicodedata
+
     word = (text or "").strip()
-    for ch in _CAPTURE_WORD_FORMAT_CHARS:
-        word = word.replace(ch, "")
-    return word.strip()
+    kept = []
+    for ch in word:
+        code = ord(ch)
+        if unicodedata.category(ch) == "Cf":
+            continue
+        if 0xFE00 <= code <= 0xFE0F or code == 0x034F:
+            continue
+        kept.append(ch)
+    return "".join(kept).strip()
 
 
 def _image_looks_blank(image):
@@ -5097,8 +5114,12 @@ class ScriptRunnerWindow(QWidget):
                 text += (f"\n添付の {new_name} は ZIP ファイル"
                          "です。.txt を外してから開いてください。")
                 self._diag(f"ZIP 添付を名前変えして添付: {new_name}")
+        # 入れた文を項目に残す (2.59)。入力・送信方式2 では、
+        # 送信の段がこの文と入力欄を照合する。
+        item.answered_text = text
         self._refresh_send_ready()
         sender = self.ai_sender or _default_ai_sender
+        send_lenient = profile.get("send_method") == 2
         self._ai_filling = True
         self._ai_answer_item = item
         self._refresh_list()
@@ -5115,7 +5136,19 @@ class ScriptRunnerWindow(QWidget):
                 # 送信役の差し替え口には従来の2引数のものがある
                 # (テストの fake 等) ので、添付があるときだけ
                 # 3引数で呼ぶ。
-                if attach_paths:
+                if send_lenient:
+                    # 方式2 (2.59): 書き込みでは止めない。
+                    # lenient を知らない差し替え口では従来の
+                    # 呼び方に倒す。
+                    try:
+                        result = sender(text, profile, attach_paths,
+                                        lenient=True)
+                    except TypeError:
+                        if attach_paths:
+                            result = sender(text, profile, attach_paths)
+                        else:
+                            result = sender(text, profile)
+                elif attach_paths:
                     result = sender(text, profile, attach_paths)
                 else:
                     result = sender(text, profile)
@@ -5409,6 +5442,12 @@ class ScriptRunnerWindow(QWidget):
                 "で設定してください", "error")
             return
         presser = self.ai_presser or _default_ai_presser
+        # 入力・送信方式2 (2.59): 回答で入れた文を渡し、送信の
+        # 段で入力欄と照合する。入れた文が残っていない (この版
+        # より前に回答した等) ときは従来の押下に倒す。
+        expected = None
+        if profile.get("send_method") == 2:
+            expected = getattr(item, "answered_text", "") or None
         self._ai_sending = True
         self._ai_send_item = item
         self._refresh_list()
@@ -5422,7 +5461,15 @@ class ScriptRunnerWindow(QWidget):
 
         def work():
             try:
-                result = presser(profile)
+                if expected:
+                    try:
+                        result = presser(profile, expected)
+                    except TypeError:
+                        # 文の引数を知らない差し替え口 (テストの
+                        # fake 等) では従来の呼び方に倒す。
+                        result = presser(profile)
+                else:
+                    result = presser(profile)
             except Exception as e:  # noqa: BLE001
                 result = _AiAnswerResult(
                     False, f"送信できませんでした（{e}）")
@@ -9220,18 +9267,26 @@ class ScriptRunnerWindow(QWidget):
         profile = origin_profile
         label = "合図が出た窓"
         slug = "origin"
-        if lowered in ("Muse", "copilot"):
-            name = "Muse" if lowered == "Muse" else "Copilot"
+        if lowered in ("Muse", "muse", "copilot"):
+            # Muse の窓では、チャットの表示で "Claude" が
+            # "Muse" に置き換わって見える (2.56 の実地で、失敗文
+            # の文字コードから確定)。合図の語が Muse でも
+            # Muse の窓として受ける (2.57)。
+            name = "Copilot" if lowered == "copilot" else "Muse"
             configured, by_name = self._resolve_profile_by_name(
                 name)
             if not configured or by_name is None:
-                return None, name, lowered, \
+                return None, name, name.lower(), \
                     "その窓の投げ先が設定されていません"
             profile = by_name
             label = name
-            slug = lowered
+            slug = name.lower()
         elif word:
+            codes = " ".join(
+                f"U+{ord(ch):04X}" for ch in word[:16])
             return None, word, "unknown", \
+                f"対象『{word}』が分かりません" \
+                f"（文字コード: {codes}）。" \
                 "対象は Muse / Copilot / PHAL / 全画面 の" \
                 "いずれかで指定してください"
         if profile is None:

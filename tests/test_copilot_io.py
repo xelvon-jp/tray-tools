@@ -241,6 +241,10 @@ class FakeRunner:
             return {"ok": True, "status": "sent"}
         if op == "wait":
             return {"ok": True, "done": True, "elapsed": 2.0}
+        if op == "wait_sendable":
+            return {"ok": True, "done": True, "elapsed": 0.0}
+        if op == "press_match":
+            return {"ok": True, "pressed": True}
         if op == "response":
             assert request["previous_length"] == 777
             return {"ok": True, "text": "裏方からの応答"}
@@ -259,7 +263,7 @@ def test_subprocess_session_flow():
     assert response.ok and response.text == "裏方からの応答"
     assert response.code_blocks == ["y = 2"]
     # 操作は全部裏方へ流れ、順番も往復のとおり
-    assert runner.requests == ["snapshot", "input", "send",
+    assert runner.requests == ["snapshot", "wait_sendable", "input", "send",
                                "wait", "response", "blocks"]
 
 
@@ -469,6 +473,8 @@ def _fill_probe_runner(request, timeout):
         return {"ok": True, "title": "Copilot", "text_length": 10}
     if op == "input":
         return {"ok": True, "input_text": ""}
+    if op == "wait_sendable":
+        return {"ok": True, "done": True, "elapsed": 0.0}
     if op == "fill":
         return {"ok": True, "filled": True}
     if op == "probe":
@@ -1016,6 +1022,8 @@ def test_subprocess_transport_passes_attachments():
             return {"ok": True, "length": 10}
         if op == "input":
             return {"ok": True, "input_text": ""}
+        if op == "wait_sendable":
+            return {"ok": True, "done": True, "elapsed": 0.0}
         if op == "fill":
             if "attachments" in request:
                 return {"ok": True, "filled": True,
@@ -1071,6 +1079,70 @@ def test_worker_dispatch_fill_with_attachments():
                           "attach_failed": ["b.txt"]}
         assert FakeLoopTransport.last.got == (
             "abc", ["/out/a.txt", "/out/b.txt"])
+    finally:
+        copilot_io.CopilotLoopTransport = real
+
+
+def test_session_press_send_with_expected_through_subprocess():
+    """方式2 の送信 (2.59): セッションが press_match を裏方へ流す。"""
+    runner = FakeRunner()
+    session = copilot_io.CopilotSession(
+        copilot_io.SubprocessTransport(runner))
+    result = session.press_send(expected="想定の文")
+    assert result.ok
+    assert runner.requests == ["wait_sendable", "press_match"]
+
+
+def test_session_fill_lenient_through_subprocess():
+    """方式2 の書き込み (2.59): lenient が裏方への依頼に乗る。"""
+    recorded = []
+
+    def runner(request, timeout):
+        recorded.append(dict(request))
+        op = request["op"]
+        if op == "input":
+            return {"ok": True, "input_text": ""}
+        if op == "wait_sendable":
+            return {"ok": True, "done": True, "elapsed": 0.0}
+        if op == "fill":
+            return {"ok": True, "filled": True}
+        raise AssertionError(op)
+
+    session = copilot_io.CopilotSession(
+        copilot_io.SubprocessTransport(runner))
+    assert session.fill("結果です", lenient=True).ok
+    fill_req = [r for r in recorded if r["op"] == "fill"][0]
+    assert fill_req.get("lenient") is True
+    recorded.clear()
+    assert session.fill("結果です").ok
+    fill_req2 = [r for r in recorded if r["op"] == "fill"][0]
+    assert "lenient" not in fill_req2
+
+
+def test_worker_dispatch_press_match():
+    """裏方は press_match を transport へ渡す (2.59)。"""
+    import copilot_io_worker
+
+    class FakeLoopTransport:
+        last = None
+
+        def __init__(self, profile=None):
+            FakeLoopTransport.last = self
+
+        def press_send_if_text(self, expected, timeout):
+            self.got = (expected, timeout)
+            return True
+
+        def close(self):
+            pass
+
+    real = copilot_io.CopilotLoopTransport
+    copilot_io.CopilotLoopTransport = FakeLoopTransport
+    try:
+        result = copilot_io_worker._run(
+            {"op": "press_match", "text": "想定の文", "timeout": 7})
+        assert result == {"ok": True, "pressed": True}
+        assert FakeLoopTransport.last.got == ("想定の文", 7.0)
     finally:
         copilot_io.CopilotLoopTransport = real
 

@@ -3004,6 +3004,85 @@ def test_attach_file_dialog_without_button_is_not_found():
             raise AssertionError("InputStageError になるはず")
 
 
+def test_input_matches_for_send_accepts_attach_failure_lines():
+    """送信の段の確認 (2.59): 実質一致と、末尾の添付失敗行は可。
+
+    それ以外の追記や別文は不可 (違う文を送らないため)。"""
+    f = copilot_loop._input_matches_for_send
+    assert f("結果です\n2行目", "結果です\n2行目")
+    assert f("結果です\r\n2行目 ", "結果です\n2行目")
+    assert f("結果です\n添付できませんでした：a.txt", "結果です")
+    assert not f("結果です\n人の追記", "結果です")
+    assert not f("別の文", "結果です")
+    assert not f("", "結果です")
+
+
+def test_press_send_if_text_presses_when_matches():
+    """入力欄の文が想定どおりになった時点で送信ボタンを押す。"""
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    reads = iter(["まだ入っていない", "想定の文"])
+    cp._read_input_quietly = lambda: next(reads, "想定の文")
+    pressed = []
+    cp.press_send_button = lambda: pressed.append(1) or True
+    assert cp.press_send_if_text("想定の文", timeout=5, poll=0.01)
+    assert pressed == [1]
+
+
+def test_press_send_if_text_raises_on_mismatch():
+    """想定と合わないままなら、押さずに段つきで上げる。"""
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._read_input_quietly = lambda: "違う文"
+    cp.press_send_button = lambda: True
+    try:
+        cp.press_send_if_text("想定の文", timeout=0.2, poll=0.05)
+    except copilot_loop.InputStageError as e:
+        assert e.stage == "mismatch"
+        assert "想定と違う" in str(e)
+    else:
+        raise AssertionError("InputStageError になるはず")
+
+
+def test_set_input_without_verify_does_not_raise_on_mismatch():
+    """方式2 の書き込み (2.59): 読み直しが別物でも例外にしない。
+
+    成否は送信の段が判定する。verify あり (従来) では同じ条件で
+    失敗として上がることも、あわせて確かめる。"""
+    class FakePattern:
+        def QueryInterface(self, _iid):
+            return self
+
+        def SetValue(self, _value):
+            pass
+
+    class FakeBox:
+        def GetCurrentPattern(self, _pattern):
+            return FakePattern()
+
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._descendants = lambda: (None, [])
+    cp._find_input_box = lambda desc: (FakeBox(), [])
+    cp._write_input_round = lambda pattern, text: False
+    cp._read_input_quietly = lambda: "別の文"
+    cp._force_write_input = lambda text: False
+    cp._input_reflects = lambda text, timeout=0: False
+    cp._paste_input_text = lambda text: None
+    saved_read = copilot_loop._clipboard_read_text
+    saved_write = copilot_loop._clipboard_write_text
+    copilot_loop._clipboard_read_text = lambda: None
+    copilot_loop._clipboard_write_text = lambda text: None
+    try:
+        cp.set_input("想定の文", verify=False)  # 例外にならない
+        try:
+            cp.set_input("想定の文")
+        except copilot_loop.InputStageError:
+            pass
+        else:
+            raise AssertionError("従来の形では InputStageError のはず")
+    finally:
+        copilot_loop._clipboard_read_text = saved_read
+        copilot_loop._clipboard_write_text = saved_write
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

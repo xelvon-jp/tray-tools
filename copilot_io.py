@@ -42,6 +42,9 @@ WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 応答待ち(wait)だけは、待ち時間そのものに余裕を足して別に決める。
 WORKER_OP_TIMEOUT = 90.0
 WORKER_WAIT_MARGIN = 60.0
+# 生成中の送信保留 (2.58): 保留の上限 (秒)。生成が終わってから
+# 送信するまでの置き時間は copilot_loop.wait_until_sendable 側。
+SEND_HOLD_TIMEOUT = 300.0
 
 
 @dataclass
@@ -255,7 +258,7 @@ class SubprocessTransport:
         return bool(response["sent"])
 
     def fill_prompt(self, text, attachments=None, force=False,
-                    image_paste=False):
+                    image_paste=False, lenient=False):
         request = {"op": "fill", "text": text}
         if attachments:
             request["attachments"] = [str(p) for p in attachments]
@@ -263,6 +266,8 @@ class SubprocessTransport:
             request["force"] = True
         if image_paste:
             request["image_paste"] = True
+        if lenient:
+            request["lenient"] = True
         response = self._call(request)
         self.attach_done = list(response.get("attach_done") or [])
         self.attach_failed = list(response.get("attach_failed") or [])
@@ -285,6 +290,13 @@ class SubprocessTransport:
 
     def press_send(self):
         return bool(self._call({"op": "press_send"})["pressed"])
+
+    def press_send_if_text(self, expected, timeout=10.0):
+        response = self._call(
+            {"op": "press_match", "text": expected,
+             "timeout": timeout},
+            timeout=timeout + WORKER_WAIT_MARGIN)
+        return bool(response["pressed"])
 
     def latest_download(self):
         return self.latest_scan().get("candidate")
@@ -331,6 +343,12 @@ class SubprocessTransport:
     def wait_until_idle(self, timeout):
         response = self._call({"op": "wait", "timeout": timeout},
                               timeout=timeout + WORKER_WAIT_MARGIN)
+        return bool(response["done"]), float(response["elapsed"])
+
+    def wait_sendable(self, timeout):
+        response = self._call(
+            {"op": "wait_sendable", "timeout": timeout},
+            timeout=timeout + WORKER_WAIT_MARGIN)
         return bool(response["done"]), float(response["elapsed"])
 
     def new_response(self, previous_length, sent_prompt=None):
@@ -456,17 +474,20 @@ class CopilotLoopTransport:
         return cp.send_prompt(text)
 
     def fill_prompt(self, text, attachments=None, force=False,
-                    image_paste=False):
+                    image_paste=False, lenient=False):
         """入力欄に入れるだけ (送信ボタンは押さない)。
 
         force は、通常の書き込みが反映されないときの打鍵まで
         含む強制の段 (2.39、copilot_loop.set_input の force)。
         force でなければ従来どおりの引数で呼ぶ (force を知ら
-        ない相手でも壊れないように)。"""
+        ない相手でも壊れないように)。lenient (2.59、方式2) は
+        書き込みの成否を読み直しの一致で判定しない。"""
         text = self._attach_first(text, attachments, image_paste)
         cp = self._ensure()
         if force:
-            cp.set_input(text, force=True)
+            cp.set_input(text, force=True, verify=not lenient)
+        elif lenient:
+            cp.set_input(text, verify=False)
         else:
             cp.set_input(text)
         return True
@@ -493,6 +514,13 @@ class CopilotLoopTransport:
         上がる。CopilotSession.press_send が理由の文に畳む。"""
         return self._ensure().press_send_button()
 
+    def press_send_if_text(self, expected, timeout=10.0):
+        """入力欄の文が想定どおりなら送信ボタンを押す (2.59)。
+
+        失敗は press_send と同じく段つきの例外がそのまま上がる。"""
+        return self._ensure().press_send_if_text(
+            expected, timeout=timeout)
+
     def latest_download(self):
         return self._ensure().latest_download_candidate()
 
@@ -510,6 +538,14 @@ class CopilotLoopTransport:
 
     def wait_until_idle(self, timeout):
         return self._ensure().wait_until_idle(timeout=timeout)
+
+    def wait_sendable(self, timeout):
+        cp = self._ensure()
+        fn = getattr(cp, "wait_until_sendable", None)
+        if fn is None:
+            # 待てる段を持たない相手 (テストの fake 等) では保留しない。
+            return True, 0.0
+        return fn(timeout=timeout)
 
     def new_response(self, previous_length, sent_prompt=None):
         return self._ensure().new_response(previous_length, sent_prompt=sent_prompt)
@@ -549,7 +585,7 @@ class CopilotSession:
         return self._transport
 
     def _call_prompt(self, method_name, text, force, attachments,
-                     image_paste=False):
+                     image_paste=False, lenient=False):
         """transport の send_prompt / fill_prompt を呼ぶ (2.39)。
 
         force は 2.39 で足した引数。付けずに呼ぶのが従来の形
@@ -567,6 +603,8 @@ class CopilotSession:
             extra["force"] = True
         if image_paste:
             extra["image_paste"] = True
+        if lenient:
+            extra["lenient"] = True
         if not extra:
             return fn(text, **kwargs)
         try:
@@ -583,6 +621,27 @@ class CopilotSession:
         done = list(getattr(tp, "attach_done", None) or [])
         failed = list(getattr(tp, "attach_failed", None) or [])
         return done, failed
+
+    def _wait_sendable(self):
+        """生成中なら終わるまで送信を保留する (2.58)。
+
+        戻り値は (進めてよいか, 理由)。transport が wait_sendable
+        を持たない (テストの fake 等) ときは保留しない。保留の
+        上限を超えたら進めないで返す (入力欄には何も書かない)。
+        裏方の呼び出し自体が失敗したときも進めない: 生成中か
+        分からないまま書くと、弾かれる事故を繰り返す。"""
+        fn = getattr(self._tp(), "wait_sendable", None)
+        if fn is None:
+            return True, ""
+        try:
+            done, _elapsed = fn(SEND_HOLD_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            return False, f"生成中か確かめられませんでした（{e}）"
+        if done:
+            return True, ""
+        return False, \
+            "生成中が続くため、回答の送信を保留し続けました" \
+            f"（{int(SEND_HOLD_TIMEOUT)}秒）"
 
     def send(self, text, force=False, attachments=None) -> SendResult:
         """送る。force=False のとき、入力欄に書きかけの文があれば
@@ -601,6 +660,9 @@ class CopilotSession:
             self._previous_length = self._tp().snapshot_length()
         except Exception as e:  # noqa: BLE001  理由は利用者への文にする
             return SendResult(False, f"Copilot に送れませんでした（{e}）")
+        ok, reason = self._wait_sendable()
+        if not ok:
+            return SendResult(False, reason)
         if not force:
             existing = None
             getter = getattr(self._tp(), "input_text", None)
@@ -632,7 +694,7 @@ class CopilotSession:
 
     # -- 入れるだけ -------------------------------------------------------
     def fill(self, text, force=False, attachments=None,
-             image_paste=False) -> SendResult:
+             image_paste=False, lenient=False) -> SendResult:
         """入力欄に text を入れるだけ。送信はしない。
 
         書きかけの扱いは send と同じ: force=False で入力欄に文が
@@ -640,9 +702,14 @@ class CopilotSession:
         書きかけを消さない)。結果の形も send とそろえてある。
         attachments の扱いも send と同じ (入れる前に添付する)。
         image_paste (2.55) は、クリップボードの画像を入れる前に
-        貼る (キャプチャの配達)。"""
+        貼る (キャプチャの配達)。lenient (2.59、入力・送信方式2) は、
+        書き込みの成否を読み直しの一致で判定しない (成否は送信の
+        段の確認が判定する)。"""
         if not text or not text.strip():
             return SendResult(False, "入れるテキストが空です")
+        ok, reason = self._wait_sendable()
+        if not ok:
+            return SendResult(False, reason)
         if not force:
             existing = None
             getter = getattr(self._tp(), "input_text", None)
@@ -665,7 +732,7 @@ class CopilotSession:
                     False, "この経路では入力欄に入れられません")
             filled = self._call_prompt(
                 "fill_prompt", text, force, attachments,
-                image_paste=image_paste)
+                image_paste=image_paste, lenient=lenient)
         except Exception as e:  # noqa: BLE001
             return SendResult(
                 False, f"入力欄に入れられませんでした（{e}）")
@@ -760,12 +827,32 @@ class CopilotSession:
         return ReadResult(True, "入力欄を読みました", str(value))
 
     # -- 送信ボタンを押す ---------------------------------------------------
-    def press_send(self) -> SendResult:
+    def press_send(self, expected=None, timeout=10.0) -> SendResult:
         """プロファイルの目印 (send_*) の送信ボタンを押す。
 
         入力欄への投入 (fill) とは別の操作で、こちらは本当に送信する。
         失敗は段つきの理由 (窓が無い / ボタンが見つからない・候補つき /
-        押す段で失敗) がそのまま message になる。"""
+        押す段で失敗) がそのまま message になる。
+        expected (2.59、入力・送信方式2) を渡すと、入力欄の文が
+        その文と合うときだけ押す (合うまで timeout 秒、読み直しを
+        繰り返す)。"""
+        ok, reason = self._wait_sendable()
+        if not ok:
+            return SendResult(False, reason)
+        if expected:
+            try:
+                matcher = getattr(self._tp(), "press_send_if_text",
+                                  None)
+                if matcher is None:
+                    return SendResult(
+                        False, "この経路では文の確認つき送信ができません")
+                pressed = matcher(expected, timeout)
+            except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+                return SendResult(
+                    False, str(e) or "送信ボタンを押せませんでした")
+            if not pressed:
+                return SendResult(False, "送信ボタンを押せませんでした")
+            return SendResult(True, "送信ボタンを押しました")
         try:
             presser = getattr(self._tp(), "press_send", None)
             if presser is None:
@@ -1083,17 +1170,19 @@ def send_text(text, transport=None, force=False, profile=None,
 
 
 def fill_text(text, transport=None, force=False, profile=None,
-              attachments=None, image_paste=False) -> SendResult:
+              attachments=None, image_paste=False,
+              lenient=False) -> SendResult:
     """入力欄に入れるだけの近道 (送信はしない)。テスト入力用。
 
     force の意味は CopilotSession.fill と同じ (書きかけがあっても
     上書きする)。profile の意味は send_text と同じ。attachments の
     意味も CopilotSession.fill と同じ。image_paste (2.55) は、
-    クリップボードの画像を入れる前に貼る (キャプチャの配達)。"""
+    クリップボードの画像を入れる前に貼る (キャプチャの配達)。
+    lenient (2.59) は書き込みの成否を読み直しで判定しない。"""
     session = CopilotSession(transport, profile=profile)
     try:
         return session.fill(text, force=force, attachments=attachments,
-                            image_paste=image_paste)
+                            image_paste=image_paste, lenient=lenient)
     finally:
         session.close()
 
@@ -1138,14 +1227,17 @@ def read_input_text(profile=None, transport=None) -> ReadResult:
         session.close()
 
 
-def press_send_button(profile=None, transport=None) -> SendResult:
+def press_send_button(profile=None, transport=None, expected=None,
+                      timeout=10.0) -> SendResult:
     """プロファイルの目印 (send_*) の送信ボタンを押す近道。
 
     本当に送信する操作なので、呼ぶのは人の押下に応じるときだけ
-    (PHAL の「送信」ボタン)。profile の意味は send_text と同じ。"""
+    (PHAL の「送信」ボタン)。profile の意味は send_text と同じ。
+    expected (2.59、入力・送信方式2) を渡すと、入力欄の文が
+    その文と合うときだけ押す。"""
     session = CopilotSession(transport, profile=profile)
     try:
-        return session.press_send()
+        return session.press_send(expected=expected, timeout=timeout)
     finally:
         session.close()
 

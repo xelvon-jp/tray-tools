@@ -188,6 +188,25 @@ def sanitize_attach_method(value) -> str:
     return value if value in ATTACH_METHOD_KEYS else "auto"
 
 
+# 入力・送信方式 (2.59)。プロファイルごとに持つ (target の
+# send_method)。方式1 は従来 (書き込みの読み直しの一致で成否を
+# 判定)。方式2 は、書き込みでは止めず、送信の段で入力欄の文が
+# 想定どおりかを確認してから送信ボタンを押す (職場の Copilot
+# で、文は入っているのに読み直しが一致せず止まる事故への対処)。
+SEND_METHOD_LABELS = (
+    (1, "方式1（従来）"),
+    (2, "方式2（送信時に文を確認）"),
+)
+SEND_METHOD_KEYS = tuple(key for key, _label in SEND_METHOD_LABELS)
+
+
+def sanitize_send_method(value) -> int:
+    """入力・送信方式を整える。2 以外は 1 (従来) に倒す。"""
+    if value == 2 or value == "2":
+        return 2
+    return 1
+
+
 # 添付テスト用のファイル (outbox へ書く)。送信はされない。
 ATTACH_TEST_FILE_NAME = "phal-attach-test.txt"
 ATTACH_TEST_TEXT = (
@@ -338,6 +357,8 @@ def _profile_entry(name, raw_target, fallback_source=None) -> dict:
         source.get("attach_method"))
     cleaned["zip_as_txt"] = sanitize_zip_as_txt(
         source.get("zip_as_txt"))
+    cleaned["send_method"] = sanitize_send_method(
+        source.get("send_method"))
     return {"name": _clean_profile_name(name),
             "target": cleaned}
 
@@ -427,6 +448,11 @@ def build_profile(fields) -> dict:
     zip_as_txt = sanitize_zip_as_txt(
         fields.get("zip_as_txt") if isinstance(fields, dict)
         else None)
+    # 入力・送信方式 (2.59) も欄の外の項目。attach_method と
+    # 同じく、先に取り出す。
+    send_method = sanitize_send_method(
+        fields.get("send_method") if isinstance(fields, dict)
+        else None)
     fields = sanitize_fields(fields)
     return {
         "name": PROFILE_NAME,
@@ -456,6 +482,8 @@ def build_profile(fields) -> dict:
         "attach_method": attach_method,
         # ZIP 添付を .zip.txt に変えて渡すか (1.81)。
         "zip_as_txt": zip_as_txt,
+        # 入力・送信方式 (2.59)。script_runner の回答・送信が読む。
+        "send_method": send_method,
     }
 
 
@@ -973,6 +1001,11 @@ class AiProfilePage(QWidget):
         for key, label in ATTACH_METHOD_LABELS:
             self._attach_method_combo.addItem(label, key)
         form.addRow("添付方式", self._attach_method_combo)
+        # 入力・送信方式 (2.59)。添付方式と同じく選択で足す。
+        self._send_method_combo = QComboBox()
+        for key, label in SEND_METHOD_LABELS:
+            self._send_method_combo.addItem(label, key)
+        form.addRow("入力・送信方式", self._send_method_combo)
         layout.addLayout(form)
         # ZIP 添付を .zip.txt に変えて渡す (1.81、プロファイル
         # ごと。ユーザー → Copilot の向きは ZIP をそのまま
@@ -1143,6 +1176,9 @@ class AiProfilePage(QWidget):
         method = sanitize_attach_method(fields.get("attach_method"))
         index = self._attach_method_combo.findData(method)
         self._attach_method_combo.setCurrentIndex(max(index, 0))
+        send_method = sanitize_send_method(fields.get("send_method"))
+        index = self._send_method_combo.findData(send_method)
+        self._send_method_combo.setCurrentIndex(max(index, 0))
         self._zip_as_txt_box.setChecked(
             sanitize_zip_as_txt(fields.get("zip_as_txt")))
 
@@ -1151,6 +1187,8 @@ class AiProfilePage(QWidget):
             {key: self._edits[key].text() for key in FIELD_KEYS})
         result["attach_method"] = sanitize_attach_method(
             self._attach_method_combo.currentData())
+        result["send_method"] = sanitize_send_method(
+            self._send_method_combo.currentData())
         result["zip_as_txt"] = bool(self._zip_as_txt_box.isChecked())
         return result
 

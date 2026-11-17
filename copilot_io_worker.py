@@ -74,6 +74,8 @@ def _run(request):
                 kwargs["force"] = True
             if request.get("image_paste"):
                 kwargs["image_paste"] = True
+            if request.get("lenient"):
+                kwargs["lenient"] = True
             filled = bool(transport.fill_prompt(
                 request["text"], **kwargs))
             return {"ok": True, "filled": filled,
@@ -94,6 +96,12 @@ def _run(request):
             return {"ok": True, "candidates": transport.scan_buttons()}
         if op == "press_send":
             return {"ok": True, "pressed": bool(transport.press_send())}
+        if op == "press_match":
+            # 入力・送信方式2 (2.59): 入力欄の文が想定どおりなら押す。
+            return {"ok": True,
+                    "pressed": bool(transport.press_send_if_text(
+                        request["text"],
+                        float(request.get("timeout") or 10)))}
         if op == "latest_download":
             # 診断の目印 (1-43) とリセットの目印 (1-52)、再実行
             # の目印 (1.63)、候補の全件 (1-57) も同じ走査で取る。
@@ -142,6 +150,11 @@ def _run(request):
         if op == "wait":
             done, elapsed = transport.wait_until_idle(float(request["timeout"]))
             return {"ok": True, "done": bool(done), "elapsed": float(elapsed)}
+        if op == "wait_sendable":
+            done, elapsed = transport.wait_sendable(
+                float(request["timeout"]))
+            return {"ok": True, "done": bool(done),
+                    "elapsed": float(elapsed)}
         if op == "response":
             text = transport.new_response(
                 request.get("previous_length") or 0,

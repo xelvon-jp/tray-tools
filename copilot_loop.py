@@ -684,6 +684,38 @@ def _input_texts_equivalent(read_back, intended):
     return _norm(read_back) != "" and _norm(read_back) == _norm(intended)
 
 
+def _input_matches_for_send(read_back, intended):
+    """送信の段の確認 (2.59、方式2): 読み直した文が想定どおりか。
+
+    実質一致 (_input_texts_equivalent) なら可。末尾に添付の
+    失敗行 (「添付できませんでした：…」) が足された形も可と
+    する: 添付できなかったときに copilot 側が足す行で、想定の
+    文そのものは入っているため。それ以外の文が混ざっていたら
+    不可。"""
+    if _input_texts_equivalent(read_back, intended):
+        return True
+
+    def _lines(value):
+        lines = str(value or "").replace("\r\n", "\n") \
+            .replace("\r", "\n").split("\n")
+        lines = [line.rstrip() for line in lines]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    read_lines = _lines(read_back)
+    intended_lines = _lines(intended)
+    if not intended_lines or len(read_lines) <= len(intended_lines):
+        return False
+    if read_lines[:len(intended_lines)] != intended_lines:
+        return False
+    extra = read_lines[len(intended_lines):]
+    return all(line.startswith("添付できませんでした")
+               for line in extra if line)
+
+
 # DL カードの名前が1行に潰れているとき、コメントの後ろにコードが
 # 同じ行で続く。その始まりとみなす目印 (前後に空白のある形)。
 _DOWNLOAD_CODE_STARTERS = (" import ", " from ", " def ", " class ")
@@ -1924,13 +1956,63 @@ class Copilot:
             time.sleep(poll)
         return False, time.time() - start
 
+    def wait_until_sendable(self, timeout=300, poll=0.5,
+                            settle_seconds=3.0):
+        """生成中なら終わるまで待つ (2.58)。(送れるか, 経過秒) を返す。
+
+        送信ボタンは生成中「生成を停止する」に化ける。あの状態で
+        入力欄へ書いたり送信ボタンを押したりすると、生成を止め
+        たり書き込みが弾かれたりする (2026-11-17、環境A の実地で
+        回答の書き込みが弾かれて失敗した)。送信の前にここで
+        保留する。
+
+        規則:
+          - 最初の確認で生成中でなければ、待たずに送れる
+          - 生成中を見たら、終わるまで poll 間隔で見続ける
+          - 生成が終わったら settle_seconds だけ置いてから送れる
+            とする (持ち主の指定: 送信に戻っても即時は送らない)。
+            置いている間にまた生成中へ戻ったら、待ちに戻る
+          - timeout を超えたら送れないで返す
+          - 状態が取れない (窓が無い等) ときは「生成中ではない」
+            とみなして送れるで返す。本当の失敗は、続く書き込み・
+            押下の段で理由つきで出る
+        """
+        start = time.time()
+        saw_busy = False
+        while True:
+            try:
+                current = self.state()
+            except Exception:  # noqa: BLE001  判定できないときは進む
+                return True, time.time() - start
+            if current == "busy":
+                saw_busy = True
+            elif not saw_busy:
+                return True, time.time() - start
+            else:
+                time.sleep(settle_seconds)
+                try:
+                    current = self.state()
+                except Exception:  # noqa: BLE001
+                    return True, time.time() - start
+                if current != "busy":
+                    return True, time.time() - start
+                saw_busy = True
+            if time.time() - start >= timeout:
+                return False, time.time() - start
+            time.sleep(poll)
+
     # -- 書く --------------------------------------------------------------
-    def set_input(self, text, force=False):
+    def set_input(self, text, force=False, verify=True):
         """入力欄に文字を入れる。送信はしない。
 
         失敗は段つき(InputStageError)で上げる: 見つからない /
         書き込む仕組みが無い / 書き込み自体の失敗。呼び側が理由を
         一文に畳まなくて済むように。
+
+        verify=False (2.59、入力・送信方式2) のときは、書き込みの
+        成否を読み直しの一致で判定しない。寛容に書いて戻り、成否は
+        送信の段の確認 (press_send_if_text) が判定する。入力欄が
+        無い・書き込む仕組みが無いときは従来どおり段つきで上げる。
 
         【書き込みは2段構え (2.03)】
         まず ValuePattern.SetValue で書く (Edge の Muse では
@@ -1970,6 +2052,11 @@ class Copilot:
             # 空にしてから通常の書き込みをすれば、打鍵まで
             # 行かずに済むことが多い。
             self._clear_input_physically(box)
+        if not verify:
+            # 方式2 (2.59): 寛容に書いて戻る。成否は送信の段の
+            # 確認が判定する。
+            self._write_input_lenient(pattern, text)
+            return
         if self._write_input_round(pattern, text):
             return
         last = self._read_input_quietly()
@@ -2050,6 +2137,37 @@ class Copilot:
             self._paste_input_text(text)
             return self._input_reflects(
                 text, timeout=INPUT_VERIFY_MAX_SECONDS)
+        finally:
+            if saved_text is not None:
+                try:
+                    _clipboard_write_text(saved_text)
+                except Exception:  # noqa: BLE001  復元は静かに試す
+                    pass
+
+    def _write_input_lenient(self, pattern, text):
+        """寛容な書き込み (2.59、方式2用): 値の設定→短く確認、
+        ダメなら貼り付け→短く確認。一致しなくても例外にしない。
+
+        職場の Copilot では、文が入っているのに読み直しが一致
+        しないことがある。方式2 では成否を送信の段の確認
+        (press_send_if_text) が判定するので、ここでは最善を
+        尽くして戻る。"""
+        try:
+            pattern.QueryInterface(
+                UIA.IUIAutomationValuePattern).SetValue(text)
+        except Exception:  # noqa: BLE001  貼り付けの段へ進む
+            pass
+        else:
+            if self._input_reflects(
+                    text, timeout=INPUT_VERIFY_BASIC_SECONDS):
+                return
+        saved_text = _clipboard_read_text()
+        try:
+            self._paste_input_text(text)
+            self._input_reflects(
+                text, timeout=INPUT_VERIFY_BASIC_SECONDS)
+        except Exception:  # noqa: BLE001  成否は送信の段で判定
+            pass
         finally:
             if saved_text is not None:
                 try:
@@ -2395,6 +2513,26 @@ class Copilot:
             "unwritable",
             "送信ボタンを押しましたが、送信されませんでした"
             "（入力欄に文が残っています）")
+
+    def press_send_if_text(self, expected, timeout=10, poll=0.5):
+        """入力欄の文が想定どおりなら送信ボタンを押す (2.59、方式2)。
+
+        読み直しを timeout まで繰り返し、想定と合った時点で
+        press_send_button で押す。文の入りが遅い相手でも、入った
+        時点で進める。合わないまま timeout を超えたら、押さずに
+        InputStageError (段は "mismatch") で上げる。"""
+        start = time.time()
+        while True:
+            current = self._read_input_quietly()
+            if current is not None and _input_matches_for_send(
+                    current, expected):
+                break
+            if time.time() - start >= timeout:
+                raise InputStageError(
+                    "mismatch",
+                    "入力欄の文が想定と違うため送信しませんでした")
+            time.sleep(poll)
+        return self.press_send_button()
 
     def _input_is_empty(self, timeout=0.0):
         """入力欄が空か (送信できたかの確認用、2.06)。

@@ -23,12 +23,16 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.64"
+PHAL_VERSION = "2.66"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
 # 合わなくても送信する。
 SEND_FORCE_RATIO = 0.9
+
+# 受領応答は、実行がこの秒数を超えても続いているときだけ出す
+# (2.66)。速く終わる実行では受領を出さず、結果だけが行く。
+ACK_DELAY_SECONDS = 5.0
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -1623,6 +1627,8 @@ class ScriptRunnerWindow(QWidget):
         # 連鎖の印 (_ai_filling 等) とは混ぜない。
         self._ack_sending = False
         self._ack_pending_answer = None
+        # 受領応答を出す義務がある実行中の項目 (2.66、遅延送信)。
+        self._ack_due_item = None
         self._ack_signals = _AiSignals()
         self._ack_signals.done.connect(self._on_ack_done)
         # 開始プロンプトの送信 (1.77)。送信の最中の印、結果を
@@ -3590,6 +3596,7 @@ class ScriptRunnerWindow(QWidget):
 
     def _poll_inner(self):
         self.restart_button.setEnabled(self._running_item is None)
+        self._maybe_send_delayed_ack()
         # 追いかけモードの印と、到着した行の色付けの期限 (2.07)。
         self._refresh_chase_label()
         if self._highlight_name and \
@@ -4589,10 +4596,12 @@ class ScriptRunnerWindow(QWidget):
                 "回しました", "ok")
             return
         # 自動実行 (auto=True は _pump_auto_run からだけ) のときは、
-        # チェックを通過して実行が始まるこの直前に、受領応答を
-        # 先行して送る (1-51)。手動の実行では送らない。
+        # 受領応答の義務だけを控える (1-51、2.66 で遅延化)。実際に
+        # 出すのは、実行が ACK_DELAY_SECONDS を超えても続いている
+        # ときだけで、見回りの _maybe_send_delayed_ack が担う。
+        # 手動の実行では送らない。
         if auto and self._automation_flags()["auto_ack"]:
-            self._send_ack(item)
+            self._ack_due_item = item
         self._running_item = item
         self._running_rerun = rerun
         self._running_args = [str(a) for a in (run_args or [])]
@@ -5637,11 +5646,35 @@ class ScriptRunnerWindow(QWidget):
             self._diag(f"再開通知に失敗: {message}")
 
     # ---------------- AI へ受領応答 ----------------
-    def _send_ack(self, item: ScriptItem):
-        """自動実行の開始を、受領応答 (Ack) として先に送る (1-51)。
+    def _maybe_send_delayed_ack(self):
+        """受領応答の遅延送信 (2.66)。
 
-        結果の回答とは別に「受け取って実行を始める」という1行を、
-        実行が始まる直前に fill + 送信まで一気にやる (裏方仕事)。
+        実行の開始では出さず、ACK_DELAY_SECONDS を超えても実行が
+        続いているときだけ出す。終わっていれば出さない (結果が
+        そのまま届く)。他の送信が途中なら、空くまで見送って
+        次の見回りで出す。"""
+        item = self._ack_due_item
+        if item is None:
+            return
+        if self._running_item is not item:
+            self._ack_due_item = None
+            return
+        if time.monotonic() - self._run_started_at \
+                < ACK_DELAY_SECONDS:
+            return
+        if self._ack_sending or self._ai_filling \
+                or self._ai_sending or self._diag_sending \
+                or self._notice_sending or self._intro_sending:
+            return
+        self._ack_due_item = None
+        self._send_ack(item)
+
+    def _send_ack(self, item: ScriptItem):
+        """自動実行の開始を、受領応答 (Ack) として送る (1-51)。
+
+        結果の回答とは別に「受け取って実行を始める」という1行を
+        fill + 送信まで一気にやる (裏方仕事)。呼ぶのは遅延側
+        (_maybe_send_delayed_ack、2.66) だけになった。
         送る役は回答・診断と同じ ai_sender / ai_presser。項目の
         answered / sent には触らない (受領は回答ではない)。診断の
         自動応答の消費控えにも触らない。

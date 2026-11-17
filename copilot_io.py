@@ -568,6 +568,13 @@ class CopilotLoopTransport:
                 self._cp = None
 
 
+# PHAL 自身が入力欄に書いた文の控え (2.65、プロファイル名ごと)。
+# 送信の段で止まると PHAL の文が入力欄に残り、次の送信がそれを
+# 人の書きかけと誤認して止まる事故への手当て。残り文が控えと
+# 実質一致すれば自分のものとして扱い、送信が成功したら消す。
+_OWN_INPUT_TEXTS = {}
+
+
 class CopilotSession:
     """1回の往復(送る→待つ→取る)を束ねる。
 
@@ -590,6 +597,53 @@ class CopilotSession:
         if self._transport is None:
             self._transport = SubprocessTransport(profile=self._profile)
         return self._transport
+
+    # -- 自分が書いた文の控え (2.65) --------------------------------
+    def _own_key(self):
+        profile = self._profile
+        if profile is None and self._transport is not None:
+            profile = getattr(self._transport, "_profile", None)
+        if isinstance(profile, dict):
+            return str(profile.get("name") or "")
+        return str(profile or "")
+
+    def _remember_own_input(self, fallback_text):
+        """入力欄に書いた自分の文を控える (2.65)。
+
+        実際に欄へ入った文 (読み直し) を優先し、読めなければ
+        書いた文そのものを控える。"""
+        value = None
+        getter = getattr(self._tp(), "input_text", None)
+        if getter is not None:
+            try:
+                value = getter()
+            except Exception:  # noqa: BLE001  控えは最善努力
+                value = None
+        if not value or not str(value).strip():
+            value = fallback_text
+        if value and str(value).strip():
+            _OWN_INPUT_TEXTS[self._own_key()] = str(value)
+
+    def _forget_own_input(self):
+        """送信が成功したので、自分の文の控えを消す (2.65)。"""
+        _OWN_INPUT_TEXTS.pop(self._own_key(), None)
+
+    def _is_own_input(self, existing, text):
+        """入力欄の残り文が、PHAL 自身が書いたものか (2.65)。
+
+        控えと実質一致すれば自分のもの。控えが無い (再開後など)
+        ときも、今回書く文そのものと実質一致すれば、同じ文の
+        送り直しとして自分の残り文と扱う。人が書いた文や、
+        人が手を入れた文は一致しないので、従来どおり止まる。"""
+        if not existing or not str(existing).strip():
+            return False
+        import copilot_loop  # 重く Windows 寄りなので使うときだけ読む
+        own = _OWN_INPUT_TEXTS.get(self._own_key())
+        if own is not None and copilot_loop._input_texts_equivalent(
+                existing, own):
+            return True
+        return bool(text) and copilot_loop._input_texts_equivalent(
+            existing, text)
 
     def _call_prompt(self, method_name, text, force, attachments,
                      image_paste=False, lenient=False):
@@ -680,11 +734,14 @@ class CopilotSession:
                     return SendResult(
                         False, f"Copilot に送れませんでした（{e}）")
             if existing and existing.strip():
-                return SendResult(
-                    False,
-                    "Copilot の入力欄に書きかけの文があります。"
-                    "そのまま送ると上書きされて消えます",
-                    needs_confirm=True)
+                if self._is_own_input(existing, text):
+                    pass  # 自分の文の残り。上書きして進める (2.65)
+                else:
+                    return SendResult(
+                        False,
+                        "Copilot の入力欄に書きかけの文があります。"
+                        "そのまま送ると上書きされて消えます",
+                        needs_confirm=True)
         try:
             sent = self._call_prompt(
                 "send_prompt", text, force, attachments)
@@ -692,9 +749,13 @@ class CopilotSession:
             return SendResult(False, f"Copilot に送れませんでした（{e}）")
         done, failed = self._attach_outcome()
         if not sent:
+            # 送れなかった文は入力欄に残っていることが多い。
+            # 自分の文として控え、次の送信で誤認しない (2.65)。
+            self._remember_own_input(text)
             return SendResult(
                 False, "Copilot に送信できませんでした（送信ボタンが見つからない等）",
                 attach_done=done, attach_failed=failed)
+        self._forget_own_input()
         self._sent_text = text
         return SendResult(True, "Copilot に送信しました",
                           attach_done=done, attach_failed=failed)
@@ -727,11 +788,14 @@ class CopilotSession:
                     return SendResult(
                         False, f"入力欄に入れられませんでした（{e}）")
             if existing and existing.strip():
-                return SendResult(
-                    False,
-                    "入力欄に書きかけの文があります。"
-                    "テストでも上書きはしません",
-                    needs_confirm=True)
+                if self._is_own_input(existing, text):
+                    pass  # 自分の文の残り。上書きして進める (2.65)
+                else:
+                    return SendResult(
+                        False,
+                        "入力欄に書きかけの文があります。"
+                        "テストでも上書きはしません",
+                        needs_confirm=True)
         try:
             filler = getattr(self._tp(), "fill_prompt", None)
             if filler is None:
@@ -747,6 +811,7 @@ class CopilotSession:
         if not filled:
             return SendResult(False, "入力欄に入れられませんでした",
                               attach_done=done, attach_failed=failed)
+        self._remember_own_input(text)
         return SendResult(True, "入力欄に入れました（送信はしていません）",
                           attach_done=done, attach_failed=failed)
 
@@ -871,6 +936,7 @@ class CopilotSession:
                     False, str(e) or "送信ボタンを押せませんでした")
             if not pressed:
                 return SendResult(False, "送信ボタンを押せませんでした")
+            self._forget_own_input()
             if ratio is not None:
                 return SendResult(
                     True,
@@ -887,6 +953,7 @@ class CopilotSession:
             return SendResult(False, str(e) or "送信ボタンを押せませんでした")
         if not pressed:
             return SendResult(False, "送信ボタンを押せませんでした")
+        self._forget_own_input()
         return SendResult(True, "送信ボタンを押しました")
 
     # -- 送信ボタンの調査 ---------------------------------------------------

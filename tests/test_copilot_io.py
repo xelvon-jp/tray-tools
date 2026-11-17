@@ -174,6 +174,51 @@ def test_send_ignores_blank_input():
     assert result.ok and fake.sent == ["質問です"]
 
 
+class FillFakeTransport(FakeTransport):
+    """fill で入力欄に文が入り、press で空になる fake (2.65)。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.filled = []
+
+    def fill_prompt(self, text, **kwargs):
+        self._input_value = text
+        self.filled.append(text)
+        return True
+
+    def press_send(self):
+        self._input_value = ""
+        return True
+
+
+def test_fill_own_residue_is_not_a_draft():
+    """自分が入れた文が残っていても、次の投入は書きかけ扱いしない。
+
+    送信の段で止まった回答が入力欄に残り、次の送信がそれを
+    人の書きかけと誤認した実機の事故への直し (2.65)。"""
+    fake = FillFakeTransport()
+    assert copilot_io.fill_text("回答A", transport=fake).ok
+    second = copilot_io.fill_text("回答B", transport=fake)
+    assert second.ok and not second.needs_confirm
+    assert fake.filled == ["回答A", "回答B"]
+    # 人の文に変わっていたら、従来どおり止める
+    fake._input_value = "人が書いた文"
+    third = copilot_io.fill_text("回答C", transport=fake)
+    assert not third.ok and third.needs_confirm
+
+
+def test_press_send_clears_own_record():
+    """送信が成功したら控えを消す (2.65)。
+
+    消した後は、同じ文でも人の文として扱い、止める。"""
+    fake = FillFakeTransport()
+    assert copilot_io.fill_text("回答A", transport=fake).ok
+    assert copilot_io.press_send_button(transport=fake).ok
+    fake._input_value = "回答A"  # 人が同じ文を書いたつもり
+    result = copilot_io.fill_text("回答B", transport=fake)
+    assert not result.ok and result.needs_confirm
+
+
 def test_loop_transport_input_unreadable_fails_closed():
     """入力欄が読めないときは、空と誤認して送らず失敗で止める。
 

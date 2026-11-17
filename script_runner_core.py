@@ -3262,6 +3262,23 @@ def build_status_qr_text(version, state_label, stage_label, step,
     return "\n".join(lines)
 
 
+def build_send_mismatch_qr_text(version, ai_name, item_name,
+                                message) -> str:
+    """送信診断QR の中身を組み立てる (2.60)。
+
+    方式2の照合失敗の診断を、スマホで運んで共有するための
+    短い文。版数・対象・項目名と、失敗の文面 (診断の詳細
+    つき) を入れる。QR 1枚の上限 (960バイト) に収まるよう、
+    900バイトを超えたら末尾を切る。"""
+    text = (f"[PHAL送信診断] Ver{version}\n"
+            f"対象: {ai_name or '不明'}／項目: {item_name or '不明'}\n"
+            f"{message}")
+    raw = text.encode("utf-8")
+    if len(raw) > 900:
+        text = raw[:900].decode("utf-8", errors="ignore")
+    return text
+
+
 def build_phal_status(version, state, command_id="", detail="",
                       stopped_reason="", step=0, item="", at=None) -> dict:
     """モニタ表示用の状態の辞書を作る。

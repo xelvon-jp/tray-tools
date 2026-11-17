@@ -716,6 +716,37 @@ def _input_matches_for_send(read_back, intended):
                for line in extra if line)
 
 
+def _send_mismatch_detail(read_back, intended) -> str:
+    """送信の段の照合が合わなかったときの診断文 (2.60)。
+
+    想定と実際の字数・行数と、最初の違いの行 (番号と両方の
+    内容を短く切ったもの) を1つにまとめる。行の切り分けは
+    照合 (_input_texts_equivalent) と同じ。QR で共有する
+    前提なので短く保つ (行の内容は各20字まで)。"""
+    def _lines(value):
+        lines = str(value or "").replace("\r\n", "\n") \
+            .replace("\r", "\n").split("\n")
+        lines = [line.rstrip() for line in lines]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    exp_lines = _lines(intended)
+    act_lines = _lines(read_back)
+    head = (f"想定{len(str(intended or ''))}字{len(exp_lines)}行"
+            f"／実際{len(str(read_back or ''))}字{len(act_lines)}行")
+    for i in range(max(len(exp_lines), len(act_lines))):
+        exp = exp_lines[i] if i < len(exp_lines) else None
+        act = act_lines[i] if i < len(act_lines) else None
+        if exp != act:
+            exp_s = "（なし）" if exp is None else f"『{exp[:20]}』"
+            act_s = "（なし）" if act is None else f"『{act[:20]}』"
+            return f"{head}／{i + 1}行目 想定{exp_s} 実際{act_s}"
+    return head + "／違いの行は特定できません"
+
+
 # DL カードの名前が1行に潰れているとき、コメントの後ろにコードが
 # 同じ行で続く。その始まりとみなす目印 (前後に空白のある形)。
 _DOWNLOAD_CODE_STARTERS = (" import ", " from ", " def ", " class ")
@@ -2522,15 +2553,19 @@ class Copilot:
         時点で進める。合わないまま timeout を超えたら、押さずに
         InputStageError (段は "mismatch") で上げる。"""
         start = time.time()
+        last = None
         while True:
             current = self._read_input_quietly()
+            if current is not None:
+                last = current
             if current is not None and _input_matches_for_send(
                     current, expected):
                 break
             if time.time() - start >= timeout:
                 raise InputStageError(
                     "mismatch",
-                    "入力欄の文が想定と違うため送信しませんでした")
+                    "入力欄の文が想定と違うため送信しませんでした（"
+                    + _send_mismatch_detail(last, expected) + "）")
             time.sleep(poll)
         return self.press_send_button()
 

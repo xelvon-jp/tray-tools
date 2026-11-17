@@ -3376,6 +3376,29 @@ def test_command_history_record_and_cap():
             Path(td) / "none.json") == []
 
 
+def test_send_mismatch_qr_text():
+    # 送信診断QR の中身 (2.60): 版数・対象・項目・診断の文面が
+    # 入り、QR 1枚 (960バイト) に収まる。
+    text = core.build_send_mismatch_qr_text(
+        "2.60", "Copilot", "1-351_test.phal",
+        "入力欄の文が想定と違うため送信しませんでした"
+        "（想定120字5行／実際118字5行／3行目 "
+        "想定『あ』 実際『い』）")
+    lines = text.split("\n")
+    assert lines[0] == "[PHAL送信診断] Ver2.60", lines
+    assert "対象: Copilot／項目: 1-351_test.phal" in text
+    assert "想定120字5行" in text
+    assert len(text.encode("utf-8")) <= 900
+    # 長すぎる文面は末尾を切って収める。
+    long_text = core.build_send_mismatch_qr_text(
+        "2.60", "Copilot", "x.phal", "あ" * 1000)
+    assert len(long_text.encode("utf-8")) <= 900
+    # QR の版数が上限 (25) を超えない。
+    import diagnostics
+    qr = diagnostics.make_qr(text)
+    assert qr.version <= 25, qr.version
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -3503,6 +3526,7 @@ if __name__ == "__main__":
         test_parse_file_request_specs,
         test_file_range_slicing,
         test_status_qr_text,
+        test_send_mismatch_qr_text,
     ]
     for test in tests:
         test()

@@ -3083,6 +3083,38 @@ def test_set_input_without_verify_does_not_raise_on_mismatch():
         copilot_loop._clipboard_write_text = saved_write
 
 
+def test_send_mismatch_detail_reports_first_difference():
+    """診断文 (2.60): 字数・行数と最初の違いの行を出す。"""
+    d = copilot_loop._send_mismatch_detail
+    detail = d("1行目\n違う行\n3行目", "1行目\n想定の行\n3行目")
+    assert "想定12字3行" in detail, detail
+    assert "実際11字3行" in detail, detail
+    assert "2行目" in detail, detail
+    assert "『想定の行』" in detail, detail
+    assert "『違う行』" in detail, detail
+    # 実際が短い (行が無い) 形
+    detail2 = d("1行目", "1行目\n2行目")
+    assert "実際『（なし）』" in detail2 or "実際（なし）" in detail2, detail2
+    assert "2行目" in detail2, detail2
+    # 長い行は20字で切る
+    detail3 = d("あ" * 30, "い" * 30)
+    assert "あ" * 20 in detail3 and "あ" * 21 not in detail3, detail3
+
+
+def test_press_send_if_text_mismatch_message_has_detail():
+    """合わないときの文面に診断 (字数・違いの行) が入る (2.60)。"""
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._read_input_quietly = lambda: "別の文です"
+    cp.press_send_button = lambda: True
+    try:
+        cp.press_send_if_text("想定の文です", timeout=0.2, poll=0.05)
+    except copilot_loop.InputStageError as e:
+        assert "想定6字" in str(e), e
+        assert "1行目" in str(e), e
+    else:
+        raise AssertionError("InputStageError になるはず")
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

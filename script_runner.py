@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.59"
+PHAL_VERSION = "2.60"
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
 # DL 完了から実行開始までのような段階の合間の一瞬に、
@@ -5497,6 +5497,10 @@ class ScriptRunnerWindow(QWidget):
                        ai=(item.ai or None) if item is not None
                        else None)
             self._set_note(str(message), "error")
+            if "入力欄の文が想定と違う" in str(message):
+                # 方式2の照合失敗 (2.60): 診断を QR で共有
+                # できる小窓を出す。
+                self._show_send_mismatch_qr(item, str(message))
         self._refresh_list()
         if getattr(result, "ok", False):
             self._publish_phal_idle("送信しました")
@@ -5507,6 +5511,57 @@ class ScriptRunnerWindow(QWidget):
         self._pump_register()
         # 保留中の開き直しがあれば、連鎖が済んだこの時点で実行する。
         self._fire_deferred_restart()
+
+    def _show_send_mismatch_qr(self, item, message):
+        """方式2の照合失敗を、QR で共有できる小窓で出す (2.60)。
+
+        共有文は窓にも併記する (スマホで読む前に中身を
+        確認できるように)。QR の生成は tray-tools の診断の
+        仕組み (diagnostics、segno) を使う。ここでの失敗は
+        送信失敗の表示そのものに影響させない。"""
+        try:
+            import diagnostics
+            from diagnostics_window import QrView
+
+            text = core.build_send_mismatch_qr_text(
+                PHAL_VERSION,
+                (item.ai or None) if item is not None else None,
+                item.name if item is not None else None,
+                message)
+            image = diagnostics.qr_to_qimage(
+                diagnostics.make_qr(text), scale=6)
+        except Exception:  # noqa: BLE001
+            return
+        old = getattr(self, "_send_mismatch_window", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001
+                pass
+        window = QDialog(self)
+        window.setWindowTitle("送信診断の共有")
+        layout = QVBoxLayout(window)
+        intro = QLabel(
+            "送信時の照合が合わなかった診断です。"
+            "スマホで QR を読んで、文をそのまま共有してください。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        view = QrView(window)
+        view.set_image(image)
+        view.setMinimumSize(320, 320)
+        layout.addWidget(view)
+        body = QLabel(text)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(body)
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(window.close)
+        layout.addWidget(close_button)
+        window.resize(420, 560)
+        self._send_mismatch_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     # ---------------- AI へ再開通知 ----------------
     def _try_startup_notice(self):

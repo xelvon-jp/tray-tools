@@ -258,7 +258,8 @@ class SubprocessTransport:
         return bool(response["sent"])
 
     def fill_prompt(self, text, attachments=None, force=False,
-                    image_paste=False, lenient=False):
+                    image_paste=False, lenient=False,
+                    direct_check=False):
         request = {"op": "fill", "text": text}
         if attachments:
             request["attachments"] = [str(p) for p in attachments]
@@ -268,6 +269,8 @@ class SubprocessTransport:
             request["image_paste"] = True
         if lenient:
             request["lenient"] = True
+        if direct_check:
+            request["direct_check"] = True
         response = self._call(request)
         self.attach_done = list(response.get("attach_done") or [])
         self.attach_failed = list(response.get("attach_failed") or [])
@@ -292,11 +295,13 @@ class SubprocessTransport:
         return bool(self._call({"op": "press_send"})["pressed"])
 
     def press_send_if_text(self, expected, timeout=10.0,
-                           force_threshold=None):
+                           force_threshold=None, early_force=False):
         request = {"op": "press_match", "text": expected,
                    "timeout": timeout}
         if force_threshold is not None:
             request["force_threshold"] = force_threshold
+        if early_force:
+            request["early_force"] = True
         response = self._call(
             request, timeout=timeout + WORKER_WAIT_MARGIN)
         return bool(response["pressed"]), \
@@ -478,20 +483,24 @@ class CopilotLoopTransport:
         return cp.send_prompt(text)
 
     def fill_prompt(self, text, attachments=None, force=False,
-                    image_paste=False, lenient=False):
+                    image_paste=False, lenient=False,
+                    direct_check=False):
         """入力欄に入れるだけ (送信ボタンは押さない)。
 
         force は、通常の書き込みが反映されないときの打鍵まで
         含む強制の段 (2.39、copilot_loop.set_input の force)。
         force でなければ従来どおりの引数で呼ぶ (force を知ら
         ない相手でも壊れないように)。lenient (2.59、方式2) は
-        書き込みの成否を読み直しの一致で判定しない。"""
+        書き込みの成否を読み直しの一致で判定しない。
+        direct_check (2.68、方式4) は寛容な書き込みの確認を
+        直接読みにする。"""
         text = self._attach_first(text, attachments, image_paste)
         cp = self._ensure()
         if force:
             cp.set_input(text, force=True, verify=not lenient)
         elif lenient:
-            cp.set_input(text, verify=False)
+            cp.set_input(text, verify=False,
+                         direct_check=direct_check)
         else:
             cp.set_input(text)
         return True
@@ -519,14 +528,17 @@ class CopilotLoopTransport:
         return self._ensure().press_send_button()
 
     def press_send_if_text(self, expected, timeout=10.0,
-                           force_threshold=None):
+                           force_threshold=None, early_force=False):
         """入力欄の文が想定どおりなら送信ボタンを押す (2.59)。
 
         失敗は press_send と同じく段つきの例外がそのまま上がる。
-        戻り値は (押せたか, 強制送信の一致率または None)。"""
+        戻り値は (押せたか, 強制送信の一致率または None)。
+        early_force (2.68、方式4) は、読み直しが安定して
+        一致率が下限以上なら timeout を待たずに押す。"""
         return self._ensure().press_send_if_text(
             expected, timeout=timeout,
-            force_threshold=force_threshold)
+            force_threshold=force_threshold,
+            early_force=early_force)
 
     def latest_download(self):
         return self._ensure().latest_download_candidate()
@@ -646,7 +658,8 @@ class CopilotSession:
             existing, text)
 
     def _call_prompt(self, method_name, text, force, attachments,
-                     image_paste=False, lenient=False):
+                     image_paste=False, lenient=False,
+                     direct_check=False):
         """transport の send_prompt / fill_prompt を呼ぶ (2.39)。
 
         force は 2.39 で足した引数。付けずに呼ぶのが従来の形
@@ -666,6 +679,8 @@ class CopilotSession:
             extra["image_paste"] = True
         if lenient:
             extra["lenient"] = True
+        if direct_check:
+            extra["direct_check"] = True
         if not extra:
             return fn(text, **kwargs)
         try:
@@ -762,7 +777,8 @@ class CopilotSession:
 
     # -- 入れるだけ -------------------------------------------------------
     def fill(self, text, force=False, attachments=None,
-             image_paste=False, lenient=False) -> SendResult:
+             image_paste=False, lenient=False,
+             direct_check=False) -> SendResult:
         """入力欄に text を入れるだけ。送信はしない。
 
         書きかけの扱いは send と同じ: force=False で入力欄に文が
@@ -803,7 +819,8 @@ class CopilotSession:
                     False, "この経路では入力欄に入れられません")
             filled = self._call_prompt(
                 "fill_prompt", text, force, attachments,
-                image_paste=image_paste, lenient=lenient)
+                image_paste=image_paste, lenient=lenient,
+                direct_check=direct_check)
         except Exception as e:  # noqa: BLE001
             return SendResult(
                 False, f"入力欄に入れられませんでした（{e}）")
@@ -900,7 +917,8 @@ class CopilotSession:
 
     # -- 送信ボタンを押す ---------------------------------------------------
     def press_send(self, expected=None, timeout=10.0,
-                   force_threshold=None) -> SendResult:
+                   force_threshold=None,
+                   early_force=False) -> SendResult:
         """プロファイルの目印 (send_*) の送信ボタンを押す。
 
         入力欄への投入 (fill) とは別の操作で、こちらは本当に送信する。
@@ -921,14 +939,24 @@ class CopilotSession:
                 if matcher is None:
                     return SendResult(
                         False, "この経路では文の確認つき送信ができません")
+                matcher_kwargs = {}
+                if force_threshold is not None:
+                    matcher_kwargs["force_threshold"] = \
+                        force_threshold
+                if early_force:
+                    matcher_kwargs["early_force"] = True
                 try:
-                    result = matcher(
-                        expected, timeout,
-                        force_threshold=force_threshold)
+                    result = matcher(expected, timeout,
+                                     **matcher_kwargs)
                 except TypeError:
-                    # force_threshold を知らない経路 (旧い裏方等)
-                    # では、方式2の形で呼ぶ。
-                    result = matcher(expected, timeout)
+                    # 新しい引数を知らない経路 (旧い裏方等) では、
+                    # 方式3→方式2の順に呼び方を落とす。
+                    try:
+                        result = matcher(
+                            expected, timeout,
+                            force_threshold=force_threshold)
+                    except TypeError:
+                        result = matcher(expected, timeout)
                 pressed, ratio = result \
                     if isinstance(result, tuple) else (result, None)
             except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
@@ -1262,7 +1290,7 @@ def send_text(text, transport=None, force=False, profile=None,
 
 def fill_text(text, transport=None, force=False, profile=None,
               attachments=None, image_paste=False,
-              lenient=False) -> SendResult:
+              lenient=False, direct_check=False) -> SendResult:
     """入力欄に入れるだけの近道 (送信はしない)。テスト入力用。
 
     force の意味は CopilotSession.fill と同じ (書きかけがあっても
@@ -1273,7 +1301,8 @@ def fill_text(text, transport=None, force=False, profile=None,
     session = CopilotSession(transport, profile=profile)
     try:
         return session.fill(text, force=force, attachments=attachments,
-                            image_paste=image_paste, lenient=lenient)
+                            image_paste=image_paste, lenient=lenient,
+                            direct_check=direct_check)
     finally:
         session.close()
 
@@ -1319,7 +1348,8 @@ def read_input_text(profile=None, transport=None) -> ReadResult:
 
 
 def press_send_button(profile=None, transport=None, expected=None,
-                      timeout=10.0, force_threshold=None) -> SendResult:
+                      timeout=10.0, force_threshold=None,
+                      early_force=False) -> SendResult:
     """プロファイルの目印 (send_*) の送信ボタンを押す近道。
 
     本当に送信する操作なので、呼ぶのは人の押下に応じるときだけ
@@ -1330,7 +1360,8 @@ def press_send_button(profile=None, transport=None, expected=None,
     session = CopilotSession(transport, profile=profile)
     try:
         return session.press_send(expected=expected, timeout=timeout,
-                                  force_threshold=force_threshold)
+                                  force_threshold=force_threshold,
+                                  early_force=early_force)
     finally:
         session.close()
 

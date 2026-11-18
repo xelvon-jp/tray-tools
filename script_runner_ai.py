@@ -193,16 +193,22 @@ def sanitize_attach_method(value) -> str:
 # 判定)。方式2 は、書き込みでは止めず、送信の段で入力欄の文が
 # 想定どおりかを確認してから送信ボタンを押す (職場の Copilot
 # で、文は入っているのに読み直しが一致せず止まる事故への対処)。
+# 方式4 (2.68) は方式3 の判定に加え、書き込みの確認を直接読み
+# にし、送信は読み直しが安定して大部分が合えば制限時間を
+# 待たずに押す (環境2 で回答→送信が遅い問題への対処)。
 SEND_METHOD_LABELS = (
     (1, "方式1（従来）"),
     (2, "方式2（送信時に文を確認）"),
     (3, "方式3（文を確認＋大部分が合えば送信）"),
+    (4, "方式4（大部分が合えば即送信・高速）"),
 )
 SEND_METHOD_KEYS = tuple(key for key, _label in SEND_METHOD_LABELS)
 
 
 def sanitize_send_method(value) -> int:
-    """入力・送信方式を整える。2・3 以外は 1 (従来) に倒す。"""
+    """入力・送信方式を整える。2・3・4 以外は 1 (従来) に倒す。"""
+    if value == 4 or value == "4":
+        return 4
     if value == 3 or value == "3":
         return 3
     if value == 2 or value == "2":

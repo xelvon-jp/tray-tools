@@ -2044,7 +2044,8 @@ class Copilot:
             time.sleep(poll)
 
     # -- 書く --------------------------------------------------------------
-    def set_input(self, text, force=False, verify=True):
+    def set_input(self, text, force=False, verify=True,
+                  direct_check=False):
         """入力欄に文字を入れる。送信はしない。
 
         失敗は段つき(InputStageError)で上げる: 見つからない /
@@ -2096,8 +2097,10 @@ class Copilot:
             self._clear_input_physically(box)
         if not verify:
             # 方式2 (2.59): 寛容に書いて戻る。成否は送信の段の
-            # 確認が判定する。
-            self._write_input_lenient(pattern, text)
+            # 確認が判定する。direct_check (2.68、方式4) は
+            # 寛容な書き込みの確認を直接読みにする。
+            self._write_input_lenient(pattern, text,
+                                      direct_check=direct_check)
             return
         if self._write_input_round(pattern, text):
             return
@@ -2186,28 +2189,46 @@ class Copilot:
                 except Exception:  # noqa: BLE001  復元は静かに試す
                     pass
 
-    def _write_input_lenient(self, pattern, text):
+    def _write_input_lenient(self, pattern, text,
+                             direct_check=False):
         """寛容な書き込み (2.59、方式2用): 値の設定→短く確認、
         ダメなら貼り付け→短く確認。一致しなくても例外にしない。
 
         職場の Copilot では、文が入っているのに読み直しが一致
         しないことがある。方式2 では成否を送信の段の確認
         (press_send_if_text) が判定するので、ここでは最善を
-        尽くして戻る。"""
+        尽くして戻る。
+
+        direct_check (2.68、方式4 のみ): 値の設定の後の確認を、
+        画面要素を全走査する _input_reflects ではなく、手元の
+        pattern から直接読む形にする (_pattern_current_value)。
+        直接読んで実質一致したら貼り付けへ進まない。直接
+        読めないときだけ全走査の確認へ倒す。貼り付けの後の
+        確認 (結果を使っていなかった) もしない。方式2・3 は
+        従来どおり (全走査の確認を両段でする)。"""
         try:
             pattern.QueryInterface(
                 UIA.IUIAutomationValuePattern).SetValue(text)
         except Exception:  # noqa: BLE001  貼り付けの段へ進む
             pass
         else:
-            if self._input_reflects(
+            if direct_check:
+                direct = self._pattern_current_value(pattern)
+                if direct is not None:
+                    if _input_texts_equivalent(direct, text):
+                        return
+                elif self._input_reflects(
+                        text, timeout=INPUT_VERIFY_BASIC_SECONDS):
+                    return
+            elif self._input_reflects(
                     text, timeout=INPUT_VERIFY_BASIC_SECONDS):
                 return
         saved_text = _clipboard_read_text()
         try:
             self._paste_input_text(text)
-            self._input_reflects(
-                text, timeout=INPUT_VERIFY_BASIC_SECONDS)
+            if not direct_check:
+                self._input_reflects(
+                    text, timeout=INPUT_VERIFY_BASIC_SECONDS)
         except Exception:  # noqa: BLE001  成否は送信の段で判定
             pass
         finally:
@@ -2216,6 +2237,18 @@ class Copilot:
                     _clipboard_write_text(saved_text)
                 except Exception:  # noqa: BLE001  復元は静かに試す
                     pass
+
+    def _pattern_current_value(self, pattern):
+        """手元の ValuePattern から今の値を直接読む (2.67)。
+
+        画面要素の全走査 (_descendants) を経ないので速い。
+        読めなければ None (呼び側が全走査の確認へ倒す)。"""
+        try:
+            value = pattern.QueryInterface(
+                UIA.IUIAutomationValuePattern).CurrentValue
+        except Exception:  # noqa: BLE001  読めないときは None
+            return None
+        return value if isinstance(value, str) else None
 
     def _read_input_quietly(self):
         """入力欄の今の文を1回だけ読む。読めなければ None。
@@ -2557,7 +2590,7 @@ class Copilot:
             "（入力欄に文が残っています）")
 
     def press_send_if_text(self, expected, timeout=10, poll=0.5,
-                           force_threshold=None):
+                           force_threshold=None, early_force=False):
         """入力欄の文が想定どおりなら送信ボタンを押す (2.59、方式2)。
 
         読み直しを timeout まで繰り返し、想定と合った時点で
@@ -2566,9 +2599,18 @@ class Copilot:
         InputStageError (段は "mismatch") で上げる。
         force_threshold (2.61、方式3) を渡すと、合わなかった
         ときに一致率がその値以上なら押す。戻り値は
-        (押せたか, 強制送信の一致率または None) の組。"""
+        (押せたか, 強制送信の一致率または None) の組。
+
+        早期の強制判定 (2.68、方式4 のみ): early_force を渡すと、
+        読み直した文が2回続けて同じ (入力が落ち着いた) で、
+        一致率が下限以上なら、timeout を待たずにその時点で
+        押す。方式3 (early_force なし) は従来どおり、下限の
+        判定は timeout 切れのときだけ。なお一致率の計算
+        (_send_match_ratio) には、想定の先頭行が実際に無い文は
+        0 になる歯止めが入っている。"""
         start = time.time()
         last = None
+        previous = None
         while True:
             current = self._read_input_quietly()
             if current is not None:
@@ -2576,6 +2618,13 @@ class Copilot:
             if current is not None and _input_matches_for_send(
                     current, expected):
                 break
+            if early_force and force_threshold is not None \
+                    and current is not None \
+                    and previous is not None and current == previous:
+                ratio = _send_match_ratio(current, expected)
+                if ratio >= force_threshold:
+                    return self.press_send_button(), ratio
+            previous = current
             if time.time() - start >= timeout:
                 if force_threshold is not None:
                     ratio = _send_match_ratio(last, expected)

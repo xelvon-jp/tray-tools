@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.66"
+PHAL_VERSION = "2.68"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -918,7 +918,8 @@ class _AiAnswerResult:
 
 
 def _default_ai_sender(text, profile, attachments=None,
-                       image_paste=False, lenient=False):
+                       image_paste=False, lenient=False,
+                       direct_check=False):
     """AI の入力欄へ入れるだけの送信役 (送信はしない)。
 
     copilot_io.fill_text を使う (EDDy のテスト入力と同じ経路)。
@@ -936,10 +937,12 @@ def _default_ai_sender(text, profile, attachments=None,
     return copilot_io.fill_text(text, profile=profile,
                                 attachments=attachments,
                                 image_paste=image_paste,
-                                lenient=lenient)
+                                lenient=lenient,
+                                direct_check=direct_check)
 
 
-def _default_ai_presser(profile, expected=None, force_threshold=None):
+def _default_ai_presser(profile, expected=None, force_threshold=None,
+                        early_force=False):
     """AI の送信ボタンを押す役。本当に送信する。
 
     expected (2.59、入力・送信方式2) を渡したときは、入力欄の
@@ -960,7 +963,8 @@ def _default_ai_presser(profile, expected=None, force_threshold=None):
     if expected:
         return copilot_io.press_send_button(
             profile=profile, expected=expected,
-            force_threshold=force_threshold)
+            force_threshold=force_threshold,
+            early_force=early_force)
     read = copilot_io.read_input_text(profile=profile)
     if not read.ok:
         return read
@@ -1804,19 +1808,21 @@ class ScriptRunnerWindow(QWidget):
     # ---------------- 画面 ----------------
     @staticmethod
     def _emergency_button_style(stopped):
-        """非常停止ボタンのスタイル (1.64)。
+        """非常停止ボタンのスタイル (1.64、2.67 で縮小)。
 
-        常時赤系で大きく目立たせる。非常停止中はさらに明るい
+        常時赤系で目立たせる。非常停止中はさらに明るい
         赤＋明るい枠にして、文言も「非常停止中（解除）」に
-        変わる (_toggle_emergency_stop が付け替える)。"""
+        変わる (_toggle_emergency_stop が付け替える)。
+        2.67 からは、使う機会が少ないので他のボタンと同じ
+        高さに縮めた (赤＋太字はそのまま)。"""
         if stopped:
             return ("background-color: #e03131; color: white;"
-                    " font-size: 14px; font-weight: bold;"
-                    " border: 2px solid #ff8787; border-radius: 8px;"
-                    " padding: 6px 18px;")
+                    " font-size: 12px; font-weight: bold;"
+                    " border: 2px solid #ff8787; border-radius: 6px;"
+                    " padding: 3px 10px;")
         return ("background-color: #c0272d; color: white;"
-                " font-size: 14px; font-weight: bold;"
-                " border-radius: 8px; padding: 6px 18px;")
+                " font-size: 12px; font-weight: bold;"
+                " border-radius: 6px; padding: 3px 10px;")
 
     @staticmethod
     def _big_panel_style(emergency):
@@ -1880,41 +1886,94 @@ class ScriptRunnerWindow(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # タイトル行 (1.64)。タイトルを左に、非常停止ボタンを
-        # 同じ行の右端に置く。非常停止は自動化全体を止める
-        # 非常用のボタンなので、いつでも目に入りすぐ押せる
-        # よう、大きく赤くしてここへ移した (1.63 までは下部の
-        # ボタン行にあった)。タイトルの横方向は Preferred
-        # (既定) にする。Ignored にすると stretch とボタンに
-        # 挟まれたこの行では幅0に潰れて文字が消える (1.64 の
-        # 実機で発生し、1.65 で修正)。文言は固定の短い文字列
-        # なので、窓の最小幅を押し広げる問題は起きない。
+        # 最上段の1行 (2.67 で集約)。タイトルを左に、ボタンと
+        # 表示のチェックは全部この行の右側へ右揃えで並べる。
+        # 以前はタイトル行 (小窓・非常停止) と、進捗パネルの
+        # 下のボタン行 (設定・状態QR・おどうぐばこ・開き直す・
+        # 版・前面に固定) と、一覧の上の絞り込み行 (ダーク) に
+        # 分かれていた。非常停止は使う機会が少ないので、他の
+        # ボタンと同じ高さに縮めた (1.64〜2.66 は高さ44の大きな
+        # ボタン)。赤い見た目と、停止中に進捗パネルの枠が赤く
+        # なる表示はそのまま。タイトルは短く "PHAL" だけにする
+        # (正式名と版は窓のタイトルバーに出ている。全文は
+        # ツールチップ)。タイトルの横方向は Preferred (既定)。
+        # Ignored にすると stretch とボタンに挟まれたこの行で
+        # は幅0に潰れて文字が消える (1.64 の実機で発生し、
+        # 1.65 で修正)。
         title_row = QHBoxLayout()
-        title = QLabel("PHAL：PHAL Helps Agent Loop")
+        title = QLabel("PHAL")
         title.setFont(QFont(title.font().family(), 11, QFont.Weight.Bold))
+        title.setToolTip("PHAL：PHAL Helps Agent Loop")
         title.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         title_row.addWidget(title)
         title_row.addStretch(1)
-        # 小窓モードの切替 (2.27)。上部 (タイトル行と状態
-        # パネル) だけを残して下部を隠す。状態は設定に覚える。
+        # 小窓モードの切替 (2.27)。上部 (この行と状態パネル)
+        # だけを残して下部を隠す。状態は設定に覚える。
         self.mini_button = QPushButton("小窓")
         self.mini_button.setCheckable(True)
         self.mini_button.setToolTip(
             "小窓モード (上部の状態パネルだけを表示) の切り替え")
         self.mini_button.clicked.connect(self._toggle_mini_mode)
         title_row.addWidget(self.mini_button)
+        self.ai_window_button = QPushButton("設定")
+        self.ai_window_button.clicked.connect(self._open_ai_window)
+        title_row.addWidget(self.ai_window_button)
+        # 状態QR (2.09)。外から見えない場所でも、PHAL の状態
+        # だけはスマホで運べるようにする。
+        self.qr_button = QPushButton("状態QR")
+        self.qr_button.setToolTip(
+            "PHAL の状態だけを QR コードで表示します"
+            "（スマホで読んでチャットへ貼る用）")
+        self.qr_button.clicked.connect(self._show_status_qr)
+        title_row.addWidget(self.qr_button)
+        # おどうぐばこの GUI を開くボタン (2.37)。本体は独立
+        # モジュールで、窓は PHAL 側で保持する (閉じても作り
+        # 直さない)。
+        self.odougubako_button = QPushButton("おどうぐばこ")
+        self.odougubako_button.setToolTip(
+            "おどうぐばこ（AI の道具箱）の一覧ウィンドウを開きます")
+        self.odougubako_button.clicked.connect(self._open_odougubako)
+        title_row.addWidget(self.odougubako_button)
+        self._odougubako_window = None
+        self.restart_button = QPushButton("開き直す")
+        self.restart_button.setToolTip("PHAL を新しいコードで開き直します")
+        self.restart_button.clicked.connect(self.restart)
+        title_row.addWidget(self.restart_button)
         self.emergency_button = QPushButton("非常停止")
         self.emergency_button.setToolTip(
             "自動化（DL・実行・回答・送信）をすべて止めます。"
             "もう一度押すと解除します")
-        self.emergency_button.setMinimumHeight(44)
         self.emergency_button.setStyleSheet(
             self._emergency_button_style(False))
         self.emergency_button.clicked.connect(
             self._toggle_emergency_stop)
         title_row.addWidget(self.emergency_button)
+        version = QLabel(self._version_label())
+        version.setStyleSheet(
+            f"color: {self._theme()['muted']}; font-size: 11px;")
+        title_row.addWidget(version)
+        self.version_label = version
+        self.on_top_box = QCheckBox("前面に固定")
+        self.on_top_box.setChecked(bool(self.config.get("always_on_top")))
+        self.on_top_box.toggled.connect(
+            lambda on: self._apply_on_top(on, save=True))
+        title_row.addWidget(self.on_top_box)
+        # ダークの切替も表示のチェックとしてこの行の右端へ
+        # (2.67。以前は一覧の上の絞り込み行の右端にあった)。
+        self.dark_box = QCheckBox("ダーク")
+        self.dark_box.setToolTip("PHAL の窓を暗い配色にします")
+        self.dark_box.setChecked(self._dark_mode)
+        self.dark_box.toggled.connect(self._apply_dark_mode)
+        title_row.addWidget(self.dark_box)
         layout.addLayout(title_row)
+
+        # 進捗パネルのラベル (2.67)。「直前の結果」「動作ログ」
+        # と同じ小さな見出しを、各段の頭にそろえる。
+        self.progress_caption = QLabel("進捗")
+        self.progress_caption.setStyleSheet(
+            f"color: {self._theme()['muted']}; font-size: 11px;")
+        layout.addWidget(self.progress_caption)
 
         # 大きな進捗表示 (1.64、2.15 で階形式)。タイトルの直下に
         # 横幅いっぱいのパネルとして置く。中身は AI ごとの「階」
@@ -1972,47 +2031,11 @@ class ScriptRunnerWindow(QWidget):
         self._big_panel_emergency = False
         self._refresh_status_strip()
 
-        header = QHBoxLayout()
-        # 連携先の表示と切替は、大きな進捗表示の階へ移した
-        # (2.15)。ここは窓全体のボタンの行で、階の作り直しは
-        # _refresh_ai_label が受け持つ。
+        # 連携先の表示と切替は、大きな進捗表示の階が担う
+        # (2.15)。階の作り直しは _refresh_ai_label が受け持つ。
+        # 窓全体のボタン行は 2.67 で最上段の1行へ集約した
+        # (この下にあった行は廃止)。
         self._refresh_ai_label()
-        header.addStretch(1)
-        self.ai_window_button = QPushButton("設定")
-        self.ai_window_button.clicked.connect(self._open_ai_window)
-        header.addWidget(self.ai_window_button)
-        # 状態QR (2.09)。外から見えない場所でも、PHAL の状態
-        # だけはスマホで運べるようにする。
-        self.qr_button = QPushButton("状態QR")
-        self.qr_button.setToolTip(
-            "PHAL の状態だけを QR コードで表示します"
-            "（スマホで読んでチャットへ貼る用）")
-        self.qr_button.clicked.connect(self._show_status_qr)
-        header.addWidget(self.qr_button)
-        # おどうぐばこの GUI を開くボタン (2.37)。本体は独立
-        # モジュールで、窓は PHAL 側で保持する (閉じても作り
-        # 直さない)。
-        self.odougubako_button = QPushButton("おどうぐばこ")
-        self.odougubako_button.setToolTip(
-            "おどうぐばこ（AI の道具箱）の一覧ウィンドウを開きます")
-        self.odougubako_button.clicked.connect(self._open_odougubako)
-        header.addWidget(self.odougubako_button)
-        self._odougubako_window = None
-        self.restart_button = QPushButton("開き直す")
-        self.restart_button.setToolTip("PHAL を新しいコードで開き直します")
-        self.restart_button.clicked.connect(self.restart)
-        header.addWidget(self.restart_button)
-        version = QLabel(self._version_label())
-        version.setStyleSheet(
-            f"color: {self._theme()['muted']}; font-size: 11px;")
-        header.addWidget(version)
-        self.version_label = version
-        self.on_top_box = QCheckBox("前面に固定")
-        self.on_top_box.setChecked(bool(self.config.get("always_on_top")))
-        self.on_top_box.toggled.connect(
-            lambda on: self._apply_on_top(on, save=True))
-        header.addWidget(self.on_top_box)
-        layout.addLayout(header)
 
         # 検知の帯 (2.07)。ダウンロード候補を見つけたら、色付きで
         # しばらく知らせる。消えるのはタイマ (出す側が秒数を決める)。
@@ -2048,24 +2071,16 @@ class ScriptRunnerWindow(QWidget):
         layout.addWidget(caption)
         self.folder_caption = caption
 
-        # 絞り込み。隠すのは見た目だけで、裏のチェックや実行の
-        # 追跡は全ファイルのまま(_visible_items が表の行との対応)。
-        filter_row = QHBoxLayout()
-        self.hide_no_id_box = QCheckBox("ID が無いファイルを表示しない")
-        self.hide_no_id_box.setChecked(bool(self.config.get("hide_no_id")))
-        self.hide_no_id_box.toggled.connect(self._apply_hide_no_id)
-        filter_row.addWidget(self.hide_no_id_box)
-        filter_row.addStretch(1)
-        # ダークの切替は見出し行ではなくここに置く。見出し行は
-        # 中身の幅が窓の最小幅を決めてしまう (設計幅 340 を超える
-        # と窓が縮まなくなる) ため、設定の並びであるこの行の
-        # 右端に置く (1-44)。
-        self.dark_box = QCheckBox("ダーク")
-        self.dark_box.setToolTip("PHAL の窓を暗い配色にします")
-        self.dark_box.setChecked(self._dark_mode)
-        self.dark_box.toggled.connect(self._apply_dark_mode)
-        filter_row.addWidget(self.dark_box)
-        layout.addLayout(filter_row)
+        # 一覧のラベル (2.67)。「進捗」「直前の結果」「動作
+        # ログ」と同じ小さな見出し。以前ここにあった絞り込み行
+        # は廃止した: 「ID が無いファイルを表示しない」は表の
+        # 下の「記録をコピー」の右へ、「ダーク」は最上段の
+        # 1行の右端へ移した (どちらも部品は _build_ui の
+        # それぞれの場所で作る)。
+        self.list_caption = QLabel("一覧")
+        self.list_caption.setStyleSheet(
+            f"color: {self._theme()['muted']}; font-size: 11px;")
+        layout.addWidget(self.list_caption)
 
         # 一覧は1スクリプト1行の表(時刻/ID/ファイル名/ハッシュ/
         # 概要/状態/実行)。
@@ -2129,8 +2144,15 @@ class ScriptRunnerWindow(QWidget):
             "直近の実行履歴を Markdown にしてクリップボードへ入れます")
         self.record_button.clicked.connect(self._copy_loop_record)
         intro_row.addWidget(self.record_button)
-        # 非常停止ボタンは 1.64 でタイトル行の右端へ移した
-        # (_build_ui の先頭)。ここには置かない。
+        # 「ID が無いファイルを表示しない」は「記録をコピー」
+        # の右へ (2.67、持ち主の指定)。以前は表の上の絞り込み
+        # 行にあった。隠すのは見た目だけで、裏のチェックや
+        # 実行の追跡は全ファイルのまま (_visible_items が表の
+        # 行との対応)。
+        self.hide_no_id_box = QCheckBox("ID が無いファイルを表示しない")
+        self.hide_no_id_box.setChecked(bool(self.config.get("hide_no_id")))
+        self.hide_no_id_box.toggled.connect(self._apply_hide_no_id)
+        intro_row.addWidget(self.hide_no_id_box)
         intro_row.addStretch(1)
         layout.addLayout(intro_row)
 
@@ -2431,6 +2453,10 @@ class ScriptRunnerWindow(QWidget):
         # 当て直す (2.15)。
         self._refresh_ai_label()
         self.result_caption.setStyleSheet(muted_style)
+        # 段の見出し (2.67 でそろえた分) も同じ色へ追随させる。
+        self.progress_caption.setStyleSheet(muted_style)
+        self.list_caption.setStyleSheet(muted_style)
+        self.log_caption.setStyleSheet(muted_style)
         self.folder_caption.setText(self._caption_html())
         self.note.setStyleSheet(
             theme["note_styles"].get(self._note_kind, ""))
@@ -3994,6 +4020,21 @@ class ScriptRunnerWindow(QWidget):
                 else float(entry[1].get("at") or 0)),
             reverse=True)
         self._row_entry_list = entries
+        # 新しいアイテムが増えたら最上段へスクロールする
+        # (2.67、持ち主の指定)。前回の描画で見えていたキーの
+        # 集合と比べ、初めて出るキーがあれば「追加」とみなす。
+        # 既存アイテムの状態変化だけの描き直しでは動かさない。
+        # 選択は変えない (表示位置だけ動かす)。DL の特別行も
+        # 対象に含める。
+        current_keys = {("holder", holder.key) for holder in holders}
+        for kind, entry in entries:
+            current_keys.add(
+                (kind, entry.key if kind == "file"
+                 else str(entry.get("key") or "")))
+        seen_keys = getattr(self, "_list_seen_keys", None)
+        new_arrival = seen_keys is not None and bool(
+            current_keys - seen_keys)
+        self._list_seen_keys = current_keys
         with QSignalBlocker(self.table):
             self.table.setRowCount(len(entries) + offset)
             for holder_row, holder in enumerate(holders):
@@ -4031,6 +4072,10 @@ class ScriptRunnerWindow(QWidget):
             else:
                 # 出せる行が無い。隠れた項目が選択に残らないようにする。
                 self._selected_key = None
+        if new_arrival:
+            # 選択セルの確定 (setCurrentCell) より後で戻す。
+            # 先に戻すと、選択行へ寄せる動きに負ける。
+            self.table.scrollToTop()
         self._fit_name_column()
 
     def _fit_name_column(self):
@@ -5124,7 +5169,9 @@ class ScriptRunnerWindow(QWidget):
         item.answered_text = text
         self._refresh_send_ready()
         sender = self.ai_sender or _default_ai_sender
-        send_lenient = profile.get("send_method") in (2, 3)
+        send_lenient = profile.get("send_method") in (2, 3, 4)
+        # 方式4 (2.68) は、寛容な書き込みの確認を直接読みにする。
+        send_direct = profile.get("send_method") == 4
         self._ai_filling = True
         self._ai_answer_item = item
         self._refresh_list()
@@ -5144,15 +5191,25 @@ class ScriptRunnerWindow(QWidget):
                 if send_lenient:
                     # 方式2 (2.59): 書き込みでは止めない。
                     # lenient を知らない差し替え口では従来の
-                    # 呼び方に倒す。
+                    # 呼び方に倒す。direct_check (2.68、方式4) も
+                    # 同じ作法で、知らない口では lenient だけに倒す。
                     try:
-                        result = sender(text, profile, attach_paths,
-                                        lenient=True)
-                    except TypeError:
-                        if attach_paths:
-                            result = sender(text, profile, attach_paths)
+                        if send_direct:
+                            result = sender(
+                                text, profile, attach_paths,
+                                lenient=True, direct_check=True)
                         else:
-                            result = sender(text, profile)
+                            result = sender(text, profile, attach_paths,
+                                            lenient=True)
+                    except TypeError:
+                        try:
+                            result = sender(text, profile, attach_paths,
+                                            lenient=True)
+                        except TypeError:
+                            if attach_paths:
+                                result = sender(text, profile, attach_paths)
+                            else:
+                                result = sender(text, profile)
                 elif attach_paths:
                     result = sender(text, profile, attach_paths)
                 else:
@@ -5454,10 +5511,15 @@ class ScriptRunnerWindow(QWidget):
         # ときは従来の押下に倒す。
         expected = None
         force_threshold = None
-        if profile.get("send_method") in (2, 3):
+        early_force = False
+        if profile.get("send_method") in (2, 3, 4):
             expected = getattr(item, "answered_text", "") or None
-            if expected and profile.get("send_method") == 3:
+            if expected and profile.get("send_method") in (3, 4):
                 force_threshold = SEND_FORCE_RATIO
+            if expected and profile.get("send_method") == 4:
+                # 方式4 (2.68): 読み直しが安定して大部分が
+                # 合えば、制限時間を待たずに押す。
+                early_force = True
         self._ai_sending = True
         self._ai_send_item = item
         self._refresh_list()
@@ -5474,15 +5536,20 @@ class ScriptRunnerWindow(QWidget):
                 if expected:
                     try:
                         result = presser(
-                            profile, expected, force_threshold)
+                            profile, expected, force_threshold,
+                            early_force=early_force)
                     except TypeError:
                         try:
-                            result = presser(profile, expected)
+                            result = presser(
+                                profile, expected, force_threshold)
                         except TypeError:
-                            # 文の引数を知らない差し替え口
-                            # (テストの fake 等) では従来の
-                            # 呼び方に倒す。
-                            result = presser(profile)
+                            try:
+                                result = presser(profile, expected)
+                            except TypeError:
+                                # 文の引数を知らない差し替え口
+                                # (テストの fake 等) では従来の
+                                # 呼び方に倒す。
+                                result = presser(profile)
                 else:
                     result = presser(profile)
             except Exception as e:  # noqa: BLE001

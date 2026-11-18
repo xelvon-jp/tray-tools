@@ -3184,6 +3184,75 @@ def test_press_send_if_text_forces_when_mostly_matches():
         raise AssertionError("InputStageError になるはず")
 
 
+def test_press_send_if_text_forces_early_when_stable():
+    """方式4 の早期強制 (2.68): 読み直しが安定して一致率が
+    下限以上なら、timeout を待たずに押す。"""
+    import time as _time
+
+    ten = "\n".join(f"{i}行目" for i in range(10))
+    nine = "\n".join(
+        f"{i}行目" if i != 5 else "違う行" for i in range(10))
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp._read_input_quietly = lambda: nine
+    pressed = []
+    cp.press_send_button = lambda: pressed.append(1) or True
+    start = _time.time()
+    ok, ratio = cp.press_send_if_text(
+        ten, timeout=30, poll=0.01, force_threshold=0.9,
+        early_force=True)
+    elapsed = _time.time() - start
+    assert ok and pressed == [1]
+    assert ratio is not None and abs(ratio - 0.9) < 1e-9
+    assert elapsed < 5, elapsed
+    # early_force が無ければ (方式3)、安定していても timeout
+    # までは押さない (2.66 までの挙動)。
+    cp3 = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    cp3._read_input_quietly = lambda: nine
+    pressed3 = []
+    cp3.press_send_button = lambda: pressed3.append(1) or True
+    start = _time.time()
+    ok3, ratio3 = cp3.press_send_if_text(
+        ten, timeout=0.3, poll=0.01, force_threshold=0.9)
+    elapsed3 = _time.time() - start
+    assert ok3 and pressed3 == [1] and ratio3 is not None
+    assert elapsed3 >= 0.3, elapsed3
+
+
+def test_write_input_lenient_skips_paste_when_direct_matches():
+    """寛容な書き込み (2.68、方式4): 値の設定が直接読みで
+    実質一致したら、貼り付けへ進まない。"""
+    class FakePattern:
+        def __init__(self):
+            self.value = ""
+
+        def QueryInterface(self, _iid):
+            return self
+
+        def SetValue(self, value):
+            self.value = value
+
+        @property
+        def CurrentValue(self):
+            return self.value
+
+    cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+    pasted = []
+    cp._paste_input_text = lambda text: pasted.append(text)
+    # VM (UIA が無い環境) では、目印の型だけ差し替えて通す
+    saved_uia = copilot_loop.UIA
+
+    class _FakeUia:
+        IUIAutomationValuePattern = object()
+
+    copilot_loop.UIA = _FakeUia()
+    try:
+        cp._write_input_lenient(FakePattern(), "想定の文",
+                                direct_check=True)
+    finally:
+        copilot_loop.UIA = saved_uia
+    assert pasted == []
+
+
 def main():
     tests = [(name, fn) for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

@@ -749,7 +749,11 @@ def test_run_button_press_and_reuse():
                 + sr.PHAL_VERSION), window.windowTitle()
             headings = [label.text()
                         for label in window.findChildren(QLabel)]
-            assert "PHAL：PHAL Helps Agent Loop" in headings, headings
+            # 最上段のタイトルは短く "PHAL" (2.67。正式名は
+            # 窓のタイトルバーに出ている)。段の見出しも見る。
+            assert "PHAL" in headings, headings
+            assert "進捗" in headings, headings
+            assert "一覧" in headings, headings
             for name in ("ok.py", "warn.py"):
                 copied.clear()
                 item = select(window, name)

@@ -76,6 +76,8 @@ def _run(request):
                 kwargs["image_paste"] = True
             if request.get("lenient"):
                 kwargs["lenient"] = True
+            if request.get("direct_check"):
+                kwargs["direct_check"] = True
             filled = bool(transport.fill_prompt(
                 request["text"], **kwargs))
             return {"ok": True, "filled": filled,
@@ -105,6 +107,8 @@ def _run(request):
             if request.get("force_threshold") is not None:
                 kwargs["force_threshold"] = \
                     request["force_threshold"]
+            if request.get("early_force"):
+                kwargs["early_force"] = True
             result = transport.press_send_if_text(
                 request["text"],
                 float(request.get("timeout") or 10), **kwargs)

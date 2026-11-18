@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.84"
+PHAL_VERSION = "2.86"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -1364,6 +1364,11 @@ class ScriptRunnerWindow(QWidget):
         self._diag_ctx_rid = ""
         # 押下中の候補がどの窓の分か (到着の出どころ付けに使う)。
         self._dl_press_watch = None
+        # 進捗バーを描く階の控え (2.85、不具合B)。連鎖の開始
+        # (候補の検出・実行の開始・回答の開始) で出どころの
+        # 窓名を控え、段階と段階の間の区間でもその階へ描く。
+        # 連鎖の残りが無くなった待機への発行で下ろす。
+        self._chain_ai = ""
         # 一覧の上限からあふれて外したファイルの控え (2.46)。
         # {key: (mtime, size)}。外した事実を覚えておき、同じ
         # 中身のまま候補に戻ってきても新規扱いしない (チェック
@@ -2784,6 +2789,12 @@ class ScriptRunnerWindow(QWidget):
             return
         if not self._chain_in_flight():
             self._publish_phal_status("idle", detail)
+            # 待機に戻った時点で、連鎖の残りが無い窓の階の控えは
+            # 下ろす (2.85)。残りがある間 (到着の確認直後など)
+            # は保つ。
+            if self._chain_ai \
+                    and not self._chain_outstanding(self._chain_ai):
+                self._chain_ai = ""
 
     def _status_strip_text(self) -> str:
         """小さい情報行の1行 (1.48 の帯の文言、1.64 で大きな
@@ -2891,13 +2902,51 @@ class ScriptRunnerWindow(QWidget):
                     self._emergency_stopped))
             self._update_pulse()
 
+    def _chain_outstanding(self, name) -> bool:
+        """その窓の連鎖に、まだ残りがあるか (2.85)。
+
+        候補の表示中・到着待ち・実行待ちの列・結果を表示中の
+        未送信の項目・回答や受領の保留・返事待ちの間は残りが
+        ある。進捗バーの階の控え (_chain_ai) をいつまで保つか
+        の判定に使う。"""
+        if not name:
+            return False
+        state = (getattr(self, "_watches", None) or {}).get(name)
+        if state is not None:
+            if getattr(state, "holder", None) is not None:
+                return True
+            if time.monotonic() < getattr(
+                    state, "awaiting_reply_until", 0.0):
+                return True
+        for entry in getattr(self, "_dl_awaiting", None) or []:
+            if entry[2] == name:
+                return True
+        for item in (getattr(self, "_running_item", None),
+                     getattr(self, "_ai_answer_item", None),
+                     getattr(self, "_ai_send_item", None),
+                     getattr(self, "_answer_pending_item", None),
+                     getattr(self, "_ack_pending_answer", None)):
+            if getattr(item, "ai", None) == name:
+                return True
+        display = getattr(self, "_display_item", None)
+        if getattr(display, "ai", None) == name \
+                and not getattr(display, "sent", False):
+            return True
+        return any(getattr(item, "ai", None) == name
+                   for item in getattr(self, "_auto_run_queue", [])
+                   or [])
+
     def _stage_floor_name(self) -> str:
         """段階を描く階の名前 (2.15)。
 
         段階や連鎖が動いている間は、連鎖の出どころ (押した窓・
         ツールの出どころ・処理中の窓)、次に動いている項目の
-        出どころ (item.ai) の階へ描く (2.46)。どちらも分から
-        ない合図だけの連鎖や待機中は既定の投げ先の階 (2.21、
+        出どころ (item.ai) の階へ描く (2.46)。段階と段階の間
+        の区間 (候補の表示中・到着の確認後・返事待ち) は、
+        連鎖の開始で控えた _chain_ai を見る (2.85、不具合B:
+        控えが無いと既定の階へ落ち、Copilot の連鎖の途中で
+        進捗バーが Muse の階に出た)。どちらも分からない
+        合図だけの連鎖や待機中は既定の投げ先の階 (2.21、
         元の「主の階」)。"""
         floors = getattr(self, "_floors", None) or {}
         if not floors:
@@ -2905,7 +2954,9 @@ class ScriptRunnerWindow(QWidget):
         if self._display_stage()[0] is not None \
                 or getattr(self, "_running_item", None) is not None \
                 or getattr(self, "_ai_filling", False) \
-                or getattr(self, "_ai_sending", False):
+                or getattr(self, "_ai_sending", False) \
+                or self._chain_outstanding(
+                    getattr(self, "_chain_ai", "")):
             # 連鎖の出どころを先に見る (2.46)。DL のように項目が
             # まだ無い連鎖でも、押した窓・ツールの出どころ・
             # 処理中の窓が分かれば、その階へ描く (項目が無い
@@ -2924,6 +2975,10 @@ class ScriptRunnerWindow(QWidget):
                 ai = getattr(item, "ai", None)
                 if ai and ai in floors:
                     return ai
+            # 段階と段階の間の区間は、連鎖の控えを見る (2.85)。
+            chain_ai = getattr(self, "_chain_ai", "")
+            if chain_ai and chain_ai in floors:
+                return chain_ai
         if self._ai_name in floors:
             return self._ai_name
         return next(iter(floors))
@@ -4960,6 +5015,8 @@ class ScriptRunnerWindow(QWidget):
                    request_id: str = ""):
         if self._running_item is not None or item.result is None:
             return
+        if item.ai:
+            self._chain_ai = item.ai  # 連鎖の階の控え (2.85)
         # 実行の直前に sha256 を取り直す。チェックしたときと違えば
         # 実行せず、チェックからやり直す(仕様のアオイ追記2)。
         current = core.file_sha256(item.path)
@@ -5553,6 +5610,8 @@ class ScriptRunnerWindow(QWidget):
         # 消す (2.77、レビュー重大2: 手動で回答し直したときに
         # 控えが残ると、見回りが同じ回答を入れ直した)。
         self._clear_answer_pending(item)
+        if item.ai:
+            self._chain_ai = item.ai  # 連鎖の階の控え (2.85)
         run = item.last_run
         if run is None:
             return
@@ -7136,6 +7195,8 @@ class ScriptRunnerWindow(QWidget):
             return  # 同じ候補のまま。検出時刻もそのままにする
         holder.watch = state.name
         state.holder = holder
+        # 連鎖の開始。進捗バーの階をこの窓に控える (2.85)。
+        self._chain_ai = state.name
         state.idle_since = None
         state.last_candidate_key = holder.key
         self._diag(
@@ -12599,6 +12660,11 @@ class ScriptRunnerWindow(QWidget):
             ("ダウンロード", dl_sec),
             ("チェック", check_sec),
             ("実行", gap("run_start", "run_done")),
+            # 実行終了から結果入力の開始まで (2.86、試験所見の
+            # 3件目)。結果文の組み立て・受領応答の送信・保留の
+            # 解消待ちが入る区間で、以前は内訳に出ていなかった
+            # (実測で5〜6秒あった)。
+            ("入力開始まで", gap("run_done", "fill_start")),
             ("結果入力", gap("fill_start", "fill_done")),
             ("送信", gap("send_start", "send_done")),
             ("次の検出まで", None),

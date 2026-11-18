@@ -4135,6 +4135,109 @@ def test_log_ai_name_follows_copilot_chain():
             os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
 
 
+def test_stage_floor_follows_copilot_chain_gaps():
+    # 不具合B (2.85、copilot-trial-20261119): 二重待受で
+    # Copilot の連鎖の途中、段階と段階の間の区間でも進捗
+    # バーを描く階が Copilot になること。候補の表示中・
+    # 到着後から実行までの間・返事待ちを確かめ、連鎖が
+    # 終われば主 (Muse) の階へ戻ることも見る。
+    # (2.84 では候補の表示中と返事待ちで Muse に落ちる。)
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            window.ai_dl_presser = (  # type: ignore[method-assign]
+                lambda profile, key=None: sr._AiAnswerResult(
+                    True, "ok"))
+            try:
+                assert window._stage_floor_name() == "Muse"
+                copilot = window._watch_list[1]
+                assert copilot.name == "Copilot"
+                # 候補の検出 (連鎖の開始)。
+                candidate = {
+                    "name": "#!phal python\n"
+                            "# 9-7: 階のテスト用スクリプト\n"
+                            "print(1)\n",
+                    "class_name": "cls group/card",
+                    "label": "9-7: 階のテスト用スクリプト",
+                    "summary": "9-7: 階のテスト用スクリプト",
+                }
+                window._dispatch_state = copilot
+                window._on_dl_checked(
+                    sr._DlCheckResult(True, "", candidate))
+                QCoreApplication.processEvents()
+                assert copilot.holder is not None
+                assert window._stage_floor_name() == "Copilot", \
+                    window._stage_floor_name()
+                # 到着後、実行が始まるまでの間 (段階は無い)。
+                copilot.holder = None
+                item = _origin_item(watch, "Copilot")
+                window._display_item = item
+                window._stage = None
+                window._last_stage = None
+                assert window._stage_floor_name() == "Copilot", \
+                    window._stage_floor_name()
+                # 送信済みで返事待ちの間。
+                item.sent = True
+                window._display_item = None
+                copilot.awaiting_reply_until = \
+                    time.monotonic() + 60
+                assert window._stage_floor_name() == "Copilot", \
+                    window._stage_floor_name()
+                # 返事待ちが終わり、待機に戻れば主の階へ戻る。
+                copilot.awaiting_reply_until = 0.0
+                window._publish_phal_idle("待機中")
+                assert window._chain_ai == ""
+                assert window._stage_floor_name() == "Muse", \
+                    window._stage_floor_name()
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
+def test_loop_breakdown_includes_fill_start_gap():
+    # 試験所見の3件目 (2.86): 実行終了 → 結果入力の開始の
+    # 区間 (実測5〜6秒) が、ループ内訳に出ること。以前は
+    # 実行と結果入力の間に区間が無く、消えていた。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, _watch = _make_dl_window(
+                tmp, ai_target={"process_name": "dummy.exe"})
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                window._loop_marks = {
+                    "detected": 100.0, "baseline": None,
+                    "run_start": 101.0, "run_done": 101.2,
+                    "fill_start": 106.2, "fill_done": 108.2,
+                    "send_start": 108.2, "send_done": 110.0,
+                    "name": "1-1_test.phal",
+                }
+                window._loop_finish_send()
+                stages = dict(window._loop_stages)
+                assert abs(stages["入力開始まで"] - 5.0) < 0.01, \
+                    stages
+                assert abs(stages["結果入力"] - 2.0) < 0.01, stages
+                line = window._loop_breakdown_line()
+                assert "入力開始まで 5.0秒" in line, line
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 def test_log_viewer_dialog_shows_events():
     # 動作ログビューア (1.90): 置き場の記録が日付つきで出る
     # ことと、設定画面に「動作ログ」ボタンがあること。

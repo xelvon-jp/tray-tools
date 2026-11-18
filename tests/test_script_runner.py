@@ -1215,6 +1215,80 @@ def test_append_run_log():
         assert record["time"]
 
 
+def test_skipped_records_roundtrip():
+    """見送りの控え (2.76): 名前と sha256 の組で残り、開き直し
+    (読み直し) をまたいで効く。形の違う項目は落とす。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "phal_skipped.json"
+        records = {}
+        assert not core.skipped_contains(records, "a.py", "ab12")
+        core.skipped_put(records, "a.py", "ab12")
+        assert core.skipped_contains(records, "a.py", "ab12")
+        # 名前か中身が違えば別の到着。
+        assert not core.skipped_contains(records, "a.py", "cd34")
+        assert not core.skipped_contains(records, "b.py", "ab12")
+        core.save_skipped(records, path)
+        loaded = core.load_skipped(path)
+        assert core.skipped_contains(loaded, "a.py", "ab12")
+        core.skipped_discard(loaded, "a.py", "ab12")
+        assert not core.skipped_contains(loaded, "a.py", "ab12")
+        # 壊れたファイルは空に倒す。
+        path.write_text("{壊れている", encoding="utf-8")
+        assert core.load_skipped(path) == {}
+        # 上限を超えたら古い方から落ちる。
+        many = {}
+        saved = core.SKIPPED_LIMIT
+        try:
+            core.SKIPPED_LIMIT = 3
+            for i in range(5):
+                core.skipped_put(many, f"f{i}.py", f"sha{i}")
+        finally:
+            core.SKIPPED_LIMIT = saved
+        assert len(many) == 3
+        assert core.skipped_contains(many, "f4.py", "sha4")
+        assert not core.skipped_contains(many, "f0.py", "sha0")
+
+
+def test_normalize_config_column_widths_clamped():
+    """列幅は形が合えば残るが、狭すぎる幅は下限まで広がる
+    (2.74)。実行ボタンの列 (末尾) の下限は大きめ。"""
+    config = core.normalize_config(
+        {"column_widths": [100, 90, 300, 60, 80, 400, 70, 130]})
+    assert config["column_widths"] == [100, 90, 300, 60, 80, 400,
+                                       70, 130]
+    narrow = core.normalize_config(
+        {"column_widths": [100, 90, 300, 60, 80, 400, 70, 10]})
+    assert narrow["column_widths"][7] == core.RUN_COLUMN_MIN_WIDTH
+    assert narrow["column_widths"][0] == 100
+    tiny = core.normalize_config(
+        {"column_widths": [10, 10, 10, 10, 10, 10, 10, 10]})
+    assert tiny["column_widths"][0] == core.COLUMN_MIN_WIDTH
+    assert tiny["column_widths"][7] == core.RUN_COLUMN_MIN_WIDTH
+    broken = core.normalize_config({"column_widths": [1, 2, 3]})
+    assert broken["column_widths"] is None
+
+
+def test_append_run_log_trims_when_too_big():
+    """実行ログ (jsonl) は大きくなりすぎたら新しい方だけ残す
+    (2.73。それまでは際限なく伸びていた)。"""
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "log.jsonl"
+        run = core.RunResult(name="a.py", path="C:/x/a.py",
+                             exit_code=0, seconds=0.1,
+                             stdout="x" * 100, sha256="ab12")
+        saved = (core.RUN_LOG_MAX_BYTES, core.RUN_LOG_LIMIT)
+        try:
+            core.RUN_LOG_MAX_BYTES = 300
+            core.RUN_LOG_LIMIT = 2
+            for _ in range(5):
+                core.append_run_log(run, None, log_path)
+        finally:
+            core.RUN_LOG_MAX_BYTES, core.RUN_LOG_LIMIT = saved
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[-1])["file"] == "a.py"
+
+
 def test_check_script_dispatch():
     with tempfile.TemporaryDirectory() as td:
         path = write(Path(td), "ok.py", "print(1)\n")
@@ -1354,6 +1428,14 @@ def test_ps1_bom_copy_source_cases():
         jp = write(tmp, "c.ps1", "Write-Output 'こんにちは'\n")
         assert core.ps1_bom_copy_source(jp) == jp.read_bytes()
         assert core.ps1_bom_copy_source(tmp / "none.ps1") is None
+        # 2.69 (レビュー高4): UTF-8 として読めないものは写しを
+        # 作らない (付けた BOM で壊れるため)
+        cp932 = write(tmp, "d.ps1",
+                      "Write-Output 'こんにちは'\n".encode("cp932"))
+        assert core.ps1_bom_copy_source(cp932) is None
+        utf16 = write(tmp, "e.ps1",
+                      b"\xff\xfe" + "Write-Output 'あ'\n".encode("utf-16-le"))
+        assert core.ps1_bom_copy_source(utf16) is None
 
 
 _PS_STUB_RESULT = {"errors": [], "commands": [], "redirections": [],
@@ -2467,11 +2549,34 @@ def test_phal_status_build_and_write_only_on_change():
             detail="実行中: 12-03_demo.py",
             step=2, item="デモをする", at=1700000000)
         assert status == {
-            "schema": 1, "version": "1.46", "state": "run",
+            "schema": 2, "version": "1.46", "state": "run",
             "command_id": "12-03",
             "detail": "実行中: 12-03_demo.py",
             "stopped_reason": "", "step": 2, "item": "デモをする",
+            "last_run": None, "last_error": None,
             "updated": 1700000000}
+        # last_run / last_error は形を整えて載る (2.73)。
+        with_run = core.build_phal_status(
+            "1.46", "idle", at=1700000000,
+            last_run={"name": "a.py", "command_id": "12-03",
+                      "outcome": "failed", "exit_code": 3,
+                      "seconds": 1.25, "stdout_head": "出\n力",
+                      "stderr_head": "エ ラー", "at": 1699999999},
+            last_error={"stage": "run", "reason": "終了コード 3",
+                        "at": 1699999999})
+        assert with_run["last_run"] == {
+            "name": "a.py", "command_id": "12-03",
+            "outcome": "failed", "exit_code": 3, "seconds": 1.25,
+            "stdout_head": "出 力", "stderr_head": "エ ラー",
+            "at": 1699999999}
+        assert with_run["last_error"] == {
+            "stage": "run", "reason": "終了コード 3",
+            "at": 1699999999}
+        # 形の違う控えは None になる (落とすだけで止めない)。
+        bogus = core.build_phal_status(
+            "1.46", "idle", last_run="x", last_error=3, at=1)
+        assert bogus["last_run"] is None
+        assert bogus["last_error"] is None
         # 知らない state は作らない。
         try:
             core.build_phal_status("1.46", "flying")
@@ -3403,6 +3508,43 @@ def test_send_mismatch_qr_text():
     assert qr.version <= 25, qr.version
 
 
+def test_all_auto_done_handlers_handle_deferred():
+    """deferred (送信待ちの文による保留、2.71) を見ない自動送信の
+    完了処理が残っていないこと (2.78、レビュー重大1)。
+
+    目印を消費する自動応答は、deferred の分岐で消費せずに残さ
+    なければならない (消費すると、返事のないまま依頼が消える)。
+    ここに挙げた完了処理は、本文に deferred の扱いがあることを
+    縛る。対象外は、文を入れずキー送信だけのもの (送信ボタン
+    _on_ai_send_done、リアクション _on_react_done)、人がその場
+    で受けるもの (開始プロンプト _on_intro_done は失敗時に
+    クリップボードへ fallback する)、立ち上げ直後で送信待ちの
+    文があり得ないもの (_on_startup_notice_done)、中継の ACK
+    (_on_relay_ack_done、ベストエフォートで失敗は診断に残る)
+    だけ。"""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "script_runner.py").read_text(encoding="utf-8")
+    handlers = [
+        "_on_ai_answer_done", "_on_ack_done", "_on_notice_done",
+        "_on_diag_auto_done", "_on_resend_auto_done",
+        "_on_settings_auto_done", "_on_relay_auto_done",
+        "_on_manual_auto_done", "_on_file_auto_done",
+        "_on_capture_auto_done", "_on_fulltext_auto_done",
+        "_on_history_auto_done", "_on_stop_auto_done",
+        "_on_log_auto_done", "_on_tool_auto_done",
+        "_on_describe_auto_done", "_on_eval_auto_done",
+        "_on_input_auto_done", "_on_register_auto_done",
+        "_on_refire_notice_done",
+    ]
+    for name in handlers:
+        start = src.index(f"    def {name}(")
+        end = src.index("\n    def ", start + 1)
+        body = src[start:end]
+        assert "deferred" in body, \
+            f"{name} が deferred を見ていない"
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -3461,6 +3603,9 @@ if __name__ == "__main__":
         test_execute_stop_button,
         test_execute_missing_python,
         test_append_run_log,
+        test_append_run_log_trims_when_too_big,
+        test_normalize_config_column_widths_clamped,
+        test_skipped_records_roundtrip,
         test_check_script_dispatch,
         test_list_candidates_excludes_bom_copies_and_stable_order,
         test_check_python_danger_respects_import_aliases,
@@ -3495,6 +3640,7 @@ if __name__ == "__main__":
         test_parse_progress_line,
         test_execute_streaming_output,
         test_phal_status_build_and_write_only_on_change,
+        test_all_auto_done_handlers_handle_deferred,
         test_collect_intro_environment_with_fake_runner,
         test_collect_intro_environment_runner_missing_is_unknown,
         test_collect_intro_modules_truncated,

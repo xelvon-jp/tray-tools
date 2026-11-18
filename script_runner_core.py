@@ -39,6 +39,8 @@ STATUS_UNKNOWN = "unknown"  # チェック不能(Python / PowerShell が見つ�
 # 実行ログ (append_run_log) のファイル名。動作ログ (1.89) の
 # ACTIVITY_LOG_FILENAME ("script_runner_log.json") とは別物。
 LOG_FILENAME = "script_runner_log.jsonl"
+RUN_LOG_LIMIT = 1000            # 実行ログに残す件数の上限 (2.73)
+RUN_LOG_MAX_BYTES = 2_000_000   # これを超えたら古い記録を落とす
 PS_ALLOWLIST_FILENAME = "script_runner_ps_allowlist.json"
 
 # ブラウザの書きかけなど、対象にしない末尾。
@@ -118,11 +120,16 @@ DEFAULT_CONFIG = {
     "summary_lines": 100,      # 要約に切り替える行数(出力+エラー出力の合計)
     "summary_chars": 8000,     # 要約に切り替える文字数(出力+エラー出力の合計)
     "window_geometry": None,   # [x, y, w, h]
+    "column_widths": None,     # 一覧の列幅 [px x 8] (ドラッグで変更、2.72)
     "always_on_top": False,    # 前面に固定
     "hide_no_id": True,        # ID が無いファイルを表示しない
     "dark_mode": False,        # ダークモード (窓の中の「ダーク」の切替)
     "mini_mode": False,        # 小窓モード (上部だけ表示、2.27)
 }
+
+
+COLUMN_MIN_WIDTH = 32        # 一覧の列幅の下限 [px] (2.74)
+RUN_COLUMN_MIN_WIDTH = 124   # 実行ボタンの列 (末尾) の下限 [px] (2.74、2.76 で「飛ばす」と並ぶ幅に拡大)
 
 
 def _int_or(value, default, minimum, maximum):
@@ -158,6 +165,19 @@ def normalize_config(section) -> dict:
     if not (isinstance(geometry, list) and len(geometry) == 4
             and all(isinstance(v, int) for v in geometry)):
         config["window_geometry"] = None
+    widths = config["column_widths"]
+    if not (isinstance(widths, list) and len(widths) == 8
+            and all(isinstance(v, int) and 10 <= v <= 2000
+                    for v in widths)):
+        config["column_widths"] = None
+    else:
+        # 狭すぎる幅は下限まで広げる (2.74)。とくに実行ボタンの
+        # 列 (末尾) は、ボタンがまだ無い状態で測った幅が保存される
+        # と、次回から潰れて見えなくなる (実機報告 2026-11-18)。
+        config["column_widths"] = [
+            max(v, RUN_COLUMN_MIN_WIDTH if i == 7
+                else COLUMN_MIN_WIDTH)
+            for i, v in enumerate(widths)]
     config["always_on_top"] = bool(config["always_on_top"])
     config["hide_no_id"] = bool(config["hide_no_id"])
     config["dark_mode"] = bool(config["dark_mode"])
@@ -738,6 +758,99 @@ def executed_hash_contains(records: dict, sha256: str) -> bool:
         return False
     saved_at = records.get(sha256)
     return not _executed_hash_expired(saved_at, time.time())
+
+
+# ---------------------------------------------------------------
+# 持ち主が見送った到着の控え (2.76)。
+# 「この到着は自動で走らせるな」という持ち主の指定を、開き直し
+# をまたいで残す。キーはファイル名と sha256 の組 (同じ名前でも
+# 中身が変われば別の到着、同じ中身でも名前が違えば別の到着)。
+# 実行済みハッシュの控えと同じ作法 (同じ置き場・壊れたら空に
+# 倒す・別名で書いてから置き換える)。見送りの指定に期限は付け
+# ないが、件数の上限を超えたら古い方から落とす。
+# ---------------------------------------------------------------
+SKIPPED_FILENAME = "phal_skipped.json"
+SKIPPED_LIMIT = 200
+
+
+def skipped_path() -> Path:
+    return data_dir() / SKIPPED_FILENAME
+
+
+def _skipped_key(name, sha256) -> str:
+    return f"{name}|{sha256}"
+
+
+def load_skipped(records_path=None) -> dict:
+    """控え {キー: {"name", "sha256", "at"}} を読み込む。
+
+    壊れている・読めない・形の違う項目は落とす (見送りが1回分
+    緩むだけで、実行そのものは止めない)。"""
+    path = Path(records_path) if records_path is not None \
+        else skipped_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    records = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        sha = entry.get("sha256")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(sha, str) or not sha:
+            continue
+        if key != _skipped_key(name, sha):
+            continue
+        records[key] = {"name": name, "sha256": sha,
+                        "at": entry.get("at")}
+    return records
+
+
+def save_skipped(records: dict, records_path=None) -> None:
+    """控えを書き出す。失敗しても黙って諦める。書きかけで壊さ
+    ないよう、一度別名で書いてから置き換える。"""
+    path = Path(records_path) if records_path is not None \
+        else skipped_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(records, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def skipped_contains(records: dict, name, sha256) -> bool:
+    """その到着 (名前と中身の組) が見送りの控えにあるか。"""
+    if not name or not sha256:
+        return False
+    return _skipped_key(name, sha256) in records
+
+
+def skipped_put(records: dict, name, sha256) -> None:
+    """見送りを控える。上限を超えたら古い方から落とす。"""
+    if not name or not sha256:
+        return
+    records[_skipped_key(name, sha256)] = {
+        "name": name, "sha256": sha256, "at": time.time()}
+    while len(records) > SKIPPED_LIMIT:
+        oldest = min(records,
+                     key=lambda k: records[k].get("at") or 0)
+        del records[oldest]
+
+
+def skipped_discard(records: dict, name, sha256) -> None:
+    """見送りの控えを外す (見送りの解除)。"""
+    if not name or not sha256:
+        return
+    records.pop(_skipped_key(name, sha256), None)
 
 
 # ---------------------------------------------------------------
@@ -3279,19 +3392,67 @@ def build_send_mismatch_qr_text(version, ai_name, item_name,
     return text
 
 
+def _phal_status_last_run(raw) -> dict | None:
+    """直近の実行結果の控えを、状態ファイル用の形に整える (2.73)。
+
+    窓側が RunResult から作った辞書を受ける。at は控えを作った
+    時刻 (epoch 秒) で、状態の updated とは別に保持する (毎回の
+    状態発行で変わると、変化時だけ書く仕組みが崩れるため)。"""
+    if not isinstance(raw, dict):
+        return None
+    exit_code = raw.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    try:
+        seconds = round(float(raw.get("seconds") or 0), 3)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    at = raw.get("at")
+    if isinstance(at, bool) or not isinstance(at, int):
+        at = int(time.time())
+    return {
+        "name": _phal_status_one_line(raw.get("name")),
+        "command_id": str(raw.get("command_id") or ""),
+        "outcome": str(raw.get("outcome") or ""),
+        "exit_code": exit_code,
+        "seconds": seconds,
+        "stdout_head": _phal_status_one_line(raw.get("stdout_head")),
+        "stderr_head": _phal_status_one_line(raw.get("stderr_head")),
+        "at": at,
+    }
+
+
+def _phal_status_last_error(raw) -> dict | None:
+    """直近のエラーの控えを、状態ファイル用の形に整える (2.73)。"""
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")
+    if isinstance(at, bool) or not isinstance(at, int):
+        at = int(time.time())
+    return {
+        "stage": _phal_status_one_line(raw.get("stage")),
+        "reason": _phal_status_one_line(raw.get("reason")),
+        "at": at,
+    }
+
+
 def build_phal_status(version, state, command_id="", detail="",
-                      stopped_reason="", step=0, item="", at=None) -> dict:
+                      stopped_reason="", step=0, item="", at=None,
+                      last_run=None, last_error=None) -> dict:
     """モニタ表示用の状態の辞書を作る。
 
     state は idle(待機) / dl(ダウンロード・新着待ち) / run(実行中)
     / answer(回答中) / send(送信中) / stopped(止まった) のどれか。
     step は PHAL 起動後の実行手数。item は実行中または直近の
     スクリプトの概要。updated は epoch 秒(整数)。知らない state
-    は ValueError (窓側は決まった段だけを渡す)。"""
+    は ValueError (窓側は決まった段だけを渡す)。
+    schema 2 (2.73): last_run (直近の実行結果) と last_error
+    (直近のエラー) を足した。schema 1 の項目はそのままなので、
+    古い読み手は追加分を無視して読める。"""
     if state not in PHAL_STATUS_STATES:
         raise ValueError(f"unknown PHAL state: {state!r}")
     return {
-        "schema": 1,
+        "schema": 2,
         "version": str(version),
         "state": state,
         "command_id": str(command_id or ""),
@@ -3299,6 +3460,8 @@ def build_phal_status(version, state, command_id="", detail="",
         "stopped_reason": _phal_status_one_line(stopped_reason),
         "step": int(step),
         "item": _phal_status_one_line(item),
+        "last_run": _phal_status_last_run(last_run),
+        "last_error": _phal_status_last_error(last_error),
         "updated": int(at if at is not None else time.time()),
     }
 
@@ -4217,6 +4380,15 @@ def ps1_bom_copy_source(path):
     if raw.startswith(UTF8_BOM):
         return None
     if all(byte < 0x80 for byte in raw):
+        return None
+    # 厳密に UTF-8 として読めるものだけを写しの対象にする
+    # (2.69、レビュー高4)。UTF-16 や cp932 の .ps1 は非 ASCII
+    # バイトを含むため旧い判定では対象に入り、UTF-8 BOM を
+    # 付けた写しで壊れていた (実測)。読めないものは写しを
+    # 作らず、元のファイルのまま扱う。
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
         return None
     return raw
 
@@ -5867,3 +6039,26 @@ def append_run_log(run: RunResult, check: CheckResult = None,
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass  # 記録できないことは実行の邪魔をしない
+    _trim_run_log(log_path)
+
+
+def _trim_run_log(log_path) -> None:
+    """実行ログが大きくなりすぎたら、新しい方から上限件数だけ
+    残す (2.73。それまでは際限なく伸びていた)。
+
+    サイズが上限以下なら何もしない。失敗しても黙って諦める
+    (記録の都合で実行を止めない)。"""
+    try:
+        log_path = Path(log_path)
+        if log_path.stat().st_size <= RUN_LOG_MAX_BYTES:
+            return
+        lines = [ln for ln in
+                 log_path.read_text(encoding="utf-8").splitlines()
+                 if ln.strip()]
+        tmp = log_path.with_name(log_path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            for ln in lines[-RUN_LOG_LIMIT:]:
+                f.write(ln + "\n")
+        os.replace(tmp, log_path)
+    except OSError:
+        pass

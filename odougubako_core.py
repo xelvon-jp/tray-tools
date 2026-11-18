@@ -64,9 +64,16 @@ def _parse_iso(text):
 
 
 def folder_name(text) -> str:
-    """フォルダ名に使える形にする (分類名用)。"""
+    """フォルダ名に使える形にする (分類名用)。
+
+    ".." のようなドットだけの名前は、親フォルダを指して
+    置き場の外へ出てしまうので、既定の分類へ落とす
+    (2.70、レビュー中・実測)。"""
     cleaned = _FOLDER_BAD_RE.sub("_", str(text or "").strip())
-    return cleaned or DEFAULT_CATEGORY
+    cleaned = cleaned.strip(". ")
+    if not cleaned or cleaned in (".", ".."):
+        return DEFAULT_CATEGORY
+    return cleaned
 
 
 def valid_tool_name(name) -> bool:
@@ -284,9 +291,14 @@ def iter_tool_folders(root=None):
 
 
 def find_tool(name, root=None):
-    """道具名からフォルダを探す (無ければ None)。"""
+    """道具名からフォルダを探す (無ければ None)。
+
+    大文字小文字の違いは同一視する (2.70、レビュー中・実測)。
+    Windows では CsvPeek と csvpeek のフォルダは同じ場所に
+    なるため、別物として作ると黙って上書きになっていた。"""
+    wanted = str(name or "").lower()
     for _category, tool_name, folder in iter_tool_folders(root):
-        if tool_name == name:
+        if tool_name.lower() == wanted:
             return folder
     return None
 
@@ -376,23 +388,37 @@ def register_source(source: str, created_from: str = "",
         return {"ok": False, "reason": " / ".join(issues), "tool": None}
     category = folder_name(decl["category"] or DEFAULT_CATEGORY)
     root.mkdir(parents=True, exist_ok=True)
-    folder = root / category / name
     existing = find_tool(name, root)
+    if existing is not None:
+        # 既存のフォルダ名 (大文字小文字の綴り) を引き継ぐ (2.70)
+        folder = root / category / existing.name
+    else:
+        folder = root / category / name
     previous_version = 0
     if existing is not None:
         previous_version = int(load_meta(existing).get("version", 1))
-        prev_dir = existing / ".prev"
-        if prev_dir.exists():
-            shutil.rmtree(prev_dir)
-        prev_dir.mkdir(parents=True)
-        for item in existing.iterdir():
-            if item.name == ".prev":
-                continue
-            if item.is_dir():
-                shutil.copytree(item, prev_dir / item.name)
-            else:
-                shutil.copy2(item, prev_dir / item.name)
-        if existing != folder:
+
+        def _save_prev(prev_dir):
+            if prev_dir.exists():
+                shutil.rmtree(prev_dir)
+            prev_dir.mkdir(parents=True)
+            for item in existing.iterdir():
+                if item.name == ".prev":
+                    continue
+                if item.is_dir():
+                    shutil.copytree(item, prev_dir / item.name)
+                else:
+                    shutil.copy2(item, prev_dir / item.name)
+
+        if existing == folder:
+            _save_prev(existing / ".prev")
+        else:
+            # 分類が変わるときは、前版を新しいフォルダの .prev へ
+            # 運んでから旧フォルダを消す (2.70、レビュー中・実測。
+            # 旧い作りは .prev を作った直後に旧フォルダごと消して
+            # いたので、前版が残らなかった)
+            folder.mkdir(parents=True, exist_ok=True)
+            _save_prev(folder / ".prev")
             shutil.rmtree(existing)
     folder.mkdir(parents=True, exist_ok=True)
     scripts = folder / "scripts"

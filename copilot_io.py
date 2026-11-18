@@ -54,6 +54,9 @@ class SendResult:
     # 入力欄に書きかけの文があり、まだ送っていない(利用者の確認待ち)。
     # True のときは、確かめてから force=True で送り直す。
     needs_confirm: bool = False
+    # 送信待ちの自分の文が入力欄にあり、上書きを避けて保留した
+    # (2.71、レビュー高3)。呼び側は空いたら送り直す。
+    deferred: bool = False
     # 添付の結果 (1.58)。attachments を渡したとき、copilot 側で
     # 添付できたファイル名 (名前だけ) と、できなかったファイル名。
     # 添付は入力・送信の前に行われ、失敗しても配達自体は止まらない
@@ -584,7 +587,11 @@ class CopilotLoopTransport:
 # 送信の段で止まると PHAL の文が入力欄に残り、次の送信がそれを
 # 人の書きかけと誤認して止まる事故への手当て。残り文が控えと
 # 実質一致すれば自分のものとして扱い、送信が成功したら消す。
+# 2.71 からは状態 (送信中/失敗) つきの辞書で持つ (レビュー高3)。
 _OWN_INPUT_TEXTS = {}
+
+# 送信中の控えを「失敗で残った」へ倒すまでの秒数 (2.71)。
+OWN_INPUT_SENDING_LIMIT = 300.0
 
 
 class CopilotSession:
@@ -619,11 +626,16 @@ class CopilotSession:
             return str(profile.get("name") or "")
         return str(profile or "")
 
-    def _remember_own_input(self, fallback_text):
-        """入力欄に書いた自分の文を控える (2.65)。
+    def _remember_own_input(self, fallback_text, state="sending"):
+        """入力欄に書いた自分の文を、状態つきで控える (2.65、2.71)。
 
         実際に欄へ入った文 (読み直し) を優先し、読めなければ
-        書いた文そのものを控える。"""
+        書いた文そのものを控える。状態は2つ (2.71、レビュー高3、
+        アオイの案): "sending" は fill の直後で送信待ち、
+        "failed" は送信が失敗して残った文。失敗の文は上書き
+        してよいが、送信中の文を別の文で上書きすると、送信
+        待ちの回答が消えたまま完了表示になるため、上書きせず
+        保留に回す。"""
         value = None
         getter = getattr(self._tp(), "input_text", None)
         if getter is not None:
@@ -634,11 +646,51 @@ class CopilotSession:
         if not value or not str(value).strip():
             value = fallback_text
         if value and str(value).strip():
-            _OWN_INPUT_TEXTS[self._own_key()] = str(value)
+            _OWN_INPUT_TEXTS[self._own_key()] = {
+                "text": str(value), "state": state,
+                "at": time.time()}
 
     def _forget_own_input(self):
         """送信が成功したので、自分の文の控えを消す (2.65)。"""
         _OWN_INPUT_TEXTS.pop(self._own_key(), None)
+
+    def _own_input_state(self):
+        """控えの状態を返す (2.71)。控えが無ければ None。
+
+        "sending" のまま OWN_INPUT_SENDING_LIMIT 秒を過ぎたら
+        "failed" として扱う (送信の段がどこかで落ちても、
+        取り残されて永久に保留し続けないため)。"""
+        record = _OWN_INPUT_TEXTS.get(self._own_key())
+        if not isinstance(record, dict):
+            return None
+        if record.get("state") == "sending" and \
+                time.time() - float(record.get("at") or 0) \
+                > OWN_INPUT_SENDING_LIMIT:
+            return "failed"
+        return str(record.get("state") or "failed")
+
+    def _own_overwrite_verdict(self, existing, text):
+        """自分の文の残りへの上書きの判定 (2.71、レビュー高3)。
+
+        "go" は上書きして進める (同じ文の送り直しと、失敗で
+        残った文への上書き)。"defer" は保留する (送信中の文を
+        別の文で上書きしようとしたときだけ)。"""
+        import copilot_loop  # 重く Windows 寄りなので使うときだけ読む
+        if text and copilot_loop._input_texts_equivalent(
+                existing, text):
+            return "go"
+        if self._own_input_state() == "sending":
+            return "defer"
+        return "go"
+
+    def _mark_own_input_failed(self):
+        """控えの状態を "failed" に倒す (2.71)。
+
+        送信ボタンの段が失敗に終わったら、残った文は「失敗で
+        残った」扱いにし、次の文で上書きできるようにする。"""
+        record = _OWN_INPUT_TEXTS.get(self._own_key())
+        if isinstance(record, dict):
+            record["state"] = "failed"
 
     def _is_own_input(self, existing, text):
         """入力欄の残り文が、PHAL 自身が書いたものか (2.65)。
@@ -650,7 +702,8 @@ class CopilotSession:
         if not existing or not str(existing).strip():
             return False
         import copilot_loop  # 重く Windows 寄りなので使うときだけ読む
-        own = _OWN_INPUT_TEXTS.get(self._own_key())
+        record = _OWN_INPUT_TEXTS.get(self._own_key())
+        own = record.get("text") if isinstance(record, dict) else record
         if own is not None and copilot_loop._input_texts_equivalent(
                 existing, own):
             return True
@@ -730,15 +783,18 @@ class CopilotSession:
         attach_done / attach_failed にも残る)。"""
         if not text or not text.strip():
             return SendResult(False, "送るテキストが空です")
-        try:
-            # 送信直前の全文長を控える。窓が無い環境ではここで落ちるので、
-            # 「起動していない」を先に伝える形になる。
-            self._previous_length = self._tp().snapshot_length()
-        except Exception as e:  # noqa: BLE001  理由は利用者への文にする
-            return SendResult(False, f"Copilot に送れませんでした（{e}）")
         ok, reason = self._wait_sendable()
         if not ok:
             return SendResult(False, reason)
+        try:
+            # 送信直前の全文長を控える (2.70、レビュー中)。生成中の
+            # 保留 (最大300秒) の前に取ると、その間に増えた前の
+            # 回答の続きが今回の回答に混ざるので、保留の後に取る。
+            # 窓が無い環境ではここで落ちるので、「起動していない」
+            # を伝える形にもなる。
+            self._previous_length = self._tp().snapshot_length()
+        except Exception as e:  # noqa: BLE001  理由は利用者への文にする
+            return SendResult(False, f"Copilot に送れませんでした（{e}）")
         if not force:
             existing = None
             getter = getattr(self._tp(), "input_text", None)
@@ -749,24 +805,38 @@ class CopilotSession:
                     return SendResult(
                         False, f"Copilot に送れませんでした（{e}）")
             if existing and existing.strip():
-                if self._is_own_input(existing, text):
-                    pass  # 自分の文の残り。上書きして進める (2.65)
-                else:
+                if not self._is_own_input(existing, text):
                     return SendResult(
                         False,
                         "Copilot の入力欄に書きかけの文があります。"
                         "そのまま送ると上書きされて消えます",
                         needs_confirm=True)
+                if self._own_overwrite_verdict(existing, text) \
+                        == "defer":
+                    return SendResult(
+                        False,
+                        "送信待ちの文が入力欄にあるため、"
+                        "上書きせず保留しました",
+                        deferred=True)
+                # 自分の文の残り (失敗分・送り直し)。上書きして
+                # 進める (2.65)
         try:
             sent = self._call_prompt(
                 "send_prompt", text, force, attachments)
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, WorkerError):
+                # 裏方が時間切れ等で落ちたときは、文が欄に残って
+                # いるかもしれない。自分の文として控え、次の
+                # 送信で人の書きかけと誤認しない (2.70、レビュー中)。
+                # 状態は「失敗で残った」(2.71)
+                self._remember_own_input(text, state="failed")
             return SendResult(False, f"Copilot に送れませんでした（{e}）")
         done, failed = self._attach_outcome()
         if not sent:
             # 送れなかった文は入力欄に残っていることが多い。
             # 自分の文として控え、次の送信で誤認しない (2.65)。
-            self._remember_own_input(text)
+            # 状態は「失敗で残った」(2.71)
+            self._remember_own_input(text, state="failed")
             return SendResult(
                 False, "Copilot に送信できませんでした（送信ボタンが見つからない等）",
                 attach_done=done, attach_failed=failed)
@@ -804,14 +874,21 @@ class CopilotSession:
                     return SendResult(
                         False, f"入力欄に入れられませんでした（{e}）")
             if existing and existing.strip():
-                if self._is_own_input(existing, text):
-                    pass  # 自分の文の残り。上書きして進める (2.65)
-                else:
+                if not self._is_own_input(existing, text):
                     return SendResult(
                         False,
                         "入力欄に書きかけの文があります。"
                         "テストでも上書きはしません",
                         needs_confirm=True)
+                if self._own_overwrite_verdict(existing, text) \
+                        == "defer":
+                    return SendResult(
+                        False,
+                        "送信待ちの文が入力欄にあるため、"
+                        "上書きせず保留しました",
+                        deferred=True)
+                # 自分の文の残り (失敗分・送り直し)。上書きして
+                # 進める (2.65)
         try:
             filler = getattr(self._tp(), "fill_prompt", None)
             if filler is None:
@@ -822,6 +899,10 @@ class CopilotSession:
                 image_paste=image_paste, lenient=lenient,
                 direct_check=direct_check)
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, WorkerError):
+                # send と同じ (2.70): 残った文を自分の文として
+                # 控える。状態は「失敗で残った」(2.71)
+                self._remember_own_input(text, state="failed")
             return SendResult(
                 False, f"入力欄に入れられませんでした（{e}）")
         done, failed = self._attach_outcome()
@@ -960,9 +1041,11 @@ class CopilotSession:
                 pressed, ratio = result \
                     if isinstance(result, tuple) else (result, None)
             except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+                self._mark_own_input_failed()
                 return SendResult(
                     False, str(e) or "送信ボタンを押せませんでした")
             if not pressed:
+                self._mark_own_input_failed()
                 return SendResult(False, "送信ボタンを押せませんでした")
             self._forget_own_input()
             if ratio is not None:
@@ -978,8 +1061,10 @@ class CopilotSession:
                     False, "この経路では送信ボタンを押せません")
             pressed = presser()
         except Exception as e:  # noqa: BLE001  段つきの文をそのまま伝える
+            self._mark_own_input_failed()
             return SendResult(False, str(e) or "送信ボタンを押せませんでした")
         if not pressed:
+            self._mark_own_input_failed()
             return SendResult(False, "送信ボタンを押せませんでした")
         self._forget_own_input()
         return SendResult(True, "送信ボタンを押しました")

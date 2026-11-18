@@ -262,6 +262,24 @@ def send_configured(fields) -> bool:
                 or fields["send_class"])
 
 
+ACK_DELAY_DEFAULT = 5
+
+
+def sanitize_ack_delay(section) -> int:
+    """受領応答を出すまでの秒数 (2.72、環境2の所感から)。
+
+    settings の script_runner 節の ack_delay_seconds を
+    0〜3600 の int に整える。欠け・壊れは既定 (5秒)。0 なら
+    実行の開始直後から出す (見回りの間隔で実際に出る)。"""
+    value = section.get("ack_delay_seconds") \
+        if isinstance(section, dict) else section
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return ACK_DELAY_DEFAULT
+    return max(0, min(3600, number))
+
+
 def sanitize_automation(value) -> dict:
     """自動化の切替を整える。{auto_dl, auto_run, auto_answer,
     auto_send, auto_diag, auto_ack, auto_reset, auto_rerun,
@@ -1772,12 +1790,30 @@ class AutomationPage(QWidget):
             box.setChecked(given[key])
             self._auto_boxes[key] = box
             layout.addWidget(box)
+            if key == "auto_ack":
+                # 受領を出すまでの秒数 (2.72)。受領の切替の直下に
+                # 置く。0 で開始直後、大きくすれば速い実行では
+                # 受領が出なくなる (結果だけが届く)。
+                row = QHBoxLayout()
+                row.addSpacing(24)
+                row.addWidget(QLabel("受領を出すまでの秒数"))
+                self._ack_delay_spin = QSpinBox()
+                self._ack_delay_spin.setRange(0, 3600)
+                self._ack_delay_spin.setSuffix(" 秒")
+                self._ack_delay_spin.setValue(
+                    sanitize_ack_delay(automation))
+                row.addWidget(self._ack_delay_spin)
+                row.addStretch(1)
+                layout.addLayout(row)
         layout.addStretch(1)
 
     def automation(self) -> dict:
         """自動化の切替の今の値 (script_runner 節へ保存する形)。"""
-        return {key: bool(self._auto_boxes[key].isChecked())
-                for key in AUTO_KEYS}
+        result = {key: bool(self._auto_boxes[key].isChecked())
+                  for key in AUTO_KEYS}
+        result["ack_delay_seconds"] = int(
+            self._ack_delay_spin.value())
+        return result
 
 
 class CommonSettingsPage(QWidget):

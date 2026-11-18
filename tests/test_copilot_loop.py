@@ -2367,10 +2367,11 @@ class _PasteRig:
     ので、モジュール関数ごと差し替えて順序と成否を握る。"""
 
     def __init__(self, state, *, write_file_error=None,
-                 confirm_timeout=None):
+                 confirm_timeout=None, foreground=True):
         self._state = state
         self._write_file_error = write_file_error
         self._confirm_timeout = confirm_timeout
+        self._foreground = foreground
         self._saved = {}
 
     def _patch(self, name, value):
@@ -2407,6 +2408,12 @@ class _PasteRig:
                     lambda hwnd: state["log"].append(("front", hwnd))
                     or True)
         self._patch("_send_ctrl_v", send_ctrl_v)
+        # 前面確認 (2.69) は実機の前面窓と比べるので、fake の窓
+        # では必ず落ちる。既定は「前面が合っている」に差し替え、
+        # 前面でない場合のテストだけ foreground=False で外す
+        # (2.77、レビュー重大3)。
+        self._patch("_foreground_matches",
+                    lambda hwnd: self._foreground)
         self._patch("ATTACH_FOREGROUND_WAIT", 0.0)
         self._patch("ATTACH_FOCUS_WAIT", 0.0)
         if self._confirm_timeout is not None:
@@ -2430,6 +2437,41 @@ def test_attach_file_paste_happy_path():
         ("file", "C:\\out\\result.csv"), ("front", 424242), "focus",
         "paste", ("restore", "元のテキスト")]
     assert state["attached_names"] == ["result.csv"]
+
+
+def test_foreground_check_blocks_paste_when_not_foreground():
+    """前面が対象の窓でなければ、Ctrl+V は1回も送られない
+    (2.77、レビュー重大3。高1の本体を縛る)。"""
+    state = _paste_state(clip_text="元のテキスト", paste_plan=[True])
+    cp = _paste_copilot(state)
+    with _PasteRig(state, foreground=False):
+        try:
+            cp.attach_file_paste("C:\\out\\result.csv")
+        except copilot_loop.InputStageError as e:
+            assert e.stage == "unwritable"
+            assert "前面" in str(e)
+        else:
+            raise AssertionError("前面でないのに貼り付けが進んだ")
+    assert "paste" not in state["log"]
+    assert state["attached_names"] == []
+
+
+def test_foreground_check_allows_paste_when_foreground():
+    """前面が対象の窓なら、従来どおり貼り付けが進む (2.77)。"""
+    state = _paste_state(clip_text="元のテキスト", paste_plan=[True])
+    cp = _paste_copilot(state)
+    with _PasteRig(state, foreground=True):
+        cp.attach_file_paste("C:\\out\\result.csv")
+    assert "paste" in state["log"]
+    assert state["attached_names"] == ["result.csv"]
+
+
+def test_foreground_matches_without_hwnd_passes():
+    """hwnd が無いときは比べようがないので従来どおり通す
+    (2.77、レビュー重大3)。"""
+    assert copilot_loop._foreground_matches(None) is True
+    assert copilot_loop._foreground_matches(0) is True
+    copilot_loop._require_foreground(None)  # 例外にならない
 
 
 def test_attach_file_confirmed_by_remove_button():
@@ -2801,6 +2843,9 @@ class _DialogRig:
     def __enter__(self):
         self._patch("_enum_top_level_windows",
                     lambda: list(self.candidates))
+        # 前面確認 (2.69) は fake の窓では実機の前面と合わない
+        # ので、合っていることに差し替える (2.77、重大3)。
+        self._patch("_foreground_matches", lambda hwnd: True)
         self._patch("ATTACH_POLL", 0.0)
         self._patch("DIALOG_SUBMIT_WAIT", 0.0)
         self._patch("DIALOG_CLOSE_WAIT", 0.0)

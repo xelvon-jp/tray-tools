@@ -268,6 +268,10 @@ if user32 is not None:
     user32.SetClipboardData.restype = ctypes.c_void_p
     user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
     user32.SetForegroundWindow.restype = ctypes.c_bool
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user32.GetAncestor.restype = ctypes.c_void_p
     user32.keybd_event.argtypes = [
         ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ulong,
         ctypes.c_size_t]
@@ -1383,6 +1387,46 @@ def _bring_to_front(hwnd):
         return False
 
 
+GA_ROOT = 2
+
+
+def _window_root(hwnd):
+    """窓のルート (最上位の親) を返す。取れなければ hwnd 自身。"""
+    if user32 is None or not hwnd:
+        return hwnd
+    try:
+        root = user32.GetAncestor(ctypes.c_void_p(hwnd), GA_ROOT)
+        return root or hwnd
+    except Exception:  # noqa: BLE001  取れなければ自身で比べる
+        return hwnd
+
+
+def _foreground_matches(hwnd):
+    """前面の窓のルートが hwnd のルートと一致するか (2.69、
+    レビュー高1)。
+
+    キー送信はフォーカスのある窓へ届くので、前面化が失敗した
+    まま送ると、利用者が操作している別のアプリへ届く。送る
+    直前にここで確かめ、合わなければ送らない。hwnd が無い・
+    user32 が無い環境では比べようがないので True (従来どおり
+    読み直しの確認に任せる)。"""
+    if user32 is None or not hwnd:
+        return True
+    try:
+        fg = user32.GetForegroundWindow()
+    except Exception:  # noqa: BLE001  取れなければ従来どおり進む
+        return True
+    if not fg:
+        return False
+    return _window_root(fg) == _window_root(hwnd)
+
+
+def _require_foreground(hwnd):
+    """前面が対象の窓でなければ RuntimeError (2.69、レビュー高1)。"""
+    if not _foreground_matches(hwnd):
+        raise RuntimeError("対象の窓が前面ではありません")
+
+
 def _send_ctrl_v():
     """Ctrl+V のキー送信。貼り付けはフォーカスのある窓へ届く。"""
     if user32 is None:
@@ -2127,6 +2171,9 @@ class Copilot:
         try:
             _bring_to_front(getattr(self, "hwnd_main", None))
             time.sleep(ATTACH_FOREGROUND_WAIT)
+            if not _foreground_matches(
+                    getattr(self, "hwnd_main", None)):
+                return  # 前面でない窓へキーを送らない (2.69、高1)
             box.SetFocus()
             time.sleep(ATTACH_FOCUS_WAIT)
             _send_ctrl_a()
@@ -2151,6 +2198,7 @@ class Copilot:
             if box is None:
                 return False
             self._clear_input_physically(box)
+            _require_foreground(getattr(self, "hwnd_main", None))
             ime_wnd = _suspend_ime(getattr(self, "hwnd_main", None))
             try:
                 _type_unicode_text(text)
@@ -2226,7 +2274,13 @@ class Copilot:
         saved_text = _clipboard_read_text()
         try:
             self._paste_input_text(text)
-            if not direct_check:
+            if direct_check:
+                # 確認読みをしない方式では、貼り付けが相手に
+                # 届く前にクリップボードを戻すと、戻した文が
+                # 貼られるおそれがある。少し待ってから戻す
+                # (2.70、レビュー中)。
+                time.sleep(0.3)
+            else:
                 self._input_reflects(
                     text, timeout=INPUT_VERIFY_BASIC_SECONDS)
         except Exception:  # noqa: BLE001  成否は送信の段で判定
@@ -2329,6 +2383,7 @@ class Copilot:
                 f"入力欄へフォーカスできませんでした（{e}）") from e
         time.sleep(ATTACH_FOCUS_WAIT)
         try:
+            _require_foreground(getattr(self, "hwnd_main", None))
             _send_ctrl_v()
         except Exception as e:  # noqa: BLE001  段つきの文に畳む
             raise InputStageError(
@@ -4098,6 +4153,7 @@ class Copilot:
                     f"入力欄へフォーカスできませんでした（{e}）") from e
             time.sleep(ATTACH_FOCUS_WAIT)
             try:
+                _require_foreground(getattr(self, "hwnd_main", None))
                 _send_ctrl_v()
             except Exception as e:  # noqa: BLE001  段つきの文に畳む
                 raise InputStageError(
@@ -4158,6 +4214,7 @@ class Copilot:
                 f"入力欄へフォーカスできませんでした（{e}）") from e
         time.sleep(ATTACH_FOCUS_WAIT)
         try:
+            _require_foreground(getattr(self, "hwnd_main", None))
             _send_ctrl_v()
         except Exception as e:  # noqa: BLE001  段つきの文に畳む
             raise InputStageError(
@@ -4363,10 +4420,14 @@ class Copilot:
         except Exception:  # noqa: BLE001  取れなくても先へ進む
             hwnd = None
         _bring_to_front(hwnd)
-        try:
-            _send_alt_o()
-        except Exception:  # noqa: BLE001  送れなければ Invoke で試す
-            pass
+        if hwnd and not _foreground_matches(hwnd):
+            pass  # 前面でない窓へキーを送らない (2.69、高1)。
+            # ダイアログは開いたままなので、下の Invoke へ進む
+        else:
+            try:
+                _send_alt_o()
+            except Exception:  # noqa: BLE001  送れなければ Invoke で試す
+                pass
         deadline = time.time() + DIALOG_CLOSE_WAIT
         while self._file_dialog_still_open(hwnd):
             if time.time() >= deadline:

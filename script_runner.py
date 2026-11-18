@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.68"
+PHAL_VERSION = "2.78"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -53,7 +53,8 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent, QObject, QSignalBlocker, Qt, QTimer, Signal)
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -185,6 +186,7 @@ COL_HASH = 4
 COL_SUMMARY = 5
 COL_STATUS = 6
 COL_RUN = 7
+SUMMARY_COLUMN_MIN_WIDTH = 80  # 概要列の下限 [px] (幅の配分用、2.75)
 
 STATUS_COLORS = {
     core.STATUS_OK: "#1f7a45",
@@ -341,7 +343,9 @@ def _chrome_stylesheet(chrome: dict) -> str:
         "QHeaderView::section {"
         f" background-color: {chrome['header']};"
         f" color: {chrome['text']};"
-        " border: none; padding: 2px 4px; }"
+        " border: none;"
+        f" border-right: 1px solid {chrome['border']};"
+        " padding: 2px 4px; }"
         "QTableWidget {"
         f" background-color: {chrome['base']};"
         f" alternate-background-color: {chrome['alternate_base']};"
@@ -1271,6 +1275,12 @@ class ScriptItem:
         # でも二度と相手にしない (中身が変われば見回りが外す)。
         # 手動の実行はこの印に関係なく常にできる。
         self.auto_skip_executed = False
+        # 持ち主が「飛ばす」で見送った印 (2.76)。立ったら、この
+        # 到着は自動実行の入口・待ち列のどちらでも相手にしない。
+        # 手動の実行はこの印に関係なく常にできる。控え (core の
+        # skipped、名前と sha256 の組) と行き来して、開き直しを
+        # またいで残る。
+        self.skipped = False
 
     def stat_key(self):
         return (self.mtime, self.size)
@@ -1631,8 +1641,27 @@ class ScriptRunnerWindow(QWidget):
         # 連鎖の印 (_ai_filling 等) とは混ぜない。
         self._ack_sending = False
         self._ack_pending_answer = None
+        # 回答の投入が他の送信と重なって見送られた項目の控え
+        # (2.70、レビュー高6)。空いたら見回りが進める。
+        self._answer_pending_item = None
+        # 保留の再試行の間隔 (2.77、レビュー中2)。見回りのたびに
+        # 送り役を起こさないよう、次に試してよい時刻と、伸びて
+        # いく間隔 (2秒から10秒まで) を持つ。保留の診断は
+        # episode ごとに1回だけ (_answer_pending_noted)。
+        self._answer_pending_next_at = 0.0
+        self._answer_pending_delay = 0.0
+        self._answer_pending_noted = False
+        # 受領の保留の再試行を抑える時刻 (2.77、レビュー中2)。
+        self._ack_blocked_until = 0.0
+        # 自動送信の保留 (deferred) の共通の間隔 (2.78、
+        # レビュー重大1)。送信待ちの文がある間は、ほかの自動
+        # 送信は撃ち直しを間引く (_chain_in_flight に混ぜる)。
+        self._auto_blocked_until = 0.0
+        self._auto_blocked = False
         # 受領応答を出す義務がある実行中の項目 (2.66、遅延送信)。
         self._ack_due_item = None
+        # 送信中の受領応答の項目 (2.71)。保留されたら義務へ戻す。
+        self._ack_item = None
         self._ack_signals = _AiSignals()
         self._ack_signals.done.connect(self._on_ack_done)
         # 開始プロンプトの送信 (1.77)。送信の最中の印、結果を
@@ -1660,6 +1689,12 @@ class ScriptRunnerWindow(QWidget):
         # 結果を受けるシグナル。受領の系統とは混ぜない。
         self._blocked_notified = core.load_blocked_notified()
         self._notice_sending = False
+        # 送信中の知らせの項目と、保留された知らせの再送の控え
+        # (2.78、レビュー重大1)。知らせは合図の見張りからは
+        # 撃ち直されないので、見回りで再送する。
+        self._notice_item = None
+        self._notice_pending_item = None
+        self._notice_retry_next_at = 0.0
         self._notice_signals = _AiSignals()
         self._notice_signals.done.connect(self._on_notice_done)
         # チャットの検出役・DL 押下役 (テストで差し替える。None なら
@@ -1711,6 +1746,8 @@ class ScriptRunnerWindow(QWidget):
         # key (この会話で1項目1度だけ出すため)。
         self._executed_hashes = core.load_executed_hashes()
         self._executed_skip_noted = set()
+        # 持ち主が見送った到着の控え (2.76、名前と sha256 の組)。
+        self._skipped = core.load_skipped()
         # 前回の実行結果の控え (1.56)。再実行の差分の相手。
         # コマンドID (無ければファイル名) ごとに直近1件の結果文
         # (差分の対象になる部分)。開き直しをまたぐ JSON から読む。
@@ -1726,6 +1763,11 @@ class ScriptRunnerWindow(QWidget):
         self._phal_step = 0
         self._phal_command_id = ""
         self._phal_item = ""
+        # 直近の実行結果と直近のエラーの控え (2.73、phal_status
+        # .json の last_run / last_error)。_note_phal_run が実行の
+        # 終了ごとに差し替え、_publish_phal_status が毎回載せる。
+        self._phal_last_run = None
+        self._phal_last_error = None
         # 直近に発行した状態 (状態QR が読む、2.09)。
         self._phal_state = "idle"
         # 大きな進捗表示 (1.64) の対象行に出す項目 (実行中または
@@ -2104,19 +2146,34 @@ class ScriptRunnerWindow(QWidget):
         # スタイル側でも止める(delegate と二重の対策)。
         self._table_style = _NoFocusRectStyle(self.table.style())
         self.table.setStyle(self._table_style)
-        self.table.setShowGrid(False)
+        # 列の境界が分かるよう格子線は出す (2.75。色はテーマの
+        # gridline-color)。列幅をドラッグで変えるようになって、
+        # 境目が見えないと掴めないという実機報告を受けた。
+        self.table.setShowGrid(True)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(COL_ID, QHeaderView.ResizeMode.ResizeToContents)
-        # ファイル名だけは Interactive: 幅は _fit_name_column が
-        # 中身に合わせて上限つきで決める (ResizeToContents だと
-        # 長い名前が際限なく列を押し広げるため)。
-        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(COL_AI, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(COL_HASH, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(COL_SUMMARY, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(COL_RUN, QHeaderView.ResizeMode.ResizeToContents)
+        # 列幅は全部ドラッグで変えられる (2.72、環境2の所感から)。
+        # 概要も含めて全部 Interactive (2.75)。Stretch だと概要の
+        # 境界をドラッグしても幅が戻り、直感的でなかった。余った
+        # 幅の配分は、表の大きさが変わったときに _distribute_
+        # table_width が概要へ寄せる。保存済みの幅があればそれを
+        # 初期値にする (保存は終了時)。保存が無い間は、ファイル
+        # 名は _fit_name_column が、その他の列は初回だけ中身に
+        # 合わせて決める。
+        for col in (COL_TIME, COL_ID, COL_NAME, COL_AI, COL_HASH,
+                    COL_SUMMARY, COL_STATUS, COL_RUN):
+            header.setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Interactive)
+        saved_widths = self.config.get("column_widths")
+        if saved_widths:
+            for col, width in enumerate(saved_widths):
+                header.resizeSection(col, width)
+        # 実行ボタンの列の下限 (2.74)。保存済みの幅が壊れて
+        # いても、ボタンが潰れて見えなくならないようにする
+        # (core.normalize_config でも締めているが、ここでも守る)。
+        if header.sectionSize(COL_RUN) < core.RUN_COLUMN_MIN_WIDTH:
+            header.resizeSection(COL_RUN, core.RUN_COLUMN_MIN_WIDTH)
+        # 表の大きさの変化で、幅の余りを概要列へ配る (2.75)。
+        self.table.installEventFilter(self)
         self.table.currentCellChanged.connect(self._on_selection_changed)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.table.setContextMenuPolicy(
@@ -2579,6 +2636,50 @@ class ScriptRunnerWindow(QWidget):
         except Exception:  # noqa: BLE001
             pass
 
+    def _note_phal_run(self, run, command_id):
+        """直近の実行結果を phal_status.json 用に控える (2.73)。
+
+        実行の終了ごとに _phal_last_run を差し替え、成功でない
+        ときは _phal_last_error (段は run) も差し替える。成功して
+        も last_error は消さない (直近のエラーはいつ・何だったか
+        を残す)。実際の書き出しは、この後の _publish_phal_status
+        (停止・待機・回答のいずれか) が担う。"""
+        if run.start_error:
+            outcome = "start_error"
+        elif run.timed_out:
+            outcome = "timeout"
+        elif run.stopped:
+            outcome = "stopped"
+        elif run.policy_stop:
+            outcome = "policy_stop"
+        elif run.exit_code == 0:
+            outcome = "ok"
+        else:
+            outcome = "failed"
+        self._phal_last_run = {
+            "name": run.name,
+            "command_id": command_id or "",
+            "outcome": outcome,
+            "exit_code": run.exit_code,
+            "seconds": run.seconds,
+            "stdout_head": (run.stdout or "")[:500],
+            "stderr_head": (run.stderr or "")[:500],
+            "at": int(time.time()),
+        }
+        if outcome != "ok":
+            reason = run.start_error or ""
+            if not reason and run.stderr and run.stderr.strip():
+                reason = run.stderr.strip().splitlines()[0]
+            if not reason:
+                reason = {
+                    "timeout": "時間切れで止めました",
+                    "stopped": "停止されました",
+                    "policy_stop": "実行ポリシーで止めました",
+                }.get(outcome, f"終了コード {run.exit_code}")
+            self._phal_last_error = {
+                "stage": "run", "reason": reason,
+                "at": int(time.time())}
+
     def _publish_phal_status(self, state, detail="",
                              stopped_reason="", command_id=None,
                              item=None, affect_stage=True):
@@ -2634,7 +2735,9 @@ class ScriptRunnerWindow(QWidget):
                 PHAL_VERSION, state,
                 command_id=self._phal_command_id,
                 detail=detail, stopped_reason=stopped_reason,
-                step=self._phal_step, item=self._phal_item)
+                step=self._phal_step, item=self._phal_item,
+                last_run=self._phal_last_run,
+                last_error=self._phal_last_error)
             core.write_phal_status(status)
         except Exception:  # noqa: BLE001  状態の書き出しは本体を止めない
             pass
@@ -2785,7 +2888,8 @@ class ScriptRunnerWindow(QWidget):
                     return ai
             for item in (getattr(self, "_running_item", None),
                          getattr(self, "_display_item", None),
-                         getattr(self, "_ack_pending_answer", None)):
+                         getattr(self, "_ack_pending_answer", None),
+                         getattr(self, "_answer_pending_item", None)):
                 ai = getattr(item, "ai", None)
                 if ai and ai in floors:
                     return ai
@@ -3623,6 +3727,8 @@ class ScriptRunnerWindow(QWidget):
     def _poll_inner(self):
         self.restart_button.setEnabled(self._running_item is None)
         self._maybe_send_delayed_ack()
+        self._pump_pending_answer()
+        self._pump_pending_notice()
         # 追いかけモードの印と、到着した行の色付けの期限 (2.07)。
         self._refresh_chase_label()
         if self._highlight_name and \
@@ -3772,6 +3878,16 @@ class ScriptRunnerWindow(QWidget):
             f"{self._diag_status_label(result.status)}{ms}",
             ai=item.ai or None)
         self._restore_ran(item)
+        # 見送りの控えとの行き来 (2.76)。チェック前に見送られて
+        # いたら、ここで分かった sha256 で控えへ確定する。控えに
+        # ある到着は項目に印を立てておく (表示と自動実行の門)。
+        if item.skipped:
+            if result.sha256:
+                core.skipped_put(self._skipped, item.name,
+                                 result.sha256)
+                core.save_skipped(self._skipped)
+        else:
+            self._skip_if_user_skipped(item)
         if item.auto_eligible:
             # 対象の控えに、チェックで分かった sha256 も埋める。
             self._remember_pending_run(
@@ -3802,6 +3918,8 @@ class ScriptRunnerWindow(QWidget):
         そろえる。"""
         if item is None or item.result is None:
             return
+        if self._skip_if_user_skipped(item):
+            return  # 持ち主が見送った到着は、自動では走らせない
         if item.auto_skip_executed:
             return  # 実行済みの中身と分かった分は、もう相手にしない
         if not item.auto_eligible:
@@ -3893,6 +4011,53 @@ class ScriptRunnerWindow(QWidget):
                 f"・{item.name}", "warn")
         return True
 
+    def _skip_if_user_skipped(self, item: ScriptItem) -> bool:
+        """持ち主が見送った到着なら、項目に印を付けて True (2.76)。
+
+        判定は控え (名前と sha256 の組) で行う。手動の実行はここ
+        では止めない (この判定を通るのは自動実行の入口と待ち列
+        だけ)。"""
+        sha = item.result.sha256 if item.result is not None else ""
+        if not core.skipped_contains(self._skipped, item.name, sha):
+            return False
+        item.skipped = True
+        return True
+
+    def _skip_item(self, item: ScriptItem):
+        """到着を見送る (2.76、「飛ばす」ボタンと右クリック)。
+
+        自動実行の待ち列から外し、項目に印を付け、sha256 が
+        分かっていれば控えにも残す (開き直しをまたぐ)。チェック
+        前で sha256 がまだ無いときは、チェック完了時に
+        _on_check_done が控えへ確定する。"""
+        if item.ran or item is self._running_item:
+            return
+        item.skipped = True
+        if item.key in self._auto_run_queue:
+            self._auto_run_queue.remove(item.key)
+        sha = item.result.sha256 if item.result is not None else ""
+        if sha:
+            core.skipped_put(self._skipped, item.name, sha)
+            core.save_skipped(self._skipped)
+        self._diag(f"自動実行を見送り（持ち主の指定）: {item.name}",
+                   ai=item.ai or None)
+        self._set_note(f"自動実行を見送りました・{item.name}", "ok")
+        self._refresh_list()
+
+    def _unskip_item(self, item: ScriptItem):
+        """見送りを取り消す (2.76、右クリック)。
+
+        印と控えを外し、自動実行の入口へ改めて通す (条件が合え
+        ば待ち列に入り直す)。"""
+        item.skipped = False
+        sha = item.result.sha256 if item.result is not None else ""
+        if sha:
+            core.skipped_discard(self._skipped, item.name, sha)
+            core.save_skipped(self._skipped)
+        self._set_note(f"見送りを取り消しました・{item.name}", "ok")
+        self._refresh_list()
+        self._admit_auto_run(item)
+
     def _pump_auto_run(self):
         """自動実行の待ち列から、次の1件を始める。
 
@@ -3917,6 +4082,8 @@ class ScriptRunnerWindow(QWidget):
             if item.result is None or item.status not in (
                     core.STATUS_OK, core.STATUS_WARN):
                 continue
+            if item.skipped or self._skip_if_user_skipped(item):
+                continue  # 持ち主が見送った。待ち列から外して進む
             if self._skip_if_executed(item):
                 continue  # 同じ中身を実行済み。待ち列から外して進む
             ident = (item.key, item.stat_key())
@@ -4078,6 +4245,34 @@ class ScriptRunnerWindow(QWidget):
             self.table.scrollToTop()
         self._fit_name_column()
 
+    def eventFilter(self, obj, event):
+        """表の大きさが変わったら、幅の余りを概要列へ配る (2.75)。"""
+        if obj is self.table and event.type() == QEvent.Type.Resize:
+            self._distribute_table_width()
+        return super().eventFilter(obj, event)
+
+    def _distribute_table_width(self):
+        """列幅の合計を表の幅に合わせ、差分を概要列で受ける (2.75)。
+
+        概要を Stretch にしていた頃は、概要の境界をドラッグして
+        も幅が戻って直感的でなかった。全列 Interactive にした
+        代わり、余りの配分は表 (≒窓) の大きさが変わったとき
+        だけ、ここで行う。概要が下限に達したら、それ以上は
+        縮めず横スクロールに任せる。"""
+        header = self.table.horizontalHeader()
+        viewport = self.table.viewport().width()
+        if viewport <= 0:
+            return
+        total = sum(header.sectionSize(col)
+                    for col in range(self.table.columnCount()))
+        delta = viewport - total
+        if delta == 0:
+            return
+        current = header.sectionSize(COL_SUMMARY)
+        new_width = max(SUMMARY_COLUMN_MIN_WIDTH, current + delta)
+        if new_width != current:
+            header.resizeSection(COL_SUMMARY, new_width)
+
     def _fit_name_column(self):
         """ファイル名の列幅を、表示中の名前の一番長いものに合わせる
         (上限つき)。
@@ -4085,8 +4280,24 @@ class ScriptRunnerWindow(QWidget):
         ResizeToContents だと長い名前が列を際限なく押し広げるので、
         この列だけ Interactive にして幅をここで決める。上限を超える
         名前は省略表示になり (全文はツールチップ)、余った幅は伸縮
-        する概要の列が受け取る。窓幅を変えても伸びるのは概要だけ。"""
+        する概要の列が受け取る。窓幅を変えても伸びるのは概要だけ。
+
+        保存済みの列幅があるときは、利用者の幅を優先して何も
+        しない (2.72)。無いときは、その他の列も初回だけ中身に
+        合わせる。"""
+        if self.config.get("column_widths"):
+            return
         header = self.table.horizontalHeader()
+        if not getattr(self, "_other_columns_fitted", False):
+            self._other_columns_fitted = True
+            for col in (COL_TIME, COL_ID, COL_AI, COL_HASH,
+                        COL_STATUS, COL_RUN):
+                self.table.resizeColumnToContents(col)
+            # ボタンがまだ無い行ばかりだと、実行ボタンの列が
+            # 測れず潰れた幅になる (2.74、実機報告 2026-11-18)。
+            if header.sectionSize(COL_RUN) < core.RUN_COLUMN_MIN_WIDTH:
+                header.resizeSection(
+                    COL_RUN, core.RUN_COLUMN_MIN_WIDTH)
         font = self.table.font()
         font.setBold(True)  # ファイル名のセルは太字で描かれる
         metrics = QFontMetrics(font)
@@ -4152,18 +4363,18 @@ class ScriptRunnerWindow(QWidget):
         # なる(実機報告 2026-11-14)。
         existing = self.table.cellWidget(row, COL_RUN)
         spec = self._run_button_spec(item)
-        if spec is None:
+        # 「飛ばす」は実行前の行にだけ出す (2.76)。見送り済み・
+        # 実行中・実行済みの行には出さない。
+        want_skip = (not item.ran and not item.skipped
+                     and item is not self._running_item)
+        if spec is None and not want_skip:
             if existing is not None:
                 self.table.removeCellWidget(row, COL_RUN)
-        elif not (isinstance(existing, QPushButton)
-                  and existing.property("phal_item_key") == item.key
-                  and existing.isEnabled() == spec[0]
-                  and bool(existing.property("phal_accent")) == spec[1]
-                  and existing.property("phal_mode") == spec[2]
-                  and existing.property("phal_theme")
-                  == ("dark" if self._dark_mode else "light")):
-            self.table.setCellWidget(row, COL_RUN,
-                                     self._make_run_button(item))
+        elif not self._row_buttons_match(existing, item, spec,
+                                         want_skip):
+            self.table.setCellWidget(
+                row, COL_RUN,
+                self._make_row_buttons(item, spec, want_skip))
         # 到着したての行の色付け (2.07)。期限は _poll_inner が見て、
         # 切れたら描き直して消す。
         if self._highlight_name and \
@@ -4296,6 +4507,8 @@ class ScriptRunnerWindow(QWidget):
         # エラーは実行できないので「・済」は付かない。
         if item is self._running_item:
             return "実行中"
+        if item.skipped and not item.ran:
+            return "見送り"
         if item.status == "checking":
             return "チェック中"
         if item.returned:
@@ -4367,7 +4580,8 @@ class ScriptRunnerWindow(QWidget):
         # 「押せない」感じになる(実機報告 2026-11-14)。押した瞬間に
         # 始める。
         if mode == "answer":
-            button.pressed.connect(lambda it=item: self._answer_to_ai(it))
+            button.pressed.connect(
+                lambda it=item: self._answer_to_ai(it, manual=True))
         elif mode == "send":
             button.pressed.connect(lambda it=item: self._send_to_ai(it))
         elif mode == "rerun":
@@ -4375,6 +4589,69 @@ class ScriptRunnerWindow(QWidget):
         else:
             button.pressed.connect(lambda it=item: self._start_run(it))
         return button
+
+    def _row_buttons_match(self, existing, item, spec, want_skip):
+        """行のボタン類が今の項目・姿と一致するか (2.76)。
+
+        _fill_row が作り直しを避けるための見比べ。実行ボタンだけ
+        の頃の条件 (項目・押せるか・目立たせ・役割・テーマ) に、
+        「飛ばす」の有無を足した。"""
+        if existing is None:
+            return False
+        if existing.property("phal_item_key") != item.key:
+            return False
+        if bool(existing.property("phal_skip")) != want_skip:
+            return False
+        if existing.property("phal_theme") \
+                != ("dark" if self._dark_mode else "light"):
+            return False
+        if spec is None:
+            return not existing.property("phal_mode")
+        return (existing.property("phal_mode") == spec[2]
+                and bool(existing.property("phal_enabled")) == spec[0]
+                and bool(existing.property("phal_accent")) == spec[1])
+
+    def _make_row_buttons(self, item, spec, want_skip):
+        """行のボタン類を作る (2.76)。
+
+        「飛ばす」が要らない行は、これまでどおり実行ボタン単体。
+        要る行は、実行ボタン (あれば) と「飛ばす」を横に並べた
+        入れ物にする。押した瞬間に始める作法 (pressed) は実行
+        ボタンと同じ。"""
+        theme_name = "dark" if self._dark_mode else "light"
+        run_button = self._make_run_button(item) \
+            if spec is not None else None
+        if not want_skip:
+            run_button.setProperty("phal_enabled", spec[0])
+            run_button.setProperty("phal_skip", False)
+            return run_button
+        skip_button = QPushButton("飛ばす")
+        skip_button.setToolTip(
+            "この到着を自動実行しない（手動では実行できます）")
+        skip_button.pressed.connect(
+            lambda it=item: self._skip_item(it))
+        if run_button is None:
+            skip_button.setProperty("phal_item_key", item.key)
+            skip_button.setProperty("phal_mode", "")
+            skip_button.setProperty("phal_enabled", True)
+            skip_button.setProperty("phal_accent", False)
+            skip_button.setProperty("phal_skip", True)
+            skip_button.setProperty("phal_theme", theme_name)
+            return skip_button
+        run_button.setProperty("phal_enabled", spec[0])
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(run_button, 1)
+        layout.addWidget(skip_button)
+        box.setProperty("phal_item_key", item.key)
+        box.setProperty("phal_mode", spec[2])
+        box.setProperty("phal_enabled", spec[0])
+        box.setProperty("phal_accent", spec[1])
+        box.setProperty("phal_skip", True)
+        box.setProperty("phal_theme", theme_name)
+        return box
 
     def _on_selection_changed(self, row: int, *_rest):
         if row < len(self._holders()):
@@ -4454,6 +4731,16 @@ class ScriptRunnerWindow(QWidget):
             action = menu.addAction("エラーをコピー")
             action.triggered.connect(
                 lambda _c=False, it=item: self._copy_check_error(it))
+        # 見送り (2.76)。実行前の行だけに出す。
+        if not item.ran and item is not self._running_item:
+            if item.skipped:
+                unskip_action = menu.addAction("見送りを解除")
+                unskip_action.triggered.connect(
+                    lambda _c=False, it=item: self._unskip_item(it))
+            else:
+                skip_action = menu.addAction("自動実行を飛ばす")
+                skip_action.triggered.connect(
+                    lambda _c=False, it=item: self._skip_item(it))
         menu.addSeparator()
         ret = menu.addAction("差し戻す…")
         ret.setEnabled(item is not self._running_item)
@@ -4692,10 +4979,19 @@ class ScriptRunnerWindow(QWidget):
         import threading
 
         def work():
-            run = core.execute_script(
-                item.path, self.config, self._run_handle,
-                expected_sha256=item.result.sha256,
-                args=self._running_args)
+            # try で包む (2.69、レビュー高5)。ここだけ包まれて
+            # いないと、例外でスレッドが黙って死に、_running_item
+            # が残ったまま自動化が全部止まる。失敗は起動でき
+            # なかった形の結果として完了側へ渡す。
+            try:
+                run = core.execute_script(
+                    item.path, self.config, self._run_handle,
+                    expected_sha256=item.result.sha256,
+                    args=self._running_args)
+            except Exception as e:  # noqa: BLE001  完了側で報告する
+                run = core.RunResult(
+                    name=item.name, path=str(item.path),
+                    start_error=f"実行の裏方で例外: {e}")
             self._run_signals.done.emit(run)
 
         self._run_thread = threading.Thread(
@@ -4767,6 +5063,7 @@ class ScriptRunnerWindow(QWidget):
             f"実行終了: {run.name} 終了コード {run.exit_code}"
             f"（{run.seconds:.1f}秒）{flags}",
             ai=(item.ai or None) if item is not None else None)
+        self._note_phal_run(run, core.parse_command_id(run.name))
         if run.stopped or run.timed_out or run.policy_stop:
             reason = ("停止されました" if run.stopped else
                       "時間切れで止めました" if run.timed_out else
@@ -5017,7 +5314,10 @@ class ScriptRunnerWindow(QWidget):
         dialog = sr_ai.SettingsDialog(
             profiles[active]["target"], self,
             profiles=profiles, active_index=active,
-            automation=sr_ai.sanitize_automation(section),
+            automation={
+                **sr_ai.sanitize_automation(section),
+                "ack_delay_seconds": sr_ai.sanitize_ack_delay(section),
+            },
             common={
                 "watch_text": str(
                     core.resolve_watch_folder(section)),
@@ -5100,7 +5400,46 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 f"ツール置き場を開けませんでした（{e}）", "error")
 
-    def _answer_to_ai(self, item: ScriptItem):
+    def _schedule_answer_retry(self):
+        """保留した回答の、次の再試行の時刻を決める (2.77)。
+
+        間隔は2秒から始めて倍々に伸ばし、10秒で頭打ちにする
+        (レビュー中2: 見回りのたびに送り役が走らないように)。
+        保留が解けたときに _clear_answer_pending が間隔を戻す。"""
+        self._answer_pending_delay = min(
+            max(self._answer_pending_delay * 2, 2.0), 10.0)
+        self._answer_pending_next_at = (
+            time.monotonic() + self._answer_pending_delay)
+
+    def _clear_answer_pending(self, item=None):
+        """保留の控えを消す (2.77)。item を渡したら、その項目の
+        控えのときだけ消す。"""
+        if item is not None and self._answer_pending_item is not item:
+            return
+        self._answer_pending_item = None
+        self._answer_pending_delay = 0.0
+        self._answer_pending_noted = False
+
+    def _pump_pending_answer(self):
+        """保留中の回答を、空いたら進める (2.70、レビュー高6)。
+
+        見回りから呼ぶ。非常停止中は自動の回答へ進まない
+        (1.63 の線引きに合わせる)。回答済み・送信済みなら控えは
+        捨てる (2.77、レビュー重大2: 成功や手動の回答で控えが
+        残ると、同じ回答を入れ直した)。再試行の間隔が空くまで
+        は送り役を起こさない (2.77、レビュー中2)。"""
+        item = self._answer_pending_item
+        if item is None or self._emergency_stopped:
+            return
+        if item.answered or item.sent or item.last_run is None:
+            self._clear_answer_pending()
+            return
+        if time.monotonic() < self._answer_pending_next_at:
+            return
+        self._answer_pending_item = None
+        self._answer_to_ai(item)
+
+    def _answer_to_ai(self, item: ScriptItem, manual=False):
         """実行結果を、設定済みの AI の入力欄へ入れる (送信はしない)。
 
         入れる文は、結果をクリップボードへ入れるときと全く同じ文
@@ -5108,12 +5447,35 @@ class ScriptRunnerWindow(QWidget):
         差分だけの文)。送るかどうかは人が決める (この道具の
         線引き)。入力欄への投入は裏方 (copilot_io の worker) 仕事で
         数秒かかることがあるので、EDDy と同じく別スレッドで回し、
-        終わりはシグナルで受ける。"""
+        終わりはシグナルで受ける。
+
+        他の送信の最中であれば、黙って見送らず保留に控える
+        (2.70、レビュー高6)。空いたら見回りの
+        _pump_pending_answer が進める。手動の押下 (manual) では
+        保留した旨をノートにも出す。"""
         if self._running_item is not None or self._ai_filling \
                 or self._ai_sending or self._diag_sending \
                 or self._ack_sending or self._notice_sending \
                 or self._intro_sending or self._relay_sending:
+            if item.last_run is not None:
+                if self._answer_pending_item is not item:
+                    self._answer_pending_item = item
+                    self._answer_pending_noted = False
+                if not self._answer_pending_noted:
+                    self._diag(
+                        f"回答を保留しました（他の送信の最中）: "
+                        f"{item.name}")
+                    self._answer_pending_noted = True
+                self._schedule_answer_retry()
+                if manual:
+                    self._set_note(
+                        "他の送信が終わるまで、回答を保留しました",
+                        "ok")
             return
+        # ここまで来たら実際に始める。保留の控えがこの項目なら
+        # 消す (2.77、レビュー重大2: 手動で回答し直したときに
+        # 控えが残ると、見回りが同じ回答を入れ直した)。
+        self._clear_answer_pending(item)
         run = item.last_run
         if run is None:
             return
@@ -5231,6 +5593,8 @@ class ScriptRunnerWindow(QWidget):
                 ai=(item.ai or None) if item is not None else None)
             if item is not None:
                 item.answered = True
+                # 成功したら保留の控えも消す (2.77、レビュー重大2)。
+                self._clear_answer_pending(item)
             if self._ai_send_ready:
                 self._set_note("AI の入力欄に結果を入れました", "ok")
             else:
@@ -5240,6 +5604,20 @@ class ScriptRunnerWindow(QWidget):
                     "AI の入力欄に結果を入れました。"
                     "送信ボタンは未設定です"
                     "（「設定」で設定できます）", "ok")
+        elif getattr(result, "deferred", False) \
+                and item is not None:
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.71、レビュー高3)。空いたら見回りが進める。
+            self._answer_pending_item = item
+            self._answer_pending_noted = True
+            self._schedule_answer_retry()
+            self._diag(
+                f"AIへの回答を保留しました（送信待ちの文があるため）: "
+                f"{item.name}",
+                ai=(item.ai or None))
+            self._set_note(
+                "送信待ちの文があるため、回答を保留しました"
+                "（空いたら自動で入れます）", "ok")
         else:
             message = getattr(result, "message", "") \
                 or "AI へ回答できませんでした"
@@ -5726,13 +6104,17 @@ class ScriptRunnerWindow(QWidget):
         if self._running_item is not item:
             self._ack_due_item = None
             return
-        if time.monotonic() - self._run_started_at \
-                < ACK_DELAY_SECONDS:
+        # 秒数は設定から取る (2.72、設定画面の自動化タブで変更可)
+        delay = self._automation_flags().get(
+            "ack_delay", ACK_DELAY_SECONDS)
+        if time.monotonic() - self._run_started_at < delay:
             return
         if self._ack_sending or self._ai_filling \
                 or self._ai_sending or self._diag_sending \
                 or self._notice_sending or self._intro_sending:
             return
+        if time.monotonic() < self._ack_blocked_until:
+            return  # 保留された直後は間隔を空ける (2.77、中2)
         self._ack_due_item = None
         self._send_ack(item)
 
@@ -5765,6 +6147,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._ack_sending = True
+        self._ack_item = item
 
         import threading
 
@@ -5783,8 +6166,18 @@ class ScriptRunnerWindow(QWidget):
 
     def _on_ack_done(self, result):
         self._ack_sending = False
+        ack_item, self._ack_item = self._ack_item, None
         if getattr(result, "ok", False):
             self._diag("受領応答を送りました")
+        elif getattr(result, "deferred", False) \
+                and ack_item is not None \
+                and self._running_item is ack_item:
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.71、レビュー高3)。実行が続いている間は義務へ
+            # 戻し、見回りが空いたら出し直す。
+            self._ack_due_item = ack_item
+            self._ack_blocked_until = time.monotonic() + 5.0
+            self._diag("受領応答を保留しました（送信待ちの文があるため）")
         else:
             message = str(getattr(result, "message", "") or "")
             self._diag(f"受領応答に失敗: {message}")
@@ -5842,18 +6235,31 @@ class ScriptRunnerWindow(QWidget):
             return
         if not configured:
             return
-        reason = ""
-        if result.issues:
-            reason = str(result.issues[0].message or "")
-        if not reason:
-            reason = str(result.headline or "")
-        text = core.build_blocked_text(
-            core.parse_command_id(item.name) or "", item.name, reason)
+        text = self._blocked_notice_text(item)
         core.blocked_notified_put(self._blocked_notified, sha)
         core.save_blocked_notified(self._blocked_notified)
+        self._send_blocked_notice(item, text, profile)
+
+    def _blocked_notice_text(self, item: ScriptItem) -> str:
+        """止まった知らせの文を組み立てる (2.78 で分離。再送でも
+        同じ文になるよう、項目のチェック結果から作る)。"""
+        result = item.result
+        reason = ""
+        if result is not None and result.issues:
+            reason = str(result.issues[0].message or "")
+        if not reason and result is not None:
+            reason = str(result.headline or "")
+        return core.build_blocked_text(
+            core.parse_command_id(item.name) or "", item.name, reason)
+
+    def _send_blocked_notice(self, item: ScriptItem, text: str,
+                             profile):
+        """止まった知らせを送る (裏方仕事)。控え (知らせ済み) は
+        呼び側が先に残してある。再送もここを通る。"""
         sender = self.ai_sender or _default_ai_sender
         presser = self.ai_presser or _default_ai_presser
         self._notice_sending = True
+        self._notice_item = item
 
         import threading
 
@@ -5870,9 +6276,49 @@ class ScriptRunnerWindow(QWidget):
         threading.Thread(
             target=work, daemon=True, name="phal-ai-blocked").start()
 
+    def _pump_pending_notice(self):
+        """保留された止まった知らせを、空いたら送り直す (2.78、
+        レビュー重大1)。
+
+        知らせは合図の見張りからは撃ち直されない (チェックで
+        止まった出来事は一度きり) ので、見回りが担う。控え
+        (知らせ済み) は最初の送信前に残してあるので、ここでは
+        送るだけ。"""
+        item = self._notice_pending_item
+        if item is None or self._emergency_stopped:
+            return
+        if time.monotonic() < self._notice_retry_next_at:
+            return
+        if self._notice_sending or self._ai_filling \
+                or self._ai_sending or self._diag_sending \
+                or self._ack_sending:
+            return
+        if item.result is None \
+                or item.result.status != core.STATUS_ERROR:
+            self._notice_pending_item = None
+            return
+        try:
+            configured, profile = self._resolve_ai_target()
+        except Exception:  # noqa: BLE001  次の見回りで試し直す
+            return
+        if not configured:
+            return
+        self._notice_pending_item = None
+        self._send_blocked_notice(
+            item, self._blocked_notice_text(item), profile)
+
     def _on_notice_done(self, result):
         self._notice_sending = False
-        if getattr(result, "ok", False):
+        item, self._notice_item = self._notice_item, None
+        if getattr(result, "deferred", False) \
+                and item is not None:
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。文はまだ入力欄へ届いて
+            # いないので、見回りで送り直す。
+            self._notice_pending_item = item
+            self._notice_retry_next_at = time.monotonic() + 5.0
+            self._note_deferred("チェックで止まった知らせ")
+        elif getattr(result, "ok", False):
             self._diag("チェックで止まった知らせを送りました")
         else:
             message = str(getattr(result, "message", "") or "")
@@ -5895,11 +6341,14 @@ class ScriptRunnerWindow(QWidget):
 
             section = settings_module.load_settings(
                 self.settings_path).get("script_runner") or {}
-            return sr_ai.sanitize_automation(section)
+            result = sr_ai.sanitize_automation(section)
+            result["ack_delay"] = sr_ai.sanitize_ack_delay(section)
+            return result
         except Exception:  # noqa: BLE001  読めなければ手動のまま
             return {"auto_dl": False, "auto_run": False,
                     "auto_answer": False, "auto_send": False,
                     "auto_diag": False, "auto_ack": True,
+                    "ack_delay": ACK_DELAY_SECONDS,
                     "auto_reset": False, "auto_rerun": False,
                     "auto_resend": False, "auto_tool": False}
 
@@ -6856,6 +7305,10 @@ class ScriptRunnerWindow(QWidget):
         self._refire_sending = False
         if getattr(result, "ok", False):
             self._diag("応答済みの知らせを送りました")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。
+            self._note_deferred("応答済みの知らせ")
         else:
             message = str(getattr(result, "message", "") or "")
             self._diag(f"応答済みの知らせに失敗: {message}")
@@ -7371,6 +7824,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "診断の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("診断の自動応答")
         else:
             self._consume_diag_marker(mid, key)
             self._diag(f"診断の自動応答に失敗: {message}", rid=answered_req or None)
@@ -7890,6 +8349,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "結果の自動再送: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("結果の自動再送")
         else:
             self._consume_resend_marker(mid, key)
             self._diag(f"結果の自動再送に失敗: {message}", rid=log_rid or None)
@@ -8078,6 +8543,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "設定の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("設定の自動応答")
         else:
             self._consume_settings_marker(mid, key)
             self._diag(f"設定の自動応答に失敗: {message}", rid=answered_req or None)
@@ -8760,6 +9231,16 @@ class ScriptRunnerWindow(QWidget):
             self._post_relay_ack(
                 f"{skip_head} {name}の入力欄に"
                 "書きかけがあります", state=ack_state)
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。消費もクリアもせず、
+            # 送り直しの回数を数えずに控え直す (失敗の
+            # 送り直しと同じ経路)。失敗の ACK は出さない。
+            self._stash_relay_pending(
+                mid, key, body, retries=retries,
+                delay=5.0,
+                src=source_name, dst=name, rid=request_id)
+            self._note_deferred("中継")
         elif retries < core.RELAY_RETRY_MAX:
             # 失敗は消費せず、少し置いて1回だけ送り直す
             # (2.13)。主側の送信と取り合ったような一時的な
@@ -8982,6 +9463,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "マニュアルの自動再送: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("手順書の自動応答")
         else:
             self._consume_manual_marker(mid, key)
             self._diag(f"マニュアルの自動再送に失敗: {message}", rid=answered_req or None)
@@ -9292,6 +9779,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "ファイルの自動送信: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("ファイルの自動応答")
         else:
             self._consume_file_marker(mid, key)
             self._diag(f"ファイルの自動送信に失敗: {message}", rid=log_rid or None)
@@ -9629,6 +10122,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "キャプチャの自動送信: 入力欄に書きかけがある"
                 "ため送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("キャプチャの自動応答")
         else:
             self._consume_capture_marker(mid, key)
             self._diag(f"キャプチャの自動送信に失敗: {message}",
@@ -9850,6 +10349,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "全文の自動送信: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("全文の自動応答")
         else:
             self._consume_fulltext_marker(mid, key)
             self._diag(f"全文の自動送信に失敗: {message}", rid=log_rid or None)
@@ -10027,6 +10532,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "一覧の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("履歴の自動応答")
         else:
             self._consume_history_marker(mid, key)
             self._diag(f"一覧の自動応答に失敗: {message}", rid=answered_req or None)
@@ -10246,6 +10757,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "停止の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("停止の自動応答")
         else:
             self._consume_stop_marker(mid, key)
             self._diag(f"停止の自動応答に失敗: {message}", rid=answered_req or None)
@@ -10451,6 +10968,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "ログの自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("ログの自動応答")
         else:
             self._consume_log_marker(mid, key)
             self._diag(f"ログの自動応答に失敗: {message}",
@@ -10757,6 +11280,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "ツール実行の応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("道具の自動応答")
         else:
             self._consume_tool_marker(mid, key)
             self._diag(f"ツール実行の応答に失敗: {message}",
@@ -10960,6 +11489,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "道具説明の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("説明の自動応答")
         else:
             self._consume_describe_marker(mid, key)
             self._diag(f"道具説明の自動応答に失敗: {message}",
@@ -11166,6 +11701,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 "道具評価の自動応答: 入力欄に書きかけがあるため"
                 "送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("評価の自動応答")
         else:
             self._consume_eval_marker(mid, key)
             self._diag(f"道具評価の自動応答に失敗: {message}",
@@ -11476,6 +12017,12 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(
                 f"{label}の自動応答: 合図の窓の入力欄に"
                 "書きかけがあるため送りませんでした", "warn")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。目印は消費しない。
+            # 見張りが空いたときに撃ち直すので、依頼は
+            # 消えない。
+            self._note_deferred("入力の自動応答")
         else:
             self._consume_input_marker(mid, key)
             self._diag(f"{label}の自動応答に失敗: {message}",
@@ -11605,6 +12152,11 @@ class ScriptRunnerWindow(QWidget):
                        or None)
             self._set_note("道具を登録しました", "ok")
             self._publish_phal_idle("道具を登録しました")
+        elif getattr(result, "deferred", False):
+            # 送信待ちの文があり上書きを避けて保留された
+            # (2.78、レビュー重大1)。
+            self._note_deferred("道具登録の結果")
+            self._set_note("道具登録の結果を保留しました（空いたら送ります）", "ok")
         else:
             message = str(getattr(result, "message", "") or "")
             self._diag(f"道具登録の結果の送信に失敗: {message}",
@@ -11759,6 +12311,23 @@ class ScriptRunnerWindow(QWidget):
         self._diag("開き直しの頼みを受けた（即時）")
         self.restart()
 
+    def _note_deferred(self, what: str):
+        """自動送信が保留 (deferred) されたときの共通の扱い
+        (2.78、レビュー重大1)。
+
+        送信待ちの文がある間は、ほかの自動送信は上書きを避けて
+        保留される (2.71)。完了側で目印を消費しなければ、見張り
+        が空いたときに撃ち直すので、依頼は消えない。撃ち直しの
+        間隔は、ここで決める _auto_blocked_until を
+        _chain_in_flight に混ぜて空ける (見回りのたびに裏方を
+        起こさない)。診断は保留の期間ごとに1回だけ残す。"""
+        now = time.monotonic()
+        if not self._auto_blocked:
+            self._auto_blocked = True
+            self._diag(
+                f"{what}を保留しました（送信待ちの文があるため）")
+        self._auto_blocked_until = now + 5.0
+
     def _chain_in_flight(self) -> bool:
         """自動化の連鎖が途中かどうか。
 
@@ -11766,7 +12335,12 @@ class ScriptRunnerWindow(QWidget):
         知らせの送信中はもちろん途中。自動実行の待ち列に残りが
         ある場合も、切替が入っている間は途中とみなす (切替が
         切れた待ち列は進まないので、途中には数えない。詰まった
-        まま開き直しが永遠に来ない事態を避ける)。"""
+        まま開き直しが永遠に来ない事態を避ける)。送信待ちの文
+        による保留の間隔 (_auto_blocked_until、2.78) の間も
+        途中とみなし、自動応答の撃ち直しを間引く。"""
+        if time.monotonic() < self._auto_blocked_until:
+            return True
+        self._auto_blocked = False
         if self._running_item is not None or self._ai_filling \
                 or self._ai_sending or self._diag_sending \
                 or self._ack_sending or self._notice_sending \
@@ -11997,7 +12571,10 @@ class ScriptRunnerWindow(QWidget):
                 {"window_geometry": save_rect,
                  "always_on_top": bool(self.config.get("always_on_top")),
                  "hide_no_id": bool(self.config.get("hide_no_id")),
-                 "dark_mode": bool(self.config.get("dark_mode"))},
+                 "dark_mode": bool(self.config.get("dark_mode")),
+                 "column_widths": [
+                     self.table.horizontalHeader().sectionSize(col)
+                     for col in range(8)]},
                 self.settings_path)
         except Exception:  # noqa: BLE001  終わりの保存で落とさない
             pass

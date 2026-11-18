@@ -195,16 +195,29 @@ def test_fill_own_residue_is_not_a_draft():
     """自分が入れた文が残っていても、次の投入は書きかけ扱いしない。
 
     送信の段で止まった回答が入力欄に残り、次の送信がそれを
-    人の書きかけと誤認した実機の事故への直し (2.65)。"""
+    人の書きかけと誤認した実機の事故への直し (2.65)。
+    2.71 からは状態で分ける (レビュー高3): 送信待ち (fill の
+    直後) の文は別の文で上書きせず保留 (deferred) し、送信が
+    失敗して残った文は上書きしてよい。"""
     fake = FillFakeTransport()
     assert copilot_io.fill_text("回答A", transport=fake).ok
+    # 送信待ちの文は、別の文で上書きしない (保留)
     second = copilot_io.fill_text("回答B", transport=fake)
-    assert second.ok and not second.needs_confirm
-    assert fake.filled == ["回答A", "回答B"]
+    assert not second.ok and second.deferred
+    assert not second.needs_confirm
+    assert fake.filled == ["回答A"]
+    # 同じ文の入れ直しは進める
+    assert copilot_io.fill_text("回答A", transport=fake).ok
+    # 送信が失敗したら、残った文は上書きしてよい
+    fake.press_send = lambda: False
+    assert not copilot_io.press_send_button(transport=fake).ok
+    third = copilot_io.fill_text("回答B", transport=fake)
+    assert third.ok and not third.needs_confirm
+    assert fake.filled[-1] == "回答B"
     # 人の文に変わっていたら、従来どおり止める
     fake._input_value = "人が書いた文"
-    third = copilot_io.fill_text("回答C", transport=fake)
-    assert not third.ok and third.needs_confirm
+    fourth = copilot_io.fill_text("回答C", transport=fake)
+    assert not fourth.ok and fourth.needs_confirm
 
 
 def test_press_send_clears_own_record():
@@ -309,8 +322,10 @@ def test_subprocess_session_flow():
     response = session.last_response()
     assert response.ok and response.text == "裏方からの応答"
     assert response.code_blocks == ["y = 2"]
-    # 操作は全部裏方へ流れ、順番も往復のとおり
-    assert runner.requests == ["snapshot", "wait_sendable", "input", "send",
+    # 操作は全部裏方へ流れ、順番も往復のとおり。snapshot は
+    # wait_sendable の後 (2.70、レビュー中: 保留の間に増えた
+    # 前の回答の続きを、今回の回答に混ぜないため)
+    assert runner.requests == ["wait_sendable", "snapshot", "input", "send",
                                "wait", "response", "blocks"]
 
 

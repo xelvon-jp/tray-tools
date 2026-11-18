@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.80"
+PHAL_VERSION = "2.82"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -119,6 +119,12 @@ SIGNATURE_INTERVAL_SEC = 5.0
 CHASE_INTERVAL_SEC = 1.5
 CHASE_WINDOW_SEC = 30.0
 FULL_SCAN_MAX_GAP_SEC = 60.0
+
+# 返事待ちの間の間隔 (2.81、段階1)。結果を送った後、次の候補が
+# 出るまで (上限は設定 reply_wait_seconds、既定 180 秒) は、
+# 署名と本走査の間隔を短くして返事への気づきを早める。
+SIGNATURE_INTERVAL_AWAITING_SEC = 2.0
+FULL_SCAN_GAP_AWAITING_SEC = 15.0
 
 # DL 候補の名前 (中身の冒頭) から、ファイル名らしき部分を取る
 # ための目印。「既に一覧にあるファイルか」の判定に使う。
@@ -900,6 +906,10 @@ class _WatchState:
         self.last_full_scan = 0.0
         self.signature = None
         self.chase_until = 0.0
+        # 返事待ちの期限 (monotonic、2.81、段階1)。結果を送った
+        # 後、次の候補が出るまで (またはこの期限まで) は、署名
+        # と本走査の間隔を短くする。0 なら返事待ちでない。
+        self.awaiting_reply_until = 0.0
         # 直近の走査の1行 (診断の束に出す、1-57)。
         self.last_scan = "直近の走査: まだ無い"
         # この窓の見張りが「何も無い」状態に入った時刻
@@ -3546,6 +3556,11 @@ class ScriptRunnerWindow(QWidget):
         item = self._items_by_key.get(key)
         if item is None:
             item = ScriptItem(path, mtime, size)
+            # ループ内訳の到着の境目 (2.81)。ファイルが一覧に
+            # 初めて現れた時点を、ダウンロードの区間の終端にする。
+            if "detected" in self._loop_marks \
+                    and "arrived" not in self._loop_marks:
+                self._loop_marks["arrived"] = time.monotonic()
             # 起動スナップショットに無い (または中身が違う) なら、
             # 起動後に現れた分として自動実行の対象にできる。開き
             # 直す前に対象だった分は、控えが一致すれば引き続き対象。
@@ -5996,6 +6011,8 @@ class ScriptRunnerWindow(QWidget):
             self._diag(
                 f"AIへ送信を押した: {item.name if item else ''}",
                 ai=(item.ai or None) if item is not None else None)
+            # 送れたら返事待ちに入る (2.81、段階1)。
+            self._begin_reply_wait()
             if item is not None:
                 # サイクル完了。last_run (差し戻しの証拠) と回答済みの
                 # 印は残し、ボタンだけ「実行」に戻る。
@@ -6394,12 +6411,14 @@ class ScriptRunnerWindow(QWidget):
                 self.settings_path).get("script_runner") or {}
             result = sr_ai.sanitize_automation(section)
             result["ack_delay"] = sr_ai.sanitize_ack_delay(section)
+            result["reply_wait"] = sr_ai.sanitize_reply_wait(section)
             return result
         except Exception:  # noqa: BLE001  読めなければ手動のまま
             return {"auto_dl": False, "auto_run": False,
                     "auto_answer": False, "auto_send": False,
                     "auto_diag": False, "auto_ack": True,
                     "ack_delay": ACK_DELAY_SECONDS,
+                    "reply_wait": core.REPLY_WAIT_DEFAULT_SEC,
                     "auto_reset": False, "auto_rerun": False,
                     "auto_resend": False, "auto_tool": False}
 
@@ -6535,24 +6554,31 @@ class ScriptRunnerWindow(QWidget):
             return
         now = time.monotonic()
         # 追いかけモード (2.07): 送信・実行・DL 待ちの途中は、
-        # 返事が来るはずの時間帯なので追いかけに入る。
+        # 返事が来るはずの時間帯なので追いかけに入る。返事待ち
+        # (2.81、段階1) では追いかけに入らない (2.82、レビュー
+        # 指摘)。返事待ちの間は、署名と本走査の間隔を短くする
+        # だけで、本走査を 1.5 秒ごとに回し続けない。追いかけに
+        # 入るのは、署名が変わったときと従来の合図のときだけ。
+        awaiting = now < state.awaiting_reply_until
         if self._ai_busy_for_chase():
             self._enter_chase(state)
         chasing = now < state.chase_until
-        if chasing:
-            if now - state.last_check < CHASE_INTERVAL_SEC:
-                return
+        # 次の一手 (本走査・署名・待つ) は core の純関数で決める。
+        # 返事待ちの間は、署名と本走査の間隔が短い方に替わる。
+        action = core.watch_next_action(
+            now, last_check=state.last_check,
+            last_full_scan=state.last_full_scan,
+            sig_last_check=state.sig_last_check,
+            chasing=chasing, awaiting_reply=awaiting,
+            chat_interval=CHAT_POLL_INTERVAL_SEC,
+            chase_interval=CHASE_INTERVAL_SEC,
+            sig_interval=SIGNATURE_INTERVAL_SEC,
+            sig_interval_awaiting=SIGNATURE_INTERVAL_AWAITING_SEC,
+            full_gap=FULL_SCAN_MAX_GAP_SEC,
+            full_gap_awaiting=FULL_SCAN_GAP_AWAITING_SEC)
+        if action == "full":
             self._start_dl_check(state, signature=False)
-        elif state.last_full_scan == 0.0 or \
-                now - state.last_full_scan >= FULL_SCAN_MAX_GAP_SEC:
-            # まだ本走査をしていない (初回) か、前回の本走査から
-            # 空きすぎたときは本走査。間隔は従来どおり。
-            if now - state.last_check < CHAT_POLL_INTERVAL_SEC:
-                return
-            self._start_dl_check(state, signature=False)
-        else:
-            if now - state.sig_last_check < SIGNATURE_INTERVAL_SEC:
-                return
+        elif action == "signature":
             self._start_dl_check(state, signature=True)
 
     def _start_dl_check(self, state, signature):
@@ -6591,6 +6617,24 @@ class ScriptRunnerWindow(QWidget):
 
         threading.Thread(
             target=work, daemon=True, name="phal-dl-watch").start()
+
+    def _begin_reply_wait(self):
+        """返事待ちに入る (2.81、段階1)。
+
+        結果を送れた直後に呼ぶ。見張っている全ての窓で、次の
+        候補が出るまで (または設定の上限まで)、署名と本走査の
+        間隔を短くする (間隔の切替えは _maybe_check_one)。
+        上限が 0 のときは入らない。"""
+        try:
+            wait = self._automation_flags().get(
+                "reply_wait", core.REPLY_WAIT_DEFAULT_SEC)
+        except Exception:  # noqa: BLE001  読めなければ既定で続ける
+            wait = core.REPLY_WAIT_DEFAULT_SEC
+        if not wait or wait <= 0:
+            return
+        until = time.monotonic() + wait
+        for state in getattr(self, "_watches", {}).values():
+            state.awaiting_reply_until = until
 
     def _enter_chase(self, state):
         """追いかけモードに入る (期限を延ばす、2.07)。"""
@@ -6765,6 +6809,11 @@ class ScriptRunnerWindow(QWidget):
                 any(getattr(result, name, None)
                     for name in _marker_names):
             self._enter_chase(state)
+        # 候補が出たら返事は来ているので、返事待ちは終える
+        # (2.81、段階1)。
+        if getattr(result, "candidate", None) or \
+                getattr(result, "candidates", None):
+            state.awaiting_reply_until = 0.0
         # 合図への応答は、その合図が出た窓へ返す (2.08)。この
         # 結果の処理の間だけ、出どころの窓を投げ先の解決に
         # 割り当てる (合図の判定が終わればすぐ戻す)。
@@ -12418,7 +12467,13 @@ class ScriptRunnerWindow(QWidget):
         if marks.get("baseline") is not None:
             detect_sec = max(0.0, marks["detected"] - marks["baseline"])
         dl_sec = None
-        if "checked" in marks:
+        check_sec = marks.get("check_elapsed")
+        if "arrived" in marks:
+            # 到着の境目があるときは、ダウンロード (検出→到着) と
+            # チェック (到着→チェック完了) に分ける (2.81)。
+            dl_sec = gap("detected", "arrived")
+            check_sec = gap("arrived", "checked")
+        elif "checked" in marks:
             dl_sec = max(
                 0.0, marks["checked"]
                 - (marks.get("check_elapsed") or 0.0)
@@ -12426,7 +12481,7 @@ class ScriptRunnerWindow(QWidget):
         self._loop_stages = [
             ("検出", detect_sec),
             ("ダウンロード", dl_sec),
-            ("チェック", marks.get("check_elapsed")),
+            ("チェック", check_sec),
             ("実行", gap("run_start", "run_done")),
             ("結果入力", gap("fill_start", "fill_done")),
             ("送信", gap("send_start", "send_done")),

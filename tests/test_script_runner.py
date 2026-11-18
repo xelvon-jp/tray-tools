@@ -3578,6 +3578,85 @@ def test_format_loop_breakdown_and_log_reply_loop_line():
     assert text2.split("\n")[1] == "（記録はありません）"
 
 
+def test_watch_next_action_cadence():
+    """見張りの間隔の決定 (2.81、段階1): 追いかけ中は本走査を
+    短い間隔で、通常は署名と本走査の最大間隔、返事待ちの間は
+    署名と本走査の間隔が短い方に替わる。"""
+    base = dict(chat_interval=10.0, chase_interval=1.5,
+                sig_interval=5.0, sig_interval_awaiting=2.0,
+                full_gap=60.0, full_gap_awaiting=15.0)
+
+    def act(now, **kw):
+        args = dict(last_check=0.0, last_full_scan=0.0,
+                    sig_last_check=0.0, chasing=False,
+                    awaiting_reply=False)
+        args.update(base)
+        args.update(kw)
+        return core.watch_next_action(now, **args)
+
+    # 初回 (本走査がまだ無い) は本走査。chat の間隔の門は効く。
+    assert act(100.0) == "full"
+    assert act(100.0, last_check=95.0) == "wait"
+    # 追いかけ中: 1.5秒たてば本走査、まだなら待つ。
+    kw = dict(last_check=100.0, last_full_scan=100.0)
+    assert act(101.0, chasing=True, **kw) == "wait"
+    assert act(101.5, chasing=True, **kw) == "full"
+    # 通常: 署名は5秒間隔。
+    kw2 = dict(last_check=90.0, last_full_scan=95.0,
+               sig_last_check=100.0)
+    assert act(104.0, **kw2) == "wait"
+    assert act(105.0, **kw2) == "signature"
+    # 返事待ち: 署名は2秒間隔になる。
+    assert act(102.0, awaiting_reply=True, **kw2) == "signature"
+    # 返事待ち: 本走査の最大間隔は15秒 (95→110で本走査の番)。
+    assert act(110.0, awaiting_reply=True, **kw2) == "full"
+    # 通常なら同じ時刻でも本走査の番ではない (60秒)。
+    assert act(110.0, **kw2) == "signature"
+    # 返事待ちの上限を過ぎれば (awaiting_reply=False) 元に戻る。
+    assert act(110.0, awaiting_reply=False, **kw2) == "signature"
+
+
+def test_watch_awaiting_does_not_full_scan_at_chase_interval():
+    """返事待ちの間は、本走査が追いかけの間隔 (1.5秒) では
+    回らない (2.82、レビュー指摘)。署名は2秒ごと、本走査は
+    最大でも15秒に1回。窓側の時刻の控えの動き (本走査は
+    last_check と last_full_scan、署名は sig_last_check だけを
+    進める) をなぞって確かめる。"""
+    base = dict(chat_interval=10.0, chase_interval=1.5,
+                sig_interval=5.0, sig_interval_awaiting=2.0,
+                full_gap=60.0, full_gap_awaiting=15.0)
+    last_check = 0.0
+    last_full = 0.0
+    sig_last = 0.0
+    fulls = []
+    sigs = []
+    t = 1000.0
+    while t <= 1040.0:
+        action = core.watch_next_action(
+            t, last_check=last_check, last_full_scan=last_full,
+            sig_last_check=sig_last, chasing=False,
+            awaiting_reply=True, **base)
+        if action == "full":
+            fulls.append(t)
+            last_check = t
+            last_full = t
+        elif action == "signature":
+            sigs.append(t)
+            sig_last = t
+        t += 0.5
+    # 初回は本走査。以後の本走査は15秒以上空く (1.5秒ごとには
+    # 回らない)。
+    assert fulls[0] == 1000.0
+    assert len(fulls) >= 3
+    for prev, cur in zip(fulls, fulls[1:]):
+        assert cur - prev >= 15.0
+    # 署名は2秒ごとに回っている (最初は控えが無いので、本走査の
+    # 直後に1回入り、以後は2秒間隔)。
+    assert sigs[0] == 1000.5
+    for prev, cur in zip(sigs, sigs[1:]):
+        assert cur - prev == 2.0
+
+
 def test_odougubako_register_changes():
     """おどうぐばこの登録の直し (2.80、レビュー中5): 分類を
     変えても .prev と登録日時が残ること、大小文字だけ違う名前
@@ -3730,6 +3809,8 @@ if __name__ == "__main__":
         test_phal_status_build_and_write_only_on_change,
         test_all_auto_done_handlers_handle_deferred,
         test_format_loop_breakdown_and_log_reply_loop_line,
+        test_watch_next_action_cadence,
+        test_watch_awaiting_does_not_full_scan_at_chase_interval,
         test_odougubako_register_changes,
         test_ack_delay_default_unified,
         test_collect_intro_environment_with_fake_runner,

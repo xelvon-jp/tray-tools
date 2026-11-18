@@ -279,6 +279,22 @@ def sanitize_ack_delay(section) -> int:
     return max(0, min(3600, number))
 
 
+def sanitize_reply_wait(section) -> int:
+    """返事待ちの上限の秒数 (2.81、段階1)。
+
+    settings の script_runner 節の reply_wait_seconds を
+    0〜3600 の int に整える。欠け・壊れは既定 (180秒、core の
+    REPLY_WAIT_DEFAULT_SEC)。0 なら返事待ちに入らない。"""
+    value = section.get("reply_wait_seconds") \
+        if isinstance(section, dict) else section
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        import script_runner_core as core
+        return core.REPLY_WAIT_DEFAULT_SEC
+    return max(0, min(3600, number))
+
+
 def sanitize_automation(value) -> dict:
     """自動化の切替を整える。{auto_dl, auto_run, auto_answer,
     auto_send, auto_diag, auto_ack, auto_reset, auto_rerun,
@@ -1808,6 +1824,24 @@ class AutomationPage(QWidget):
                 row.addWidget(self._ack_delay_spin)
                 row.addStretch(1)
                 layout.addLayout(row)
+            if key == "auto_send":
+                # 返事待ちの上限 (2.81、段階1)。結果を送った後、
+                # 次の候補が出るまで追いかけを続ける時間。送信の
+                # 切替の直下に置き、切の間は触れないようにする。
+                row = QHBoxLayout()
+                row.addSpacing(24)
+                row.addWidget(QLabel("返事待ちの上限"))
+                self._reply_wait_spin = QSpinBox()
+                self._reply_wait_spin.setRange(0, 3600)
+                self._reply_wait_spin.setSuffix(" 秒")
+                self._reply_wait_spin.setValue(
+                    sanitize_reply_wait(automation))
+                self._reply_wait_spin.setEnabled(given["auto_send"])
+                box.toggled.connect(
+                    self._reply_wait_spin.setEnabled)
+                row.addWidget(self._reply_wait_spin)
+                row.addStretch(1)
+                layout.addLayout(row)
         layout.addStretch(1)
 
     def automation(self) -> dict:
@@ -1816,6 +1850,8 @@ class AutomationPage(QWidget):
                   for key in AUTO_KEYS}
         result["ack_delay_seconds"] = int(
             self._ack_delay_spin.value())
+        result["reply_wait_seconds"] = int(
+            self._reply_wait_spin.value())
         return result
 
 

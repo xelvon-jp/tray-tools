@@ -1536,6 +1536,34 @@ def command_history_settle_pending(records: list) -> int:
     return changed
 
 
+def watch_next_action(now, *, last_check, last_full_scan,
+                      sig_last_check, chasing, awaiting_reply,
+                      chat_interval, chase_interval, sig_interval,
+                      sig_interval_awaiting, full_gap,
+                      full_gap_awaiting) -> str:
+    """見張りの次の一手を決める (2.81、段階1)。
+
+    戻り値は "full" (本走査) / "signature" (署名だけ) / "wait"
+    (まだ間隔が空いていない)。追いかけ中は本走査を
+    chase_interval ごとに回す。通常は署名を sig_interval ごと
+    に見て、本走査は full_gap に1回は必ず挟む。返事待ち
+    (awaiting_reply) の間は、署名の間隔と本走査の最大間隔を
+    短い方 (sig_interval_awaiting / full_gap_awaiting) に
+    切り替える。本走査の番でも、chat_interval の間隔の門は
+    従来どおり効く。"""
+    if chasing:
+        return "full" if now - last_check >= chase_interval \
+            else "wait"
+    gap = full_gap_awaiting if awaiting_reply else full_gap
+    if last_full_scan == 0.0 or now - last_full_scan >= gap:
+        return "full" if now - last_check >= chat_interval \
+            else "wait"
+    interval = sig_interval_awaiting if awaiting_reply \
+        else sig_interval
+    return "signature" if now - sig_last_check >= interval \
+        else "wait"
+
+
 def format_loop_breakdown(stages, item_name: str = "") -> str:
     """ループ内訳の区間表を1行に整える (2.79)。
 
@@ -2001,6 +2029,7 @@ RELAY_RETRY_DELAY_SEC = 20.0       # 中継の送り直しまでの待ち (2.13)
 RELAY_RETRY_MAX = 1                # 中継の送り直しの回数上限 (2.13)
 RELAY_ACK_DELAY_SEC = 30.0         # 中継の成功ACKを保留する秒数 (2.27)
 ACK_DELAY_DEFAULT_SEC = 5          # 受領応答を出すまでの秒数の既定 (2.80 で一本化。script_runner.ACK_DELAY_SECONDS と script_runner_ai.sanitize_ack_delay の既定はこれに合わせる)
+REPLY_WAIT_DEFAULT_SEC = 180       # 返事待ちの上限の既定 (2.81、段階1)
 RELAY_ID_HISTORY_LIMIT = 32        # 中継の ID 履歴に残す連鎖 (起点+ID) の上限 (2.41)
 RELAY_ID_MAX_COUNT = 3             # 同じ連鎖で中継できる回数の上限 (2.41)
 

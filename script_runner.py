@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.82"
+PHAL_VERSION = "2.83"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -5726,12 +5726,14 @@ class ScriptRunnerWindow(QWidget):
         path = Path(__file__).resolve().parent / "phal-ai-manual.md"
         return path if path.is_file() else None
 
-    def _intro_auto_text(self):
+    def _intro_auto_text(self, profile_name=""):
         """開始プロンプトの自動生成の文 (1.47)。
 
         環境は呼んだ時点で集める。集められない項目は core 側が
         「不明」にするので、ここでは止まらない。マニュアルの
-        ファイルがあれば、添付している旨も文に入る (1.78)。"""
+        ファイルがあれば、添付している旨も文に入る (1.78)。
+        profile_name (2.83) は入れる窓を選んだときの相手で、
+        ZIP の行の判定はその相手に合わせる。"""
         try:
             env = core.collect_intro_environment(
                 watch_folder=self.watch_folder,
@@ -5739,16 +5741,21 @@ class ScriptRunnerWindow(QWidget):
         except Exception:  # noqa: BLE001  集められなくても文は作る
             env = {"watch_folder": str(self.watch_folder)}
         env["manual_attached"] = self._intro_manual_path() is not None
-        # ZIP の行 (1.81) は、有効なプロファイルで zip_as_txt
-        # が入っている相手にだけ出す。設定は毎回ファイルから
+        # ZIP の行 (1.81) は、相手のプロファイルで zip_as_txt
+        # が入っているときにだけ出す。設定は毎回ファイルから
         # 取り直す。
         try:
             import script_runner_ai as sr_ai
             section = settings_module.load_settings(
                 self.settings_path).get("script_runner") or {}
             profiles, active = sr_ai.sanitize_profiles(section)
-            env["zip_as_txt"] = bool(
-                profiles[active]["target"].get("zip_as_txt"))
+            target = profiles[active]["target"]
+            if profile_name:
+                for entry in profiles:
+                    if entry["name"] == profile_name:
+                        target = entry["target"]
+                        break
+            env["zip_as_txt"] = bool(target.get("zip_as_txt"))
         except Exception:  # noqa: BLE001  行を出さないだけ
             env["zip_as_txt"] = False
         # 作業フォルダ (1.83): 直前にダイアログで選んだもの、
@@ -5767,12 +5774,13 @@ class ScriptRunnerWindow(QWidget):
             return ""
         return value if isinstance(value, str) else ""
 
-    def _intro_prompt_text(self):
+    def _intro_prompt_text(self, profile_name=""):
         """実際に送る開始プロンプトの文。
 
         「設定」で保存した文 (script_runner 節の intro_prompt) が
         あればそれを、無ければ自動生成の文を使う。保存した文は
-        押すたびにファイルから取り直す (変えたら次から効く)。"""
+        押すたびにファイルから取り直す (変えたら次から効く)。
+        profile_name (2.83) は入れる窓を選んだときの相手。"""
         try:
             section = settings_module.load_settings(
                 self.settings_path).get("script_runner") or {}
@@ -5781,7 +5789,38 @@ class ScriptRunnerWindow(QWidget):
             saved = None
         if isinstance(saved, str) and saved.strip():
             return saved
-        return self._intro_auto_text()
+        return self._intro_auto_text(profile_name)
+
+    def _choose_intro_target(self):
+        """開始プロンプトを入れる窓の名前を選ぶ (2.83)。
+
+        戻り値は、選ばれたプロファイル名。見張り対象 (設定済み
+        のもの) が1つ以下なら "" (従来どおり有効なプロファイル
+        でよい)。選ぶ画面でキャンセルされたら None (入れない)。
+        初期の選択は、いま有効なプロファイル。"""
+        try:
+            import script_runner_ai as sr_ai
+
+            section = settings_module.load_settings(
+                self.settings_path).get("script_runner") or {}
+            profiles, active = sr_ai.sanitize_profiles(section)
+            watch_names = sr_ai.sanitize_watch_profiles(section)
+        except Exception:  # noqa: BLE001  読めなければ従来どおり
+            return ""
+        names = [entry["name"] for entry in profiles
+                 if entry["name"] in watch_names
+                 and sr_ai.is_configured(entry["target"])]
+        if len(names) < 2:
+            return ""
+        active_name = profiles[active]["name"]
+        current = names.index(active_name) \
+            if active_name in names else 0
+        choice, ok = QInputDialog.getItem(
+            self, "PHAL", "入れる窓を選んでください",
+            names, current, False)
+        if not ok:
+            return None
+        return choice
 
     def _on_intro_clicked(self):
         """「PHALループ開始プロンプトを入力」: 開始プロンプトを
@@ -5793,7 +5832,8 @@ class ScriptRunnerWindow(QWidget):
         未設定・投入の失敗) は、文をクリップボードへ入れて
         ダイアログではっきり知らせる (ステータスバーの一瞬の
         表示だけにしない)。別の送信が途中のときも、ダイアログ
-        で知らせて送らない。"""
+        で知らせて送らない。見張り対象が2つ以上あるときは、
+        入れる窓を選んでもらう (2.83)。"""
         if self._intro_sending or self._ai_filling \
                 or self._ai_sending or self._diag_sending \
                 or self._ack_sending or self._notice_sending:
@@ -5820,11 +5860,24 @@ class ScriptRunnerWindow(QWidget):
                 self.settings_path)
         except Exception:  # noqa: BLE001  残せなくても続ける
             pass
-        text = self._intro_prompt_text()
+        # 入れる窓の選択 (2.83)。見張り対象が2つ以上あるときは、
+        # どちらへ入れるかを選んでもらう。キャンセルされたら
+        # 入れない。1つだけなら従来どおり有効なプロファイル。
+        chosen_name = self._choose_intro_target()
+        if chosen_name is None:
+            self._set_note(
+                "窓が選ばれなかったので、開始プロンプトは"
+                "入れませんでした", "warn")
+            return
         try:
-            configured, profile = self._resolve_ai_target()
+            if chosen_name:
+                configured, profile = \
+                    self._resolve_profile_by_name(chosen_name)
+            else:
+                configured, profile = self._resolve_ai_target()
         except Exception:  # noqa: BLE001  未設定として扱う
             configured, profile = False, None
+        text = self._intro_prompt_text(chosen_name)
         if not configured:
             self._intro_fallback(
                 text, "AI の投げ先が設定されていません")
@@ -5832,6 +5885,7 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         self._intro_sending = True
         self._intro_text = text
+        self._intro_window_name = chosen_name
         manual = self._intro_manual_path()
         attach = [str(manual)] if manual is not None else []
         self._intro_attached = bool(attach)
@@ -5857,9 +5911,13 @@ class ScriptRunnerWindow(QWidget):
         if getattr(result, "ok", False):
             suffix = ("（マニュアルを添付）"
                       if self._intro_attached else "")
-            self._diag(f"開始プロンプトを入力しました{suffix}")
+            # どちらの窓へ入れたかを出す (2.83)。二重待機では、
+            # 確認しに行く窓を取り違えやすいため。
+            window = getattr(self, "_intro_window_name", "")
+            where = f"（{window}）" if window else ""
+            self._diag(f"開始プロンプトを入力しました{where}{suffix}")
             self._set_note(
-                "開始プロンプトを入力しました。"
+                f"開始プロンプトを入力しました{where}。"
                 "確認して送信してください", "ok")
             return
         message = str(getattr(result, "message", "") or "")

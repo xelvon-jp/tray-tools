@@ -4165,9 +4165,11 @@ def test_stage_floor_follows_copilot_chain_gaps():
                     "label": "9-7: 階のテスト用スクリプト",
                     "summary": "9-7: 階のテスト用スクリプト",
                 }
-                window._dispatch_state = copilot
+                # 結果の窓は result.watch で伝える (2.08)。
+                # _dispatch_state は処理側が立てるもの。
                 window._on_dl_checked(
-                    sr._DlCheckResult(True, "", candidate))
+                    sr._DlCheckResult(True, "", candidate,
+                                      watch="Copilot"))
                 QCoreApplication.processEvents()
                 assert copilot.holder is not None
                 assert window._stage_floor_name() == "Copilot", \

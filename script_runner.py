@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.83"
+PHAL_VERSION = "2.84"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -2569,11 +2569,14 @@ class ScriptRunnerWindow(QWidget):
 
         動作ログの [AI名] (ai、2.40 で出どころに合わせるよう
         修正): 明示の引数 > 走査の処理中 (_dispatch_state) は
-        その窓のプロファイル名 > 主プロファイル名 (_ai_name)。
-        全体の出来事 (非常停止など) は、呼び側が ai="" を明示
-        すると名前を付けない。以前は全件に主プロファイル名を
-        押していたため、二重待受で Copilot の窓の出来事まで
-        [Muse] と出る不具合があった。
+        その窓のプロファイル名 > 段階の階の名前
+        (_stage_floor_name、2.84)。階は連鎖の出どころ・動いて
+        いる項目から決まり、どちらも無ければ既定の階 (= 主
+        プロファイル名) になる。全体の出来事 (非常停止など)
+        は、呼び側が ai="" を明示すると名前を付けない。以前は
+        既定が主プロファイル名だったため、二重待受で Copilot
+        の窓の出来事まで [Muse] と出る不具合があった (2.40 で
+        一度直したが、_set_note 経由などが残っていた)。
         rid (2.40) は合図の依頼 ID。明示の引数 > 走査の処理中
         に _dispatch_signal が立てた控え (_diag_ctx_rid)。
         非同期の完了側は、控えの組から取り出した ID を明示で
@@ -2594,7 +2597,14 @@ class ScriptRunnerWindow(QWidget):
                     if dispatch is not None:
                         ai = getattr(dispatch, "name", "") or ""
                     else:
-                        ai = getattr(self, "_ai_name", "")
+                        # 連鎖の出どころが分かる間は、その階の
+                        # 名前を付ける (2.84)。階が取れなければ
+                        # 主プロファイル名。
+                        try:
+                            ai = self._stage_floor_name() or \
+                                getattr(self, "_ai_name", "")
+                        except Exception:  # noqa: BLE001
+                            ai = getattr(self, "_ai_name", "")
                 if rid is None:
                     rid = getattr(self, "_diag_ctx_rid", "") \
                         or None
@@ -3384,7 +3394,7 @@ class ScriptRunnerWindow(QWidget):
         return (f"現在=({rect.x()},{rect.y()},"
                 f"{rect.width()}x{rect.height()}) 保存={saved}")
 
-    def _set_note(self, text: str, kind: str = ""):
+    def _set_note(self, text: str, kind: str = "", ai=None):
         self._note_kind = kind
         self.note.setText(text)
         self.note.setStyleSheet(
@@ -3393,12 +3403,15 @@ class ScriptRunnerWindow(QWidget):
         # バグの検証で要る情報がここだけに残って消えないよう、
         # 動作ログにも残す (2.00、ユーザーの指定)。空の消去と、
         # 直近に同じ文が記録済みの繰り返しは入れない。
+        # ai (2.84) は動作ログの [AI名] の出どころ。項目を扱う
+        # 呼び出しは item.ai を渡す。省略時は _diag 側の決め方
+        # (処理中の窓 > 段階の階) に任せる。
         if text:
             try:
                 recent = [e.get("text")
                           for e in self._log_events[-5:]]
                 if text not in recent:
-                    self._diag(text)
+                    self._diag(text, ai=ai)
             except Exception:  # noqa: BLE001  ログは本体を止めない
                 pass
 
@@ -4131,7 +4144,8 @@ class ScriptRunnerWindow(QWidget):
                 self._diag(f"自動実行を開始: {item.name}",
                            ai=item.ai or None)
                 self._set_note(
-                    f"自動で実行を始めました・{item.name}", "ok")
+                    f"自動で実行を始めました・{item.name}", "ok",
+                    ai=item.ai or None)
             return
 
     # ---------------- 一覧の描画 ----------------
@@ -5218,7 +5232,9 @@ class ScriptRunnerWindow(QWidget):
             self._set_note(core.POLICY_NOTE, "error")
         elif copied:
             self._set_note(
-                "クリップボードに入れました。Copilot に貼ってください", "ok")
+                "クリップボードに入れました。Copilot に貼ってください",
+                "ok",
+                ai=(item.ai or None) if item is not None else None)
         else:
             self._set_note("クリップボードへ入れませんでした", "error")
         self._refresh_list()
@@ -5659,14 +5675,19 @@ class ScriptRunnerWindow(QWidget):
                 # 成功したら保留の控えも消す (2.77、レビュー重大2)。
                 self._clear_answer_pending(item)
             if self._ai_send_ready:
-                self._set_note("AI の入力欄に結果を入れました", "ok")
+                self._set_note(
+                    "AI の入力欄に結果を入れました", "ok",
+                    ai=(item.ai or None) if item is not None
+                    else None)
             else:
                 # 送信ボタンの目印が無ければ、ボタンは「AIへ回答」の
                 # ままになる。その理由と直し方を添える。
                 self._set_note(
                     "AI の入力欄に結果を入れました。"
                     "送信ボタンは未設定です"
-                    "（「設定」で設定できます）", "ok")
+                    "（「設定」で設定できます）", "ok",
+                    ai=(item.ai or None) if item is not None
+                    else None)
         elif getattr(result, "deferred", False) \
                 and item is not None:
             # 送信待ちの文があり上書きを避けて保留された
@@ -5680,20 +5701,28 @@ class ScriptRunnerWindow(QWidget):
                 ai=(item.ai or None))
             self._set_note(
                 "送信待ちの文があるため、回答を保留しました"
-                "（空いたら自動で入れます）", "ok")
+                "（空いたら自動で入れます）", "ok",
+                ai=(item.ai or None) if item is not None
+                else None)
         else:
             message = getattr(result, "message", "") \
                 or "AI へ回答できませんでした"
             self._diag(f"AIへ回答に失敗: {message}",
                        ai=(item.ai or None) if item is not None
                        else None)
-            self._set_note(str(message), "error")
+            self._set_note(str(message), "error",
+                           ai=(item.ai or None) if item is not None
+                           else None)
         # 添付の結果 (1.58) も診断に残す (copilot 側で添付できた
         # もの・できなかったもの、ファイル名だけ)。
         for name in getattr(result, "attach_done", None) or []:
-            self._diag(f"添付した: {name}")
+            self._diag(f"添付した: {name}",
+                       ai=(item.ai or None) if item is not None
+                       else None)
         for name in getattr(result, "attach_failed", None) or []:
-            self._diag(f"添付に失敗: {name}")
+            self._diag(f"添付に失敗: {name}",
+                       ai=(item.ai or None) if item is not None
+                       else None)
         self._refresh_list()
         # 自動化: 「送信を自動で押す」が入っていれば、入れた回答を
         # そのまま送信まで進める (手で入れた場合も同じ)。送信ボタン
@@ -5791,6 +5820,18 @@ class ScriptRunnerWindow(QWidget):
             return saved
         return self._intro_auto_text(profile_name)
 
+    def _active_profile_name(self):
+        """いま有効なプロファイルの名前 (読めなければ "")。"""
+        try:
+            import script_runner_ai as sr_ai
+
+            section = settings_module.load_settings(
+                self.settings_path).get("script_runner") or {}
+            profiles, active = sr_ai.sanitize_profiles(section)
+            return profiles[active]["name"]
+        except Exception:  # noqa: BLE001  名前は分からなくても進む
+            return ""
+
     def _choose_intro_target(self):
         """開始プロンプトを入れる窓の名前を選ぶ (2.83)。
 
@@ -5885,7 +5926,10 @@ class ScriptRunnerWindow(QWidget):
         sender = self.ai_sender or _default_ai_sender
         self._intro_sending = True
         self._intro_text = text
-        self._intro_window_name = chosen_name
+        # 選ばなかったときは、有効なプロファイルが実際の相手。
+        # 完了の注記と動作ログの出どころに使う (2.84)。
+        self._intro_window_name = chosen_name \
+            or self._active_profile_name()
         manual = self._intro_manual_path()
         attach = [str(manual)] if manual is not None else []
         self._intro_attached = bool(attach)
@@ -5915,10 +5959,12 @@ class ScriptRunnerWindow(QWidget):
             # 確認しに行く窓を取り違えやすいため。
             window = getattr(self, "_intro_window_name", "")
             where = f"（{window}）" if window else ""
-            self._diag(f"開始プロンプトを入力しました{where}{suffix}")
+            self._diag(f"開始プロンプトを入力しました{where}{suffix}",
+                       ai=window or None)
             self._set_note(
                 f"開始プロンプトを入力しました{where}。"
-                "確認して送信してください", "ok")
+                "確認して送信してください", "ok",
+                ai=window or None)
             return
         message = str(getattr(result, "message", "") or "")
         reason = (f"AI の窓へ入れませんでした（{message}）"
@@ -6082,16 +6128,22 @@ class ScriptRunnerWindow(QWidget):
                     f"AIへの送信: {message}",
                     ai=(item.ai or None) if item is not None
                     else None)
-                self._set_note(message, "ok")
+                self._set_note(message, "ok",
+                               ai=(item.ai or None)
+                               if item is not None else None)
             else:
-                self._set_note("送信しました", "ok")
+                self._set_note("送信しました", "ok",
+                               ai=(item.ai or None)
+                               if item is not None else None)
         else:
             message = getattr(result, "message", "") \
                 or "送信できませんでした"
             self._diag(f"AIへの送信に失敗: {message}",
                        ai=(item.ai or None) if item is not None
                        else None)
-            self._set_note(str(message), "error")
+            self._set_note(str(message), "error",
+                           ai=(item.ai or None) if item is not None
+                           else None)
             if "入力欄の文が想定と違う" in str(message):
                 # 方式2の照合失敗 (2.60): 診断を QR で共有
                 # できる小窓を出す。
@@ -7209,7 +7261,8 @@ class ScriptRunnerWindow(QWidget):
                 press_state.holder = None
             self._set_note(
                 "自動でダウンロードしました" if self._dl_press_auto
-                else "ダウンロードしました", "ok")
+                else "ダウンロードしました", "ok",
+                ai=press_state.name or None)
             _banner_head = "自動でダウンロードしました：" \
                 if self._dl_press_auto else "ダウンロードしました："
             self._show_banner(_banner_head + awaiting_label)
@@ -7252,8 +7305,12 @@ class ScriptRunnerWindow(QWidget):
         except Exception:  # noqa: BLE001  解決できなければ送らない
             configured, profile = False, None
         if not configured:
-            self._diag("ESC送信: 投げ先が未設定のため見送り")
+            self._diag("ESC送信: 投げ先が未設定のため見送り",
+                       ai=watch_name or None)
             return
+        # 完了側 (_on_escape_sent) が動作ログへ出すときの
+        # 出どころ (2.84)。
+        self._esc_watch_name = watch_name
         sender = self.ai_esc_sender or _default_ai_esc_sender
 
         import threading
@@ -7271,7 +7328,8 @@ class ScriptRunnerWindow(QWidget):
 
     def _on_escape_sent(self, result):
         message = str(getattr(result, "message", "") or "")
-        self._diag(message if message else "ESC送信: failed")
+        self._diag(message if message else "ESC送信: failed",
+                   ai=getattr(self, "_esc_watch_name", "") or None)
 
     # ---------------- 合図の再応答の抑止 (1.95、2.00 で作り替え) ----
     # 応答済みの合図が、開き直しをまたいで同定子 (id・key) が

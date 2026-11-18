@@ -4058,6 +4058,83 @@ def test_diag_writes_log_and_collapses_cached_checks():
             os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
 
 
+def test_log_ai_name_follows_copilot_chain():
+    # 不具合A (2.84、copilot-trial-20261119): 二重待受で
+    # Copilot の連鎖の出来事が、動作ログで [Copilot] になる
+    # こと。_set_note 経由 (結果入力・送信の完了)、開始
+    # プロンプト、ESC 送信、ai 省略時の既定 (段階の階) を
+    # 確かめる。待機中の全体の出来事は主 (Muse) のまま。
+    prev_data_dir = os.environ.get("TRAYTOOLS_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            os.environ["TRAYTOOLS_DATA_DIR"] = str(tmp / "data")
+            settings_path, watch = _make_dual_window(tmp)
+            window = sr.ScriptRunnerWindow(str(settings_path))
+            try:
+                def logged(text):
+                    return [e for e in window._log_events
+                            if e["text"] == text]
+
+                window._diag("待機中の記録")
+                hits = logged("待機中の記録")
+                assert hits and hits[0]["ai"] == "Muse", hits
+
+                item = _origin_item(watch, "Copilot")
+                # 結果入力の完了。
+                window._ai_answer_item = item
+                window._ai_send_ready = True
+                window._on_ai_answer_done(
+                    sr._AiAnswerResult(True, ""))
+                hits = logged("AI の入力欄に結果を入れました")
+                assert hits and hits[0]["ai"] == "Copilot", hits
+                # 送信の完了。
+                window._ai_send_item = item
+                window._on_ai_send_done(sr._AiAnswerResult(True, ""))
+                hits = logged("送信しました")
+                assert hits and hits[0]["ai"] == "Copilot", hits
+                # ai を渡さない _set_note でも、連鎖の出どころ
+                # (DL を押した窓) から Copilot になる。
+                window._stage = "dl"
+                window._stage_since = time.monotonic()
+                window._dl_press_watch = "Copilot"
+                window._set_note("自動でダウンロードしました", "ok")
+                hits = logged("自動でダウンロードしました")
+                assert hits and hits[0]["ai"] == "Copilot", hits
+                window._stage = None
+                window._dl_press_watch = None
+                # 開始プロンプト (相手は Copilot)。
+                window._intro_window_name = "Copilot"
+                window._intro_text = "文"
+                window._intro_attached = False
+                window._on_intro_done(sr._AiAnswerResult(True, ""))
+                hits = [e for e in window._log_events
+                        if e["text"].startswith(
+                            "開始プロンプトを入力しました")]
+                assert hits and all(
+                    e["ai"] == "Copilot" for e in hits), hits
+                # ESC 送信の完了。
+                window.ai_esc_sender = (  # type: ignore[method-assign]
+                    lambda profile: sr._AiAnswerResult(
+                        True, "ESC送信: sent"))
+                window._send_escape_to_ai("Copilot")
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    QCoreApplication.processEvents()
+                    if logged("ESC送信: sent"):
+                        break
+                    time.sleep(0.05)
+                hits = logged("ESC送信: sent")
+                assert hits and hits[0]["ai"] == "Copilot", hits
+            finally:
+                window.close()
+    finally:
+        if prev_data_dir is None:
+            os.environ.pop("TRAYTOOLS_DATA_DIR", None)
+        else:
+            os.environ["TRAYTOOLS_DATA_DIR"] = prev_data_dir
+
+
 def test_log_viewer_dialog_shows_events():
     # 動作ログビューア (1.90): 置き場の記録が日付つきで出る
     # ことと、設定画面に「動作ログ」ボタンがあること。

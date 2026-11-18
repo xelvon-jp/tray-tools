@@ -299,9 +299,16 @@ class _RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 if user32 is not None:
     user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
     user32.GetWindowRect.restype = ctypes.c_bool
+    # クリック位置の下の窓を調べる用 (2.80、レビュー中7)。
+    user32.WindowFromPoint.argtypes = [_POINT]
+    user32.WindowFromPoint.restype = ctypes.c_void_p
     # ESC の PostMessage 用 (1-67)。WPARAM は size_t、LPARAM は
     # ssize_t (署名なしだと HWND と同じく 64bit で化ける)。
     user32.PostMessageW.argtypes = [
@@ -404,6 +411,29 @@ def _click_at(x, y):
         raise RuntimeError(f"クリックを送れませんでした (SendInput={sent})")
 
 
+def _require_point_on_element_window(el, x, y):
+    """クリックする点の下にある窓が、要素の窓と一致するか
+    (2.80、レビュー中7)。
+
+    別の窓が上に重なっていたら、その窓へクリックが届いてしまう
+    ので送らない。要素のハンドルが取れない・user32 が無い環境
+    では比べようがないので通す (従来どおり)。"""
+    if user32 is None:
+        return
+    try:
+        handle = el.CurrentNativeWindowHandle
+    except Exception:  # noqa: BLE001  取れなければ従来どおり進む
+        return
+    if not handle:
+        return
+    try:
+        under = user32.WindowFromPoint(_POINT(x, y))
+    except Exception:  # noqa: BLE001  取れなければ従来どおり進む
+        return
+    if under and _window_root(under) != _window_root(handle):
+        raise RuntimeError("クリックする位置に別の窓が重なっています")
+
+
 def _click_element(el):
     """要素の外接矩形の中心をクリックする。位置が取れなければ
     RuntimeError (_activate_element が理由として畳む)。"""
@@ -411,7 +441,9 @@ def _click_element(el):
     if rect is None:
         raise RuntimeError("要素の位置が分かりません")
     left, top, right, bottom = rect
-    _click_at((left + right) // 2, (top + bottom) // 2)
+    x, y = (left + right) // 2, (top + bottom) // 2
+    _require_point_on_element_window(el, x, y)
+    _click_at(x, y)
 
 
 def _post_escape(hwnd):
@@ -1401,17 +1433,11 @@ def _window_root(hwnd):
         return hwnd
 
 
-def _foreground_matches(hwnd):
-    """前面の窓のルートが hwnd のルートと一致するか (2.69、
-    レビュー高1)。
+FOREGROUND_RETRY_WAIT = 0.15  # 前面確認の再試行までの待ち (2.80)
 
-    キー送信はフォーカスのある窓へ届くので、前面化が失敗した
-    まま送ると、利用者が操作している別のアプリへ届く。送る
-    直前にここで確かめ、合わなければ送らない。hwnd が無い・
-    user32 が無い環境では比べようがないので True (従来どおり
-    読み直しの確認に任せる)。"""
-    if user32 is None or not hwnd:
-        return True
+
+def _foreground_matches_once(hwnd):
+    """前面の窓のルートが hwnd のルートと一致するか (1回だけ)。"""
     try:
         fg = user32.GetForegroundWindow()
     except Exception:  # noqa: BLE001  取れなければ従来どおり進む
@@ -1421,8 +1447,33 @@ def _foreground_matches(hwnd):
     return _window_root(fg) == _window_root(hwnd)
 
 
+def _foreground_matches(hwnd):
+    """前面の窓のルートが hwnd のルートと一致するか (2.69、
+    レビュー高1)。
+
+    キー送信はフォーカスのある窓へ届くので、前面化が失敗した
+    まま送ると、利用者が操作している別のアプリへ届く。送る
+    直前にここで確かめ、合わなければ送らない。hwnd が無い・
+    user32 が無い環境では比べようがないので True (従来どおり
+    読み直しの確認に任せる)。前面化の反映は一瞬遅れることが
+    あるので、合わなければ短く待ってもう1回だけ見る (2.80、
+    レビュー中7)。"""
+    if user32 is None or not hwnd:
+        return True
+    if _foreground_matches_once(hwnd):
+        return True
+    time.sleep(FOREGROUND_RETRY_WAIT)
+    return _foreground_matches_once(hwnd)
+
+
 def _require_foreground(hwnd):
-    """前面が対象の窓でなければ RuntimeError (2.69、レビュー高1)。"""
+    """前面が対象の窓でなければ RuntimeError (2.69、レビュー高1)。
+
+    hwnd が無いときは、対象の窓が特定できていないので送らない
+    (2.80、レビュー中7。_foreground_matches の素通りは、比べる
+    だけの場所のためのもの)。"""
+    if not hwnd:
+        raise RuntimeError("対象の窓が特定できません")
     if not _foreground_matches(hwnd):
         raise RuntimeError("対象の窓が前面ではありません")
 

@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.78"
+PHAL_VERSION = "2.80"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -32,6 +32,7 @@ SEND_FORCE_RATIO = 0.9
 
 # 受領応答は、実行がこの秒数を超えても続いているときだけ出す
 # (2.66)。速く終わる実行では受領を出さず、結果だけが行く。
+# 既定値は core.ACK_DELAY_DEFAULT_SEC と一致させること (2.80)。
 ACK_DELAY_SECONDS = 5.0
 
 # 段階が落ちたあと、表示だけ直前の段階を保つ秒数 (1.67)。
@@ -1658,6 +1659,13 @@ class ScriptRunnerWindow(QWidget):
         # 送信は撃ち直しを間引く (_chain_in_flight に混ぜる)。
         self._auto_blocked_until = 0.0
         self._auto_blocked = False
+        # ループ内訳の計測 (2.79)。区間の境目の時刻 (monotonic)
+        # と、直近の完了ループの区間表を控える。診断の束と
+        # 動作ログの要約へ出すためのもので、動作には影響しない。
+        self._loop_marks = {}
+        self._loop_prev_send_done = None
+        self._loop_stages = None
+        self._loop_stages_name = ""
         # 受領応答を出す義務がある実行中の項目 (2.66、遅延送信)。
         self._ack_due_item = None
         # 送信中の受領応答の項目 (2.71)。保留されたら義務へ戻す。
@@ -2174,6 +2182,9 @@ class ScriptRunnerWindow(QWidget):
             header.resizeSection(COL_RUN, core.RUN_COLUMN_MIN_WIDTH)
         # 表の大きさの変化で、幅の余りを概要列へ配る (2.75)。
         self.table.installEventFilter(self)
+        # 名前列を利用者がドラッグしたら、自動合わせを止める
+        # (2.80、レビュー中3)。
+        header.sectionResized.connect(self._on_section_resized)
         self.table.currentCellChanged.connect(self._on_selection_changed)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.table.setContextMenuPolicy(
@@ -3336,6 +3347,7 @@ class ScriptRunnerWindow(QWidget):
                 "回答を入れている最中" if self._ai_filling else
                 "送信を押している最中" if self._ai_sending else "なし"),
             f"自動実行の待ち: {len(self._auto_run_queue)}件",
+            self._loop_breakdown_line(),
             "開き直しの保留: " + (
                 "あり" if self._restart_deferred else "なし"),
             # 窓位置と復元の照合の記録 (1.70)。
@@ -3872,6 +3884,12 @@ class ScriptRunnerWindow(QWidget):
             return  # チェックのあいだに中身が変わった。新しい方に任せる
         item.result = result
         item.status = result.status
+        # ループ内訳のチェックの境目 (2.79)。
+        if "detected" in self._loop_marks \
+                and "checked" not in self._loop_marks:
+            self._loop_marks["checked"] = time.monotonic()
+            if elapsed_ms is not None:
+                self._loop_marks["check_elapsed"] = elapsed_ms / 1000.0
         ms = f"（{elapsed_ms}ms）" if elapsed_ms is not None else ""
         self._diag(
             f"チェック: {item.name} → "
@@ -4246,10 +4264,22 @@ class ScriptRunnerWindow(QWidget):
         self._fit_name_column()
 
     def eventFilter(self, obj, event):
-        """表の大きさが変わったら、幅の余りを概要列へ配る (2.75)。"""
+        """表の大きさが変わったら、幅の余りを概要列へ配る (2.75)。
+
+        eventFilter は表が Resize を処理する前に呼ばれるので、
+        その場で viewport の幅を見ると1回前の幅になる (2.80、
+        レビュー中1)。処理の後に配り直すよう、タイマで遅らせる。"""
         if obj is self.table and event.type() == QEvent.Type.Resize:
-            self._distribute_table_width()
+            QTimer.singleShot(0, self._distribute_table_width)
         return super().eventFilter(obj, event)
+
+    def _on_section_resized(self, index, _old, _new):
+        """名前列を利用者がドラッグしたら印を立てる (2.80、中3)。
+
+        コード側の自動合わせ (_fit_name_column) の最中は立てない。"""
+        if index == COL_NAME \
+                and not getattr(self, "_fitting_columns", False):
+            self._name_column_user_sized = True
 
     def _distribute_table_width(self):
         """列幅の合計を表の幅に合わせ、差分を概要列で受ける (2.75)。
@@ -4288,7 +4318,11 @@ class ScriptRunnerWindow(QWidget):
         if self.config.get("column_widths"):
             return
         header = self.table.horizontalHeader()
-        if not getattr(self, "_other_columns_fitted", False):
+        # その他の列の初回の測定は、最初に行が入ったときにする
+        # (2.80、レビュー中3)。一覧が空のうちに測ると、見出しの
+        # 幅だけで決まってしまう。
+        if not getattr(self, "_other_columns_fitted", False) \
+                and self._visible_items():
             self._other_columns_fitted = True
             for col in (COL_TIME, COL_ID, COL_AI, COL_HASH,
                         COL_STATUS, COL_RUN):
@@ -4314,8 +4348,16 @@ class ScriptRunnerWindow(QWidget):
                 widest = max(widest,
                              metrics.horizontalAdvance(label))
         width = min(widest + 24, NAME_COLUMN_MAX_WIDTH)
+        # 利用者が名前列をドラッグしていたら、その幅を優先する
+        # (2.80、レビュー中3)。
+        if getattr(self, "_name_column_user_sized", False):
+            return
         if header.sectionSize(COL_NAME) != width:
-            header.resizeSection(COL_NAME, width)
+            self._fitting_columns = True
+            try:
+                header.resizeSection(COL_NAME, width)
+            finally:
+                self._fitting_columns = False
 
     def _fill_row(self, row: int, item: ScriptItem,
                   dup_shas=frozenset()):
@@ -4939,6 +4981,9 @@ class ScriptRunnerWindow(QWidget):
         self._running_args = [str(a) for a in (run_args or [])]
         self._running_request_id = str(request_id or "")
         self._run_started_at = time.monotonic()
+        if "detected" in self._loop_marks:
+            self._loop_marks["run_start"] = self._run_started_at
+            self._loop_marks["name"] = item.name
         self._diag(f"実行開始: {item.name}", ai=item.ai or None)
         # 実行手数を数えて、モニタ表示用の状態を出す。
         self._phal_step += 1
@@ -5027,6 +5072,7 @@ class ScriptRunnerWindow(QWidget):
             self._run_handle.stop()
 
     def _on_run_done(self, run: core.RunResult):
+        self._loop_mark("run_done")  # ループ内訳の境目 (2.79)
         item = self._running_item
         self._running_item = None
         was_rerun = self._running_rerun
@@ -5535,6 +5581,7 @@ class ScriptRunnerWindow(QWidget):
         # 方式4 (2.68) は、寛容な書き込みの確認を直接読みにする。
         send_direct = profile.get("send_method") == 4
         self._ai_filling = True
+        self._loop_mark("fill_start")  # ループ内訳の境目 (2.79)
         self._ai_answer_item = item
         self._refresh_list()
         self._display_item = item
@@ -5585,6 +5632,7 @@ class ScriptRunnerWindow(QWidget):
             target=work, daemon=True, name="phal-ai-answer").start()
 
     def _on_ai_answer_done(self, result):
+        self._loop_mark("fill_done")  # ループ内訳の境目 (2.79)
         self._ai_filling = False
         item, self._ai_answer_item = self._ai_answer_item, None
         if getattr(result, "ok", False):
@@ -5899,6 +5947,7 @@ class ScriptRunnerWindow(QWidget):
                 # 合えば、制限時間を待たずに押す。
                 early_force = True
         self._ai_sending = True
+        self._loop_mark("send_start")  # ループ内訳の境目 (2.79)
         self._ai_send_item = item
         self._refresh_list()
         self._display_item = item
@@ -5939,6 +5988,8 @@ class ScriptRunnerWindow(QWidget):
             target=work, daemon=True, name="phal-ai-send").start()
 
     def _on_ai_send_done(self, result):
+        self._loop_mark("send_done")  # ループ内訳の境目 (2.79)
+        self._loop_finish_send()
         self._ai_sending = False
         item, self._ai_send_item = self._ai_send_item, None
         if getattr(result, "ok", False):
@@ -6981,6 +7032,8 @@ class ScriptRunnerWindow(QWidget):
                     "で設定してください", "error")
                 return
         presser = self.ai_dl_presser or _default_ai_dl_presser
+        if auto:
+            self._loop_begin()  # ループ内訳の検出の境目 (2.79)
         self._dl_pressing = True
         self._dl_press_auto = auto
         self._dl_press_key = holder.key
@@ -10897,7 +10950,9 @@ class ScriptRunnerWindow(QWidget):
         spec = core.parse_log_request(params)
         events = core.select_log_events(
             core.load_log_events(), spec)
-        text = core.build_log_reply(events, spec, request_id=req)
+        text = core.build_log_reply(
+            events, spec, request_id=req,
+            loop_line=self._loop_breakdown_line())
         attach = []
         if len(text) > 3800:
             path = core.data_dir() / "phal-log-latest.txt"
@@ -12327,6 +12382,67 @@ class ScriptRunnerWindow(QWidget):
             self._diag(
                 f"{what}を保留しました（送信待ちの文があるため）")
         self._auto_blocked_until = now + 5.0
+
+    def _loop_mark(self, name: str):
+        """ループ内訳の境目を打つ (2.79)。計測だけの控え。"""
+        self._loop_marks[name] = time.monotonic()
+
+    def _loop_begin(self):
+        """新しいループの検出 (2.79)。
+
+        前のループの「次の検出まで」を確定させてから、今回の
+        境目を打ち始める。検出の区間は、前の送信完了から今回の
+        検出まで (AI の生成と見張りの確認間隔を含む)。"""
+        now = time.monotonic()
+        if self._loop_stages is not None \
+                and self._loop_prev_send_done is not None:
+            for i, (name, sec) in enumerate(self._loop_stages):
+                if name == "次の検出まで" and sec is None:
+                    self._loop_stages[i] = (
+                        name, now - self._loop_prev_send_done)
+        self._loop_marks = {"detected": now,
+                            "baseline": self._loop_prev_send_done}
+
+    def _loop_finish_send(self):
+        """送信が終わったら、今回のループの区間表を作る (2.79)。"""
+        marks = self._loop_marks
+        if "detected" not in marks or "send_done" not in marks:
+            return
+
+        def gap(a, b):
+            if a in marks and b in marks:
+                return max(0.0, marks[b] - marks[a])
+            return None
+
+        detect_sec = None
+        if marks.get("baseline") is not None:
+            detect_sec = max(0.0, marks["detected"] - marks["baseline"])
+        dl_sec = None
+        if "checked" in marks:
+            dl_sec = max(
+                0.0, marks["checked"]
+                - (marks.get("check_elapsed") or 0.0)
+                - marks["detected"])
+        self._loop_stages = [
+            ("検出", detect_sec),
+            ("ダウンロード", dl_sec),
+            ("チェック", marks.get("check_elapsed")),
+            ("実行", gap("run_start", "run_done")),
+            ("結果入力", gap("fill_start", "fill_done")),
+            ("送信", gap("send_start", "send_done")),
+            ("次の検出まで", None),
+        ]
+        self._loop_stages_name = marks.get("name", "")
+        self._loop_prev_send_done = marks["send_done"]
+        self._loop_marks = {}
+
+    def _loop_breakdown_line(self) -> str:
+        """診断の束・動作ログの要約へ出すループ内訳の1行
+        (2.79)。"""
+        if not self._loop_stages:
+            return "ループ内訳: まだ完了したループがありません"
+        return core.format_loop_breakdown(
+            self._loop_stages, self._loop_stages_name)
 
     def _chain_in_flight(self) -> bool:
         """自動化の連鎖が途中かどうか。

@@ -395,8 +395,13 @@ def register_source(source: str, created_from: str = "",
     else:
         folder = root / category / name
     previous_version = 0
+    existing_meta = {}
     if existing is not None:
-        previous_version = int(load_meta(existing).get("version", 1))
+        # 旧 meta はここで読んでおく (2.80、レビュー中5)。分類が
+        # 変わると旧フォルダは消えるので、後からでは登録日時が
+        # 読めない。
+        existing_meta = load_meta(existing)
+        previous_version = int(existing_meta.get("version", 1))
 
         def _save_prev(prev_dir):
             if prev_dir.exists():
@@ -414,12 +419,12 @@ def register_source(source: str, created_from: str = "",
             _save_prev(existing / ".prev")
         else:
             # 分類が変わるときは、前版を新しいフォルダの .prev へ
-            # 運んでから旧フォルダを消す (2.70、レビュー中・実測。
-            # 旧い作りは .prev を作った直後に旧フォルダごと消して
-            # いたので、前版が残らなかった)
+            # 運ぶ (2.70、レビュー中・実測。旧い作りは .prev を
+            # 作った直後に旧フォルダごと消していたので、前版が
+            # 残らなかった)。旧フォルダを消すのは、本体を書き
+            # 終えてから (2.80、レビュー中5)。
             folder.mkdir(parents=True, exist_ok=True)
             _save_prev(folder / ".prev")
-            shutil.rmtree(existing)
     folder.mkdir(parents=True, exist_ok=True)
     scripts = folder / "scripts"
     scripts.mkdir(exist_ok=True)
@@ -443,13 +448,22 @@ def register_source(source: str, created_from: str = "",
         "updated_at": stamp,
     }
     if existing is not None:
-        old_meta = load_meta(existing) if existing == folder else meta
-        meta["registered_at"] = old_meta.get("registered_at", stamp)
+        meta["registered_at"] = existing_meta.get(
+            "registered_at", stamp)
     _write_json(folder / META_FILENAME, meta)
+    if existing is not None and existing != folder \
+            and existing.exists():
+        # 分類が変わったときの旧フォルダは、本体を書き終えてから
+        # 消す (2.80、レビュー中5)。途中で落ちても、本体の無い
+        # フォルダだけが残る形にはならない。
+        shutil.rmtree(existing)
     rebuild_index(root)
     info = None
     for tool in list_tools(root):
-        if tool["name"] == name:
+        # 名前の照合は大小文字を同一視する (2.80、レビュー中5)。
+        # 厳密比較だと、綴りだけ違う再登録で tool が None になり、
+        # 登録の確認文が出なかった。
+        if tool["name"].lower() == name.lower():
             info = tool
             break
     return {"ok": True, "reason": "", "tool": info}
@@ -462,7 +476,9 @@ def describe(name, root=None) -> str:
     if folder is None:
         return ""
     usage = load_usage(root)
-    usage_of(usage, name)["describe_count"] += 1
+    # 使用回数の記録は、フォルダの綴り (正規の名前) に寄せる
+    # (2.80、レビュー中5)。呼び名の綴りごとに分かれないように。
+    usage_of(usage, folder.name)["describe_count"] += 1
     save_usage(usage, root)
     try:
         return (folder / SKILL_FILENAME).read_text(encoding="utf-8")
@@ -473,6 +489,9 @@ def describe(name, root=None) -> str:
 def record_run(name, ok: bool, seconds: float, args_summary: str = "",
                root=None) -> None:
     root = Path(root) if root else root_dir()
+    folder = find_tool(name, root)
+    if folder is not None:
+        name = folder.name  # 記録は正規の綴りに寄せる (2.80、中5)
     usage = load_usage(root)
     entry = usage_of(usage, name)
     entry["count"] += 1

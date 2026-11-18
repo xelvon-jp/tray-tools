@@ -1266,27 +1266,37 @@ def test_normalize_config_column_widths_clamped():
     assert tiny["column_widths"][7] == core.RUN_COLUMN_MIN_WIDTH
     broken = core.normalize_config({"column_widths": [1, 2, 3]})
     assert broken["column_widths"] is None
+    # 範囲を超えた幅は、全部捨てずに上限へ丸める (2.80、レビュー
+    # 中4)。概要列は幅広の画面で 2000 を超えることがある。
+    wide = core.normalize_config(
+        {"column_widths": [100, 90, 300, 60, 80, 2500, 70, 130]})
+    assert wide["column_widths"] == [100, 90, 300, 60, 80, 2000,
+                                     70, 130]
 
 
 def test_append_run_log_trims_when_too_big():
     """実行ログ (jsonl) は大きくなりすぎたら新しい方だけ残す
-    (2.73。それまでは際限なく伸びていた)。"""
+    (2.73。それまでは際限なく伸びていた)。残るのは最新の
+    ものから上限件数で、一時ファイルは残らない (2.80、中6)。"""
     with tempfile.TemporaryDirectory() as td:
         log_path = Path(td) / "log.jsonl"
-        run = core.RunResult(name="a.py", path="C:/x/a.py",
-                             exit_code=0, seconds=0.1,
-                             stdout="x" * 100, sha256="ab12")
         saved = (core.RUN_LOG_MAX_BYTES, core.RUN_LOG_LIMIT)
         try:
             core.RUN_LOG_MAX_BYTES = 300
             core.RUN_LOG_LIMIT = 2
-            for _ in range(5):
+            for i in range(5):
+                run = core.RunResult(
+                    name=f"a{i}.py", path=f"C:/x/a{i}.py",
+                    exit_code=0, seconds=0.1,
+                    stdout="x" * 100, sha256="ab12")
                 core.append_run_log(run, None, log_path)
         finally:
             core.RUN_LOG_MAX_BYTES, core.RUN_LOG_LIMIT = saved
         lines = log_path.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 2
-        assert json.loads(lines[-1])["file"] == "a.py"
+        assert json.loads(lines[0])["file"] == "a3.py"
+        assert json.loads(lines[1])["file"] == "a4.py"
+        assert not (Path(td) / "log.jsonl.tmp").exists()
 
 
 def test_check_script_dispatch():
@@ -3545,6 +3555,84 @@ def test_all_auto_done_handlers_handle_deferred():
             f"{name} が deferred を見ていない"
 
 
+def test_format_loop_breakdown_and_log_reply_loop_line():
+    """ループ内訳の1行 (2.79): 最長の区間の選出、未計測の区間は
+    「-」、動作ログの返信では見出しの直後に入る。"""
+    stages = [("検出", 12.34), ("ダウンロード", 1.2),
+              ("チェック", 0.05), ("実行", 3.0), ("結果入力", None),
+              ("送信", 299.0), ("次の検出まで", None)]
+    line = core.format_loop_breakdown(stages, "1-999_test.phal")
+    assert line.startswith("ループ内訳（1-999_test.phal）: ")
+    assert "検出 12.3秒" in line
+    assert "結果入力 -" in line
+    assert line.endswith("（最長: 送信 299.0秒）")
+    assert core.format_loop_breakdown([]) == ""
+    # 動作ログの返信: ループ内訳は見出しの直後。
+    text = core.build_log_reply([], {"label": "直近50件"},
+                                loop_line=line)
+    rows = text.split("\n")
+    assert rows[1] == line
+    assert rows[2] == "（記録はありません）"
+    # loop_line が無ければ従来どおり。
+    text2 = core.build_log_reply([], {"label": "直近50件"})
+    assert text2.split("\n")[1] == "（記録はありません）"
+
+
+def test_odougubako_register_changes():
+    """おどうぐばこの登録の直し (2.80、レビュー中5): 分類を
+    変えても .prev と登録日時が残ること、大小文字だけ違う名前
+    でも tool が返ること、フォルダ名の正規化。"""
+    import odougubako_core as odo
+    src = ("# phal-tool: CsvPeek\n"
+           "# phal-usage: CSVの先頭を表示して中身を確認する道具です\n"
+           "# phal-category: files\n"
+           "print('v1')\n")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        r1 = odo.register_source(src, root=root)
+        assert r1["ok"] and r1["tool"] is not None
+        folder1 = odo.find_tool("CsvPeek", root)
+        assert folder1 is not None
+        meta1 = odo.load_meta(folder1)
+        # 分類を変えて再登録: .prev と登録日時が引き継がれる。
+        src2 = src.replace("files", "data").replace("v1", "v2")
+        r2 = odo.register_source(src2, root=root)
+        assert r2["ok"] and r2["tool"] is not None
+        folder2 = odo.find_tool("csvpeek", root)  # 大小は同一視
+        assert folder2 is not None
+        assert folder2.parent.name == "data"
+        assert not (root / "files" / "CsvPeek").exists()
+        prev_main = folder2 / ".prev" / "scripts" / "main.py"
+        assert prev_main.exists()
+        assert "v1" in prev_main.read_text(encoding="utf-8")
+        meta2 = odo.load_meta(folder2)
+        assert meta2["registered_at"] == meta1["registered_at"]
+        assert meta2["version"] == meta1["version"] + 1
+        # 大小文字だけ違う名前で再登録しても tool が返る。
+        src3 = src2.replace("CsvPeek", "csvpeek")
+        r3 = odo.register_source(src3, root=root)
+        assert r3["ok"] and r3["tool"] is not None
+        # フォルダ名の正規化: 外へ出る名前は既定の分類へ落ちる。
+        assert odo.folder_name("..") == odo.DEFAULT_CATEGORY
+        assert odo.folder_name("") == odo.DEFAULT_CATEGORY
+        assert odo.folder_name("a/b") == "a_b"
+
+
+def test_ack_delay_default_unified():
+    """受領の遅延の既定は core の ACK_DELAY_DEFAULT_SEC に
+    一本化する (2.80、レビューの低)。窓側と設定側の字面が
+    ずれていないことを見る。"""
+    assert core.ACK_DELAY_DEFAULT_SEC == 5
+    root = Path(__file__).resolve().parent.parent
+    win_src = (root / "script_runner.py").read_text(encoding="utf-8")
+    assert f"ACK_DELAY_SECONDS = {core.ACK_DELAY_DEFAULT_SEC}.0" \
+        in win_src
+    ai_src = (root / "script_runner_ai.py").read_text(
+        encoding="utf-8")
+    assert "ACK_DELAY_DEFAULT = " not in ai_src
+    assert "core.ACK_DELAY_DEFAULT_SEC" in ai_src
+
+
 if __name__ == "__main__":
     tests = [
         test_normalize_config_defaults_and_clamps,
@@ -3641,6 +3729,9 @@ if __name__ == "__main__":
         test_execute_streaming_output,
         test_phal_status_build_and_write_only_on_change,
         test_all_auto_done_handlers_handle_deferred,
+        test_format_loop_breakdown_and_log_reply_loop_line,
+        test_odougubako_register_changes,
+        test_ack_delay_default_unified,
         test_collect_intro_environment_with_fake_runner,
         test_collect_intro_environment_runner_missing_is_unknown,
         test_collect_intro_modules_truncated,

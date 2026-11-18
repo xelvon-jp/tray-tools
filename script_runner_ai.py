@@ -262,21 +262,20 @@ def send_configured(fields) -> bool:
                 or fields["send_class"])
 
 
-ACK_DELAY_DEFAULT = 5
-
-
 def sanitize_ack_delay(section) -> int:
     """受領応答を出すまでの秒数 (2.72、環境2の所感から)。
 
     settings の script_runner 節の ack_delay_seconds を
-    0〜3600 の int に整える。欠け・壊れは既定 (5秒)。0 なら
-    実行の開始直後から出す (見回りの間隔で実際に出る)。"""
+    0〜3600 の int に整える。欠け・壊れは既定 (5秒、core の
+    ACK_DELAY_DEFAULT_SEC、2.80 で一本化)。0 なら実行の開始
+    直後から出す (見回りの間隔で実際に出る)。"""
     value = section.get("ack_delay_seconds") \
         if isinstance(section, dict) else section
     try:
         number = int(value)
     except (TypeError, ValueError):
-        return ACK_DELAY_DEFAULT
+        import script_runner_core as core
+        return core.ACK_DELAY_DEFAULT_SEC
     return max(0, min(3600, number))
 
 
@@ -1802,6 +1801,10 @@ class AutomationPage(QWidget):
                 self._ack_delay_spin.setSuffix(" 秒")
                 self._ack_delay_spin.setValue(
                     sanitize_ack_delay(automation))
+                # 受領の切替が切の間は、秒数を触れないようにする
+                # (2.80、レビューの低)。
+                self._ack_delay_spin.setEnabled(given["auto_ack"])
+                box.toggled.connect(self._ack_delay_spin.setEnabled)
                 row.addWidget(self._ack_delay_spin)
                 row.addStretch(1)
                 layout.addLayout(row)

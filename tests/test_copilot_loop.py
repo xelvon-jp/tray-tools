@@ -2467,11 +2467,78 @@ def test_foreground_check_allows_paste_when_foreground():
 
 
 def test_foreground_matches_without_hwnd_passes():
-    """hwnd が無いときは比べようがないので従来どおり通す
-    (2.77、レビュー重大3)。"""
+    """hwnd が無いときは比べようがないので _foreground_matches
+    は従来どおり通す (2.77、レビュー重大3)。ただしキー送信の門
+    (_require_foreground) は、対象の窓が特定できないとき
+    送らない (2.80、レビュー中7)。"""
     assert copilot_loop._foreground_matches(None) is True
     assert copilot_loop._foreground_matches(0) is True
-    copilot_loop._require_foreground(None)  # 例外にならない
+    try:
+        copilot_loop._require_foreground(None)
+        raised = None
+    except RuntimeError as e:
+        raised = e
+    assert raised is not None
+    assert "特定できません" in str(raised)
+
+
+def test_foreground_matches_retries_once():
+    """前面化の反映が一瞬遅れても、短く待ってもう1回見れば
+    通る (2.80、レビュー中7)。"""
+    calls = []
+
+    def fake_once(_hwnd):
+        calls.append(1)
+        return len(calls) >= 2
+
+    saved = (copilot_loop._foreground_matches_once,
+             copilot_loop.FOREGROUND_RETRY_WAIT, copilot_loop.user32)
+    copilot_loop._foreground_matches_once = fake_once
+    copilot_loop.FOREGROUND_RETRY_WAIT = 0
+    copilot_loop.user32 = object()  # None だと素通りするので差替える
+    try:
+        assert copilot_loop._foreground_matches(123) is True
+        assert len(calls) == 2
+    finally:
+        (copilot_loop._foreground_matches_once,
+         copilot_loop.FOREGROUND_RETRY_WAIT,
+         copilot_loop.user32) = saved
+
+
+def test_click_element_blocked_by_covering_window():
+    """クリックする位置に別の窓が重なっていたら送らない
+    (2.80、レビュー中7)。同じ窓なら従来どおり送る。"""
+    rect = types.SimpleNamespace(left=0, top=0, right=100, bottom=40)
+    el = types.SimpleNamespace(
+        CurrentBoundingRectangle=rect, CurrentNativeWindowHandle=111)
+
+    class FakeUser32:
+        def __init__(self, under):
+            self._under = under
+
+        def WindowFromPoint(self, _pt):
+            return self._under
+
+        def GetAncestor(self, hwnd, _flag):
+            return hwnd.value if hasattr(hwnd, "value") else hwnd
+
+    saved = (copilot_loop.user32, copilot_loop._click_at)
+    clicks = []
+    copilot_loop._click_at = lambda x, y: clicks.append((x, y))
+    try:
+        copilot_loop.user32 = FakeUser32(999)  # 別の窓が重なっている
+        try:
+            copilot_loop._click_element(el)
+            raised = None
+        except RuntimeError as e:
+            raised = e
+        assert raised is not None and "重なって" in str(raised)
+        assert clicks == []
+        copilot_loop.user32 = FakeUser32(111)  # 要素の窓自身
+        copilot_loop._click_element(el)
+        assert clicks == [(50, 20)]
+    finally:
+        copilot_loop.user32, copilot_loop._click_at = saved
 
 
 def test_attach_file_confirmed_by_remove_button():

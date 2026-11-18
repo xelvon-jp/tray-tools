@@ -167,15 +167,18 @@ def normalize_config(section) -> dict:
         config["window_geometry"] = None
     widths = config["column_widths"]
     if not (isinstance(widths, list) and len(widths) == 8
-            and all(isinstance(v, int) and 10 <= v <= 2000
-                    for v in widths)):
+            and all(isinstance(v, int) for v in widths)):
         config["column_widths"] = None
     else:
-        # 狭すぎる幅は下限まで広げる (2.74)。とくに実行ボタンの
-        # 列 (末尾) は、ボタンがまだ無い状態で測った幅が保存される
-        # と、次回から潰れて見えなくなる (実機報告 2026-11-18)。
+        # 範囲外の幅は捨てずに丸める (2.80、レビュー中4)。概要列は
+        # 幅広の画面で 2000 を超えることがあり、1列でも超えると
+        # 全部捨てられていた。狭すぎる幅は下限まで広げる (2.74)。
+        # とくに実行ボタンの列 (末尾) は、ボタンがまだ無い状態で
+        # 測った幅が保存されると、次回から潰れて見えなくなる
+        # (実機報告 2026-11-18)。
         config["column_widths"] = [
-            max(v, RUN_COLUMN_MIN_WIDTH if i == 7
+            max(min(v, 2000),
+                RUN_COLUMN_MIN_WIDTH if i == 7
                 else COLUMN_MIN_WIDTH)
             for i, v in enumerate(widths)]
     config["always_on_top"] = bool(config["always_on_top"])
@@ -1533,6 +1536,32 @@ def command_history_settle_pending(records: list) -> int:
     return changed
 
 
+def format_loop_breakdown(stages, item_name: str = "") -> str:
+    """ループ内訳の区間表を1行に整える (2.79)。
+
+    stages は (区間名, 秒数) の並びで、秒数が None の区間は
+    「-」で出す。最も長かった区間は末尾に「（最長: 名前 N秒）」
+    で添える。診断の束と動作ログの要約の両方で使う。"""
+    if not stages:
+        return ""
+    parts = []
+    longest_name, longest_sec = "", None
+    for name, sec in stages:
+        if sec is None:
+            parts.append(f"{name} -")
+            continue
+        parts.append(f"{name} {sec:.1f}秒")
+        if longest_sec is None or sec > longest_sec:
+            longest_name, longest_sec = name, sec
+    head = "ループ内訳"
+    if item_name:
+        head += f"（{item_name}）"
+    line = head + ": " + " / ".join(parts)
+    if longest_sec is not None:
+        line += f"（最長: {longest_name} {longest_sec:.1f}秒）"
+    return line
+
+
 def build_diag_bundle(version: str, toggles: dict, profile_name: str,
                       chain_lines, events, at=None,
                       request_id: str = "") -> str:
@@ -1971,6 +2000,7 @@ RELAY_PENDING_TTL_SEC = 600.0      # 中継の保留控えの寿命 (2.13)
 RELAY_RETRY_DELAY_SEC = 20.0       # 中継の送り直しまでの待ち (2.13)
 RELAY_RETRY_MAX = 1                # 中継の送り直しの回数上限 (2.13)
 RELAY_ACK_DELAY_SEC = 30.0         # 中継の成功ACKを保留する秒数 (2.27)
+ACK_DELAY_DEFAULT_SEC = 5          # 受領応答を出すまでの秒数の既定 (2.80 で一本化。script_runner.ACK_DELAY_SECONDS と script_runner_ai.sanitize_ack_delay の既定はこれに合わせる)
 RELAY_ID_HISTORY_LIMIT = 32        # 中継の ID 履歴に残す連鎖 (起点+ID) の上限 (2.41)
 RELAY_ID_MAX_COUNT = 3             # 同じ連鎖で中継できる回数の上限 (2.41)
 
@@ -3074,7 +3104,8 @@ def select_log_events(events, spec, now=None) -> list:
     return picked[-count:] if count > 0 else picked
 
 
-def build_log_reply(events, spec, request_id: str = "") -> str:
+def build_log_reply(events, spec, request_id: str = "",
+                    loop_line: str = "") -> str:
     """ログリクエストへの返信を組み立てる (1.96)。
 
     見出しは「[PHAL:動作ログ] {label}・{n}件」で、label が既に
@@ -3082,7 +3113,8 @@ def build_log_reply(events, spec, request_id: str = "") -> str:
     中身はビューアと同じ日付つきの行。記録が無ければ
     「(記録はありません)」を添える。
     request_id (2.40) は合図の依頼 ID で、見出しを
-    「[PHAL:動作ログ ID]」の形にする。無ければ従来どおり。"""
+    「[PHAL:動作ログ ID]」の形にする。無ければ従来どおり。
+    loop_line (2.79) はループ内訳の1行で、見出しの直後に入る。"""
     events = [e for e in (events or []) if isinstance(e, dict)]
     spec = spec if isinstance(spec, dict) else {}
     label = str(spec.get("label") or "")
@@ -3092,10 +3124,13 @@ def build_log_reply(events, spec, request_id: str = "") -> str:
         head = f"{mark} {label}"
     else:
         head = f"{mark} {label}・{len(events)}件"
+    lines = [head]
+    if loop_line:
+        lines.append(loop_line)
     if not events:
-        return head + "\n（記録はありません）"
+        return "\n".join(lines + ["（記録はありません）"])
     return "\n".join(
-        [head] + format_log_lines(events, with_date=True))
+        lines + format_log_lines(events, with_date=True))
 
 
 def find_full_output(command_id, outputs_dir=None):
@@ -6052,13 +6087,18 @@ def _trim_run_log(log_path) -> None:
         log_path = Path(log_path)
         if log_path.stat().st_size <= RUN_LOG_MAX_BYTES:
             return
+        # 行の分割は "\n" だけにする (2.80、レビュー中6)。
+        # splitlines() は U+2028 等でも割るので、出力に含まれると
+        # 1件が途中で割れる。壊れた文字 (多バイトの途中で切れた
+        # 行) があっても、以降の追記が毎回失敗しないよう、
+        # デコードできないファイルは諦める (ValueError も捕まえる)。
         lines = [ln for ln in
-                 log_path.read_text(encoding="utf-8").splitlines()
+                 log_path.read_text(encoding="utf-8").split("\n")
                  if ln.strip()]
         tmp = log_path.with_name(log_path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8", newline="") as f:
             for ln in lines[-RUN_LOG_LIMIT:]:
                 f.write(ln + "\n")
         os.replace(tmp, log_path)
-    except OSError:
+    except (OSError, ValueError):
         pass

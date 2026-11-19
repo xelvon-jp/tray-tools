@@ -2221,6 +2221,223 @@ def session_wake(ctx: PlaybookContext, params: dict) -> ExecOutcome:
 
 # -- 登録簿と実行の振り分け ----------------------------------------------
 
+# -- PB-4035: mcp_hands ---------------------------------------------------
+# mcp_hands サーバ (PC 側の手先 MCP) の公開 (Tailscale Funnel) の
+# 開閉。サーバ本体はログオン時に常駐する前提で、ここが扱うのは
+# Funnel だけ。開けた事実と期限は状態ファイルに残し、期限切れの
+# 自動閉じは窓口とは独立した見張り (スケジュールタスク) が担う。
+# 状態ファイルの形式は見張りと共用の契約 (仕様 §PB-4035)。
+
+MCP_HANDS_DEFAULT_STATE_PATH = r"R:\claude\mcp-hands\funnel_state.json"
+MCP_HANDS_DEFAULT_SERVER_URL = "http://127.0.0.1:8765/mcp"
+MCP_HANDS_DEFAULT_TARGET = "http://127.0.0.1:8765"
+MCP_HANDS_DEFAULT_HOURS = 2
+MCP_HANDS_MAX_HOURS = 12
+FUNNEL_TIMEOUT_SEC = 60
+
+
+def _mcp_server_alive(url: str) -> bool:
+    """mcp_hands サーバが応答するか。HTTP の応答が何か返れば生存
+    (401 でもよい)。接続できない・時間切れは不生存。起こしには
+    行かない (常駐の前提が崩れているなら、その事実を返す)。"""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, method="GET")
+    try:
+        urllib.request.urlopen(req, timeout=3)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def _mcp_iso(epoch: float) -> str:
+    from datetime import datetime
+    return datetime.fromtimestamp(epoch).astimezone().isoformat(
+        timespec="seconds")
+
+
+def _mcp_read_state(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mcp_write_state(path: str, state: dict) -> bool:
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _mcp_funnel_open(ctx: PlaybookContext, tailscale: str) -> Optional[bool]:
+    """Funnel が開いているか。判定できなければ None。"""
+    r = ctx.runner.run([tailscale, "funnel", "status"],
+                       STATUS_TIMEOUT_SEC)
+    if r.returncode is None:
+        return None
+    return "https://" in (r.output or "")
+
+
+def _mcp_state_open(deadline_epoch: float) -> dict:
+    return {"status": "open", "deadline_epoch": int(deadline_epoch),
+            "deadline": _mcp_iso(deadline_epoch),
+            "updated_at": _mcp_iso(time.time()), "by": "pb4035"}
+
+
+def _mcp_state_closed() -> dict:
+    return {"status": "closed", "deadline_epoch": None, "deadline": None,
+            "updated_at": _mcp_iso(time.time()), "by": "pb4035"}
+
+
+def mcp_hands(ctx: PlaybookContext, params: dict) -> ExecOutcome:
+    """mcp_hands の公開 (Funnel) の開閉・状態・延長 (PB-4035)。"""
+    log = StepLog("pb4035")
+    action = params.get("action")
+    if action not in ("open", "close", "status", "extend"):
+        return ExecOutcome(
+            ok=False, state=model.RESULT_REJECTED,
+            summary="action は open / close / status / extend のいずれかを"
+                    "指定してください", detail=log.text())
+    extra = set(params) - {"action", "hours"}
+    if extra:
+        return ExecOutcome(
+            ok=False, state=model.RESULT_REJECTED,
+            summary=f"未知の引数です: {', '.join(sorted(extra))}",
+            detail=log.text())
+    hours = params.get("hours", MCP_HANDS_DEFAULT_HOURS)
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) \
+            or not 0 < hours <= MCP_HANDS_MAX_HOURS:
+        return ExecOutcome(
+            ok=False, state=model.RESULT_REJECTED,
+            summary=f"hours は 0 より大きく {MCP_HANDS_MAX_HOURS} 以下で"
+                    "指定してください", detail=log.text())
+    tailscale = ctx.settings.get("tailscale_exe") or "tailscale"
+    state_path = ctx.settings.get("state_path") \
+        or MCP_HANDS_DEFAULT_STATE_PATH
+    server_url = ctx.settings.get("server_url") \
+        or MCP_HANDS_DEFAULT_SERVER_URL
+    target = ctx.settings.get("funnel_target") or MCP_HANDS_DEFAULT_TARGET
+
+    if action == "status":
+        opened = _mcp_funnel_open(ctx, tailscale)
+        log.step("funnel.status", "ok" if opened is not None else "ng")
+        state = _mcp_read_state(state_path)
+        alive = _mcp_server_alive(server_url)
+        log.step("server", "ok" if alive else "ng")
+        if opened:
+            head = f"公開中です（期限 {state.get('deadline') or '不明'}）"
+        elif opened is None:
+            head = "Funnel の状態を判定できませんでした"
+        else:
+            head = "閉じています"
+        return ExecOutcome(
+            ok=True,
+            summary=f"{head}。サーバは"
+                    f"{'応答しています' if alive else '応答しません'}",
+            detail=log.text())
+
+    if action == "close":
+        r = ctx.runner.run([tailscale, "funnel", "--https=443", "off"],
+                           FUNNEL_TIMEOUT_SEC)
+        if r.returncode != 0:
+            log.step("funnel.off", "ng", (r.output or "").strip()[:200])
+            return _failed(log, "Funnel を閉じるコマンドが失敗しました")
+        log.step("funnel.off", "ok")
+        opened = _mcp_funnel_open(ctx, tailscale)
+        if opened:
+            log.step("verify", "ng")
+            return _failed(log, "閉じたはずの Funnel が開いたままです")
+        log.step("verify", "ok")
+        if _mcp_write_state(state_path, _mcp_state_closed()):
+            log.step("state", "ok")
+        else:
+            log.step("state", "ng", "状態ファイルへ書けませんでした")
+        sent = _notify_pushover(
+            "ARiA: mcp_hands の公開を閉じました",
+            "Tailscale Funnel を閉じました。外からは届きません。")
+        log.step("notify", "ok" if sent else "skipped")
+        return ExecOutcome(ok=True, summary="公開を閉じました",
+                           detail=log.text())
+
+    if action == "extend":
+        state = _mcp_read_state(state_path)
+        opened = _mcp_funnel_open(ctx, tailscale)
+        if state.get("status") != "open" or not opened:
+            log.step("guard.open", "blocked")
+            log.stopped("funnel open", "closed")
+            return _blocked(log, "開いていないので期限は延ばせません")
+        log.step("guard.open", "ok")
+        deadline = time.time() + float(hours) * 3600
+        if not _mcp_write_state(state_path, _mcp_state_open(deadline)):
+            log.step("state", "ng")
+            return _failed(log, "状態ファイルへ書けず、延長できませんでした")
+        log.step("state", "ok")
+        return ExecOutcome(
+            ok=True,
+            summary=f"期限を {_mcp_iso(deadline)} まで延ばしました",
+            detail=log.text())
+
+    # action == "open"
+    if not _mcp_server_alive(server_url):
+        log.step("guard.server", "ng")
+        log.stopped("mcp_hands server responding", "no response")
+        return _blocked(
+            log, "mcp_hands サーバが応答しません（常駐が落ちています）。"
+                 "公開は開けません")
+    log.step("guard.server", "ok")
+    opened = _mcp_funnel_open(ctx, tailscale)
+    if opened is None:
+        log.step("funnel.status", "ng")
+        return _failed(log, "Funnel の現在状態を判定できませんでした")
+    deadline = time.time() + float(hours) * 3600
+    if opened:
+        log.step("funnel.status", "ok", "already open")
+        if not _mcp_write_state(state_path, _mcp_state_open(deadline)):
+            log.step("state", "ng")
+            return _failed(log, "状態ファイルへ書けず、期限を更新できませんでした")
+        log.step("state", "ok")
+        return ExecOutcome(
+            ok=True,
+            summary=f"既に開いています。期限を {_mcp_iso(deadline)} まで"
+                    "延ばしました", detail=log.text())
+    r = ctx.runner.run(
+        [tailscale, "funnel", "--bg", "--https=443", target],
+        FUNNEL_TIMEOUT_SEC)
+    if r.returncode != 0:
+        log.step("funnel.on", "ng", (r.output or "").strip()[:200])
+        return _failed(log, "Funnel を開けるコマンドが失敗しました")
+    log.step("funnel.on", "ok")
+    if not _mcp_funnel_open(ctx, tailscale):
+        log.step("verify", "ng")
+        return _failed(log, "開けたはずの Funnel が status で確認できません")
+    log.step("verify", "ok")
+    if not _mcp_write_state(state_path, _mcp_state_open(deadline)):
+        log.step("state", "ng")
+        ctx.runner.run([tailscale, "funnel", "--https=443", "off"],
+                       FUNNEL_TIMEOUT_SEC)
+        log.step("rollback.funnel_off", "ok")
+        return _failed(
+            log, "状態ファイルへ書けないため、期限の見張りが効きません。"
+                 "開けた Funnel は閉じました")
+    log.step("state", "ok")
+    sent = _notify_pushover(
+        "ARiA: mcp_hands の公開を開けました",
+        f"Tailscale Funnel を開けました。期限は {_mcp_iso(deadline)} です。")
+    log.step("notify", "ok" if sent else "skipped")
+    return ExecOutcome(
+        ok=True, summary=f"公開を開けました（期限 {_mcp_iso(deadline)}）",
+        detail=log.text())
+
+
 PLAYBOOKS = {
     "pb1001": traytools_sync,
     "pb1002": daemon_sync,
@@ -2231,6 +2448,7 @@ PLAYBOOKS = {
     "pb4031": powershell_run,
     "pb4033": script_library,
     "pb4034": session_wake,
+    "pb4035": mcp_hands,
     "pb1007": watcher_sync,
     "pb5008": pc_capture,
     "pb5012": log_fetch,
@@ -2250,6 +2468,7 @@ PLAYBOOK_ALIASES = {
     "pc_capture": "pb5008",
     "script_library": "pb4033",
     "session_wake": "pb4034",
+    "mcp_hands": "pb4035",
     "log_fetch": "pb5012",
     "watcher_log_fetch": "pb5012",
     "inbox_status": "pb5015",

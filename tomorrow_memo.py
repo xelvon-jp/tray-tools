@@ -15,13 +15,18 @@
 #         待たないので、書き換えの途中で PC が落ちても前の内容が残る
 #     保存は一時ファイル + os.replace の原子的書き換えで、途中で落ちても
 #     ファイルが半端な状態にはならない。
-#   - 起動時に、まだ見ていない(未表示の)メモがあれば窓で出す。空なら出さない。
-#     ただし出すのは「書いた日が今日より前」で「今日が最後に表示した日より
-#     後」のときだけ(最後に表示した日はデータに覚えておく)。同じ日の再起動や
-#     自動反映では出直さず、書いた当日にも出ない。判定は PC の起動時刻では
-#     しない(長期連続稼働・休止・高速スタートアップでは起動時刻が戻らず、
-#     当てにならないため)。
-#   - 窓から過去のメモも読める(読み取り専用)。
+#   - 起動時に、直近のメモを窓で出す。まだ見ていない現在のメモがあればそれ、
+#     無ければ最後に表示したメモ(履歴の先頭が「表示済み」のとき)。一度見た
+#     メモでも、新しく書くまでは毎日出す(2026-11-19 Nagato の要望。「更新が
+#     無くても直近にメモした内容を起動時に見たい。不要なら閉じれば良い」)。
+#     自分で空にしたメモ(履歴の先頭が「書き換え前」)は、消したつもりなので出さない。
+#     出すのは「書いた日が今日より前」で「今日が最後に表示した日より後」の
+#     ときだけ(最後に表示した日はデータに覚えておく)。同じ日の再起動や自動
+#     反映では出直さず、書いた当日にも出ない。判定は PC の起動時刻ではしない
+#     (長期連続稼働・休止・高速スタートアップでは起動時刻が戻らず、当てに
+#     ならないため)。
+#   - 過去のメモは窓の下半分に常に並べる(読み取り専用)。以前は「過去のメモ…」
+#     ボタンで別窓を開く形だったが、見るたびに押すのが不便だった(同じ要望)。
 #
 # データの持ち方と窓をこのモジュールにまとめ、データ部分(TomorrowMemoStore)は
 # Qt に依存させない(テストと将来の使い回しのため)。
@@ -300,33 +305,59 @@ class TomorrowMemoStore:
             and not current["seen"]
         )
 
-    def has_unseen_for_startup(self, today=None) -> bool:
-        """起動時に出すべき未表示メモがあるか(日付で判定する)。
+    def latest_memo(self):
+        """直近のメモ(起動時に出す候補)。{text, written_at, seen} か None。
+
+        現在のメモがあればそれ(seen は現在のメモの表示済みの印)。無ければ、
+        履歴の先頭が「表示済み」か「統合」のときだけその本文(seen=True)。
+        履歴の先頭が「書き換え前」なのは、書く窓でメモを空にしたとき
+        (消したつもりのもの)なので出さない。"""
+        state = self._load()
+        current = state["current"]
+        if current and current["text"].strip():
+            return {"text": current["text"],
+                    "written_at": current["written_at"],
+                    "seen": bool(current["seen"])}
+        history = state["history"]
+        if history and history[0]["reason"] in (REASON_SEEN, REASON_MERGED) \
+                and history[0]["text"].strip():
+            return {"text": history[0]["text"],
+                    "written_at": history[0]["written_at"],
+                    "seen": True}
+        return None
+
+    def memo_for_startup(self, today=None):
+        """起動時に出すメモ(latest_memo の形)。出さないなら None。
 
         出すのは次の両方を満たすときだけ:
           - メモを書いた日が今日より前
           - 今日が、最後に表示した日より後(まだ表示したことが無ければ満たす)
         つまり「最後に表示した日より後の日付での、最初の起動」で1回だけ
-        出す。同じ日の再起動では出ないし、書いた当日にも出ないので、自動
-        反映や再起動のたびに、書いたばかりのメモが誰も見ていないのに
-        表示済みになることもない。
+        出す。一度見たメモでも、新しく書くまでは毎日出す。同じ日の再起動
+        では出ないし、書いた当日にも出ない(自動反映や再起動のたびに窓が
+        出るのを避ける)。
         PC の起動時刻では判定しない(長期連続稼働や休止・高速スタート
         アップでは起動時刻が戻らず、当てにならないため)。
         書いた日時が読めない場合は出す側に倒す。
         today はテスト用で、date / datetime / "YYYY-MM-DD" のどれでも
         よく、省略時は今日。"""
-        if not self.has_unseen():
-            return False
+        memo = self.latest_memo()
+        if memo is None:
+            return None
         today_str = _as_date_str(today)
         last_shown = self._load()["last_shown_date"]
         if last_shown and today_str <= last_shown:
-            return False
+            return None
         try:
             written_day = datetime.fromisoformat(
-                self._load()["current"]["written_at"]).date().isoformat()
+                memo["written_at"]).date().isoformat()
         except (TypeError, ValueError):
-            return True
-        return written_day < today_str
+            return memo
+        return memo if written_day < today_str else None
+
+    def has_memo_for_startup(self, today=None) -> bool:
+        """起動時に出すメモがあるか(memo_for_startup が None でないか)。"""
+        return self.memo_for_startup(today) is not None
 
     def last_shown_date(self):
         """最後に起動時表示した日("YYYY-MM-DD")。まだ無ければ None。"""
@@ -430,7 +461,7 @@ class TomorrowMemoStore:
 # 使う側(テスト等)が Qt を引きずらないよう、窓のクラス定義の直前で行う。
 from PySide6.QtCore import Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QDialog, QHBoxLayout, QLabel, QListWidget, QPlainTextEdit, QPushButton,
+    QHBoxLayout, QLabel, QListWidget, QPlainTextEdit, QPushButton, QSplitter,
     QVBoxLayout, QWidget,
 )
 
@@ -439,30 +470,52 @@ from PySide6.QtWidgets import (  # noqa: E402
 AUTOSAVE_DELAY_MS = 400
 
 
-class TomorrowMemoHistoryDialog(QDialog):
-    """過去のメモを読む窓(読み取り専用)。"""
+def history_label(item: dict) -> str:
+    """過去のメモの一覧に出す1行(「2026-11-13 19:20（表示済み）」)。"""
+    label = format_written_at(item["written_at"])
+    reason = _REASON_LABELS.get(item["reason"], "")
+    return f"{label}（{reason}）" if reason else label
+
+
+class TomorrowMemoHistoryPane(QWidget):
+    """過去のメモの一覧と本文(読み取り専用)。メモの窓の下半分に常に出す。
+
+    以前は「過去のメモ…」ボタンで別窓を開いていたが、見るたびに押すのが
+    不便だったので常設にした(2026-11-19)。中身は refresh() で読み直す
+    (書き換えで履歴が増えたときに、持ち主の窓が呼ぶ)。"""
 
     def __init__(self, store: TomorrowMemoStore, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("過去のメモ")
-        self.resize(480, 360)
-        layout = QHBoxLayout(self)
+        self._store = store
+        self._items = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._title = QLabel(self)
+        layout.addWidget(self._title)
+        body = QHBoxLayout()
         self._list = QListWidget(self)
         self._list.setMaximumWidth(210)
-        layout.addWidget(self._list)
+        body.addWidget(self._list)
         self._view = QPlainTextEdit(self)
         self._view.setReadOnly(True)
-        layout.addWidget(self._view)
-        for item in store.history():
-            label = format_written_at(item["written_at"])
-            reason = _REASON_LABELS.get(item["reason"], "")
-            if reason:
-                label = f"{label}（{reason}）"
-            self._list.addItem(label)
-        self._items = store.history()
+        body.addWidget(self._view)
+        layout.addLayout(body)
         self._list.currentRowChanged.connect(self._show_row)
+
+    def refresh(self, start_row: int = 0) -> None:
+        """履歴を読み直して並べる。選んでいた行の位置は保たず、start_row 行目
+        (既定は先頭=新しいもの。行が足りなければ先頭)を選ぶ。"""
+        self._items = self._store.history()
+        self._list.blockSignals(True)
+        self._list.clear()
+        for item in self._items:
+            self._list.addItem(history_label(item))
+        self._list.blockSignals(False)
+        self._title.setText(f"過去のメモ（{len(self._items)}件）")
         if self._items:
-            self._list.setCurrentRow(0)
+            row = start_row if 0 <= start_row < len(self._items) else 0
+            self._list.setCurrentRow(row)
+            self._show_row(row)
         else:
             self._view.setPlainText("（過去のメモはまだありません）")
 
@@ -488,19 +541,27 @@ class TomorrowMemoWindow(QWidget):
         self._snapshot_archived = False
         self.setWindowTitle("🌅 明日の自分へメモ")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(460, 330)
+        self.resize(560, 520)
 
         layout = QVBoxLayout(self)
-        self._date_label = QLabel(self)
-        layout.addWidget(self._date_label)
-        self._edit = QPlainTextEdit(self)
-        layout.addWidget(self._edit)
-        self._status_label = QLabel(self)
-        layout.addWidget(self._status_label)
+        # 上半分が今のメモ、下半分が過去のメモ(常設)。境目はドラッグで動かせる
+        splitter = QSplitter(Qt.Vertical, self)
+        top = QWidget(splitter)
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        self._date_label = QLabel(top)
+        top_layout.addWidget(self._date_label)
+        self._edit = QPlainTextEdit(top)
+        top_layout.addWidget(self._edit)
+        self._status_label = QLabel(top)
+        top_layout.addWidget(self._status_label)
+        splitter.addWidget(top)
+        self._history_pane = TomorrowMemoHistoryPane(store, splitter)
+        splitter.addWidget(self._history_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
         buttons = QHBoxLayout()
-        self._history_button = QPushButton("過去のメモ…", self)
-        self._history_button.clicked.connect(self._show_history)
-        buttons.addWidget(self._history_button)
         buttons.addStretch(1)
         self._write_button = QPushButton("メモを書く", self)
         self._write_button.clicked.connect(self.switch_to_write)
@@ -514,7 +575,6 @@ class TomorrowMemoWindow(QWidget):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._save_now)
         self._edit.textChanged.connect(self._on_text_changed)
-        self._history_dialog = None
 
     # ---------------------------------------------------------------
     # 表示の切り替え
@@ -537,26 +597,40 @@ class TomorrowMemoWindow(QWidget):
             self._date_label.setText("明日の自分へのメモを書く")
         self._status_label.setText("書くと自動で保存されます")
         self._write_button.setVisible(False)
+        self._history_pane.refresh()
         self.show()
         self.raise_()
         self.activateWindow()
         self._edit.setFocus()
 
     def show_read(self) -> None:
-        """起動時の表示用に開く(読み取り専用)。閉じると表示済みになり、
-        内容は履歴へ移る。"""
-        current = self._store.current()
+        """起動時の表示用に開く(読み取り専用)。出すのは直近のメモ
+        (TomorrowMemoStore.latest_memo)で、前に見たメモでもよい。
+        閉じると、まだ見ていなかった現在のメモは表示済みになって履歴へ移る。"""
+        memo = self._store.latest_memo()
         self._mode = "read"
         self._snapshot = None
         self._edit.blockSignals(True)
-        self._edit.setPlainText(current["text"] if current else "")
+        self._edit.setPlainText(memo["text"] if memo else "")
         self._edit.blockSignals(False)
         self._edit.setReadOnly(True)
-        if current:
-            self._date_label.setText(
-                f"{format_written_at(current['written_at'])} に書かれたメモ")
-        self._status_label.setText("閉じると履歴に残ります")
+        if memo:
+            when = format_written_at(memo["written_at"])
+            if memo["seen"]:
+                self._date_label.setText(
+                    f"{when} に書かれたメモ（前にも表示しました。新しく書くまで毎日出ます）")
+            else:
+                self._date_label.setText(f"{when} に書かれたメモ")
+        else:
+            self._date_label.setText("")
+        if memo and not memo["seen"]:
+            self._status_label.setText("閉じると履歴に残ります")
+        else:
+            self._status_label.setText("")
         self._write_button.setVisible(True)
+        # 上に出しているのが履歴の先頭(前に見たメモ)なら、下ではその1つ前を
+        # 選んでおく(同じ本文が上下に並ばないように)
+        self._history_pane.refresh(start_row=1 if memo and memo["seen"] else 0)
         self.show()
         self.raise_()
         self.activateWindow()
@@ -597,6 +671,7 @@ class TomorrowMemoWindow(QWidget):
             return
         if self._store.archive_snapshot(self._snapshot):
             self._snapshot_archived = True
+            self._history_pane.refresh()
 
     def _save_now(self) -> None:
         if self._mode != "write":
@@ -609,22 +684,6 @@ class TomorrowMemoWindow(QWidget):
                 f"保存しました（{format_written_at(current['written_at'])}）")
         else:
             self._status_label.setText("書くと自動で保存されます")
-
-    # ---------------------------------------------------------------
-    # 過去のメモ
-    # ---------------------------------------------------------------
-    def _show_history(self) -> None:
-        if self._history_dialog is None:
-            self._history_dialog = TomorrowMemoHistoryDialog(self._store, self)
-            self._history_dialog.finished.connect(self._on_history_closed)
-        self._history_dialog.show()
-        self._history_dialog.raise_()
-        self._history_dialog.activateWindow()
-
-    def _on_history_closed(self, _result) -> None:
-        if self._history_dialog is not None:
-            self._history_dialog.deleteLater()
-            self._history_dialog = None
 
     # ---------------------------------------------------------------
     # 閉じる

@@ -216,25 +216,62 @@ def test_startup_visibility_depends_on_dates():
     tmp, store = make_store()
     store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
     # 書いた当日は出さない(その日のうちの再起動や自動反映で出直さない)
-    assert store.has_unseen_for_startup(date(2026, 11, 13)) is False
+    assert store.has_memo_for_startup(date(2026, 11, 13)) is False
     # 翌日なら出す(日付は文字列で渡してもよい)
-    assert store.has_unseen_for_startup("2026-11-14") is True
+    assert store.has_memo_for_startup("2026-11-14") is True
+    assert store.memo_for_startup("2026-11-14")["text"] == "昨夜のメモ"
     # 表示したことを覚えたら、その日はもう出ない(窓が閉じられずに
     # 未表示のまま残っても)
     store.note_shown("2026-11-14")
     assert store.last_shown_date() == "2026-11-14"
-    assert store.has_unseen_for_startup(date(2026, 11, 14)) is False
+    assert store.has_memo_for_startup(date(2026, 11, 14)) is False
     # 表示した日はファイルに残り、読み直しても効く
     reloaded = tomorrow_memo.TomorrowMemoStore(store.path)
     assert reloaded.last_shown_date() == "2026-11-14"
-    assert reloaded.has_unseen_for_startup(date(2026, 11, 14)) is False
+    assert reloaded.has_memo_for_startup(date(2026, 11, 14)) is False
     # さらに翌日なら、未表示のままならまた出す
-    assert store.has_unseen_for_startup(date(2026, 11, 15)) is True
-    # 表示済み(履歴へ移動)になったら、日付によらず出さない
-    store.mark_seen()
-    assert store.has_unseen_for_startup(date(2026, 11, 15)) is False
-    assert store.has_unseen_for_startup() is False
+    assert store.has_memo_for_startup(date(2026, 11, 15)) is True
     tmp.cleanup()
+
+
+def test_startup_shows_latest_memo_even_after_seen():
+    # 2026-11-19 の要望: 一度見たメモでも、新しく書くまでは毎日起動時に出す
+    tmp, store = make_store()
+    store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
+    store.note_shown("2026-11-14")
+    store.mark_seen(now="2026-11-14T08:00:00")   # 表示して閉じた(履歴へ)
+    assert store.current() is None
+    # 同じ日にはもう出さない
+    assert store.has_memo_for_startup("2026-11-14") is False
+    # 翌日も、見たメモをもう一度出す(表示済みの印つき)
+    memo = store.memo_for_startup("2026-11-15")
+    assert memo is not None and memo["text"] == "昨夜のメモ" and memo["seen"] is True
+    store.note_shown("2026-11-15")
+    assert store.has_memo_for_startup("2026-11-16") is True
+    # 新しく書いたら、書いた当日は出さず、翌日は新しいほうを出す
+    store.set_text("新しいメモ", now="2026-11-16T20:00:00")
+    store.note_shown("2026-11-16")
+    assert store.memo_for_startup("2026-11-17")["text"] == "新しいメモ"
+    assert store.memo_for_startup("2026-11-17")["seen"] is False
+    tmp.cleanup()
+
+
+def test_startup_skips_cleared_memo():
+    # 書く窓でメモを空にした(消したつもり)なら、履歴に残った前の内容は
+    # 起動時には出さない
+    tmp, store = make_store()
+    store.set_text("消すつもりのメモ", now="2026-11-13T19:20:00")
+    snapshot = store.snapshot()
+    store.set_text("")
+    assert store.finish_edit_session(snapshot, now="2026-11-13T19:30:00") is True
+    assert store.history()[0]["reason"] == "replaced"
+    assert store.latest_memo() is None
+    assert store.has_memo_for_startup("2026-11-14") is False
+    # 何も無ければもちろん出さない
+    tmp2, empty = make_store()
+    assert empty.memo_for_startup("2026-11-14") is None
+    tmp.cleanup()
+    tmp2.cleanup()
 
 
 def test_legacy_merged_when_both_files_exist():
@@ -439,6 +476,61 @@ def test_window_read_close_marks_seen():
     tmp.cleanup()
 
 
+def test_window_shows_history_without_button():
+    # 2026-11-19 の要望: 過去のメモはボタンを押さずに窓の下半分で見える
+    app()
+    tmp, store = make_store()
+    store.set_text("一昨日のメモ", now="2026-11-12T19:20:00")
+    store.mark_seen(now="2026-11-13T08:00:00")
+    store.set_text("昨日のメモ", now="2026-11-13T19:20:00")
+    window = tomorrow_memo.TomorrowMemoWindow(store)
+    assert not hasattr(window, "_history_button")
+    window.show_write()
+    pane = window._history_pane
+    assert pane.isVisible()
+    assert pane._list.count() == 1
+    assert pane._view.toPlainText() == "一昨日のメモ"    # 先頭を選んだ状態
+    assert "1件" in pane._title.text()
+    # 書き換えて最初の自動保存が走ったら、前の内容がすぐ一覧に増える
+    window._edit.setPlainText("今日のメモ")
+    window._save_now()
+    assert pane._list.count() == 2
+    assert pane._view.toPlainText() == "昨日のメモ"
+    window.close()
+    app().processEvents()
+    tmp.cleanup()
+
+
+def test_window_read_shows_seen_memo_again():
+    # 起動時の表示: 前に見たメモ(履歴の先頭)でも出し、閉じても履歴は増えない
+    app()
+    tmp, store = make_store()
+    store.set_text("見たメモ", now="2026-11-13T19:20:00")
+    store.mark_seen(now="2026-11-14T08:00:00")
+    two_tmp, two = make_store()
+    two.set_text("古いメモ", now="2026-11-11T19:20:00")
+    two.mark_seen(now="2026-11-12T08:00:00")
+    two.set_text("新しいメモ", now="2026-11-12T19:20:00")
+    two.mark_seen(now="2026-11-13T08:00:00")
+    other = tomorrow_memo.TomorrowMemoWindow(two)
+    other.show_read()
+    assert other._edit.toPlainText() == "新しいメモ"
+    assert other._history_pane._view.toPlainText() == "古いメモ"  # 1つ前を選ぶ
+    other.close()
+    app().processEvents()
+    two_tmp.cleanup()
+    window = tomorrow_memo.TomorrowMemoWindow(store)
+    window.show_read()
+    assert window._edit.toPlainText() == "見たメモ"
+    assert "前にも表示しました" in window._date_label.text()
+    # 下の一覧はあるが、上と同じ本文を重ねて選ばない(1件しか無ければ先頭)
+    assert window._history_pane._list.currentRow() == 0
+    window.close()
+    app().processEvents()
+    assert len(store.history()) == 1
+    tmp.cleanup()
+
+
 def test_window_switch_to_write_archives_read_memo():
     app()
     tmp, store = make_store()
@@ -493,6 +585,28 @@ def test_feature_startup_shows_only_unseen():
     window.close()
     app().processEvents()
     assert store.has_unseen() is False
+    tmp.cleanup()
+
+
+def test_feature_startup_shows_seen_memo_next_day():
+    app()
+    tmp, store = make_store()
+    feature = make_feature(store)
+    store.set_text("昨夜のメモ", now="2026-11-13T19:20:00")
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
+    window = feature.tomorrow_memo_window
+    window.close()                        # 見て閉じた(履歴へ)
+    app().processEvents()
+    assert store.current() is None
+    # 同じ日の再起動では出ない
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 14))
+    assert feature.tomorrow_memo_window is None
+    # 翌日はもう一度出る
+    feature._show_unseen_tomorrow_memo(today=date(2026, 11, 15))
+    window = feature.tomorrow_memo_window
+    assert window is not None and window._edit.toPlainText() == "昨夜のメモ"
+    window.close()
+    app().processEvents()
     tmp.cleanup()
 
 
@@ -552,12 +666,17 @@ if __name__ == "__main__":
         test_legacy_merged_when_both_files_exist,
         test_legacy_merge_does_not_grow_when_legacy_file_stays,
         test_startup_visibility_depends_on_dates,
+        test_startup_shows_latest_memo_even_after_seen,
+        test_startup_skips_cleared_memo,
         test_window_write_autosaves,
         test_window_first_autosave_archives_previous,
         test_window_read_close_marks_seen,
+        test_window_shows_history_without_button,
+        test_window_read_shows_seen_memo_again,
         test_window_switch_to_write_archives_read_memo,
         test_feature_opens_write_window_and_notifies_waiter,
         test_feature_startup_shows_only_unseen,
+        test_feature_startup_shows_seen_memo_next_day,
         test_feature_startup_respects_dates,
         test_command_registration_strings,
         test_gitignore_lists_tomorrow_memo,

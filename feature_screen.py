@@ -1330,7 +1330,8 @@ class ScreenFeature:
         return window
 
     def _show_unseen_tomorrow_memo(self, today=None):
-        """起動時: まだ見ていないメモがあれば表示用に出す。
+        """起動時: 直近のメモがあれば表示用に出す(前に見たメモでも、新しく
+        書くまでは毎日出す。TomorrowMemoStore.memo_for_startup)。
 
         出すのは「書いた日が今日より前」で「今日が最後に表示した日より後」
         のときだけ(日付で判定する。PC の起動時刻は長期連続稼働や休止・
@@ -1340,7 +1341,7 @@ class ScreenFeature:
             if self.tomorrow_memo_window is not None:
                 return
             store = self._get_tomorrow_memo_store()
-            if store.has_unseen_for_startup(today):
+            if store.has_memo_for_startup(today):
                 self._show_tomorrow_memo("read")
                 store.note_shown(today)
         except Exception:  # noqa: BLE001  起動時のおまけ。本体は落とさない

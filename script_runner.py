@@ -2389,6 +2389,11 @@ class ScriptRunnerWindow(QWidget):
             # 階ごとに枠でグループを分ける (2.16)。
             row = QFrame()
             row.setStyleSheet(self._floor_frame_style())
+            # 階の高さは固定 (2.92)。窓を縦に広げても (スナップ等)
+            # 進捗バーは伸ばさない。
+            row.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Fixed)
             # 背景の層と中身を重ねる (2.25)。明滅は背景の層
             # だけ (不透明度で滑らかに)。ブロックや文字は
             # 薄くならない。
@@ -2412,7 +2417,8 @@ class ScriptRunnerWindow(QWidget):
             row_layout.setContentsMargins(6, 3, 6, 3)
             row_layout.setSpacing(4)
             floor = {"row": row, "check": None, "name_label": None,
-                     "bg": bg, "effect": effect}
+                     "bg": bg, "effect": effect,
+                     "row_layout": row_layout}
             name_widget = name_widgets[index]
             name_widget.setFixedWidth(name_width)
             row_layout.addWidget(name_widget)
@@ -2433,6 +2439,7 @@ class ScriptRunnerWindow(QWidget):
                 arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 arrow.setStyleSheet(
                     "font-size: 12px; font-weight: bold;"
+                    " border: none; background: transparent;"
                     f" color: {self._theme()['muted']};")
                 row_layout.addWidget(arrow)
                 block = QLabel(core.STAGE_LABELS[stage_key])
@@ -2451,19 +2458,77 @@ class ScriptRunnerWindow(QWidget):
             number.setAlignment(Qt.AlignmentFlag.AlignCenter)
             number.setMinimumWidth(76)
             number.setStyleSheet(
-                "font-size: 17px; font-weight: bold;")
+                "font-size: 17px; font-weight: bold; border: none;")
             number_box.addWidget(number)
             caption = QLabel("待機中")
             caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
             caption.setStyleSheet(
-                f"font-size: 10px; color: {self._theme()['muted']};")
+                f"font-size: 10px; border: none;"
+                f" color: {self._theme()['muted']};")
             number_box.addWidget(caption)
             row_layout.addLayout(number_box)
             floor["number"] = number
             floor["caption"] = caption
             layout.addWidget(row)
             self._floors[name] = floor
+        # 小窓のまま階が作り直されたときも、小窓の寸法にそろえる
+        self._apply_mini_compact(getattr(self, "_mini_mode", False))
+        if getattr(self, "_mini_mode", False):
+            QTimer.singleShot(0, self._refit_mini_height)
 
+    def _apply_mini_compact(self, on):
+        """小窓モードの寸法の詰め (実用の表示は残す)。
+
+        隠す: 「進捗」の見出し、状態QR・おどうぐばこ・開き直す・
+        版・ダーク (どれも小窓を戻せば使える)。残す: 小窓・設定・
+        非常停止・前面に固定、各階 (名前・段階ブロック・数字)、
+        対象行、情報行。余白・ブロックの高さ・数字の文字を縮める。"""
+        on = bool(on)
+        for name in ("progress_caption", "qr_button",
+                     "odougubako_button", "restart_button",
+                     "version_label", "dark_box"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(not on)
+        layout = self.layout()
+        if layout is not None:
+            if on:
+                layout.setContentsMargins(4, 4, 4, 4)
+                layout.setSpacing(3)
+            else:
+                layout.setContentsMargins(8, 8, 8, 8)
+                layout.setSpacing(6)
+        panel = getattr(self, "_big_panel", None)
+        if panel is not None and panel.layout() is not None:
+            if on:
+                panel.layout().setContentsMargins(5, 3, 5, 3)
+                panel.layout().setSpacing(2)
+            else:
+                panel.layout().setContentsMargins(8, 6, 8, 6)
+                panel.layout().setSpacing(4)
+        floors_layout = getattr(self, "_floors_layout", None)
+        if floors_layout is not None:
+            floors_layout.setSpacing(2 if on else 3)
+        block_height = 16 if on else 22
+        for floor in getattr(self, "_floors", {}).values():
+            row_layout = floor.get("row_layout")
+            if row_layout is not None:
+                if on:
+                    row_layout.setContentsMargins(4, 1, 4, 1)
+                    row_layout.setSpacing(2)
+                else:
+                    row_layout.setContentsMargins(6, 3, 6, 3)
+                    row_layout.setSpacing(4)
+            floor["watch"].setMinimumHeight(block_height)
+            for block in floor["chips"].values():
+                block.setMinimumHeight(block_height)
+            floor["number"].setMinimumWidth(52 if on else 76)
+            floor["number"].setStyleSheet(
+                "font-size: %dpx; font-weight: bold; border: none;"
+                % (13 if on else 17))
+            floor["caption"].setStyleSheet(
+                f"font-size: {9 if on else 10}px; border: none;"
+                f" color: {self._theme()['muted']};")
 
     def _on_ai_check_toggled(self, name: str, checked: bool):
         """階のチェックで見張る窓の集合を入れ切りする (2.20、
@@ -6346,6 +6411,12 @@ class ScriptRunnerWindow(QWidget):
         起動そのものは止めない。"""
         if self._startup_notice_done \
                 or self._startup_notice_sending:
+            return
+        # 既定では送らない (2.92)。開き直すたびに投げ先 (Muse 等)
+        # へ飛ぶのが邪魔なため。送りたいときは設定
+        # script_runner.startup_notice を true にする。
+        if not bool(self.config.get("startup_notice", False)):
+            self._startup_notice_done = True
             return
         if self._ack_sending or self._ai_filling \
                 or self._ai_sending or self._diag_sending \
@@ -12864,7 +12935,11 @@ class ScriptRunnerWindow(QWidget):
         if layout is not None:
             layout.invalidate()
             layout.activate()
-        self.resize(self.width(), self.sizeHint().height())
+        # 小窓の高さは上部の寸法で固定する (2.92)。スナップ等で
+        # 縦に伸ばされても、進捗バーが間延びしないように。
+        height = self.sizeHint().height()
+        self.setMaximumHeight(height)
+        self.resize(self.width(), height)
 
     def _set_mini_mode(self, on, save=False):
         """小窓モードの切り替え (2.27)。
@@ -12881,6 +12956,8 @@ class ScriptRunnerWindow(QWidget):
             return
         if on and not self._normal_height:
             self._normal_height = self.height()
+        self._apply_mini_compact(on)
+        self._apply_frameless(on)
         for i in range(getattr(self, "_lower_start", 0),
                        layout.count()):
             item = layout.itemAt(i)
@@ -12892,6 +12969,7 @@ class ScriptRunnerWindow(QWidget):
             # ため、次の巡回でもう一度合わせる (2.28)。
             QTimer.singleShot(0, self._refit_mini_height)
         else:
+            self.setMaximumHeight(16777215)  # 小窓の高さ固定を外す
             height = self._normal_height or 0
             self._normal_height = None
             self.resize(self.width(),
@@ -12927,6 +13005,64 @@ class ScriptRunnerWindow(QWidget):
         else:
             self.result_caption.setText("直前の結果")
             self.output.setPlainText("")
+
+    # ---------------- 小窓のタイトルバー非表示 (2.92) ----------------
+    _EDGE = 5  # 枠なしのとき、左右の縁をつかめる幅 (px)
+
+    def _apply_frameless(self, on: bool):
+        """小窓モード中だけ、OS のタイトルバーを消す。
+
+        移動は窓の空いた所のドラッグ、横幅の変更は左右の縁の
+        ドラッグ (どちらも OS の移動・サイズ変更を使うので
+        スナップも効く)。閉じる・最大化は小窓を戻して使う。
+        フラグを変えると窓はいったん隠れるので、見えていたら
+        同じ位置 (クライアント左上) で出し直す。"""
+        flag = Qt.WindowType.FramelessWindowHint
+        if bool(self.windowFlags() & flag) == bool(on):
+            return
+        was_visible = self.isVisible()
+        top_left = self.geometry().topLeft()
+        self.setWindowFlag(flag, bool(on))
+        self.setMouseTracking(bool(on))
+        if not on:
+            self.unsetCursor()
+        if was_visible:
+            self.show()
+            self.move(top_left)
+            self.raise_()
+
+    def _edge_at(self, pos):
+        if not (self.windowFlags()
+                & Qt.WindowType.FramelessWindowHint):
+            return None
+        if pos.x() <= self._EDGE:
+            return Qt.Edge.LeftEdge
+        if pos.x() >= self.width() - self._EDGE:
+            return Qt.Edge.RightEdge
+        return None
+
+    def mouseMoveEvent(self, event):
+        edge = self._edge_at(event.position().toPoint())
+        if edge is not None:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and (self.windowFlags()
+                     & Qt.WindowType.FramelessWindowHint)):
+            handle = self.windowHandle()
+            if handle is not None:
+                edge = self._edge_at(event.position().toPoint())
+                if edge is not None:
+                    handle.startSystemResize(edge)
+                else:
+                    handle.startSystemMove()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def _apply_on_top(self, on: bool, save: bool):
         self.config["always_on_top"] = bool(on)

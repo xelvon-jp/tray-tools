@@ -115,6 +115,18 @@
     <button id="tokenSave">保存</button>
   </section>
 
+  <section class="card" id="textCard">
+    <h2>テキスト</h2>
+    <textarea id="textOut" placeholder="ここをタップ →「ペースト」で送れます"></textarea>
+    <div class="btns">
+      <button id="textSend">PCへ送る</button>
+      <button class="ghost" id="textGet">PCから取得</button>
+    </div>
+    <label class="hint"><input type="checkbox" id="autoSend"> 貼り付けたらすぐ送る</label>
+    <p class="msg" id="textMsg"></p>
+    <a id="pcLink" target="_blank" rel="noopener" hidden></a>
+  </section>
+
   <section class="card" id="sendCard">
     <label class="pick">
       写真・ファイルを選ぶ
@@ -134,17 +146,6 @@
       <button class="ghost" id="next">次 ▶</button>
     </div>
     <p class="msg" id="showMsg"></p>
-  </section>
-
-  <section class="card" id="textCard">
-    <h2>テキスト</h2>
-    <textarea id="textOut" placeholder="URL やメモを貼り付け（長押し →「ペースト」）"></textarea>
-    <div class="btns">
-      <button id="textSend">PCへ送る</button>
-      <button class="ghost" id="textGet">PCから取得</button>
-    </div>
-    <p class="msg" id="textMsg"></p>
-    <a id="pcLink" target="_blank" rel="noopener" hidden></a>
   </section>
 
   <footer id="footer">LAN Drop</footer>
@@ -417,7 +418,7 @@
   // ---- テキスト ----
   function textMsg(text, cls) { const m = $("textMsg"); m.textContent = text; m.className = "msg " + (cls || ""); }
 
-  $("textSend").onclick = async () => {
+  async function sendText() {
     const text = $("textOut").value;
     if (!text.trim()) { textMsg("テキストが空です", "ng"); return; }
     try {
@@ -434,7 +435,17 @@
       }
       else { textMsg(`送れませんでした（${r.status}）`, "ng"); if (r.status === 401) showToken(true); }
     } catch { textMsg("PCに届きません", "ng"); }
-  };
+  }
+  $("textSend").onclick = sendText;
+
+  // 貼り付けたらすぐ送る（既定オン。選択は localStorage に残す）
+  const AUTO_KEY = "landrop.autoSend";
+  const readAuto = () => { try { return localStorage.getItem(AUTO_KEY) !== "0"; } catch { return true; } };
+  $("autoSend").checked = readAuto();
+  $("autoSend").onchange = () => { try { localStorage.setItem(AUTO_KEY, $("autoSend").checked ? "1" : "0"); } catch {} };
+  $("textOut").addEventListener("paste", () => {
+    if ($("autoSend").checked) setTimeout(sendText, 0);  // 貼り付けが反映されてから送る
+  });
 
   // HTTP のページでは navigator.clipboard が使えないので、選択して execCommand("copy") で代用する
   function copyFromTextarea() {

@@ -10,6 +10,8 @@
 #
 # どのスレッドから呼んでもよい(QImage はスレッドをまたいで渡してよい。QPixmap にするのは
 # UI スレッドで)。Qt に依存しない計算(向きの行列・収める大きさ)は filer_core にある。
+import os
+
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QImage, QImageIOHandler, QImageReader, QTransform
 
@@ -23,6 +25,29 @@ def turned_image(image: QImage, turn) -> QImage:
         return image
     m11, m12, m21, m22 = turn
     return image.transformed(QTransform(m11, m12, m21, m22, 0, 0), Qt.FastTransformation)
+
+
+def unreadable_reason(path: str, size: QSize, qt_message: str = "") -> str:
+    """画像が読めなかった理由を、利用者向けの一文にする。
+
+    ヘッダから大きさが分かるのに読めないのは、ほとんどが Qt の読み込み上限
+    (QImageReader.allocationLimit。既定 256MB、展開後 4 バイト/画素で数える)。
+    PNG / BMP などは縮めながら読めず、全部を展開するので約 64MP(8000×8000)を超えると当たる。"""
+    limit_mb = QImageReader.allocationLimit()
+    if size.isValid():
+        pixels = size.width() * size.height()
+        need_mb = pixels * 4 / (1024 * 1024)
+        if limit_mb and need_mb > limit_mb:
+            return (f"画像が大きすぎて読めません（{size.width()}×{size.height()}"
+                    f" = {pixels / 1_000_000:.0f}MP。展開に約 {need_mb:.0f}MB 要り、"
+                    f"表示の上限は {limit_mb}MB です）")
+        return (f"画像を読めませんでした（{size.width()}×{size.height()}）。"
+                "ファイルが壊れているか、途中で切れている可能性があります"
+                + (f"［{qt_message}］" if qt_message else ""))
+    if not os.path.exists(path):
+        return "ファイルが見つかりません"
+    return ("画像として読めません。対応していない形式か、ファイルが壊れている可能性があります"
+            + (f"［{qt_message}］" if qt_message else ""))
 
 
 def read_image(path: str, box_w: int, box_h: int):
@@ -57,7 +82,7 @@ def read_image(path: str, box_w: int, box_h: int):
             scaled = True
     image = reader.read()
     if image.isNull():
-        raise OSError(reader.errorString() or "画像として読めません")
+        raise OSError(unreadable_reason(path, size, reader.errorString()))
     image = turned_image(image, own_turn)
     if size.isValid():
         original = (size.height(), size.width()) if rotated else (size.width(), size.height())

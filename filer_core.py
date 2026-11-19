@@ -2374,7 +2374,7 @@ PREVIEW_HTML_EXTS = frozenset("html htm xhtml".split())
 PREVIEW_MARKDOWN_EXTS = frozenset("md markdown".split())
 PREVIEW_TEXT_LINES = 200
 PREVIEW_TEXT_BYTES = 256 * 1024
-PREVIEW_ARCHIVE_MAX = 4 * 1024 * 1024     # 書庫の中はこれ以下だけ取り出して見せる
+PREVIEW_ARCHIVE_MAX = 32 * 1024 * 1024    # 書庫の中はこれ以下だけ取り出して見せる
 PREVIEW_FOLDER_NAMES = 40
 
 

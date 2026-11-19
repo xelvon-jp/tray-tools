@@ -298,6 +298,24 @@ def _exif_photo(path, orientation=None, taken=None, size=(40, 20)):
     return str(path)
 
 
+def test_unreadable_image_reasons_are_friendly():
+    """読めない画像の理由が、大きすぎ/壊れている/無い、で言い分けられる。"""
+    import image_load
+    from PySide6.QtCore import QSize
+    with tempfile.TemporaryDirectory() as tmp:
+        exists = str(Path(tmp, "x.png"))
+        _touch(Path(exists), b"x")
+        # 展開後が上限(既定 256MB)を超える大きさ → 「大きすぎ」と大きさ・上限が出る
+        msg = image_load.unreadable_reason(exists, QSize(12000, 12000), "Unable to read image data")
+        assert "大きすぎて読めません" in msg and "12000×12000" in msg and "256MB" in msg, msg
+        # 小さいのに読めない → 壊れている可能性
+        msg = image_load.unreadable_reason(exists, QSize(100, 100), "Unable to read image data")
+        assert "壊れている" in msg and "大きすぎ" not in msg, msg
+        # 大きさが分からない: 無いファイル / 形式が違うファイル
+        assert "見つかりません" in image_load.unreadable_reason(str(Path(tmp, "none.png")), QSize())
+        assert "対応していない形式" in image_load.unreadable_reason(exists, QSize())
+
+
 def test_exif_datetime_and_orientation_shared():
     import filer_preview
     import image_load

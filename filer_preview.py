@@ -160,7 +160,8 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
         if archive is not None and kind in ("text", "image", "html", "markdown"):
             if entry.size > core.PREVIEW_ARCHIVE_MAX:
                 result.update(kind="info", lines=core.info_lines(entry.name, entry)
-                              + ["", "（書庫の中の大きなファイルは中身を出しません）"])
+                              + ["", "（書庫の中のファイルが大きいため中身を出しません。"
+                                 f"上限 {core.PREVIEW_ARCHIVE_MAX // (1024 * 1024)}MB）"])
                 return result
             index = filer_archive.get_index(archive[0])
             plan = filer_archive.plan_extract(index, archive[1], [entry.name])

@@ -224,6 +224,9 @@ class PreviewWidget(QWidget):
         layout.setSpacing(0)
         self.header = QLabel("Preview")
         self.header.setTextFormat(Qt.PlainText)
+        # 長いファイル名で窓の最小幅が広がり、左右の仕切りが動くのを防ぐ
+        # (QLabel は既定で文字が全部入る幅を最小幅にする。はみ出た分は切れる)
+        self.header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.header.setFont(font)
         self.header.setStyleSheet(f"background-color: {colors['header_inactive']};"
                                   f" color: {colors['header_inactive_text']}; padding: 0 4px;")

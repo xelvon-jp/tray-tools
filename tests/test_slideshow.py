@@ -316,6 +316,30 @@ def test_unreadable_image_reasons_are_friendly():
         assert "対応していない形式" in image_load.unreadable_reason(exists, QSize())
 
 
+def test_preview_header_does_not_widen_pane():
+    """長いファイル名でプレビューの最小幅が広がらない(左右の仕切りが動かない)。"""
+    import filer_preview
+    from PySide6.QtGui import QColor, QFont, QImage
+    app = _qapp()
+    colors = {k: "#222222" for k in ("header_inactive", "header_inactive_text",
+                                     "background", "text")}
+    pv = filer_preview.PreviewWidget(None, colors, QFont("Meiryo", 10))
+    img = QImage(40, 30, QImage.Format_RGB32)
+    img.fill(QColor("gray"))
+    pv.show()
+    pv.show_result({"kind": "image", "title": "a.jpg", "note": "4000×3000", "image": img})
+    app.processEvents()
+    short = pv.minimumSizeHint().width()
+    pv.show_result({"kind": "image", "title": "IMG_" + "x" * 120 + ".jpg",
+                    "note": "4000×3000", "image": img})
+    app.processEvents()
+    width = pv.minimumSizeHint().width()
+    pv.close()          # 開いたままだと、後のテスト(前面・カーソル)に影響する
+    pv.deleteLater()
+    app.processEvents()
+    assert width == short, (short, width)
+
+
 def test_exif_datetime_and_orientation_shared():
     import filer_preview
     import image_load

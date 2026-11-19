@@ -313,6 +313,9 @@ def test_check_powershell_cases():
         ("Get-ChildItem > out.txt\n", core.STATUS_WARN, "リダイレクト"),
         ("[IO.File]::Delete('x')\n", core.STATUS_WARN, ".NET"),
         ("Start-Process notepad\n", core.STATUS_WARN, "Start-Process"),
+        # 別名も実体に引き直されて要確認になる (2.91)。
+        ("start notepad\n", core.STATUS_WARN, "Start-Process"),
+        ("saps notepad\n", core.STATUS_WARN, "Start-Process"),
     ]
     with tempfile.TemporaryDirectory() as td:
         for i, (src, status, needle) in enumerate(cases):
@@ -3894,7 +3897,18 @@ if __name__ == "__main__":
         test_status_qr_text,
         test_send_mismatch_qr_text,
     ]
+    # 1件の失敗で止めず、最後まで回して集計を出す
+    # (test_copilot_loop.py の実行器と同じ作法、2.91)。
+    failed = 0
     for test in tests:
-        test()
-        print(f"ok {test.__name__}")
-    print(f"{len(tests)}/{len(tests)} passed")
+        try:
+            test()
+            print(f"ok {test.__name__}")
+        except Exception:  # noqa: BLE001
+            failed += 1
+            import traceback
+            traceback.print_exc()
+            print(f"FAIL {test.__name__}")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    sys.stdout.flush()
+    os._exit(1 if failed else 0)

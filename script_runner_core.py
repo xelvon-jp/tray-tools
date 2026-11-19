@@ -4279,8 +4279,12 @@ def check_python_script(path, python_exe: str) -> CheckResult:
 def load_ps_allowlist(path=None) -> list:
     """許可リスト(JSON データファイル)。読めなければ組み込みの既定。
 
-    足すときは陽太さんの OK を取る決まり(仕様)。既定はこのファイルと
-    同じ内容で、データファイルが無い環境でもチェックが動くための保険。"""
+    これは「読むだけ」とみなせる命令の参考リストで、警告
+    (要確認) の判定には使わない (2026-11-14 に緩和。警告は
+    実害のある命令の一覧 _PS_DANGER_COMMANDS などで決める。
+    リストに無い命令でも、実害の一覧に無ければ要確認には
+    ならない)。既定はこのファイルと同じ内容で、データ
+    ファイルが無い環境でも読み出せるための保険。"""
     if path is None:
         path = Path(__file__).resolve().parent / PS_ALLOWLIST_FILENAME
     try:
@@ -4297,7 +4301,8 @@ _PS_ALLOWLIST_DEFAULT = [
     "Get-*", "Select-*", "Measure-*", "Test-Path", "Sort-Object",
     "Group-Object", "Where-Object", "ForEach-Object", "Format-*",
     "Out-String", "Write-Output", "ConvertTo-*",
-    # パネルがあとで上書きするので、黄にしない(仕様のアオイ追記4)。
+    # パネル自身が結果を入れるのに使う命令。実害のある命令の
+    # 一覧に入っていないので、要確認にはならない (2.91)。
     "Set-Clipboard",
 ]
 
@@ -4386,6 +4391,10 @@ _PS_DANGER_COMMANDS = {
     "out-file": "ファイルへ書き込む命令があります",
     "invoke-expression": "文字列を実行する命令があります",
     "invoke-command": "動的に実行する命令があります",
+    # 別のプログラムを起動する命令 (2.91)。Invoke-Expression と
+    # 同種の危うさ (何が走るかは引数次第) なので要確認にする。
+    # 別名の start / saps は、チェック役の引き直しで拾える。
+    "start-process": "別のプログラムを起動する命令があります",
     "invoke-webrequest": "外部へ通信する命令があります",
     "invoke-restmethod": "外部へ通信する命令があります",
     "send-mailmessage": "メールを送る命令があります",

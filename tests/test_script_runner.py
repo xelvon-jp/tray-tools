@@ -1215,6 +1215,23 @@ def test_append_run_log():
         assert record["time"]
 
 
+def test_append_run_log_records_ai():
+    """実行ログに ai (出どころ) が残り、読み戻せる (2.90)。
+
+    DL 候補の「実行済み (ID・AI名一致、実行ログ)」判定の材料。
+    ai を渡さない記録では空になる (古い記録の扱い)。"""
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "log.jsonl"
+        run = core.RunResult(name="1-2_a.phal", path="C:/x/1-2_a.phal",
+                             exit_code=0, seconds=0.5, stdout="",
+                             sha256="cd34")
+        core.append_run_log(run, None, log_path, ai="Copilot")
+        core.append_run_log(run, None, log_path)
+        records = core.load_run_log_records(limit=10,
+                                            log_path=log_path)
+        assert [r.get("ai") for r in records] == ["Copilot", ""]
+
+
 def test_skipped_records_roundtrip():
     """見送りの控え (2.76): 名前と sha256 の組で残り、開き直し
     (読み直し) をまたいで効く。形の違う項目は落とす。"""
@@ -1796,6 +1813,31 @@ def test_respawn_when_gone_gives_up_on_timeout():
     # 上限を過ぎても消えなければ、起こさずに諦める。
     assert done is False
     assert state["spawned"] == 0
+
+
+def test_respawn_when_gone_logs_outcome():
+    # 寝かせ役の上限と結末のログ (2.88)。上限は 120 秒。
+    # 諦めたときは理由が、起こしたときはその旨が残る。
+    assert launch.RESPAWN_TIMEOUT_SECONDS == 120.0
+    logs = []
+    state = {"now": 0.0}
+
+    def sleep(seconds):
+        state["now"] += seconds
+
+    done = launch.respawn_when_gone(
+        lambda: True, lambda: None,
+        timeout=2.0, interval=0.25, sleep_fn=sleep,
+        clock=lambda: state["now"], log_fn=logs.append)
+    assert done is False
+    assert any("諦めました" in line for line in logs), logs
+    logs.clear()
+    done = launch.respawn_when_gone(
+        lambda: False, lambda: None,
+        timeout=2.0, interval=0.25, sleep_fn=sleep,
+        clock=lambda: state["now"], log_fn=logs.append)
+    assert done is True
+    assert any("後継を起こしました" in line for line in logs), logs
 
 
 def test_diag_events_roundtrip_and_corrupt():
@@ -3770,6 +3812,7 @@ if __name__ == "__main__":
         test_execute_stop_button,
         test_execute_missing_python,
         test_append_run_log,
+        test_append_run_log_records_ai,
         test_append_run_log_trims_when_too_big,
         test_normalize_config_column_widths_clamped,
         test_skipped_records_roundtrip,
@@ -3796,6 +3839,7 @@ if __name__ == "__main__":
         test_respawn_when_gone_spawns_once_after_exit,
         test_respawn_when_gone_already_gone_spawns_immediately,
         test_respawn_when_gone_gives_up_on_timeout,
+        test_respawn_when_gone_logs_outcome,
         test_phal_engine_check_and_execute,
         test_diag_events_roundtrip_and_corrupt,
         test_diag_bundle_composition_and_trim,

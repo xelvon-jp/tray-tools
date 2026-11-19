@@ -156,9 +156,14 @@ def _run(request):
         if op == "press_download":
             # key は窓側が選んだ候補 (名前+クラス名、1-57)。
             # 無ければ裏方は従来どおり最新の1件を選ぶ。
-            return {"ok": True,
-                    "pressed": bool(
-                        transport.press_download(request.get("key")))}
+            # 救済が働いたら note で注記を返す (2.89)。
+            pressed = bool(
+                transport.press_download(request.get("key")))
+            response = {"ok": True, "pressed": pressed}
+            note = getattr(transport, "last_press_note", "") or ""
+            if note:
+                response["note"] = note
+            return response
         if op == "send_escape":
             return {"ok": True, "status": transport.send_escape()}
         if op == "wait":

@@ -1180,6 +1180,21 @@ ATTACH_FOCUS_WAIT = 0.3
 # 速く進めるため。
 INPUT_VERIFY_BASIC_SECONDS = 2.0
 INPUT_VERIFY_MAX_SECONDS = 10.0
+# 値の設定 (SetValue) の直後の確認だけに使う短い窓 (2.90)。
+# SetValue が反映しないアプリ (Copilot アプリ) では、基本の
+# 2秒を毎回まるごと待ってから貼り付けへ進んでいた (試験2の
+# 実測で、結果入力の固定待ちの主因)。反映するアプリは
+# 0.2秒ごとの読み直しでこの窓の中に一致するので、短くしても
+# 速さは変わらない。貼り付け後の確認は従来どおり基本2秒・
+# 最長10秒で、反映の確認自体は落とさない。
+INPUT_VERIFY_QUICK_SECONDS = 0.6
+# 送信ボタンを Invoke で押したあと、入力欄が空になるのを見る
+# 窓 (2.90)。Invoke では送れないアプリ (Copilot アプリ) では
+# この窓を毎回まるごと待ってからクリックへ進んでいた (試験2
+# の実測で約2秒)。1秒に縮め、ボタンが見つからなくなった
+# ときは欄が空かをもう一度見てから失敗にする (送信済みで
+# 画面が変わっただけの誤判定を防ぐ)。
+SEND_CLEAR_WAIT_SECONDS = 1.0
 
 # ダイアログ方式の目印と待ち (1.61)。
 ATTACH_BUTTON_NAME = "ファイルを添付"
@@ -1640,6 +1655,25 @@ def _enum_top_level_windows():
 
     user32.EnumWindows(EnumProc(on_window), None)
     return found
+
+
+_DOWNLOAD_ID_RE = re.compile(r"^([A-Za-z]?\d{1,3}-\d{1,3})(?=_|:|\s|：)")
+
+
+def _download_id_of(name):
+    """候補の名前から、ファイルの ID (1-10 など) を取り出す。
+
+    リンク型はファイル名の頭 (1-10_...) から、カード型は
+    要約の頭 (1-10: ...) から取る。取れなければ ""。
+    ID の形は script_runner_core.parse_command_id と同じ
+    (英字1文字まで + 数字-数字)。"""
+    text = (name or "").strip()
+    if not text:
+        return ""
+    if text.startswith("#!"):
+        text = _download_summary(text)
+    match = _DOWNLOAD_ID_RE.match(text)
+    return match.group(1) if match else ""
 
 
 def _download_summary(name):
@@ -2265,8 +2299,9 @@ class Copilot:
 
         読み直しが完全一致したら True。値の設定自体の例外は
         段つきにして上げる (従来どおり)。確認の窓は、値の設定
-        が基本の2秒、貼り付けが基本2秒から最長10秒まで読み
-        直しを続ける (2.26)。"""
+        が短い窓 (QUICK、2.90。それまでは基本の2秒で、反映
+        しないアプリでは毎回まるごと待っていた)、貼り付けが
+        基本2秒から最長10秒まで読み直しを続ける (2.26)。"""
         try:
             pattern.QueryInterface(
                 UIA.IUIAutomationValuePattern).SetValue(text)
@@ -2274,7 +2309,7 @@ class Copilot:
             raise InputStageError(
                 "unwritable",
                 f"入力欄に書き込めませんでした（{e}）") from e
-        if self._input_reflects(text, timeout=INPUT_VERIFY_BASIC_SECONDS):
+        if self._input_reflects(text, timeout=INPUT_VERIFY_QUICK_SECONDS):
             return True
         saved_text = _clipboard_read_text()
         try:
@@ -2671,11 +2706,16 @@ class Copilot:
             raise InputStageError(
                 "unwritable",
                 f"送信ボタンを押せませんでした（{e}）") from e
-        if self._input_is_empty(timeout=2.0):
+        if self._input_is_empty(timeout=SEND_CLEAR_WAIT_SECONDS):
             return True
         _root, desc = self._descendants()
         el, _candidates = self._find_send_button(desc)
         if el is None:
+            # ボタンが消えたのは、送信が済んで画面が変わった
+            # ためかもしれない (2.90)。欄が空なら送信済みと
+            # みなす。文が残っているときだけ従来どおり失敗。
+            if self._input_is_empty(timeout=0.6):
+                return True
             raise InputStageError(
                 "unwritable",
                 "送信ボタンを押しましたが、送信されませんでした"
@@ -4020,14 +4060,49 @@ class Copilot:
                 and c[3] == (key.get("class_name") or "")]
         return matches[-1] if matches else None
 
+    def _pick_for_press(self, desc, key):
+        """押下の対象を決める (2.89、アオイの決定)。
+
+        key が無ければ従来どおり、最新のスクリプトらしい候補。
+        key があれば、まず名前+クラス名の完全一致を探す。無ければ
+        救済として、ID (1-10 など) が要求と一致する候補が木の中に
+        1件だけあるときに限りそれを押す (クラス名だけが変わった
+        場合の救済。働いたら self.press_note に残す)。ID の合う
+        候補が無い・複数あるときは None を返し、呼び側は
+        「候補のカードが見つかりません」で失敗にする。ID の違う
+        カードを押すことは絶対にしない (2.88 までは、一致が無いと
+        最新のカードに無言で倒していて、別のファイルを落とす
+        実例があった)。"""
+        if not key:
+            return self._pick_download_candidate(desc)
+        picked = self._pick_download_candidate_by_key(desc, key)
+        if picked is not None:
+            return picked
+        wanted = _download_id_of(key.get("name") or "")
+        if not wanted:
+            return None
+        pool = (self._scripty_cards(self._download_candidates(desc))
+                + self._scripty_cards(
+                    self._download_link_candidates(desc)))
+        matches = [c for c in pool
+                   if _download_id_of(c[2]) == wanted]
+        if len(matches) != 1:
+            return None
+        self.press_note = (
+            f"候補の救済で押しました（ID {wanted}、"
+            "名前とクラス名の完全一致が無かったため）")
+        return matches[0]
+
     def press_download_candidate(self, key=None):
         """最新の添付をダウンロードする (2段で押す)。
 
         key ({"name", "class_name"}) が渡されたら、窓側が選んだ
         その候補を押す (1-57)。検出から時間が経つと木は変わるので、
         保存した要素は使わず、取り直した木から key に一致する
-        カードを探す。key に一致するものが無ければ、従来の選び方
-        (_pick_download_candidate) に倒す。
+        カードを探す。完全一致が無ければ、ID が一致する候補が
+        1件だけのときだけ救済として押す (2.89、_pick_for_press)。
+        それも無ければ「候補のカードが見つかりません」で失敗に
+        する。別の ID のカードを押すことは絶対にしない。
 
         【カード自体は押さない】1-22 までの実装はカードを Invoke
         していたが、実機 (2026-11-15、持ち主の注釈つき画面) では、
@@ -4057,10 +4132,14 @@ class Copilot:
         # リンク型 (Copilot アプリ) はリンク自体を直接押す。ESC や
         # フライアウトの後片付けは Edge の作法で、アプリには
         # 関係ないので、リンクと分かったら即座に押して終わる。
+        self.press_note = ""
         _root, desc = self._descendants()
-        picked = self._pick_download_candidate_by_key(desc, key)
-        if picked is None:
-            picked = self._pick_download_candidate(desc)
+        picked = self._pick_for_press(desc, key)
+        if picked is None and key:
+            raise InputStageError(
+                "not_found",
+                "候補のカードが見つかりませんでした"
+                "（チャットの内容が変わった可能性があります）")
         if picked is not None:
             try:
                 picked_type = picked[1].CurrentControlType
@@ -4086,10 +4165,13 @@ class Copilot:
                  if self._flyout_dismissal == "left" else "")
         stuck += f"（ESC送信: {self._esc_before_press}）"
         _root, desc = self._descendants()
-        picked = self._pick_download_candidate_by_key(desc, key)
+        picked = self._pick_for_press(desc, key)
         if picked is None:
-            picked = self._pick_download_candidate(desc)
-        if picked is None:
+            if key:
+                raise InputStageError(
+                    "not_found",
+                    "候補のカードが見つかりませんでした"
+                    "（チャットの内容が変わった可能性があります）")
             raise InputStageError(
                 "not_found",
                 "ダウンロードできるものが見つかりませんでした"

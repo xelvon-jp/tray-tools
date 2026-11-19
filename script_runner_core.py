@@ -6075,17 +6075,21 @@ def build_check_preview(result: CheckResult) -> str:
 # 実行の記録
 # ---------------------------------------------------------------
 def append_run_log(run: RunResult, check: CheckResult = None,
-                    log_path=None) -> None:
+                    log_path=None, ai: str = "") -> None:
     """実行の記録を %LOCALAPPDATA%\traytools の下へ1行足す。
 
     時刻、ファイル名、sha256(実行したときのもの)、チェックの結果、
     終了コード、出力の先頭。職場で「何を走らせたか」を後から
-    説明できるようにするためのもの。リポジトリの中には置かない。"""
+    説明できるようにするためのもの。リポジトリの中には置かない。
+    ai (2.90) は出どころの AI 名。DL 候補の「実行済み」判定
+    (ID・AI名の一致) に使う。古い記録には無いので、判定では
+    空の記録を数えない。"""
     if log_path is None:
         log_path = data_dir() / LOG_FILENAME
     record = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "file": run.name,
+        "ai": ai or "",
         "path": run.path,
         "sha256": run.sha256,
         "check": (check.status if check is not None else ""),

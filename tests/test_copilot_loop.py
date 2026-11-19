@@ -1536,6 +1536,106 @@ def _patched_uia():
         TreeScope_Descendants=4)
 
 
+def test_set_input_goes_to_paste_after_quick_verify():
+    """SetValue が反映しない欄では、短い確認 (QUICK) の後に
+    貼り付けへ進む (2.90)。
+
+    それまでは基本の2秒を毎回まるごと待っていた (Copilot
+    アプリでの結果入力の固定待ち)。貼り付け後の確認は
+    最長 (MAX) の窓で見る。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = types.SimpleNamespace(
+        IUIAutomationValuePattern=object())
+    try:
+        box = DeafElement(name="メッセージ", value="")
+        cp = _copilot({"name": "phal-ai", "input_name": "メッセージ"},
+                      [box])
+        timeouts = []
+
+        def fake_reflects(text, timeout=0.0):
+            timeouts.append(timeout)
+            return box.value == text
+
+        cp._input_reflects = fake_reflects
+        pastes = []
+
+        def fake_paste(text):
+            pastes.append(text)
+            box.value = text
+
+        cp._paste_input_text = fake_paste
+        cp.set_input("結果の文")
+        assert box.value == "結果の文"
+        assert len(pastes) == 1
+        assert timeouts[0] == copilot_loop.INPUT_VERIFY_QUICK_SECONDS
+        assert timeouts[1] == copilot_loop.INPUT_VERIFY_MAX_SECONDS
+    finally:
+        copilot_loop.UIA = saved_uia
+
+
+def test_press_send_button_vanished_button_counts_as_sent():
+    """Invoke で送れず、再走査でボタンが消えていたら、欄が
+    空なら送信済みとみなす (2.90)。
+
+    送信が済んで画面が変わっただけのケースを、失敗と
+    誤判定しないための歯止め。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = types.SimpleNamespace(
+        IUIAutomationInvokePattern=object())
+    try:
+        box = FakeElement(name="メッセージ", value="本文")
+        button = FakeButtonElement(name="送信")
+        cp = _pressable_copilot(
+            {"name": "phal-ai", "send_name": "送信",
+             "input_name": "メッセージ"}, [box, button])
+        scans = {"n": 0}
+
+        def descendants(heal=True):
+            scans["n"] += 1
+            if scans["n"] == 1:
+                return None, FakeDesc([box, button])
+            return None, FakeDesc([box])
+
+        cp._descendants = descendants
+        empties = iter([False, True])
+        cp._input_is_empty = lambda timeout=0.0: next(empties)
+        assert cp.press_send_button() is True
+        assert button.invoked
+    finally:
+        copilot_loop.UIA = saved_uia
+
+
+def test_press_send_button_vanished_button_fails_when_text_remains():
+    """ボタンが消えても文が残っていれば、従来どおり失敗 (2.90)。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = types.SimpleNamespace(
+        IUIAutomationInvokePattern=object())
+    try:
+        box = FakeElement(name="メッセージ", value="本文")
+        button = FakeButtonElement(name="送信")
+        cp = _pressable_copilot(
+            {"name": "phal-ai", "send_name": "送信",
+             "input_name": "メッセージ"}, [box, button])
+        scans = {"n": 0}
+
+        def descendants(heal=True):
+            scans["n"] += 1
+            if scans["n"] == 1:
+                return None, FakeDesc([box, button])
+            return None, FakeDesc([box])
+
+        cp._descendants = descendants
+        cp._input_is_empty = lambda timeout=0.0: False
+        try:
+            cp.press_send_button()
+        except copilot_loop.InputStageError as e:
+            assert e.stage == "unwritable"
+        else:
+            raise AssertionError("InputStageError になるはず")
+    finally:
+        copilot_loop.UIA = saved_uia
+
+
 def test_press_download_two_steps_invoke():
     """押下は2段: カードは押さず、「…」→「ダウンロード」の順に押す。
 
@@ -1630,8 +1730,12 @@ def test_press_download_with_key_picks_that_card():
         copilot_loop.UIA = saved_uia
 
 
-def test_press_download_with_unknown_key_falls_back_to_latest():
-    """key に一致するカードが無ければ、従来の最新カードに倒す。"""
+def test_press_download_with_unknown_key_fails_without_pressing():
+    """key に一致するカードが無ければ、別のカードを押さず失敗にする。
+
+    2.89、アオイの決定。2.88 までは最新のカードに無言で倒して
+    いて、別のファイルを落とす実例があった (1-10 を押して
+    1-9 が落ちた)。ID の手掛かりも無い key は救済もしない。"""
     saved_uia = copilot_loop.UIA
     copilot_loop.UIA = _patched_uia()
     try:
@@ -1641,8 +1745,75 @@ def test_press_download_with_unknown_key_falls_back_to_latest():
         cp = _download_flow_copilot(
             [card, options], [card, options, item], options)
         key = {"name": "もう無いカード", "class_name": CARD_CLASS}
+        try:
+            cp.press_download_candidate(key)
+        except copilot_loop.InputStageError as e:
+            assert "候補のカードが見つかりません" in str(e), str(e)
+        else:
+            raise AssertionError("InputStageError になるはず")
+        assert not options.invoked and not item.invoked
+        assert not card.invoked
+    finally:
+        copilot_loop.UIA = saved_uia
+
+
+def test_press_download_relief_by_unique_id():
+    """完全一致が無くても、ID が合う候補が1件だけなら救済で押す。
+
+    クラス名だけが変わった場合の救済 (2.89)。別の ID (1-21) の
+    カードは絶対に押さない。救済が働いたら press_note に残る。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = _patched_uia()
+    try:
+        old = _card("#!phal python\n# 1-20: 古いカード\nimport base64")
+        old_options = FakeButtonElement(name="その他のオプション")
+        new = _card("#!phal python\n# 1-21: 新しいカード\nimport base64")
+        new_options = FakeButtonElement(name="その他のオプション")
+        item = _menu_item()
+        before = [old, old_options, new, new_options]
+        after = before + [item]
+
+        def descendants(heal=True):
+            opened = old_options.invoked or new_options.invoked
+            return None, FakeDesc(after if opened else before)
+
+        cp = copilot_loop.Copilot.__new__(copilot_loop.Copilot)
+        cp.profile = {"name": "phal-ai"}
+        cp._descendants = descendants
+        key = {"name": old.CurrentName,
+               "class_name": "変わってしまったクラス名"}
         assert cp.press_download_candidate(key) is True
-        assert options.invoked and item.invoked
+        assert old_options.invoked and not new_options.invoked
+        assert item.invoked
+        assert "候補の救済" in cp.press_note, cp.press_note
+        assert "1-20" in cp.press_note, cp.press_note
+    finally:
+        copilot_loop.UIA = saved_uia
+
+
+def test_press_download_relief_rejects_ambiguous_id():
+    """ID が合う候補が複数あるときは、救済せず失敗にする (2.89)。"""
+    saved_uia = copilot_loop.UIA
+    copilot_loop.UIA = _patched_uia()
+    try:
+        first = _card("#!phal python\n# 1-20: 最初のカード\nimport base64")
+        first_options = FakeButtonElement(name="その他のオプション")
+        second = _card("#!phal python\n# 1-20: 再出のカード\nimport base64")
+        second_options = FakeButtonElement(name="その他のオプション")
+        item = _menu_item()
+        before = [first, first_options, second, second_options]
+        after = before + [item]
+        cp = _download_flow_copilot(before, after, first_options)
+        key = {"name": first.CurrentName,
+               "class_name": "変わってしまったクラス名"}
+        try:
+            cp.press_download_candidate(key)
+        except copilot_loop.InputStageError as e:
+            assert "候補のカードが見つかりません" in str(e), str(e)
+        else:
+            raise AssertionError("InputStageError になるはず")
+        assert not first_options.invoked and not second_options.invoked
+        assert not item.invoked
     finally:
         copilot_loop.UIA = saved_uia
 

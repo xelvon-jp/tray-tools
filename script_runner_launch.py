@@ -33,10 +33,39 @@ SERVER_NAME = "traytools.script_runner"
 SHOW_COMMAND = b"show\n"
 RESTART_COMMAND = b"restart\n"
 
-# 寝かせ役が見張る間隔と上限。パネルが閉じてミューテックスが手放される
-# までは数秒もかからない想定で、上限を過ぎたら後継は起こさない。
+# 寝かせ役が見張る間隔と上限。上限を過ぎたら後継は起こさない。
+# 上限は 120 秒 (2.88 までは 15 秒)。閉じる側の待ち (実行中
+# スクリプトの停止や設定保存のロック) や、ダイアログの残りで
+# プロセスの終了が遅れると、15 秒では諦めてしまい、開き直しが
+# 復活しない実例があった (2026-11-19)。諦めたときは理由を
+# ログ (phal-respawn.log) に残す。
 RESPAWN_POLL_SECONDS = 0.25
-RESPAWN_TIMEOUT_SECONDS = 15.0
+RESPAWN_TIMEOUT_SECONDS = 120.0
+
+
+def _respawn_log_path():
+    """寝かせ役のログの置き場 (script_runner_core.data_dir と
+    同じ作法。ここは標準ライブラリだけで書く)。"""
+    import os
+    from pathlib import Path
+
+    override = os.environ.get("TRAYTOOLS_DATA_DIR")
+    if override:
+        return Path(override) / "phal-respawn.log"
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "traytools" / "phal-respawn.log"
+
+
+def _respawn_log(message: str) -> None:
+    """寝かせ役の出来事を1行残す。失敗しても寝かせ役は止めない。"""
+    try:
+        path = _respawn_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {message}\n")
+    except Exception:  # noqa: BLE001  ログで本筋を止めない
+        pass
 
 
 def is_running() -> bool:
@@ -95,20 +124,29 @@ def restart(settings_path=None) -> str:
 def respawn_when_gone(is_running_fn, spawn_fn,
                       timeout=RESPAWN_TIMEOUT_SECONDS,
                       interval=RESPAWN_POLL_SECONDS,
-                      sleep_fn=time.sleep, clock=time.monotonic) -> bool:
+                      sleep_fn=time.sleep, clock=time.monotonic,
+                      log_fn=None) -> bool:
     """is_running_fn() が False になったら spawn_fn() を1度だけ呼ぶ。
 
     寝かせ役の心臓部(テストで差し替えられるよう、相手と時計を外から
     受ける)。まだ生きている間は何もしない。timeout を過ぎても消えて
     いなければ、起こさずに諦めて False を返す。後継は高々1つで、
     「再開待ち」のような状態は受け継がない。
+    結末 (後継を起こした / 諦めた) は log_fn へ残す (2.88。
+    既定は phal-respawn.log への追記)。
     """
+    if log_fn is None:
+        log_fn = _respawn_log
     deadline = clock() + timeout
     while is_running_fn():
         if clock() >= deadline:
+            log_fn(
+                f"寝かせ役: {timeout:.0f}秒待っても前の PHAL が"
+                "終わらないため、後継を起こさずに諦めました")
             return False
         sleep_fn(interval)
     spawn_fn()
+    log_fn("寝かせ役: 前の PHAL の終了を確認し、後継を起こしました")
     return True
 
 
@@ -140,6 +178,8 @@ def _respawn_entry(argv) -> int:
         index = argv.index("--settings")
         if index + 1 < len(argv):
             settings_path = argv[index + 1]
+    _respawn_log(
+        f"寝かせ役: 開始（上限 {RESPAWN_TIMEOUT_SECONDS:.0f} 秒）")
     respawn_when_gone(is_running, lambda: spawn(settings_path))
     return 0
 

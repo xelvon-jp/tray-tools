@@ -229,6 +229,13 @@ class SubprocessTransport:
         # 写すための控え。
         self.attach_done = []
         self.attach_failed = []
+        # 直近の press_download で救済が働いたときの注記 (2.89)。
+        # 裏方の応答から受けて、CopilotSession が結果へ写す。
+        self._last_press_note = ""
+
+    @property
+    def last_press_note(self):
+        return self._last_press_note
 
     def _call(self, request, timeout=None):
         if self._profile is not None:
@@ -346,7 +353,9 @@ class SubprocessTransport:
             # 窓側が選んだ候補 (名前+クラス名) を裏方へ渡す (1-57)。
             # 無ければ依頼は従来と同形 (裏方は最新の1件を選ぶ)。
             request["key"] = key
-        return bool(self._call(request)["pressed"])
+        response = self._call(request)
+        self._last_press_note = response.get("note") or ""
+        return bool(response["pressed"])
 
     def send_escape(self):
         return str(self._call({"op": "send_escape"}).get("status")
@@ -554,6 +563,13 @@ class CopilotLoopTransport:
 
     def press_download(self, key=None):
         return self._ensure().press_download_candidate(key)
+
+    @property
+    def last_press_note(self):
+        """直近の press_download で救済が働いたときの注記 (2.89)。"""
+        if self._cp is None:
+            return ""
+        return getattr(self._cp, "press_note", "") or ""
 
     def send_escape(self):
         return self._ensure().send_escape()
@@ -1289,8 +1305,9 @@ class CopilotSession:
         key ({"name", "class_name"}) が渡されたら、窓側が選んだ
         その候補を押す (1-57)。失敗は段つきの理由 (窓が無い /
         候補が消えた / 押す段で失敗) がそのまま message になる。"""
+        tp = self._tp()
         try:
-            presser = getattr(self._tp(), "press_download", None)
+            presser = getattr(tp, "press_download", None)
             if presser is None:
                 return SendResult(
                     False, "この経路ではダウンロードボタンを押せません")
@@ -1300,7 +1317,13 @@ class CopilotSession:
                 False, str(e) or "ダウンロードボタンを押せませんでした")
         if not pressed:
             return SendResult(False, "ダウンロードボタンを押せませんでした")
-        return SendResult(True, "ダウンロードボタンを押しました")
+        # 救済が働いたら、その旨を文に含める (2.89)。窓側は
+        # この文を診断に残す。
+        note = getattr(tp, "last_press_note", "") or ""
+        message = "ダウンロードボタンを押しました"
+        if note:
+            message += f"（{note}）"
+        return SendResult(True, message)
 
     def send_escape(self) -> SendResult:
         """対象の窓へ ESC を送る (1-67)。

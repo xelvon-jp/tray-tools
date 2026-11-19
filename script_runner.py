@@ -23,7 +23,7 @@
 # PHAL の版。配布 (設置スクリプト) のたびに、配布番号に合わせて
 # 更新する。タイトルバーに出して、開いている窓の版が分かるように
 # する (古い窓が残っている事故の切り分け用)。
-PHAL_VERSION = "2.87"
+PHAL_VERSION = "2.90"
 
 # 入力・送信方式3 (2.61) で「大部分が一致」とみなす一致率の
 # 下限。行単位で比べた比率がこれ以上なら、送信時の確認が
@@ -1275,6 +1275,7 @@ class ScriptItem:
         self.attach_names = []
         self.confirm_armed = False  # 「中身を見てから実行」の2段目
         self.answered = False       # 結果を AI の入力欄へ入れ終わった印
+        self.answer_tried = 0       # 回答の入れ直しの回数 (2.90)
         self.sent = False           # 送信まで済ませた印(サイクル完了)
         # 自動実行の対象か。パネル起動の時点で既にあったファイル
         # (とそのときの中身) は False のまま。起動後に新しく現れた
@@ -1378,6 +1379,16 @@ class ScriptRunnerWindow(QWidget):
         # 控えは開き直しで消えるので、core の控えファイルから
         # 読み込んでおく (1-29)。
         self._dl_consumed_persisted = core.load_dl_consumed()
+        # 実行済みの (コマンドID, AI名) の組 (2.90)。実行ログ
+        # から作る。DL 候補の抑制に使う (古いカードの再押下の
+        # 防止)。ai の無い古い記録は数えない。
+        self._ran_identities = set()
+        for record in core.load_run_log_records(limit=400):
+            ran_id = core.parse_command_id(
+                str(record.get("file") or ""))
+            ran_ai = str(record.get("ai") or "")
+            if ran_id and ran_ai:
+                self._ran_identities.add((ran_id, ran_ai))
         # 開き直し引き継ぎ (1.70) の控えは代表の状態が持つ。
         # 閉じるときに直近の候補の key を残し (closeEvent)、
         # すぐ開き直した場合は最初の検出で「続き」判定に使う。
@@ -1863,6 +1874,9 @@ class ScriptRunnerWindow(QWidget):
         self._strip_timer = QTimer(self)
         self._strip_timer.timeout.connect(self._refresh_status_strip)
         self._strip_timer.start(1000)
+        # 起動の境目を診断に残す (2.89)。開き直しの後継が
+        # いつ上がったかを、後から時刻で切り分けるため。
+        self._diag(f"起動開始（PHAL {PHAL_VERSION}）")
         # 起動時は待機。モニタ側は、このファイルがあれば PHAL が
         # 動いていると分かる。
         self._publish_phal_status("idle", "待機中")
@@ -3591,8 +3605,12 @@ class ScriptRunnerWindow(QWidget):
                 break
         ai_name = entries[0][2] if len(entries[0]) > 2 else ""
         if matched is not None:
+            # 照合の記録は、一致した待ちの窓で付ける (2.90。
+            # それまでは先頭の待ちの窓で付けていて、2つの窓が
+            # 待っていると別の窓の記録になった)。
+            matched_ai = matched[2] if len(matched) > 2 else ""
             self._diag(f"DL到着の照合: {name} は{matched_key}で一致",
-                       ai=ai_name or None)
+                       ai=matched_ai or None)
         else:
             first = entries[0]
             exp_name = first[4] if len(first) > 4 else ""
@@ -3639,6 +3657,25 @@ class ScriptRunnerWindow(QWidget):
             # 後に現れたファイルなら、今連携している AI を付ける。
             # 起動前からあった分は分からないので付けない。
             item.ai = self._item_ai.get(item.name, "")
+            if not item.ai:
+                # カードを目撃した窓が分かれば、それを出どころ
+                # にする (2.90、試験2の所見3)。AI の画面で手で
+                # ダウンロードしたファイルは押下の控えが無く、
+                # 連携中の AI 名で付けると別の窓の項目になる。
+                # 「 (1)」の連番を外した名前でも引く。
+                seen = self._card_seen_profile(item.name)
+                if not seen:
+                    stripped = re.sub(
+                        r" \(\d+\)(\.[^.]+)$", r"\1", item.name)
+                    if stripped != item.name:
+                        seen = self._card_seen_profile(stripped)
+                if not seen:
+                    seen = self._card_seen_fp_profile(
+                        _file_head_fingerprint(path))
+                if seen:
+                    item.ai = seen
+                    self._item_ai[item.name] = seen
+                    core.save_item_ai(self._item_ai)
             if not item.ai and not self._is_launch_stat(
                     key, mtime, size):
                 ai_name = getattr(self, "_ai_name", "")
@@ -4906,7 +4943,8 @@ class ScriptRunnerWindow(QWidget):
             if item.status == core.STATUS_ERROR:
                 self._set_note(
                     "実行はできません。エラーをコピーして Copilot に貼ると、"
-                    "直してもらえます", "error")
+                    "直してもらえます", "error",
+                    ai=item.ai or None)
             elif item.status == core.STATUS_WARN:
                 self._set_note(
                     "警告がありますが、F5 で実行できます。"
@@ -5179,6 +5217,7 @@ class ScriptRunnerWindow(QWidget):
             # 新しい実行結果は、まだ回答も送信もしていない。
             item.answered = False
             item.sent = False
+            item.answer_tried = 0  # 回答の入れ直しの予算を戻す (2.90)
             check = item.result
         else:
             check = None
@@ -5273,7 +5312,13 @@ class ScriptRunnerWindow(QWidget):
             copied = True
         except Exception:  # noqa: BLE001
             copied = False
-        core.append_run_log(run, check)
+        core.append_run_log(
+            run, check,
+            ai=(item.ai if item is not None else "") or "")
+        if item is not None and item.ai:
+            ran_id = core.parse_command_id(run.name)
+            if ran_id:
+                self._ran_identities.add((ran_id, item.ai))
         self._last_run = (item.key if item is not None else "", run)
         # ループ記録の控えに1手足す (1.51)。ねらいは表の概要。
         self._loop_records.append(core.LoopRecord(
@@ -5724,6 +5769,7 @@ class ScriptRunnerWindow(QWidget):
     def _on_ai_answer_done(self, result):
         self._loop_mark("fill_done")  # ループ内訳の境目 (2.79)
         self._ai_filling = False
+        retrying = False  # 入れ直しを始めたら待機へ戻さない (2.90)
         item, self._ai_answer_item = self._ai_answer_item, None
         if getattr(result, "ok", False):
             self._diag(
@@ -5766,12 +5812,31 @@ class ScriptRunnerWindow(QWidget):
         else:
             message = getattr(result, "message", "") \
                 or "AI へ回答できませんでした"
-            self._diag(f"AIへ回答に失敗: {message}",
-                       ai=(item.ai or None) if item is not None
-                       else None)
-            self._set_note(str(message), "error",
+            if item is not None \
+                    and not getattr(result, "needs_confirm", False) \
+                    and getattr(item, "answer_tried", 0) < 1:
+                # 入力の失敗は1回だけ入れ直す (2.90、試験2の
+                # 所見2)。裏方が前面化からやり直すので、一時的
+                # な反映不良なら復帰する。再試行も失敗したら、
+                # 次の完了で従来どおり失敗として知らせる。
+                item.answer_tried = \
+                    getattr(item, "answer_tried", 0) + 1
+                retrying = True
+                self._diag(
+                    f"AIへの回答に失敗したので入れ直します: "
+                    f"{message}",
+                    ai=item.ai or None)
+                self._set_note(
+                    "AI への回答に失敗したので、入れ直します",
+                    "warn", ai=item.ai or None)
+                self._answer_to_ai(item)
+            else:
+                self._diag(f"AIへ回答に失敗: {message}",
                            ai=(item.ai or None) if item is not None
                            else None)
+                self._set_note(str(message), "error",
+                               ai=(item.ai or None) if item is not None
+                               else None)
         # 添付の結果 (1.58) も診断に残す (copilot 側で添付できた
         # もの・できなかったもの、ファイル名だけ)。
         for name in getattr(result, "attach_done", None) or []:
@@ -5796,7 +5861,7 @@ class ScriptRunnerWindow(QWidget):
         elif getattr(result, "ok", False):
             # 送信へ進まない場合は、ここで待機に戻る。
             self._publish_phal_idle("AI の入力欄に結果を入れました")
-        else:
+        elif not retrying:
             self._publish_phal_idle("AI への回答に失敗しました")
         # この項目の連鎖が一段落したら、自動実行の次を進める
         # (送信まで自動の場合は _on_ai_send_done でもう一度呼ぶ)。
@@ -6556,10 +6621,14 @@ class ScriptRunnerWindow(QWidget):
             self._notice_retry_next_at = time.monotonic() + 5.0
             self._note_deferred("チェックで止まった知らせ")
         elif getattr(result, "ok", False):
-            self._diag("チェックで止まった知らせを送りました")
+            self._diag("チェックで止まった知らせを送りました",
+                       ai=(item.ai or None) if item is not None
+                       else None)
         else:
             message = str(getattr(result, "message", "") or "")
-            self._diag(f"チェックで止まった知らせに失敗: {message}")
+            self._diag(f"チェックで止まった知らせに失敗: {message}",
+                       ai=(item.ai or None) if item is not None
+                       else None)
         # 自動実行の待ち列があれば次を進める (受領の完了側と同じ)。
         self._pump_auto_run()
         self._pump_register()
@@ -6886,6 +6955,15 @@ class ScriptRunnerWindow(QWidget):
                 and item.ai == state.name
                 for item in self._items):
             return "一覧に既にある（ID・AI名一致）"
+        # 実行ログに同じ ID・AI名の実行済みがあれば出さない
+        # (2.90)。開き直しをまたぐと一覧は空になるので、現物の
+        # ファイルがフォルダから無くなった古いカードが、再描画
+        # で木に再び載ったときに押下の対象へ戻ってしまうのを
+        # 防ぐ (試験2の所見4)。手動のダウンロードで届いた
+        # ファイルは、従来どおりフォルダ側の経路で実行できる。
+        if holder_id and (holder_id, state.name) \
+                in self._ran_identities:
+            return "実行済み（ID・AI名一致、実行ログ）"
         # 同じファイルが既に一覧にあるか (名前・概要での判定)。
         if not self._dl_holder_in_items(holder):
             return None
@@ -7298,6 +7376,11 @@ class ScriptRunnerWindow(QWidget):
         if getattr(result, "ok", False):
             self._diag("DL押下に成功（到着待ち）",
                        ai=self._dl_press_watch or None)
+            # 救済で押したときは、その旨も診断に残す (2.89)。
+            message = str(getattr(result, "message", "") or "")
+            if "候補の救済" in message:
+                self._diag(message,
+                           ai=self._dl_press_watch or None)
             # 到着の確認は、落としたファイルが一覧に現れた時点
             # (_poll_candidate) で残す。候補の表示名を控えておく。
             press_state = self._watches.get(
@@ -12457,7 +12540,7 @@ class ScriptRunnerWindow(QWidget):
         self._set_clipboard(core.build_check_text(item.name, item.result))
         self._set_note(
             "エラーをクリップボードに入れました。Copilot に貼ってください",
-            "ok")
+            "ok", ai=item.ai or None)
 
     def _copy_last(self):
         if self._last_clipboard_text:
@@ -12738,6 +12821,15 @@ class ScriptRunnerWindow(QWidget):
             return
         self._diag("開き直しを実行する")
         self.close()
+        # 閉じるのが長引く場合の保険 (2.88)。ダイアログの残りや
+        # イベントループの滞留でプロセスが残ると、ミューテックス
+        # が手放されず、寝かせ役が待つ間も後継が上がらない
+        # (2026-11-19 の実例: 開き直しが復活しなかった)。保存は
+        # closeEvent で済んでいるので、10秒たっても生きていれば
+        # 強制的に終わる。寝かせ役の上限 (120秒) より十分短い。
+        hard_exit = threading.Timer(10.0, os._exit, args=(0,))
+        hard_exit.daemon = True
+        hard_exit.start()
 
     # ---------------- 絞り込み・前面固定・終了 ----------------
     def _toggle_mini_mode(self):
@@ -12907,7 +12999,22 @@ class ScriptRunnerWindow(QWidget):
 
     def closeEvent(self, event):
         try:
-            self._poll_timer.stop()
+            # 待ち中の処理はここで止める (2.88)。タイマ類は全部
+            # 止め、見回りの裏方も止める。裏方の呼び出し自体は
+            # daemon スレッドの側で個別に時間切れを持つので、
+            # ここで待つことは無い。実行中スクリプトの停止は
+            # taskkill の上限 (10秒) 、設定保存のロックは上限
+            # (5秒) までで、どちらも例外は下で受ける。タイマの
+            # 停止は、どれか欠けても保存を巻き込まないよう
+            # 別に受ける。
+            try:
+                self._poll_timer.stop()
+                self._strip_timer.stop()
+                self._pulse_timer.stop()
+                self._banner_timer.stop()
+                self._cached_check_timer.stop()
+            except Exception:  # noqa: BLE001  保存を優先する
+                pass
             if self._run_handle is not None:
                 self._run_handle.stop()
             self._check_worker.stop()

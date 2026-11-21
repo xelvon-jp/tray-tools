@@ -1,0 +1,6 @@
+# -*- coding: utf-8 -*-
+# PYTHONUTF8=1 を付けて pip install -r requirements.txt を実行すること
+faster-whisper
+sounddevice
+numpy
+PySide6

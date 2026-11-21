@@ -553,6 +553,18 @@ DEFAULT_SETTINGS = {
         "always_on_top": False,
         "hide_no_id": True,
     },
+    # 壁打ち文字起こし(kabeuchi_stt/・kabeuchi_launch.py)。画面アイコンの
+    # 「🎙 壁打ち文字起こし…」から別プロセスで開く。録音と認識は常駐の外で動く。
+    #   python  … 使う Python(pythonw.exe のパス。空なら %USERPROFILE%\.venvs\kabeuchi-stt の
+    #             pythonw.exe、無ければ tray-tools の venv に faster_whisper があるときだけそれ)。
+    #             職場PCなどで別の場所に入れたときに指定する
+    #   hotkey  … 窓を開くホットキー。既定は割り当てなし(空)。割り当てるなら、Claude アプリなど
+    #             常用アプリのショートカットと重ならない組み合わせを選ぶこと。
+    #             壁打ち文字起こし自身の録音ホットキーは kabeuchi_stt\settings.json 側
+    "kabeuchi": {
+        "python": "",
+        "hotkey": "",
+    },
     # 窓の配置(window_layout.py)。画面アイコンの「🪟 窓の配置」から使う。
     #   presets … [{name, items: [{exe, title, rect: [l, t, r, b], zoomed}]}]
     #             選んだ窓の位置と大きさを名前付きで覚えたもの。適用は手動だけ

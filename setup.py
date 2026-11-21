@@ -24,6 +24,11 @@ REQUIREMENTS = PROJECT_DIR / "requirements.txt"
 SETTINGS_PATH = PROJECT_DIR / "settings.json"
 SHORTCUT_PATH = PROJECT_DIR / "TrayTools.lnk"
 ICON_PATH = PROJECT_DIR / "icons" / "rapture.ico"
+# 壁打ち文字起こし(kabeuchi_stt)専用の venv。faster-whisper が重い(CPU を使い切る)ので、
+# tray-tools 本体の venv とは分ける。kabeuchi_launch.default_python と同じ場所。
+WHISPER_VENV_DIR = Path.home() / ".venvs" / "kabeuchi-stt"
+WHISPER_VENV_PYTHON = WHISPER_VENV_DIR / "Scripts" / "python.exe"
+WHISPER_REQUIREMENTS = PROJECT_DIR / "requirements-whisper.txt"
 
 MIN_PYTHON = (3, 10)
 
@@ -310,6 +315,60 @@ def install_ocr_optional(with_ocr) -> None:
         print("  プロキシ等を解決したら、setup.py --with-ocr をもう一度実行してください。")
         return
     print("  OK")
+
+
+# 壁打ち文字起こし(kabeuchi_stt)の依存。専用の venv(%USERPROFILE%\.venvs\kabeuchi-stt)に
+# 入れる。数百MBあり、入れなくても他の機能は動くので、AI と同じく任意にする。失敗しても
+# セットアップは止めない。モデル(Whisper)はここでは取得しない(初回の清書で kabeuchi_stt が
+# 取得する。外へ出られない職場PCでは kabeuchi_stt\models\ へ手置き)。
+WHISPER_MODULES = ["faster_whisper", "sounddevice", "numpy", "PySide6"]
+
+
+def _whisper_installed() -> bool:
+    if not WHISPER_VENV_PYTHON.exists():
+        return False
+    code = "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in %r) else 1)" % (WHISPER_MODULES,)
+    return subprocess.run([str(WHISPER_VENV_PYTHON), "-c", code]).returncode == 0
+
+
+def install_whisper_optional(with_whisper) -> None:
+    print()
+    print("  [任意] 壁打ち文字起こし(faster-whisper など。専用の venv に入れます)")
+    if _whisper_installed():
+        print("  既に入っているのでそのまま使います")
+        return
+    if with_whisper is None:
+        print("  マイクで話した内容を、この PC の中だけで文字起こしします(音声は外へ出ません)。")
+        print("  数百MBあり、入れなくても他の機能は動きます。")
+        with_whisper = _ask_yes_no("  入れますか?", default=False)
+    if not with_whisper:
+        print("  入れません(あとから setup.py --with-whisper で入れられます)")
+        return
+    if not WHISPER_REQUIREMENTS.exists():
+        print(f"  警告: {WHISPER_REQUIREMENTS} が見つかりません。壁打ち文字起こしは入れません。")
+        return
+    print(f"  場所: {WHISPER_VENV_DIR}")
+    if not WHISPER_VENV_PYTHON.exists():
+        print("  専用の venv を作成中...")
+        result = subprocess.run([sys.executable, "-m", "venv", str(WHISPER_VENV_DIR)])
+        if result.returncode != 0 or not WHISPER_VENV_PYTHON.exists():
+            print()
+            print("  警告: venv の作成に失敗しました。壁打ち文字起こしは使えませんが、他は使えます。")
+            print(f"  次を手で実行して、エラー内容を確認してください: {sys.executable} -m venv {WHISPER_VENV_DIR}")
+            return
+    print("  pip install -r requirements-whisper.txt を実行します (数分かかります)")
+    result = subprocess.run(
+        [str(WHISPER_VENV_PYTHON), "-m", "pip", "install", "-r", str(WHISPER_REQUIREMENTS)],
+        env=_pip_env(),
+    )
+    if result.returncode != 0:
+        print()
+        print("  警告: インストールに失敗しました。壁打ち文字起こしが開けないだけで、他は使えます。")
+        print("  プロキシ等を解決したら、setup.py --with-whisper をもう一度実行してください。")
+        return
+    print("  OK")
+    print("  モデル(Whisper)は、初回の清書のときに kabeuchi_stt が取得します。外部へ接続できない PC では")
+    print("  別の PC で取得したモデルを kabeuchi_stt\\models\\ へ置いてください(kabeuchi_stt\\README.md 参照)。")
 
 
 # ---------------------------------------------------------------
@@ -648,10 +707,15 @@ def main() -> None:
                      help="付箋の OCR 用の WinRT パッケージ群を入れる(確認を省略)")
     ocr.add_argument("--no-ocr", dest="with_ocr", action="store_false",
                      help="WinRT パッケージ群を入れない(確認を省略)")
+    whisper = parser.add_mutually_exclusive_group()
+    whisper.add_argument("--with-whisper", dest="with_whisper", action="store_true",
+                         help="壁打ち文字起こし用の専用 venv(faster-whisper など)を作って入れる(確認を省略)")
+    whisper.add_argument("--no-whisper", dest="with_whisper", action="store_false",
+                         help="壁打ち文字起こし用の依存を入れない(確認を省略)")
     parser.add_argument("--env", dest="env", type=int, choices=[1, 2, 3], default=None,
                         help="この PC の環境(1/2/3)。あっふ のスマホ送信(QR)が有効なのは環境1だけ(確認を省略)")
     parser.set_defaults(startup=None, redetect=None, with_ai=None, with_vector=None,
-                        with_ocr=None)
+                        with_ocr=None, with_whisper=None)
     args = parser.parse_args()
 
     print("tray-tools セットアップ")
@@ -663,6 +727,7 @@ def main() -> None:
     install_ai_optional(args.with_ai)
     install_vector_optional(args.with_vector)
     install_ocr_optional(args.with_ocr)
+    install_whisper_optional(args.with_whisper)
     setup_settings(args.redetect, args.env)
     setup_shortcut()
     setup_startup(args.startup)

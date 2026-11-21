@@ -310,6 +310,23 @@ def _make_trigger(bridge: HotkeyBridge, app_settings: dict, handlers: dict,
     return trigger
 
 
+def _combo_for(app_settings: dict, hotkey_config: dict, name: str):
+    """設定キー名に対応する組み合わせを返す(無ければ None)。
+
+    ふつうの名前は settings.json の "hotkeys" の中を引く。ドットを含む名前
+    ("kabeuchi.hotkey")は、設定の入れ子をそのままたどる(設定の置き場が "hotkeys" ではなく
+    機能ごとの節にある機能のため。既存の名前にドットは無いので、挙動は変わらない)。
+    たどれない・文字列でないときは None(= 登録しない)。"""
+    if "." not in name:
+        return hotkey_config.get(name)
+    node = app_settings
+    for part in name.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node if isinstance(node, str) else None
+
+
 def _register_hotkeys(bridge: HotkeyBridge, app_settings: dict, handlers: dict,
                       on_error=None) -> list:
     """設定にある組み合わせを keyboard に登録する。登録できた設定キー名を返す。
@@ -322,7 +339,7 @@ def _register_hotkeys(bridge: HotkeyBridge, app_settings: dict, handlers: dict,
     registered = []
     hotkey_config = app_settings.get("hotkeys", {})
     for name in handlers:
-        combo = hotkey_config.get(name)
+        combo = _combo_for(app_settings, hotkey_config, name)
         if not combo:
             continue
         try:

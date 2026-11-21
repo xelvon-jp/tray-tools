@@ -1,0 +1,9 @@
+# -*- coding: utf-8 -*-
+# 壁打ち文字起こし(kabeuchi_stt)専用の依存。tray-tools 本体の requirements.txt とは分けてある
+# (faster-whisper は重く、CPU を使い切るため、本体の venv には混ぜない)。
+# python setup.py --with-whisper が専用の venv(%USERPROFILE%\.venvs\kabeuchi-stt)を作って入れる。
+# 手で入れるなら: pip install -r requirements-whisper.txt(kabeuchi_stt\requirements.txt と同じ内容)
+faster-whisper
+sounddevice
+numpy
+PySide6

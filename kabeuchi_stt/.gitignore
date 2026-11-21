@@ -1,0 +1,7 @@
+settings.json
+out/
+models/
+__pycache__/
+*.wav
+error.log
+*.lnk

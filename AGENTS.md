@@ -203,6 +203,20 @@ PCごとの違いは `settings.json` の `copilot_profiles` で上書きでき�
 
 `settings.json` を丸ごと書き戻さない。**ファイルを読み直して該当キーだけ差し替える**（丸ごと書くと未設定の既定値まで焼き込まれ、ファイルの姿が変わる）。`snippets.push_recent` / `launcher.save_bookmark` / `clipboard_preview._save_size` が同じ作法。
 
+## 壁打ち文字起こし（`kabeuchi_stt/` / `kabeuchi_launch.py`）は別プロセス・別 venv
+
+マイクで録音して faster-whisper で文字起こしする独立したアプリを同梱している。使い方は `README.md` の「壁打ち文字起こし」の節。**触るときに壊しやすいところだけ書く。**
+
+- **常駐に同居させない。** Whisper の推論は CPU を使い切る（常駐のホットキーとメニューがもたつく）。COM は使わない（`comtypes` / `pycaw` を入れない）。起こすのは `kabeuchi_launch.py`（`pythonw.exe` + `DETACHED_PROCESS`）だけで、**常駐が import してよいのもこれだけ。** `kabeuchi_launch.py` は PySide6・faster-whisper・numpy を import しない（`tests/test_kabeuchi_launch.py` が見張る）。`kabeuchi_stt` 側のモジュールを常駐から import しない
+- **トレイアイコンを増やさない。** 必ず `--no-tray` で起こす。`kabeuchi_stt/main.py` の `setQuitOnLastWindowClosed(bool(no_tray))` を `False` に戻さないこと（戻すと、窓を閉じてもプロセスが見えないまま残り、CPU とマイクを握り続ける）
+- **単一起動は `kabeuchi_stt` 自身の `QLocalServer`**（`SERVER_NAME`）で、あっふ・スライドショーのミューテックスとは別の仕組み。名前は `kabeuchi_launch.SERVER_NAME` と `kabeuchi_stt/single_instance.py` の両方にあり、片方だけ変えると「出して」が届かず窓が2つになる（テストが見張る）
+- **名前の衝突に注意。** `kabeuchi_stt/` には `hotkeys.py` / `settings.py` / `main.py` など、リポジトリ直下と同名の別物がある。`kabeuchi_stt` を `sys.path` に足して直下のモジュールと同じプロセスで import しないこと。`kabeuchi_stt/main.py` は自分のフォルダを先頭に入れて別プロセスで動く前提
+- **`settings.json` は丸ごと書き戻さない**（上の「設定ファイル」）。tray-tools 側の `kabeuchi` 節（`python` / `hotkey`）は読むだけ。`kabeuchi_stt/settings.json` は `kabeuchi_stt` 自身が窓の位置などを書くので、tray-tools から触るなら該当キーだけ差し替える
+- **モデル・本人のデータは git に入れない。** `kabeuchi_stt/models/`・`out/`・`settings.json`・`*.wav` は `kabeuchi_stt/.gitignore` で除外している。履歴・辞書は `%LOCALAPPDATA%\kabeuchi_stt\`。このリポジトリは public なので、`kabeuchi_stt` の中に実パス・メールアドレス・業務の話題を入れない（テスト `test_bundle_has_no_personal_paths_or_data_files` が実パスを見張る。例文は中立にしてある）
+- **ホットキーを新設するときは、Claude アプリ等の常用アプリのショートカットと衝突しないか確認する。** 既定は割り当てなし（`kabeuchi.hotkey` は空）。`kabeuchi.hotkey` のようなドット名は `hotkeys.py` が設定の入れ子をたどる（`hotkeys` 節ではない）。`kabeuchi_stt` 自身の録音ホットキー（`RegisterHotKey`）とは別
+- **CI は `kabeuchi_stt/tests` を回さない**（faster-whisper・実モデル・SAPI・マイクが前提）。`tests/run_all.py` は直下の `tests/test_*.py` だけを数えるので、`kabeuchi_stt/tests` は対象外。`kabeuchi_stt` を直したら手元で `kabeuchi_stt\tests\run_all.py --fast`（専用 venv `%USERPROFILE%\.venvs\kabeuchi-stt`）を回す
+- **同梱は 2026-11-22（版 20261122-02）のコピー。** 元の開発フォルダにも同じコードがある。改修を持ち込むときは、公開用に中立へ直した例文（テスト・README）を元の業務の例文に戻さないこと
+
 ## photometa は PhotoCuller からも使われている
 
 `photometa/` は別アプリ PhotoCuller（private リポジトリ photo-culler）が、PC 上のこのフォルダから直接 import している。**tray-tools を pull しただけで、PhotoCuller 側を何も変えなくても PhotoCuller が壊れる。**

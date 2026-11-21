@@ -32,6 +32,7 @@ import color_picker
 import command_launcher
 import command_palette
 import cursor_finder
+import kabeuchi_launch
 from picker import PickerWindow
 from settings import update_settings, update_settings_section
 import unified_picker
@@ -677,6 +678,12 @@ class ScreenFeature:
             self._with_hotkey("🎙 一人会議を開始…", hotkey_config.get("teams_meeting")),
             lambda: self.start_teams_meeting("menu"),
         )
+        # 壁打ち文字起こし(kabeuchi_stt)。一人会議の隣に置く(どちらも「マイクに向かって話す」
+        # 道具)。窓は常駐とは別のプロセス(kabeuchi_launch。トレイアイコンは増やさない)。
+        self.menu.addAction(
+            self._with_hotkey("🎙 壁打ち文字起こし…", kabeuchi_launch.configured_hotkey(app_settings)),
+            self.start_kabeuchi,
+        )
         self._agent_loop_menu = self.menu.addMenu(AGENT_LOOP_MENU_TITLE)
         # 状態監視バーを出すかどうか。表示だけの入切で、監視は止めない
         # (監視の生死は _sync_copilot_watchdog がバー/パネルの表示から決める)。
@@ -907,6 +914,9 @@ class ScreenFeature:
             "screen_mirror_freeze": self.toggle_screen_mirror_freeze,
             # Teams の一人会議を立ち上げる(テーマを聞いてから子プロセスで進める)。
             "teams_meeting": lambda: self.start_teams_meeting("hotkey"),
+            # 壁打ち文字起こしを開く。組み合わせは settings.json の kabeuchi.hotkey(ドット名は
+            # hotkeys.py が入れ子をたどる)。既定は空 = 登録されない。
+            kabeuchi_launch.HOTKEY_NAME: self.start_kabeuchi,
         }
 
     @staticmethod
@@ -1754,6 +1764,18 @@ class ScreenFeature:
     # ---------------------------------------------------------------
     # 写真のスライドショー(slideshow.py。窓は別プロセス)
     # ---------------------------------------------------------------
+    def start_kabeuchi(self) -> None:
+        """壁打ち文字起こしの窓を開く。窓は別プロセス(kabeuchi_launch)。動いていれば前面に
+        出してもらう。メニューとホットキーの両方から呼ばれる。投げ切ると常駐ごと落ちるので、
+        失敗は通知にして受ける(Python や依存が無いときは、setup.py --with-whisper の案内が出る)。"""
+        try:
+            kabeuchi_launch.start(self.app_settings)
+        except kabeuchi_launch.LaunchError as e:
+            self._notify("壁打ち文字起こし", str(e))
+        except Exception as e:  # noqa: BLE001
+            self._log_failure("壁打ち文字起こしの開始")
+            self._notify("壁打ち文字起こし", f"起動できませんでした\n{e}")
+
     def start_script_runner(self) -> None:
         """スクリプト実行パネルを開く。窓は別プロセス(script_runner_launch)。
         動いていれば前面に出してもらう。"""

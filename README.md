@@ -53,7 +53,7 @@ python setup.py
 
 1. Python 3.10 以上かを確認
 2. `%USERPROFILE%\.venvs\tray-tools` に venv を作成（既にあればそのまま使う）
-3. `pip install -r requirements.txt`（失敗した場合はプロキシ指定の方法を案内します）。続けて、背景透過の任意の依存を入れるか聞きます（AI：rembg / onnxruntime は `--with-ai` / `--no-ai`、ベクタ化：vtracer は `--with-vector` / `--no-vector` で確認を省略可）
+3. `pip install -r requirements.txt`（失敗した場合はプロキシ指定の方法を案内します）。続けて、背景透過の任意の依存を入れるか聞きます（AI：rembg / onnxruntime は `--with-ai` / `--no-ai`、ベクタ化：vtracer は `--with-vector` / `--no-vector` で確認を省略可）。壁打ち文字起こしの依存（faster-whisper など）も任意で、専用の venv `%USERPROFILE%\.venvs\kabeuchi-stt` に入れます（`--with-whisper` / `--no-whisper`。[壁打ち文字起こし](#壁打ち文字起こしkabeuchi_stt--kabeuchi_launchpy)）
 4. `settings.json` を用意（下記）。このとき「環境」（1/2/3）も決めます。環境で変わるのは、あっふ の「スマホへ送る（QR）」が有効かどうかだけです（有効なのは環境1のみ）。未設定のときだけ聞き、決めた値は `settings.json` の `environment` に書きます（`--env 1` のように指定も可。再実行しても勝手には変わりません）
 5. `TrayTools.lnk` を作成
 6. サインイン時の自動起動を登録するかを `y/n` で確認（既定は「しない」。`--startup` / `--no-startup` で確認を省略可）
@@ -201,7 +201,7 @@ git pull
 
 ### 画面アイコンのメニュー構成
 
-トップは15項目に畳んであります。**よく使うもの（定型文・背景を透過・あっふ・画面ミラー）はトップに残し**、それ以外は性質ごとにサブメニューへ入れました。全部畳むと頻度の高い操作が一段深くなって遅くなり、全部並べるとトップが20項目を超えて目的の行を探せなくなるためです。ホットキーのある項目は畳んでも実害が小さい（そちらから呼べる）という判断も入っています。
+トップは16項目に畳んであります。**よく使うもの（定型文・背景を透過・あっふ・画面ミラー）はトップに残し**、それ以外は性質ごとにサブメニューへ入れました。全部畳むと頻度の高い操作が一段深くなって遅くなり、全部並べるとトップが20項目を超えて目的の行を探せなくなるためです。ホットキーのある項目は畳んでも実害が小さい（そちらから呼べる）という判断も入っています。
 
 ```
 📷 キャプチャ ▸        今すぐ / 5秒後 / 10秒後
@@ -216,6 +216,7 @@ git pull
 🪟 窓の配置 ▸        この画面に集める / 集めた窓を元に戻す / 配置プリセット
 📥 フォルダ監視移動 ▸  今すぐチェック / ルール（有効・無効）/ ルールの追加・編集
 🎙 一人会議を開始…
+🎙 壁打ち文字起こし…   ※別プロセス。要 setup.py --with-whisper（下の「壁打ち文字起こし」）
 🤖 Copilot ▸          状態監視バー / エージェントループ
 💬 AI状態監視 ▸      Claude のセッション状態 / 進捗パネル（Copilot の手番も。hooks/README.md）
 ──────
@@ -2591,6 +2592,66 @@ Everything 検索は **es.exe の代わりに小さな Python スクリプト（
 
 一覧作り（拡張子・隠し/システム・サブフォルダの有無・ジャンクションに潜らない・読めない/無いフォルダ・複数フォルダを交互に）、選び方（フォルダが等確率・袋方式で一巡するまで重ならない・周の変わり目・走査中の追加・読めない写真を外す・入れ子の重なり）、履歴、Ken Burns の矩形（上下左右に黒が新たに出ない）、設定の既定値と読み書き（キーだけ差し替えて他を消さない）、EXIF の向きと撮影日時（JPEG / PNG / WebP。あっふのプレビューが共通の読み込みを使っていること）、窓（offscreen。時刻・乱数・読み込みを差し替えて、フェードとズームの進み・自動で次へ・フェード中の画素が沈まないこと・止まっている間は描き直さない・キー操作・クリックで終わる・カーソル・読めない写真を飛ばす・写真が無いときの表示と終了・持つ絵の数）、`SetThreadExecutionState` の設定と解除（差し替え）、待ち受けの `play` / `config` / `quit`、起動（`--folder` などの引数・動いていれば送るだけ）、あっふの `Ctrl+Enter` で項目が出て正しい引数で別プロセスを起こすこと（起動は差し替え）、設定ダイアログ（Space でチェック・Del で削除・重ねない・[OK] でキーだけ書く）、トレイのモニタ選択を確かめます。触るのは一時フォルダと一時の settings.json だけで、別プロセスも起こしません。CI（`.github/workflows/test.yml`）でもファイラの次に回します。
 
+## 壁打ち文字起こし（`kabeuchi_stt/` / `kabeuchi_launch.py`）
+
+**マイクに向かって30分ほど独り言を話し、その場で文字起こしするローカル完結のツールです。画面アイコンの「🎙 壁打ち文字起こし…」（または設定したホットキー）で窓が開きます。音声は外へ出ません**（認識は PC の中の faster-whisper で行い、録音・文字・履歴はすべてこの PC の中に置きます。ネットワークに出るのは、初回にモデルを取得するときだけです）。
+
+機能（タイムラインの波形→仮認識→清書、マイク音量の指摘、専門用語・自動置換、履歴と全文検索、Copilot 用プロンプト、改行の整形など）と仕様は `kabeuchi_stt\README.md` と `kabeuchi_stt\SPEC.md` にあります。ここには tray-tools から使うときの要点だけを書きます。
+
+### 導入（`setup.py --with-whisper`）
+
+```
+python setup.py --with-whisper
+```
+
+専用の venv `%USERPROFILE%\.venvs\kabeuchi-stt` を作り、`requirements-whisper.txt`（faster-whisper・sounddevice・numpy・PySide6）を入れます。数百MBあります。**tray-tools 本体の venv には混ぜません**（faster-whisper が重く、推論が CPU を使い切るため）。`--with-ai` と同じ流儀で、指定しなければ入れるか聞かれ（既定は入れない）、`--no-whisper` で確認を省略できます。何度流しても壊れず、既に入っていれば何もしません。管理者権限は要りません。**入れなくても他の機能は動きます**。入っていない状態でメニューを押すと「python setup.py --with-whisper を実行してください」と通知が出ます。
+
+Whisper のモデルは、setup では取得しません。初回の清書のときに `kabeuchi_stt` が取得し、`kabeuchi_stt\models\` に置きます（git には入りません）。**外部へ接続できない PC（SSL 検査のある職場PCなど）では、別の PC で取得したモデルを手で置きます**: 別の PC で `python -c "from faster_whisper import download_model; print(download_model('small'))"` を実行し、表示されたフォルダの中身を `kabeuchi_stt\models\small\` へコピーします（直下に `model.bin` が来る形。目安: base 約140MB / small 約460MB / medium 約1.5GB）。置き場所は `kabeuchi_stt\settings.json` の `model_dir` で変えられます。
+
+### 使い方
+
+- **開く**: 画面アイコンのメニュー「🎙 壁打ち文字起こし…」（「🎙 一人会議を開始…」の隣）。ホットキーは既定では**割り当てていません**（下の `kabeuchi.hotkey`）。
+- すでに開いていれば、もう一度押しても窓は増えず、開いている窓が前面に出ます（単一起動）。
+- **窓を閉じるとプロセスごと終わります**（トレイに残りません。録音中・清書の途中で閉じようとすると確認が出ます）。再起動しても、開いている窓は道連れになりません。
+- 録音・一時停止・清書・履歴・辞書など窓の中の操作は `kabeuchi_stt\README.md` を見てください。窓の中のホットキー（`hotkey_record` など）は `kabeuchi_stt\settings.json` で、tray-tools のものとは別です。
+
+### 設定（tray-tools の `settings.json` の `kabeuchi` 節）
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `kabeuchi.python` | 空 | 使う Python（`pythonw.exe` のパス）。空なら `%USERPROFILE%\.venvs\kabeuchi-stt\Scripts\pythonw.exe`。それが無い（または依存が足りない）ときは、tray-tools の venv に faster_whisper と sounddevice が入っている場合だけそれを使う。別の場所に入れたときに指定する（`python.exe` を書いても、同じ場所に `pythonw.exe` があればそちらで起こす） |
+| `kabeuchi.hotkey` | 空（割り当てなし） | 窓を開くホットキー。`keyboard` ライブラリの書式（例 `ctrl+alt+k`）。空ならメニューからだけ |
+
+ホットキーを割り当てるときは、**Claude アプリなど常用アプリのショートカットと衝突しない組み合わせにしてください**（グローバルのホットキーは前面のアプリより先に取るため、衝突すると相手のショートカットが効かなくなります。`filer` の `ctrl+alt+a` が Claude の「アーカイブ」と重なって外した前例があります）。tray-tools が既に使っている組み合わせ（`hotkeys` 節、`ctrl+alt+h r s m c t v l o b w p q f e n` と `win+j`）とも重ならないこと。例として `ctrl+alt+k` を挙げますが、手元の常用アプリと重ならないかは確かめてください。
+
+### データの置き場所
+
+本人のデータは `%LOCALAPPDATA%\kabeuchi_stt\` に置きます（`history.db`＝履歴、`replacements.json`＝置換辞書、`presets.json`＝プロンプトのプリセット、`error.log`）。録音 WAV と txt / md は `kabeuchi_stt\out\`（`out_dir` で変更可）。`kabeuchi_stt\settings.json`・`models\`・`out\`・`*.wav` は `kabeuchi_stt\.gitignore` で追跡されません。
+
+### 注意
+
+- **マイクは排他的に使われることがあります。** 他のアプリ（Teams の会議、一人会議など）がマイクを排他で使っていると、窓は「マイクを使用中のため確認できません」と出して録音できません。会議の最中に開くなら、先に確かめてください。窓が見えている間は、待機中もマイクを開いてメーターを動かします（音声は保存も認識もしません。窓を隠す・最小化する・5分操作しないと閉じます）。
+- 認識は CPU を使い切ります（逐次認識のスレッド数は絞ってあります）。重い作業と同時には使いにくいので、別プロセスにしてあります。
+- 職場PCでは、モデルの手置き（上）と、`pip` がプロキシで弾かれたときの対処（`setup.py` の案内に従う）が要ります。
+
+### 作りの判断
+
+- **別プロセスで動かします**（`kabeuchi_launch.spawn`。`pythonw.exe` + `DETACHED_PROCESS`、背景透過・スライドショーと同じ）。理由は2つ。Whisper の推論が CPU を使い切り、常駐と同居させるとホットキーやメニューがもたつくこと。もう1つは、重い読み込みやクラッシュが常駐を巻き込まないようにすること（常駐は COM を抱えているので、重い GC を同居させたくない）。**この機能は COM を使いません**（`comtypes` / `pycaw` も使わない）。
+- **トレイアイコンを増やしません。** 通知領域のアイコンは2つに固定する方針なので、`kabeuchi_stt` 自身のトレイアイコンは出さず、必ず `--no-tray` を付けて起こします。このとき窓を閉じるとプロセスが終わります（`QApplication.setQuitOnLastWindowClosed(True)`）。取り残されて、見えないまま CPU とマイクを握り続けることがありません。
+- **単一起動は `kabeuchi_stt` 自身が持っています**（`QLocalServer` の `kabeuchi_stt_v2_single_instance`）。`kabeuchi_launch.start` は、動いていればこの待ち受けへ「出して」を送って終わり（`sent`）、届かなければ起こします（`spawned`）。起こされた側も先客に気づけば同じ依頼を送って引き返すので、押し間違えて二重に起こしても窓は1つです。ミューテックスで決めるあっふやスライドショーとは判定の仕組みが違いますが、**窓が1つだけ**という結果は同じです。
+- **起動用のモジュールは軽く保っています**（`kabeuchi_launch.py` は標準ライブラリだけ。PySide6 は「出して」を送る関数の中で初めて読みます。常駐がすでに読み込んでいるものです）。faster-whisper・numpy を常駐に読み込まないための決まりで、`tests/test_kabeuchi_launch.py` が見張っています。
+- **失敗は通知に受けます。** Python が見つからない・依存が無い・スクリプトが無い、といったときは `LaunchError`（日本語の文面）にして、「`python setup.py --with-whisper` を実行してください」と通知します。ホットキーからも呼ばれるので、例外は投げ切りません。
+- **ホットキーは `hotkeys.py` の作法に従います。** `kabeuchi.hotkey` のように「ドットを含む設定キー名」は、`hotkeys` 節ではなく設定の入れ子をたどって組み合わせを引きます（`hotkeys._combo_for`）。コールバックは `keyboard` のスレッドから Signal でメインスレッドへ渡り、実処理は `try` で受けます。
+
+### テスト
+
+```
+%USERPROFILE%\.venvs\tray-tools\Scripts\python.exe tests\test_kabeuchi_launch.py
+%USERPROFILE%\.venvs\kabeuchi-stt\Scripts\python.exe kabeuchi_stt\tests\run_all.py --fast
+```
+
+前者は起動コマンドの組み立て（`--no-tray`・`DETACHED_PROCESS`・作業フォルダ）、使う Python の決め方（設定・専用 venv・tray-tools の venv・見つからないときの文面）、依存が無いときの扱い、ダミーのコマンドでの実起動、ホットキー名の解決と既定で何も登録しないこと、`setup.py --with-whisper`（pip も venv 作成も走らせず、呼び出しだけ確かめる）、同梱物に個人の実パスやメールアドレスが無いことを確かめます。窓は出さず、マイクも開きません。後者は `kabeuchi_stt` 自身のテスト（`--fast` は実モデルを使う e2e を除く。窓は画面に出さず、マイクは開かず、音も出しません）です。**CI（`.github/workflows/test.yml`）では `kabeuchi_stt\tests` は回りません**（faster-whisper・実モデル・SAPI・マイクまわりが前提のため。`tests/` の `run_all.py` は直下の `test_*.py` だけを数えます）。`tests/test_kabeuchi_launch.py` は CI の「残りのテスト全部」に入ります。
+
 ## 写真の★（`photometa/`）
 
 **写真ファイル自身に★（レーティング）とキーワードを書き、読み、条件式で絞り込むための共通パッケージです。** あっふと PhotoCuller（別アプリ）の両方から読み込むので、**Qt に依存しません**。あっふでの使い方は「写真フォルダモードと★」の節。
@@ -3001,6 +3062,8 @@ QR には `segno` を使います（`requirements.txt` に入っているので 
 | `teams_meeting.steps` | 手順の上書き・追加（既定 `[]`）。同じ `key` なら書いた項目だけ差し替え、新しい `key` は `after` / `before` で位置を決めて足す。`disabled: true` で飛ばす。`tools/uia_probe.py --teams` が断片を出します |
 | `teams_meeting.app` | 窓の探し方の上書き。`process_name`（既定 `ms-teams.exe`）／`window_class`（既定は空＝見ない。このPCの実測は `TeamsWebView`）／`launch`（起動の候補。既定 `ms-teams:` とストアアプリ） |
 | `teams_meeting.poll_seconds` | 要素を探し直す間隔・秒（既定 `0.3`） |
+| `kabeuchi.python` | 壁打ち文字起こしに使う Python（`pythonw.exe` のパス）。空なら `%USERPROFILE%\.venvs\kabeuchi-stt\Scripts\pythonw.exe`、それが無ければ tray-tools の venv に faster_whisper があるときだけそれ（職場PCなど別の場所に入れたときに指定） |
+| `kabeuchi.hotkey` | 壁打ち文字起こしの窓を開くホットキー。**既定は空（割り当てなし）**。`hotkeys` 節ではなくこの節にある。割り当てるときは Claude アプリなど常用アプリと衝突しない組み合わせに |
 | `screen_mirror.fps` | 1秒あたりに送る枚数（1〜60・既定 `30`）。**範囲が大きいほど重くなります**（1280×720 で約30fps／CPU 60〜75%、1920×1080 で 26〜30fps／65〜110%。いずれも1コア換算）。大きく映したいときはここを 20 や 15 へ落としてください |
 | `screen_mirror.target_screen_name` | ミラー先のモニタ名（`QScreen.name()`）。**メニューの「🖵 ミラー先」で選ぶと自動で書き換わります**。空なら選択範囲が乗っていないモニタを自動で使う。**知らない名前は自動へ落ちるので、別のPCへ持って行っても壊れません** |
 | `screen_mirror.aspect` | 範囲選択の既定の縦横比。`16:9`（既定）／`4:3`／`free`。**大きさは固定されません**（比率だけ）。選択中も `1`/`2`/`3` キーとホイールで切り替えられます（切り替えた結果はその起動の間だけ覚えます） |

@@ -6405,7 +6405,12 @@ class FilerWindow(QWidget):
 
     def cmd_drive(self):
         drives = filer_shell.list_drives()
-        self._open_picker("ドライブ", [(label, root) for root, label in drives], self.jump_to)
+        # いま居るドライブを選んだ状態で開く(無ければ先頭)。
+        current = os.path.normcase(self.active.drive_root() or "")
+        row = next((i for i, (root, _label) in enumerate(drives)
+                    if os.path.normcase(root) == current), None)
+        self._open_picker("ドライブ", [(label, root) for root, label in drives], self.jump_to,
+                          initial_row=row)
 
     # --- マスク ---
     def cmd_mask_clear(self):

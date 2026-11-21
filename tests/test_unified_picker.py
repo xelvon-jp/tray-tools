@@ -896,6 +896,21 @@ def test_picker_kwargs():
         kwargs_f["preview_provider"](jump)
 
 
+def test_picker_initial_row():
+    """initial_row で開いた直後の選択行を決められる(ドライブ選択でいまのドライブを選ぶ用)。"""
+    from PySide6.QtWidgets import QApplication
+    from picker import PickerWindow
+    QApplication.instance() or QApplication([])
+    items = [("C:  OS", "C:\\"), ("D:  Data", "D:\\"), ("E:  USB", "E:\\")]
+    for initial, expected in ((None, 0), (2, 2), (1, 1), (9, 0), (-1, 0)):
+        w = PickerWindow("ドライブ", items, lambda *_: None, initial_row=initial)
+        try:
+            assert w.list.currentRow() == expected, (initial, w.list.currentRow())
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 ALL_TESTS = [value for name, value in sorted(globals().items())
              if name.startswith("test_")]
 

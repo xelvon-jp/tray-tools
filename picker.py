@@ -196,6 +196,7 @@ class PickerWindow(QWidget):
       巻き戻さずに受け付ける(パスの打ちかけのように、続きを打てば候補が出る形の
       ための抜け道)。テキストが何を意味するかは呼び出し側だけが知るので、
       判定はここでは持たない
+    - initial_row … 開いた直後に選んでおく行(0 始まり。範囲外・None なら先頭)
     - tab_text(表示名, データ) -> str or None … Tab を押したときに入力欄へ入れる文字列。
       返すと入力欄がそれに差し替わり(カーソルは末尾)、textChanged で一覧が組み直る。
       窓は閉じない。渡した場合、None が返るときも Tab は食べる(Qtの既定のフォーカス
@@ -249,6 +250,7 @@ class PickerWindow(QWidget):
         on_calc=None,
         on_ctrl_enter=None,
         accept_empty=None,
+        initial_row: int = None,
     ):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -389,6 +391,8 @@ class PickerWindow(QWidget):
         )
 
         self._refresh_list("")
+        if initial_row is not None and 0 <= initial_row < self.list.count():
+            self.list.setCurrentRow(initial_row)    # 開いた直後に選んでおく行(既定は先頭)
         self._fit_to_items()
         self._move_to_center()
 

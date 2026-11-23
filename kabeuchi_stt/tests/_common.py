@@ -20,6 +20,34 @@ faulthandler.dump_traceback_later(int(os.environ.get("KABEUCHI_TEST_TIMEOUT", "2
 
 import numpy as np  # noqa: E402
 
+
+class _FakeClipboard:
+    """テスト中の QGuiApplication.clipboard()。本物のクリップボード（利用者が使っている）を書き換えない。"""
+
+    def __init__(self):
+        self._t = ""
+
+    def text(self, *a, **k):
+        return self._t
+
+    def setText(self, t, *a, **k):
+        self._t = str(t)
+
+    def clear(self, *a, **k):
+        self._t = ""
+
+
+def _isolate_clipboard():
+    try:
+        from PySide6.QtGui import QGuiApplication
+        fake = _FakeClipboard()
+        QGuiApplication.clipboard = staticmethod(lambda: fake)
+    except Exception:
+        pass
+
+
+_isolate_clipboard()
+
 SR = 16000
 
 

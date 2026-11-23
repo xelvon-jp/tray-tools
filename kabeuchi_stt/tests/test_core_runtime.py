@@ -15,7 +15,7 @@ from finalize_queue import CANCELLED, DONE, ERROR, PENDING, FinalizeQueue
 from hotkeys import (MOD_ALT, MOD_CONTROL, MOD_SHIFT, HotkeyManager, parse_hotkey)
 from model_cache import ModelCache
 from replacements import Replacer
-from session import Session, run_mic_test
+from session import Session
 
 
 class QueueTest(unittest.TestCase):
@@ -328,18 +328,6 @@ class SessionTest(unittest.TestCase):
         sess.stop()
         self.assertTrue(sess.timeline.rows() == [] or sess.timeline.duration < 2)
 
-    def test_mic_test_with_fake_device(self):
-        good = C.speechlike(3, -12)
-        stats, issues = run_mic_test(self.s, sd=FakeSD(good, speed=50.0), seconds=0.3,
-                                     sleep=lambda s: time.sleep(s))
-        self.assertEqual(issues, [])
-        quiet = C.sine(3, -45)
-        stats, issues = run_mic_test(self.s, sd=FakeSD(quiet, speed=50.0), seconds=0.3,
-                                     sleep=lambda s: time.sleep(s))
-        self.assertIn("low", {i.code for i in issues})
-        stats, issues = run_mic_test(self.s, sd=FakeSD(np.zeros(C.SR * 3, dtype=np.int16), speed=50.0),
-                                     seconds=0.3, sleep=lambda s: time.sleep(s))
-        self.assertEqual({i.code for i in issues}, {"silent"})
 
 
 if __name__ == "__main__":

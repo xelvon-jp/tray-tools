@@ -26,7 +26,7 @@ from session import Session
 from settings import load_settings
 from transcriber import load_model
 
-TEXT = "今日は予算の確認作業を、AIで自動化する方法を考えています。まず一次集計から始めます。"
+TEXT = "今日は基地局の評価作業を、AIで自動化する方法を考えています。まず一次解析から始めます。"
 
 
 def make_tts(path: Path) -> bool:
@@ -84,20 +84,9 @@ class FakeSD:
         return []
 
 
-def model_present(name: str) -> bool:
-    """モデルが手元（model_dir）にあるか。無いときに勝手にダウンロードを始めないため、テストはスキップする。"""
-    from settings import resolve_dir
-    mdir = resolve_dir(load_settings(create=False).get("model_dir", "models"))
-    return (mdir / name / "model.bin").exists() or any(mdir.glob(f"models--*faster-whisper-{name}"))
-
-
 @unittest.skipUnless(sys.platform == "win32", "Windows only")
 class E2ETest(unittest.TestCase):
     def test_full_flow(self):
-        s0 = load_settings(create=False)
-        for need in (s0["final_model"], s0["live_model"]):
-            if not model_present(need):
-                self.skipTest(f"モデル {need} が model_dir にありません（SKIP。README の「モデルのオフライン手置き」）")
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             tts = d / "tts.wav"
@@ -110,8 +99,8 @@ class E2ETest(unittest.TestCase):
 
             s = load_settings(create=False)
             s["out_dir"] = str(d / "out")
-            s["hotwords"] = "予算, 一次集計, 自動化"
-            replacer = Replacer([{"from": "予算", "to": "予算(NEW)"}])  # 必ず出る語で置換を確認
+            s["hotwords"] = "基地局, 一次解析, 自動化"
+            replacer = Replacer([{"from": "基地局", "to": "基地局(BTS)"}])  # 必ず出る語で置換を確認
             hist = History(d / "h.db")
             cache = ModelCache(lambda n, th: load_model(n, s, cpu_threads=th), idle_sec=600)
             events = []
@@ -145,17 +134,17 @@ class E2ETest(unittest.TestCase):
             # 認識結果の基本（TTS なので専門語まで拾えることを期待するが、ゆるく見る）
             self.assertIn("自動化", r.text)
             # 置換: 清書の出力に辞書が適用され、txt/md にも入っている
-            self.assertIn("予算(NEW)", r.text)
-            self.assertNotIn("予算(NEW)(NEW)", r.text)
-            self.assertIn("予算(NEW)", Path(r.txt_path).read_text(encoding="utf-8"))
-            self.assertIn("予算(NEW)", Path(r.md_path).read_text(encoding="utf-8"))
+            self.assertIn("基地局(BTS)", r.text)
+            self.assertNotIn("基地局(BTS)(BTS)", r.text)
+            self.assertIn("基地局(BTS)", Path(r.txt_path).read_text(encoding="utf-8"))
+            self.assertIn("基地局(BTS)", Path(r.md_path).read_text(encoding="utf-8"))
             # タイムライン: 仮認識の行が清書に置き換わった
             self.assertTrue(tl.is_final)
             self.assertTrue(all(r_.state == "final" for r_ in tl.rows()))
             self.assertEqual(tl.final_text(), r.text)
             # 履歴に登録され、検索できる
             self.assertEqual(len(hist.list()), 1)
-            self.assertEqual([x.id for x in hist.search("NEW 自動化")], [job.history_id])
+            self.assertEqual([x.id for x in hist.search("BTS 自動化")], [job.history_id])
             self.assertEqual(hist.search("存在しない語"), [])
             rec = hist.get(job.history_id)
             self.assertEqual(rec.wav_path, str(wav))
@@ -164,7 +153,7 @@ class E2ETest(unittest.TestCase):
             # プロンプト組み立て
             out = build_prompt("要約3行とToDoにしてください。", rec.current_text)
             self.assertTrue(out.startswith("要約3行とToDoにしてください。"))
-            self.assertIn("予算(NEW)", out)
+            self.assertIn("基地局(BTS)", out)
             # モデルは常駐（2回目の清書で再ロードされない）
             loads_before = cache.loads
             job2 = q.submit(wav, history_id=job.history_id)

@@ -11,8 +11,15 @@ import time
 from pathlib import Path
 
 here = Path(__file__).resolve().parent
-names = ["test_core_mic", "test_core_data", "test_core_runtime", "test_core_v15", "test_core_v16",
-         "test_gui_smoke", "test_gui_v15", "test_gui_v16"]
+names = ["test_models_catalog", "test_audio_compress", "test_silence_gate", "test_core_mic", "test_core_data", "test_core_runtime", "test_core_v15", "test_core_v16",
+         "test_dialogue_profile", "test_dialogue_deliver", "test_dialogue_send", "test_dialogue_client",
+         "test_dialogue_segmenter", "test_meter_line", "test_dialogue_text", "test_dialogue_buffer", "test_dialogue_draft", "test_dialogue_session", "test_dialogue_prov", "test_dialogue_headset", "test_dialogue_hid", "test_headset_probe", "test_dialogue_mouse", "test_dialogue_click",
+         "test_dialogue_ui_logic", "test_dialogue_controller", "test_dialogue_send_flow", "test_unified_logic",
+         ]
+# 画面（Qt）のテストは遅い（合計 約2.5分）ので、普段は回さない。画面のコードを変えたときだけ --gui を付ける
+GUI = ["test_gui_smoke", "test_gui_v15", "test_gui_v16", "test_gui_dialogue", "test_gui_unified"]
+if "--gui" in sys.argv:
+    names += GUI
 if "--fast" not in sys.argv:
     names.append("test_e2e")
 t0 = time.time()

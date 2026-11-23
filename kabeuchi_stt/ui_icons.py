@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 import ui_style as S
 
-NAMES = ("rec", "stop", "pause", "play", "compact", "expand", "pin", "mic", "wave", "folder", "gear", "close")
+NAMES = ("rec", "stop", "pause", "play", "compact", "expand", "pin", "mic", "wave", "folder", "gear", "close", "drawer", "chev_down", "chev_up")
 SIZES = (16, 20, 24, 32, 48)
 
 NORMAL = "#c3c9d6"
@@ -114,6 +114,21 @@ def draw(name: str, size: int, color: str) -> QPixmap:
             a = math.radians(k * 45)
             p.drawLine(QPointF(s * (0.5 + 0.30 * math.cos(a)), s * (0.5 + 0.30 * math.sin(a))),
                        QPointF(s * (0.5 + 0.40 * math.cos(a)), s * (0.5 + 0.40 * math.sin(a))))
+    elif name == "drawer":
+        # 窓の枠＋右の引き出し（縦線と、中の行）
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, w))
+        p.drawRoundedRect(QRectF(s * 0.14, s * 0.2, s * 0.72, s * 0.6), s * 0.1, s * 0.1)
+        p.drawLine(QPointF(s * 0.58, s * 0.2), QPointF(s * 0.58, s * 0.8))
+        p.drawLine(QPointF(s * 0.67, s * 0.38), QPointF(s * 0.77, s * 0.38))
+        p.drawLine(QPointF(s * 0.67, s * 0.5), QPointF(s * 0.77, s * 0.5))
+        p.drawLine(QPointF(s * 0.67, s * 0.62), QPointF(s * 0.77, s * 0.62))
+    elif name in ("chev_down", "chev_up"):
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_pen(c, w * 1.1))
+        y0, y1 = (0.38, 0.62) if name == "chev_down" else (0.62, 0.38)
+        p.drawLine(QPointF(s * 0.28, s * y0), QPointF(s * 0.5, s * y1))
+        p.drawLine(QPointF(s * 0.5, s * y1), QPointF(s * 0.72, s * y0))
     elif name == "close":
         p.setPen(_pen(c, w))
         p.drawLine(QPointF(s * 0.28, s * 0.28), QPointF(s * 0.72, s * 0.72))

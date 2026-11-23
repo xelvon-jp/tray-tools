@@ -15,7 +15,7 @@ import re
 import sqlite3
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS recordings (
   text TEXT NOT NULL DEFAULT '',
   edited_text TEXT,
   edited_at TEXT,
-  segments_json TEXT NOT NULL DEFAULT '[]'
+  segments_json TEXT NOT NULL DEFAULT '[]',
+  cuts_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_rec_created ON recordings(created_at DESC);
 """
@@ -96,6 +97,7 @@ class Record:
     edited_text: str | None
     edited_at: str | None
     segments: list  # [(start, end, text), ...]
+    cuts: list = field(default_factory=list)  # 無音を縮めた場所 [[元の start, 元の end, 残した長さ], ...]（Opus の音声の時刻合わせ用）
 
     @property
     def current_text(self) -> str:
@@ -110,6 +112,9 @@ class History:
         self._db.row_factory = sqlite3.Row
         with self._lock:
             self._db.executescript(_SCHEMA)
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(recordings)").fetchall()}
+            if "cuts_json" not in cols:       # 既存DBの自動マイグレーション
+                self._db.execute("ALTER TABLE recordings ADD COLUMN cuts_json TEXT NOT NULL DEFAULT ''")
             self._db.commit()
 
     def close(self) -> None:
@@ -122,8 +127,13 @@ class History:
             segs = [tuple(s) for s in json.loads(r["segments_json"] or "[]")]
         except Exception:
             segs = []
+        try:
+            from audio_compress import cuts_from_json
+            cuts = cuts_from_json(r["cuts_json"])
+        except Exception:
+            cuts = []
         return Record(r["id"], r["created_at"], r["duration"], r["title"], r["model"], r["wav_path"],
-                      r["txt_path"], r["md_path"], r["text"], r["edited_text"], r["edited_at"], segs)
+                      r["txt_path"], r["md_path"], r["text"], r["edited_text"], r["edited_at"], segs, cuts)
 
     def add(self, *, text: str, segments: list, duration: float, model: str, wav_path="",
             txt_path="", md_path="", created_at: str | None = None) -> int:
@@ -143,7 +153,7 @@ class History:
         with self._lock:
             self._db.execute(
                 "UPDATE recordings SET text=?,segments_json=?,duration=?,model=?,title=?,txt_path=?,md_path=?,"
-                "edited_text=NULL,edited_at=NULL WHERE id=?",
+                "edited_text=NULL,edited_at=NULL,cuts_json='' WHERE id=?",
                 (text, json.dumps([list(s) for s in segments], ensure_ascii=False), float(duration), model,
                  first_sentence(text), str(txt_path), str(md_path), rec_id))
             self._db.commit()
@@ -162,6 +172,19 @@ class History:
                 self._db.execute("UPDATE recordings SET edited_text=NULL,edited_at=NULL,title=? WHERE id=?",
                                  (first_sentence(r["text"]), rec_id))
                 self._db.commit()
+
+    def set_audio_path(self, rec_id: int, path: str | Path) -> None:
+        """録音ファイルの場所を差し替える（WAV を Opus に圧縮したとき）。列名は wav_path のまま（WAV 以外も入る）。"""
+        with self._lock:
+            self._db.execute("UPDATE recordings SET wav_path=? WHERE id=?", (str(path), rec_id))
+            self._db.commit()
+
+    def set_cuts(self, rec_id: int, cuts) -> None:
+        """無音を縮めた場所 [[start,end,keep],...]（元の時刻）を保存する。空なら記録なし。"""
+        from audio_compress import cuts_to_json
+        with self._lock:
+            self._db.execute("UPDATE recordings SET cuts_json=? WHERE id=?", (cuts_to_json(cuts) if cuts else "", rec_id))
+            self._db.commit()
 
     def get(self, rec_id: int) -> Record | None:
         with self._lock:
@@ -202,8 +225,11 @@ class History:
             return []
         failed: list[str] = []
         if include_files:
+            with self._lock:      # 同じ録音を別モデルで清書した別の履歴が使っているファイルは、ごみ箱へ移さず残す
+                rows = self._db.execute("SELECT wav_path,txt_path,md_path FROM recordings WHERE id!=?", (rec_id,)).fetchall()
+            shared = {str(x) for r in rows for x in (r[0], r[1], r[2]) if x}
             for p in (rec.wav_path, rec.txt_path, rec.md_path):
-                if p and Path(p).exists():
+                if p and str(p) not in shared and Path(p).exists():
                     try:
                         trasher(Path(p))
                     except Exception:

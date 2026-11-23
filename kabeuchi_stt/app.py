@@ -244,14 +244,8 @@ class KabeuchiApp:
     def finish_final(self, r):
         self.busy_final = False
         self.txt_final.insert("1.0", r.text)
-        try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(r.text)
-            self.root.update()
-            clip = "クリップボードにコピー済み"
-        except Exception as e:
-            clip = f"クリップボード失敗: {e}"
-        self.status(f"完了（{r.elapsed:.0f}秒 / 音声{r.audio_seconds:.0f}秒）  {r.txt_path}  {r.md_path}  {clip}")
+        # クリップボードへは自動で入れない（結果の欄から、選択して Ctrl+C でコピーする）
+        self.status(f"完了（{r.elapsed:.0f}秒 / 音声{r.audio_seconds:.0f}秒）  {r.txt_path}  {r.md_path}")
 
     def run(self):
         self.root.mainloop()

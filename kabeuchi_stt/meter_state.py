@@ -42,3 +42,54 @@ class HoldLatch:
     def reset(self) -> None:
         self._until = 0.0
         self.value = False
+
+
+# ---- 認識開始ライン（音量バー上のしきい値。純関数）
+# バーは -60..0 dBFS（audio_input.level_from_rms と同じ）。ラインは -60..-6 に丸める。
+BAR_DB_MIN = -60.0
+BAR_DB_MAX = 0.0
+LINE_DB_MIN = -60.0
+LINE_DB_MAX = -6.0
+LINE_DB_DEFAULT = -50.0
+
+
+def clamp_line_db(v, default: float = LINE_DB_DEFAULT) -> float:
+    """認識開始ラインの値を整数 dB に丸め、範囲内へ収める。None・不正値は既定。"""
+    try:
+        f = float(v)
+        if f != f or f in (float("inf"), float("-inf")):
+            return float(default)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(max(LINE_DB_MIN, min(LINE_DB_MAX, round(f))))
+
+
+def db_to_frac(db: float) -> float:
+    """dBFS → バー上の位置（0..1）。"""
+    return max(0.0, min(1.0, (float(db) - BAR_DB_MIN) / (BAR_DB_MAX - BAR_DB_MIN)))
+
+
+def frac_to_db(frac: float) -> float:
+    return BAR_DB_MIN + max(0.0, min(1.0, float(frac))) * (BAR_DB_MAX - BAR_DB_MIN)
+
+
+def x_to_line_db(x: float, left: float, width: float) -> float:
+    """バー上の x 座標（left から width 幅の領域）→ 丸めた dBFS。"""
+    if width <= 0:
+        return LINE_DB_DEFAULT
+    return clamp_line_db(frac_to_db((float(x) - left) / width))
+
+
+def line_db_to_x(db: float, left: float, width: float) -> float:
+    return left + db_to_frac(db) * width
+
+
+def store_voice_min(settings: dict, db) -> float:
+    """設定 dialogue.voice_min_dbfs へ丸めた値を保存して返す（dialogue 節が無ければ作る）。"""
+    v = clamp_line_db(db)
+    d = settings.get("dialogue")
+    if not isinstance(d, dict):
+        d = {}
+        settings["dialogue"] = d
+    d["voice_min_dbfs"] = v
+    return v

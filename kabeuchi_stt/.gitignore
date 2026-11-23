@@ -3,5 +3,3 @@ out/
 models/
 __pycache__/
 *.wav
-error.log
-*.lnk

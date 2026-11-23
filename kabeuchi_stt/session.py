@@ -205,7 +205,8 @@ class Session:
         return None
 
     # ---- 録音
-    def start(self, wav_path: Path | None = None, live_enabled: bool | None = None) -> Path:
+    def start(self, wav_path: Path | None = None, live_enabled: bool | None = None,
+              extra_parts: tuple = ()) -> Path:
         with self._hub_lock:
             if self.is_recording:
                 raise RuntimeError("すでに録音中です")
@@ -218,6 +219,7 @@ class Session:
             self.live = None
             self._pause_wall, self._pause_lengths, self._pause_ids, self.paused_total = None, [], [], 0.0
             parts = [tl.feed, self.monitor.feed, self.silence.feed]
+            parts.extend(p for p in extra_parts if p is not None)   # 対話モードの区切り器など（録音の頭から受ける）
             self._tap_parts = parts
             if live_enabled is None:
                 live_enabled = bool(self.s.get("live_enabled", True))
@@ -358,55 +360,3 @@ class Session:
     @property
     def elapsed(self) -> float:
         return self.rec.elapsed if self.rec else 0.0
-
-    def mic_test(self, seconds: float = 3.0, sleep: Callable[[float], None] = time.sleep):
-        """マイクテスト。待機中モニターで入力が開いていれば、そのストリームを聞く（二重に開かない）。"""
-        with self._hub_lock:
-            use_hub = self.hub.is_open and not self.is_recording
-            if use_hub:
-                chunks: list[np.ndarray] = []
-                orig = self.hub.idle_consumer
-
-                def tap(x: np.ndarray) -> None:
-                    chunks.append(x)
-                    if orig is not None:
-                        orig(x)
-                self.hub.idle_consumer = tap
-        if not use_hub:
-            return run_mic_test(self.s, sd=self.sd, seconds=seconds, sleep=sleep)
-        try:
-            sleep(seconds)
-        finally:
-            self.hub.idle_consumer = orig
-        x = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
-        stats = measure(x)
-        return stats, diagnose(stats, mic_thresholds(self.s), expect_speech=True)
-
-
-def run_mic_test(settings: dict, sd=None, seconds: float = 3.0,
-                 sleep: Callable[[float], None] = time.sleep):
-    """マイクテスト（録音前に 3 秒だけ聞いて音量を診断する）。
-
-    **実際にマイクを開く**。UI のボタンからだけ呼ぶ。テストでは sd を差し替える。
-    戻り値: (Stats, [Issue])
-    """
-    from recorder import resolve_device
-    if sd is None:
-        import sounddevice as sd  # type: ignore
-    chunks: list[np.ndarray] = []
-
-    def cb(indata, frames, ti, status):
-        chunks.append(np.array(indata[:, 0], dtype=np.int16, copy=True))
-
-    dev = resolve_device(settings.get("input_device"), sd)
-    st = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", device=dev,
-                        blocksize=0, callback=cb)
-    st.start()
-    try:
-        sleep(seconds)
-    finally:
-        st.stop()
-        st.close()
-    x = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
-    stats = measure(x)
-    return stats, diagnose(stats, mic_thresholds(settings), expect_speech=True)

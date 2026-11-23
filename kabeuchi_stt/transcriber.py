@@ -20,6 +20,7 @@ from typing import Callable
 import numpy as np
 
 from recorder import SAMPLE_RATE
+from model_cache import find_local_model, repo_id_for
 from settings import resolve_dir
 
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -33,7 +34,7 @@ class ModelUnavailableError(RuntimeError):
 
 
 def offline_help(name: str, model_dir: Path, cause: str = "") -> str:
-    repo = f"Systran/faster-whisper-{name}"
+    repo = repo_id_for(name)
     return (
         f"モデル '{name}' を取得できませんでした。\n"
         f"（原因: {cause}）\n\n"
@@ -60,10 +61,10 @@ def load_model(name: str, settings: dict, cpu_threads: int = 0, log: Callable[[s
     kw = dict(device=device, compute_type=ctype, cpu_threads=cpu_threads)
 
     # 1) 手置き: model_dir/<name>/model.bin、または name 自体がフォルダパス
-    for cand in (model_dir / name, Path(name)):
-        if (cand / "model.bin").exists():
-            log(f"モデル読込（手置き・オフライン）: {cand}")
-            return WhisperModel(str(cand), local_files_only=True, **kw)
+    found = find_local_model(name, model_dir)       # 取得済みかどうかの規則は models_catalog.is_downloaded と共有
+    if found is not None and found[0] == "manual":
+        log(f"モデル読込（手置き・オフライン）: {found[1]}")
+        return WhisperModel(str(found[1]), local_files_only=True, **kw)
     # 2) model_dir を HF キャッシュ形式の置き場として、取得済みなら使う
     try:
         log(f"モデル読込（取得済みキャッシュ）: {name}")
@@ -191,7 +192,9 @@ class LiveTranscriber:
                     condition_on_previous_text=False, initial_prompt=prompt,
                     hotwords=self.s.get("hotwords") or None,
                     without_timestamps=True)
-                text = "".join(x.text for x in segs if getattr(x, "no_speech_prob", 0) < 0.6).strip()
+                # 無音の幻覚だけ捨てる（無音確率が高く、かつ自信も低いとき。声が小さい本物の発話を捨てない）
+                text = "".join(x.text for x in segs if not (getattr(x, "no_speech_prob", 0) >= 0.6
+                                                            and getattr(x, "avg_logprob", 0.0) < -1.0)).strip()
                 self.processed_segments += 1
                 if text:
                     if self.on_segment is not None:
@@ -315,7 +318,12 @@ def load_wav_float(path: Path) -> np.ndarray:
                 return x
     except Exception:
         pass
-    from faster_whisper.audio import decode_audio  # mp3 等。PyAV の版によっては失敗しうる
+    try:
+        from audio_compress import decode_audio_float   # Opus（圧縮した録音）・mp3 等。PyAV を直接使う
+        return decode_audio_float(path, SAMPLE_RATE)
+    except Exception:
+        pass
+    from faster_whisper.audio import decode_audio  # PyAV の版によっては失敗しうる
     return decode_audio(str(path), sampling_rate=SAMPLE_RATE)
 
 
@@ -327,12 +335,12 @@ def _mmss(t: float) -> str:
 def save_outputs(wav_path: Path, segments: list, settings: dict, model_name: str,
                  out_dir: Path | None = None,
                  formatter: Callable[..., str] | None = None,
-                 gaps: list | None = None) -> tuple[Path, Path, str]:
+                 gaps: list | None = None, file_tag: str = "") -> tuple[Path, Path, str]:
     """txt / md を保存。formatter（区間のリスト→全文）があれば全文はそれで整形（すき間による改行など）。
     元の区間（時刻つき）は変えない。md の「タイムスタンプ付き」は区間ごとのまま。"""
     out_dir = Path(out_dir) if out_dir else resolve_dir(settings.get("out_dir", "out"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(wav_path).stem
+    stem = Path(wav_path).stem + (f"_{file_tag}" if file_tag else "")   # 同じ録音を別モデルで清書したとき、txt/md を上書きしない
     text = (formatter(segments, gaps=gaps) if gaps is not None else formatter(segments)) if formatter is not None else "\n".join(t for _, _, t in segments if t)
     txt = out_dir / f"{stem}.txt"
     md = out_dir / f"{stem}.md"
@@ -357,6 +365,7 @@ def transcribe_wav(
     model=None,
     postprocess: Callable[[str], str] | None = None,
     formatter: Callable[..., str] | None = None,
+    file_tag: str = "",
 ) -> FinalResult:
     """WAV 全体を清書。進捗は 0.0〜1.0。"""
     wav_path = Path(wav_path)
@@ -370,17 +379,28 @@ def transcribe_wav(
                            log=on_status)
     on_status("清書中…")
     audio = load_wav_float(wav_path)
-    segs, info = model.transcribe(
-        audio,
-        language=settings.get("language", "ja"),
-        vad_filter=True,
-        condition_on_previous_text=False,
-        initial_prompt=settings.get("initial_prompt") or None,
-        # initial_prompt は condition_on_previous_text=False だと最初の窓にしか効かない。
-        # hotwords は全窓のプロンプトに入るので、専門語はこちらで渡す。
-        hotwords=settings.get("hotwords") or None,
-        beam_size=5,
-    )
+    from models_catalog import supports_hotwords
+
+    def _decode(use_hot: bool):
+        return model.transcribe(
+            audio,
+            language=settings.get("language", "ja"),
+            vad_filter=True,
+            condition_on_previous_text=False,
+            initial_prompt=settings.get("initial_prompt") or None,
+            # initial_prompt は condition_on_previous_text=False だと最初の窓にしか効かない。
+            # hotwords は全窓のプロンプトに入るので、専門語はこちらで渡す（渡すと何も出なくなるモデルには渡さない）。
+            hotwords=(settings.get("hotwords") or None) if use_hot else None,
+            beam_size=5,
+        )
+
+    use_hot = bool(supports_hotwords(model_name) and settings.get("hotwords"))
+    segs_list = list(_decode(use_hot)[0])
+    if use_hot and len(audio) / SAMPLE_RATE >= 3.0 and not any(sg.text.strip() for sg in segs_list):
+        # 声のある録音なのに、1文字も出なかった（hotwords で出力が止まるモデルがある）。用語なしで、もう1回やり直す
+        on_status("清書の結果が空だったので、専門用語なしでやり直します…")
+        segs_list = list(_decode(False)[0])
+    segs = iter(segs_list)
     total = len(audio) / SAMPLE_RATE or 1.0
     out = []
     for sg in segs:
@@ -400,6 +420,6 @@ def transcribe_wav(
             gaps = silence_gaps(audio, out)
         except Exception:
             gaps = None  # 測れなくても清書は続ける（時刻のすき間だけで整形）
-    txt, md, text = save_outputs(wav_path, out, settings, model_name, out_dir, formatter=formatter, gaps=gaps)
+    txt, md, text = save_outputs(wav_path, out, settings, model_name, out_dir, formatter=formatter, gaps=gaps, file_tag=file_tag)
     return FinalResult(text=text, segments=out, txt_path=txt, md_path=md,
                        audio_seconds=total, elapsed=time.monotonic() - t0, gaps=gaps)

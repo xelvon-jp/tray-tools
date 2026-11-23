@@ -60,7 +60,7 @@ def pump(sec=0.3, until=None):
 def fake_transcribe(wav, s, model_name=None, on_progress=None, on_status=None, cancel=None, model=None,
                     postprocess=None, **kw):
     on_progress(0.5)
-    segs = [(0.0, 3.0, "不線を貼ります。"), (3.5, 6.0, "予算の話です。")]
+    segs = [(0.0, 3.0, "不線を貼ります。"), (3.5, 6.0, "基地局の話です。")]
     segs = [(a, b, postprocess(t) if postprocess else t) for a, b, t in segs]
     text = "\n".join(t for _, _, t in segs)
     return FinalResult(text=text, segments=segs, txt_path=None, md_path=None, audio_seconds=7.0, elapsed=0.1)
@@ -106,28 +106,29 @@ class GuiSmokeTest(unittest.TestCase):
 
     def test_record_stop_finalize_history_flow(self):
         w = self.win
-        w.toggle_record()
+        w.toggle_record()                          # 録音ボタン＝セッション開始（画面は AI対話の流れ1つ）
         self.assertTrue(self.svc.session.is_recording)
-        self.assertEqual(w.btn_rec.text(), "停止して清書")
-        self.assertFalse(w.btn_mictest.isEnabled())
-        pump(1.0, until=lambda: w.timeline_view.row_count >= 1)
-        self.assertGreaterEqual(w.timeline_view.row_count, 1)
-        pump(1.5, until=lambda: w.lbl_time.text() != "00:00:00")
-        self.assertNotEqual(w.lbl_time.text(), "00:00:00")
-        w.toggle_record()
-        self.assertFalse(self.svc.session.is_recording)
-        self.assertEqual(w.btn_rec.text(), "録音開始")
-        # 清書が終わり、履歴・クリップボード・タイムラインが更新される
-        self.assertTrue(pump(5, until=lambda: w.lst_hist.count() == 1))
-        self.assertEqual(QGuiApplication.clipboard().text(), "付箋を貼ります。\n予算の話です。")  # 既定の辞書: 不線→付箋
-        rows = self.svc.session.timeline.rows()
-        self.assertTrue(rows and all(r.state == "final" for r in rows))
-        self.assertIn("清書完了", w.statusBar().currentMessage())
+        self.assertTrue(w._dialogue_active())
+        u = w.unified
+        u.refresh()
+        self.assertEqual(u.btn_rec.text(), "停止")
+        pump(1.0, until=lambda: len(self.svc.session.timeline.rows()) >= 1)
+        self.assertGreaterEqual(len(self.svc.session.timeline.rows()), 1)
+        self.assertTrue(pump(4.0, until=lambda: u.lbl_time.text() not in ("--:--", "00:00")))   # 1 秒以上録る（短すぎる録音は清書しない）
+        w.toggle_record()                          # 停止＝セッション終了。録音全体の清書が裏で始まる
+        self.assertTrue(pump(8, until=lambda: not self.svc.session.is_recording and not w._dialogue_active()))
+        u.refresh()
+        self.assertEqual(u.btn_rec.text(), "録音")
+        # 清書が終わり、履歴が更新される（クリップボードへは入れない）
+        self.assertTrue(pump(8, until=lambda: w.lst_hist.count() == 1))
+        self.assertNotIn("基地局の話です", QGuiApplication.clipboard().text())   # クリップボードへは自動で入れない（利用者が明示的にコピーしたときだけ）
+        self.assertTrue(pump(3, until=lambda: "清書完了" in w.statusBar().currentMessage()))
+        self.assertEqual(w.progress_text(), "")                                 # 清書が終われば、通知の行には何も出さない
         # 清書中でも次の録音を始められる
         w.toggle_record()
         self.assertTrue(self.svc.session.is_recording)
         w.toggle_record()
-        pump(1.0)
+        self.assertTrue(pump(8, until=lambda: not w._dialogue_active()))
 
     def test_dictionary_chips_presets_persist(self):
         w = self.win
@@ -147,23 +148,14 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertEqual(self.svc.replacer.apply("壁内の話"), "壁打ちの話")
         from replacements import load_pairs
         self.assertIn({"from": "壁内", "to": "壁打ち"}, load_pairs())
-        # プリセット: 追加 → 保存 → 送る（プロンプト＋文字起こし）
+        # プリセット: 追加 → 保存（宛先が Copilot のときの前置きに使う。クリップボードへは送らない）
         n0 = w.cmb_preset.count()
         w.ed_pname.setText("テスト用")
         w.ed_prompt.setPlainText("これを要約して")
         w.preset_new()
         self.assertEqual(w.cmb_preset.count(), n0 + 1)
         self.assertEqual(w.cmb_preset.currentText(), "テスト用")
-        w._last_text = "本文です"
-        w.send_main()
-        clip = QGuiApplication.clipboard().text()
-        self.assertTrue(clip.startswith("これを要約して"))
-        self.assertIn("本文です", clip)
-        # 文字起こしが無ければコピーしない
-        w._last_text = ""
-        QGuiApplication.clipboard().setText("元のまま")
-        w.send_main()
-        self.assertEqual(QGuiApplication.clipboard().text(), "元のまま")
+        self.assertFalse(hasattr(w, "send_main"))
 
     def test_history_view_edit_play_suggest_delete(self):
         w = self.win
@@ -172,14 +164,14 @@ class GuiSmokeTest(unittest.TestCase):
         with wave.open(str(wavp), "wb") as f:
             f.setnchannels(1), f.setsampwidth(2), f.setframerate(16000)
             f.writeframes(C.sine(6, -20).tobytes())
-        segs = [(0.0, 3.0, "不線を貼ります。"), (3.0, 6.0, "予算の話です。")]
-        rid = self.hist.add(text="不線を貼ります。\n予算の話です。", segments=segs, duration=6.0, model="small",
+        segs = [(0.0, 3.0, "不線を貼ります。"), (3.0, 6.0, "基地局の話です。")]
+        rid = self.hist.add(text="不線を貼ります。\n基地局の話です。", segments=segs, duration=6.0, model="small",
                             wav_path=str(wavp))
         w.reload_history()
         self.assertEqual(w.lst_hist.count(), 1)
         w.lst_hist.setCurrentRow(0)
         pump(0.2)
-        self.assertEqual(w.editor.toPlainText(), "不線を貼ります。\n予算の話です。")
+        self.assertEqual(w.editor.toPlainText(), "不線を貼ります。\n基地局の話です。")
         self.assertTrue(w.btn_play.isEnabled())
         # 行クリック → その位置から再生（状態の遷移だけ確認。ミュート・音量0）
         w.editor_line_clicked(1)
@@ -189,12 +181,12 @@ class GuiSmokeTest(unittest.TestCase):
         pump(0.3)
         self.assertFalse(w.player.is_playing)
         # 修正して保存 → 元の清書は残る・検索にも出る
-        w.editor.setPlainText("付箋を貼ります。\n予算の話です。")
+        w.editor.setPlainText("付箋を貼ります。\n基地局の話です。")
         self.assertTrue(w._edit_dirty)
         w.save_edit()
         rec = self.hist.get(rid)
-        self.assertEqual(rec.edited_text, "付箋を貼ります。\n予算の話です。")
-        self.assertEqual(rec.text, "不線を貼ります。\n予算の話です。")
+        self.assertEqual(rec.edited_text, "付箋を貼ります。\n基地局の話です。")
+        self.assertEqual(rec.text, "不線を貼ります。\n基地局の話です。")
         w.ed_search.setText("付箋")
         w.reload_history()
         self.assertEqual(w.lst_hist.count(), 1)
@@ -250,20 +242,73 @@ class GuiSmokeTest(unittest.TestCase):
     def test_pick_wav_goes_through_hook(self):
         w = self.win
         w._open_file = lambda *a: str(self.d / "x.wav")
+        w._ask_wav_model = lambda wav: "small"        # モデル選択ダイアログは出さない
         w.pick_wav()
         self.assertTrue(pump(5, until=lambda: len(self.svc.queue.jobs) == 1))
 
-    def test_mic_test_result_and_issue_banner(self):
-        from mic_check import diagnose, measure
+    def test_pick_wav_uses_chosen_model_and_history_shows_it(self):
+        """別のモデルで同じ録音を清書すると、履歴にそのモデル名で並ぶ（txt/md は別名）。"""
         w = self.win
-        st = measure(C.sine(3, -45))
-        w.show_mic_test_result(st, diagnose(st))
-        self.assertIn("小さすぎ", w.badge.text())
-        self.assertFalse(w.banner.isHidden())
-        self.assertIn("入力音量", w.banner.text())
-        st = measure(C.speechlike(3, -12))
-        w.show_mic_test_result(st, diagnose(st))
-        self.assertIn("OK", w.badge.text())
+        wav = self.d / "x.wav"
+        wav.write_bytes(b"")
+        w._open_file = lambda *a: str(wav)
+        w._ask_wav_model = lambda p: "large-v3-turbo"
+        w.pick_wav()
+        self.assertTrue(pump(5, until=lambda: len(self.svc.queue.jobs) == 1 and not self.svc.queue.busy))
+        job = self.svc.queue.jobs[0]
+        self.assertEqual(job.model, "large-v3-turbo")
+        self.assertEqual(job.file_tag, "large-v3-turbo")      # 設定の既定(small)と違うので別名
+        self.assertEqual([r.model for r in self.hist.list(10)], ["large-v3-turbo"])
+        w._ask_wav_model = lambda p: "small"
+        w.pick_wav()
+        self.assertTrue(pump(5, until=lambda: len(self.svc.queue.jobs) == 2 and not self.svc.queue.busy))
+        self.assertEqual(self.svc.queue.jobs[1].file_tag, "")
+        self.assertEqual(sorted(r.model for r in self.hist.list(10)), ["large-v3-turbo", "small"])
+
+    def test_wav_model_dialog_default_and_warning(self):
+        from ui_models import WavModelDialog
+        d = WavModelDialog("a.wav", self.d / "nomodels", "medium", self.win)
+        self.assertEqual(d.model(), "medium")
+        self.assertIn("まだ取得していません", d.warn.text())      # 空のフォルダなので未取得
+        d.model_combo.setCurrentIndex(d.model_combo.findData("kotoba-tech/kotoba-whisper-v2.0-faster"))
+        self.assertEqual(d.model(), "kotoba-tech/kotoba-whisper-v2.0-faster")
+
+    def test_settings_dialog_models_catalog_and_warning(self):
+        from ui_main import SettingsDialog
+        s = dict(self.s, model_dir=str(self.d / "empty"), final_model="my/custom-model")
+        s["dialogue"] = {"model": "small"}
+        d = SettingsDialog(s, [], self.win)
+        self.assertEqual(d.final_model.currentData(), "my/custom-model")      # カタログ外もそのまま選べる・保存できる
+        self.assertEqual(d.values()["final_model"], "my/custom-model")
+        self.assertIn("まだ取得していません", d.model_warn.text())
+        self.assertIn("【未取得】", d.final_model.currentText())
+        self.assertTrue(hasattr(d, "btn_models"))
+        md = self.d / "have"                                                   # 取得済みの置き場では警告が消える
+        (md / "small").mkdir(parents=True)
+        (md / "small" / "model.bin").write_bytes(b"x")
+        d2 = SettingsDialog(dict(self.s, model_dir=str(md), final_model="small", dialogue={"model": "small"}), [], self.win)
+        self.assertEqual(d2.model_warn.text(), "")
+        self.assertIn("【取得済み】", d2.final_model.currentText())
+
+    def test_model_manager_download_with_fake(self):
+        from ui_models import ModelManagerDialog
+        import models_catalog as MC
+        md = self.d / "mm"
+        md.mkdir()
+
+        def fake(key, model_dir, cb, cancel):
+            cb(50, 100)
+            cb(100, 100)
+            p = Path(model_dir) / MC.model_name(key)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "model.bin").write_bytes(b"x")
+            return MC.DownloadResult(True, "ok")
+        d = ModelManagerDialog(md, self.win, downloader=fake)
+        self.assertEqual(d.rows["small"]["state"].text(), "未取得")
+        d._on_button("small")
+        self.assertTrue(pump(5, until=lambda: d.rows["small"]["state"].text() == "取得済み"))
+        self.assertFalse(d.rows["small"]["btn"].isEnabled())                 # 取得済みは押せない（灰色）
+        self.assertTrue(d.rows["base"]["btn"].isEnabled())
 
     def test_slot_exception_does_not_crash(self):
         w = self.win
@@ -277,29 +322,6 @@ class GuiSmokeTest(unittest.TestCase):
     def test_close_hides_not_quits_when_tray(self):
         # トレイが無い構成（use_tray=False）では通常どおり閉じる
         self.assertIsNone(self.win._tray)
-
-    def test_close_without_tray_asks_when_busy_and_quits_process(self):
-        """--no-tray（tray-tools から起こす形）: 窓を閉じるとプロセスが終わるので、録音中・清書中は確認する。
-        プロセスが終わること自体は main.py の setQuitOnLastWindowClosed(bool(no_tray))（ソースで確認）。"""
-        from PySide6.QtGui import QCloseEvent
-        main_src = (C.ROOT / "main.py").read_text(encoding="utf-8")
-        self.assertIn("app.setQuitOnLastWindowClosed(bool(no_tray))", main_src)
-        self.win._busy_messages = lambda: ["録音中です。"]
-        self.answer = QMessageBox.No
-        ev = QCloseEvent()
-        self.win.closeEvent(ev)
-        self.assertFalse(ev.isAccepted())          # 取り消された（閉じない）
-        self.assertIn("終了", self.asked)
-        self.answer = QMessageBox.Yes
-        ev2 = QCloseEvent()
-        self.win.closeEvent(ev2)
-        self.assertTrue(ev2.isAccepted())          # 了承すれば閉じる
-        self.win._busy_messages = lambda: []
-        self.asked.clear()
-        ev3 = QCloseEvent()
-        self.win.closeEvent(ev3)
-        self.assertTrue(ev3.isAccepted())
-        self.assertEqual(self.asked, [])           # 何も失わないときは確認しない
 
 
 class SingleInstanceTest(unittest.TestCase):

@@ -9,7 +9,46 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable
+
+
+def repo_id_for(name: str) -> str:
+    """モデル名 → Hugging Face のリポジトリ ID（'org/repo' ならそのまま。faster-whisper の短い名前は表から引く）。"""
+    if "/" in name:
+        return name
+    try:
+        from faster_whisper.utils import _MODELS
+        got = _MODELS.get(name)
+        if got:
+            return got
+    except Exception:
+        pass
+    return f"Systran/faster-whisper-{name}"
+
+
+def find_local_model(name: str, model_dir: Path) -> tuple[str, Path] | None:
+    """ネットに出ずに、取得済みのモデルを探す（load_model と is_downloaded が共有する規則）。
+
+    ① 手置き: model_dir/<name>/model.bin、または name 自体がフォルダパス → ("manual", フォルダ)
+    ② model_dir 内の取得済み HF キャッシュ（models--org--repo/snapshots/*/model.bin）→ ("cache", スナップショット)
+    どちらも無ければ None（読み込み時はこのあと③ダウンロードに進む）。"""
+    model_dir = Path(model_dir)
+    for cand in (model_dir / name, Path(name)):
+        try:
+            if (cand / "model.bin").exists():
+                return "manual", cand
+        except OSError:
+            continue
+    snap_root = model_dir / ("models--" + repo_id_for(name).replace("/", "--")) / "snapshots"
+    try:
+        if snap_root.is_dir():
+            for snap in sorted(snap_root.iterdir()):
+                if (snap / "model.bin").exists():
+                    return "cache", snap
+    except OSError:
+        pass
+    return None
 
 
 class ModelCache:

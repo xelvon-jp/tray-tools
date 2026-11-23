@@ -7,9 +7,10 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QPoint, QPointF, QR
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextCursor,
                            QTextFormat)
 from PySide6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QLayout, QListView, QPlainTextEdit,
-                               QPushButton, QSizePolicy, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+                               QPushButton, QSizePolicy, QStyle, QToolTip, QStyledItemDelegate, QStyleOptionViewItem,
                                QWidget)
 
+import meter_state as MS
 import ui_style as S
 from timeline import DRAFT, FINAL, PAUSE, SILENCE, WAVE, Row, _mmss
 
@@ -240,10 +241,21 @@ class CheckBox(QCheckBox):
 
 # ------------------------------------------------------------ メーター
 class MeterWidget(QWidget):
-    """横長の音量メーター。0..1 を緑→黄→赤で描く。"""
+    """横長の音量メーター。0..1 を緑→黄→赤で描く。
+
+    set_line() を呼ぶと「認識開始ライン」（アクセント色の細い縦線＋つまみ）を重ねて描く。ドラッグで動かせる
+    （動かしている間 lineDragged、離したとき lineReleased、ダブルクリックで lineReset）。
+    白い縦線は従来どおり「直近のピーク保持」の印で、ラインとは別物。"""
+
+    lineDragged = Signal(float)
+    lineReleased = Signal(float)
+    lineReset = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._line = None          # 認識開始ライン（dBFS）。None なら出さない
+        self._drag = False
+        self.setMouseTracking(True)
         self._v = 0.0
         self._hold = 0.0
         self._unrec = False
@@ -256,8 +268,82 @@ class MeterWidget(QWidget):
         on = bool(on)
         if on != self._unrec:
             self._unrec = on
-            self.setToolTip("録音されていません" if on else "")
+            self._update_tip()
             self.update()
+
+    # ---- 認識開始ライン
+    def set_line(self, db) -> None:
+        """ライン位置（dBFS）。None で非表示。ドラッグ中は外からの更新を無視する。"""
+        if self._drag:
+            return
+        v = None if db is None else MS.clamp_line_db(db)
+        if v != self._line:
+            self._line = v
+            self._update_tip()
+            self.update()
+
+    def _bar_geom(self):
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        return r, r.left() + 3, r.width() - 6
+
+    def _update_tip(self) -> None:
+        tips = []
+        if self._unrec:
+            tips.append("録音されていません")
+        if self._line is not None:
+            tips.append(f"認識開始ライン {self._line:.0f} dB（これより小さい音は認識しません。ドラッグで調整、"
+                        "ダブルクリックで既定に戻す）。白い線は直近のピークです")
+        self.setToolTip(chr(10).join(tips))
+
+    def _near_line(self, x: float) -> bool:
+        if self._line is None:
+            return False
+        _, left, w = self._bar_geom()
+        return abs(x - MS.line_db_to_x(self._line, left, w)) <= 9
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._near_line(ev.position().x()):
+            self._drag = True
+            self._move_to(ev.position().x())
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._drag:
+            self._move_to(ev.position().x())
+            ev.accept()
+            return
+        self.setCursor(Qt.SizeHorCursor if self._near_line(ev.position().x()) else Qt.ArrowCursor)
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag:
+            self._move_to(ev.position().x())
+            self._drag = False
+            QToolTip.hideText()
+            self.lineReleased.emit(float(self._line))
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if self._line is not None and self._near_line(ev.position().x()):
+            self._drag = False
+            self.lineReset.emit()
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+    def _move_to(self, x: float) -> None:
+        _, left, w = self._bar_geom()
+        v = MS.x_to_line_db(x, left, w)
+        if v != self._line:
+            self._line = v
+            self._update_tip()
+            self.update()
+            self.lineDragged.emit(v)
+        QToolTip.showText(self.mapToGlobal(QPoint(int(MS.line_db_to_x(v, left, w)), -22)), f"{v:.0f} dB", self)
 
     @property
     def unrecorded(self) -> bool:
@@ -293,6 +379,21 @@ class MeterWidget(QWidget):
         hx = r.left() + 3 + self._hold * (r.width() - 6)
         p.setPen(QPen(QColor(S.TEXT), 2))
         p.drawLine(int(hx), int(r.top() + 3), int(hx), int(r.bottom() - 3))
+        if self._line is not None:
+            lx = MS.line_db_to_x(self._line, r.left() + 3, r.width() - 6)
+            p.setPen(QPen(QColor(S.ACCENT_HI if self._drag else S.ACCENT), 2))
+            p.drawLine(int(lx), int(r.top() + 1), int(lx), int(r.bottom() - 1))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(S.ACCENT_HI if self._drag else S.ACCENT))
+            p.drawPolygon([QPointF(lx - 4, r.top()), QPointF(lx + 4, r.top()), QPointF(lx, r.top() + 4)])
+            if self._drag or self.underMouse():
+                f = QFont(S.FONT_FAMILY, max(7, S.BASE_PT - 2))
+                p.setFont(f)
+                txt = f"{self._line:.0f} dB"
+                tw = QFontMetrics(f).horizontalAdvance(txt)
+                tx = lx + 6 if lx + 6 + tw < r.right() else lx - 6 - tw
+                p.setPen(QColor(S.TEXT))
+                p.drawText(QRectF(tx, r.top(), tw + 2, r.height()), Qt.AlignVCenter | Qt.AlignLeft, txt)
         if self._unrec:
             # 色に頼らない目印: 右端に赤い印「● 未録音」（狭いときは「●」だけ）
             f = QFont(S.FONT_FAMILY, max(7, S.BASE_PT - 2))
@@ -449,7 +550,7 @@ class TimelineDelegate(QStyledItemDelegate):
         lab = QRect(rect.left() + self.PAD + 4, rect.top(), lw, rect.height())
         p.setFont(self.font_label)
         p.setPen(QColor(S.MUTED))
-        tag = {WAVE: "波形", DRAFT: "仮認識", FINAL: "清書"}[r.state]
+        tag = r.tag or {WAVE: "波形", DRAFT: "仮認識", FINAL: "清書"}[r.state]
         if self.compact:
             # コンパクト: 開始時刻だけ（状態は左の帯の色。録音中の行だけ赤い点）
             if r.live:
@@ -461,7 +562,7 @@ class TimelineDelegate(QStyledItemDelegate):
             p.setFont(f2)
             if r.live:
                 p.setPen(QColor(S.REC))
-                tag = "● 録音中"
+                tag = "● 認識中" if r.tag == "認識中" else "● 録音中"
             else:
                 p.setPen(col if r.state != FINAL else QColor("#cfd3da"))
             p.drawText(lab.adjusted(0, 0, 0, -8), Qt.AlignBottom | Qt.AlignLeft, tag)

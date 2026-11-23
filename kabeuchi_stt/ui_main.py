@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """メイン窓（PySide6）。画面の組み立てと操作。ロジックは各コアモジュールに任せる。
 
-スレッドの扱い: 清書キュー・逐次認識・ホットキーのコールバックは別スレッドから来るので、
+スレッドの扱い: 清書キュー・ホットキーのコールバックは別スレッドから来るので、
 Bridge の Signal 経由でメインスレッドへ渡す。全スロットは safe() で包み、例外で落とさない。
 """
 from __future__ import annotations
@@ -17,38 +17,37 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QMenu, QPlainTextEdit, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QSystemTrayIcon,
+                               QMessageBox, QMenu, QPlainTextEdit, QPushButton,
+                               QSlider, QSpinBox, QSystemTrayIcon,
                                QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
+import audio_compress as AC
+import models_catalog as MC
 import ui_icons as I
 import ui_style as S
+import ui_unified_logic as U
 from finalize_queue import CANCELLED, DONE, ERROR, PENDING, RUNNING, Job
 from geometry_util import clamp_geometry, parse_geometry
 from history import History, Record, snippet
 from meter_state import HoldLatch, meter_unrecorded
 from mic_check import Issue
-from paragraph import format_for_output
 from playback_devices import combo_entries
-from presets import build_prompt, load_presets, save_presets
+from presets import load_presets, save_presets
 from replacements import save_pairs, suggest_replacements
 from services import Services
-from settings import resolve_dir, save_settings
-from timeline import Timeline
-from ui_menu import COPIED_MESSAGE, MenuItem, SEP, history_menu, is_text_row, timeline_menu
-from ui_widgets import (AudioPlayer, CheckBox, ChipsWidget, ClickableText, ElidedLabel, MeterWidget,
-                        TimelineView, WrapBarLayout)
-from version import VERSION
+from settings import dialogue_config, resolve_dir, save_settings
+from ui_models import ModelManagerDialog, WavModelDialog, combo_value, fill_model_combo
+from ui_menu import COPIED_MESSAGE, MenuItem, SEP, history_menu, is_text_row
+from ui_widgets import AudioPlayer, CheckBox, ChipsWidget, ClickableText, ElidedLabel, MeterWidget, WrapBarLayout
+from version import APP_NAME, VERSION
 from viewer_core import block_for_time, seek_time_for_block, viewer_segments
 
 log = logging.getLogger("kabeuchi")
 
-NORMAL_DEFAULT = (1320, 820)
-COMPACT_DEFAULT = (420, 300)
-SIDE_PANEL_MIN_WINDOW_W = 780   # この幅より狭い通常表示では、右パネルを自動で隠す
-IDLE_BAND_SEC = 20              # 「録音していません」の帯を出しておく秒数
+MIN_FINALIZE_BYTES = 16000 * 2 * 1        # これ（約1秒ぶんの 16kHz 16bit モノラル）より小さい録音は、録音全体の清書を見送る
+IDLE_MONITOR_TIMEOUT_SEC = 300  # 操作が無いままこの秒数たったら、待機中のマイク確認を止める（設定画面には出さない固定値）
 
 
 def safe(fn):
@@ -81,7 +80,16 @@ class Bridge(QObject):
     job_event = Signal(object)
     status = Signal(str)
     hotkey = Signal(str)
-    mic_test = Signal(object)
+
+
+def wav_seconds(path) -> float:
+    """WAV の長さ（秒）。読めなければ 0。"""
+    try:
+        import wave
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 16000)
+    except Exception:
+        return 0.0
 
 
 def _pill(bg: str, fg: str, bold: bool = True) -> str:
@@ -90,25 +98,48 @@ def _pill(bg: str, fg: str, bold: bool = True) -> str:
 
 
 class SettingsDialog(QDialog):
+    """設定ダイアログ。共通／録音と清書／AI対話の3タブ。"""
+
     def __init__(self, settings: dict, devices: list[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle("設定")
         self.setMinimumWidth(560)
-        f = QFormLayout(self)
-        f.setLabelAlignment(Qt.AlignRight)
+        self.setting_tabs = QTabWidget()
+
+        def _page(title: str, desc: str):
+            pg = QWidget()
+            lay = QVBoxLayout(pg)
+            d = QLabel(desc)
+            d.setWordWrap(True)
+            d.setStyleSheet(f"color: {S.MUTED}; font-size: 9pt;")
+            lay.addWidget(d)
+            form = QFormLayout()
+            form.setLabelAlignment(Qt.AlignRight)
+            lay.addLayout(form)
+            lay.addStretch(1)
+            self.setting_tabs.addTab(pg, title)
+            return form
+
+        f_common = _page("共通", "共通: 画面・マイク・認識モデルの設定")
+        f_wall = _page("録音と清書", "録音と清書: セッションを終えたあとの、録音全体の清書と履歴・ホットキーの設定")
+        f = _page("AI対話", "AI対話: 話しながら、AIアプリの入力欄へ届ける使い方の設定")
         self.size_combo = QComboBox()
         for key, label in S.SIZE_LABELS.items():
             self.size_combo.addItem(label, key)
         cur_size = str(settings.get("display_size", S.DEFAULT_SIZE))
         self.size_combo.setCurrentIndex(max(0, self.size_combo.findData(cur_size)))
+        self.size_combo.setToolTip("文字とボタンの大きさ。保存するとすぐ変わります")
+        self.model_dir = resolve_dir(settings.get("model_dir", "models"))
         self.final_model = QComboBox()
-        self.final_model.setEditable(True)
-        self.final_model.addItems(["base", "small", "medium", "large-v3"])
-        self.final_model.setCurrentText(str(settings.get("final_model", "small")))
-        self.live_model = QComboBox()
-        self.live_model.setEditable(True)
-        self.live_model.addItems(["tiny", "base", "small"])
-        self.live_model.setCurrentText(str(settings.get("live_model", "base")))
+        fill_model_combo(self.final_model, self.model_dir, str(settings.get("final_model", "small")), "final")
+        self.final_model.setToolTip("セッションを終えたあと、録音全体を文字にして履歴に保存するときの認識モデル（WAV を選んで清書するときの既定も"
+                                    "これです）。大きいほど正確ですが、時間がかかります")
+        self.finalize_on_end = QComboBox()
+        self.finalize_on_end.addItem("する（右の清書モデルで、録音全体を丁寧に認識し直す）", True)
+        self.finalize_on_end.addItem("しない（発話ごとの結果をそのまま履歴に保存）", False)
+        self.finalize_on_end.setCurrentIndex(0 if bool(settings.get("finalize_on_end", True)) else 1)
+        self.finalize_on_end.setToolTip("する: 録音を止めたあと、録音全体を「録音全体の清書モデル」で認識し直して履歴に保存します（次の録音が始まるまで待ち、"
+                                        "録音中は始めません）。しない: 再認識せず、喋っている間に出た発話ごとの結果を、そのまま履歴の1件にします（待ち時間なし）")
         self.device = QComboBox()
         self.device.addItem("既定のマイク", None)
         cur = settings.get("input_device")
@@ -116,33 +147,73 @@ class SettingsDialog(QDialog):
             self.device.addItem(f"{d['index']}: {d['name']} [{d['hostapi']}]", d["index"])
             if cur is not None and (cur == d["index"] or str(cur).lower() in d["name"].lower()):
                 self.device.setCurrentIndex(self.device.count() - 1)
-        self.silence = QSpinBox()
-        self.silence.setRange(0, 7200)
-        self.silence.setSuffix(" 秒（0=無効）")
-        self.silence.setValue(int(settings.get("silence_stop_sec", 180)))
+        self.idle_stop = QSpinBox()
+        self.idle_stop.setRange(0, 7200)
+        self.idle_stop.setSuffix(" 秒（0=無効）")
+        self.idle_stop.setValue(int(dialogue_config(settings).get("idle_stop_sec", 180)))
+        self.idle_stop.setToolTip("喋りが入らないまま、この秒数がたつとセッションを自動で終えます（次のセッションから）")
         self.hk_rec = QLineEdit(str(settings.get("hotkey_record", "")))
         self.hk_rec.setPlaceholderText("例 Ctrl+Alt+F9（空=未割り当て）")
         self.hk_pause = QLineEdit(str(settings.get("hotkey_pause", "")))
         self.hk_pause.setPlaceholderText("例 Ctrl+Alt+F8（空=未割り当て）")
         self.hk_show = QLineEdit(str(settings.get("hotkey_show", "")))
         self.hk_show.setPlaceholderText("例 Ctrl+Alt+F10（空=未割り当て）")
-        self.auto_copy = CheckBox("清書が終わったらクリップボードへ全文をコピー")
-        self.auto_copy.setChecked(bool(settings.get("auto_copy", True)))
-        # 待機中のマイク監視
+        dcfg = dialogue_config(settings)
+        self.dlg_model = QComboBox()
+        # カタログ外のモデル名（設定ファイルに手で書いたもの）も、末尾に足してそのまま残す
+        fill_model_combo(self.dlg_model, self.model_dir, str(dcfg.get("model") or "small"), "dialogue")
+        self.dlg_model.setToolTip("AI対話で、話を区切るたびに文字にする認識モデル。大きいほど正確ですが、下書きに出るまで時間がかかります"
+                                  "（効くのは次のセッションから）")
+        self.dlg_headset = CheckBox("ヘッドセットのボタンで確定する")
+        self.dlg_headset.setChecked(bool(dcfg["headset_button"]))
+        self.dlg_headset_note = QLabel("セッション中だけ、ヘッドセットのボタンを USB から直接読み取り（読み取り専用）、"
+                                       "再生/一時停止ボタンも独占します。独占できないときは動画・音楽の再生/一時停止も"
+                                       "同時に反応する場合があります。独占中は動画・音楽の再生操作が効かなくなります。"
+                                       "検出方式は settings.json の dialogue.headset_mode（auto/hid/hotkey）")
+        self.dlg_headset_note.setWordWrap(True)
+        self.dlg_headset_note.setStyleSheet(f"color: {S.MUTED};")
+        self.dlg_mouse_label = QLabel("マウスで確定（次回から）")
+        self.dlg_mouse = QComboBox()
+        for label, key in (("なし", ""), ("戻るボタン（サイドボタン）", "back"), ("進むボタン（サイドボタン）", "forward")):
+            self.dlg_mouse.addItem(label, key)
+        self.dlg_mouse.setCurrentIndex(max(0, self.dlg_mouse.findData(str(dcfg.get("mouse_button") or ""))))
+        self.dlg_mouse.setToolTip("（効くのは次のセッションから）セッション中だけ、マウスのサイドボタンを押したら確定します。そのボタンは他のアプリへ"
+                                  "渡しません（ブラウザの戻る／進むも効きません）。効くのは次のセッションから。"
+                                  "会社の PC ではセキュリティソフトに警告されることがあります")
+        self.dlg_click = CheckBox("舌打ち2回で確定（実験・次回から）")
+        self.dlg_click.setChecked(bool(dcfg.get("click_commit")))
+        self.dlg_click.setToolTip("（効くのは次のセッションから・実験機能）セッション中だけ、マイクの音で「舌打ちを2回続けて」（0.2〜0.7秒間隔）鳴らしたことを"
+                                  "検出して、確定して届けます。前後0.3秒が静かなときだけ反応するので、静かな場所向けです。1回だけ・3回以上・"
+                                  "会話の中の音では動きません（誤動作や取りこぼしが起こりえます）。追加ソフト・特別な権限は要りません")
+        self.hk_dialogue = QLineEdit(str(settings.get("hotkey_dialogue_commit", "")))
+        self.hk_dialogue.setPlaceholderText("例 Ctrl+Alt+F7（空=未割り当て）")
+        self.dlg_nl = CheckBox("句点で改行する（文中の「。」「？」「！」の直後に改行。話を区切った所は空行）")
+        self.dlg_nl.setChecked(bool(dcfg["newline_after_sentence"]))
+        self.dlg_utt_gap = QDoubleSpinBox()
+        self.dlg_utt_gap.setRange(0.3, 10.0)
+        self.dlg_utt_gap.setSingleStep(0.1)
+        self.dlg_utt_gap.setDecimals(1)
+        self.dlg_utt_gap.setSuffix(" 秒の無音で区切る")
+        self.dlg_utt_gap.setValue(float(dcfg["utterance_gap_sec"]))
+        self.dlg_existing = QComboBox()
+        for key, label in (("append", "追記（書きかけの後ろへ足す）"), ("overwrite", "上書き"), ("abort", "中止（未配達にする）")):
+            self.dlg_existing.addItem(label, key)
+        self.dlg_existing.setCurrentIndex(max(0, self.dlg_existing.findData(str(dcfg["existing_text"]))))
+        self.compress = QComboBox()
+        for key in AC.MODES:
+            self.compress.addItem(AC.MODE_LABELS[key], key)
+        self.compress.setCurrentIndex(max(0, self.compress.findData(AC.normalize_mode(settings.get("audio_compress")))))
+        self.compress_kbps = QSpinBox()
+        self.compress_kbps.setRange(6, 256)
+        self.compress_kbps.setSuffix(" kbps（モノラル）")
+        self.compress_kbps.setValue(AC.kbps_of(settings))
+        self.compress.currentIndexChanged.connect(lambda _i: self._compress_changed())
+        # 待機中のマイク確認（窓が見えている間だけ。保存・認識はしない）
         self.idle_monitor = CheckBox("待機中もマイクを確認する（窓が見えている間だけ。保存・認識はしない）")
         self.idle_monitor.setChecked(bool(settings.get("idle_monitor", True)))
-        self.idle_timeout = QSpinBox()
-        self.idle_timeout.setRange(0, 86400)
-        self.idle_timeout.setSuffix(" 秒（0=閉じない）")
-        self.idle_timeout.setValue(int(settings.get("idle_monitor_timeout_sec", 300)))
-        self.idle_prompt = CheckBox("録音していないのに話しているとき「録音していません」を出す")
-        self.idle_prompt.setChecked(bool(settings.get("idle_prompt_enabled", True)))
-        self.idle_cooldown = QSpinBox()
-        self.idle_cooldown.setRange(5, 3600)
-        self.idle_cooldown.setSuffix(" 秒")
-        self.idle_cooldown.setValue(int(settings.get("idle_prompt_cooldown_sec", 60)))
+        self.idle_monitor.setToolTip("録音していないときも、音量メーターとマイクの状態の表示を動かします。録音も文字起こしもしません")
         # 清書の改行
-        self.para_on = CheckBox("清書の出力をすき間の長さで改行する（txt / md / クリップボード）")
+        self.para_on = CheckBox("清書の出力をすき間の長さで改行する（txt / md と、AI対話の下書き）")
         self.para_on.setChecked(bool(settings.get("paragraph_enabled", True)))
         self.para_gap = QDoubleSpinBox()
         self.para_gap.setRange(0.5, 30.0)
@@ -160,49 +231,120 @@ class SettingsDialog(QDialog):
                       "Ctrl / Alt / Shift / Win のどれかを含める必要があります。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {S.MUTED};")
-        f.addRow("表示サイズ", self.size_combo)
-        f.addRow("清書モデル", self.final_model)
-        f.addRow("逐次認識モデル", self.live_model)
-        f.addRow("マイク", self.device)
-        f.addRow("無音で自動停止", self.silence)
-        f.addRow("", self.idle_monitor)
-        f.addRow("モニターを閉じるまで", self.idle_timeout)
-        f.addRow("", self.idle_prompt)
-        f.addRow("指摘の間隔", self.idle_cooldown)
-        f.addRow("", self.para_on)
-        f.addRow("改行（句点のあと）", self.para_gap)
-        f.addRow("改行（必ず）", self.para_force)
-        f.addRow("ホットキー: 録音の開始/停止", self.hk_rec)
-        f.addRow("ホットキー: 一時停止/再開", self.hk_pause)
-        f.addRow("ホットキー: 窓の表示/非表示", self.hk_show)
-        f.addRow("", self.auto_copy)
-        f.addRow(note)
+        f_common.addRow("表示サイズ", self.size_combo)
+        f_common.addRow("マイク", self.device)
+        f_common.addRow("", self.idle_monitor)
+        f_common.addRow("録音の圧縮（清書のあと）", self.compress)
+        f_common.addRow("圧縮の音質", self.compress_kbps)
+        self.btn_models = QPushButton("モデルの取得・管理…")
+        self.btn_models.setToolTip("認識モデルを取得（ダウンロード）します。押したときだけ通信します")
+        self.btn_models.clicked.connect(self.open_model_manager)
+        f_common.addRow("認識モデル", self.btn_models)
+        f_wall.addRow("録音全体の清書", self.finalize_on_end)
+        f_wall.addRow("録音全体の清書モデル", self.final_model)
+        self.final_model.setEnabled(bool(self.finalize_on_end.currentData()))
+        self.finalize_on_end.currentIndexChanged.connect(
+            lambda _i: self.final_model.setEnabled(bool(self.finalize_on_end.currentData())))
+        f_wall.addRow("無音で自動終了", self.idle_stop)
+        f_wall.addRow("", self.para_on)
+        f_wall.addRow("改行（句点のあと）", self.para_gap)
+        f_wall.addRow("改行（必ず）", self.para_force)
+        f_wall.addRow("ホットキー: 録音の開始/停止", self.hk_rec)
+        f_wall.addRow("ホットキー: 保留/再開", self.hk_pause)
+        f_wall.addRow("ホットキー: 窓の表示/非表示", self.hk_show)
+        f_wall.addRow(note)
+        f.addRow("AI対話の認識モデル", self.dlg_model)
+        f.addRow("", self.dlg_headset)
+        f.addRow("", self.dlg_headset_note)
+        hk_row = QHBoxLayout()           # 高さを増やさないよう、確定ホットキーと同じ行に置く
+        hk_row.setContentsMargins(0, 0, 0, 0)
+        hk_row.addWidget(self.hk_dialogue, 1)
+        hk_row.addWidget(self.dlg_mouse_label)
+        hk_row.addWidget(self.dlg_mouse)
+        hk_row.addWidget(self.dlg_click)
+        f.addRow("ホットキー: 確定", hk_row)
+        f.addRow("", self.dlg_nl)
+        f.addRow("発話の区切り", self.dlg_utt_gap)
+        f.addRow("入力欄に書きかけ", self.dlg_existing)
+        dnote = QLabel("区切り・認識モデルの設定は、次のセッションから効きます。確定ホットキーは保存すると登録し直します。"
+                       "確定は必ず操作（ボタン・ヘッドセット・ショートカット）で行います。無音で自動確定する機能はありません。"
+                       "送信まで行うかどうかは、メイン画面の宛先の右の［送信までする］で選びます。")
+        dnote.setWordWrap(True)
+        dnote.setStyleSheet(f"color: {S.MUTED};")
+        f.addRow(dnote)
+        self._compress_changed()
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("保存")
         bb.button(QDialogButtonBox.Cancel).setText("キャンセル")
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        f.addRow(bb)
+        root = QVBoxLayout(self)
+        root.addWidget(self.setting_tabs)
+        self.model_warn = QLabel("")
+        self.model_warn.setWordWrap(True)
+        self.model_warn.setStyleSheet("color: #B45309;")
+        root.addWidget(self.model_warn)
+        root.addWidget(bb)
+        self.final_model.currentIndexChanged.connect(lambda _i: self._update_model_warn())
+        self.dlg_model.currentIndexChanged.connect(lambda _i: self._update_model_warn())
+        self._update_model_warn()
+
+    def missing_models(self) -> list[str]:
+        """選んでいる録音全体の清書モデル・AI対話モデルのうち、まだ取得していないもの（保存は止めない）。"""
+        out = []
+        for cb in (self.final_model, self.dlg_model):
+            m = combo_value(cb, "small")
+            if not MC.is_downloaded(m, self.model_dir) and m not in out:
+                out.append(m)
+        return out
+
+    def _update_model_warn(self) -> None:
+        miss = self.missing_models()
+        self.model_warn.setText(
+            f"このモデルはまだ取得していません（{', '.join(miss)}）。［モデルの取得・管理…］で取得してください" if miss else "")
+
+    def open_model_manager(self) -> None:
+        dlg = ModelManagerDialog(self.model_dir, self)
+        dlg.exec()
+        for cb in (self.final_model, self.dlg_model):    # 取得状況の表示を更新（選択は保つ）
+            fill_model_combo(cb, self.model_dir, combo_value(cb, "small"), "final" if cb is self.final_model else "dialogue")
+        self._update_model_warn()
+
+    def _compress_changed(self) -> None:
+        self.compress_kbps.setEnabled(self.compress.currentData() != "off")
+
+    def dialogue_values(self) -> dict:
+        """dialogue 節へ入れるキーだけ（ほかのキーは触らない。send_after_deliver はメイン画面の［送信までする］が持つ）。"""
+        return {
+            "model": combo_value(self.dlg_model, "small"),
+            "headset_button": self.dlg_headset.isChecked(),
+            "mouse_button": self.dlg_mouse.currentData() or "",
+            "click_commit": self.dlg_click.isChecked(),
+            "idle_stop_sec": self.idle_stop.value(),
+            "newline_after_sentence": self.dlg_nl.isChecked(),
+            "break_blank_line": self.dlg_nl.isChecked(),
+            "utterance_gap_sec": self.dlg_utt_gap.value(),
+            "existing_text": self.dlg_existing.currentData(),
+        }
 
     def values(self) -> dict:
         gap, force = self.para_gap.value(), self.para_force.value()
         return {
             "display_size": self.size_combo.currentData(),
-            "final_model": self.final_model.currentText().strip() or "small",
-            "live_model": self.live_model.currentText().strip() or "base",
+            "final_model": combo_value(self.final_model, "small"),
+            "finalize_on_end": bool(self.finalize_on_end.currentData()),
             "input_device": self.device.currentData(),
-            "silence_stop_sec": self.silence.value(),
             "idle_monitor": self.idle_monitor.isChecked(),
-            "idle_monitor_timeout_sec": self.idle_timeout.value(),
-            "idle_prompt_enabled": self.idle_prompt.isChecked(),
-            "idle_prompt_cooldown_sec": self.idle_cooldown.value(),
             "paragraph_enabled": self.para_on.isChecked(),
             "paragraph_gap_sec": gap,
             "paragraph_force_gap_sec": max(gap, force),
             "hotkey_record": self.hk_rec.text().strip(),
             "hotkey_pause": self.hk_pause.text().strip(),
             "hotkey_show": self.hk_show.text().strip(),
-            "auto_copy": self.auto_copy.isChecked(),
+            "audio_compress": self.compress.currentData(),
+            "audio_compress_kbps": self.compress_kbps.value(),
+            "hotkey_dialogue_commit": self.hk_dialogue.text().strip(),
+            "dialogue_opts": self.dialogue_values(),            # open_settings が dialogue 節の該当キーだけ差し替える
         }
 
 
@@ -248,7 +390,7 @@ class MainWindow(QMainWindow):
         self.svc, self.bridge = svc, bridge
         self.settings_path = settings_path  # None=既定の settings.json
         self.s = svc.settings
-        self.setWindowTitle(f"壁打ち文字起こし  v{VERSION}")
+        self.setWindowTitle(f"{APP_NAME}  v{VERSION}")
         self.setWindowIcon(S.make_icon())
         self.setMinimumSize(380, 220)
         self._quitting = False
@@ -256,21 +398,21 @@ class MainWindow(QMainWindow):
         self._current_rec: Record | None = None
         self._edit_dirty = False
         self._loading_editor = False
-        self._mic_test_info = ""
-        self._mic_test_until = 0.0      # マイクテストの結果を、この時刻まで監視の表示で上書きしない
         self._issues: list[Issue] = []
         self._tick_n = 0
         self._tray: QSystemTrayIcon | None = None
         self.hotkey_mgr = None
-        self._compact = bool(self.s.get("compact_mode", False))
         self._pinned = bool(self.s.get("always_on_top", False))
         self._last_activity = time.monotonic()
-        self._idle_band_until = 0.0
         self._unrec_latch = HoldLatch(0.5)
-        self._menu_source = "timeline"
         self._menu_exec = lambda menu, pos: menu.exec(pos)   # テストでは差し替える（実画面にメニューを出さない）
         self._geo_ready = False
         self._geo_saved: dict[str, list] = {}
+        self.dialogue_ctl = None         # AI対話モード（常に有効）
+        self.dialogue_panel = None       # 対話パネル（統合 GUI の UnifiedPanel）
+        self.unified = None              # 統合 GUI（ui_unified.UnifiedView）
+        self._job_t0: dict[int, float] = {}   # 清書の仕事の番号 → 実行を始めたのを見た時刻（残り時間の見積もり用）
+        self._rec_ui_on = False          # トレイのメニュー・アイコンに出している「録音中」の状態
 
         if self._pinned:
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
@@ -290,15 +432,14 @@ class MainWindow(QMainWindow):
         self._geo_timer.setSingleShot(True)
         self._geo_timer.setInterval(700)
         self._geo_timer.timeout.connect(lambda: self._save_geometry())
-        self.timeline_view.set_timeline(self.svc.session.timeline)
+        self._ensure_dialogue()
+        self.svc.queue.set_gate(self._queue_gate_open)      # セッション中は、録音全体の清書を始めない
         self.reload_history()
         self._update_queue_ui()
-        self._apply_mode_widgets()
         if str(self.s.get("display_size", S.DEFAULT_SIZE)) != S.DISPLAY_SIZE:
             self.apply_display_size(str(self.s.get("display_size", S.DEFAULT_SIZE)))
         self._restore_geometry()
         self._geo_ready = True
-        self._apply_responsive()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -318,169 +459,27 @@ class MainWindow(QMainWindow):
 
     # =============================================================== 画面の組み立て
     def _build_ui(self, volume: float, device_provider=None, muted: bool = False) -> None:
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        self.tabs.addTab(self._build_main_tab(), "壁打ち")
-        self.tabs.addTab(self._build_history_tab(), "履歴・検索")
+        """画面は統合 GUI（UnifiedView）だけ。履歴・用語辞書・Copilot・清書キュー・再生などの部品はここで作って持ち、
+        見える場所（右の引き出し）へは Drawer が移し入れる。録音・履歴・辞書の処理はこの窓が受け持つ。"""
+        self.statusBar().showMessage("待機中")
+        self._build_recording_parts()
+        self._build_side_groups()
+        self._build_history_parts()
+        self.queue_group = self._build_queue_panel()
         self.player = AudioPlayer(self, volume=volume, provider=device_provider,
                                   selected_id=str(self.s.get("playback_device", "")), muted=muted)
-        self.statusBar().showMessage("待機中")
         self._fill_out_combo()
+        self._build_unified()
 
-    def _frame(self) -> QFrame:
-        f = QFrame()
-        f.setObjectName("bar")
-        f.setAttribute(Qt.WA_StyledBackground, True)
-        f.setStyleSheet(f"#bar {{ background: {S.PANEL}; border: 1px solid {S.BORDER}; border-radius: 10px; }}")
-        return f
-
-    def _time_style(self, pt: int) -> str:
-        return f"font-family: Consolas; font-size: {pt}pt; font-weight: bold; color: {S.TEXT};"
-
-    def _fit_time_label(self) -> None:
-        """00:00:00 が必ず収まる幅を、実際の描画フォントから決める（切れない・重ならない）。"""
-        lb = self.lbl_time
-        lb.setStyleSheet(self._time_style(S.TIME_PT_COMPACT if self._compact else S.TIME_PT))
-        lb.ensurePolished()
-        from PySide6.QtGui import QFontMetrics
-        fm = QFontMetrics(lb.font())
-        w = max(fm.horizontalAdvance("00:00:00"), fm.horizontalAdvance("88:88:88")) + 10
-        lb.setFixedWidth(w)
-        lb.setFixedHeight(fm.height() + 6)
-
-    def _build_main_tab(self) -> QWidget:
-        w = QWidget()
-        self.main_tab = w
-        root = QVBoxLayout(w)
-        self.main_root = root
-        root.setContentsMargins(10, 10, 10, 8)
-        root.setSpacing(8)
-
-        # --- 上段（幅が足りなければ折り返す。時間表示は固定幅で切れない）
-        top = self._frame()
-        self.top_bar = top
-        tl = WrapBarLayout(top, hspace=12, vspace=8)
-        tl.setContentsMargins(12, 10, 12, 10)
-        self.top_layout = tl
-        self.btn_rec = QPushButton("録音開始")
-        self.btn_rec.setObjectName("rec")
-        self.btn_rec.setCursor(Qt.PointingHandCursor)
-        self.btn_pause = QPushButton("一時停止")
-        self.btn_pause.setObjectName("pause")
-        self.btn_pause.setCursor(Qt.PointingHandCursor)
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.setToolTip("録音を一時停止 / 再開（同じ WAV に続けます。休止中は経過時間も止まります）")
-        self.lbl_time = QLabel("00:00:00")
+    def _build_recording_parts(self) -> None:
+        """録音まわりの部品。メーターは、録音していないのに話している状態（赤）の判定の入れ物として持つ（統合 GUI が値を読む）。
+        WAV清書・出力フォルダは ⚙ メニューにある。"""
         self.meter = MeterWidget()
-        self.badge = ElidedLabel("", pad=34)
-        self.badge.setMinimumHeight(30)
-        self.badge.setMaximumWidth(380)
-        self.btn_mictest = QPushButton("マイクテスト")
-        self.btn_wav = QPushButton("WAV清書")
-        self.btn_folder = QPushButton("フォルダ")
-        self.btn_settings = QPushButton("設定")
-        self.btn_compact = QPushButton("コンパクト")
-        self.btn_compact.setCheckable(True)     # コンパクト表示中は ON（アクセント色）
-        self.btn_pin = QPushButton("最前面")
-        self.btn_pin.setCheckable(True)
-        self.btn_pin.setChecked(self._pinned)
-        self._btn_mode = "label"   # "label"=アイコン+ラベル / "icon"=アイコンのみ（ツールチップ）
-        self._fit_time_label()
-        # 道具ボタンは 1 つのグループにして、幅が足りなければグループごと次の段へ（1 つだけ取り残されない）
-        tools = QWidget()
-        self.tools_group = tools
-        tg = WrapBarLayout(tools, hspace=8, vspace=6)
-        for b in (self.btn_mictest, self.btn_wav, self.btn_folder, self.btn_settings, self.btn_compact, self.btn_pin):
-            tg.add(b)
-        tl.add(self.btn_rec)
-        tl.add(self.btn_pause)
-        tl.add(self.lbl_time)
-        tl.add(self.meter, grow=True)
-        tl.add(self.badge)
-        tl.add(tools)
-        root.addWidget(top)
 
-        # 「録音していません（話しているようです）」の帯（待機中モニターが話し声を検出したとき）
-        band = QFrame()
-        band.setObjectName("idleBand")
-        band.setAttribute(Qt.WA_StyledBackground, True)
-        band.setStyleSheet(f"#idleBand {{ background: {S.WARN_BG}; border: 1px solid {S.ORANGE}; border-radius: 8px; }}"
-                           f" #idleBand QLabel {{ background: transparent; color: #ffd9a0; font-weight: bold; }}")
-        bl = WrapBarLayout(band, hspace=12, vspace=6)
-        bl.setContentsMargins(12, 7, 12, 7)
-        self.idle_label = ElidedLabel("録音していません（話しているようです）")
-        self.btn_idle_rec = QPushButton("録音開始")
-        self.btn_idle_rec.setObjectName("recSmall")
-        self.btn_idle_rec.setCursor(Qt.PointingHandCursor)
-        self.btn_idle_close = QPushButton()
-        self.btn_idle_close.setObjectName("ghostIcon")
-        self.btn_idle_close.setIcon(I.make_icon("close"))
-        self.btn_idle_close.setIconSize(QSize(14, 14))
-        self.btn_idle_close.setFixedSize(30, 28)
-        self.btn_idle_close.setToolTip("閉じる")
-        self._band_kind = "idle"
-        bl.add(self.idle_label, grow=True)
-        bl.add(self.btn_idle_rec)
-        bl.add(self.btn_idle_close)
-        band.setVisible(False)
-        self.idle_band = band
-        root.addWidget(band)
-
-        # マイクの指摘（具体的な対処つき）。録音は止めない
-        self.banner = QLabel("")
-        self.banner.setWordWrap(True)
-        self.banner.setTextFormat(Qt.RichText)
-        self.banner.setVisible(False)
-        self.banner.setContentsMargins(14, 8, 14, 8)
-        root.addWidget(self.banner)
-
-        opt = QWidget()
-        self.opt_row = opt
-        ol = WrapBarLayout(opt, hspace=14, vspace=4)
-        self.chk_live = CheckBox("逐次認識（録音中に仮の文字を出す）")
-        self.chk_live.setChecked(bool(self.s.get("live_enabled", True)))
-        self.chk_live.setToolTip("録音中でも切り替えられます（ON にするとその時点から仮の文字を出します。録音は止まりません）")
-        self.lbl_live_state = ElidedLabel("")
-        self.lbl_live_state.setStyleSheet(f"color: {S.MUTED};")
-        legend = QLabel(f'<span style="color:{S.TEAL}">■ 波形（未認識）</span>　'
-                        f'<span style="color:{S.ORANGE}">■ 仮認識</span>　'
-                        f'<span style="color:#ffffff">■ 清書済み</span>')
-        legend.setTextFormat(Qt.RichText)
-        ol.add(self.chk_live)
-        ol.add(self.lbl_live_state, grow=True)
-        ol.add(legend)
-        root.addWidget(opt)
-
-        # --- 中央: タイムライン | 右パネル
-        split = QSplitter(Qt.Horizontal)
-        self.split = split
-        self.timeline_view = TimelineView()
-        self.timeline_view.setMinimumWidth(220)
-        split.addWidget(self.timeline_view)
-        self.side_scroll = self._build_side_panel()
-        split.addWidget(self.side_scroll)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 0)
-        split.setSizes([860, 420])
-        split.setChildrenCollapsible(False)
-        root.addWidget(split, 1)
-
-        # --- 下段: 清書キュー（通常）／ 1行の要約（コンパクト）
-        self.queue_group = self._build_queue_panel()
-        root.addWidget(self.queue_group)
-        self.lbl_queue_compact = ElidedLabel("待機中（清書なし）")
-        self.lbl_queue_compact.setStyleSheet(f"color: {S.MUTED}; padding: 0 4px;")
-        root.addWidget(self.lbl_queue_compact)
-        return w
-
-    def _build_side_panel(self) -> QWidget:
-        host = QWidget()
-        lay = QVBoxLayout(host)
-        lay.setContentsMargins(0, 14, 8, 4)
-        lay.setSpacing(10)
-
+    def _build_side_groups(self) -> None:
         # 専門用語
         g = QGroupBox("専門用語（認識の手がかり）")
+        self.grp_hot = g
         gl = QVBoxLayout(g)
         self.chips = ChipsWidget()
         self.chips.set_words(self._hotwords_list())
@@ -493,10 +492,10 @@ class MainWindow(QMainWindow):
         gl.addLayout(row)
         gl.addWidget(self.chips)
         self.btn_hot_add = b
-        lay.addWidget(g)
 
         # 置換辞書
         g = QGroupBox("自動置換辞書（誤認識 → 正解）")
+        self.grp_dict = g
         gl = QVBoxLayout(g)
         self.tbl = QTableWidget(0, 2)
         self.tbl.setHorizontalHeaderLabels(["誤認識", "正解"])
@@ -510,24 +509,24 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_dict_add)
         row.addWidget(self.btn_dict_del)
         row.addStretch(1)
-        hint = QLabel("長い誤認識が優先・1回だけ適用。清書と仮認識の両方に効きます。")
+        hint = QLabel("長い誤認識が優先・1回だけ適用。清書に効きます。")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {S.MUTED}; font-size: {S.BASE_PT - 1}pt;")
         self.hint_dict = hint
         gl.addWidget(self.tbl)
         gl.addLayout(row)
         gl.addWidget(hint)
-        lay.addWidget(g)
         self._fill_dict_table()
 
-        # Copilot プリセット
-        g = QGroupBox("Copilot プロンプト（クリップボードへ送る）")
+        # 前置き（名前＋本文）
+        g = QGroupBox("前置き（メイン画面の［前置き ▾］から下書きの先頭へ入れられます）")
+        self.grp_preset = g
         gl = QVBoxLayout(g)
         self.cmb_preset = QComboBox()
         self.ed_pname = QLineEdit()
-        self.ed_pname.setPlaceholderText("プリセット名")
+        self.ed_pname.setPlaceholderText("前置きの名前")
         self.ed_prompt = QPlainTextEdit()
-        self.ed_prompt.setPlaceholderText("プロンプト本文")
+        self.ed_prompt.setPlaceholderText("前置きの本文")
         self.ed_prompt.setMinimumHeight(110)
         row = QHBoxLayout()
         self.btn_p_new = QPushButton("新規として追加")
@@ -536,42 +535,21 @@ class MainWindow(QMainWindow):
         self.btn_p_del.setObjectName("danger")
         for b in (self.btn_p_new, self.btn_p_save, self.btn_p_del):
             row.addWidget(b)
-        self.btn_send = QPushButton("プロンプト＋文字起こしをコピー")
-        self.btn_send.setObjectName("primary")
         gl.addWidget(self.cmb_preset)
         gl.addWidget(self.ed_pname)
         gl.addWidget(self.ed_prompt)
         gl.addLayout(row)
-        gl.addWidget(self.btn_send)
-        lay.addWidget(g)
-        lay.addStretch(1)
         self.presets = load_presets()
         self._fill_presets()
 
-        sc = QScrollArea()
-        sc.setWidgetResizable(True)
-        sc.setFrameShape(QFrame.NoFrame)
-        sc.setWidget(host)
-        sc.setMinimumWidth(360)
-        return sc
-
     def _build_queue_panel(self) -> QWidget:
-        g = QGroupBox("清書キュー")
+        """清書の状況（直近の清書の一覧と、実行中の中断）。進み具合・残り時間は、メイン画面の通知の行に出る。"""
+        g = QGroupBox("清書の状況")
         lay = QVBoxLayout(g)
         lay.setContentsMargins(10, 6, 10, 8)
-        row = WrapBarLayout(hspace=10, vspace=4)
-        self.lbl_queue = ElidedLabel("待機中（清書なし）")
-        self.prog = QProgressBar()
-        self.prog.setRange(0, 100)
-        self.prog.setValue(0)
-        self.prog.setMaximumWidth(360)
-        self.prog.setMinimumWidth(120)
-        self.btn_q_cancel = QPushButton("実行中を中断")
+        self.btn_q_cancel = QPushButton("実行中の清書を中断")
         self.btn_q_cancel.setEnabled(False)
-        row.add(self.lbl_queue, grow=True)
-        row.add(self.prog)
-        row.add(self.btn_q_cancel)
-        lay.addLayout(row)
+        lay.addWidget(self.btn_q_cancel)
         self.lst_queue = QListWidget()
         self.lst_queue.setFixedHeight(84)
         self.lst_queue.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -579,21 +557,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lst_queue)
         return g
 
-    def _build_history_tab(self) -> QWidget:
-        w = QWidget()
-        self.history_page = w
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(10, 10, 10, 8)
-        split = QSplitter(Qt.Horizontal)
-        split.setChildrenCollapsible(False)
-        lay.addWidget(split)
-        # 左: 検索＋一覧
-        left = QWidget()
-        left.setMinimumWidth(160)
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 6, 0)
+    def _build_history_parts(self) -> None:
+        """履歴（検索・一覧・閲覧・再生・修正）の部品。並べるのは引き出しの履歴タブ。"""
         self.ed_search = QLineEdit()
-        self.ed_search.setPlaceholderText("全文検索（空白区切りで AND）　例: 予算 自動化")
+        self.ed_search.setPlaceholderText("全文検索（空白区切りで AND）　例: 基地局 自動化")
         self.ed_search.setClearButtonEnabled(True)
         self.lst_hist = QListWidget()
         self.lst_hist.setSpacing(2)
@@ -601,15 +568,6 @@ class MainWindow(QMainWindow):
         self.lst_hist.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.lbl_hist_count = QLabel("")
         self.lbl_hist_count.setStyleSheet(f"color: {S.MUTED};")
-        ll.addWidget(self.ed_search)
-        ll.addWidget(self.lbl_hist_count)
-        ll.addWidget(self.lst_hist, 1)
-        split.addWidget(left)
-        # 右: 閲覧
-        right = QWidget()
-        right.setMinimumWidth(240)
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(6, 0, 0, 0)
         self.lbl_rec_meta = QLabel("左の一覧から録音を選ぶと、ここに清書が出ます。行をクリックするとその位置から音声を再生します。")
         self.lbl_rec_meta.setWordWrap(True)
         self.lbl_rec_meta.setStyleSheet(f"color: {S.MUTED};")
@@ -642,41 +600,22 @@ class MainWindow(QMainWindow):
         self.lbl_out_notice.setWordWrap(True)
         self.lbl_out_notice.setVisible(False)
         bw = QWidget()
+        self.hist_btn_row = bw       # 参照を持っておく（無いと、引き出しへ移す前にボタンごと消える）
         bl = WrapBarLayout(bw, hspace=8, vspace=6)
         self.btn_h_save = QPushButton("修正を保存")
         self.btn_h_save.setObjectName("primary")
         self.btn_h_revert = QPushButton("元の清書に戻す")
         self.btn_h_dict = QPushButton("直した語を辞書へ…")
         self.btn_h_redo = QPushButton("WAVから清書をやり直す")
-        self.btn_h_send = QPushButton("Copilot用にコピー")
         self.btn_h_del = QPushButton("削除（ごみ箱へ）")
         self.btn_h_del.setObjectName("danger")
-        for b in (self.btn_h_save, self.btn_h_revert, self.btn_h_dict, self.btn_h_redo, self.btn_h_send, self.btn_h_del):
+        for b in (self.btn_h_save, self.btn_h_revert, self.btn_h_dict, self.btn_h_redo, self.btn_h_del):
             bl.add(b)
-        rl.addWidget(self.lbl_rec_meta)
-        rl.addWidget(self.editor, 1)
-        rl.addWidget(pw)
-        rl.addWidget(self.lbl_out_notice)
-        rl.addWidget(bw)
-        split.addWidget(right)
-        split.setSizes([420, 860])
         self._set_viewer_enabled(False)
-        return w
 
     # =============================================================== 接続
     def _connect(self) -> None:
-        self.btn_rec.clicked.connect(lambda: self.toggle_record())
-        self.btn_pause.clicked.connect(lambda: self.toggle_pause())
-        self.btn_idle_rec.clicked.connect(lambda: self.start_from_idle_band())
-        self.btn_idle_close.clicked.connect(lambda: self.hide_idle_band())
-        self.btn_mictest.clicked.connect(lambda: self.start_mic_test())
-        self.btn_wav.clicked.connect(lambda: self.pick_wav())
-        self.btn_folder.clicked.connect(lambda: self.open_out())
-        self.btn_settings.clicked.connect(lambda: self.open_settings())
-        self.btn_compact.clicked.connect(lambda: self.set_compact(not self._compact))
-        self.btn_pin.toggled.connect(lambda v: self.set_always_on_top(bool(v)))
         self.btn_q_cancel.clicked.connect(lambda: self.cancel_current())
-        self.chk_live.toggled.connect(lambda v: self._set_live(v))
         # 専門用語
         self.btn_hot_add.clicked.connect(lambda: self.add_hotword())
         self.ed_hot.returnPressed.connect(lambda: self.add_hotword())
@@ -690,7 +629,6 @@ class MainWindow(QMainWindow):
         self.btn_p_new.clicked.connect(lambda: self.preset_new())
         self.btn_p_save.clicked.connect(lambda: self.preset_save())
         self.btn_p_del.clicked.connect(lambda: self.preset_delete())
-        self.btn_send.clicked.connect(lambda: self.send_main())
         # 履歴
         self.ed_search.textChanged.connect(lambda t: self._search_later())
         self._search_timer = QTimer(self)
@@ -700,7 +638,6 @@ class MainWindow(QMainWindow):
         self.lst_hist.currentItemChanged.connect(lambda cur, prev: self.history_selected(cur))
         self.editor.lineClicked.connect(lambda i: self.editor_line_clicked(i))
         self.editor.contextRequested.connect(lambda i, sel, pos: self._on_history_context(i, sel, pos))
-        self.timeline_view.contextRequested.connect(lambda i, pos: self._on_timeline_context(i, pos))
         self.editor.textChanged.connect(lambda: self._editor_changed())
         self.chk_click.toggled.connect(lambda v: setattr(self.editor, "click_enabled", v))
         self.btn_play.clicked.connect(lambda: self.player.toggle())
@@ -715,29 +652,25 @@ class MainWindow(QMainWindow):
         self.btn_h_revert.clicked.connect(lambda: self.revert_edit())
         self.btn_h_dict.clicked.connect(lambda: self.suggest_dict())
         self.btn_h_redo.clicked.connect(lambda: self.redo_final())
-        self.btn_h_send.clicked.connect(lambda: self.send_history())
         self.btn_h_del.clicked.connect(lambda: self.delete_record())
         # スレッド橋渡し
         self.bridge.job_event.connect(self._on_job_event)
         self.bridge.status.connect(lambda m: self.statusBar().showMessage(m, 10000))
         self.bridge.hotkey.connect(self._on_hotkey)
-        self.bridge.mic_test.connect(self._on_mic_test)
 
     def _build_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self._tray = QSystemTrayIcon(S.make_icon(), self)
-        self._tray.setToolTip(f"壁打ち文字起こし v{VERSION}")
+        self._tray.setToolTip(f"{APP_NAME} v{VERSION}")
         m = QMenu()
         self.act_toggle = QAction("画面を表示 / 隠す", m)
         self.act_toggle.triggered.connect(lambda: self.toggle_window())
         self.act_rec = QAction("録音を開始", m)
         self.act_rec.triggered.connect(lambda: self.toggle_record())
-        self.act_pause = QAction("一時停止", m)
+        self.act_pause = QAction("保留", m)
         self.act_pause.setEnabled(False)
         self.act_pause.triggered.connect(lambda: self.toggle_pause())
-        self.act_compact = QAction("コンパクト表示にする", m)
-        self.act_compact.triggered.connect(lambda: self.set_compact(not self._compact))
         a_dict = QAction("辞書・専門用語を開く", m)
         a_dict.triggered.connect(lambda: self.show_main(tab=0))
         a_hist = QAction("履歴・検索を開く", m)
@@ -746,7 +679,7 @@ class MainWindow(QMainWindow):
         a_set.triggered.connect(lambda: self.open_settings())
         a_quit = QAction("終了", m)
         a_quit.triggered.connect(lambda: self.quit_app())
-        for a in (self.act_toggle, self.act_rec, self.act_pause, self.act_compact, a_dict, a_hist, a_set):
+        for a in (self.act_toggle, self.act_rec, self.act_pause, a_dict, a_hist, a_set):
             m.addAction(a)
         m.addSeparator()
         m.addAction(a_quit)
@@ -772,9 +705,8 @@ class MainWindow(QMainWindow):
     def show_main(self, tab: int | None = None) -> None:
         """自分の窓を表示して前面へ（トレイ/ホットキー/2つ目の起動からの要求）。"""
         if tab is not None:
-            if self._compact:       # 履歴・辞書は通常表示でだけ
-                self.set_compact(False)
-            self.tabs.setCurrentIndex(tab)
+            from ui_drawer import TAB_HISTORY, TAB_TERMS
+            self.unified.set_drawer(True, tab=TAB_TERMS if tab == 0 else TAB_HISTORY)     # 辞書・専門用語 / 履歴・検索
         self._touch()
         self.showNormal()
         self.raise_()
@@ -803,8 +735,9 @@ class MainWindow(QMainWindow):
             out.append((g.x(), g.y(), g.width(), g.height()))
         return out
 
-    def _geo_key(self, compact: bool | None = None) -> str:
-        return "win_geometry_compact" if (self._compact if compact is None else compact) else "win_geometry_normal"
+    def _geo_key(self) -> str:
+        """位置とサイズは、引き出しの開閉ごとに別々に覚える。"""
+        return "win_geometry_unified_drawer" if self.unified.drawer_open else "win_geometry_unified"
 
     def _current_rect(self) -> tuple[int, int, int, int] | None:
         if self.isMinimized() or self.isFullScreen():
@@ -812,14 +745,14 @@ class MainWindow(QMainWindow):
         g = self.normalGeometry() if self.isMaximized() else self.geometry()
         return g.x(), g.y(), g.width(), g.height()
 
-    def _save_geometry(self, compact: bool | None = None) -> None:
+    def _save_geometry(self) -> None:
         """いまの位置とサイズを、現在のモード用に設定へ保存する（変わっていなければ書かない）。"""
         if not self._geo_ready:
             return
         r = self._current_rect()
         if r is None:
             return
-        key = self._geo_key(compact)
+        key = self._geo_key()
         if list(self.s.get(key) or []) != list(r):
             self.s[key] = list(r)
             self._save_settings()
@@ -831,7 +764,7 @@ class MainWindow(QMainWindow):
         if saved is not None:
             self.setGeometry(*clamp_geometry(saved, screens))
             return
-        w, h = COMPACT_DEFAULT if self._compact else NORMAL_DEFAULT
+        w, h = self._unified_default_size()
         if screens:
             w, h = min(w, screens[0][2]), min(h, screens[0][3])
         self.resize(w, h)
@@ -845,16 +778,6 @@ class MainWindow(QMainWindow):
         super().resizeEvent(ev)
         if getattr(self, "_geo_ready", False):
             self._geo_timer.start()
-            self._apply_responsive()
-
-    def _apply_responsive(self) -> None:
-        """通常表示で幅が狭いときは右パネルを隠す（タイムラインを読めるように）。"""
-        show = (not self._compact) and self.width() >= SIDE_PANEL_MIN_WINDOW_W
-        if self.side_scroll.isHidden() == show:
-            self.side_scroll.setVisible(show)
-
-    def _rec_texts(self) -> tuple[str, str]:
-        return ("録音", "停止") if self._compact else ("録音開始", "停止して清書")
 
     # ---- 表示サイズ（小/標準/大）。再起動せずに反映する
     def apply_display_size(self, name: str) -> None:
@@ -864,120 +787,20 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setStyleSheet(S.QSS)
             app.setFont(S.app_font())
-        self._fit_time_label()
-        self.timeline_view.refresh_fonts()
         self.editor.setStyleSheet(f"QPlainTextEdit {{ font-size: {S.BASE_PT + 1}pt; padding: 8px; }}")
         self.hint_dict.setStyleSheet(f"color: {S.MUTED}; font-size: {S.BASE_PT - 1}pt;")
         for w in self.findChildren(ElidedLabel):
             w._apply()
         for w in self.findChildren(QWidget):
             w.updateGeometry()
-        self._style_buttons()
-        self.top_layout.invalidate()
-        self.main_root.invalidate()
-
-    # ---- ボタンの見た目（アイコンはコード描画。2 案: label=アイコン+ラベル / icon=アイコンのみ）
-    def _style_btn(self, b: QPushButton, icon_name: str, label: str, tip: str, icon_only: bool) -> None:
-        name = "ghostIcon" if icon_only else "ghost"
-        if b.objectName() != name:
-            b.setObjectName(name)
-            b.style().unpolish(b)
-            b.style().polish(b)
-        b.setIcon(I.make_icon(icon_name))
-        b.setIconSize(QSize(16, 16))
-        b.setText("" if icon_only else label)
-        b.setToolTip(tip)
-        b.setCursor(Qt.PointingHandCursor)
-        if icon_only:
-            b.setFixedSize(36, 34)
-        else:
-            b.setMinimumSize(0, 0)
-            b.setMaximumSize(16777215, 16777215)
-
-    def apply_button_style(self, mode: str) -> None:
-        """上段の補助ボタンの見た目。label=アイコン+短いラベル / icon=アイコンのみ+ツールチップ。"""
-        self._btn_mode = "icon" if mode == "icon" else "label"
-        self._style_buttons()
-
-    def _style_buttons(self) -> None:
-        c = self._compact
-        io = self._btn_mode == "icon"
-        self._style_btn(self.btn_mictest, "mic", "マイクテスト", "マイクテスト（3秒）: 話しながら押すと、音量を診断します", io)
-        self._style_btn(self.btn_wav, "wave", "WAV清書", "WAV ファイルを選んで清書する", io)
-        self._style_btn(self.btn_folder, "folder", "フォルダ", "出力フォルダ（録音・文字起こし）を開く", io)
-        self._style_btn(self.btn_settings, "gear", "設定", "設定", io)
-        # コンパクトと最前面は、狭いコンパクト表示では常にアイコンのみ。トグル状態は ON のときアクセント色
-        self._style_btn(self.btn_compact, "expand" if c else "compact", "コンパクト",
-                        "通常表示に戻す" if c else "コンパクト表示（録音・時間・メーター・直近の行だけの小さな窓）", io or c)
-        self.btn_compact.blockSignals(True)
-        self.btn_compact.setChecked(c)
-        self.btn_compact.blockSignals(False)
-        self._style_btn(self.btn_pin, "pin", "最前面",
-                        "最前面を解除" if self.btn_pin.isChecked() else "他の窓より前に固定（前面化の強制はしません）", io or c)
-        self.top_layout.invalidate()
-        self.tools_group.updateGeometry()
-
-    def _apply_mode_widgets(self) -> None:
-        c = self._compact
-        for w in (self.btn_mictest, self.btn_wav, self.btn_folder, self.btn_settings, self.opt_row,
-                  self.queue_group):
-            w.setVisible(not c)
-        self.lbl_queue_compact.setVisible(c)
-        self.tabs.tabBar().setVisible(not c)
-        if c:
-            self.tabs.setCurrentIndex(0)
-        self.timeline_view.set_compact(c)
-        # QTabWidget の最小サイズは隠れているページも含めて決まる。コンパクトでは履歴ページを無視させて小さくできるようにする
-        self.history_page.setSizePolicy(QSizePolicy.Ignored if c else QSizePolicy.Preferred,
-                                        QSizePolicy.Ignored if c else QSizePolicy.Preferred)
-        self._refresh_band_texts()
-        self._style_buttons()
-        m = 6 if c else 10
-        self.main_root.setContentsMargins(m, m, m, 6 if c else 8)
-        self.main_root.setSpacing(5 if c else 8)
-        self.top_layout.setContentsMargins(8 if c else 12, 6 if c else 10, 8 if c else 12, 6 if c else 10)
-        self.btn_rec.setMinimumWidth(0 if c else 150)
-        self._fit_time_label()
-        self._set_recording_ui(self.svc.session.is_recording)
-        self._apply_responsive()
-        self._set_issues(self._issues)
-        if hasattr(self, "act_compact"):
-            self.act_compact.setText("通常表示にする" if c else "コンパクト表示にする")
-        self.top_layout.invalidate()
-
-    @safe
-    def set_compact(self, on: bool) -> None:
-        """通常 / コンパクトの切り替え。それぞれの位置とサイズを保存・復元する。"""
-        on = bool(on)
-        if on == self._compact:
-            return
-        self._save_geometry()                 # 今のモードの位置を保存してから切り替える
-        self._geo_ready = False
-        try:
-            keep = self.geometry()
-            self._compact = on
-            self.s["compact_mode"] = on
-            self._apply_mode_widgets()
-            saved = parse_geometry(self.s.get(self._geo_key()))
-            if saved is None:                  # 初めてのモード: いまの左上のまま、既定サイズ
-                dw, dh = COMPACT_DEFAULT if on else NORMAL_DEFAULT
-                saved = (keep.x(), keep.y(), dw, dh)
-            self.setGeometry(*clamp_geometry(saved, self._screens()))
-            self._apply_responsive()          # 新しい幅で右パネルの出し入れを決め直す
-        finally:
-            self._geo_ready = True
-        self._save_settings()
-        self._save_geometry()
+        self.unified.refit()
+        self._apply_unified_min()
 
     @safe
     def set_always_on_top(self, on: bool) -> None:
         """最前面のピン。フラグを変えるとウィンドウが作り直されるので、位置・状態を戻して show し直す。
         前面化の強制（SetForegroundWindow 等）はしない（アクティブ化せずに表示するだけ）。"""
         on = bool(on)
-        if self.btn_pin.isChecked() != on:
-            self.btn_pin.blockSignals(True)
-            self.btn_pin.setChecked(on)
-            self.btn_pin.blockSignals(False)
         self._pinned = on
         self.s["always_on_top"] = on
         self._save_settings()
@@ -1011,13 +834,6 @@ class MainWindow(QMainWindow):
                 self._hint_shown = True
                 self._notify("トレイに常駐しています", "終了はトレイアイコンの右クリック → 終了。")
             return
-        if self._tray is None and not self._quitting:
-            # --no-tray（tray-tools から起こした場合など）: 窓を閉じるとプロセスが終わる（main が
-            # setQuitOnLastWindowClosed(True) にしている）。録音中・清書中に誤って閉じて失わないよう確かめる。
-            msg = self._busy_messages()
-            if msg and self._question("終了", "\n".join(msg) + "\n\n窓を閉じると終了します。終了しますか？") != QMessageBox.Yes:
-                ev.ignore()
-                return
         self._save_geometry()
         self._geo_ready = False
         app = QApplication.instance()
@@ -1025,23 +841,19 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         super().closeEvent(ev)
 
-    def _busy_messages(self) -> list:
-        """終了すると失われるものの説明（録音中・清書が残っている）。無ければ空。"""
-        msg = []
-        if self.svc.session.is_recording:
-            msg.append("録音中です。止めて終了します（WAV は残ります）。")
-        if self.svc.queue.busy:
-            msg.append("清書が残っています。終了すると中断されます（あとで履歴から「WAVから清書」できます）。")
-        return msg
-
     @safe
     def quit_app(self) -> None:
         sess, q = self.svc.session, self.svc.queue
-        msg = self._busy_messages()
+        msg = []
+        if sess.is_recording:
+            msg.append("録音中です。止めて終了します（WAV は残ります）。")
+        if q.busy:
+            msg.append("清書が残っています。終了すると中断されます（あとで履歴から「WAVから清書」できます）。")
         if msg and self._question( "終了", "\n".join(msg) + "\n\n終了しますか？") != QMessageBox.Yes:
             return
         self._quitting = True
         self._save_geometry()
+        self._shutdown_dialogue()       # ヘッドセットの独占・ワーカーを止める（録音の停止より先に）
         try:
             sess.close()
         except Exception:
@@ -1056,250 +868,77 @@ class MainWindow(QMainWindow):
             self._tray.hide()
         QGuiApplication.quit()
 
-    # =============================================================== 録音
-    def _set_live(self, v: bool) -> None:
-        """逐次認識の ON/OFF。録音中なら、その場で切り替える（録音・WAV には触れない）。"""
-        self.s["live_enabled"] = bool(v)
-        sess = self.svc.session
-        if sess.is_recording:
-            try:
-                sess.set_live(bool(v))
-            except Exception:
-                log.exception("録音中の逐次認識の切替")
-                self.statusBar().showMessage("逐次認識を切り替えられませんでした（録音は続いています）", 8000)
-                return
-            self.lbl_live_state.setText("" if v else "逐次認識: OFF")
-            self.statusBar().showMessage("逐次認識を始めました（この時点から）" if v else "逐次認識を止めました（録音は続いています）", 6000)
-
+    # =============================================================== 録音（＝AI対話のセッション。録音ボタン1つ）
     def _set_recording_ui(self, on: bool) -> None:
-        idle_t, rec_t = self._rec_texts()
-        self.btn_rec.setObjectName("recStop" if on else "rec")
-        self.btn_rec.setText(rec_t if on else idle_t)
-        self.btn_rec.setIcon(I.make_icon("stop", fixed_color=S.REC) if on else I.make_icon("rec", fixed_color="#ffffff"))
-        self.btn_rec.setIconSize(QSize(14, 14))
-        self.btn_rec.style().unpolish(self.btn_rec)
-        self.btn_rec.style().polish(self.btn_rec)
-        self.btn_mictest.setEnabled(not on)
-        # 逐次認識のチェックは録音中でも切り替えられる（録音自体は止めない）
-        self.btn_pause.setEnabled(on)
-        self._set_paused_ui(on and self.svc.session.is_paused)
+        """録音の開始・停止に合わせる部品（トレイのメニューとアイコン）。録音ボタンは統合 GUI が自分で更新する。"""
+        self._rec_ui_on = bool(on)
+        self._set_paused_ui(self._dialogue_held())
         if self._tray is not None:
             self.act_rec.setText("録音を停止" if on else "録音を開始")
             self.act_pause.setEnabled(on)
             self._tray.setIcon(S.make_icon(on))
 
+    def _dialogue_held(self) -> bool:
+        c = self.dialogue_ctl
+        return bool(c is not None and c.active and c.snapshot().get("held"))
+
     def _set_paused_ui(self, paused: bool) -> None:
-        self.btn_pause.setObjectName("pauseOn" if paused else "pause")
-        self.btn_pause.setText("再開" if paused else "一時停止")
-        self.btn_pause.setIcon(I.make_icon("play", fixed_color=S.ORANGE) if paused else I.make_icon("pause"))
-        self.btn_pause.setIconSize(QSize(14, 14))
-        self.btn_pause.style().unpolish(self.btn_pause)
-        self.btn_pause.style().polish(self.btn_pause)
         if self._tray is not None:
-            self.act_pause.setText("再開" if paused else "一時停止")
+            self.act_pause.setText("保留を解除" if paused else "保留")
             if self.svc.session.is_recording:
-                self._tray.setToolTip(f"壁打ち文字起こし v{VERSION}" + ("（一時停止中）" if paused else "（録音中）"))
+                self._tray.setToolTip(f"{APP_NAME} v{VERSION}" + ("（保留中）" if paused else "（録音中）"))
             else:
-                self._tray.setToolTip(f"壁打ち文字起こし v{VERSION}")
+                self._tray.setToolTip(f"{APP_NAME} v{VERSION}")
 
     @safe
     def toggle_record(self) -> None:
-        if self.svc.session.is_recording:
-            self.stop_recording("停止")
-        else:
-            self.start_recording()
+        """録音ボタン・ホットキー・トレイ: 録音ボタンは1つ（セッション開始 ⇄ 終了）。"""
+        self.unified.rec_pressed()
 
     @safe
     def toggle_pause(self) -> None:
-        sess = self.svc.session
-        if not sess.is_recording:
-            return
-        paused = sess.toggle_pause()
-        self._set_paused_ui(bool(paused))
-        self.statusBar().showMessage("一時停止しました（再開すると同じ WAV に続きます）" if paused else "再開しました", 6000)
-        self._touch()
+        """保留（取り込みを止める）／保留を解除。"""
+        self.unified.pause_pressed()
 
-    def start_recording(self) -> None:
-        sess = self.svc.session
-        self.player.stop()
-        try:
-            wav = sess.start()
-        except Exception as e:
-            log.exception("録音開始に失敗")
-            self._warn( "録音を開始できません", f"{e}\n\nマイクの接続と、設定のマイク選択を確認してください。")
-            return
-        self.timeline_view.set_timeline(sess.timeline)
-        self._mic_test_info = ""
-        self.hide_idle_band()
-        self._touch()
-        self._set_recording_ui(True)
-        self.statusBar().showMessage(f"録音中: {wav.name}")
-
-    def stop_recording(self, why: str = "停止") -> None:
-        sess = self.svc.session
-        tl = sess.timeline
-        wav = sess.stop()
-        self._set_recording_ui(False)
-        self.lbl_live_state.setText("")
-        self._touch()
-        self._set_issues([])
-        if wav is None:
-            return
-        job = self.svc.queue.submit(Path(wav), timeline=tl)
-        self.statusBar().showMessage(f"{why}しました。清書キューに入れました: {Path(wav).name}")
-        self._update_queue_ui()
-
-    # ---- 「録音していません」の帯
-    def show_idle_band(self, kind: str = "idle") -> None:
-        """kind: "idle"=録音していません / "paused"=一時停止中です（話していますが録音されていません）。"""
-        self._band_kind = kind
-        self._refresh_band_texts()
-        self.idle_band.setVisible(True)
-        self._idle_band_until = time.monotonic() + IDLE_BAND_SEC
-
-    def _refresh_band_texts(self) -> None:
-        c = self._compact
-        if self._band_kind == "paused":
-            self.idle_label.setText("一時停止中です" if c else "一時停止中です（話していますが録音されていません）")
-            self.btn_idle_rec.setText("再開")
-            self.btn_idle_rec.setIcon(I.make_icon("play", fixed_color="#ffffff"))
-        else:
-            self.idle_label.setText("録音していません" if c else "録音していません（話しているようです）")
-            self.btn_idle_rec.setText("録音開始")
-            self.btn_idle_rec.setIcon(I.make_icon("rec", fixed_color="#ffffff"))
-        self.btn_idle_rec.setIconSize(QSize(12, 12))
-
-    @safe
-    def hide_idle_band(self) -> None:
-        self.idle_band.setVisible(False)
-        self._idle_band_until = 0.0
-
-    @safe
-    def start_from_idle_band(self) -> None:
-        kind = self._band_kind
-        self.hide_idle_band()
-        sess = self.svc.session
-        if kind == "paused":
-            if sess.is_recording and sess.is_paused:
-                self.toggle_pause()
-        elif not sess.is_recording:
-            self.start_recording()
+    def _sync_recording_ui(self) -> None:
+        """録音（セッション）の開始・終了・保留に、トレイのメニュー・アイコンを合わせる（変わったときだけ）。"""
+        on = bool(self.svc.session.is_recording)
+        held = self._dialogue_held() if on else False
+        key = (on, held)
+        if key != getattr(self, "_rec_ui_key", None):
+            self._rec_ui_key = key
+            self._set_recording_ui(on)
+            if on:
+                self.player.stop()
+                self._touch()
+            else:
+                self._set_issues([])
 
     # =============================================================== マイクの指摘
     def _set_issues(self, issues: list[Issue], recording: bool | None = None) -> None:
-        """バッジと帯を更新する。recording=None なら実際の状態から決める。
-        「監視中」= 録音中、または待機中モニターが入力を開いているとき。"""
-        sess = self.svc.session
+        """マイクの指摘を覚える（統合 GUI のマイク状態チップが読む）。"""
         self._issues = issues
-        parts = []
-        rec_now = sess.is_recording if recording is None else recording
-        monitoring = rec_now or sess.monitor_active
-        if monitoring:
-            if issues:
-                err = any(i.severity == "error" for i in issues)
-                self._set_badge("⚠ " + " / ".join(i.message for i in issues), _pill(S.REC if err else S.ORANGE, "#101010"))
-            elif (not rec_now) and sess.idle_monitor.stats() is None:
-                self._set_badge("◌ 確認中…", _pill(S.PANEL2, S.MUTED, bold=False))
-            else:
-                self._set_badge("● 入力OK", _pill("#1f3a2c", S.OKGREEN, bold=False))
-        elif sess.monitor_error:
-            self._set_badge("⚠ " + sess.monitor_error, _pill(S.PANEL2, "#ffcb7a", bold=False))
-        else:
-            self._set_badge(self._mic_test_badge(), self._mic_test_badge_style())
-        if self._mic_test_info and not rec_now:
-            parts.append(f'<span style="color:{S.MUTED}">{self._mic_test_info}</span>')
-        for i in issues:
-            col = "#ff9a9d" if i.severity == "error" else "#ffcb7a"
-            parts.append(f'<span style="color:{col}; font-weight:bold">⚠ {i.message}</span>　{i.advice}')
-        self.banner.setVisible(bool(parts) and not self._compact)
-        if parts:
-            any_err = any(i.severity == "error" for i in issues)
-            bg = S.ERR_BG if any_err else S.WARN_BG if issues else S.PANEL
-            style = f"background: {bg}; border-radius: 8px; border: 1px solid {S.BORDER};"
-            if self.banner.styleSheet() != style:
-                self.banner.setStyleSheet(style)
-            html = "<br>".join(parts)
-            if self.banner.text() != html:
-                self.banner.setText(html)
 
-    def _set_badge(self, text: str, style: str) -> None:
-        """バッジの文字と見た目。変わったときだけ更新する（毎回スタイルを入れ直すと再描画・再配置が走る）。"""
-        if self.badge.styleSheet() != style:
-            self.badge.setStyleSheet(style)
-        if self.badge.text() != text:
-            self.badge.setText(text)
-
-    def _mic_test_badge(self) -> str:
-        return getattr(self, "_mic_badge_text", "")
-
-    def _mic_test_badge_style(self) -> str:
-        return getattr(self, "_mic_badge_style", "")
-
-    @safe
-    def start_mic_test(self) -> None:
-        if self.svc.session.is_recording:
-            return
-        self.btn_mictest.setEnabled(False)
-        self.btn_mictest.setText("聞いています…" if self._btn_mode == "label" else "")
-        self.btn_mictest.setToolTip("聞いています…（話してください）")
-
-        def work():
-            try:
-                res = self.svc.session.mic_test()
-            except Exception as e:
-                res = e
-            self.bridge.mic_test.emit(res)
-        threading.Thread(target=work, name="kabeuchi-mictest", daemon=True).start()
-
-    @safe
-    def _on_mic_test(self, res) -> None:
-        self.btn_mictest.setEnabled(True)
-        self._style_buttons()
-        if isinstance(res, Exception):
-            self._mic_test_info = f"マイクテストできませんでした: {res}"
-            self._mic_badge_text = "⚠ マイクを開けません"
-            self._mic_badge_style = _pill(S.REC, "#101010")
-            self._set_issues([])
-            return
-        stats, issues = res
-        self.show_mic_test_result(stats, issues)
-
-    def show_mic_test_result(self, stats, issues) -> None:
-        self._mic_test_info = (f"マイクテスト: ピーク {stats.peak_dbfs:.0f} dBFS ／ 無音時の床 {stats.floor_dbfs:.0f} dBFS ／ "
-                               f"音割れ {stats.clip_ratio * 100:.2f}%")
-        self._mic_test_until = time.monotonic() + 8.0
-        if issues:
-            self._mic_badge_text = "⚠ " + " / ".join(i.message for i in issues)
-            err = any(i.severity == "error" for i in issues)
-            self._mic_badge_style = _pill(S.REC if err else S.ORANGE, "#101010")
-        else:
-            self._mic_badge_text = "● マイクOK"
-            self._mic_badge_style = _pill("#1f3a2c", S.OKGREEN, bold=False)
-        self._set_issues(issues)
-
-    # =============================================================== 待機中モニター
+    # =============================================================== 待機中のマイク確認
     def _monitor_wanted(self) -> bool:
         """窓が見えている間だけ。最小化・トレイ格納・一定時間操作なしでは閉じる。"""
         if not bool(self.s.get("idle_monitor", True)):
             return False
         if not self.isVisible() or self.isMinimized():
             return False
-        to = float(self.s.get("idle_monitor_timeout_sec", 300))
+        to = float(IDLE_MONITOR_TIMEOUT_SEC)
         if to > 0 and (time.monotonic() - self._last_activity) > to:
             return False
         return True
 
     def _refresh_mic_ui(self) -> None:
-        """待機中・一時停止中のマイク表示（バッジ・帯）を更新。マイクテストの直後は上書きしない。"""
+        """待機中・一時停止中のマイクの指摘を更新。"""
         sess = self.svc.session
-        if time.monotonic() < self._mic_test_until:
-            return
         if sess.is_recording and not sess.is_paused:
             return  # 録音中は録音の監視（_tick 内）が更新する
         if sess.monitor_active:
             if self.svc.session.hub.seconds_since_audio > 3.0:
-                self._issues = []
-                self._set_badge("⚠ 音が届いていません", _pill(S.REC, "#101010"))
+                self._issues = []       # 「音が届いていません」はチップが自分で判定して出す
                 return
             self._set_issues(sess.mic_issues())
         else:
@@ -1312,50 +951,26 @@ class MainWindow(QMainWindow):
         sess = self.svc.session
         rec = sess.rec
         now = time.monotonic()
-        active = self.isVisible() and not self.isMinimized()
         sess.request_monitor(self._monitor_wanted())
         if sess.is_recording and rec is not None:
-            paused = sess.is_paused
-            self.lbl_time.setText(fmt_hms(rec.elapsed))
             self.meter.set_level(sess.level)
             self._update_meter_unrecorded(now)
-            if paused:
-                self.lbl_live_state.setText(f"一時停止中 {fmt_dur(sess.paused_sec)}（録音は止まっています）")
+            if sess.is_paused:
                 if self._tick_n % 5 == 0:
                     self._refresh_mic_ui()
-                if self._tick_n % 3 == 0:
-                    kind = sess.poll_idle_prompt(active)      # 一時停止中に話し声 → 「一時停止中です」
-                    if kind:
-                        self.show_idle_band(kind)
             else:
-                if self._band_kind == "paused" and not self.idle_band.isHidden():
-                    self.hide_idle_band()        # 再開したら「一時停止中です」の帯は消す
-                if rec.seconds_since_audio > 2.0:
-                    self._set_badge("⚠ 音が届いていません", _pill(S.REC, "#101010"))
-                elif self._tick_n % 10 == 0:
+                if rec.seconds_since_audio <= 2.0 and self._tick_n % 10 == 0:
                     self._set_issues(sess.monitor.issues())
-                if sess.silence.should_stop():
-                    self.stop_recording("無音が続いたので自動停止")
-                    self._notify("自動停止しました", f"{int(self.s.get('silence_stop_sec', 180))}秒以上の無音が続いたため録音を止め、清書に回しました。")
-                live = sess.live
-                if live is not None:
-                    if live.error:
-                        self.lbl_live_state.setText("逐次認識は無効です（録音は継続）")
-                    else:
-                        self.lbl_live_state.setText(f"逐次認識: 処理済み {live.processed_segments}・待ち {live.pending_segments}")
+                # 無音が続いたときの自動終了は、AI対話のセッション側（dialogue.idle_stop_sec）が行う
         else:
-            self.meter.set_level(sess.level)  # 待機中モニターが開いていれば動く（閉じていれば 0）
+            self.meter.set_level(sess.level)  # 待機中のマイク確認が開いていれば動く（閉じていれば 0）
             self._update_meter_unrecorded(now)
-            if self._tick_n % 3 == 0:
-                kind = sess.poll_idle_prompt(active)
-                if kind:
-                    self.show_idle_band(kind)
             if self._tick_n % 5 == 0:
                 self._refresh_mic_ui()
-        if self._idle_band_until and now > self._idle_band_until:
-            self.hide_idle_band()
-        self.timeline_view.refresh()
+        self._sync_recording_ui()
+        self.unified.refresh()
         if self._tick_n % 3 == 0:
+            self.svc.queue.poke()          # セッションの開始・終了を、清書キューのゲートへ反映する
             self._update_queue_ui()
 
     def _update_meter_unrecorded(self, now: float) -> None:
@@ -1365,49 +980,20 @@ class MainWindow(QMainWindow):
                                 sess.speaking_now())
         self.meter.set_unrecorded(self._unrec_latch.update(now, cond))
 
-    # =============================================================== 右クリックメニュー（文字起こし部分）
-    def _timeline_rows(self) -> list:
-        return self.timeline_view._model._rows
-
-    def timeline_menu_items(self, idx: int, selection: str = "") -> list[MenuItem]:
-        return timeline_menu(self._timeline_rows(), idx, selection)
-
-    def _full_text_for_menu(self) -> str:
-        """現在の録音の全文。清書済みなら清書の出力と同じ整形（すき間の改行）、前なら見えている行を時刻順に連結。"""
-        tl = self.timeline_view._model._tl
-        rows = self._timeline_rows()
-        if tl is not None and tl.is_final and tl.final_segments():
-            return format_for_output(tl.final_segments(), self.s, tl.final_gaps())
-        from ui_menu import rows_text_from
-        return rows_text_from(rows, 0)
-
-    def _from_here_text(self, idx: int) -> str:
-        tl = self.timeline_view._model._tl
-        rows = self._timeline_rows()
-        if tl is not None and tl.is_final and tl.final_segments() and 0 <= idx < len(rows):
-            t0 = rows[idx].start
-            segs = tl.final_segments()
-            gaps = tl.final_gaps()
-            keep = [i for i, sg in enumerate(segs) if sg[0] >= t0 - 1e-6]
-            return format_for_output([segs[i] for i in keep], self.s,
-                                     None if gaps is None else [gaps[i] if i < len(gaps) else None for i in keep])
-        from ui_menu import rows_text_from
-        return rows_text_from(rows, idx)
-
+    # =============================================================== 右クリックメニュー（履歴の文字起こし部分）
     def _copy_text(self, text: str, key: str) -> None:
         QGuiApplication.clipboard().setText(text)
         self.statusBar().showMessage(COPIED_MESSAGE.get(key, "コピーしました"), 4000)
 
     def run_menu_item(self, item: MenuItem) -> None:
-        """メニュー項目を実行する（タイムライン・履歴の両方）。"""
+        """メニュー項目を実行する。"""
         k = item.key
         if k in ("copy_selection", "copy_part"):
             self._copy_text(item.payload, k)
         elif k == "copy_all":
-            self._copy_text(self._history_full_text() if self._menu_source == "history" else self._full_text_for_menu(), k)
+            self._copy_text(self._history_full_text(), k)
         elif k == "copy_from_here":
-            self._copy_text(self._history_from_here(item.index) if self._menu_source == "history"
-                            else self._from_here_text(item.index), k)
+            self._copy_text(self._history_from_here(item.index), k)
         elif k == "play_from":
             self.editor_line_clicked(item.index)
 
@@ -1433,12 +1019,6 @@ class MainWindow(QMainWindow):
         if chosen in actions:
             self.run_menu_item(actions[chosen])
 
-    @safe
-    def _on_timeline_context(self, idx: int, pos) -> None:
-        self._menu_source = "timeline"
-        sel = ""
-        self._show_menu(self.timeline_menu_items(idx, sel), pos)
-
     def _history_blocks(self) -> list[str]:
         return self.editor.toPlainText().split("\n")
 
@@ -1453,7 +1033,6 @@ class MainWindow(QMainWindow):
 
     @safe
     def _on_history_context(self, idx: int, selection: str, pos) -> None:
-        self._menu_source = "history"
         extra = []
         try:                                   # 編集用の標準項目（切り取り・貼り付け・元に戻す等）も下に残す
             extra = list(self.editor.createStandardContextMenu().actions())
@@ -1468,37 +1047,40 @@ class MainWindow(QMainWindow):
         if job.status == DONE and job.result is not None:
             r = job.result
             self._last_text = r.text
-            msg = "全文をクリップボードへコピーしました" if self.s.get("auto_copy", True) else "清書が終わりました"
-            if self.s.get("auto_copy", True):
-                QGuiApplication.clipboard().setText(r.text)
-            self._notify("清書が完了しました", f"{job.title}（{r.audio_seconds:.0f}秒の音声を{r.elapsed:.0f}秒で清書）\n{msg}")
-            self.statusBar().showMessage(f"清書完了: {job.title}　{msg}", 15000)
+            self._notify("清書が完了しました", f"{job.title}（{r.audio_seconds:.0f}秒の音声を{r.elapsed:.0f}秒で清書）\n履歴に保存しました")
+            self.statusBar().showMessage(f"清書完了: {job.title}　履歴に保存しました", 15000)
             self.reload_history(keep=job.history_id)
         elif job.status == ERROR:
             self._notify("清書できませんでした", f"{job.title}: {job.error.splitlines()[0] if job.error else ''}")
             self.statusBar().showMessage(f"清書エラー: {job.error.splitlines()[0] if job.error else ''}", 20000)
             log.error("清書エラー %s: %s", job.title, job.error)
 
+    def _queue_gate_open(self) -> bool:
+        """清書キューのゲート: セッション中（録音中）は閉じる。終わったら開く（待機中の清書が始まる）。"""
+        try:
+            return not self._dialogue_active()
+        except Exception:
+            return True
+
+    def progress_text(self) -> str:
+        """メイン画面の通知の行に出す「清書中 35%（あと約3分）」。清書も待機も無いときは空文字（何も出さない）。"""
+        q = self.svc.queue
+        cur, wait = q.current, q.waiting
+        if cur is None:
+            return U.finalize_progress_text(None, 0.0, wait, running=False, gated=q.gated)
+        t0 = self._job_t0.get(cur.id)
+        elapsed = (time.monotonic() - t0) if t0 is not None else 0.0
+        return U.finalize_progress_text(cur.progress, elapsed, wait, running=True)
+
     def _update_queue_ui(self) -> None:
         q = self.svc.queue
         cur = q.current
-        wait = q.waiting
         jobs = q.jobs[-6:][::-1]
-        if cur is not None:
-            text = f"清書中: {cur.title}（{int(cur.progress * 100)}%）　待機 {wait} 件"
-            self.lbl_queue.setText(text)
-            self.lbl_queue_compact.setText(f"清書中 {int(cur.progress * 100)}%　待機 {wait} 件")
-            self.prog.setValue(int(cur.progress * 100))
-        elif wait:
-            self.lbl_queue.setText(f"待機 {wait} 件")
-            self.lbl_queue_compact.setText(f"清書 待機 {wait} 件")
-            self.prog.setValue(0)
-        else:
-            done = next((j for j in jobs if j.status == DONE), None)
-            self.lbl_queue.setText("待機中（清書なし）")
-            self.lbl_queue_compact.setText(f"清書完了: {done.title}" if (done and jobs and jobs[0] is done)
-                                           else "清書: 待機中（なし）")
-            self.prog.setValue(0)
+        if cur is not None and cur.id not in self._job_t0:
+            self._job_t0[cur.id] = time.monotonic()
+        for k in list(self._job_t0):                     # 終わった仕事の控えは捨てる
+            if cur is None or k != cur.id:
+                del self._job_t0[k]
         self.btn_q_cancel.setEnabled(cur is not None)
         self.lst_queue.clear()
         for j in jobs:
@@ -1513,6 +1095,65 @@ class MainWindow(QMainWindow):
                 extra = "　" + j.message
             self.lst_queue.addItem(f"{icon}　{j.title}{extra}")
 
+    def on_session_stopped(self, report: dict) -> None:
+        """AI対話のセッションが終わった（統合 GUI から）。設定「録音全体の清書」が「する」なら、録音全体を清書して履歴に保存する仕事を
+        積む（清書キューは裏で動くが、セッション中は始めない。次のセッションをすぐ始めてよい）。「しない」なら、再認識せず、
+        セッション中の発話ごとの結果から履歴の1件を作る。録音ファイルが無い・短すぎるときは作らない。"""
+        raw = str((report or {}).get("wav") or "")
+        wav = Path(raw)
+        u = self.unified
+        if not bool(self.s.get("finalize_on_end", True)):
+            self._save_session_history(wav, 0)
+            return
+        if not raw or not wav.is_file() or wav.stat().st_size < MIN_FINALIZE_BYTES:
+            if u is not None:
+                u.notice("録音が短い（または見つからない）ので、録音全体の清書は見送りました", "muted")
+            return
+        try:
+            self.svc.queue.submit(wav, compress=True)
+        except RuntimeError:        # 終了処理中
+            return
+        self._update_queue_ui()
+        if u is not None:
+            u.notice("セッションを終えました。録音全体の清書は、次の録音が始まる前なら始めます（終わると履歴に残ります）", "accent")
+
+    def _save_session_history(self, wav: Path, tries: int) -> None:
+        """「しない」: セッション中の発話ごとの結果（時刻つき）から履歴の1件を作る。認識待ちが残っていれば、終わるのを少し待つ。
+        そのあと、WAV→Opus の圧縮（と無音カット）は軽い仕事として清書キューへ（ゲートに関係なく進む）。"""
+        from paragraph import plain_text
+        u = self.unified
+        c = self.dialogue_ctl
+        ds = c.ds if c is not None else None
+        if ds is None:
+            return
+        try:
+            pend = int(ds.pending_recognitions)
+        except Exception:
+            pend = 0
+        if pend > 0 and tries < 120:                  # 認識が終わるのを待つ（最大2分）。終わった分は全部入れる
+            QTimer.singleShot(1000, lambda: self._save_session_history(wav, tries + 1))
+            return
+        segs = [(float(a), float(b), str(t)) for a, b, t in ds.session_segments()]
+        text = plain_text(segs)
+        dur = wav_seconds(wav)
+        if dur <= 0 and segs:
+            dur = max(b for _a, b, _t in segs)
+        if not text.strip() or dur < 1.0 or not wav.is_file():
+            if u is not None:
+                u.notice("録音が短い（または文字がない）ので、履歴は作りませんでした", "muted")
+            return
+        name = str(dialogue_config(self.s).get("model") or "small")
+        hid = self.svc.history.add(text=text, segments=segs, duration=dur, model=f"{name}（発話ごと）", wav_path=wav)
+        if AC.normalize_mode(self.s.get("audio_compress")) != "off":
+            try:
+                self.svc.queue.submit(wav, history_id=hid, compress_only=True)
+            except RuntimeError:
+                pass
+        self.reload_history(keep=hid)
+        self._update_queue_ui()
+        if u is not None:
+            u.notice("セッションを終えました。発話ごとの結果を履歴に保存しました", "accent")
+
     @safe
     def cancel_current(self) -> None:
         cur = self.svc.queue.current
@@ -1522,10 +1163,25 @@ class MainWindow(QMainWindow):
     @safe
     def pick_wav(self) -> None:
         p = self._open_file("清書する WAV を選ぶ", str(resolve_dir(self.s.get("out_dir", "out"))),
-                            "WAV (*.wav);;すべて (*.*)")
-        if p:
-            self.svc.queue.submit(Path(p))
-            self.statusBar().showMessage(f"清書キューに入れました: {Path(p).name}")
+                            "音声 (*.wav *.opus *.ogg);;すべて (*.*)")
+        if not p:
+            return
+        model = self._ask_wav_model(Path(p))
+        if model is None:
+            return
+        default = str(self.s.get("final_model", "small"))
+        # 既定と違うモデルで清書したときは、txt/md を別名にして、同じ録音の別モデルの結果を上書きしない
+        tag = "" if MC.model_name(model) == MC.model_name(default) else MC.model_name(model).replace("/", "-")
+        self.svc.queue.submit(Path(p), model=MC.model_name(model), file_tag=tag)
+        self.statusBar().showMessage(f"清書キューに入れました（モデル: {model}）: {Path(p).name}")
+
+    def _ask_wav_model(self, wav: Path) -> str | None:
+        """WAV清書で使うモデルを選ぶ（既定は設定の録音全体の清書モデル）。キャンセルなら None。"""
+        dlg = WavModelDialog(wav.name, resolve_dir(self.s.get("model_dir", "models")),
+                             str(self.s.get("final_model", "small")), self)
+        if self._exec(dlg) != QDialog.Accepted:
+            return None
+        return dlg.model()
 
     @safe
     def open_out(self) -> None:
@@ -1629,6 +1285,8 @@ class MainWindow(QMainWindow):
             self.cmb_preset.setCurrentIndex(names.index(sel))
         self.cmb_preset.blockSignals(False)
         self.preset_selected()
+        if self.unified is not None and self.unified.panel is not None:      # 画面を組み立てている最中はまだ無い
+            self.unified.panel.fill_prompts()       # メイン画面の「前置き ▾」のメニューも合わせる
 
     @safe
     def preset_selected(self) -> None:
@@ -1682,33 +1340,6 @@ class MainWindow(QMainWindow):
         save_presets(self.presets)
         self._fill_presets()
 
-    def _compose(self, transcript: str) -> str | None:
-        if not transcript.strip():
-            self.statusBar().showMessage("送る文字起こしがまだありません（清書が終わるか、履歴から開いてください）", 8000)
-            return None
-        return build_prompt(self.ed_prompt.toPlainText(), transcript)
-
-    def _main_transcript(self) -> str:
-        """「送る」の対象: 今の録音の清書。設定が ON なら、すき間で改行した全文。"""
-        tl = self.svc.session.timeline
-        if tl.is_final and tl.final_text():
-            return format_for_output(tl.final_segments(), self.s, tl.final_gaps())
-        return self._last_text
-
-    @safe
-    def send_main(self) -> None:
-        out = self._compose(self._main_transcript())
-        if out is not None:
-            QGuiApplication.clipboard().setText(out)
-            self.statusBar().showMessage("プロンプト＋文字起こしをクリップボードへコピーしました。Copilot に貼り付けてください", 10000)
-
-    @safe
-    def send_history(self) -> None:
-        out = self._compose(self.editor.toPlainText())
-        if out is not None:
-            QGuiApplication.clipboard().setText(out)
-            self.statusBar().showMessage("プロンプト＋文字起こしをクリップボードへコピーしました。Copilot に貼り付けてください", 10000)
-
     # =============================================================== 履歴と閲覧
     def _search_later(self) -> None:
         self._search_timer.start()
@@ -1736,7 +1367,7 @@ class MainWindow(QMainWindow):
 
     def _set_viewer_enabled(self, on: bool) -> None:
         for w in (self.editor, self.btn_play, self.slider, self.btn_h_save, self.btn_h_revert, self.btn_h_dict,
-                  self.btn_h_redo, self.btn_h_send, self.btn_h_del):
+                  self.btn_h_redo, self.btn_h_del):
             w.setEnabled(on)
 
     def _confirm_discard(self) -> bool:
@@ -1782,20 +1413,36 @@ class MainWindow(QMainWindow):
         self._edit_dirty = False
         self.editor.highlight_block(None)
         self._set_viewer_enabled(True)
-        has_wav = bool(rec.wav_path) and Path(rec.wav_path).exists()
+        has_wav = bool(rec.wav_path) and Path(rec.wav_path).exists()   # WAV または圧縮後の Opus
         self.btn_play.setEnabled(has_wav)
         self.slider.setEnabled(has_wav)
         self.btn_h_redo.setEnabled(has_wav)
-        self.player.load(rec.wav_path if has_wav else "")
+        self.player.load(AC.playback_source(rec.wav_path) if has_wav else "")
         self.slider.setValue(0)
         when = rec.created_at.replace("T", " ")
         ed = f"　修正: {rec.edited_at.replace('T', ' ')}" if rec.edited_at else ""
         self.lbl_rec_meta.setText(f"{when}　長さ {fmt_dur(rec.duration)}　モデル {rec.model}{ed}"
-                                  + ("" if has_wav else "　（WAV が見つからないので再生・やり直しはできません）"))
+                                  + ("" if has_wav else "　（録音ファイルが見つからないので再生・やり直しはできません）"))
 
     def _editor_changed(self) -> None:
         if not self._loading_editor:
             self._edit_dirty = True
+
+    @staticmethod
+    def _cuts_of(rec) -> list:
+        """無音を縮めた Opus の履歴なら、その記録（元の時刻 -> 縮めた音声の時刻の変換に使う）。WAV・記録なしは空。"""
+        cuts = getattr(rec, "cuts", None) or []
+        return cuts if cuts and not AC.is_wav(rec.wav_path or "x.wav") else []
+
+    def _audio_time(self, rec, t: float) -> float:
+        """セグメントの時刻（元の時刻）-> 音声ファイル上の再生位置。"""
+        c = self._cuts_of(rec)
+        return AC.orig_to_cut_time(t, c) if c else t
+
+    def _orig_time(self, rec, sec: float) -> float:
+        """音声ファイル上の再生位置 -> セグメントの時刻（元の時刻）。"""
+        c = self._cuts_of(rec)
+        return AC.cut_to_orig_time(sec, c) if c else sec
 
     @safe
     def editor_line_clicked(self, idx: int) -> None:
@@ -1804,7 +1451,7 @@ class MainWindow(QMainWindow):
             return
         t = seek_time_for_block(viewer_segments(rec.segments), idx, self.editor.blockCount(), rec.duration)
         if t is not None:
-            self.player.play_from(t)
+            self.player.play_from(self._audio_time(rec, t))
 
     @safe
     def _player_position(self, sec: float) -> None:
@@ -1815,7 +1462,7 @@ class MainWindow(QMainWindow):
         if rec is not None:
             segs = viewer_segments(rec.segments)
             if len(segs) == self.editor.blockCount():
-                self.editor.highlight_block(block_for_time(segs, sec))
+                self.editor.highlight_block(block_for_time(segs, self._orig_time(rec, sec)))
 
     def _player_duration(self, ms: int) -> None:
         self.slider.setRange(0, int(ms))
@@ -1924,7 +1571,7 @@ class MainWindow(QMainWindow):
         rec = self._current_rec
         if rec is None:
             return
-        if self._question( "削除", f"この録音を履歴から消し、WAV・txt・md をごみ箱へ移します。\n\n{rec.title}\n\nよろしいですか？") != QMessageBox.Yes:
+        if self._question( "削除", f"この録音を履歴から消し、録音ファイル（WAV/Opus）・txt・md をごみ箱へ移します。\n\n{rec.title}\n\nよろしいですか？") != QMessageBox.Yes:
             return
         self.player.stop()
         self.player.load("")
@@ -1938,6 +1585,117 @@ class MainWindow(QMainWindow):
         if failed:
             self._warn( "ごみ箱へ移せなかったファイル", "次のファイルは残してあります:\n" + "\n".join(failed))
 
+    # =============================================================== 統合 GUI（3行窓＋引き出し）。AI対話モードは常に有効
+    def _build_unified(self) -> None:
+        """中央を統合 GUI にする。録音・履歴・辞書の処理はこの窓が持ち、履歴・辞書などの部品は引き出しへ移る。"""
+        from ui_unified import UnifiedView
+        self.unified = UnifiedView(self)
+        self.setCentralWidget(self.unified)
+        self.statusBar().setVisible(False)           # 通知は下書き欄の下の1行へ
+        self.statusBar().messageChanged.connect(lambda m: self._status_to_notice(m))
+
+    def _status_to_notice(self, msg: str) -> None:
+        u = self.unified
+        if msg and u is not None and u.panel is not None:
+            u.panel.set_notice(msg, "muted")
+
+    def _unified_default_size(self) -> tuple[int, int]:
+        from ui_unified import UNIFIED_DEFAULT, UNIFIED_DRAWER_DEFAULT, UNIFIED_EXPANDED_DEFAULT
+        u = self.unified
+        if u.drawer_open:
+            return UNIFIED_DRAWER_DEFAULT
+        return UNIFIED_EXPANDED_DEFAULT if (u.panel is not None and u.panel.expanded) else UNIFIED_DEFAULT
+
+    def _apply_unified_min(self) -> None:
+        """統合 GUI の最小サイズ（部品が重ならない大きさ）。明示的な最小サイズがあるとレイアウトの最小が効かないので、自分で決める。"""
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.sendPostedEvents(None, QEvent.LayoutRequest)   # 部品の大きさを変えた直後は最小サイズの値がまだ古いので、先に再計算させる
+        lay = self.unified.layout()
+        if lay is not None:
+            lay.activate()
+        sh = self.unified.minimumSizeHint()
+        self.setMinimumSize(max(sh.width(), 320), max(sh.height(), 200))
+
+    def _unified_relayout(self, mutate) -> None:
+        """引き出しの開閉など、窓の大きさが変わる切り替え。いまの状態の位置とサイズを保存し、切り替えたあとの状態の
+        位置とサイズを復元する（まだ覚えていなければ、左上を保って幅を増減）。"""
+        self._save_geometry()
+        self._geo_ready = False
+        try:
+            keep = self.geometry()
+            was_open = self.unified.drawer_open
+            mutate()
+            self._apply_unified_min()
+            saved = parse_geometry(self.s.get(self._geo_key()))
+            if saved is None:
+                from ui_drawer import DRAWER_WIDTH
+                now_open = self.unified.drawer_open
+                w = keep.width() + (DRAWER_WIDTH if (now_open and not was_open) else -DRAWER_WIDTH if (was_open and not now_open) else 0)
+                h = keep.height() if not (now_open and not was_open) else max(keep.height(), self._unified_default_size()[1])
+                saved = (keep.x(), keep.y(), max(w, self.minimumWidth()), max(h, self.minimumHeight()))
+            self.setGeometry(*clamp_geometry(saved, self._screens()))
+        finally:
+            self._geo_ready = True
+        self._save_geometry()
+
+    def _unified_resize_for_expand(self, on: bool) -> None:
+        """下書きを広げた／直近3行へ戻した: 最小サイズを取り直し、戻したときは窓も縮める。
+        部品の大きさを変えた直後は、入れ子のレイアウトの最小サイズがまだ古い（再計算はイベントループの次の回）ので、1回待ってから行う。"""
+        QTimer.singleShot(0, lambda: self._unified_resize_for_expand_now(on))
+
+    def _unified_resize_for_expand_now(self, on: bool) -> None:
+        self._apply_unified_min()
+        if self.isMaximized() or self.isMinimized():
+            return
+        g = self.geometry()
+        if on:
+            from ui_unified import UNIFIED_EXPANDED_DEFAULT
+            h = max(g.height(), UNIFIED_EXPANDED_DEFAULT[1])
+        else:
+            from ui_unified import UNIFIED_DEFAULT
+            h = max(self.minimumHeight(), UNIFIED_DEFAULT[1])
+        self.resize(g.width(), h)
+
+    def _dialogue_active(self) -> bool:
+        c = self.dialogue_ctl
+        return bool(c is not None and c.active)
+
+    def _ensure_dialogue(self) -> None:
+        """対話パネルを（なければ）作って統合 GUI へ取り付ける。部品の組み立てだけで、録音もワーカーも始めない。"""
+        if self.dialogue_panel is not None:
+            return
+        from dialogue_controller import DialogueController
+        from dialogue_session import make_whisper_recognizer
+        from ui_unified import UnifiedPanel
+
+        self.dialogue_ctl = DialogueController(
+            self.s, self.svc.session, make_whisper_recognizer(self.s, model_cache=self.svc.cache),
+            replacer=self.svc.replacer, on_status=lambda m: self.bridge.status.emit(m),
+            on_last_target=lambda name: self._save_settings(), on_settings_changed=self._save_settings)
+        self.dialogue_panel = UnifiedPanel(self.dialogue_ctl, host=self, parent=self.unified,
+                                           on_started=self._sync_recording_ui, on_settings=self.open_settings)
+        self.unified.attach_panel(self.dialogue_panel)
+
+    def _shutdown_dialogue(self) -> None:
+        """対話のセッション・ワーカー・ヘッドセットを必ず止める（何度呼んでも安全）。"""
+        c, w = self.dialogue_ctl, self.dialogue_panel
+        self.dialogue_ctl = self.dialogue_panel = None
+        if self.unified is not None:
+            self.unified.panel = None
+        try:
+            if c is not None:
+                c.shutdown()
+        except Exception:
+            log.exception("対話モードの停止")
+        if w is not None:
+            try:
+                w.timer.stop()
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+            except Exception:
+                pass
+
     # =============================================================== 設定・ホットキー
     @safe
     def open_settings(self) -> None:
@@ -1950,13 +1708,19 @@ class MainWindow(QMainWindow):
         if self._exec(dlg) != QDialog.Accepted:
             return
         v = dlg.values()
-        hk_keys = ("hotkey_record", "hotkey_show", "hotkey_pause")
+        dlg_opts = dict(v.pop("dialogue_opts", {}) or {})
+        old_headset = bool(dialogue_config(self.s)["headset_button"])
+        hk_keys = ("hotkey_record", "hotkey_show", "hotkey_pause", "hotkey_dialogue_commit")
         changed_hk = any(v[k] != self.s.get(k, "") for k in hk_keys)
         dev_changed = v["input_device"] != self.s.get("input_device")
         size_changed = v["display_size"] != self.s.get("display_size", S.DISPLAY_SIZE)
         self.s.update(v)
+        # dialogue 節は該当キーだけ差し替える（worker_python・last_target など、ほかのキーは触らない）
+        self.s["dialogue"] = {**(self.s.get("dialogue") or {}), **dlg_opts}
+        if (self.dialogue_ctl is not None and bool(dlg_opts.get("headset_button", old_headset)) != old_headset
+                and self.dialogue_ctl.active):
+            self.dialogue_ctl.apply_headset_setting()      # セッション中なら、ヘッドセットの独占を今すぐ登録・解除
         self._save_settings()
-        self.svc.session.silence.limit_sec = float(v["silence_stop_sec"])
         if size_changed:
             self.apply_display_size(v["display_size"])
         if dev_changed:
@@ -1972,7 +1736,8 @@ class MainWindow(QMainWindow):
             self.hotkey_mgr.stop()
         self.hotkey_mgr = HotkeyManager(
             {"record": str(self.s.get("hotkey_record", "")), "pause": str(self.s.get("hotkey_pause", "")),
-             "show": str(self.s.get("hotkey_show", ""))},
+             "show": str(self.s.get("hotkey_show", "")),
+             "dialogue": str(self.s.get("hotkey_dialogue_commit", ""))},
             callback=lambda name: self.bridge.hotkey.emit(name))
         res = self.hotkey_mgr.start()
         errs = [f"{k}: {v}" for k, v in res.items() if v]
@@ -1980,13 +1745,16 @@ class MainWindow(QMainWindow):
             self._warn( "ホットキーを登録できません", "\n".join(errs))
         elif res:
             self.statusBar().showMessage("ホットキーを登録しました: " + " / ".join(
-                f"{k}={self.s.get('hotkey_' + k)}" for k in res), 8000)
+                f"{k}={self.s.get('hotkey_dialogue_commit' if k == 'dialogue' else 'hotkey_' + k)}" for k in res), 8000)
 
     @safe
     def _on_hotkey(self, name: str) -> None:
         if name == "record":
             self.toggle_record()
-        elif name == "pause":
+        elif name == "pause":          # 保留／保留を解除
             self.toggle_pause()
         elif name == "show":
             self.toggle_window()
+        elif name == "dialogue":
+            if self.dialogue_panel is not None:
+                self.dialogue_panel.commit_from_hotkey()

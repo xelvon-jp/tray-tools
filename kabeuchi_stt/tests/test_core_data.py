@@ -21,15 +21,15 @@ def R(*pairs):
 
 class ReplacerTest(unittest.TestCase):
     def test_basic(self):
-        r = R(("一時集計", "一次集計"), ("不線", "付箋"))
-        self.assertEqual(r.apply("一時集計の不線を貼る"), "一次集計の付箋を貼る")
+        r = R(("一時解析", "一次解析"), ("不線", "付箋"))
+        self.assertEqual(r.apply("一時解析の不線を貼る"), "一次解析の付箋を貼る")
 
     def test_longest_wins_on_overlap(self):
-        r = R(("集計", "しゅうけい"), ("一時集計", "一次集計"))
-        self.assertEqual(r.apply("一時集計と集計"), "一次集計としゅうけい")
+        r = R(("解析", "かいせき"), ("一時解析", "一次解析"))
+        self.assertEqual(r.apply("一時解析と解析"), "一次解析とかいせき")
         # 登録順を逆にしても同じ
-        r = R(("一時集計", "一次集計"), ("集計", "しゅうけい"))
-        self.assertEqual(r.apply("一時集計と集計"), "一次集計としゅうけい")
+        r = R(("一時解析", "一次解析"), ("解析", "かいせき"))
+        self.assertEqual(r.apply("一時解析と解析"), "一次解析とかいせき")
 
     def test_single_pass_no_chaining(self):
         r = R(("a", "b"), ("b", "c"))
@@ -37,8 +37,8 @@ class ReplacerTest(unittest.TestCase):
 
     def test_output_containing_key_is_not_reprocessed(self):
         # 置換結果の中に誤認識語が含まれていても、1パスなので再置換されず停止する
-        r = R(("API", "API検索"))
-        self.assertEqual(r.apply("APIとAPI"), "API検索とAPI検索")
+        r = R(("RAG", "RAG検索"))
+        self.assertEqual(r.apply("RAGとRAG"), "RAG検索とRAG検索")
         r2 = R(("あ", "あい"), ("い", "いあ"))
         self.assertEqual(r2.apply("あい"), "あいいあ")
 
@@ -70,7 +70,7 @@ class ReplacerTest(unittest.TestCase):
             self.assertEqual(load_pairs(p), [])
 
     def test_suggest(self):
-        self.assertEqual(suggest_replacements("一時集計をする", "一次集計をする"), [("時", "次")])
+        self.assertEqual(suggest_replacements("一時解析をする", "一次解析をする"), [("時", "次")])
         s = suggest_replacements("不線を貼る", "付箋を貼る")
         self.assertEqual(s, [("不線", "付箋")])
         # 挿入・削除のみは候補にしない／同一は空
@@ -132,12 +132,12 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual([x.id for x in self.h.list()], [b, a])  # 新しい順
 
     def test_search_and_or_case(self):
-        self.add("予算の評価をAIで自動化する。APIを使う。")
+        self.add("基地局の評価をAIで自動化する。RAGを使う。")
         self.add("夕飯はカレーにする。")
-        self.add("APIの話だけ。")
-        self.assertEqual(len(self.h.search("API")), 2)
-        self.assertEqual(len(self.h.search("api 予算")), 1)      # AND・大文字小文字無視
-        self.assertEqual(len(self.h.search("カレー 予算")), 0)
+        self.add("RAGの話だけ。")
+        self.assertEqual(len(self.h.search("RAG")), 2)
+        self.assertEqual(len(self.h.search("rag 基地局")), 1)      # AND・大文字小文字無視
+        self.assertEqual(len(self.h.search("カレー 基地局")), 0)
         self.assertEqual(len(self.h.search("")), 3)                # 空=全件
         self.assertEqual(len(self.h.search("　")), 3)              # 全角空白のみ
         self.assertEqual(self.h.search("存在しない"), [])
@@ -190,9 +190,9 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(self.h.delete(i, trasher=lambda p: self.fail("呼ばれない")), [])
 
     def test_snippet(self):
-        t = "あ" * 50 + "予算" + "い" * 50
-        s = snippet(t, "予算", 5)
-        self.assertEqual(s, "…" + "あ" * 5 + "予算" + "い" * 5 + "…")
+        t = "あ" * 50 + "基地局" + "い" * 50
+        s = snippet(t, "基地局", 5)
+        self.assertEqual(s, "…" + "あ" * 5 + "基地局" + "い" * 5 + "…")
         self.assertEqual(snippet("短い文", "ない"), "短い文")
 
     def test_real_recycle_bin_function_on_missing_file_is_noop(self):

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-NAME = "壁打ち文字起こし"
+NAME = "コダマ"
 
 
 def find_pythonw(explicit: str | None = None) -> Path:
@@ -64,7 +64,7 @@ def main(argv=None) -> int:
         subprocess.run([sys.executable, str(ROOT / "make_assets.py")], check=True)
     pyw = find_pythonw(a.python)
     lnk = ROOT / f"{NAME}.lnk"
-    cmd = build_command(lnk, pyw, f'"{ROOT / "main.py"}"', ROOT, icon, "壁打ち文字起こし（ローカル完結）")
+    cmd = build_command(lnk, pyw, f'"{ROOT / "main.py"}"', ROOT, icon, "コダマ（ローカル完結の文字起こし）")
     if a.print_only:
         print(cmd)
         return 0

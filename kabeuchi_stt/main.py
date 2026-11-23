@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""壁打ち文字起こし v2 の入口（PySide6）。
+"""コダマ（旧・壁打ち文字起こし）v2 の入口（PySide6）。
 
   GUI（トレイ常駐）  : python main.py
-  清書のやり直し      : python main.py --wav out\\xxx.wav [--model medium]   （GUIなし）
+  清書のやり直し      : python main.py --wav out\\xxx.wav [--model medium]   （GUIなし。.opus も可）
   デバイス一覧        : python main.py --list-devices                         （マイクは開かない）
   窓を出さず常駐のみ  : python main.py --hidden
 旧 v1（tkinter）は app.py のまま残してある。
@@ -34,14 +34,12 @@ def run_gui(settings: dict, hidden: bool = False, no_tray: bool = False) -> int:
     set_app_user_model_id()  # 専用の AppUserModelID（タスクバーで python のアイコンにまとまらない）。窓を作る前に
     log = setup_error_log()
     app = QApplication(sys.argv)
-    app.setApplicationName("壁打ち文字起こし")
+    app.setApplicationName("コダマ")
     S.set_size(str(settings.get("display_size", S.DEFAULT_SIZE)))
     app.setFont(S.app_font())
     app.setStyleSheet(S.QSS)
     app.setWindowIcon(make_icon())
-    # トレイ常駐のときは窓を閉じても終わらない。--no-tray（tray-tools から起こす形）では、窓を閉じたら
-    # プロセスも終わる（取り残されて見えないまま CPU・マイクを握り続けないため）。
-    app.setQuitOnLastWindowClosed(bool(no_tray))
+    app.setQuitOnLastWindowClosed(False)
 
     if notify_existing():  # 2つ目の起動: 既存の窓を出して終わる
         return 0
@@ -57,6 +55,10 @@ def run_gui(settings: dict, hidden: bool = False, no_tray: bool = False) -> int:
     if not hidden or no_tray:
         win.show()
     code = app.exec()
+    try:
+        win._shutdown_dialogue()   # AI対話モード（ヘッドセットの独占・UIA ワーカー）を必ず止める
+    except Exception:
+        log.exception("終了時の対話モード停止")
     try:
         svc.session.close()
     except Exception:
@@ -86,8 +88,8 @@ def cli_wav(wav: str, model: str | None, settings: dict) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=f"壁打ち文字起こし v2 {VERSION}")
-    ap.add_argument("--wav", help="既存の WAV を清書だけやり直す（GUIなし）")
+    ap = argparse.ArgumentParser(description=f"コダマ v2 {VERSION}")
+    ap.add_argument("--wav", help="既存の録音（WAV / 圧縮した Opus）を清書だけやり直す（GUIなし）")
     ap.add_argument("--model", help="清書モデルを一時的に変更（small / medium / large-v3）")
     ap.add_argument("--list-devices", action="store_true", help="入力デバイス一覧（マイクは開かない）")
     ap.add_argument("--hidden", action="store_true", help="窓を出さずトレイ常駐で起動")

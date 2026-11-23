@@ -364,7 +364,7 @@ def test_screen_feature_wiring():
     finally:
         kl.start = real_start
     src = Path(feature_screen.__file__).read_text(encoding="utf-8")
-    assert "🎙 壁打ち文字起こし…" in src
+    assert "🎙 コダマ…" in src
 
 
 # ---------------------------------------------------------------

@@ -18,7 +18,7 @@ import numpy as np
 
 import _common as C
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QFontMetrics, QGuiApplication
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox, QPushButton, QWidget)
 
 import ui_style as S
@@ -78,7 +78,7 @@ def fake_transcribe(wav, s, model_name=None, on_progress=None, on_status=None, c
                     postprocess=None, formatter=None, **kw):
     """本物の transcribe_wav と同じく、formatter（すき間による改行）を全文に適用する。"""
     on_progress(0.5)
-    segs = [(0.0, 3.0, "壁打ちを始めます。"), (3.5, 6.0, "予算の話です"), (12.0, 14.0, "以上です")]
+    segs = [(0.0, 3.0, "壁打ちを始めます。"), (3.5, 6.0, "基地局の話です"), (12.0, 14.0, "以上です")]
     text = formatter(segs) if formatter else "\n".join(t for _, _, t in segs)
     return FinalResult(text=text, segments=segs, txt_path=None, md_path=None, audio_seconds=14.0, elapsed=0.1)
 
@@ -201,16 +201,6 @@ class CheckBoxWidgetTest(unittest.TestCase):
         self.assertNotEqual(ia, ib)
         self.assertLess(self.grab_center(b).lightness(), self.grab_center(a).lightness())
 
-    def test_size_fits_text_and_toggles(self):
-        cb = CheckBox("クリップボードへ全文をコピー")
-        fm = QFontMetrics(cb.font())
-        self.assertGreaterEqual(cb.sizeHint().width(), CheckBox.BOX + fm.horizontalAdvance(cb.text()))
-        self.assertFalse(cb.isChecked())
-        cb.toggle()
-        self.assertTrue(cb.isChecked())
-        self.assertTrue(cb.hitButton(cb.rect().center()))
-
-
 class LayoutWidgetTest(unittest.TestCase):
     def test_elided_label(self):
         lb = ElidedLabel("とても長い文章がここに入ります。とても長い文章がここに入ります。", pad=0)
@@ -248,124 +238,56 @@ class LayoutWidgetTest(unittest.TestCase):
         self.assertEqual(lay.minimumSize().width(), 100)
 
 
-def name(w):
-    return w.text() if hasattr(w, "text") else type(w).__name__
-
-
 def QLabelText(lb):
     from PySide6.QtWidgets import QLabel
     return QLabel.text(lb)
 
 
-class TopBarTest(GuiBase):
-    WIDTHS = (480, 560, 700, 1000, 1400)
-
-    def check_bar(self, w, label):
-        bar = w.top_bar
-        # レイアウトの再計算は非同期。上段の枠が必要な高さに落ち着くまで待つ（負荷の高いときの取りこぼし対策）
-        pump(0.15)
-        pump(3.0, until=lambda: bar.height() >= bar.heightForWidth(bar.width()) - 1)
-        rect = bar.rect()
-        kids = [c for c in (w.btn_rec, w.btn_pause, w.lbl_time, w.meter, w.badge, w.btn_mictest, w.btn_wav,
-                            w.btn_folder, w.btn_settings, w.btn_compact, w.btn_pin) if not c.isHidden()]
-        boxes = {c: QRect(c.mapTo(bar, c.rect().topLeft()), c.size()) for c in kids}   # 入れ子のグループ内も、枠から見た位置で比べる
-        for c, g in boxes.items():
-            self.assertTrue(rect.contains(g), f"{label}: {name(c)} が枠からはみ出し {g} / {rect}")
-        for i, a in enumerate(kids):
-            for b in kids[i + 1:]:
-                self.assertFalse(boxes[a].intersects(boxes[b]),
-                                 f"{label}: {name(a)} と {name(b)} が重なっている {boxes[a]} {boxes[b]}")
-        # 時間表示は「00:00:00」が必ず収まる
-        fm = QFontMetrics(w.lbl_time.font())
-        need = max(fm.horizontalAdvance("00:00:00"), fm.horizontalAdvance("88:88:88"))
-        self.assertGreaterEqual(w.lbl_time.width(), need, f"{label}: 時間表示が狭い")
-        # ボタンは文字が切れない幅
-        for b in (w.btn_rec, w.btn_pause, w.btn_mictest, w.btn_wav, w.btn_folder, w.btn_settings, w.btn_compact, w.btn_pin):
-            if not b.isHidden():
-                self.assertGreaterEqual(b.width(), b.minimumSizeHint().width(), f"{label}: {b.text()} の文字が切れる")
-        # 1 段目にも 2 段目にもメーターが潰れない
-        self.assertGreaterEqual(w.meter.width(), w.meter.minimumWidth())
-
-    def test_normal_mode_all_widths(self):
-        w, _ = self.make()
-        for width in self.WIDTHS:
-            w.resize(width, 760)
-            self.check_bar(w, f"通常 {width}px(実際 {w.width()})")
-
-    def test_compact_mode_widths(self):
-        w, _ = self.make()
-        w.set_compact(True)
-        for width in (420, 480, 560, 700):
-            w.resize(width, 300)
-            self.check_bar(w, f"コンパクト {width}px(実際 {w.width()})")
-        w.resize(420, 300)
-        pump(0.2)
-        self.assertLessEqual(w.top_bar.height(), 104, "コンパクト 420px では上段が 2 段に収まる")
-
-    def test_recording_state_buttons_fit(self):
-        w, _ = self.make()
-        w.toggle_record()
-        for width in self.WIDTHS:
-            w.resize(width, 760)
-            self.check_bar(w, f"録音中 {width}px")
-        w.toggle_pause()
-        w.resize(520, 760)
-        self.check_bar(w, "一時停止中 520px")
-        w.toggle_record()
-
-    def test_long_mic_message_does_not_break_layout(self):
-        from mic_check import Issue
-        w, _ = self.make()
-        w._set_issues([Issue("low", "warn", "音が小さすぎます", "x"), Issue("noisy", "warn", "ノイズが大きいです", "y"),
-                       Issue("clipping", "warn", "音割れしています", "z")], recording=True)
-        for width in self.WIDTHS:
-            w.resize(width, 760)
-            self.check_bar(w, f"長い指摘 {width}px")
-
-
 class RecordingFlowTest(GuiBase):
-    def test_pause_resume_button_flow(self):
+    def test_hold_resume_button_flow(self):
+        """一時停止のボタンは［保留］（取り込みを止める）。録音（マイク）は続き、経過時間も進む。"""
         w, svc = self.make()
-        self.assertFalse(w.btn_pause.isEnabled())
-        w.toggle_record()
-        self.assertTrue(w.btn_pause.isEnabled())
-        self.assertEqual(w.btn_pause.text(), "一時停止")
-        pump(0.6, until=lambda: w.lbl_time.text() != "00:00:00")
-        w.btn_pause.click()                       # 内部の click()。OS へのマウス送信ではない
-        self.assertTrue(svc.session.is_paused)
-        self.assertEqual(w.btn_pause.text(), "再開")
+        u = w.unified
+        u.refresh()
+        self.assertFalse(u.btn_pause.isEnabled())
+        w.toggle_record()                          # 録音ボタン＝セッション開始
+        u.refresh()
+        self.assertTrue(w._dialogue_active())
+        self.assertTrue(u.btn_pause.isEnabled())
+        self.assertFalse(u.btn_pause.isChecked())
+        pump(0.6, until=lambda: u.lbl_time.text() not in ("--:--", "0:00"))
+        u.btn_pause.click()                       # 内部の click()。OS へのマウス送信ではない
+        self.assertTrue(w.dialogue_ctl.ds.is_held)
+        self.assertFalse(svc.session.is_paused)    # マイクの録音は止めない
         pump(0.3)
-        t1 = w.lbl_time.text()
-        pump(0.6)
-        self.assertEqual(w.lbl_time.text(), t1, "一時停止中に経過時間が進んだ")
-        self.assertIn("一時停止中", w.lbl_live_state.text())
-        self.assertTrue(pump(2.0, until=lambda: w.meter._v > 0.0), "一時停止中もメーターは動く")
-        w.btn_pause.click()
-        self.assertFalse(svc.session.is_paused)
-        self.assertEqual(w.btn_pause.text(), "一時停止")
-        pump(0.8, until=lambda: w.lbl_time.text() != t1)
-        self.assertNotEqual(w.lbl_time.text(), t1)
-        kinds = [r.kind for r in svc.session.timeline.rows()]
-        self.assertIn("pause", kinds)
-        w.toggle_record()
-        self.assertFalse(w.btn_pause.isEnabled())
-        self.assertTrue(pump(5, until=lambda: w.lst_hist.count() == 1))   # 一時停止を挟んでも 1 本として履歴に載る
+        self.assertTrue(u.btn_pause.isChecked())
+        self.assertIn("保留", u.btn_pause.toolTip())
+        self.assertTrue(pump(2.0, until=lambda: w.meter._v > 0.0), "保留中もメーターは動く")
+        u.btn_pause.click()
+        self.assertFalse(w.dialogue_ctl.ds.is_held)
+        self.assertTrue(svc.session.is_recording)
+        w.toggle_record()                          # 停止＝セッション終了。録音全体を清書して履歴に載せる
+        self.assertTrue(pump(8, until=lambda: not w._dialogue_active()))
+        u.refresh()
+        self.assertFalse(u.btn_pause.isEnabled())
+        self.assertTrue(pump(8, until=lambda: w.lst_hist.count() == 1))   # 保留を挟んでも 1 本として履歴に載る
         self.assertEqual(len(self.wins_history()), 1)
 
     def wins_history(self):
         return self._wins[0][2].list()
 
-    def test_pause_hotkey_signal_and_registration(self):
+    def test_pause_hotkey_toggles_hold_and_registration(self):
         w, svc = self.make()
         w.toggle_record()
         pump(0.3)
         w.bridge.hotkey.emit("pause")             # ホットキー押下の代わりに、スロットへ直接シグナル
         pump(0.1)
-        self.assertTrue(svc.session.is_paused)
+        self.assertTrue(w.dialogue_ctl.ds.is_held)
         w.bridge.hotkey.emit("pause")
         pump(0.1)
-        self.assertFalse(svc.session.is_paused)
+        self.assertFalse(w.dialogue_ctl.ds.is_held)
         w.toggle_record()
+        self.assertTrue(pump(8, until=lambda: not w._dialogue_active()))
         # 登録・解除だけ確認（実押下はしない）
         w.s["hotkey_pause"] = "Ctrl+Alt+Shift+F22"
         w.s["hotkey_record"] = ""
@@ -377,37 +299,29 @@ class RecordingFlowTest(GuiBase):
             w.hotkey_mgr.stop()
             w.hotkey_mgr = None
 
-    def test_silence_autostop_ignored_while_paused(self):
-        w, svc = self.make(sd=FakeSD(np.zeros(16000 * 5, dtype=np.int16), speed=10.0, loop=True), silence_stop_sec=1)
-        svc.session.silence.limit_sec = 1
+    def test_silence_ends_the_session_and_finalizes_the_recording(self):
+        """無音が続くと、AI対話のセッション（dialogue.idle_stop_sec）が自動で終わり、録音全体の清書が履歴に載る。"""
+        w, svc = self.make(sd=FakeSD(np.zeros(16000 * 5, dtype=np.int16), speed=10.0, loop=True),
+                           dialogue={**DEFAULTS["dialogue"], "idle_stop_sec": 1})
         w.toggle_record()
-        self.assertTrue(svc.session.is_recording)
-        w.toggle_pause()
-        pump(1.5)
-        self.assertTrue(svc.session.is_recording, "一時停止中に無音の自動停止が動いた")
-        w.toggle_pause()
-        self.assertTrue(pump(4, until=lambda: not svc.session.is_recording), "再開後は無音で自動停止する")
+        self.assertTrue(w._dialogue_active())
+        self.assertTrue(pump(8, until=lambda: not w._dialogue_active() and not svc.session.is_recording),
+                        "無音が続いたのにセッションが終わらない")
+        self.assertTrue(pump(8, until=lambda: w.lst_hist.count() == 1))
 
-    def test_paragraph_applies_to_clipboard_and_send_but_history_keeps_raw(self):
+    def test_history_keeps_raw_text_and_nothing_goes_to_the_clipboard(self):
         w, svc = self.make()
         w.toggle_record()
         pump(0.5)
         w.toggle_record()
-        self.assertTrue(pump(5, until=lambda: w.lst_hist.count() == 1))
+        self.assertTrue(pump(8, until=lambda: w.lst_hist.count() == 1))
         pump(0.2)
-        # 0→3 / 3.5→6 はすき間 0.5 秒でつなぐ。6→12 は 6 秒: 句点がないので「。」を補って改行
-        self.assertEqual(clip_text(), "壁打ちを始めます。予算の話です。\n以上です")
+        self.assertEqual(clip_text(), "")                    # 清書が終わっても、クリップボードへは自動で入れない
         rec = self._wins[0][2].list()[0]
-        self.assertEqual(rec.text, "壁打ちを始めます。\n予算の話です\n以上です")
+        self.assertEqual(rec.text, "壁打ちを始めます。\n基地局の話です\n以上です")   # 履歴には整形しない本文
         self.assertEqual(len(rec.segments), 3)
-        w.ed_prompt.setPlainText("要約して")
-        w.send_main()
-        self.assertIn("壁打ちを始めます。予算の話です。\n以上です", clip_text(),
-                      w.statusBar().currentMessage())
-        # 設定で OFF にすると従来どおり
-        w.s["paragraph_enabled"] = False
-        w.send_main()
-        self.assertIn("壁打ちを始めます。\n予算の話です\n以上です", clip_text())
+        for gone in ("btn_send", "btn_h_send", "send_main", "send_history", "chk_live", "lbl_queue_compact", "prog"):
+            self.assertFalse(hasattr(w, gone), gone)         # 「コピーして送る」系の部品は無い
 
 
 class IdleMonitorTest(GuiBase):
@@ -428,11 +342,15 @@ class IdleMonitorTest(GuiBase):
         self.assertTrue(pump(3, until=lambda: svc.session.monitor_active))
 
     def test_monitor_closes_after_inactivity_and_reopens_on_touch(self):
-        w, svc = self.make(idle_monitor_timeout_sec=60)
+        import ui_main
+        w, svc = self.make()
+        with mock.patch.object(ui_main, "IDLE_MONITOR_TIMEOUT_SEC", 60):
+            self._monitor_closes(w, svc)
+
+    def _monitor_closes(self, w, svc):
         self.assertTrue(pump(3, until=lambda: svc.session.monitor_active))
         w._last_activity -= 120
         self.assertTrue(pump(3, until=lambda: not svc.session.monitor_active), "一定時間操作がなければ閉じる")
-        self.assertIn("停止", "停止")   # 画面の表示は下の画像確認で見る
         w._touch()
         self.assertTrue(pump(3, until=lambda: svc.session.monitor_active))
 
@@ -446,108 +364,27 @@ class IdleMonitorTest(GuiBase):
         w, svc = self.make(sd=sd)
         pump(0.8)
         self.assertFalse(svc.session.monitor_active)
-        self.assertIn("マイクを使用中のため確認できません", w.badge.text())
+        w.unified.refresh()
+        self.assertEqual(w.unified.chip.key, "busy")          # マイクを使用中のため確認できない（エラーにはしない）
         self.assertEqual([a for a in self.asked if a.startswith("warn:")], [])   # ダイアログは出さない
-        self.assertIn("録音", w.btn_rec.text())
-
-    def test_idle_band_appears_on_speech_and_record_button_starts_recording(self):
-        w, svc = self.make()
-        self.assertTrue(w.idle_band.isHidden())
-        self.assertTrue(pump(6, until=lambda: not w.idle_band.isHidden()), "話しているのに録音していない → 帯")
-        self.assertIn("録音していません", w.idle_label.text())
-        w.btn_idle_rec.click()
-        self.assertTrue(svc.session.is_recording)
-        self.assertTrue(w.idle_band.isHidden())
-
-    def test_idle_band_not_shown_when_window_hidden_or_disabled_or_cooldown(self):
-        w, svc = self.make()
-        w.hide()
-        pump(1.5)
-        self.assertTrue(w.idle_band.isHidden(), "窓が隠れているときは出さない")
-        w.show()
-        self.assertTrue(pump(6, until=lambda: not w.idle_band.isHidden()))
-        w.hide_idle_band()
-        pump(2.0)
-        self.assertTrue(w.idle_band.isHidden(), "クールダウン中は再度出さない（既定 60 秒）")
-        w2, svc2 = self.make(idle_prompt_enabled=False)
-        pump(2.5)
-        self.assertTrue(w2.idle_band.isHidden(), "設定で OFF")
-
-    def test_close_button_dismisses_band(self):
-        w, _ = self.make()
-        self.assertTrue(pump(6, until=lambda: not w.idle_band.isHidden()))
-        w.btn_idle_close.click()
-        self.assertTrue(w.idle_band.isHidden())
-
-    def test_mic_test_uses_the_open_stream(self):
-        sd = FakeSD(C.speechlike(8, -12), speed=10.0, loop=True)
-        w, svc = self.make(sd=sd)
-        self.assertTrue(pump(3, until=lambda: svc.session.monitor_active))
-        stats, issues = svc.session.mic_test(seconds=0.3)
-        self.assertEqual(sd.opened, 1)
 
 
-class ModeAndGeometryTest(GuiBase):
+
+class GeometryTest(GuiBase):
+    """位置とサイズの保存・復元（引き出しを閉じた状態のキー win_geometry_unified）。"""
+
     def settings_file(self, idx=0):
         return json.loads((Path(self._d.name) / f"settings{idx}.json").read_text(encoding="utf-8"))
 
-    def test_compact_toggle_hides_the_big_parts_and_restores(self):
-        w, _ = self.make()
-        w.resize(1200, 780)
-        pump(0.2)
-        self.assertFalse(w.side_scroll.isHidden())
-        self.assertFalse(w.queue_group.isHidden())
-        w.set_compact(True)
-        pump(0.2)
-        self.assertTrue(w.side_scroll.isHidden())
-        self.assertTrue(w.queue_group.isHidden())
-        self.assertTrue(w.opt_row.isHidden())
-        self.assertTrue(w.btn_mictest.isHidden() and w.btn_wav.isHidden() and w.btn_settings.isHidden())
-        self.assertTrue(w.lbl_queue_compact.isVisible() or not w.lbl_queue_compact.isHidden())
-        self.assertFalse(w.tabs.tabBar().isVisible())
-        self.assertTrue(w.btn_compact.isChecked())
-        self.assertEqual((w.width(), w.height()), (420, 300))
-        self.assertTrue(w.timeline_view.itemDelegate().compact)
-        self.assertEqual(w.btn_rec.text(), "録音")
-        self.assertTrue(self.settings_file()["compact_mode"])
-        w.set_compact(False)
-        pump(0.2)
-        self.assertEqual((w.width(), w.height()), (1200, 780), "通常に戻すと元のサイズ")
-        self.assertFalse(w.side_scroll.isHidden())
-        self.assertEqual(w.btn_rec.text(), "録音開始")
-        self.assertFalse(self.settings_file()["compact_mode"])
-
-    def test_each_mode_remembers_its_own_size_and_position(self):
-        w, _ = self.make()
-        w.setGeometry(50, 60, 1100, 700)
-        pump(0.1)
-        w.set_compact(True)
-        w.setGeometry(300, 200, 480, 340)
-        pump(0.1)
-        w.set_compact(False)
-        self.assertEqual(tuple(self.settings_file()["win_geometry_compact"]), (300, 200, 480, 340))
-        self.assertEqual(tuple(self.settings_file()["win_geometry_normal"]), (50, 60, 1100, 700))
-        g = w.geometry()
-        self.assertEqual((g.x(), g.y(), g.width(), g.height()), (50, 60, 1100, 700))
-        w.set_compact(True)
-        g = w.geometry()
-        self.assertEqual((g.x(), g.y(), g.width(), g.height()), (300, 200, 480, 340))
-
     def test_restore_on_startup_and_clamp_off_screen(self):
         scr = QGuiApplication.screens()[0].availableGeometry()
-        w, _ = self.make(compact_mode=True, win_geometry_compact=[scr.x() + 30000, scr.y() + 30000, 460, 320],
-                         win_geometry_normal=[scr.x() + 40, scr.y() + 40, 1000, 640])
+        w, _ = self.make(win_geometry_unified=[scr.x() + 30000, scr.y() + 30000, 460, 320])
         g = w.geometry()
-        self.assertTrue(w._compact)
-        self.assertEqual((g.width(), g.height()), (460, 320))
         self.assertTrue(scr.contains(g), f"画面外に出ている: {g} / {scr}")
-        w.set_compact(False)
-        g = w.geometry()
-        self.assertEqual((g.x(), g.y(), g.width(), g.height()), (scr.x() + 40, scr.y() + 40, 1000, 640))
 
     def test_oversized_saved_size_is_shrunk_to_screen(self):
         scr = QGuiApplication.screens()[0].availableGeometry()
-        w, _ = self.make(win_geometry_normal=[0, 0, scr.width() * 3, scr.height() * 3])
+        w, _ = self.make(win_geometry_unified=[0, 0, scr.width() * 3, scr.height() * 3])
         g = w.geometry()
         self.assertLessEqual(g.width(), scr.width())
         self.assertLessEqual(g.height(), scr.height())
@@ -556,32 +393,20 @@ class ModeAndGeometryTest(GuiBase):
         w, _ = self.make()
         w.setGeometry(70, 80, 900, 650)
         pump(1.2)
-        self.assertEqual(tuple(self.settings_file()["win_geometry_normal"]), (70, 80, 900, 650))
+        self.assertEqual(tuple(self.settings_file()["win_geometry_unified"]), (70, 80, 900, 650))
 
     def test_close_saves_geometry(self):
         w, _ = self.make()
         w.setGeometry(90, 95, 880, 640)
         w.close()
-        self.assertEqual(tuple(self.settings_file()["win_geometry_normal"]), (90, 95, 880, 640))
+        self.assertEqual(tuple(self.settings_file()["win_geometry_unified"]), (90, 95, 880, 640))
 
-    def test_history_tab_request_leaves_compact(self):
+    def test_history_tab_request_opens_the_drawer(self):
+        from ui_drawer import TAB_HISTORY
         w, _ = self.make()
-        w.set_compact(True)
         w.show_main(tab=1)
-        self.assertFalse(w._compact)
-        self.assertEqual(w.tabs.currentIndex(), 1)
-
-    def test_side_panel_hides_when_narrow(self):
-        w, _ = self.make()
-        w.resize(1200, 700)
-        pump(0.1)
-        self.assertFalse(w.side_scroll.isHidden())
-        w.resize(640, 700)
-        pump(0.1)
-        self.assertTrue(w.side_scroll.isHidden())
-        w.resize(1000, 700)
-        pump(0.1)
-        self.assertFalse(w.side_scroll.isHidden())
+        self.assertTrue(w.unified.drawer_open)
+        self.assertEqual(w.unified.drawer.current_tab(), TAB_HISTORY)
 
 
 class PinTest(GuiBase):
@@ -589,7 +414,7 @@ class PinTest(GuiBase):
         w, _ = self.make()
         w.setGeometry(120, 140, 760, 560)
         pump(0.1)
-        w.btn_pin.setChecked(True)
+        w.unified.btn_pin.setChecked(True)
         pump(0.2)
         self.assertTrue(bool(w.windowFlags() & Qt.WindowStaysOnTopHint))
         self.assertTrue(w.isVisible())
@@ -598,7 +423,7 @@ class PinTest(GuiBase):
         self.assertLess(abs(g.x() - 120) + abs(g.y() - 140), 40)    # 窓の再作成で枠分ずれても大きくは動かない
         self.assertFalse(w.testAttribute(Qt.WA_ShowWithoutActivating), "アクティブ化抑止の一時指定を戻している")
         self.assertTrue(json.loads((Path(self._d.name) / "settings0.json").read_text(encoding="utf-8"))["always_on_top"])
-        w.btn_pin.setChecked(False)
+        w.unified.btn_pin.setChecked(False)
         pump(0.2)
         self.assertFalse(bool(w.windowFlags() & Qt.WindowStaysOnTopHint))
         self.assertTrue(w.isVisible())
@@ -610,12 +435,12 @@ class PinTest(GuiBase):
         w.set_always_on_top(True)
         pump(0.1)
         self.assertFalse(w.isVisible(), "トレイに隠れている窓をピン切替で出さない")
-        self.assertTrue(w.btn_pin.isChecked())
+        self.assertTrue(w._pinned)
 
     def test_pinned_at_startup(self):
         w, _ = self.make(always_on_top=True)
         self.assertTrue(bool(w.windowFlags() & Qt.WindowStaysOnTopHint))
-        self.assertTrue(w.btn_pin.isChecked())
+        self.assertTrue(w.unified.btn_pin.isChecked())
 
     def test_recording_survives_pin_toggle(self):
         w, svc = self.make()
@@ -713,26 +538,25 @@ class DialogsTest(GuiBase):
         w, _ = self.make()
         d = SettingsDialog(w.s, [{"index": 1, "name": "マイク", "hostapi": "MME"}], w)
         v = d.values()
-        for k in ("idle_monitor", "idle_monitor_timeout_sec", "idle_prompt_enabled", "idle_prompt_cooldown_sec",
-                  "paragraph_enabled", "paragraph_gap_sec", "paragraph_force_gap_sec", "hotkey_pause"):
+        for k in ("idle_monitor", "paragraph_enabled", "paragraph_gap_sec", "paragraph_force_gap_sec", "hotkey_pause"):
             self.assertIn(k, v)
+        for k in ("idle_monitor_timeout_sec", "idle_prompt_enabled", "idle_prompt_cooldown_sec", "ui_layout", "dialogue_enabled"):
+            self.assertNotIn(k, v, "画面から消した項目は保存しない（固定値）")
         self.assertTrue(v["idle_monitor"] and v["paragraph_enabled"])
         self.assertEqual((v["paragraph_gap_sec"], v["paragraph_force_gap_sec"]), (2.0, 3.0))
         d.idle_monitor.setChecked(False)
         d.para_gap.setValue(4.0)
         d.para_force.setValue(2.5)           # 強制のほうが小さい設定は、強制を通常のしきい値まで引き上げる
         d.hk_pause.setText("Ctrl+Alt+F8")
-        d.idle_cooldown.setValue(120)
         v = d.values()
         self.assertFalse(v["idle_monitor"])
         self.assertEqual((v["paragraph_gap_sec"], v["paragraph_force_gap_sec"]), (4.0, 4.0))
         self.assertEqual(v["hotkey_pause"], "Ctrl+Alt+F8")
-        self.assertEqual(v["idle_prompt_cooldown_sec"], 120)
 
     def test_open_settings_applies_through_hook(self):
         w, svc = self.make()
         d = SettingsDialog(w.s, [], w)
-        d.idle_prompt.setChecked(False)
+        d.idle_monitor.setChecked(False)
         d.para_on.setChecked(False)
         w._exec = lambda dlg: QDialog.Accepted
         import ui_main
@@ -742,7 +566,7 @@ class DialogsTest(GuiBase):
             w.open_settings()
         finally:
             ui_main.SettingsDialog = orig
-        self.assertFalse(w.s["idle_prompt_enabled"])
+        self.assertFalse(w.s["idle_monitor"])
         self.assertFalse(w.s["paragraph_enabled"])
         saved = json.loads((Path(self._d.name) / "settings0.json").read_text(encoding="utf-8"))
         self.assertFalse(saved["paragraph_enabled"])

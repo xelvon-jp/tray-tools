@@ -156,8 +156,8 @@ class ParagraphTest(unittest.TestCase):
         self.assertEqual(format_paragraphs(S((0, 1, ""), (2, 3, "あ"))), "あ")
 
     def test_ascii_neighbours_get_a_space(self):
-        self.assertEqual(format_paragraphs(S((0, 1, "API"), (1.2, 2, "is good"))), "API is good")
-        self.assertEqual(format_paragraphs(S((0, 1, "API"), (1.2, 2, "は良い"))), "APIは良い")
+        self.assertEqual(format_paragraphs(S((0, 1, "RAG"), (1.2, 2, "is good"))), "RAG is good")
+        self.assertEqual(format_paragraphs(S((0, 1, "RAG"), (1.2, 2, "は良い"))), "RAGは良い")
 
     def test_overlap_and_garbage_do_not_crash(self):
         self.assertEqual(format_paragraphs(S((0, 5, "あ。"), (3, 6, "い。"))), "あ。い。")  # 重なり: すき間は負
@@ -640,14 +640,6 @@ class MonitorHandoffTest(unittest.TestCase):
         s.input_device_changed()
         self.assertFalse(s.monitor_active)
         self.assertEqual(sd.closed, 1)
-
-    def test_mic_test_listens_on_the_open_stream(self):
-        sd = RampSD()
-        s = self.session(sd)
-        s.apply_monitor_now(True)
-        stats, issues = s.mic_test(seconds=0.3, sleep=time.sleep)
-        self.assertEqual(sd.opened, 1, "テストのためにもう一度開いてはいけない")
-        self.assertGreater(stats.seconds, 0.2)
 
     def test_recorder_alone_still_works_with_pause(self):
         sd = RampSD()

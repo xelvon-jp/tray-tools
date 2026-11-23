@@ -6,6 +6,8 @@
 - feed(samples)      : 録音ブロックを渡すと波形（0.5秒ごとのピーク）を積む。録音スレッドから呼んでよい。
 - add_draft(s, e, t) : 仮認識の区間を追加（認識スレッドから）。
 - set_final(segs)    : 清書結果で全行を置き換える（行は FINAL へ）。
+- add_pending(s, e) / remove_pending(s) : AI対話モード。区切った発話が認識待ちの間の印（行の見出しに「認識中」）。
+- commit_drafts() / drop_uncommitted() : AI対話モード。ここまでの仮認識を「確定」（白）にする / 確定前の仮認識を捨てる。
 - add_pause(at_sec)  : 一時停止の印（WAV 上の位置）。印の行を1行出し、行はその位置で区切る。
 - set_pause_length(i, sec): 再開したとき、その一時停止の休止時間（実時間）を入れる。
 
@@ -53,6 +55,7 @@ class Row:
     peaks: list = field(default_factory=list)  # 0.5 秒ごとの 0..1
     live: bool = False                         # 録音中の最終行
     kind: str = AUDIO
+    tag: str = ""                              # 見出しの文言を上書きする（対話モードの「確定」「認識中」）
     slots: int = 0                             # 波形の枠の数（0=row_sec 相当）。区切られた短い行で「未録音の点線」を出さないため
 
     @property
@@ -72,6 +75,8 @@ class Timeline:
         self._carry = np.zeros(0, dtype=np.int16)
         self._drafts: list[tuple[float, float, str]] = []
         self._finals: list[tuple[float, float, str]] = []
+        self._pending: list[tuple[float, float]] = []   # 認識待ちの発話（対話モード）
+        self._committed: set[float] = set()             # 「確定」済みの仮認識（開始秒。対話モード）
         self._pauses: list[list] = []   # [WAV上の秒, 休止の実時間(秒) or None（休止中）]
         self._is_final = False
         self._final_gaps: list | None = None
@@ -106,6 +111,56 @@ class Timeline:
             self._drafts.append((float(start), float(end), text))
             self.version += 1
 
+    def add_pending(self, start: float, end: float) -> None:
+        with self._lock:
+            self._pending.append((float(start), float(end)))
+            self.version += 1
+
+    def remove_pending(self, start: float) -> None:
+        with self._lock:
+            for i, (s, _) in enumerate(self._pending):
+                if abs(s - float(start)) < 1e-6:
+                    del self._pending[i]
+                    self.version += 1
+                    return
+
+    def set_draft(self, start: float, end: float, text: str) -> None:
+        """対話モード: 開始秒をキーに、仮認識（base）→清書（small）の置き換えができる版の add_draft。空文字なら消す。"""
+        text = (text or "").strip()
+        start = float(start)
+        with self._lock:
+            for i, (s, _e, _t) in enumerate(self._drafts):
+                if abs(s - start) < 1e-6:
+                    if text:
+                        self._drafts[i] = (s, float(end), text)
+                    else:
+                        del self._drafts[i]
+                    self.version += 1
+                    return
+            if text:
+                self._drafts.append((start, float(end), text))
+                self._drafts.sort(key=lambda d: d[0])
+                self.version += 1
+
+    def remove_draft(self, start: float) -> None:
+        self.set_draft(start, start, "")
+
+    def commit_drafts(self) -> None:
+        """いまある仮認識をすべて「確定」にする（対話モードで確定操作を受け付けたとき）。"""
+        with self._lock:
+            now = {s for s, _e, _t in self._drafts}
+            if not now <= self._committed:
+                self._committed |= now
+                self.version += 1
+
+    def drop_uncommitted(self) -> None:
+        """確定前の仮認識を捨てる（対話モードで下書きを破棄したとき）。"""
+        with self._lock:
+            keep = [d for d in self._drafts if d[0] in self._committed]
+            if len(keep) != len(self._drafts):
+                self._drafts = keep
+                self.version += 1
+
     def add_pause(self, at_sec: float) -> int:
         """一時停止の印を追加。戻り値は印の番号（set_pause_length 用）。"""
         with self._lock:
@@ -133,6 +188,7 @@ class Timeline:
             v = self.version + 1
             self._peaks, self._carry = [], np.zeros(0, dtype=np.int16)
             self._drafts, self._finals, self._pauses = [], [], []
+            self._pending, self._committed = [], set()
             self._is_final, self._final_duration, self._recording = False, 0.0, False
             self.version = v
 
@@ -166,6 +222,11 @@ class Timeline:
         with self._lock:
             return list(self._finals)
 
+    def draft_segments(self) -> list:
+        """仮認識の区間 (開始秒, 終了秒, 文字) の控え（開始秒順ではなく追加順）。統合 GUI の下書き欄が、発話ごとの黄色の行にするために読む。"""
+        with self._lock:
+            return list(self._drafts)
+
     def rows(self) -> list[Row]:
         with self._lock:
             dur = self.duration
@@ -187,16 +248,22 @@ class Timeline:
                     hi = b if (not last or closed) else a + rs
                     ia = int(round(a / BUCKET_SEC))
                     peaks = self._peaks[ia:ia + per_row]
+                    tag = ""
                     if self._is_final:
                         state = FINAL
                         text = "".join(t for s, _, t in self._finals if a <= s < hi)
                     else:
-                        drafts = [t for s, _, t in self._drafts if a <= s < hi]
+                        inrow = [(s, t) for s, _, t in self._drafts if a <= s < hi]
+                        drafts = [t for _s, t in inrow]
                         state = DRAFT if drafts else WAVE
                         text = "".join(drafts)
+                        if drafts and all(s in self._committed for s, _t in inrow):
+                            state, tag = FINAL, "確定"        # 対話モード: 確定済みの発話だけの行は白
+                        elif not drafts and any(a <= s < hi for s, _ in self._pending):
+                            tag = "認識中"
                     slots = per_row if (last and not closed) else max(1, int(math.ceil((b - a) / BUCKET_SEC - 1e-9)))
                     rows.append(Row(0, a, b, state, text, list(peaks),
-                                    live=self._recording and last and not closed,
+                                    live=self._recording and last and not closed, tag=tag,
                                     slots=0 if slots >= per_row else slots))
                 if k < len(pauses):
                     at, length = pauses[k]

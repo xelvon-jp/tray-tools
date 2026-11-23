@@ -120,6 +120,7 @@ QPushButton#rec:hover {{ background: #f0585d; }}
 QPushButton#rec:disabled {{ background: #5a2a2d; color: #b89a9b; }}
 QPushButton#recSmall {{ background: {REC}; border: none; font-weight: bold; padding: 5px 14px; color: white; border-radius: 8px; }}
 QPushButton#recSmall:hover {{ background: #f0585d; }}
+QPushButton#recStopSmall {{ background: #2b2f3a; border: 2px solid {REC}; font-weight: bold; padding: 3px 12px; color: {TEXT}; border-radius: 8px; }}
 QPushButton#flat {{ background: transparent; border: 1px solid transparent; padding: 4px 10px; color: {MUTED}; }}
 QPushButton#flat:hover {{ color: {TEXT}; border-color: {BORDER}; }}
 QPushButton#recStop {{ background: #2b2f3a; border: 2px solid {REC}; font-weight: bold; padding: 7px 19px; color: {TEXT}; }}

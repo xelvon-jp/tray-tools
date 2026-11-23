@@ -681,7 +681,7 @@ class ScreenFeature:
         # 壁打ち文字起こし(kabeuchi_stt)。一人会議の隣に置く(どちらも「マイクに向かって話す」
         # 道具)。窓は常駐とは別のプロセス(kabeuchi_launch。トレイアイコンは増やさない)。
         self.menu.addAction(
-            self._with_hotkey("🎙 壁打ち文字起こし…", kabeuchi_launch.configured_hotkey(app_settings)),
+            self._with_hotkey("🎙 コダマ…", kabeuchi_launch.configured_hotkey(app_settings)),
             self.start_kabeuchi,
         )
         self._agent_loop_menu = self.menu.addMenu(AGENT_LOOP_MENU_TITLE)

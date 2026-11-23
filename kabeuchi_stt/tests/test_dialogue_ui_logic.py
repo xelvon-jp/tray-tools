@@ -268,6 +268,11 @@ class OneColumnLogicTest(unittest.TestCase):
         self.assertEqual(L.idle_hint({"active": True, "undelivered_count": 2}), ("未配達 2件", "warn"))
         self.assertEqual(L.idle_hint({"active": True})[1], "muted")
         self.assertEqual(L.idle_hint({"active": False})[0], "")
+    def test_idle_hint_lists_only_enabled_methods(self):
+        a = {"active": True}
+        self.assertEqual(L.idle_hint(a)[0], "Ctrl+Enter でも確定")
+        self.assertEqual(L.idle_hint(a, methods=["ヘッドセット"])[0], "Ctrl+Enter／ヘッドセットでも確定")
+        self.assertEqual(L.idle_hint(a, methods=["マウス", "舌打ち"])[0], "Ctrl+Enter／マウス／舌打ちでも確定")
 
     def test_delivered_short_texts(self):
         t, tone = L.delivered_short({}, "14:32")

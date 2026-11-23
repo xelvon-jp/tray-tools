@@ -356,7 +356,7 @@ class DialoguePanel(QWidget):
 
     def _render_notice(self) -> None:
         snap = self.ctl.snapshot()
-        text, tone, faded = self._notice.view(time.monotonic(), L.idle_hint(snap))
+        text, tone, faded = self._notice.view(time.monotonic(), L.idle_hint(snap, methods=self.ctl.commit_method_names()))
         if self.lbl_notice.text() != text:
             self.lbl_notice.setText(text)
             self.lbl_notice.setToolTip(text)
@@ -364,7 +364,7 @@ class DialoguePanel(QWidget):
 
     def notice_text(self) -> str:
         """いま下段の通知に出ている文言（テスト・診断用）。"""
-        return self._notice.view(time.monotonic(), L.idle_hint(self.ctl.snapshot()))[0]
+        return self._notice.view(time.monotonic(), L.idle_hint(self.ctl.snapshot(), methods=self.ctl.commit_method_names()))[0]
 
     def fill_presets(self) -> None:
         names = self.ctl.preset_names()

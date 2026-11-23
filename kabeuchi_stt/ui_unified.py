@@ -596,7 +596,7 @@ class UnifiedPanel(DialoguePanel):
             return self._alert_text, "alert", False
         """通知の行に出す (文言, tone, 薄くするか)。常設のヒントと、未配達の警告・一時的な操作の通知だけ。
         無音カウントダウンは下書き欄の末尾の行、清書の進みは状態バッジ、認識待ちは確定ボタン、配達の結果は送信ブロックに出す。"""
-        return self._notice.view(time.monotonic(), L.idle_hint(self.ctl.snapshot()))
+        return self._notice.view(time.monotonic(), L.idle_hint(self.ctl.snapshot(), methods=self.ctl.commit_method_names()))
 
     def _render_notice(self) -> None:
         text, tone, faded = self._notice_view()

@@ -557,10 +557,16 @@ class NoticeLine:
         return fallback[0], fallback[1], False
 
 
-IDLE_HINT = "Ctrl+Enter／ヘッドセットでも確定"
+IDLE_HINT = "Ctrl+Enter でも確定"
 
 
-def idle_hint(snap: dict | None, undelivered_extra: int = 0) -> tuple[str, str]:
+def idle_hint_text(methods=None) -> str:
+    """常時の案内。methods は、いま有効な確定の手段の名前（「ヘッドセット」「マウス」「舌打ち」）。使っていない手段は出さない。"""
+    names = [m for m in (methods or []) if m]
+    return "Ctrl+Enter／" + "／".join(names) + "でも確定" if names else IDLE_HINT
+
+
+def idle_hint(snap: dict | None, undelivered_extra: int = 0, methods=None) -> tuple[str, str]:
     """通知が無いときに下段へ出す常時の案内。未配達があればその件数（警告色）。"""
     s = snap or {}
     n = int(s.get("undelivered_count") or 0)
@@ -568,7 +574,7 @@ def idle_hint(snap: dict | None, undelivered_extra: int = 0) -> tuple[str, str]:
         return f"未配達 {n}件", "warn"
     if not s.get("active"):
         return "", "muted"
-    return IDLE_HINT, "muted"
+    return idle_hint_text(methods), "muted"
 
 
 def delivered_short(info: dict | None, hhmm: str) -> tuple[str, str]:

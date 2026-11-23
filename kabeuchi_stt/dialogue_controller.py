@@ -112,6 +112,18 @@ class DialogueController:
     def snapshot(self) -> dict:
         return self.ds.snapshot() if self.ds is not None else {"active": False}
 
+    def commit_method_names(self) -> list:
+        """いま有効な確定の手段（画面の案内用。Ctrl+Enter・画面ボタンは常に使えるので含めない）。"""
+        c = self.cfg
+        names = []
+        if c.get("headset_button"):
+            names.append("ヘッドセット")
+        if c.get("mouse_button"):
+            names.append("マウス")
+        if c.get("click_commit"):
+            names.append("舌打ち")
+        return names
+
     def set_option(self, key: str, value) -> None:
         """設定の dialogue 節の1キーだけ差し替えて保存する（パネルのチェックなど）。"""
         d = self.s.get("dialogue")

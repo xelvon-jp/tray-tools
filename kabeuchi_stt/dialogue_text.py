@@ -110,10 +110,35 @@ def normalize_for_dup(text: str) -> str:
 _SENT_SPLIT = re.compile(r"[^。？！?!]*[。？！?!]+|[^。？！?!]+")
 
 
+_CLAUSE_SPLIT = re.compile(r"[^、,。？！?!]*[、,。？！?!]+\s*|[^、,。？！?!]+")
+
+
+def _collapse_clause_runs(text: str, min_run: int = 3) -> tuple[str, int]:
+    """読点・句点で区切った節（「途中で言葉が抜けたり、」）が min_run 回以上連続したら、1回にまとめる（暴走した繰り返し）。"""
+    parts = _CLAUSE_SPLIT.findall(text or "")
+    keys = [normalize_for_dup(p) for p in parts]
+    out: list[str] = []
+    removed = 0
+    i = 0
+    while i < len(parts):
+        j = i
+        while j + 1 < len(parts) and keys[j + 1] == keys[i] and keys[i] and len(keys[i]) >= 3:
+            j += 1
+        n = j - i + 1
+        if n >= int(min_run):
+            out.append(parts[i])
+            removed += n - 1
+        else:
+            out.extend(parts[i:j + 1])
+        i = j + 1
+    return ("".join(out) if removed else (text or "")), removed
+
+
 def collapse_repeats(text: str, min_count: int = 3) -> tuple[str, int]:
     """1つの認識結果の中で、同じ文（句点・？・！区切り）が min_count 回以上出てくるとき、1回（最初の位置）にまとめる。
     戻り値は (まとめたあとの文字, 取り除いた文の数)。該当が無ければ (元の文字, 0)。"""
     t = text or ""
+    t, run_removed = _collapse_clause_runs(t)
     sents = _SENT_SPLIT.findall(t)
     keys = [normalize_for_dup(s) for s in sents]
     counts: dict[str, int] = {}
@@ -122,7 +147,7 @@ def collapse_repeats(text: str, min_count: int = 3) -> tuple[str, int]:
             counts[k] = counts.get(k, 0) + 1
     heavy = {k for k, n in counts.items() if n >= int(min_count)}
     if not heavy:
-        return t, 0
+        return t, run_removed
     seen: set[str] = set()
     out: list[str] = []
     removed = 0
@@ -133,7 +158,7 @@ def collapse_repeats(text: str, min_count: int = 3) -> tuple[str, int]:
                 continue
             seen.add(k)
         out.append(s)
-    return "".join(out).strip(), removed
+    return "".join(out).strip(), removed + run_removed
 
 
 def compose_draft(entries: list, gap_sec: float | None = None, force_gap_sec: float | None = None,

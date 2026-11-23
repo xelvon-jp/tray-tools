@@ -89,7 +89,9 @@ def make_whisper_recognizer(settings: dict, model_cache=None, model_loader=None)
             cap = max(128, min(int(len(audio) / 16000.0 * 8) + 24, 440 - used))
         except Exception:
             cap = None          # 数えられなければ上限は付けない（temperature=0 の1回だけで、再試行の長引きは防げる）
-        bounded = dict(base, temperature=0.0)
+        # 温度は 0 → 0.3 の2段だけ。同じ言葉の暴走（圧縮率が高い結果）のときだけ、温度を上げてやり直す（実測: 「途中で言葉が抜けたり、」が
+        # 6回続き、出力の上限（128）で「途中で言」と切れた）。普通の発話は1回で終わるので、遅くならない
+        bounded = dict(base, temperature=[0.0, 0.3], compression_ratio_threshold=2.2)
         if cap is not None:
             bounded["max_new_tokens"] = cap
         try:

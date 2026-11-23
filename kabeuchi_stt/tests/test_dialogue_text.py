@@ -219,5 +219,19 @@ class SentenceNewlineTest(unittest.TestCase):
         self.assertEqual(normalize_for_dup("同じ、文です。 "), normalize_for_dup("同じ文です"))
 
 
+class ClauseRunCollapseTest(unittest.TestCase):
+    def test_comma_separated_runaway_is_collapsed(self):
+        from dialogue_text import collapse_repeats
+        t = "続けて話すとき、途中で言葉が抜けたり、 途中で言葉が抜けたり、 途中で言葉が抜けたり、 途中で言葉が抜けたりしないか。"
+        out, n = collapse_repeats(t)
+        self.assertEqual(out.count("途中で言葉が抜けたり、"), 1)
+        self.assertGreaterEqual(n, 2)
+
+    def test_two_repeats_and_short_clauses_are_kept(self):
+        from dialogue_text import collapse_repeats
+        self.assertEqual(collapse_repeats("はい、はい、はい、いいえ。"), ("はい、はい、はい、いいえ。", 0))
+        t = "途中で言葉が抜けたり、途中で言葉が抜けたり、しない。"
+        self.assertEqual(collapse_repeats(t), (t, 0))
+
 if __name__ == "__main__":
     unittest.main()

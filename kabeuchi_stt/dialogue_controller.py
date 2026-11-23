@@ -299,7 +299,8 @@ class DialogueController:
         return {"existing_text": c["existing_text"], "keep_idle_foreground": bool(c["keep_idle_foreground"]),
                 "return_focus": bool(c["return_focus"]), "quiet_input_sec": float(c["quiet_input_sec"]),
                 "send": bool(c["send_after_deliver"]), "wait_while_busy": bool(c["wait_while_busy"]),
-                "busy_wait_sec": float(c["busy_wait_sec"])}
+                "busy_wait_sec": float(c["busy_wait_sec"]),
+                "force_on_mismatch": bool(c.get("force_on_mismatch", False))}
 
     def _deliver(self, text: str) -> dict:
         """DialogueSession の deliver_callback。失敗・例外はすべて未配達の結果として返す。"""

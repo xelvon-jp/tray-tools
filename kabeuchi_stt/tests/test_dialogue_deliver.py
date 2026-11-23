@@ -589,5 +589,29 @@ class PlaceholderAfterSendTest(unittest.TestCase):
                          options={"send": True, "wait_while_busy": False}, sleep=lambda s: None)
         self.assertEqual((res["status"], res.get("sent")), ("delivered", True))
 
+class ForceOnMismatchTest(unittest.TestCase):
+    """読み戻しが一致しなくても、強制オプションがONなら、配達済みとして送信まで進む（OFFなら未配達のまま）。"""
+
+    class Ops:
+        def __init__(self): self.text, self.sent = None, False
+        def find_window(self, p, h): return {"status": "ok", "hwnd": 1, "rect": (0, 0, 100, 100)}
+        def foreground_root(self): return 1
+        def wake(self, r): return {}
+        def find_input(self, r, p): return {"found": True, "element": {"rect": (0, 0, 10, 10)}, "how": "x"}
+        def read_value(self, r, p): return {"ok": True, "text": "" if self.sent else (self.text or "")}
+        def write_value(self, r, p, t): self.text = "全然ちがう内容"; return {"ok": True}
+        def find_button(self, *a): return {"found": True, "enabled": True, "name": "送信", "rect": (0, 0, 5, 5)}
+        def invoke_button(self, *a): self.sent = True; return {"invoked": True}
+
+    def test_off_stays_undelivered(self):
+        res = dd.deliver(self.Ops(), {}, "こんにちは", options={"send": True, "wait_while_busy": False, "allow_click": False,
+                                                              "front_methods": []}, sleep=lambda s: None)
+        self.assertEqual(res["status"], "undelivered")
+
+    def test_on_delivers_and_sends(self):
+        res = dd.deliver(self.Ops(), {}, "こんにちは", options={"send": True, "wait_while_busy": False, "force_on_mismatch": True},
+                         sleep=lambda s: None)
+        self.assertEqual((res["status"], res.get("readback"), res.get("sent")), ("delivered", "mismatch_forced", True))
+
 if __name__ == "__main__":
     unittest.main()

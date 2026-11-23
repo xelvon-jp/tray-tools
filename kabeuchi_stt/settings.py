@@ -92,6 +92,7 @@ DIALOGUE_DEFAULTS: dict = {
     "merge_undelivered": False,    # 未配達が複数あるとき、まとめて1通で再試行する
     "context_sentences": 2,        # 認識の文脈に渡す直前の発話数
     "send_after_deliver": False,   # 入力欄へ届けたあと、送信（送信ボタン／Enter）まで行う
+    "force_on_mismatch": False,    # 入力後の読み戻しが一致しなくても、文字が入っていれば配達済みとして送信まで進める（応急。誤送信の恐れあり）
     "wait_while_busy": True,       # 送信まで行うとき、相手が回答中（停止ボタンが見える）なら待つ
     "busy_wait_sec": 120,          # 回答中の待ちの上限（超えたら送らず「回答中のため未送信」）
     "newline_after_sentence": True,  # 文中の「。」「？」「！」の直後に改行を入れる

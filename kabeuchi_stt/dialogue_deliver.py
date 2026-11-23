@@ -92,6 +92,7 @@ DEFAULT_OPTIONS = {
     "readback_tries": 3,
     "readback_interval_sec": 0.2,
     "paste_settle_sec": 0.3,
+    "force_on_mismatch": False,         # True: 読み戻しが一致しなくても（文字が入っていれば）配達済みとして、送信まで進める
     # --- 送信まで行う ---
     "send": False,                      # True: 配達（読み戻し一致）のあと、送信まで行う
     "wait_while_busy": True,            # 回答中（busy_button が見える）なら送信を待つ
@@ -446,6 +447,10 @@ def deliver(ops, profile, text, hwnd=0, options=None, clock=time.monotonic, slee
     if wrote and verdict == "ok":
         _after_input_ok(run, root, profile, elem_rect, existing, opts, sleep, fw)
         return run.done("delivered", "uia", readback="ok")
+    if wrote and verdict == "mismatch" and opts["force_on_mismatch"]:
+        run.note("force_on_mismatch", verdict=verdict, via="uia")
+        _after_input_ok(run, root, profile, elem_rect, existing, opts, sleep, fw)
+        return run.done("delivered", "uia", readback="mismatch_forced")
 
     # 紛れ込んだ内容を、貼り付けの前に元へ戻す（二重に入れないため）。replace は全選択で上書きするので不要
     if mode != "replace" and wrote and verdict not in ("ok",):
@@ -558,6 +563,10 @@ def deliver(ops, profile, text, hwnd=0, options=None, clock=time.monotonic, slee
     if verdict2 == "ok":
         _after_input_ok(run, root, profile, elem_rect, existing, opts, sleep, fw)
         return run.done("delivered", stage, readback="ok")
+    if verdict2 == "mismatch" and opts["force_on_mismatch"]:
+        run.note("force_on_mismatch", verdict=verdict2)       # 利用者が選んだ強制送信。ログに残す
+        _after_input_ok(run, root, profile, elem_rect, existing, opts, sleep, fw)
+        return run.done("delivered", stage, readback="mismatch_forced")
     return run.done("undelivered", stage, R_MISMATCH, readback=verdict2)
 
 

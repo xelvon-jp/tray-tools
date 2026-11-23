@@ -265,6 +265,12 @@ class SettingsDialog(QDialog):
         f.addRow("ホットキー: 確定", hk_row)
         f.addRow("", self.dlg_nl)
         f.addRow("発話の区切り", self.dlg_utt_gap)
+        self.dlg_force = CheckBox("読み戻しが不一致でも強制的に届ける（応急）")
+        self.dlg_force.setChecked(bool(dcfg.get("force_on_mismatch")))
+        self.dlg_force.setToolTip("入力後の読み戻しが一致しなくても、入力欄に文字があれば「届いた」として扱い、［送信までする］がONなら送信まで進める。"
+                                  "Copilot などで、正しく入っているのに「読み戻しが一致しません」と出るときの応急策。入力欄が空・読めないときは対象外。"
+                                  "本当に崩れて入っていても送ってしまう恐れがあります。")
+        f.addRow("", self.dlg_force)
         f.addRow("入力欄に書きかけ", self.dlg_existing)
         dnote = QLabel("区切り・認識モデルの設定は、次のセッションから効きます。確定ホットキーは保存すると登録し直します。"
                        "確定は必ず操作（ボタン・ヘッドセット・ショートカット）で行います。無音で自動確定する機能はありません。"
@@ -320,6 +326,7 @@ class SettingsDialog(QDialog):
             "headset_button": self.dlg_headset.isChecked(),
             "mouse_button": self.dlg_mouse.currentData() or "",
             "click_commit": self.dlg_click.isChecked(),
+            "force_on_mismatch": self.dlg_force.isChecked(),
             "idle_stop_sec": self.idle_stop.value(),
             "newline_after_sentence": self.dlg_nl.isChecked(),
             "break_blank_line": self.dlg_nl.isChecked(),

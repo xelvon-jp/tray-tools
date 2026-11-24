@@ -3314,6 +3314,7 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self.preview_side = None
         self.preview_widget = None
+        self._focus_viewer_when_ready = False   # Enter で開いたテキストは、出たらビュアへ入る
         self._preview_fullscreen = False    # 右窓から入ったプレビューはフルスクリーン
         self._preview_was_maximized = False
         # プレビューの読み込み。要求はここへ積んで1つのスレッドが読む。新しい要求が
@@ -4347,8 +4348,13 @@ class FilerWindow(QWidget):
             else:
                 self.preview_show()
         elif core.opens_in_viewer(entry.name, self.viewer_extensions):
-            # テキストはビュアで(あふｗの拡張子判別実行)。関連付けは Ctrl+Enter。
-            self._view_entry(entry)
+            # テキストは反対窓でちらっと見る(ビュアに入った状態で出る)。そこで Enter なら
+            # 編集(EDDy)、Esc / Tab で一覧へ。独立窓のビュアは Ctrl+Enter のメニューから。
+            self._focus_viewer_when_ready = True
+            if self.preview_on:
+                self.schedule_preview(immediate=True)
+            else:
+                self.preview_show()
         else:
             self._open_file(entry)
 
@@ -6444,6 +6450,7 @@ class FilerWindow(QWidget):
             self.preview_widget = filer_preview.PreviewWidget(self, self.colors, self.log_font)
             # 埋め込みのテキストビュアから Esc / Tab / Enter で一覧へ戻る
             self.preview_widget.leave.connect(self._leave_preview_viewer)
+            self.preview_widget.edit.connect(self._edit_from_preview)
         index = self.hsplit.indexOf(other)
         self.hsplit.insertWidget(index, self.preview_widget)
         other.hide()
@@ -6470,6 +6477,14 @@ class FilerWindow(QWidget):
         else:
             self.schedule_preview(immediate=True)
 
+    def _edit_from_preview(self) -> None:
+        """プレビューのビュアで Enter: 一覧へ戻って、カーソルのファイルを編集(E と同じ)。"""
+        try:
+            self.active.view.setFocus()
+            self.cmd_edit()
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("editFromPreview")
+
     def _leave_preview_viewer(self) -> None:
         """埋め込みのテキストビュアから一覧へフォーカスを戻す。"""
         try:
@@ -6481,6 +6496,7 @@ class FilerWindow(QWidget):
         if not self.preview_on:
             return
         self.preview_on = False
+        self._focus_viewer_when_ready = False
         if self._preview_fullscreen:
             self._preview_fullscreen = False
             if self._preview_was_maximized:
@@ -6617,6 +6633,10 @@ class FilerWindow(QWidget):
             if generation != self._preview_generation or self.preview_widget is None:
                 return     # プレビューを閉じた(開き直した)あとに届いた結果
             self.preview_widget.show_result(result)
+            if self._focus_viewer_when_ready:
+                # Enter で開いたときは、ビュアが出たらそのまま中へ入る(ちらっと見る)
+                self._focus_viewer_when_ready = False
+                self.preview_widget.focus_viewer()
             self._reload_if_turned(result)
             self._update_preview_rating()
         except Exception:  # noqa: BLE001

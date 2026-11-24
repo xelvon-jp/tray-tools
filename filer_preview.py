@@ -219,6 +219,7 @@ class PreviewWidget(QWidget):
     全文が読め、検索などもできる。キーを受けるのはビュアにフォーカスを渡したときだけ
     (focus_viewer)で、Esc / Tab / Enter で一覧へ戻る(leave)。"""
 
+    edit = Signal()     # ビュアで Enter(編集したい)
     leave = Signal()    # ビュアから「一覧へ戻りたい」(呼び出し側がフォーカスを戻す)
 
     def __init__(self, parent, colors: dict, font: QFont):
@@ -417,6 +418,7 @@ class PreviewWidget(QWidget):
                             "text": self.colors.get("text")},
                     embedded=True, parent=self)
                 self.viewer.leave.connect(self.leave)
+                self.viewer.edit.connect(self.edit)
                 self.stack.addWidget(self.viewer)
             else:
                 self.viewer.load(path, result.get("title") or None)

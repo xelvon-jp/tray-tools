@@ -2218,6 +2218,11 @@ def test_window_e_key_opens_eddy():
             w.deleteLater()
 
 
+def filer_viewer_cls():
+    import filer_viewer
+    return filer_viewer.TextViewer
+
+
 def test_window_preview_text_viewer():
     """V / F3: テキストは反対窓に簡易テキストビュアで出る(全文。200 行で切れない)。
     ↑↓ で別のファイルへ移ると読み替わり、Tab / Enter でビュアへ入り、Esc で一覧へ戻る。"""
@@ -2270,17 +2275,33 @@ def test_window_preview_text_viewer():
             key(Qt.Key_Return)
             assert entered == [1, 1] and w.active_side == side, (entered, w.active_side)
             del pv.focus_viewer
-            # ビュアの中の Esc / Enter / Tab は閉じず、一覧へ戻る合図(leave)だけ出す
-            left_signals = []
+            # ビュアの中の Esc / Tab は閉じず、一覧へ戻る合図(leave)だけ出す。
+            # Enter は編集の合図(edit)で、本体は一覧へ戻って E と同じ cmd_edit を呼ぶ
+            left_signals, edit_signals = [], []
             viewer.leave.connect(lambda: left_signals.append(1))
+            viewer.edit.connect(lambda: edit_signals.append(1))
             for k in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Tab):
                 viewer.handle_key(QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier))
-            assert left_signals == [1, 1, 1], left_signals
+            assert left_signals == [1, 1] and edit_signals == [1], (left_signals, edit_signals)
             assert viewer.isVisible() or viewer.parent() is pv      # 閉じていない
+            edited = []
+            w.cmd_edit = lambda: edited.append(1)
+            w._edit_from_preview()
+            assert edited == [1]
+            del w.cmd_edit
             # もう一度 V でプレビューを閉じる(ビュアの読み込みも止まる)
             key(Qt.Key_V)
             assert not w.preview_on and w.preview_widget is None
             assert viewer.index is None or viewer.index._stop.is_set() or viewer.index.done
+            # 一覧でテキストを Enter: プレビューが開き、出たらビュアへ入る(独立窓にならない)
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            key(Qt.Key_Return)
+            assert w.preview_on and w._focus_viewer_when_ready
+            _wait_preview(w, "alpha.txt")
+            assert w.preview_widget.viewer_shown()
+            assert not w._focus_viewer_when_ready      # ビュアへ入ったので使い切った
+            assert not any(isinstance(c, filer_viewer_cls()) and c.windowFlags() & Qt.Window
+                           for c in w.findChildren(filer_viewer_cls()) if c.embedded is False)
         finally:
             w.close()
             w.deleteLater()
@@ -4417,8 +4438,11 @@ def test_enter_viewer_routing():
         assert opened == [os.path.join(L.path, "tool.exe")] and not w._viewers
         L.set_cursor(L._row_of("app.log"))
         QTest.keyClick(L.view, Qt.Key_Return)
-        assert len(w._viewers) == 1 and opened == [os.path.join(L.path, "tool.exe")]
-        viewer = w._viewers[0]
+        # テキストの Enter は反対窓のプレビュー(独立窓のビュアは開かない)
+        assert w.preview_on and not w._viewers and opened == [os.path.join(L.path, "tool.exe")]
+        w.preview_off()
+        viewer = w.open_viewer(os.path.join(L.path, "app.log"))   # 独立窓は Ctrl+Enter のメニューから
+        assert len(w._viewers) == 1
         assert viewer.area.font().pointSize() == L.pane_font.pointSize()  # 字の大きさは窓から
         w._exec_menu = _pick_menu("&O:")       # Ctrl+Enter のメニューの「関連付けで開く」
         QTest.keyClick(L.view, Qt.Key_Return, Qt.ControlModifier)

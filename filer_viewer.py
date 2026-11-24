@@ -369,6 +369,7 @@ class TextViewer(QWidget):
     # 埋め込み(embedded)のとき、Esc / Enter / BS / Q で出す。窓は閉じず、
     # 呼び出し側がフォーカスをファイル窓へ戻す。
     leave = Signal()
+    edit = Signal()     # 埋め込みで Enter: 編集へ(呼び出し側が EDDy で開く)
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
                  colors: dict = None, editor_callback=None, nav_callback=None,
@@ -592,7 +593,7 @@ class TextViewer(QWidget):
         top = self.area.verticalScrollBar().value() + 1
         status = f"{label}  {lines}  {top:,}行目  TAB{self.tab_width}"
         if self.embedded:
-            status += "  Esc/Tab: 一覧へ"
+            status += "  Enter: 編集  Esc/Tab: 一覧へ"
         if getattr(self, "rich", None) is not None:
             status += "  整形表示（R: ソース）" if self.render_mode else "  ソース表示（R: 整形）"
         if self.index.error:
@@ -728,6 +729,8 @@ class TextViewer(QWidget):
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if shift:
                 self.open_editor()
+            elif self.embedded:
+                self.edit.emit()    # ちらっと見て、そのまま Enter で編集へ
             else:
                 self.close_or_leave()
             return

@@ -6178,6 +6178,7 @@ class FilerWindow(QWidget):
 
         picker = self._open_picker(
             "統合ピッカー", build_items(), self.jump_to, on_accept=accept,
+            ime_off=True,   # 開いた直後は無変換(フォルダ名は英数字で打ち始めることが多い)
             **unified_picker.picker_kwargs(
                 state, dynamics=dynamics, on_delete=delete, on_move=move,
                 on_mode_change=mode_change,

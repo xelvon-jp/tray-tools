@@ -172,6 +172,31 @@ REJECT_FLASH_MS = 180
 REJECT_FLASH_STYLE = "QLineEdit { background-color: #6e2434; }"
 
 
+def set_ime_open(hwnd: int, opened: bool) -> bool:
+    """hwnd の窓の IME を開く/閉じる(閉じる＝無変換・直接入力)。できたら True。
+
+    windll.imm32 の共有の関数オブジェクトに型を書き込むと、他のモジュールの呼び方と
+    ぶつかりうるので、専用の WinDLL を作ってそちらに型を付ける。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    from ctypes import wintypes
+
+    imm = ctypes.WinDLL("imm32")
+    imm.ImmGetContext.argtypes = [wintypes.HWND]
+    imm.ImmGetContext.restype = wintypes.HANDLE
+    imm.ImmSetOpenStatus.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+    imm.ImmSetOpenStatus.restype = wintypes.BOOL
+    imm.ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+    imm.ImmReleaseContext.restype = wintypes.BOOL
+    himc = imm.ImmGetContext(hwnd)
+    if not himc:
+        return False
+    try:
+        return bool(imm.ImmSetOpenStatus(himc, bool(opened)))
+    finally:
+        imm.ImmReleaseContext(hwnd, himc)
+
+
 class PickerWindow(QWidget):
     """枠なしの小さな選択ウインドウ。上の入力欄で絞り込み、下のリストから1つ決める。
 
@@ -251,8 +276,10 @@ class PickerWindow(QWidget):
         on_ctrl_enter=None,
         accept_empty=None,
         initial_row: int = None,
+        ime_off: bool = False,
     ):
         super().__init__()
+        self._ime_off = bool(ime_off)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setWindowTitle(title)
 
@@ -634,6 +661,17 @@ class PickerWindow(QWidget):
         y = max(area.top(), min(y, area.bottom() - self.height()))
         self.move(x, y)
 
+    def _turn_ime_off(self) -> None:
+        """入力欄の IME を「無変換(直接入力)」にする(ime_off を渡したときだけ)。
+
+        フォルダ名やコマンドの頭文字は英数字で打つことが多いので、開いた直後に
+        かなのまま打ってしまうのを防ぐ。切るのは開いた時点だけで、そのあと自分で
+        IME を入れれば日本語も打てる。Windows 以外・IME が無いときは何もしない。"""
+        try:
+            set_ime_open(int(self.winId()), False)
+        except Exception:  # noqa: BLE001  IME を切れなくても選択窓は使える
+            pass
+
     def showEvent(self, event):
         super().showEvent(event)
         self._position_chip()
@@ -642,6 +680,11 @@ class PickerWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.search.setFocus()
+        if self._ime_off:
+            # フォーカスが入力欄に落ち着いてから切る(直後は IME の文脈がまだ前の
+            # 窓のものであることがある)。念のため少し後にもう一度。
+            QTimer.singleShot(0, self._turn_ime_off)
+            QTimer.singleShot(120, self._turn_ime_off)
         # 取れていなければ、もう一度だけ自分で前面を取りにいく。
         #
         # 【なぜ要るか】

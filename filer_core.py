@@ -64,9 +64,10 @@ DEFAULT_KEYMAP = {
     "0069": "text_editor",        # E 内蔵テキストエディタ(EDDy)で開く(2026-11-14 Nagato
                                   # 指示。対象はテキストとして開けるものだけ。以前は
                                   # 外のエディタだった)
-    "0086": "edit",               # V 外のエディタ(filer.editor)で開く(AFXW.key 0086
-                                  # &MENU edit.txt の代わり。外のエディタは V と
-                                  # Shift+Enter に残る)
+    "0086": "preview_toggle",     # V ビュー(F3 と同じ。反対窓にカーソルのファイルを出す。
+                                  # テキストは簡易ビュアで全文。2026-11-24 本人の希望で
+                                  # 外のエディタ起動から変更。エディタは E(EDDy)・
+                                  # Ctrl+Enter のメニュー・Shift+Enter)
     "2069": "text_editor",        # Ctrl+E E と同じく内蔵テキストエディタで開く
                                   # (Shift+E=新規テキスト)
     "3082": "script_runner",      # Ctrl+Shift+R スクリプト実行パネルを開く

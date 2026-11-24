@@ -17,7 +17,7 @@
 # QImage はスレッドをまたいで渡してよい(QPixmap にするのは UI スレッドで)。
 import os
 
-from PySide6.QtCore import QEvent, QUrl, Qt
+from PySide6.QtCore import QEvent, QUrl, Qt, Signal
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
@@ -213,12 +213,20 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
 
 
 class PreviewWidget(QWidget):
-    """反対窓の場所に出すプレビュー。キーは受け取らない(フォーカスはファイル窓のまま)。"""
+    """反対窓の場所に出すプレビュー。キーは受け取らない(フォーカスはファイル窓のまま)。
+
+    テキストは簡易テキストビュア(filer_viewer.TextViewer の埋め込み版)で出す。
+    全文が読め、検索などもできる。キーを受けるのはビュアにフォーカスを渡したときだけ
+    (focus_viewer)で、Esc / Tab / Enter で一覧へ戻る(leave)。"""
+
+    leave = Signal()    # ビュアから「一覧へ戻りたい」(呼び出し側がフォーカスを戻す)
 
     def __init__(self, parent, colors: dict, font: QFont):
         super().__init__(parent)
         self.setFocusPolicy(Qt.NoFocus)
         self.colors = colors
+        self._font = font
+        self.viewer = None          # 埋め込みの簡易テキストビュア(最初のテキストで作る)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -379,9 +387,56 @@ class PreviewWidget(QWidget):
             else:
                 self.rich.setMarkdown(text)
             self.stack.setCurrentWidget(self.rich)
+        elif self._show_in_viewer(result):
+            self._disp_pixmap = None
+            self._orig_pixmap = None
+            self.orig_btn.setEnabled(False)
         else:
             self._disp_pixmap = None
             self._orig_pixmap = None
             self.orig_btn.setEnabled(False)
             self.text.setPlainText("\n".join(result.get("lines") or []))
             self.stack.setCurrentWidget(self.text)
+
+    # --- 簡易テキストビュア(テキストのプレビュー) ---
+    def _show_in_viewer(self, result: dict) -> bool:
+        """テキストを簡易テキストビュアで出す。出せたら True。
+
+        読めない(消えた・権限なし等)ときは False で、呼び出し側が従来の
+        テキスト表示(読み取りスレッドが作った先頭 200 行)に戻す。"""
+        path = result.get("path")
+        if result.get("kind") != "text" or not path or not os.path.isfile(path):
+            return False
+        try:
+            if self.viewer is None:
+                import filer_viewer  # 使うときに読む
+
+                self.viewer = filer_viewer.TextViewer(
+                    path, title_name=result.get("title") or None, font=self._font,
+                    colors={"background": self.colors.get("background"),
+                            "text": self.colors.get("text")},
+                    embedded=True, parent=self)
+                self.viewer.leave.connect(self.leave)
+                self.stack.addWidget(self.viewer)
+            else:
+                self.viewer.load(path, result.get("title") or None)
+        except OSError:
+            return False
+        self.stack.setCurrentWidget(self.viewer)
+        return True
+
+    def viewer_shown(self) -> bool:
+        """いま簡易テキストビュアを出しているか。"""
+        return self.viewer is not None and self.stack.currentWidget() is self.viewer
+
+    def focus_viewer(self) -> bool:
+        """ビュアにフォーカスを渡す(スクロール・検索のキーが効くようになる)。"""
+        if not self.viewer_shown():
+            return False
+        self.viewer.area.setFocus()
+        return True
+
+    def shutdown(self) -> None:
+        """プレビューを閉じるとき。ビュアの読み込み・検索のスレッドを止める。"""
+        if self.viewer is not None:
+            self.viewer.shutdown()

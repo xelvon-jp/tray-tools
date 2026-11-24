@@ -1,6 +1,8 @@
 afx text
-# テキスト(_aliases.txt の text)のメニュー。
-"V:内蔵ビュア" &VIEW $MF
+# テキスト(_aliases.txt の text)のメニュー。先頭の項目が選ばれた状態で開くので、
+# Ctrl+Enter → Enter で内蔵エディタ(EDDy)に着く。
+# 秀丸・VS Code などはこの PC だけのメニュー(%LOCALAPPDATA%\traytools\menus\text.txt)に足す。
 "T:EDDy" &TEDIT $MF
-"E:エディタ" &EDIT $MF
+"V:内蔵ビュア(全画面)" &VIEW $MF
+"E:外のエディタ(filer.editor)" &EDIT $MF
 "N:メモ帳" notepad.exe $MF

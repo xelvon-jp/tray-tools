@@ -4146,6 +4146,13 @@ class FilerWindow(QWidget):
             return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
+        # プレビューにテキストビュアが出ているとき、Tab / Enter でそちらへ入る
+        # (スクロール・検索・行ジャンプが効く。戻るのは Esc / Tab / Enter)。
+        if (self.preview_on and self.preview_widget is not None
+                and event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter)
+                and not (mods & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier))
+                and self.preview_widget.focus_viewer()):
+            return
         if event.key() == Qt.Key_Escape and self.preview_on:
             self.preview_off()      # Esc はプレビュー(F3)を抜ける
             return
@@ -6434,6 +6441,8 @@ class FilerWindow(QWidget):
         self.preview_side = other.side
         if self.preview_widget is None:
             self.preview_widget = filer_preview.PreviewWidget(self, self.colors, self.log_font)
+            # 埋め込みのテキストビュアから Esc / Tab / Enter で一覧へ戻る
+            self.preview_widget.leave.connect(self._leave_preview_viewer)
         index = self.hsplit.indexOf(other)
         self.hsplit.insertWidget(index, self.preview_widget)
         other.hide()
@@ -6460,6 +6469,13 @@ class FilerWindow(QWidget):
         else:
             self.schedule_preview(immediate=True)
 
+    def _leave_preview_viewer(self) -> None:
+        """埋め込みのテキストビュアから一覧へフォーカスを戻す。"""
+        try:
+            self.active.view.setFocus()
+        except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
+            _log_exception("leavePreviewViewer")
+
     def preview_off(self) -> None:
         if not self.preview_on:
             return
@@ -6481,6 +6497,7 @@ class FilerWindow(QWidget):
         self.image_turn.reset()             # 回転・回転固定はビュアを抜けたら解く
         pane = self.pane(self.preview_side)
         if self.preview_widget is not None:
+            self.preview_widget.shutdown()      # 埋め込みビュアの読み込みスレッドを止める
             self.preview_widget.hide()
             self.preview_widget.setParent(None)
             self.preview_widget.deleteLater()

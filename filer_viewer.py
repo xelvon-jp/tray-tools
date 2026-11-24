@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QInputDialog,
     QLabel,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -47,6 +48,7 @@ from text_encoding import (  # noqa: F401  (再 export が目的)
 DETECT_BYTES = 4 * 1024 * 1024   # UTF-8 として正しいかを見る長さ
 INDEX_CHUNK = 4 * 1024 * 1024    # 索引作りで一度に読む長さ
 MAX_LINE_BYTES = 64 * 1024       # 1行を表示・検索に読む上限(1行が巨大なファイル対策)
+READER_IDLE_SECONDS = 0.3        # この間読まなければファイルを手放す(削除・改名を邪魔しない)
 
 # 整形表示できるマークアップ。HTML / Markdown は、ソースを見たい場面が
 # ほぼ無いので、ビュアでは整形(レンダリング結果)を既定にする。R で
@@ -161,18 +163,36 @@ class LineReader:
 
     def __init__(self, index: LineIndex):
         self.index = index
-        self._file = open(index.path, "rb")
+        # 必要になったときに開く(開いたままだと、Windows では一覧から削除・改名
+        # できなくなる。埋め込みのプレビューは見せている間ずっとファイルを持つので、
+        # 使っていないときは release_if_idle で手放す)。
+        self._file = None
+        self._last_used = 0.0
+
+    def _handle(self):
+        if self._file is None:
+            self._file = open(self.index.path, "rb")
+        self._last_used = time.monotonic()
+        return self._file
 
     def close(self) -> None:
-        try:
-            self._file.close()
-        except OSError:
-            pass
+        f, self._file = self._file, None
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    def release_if_idle(self, seconds: float) -> None:
+        """しばらく読んでいなければハンドルを閉じる(次に読むとき開き直す)。"""
+        if self._file is not None and time.monotonic() - self._last_used >= seconds:
+            self.close()
 
     def line(self, number: int) -> str:
         start, length = self.index.span(number)
-        self._file.seek(start)
-        return decode_line(self._file.read(length), self.index.encoding)
+        f = self._handle()
+        f.seek(start)
+        return decode_line(f.read(length), self.index.encoding)
 
     def block(self, begin: int, end: int) -> str:
         """begin 行目から end 行目の手前までをまとめて文字にする(検索用。1行ずつ読むより
@@ -180,8 +200,9 @@ class LineReader:
         starts = self.index.starts
         start = starts[begin]
         stop = starts[end] if end < len(starts) else self.index.size
-        self._file.seek(start)
-        return self._file.read(stop - start).decode(self.index.encoding, errors="replace")
+        f = self._handle()
+        f.seek(start)
+        return f.read(stop - start).decode(self.index.encoding, errors="replace")
 
 
 SEARCH_BLOCK_LINES = 4000
@@ -345,12 +366,22 @@ class TextViewer(QWidget):
     """1ファイルぶんのビュア窓。モードレスで、いくつ開いてもよい。"""
 
     closed = Signal(object)
+    # 埋め込み(embedded)のとき、Esc / Enter / BS / Q で出す。窓は閉じず、
+    # 呼び出し側がフォーカスをファイル窓へ戻す。
+    leave = Signal()
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
                  colors: dict = None, editor_callback=None, nav_callback=None,
-                 geometry=None, parent=None, text_editor_callback=None):
-        super().__init__(parent, Qt.Window)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
+                 geometry=None, parent=None, text_editor_callback=None,
+                 embedded: bool = False):
+        # embedded=True は、反対窓のプレビューの中に子ウィジェットとして置く使い方
+        # (独立した窓ではない)。閉じるキーは leave を出すだけで、読み替えは load() で行う。
+        self.embedded = embedded
+        if embedded:
+            super().__init__(parent)
+        else:
+            super().__init__(parent, Qt.Window)
+            self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.path = path
         self.title_name = title_name or os.path.basename(path)
         self.colors = dict(DEFAULT_VIEWER_COLORS)
@@ -382,6 +413,8 @@ class TextViewer(QWidget):
         self.status = QLabel()
         self.status.setTextFormat(Qt.PlainText)
         self.status.setContentsMargins(6, 1, 6, 1)
+        # 文字の長さで窓(埋め込みでは反対窓)の最小幅が広がらないようにする
+        self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status.setStyleSheet(f"background-color: {self.colors['status_background']};"
                                   f" color: {self.colors['status_text']};")
         layout.addWidget(self.status)
@@ -394,7 +427,9 @@ class TextViewer(QWidget):
         self.render_mode = False
         self._load_file(path, title_name)
 
-        if geometry:
+        if embedded:
+            pass                        # 大きさは置かれた場所が決める
+        elif geometry:
             self.setGeometry(*geometry)
         else:
             self.resize(900, 650)
@@ -533,6 +568,8 @@ class TextViewer(QWidget):
     def _tick(self) -> None:
         """索引作りと検索の進み具合を拾う(別スレッドから Qt を触らないため、こちらから見に行く)。"""
         try:
+            if self.reader is not None:
+                self.reader.release_if_idle(READER_IDLE_SECONDS)
             if self.index is not None:
                 self.area.update_ranges()
                 if not self.index.done:
@@ -554,6 +591,8 @@ class TextViewer(QWidget):
         self.setWindowTitle(f"{self.title_name} - {label} - {lines}")
         top = self.area.verticalScrollBar().value() + 1
         status = f"{label}  {lines}  {top:,}行目  TAB{self.tab_width}"
+        if self.embedded:
+            status += "  Esc/Tab: 一覧へ"
         if getattr(self, "rich", None) is not None:
             status += "  整形表示（R: ソース）" if self.render_mode else "  ソース表示（R: 整形）"
         if self.index.error:
@@ -684,16 +723,19 @@ class TextViewer(QWidget):
             if self.searching():
                 self._cancel_search()
             else:
-                self.close()
+                self.close_or_leave()
             return
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if shift:
                 self.open_editor()
             else:
-                self.close()
+                self.close_or_leave()
+            return
+        if key == Qt.Key_Tab and self.embedded and not (shift or ctrl):
+            self.leave.emit()   # 埋め込みでは Tab も一覧へ戻る(入るときと同じキー)
             return
         if key == Qt.Key_Backspace or (letter == "Q" and not shift):
-            self.close()        # BS はユーザーの AFXW.key で Enter(終了)に置き換え済み
+            self.close_or_leave()   # BS はユーザーの AFXW.key で Enter(終了)に置き換え済み
             return
         if shift and not ctrl and letter in ENCODING_KEYS:
             self.set_encoding(ENCODING_KEYS[letter])
@@ -823,14 +865,29 @@ class TextViewer(QWidget):
         QGuiApplication.clipboard().setText(self.visible_text())
         self.set_status("見えている行をコピーしました")
 
+    def close_or_leave(self) -> None:
+        """閉じるキー。独立窓なら閉じる。埋め込みなら一覧へ戻るだけ(窓は残す)。"""
+        if self.embedded:
+            self.leave.emit()
+        else:
+            self.close()
+
+    def load(self, path: str, title_name: str = None) -> None:
+        """埋め込みで、別のファイルへ読み替える(OSError はそのまま投げる)。"""
+        self._load_file(path, title_name)
+
+    def shutdown(self) -> None:
+        """索引作り・検索・タイマーを止めて、ファイルを手放す。"""
+        self._cancel_search()
+        self._timer.stop()
+        if self.index is not None:
+            self.index.stop()
+        if self.reader is not None:
+            self.reader.close()
+
     def closeEvent(self, event):
         try:
-            self._cancel_search()
-            self._timer.stop()
-            if self.index is not None:
-                self.index.stop()
-            if self.reader is not None:
-                self.reader.close()
+            self.shutdown()
             geometry = self.geometry()
             self.closed.emit([geometry.x(), geometry.y(), geometry.width(), geometry.height()])
         except Exception:  # noqa: BLE001  閉じられなくなるのが最悪

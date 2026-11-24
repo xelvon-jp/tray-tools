@@ -200,7 +200,7 @@ def test_sort_kinds():
     assert core.natural_key("a2") < core.natural_key("a10")
     assert core.normalize_sort({"kind": "bogus", "descending": "yes"}) == core.DEFAULT_SORT
     assert core.DEFAULT_KEYMAP["0083"] == "sort_dialog" and core.DEFAULT_KEYMAP["1083"] == "sort_reverse"
-    assert core.DEFAULT_KEYMAP["0086"] == "edit"
+    assert core.DEFAULT_KEYMAP["0086"] == "preview_toggle"   # V は F3 と同じビュー
 
 
 def test_compare_marks():
@@ -918,7 +918,7 @@ def test_window_newtext_stamp():
     _qapp()
     assert core.DEFAULT_KEYMAP["1069"] == "newtext"
     assert core.DEFAULT_KEYMAP["0069"] == "text_editor"  # E は EDDy(2026-11-14)
-    assert core.DEFAULT_KEYMAP["0086"] == "edit"  # 外のエディタは V に残る
+    assert core.DEFAULT_KEYMAP["0086"] == "preview_toggle"  # V はビュー(F3 と同じ)
     with tempfile.TemporaryDirectory() as tmp:
         left, right = _make_tree(tmp)
         settings_path = Path(tmp, "settings.json")
@@ -2048,7 +2048,7 @@ def test_window_keys_and_operations():
         filer.subprocess.Popen = lambda args, **kw: calls.append(args)
         try:
             L.marks.update({"alpha.txt", "gamma2.txt"})
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
         finally:
             filer.subprocess.Popen = real_popen
         assert sorted(os.path.basename(a[1]) for a in calls) == ["alpha.txt", "gamma2.txt"], calls
@@ -2208,12 +2208,80 @@ def test_window_e_key_opens_eddy():
             assert calls == [], calls
             # V: 従来どおり外のエディタで開く
             w.left.set_cursor(w.left._row_of("alpha.txt"))
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
             _wait(w)
             assert [os.path.basename(a[1]) for a in calls] == ["alpha.txt"], calls
             assert opened == [str(left / "alpha.txt")], opened
         finally:
             filer.subprocess.Popen = real_popen
+            w.close()
+            w.deleteLater()
+
+
+def test_window_preview_text_viewer():
+    """V / F3: テキストは反対窓に簡易テキストビュアで出る(全文。200 行で切れない)。
+    ↑↓ で別のファイルへ移ると読み替わり、Tab / Enter でビュアへ入り、Esc で一覧へ戻る。"""
+    import filer
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "alpha.txt").write_text(
+            "\n".join(f"line {i}" for i in range(1, 501)) + "\n", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
+        try:
+            # V は F3 と同じ: プレビューが開き、テキストはビュアに出る
+            w.left.set_cursor(w.left._row_of("alpha.txt"))
+            key(Qt.Key_V)
+            assert w.preview_on
+            _wait_preview(w, "alpha.txt")
+            pv = w.preview_widget
+            assert pv.viewer_shown(), "テキストがビュアに出ていない"
+            assert pv.viewer.path == str(left / "alpha.txt") and pv.viewer.embedded
+            deadline = time.monotonic() + 5
+            while not pv.viewer.index.done and time.monotonic() < deadline:
+                QTest.qWait(20)
+            assert pv.viewer.line_count() == 500, pv.viewer.line_count()   # 200 行で切れない
+            # 別のファイルへ移ると、同じビュアが読み替わる
+            viewer = pv.viewer
+            w.left.set_cursor(w.left._row_of("gamma.txt"))
+            _wait_preview(w, "gamma.txt")
+            assert pv.viewer is viewer and viewer.path == str(left / "gamma.txt")
+            # 見せている間も、ファイルを開きっぱなしにしない(一覧から改名・削除できる)
+            QTest.qWait(800)
+            os.rename(left / "gamma.txt", left / "gamma_moved.txt")
+            os.rename(left / "gamma_moved.txt", left / "gamma.txt")
+            # Tab / Enter はビュアへ入る(窓の切り替え・ビュア別窓にならない)
+            entered = []
+            pv.focus_viewer = lambda: entered.append(1) or True   # noqa: E731
+            side = w.active_side
+            key(Qt.Key_Tab)
+            key(Qt.Key_Return)
+            assert entered == [1, 1] and w.active_side == side, (entered, w.active_side)
+            del pv.focus_viewer
+            # ビュアの中の Esc / Enter / Tab は閉じず、一覧へ戻る合図(leave)だけ出す
+            left_signals = []
+            viewer.leave.connect(lambda: left_signals.append(1))
+            for k in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Tab):
+                viewer.handle_key(QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier))
+            assert left_signals == [1, 1, 1], left_signals
+            assert viewer.isVisible() or viewer.parent() is pv      # 閉じていない
+            # もう一度 V でプレビューを閉じる(ビュアの読み込みも止まる)
+            key(Qt.Key_V)
+            assert not w.preview_on and w.preview_widget is None
+            assert viewer.index is None or viewer.index._stop.is_set() or viewer.index.done
+        finally:
             w.close()
             w.deleteLater()
 
@@ -6161,12 +6229,18 @@ def test_window_preview():
             result = _wait_preview(w, "notes.txt")
             assert result["kind"] == "text" and len(result["lines"]) == core.PREVIEW_TEXT_LINES
             assert result["lines"][0] == "line 0" and result["note"] == "UTF-8"
-            assert w.preview_widget.text.toPlainText().startswith("line 0\nline 1")
+            # テキストは簡易ビュアに出る(全文。読み取りスレッドが作った 200 行ではなく)
+            viewer = w.preview_widget.viewer
+            assert w.preview_widget.viewer_shown() and viewer.path == str(left / "notes.txt")
+            deadline = time.monotonic() + 5
+            while not viewer.index.done and time.monotonic() < deadline:
+                QTest.qWait(20)
+            assert viewer.line_count() == 500 and viewer.display_line(1) == "line 1"
             # 画像は窓に収まる大きさで読む(元の 3000×2000 のままにしない)
             L.set_cursor(L._row_of("pic.png"))
             result = _wait_preview(w, "pic.png")
             box = w.preview_widget.image_box()
-            assert result["image"].width() <= box[0] and result["image"].height() <= box[1]
+            assert result["image"].width() <= box[0] and result["image"].height() <= box[1], (result["image"].size(), box, w.preview_widget.stack.size(), w.preview_widget.size())
             assert result["note"] == "3000×2000"
             # フォルダ・その他
             L.set_cursor(L._row_of("sub1"))
@@ -6800,9 +6874,15 @@ def test_preview_image_rotate_keys():
         try:
             # 一覧では R / L / H / V は従来どおり
             L.set_cursor(L._row_of("p1.png"))
-            for k in (Qt.Key_R, Qt.Key_L, Qt.Key_H, Qt.Key_V):
+            for k in (Qt.Key_R, Qt.Key_L, Qt.Key_H):
                 key(k)
-            assert calls == ["rename", "drive", "history", "edit"], calls
+            assert calls == ["rename", "drive", "history"], calls
+            calls.clear()
+            # V は F3 と同じプレビュー(一覧では)。実際には開かず呼ばれることだけ見る
+            w.cmd_preview_toggle = lambda: calls.append("preview")
+            key(Qt.Key_V)
+            del w.cmd_preview_toggle
+            assert calls == ["preview"], calls
             calls.clear()
             key(Qt.Key_F3)
             _wait_preview(w, "p1.png")
@@ -11528,26 +11608,26 @@ def test_edit_confirms_images():
             # いいえなら開かない
             L.marks.update({"alpha.txt", "photo.JPG"})
             answers.append(False)
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
             assert asked == [("画像 1 件を含む 2 件をエディタで開きますか？", False)], asked
             assert calls == []
             # はいなら全部開く
             answers.append(True)
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
             assert len(asked) == 2
             assert sorted(os.path.basename(a[1]) for a in calls) == ["alpha.txt", "photo.JPG"]
             # 画像を含まなければ確認なし(V も同じ)
             calls.clear()
             L.marks.clear()
             L.marks.add("beta.md")
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
             assert len(asked) == 2 and [os.path.basename(a[1]) for a in calls] == ["beta.md"]
             # V でカーソル行の RAW: 確かめる。いいえなら開かない
             calls.clear()
             L.marks.clear()
             L.set_cursor(L._row_of("shot.CR2"))
             answers.append(False)
-            key(Qt.Key_V)
+            w.cmd_edit()   # V は F3 と同じビューになったので、命令を直接呼ぶ
             assert asked[-1] == ("画像 1 件を含む 1 件をエディタで開きますか？", False), asked
             assert calls == [] and not answers
             # E は EDDy: 画像は対象から外れ、確認も出ない(テキストだけ開く)

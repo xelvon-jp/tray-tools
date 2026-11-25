@@ -369,6 +369,7 @@ class TextViewer(QWidget):
     # 埋め込み(embedded)のとき、Esc / Enter / BS / Q で出す。窓は閉じず、
     # 呼び出し側がフォーカスをファイル窓へ戻す。
     leave = Signal()
+    move = Signal(int)  # 埋め込みで ←→: 前(-1)・次(+1)のファイルへ(一覧のカーソルを動かす)
     edit = Signal()     # 埋め込みで Enter: 編集へ(呼び出し側が EDDy で開く)
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
@@ -614,6 +615,9 @@ class TextViewer(QWidget):
         ファイル間移動に変えた(2026-11-12)。スクロールは PageUp/PageDown、
         先頭・末尾は Ctrl+←→ と Home/End が担う。callback が無い
         (書庫から開いた等)・端のときは何もしない。"""
+        if self.embedded:
+            self.move.emit(step)    # プレビューの中では、一覧のカーソルを動かして読み替える
+            return
         if self.nav_callback is None:
             return
         target = self.nav_callback(step)

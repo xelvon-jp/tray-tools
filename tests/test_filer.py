@@ -2285,10 +2285,16 @@ def test_window_preview_text_viewer():
             assert left_signals == [1, 1] and edit_signals == [1], (left_signals, edit_signals)
             assert viewer.isVisible() or viewer.parent() is pv      # 閉じていない
             edited = []
-            w.cmd_edit = lambda: edited.append(1)
+            w.cmd_text_editor = lambda: edited.append(1)     # E と同じ EDDy(メモ帳ではない)
             w._edit_from_preview()
             assert edited == [1]
-            del w.cmd_edit
+            del w.cmd_text_editor
+            # ←→ は一覧のカーソルを前・次へ動かす(プレビューが読み替わる)
+            row = w.left.cursor_row()
+            viewer.handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_Right, Qt.NoModifier))
+            assert w.left.cursor_row() == row + 1, (row, w.left.cursor_row())
+            viewer.handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
+            assert w.left.cursor_row() == row
             # もう一度 V でプレビューを閉じる(ビュアの読み込みも止まる)
             key(Qt.Key_V)
             assert not w.preview_on and w.preview_widget is None

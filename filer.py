@@ -6451,6 +6451,7 @@ class FilerWindow(QWidget):
             # 埋め込みのテキストビュアから Esc / Tab / Enter で一覧へ戻る
             self.preview_widget.leave.connect(self._leave_preview_viewer)
             self.preview_widget.edit.connect(self._edit_from_preview)
+            self.preview_widget.move.connect(self._move_from_preview)
         index = self.hsplit.indexOf(other)
         self.hsplit.insertWidget(index, self.preview_widget)
         other.hide()
@@ -6481,9 +6482,17 @@ class FilerWindow(QWidget):
         """プレビューのビュアで Enter: 一覧へ戻って、カーソルのファイルを編集(E と同じ)。"""
         try:
             self.active.view.setFocus()
-            self.cmd_edit()
+            self.cmd_text_editor()      # E と同じ(内蔵エディタ EDDy)。filer.editor(メモ帳)ではない
         except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
             _log_exception("editFromPreview")
+
+    def _move_from_preview(self, step: int) -> None:
+        """プレビューのビュアで ←→: 一覧のカーソルを前・次へ(プレビューが読み替わる)。"""
+        try:
+            pane = self.active
+            pane.set_cursor(pane.cursor_row() + int(step))
+        except Exception:  # noqa: BLE001
+            _log_exception("moveFromPreview")
 
     def _leave_preview_viewer(self) -> None:
         """埋め込みのテキストビュアから一覧へフォーカスを戻す。"""

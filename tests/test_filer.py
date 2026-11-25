@@ -2277,12 +2277,14 @@ def test_window_preview_text_viewer():
             del pv.focus_viewer
             # ビュアの中の Esc / Tab は閉じず、一覧へ戻る合図(leave)だけ出す。
             # Enter は編集の合図(edit)で、本体は一覧へ戻って E と同じ cmd_edit を呼ぶ
-            left_signals, edit_signals = [], []
+            left_signals, edit_signals, done_signals = [], [], []
+            viewer.done.connect(lambda: done_signals.append(1))
             viewer.leave.connect(lambda: left_signals.append(1))
             viewer.edit.connect(lambda: edit_signals.append(1))
             for k in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Tab):
                 viewer.handle_key(QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier))
-            assert left_signals == [1, 1] and edit_signals == [1], (left_signals, edit_signals)
+            assert (left_signals, done_signals, edit_signals) == ([1], [1], [1]), \
+                (left_signals, done_signals, edit_signals)
             assert viewer.isVisible() or viewer.parent() is pv      # 閉じていない
             edited = []
             w.cmd_text_editor = lambda: edited.append(1)     # E と同じ EDDy(メモ帳ではない)
@@ -2306,6 +2308,9 @@ def test_window_preview_text_viewer():
             _wait_preview(w, "alpha.txt")
             assert w.preview_widget.viewer_shown()
             assert not w._focus_viewer_when_ready      # ビュアへ入ったので使い切った
+            # Enter で開いたプレビューは、ビュアの Esc 1回で閉じる
+            w.preview_widget.viewer.handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+            assert not w.preview_on and not w._preview_from_enter
             assert not any(isinstance(c, filer_viewer_cls()) and c.windowFlags() & Qt.Window
                            for c in w.findChildren(filer_viewer_cls()) if c.embedded is False)
         finally:

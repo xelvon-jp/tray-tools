@@ -3314,6 +3314,7 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self.preview_side = None
         self.preview_widget = None
+        self._preview_from_enter = False        # Enter で開いたプレビューか(Esc 1回で閉じる)
         self._focus_viewer_when_ready = False   # Enter で開いたテキストは、出たらビュアへ入る
         self._preview_fullscreen = False    # 右窓から入ったプレビューはフルスクリーン
         self._preview_was_maximized = False
@@ -4355,6 +4356,7 @@ class FilerWindow(QWidget):
                 self.schedule_preview(immediate=True)
             else:
                 self.preview_show()
+                self._preview_from_enter = True     # Enter で開いたので、Esc 1回で閉じる
         else:
             self._open_file(entry)
 
@@ -6452,6 +6454,7 @@ class FilerWindow(QWidget):
             self.preview_widget.leave.connect(self._leave_preview_viewer)
             self.preview_widget.edit.connect(self._edit_from_preview)
             self.preview_widget.move.connect(self._move_from_preview)
+            self.preview_widget.done.connect(self._finish_preview_viewer)
         index = self.hsplit.indexOf(other)
         self.hsplit.insertWidget(index, self.preview_widget)
         other.hide()
@@ -6486,6 +6489,16 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
             _log_exception("editFromPreview")
 
+    def _finish_preview_viewer(self) -> None:
+        """ビュアで Esc。Enter で開いたプレビューならそのまま閉じる(1回で抜ける)。
+        V で開いて Tab で入ったときは、一覧へ戻るだけ(プレビューは残る)。"""
+        try:
+            if self._preview_from_enter:
+                self.preview_off()
+            self._leave_preview_viewer()
+        except Exception:  # noqa: BLE001
+            _log_exception("finishPreviewViewer")
+
     def _move_from_preview(self, step: int) -> None:
         """プレビューのビュアで ←→: 一覧のカーソルを前・次へ(プレビューが読み替わる)。"""
         try:
@@ -6506,6 +6519,7 @@ class FilerWindow(QWidget):
             return
         self.preview_on = False
         self._focus_viewer_when_ready = False
+        self._preview_from_enter = False
         if self._preview_fullscreen:
             self._preview_fullscreen = False
             if self._preview_was_maximized:

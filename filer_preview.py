@@ -219,6 +219,7 @@ class PreviewWidget(QWidget):
     全文が読め、検索などもできる。キーを受けるのはビュアにフォーカスを渡したときだけ
     (focus_viewer)で、Esc / Tab / Enter で一覧へ戻る(leave)。"""
 
+    done = Signal()     # ビュアで Esc(見終わった)
     move = Signal(int)  # ビュアで ←→(前・次のファイル)
     edit = Signal()     # ビュアで Enter(編集したい)
     leave = Signal()    # ビュアから「一覧へ戻りたい」(呼び出し側がフォーカスを戻す)
@@ -421,6 +422,7 @@ class PreviewWidget(QWidget):
                 self.viewer.leave.connect(self.leave)
                 self.viewer.edit.connect(self.edit)
                 self.viewer.move.connect(self.move)
+                self.viewer.done.connect(self.done)
                 self.stack.addWidget(self.viewer)
             else:
                 self.viewer.load(path, result.get("title") or None)

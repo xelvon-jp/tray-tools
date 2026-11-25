@@ -369,6 +369,7 @@ class TextViewer(QWidget):
     # 埋め込み(embedded)のとき、Esc / Enter / BS / Q で出す。窓は閉じず、
     # 呼び出し側がフォーカスをファイル窓へ戻す。
     leave = Signal()
+    done = Signal()     # 埋め込みで Esc / BS / Q: 見終わった(Enter で開いたなら呼び出し側が閉じる)
     move = Signal(int)  # 埋め込みで ←→: 前(-1)・次(+1)のファイルへ(一覧のカーソルを動かす)
     edit = Signal()     # 埋め込みで Enter: 編集へ(呼び出し側が EDDy で開く)
 
@@ -875,7 +876,7 @@ class TextViewer(QWidget):
     def close_or_leave(self) -> None:
         """閉じるキー。独立窓なら閉じる。埋め込みなら一覧へ戻るだけ(窓は残す)。"""
         if self.embedded:
-            self.leave.emit()
+            self.done.emit()
         else:
             self.close()
 

@@ -18,7 +18,7 @@
 import os
 
 from PySide6.QtCore import QEvent, QUrl, Qt, Signal
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
     QPlainTextEdit,
@@ -78,7 +78,16 @@ def _read_pdf(path: str, box):
     image = doc.render(0, size)
     if image.isNull():
         raise RuntimeError("PDF の1ページ目を描けませんでした")
-    return image, pages
+    # QtPdf は背景が透明のまま返す。背景色の指定が無い PDF は、窓の紺色が透けて
+    # 黒い字が読めなくなるので、紙の色(白)の上に重ねる。
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    paper = QImage(image.size(), QImage.Format_RGB32)
+    paper.fill(QColor("white"))
+    painter = QPainter(paper)
+    painter.drawImage(0, 0, image)
+    painter.end()
+    return paper, pages
 
 
 # 画像の読み込み(縮小・EXIF の向き)はスライドショーと共通の image_load にある。
@@ -157,7 +166,7 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             result.update(kind="info", lines=core.info_lines(entry.name, entry)
                           + ["", "（書庫の中の PDF は中身を出しません）"])
             return result
-        if archive is not None and kind in ("text", "image", "html", "markdown"):
+        if archive is not None and kind in ("text", "image", "html", "markdown", "video"):
             if entry.size > core.PREVIEW_ARCHIVE_MAX:
                 result.update(kind="info", lines=core.info_lines(entry.name, entry)
                               + ["", "（書庫の中のファイルが大きいため中身を出しません。"
@@ -203,6 +212,9 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             dirs, files, names = _read_folder(path)
             result.update(lines=[f"{dirs} フォルダ / {files} ファイル", ""] + names
                           + (["…"] if dirs + files > len(names) else []))
+        elif kind == "video":
+            # 情報とサムネは GUI スレッドで取る(QMediaPlayer の都合。filer_video.VideoProbe)
+            result.update(lines=core.info_lines(entry.name, entry))
         elif kind == "info":
             result.update(lines=core.info_lines(entry.name, entry))
     except Exception as e:  # noqa: BLE001  見本が作れないだけ。窓は止めない
@@ -212,6 +224,11 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
     return result
 
 
+VIEWER_ACCENT = "#b45309"      # ビュア状態の帯と枠の色(琥珀。ふだんの紺とはっきり違う色)
+VIEWER_FRAME = 3                # ビュア状態の枠の太さ
+VIEWER_HINT = "   Enter/Esc: 閉じる   Ctrl+Enter: メニュー"
+
+
 class PreviewWidget(QWidget):
     """反対窓の場所に出すプレビュー。キーは受け取らない(フォーカスはファイル窓のまま)。
 
@@ -219,7 +236,10 @@ class PreviewWidget(QWidget):
     全文が読め、検索などもできる。キーを受けるのはビュアにフォーカスを渡したときだけ
     (focus_viewer)で、Esc / Tab / Enter で一覧へ戻る(leave)。"""
 
-    done = Signal()     # ビュアで Esc(見終わった)
+    done = Signal()     # ビュアで Esc / Enter(見終わった)
+    menu = Signal()     # ビュアで Ctrl+Enter(拡張子別メニュー)
+    video_move = Signal(int)    # 内蔵プレーヤで ↑↓(前・次の動画)
+    video_done = Signal()       # 内蔵プレーヤで Esc(再生をやめて情報の表示へ)
     move = Signal(int)  # ビュアで ←→(前・次のファイル)
     edit = Signal()     # ビュアで Enter(編集したい)
     leave = Signal()    # ビュアから「一覧へ戻りたい」(呼び出し側がフォーカスを戻す)
@@ -230,6 +250,14 @@ class PreviewWidget(QWidget):
         self.colors = colors
         self._font = font
         self.viewer = None          # 埋め込みの簡易テキストビュア(最初のテキストで作る)
+        self._head = None           # 頭に出す (題名, 注記, 印)。ビュア状態の切替で文言を作り直す
+        self.viewer_mode = False    # ビュア状態(Enter で入る)。見た目を変えて区別する
+        self.player_view = None     # 内蔵プレーヤ(動画。Ctrl+Enter のメニューから使うとき作る)
+        self.probe = None           # いま動画の情報・サムネを取っている VideoProbe
+        self._video_path = None
+        self._video_lines = []
+        self.web = None             # ブラウザ表示(WebEngine)。HTML で Tab/Enter したときだけ作る
+        self._html_path = None      # いま整形表示している HTML のパス(ブラウザ表示で開く)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -280,6 +308,24 @@ class PreviewWidget(QWidget):
         self.stack.addWidget(self.text)
         self.stack.addWidget(self.image)
         self.stack.addWidget(self.rich)
+        # 動画の情報ページ: 上にサムネ、下に情報(名前・サイズ・日時・属性・長さ・解像度など)
+        self.video_page = QWidget()
+        video_layout = QVBoxLayout(self.video_page)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        video_layout.setSpacing(0)
+        self.video_thumb = QLabel()
+        self.video_thumb.setAlignment(Qt.AlignCenter)
+        self.video_thumb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.video_thumb.setStyleSheet("background-color: #000000;")
+        self.video_info = QLabel()
+        self.video_info.setTextFormat(Qt.PlainText)
+        self.video_info.setFont(font)
+        self.video_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.video_info.setStyleSheet(f"background-color: {colors['background']};"
+                                      f" color: {colors['text']}; padding: 6px 8px;")
+        video_layout.addWidget(self.video_thumb, 1)
+        video_layout.addWidget(self.video_info)
+        self.stack.addWidget(self.video_page)
         layout.addWidget(self.stack, 1)
         self.last = None
         self.turn = core.TURN_IDENTITY      # 手動の回転・反転(R / L / H / V)
@@ -294,6 +340,48 @@ class PreviewWidget(QWidget):
         self.rating.setFont(rating_font)
         self.rating.hide()
         self.image.installEventFilter(self)
+
+    # --- ビュア状態の見た目(Enter で入ったとき。F3 / V だけのプレビューと見分ける) ---
+    def _header_prefix(self) -> str:
+        return "◆ VIEWER" if self.viewer_mode else "Preview"
+
+    def set_viewer_mode(self, on: bool) -> None:
+        """ビュア状態にする/戻す。頭の帯を目立つ色にして、周りに枠を付ける。"""
+        on = bool(on)
+        if on == self.viewer_mode:
+            return
+        self.viewer_mode = on
+        margin = VIEWER_FRAME if on else 0
+        self.layout().setContentsMargins(margin, margin, margin, margin)
+        if on:
+            self.header.setStyleSheet(
+                f"background-color: {VIEWER_ACCENT}; color: #ffffff; font-weight: bold;"
+                " padding: 0 4px;")
+        else:
+            self.header.setStyleSheet(
+                f"background-color: {self.colors['header_inactive']};"
+                f" color: {self.colors['header_inactive_text']}; padding: 0 4px;")
+        self._refresh_header()      # 頭の文言(プレフィックス・操作の案内)を更新
+        self.update()
+
+    def _refresh_header(self) -> None:
+        if self._head is None:
+            self.header.setText(self._header_prefix())
+            return
+        title, note, suffix = self._head
+        self.header.setText(f"{self._header_prefix()}: {title}"
+                            + (f"  [{note}]" if note else "")
+                            + (f"  {suffix}" if suffix else "")
+                            + (VIEWER_HINT if self.viewer_mode else ""))
+
+    def paintEvent(self, event):  # noqa: N802 (Qt の上書き)
+        super().paintEvent(event)
+        if self.viewer_mode:
+            from PySide6.QtGui import QPainter
+
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor(VIEWER_ACCENT))
+            painter.end()
 
     def set_rating_text(self, text: str, color: str = "#ffd400", background=None) -> None:
         """隅に出す★(🖼️ フォトフレーム用 ✓ / ☆ など)。background を渡すと一覧の★の列と
@@ -327,7 +415,8 @@ class PreviewWidget(QWidget):
 
     def show_loading(self, title: str) -> None:
         suffix = getattr(self, "turn_suffix", "")
-        self.header.setText(f"Preview: {title}  …" + (f"  {suffix}" if suffix else ""))
+        self.header.setText(f"{self._header_prefix()}: {title}  …"
+                            + (f"  {suffix}" if suffix else ""))
 
     def _show_original(self, on: bool) -> None:
         """元画像ボタン: 押している間だけ補正なしの絵に差し替える。"""
@@ -347,6 +436,10 @@ class PreviewWidget(QWidget):
 
     def show_result(self, result: dict) -> None:
         self.last = result
+        if result.get("kind") != "video":
+            self._stop_probe()
+        if self.web is not None and self.web.url().toString() not in ("", "about:blank"):
+            self.web.setUrl(QUrl("about:blank"))    # 別のファイルへ移ったら前のページは手放す
         note = result.get("note") or ""
         image = result.get("image")
         turn = getattr(self, "turn", core.TURN_IDENTITY)
@@ -355,8 +448,8 @@ class PreviewWidget(QWidget):
             if label:
                 note = f"{note} {label}" if note else label
         suffix = getattr(self, "turn_suffix", "")
-        self.header.setText(f"Preview: {result.get('title', '')}" + (f"  [{note}]" if note else "")
-                            + (f"  {suffix}" if suffix else ""))
+        self._head = (result.get("title", ""), note, suffix)
+        self._refresh_header()
         if image is not None:
             pixmap = QPixmap.fromImage(turned_image(image, turn))
             box_w, box_h = self.image_box()
@@ -377,12 +470,18 @@ class PreviewWidget(QWidget):
             self.orig_btn.setEnabled(self._orig_pixmap is not None)
             self.image.setPixmap(pixmap)
             self.stack.setCurrentWidget(self.image)
+        elif result.get("kind") == "video":
+            self._disp_pixmap = None
+            self._orig_pixmap = None
+            self.orig_btn.setEnabled(False)
+            self._show_video_info(result)
         elif result.get("rich") is not None:
             self._disp_pixmap = None
             self._orig_pixmap = None
             self.orig_btn.setEnabled(False)
             kind, text = result["rich"]
             base = result.get("path") or ""
+            self._html_path = base if kind == "html" and base else None
             self.rich.document().setBaseUrl(
                 QUrl.fromLocalFile(os.path.dirname(base) + os.sep) if base else QUrl())
             if kind == "html":
@@ -421,6 +520,7 @@ class PreviewWidget(QWidget):
                     embedded=True, parent=self)
                 self.viewer.leave.connect(self.leave)
                 self.viewer.edit.connect(self.edit)
+                self.viewer.menu.connect(self.menu)
                 self.viewer.move.connect(self.move)
                 self.viewer.done.connect(self.done)
                 self.stack.addWidget(self.viewer)
@@ -442,7 +542,170 @@ class PreviewWidget(QWidget):
         self.viewer.area.setFocus()
         return True
 
+    # --- 動画(情報とサムネ。再生は内蔵プレーヤ) ---
+    def _stop_probe(self) -> None:
+        if self.probe is not None:
+            self.probe.close()
+            self.probe.deleteLater()
+            self.probe = None
+
+    def _show_video_info(self, result: dict) -> None:
+        """動画の情報ページ。名前・サイズ・日時・属性はすぐ、サムネ・長さ・解像度などは
+        読めてから出す(読めなければ出さない)。"""
+        self._stop_probe()
+        path = result.get("path")
+        self._video_path = path
+        self._video_lines = list(result.get("lines") or [])
+        self.video_thumb.clear()
+        self.video_thumb.setText("読み込み中…" if path else "")
+        self.video_thumb.setStyleSheet("background-color: #000000; color: #aaaaaa;")
+        self._set_video_info({})
+        self.stack.setCurrentWidget(self.video_page)
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            import filer_video  # 使うときに読む(QtMultimedia は重い)
+
+            self.probe = filer_video.VideoProbe(path, self)
+            self.probe.done.connect(lambda image, meta, p=path: self._on_probe(p, image, meta))
+            self.probe.start()
+        except Exception:  # noqa: BLE001  QtMultimedia が無い環境は、情報だけ出す
+            self.video_thumb.setText("")
+            self.probe = None
+
+    def _set_video_info(self, meta: dict) -> None:
+        import filer_video
+
+        lines = list(self._video_lines)
+        lines += filer_video.describe_meta(meta)
+        lines += ["", "Ctrl+Enter → 内蔵プレーヤで再生（↑↓ で前後の動画）"]
+        self.video_info.setText(chr(10).join(lines))
+
+    def _on_probe(self, path: str, image, meta: dict) -> None:
+        if path != self._video_path or self.stack.currentWidget() is not self.video_page:
+            return
+        self._set_video_info(meta)
+        if image is None or image.isNull():
+            self.video_thumb.setText("サムネイルを作れませんでした")
+            return
+        import filer_video
+
+        size = self.video_thumb.size()
+        scaled = filer_video.thumbnail_image(image, max(size.width() - 8, 16),
+                                             max(size.height() - 8, 16))
+        self.video_thumb.setText("")
+        self.video_thumb.setPixmap(QPixmap.fromImage(scaled))
+
+    # --- 内蔵プレーヤ(動画) ---
+    def player_shown(self) -> bool:
+        return self.player_view is not None and self.stack.currentWidget() is self.player_view
+
+    def play_video(self, path: str, title: str = "", counter: str = "") -> bool:
+        """動画を内蔵プレーヤで最初から再生する(反対窓いっぱい)。出せたら True。"""
+        try:
+            if self.player_view is None:
+                import filer_video  # 使うときに読む
+
+                self.player_view = filer_video.VideoPlayerView(self._font, self)
+                self.player_view.done.connect(self.video_done)
+                self.player_view.move.connect(self.video_move)
+                self.player_view.menu.connect(self.menu)
+                self.stack.addWidget(self.player_view)
+            self._stop_probe()
+            self.player_view.play(path, title, counter)
+        except Exception:  # noqa: BLE001  QtMultimedia が使えない環境
+            self.player_view = None
+            return False
+        self._head = (title, "内蔵プレーヤ", "")
+        self._refresh_header()
+        self.stack.setCurrentWidget(self.player_view)
+        self.player_view.setFocus()
+        return True
+
+    def focus_player(self) -> None:
+        if self.player_shown():
+            self.player_view.setFocus()
+
+    def stop_player(self) -> None:
+        """再生をやめて動画を手放す(ファイルを掴んだままにしない)。"""
+        if self.player_view is not None:
+            self.player_view.stop()
+
+    # --- ブラウザ表示(HTML。Chromium の WebEngine) ---
+    def web_shown(self) -> bool:
+        return self.web is not None and self.stack.currentWidget() is self.web
+
+    def enter_web(self) -> bool:
+        """整形表示している HTML を、ブラウザ(WebEngine)で出してフォーカスを渡す。
+
+        普段の整形表示(QTextBrowser)は軽いが簡易で、flex / grid などが崩れる。
+        ここで初めて WebEngine を作る(重いので、使わなければ読み込まない)。
+        ローカルのファイルだけを開き、JavaScript は切る(見本なので)。
+        出せたら True。WebEngine が無い・HTML でないときは False。"""
+        if self.web_shown():
+            self.web.setFocus()
+            return True
+        if self.stack.currentWidget() is not self.rich or not self._html_path:
+            return False
+        try:
+            if self.web is None:
+                self.web = self._make_web()
+                self.stack.addWidget(self.web)
+            self.web.setUrl(QUrl.fromLocalFile(self._html_path))
+        except Exception:  # noqa: BLE001  WebEngine が使えない環境では従来の表示のまま
+            self.web = None
+            return False
+        self.stack.setCurrentWidget(self.web)
+        self.web.setFocus()
+        return True
+
+    def _make_web(self):
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+
+        class LocalOnlyPage(QWebEnginePage):
+            def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+                # リンクは辿らない(見本なので)。最初の読み込みだけ通す
+                return nav_type == QWebEnginePage.NavigationTypeTyped                     or url.scheme() in ("file", "about")
+
+        view = QWebEngineView()
+        view.setPage(LocalOnlyPage(view))
+        settings = view.settings()
+        settings.setAttribute(QWebEngineSettings.JavascriptEnabled, False)
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, False)
+        settings.setAttribute(QWebEngineSettings.PluginsEnabled, False)
+        view.page().setBackgroundColor(QColor("#ffffff"))   # ページの既定は白(ブラウザと同じ)
+        # キーは Chromium が受けるので、ショートカットで拾う。Esc / BS は見終わった、
+        # Tab は一覧へ戻る(テキストのビュアと同じ)
+        for key, signal in (("Esc", self.done), ("Backspace", self.done),
+                            ("Return", self.done), ("Enter", self.done), ("Tab", self.leave)):
+            shortcut = QShortcut(QKeySequence(key), view)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda s=signal: self._leave_web(s))
+        for key, step in (("Left", -1), ("Right", 1)):      # ←→ は前・次のファイル
+            shortcut = QShortcut(QKeySequence(key), view)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda s=step: self.move.emit(s))
+        for key in ("Ctrl+Return", "Ctrl+Enter"):           # Ctrl+Enter は拡張子別メニュー
+            shortcut = QShortcut(QKeySequence(key), view)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.menu.emit)
+        return view
+
+    def _leave_web(self, signal) -> None:
+        """ブラウザ表示から出る。読み込んだページは手放す(ファイルを掴まない)。"""
+        if self.web is not None:
+            self.web.setUrl(QUrl("about:blank"))
+            if self.web_shown() and self.stack.indexOf(self.rich) >= 0:
+                self.stack.setCurrentWidget(self.rich)
+        signal.emit()
+
     def shutdown(self) -> None:
-        """プレビューを閉じるとき。ビュアの読み込み・検索のスレッドを止める。"""
+        """プレビューを閉じるとき。ビュアの読み込み・検索のスレッドを止め、動画も手放す。"""
+        self._stop_probe()
+        self.stop_player()
+        if self.web is not None:
+            self.web.setUrl(QUrl("about:blank"))
         if self.viewer is not None:
             self.viewer.shutdown()

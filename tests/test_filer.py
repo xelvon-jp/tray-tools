@@ -2267,25 +2267,32 @@ def test_window_preview_text_viewer():
             QTest.qWait(800)
             os.rename(left / "gamma.txt", left / "gamma_moved.txt")
             os.rename(left / "gamma_moved.txt", left / "gamma.txt")
-            # Tab / Enter はビュアへ入る(窓の切り替え・ビュア別窓にならない)
-            entered = []
-            pv.focus_viewer = lambda: entered.append(1) or True   # noqa: E731
-            side = w.active_side
-            key(Qt.Key_Tab)
+            # ふつうのプレビュー(V)で Enter: ビュア状態に入る(見た目が変わり、独立窓にならない)
+            assert not w.viewer_mode and not pv.viewer_mode
+            assert pv.header.text().startswith("Preview")
             key(Qt.Key_Return)
-            assert entered == [1, 1] and w.active_side == side, (entered, w.active_side)
-            del pv.focus_viewer
-            # ビュアの中の Esc / Tab は閉じず、一覧へ戻る合図(leave)だけ出す。
-            # Enter は編集の合図(edit)で、本体は一覧へ戻って E と同じ cmd_edit を呼ぶ
-            left_signals, edit_signals, done_signals = [], [], []
-            viewer.done.connect(lambda: done_signals.append(1))
-            viewer.leave.connect(lambda: left_signals.append(1))
-            viewer.edit.connect(lambda: edit_signals.append(1))
-            for k in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Tab):
+            assert w.viewer_mode and pv.viewer_mode and w.preview_on
+            assert pv.header.text().startswith("◆ VIEWER") and "Ctrl+Enter" in pv.header.text()
+            # ビュアの中: Esc / Enter は見終わった(done)、Tab は一覧へ(leave)、
+            # E は編集(edit)、Ctrl+Enter はメニュー(menu)。閉じはしない
+            menus = []
+            w.cmd_ext_menu = lambda: menus.append(w.viewer_mode)    # 本物は選ぶ窓が止まるので差し替え
+            sig = {"done": [], "leave": [], "edit": [], "menu": []}
+            for name, lst in sig.items():
+                getattr(viewer, name).connect(lambda lst=lst: lst.append(1))
+            for k, m in ((Qt.Key_Return, Qt.ControlModifier), (Qt.Key_Tab, Qt.NoModifier),
+                         (Qt.Key_E, Qt.NoModifier)):
+                viewer.handle_key(QKeyEvent(QEvent.KeyPress, k, m))
+            assert menus == [True]          # メニューはビュア状態のまま出す(「内蔵ビュア」項目を隠すため)
+            assert w.viewer_mode            # Tab は一覧へフォーカスを戻すだけ(ビュア状態は続く)
+            for k in (Qt.Key_Escape, Qt.Key_Return):    # Esc / Enter は見終わった: ビュア状態を出る
                 viewer.handle_key(QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier))
-            assert (left_signals, done_signals, edit_signals) == ([1], [1], [1]), \
-                (left_signals, done_signals, edit_signals)
+            assert {k: len(v) for k, v in sig.items()} == {"done": 2, "leave": 1, "edit": 1, "menu": 1}, sig
+            assert not w.viewer_mode and w.preview_on       # V で開いたので、プレビューは残る
             assert viewer.isVisible() or viewer.parent() is pv      # 閉じていない
+            del w.cmd_ext_menu
+            key(Qt.Key_Return)              # また入る
+            assert w.viewer_mode
             edited = []
             w.cmd_text_editor = lambda: edited.append(1)     # E と同じ EDDy(メモ帳ではない)
             w._edit_from_preview()
@@ -2297,22 +2304,213 @@ def test_window_preview_text_viewer():
             assert w.left.cursor_row() == row + 1, (row, w.left.cursor_row())
             viewer.handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
             assert w.left.cursor_row() == row
+            _wait_preview(w, "gamma.txt")
+            # 一覧にフォーカスがあるときの Enter も、ビュア状態を出る(V で開いたのでプレビューは残る)
+            key(Qt.Key_Return)
+            assert not w.viewer_mode and not pv.viewer_mode and w.preview_on
+            assert pv.header.text().startswith("Preview")
             # もう一度 V でプレビューを閉じる(ビュアの読み込みも止まる)
             key(Qt.Key_V)
             assert not w.preview_on and w.preview_widget is None
             assert viewer.index is None or viewer.index._stop.is_set() or viewer.index.done
-            # 一覧でテキストを Enter: プレビューが開き、出たらビュアへ入る(独立窓にならない)
+            # 一覧でテキストを Enter: プレビューが開いてビュア状態に入る(独立窓にならない)
             w.left.set_cursor(w.left._row_of("alpha.txt"))
             key(Qt.Key_Return)
-            assert w.preview_on and w._focus_viewer_when_ready
+            assert w.preview_on and w.viewer_mode and w._preview_from_enter
             _wait_preview(w, "alpha.txt")
-            assert w.preview_widget.viewer_shown()
+            assert w.preview_widget.viewer_shown() and w.preview_widget.viewer_mode
             assert not w._focus_viewer_when_ready      # ビュアへ入ったので使い切った
             # Enter で開いたプレビューは、ビュアの Esc 1回で閉じる
             w.preview_widget.viewer.handle_key(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
-            assert not w.preview_on and not w._preview_from_enter
+            assert not w.preview_on and not w._preview_from_enter and not w.viewer_mode
+            # どの種類でも Enter で開き、もう一度 Enter で閉じる(exe も。名前・サイズなどの表示)
+            Path(left, "tool.exe").write_bytes(b"MZ")
+            w.left.reload() if hasattr(w.left, "reload") else None
+            _wait(w)
+            w.left.set_cursor(w.left._row_of("tool.exe"))
+            key(Qt.Key_Return)
+            assert w.preview_on and w.viewer_mode
+            key(Qt.Key_Return)
+            assert not w.preview_on and not w.viewer_mode
             assert not any(isinstance(c, filer_viewer_cls()) and c.windowFlags() & Qt.Window
                            for c in w.findChildren(filer_viewer_cls()) if c.embedded is False)
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_preview_html_browser_view():
+    """HTML のプレビューで Tab / Enter(enter_web): ブラウザ表示(WebEngine)へ入る。
+    JavaScript は切れていて、Esc で整形表示へ戻り(done)、ページは手放す。HTML 以外では入らない。"""
+    import filer_preview
+    from PySide6.QtGui import QFont
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    colors = {k: "#222222" for k in
+              ("header_inactive", "header_inactive_text", "background", "text")}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "a.html")
+        html = "<html><body><b>x</b><script>document.title='js'</script></body></html>"
+        path.write_text(html, encoding="utf-8")
+        pv = filer_preview.PreviewWidget(None, colors, QFont("Meiryo", 10))
+        pv.resize(600, 400)
+        pv.show()
+        try:
+            assert not pv.enter_web()                      # まだ何も出していない
+            pv.show_result({"kind": "text", "lines": ["a"], "note": ""})
+            assert not pv.enter_web()                      # テキストでは入らない
+            pv.show_result({"kind": "html", "path": str(path), "rich": ("html", html),
+                            "note": "", "title": "a.html"})
+            if not pv.enter_web():
+                print("  (WebEngine が使えないのでブラウザ表示は省略)")
+                return
+            assert pv.web_shown()
+            loaded = []
+            pv.web.loadFinished.connect(loaded.append)
+            deadline = time.monotonic() + 15
+            while not loaded and time.monotonic() < deadline:
+                QTest.qWait(50)
+            assert loaded == [True], loaded
+            got = []
+            pv.web.page().runJavaScript("document.title", got.append)
+            QTest.qWait(500)
+            assert got == [""], got                        # JavaScript は動かない
+            done = []
+            pv.done.connect(lambda: done.append(1))
+            pv._leave_web(pv.done)                         # Esc 相当
+            assert done == [1] and not pv.web_shown() and pv.stack.currentWidget() is pv.rich
+        finally:
+            pv.shutdown()
+            pv.close()
+            pv.deleteLater()
+
+
+def test_viewer_mode_html_web_and_menu_hides_view():
+    """HTML を Enter: ビュア状態でそのままブラウザ表示(WebEngine)に入り、Enter で閉じる。
+    ビュア状態の Ctrl+Enter メニューは「内蔵ビュアで開く」(&VIEW)を出さない。"""
+    import filer
+    import filer_extmenu
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    # メニュー: 隠す内部命令を指定すると、その項目が消える(区切りも詰まる)
+    resolver = filer_extmenu.Resolver({})
+    lines = [filer_extmenu.MenuLine(key="V", label="内蔵ビュア", command="&VIEW $MF"),
+             filer_extmenu.MenuLine(key="T", label="EDDy", command="&TEDIT $MF")]
+    shown = filer_extmenu.visible_layers([lines], resolver)
+    assert [x.label for x in shown] == ["内蔵ビュア", "EDDy"]
+    hidden = filer_extmenu.visible_layers([lines], resolver, hide_internal={"VIEW"})
+    assert [x.label for x in hidden] == ["EDDy"]
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "page.html").write_text(
+            "<html><body><h1>hello</h1></body></html>", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            w.left.set_cursor(w.left._row_of("page.html"))
+            QTest.keyClick(w.active.view, Qt.Key_Return)
+            assert w.preview_on and w.viewer_mode and w._preview_from_enter
+            _wait_preview(w, "page.html")
+            pv = w.preview_widget
+            deadline = time.monotonic() + 10
+            while not pv.web_shown() and time.monotonic() < deadline:
+                QTest.qWait(50)
+            if not pv.web_shown():
+                print("  (WebEngine が使えないのでブラウザ表示は省略)")
+            assert pv.header.text().startswith("◆ VIEWER")
+            # ブラウザ表示の Enter(done)でビュア状態を出て、Enter で開いたのでプレビューも閉じる
+            pv.done.emit()
+            assert not w.preview_on and not w.viewer_mode
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_video_viewer_and_player():
+    """動画: Enter でビュア状態(情報とサムネ)。Ctrl+Enter のメニューの先頭が内蔵プレーヤで、
+    再生は反対窓いっぱい。↑↓ で前後の動画(動画でないファイルは飛ばす)、Esc で情報へ戻る。
+    ffmpeg が無い環境では、テスト用の動画を作れないので省略する。"""
+    import shutil
+    import subprocess
+
+    import filer
+    import filer_extmenu
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtTest import QTest
+
+    # メニュー: 動画の先頭項目は内蔵プレーヤ(&PLAY)で、書庫の中でも出る
+    shared, _local = filer_extmenu.find_menus("mp4")
+    assert shared and shared[0].command.startswith("&PLAY"), shared[:1]
+    assert "PLAY" in filer_extmenu.ARCHIVE_OK_COMMANDS
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("  (ffmpeg が無いので動画の再生テストは省略)")
+        return
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name in ("v1.mp4", "v2.mp4"):
+            subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc=duration=2:size=160x120:rate=10", "-pix_fmt", "yuv420p",
+                            str(Path(left, name))], check=True)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        key = lambda k, m=Qt.NoModifier: QTest.keyClick(w.active.view, k, m)  # noqa: E731
+
+        def wait_until(cond, what, seconds=15):
+            deadline = time.monotonic() + seconds
+            while not cond() and time.monotonic() < deadline:
+                QTest.qWait(50)
+            assert cond(), what
+
+        try:
+            w.left.set_cursor(w.left._row_of("v1.mp4"))
+            key(Qt.Key_Return)                                   # Enter: ビュア状態(情報とサムネ)
+            assert w.preview_on and w.viewer_mode
+            _wait_preview(w, "v1.mp4")
+            pv = w.preview_widget
+            assert pv.stack.currentWidget() is pv.video_page
+            wait_until(lambda: pv.video_thumb.pixmap() is not None
+                       and not pv.video_thumb.pixmap().isNull(), "サムネが出ない")
+            assert "解像度" in pv.video_info.text() and "160×120" in pv.video_info.text()
+            # 内蔵プレーヤ(メニューの &PLAY)
+            w._start_player()
+            assert w.player_mode
+            wait_until(pv.player_shown, "プレーヤが出ない")
+            wait_until(lambda: pv.player_view._frame is not None, "映像が来ない")
+            assert pv.player_view._title == "v1.mp4" and "1 / 2" in pv.player_view._counter
+            # ↑↓: 前後の動画へ(端では動かない)
+            pv.player_view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Up, Qt.NoModifier))
+            assert w.left.cursor_entry().name == "v1.mp4"
+            pv.player_view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Down, Qt.NoModifier))
+            assert w.left.cursor_entry().name == "v2.mp4"
+            wait_until(lambda: pv.player_view._title == "v2.mp4", "次の動画に替わらない")
+            # Esc: 再生をやめて情報の表示へ(ビュア状態は続く)。動画は手放す
+            pv.player_view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+            assert not w.player_mode and w.viewer_mode
+            assert pv.player_view.player.source().isEmpty()
+            wait_until(lambda: pv.stack.currentWidget() is pv.video_page, "情報へ戻らない")
+            # Enter で、ビュア状態を出てプレビューも閉じる
+            key(Qt.Key_Return)
+            assert not w.preview_on and not w.viewer_mode
         finally:
             w.close()
             w.deleteLater()

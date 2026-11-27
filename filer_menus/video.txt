@@ -1,3 +1,5 @@
 afx video
-# 動画(_aliases.txt の video)のメニュー。
+# 動画(_aliases.txt の video)のメニュー。先頭が選ばれた状態で開くので、
+# Ctrl+Enter → Enter で内蔵プレーヤ(反対窓いっぱい。↑↓ で前後の動画)に着く。
+"P:内蔵プレーヤ" &PLAY $MF
 "V:VLC" {tool:vlc} $MF

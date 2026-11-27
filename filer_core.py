@@ -2373,6 +2373,7 @@ PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico".split())
 PREVIEW_PDF_EXTS = frozenset("pdf".split())
 PREVIEW_HTML_EXTS = frozenset("html htm xhtml".split())
 PREVIEW_MARKDOWN_EXTS = frozenset("md markdown".split())
+PREVIEW_VIDEO_EXTS = frozenset("mp4 mov mkv webm avi wmv m4v mpg mpeg".split())
 PREVIEW_TEXT_LINES = 200
 PREVIEW_TEXT_BYTES = 256 * 1024
 PREVIEW_ARCHIVE_MAX = 32 * 1024 * 1024    # 書庫の中はこれ以下だけ取り出して見せる
@@ -2381,7 +2382,7 @@ PREVIEW_FOLDER_NAMES = 40
 
 def preview_kind(entry, text_extensions) -> str:
     """プレビューで何を出すか。"none"(何も無い・"..")/ "folder" / "text" / "image" /
-    "pdf" / "html" / "markdown" / "info"。
+    "pdf" / "html" / "markdown" / "video" / "info"。
     テキストかどうかはビュアと同じ拡張子の表(filer.viewer_extensions)で決める。
     PDF・HTML・Markdown はテキストの表に載っていても整形して出すので先に見る。"""
     if entry is None or entry.is_parent:
@@ -2397,6 +2398,8 @@ def preview_kind(entry, text_extensions) -> str:
         return "html"
     if ext in PREVIEW_MARKDOWN_EXTS:
         return "markdown"
+    if ext in PREVIEW_VIDEO_EXTS:
+        return "video"
     if ext and ext in text_extensions:
         return "text"
     return "info"

@@ -43,11 +43,12 @@ APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
 # &SLIDESHOW <フォルダ> は写真のスライドショー(slideshow.py)をそのフォルダで起こす。
 # &TEDIT は内蔵テキストエディタ(editor/)で開く(filer.py の open_text_editor)。
 INTERNAL_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "SHELL", "PROPERTY", "VIEW", "OPEN",
-                               "SLIDESHOW", "TEDIT"})
+                               "SLIDESHOW", "TEDIT", "PLAY"})
+# &PLAY は動画を内蔵プレーヤ(反対窓いっぱい。filer_video.py)で再生する。
 # 書庫の中でも使える内部命令(書庫の中のパスを扱えるもの)。外部ツール・&SHELL・
 # &PROPERTY・&SLIDESHOW は実体のファイルが要るので、書庫の中では出さない。
 # &TEDIT は、対象を一時フォルダへ取り出してから内蔵エディタで開くので含める。
-ARCHIVE_OK_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "VIEW", "OPEN", "TEDIT"})
+ARCHIVE_OK_COMMANDS = frozenset({"EXCD", "EDIT", "NOP", "VIEW", "OPEN", "TEDIT", "PLAY"})
 
 LOCAL_TEMPLATE = (
     "# この PC だけで使うメニュー項目(種類別の後ろ・共通の前に付け足されます)。\n"
@@ -362,13 +363,15 @@ def program_of(command: str, resolver: Resolver):
     return [exe], None, tokens[1:]
 
 
-def usable(line: MenuLine, resolver: Resolver, in_archive: bool = False) -> bool:
-    """この PC・この場所で出してよい項目か。"""
+def usable(line: MenuLine, resolver: Resolver, in_archive: bool = False,
+           hide_internal=frozenset()) -> bool:
+    """この PC・この場所で出してよい項目か。hide_internal は出さない内部命令の名前
+    (ビュア状態で「内蔵ビュアで開く」を隠す、など)。"""
     if line.separator:
         return True
     name = internal_name(line.command)
     if name is not None:
-        if name not in INTERNAL_COMMANDS:
+        if name not in INTERNAL_COMMANDS or name in hide_internal:
             return False
         return name in ARCHIVE_OK_COMMANDS if in_archive else True
     if in_archive:
@@ -388,13 +391,14 @@ def tidy_separators(lines) -> list:
     return result
 
 
-def visible_layers(layers, resolver: Resolver, in_archive: bool = False) -> list:
+def visible_layers(layers, resolver: Resolver, in_archive: bool = False,
+                   hide_internal=frozenset()) -> list:
     """層の並び(種類別 → この PC → 共通など)を、層ごとに出してよい項目だけに
     絞り、空でない層どうしを区切りでつないで返す。"""
     result = []
     for layer in layers:
         lines = tidy_separators([line for line in (layer or [])
-                                 if usable(line, resolver, in_archive)])
+                                 if usable(line, resolver, in_archive, hide_internal)])
         if lines:
             if result:
                 result.append(MenuLine(separator=True))

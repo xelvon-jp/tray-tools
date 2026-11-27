@@ -371,7 +371,8 @@ class TextViewer(QWidget):
     leave = Signal()
     done = Signal()     # 埋め込みで Esc / BS / Q: 見終わった(Enter で開いたなら呼び出し側が閉じる)
     move = Signal(int)  # 埋め込みで ←→: 前(-1)・次(+1)のファイルへ(一覧のカーソルを動かす)
-    edit = Signal()     # 埋め込みで Enter: 編集へ(呼び出し側が EDDy で開く)
+    edit = Signal()     # 埋め込みで E: 編集へ(呼び出し側が EDDy で開く)
+    menu = Signal()     # 埋め込みで Ctrl+Enter: 拡張子別メニュー(呼び出し側が出す)
 
     def __init__(self, path: str, title_name: str = None, font: QFont = None,
                  colors: dict = None, editor_callback=None, nav_callback=None,
@@ -595,7 +596,7 @@ class TextViewer(QWidget):
         top = self.area.verticalScrollBar().value() + 1
         status = f"{label}  {lines}  {top:,}行目  TAB{self.tab_width}"
         if self.embedded:
-            status += "  Enter: 編集  Esc/Tab: 一覧へ"
+            status += "  Enter/Esc: 閉じる  E: 編集  Ctrl+Enter: メニュー  Tab: 一覧へ"
         if getattr(self, "rich", None) is not None:
             status += "  整形表示（R: ソース）" if self.render_mode else "  ソース表示（R: 整形）"
         if self.index.error:
@@ -734,10 +735,13 @@ class TextViewer(QWidget):
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if shift:
                 self.open_editor()
-            elif self.embedded:
-                self.edit.emit()    # ちらっと見て、そのまま Enter で編集へ
+            elif ctrl and self.embedded:
+                self.menu.emit()    # Ctrl+Enter: 拡張子別メニュー(編集はここから)
             else:
-                self.close_or_leave()
+                self.close_or_leave()   # Enter で見終わる(ビュアを抜ける)
+            return
+        if letter == "E" and self.embedded and not (shift or ctrl):
+            self.edit.emit()        # E: EDDy で編集
             return
         if key == Qt.Key_Tab and self.embedded and not (shift or ctrl):
             self.leave.emit()   # 埋め込みでは Tab も一覧へ戻る(入るときと同じキー)

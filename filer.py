@@ -3314,6 +3314,8 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self.preview_side = None
         self.preview_widget = None
+        self.player_mode = False                # 内蔵プレーヤで動画を再生中(↑↓ で前後の動画)
+        self.viewer_mode = False                # ビュア状態(Enter で入る。Enter / Esc で出る)
         self._preview_from_enter = False        # Enter で開いたプレビューか(Esc 1回で閉じる)
         self._focus_viewer_when_ready = False   # Enter で開いたテキストは、出たらビュアへ入る
         self._preview_fullscreen = False    # 右窓から入ったプレビューはフルスクリーン
@@ -4148,25 +4150,22 @@ class FilerWindow(QWidget):
             return
         if self.active.isearch_text is not None and self._isearch_key(event):
             return
-        # プレビューにテキストビュアが出ているとき、Tab / Enter でそちらへ入る
-        # (スクロール・検索・行ジャンプが効く。戻るのは Esc / Tab / Enter)。
-        if (self.preview_on and self.preview_widget is not None
-                and event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter)
-                and not (mods & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier))
-                and self.preview_widget.focus_viewer()):
-            return
+        # ビュア状態(Enter で入った)のとき: Enter / Esc / BS で出る。Tab はビュア(テキスト・
+        # ブラウザ)の中へ入る。一覧にフォーカスがあるとき(md・画像・情報の表示など)も同じ。
+        if (self.viewer_mode and self.preview_on and self.preview_widget is not None
+                and not (mods & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier))):
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Backspace):
+                self._leave_viewer_mode()
+                return
+            if event.key() == Qt.Key_Tab:
+                self._activate_viewer()
+                return
         if event.key() == Qt.Key_Escape and self.preview_on:
             self.preview_off()      # Esc はプレビュー(F3)を抜ける
             return
         if event.key() == Qt.Key_Backspace and self.preview_on:
             self.preview_off()      # ビューア(プレビュー)中の BS もプレビューを抜ける
             return                  # (親フォルダへは行かない。2026-10-29 要望)
-        if (event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.preview_on
-                and not (mods & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier))
-                and core.preview_kind(pane.cursor_entry(),
-                                      self.viewer_extensions) == "image"):
-            self.preview_off()      # 画像ビューア中の Enter もビューアを抜ける
-            return                  # (あふｗのビューアと同じ。2026-10-29 要望)
         vk = _vk_of(event)
         shift, ctrl, alt = (bool(mods & Qt.ShiftModifier), bool(mods & Qt.ControlModifier),
                             bool(mods & Qt.AltModifier))
@@ -4342,23 +4341,23 @@ class FilerWindow(QWidget):
         elif pane.archive is None and filer_archive.is_archive_name(entry.name):
             # 書庫ファイルは中へ入る(あふｗの仮想フォルダ)。関連付けで開きたいときは Ctrl+Enter。
             pane.load(os.path.join(pane.path, entry.name))
-        elif core.preview_kind(entry, self.viewer_extensions) == "image":
-            # 画像は内部ビューア(プレビュー)で開く。関連付けで開きたいときは Ctrl+Enter。
-            if self.preview_on:
-                self.schedule_preview(immediate=True)
-            else:
-                self.preview_show()
-        elif core.opens_in_viewer(entry.name, self.viewer_extensions):
-            # テキストは反対窓でちらっと見る(ビュアに入った状態で出る)。そこで Enter なら
-            # 編集(EDDy)、Esc / Tab で一覧へ。独立窓のビュアは Ctrl+Enter のメニューから。
-            self._focus_viewer_when_ready = True
-            if self.preview_on:
-                self.schedule_preview(immediate=True)
-            else:
-                self.preview_show()
-                self._preview_from_enter = True     # Enter で開いたので、Esc 1回で閉じる
+        elif core.default_app_for(entry.name, self.default_apps) is None:
+            # どの種類でも、反対窓のビュア(内蔵ビュア)で開く。もう一度 Enter / Esc で閉じる。
+            # 対応していない種類は、名前・サイズ・日時・属性だけを出す。編集や関連付けで
+            # 開くのは Ctrl+Enter のメニューから。filer.default_apps に登録した拡張子だけは、
+            # 登録したアプリで開く(自分で決めた割り当てを優先)。
+            self._open_in_viewer()
         else:
             self._open_file(entry)
+
+    def _open_in_viewer(self) -> None:
+        """Enter: プレビューを出して(出ていればそのまま)ビュア状態に入る。"""
+        if self.preview_on:
+            self.schedule_preview(immediate=True)
+        else:
+            self.preview_show()
+            self._preview_from_enter = True     # Enter で開いたので、出るときに閉じる
+        self._enter_viewer_mode()
 
     # --- 簡易テキストビュア ---
     def _view_entry(self, entry) -> None:
@@ -5054,8 +5053,11 @@ class FilerWindow(QWidget):
         shared, local = filer_extmenu.find_menus(kind, self.menu_shared_dir, self.menu_local_dir)
         common = filer_extmenu.common_items(self.menu_shared_dir)
         resolver = self.menu_resolver()
-        lines = filer_extmenu.visible_layers([shared, local, common], resolver,
-                                             in_archive=pane.archive is not None)
+        # ビュア状態では「内蔵ビュアで開く」(&VIEW)は出さない(もう開いているので)
+        lines = filer_extmenu.visible_layers(
+            [shared, local, common], resolver, in_archive=pane.archive is not None,
+            hide_internal=({"VIEW", "PLAY"} if self.player_mode
+                         else {"VIEW"} if self.viewer_mode else frozenset()))
         items = []
         for line in lines:
             items.append(None if line.separator else (line.key or "?", line.label, line))
@@ -5163,6 +5165,9 @@ class FilerWindow(QWidget):
         if name == "PROPERTY":
             if paths:
                 self.spawn_properties(paths)
+            return
+        if name == "PLAY":
+            self._start_player()
             return
         if name == "VIEW":
             entry = pane.cursor_entry()
@@ -6454,7 +6459,10 @@ class FilerWindow(QWidget):
             self.preview_widget.leave.connect(self._leave_preview_viewer)
             self.preview_widget.edit.connect(self._edit_from_preview)
             self.preview_widget.move.connect(self._move_from_preview)
-            self.preview_widget.done.connect(self._finish_preview_viewer)
+            self.preview_widget.done.connect(self._leave_viewer_mode)
+            self.preview_widget.menu.connect(self._menu_from_preview)
+            self.preview_widget.video_move.connect(self._move_video)
+            self.preview_widget.video_done.connect(self._stop_player)
         index = self.hsplit.indexOf(other)
         self.hsplit.insertWidget(index, self.preview_widget)
         other.hide()
@@ -6489,20 +6497,102 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001  スロットで投げ切ると落ちる
             _log_exception("editFromPreview")
 
-    def _finish_preview_viewer(self) -> None:
-        """ビュアで Esc。Enter で開いたプレビューならそのまま閉じる(1回で抜ける)。
-        V で開いて Tab で入ったときは、一覧へ戻るだけ(プレビューは残る)。"""
+    # --- ビュア状態(Enter で入る。どの種類でも Enter / Esc で出る) ---
+    def _enter_viewer_mode(self) -> None:
+        """ビュア状態に入る。見た目を変え、出せるならビュア(テキスト・ブラウザ)へ入る。"""
+        self.viewer_mode = True
+        self._focus_viewer_when_ready = True    # 読み込みが終わったら中へ入る
+        if self.preview_widget is not None:
+            self.preview_widget.set_viewer_mode(True)
+        self._activate_viewer()
+
+    def _activate_viewer(self) -> bool:
+        """プレビューに出ているものがビュアで操作できるなら、そちらへフォーカスを渡す。"""
+        pw = self.preview_widget
+        return bool(pw is not None and (pw.focus_viewer() or pw.enter_web()))
+
+    def _leave_viewer_mode(self) -> None:
+        """Enter / Esc でビュア状態を出る。Enter で開いたプレビューなら閉じる。
+        F3 / V で開いたものは、ふつうのプレビューへ戻る。"""
         try:
+            self.viewer_mode = False
+            self.player_mode = False
+            self._focus_viewer_when_ready = False
+            if self.preview_widget is not None:
+                self.preview_widget.stop_player()
+                self.preview_widget.set_viewer_mode(False)
             if self._preview_from_enter:
                 self.preview_off()
             self._leave_preview_viewer()
         except Exception:  # noqa: BLE001
-            _log_exception("finishPreviewViewer")
+            _log_exception("leaveViewerMode")
+
+    def _menu_from_preview(self) -> None:
+        """ビュアで Ctrl+Enter: 一覧へフォーカスを戻して拡張子別メニューを出す。"""
+        try:
+            if self.player_mode:
+                self.cmd_ext_menu()     # 再生は続けたまま、メニューを出す(閉じたらプレーヤへ戻る)
+                if self.preview_widget is not None:
+                    self.preview_widget.focus_player()
+                return
+            self._leave_preview_viewer()
+            self.cmd_ext_menu()
+        except Exception:  # noqa: BLE001
+            _log_exception("menuFromPreview")
+
+    # --- 内蔵プレーヤ(動画) ---
+    def _start_player(self) -> None:
+        """Ctrl+Enter のメニューの「内蔵プレーヤ」: カーソルの動画を、反対窓いっぱいで再生する。"""
+        entry = self.active.cursor_entry()
+        if core.preview_kind(entry, self.viewer_extensions) != "video":
+            self.log("内蔵プレーヤ: 動画ファイルではありません")
+            return
+        if not self.preview_on:
+            self.preview_show()
+            self._preview_from_enter = True
+        self.player_mode = True
+        self.viewer_mode = True
+        if self.preview_widget is not None:
+            self.preview_widget.set_viewer_mode(True)
+        self.schedule_preview(immediate=True)       # 読めたら _on_preview_ready で再生を始める
+
+    def _video_counter(self) -> str:
+        """「3 / 12」: いまの窓の動画のうち、カーソルが何本目か。"""
+        pane = self.active
+        videos = [i for i, e in enumerate(pane.entries)
+                  if core.preview_kind(e, self.viewer_extensions) == "video"]
+        row = pane.cursor_row()
+        return f"{videos.index(row) + 1} / {len(videos)}" if row in videos else ""
+
+    def _move_video(self, step: int) -> None:
+        """プレーヤで ↑↓: 前・次の動画へ(動画でないファイルは飛ばす)。端では動かない。"""
+        try:
+            pane = self.active
+            row = pane.cursor_row() + step
+            while 0 <= row < len(pane.entries):
+                if core.preview_kind(pane.entries[row], self.viewer_extensions) == "video":
+                    pane.set_cursor(row)
+                    return
+                row += step
+        except Exception:  # noqa: BLE001
+            _log_exception("moveVideo")
+
+    def _stop_player(self) -> None:
+        """プレーヤで Esc: 再生をやめて、動画の情報の表示(ビュア状態)へ戻る。"""
+        try:
+            self.player_mode = False
+            if self.preview_widget is not None:
+                self.preview_widget.stop_player()
+            self.schedule_preview(immediate=True)   # 情報とサムネを出し直す
+            self._leave_preview_viewer()
+        except Exception:  # noqa: BLE001
+            _log_exception("stopPlayer")
 
     def _move_from_preview(self, step: int) -> None:
         """プレビューのビュアで ←→: 一覧のカーソルを前・次へ(プレビューが読み替わる)。"""
         try:
             pane = self.active
+            self._focus_viewer_when_ready = True    # 次のファイルが出たら、またビュアへ入る
             pane.set_cursor(pane.cursor_row() + int(step))
         except Exception:  # noqa: BLE001
             _log_exception("moveFromPreview")
@@ -6520,6 +6610,8 @@ class FilerWindow(QWidget):
         self.preview_on = False
         self._focus_viewer_when_ready = False
         self._preview_from_enter = False
+        self.viewer_mode = False
+        self.player_mode = False
         if self._preview_fullscreen:
             self._preview_fullscreen = False
             if self._preview_was_maximized:
@@ -6655,11 +6747,18 @@ class FilerWindow(QWidget):
                 self._image_wait_seq = None     # 待っていた画像が出た(失敗でも解く)
             if generation != self._preview_generation or self.preview_widget is None:
                 return     # プレビューを閉じた(開き直した)あとに届いた結果
+            if self.player_mode:
+                if (result.get("kind") == "video" and result.get("path")
+                        and self.preview_widget.play_video(
+                            result["path"], result.get("title", ""), self._video_counter())):
+                    return      # 内蔵プレーヤで再生(情報の表示は作らない)
+                self.player_mode = False    # 動画でない・再生できない: 通常の表示へ
+                self.preview_widget.stop_player()
             self.preview_widget.show_result(result)
             if self._focus_viewer_when_ready:
-                # Enter で開いたときは、ビュアが出たらそのまま中へ入る(ちらっと見る)
+                # Enter で開いたとき・ビュアの ←→ で移ったときは、出たらそのまま中へ入る
                 self._focus_viewer_when_ready = False
-                self.preview_widget.focus_viewer()
+                self._activate_viewer()
             self._reload_if_turned(result)
             self._update_preview_rating()
         except Exception:  # noqa: BLE001
@@ -9784,6 +9883,48 @@ def _apply_taskbar_identity(window) -> None:
         _log_exception("taskbar")
 
 
+STALL_LOG_PATH = Path(__file__).resolve().parent / "filer_stall.log"
+STALL_LIMIT_S = 1.0
+
+
+def _start_stall_watchdog(app) -> None:
+    """画面が STALL_LIMIT_S 秒以上止まったら、全スレッドの今の処理を filer_stall.log に残す。
+    (キーが一切効かなくなる固まりの原因を、起きたあとで追えるようにする。再現しない
+    固まり用。UI スレッドが 0.2 秒ごとに時刻を更新し、別スレッドがそれを見張る。)"""
+    import faulthandler
+
+    beat = [time.monotonic()]
+    timer = QTimer(app)
+    timer.timeout.connect(lambda: beat.__setitem__(0, time.monotonic()))
+    timer.start(200)
+    app._stall_timer = timer       # 持っておかないと消える
+
+    def watch():
+        try:
+            log = open(STALL_LOG_PATH, "a", encoding="utf-8")
+        except OSError:
+            return
+        dumped = 0.0
+        while True:
+            time.sleep(0.25)
+            last = beat[0]
+            if time.monotonic() - last < STALL_LIMIT_S:
+                continue
+            if dumped == last:
+                continue            # この停止は記録済み(止まっている間は1回だけ)
+            dumped = last
+            try:
+                log.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 画面が "
+                          f"{STALL_LIMIT_S:.0f} 秒以上止まっています =====\n")
+                log.flush()
+                faulthandler.dump_traceback(file=log, all_threads=True)
+                log.flush()
+            except Exception:  # noqa: BLE001  見張りが原因で落とさない
+                pass
+
+    threading.Thread(target=watch, daemon=True, name="filer-stall-watch").start()
+
+
 def main() -> int:
     # タスクバーで pythonw の汎用アプリとしてまとめられ、汎用アイコンの
     # ままになるのを防ぐ。専用のアプリ ID を名乗ると窓のアイコンが勝つ。
@@ -9822,6 +9963,7 @@ def main() -> int:
             window.jump_to(start_path)
         _apply_taskbar_identity(window)
         window.bring_to_front()
+        _start_stall_watchdog(app)
     except Exception:  # noqa: BLE001
         _log_exception("open")
         return 1

@@ -759,7 +759,7 @@ def test_window_copy_renamed():
         menu_items = []
         state = {"choice": None, "answer": None}
 
-        def choose(title, items):
+        def choose(title, items, panel=None):
             menu_items.extend(items)
             return state["choice"]
 
@@ -1484,7 +1484,7 @@ def test_phone_menu_gating():
         section = {"left_path": str(left), "right_path": str(right), "editor": "x"}
         seen = {}
 
-        def capture(title, items):
+        def capture(title, items, panel=None):
             seen["items"] = items
             return None
 
@@ -1976,7 +1976,7 @@ def test_window_keys_and_operations():
         assert (right / "beta.md").exists() and not (left / "beta.md").exists()
 
         # C メニューは choose_menu を差し替えて通す(文字キーの選択のみの動きは別テスト)
-        w.choose_menu = lambda title, items: "copy"
+        w.choose_menu = lambda title, items, panel=None: "copy"
         L.set_cursor(L._row_of("photo.JPG"))
         key(Qt.Key_C)
         _wait(w)
@@ -2221,6 +2221,44 @@ def test_window_e_key_opens_eddy():
 def filer_viewer_cls():
     import filer_viewer
     return filer_viewer.TextViewer
+
+
+def test_viewer_focus_does_not_stray_to_text_boxes():
+    """ビュアで見ていたテキストから、ビュアを使わない種類(exe など)へ ←→ で移っても、
+    フォーカスがプレビューの文字欄・メッセージ窓へ迷い込まない(迷い込むと矢印キーが
+    食われて一覧が動かなくなる。2026-11-27 の固まり)。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name, data in (("b1.txt", b"hello" + bytes([10])) , ("b2.txt", b"abc" + bytes([10])),
+                           ("b3.exe", b"MZ"), ("b4.txt", b"zz" + bytes([10]))):
+            Path(left, name).write_bytes(data * 50 if name.endswith(".txt") else data)
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            w.left.set_cursor(w.left._row_of("b1.txt"))
+            QTest.keyClick(w.active.view, Qt.Key_Return)
+            QTest.qWait(400)
+            strays = lambda: (w.focusWidget() in (w.log_view, w.preview_widget.text,  # noqa: E731
+                                                  w.preview_widget.rich))
+            for _ in range(6):
+                QTest.keyClick(w.focusWidget() or w.active.view, Qt.Key_Right)
+                QTest.qWait(300)
+                assert not strays(), (w.active.cursor_entry().name, type(w.focusWidget()).__name__)
+            assert w.active.cursor_entry().name != "b1.txt"     # 一覧が動き続けている
+        finally:
+            w.close()
+            w.deleteLater()
 
 
 def test_window_preview_text_viewer():
@@ -2542,7 +2580,7 @@ def test_hash_copy():
         try:
             expected = hashlib.sha256(b"a" * 10).hexdigest()  # alpha.txt の中身
             w.left.set_cursor(w.left._row_of("alpha.txt"))
-            w.choose_menu = lambda title, items: "hash"
+            w.choose_menu = lambda title, items, panel=None: "hash"
             w.cmd_copy_menu()
             deadline = time.monotonic() + 5.0
             while w._hash_busy and time.monotonic() < deadline:
@@ -3351,7 +3389,7 @@ def test_window_extract_archive_u():
         _wait(w)
         L = w.left
         key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
-        w.choose_menu = lambda title, items: "other"
+        w.choose_menu = lambda title, items, panel=None: "other"
 
         # 単一フォルダの書庫は、そのまま反対窓へ
         L.set_cursor(L._row_of("single.zip"))
@@ -3384,7 +3422,7 @@ def test_window_extract_archive_u():
         assert Path(right, "pack", "docs", "sub", "deep.txt").read_bytes() == b"deep"
 
         # この窓へも展開できる
-        w.choose_menu = lambda title, items: "here"
+        w.choose_menu = lambda title, items, panel=None: "here"
         L.set_cursor(L._row_of("single.zip"))
         key(Qt.Key_U)
         _wait_extract(w)
@@ -8479,7 +8517,7 @@ def _drive_menu(w, letters, seen=None):
         fired = []
         menu.triggered.connect(lambda action: fired.append(chosen.get(action)))
         if seen is not None:
-            seen.append([a.text() for a in menu.actions() if not a.isSeparator()])
+            seen.append([a.text() for a in menu.actions() if not a.isSeparator() and a.text()])
         menu.popup(w.mapToGlobal(QPoint(40, 40)))
         QTest.qWait(30)
         for letter in letters:
@@ -8552,7 +8590,7 @@ def test_window_ext_menu():
             w._startfile = lambda path, **kw: opened.append(path)
             seen2 = []
             w._exec_menu = lambda m, c: (seen2.append(
-                [a.text() for a in m.actions() if not a.isSeparator()]), None)[1]
+                [a.text() for a in m.actions() if not a.isSeparator() and a.text()]), None)[1]
             L.set_cursor(L._row_of("data.xyz"))
             key(Qt.Key_Return, Qt.ControlModifier)
             assert seen2[0] == ["&O:関連付けで開く", "&S:エクスプローラで選択",
@@ -9623,7 +9661,7 @@ def test_window_copy_tree():
         L = w.left
         items = []
 
-        def choose(title, menu_items):
+        def choose(title, menu_items, panel=None):
             items.extend(menu_items)
             return "tree"
 
@@ -9703,7 +9741,7 @@ def test_window_copy_box_share():
                                   "box_links": old_links}}
         seen = {}
 
-        def capture(title, items):
+        def capture(title, items, panel=None):
             seen["items"] = items
             return None
 
@@ -9729,7 +9767,7 @@ def test_window_copy_box_share():
             assert not hasattr(w, "ask_box_link") and not hasattr(w, "fetch_box_link")
             # コピー後の確認窓は廃止された(プレビューに置き換え)
             assert not hasattr(w, "show_box_copied")
-            w.choose_menu = lambda title, items: "path"
+            w.choose_menu = lambda title, items, panel=None: "path"
             w.ask_copy_kind = lambda count, full_text, data: "box"
             clip = QGuiApplication.clipboard()
             w.left.set_cursor(w.left._row_of("見積書.xlsx"))
@@ -9831,7 +9869,7 @@ def test_window_ext_menu_box_open():
         original_allow = filer.filer_launch._allow_foreground
         seen = {}
 
-        def pick(title, items):
+        def pick(title, items, panel=None):
             seen["items"] = items
             return seen.get("choice")
 
@@ -9936,7 +9974,7 @@ def test_window_copy_path_box_dialog():
             share = ("/Box/ProjA/資料/\r\n"
                      "　https://app.box.com/folder/9101\r\n"
                      "　　memo.txt")
-            w.choose_menu = lambda title, items: "path"
+            w.choose_menu = lambda title, items, panel=None: "path"
             w.left.load(str(folder))
             _wait(w)
             w.left.set_cursor(w.left._row_of("memo.txt"))
@@ -11361,6 +11399,7 @@ def test_photo_journal_replay_on_startup():
     """起動時のなめ読み: 閉じている間に書かれた変更記録を先頭から読み直し、
     永続キャッシュと一覧へ反映する(末尾から読む通常の読み取りでは取りこぼす分)。"""
     import filer
+    from PySide6.QtTest import QTest
     from photometa import writer
 
     _qapp()
@@ -11388,7 +11427,15 @@ def test_photo_journal_replay_on_startup():
             w._poll_photo_journal()
             got = cache.get(str(photos / "b4.jpg"))
             assert got is not None and got.rating == 4     # ファイルの値のまま
+            replayed = []
+            w.bridge.journal_replayed.connect(lambda m: replayed.append(m))
             w._replay_photo_journal()
+            # 再生は読み取りスレッドで行い、一覧への反映は UI スレッドへ戻る
+            deadline = time.monotonic() + 5
+            while not replayed and time.monotonic() < deadline:
+                QTest.qWait(20)
+            assert replayed, "再生の結果が届かない"
+            QTest.qWait(50)
             texts = _rating_texts(L)
             assert texts["b4.jpg"] == "みてね用" and texts["e_none.jpg"] == "★2", texts
             # 永続キャッシュにも入っている(次に開いたときの読み取りで効く)

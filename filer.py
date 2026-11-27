@@ -34,6 +34,7 @@ from PySide6.QtCore import (
     QMimeData,
     QModelIndex,
     QObject,
+    QPoint,
     QRect,
     QRectF,
     Qt,
@@ -791,6 +792,7 @@ class ListBridge(QObject):
     photo_meta = Signal(object)
     # ★・キーワードを書き終えたとき (書き込みの番号, 結果の一覧 or None, エラー文字列)。
     photo_written = Signal(object)
+    journal_replayed = Signal(object)   # 起動時の変更記録の再生結果({キー: PhotoMeta})
     # 合計ファイルサイズ(I / Shift+I): 途中経過 (番号, 数えた件数) と、終わったとき
     # (番号, core.SizeTally or None, エラー文字列)。
     size_progress = Signal(object)
@@ -3297,6 +3299,7 @@ class FilerWindow(QWidget):
         self.bridge.version_ready.connect(self._on_version_ready)
         self.bridge.photo_meta.connect(self._on_photo_meta)
         self.bridge.photo_written.connect(self._on_photo_written)
+        self.bridge.journal_replayed.connect(self._on_journal_replayed)
         # 変更記録(PhotoCuller などが付けた★)。今の末尾から読む。自分の書き込みは除く。
         self._photo_journal = photo_writer.JournalReader(photo_writer.JOURNAL_PATH)
         self._photo_journal_timer = QTimer(self)
@@ -5077,7 +5080,12 @@ class FilerWindow(QWidget):
             key = next((k for k in "LKR" if k not in used), "?")
             items.append((key, "ランチャ登録する", ("register_launcher", register_path)))
         items.append(("M", "メニューを編集", ("edit",)))
-        choice = self.choose_menu(kind, items)
+        # 何に対するメニューかを帯に出す(ビュア状態なら琥珀色で、ビュアと揃える)
+        subject = (f"{len(targets)} 件" if len(targets) > 1 else kind_entry.name)
+        import filer_preview
+        accent = filer_preview.VIEWER_ACCENT if (self.viewer_mode or self.player_mode) else "#3b4a9c"
+        choice = self.choose_menu(kind, items, panel={
+            "title": f"{subject} ／ {kind}", "accent": accent})
         if choice is None:
             return
         ctx = self._menu_context(pane, targets)
@@ -6755,6 +6763,10 @@ class FilerWindow(QWidget):
                 self.player_mode = False    # 動画でない・再生できない: 通常の表示へ
                 self.preview_widget.stop_player()
             self.preview_widget.show_result(result)
+            # ページが替わってビュアが隠れると、Qt がフォーカスを近くの部品(読み取り専用の
+            # 文字欄など)へ移すことがある。そこは矢印キーを食べるだけで、一覧が動かなくなる
+            # (2026-11-27 の固まり。Tab で戻る)。落ち着いたあとで一覧へ戻す。
+            QTimer.singleShot(0, self._rescue_list_focus)
             if self._focus_viewer_when_ready:
                 # Enter で開いたとき・ビュアの ←→ で移ったときは、出たらそのまま中へ入る
                 self._focus_viewer_when_ready = False
@@ -6764,6 +6776,24 @@ class FilerWindow(QWidget):
         except Exception:  # noqa: BLE001
             self._image_wait_seq = None
             _log_exception("previewReady")
+
+    def _rescue_list_focus(self) -> None:
+        """フォーカスが、キーを食べるだけの部品(メッセージ窓・プレビューの文字欄)に
+        迷い込んでいたら、一覧へ戻す。ビュアやブラウザ表示の中に居るときは触らない。"""
+        try:
+            if not self.isActiveWindow() or QApplication.activeModalWidget()                     or QApplication.activePopupWidget():
+                return
+            fw = QApplication.focusWidget()
+            if fw is None:
+                return
+            widget = self.preview_widget
+            stray = [self.log_view]
+            if widget is not None:
+                stray += [widget.text, widget.rich]
+            if fw in stray:
+                self.active.view.setFocus()
+        except Exception:  # noqa: BLE001  タイマーから呼ぶ
+            _log_exception("rescueListFocus")
 
     def _drops_repeat(self, event) -> bool:
         """画像の読み込み中に来た、オートリピートのカーソル移動か(捨てるもの)。
@@ -9338,28 +9368,52 @@ class FilerWindow(QWidget):
         気付けず、永続キャッシュに古い★が残ってしまう。そこで起動時に1回だけ、
         .old に回った分も含めて先頭から読み、写真ごとに最後の記録を当てる
         （件数が多いと重いので、写真ごとに最後の1件へ畳んでから反映する）。
-        以後は通常の1秒ごとの読み取りが続く。"""
+        以後は通常の1秒ごとの読み取りが続く。
+
+        記録の読み込みと永続キャッシュへの書き込み(写真ごとの stat と DB)は読み取り
+        スレッドで行い、一覧への反映だけ UI スレッドで行う(以前は UI スレッドで全部
+        やっていて、記録が多いと起動直後に画面が数秒止まった。2026-11-27、見張りで判明)。"""
+        base = self._photo_journal.path
+        pid = os.getpid()
+
+        def work():
+            try:
+                entries = []
+                for path in (base + ".old", base):
+                    reader = photo_writer.JournalReader(path, from_start=True)
+                    entries += reader.read_new(exclude_pid=pid)
+                latest: dict = {}
+                for e in entries:
+                    prev = latest.get(e["path"])
+                    if (prev is not None and not isinstance(e.get("description"), str)
+                            and isinstance(prev.get("description"), str)):
+                        # 旧形式の記録（メモ欄が無い）が新しいときは、直前のメモを引き継ぐ
+                        e = {**e, "description": prev["description"]}
+                    latest[e["path"]] = e
+                if latest:
+                    metas = self._journal_metas(list(latest.values()))
+                    if metas:
+                        self.bridge.journal_replayed.emit(metas)
+            except Exception:  # noqa: BLE001  起動時の付属処理(窓が閉じた後の RuntimeError も含む)
+                _log_exception("photoJournalReplay")
+
+        threading.Thread(target=work, daemon=True, name="filer-journal-replay").start()
+
+    def _on_journal_replayed(self, metas) -> None:
+        """再生の結果を一覧へ当てる(UI スレッド)。"""
         try:
-            base = self._photo_journal.path
-            entries = []
-            for path in (base + ".old", base):
-                reader = photo_writer.JournalReader(path, from_start=True)
-                entries += reader.read_new(exclude_pid=os.getpid())
-            latest: dict = {}
-            for e in entries:
-                prev = latest.get(e["path"])
-                if (prev is not None and not isinstance(e.get("description"), str)
-                        and isinstance(prev.get("description"), str)):
-                    # 旧形式の記録（メモ欄が無い）が新しいときは、直前のメモを引き継ぐ
-                    e = {**e, "description": prev["description"]}
-                latest[e["path"]] = e
-            if latest:
-                self._apply_photo_journal_entries(list(latest.values()))
-        except Exception:  # noqa: BLE001  起動時の付属処理。失敗しても本体は続ける
-            _log_exception("photoJournalReplay")
+            self._apply_photo_metas_all(metas)
+        except Exception:  # noqa: BLE001
+            _log_exception("photoJournalReplayApply")
 
     def _apply_photo_journal_entries(self, entries) -> None:
         """変更記録の行を、一覧（出ている写真）と永続キャッシュへ反映する。"""
+        metas = self._journal_metas(entries)
+        if metas:
+            self._apply_photo_metas_all(metas)
+
+    def _journal_metas(self, entries) -> dict:
+        """変更記録の行を永続キャッシュへ書き、{キー: PhotoMeta} を返す(どのスレッドからでも)。"""
         metas = {}
         cache = _get_photo_metacache()
         for e in entries:
@@ -9384,8 +9438,7 @@ class FilerWindow(QWidget):
                 cache.update(e["path"], meta)
             except Exception:  # noqa: BLE001  キャッシュは付属。失敗しても反映は続ける
                 pass
-        if metas:
-            self._apply_photo_metas_all(metas)
+        return metas
 
     def _update_preview_rating(self) -> None:
         """画像ビュア(F3)の隅の★を、表示中の1枚に合わせる。"""
@@ -9427,15 +9480,28 @@ class FilerWindow(QWidget):
         key = rating_color_key(meta.rating)
         return text, self.colors[key], self.colors[f"{key}_bg"]
 
-    def build_menu(self, title: str, items):
+    def build_menu(self, title: str, items, panel=None):
         """文字キーは選択のみ・Enter で実行する小さなメニューを組む。(_ChooserMenu, {QAction: 値})。
 
         items は (文字, 表示, 値) か (文字, 表示, 値, チェック状態)。チェック状態を渡した
         項目はチェック付きで出す(Shift+Z の ON/OFF)。None は区切り線。先頭の項目を選んだ
-        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。"""
+        状態にしておく(開いてすぐ Enter で先頭が実行できるように)。
+
+        panel を渡すと、大きめの字・上に帯(対象の名前)・下に操作の案内を付けたパネルの
+        見た目になる(拡張子別メニュー用)。panel = {"title": 帯の文字, "accent": 帯の色}。"""
         menu = _ChooserMenu(self)
         menu.setTitle(title)
-        menu.setStyleSheet(_menu_style_sheet(self.colors))
+        sheet = _menu_style_sheet(self.colors)
+        if panel is not None:
+            sheet += (f"QMenu {{ border: 2px solid {panel['accent']}; font-size: 14pt; }}"
+                      f"QMenu::item {{ padding: 6px 28px 6px 10px; }}")
+            menu.setMinimumWidth(340)
+        menu.setStyleSheet(sheet)
+        if panel is not None:
+            menu.addAction(self._menu_label_action(
+                menu, panel["title"],
+                f"background-color: {panel['accent']}; color: #ffffff; padding: 6px 12px;"
+                " font-size: 11pt;"))
         chosen = {}
         for item in items:
             if item is None:
@@ -9451,7 +9517,23 @@ class FilerWindow(QWidget):
         first = next((a for a in menu.actions() if a.isEnabled() and not a.isSeparator()), None)
         if first is not None:
             menu.setActiveAction(first)
+        if panel is not None:
+            menu.addSeparator()
+            menu.addAction(self._menu_label_action(
+                menu, "頭文字で選択　Enter 実行　Esc 閉じる",
+                f"color: {self.colors['system']}; padding: 4px 12px; font-size: 10pt;"))
         return menu, chosen
+
+    def _menu_label_action(self, menu, text: str, style: str):
+        """メニューの中に置く、選べない1行(帯・案内)。"""
+        from PySide6.QtWidgets import QWidgetAction
+
+        label = QLabel(text)
+        label.setStyleSheet(style)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(label)
+        action.setEnabled(False)       # 矢印キーの移動で止まらない・選べない
+        return action
 
     def _menu_pos(self):
         view = self.active.view
@@ -9464,11 +9546,21 @@ class FilerWindow(QWidget):
         # 出した直後にも選び直す。popup の中で選択が外れる版の Qt があっても先頭に戻るように。
         if first is not None:
             QTimer.singleShot(0, lambda: menu.setActiveAction(first) if menu.isVisible() else None)
-        return chosen.get(menu.exec(self._menu_pos()))
+        pos = self._menu_pos()
+        if getattr(menu, "center_on_pane", False):
+            # 作業中の窓の真ん中へ(大きさは出してみないと分からないので、先に決めさせる)
+            menu.ensurePolished()
+            size = menu.sizeHint()
+            view = self.active.view
+            mid = view.viewport().mapToGlobal(view.viewport().rect().center())
+            pos = QPoint(mid.x() - size.width() // 2, mid.y() - size.height() // 2)
+        return chosen.get(menu.exec(pos))
 
-    def choose_menu(self, title: str, items):
-        """文字キーは選択のみ・Enter で実行する小さなメニュー。選んだ値か None。"""
-        menu, chosen = self.build_menu(title, items)
+    def choose_menu(self, title: str, items, panel=None):
+        """文字キーは選択のみ・Enter で実行する小さなメニュー。選んだ値か None。
+        panel を渡すと、窓の中央に出すパネルの見た目になる(build_menu 参照)。"""
+        menu, chosen = self.build_menu(title, items, panel)
+        menu.center_on_pane = panel is not None
         return self._exec_menu(menu, chosen)
 
     def choose_menu_deletable(self, title: str, items):
@@ -9885,6 +9977,7 @@ def _apply_taskbar_identity(window) -> None:
 
 STALL_LOG_PATH = Path(__file__).resolve().parent / "filer_stall.log"
 STALL_LIMIT_S = 1.0
+STALL_C_LIMIT_S = 2.0
 
 
 def _start_stall_watchdog(app) -> None:
@@ -9894,8 +9987,21 @@ def _start_stall_watchdog(app) -> None:
     import faulthandler
 
     beat = [time.monotonic()]
+    # Python の見張りは、画面側が GIL を握ったまま止まると自分も動けず、止まりが終わった後で
+    # 書こうとしても拍が更新済みで見逃す。faulthandler の dump_traceback_later は C の
+    # スレッドで動くので、GIL に関係なく、拍が途絶えて STALL_C_LIMIT_S 秒たてば書ける。
+    try:
+        c_log = open(STALL_LOG_PATH, "a", encoding="utf-8")
+    except OSError:
+        c_log = None
+
+    def on_beat():
+        beat[0] = time.monotonic()
+        if c_log is not None:
+            faulthandler.dump_traceback_later(STALL_C_LIMIT_S, file=c_log)   # 掛け直し
+
     timer = QTimer(app)
-    timer.timeout.connect(lambda: beat.__setitem__(0, time.monotonic()))
+    timer.timeout.connect(on_beat)
     timer.start(200)
     app._stall_timer = timer       # 持っておかないと消える
 

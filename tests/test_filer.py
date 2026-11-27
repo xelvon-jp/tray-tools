@@ -2474,6 +2474,55 @@ def test_viewer_mode_html_web_and_menu_hides_view():
             w.deleteLater()
 
 
+def test_web_view_left_to_parent_returns_focus_to_list():
+    """HTML のブラウザ表示から ← で「..」へ移ると、隠れたブラウザにフォーカスが残って方向キーが
+    効かなくなった(2026-11-27)。一覧へフォーカスを戻し、↑↓ で動けること。"""
+    import filer
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        Path(left, "page.html").write_text(
+            "<html><body><h1>hello</h1></body></html>", encoding="utf-8")
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        try:
+            w.left.set_cursor(w.left._row_of("page.html"))
+            QTest.keyClick(w.active.view, Qt.Key_Return)
+            _wait_preview(w, "page.html")
+            pv = w.preview_widget
+            deadline = time.monotonic() + 10
+            while not pv.web_shown() and time.monotonic() < deadline:
+                QTest.qWait(50)
+            if not pv.web_shown():
+                print("  (WebEngine が使えないのでブラウザ表示は省略)")
+                return
+            # ブラウザ表示の中から ← で前のファイル(「..」まで)へ
+            while w.active.cursor_row() > 0:
+                before = w.active.cursor_row()
+                QTest.keyClick(w.focusWidget() or w.active.view, Qt.Key_Left)
+                QTest.qWait(400)
+                assert w.active.cursor_row() < before, "← で動かない"
+            QTest.qWait(400)
+            assert w.active.cursor_entry().is_parent
+            # 隠れたブラウザや文字欄ではなく、一覧がフォーカスを持つ
+            assert w.focusWidget() is w.active.view, type(w.focusWidget()).__name__
+            QTest.keyClick(w.focusWidget(), Qt.Key_Down)
+            QTest.qWait(300)
+            assert w.active.cursor_row() == 1, "↓ で動かない"
+        finally:
+            w.close()
+            w.deleteLater()
+
+
 def test_video_viewer_and_player():
     """動画: Enter でビュア状態(情報とサムネ)。Ctrl+Enter のメニューの先頭が内蔵プレーヤで、
     再生は反対窓いっぱい。↑↓ で前後の動画(動画でないファイルは飛ばす)、Esc で情報へ戻る。
@@ -7140,7 +7189,9 @@ def test_preview_image_rotate_keys():
             return pixmap.toImage()
 
         def header():
-            return w.preview_widget.header.text()
+            # ビュア状態の見出しの末尾には操作の案内が付く。向きの表示までを見る
+            import filer_preview
+            return w.preview_widget.header.text().replace(filer_preview.VIEWER_HINT, "")
         original = None
         try:
             # 一覧では R / L / H / V は従来どおり

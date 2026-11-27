@@ -6452,6 +6452,12 @@ class FilerWindow(QWidget):
     def cmd_preview_toggle(self):
         if self.preview_on:
             self.preview_off()
+        elif core.preview_kind(self.active.cursor_entry(), self.viewer_extensions) in (
+                "image", "text"):
+            # 画像・テキストは V / F3 も Enter と同じビュア状態で開く(軽いプレビューと2種類
+            # あると紛らわしいため。2026-11-27 陽太さん、テキストは 2026-11-28)。
+            # F3 / Enter / Esc / BS のどれでも閉じる。
+            self._open_in_viewer()
         else:
             self.preview_show()
 
@@ -6690,6 +6696,11 @@ class FilerWindow(QWidget):
                     self._preview_queue.clear()
                 self._image_wait_seq = None
                 widget.show_result({"title": "..", "lines": [], "image": None})
+                # 読み込みを通らないので、ここでもフォーカスを一覧へ戻す(HTML のブラウザ表示から
+                # ← で「..」へ移ると、隠れたブラウザが握ったままキーが死ぬ。2026-11-28)
+                QTimer.singleShot(0, self._rescue_list_focus)
+                QTimer.singleShot(200, self._rescue_list_focus)
+                self._focus_viewer_when_ready = False   # 「..」で連続は切れる。次はまず一覧で動く
                 return
             box = widget.image_box()
             odd = kind == "image" and core.turn_swaps_size(self.image_turn.turn)
@@ -6767,6 +6778,7 @@ class FilerWindow(QWidget):
             # 文字欄など)へ移すことがある。そこは矢印キーを食べるだけで、一覧が動かなくなる
             # (2026-11-27 の固まり。Tab で戻る)。落ち着いたあとで一覧へ戻す。
             QTimer.singleShot(0, self._rescue_list_focus)
+            QTimer.singleShot(200, self._rescue_list_focus)   # ブラウザ表示は遅れてフォーカスを握る
             if self._focus_viewer_when_ready:
                 # Enter で開いたとき・ビュアの ←→ で移ったときは、出たらそのまま中へ入る
                 self._focus_viewer_when_ready = False
@@ -6778,19 +6790,34 @@ class FilerWindow(QWidget):
             _log_exception("previewReady")
 
     def _rescue_list_focus(self) -> None:
-        """フォーカスが、キーを食べるだけの部品(メッセージ窓・プレビューの文字欄)に
-        迷い込んでいたら、一覧へ戻す。ビュアやブラウザ表示の中に居るときは触らない。"""
+        """フォーカスが、キーを受け付けない所に迷い込んでいたら、一覧へ戻す。
+
+        ビュア・ブラウザ表示・プレーヤは、いま出ているときだけ持っていてよい。隠れたものや、
+        メッセージ窓・プレビューの文字欄のような「矢印キーを食べるだけ」の部品が持っていたら、
+        一覧へ戻す(2026-11-27: HTML のブラウザ表示から ← で「..」へ移ると、隠れたブラウザが
+        フォーカスを持ったまま、方向キーが効かなくなった)。"""
         try:
             if not self.isActiveWindow() or QApplication.activeModalWidget()                     or QApplication.activePopupWidget():
                 return
             fw = QApplication.focusWidget()
-            if fw is None:
-                return
             widget = self.preview_widget
-            stray = [self.log_view]
-            if widget is not None:
-                stray += [widget.text, widget.rich]
-            if fw in stray:
+            if fw is None:
+                if widget is not None and self.preview_on:
+                    self.active.view.setFocus()
+                return
+            if fw is self.log_view:
+                self.active.view.setFocus()
+                return
+            if widget is None or not widget.isAncestorOf(fw):
+                return
+            allowed = []
+            if widget.viewer_shown():
+                allowed.append(widget.viewer)
+            if widget.web_shown():
+                allowed.append(widget.web)
+            if widget.player_shown():
+                allowed.append(widget.player_view)
+            if not any(a is fw or a.isAncestorOf(fw) for a in allowed):
                 self.active.view.setFocus()
         except Exception:  # noqa: BLE001  タイマーから呼ぶ
             _log_exception("rescueListFocus")
@@ -10039,6 +10066,10 @@ def main() -> int:
             "traytools.affx")
     except Exception:  # noqa: BLE001  名乗れなくても起動は続ける
         pass
+    # 窓を最初から RHI 描画にしておく。しないと、HTML のブラウザ表示(WebEngine の OpenGL 系部品)
+    # を初めて足したとき Qt が窓そのものを作り直し、画面が 0.2 秒ほど消える(2026-11-28 実測。
+    # 起動時に先読みする方式は起動時にちらつくうえ、メモリも常駐するので採らなかった)。
+    os.environ.setdefault("QT_WIDGETS_RHI", "1")
     app = QApplication(sys.argv)
     # 窓とタスクバーのアイコン(本家 AfxW 風のドット明朝。affx_icon が持つ)。
     app.setWindowIcon(affx_icon.qicon())

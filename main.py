@@ -28,6 +28,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
 import action_log
+import safe_input
 import window_list
 import beep
 import capture_grab
@@ -404,6 +405,15 @@ def _build_command_handlers(features) -> dict:
         # 矩形は capture と同じ論理座標なので、そのまま --region や --window の判断に使える。
         # 論理座標への変換に Qt の画面情報が要るので、常駐に載せている。
         "windows": lambda args, reply: reply(_windows_command(args)),
+        # 窓を崩さない入力(computer-use の代わり)。対象窓(exe名 or hwnd)が前面にあるときだけ
+        # SendInput で送る。前面化・移動・サイズ変更はしない。違えば送らず理由を返す。
+        #
+        #   traytools_send.py click --window=chrome 100 200 [--right] [--double] [--dry]
+        #   traytools_send.py key --window=chrome ctrl+r [--dry]
+        #   traytools_send.py type --window=chrome "本文" [--dry]
+        "click": lambda args, reply: _input_dispatch(screen, "click", args, reply),
+        "key": lambda args, reply: _input_dispatch(screen, "key", args, reply),
+        "type": lambda args, reply: _input_dispatch(screen, "type", args, reply),
         # トーストを1枚出す。長い処理の節目を知らせる用。
         #
         #   traytools_send.py notify "変換が終わりました"
@@ -778,6 +788,45 @@ def _resolve_capture_window(spec_text):
     note = window_list.format_overlaps(window_list.find_overlaps(target, windows))
     label = f"窓 {target['exe']} hwnd={target['hwnd']}({rect.x()},{rect.y()} {rect.width()}x{rect.height()})"
     return rect, label, note, None
+
+
+INPUT_SETTLE_MS = 300  # 入力を送ってから窓を撮るまでの待ち
+
+
+def _input_dispatch(screen, kind, args, reply) -> None:
+    """click / key / type の入口。確認→送信は同期、撮影は約0.3秒待ってから非同期で返す。
+    窓には触れない(前面化・移動・サイズ変更なし)。トースト・通知は出さない。"""
+    params, error = safe_input.parse_input_args(kind, args)
+    if error:
+        reply(f"ERR {error}")
+        return
+    try:
+        windows = _collect_windows()
+    except Exception as e:  # noqa: BLE001  外部から叩かれる口。落とさない
+        reply(f"ERR 窓を列挙できません: {e}")
+        return
+    env = safe_input.Win32Env(dpr_at=capture_grab.dpr_at_device_point)
+    result = safe_input.execute(kind, params, windows, env)
+    if not result.ok:
+        reply(f"ERR {result.text}")
+        return
+    if not result.sent:
+        reply(f"OK {result.text}")
+        return
+    action_log.record("窓入力", result.log, "external")
+
+    def finish():
+        try:
+            shot = _capture_command(screen, [f"--window={result.hwnd}"])
+            if shot.startswith("OK"):
+                # 重なり警告(3行目以降)は付けない
+                reply("OK " + result.text + "\n" + "\n".join(shot.splitlines()[:2]))
+            else:
+                reply(f"OK {result.text}\n（実行後の撮影はできませんでした: {shot}）")
+        except Exception as e:  # noqa: BLE001  Qtのスロットから例外を出さない
+            reply(f"OK {result.text}\n（実行後の撮影はできませんでした: {e}）")
+
+    QTimer.singleShot(INPUT_SETTLE_MS, finish)
 
 
 def _log_command(args) -> str:

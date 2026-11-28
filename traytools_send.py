@@ -314,6 +314,12 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   capture --select             ドラッグで範囲を選んでもらって撮る（人の操作を待つ）
   capture --window=exe名|hwnd  その窓の矩形だけ撮る（窓は動かさない）
   windows [exe=名] [title=文字] [--all]  可視の最上位窓を1窓1行で一覧（読み取り専用）
+  click --window=exe名|hwnd x y [--right] [--double] [--dry]
+                               前面の対象窓へクリックを送る（窓は動かさない。違えば送らず理由を返す）
+  key --window=exe名|hwnd ctrl+r [--dry]
+                               前面の対象窓へキーを送る（Win キー・ctrl+alt+del は拒否）
+  type --window=exe名|hwnd "本文" [--dry]
+                               前面の対象窓へ文字列を入力（1000文字まで。--dry は確認だけ）
   agent-loop status            疑似エージェントループの状態
   agent-loop cancel            走っているループに停止要求（次の周の頭で止まる）
   agent-loop start <お題ファイル> [--auto] [--max=N] [--ps-timeout=N]

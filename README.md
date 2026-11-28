@@ -369,6 +369,9 @@ PC を落とすスクリプトからは `traytools_send.py tomorrow-memo` を呼
 | `pushover` | `message`（必須）, `title`, `priority`, `sound` | `openWorldHint` |
 | `capture` | `screen`, または `x`/`y`/`width`/`height`, または `window`, または `select` | |
 | `windows` | `exe`, `title`, `all` | `readOnlyHint` |
+| `click` | `window`（必須）, `x`, `y`（必須）, `button`, `double`, `dry` | 入力を送る（`readOnlyHint: false`） |
+| `key` | `window`, `keys`（必須）, `dry` | 同上 |
+| `type` | `window`, `text`（必須）, `dry` | 同上 |
 | `bookmark` | `path` | |
 | `agent_loop` | `action`（必須）, `prompt_file`, `watch`, `auto`, `max_rounds`, `finish_word` | **`destructiveHint`** |
 
@@ -407,6 +410,29 @@ traytools_send.py capture --select           範囲選択のオーバーレイ�
 **必ず常駐の `capture_grab._sct()` を通します。** `mss.MSS()` を都度作ると COM/GC 衝突でプロセスごと落ちるためで、単発の呼び出しでも同じ経路に乗せています。
 
 半透明のウィンドウも写します（`include_layered=True`）。通知やメニューが出ている状態を撮りたいためです。
+
+### 窓を崩さない入力（`click` / `key` / `type`）
+
+computer-use の `left_click` / `key` は、許可外の窓を全部最小化して窓配置を崩し、Claude 本体まで縮める。代わりに使うための口で、`SendInput` で**前面にある対象窓にだけ**送り、**窓の移動・前面化・サイズ変更・最小化・アプリ起動は一切しません**（`SetForegroundWindow` / `SetWindowPos` / `ShowWindow` は使わない）。既定オフも毎回の確認ダイアログもありません。確認はすべて自動で、違えば**送らずに理由と次の手を返します**。トーストや通知は出しません。
+
+```
+traytools_send.py click --window=chrome 100 200 [--right] [--double] [--dry]
+traytools_send.py key   --window=chrome ctrl+r [--dry]
+traytools_send.py type  --window=chrome "本文" [--dry]
+```
+
+`--window` は `capture --window=` と同じ解決（exe名 or hwnd、同じ exe が複数なら一覧つき ERR）で必須。送る前の確認（どれか違えば ERR）:
+
+- 対象が最小化されていない。
+- 対象が管理者権限（または判定不能）でない。UIPI で入力が黙って捨てられるため、送らずに中止します。
+- 前面の窓が対象であること。前面の窓の所有者連鎖（`GW_OWNER`）が対象に着けば、対象のダイアログも可。違えば「前面に出してください（いまの前面: exe/タイトル）」。
+- `click` のみ: 座標が対象窓の矩形内で、かつ座標の下の窓のルート（または所有者連鎖）が対象であること。違えば重なっている窓の exe/タイトルを返します。座標は `windows` / `capture` と同じ論理座標。
+
+`click` は `SetCursorPos` → `SendInput` で、送信後カーソルを元の位置へ戻します。`key` は修飾キーを押す→キー→離すを1回の `SendInput` で送り、途中失敗でも押しっぱなしを残さないよう後始末の KEYUP を送ります（`ctrl+r` `enter` `alt+left` `f5` `ctrl+shift+t` `ctrl++` の形式。記号キーは US 配列の VK。Win キー系と `ctrl+alt+del` は拒否）。`type` は `KEYEVENTF_UNICODE` で送り、改行は Enter キー、上限1000文字（超えたら ERR）。`SendInput` の戻り値が要求数と違えば ERR（黙って失敗させない）。
+
+成功時の応答は「何をしたか1行」＋約0.3秒待ってその窓の矩形を撮った画像のパス（`capture --window=` と同じ経路。重なり警告は付けない）。操作ログ（`action.log`）には `窓入力` として残し、`type` の本文は出さず文字数だけ。`--dry`（MCP では `dry: true`）は確認だけして送りません。実機確認はこれで行います。実装は `safe_input.py`（純関数＋`Win32Env`）、テストは `tests/test_safe_input.py`（`SendInput` はモックで、実際の入力は送らない）。
+
+**罠:** `INPUT` 構造体は x64 で 40 バイト。余計な詰め物を入れると `SendInput` が 0 を返し、例外なしで何も起きません（`safe_input.py` は import 時にサイズを検査して落とします）。
 
 ## 疑似エージェントループ（`agent_loop.py` / `copilot_loop.py` / `agent_loop_viewer.py`）
 

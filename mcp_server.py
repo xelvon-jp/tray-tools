@@ -237,6 +237,58 @@ TOOLS = [
         readOnlyHint=True,
     ),
     _tool(
+        "click",
+        "窓を崩さずクリックする",
+        "computer-use の代わりに、対象窓へマウスクリックを送る(SendInput)。**前面にある対象窓にだけ送る。"
+        "窓は動かさない**(前面化・移動・サイズ変更・最小化・アプリ起動をしない)。"
+        "対象が前面でない・座標の一番上が別の窓・管理者権限の窓・最小化・座標が窓の外、のどれかなら"
+        "送らずに理由と次の手を返す(承認は不要。確認は自動)。成功すると実行後の窓の画像パスを返す。"
+        "座標は windows / capture と同じ論理座標。送信後カーソルは元の位置へ戻す。"
+        "dry=true なら確認だけして送らない。**入力を送るので readOnly ではない。**",
+        {
+            "window": {"type": "string", "description": "対象窓。exe名(例: chrome.exe)か hwnd(windows で分かる)。"
+                       "同じexeが複数なら一覧つきのエラーになるので hwnd で指定し直す"},
+            "x": {"type": "integer", "description": "クリックするX(論理座標)"},
+            "y": {"type": "integer", "description": "クリックするY(論理座標)"},
+            "button": {"type": "string", "enum": ["left", "right"], "description": "既定 left"},
+            "double": {"type": "boolean", "description": "true でダブルクリック"},
+            "dry": {"type": "boolean", "description": "true なら確認だけして送らない"},
+        },
+        ["window", "x", "y"],
+        readOnlyHint=False, destructiveHint=False, openWorldHint=False,
+    ),
+    _tool(
+        "key",
+        "窓を崩さずキーを押す",
+        "computer-use の代わりに、対象窓へキー入力を1つ送る(SendInput)。**前面にある対象窓にだけ送る。"
+        "窓は動かさない**。違えば送らずに理由を返す(確認は自動)。"
+        "keys は \"ctrl+r\" \"enter\" \"alt+left\" \"f5\" \"ctrl+shift+t\" の形式(修飾は ctrl/shift/alt)。"
+        "Win キー系と ctrl+alt+del は拒否。成功すると実行後の窓の画像パスを返す。"
+        "dry=true なら確認だけして送らない。**入力を送るので readOnly ではない。**",
+        {
+            "window": {"type": "string", "description": "対象窓。exe名か hwnd(windows で分かる)"},
+            "keys": {"type": "string", "description": "例: ctrl+r / enter / alt+left / f5 / ctrl+shift+t"},
+            "dry": {"type": "boolean", "description": "true なら確認だけして送らない"},
+        },
+        ["window", "keys"],
+        readOnlyHint=False, destructiveHint=False, openWorldHint=False,
+    ),
+    _tool(
+        "type",
+        "窓を崩さず文字を入力する",
+        "computer-use の代わりに、対象窓へ文字列を入力する(KEYEVENTF_UNICODE)。**前面にある対象窓にだけ"
+        "送る。窓は動かさない**。違えば送らずに理由を返す(確認は自動)。上限1000文字。"
+        "改行は Enter キーとして送る。成功すると実行後の窓の画像パスを返す(本文は操作ログに残さず文字数だけ)。"
+        "dry=true なら確認だけして送らない。**入力を送るので readOnly ではない。**",
+        {
+            "window": {"type": "string", "description": "対象窓。exe名か hwnd(windows で分かる)"},
+            "text": {"type": "string", "description": "入力する本文(最大1000文字)"},
+            "dry": {"type": "boolean", "description": "true なら確認だけして送らない"},
+        },
+        ["window", "text"],
+        readOnlyHint=False, destructiveHint=False, openWorldHint=False,
+    ),
+    _tool(
         "bookmark",
         "フォルダブックマークを開く",
         "フォルダブックマークのピッカーを画面に出す。パスを渡すと、その場で登録できる。"
@@ -382,6 +434,38 @@ def _to_command(name: str, params: dict):
         if params.get("all") is True:
             args.append("--all")
         return "windows", args
+
+    if name in ("click", "key", "type"):
+        window = params.get("window")
+        window = window.strip() if isinstance(window, str) else ""
+        if not window:
+            raise ValueError("window が必要です")
+        args = [f"--window={window}"]
+        if name == "click":
+            for k in ("x", "y"):
+                v = params.get(k)
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise ValueError(f"{k} は整数です")
+            button = params.get("button") or "left"
+            if button not in ("left", "right"):
+                raise ValueError("button は left / right です")
+            args += [f"--button={button}"]
+            if params.get("double") is True:
+                args.append("--double")
+            args += [str(params["x"]), str(params["y"])]
+        elif name == "key":
+            keys = params.get("keys")
+            if not isinstance(keys, str) or not keys.strip():
+                raise ValueError("keys が必要です")
+            args.append(f"--keys={keys.strip()}")
+        else:
+            text = params.get("text")
+            if not isinstance(text, str) or text == "":
+                raise ValueError("text が必要です")
+            args.append(f"--text={text}")  # 本文は加工しない(前後の空白・改行も入力のうち)
+        if params.get("dry") is True:
+            args.append("--dry")
+        return name, args
 
     if name == "bookmark":
         path = (params.get("path") or "").strip()

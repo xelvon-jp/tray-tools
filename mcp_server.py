@@ -206,6 +206,13 @@ TOOLS = [
             "y": {"type": "integer", "description": "region 指定: 左上のY(仮想デスクトップの論理座標)"},
             "width": {"type": "integer", "minimum": 1, "description": "region 指定: 幅"},
             "height": {"type": "integer", "minimum": 1, "description": "region 指定: 高さ"},
+            "window": {
+                "type": "string",
+                "description": "窓を指定して、その窓の矩形だけを撮る。exe名(例: chrome.exe)か hwnd(windows で分かる)。"
+                "窓は動かさない・前面化しない。最小化なら撮れずエラー。他の窓が重なっていれば"
+                "応答に「重なり: …」の警告が付く(画面から切り出すので重なりも写る)。"
+                "同じexeの窓が複数なら一覧を返すので hwnd で指定し直す。screen/x/y/select とは同時に使えない",
+            },
             "select": {
                 "type": "boolean",
                 "description": "true なら範囲選択のオーバーレイを画面に出し、ユーザーがドラッグ"
@@ -214,6 +221,20 @@ TOOLS = [
                 "x/y/width/height・screen とは同時に使えない",
             },
         },
+    ),
+    _tool(
+        "windows",
+        "窓の一覧を見る",
+        "可視の最上位窓を1窓1行で返す(hwnd・exe名・PID・タイトル・クラス・矩形・モニタ番号・"
+        "最小化/TOPMOST/管理者権限/前面の別)。矩形は capture と同じ論理座標。"
+        "どの窓がどこにあるかを知ってから capture の window= や範囲指定をするのに使う。"
+        "既定は最小化・ツール窓・タイトル空を除く。読むだけで、窓の移動・前面化・入力はしない。",
+        {
+            "exe": {"type": "string", "description": "exe名の部分一致で絞る(大文字小文字は無視)"},
+            "title": {"type": "string", "description": "タイトルの部分一致で絞る"},
+            "all": {"type": "boolean", "description": "true で最小化・ツール窓・タイトル空の窓も含める"},
+        },
+        readOnlyHint=True,
     ),
     _tool(
         "bookmark",
@@ -327,9 +348,16 @@ def _to_command(name: str, params: dict):
 
     if name == "capture":
         screen = params.get("screen")
+        window = (params.get("window") or "").strip() if isinstance(params.get("window"), str) else ""
+        if params.get("window") is not None and not window:
+            raise ValueError("window が空です")
         region_keys = ("x", "y", "width", "height")
         given = [k for k in region_keys if params.get(k) is not None]
         select = params.get("select") is True
+        if window:
+            if given or select or screen is not None:
+                raise ValueError("window は screen / select / x,y,width,height と同時に使えません")
+            return "capture", [f"--window={window}"]
         if given:
             if len(given) != 4:
                 raise ValueError("region には x, y, width, height の4つが全部必要です")
@@ -344,6 +372,16 @@ def _to_command(name: str, params: dict):
                 raise ValueError("select は screen と同時に使えません")
             return "capture", ["--select"]
         return "capture", ([str(int(screen))] if screen is not None else [])
+
+    if name == "windows":
+        args = []
+        for key in ("exe", "title"):
+            value = (params.get(key) or "").strip() if isinstance(params.get(key), str) else ""
+            if value:
+                args.append(f"{key}={value}")
+        if params.get("all") is True:
+            args.append("--all")
+        return "windows", args
 
     if name == "bookmark":
         path = (params.get("path") or "").strip()

@@ -312,6 +312,8 @@ USAGE = """使い方: traytools_send.py <command> [args...]
   capture [画面番号]           画面を1枚撮って保存し、パスを返す
   capture --region=x,y,w,h     論理座標の矩形だけ撮る
   capture --select             ドラッグで範囲を選んでもらって撮る（人の操作を待つ）
+  capture --window=exe名|hwnd  その窓の矩形だけ撮る（窓は動かさない）
+  windows [exe=名] [title=文字] [--all]  可視の最上位窓を1窓1行で一覧（読み取り専用）
   agent-loop status            疑似エージェントループの状態
   agent-loop cancel            走っているループに停止要求（次の周の頭で止まる）
   agent-loop start <お題ファイル> [--auto] [--max=N] [--ps-timeout=N]

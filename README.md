@@ -367,7 +367,8 @@ PC を落とすスクリプトからは `traytools_send.py tomorrow-memo` を呼
 | `notify` | `message`（必須） | |
 | `beep` | `kind` | |
 | `pushover` | `message`（必須）, `title`, `priority`, `sound` | `openWorldHint` |
-| `capture` | `screen`, または `x`/`y`/`width`/`height`, または `select` | |
+| `capture` | `screen`, または `x`/`y`/`width`/`height`, または `window`, または `select` | |
+| `windows` | `exe`, `title`, `all` | `readOnlyHint` |
 | `bookmark` | `path` | |
 | `agent_loop` | `action`（必須）, `prompt_file`, `watch`, `auto`, `max_rounds`, `finish_word` | **`destructiveHint`** |
 
@@ -398,6 +399,8 @@ traytools_send.py capture --select           範囲選択のオーバーレイ�
 ```
 
 `--region` と `--select` と画面番号は同時に指定できません。`--select` はホットキーと同じ `FrozenSelectionOverlay` を使い、付箋は出さずに保存だけします。応答は選び終わってから返り、Esc でのキャンセルや60秒無操作のときは撮らずに「OK キャンセルされました（撮っていません）」を返します。範囲選択中・遅延カウントダウン中に呼ぶと ERR を返します。MCP の `capture` では `x` `y` `width` `height`（4つ揃えて）と `select: true` がこれに当たります。
+
+`--window=<exe名 or hwnd>`（MCP では `window`）はその窓の矩形だけを、既存の `--region` と同じ経路で撮ります。**窓は動かさず前面化もしません**（画面から切り出す方式なので、他の窓が重なっていれば重なりも写り、応答に「重なり: …」の警告が付きます）。最小化中の窓は ERR、同じ exe の窓が複数あるときは一覧を返して hwnd 指定を促します。窓の一覧は `traytools_send.py windows [exe=名] [title=文字] [--all]`（MCP の `windows`）で、1窓1行で hwnd・exe・PID・タイトル・クラス・矩形（capture と同じ論理座標）・モニタ番号・最小化/TOPMOST/管理者権限/前面を返します。既定は最小化・ツール窓・タイトル空を除きます。読み取り専用です。
 
 保存先は Rapture と同じ `capture.save_folder` で、応答の2行目に保存したパスが返ります。
 

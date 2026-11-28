@@ -28,6 +28,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
 import action_log
+import window_list
 import beep
 import capture_grab
 import com_gc_probe
@@ -396,6 +397,13 @@ def _build_command_handlers(features) -> dict:
         #
         #   traytools_send.py log 50
         "log": lambda args, reply: reply(_log_command(args)),
+        # 可視の最上位窓を1窓1行で返す(読み取り専用。移動・前面化・入力はしない)。
+        #
+        #   traytools_send.py windows [exe=名前] [title=文字列] [--all]
+        #
+        # 矩形は capture と同じ論理座標なので、そのまま --region や --window の判断に使える。
+        # 論理座標への変換に Qt の画面情報が要るので、常駐に載せている。
+        "windows": lambda args, reply: reply(_windows_command(args)),
         # トーストを1枚出す。長い処理の節目を知らせる用。
         #
         #   traytools_send.py notify "変換が終わりました"
@@ -424,6 +432,8 @@ def _build_command_handlers(features) -> dict:
         # 範囲を指定して撮る口(後方互換。引数なし・画面番号だけの呼び方は従来どおり)。
         #   traytools_send.py capture --region=x,y,w,h   仮想デスクトップの論理座標の矩形だけ
         #   traytools_send.py capture --select           ドラッグで範囲を選んでもらい、その範囲を撮る
+        #   traytools_send.py capture --window=chrome    その窓(exe名 or hwnd)の矩形だけ。窓は動かさない・前面化しない
+        #     最小化ならERR。重なる窓があれば応答に「重なり: …」を付ける。同じexeが複数なら一覧を返す
         # --select は人の操作を待つので応答が遅れる(キャンセル・無操作60秒で撮らずに返る)。
         "capture": lambda args, reply: _capture_dispatch(screen, args, reply),
         # Copilot アプリを相手にした疑似エージェントループ。
@@ -576,41 +586,48 @@ CAPTURE_SELECT_TIMEOUT_MS = 60000  # --select で人が選ぶのを待つ上限�
 
 
 def _parse_capture_args(args):
-    """capture の引数を (画面番号の文字列 or None, 矩形 or None, select か, エラー文 or None) にする。
+    """capture の引数を (画面番号の文字列 or None, 矩形 or None, select か, エラー文 or None,
+    window の指定文字列 or None) にする。
 
     従来の `capture [画面番号]` はそのまま通る(先頭の `--` で始まらない引数が画面番号)。
-    新しい口は `--region=x,y,w,h` と `--select`。どれか1つだけ。"""
+    新しい口は `--region=x,y,w,h` と `--select` と `--window=<exe名 or hwnd>`。どれか1つだけ。"""
     positional = []
     region = None
     select = False
+    window = None
     for raw in args:
         text = str(raw).strip()
         if text.startswith("--region="):
             try:
                 parts = [int(v) for v in text[len("--region="):].split(",")]
             except ValueError:
-                return None, None, False, f"--region を解釈できません: {text}（x,y,width,height の整数）"
+                return None, None, False, f"--region を解釈できません: {text}（x,y,width,height の整数）", None
             if len(parts) != 4:
-                return None, None, False, f"--region は x,y,width,height の4つです: {text}"
+                return None, None, False, f"--region は x,y,width,height の4つです: {text}", None
             if parts[2] <= 0 or parts[3] <= 0:
-                return None, None, False, "--region の width と height は 1 以上です"
+                return None, None, False, "--region の width と height は 1 以上です", None
             region = QRect(parts[0], parts[1], parts[2], parts[3])
+        elif text.startswith("--window="):
+            window = text[len("--window="):].strip()
+            if not window_list.parse_window_spec(window):
+                return None, None, False, "--window には exe名 か hwnd を指定してください", None
         elif text == "--select":
             select = True
         elif text.startswith("--"):
-            return None, None, False, f"知らないオプションです: {text}"
+            return None, None, False, f"知らないオプションです: {text}", None
         else:
             positional.append(text)
-    if region is not None and select:
-        return None, None, False, "--region と --select は同時に指定できません"
-    if positional and (region is not None or select):
-        return None, None, False, "画面番号と --region/--select は同時に指定できません"
-    return (positional[0] if positional else None), region, select, None
+    modes = sum([region is not None, select, window is not None])
+    if modes > 1:
+        return None, None, False, "--region / --select / --window は同時に指定できません", None
+    if positional and modes:
+        return None, None, False, "画面番号と --region/--select/--window は同時に指定できません", None
+    return (positional[0] if positional else None), region, select, None, window
 
 
 def _capture_dispatch(screen, args, reply) -> None:
     """capture の入口。--select だけは人の操作を待つので応答を遅らせ、他は同期で返す。"""
-    index_text, region, select, error = _parse_capture_args(args)
+    index_text, region, select, error, _window = _parse_capture_args(args)
     if error:
         reply(f"ERR {error}")
         return
@@ -664,11 +681,16 @@ def _capture_command(screen, args) -> str:
     if not screens:
         return "ERR 画面が見つかりません"
 
-    index_text, region, _select, error = _parse_capture_args(args)
+    index_text, region, _select, error, window = _parse_capture_args(args)
     if error:
         return f"ERR {error}"
 
-    if region is not None:
+    overlap_note = ""
+    if window is not None:
+        rect, label, overlap_note, werror = _resolve_capture_window(window)
+        if werror:
+            return werror
+    elif region is not None:
         desktop = capture_grab.virtual_geometry()
         rect = region.intersected(desktop)
         if rect.isEmpty():
@@ -696,7 +718,66 @@ def _capture_command(screen, args) -> str:
     if image.isNull():
         return "ERR 撮影できませんでした（空の画像）"
 
-    return _save_capture(screen, image, label)
+    reply_text = _save_capture(screen, image, label)
+    if overlap_note and reply_text.startswith("OK"):
+        reply_text += "\n" + overlap_note
+    return reply_text
+
+
+def _collect_windows():
+    """窓の一覧(論理座標)。画面番号は capture と同じ Qt の並び。読み取りだけ。"""
+    monitors = []
+    for screen in QApplication.screens():
+        g = screen.geometry()
+        monitors.append((g.x(), g.y(), g.x() + g.width(), g.y() + g.height()))
+
+    def to_logical(bounds):
+        r = capture_grab.device_bounds_to_logical(bounds)
+        return r.x(), r.y(), r.width(), r.height()
+
+    return window_list.collect_windows(to_logical, monitors)
+
+
+def _windows_command(args) -> str:
+    """可視の最上位窓を1窓1行で返す(読み取り専用。窓には触れない)。
+    `windows [exe=名前] [title=文字列] [--all]`"""
+    exe, title, show_all, error = window_list.parse_windows_args(args)
+    if error:
+        return f"ERR {error}"
+    try:
+        shown = window_list.filter_windows(_collect_windows(), exe, title, show_all)
+    except Exception as e:  # noqa: BLE001  外部から叩かれる口。落とさない
+        return f"ERR 窓を列挙できません: {e}"
+    action_log.record("窓一覧", f"{len(shown)}件", "external")
+    if not shown:
+        return "OK 該当する窓はありません"
+    return f"OK {len(shown)}窓\n" + "\n".join(window_list.format_line(w) for w in shown)
+
+
+def _resolve_capture_window(spec_text):
+    """capture --window= の対象を決める。(矩形, ラベル, 重なり警告, エラー文)。窓には触れない。"""
+    spec = window_list.parse_window_spec(spec_text)
+    try:
+        windows = _collect_windows()
+    except Exception as e:  # noqa: BLE001
+        return None, "", "", f"ERR 窓を列挙できません: {e}"
+    target, candidates, error = window_list.resolve_window(windows, spec)
+    if target is None:
+        if len(candidates) > 1:
+            lines = "\n".join(window_list.format_line(w) for w in candidates)
+            return None, "", "", f"ERR {error}\n{lines}"
+        return None, "", "", f"ERR {error}"
+    if target["minimized"] or not target["rect"]:
+        return None, "", "", (f"ERR 窓「{target['title'][:30]}」({target['exe']}) は最小化されています。"
+                              "撮れません（窓は動かしません）")
+    x, y, w, h = target["rect"]
+    desktop = capture_grab.virtual_geometry()
+    rect = QRect(x, y, w, h).intersected(desktop)
+    if rect.isEmpty():
+        return None, "", "", "ERR 窓が画面の外にあります（撮れません）"
+    note = window_list.format_overlaps(window_list.find_overlaps(target, windows))
+    label = f"窓 {target['exe']} hwnd={target['hwnd']}({rect.x()},{rect.y()} {rect.width()}x{rect.height()})"
+    return rect, label, note, None
 
 
 def _log_command(args) -> str:

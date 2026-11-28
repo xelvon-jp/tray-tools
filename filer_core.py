@@ -2369,11 +2369,14 @@ def default_app_for(name: str, apps: dict):
 # ---------------------------------------------------------------
 # プレビュー(F3)
 # ---------------------------------------------------------------
-PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico".split())
+PREVIEW_IMAGE_EXTS = frozenset("png jpg jpeg gif bmp webp ico heic heif psd svg".split())
 PREVIEW_PDF_EXTS = frozenset("pdf".split())
 PREVIEW_HTML_EXTS = frozenset("html htm xhtml".split())
 PREVIEW_MARKDOWN_EXTS = frozenset("md markdown".split())
 PREVIEW_VIDEO_EXTS = frozenset("mp4 mov mkv webm avi wmv m4v mpg mpeg".split())
+PREVIEW_AUDIO_EXTS = frozenset("mp3 m4a wav flac ogg opus aac wma".split())
+PREVIEW_XLSX_EXTS = frozenset("xlsx".split())
+PREVIEW_MODEL_EXTS = frozenset("stl 3mf".split())
 PREVIEW_TEXT_LINES = 200
 PREVIEW_TEXT_BYTES = 256 * 1024
 PREVIEW_ARCHIVE_MAX = 32 * 1024 * 1024    # 書庫の中はこれ以下だけ取り出して見せる
@@ -2382,7 +2385,7 @@ PREVIEW_FOLDER_NAMES = 40
 
 def preview_kind(entry, text_extensions) -> str:
     """プレビューで何を出すか。"none"(何も無い・"..")/ "folder" / "text" / "image" /
-    "pdf" / "html" / "markdown" / "video" / "info"。
+    "pdf" / "html" / "markdown" / "video" / "audio" / "xlsx" / "model3d" / "info"。
     テキストかどうかはビュアと同じ拡張子の表(filer.viewer_extensions)で決める。
     PDF・HTML・Markdown はテキストの表に載っていても整形して出すので先に見る。"""
     if entry is None or entry.is_parent:
@@ -2400,6 +2403,12 @@ def preview_kind(entry, text_extensions) -> str:
         return "markdown"
     if ext in PREVIEW_VIDEO_EXTS:
         return "video"
+    if ext in PREVIEW_AUDIO_EXTS:
+        return "audio"
+    if ext in PREVIEW_XLSX_EXTS:
+        return "xlsx"
+    if ext in PREVIEW_MODEL_EXTS:
+        return "model3d"
     if ext and ext in text_extensions:
         return "text"
     return "info"

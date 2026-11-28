@@ -50,12 +50,114 @@ def unreadable_reason(path: str, size: QSize, qt_message: str = "") -> str:
             + (f"［{qt_message}］" if qt_message else ""))
 
 
+PILLOW_EXTS = frozenset({"heic", "heif", "psd"})    # Qt が読めない形式は Pillow で読む
+SVG_EXTS = frozenset({"svg"})
+PSD_MAX_PIXELS = 100_000_000            # これを超える PSD は読まない(固まり・メモリ防止)
+
+
+def _ext(path: str) -> str:
+    return os.path.splitext(path)[1].lstrip(".").lower()
+
+
+def _check_psd_header(path: str) -> None:
+    """PSD の先頭 26 バイトを見て、Pillow が合成画像を出せない形式なら OSError で断る。"""
+    import struct
+
+    with open(path, "rb") as f:
+        head = f.read(26)
+    if len(head) < 26 or head[:4] != b"8BPS":
+        raise OSError("PSD ではありません（ヘッダが違います）")
+    version, _res, channels, height, width, depth, mode = struct.unpack(">H6sHIIHH", head[4:26])
+    if version == 2:
+        raise OSError("プレビュー非対応のPSD（PSB: 大きいドキュメント形式）")
+    if depth != 8:
+        raise OSError(f"プレビュー非対応のPSD（{depth}bit/チャンネル。8bit のみ対応）")
+    if mode not in (0, 1, 2, 3, 4, 7, 8, 9):
+        raise OSError(f"プレビュー非対応のPSD（カラーモード {mode}）")
+    if mode == 2:
+        pass    # インデックスカラー(Pillow は P として読める)
+    if width * height > PSD_MAX_PIXELS:
+        raise OSError(f"プレビュー非対応のPSD（{width}×{height} は大きすぎます）")
+
+
+def read_pillow_image(path: str, box_w: int, box_h: int):
+    """HEIC / HEIF(pillow_heif)・PSD(Pillow の合成画像)を読む。read_image と同じ返し方。
+    EXIF の向きは当てる。読めなければ OSError(理由つき)。"""
+    ext = _ext(path)
+    try:
+        from PIL import Image, ImageOps
+
+        if ext in ("heic", "heif"):
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        elif ext == "psd":
+            _check_psd_header(path)
+        with Image.open(path) as im:
+            im.load()
+            im = ImageOps.exif_transpose(im)
+            original = im.size
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            scaled = False
+            w, h = core.fit_size(im.size[0], im.size[1], box_w, box_h)
+            if (w, h) != im.size:
+                im = im.resize((w, h), Image.LANCZOS)
+                scaled = True
+            has_alpha = im.mode == "RGBA"
+            data = im.tobytes()
+            qimg = QImage(data, im.size[0], im.size[1], im.size[0] * (4 if has_alpha else 3),
+                          QImage.Format_RGBA8888 if has_alpha else QImage.Format_RGB888).copy()
+    except OSError:
+        raise
+    except ImportError as e:
+        raise OSError(f"{ext.upper()} を読むための部品がありません（{e}）") from e
+    except Exception as e:  # noqa: BLE001  Pillow の SyntaxError など、読めない形式は理由つきで
+        if ext == "psd":
+            raise OSError(f"プレビュー非対応のPSD（{e}）") from e
+        raise OSError(f"画像として読めません（{e}）") from e
+    return qimg, original, scaled
+
+
+def read_svg_image(path: str, box_w: int, box_h: int):
+    """SVG を QtSvg で白背景に描く(箱に収まる大きさ。小さい絵は箱いっぱいまで広げる)。"""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor, QPainter
+
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+    except ImportError as e:
+        raise OSError("SVG を表示できません（PySide6 の QtSvg がありません）") from e
+    renderer = QSvgRenderer(path)
+    if not renderer.isValid():
+        raise OSError("SVG として読めません（壊れている・非対応の記述）")
+    default = renderer.defaultSize()
+    vb = renderer.viewBoxF()
+    if default.isEmpty():
+        default = vb.size().toSize() if not vb.isEmpty() else QSize(box_w, box_h)
+    dw, dh = max(default.width(), 1), max(default.height(), 1)
+    scale = min(max(box_w, 16) / dw, max(box_h, 16) / dh)
+    w, h = max(1, int(dw * scale)), max(1, int(dh * scale))
+    image = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    renderer.render(painter, QRectF(0, 0, w, h))
+    painter.end()
+    return image, (dw, dh), (w, h) != (dw, dh)
+
+
 def read_image(path: str, box_w: int, box_h: int):
     """(絵, 表示の向きでの元の大きさ (幅, 高さ) or None, 縮めて読んだか)。
 
     EXIF の向き(カメラ・スマホの縦撮り)は当ててから返す。JPEG / TIFF は Qt の
     自動回転(setAutoTransform)で、Qt が EXIF を読まない WebP / PNG は自前で読んで
-    (core.container_exif_orientation)当てる。読めなければ OSError。"""
+    (core.container_exif_orientation)当てる。読めなければ OSError。
+    HEIC / HEIF / PSD は Pillow、SVG は QtSvg で読む(上の read_pillow_image / read_svg_image)。"""
+    ext = _ext(path)
+    if ext in PILLOW_EXTS:
+        return read_pillow_image(path, box_w, box_h)
+    if ext in SVG_EXTS:
+        return read_svg_image(path, box_w, box_h)
     reader = QImageReader(path)
     reader.setAutoTransform(True)
     size = reader.size()

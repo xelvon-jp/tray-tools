@@ -2284,9 +2284,10 @@ def test_window_preview_text_viewer():
         _wait(w)
         key = lambda k, mods=Qt.NoModifier: QTest.keyClick(w.active.view, k, mods)  # noqa: E731
         try:
-            # V は F3 と同じ: プレビューが開き、テキストはビュアに出る
+            # ふつうのプレビュー(V / F3 は Enter と同じビュア状態になったので、直接開く):
+            # プレビューが開き、テキストはビュアに出る
             w.left.set_cursor(w.left._row_of("alpha.txt"))
-            key(Qt.Key_V)
+            w.preview_show()
             assert w.preview_on
             _wait_preview(w, "alpha.txt")
             pv = w.preview_widget
@@ -2400,10 +2401,11 @@ def test_preview_html_browser_view():
             assert not pv.enter_web()                      # テキストでは入らない
             pv.show_result({"kind": "html", "path": str(path), "rich": ("html", html),
                             "note": "", "title": "a.html"})
-            if not pv.enter_web():
+            # HTML は、選んだ時点(フォーカスを渡さない)からブラウザ表示で出る
+            if not pv.web_shown():
                 print("  (WebEngine が使えないのでブラウザ表示は省略)")
                 return
-            assert pv.web_shown()
+            assert pv.enter_web() and pv.web_shown()
             loaded = []
             pv.web.loadFinished.connect(loaded.append)
             deadline = time.monotonic() + 15
@@ -2416,8 +2418,10 @@ def test_preview_html_browser_view():
             assert got == [""], got                        # JavaScript は動かない
             done = []
             pv.done.connect(lambda: done.append(1))
-            pv._leave_web(pv.done)                         # Esc 相当
-            assert done == [1] and not pv.web_shown() and pv.stack.currentWidget() is pv.rich
+            pv._leave_web(pv.done)                         # Esc 相当(ページは出したまま)
+            assert done == [1] and pv.web_shown()
+            pv.show_result({"kind": "text", "lines": ["a"], "note": ""})   # 別のファイルへ
+            assert not pv.web_shown() and pv.web.url().toString() in ("", "about:blank")
         finally:
             pv.shutdown()
             pv.close()
@@ -13077,6 +13081,483 @@ def test_update_zip_folder_setting():
         assert stored == {"filer": {"left_path": "x", "update_zip_folder": str(target)},
                           "other": 1}, stored
         assert logs == []
+
+
+def _tiny_xlsx(path, rows=300):
+    """openpyxl を使わない最小の xlsx(共有文字列・日付・真偽・inlineStr・2 シート)。"""
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rns = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    body = ['<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>']
+    for i in range(2, rows + 1):
+        body.append(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>行{i}</t></is></c>'
+                    f'<c r="B{i}" s="1"><v>45000</v></c><c r="C{i}"><v>{i * 0.5}</v></c>'
+                    f'<c r="D{i}" t="b"><v>1</v></c><c r="AZ{i}"><v>9</v></c></row>')
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml",
+                   f'<workbook {ns} {rns}><sheets><sheet name="First" sheetId="1" r:id="rId1"/>'
+                   '<sheet name="Second &amp; co" sheetId="2" r:id="rId2"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                   '<Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>')
+        z.writestr("xl/styles.xml", f'<styleSheet {ns}><cellXfs count="2"><xf numFmtId="0"/>'
+                   '<xf numFmtId="14"/></cellXfs></styleSheet>')
+        z.writestr("xl/sharedStrings.xml",
+                   f'<sst {ns}><si><t>名前</t></si><si><r><t>日</t></r><r><t>付</t></r>'
+                   '<rPh><t>ヨミ</t></rPh></si></sst>')
+        z.writestr("xl/worksheets/sheet1.xml",
+                   f'<worksheet {ns}><sheetData>{"".join(body)}</sheetData></worksheet>')
+        z.writestr("xl/worksheets/sheet2.xml", f'<worksheet {ns}><sheetData/></worksheet>')
+
+
+def test_preview_kinds_new_formats():
+    """新しい形式の種類判定・拡張子別メニュー(音声の内蔵プレーヤ・画像のグループ)。"""
+    import filer_extmenu
+
+    exts = core.normalize_viewer_extensions(None)
+    for name, kind in (("a.HEIC", "image"), ("a.heif", "image"), ("a.psd", "image"),
+                       ("a.svg", "image"),      # svg はテキストの表にも載っていても画像が先
+                       ("a.mp3", "audio"), ("a.M4A", "audio"), ("a.wav", "audio"),
+                       ("a.flac", "audio"), ("a.ogg", "audio"), ("a.opus", "audio"),
+                       ("a.aac", "audio"), ("a.wma", "audio"),
+                       ("a.xlsx", "xlsx"), ("a.stl", "model3d"), ("a.3MF", "model3d"),
+                       ("a.shd", "info"), ("a.mp4", "video")):
+        assert core.preview_kind(F(name), exts) == kind, (name, core.preview_kind(F(name), exts))
+    shared, _local = filer_extmenu.find_menus("mp3")
+    assert shared and shared[0].command.startswith("&PLAY"), shared[:1]
+    shared, _local = filer_extmenu.find_menus("heic")
+    assert shared and shared[0].command.startswith("&VIEW"), shared[:1]
+
+
+def test_formats_xlsx():
+    import filer_formats
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "t.xlsx")
+        _tiny_xlsx(path)
+        html_text, note = filer_formats.read_xlsx(str(path))
+        assert "2シート" in note
+        assert "[First]" in html_text and "Second &amp; co" in html_text   # シート名の一覧(エスケープ済み)
+        assert "名前" in html_text and "日付" in html_text          # 共有文字列(書式つき・読みは除く)
+        assert "ヨミ" not in html_text
+        assert "2023-03-15" in html_text                            # 日付の書式は日付で出す
+        assert "行2<" in html_text and "行300" not in html_text      # 先頭 200 行まで
+        assert "TRUE" in html_text and "<th>AD</th>" not in html_text   # 30 列まで(AZ は出ない)
+        assert "…" in html_text
+        assert "<td>1</td>" in html_text or "<td>0.5</td>" in html_text
+        # 壊れたファイル
+        bad = Path(tmp, "bad.xlsx")
+        bad.write_bytes(b"not a zip")
+        try:
+            filer_formats.read_xlsx(str(bad))
+            raise AssertionError("壊れた xlsx が通った")
+        except filer_formats.FormatError:
+            pass
+        # 画面側は info に落ちて理由を出す
+        import filer_preview
+
+        result = filer_preview.load_preview(str(bad), "xlsx", F("bad.xlsx", size=9))
+        assert result["kind"] == "info" and result["rich"] is None
+        assert any("読めません" in line for line in result["lines"])
+        # 正常: rich は表(path に頼らない QTextBrowser 表示)
+        result = filer_preview.load_preview(str(path), "xlsx", F("t.xlsx", size=100))
+        assert result["rich"][0] == "table" and "<table" in result["rich"][1]
+
+
+def _cube_tris(size=10.0):
+    import numpy as np
+
+    v = np.array([[x, y, z] for z in (0, size) for y in (0, size) for x in (0, size)],
+                 dtype=np.float32)
+    faces = [(0, 2, 1), (1, 2, 3), (4, 5, 6), (5, 7, 6), (0, 1, 4), (1, 5, 4),
+             (2, 6, 3), (3, 6, 7), (0, 4, 2), (2, 4, 6), (1, 3, 5), (3, 7, 5)]
+    return np.array([[v[a], v[b], v[c]] for a, b, c in faces], dtype=np.float32)
+
+
+def _write_stl_binary(path, tris):
+    import struct
+
+    out = bytearray(b"x".ljust(80, b"\0")) + struct.pack("<I", len(tris))
+    for t in tris:
+        out += struct.pack("<3f", 0, 0, 0) + struct.pack("<9f", *t.reshape(-1)) + b"\0\0"
+    Path(path).write_bytes(bytes(out))
+
+
+def test_formats_stl_3mf():
+    """STL(バイナリ / ASCII)・3MF の読み込みと、斜め上からの絵(背景以外が塗られる)。"""
+    import numpy as np
+
+    import filer_formats
+    import filer_preview
+
+    _qapp()
+    cube = _cube_tris(20.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        binary = Path(tmp, "b.stl")
+        _write_stl_binary(binary, cube)
+        tris, total = filer_formats.load_stl(str(binary))
+        assert total == 12 and tris.shape == (12, 3, 3)
+        assert np.allclose(filer_formats.model_dimensions(tris), (20, 20, 20))
+        ascii_path = Path(tmp, "a.stl")
+        lines = ["solid t"]
+        for t in cube:
+            lines.append("facet normal 0 0 0\nouter loop")
+            lines += [f"vertex {x} {y} {z}" for x, y, z in t]
+            lines.append("endloop\nendfacet")
+        lines.append("endsolid t")
+        ascii_path.write_text("\n".join(lines), encoding="utf-8")
+        tris_a, total_a = filer_formats.load_stl(str(ascii_path))
+        assert total_a == 12 and np.allclose(tris_a, tris)
+        # 絵: 背景色以外の画素がある・箱に収まる・note に三角形数と外寸(mm)
+        result = filer_preview.load_preview(str(binary), "model3d", F("b.stl", size=700),
+                                            box=(300, 200))
+        image = result["image"]
+        assert image is not None and image.width() == 300 and image.height() == 200
+        assert "12 三角形" in result["note"] and "20.0x20.0x20.0 mm" in result["note"]
+        bg = image.pixelColor(2, 2).rgb()
+        painted = sum(1 for x in range(0, 300, 6) for y in range(0, 200, 6)
+                      if image.pixelColor(x, y).rgb() != bg)
+        assert painted > 30, painted
+        # 間引き: MODEL_MAX_DRAW を超える三角形(約 30 万)
+        big = np.tile(cube, (25000, 1, 1))
+        big_path = Path(tmp, "big.stl")
+        _write_stl_binary(big_path, big)
+        t0 = time.monotonic()
+        result = filer_preview.load_preview(str(big_path), "model3d",
+                                            F("big.stl", size=big_path.stat().st_size),
+                                            box=(300, 200))
+        assert result["image"] is not None and "間引き" in result["note"], result
+        assert time.monotonic() - t0 < 30
+        # 壊れたもの → info(理由つき)
+        broken = Path(tmp, "broken.stl")
+        broken.write_bytes(b"solid x\nfacet\n")
+        result = filer_preview.load_preview(str(broken), "model3d", F("broken.stl", size=14))
+        assert result["kind"] == "info" and result["image"] is None
+        # 巨大(100MB 超)は読まず info(サイズと理由)
+        result = filer_preview.load_preview(str(binary), "model3d",
+                                            F("b.stl", size=filer_formats.MODEL_MAX_BYTES + 1))
+        assert result["kind"] == "info" and any("大きすぎる" in x for x in result["lines"])
+
+        # 3MF: オブジェクト・コンポーネント(変換つき)・build item(変換つき)・単位
+        vx = "".join(f'<vertex x="{x}" y="{y}" z="{z}"/>' for x, y, z in
+                     [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+        tx = ('<triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/>'
+              '<triangle v1="1" v2="2" v3="3"/><triangle v1="0" v2="3" v3="2"/>')
+        model = ('<model unit="centimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+                 f'<resources><object id="1"><mesh><vertices>{vx}</vertices><triangles>{tx}</triangles>'
+                 '</mesh></object><object id="2"><components><component objectid="1"/>'
+                 '<component objectid="1" transform="1 0 0 0 1 0 0 0 1 5 0 0"/></components></object>'
+                 '</resources><build><item objectid="2" transform="1 0 0 0 1 0 0 0 1 0 0 2"/></build></model>')
+        mf = Path(tmp, "m.3mf")
+        with zipfile.ZipFile(mf, "w") as z:
+            z.writestr("[Content_Types].xml", "<Types/>")
+            z.writestr("3D/3dmodel.model", model)
+        tris, total = filer_formats.load_3mf(str(mf))
+        assert total == 8                     # 4 三角形 × 2 コンポーネント
+        w, d, h = filer_formats.model_dimensions(tris)
+        assert abs(w - 60) < 1e-3 and abs(d - 10) < 1e-3 and abs(h - 10) < 1e-3   # cm → mm
+        assert abs(float(tris[..., 2].min()) - 20) < 1e-3                          # item の平行移動
+        result = filer_preview.load_preview(str(mf), "model3d", F("m.3mf", size=500),
+                                            box=(200, 150))
+        assert result["image"] is not None and "8 三角形" in result["note"]
+        bad = Path(tmp, "bad.3mf")
+        bad.write_bytes(b"not a zip")
+        result = filer_preview.load_preview(str(bad), "model3d", F("bad.3mf", size=9))
+        assert result["kind"] == "info"
+
+
+def test_formats_shd_info():
+    import filer_formats
+    import filer_preview
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "m.shd")
+        path.write_bytes(b"\x00\x01\x02Shade 3D Standard ver.14.1.3\x00" + bytes(200))
+        header, version = filer_formats.shd_header(str(path))
+        assert version == "14.1.3" and "Shade 3D" in header
+        result = filer_preview.load_preview(str(path), "info", F("m.shd", size=230))
+        assert result["kind"] == "info"
+        assert any("ver.14.1.3" in line for line in result["lines"])
+        other = Path(tmp, "o.shd")
+        other.write_bytes(bytes(100))
+        result = filer_preview.load_preview(str(other), "info", F("o.shd", size=100))
+        assert result["kind"] == "info" and any("読めません" in line for line in result["lines"])
+
+
+def test_preview_images_heic_psd_svg():
+    """heic(pillow_heif)・psd(Pillow の合成画像。非対応は理由つきで info)・svg(QtSvg)。"""
+    import struct
+
+    import filer_preview
+    from PIL import Image as PilImage
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+            heic = Path(tmp, "p.heic")
+            PilImage.new("RGB", (400, 300), (200, 50, 50)).save(str(heic))
+            result = filer_preview.load_preview(str(heic), "image", F("p.heic", size=5000),
+                                                box=(200, 200))
+            image = result["image"]
+            assert image is not None and image.width() == 200 and image.height() == 150
+            assert result["note"] == "400×300" and result["scaled"]
+            assert image.pixelColor(10, 10).red() > 150
+        except ImportError:
+            print("  (pillow_heif が無いので heic は省略)")
+        w, h = 40, 30
+        planes = b"".join(bytes([c] * (w * h)) for c in (200, 100, 50))
+        header = b"8BPS" + struct.pack(">H6sHIIHH", 1, b"\0" * 6, 3, h, w, 8, 3)
+        psd = Path(tmp, "a.psd")
+        psd.write_bytes(header + struct.pack(">III", 0, 0, 0) + struct.pack(">H", 0) + planes)
+        result = filer_preview.load_preview(str(psd), "image", F("a.psd", size=4000),
+                                            box=(100, 100))
+        assert result["image"] is not None and result["image"].width() == 40
+        c = result["image"].pixelColor(5, 5)
+        assert (c.red(), c.green(), c.blue()) == (200, 100, 50)
+        # 16bit は理由つきで info
+        deep = Path(tmp, "d.psd")
+        deep.write_bytes(b"8BPS" + struct.pack(">H6sHIIHH", 1, b"\0" * 6, 3, 4, 4, 16, 3)
+                         + struct.pack(">III", 0, 0, 0) + struct.pack(">H", 0) + bytes(96))
+        result = filer_preview.load_preview(str(deep), "image", F("d.psd", size=130))
+        assert result["kind"] == "info" and any("プレビュー非対応のPSD" in x for x in result["lines"])
+        junk = Path(tmp, "j.psd")
+        junk.write_bytes(b"8BPS junk")
+        result = filer_preview.load_preview(str(junk), "image", F("j.psd", size=9))
+        assert result["kind"] == "info"
+        # svg: 白背景に描き、箱いっぱいまで(縦横比は保つ)
+        svg = Path(tmp, "s.svg")
+        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">'
+                       '<rect width="10" height="10" fill="red"/></svg>', encoding="utf-8")
+        result = filer_preview.load_preview(str(svg), "image", F("s.svg", size=200),
+                                            box=(200, 200))
+        image = result["image"]
+        assert image is not None and image.width() == 200 and image.height() == 100
+        assert image.pixelColor(150, 80).rgb() == 0xFFFFFFFF      # 白背景
+        assert image.pixelColor(5, 5).red() > 200 and image.pixelColor(5, 5).green() < 50
+        bad = Path(tmp, "b.svg")
+        bad.write_text("<svg><oops", encoding="utf-8")
+        result = filer_preview.load_preview(str(bad), "image", F("b.svg", size=10))
+        assert result["kind"] == "info" and result["image"] is None
+
+
+def test_audio_viewer_and_player():
+    """音声: Enter でビュア状態(情報ページ)、内蔵プレーヤで再生、Esc で情報へ。↑↓ は音声だけを辿る。
+    終わったら再生を止めてファイルを手放す。"""
+    import wave
+
+    import filer
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtTest import QTest
+
+    _qapp()
+    with tempfile.TemporaryDirectory() as tmp:
+        left, right = _make_tree(tmp)
+        for name in ("s1.wav", "s2.wav"):
+            with wave.open(str(Path(left, name)), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(8000)
+                wf.writeframes(bytes(8000 * 2 * 2))
+        settings_path = Path(tmp, "settings.json")
+        settings_path.write_text("{}", encoding="utf-8")
+        w = filer.FilerWindow({"filer": {"left_path": str(left), "right_path": str(right)}},
+                              str(settings_path))
+        w.resize(1000, 600)
+        w.show()
+        w.start()
+        _wait(w)
+        key = lambda k, m=Qt.NoModifier: QTest.keyClick(w.active.view, k, m)  # noqa: E731
+
+        def wait_until(cond, what, seconds=15):
+            deadline = time.monotonic() + seconds
+            while not cond() and time.monotonic() < deadline:
+                QTest.qWait(50)
+            assert cond(), what
+
+        try:
+            w.left.set_cursor(w.left._row_of("s1.wav"))
+            key(Qt.Key_Return)
+            assert w.preview_on and w.viewer_mode
+            _wait_preview(w, "s1.wav")
+            pv = w.preview_widget
+            assert pv.stack.currentWidget() is pv.video_page
+            wait_until(lambda: "長さ" in pv.video_info.text(), "長さが出ない")
+            assert "曲" in pv.video_info.text()
+            assert pv.video_thumb.text() == "♪"
+            w._start_player()
+            assert w.player_mode
+            wait_until(pv.player_shown, "プレーヤが出ない")
+            assert pv.player_view._audio and pv.player_view._title == "s1.wav"
+            assert "1 / 2" in pv.player_view._counter
+            pv.player_view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Down, Qt.NoModifier))
+            assert w.left.cursor_entry().name == "s2.wav"
+            wait_until(lambda: pv.player_view._title == "s2.wav", "次の曲に替わらない")
+            pv.player_view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+            assert not w.player_mode and w.viewer_mode
+            assert pv.player_view.player.source().isEmpty()      # 手放した
+            wait_until(lambda: pv.stack.currentWidget() is pv.video_page, "情報へ戻らない")
+            key(Qt.Key_Return)
+            assert not w.preview_on
+        finally:
+            w.close()
+            w.deleteLater()
+
+
+def test_video_cv_thumb():
+    """動画のサムネ・情報を OpenCV で読み取りスレッド側で取る(filer_video.cv_thumb)。
+
+    取れる(情報つき・出だしが真っ黒なら先へ進む)/ 取れない(壊れたもの・音声)は None で
+    従来方式(VideoProbe)へ落ちる / キャッシュ命中(開き直さない・更新で取り直す・直近 N 本)/
+    ファイルを掴んだままにしない / load_preview が thumb を付ける・失敗は情報表示へ。"""
+    import shutil
+    import subprocess
+
+    import filer_preview
+    import filer_video
+    from PySide6.QtGui import QFont, QImage
+
+    _qapp()
+    if filer_video._load_cv2() is None:
+        print("  (cv2 が無いので OpenCV のサムネテストは省略)")
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    with tempfile.TemporaryDirectory() as tmp:
+        # 取れないもの: 壊れた動画・テキスト・空ファイル・無いファイル → 例外にせず None
+        bad = Path(tmp, "bad.mp4")
+        bad.write_bytes(b"not a video")
+        empty = Path(tmp, "empty.mov")
+        empty.write_bytes(b"")
+        for p in (bad, empty, Path(tmp, "none.mp4")):
+            assert filer_video.cv_thumb(str(p)) is None, p
+        # 壊れた動画は load_preview でも thumb が付かず、従来の情報表示のまま(VideoProbe 任せ)
+        res = filer_preview.load_preview(str(bad), "video", F("bad.mp4", size=11))
+        assert res["kind"] == "video" and "thumb" not in res and res["lines"], res
+        # 音声は cv を通さない(VideoProbe のタグ表示)
+        wav = Path(tmp, "a.wav")
+        import wave
+        with wave.open(str(wav), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(8000)
+            wf.writeframes(bytes(8000 * 2))
+        res = filer_preview.load_preview(str(wav), "audio", F("a.wav", size=16000))
+        assert res["kind"] == "audio" and "thumb" not in res
+
+        # cv_probe が例外でも落ちない: 画面は従来方式へ、ログは filer_error.log 書式(差し替えて確認)
+        logged = []
+        real_probe, real_log = filer_video.cv_probe, filer_preview._log_failure
+        try:
+            def boom(path):
+                raise RuntimeError("boom")
+
+            filer_video.cv_probe = boom
+            filer_preview._log_failure = lambda where, exc: logged.append(where)
+            res = filer_preview.load_preview(str(bad), "video", F("bad.mp4", size=11))
+            assert res["kind"] == "video" and "thumb" not in res and logged == ["videoCv"], logged
+        finally:
+            filer_video.cv_probe, filer_preview._log_failure = real_probe, real_log
+
+        if not ffmpeg:
+            print("  (ffmpeg が無いので実際の動画のテストは省略)")
+            return
+        normal = Path(tmp, "normal.mp4")
+        subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                        "testsrc=duration=3:size=160x120:rate=10", "-pix_fmt", "yuv420p",
+                        str(normal)], check=True)
+        black = Path(tmp, "black.mp4")      # 最初の 1 秒は真っ黒
+        subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                        "testsrc=duration=5:size=160x120:rate=10", "-vf",
+                        "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='lt(t,1)'",
+                        "-pix_fmt", "yuv420p", str(black)], check=True)
+
+        got = filer_video.cv_thumb(str(normal))
+        assert got is not None
+        image, meta = got
+        assert isinstance(image, QImage) and not image.isNull()
+        assert (image.width(), image.height()) == (160, 120)
+        assert meta["size"] == (160, 120) and 2500 <= meta["duration"] <= 3500, meta
+        assert round(meta["fps"]) == 10 and meta.get("video_codec"), meta
+        text = "\n".join(filer_video.describe_meta(meta))
+        assert "長さ" in text and "160×120" in text and "10fps" in text, text
+        # 黒い出だし: 先へ進んで、真っ黒でないコマを取る
+        dark_first = filer_video.cv_probe(str(black))
+        assert dark_first is not None
+        lum = dark_first[0].convertToFormat(QImage.Format.Format_Grayscale8)
+        mean = sum(lum.pixelColor(x, y).red() for x in range(0, 160, 8) for y in range(0, 120, 8)) / (20 * 15)
+        assert mean > filer_video.CV_DARK_MEAN, mean
+        # 掴んだままにしない: 取った直後に消せる(Windows は掴んでいると消せない)
+        copy = Path(tmp, "copy.mp4")
+        shutil.copy(normal, copy)
+        assert filer_video.cv_thumb(str(copy)) is not None
+        copy.unlink()
+        assert not copy.exists()
+
+        # キャッシュ: 命中は開き直さない / 更新したら取り直す / 直近 N 本だけ持つ
+        calls = []
+
+        def counting(path):
+            calls.append(path)
+            return real_probe(path)
+
+        old_size = filer_video.THUMB_CACHE_SIZE
+        try:
+            filer_video.clear_thumb_cache()
+            filer_video.cv_probe = counting
+            filer_video.cv_thumb(str(normal))
+            filer_video.cv_thumb(str(normal))
+            assert len(calls) == 1, calls                       # 2回目は命中
+            a, b = filer_video.cv_thumb(str(normal)), filer_video.cv_thumb(str(normal))
+            assert a[0].size() == b[0].size() and len(calls) == 1
+            os.utime(normal, (time.time() + 100, time.time() + 100))     # 更新時刻が変わった
+            filer_video.cv_thumb(str(normal))
+            assert len(calls) == 2, calls
+            del calls[:]
+            filer_video.THUMB_CACHE_SIZE = 2
+            names = []
+            for i in range(3):
+                p = Path(tmp, f"c{i}.mp4")
+                shutil.copy(normal, p)
+                names.append(str(p))
+                filer_video.cv_thumb(str(p))
+            assert len(calls) == 3
+            filer_video.cv_thumb(names[2])      # 直近は残っている
+            filer_video.cv_thumb(names[1])
+            assert len(calls) == 3, calls
+            filer_video.cv_thumb(names[0])      # いちばん古いのは捨てられている
+            assert len(calls) == 4, calls
+            assert len(filer_video._thumb_cache) == 2
+        finally:
+            filer_video.cv_probe = real_probe
+            filer_video.THUMB_CACHE_SIZE = old_size
+            filer_video.clear_thumb_cache()
+
+        # load_preview が thumb と情報を付け、PreviewWidget は VideoProbe を作らずにすぐ出す
+        res = filer_preview.load_preview(str(normal), "video", F("normal.mp4", size=1000))
+        assert res["kind"] == "video" and res["thumb"].width() == 160, res
+        assert res["video_meta"]["size"] == (160, 120)
+        colors = {k: "#222222" for k in
+                  ("header_inactive", "header_inactive_text", "background", "text")}
+        pv = filer_preview.PreviewWidget(None, colors, QFont("Meiryo", 10))
+        pv.resize(600, 400)
+        pv.show()
+        try:
+            pv.show_result(res)
+            assert pv.probe is None                              # Qt の読み込みは走らせない
+            assert pv.stack.currentWidget() is pv.video_page
+            assert pv.video_thumb.pixmap() is not None and not pv.video_thumb.pixmap().isNull()
+            assert "160×120" in pv.video_info.text() and "長さ" in pv.video_info.text()
+            # thumb が無い結果(cv が取れなかった)は従来どおり VideoProbe を起こす
+            res2 = filer_preview.load_preview(str(bad), "video", F("bad.mp4", size=11))
+            pv.show_result(res2)
+            assert pv.probe is not None
+        finally:
+            pv._stop_probe()
+            pv.close()
+            pv.deleteLater()
 
 
 def main() -> int:

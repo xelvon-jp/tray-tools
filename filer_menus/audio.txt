@@ -1,0 +1,5 @@
+afx audio
+# 音声(_aliases.txt の audio)のメニュー。先頭が選ばれた状態で開くので、
+# Ctrl+Enter → Enter で内蔵プレーヤ(↑↓ で前後の曲)に着く。
+"P:内蔵プレーヤ" &PLAY $MF
+"V:VLC" {tool:vlc} $MF

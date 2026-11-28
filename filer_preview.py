@@ -154,6 +154,22 @@ def _read_folder(path: str):
     return dirs, files, shown
 
 
+def _log_failure(where: str, exc: Exception) -> None:
+    """読めなかった理由を filer_error.log に残す(画面は info に落ちる)。
+    except の中から呼ぶ(traceback を使う)。filer.py の _log_exception と同じ書式・同じファイル。"""
+    try:
+        import traceback
+        from datetime import datetime
+        from pathlib import Path
+
+        log = Path(__file__).resolve().parent / "filer_error.log"
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {where} =====\n"
+                    f"{traceback.format_exc()}")
+    except Exception:  # noqa: BLE001  ログに書けなくても見本の処理は続ける
+        pass
+
+
 def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> dict:
     """プレビューの中身を作る(読み取りスレッドで呼ぶ)。
 
@@ -166,7 +182,8 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             result.update(kind="info", lines=core.info_lines(entry.name, entry)
                           + ["", "（書庫の中の PDF は中身を出しません）"])
             return result
-        if archive is not None and kind in ("text", "image", "html", "markdown", "video"):
+        if archive is not None and kind in ("text", "image", "html", "markdown", "video",
+                                            "audio", "xlsx", "model3d"):
             if entry.size > core.PREVIEW_ARCHIVE_MAX:
                 result.update(kind="info", lines=core.info_lines(entry.name, entry)
                               + ["", "（書庫の中のファイルが大きいため中身を出しません。"
@@ -196,7 +213,8 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
         elif kind == "image":
             edited = None
             orig_image = None
-            if archive is None:
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if archive is None and ext not in ("heic", "heif", "psd", "svg"):
                 edits = _photo_edits(path)
                 if edits is not None:
                     edited = _edited_image(path, edits, box)
@@ -212,13 +230,50 @@ def load_preview(path: str, kind: str, entry, box=(400, 400), archive=None) -> d
             dirs, files, names = _read_folder(path)
             result.update(lines=[f"{dirs} フォルダ / {files} ファイル", ""] + names
                           + (["…"] if dirs + files > len(names) else []))
-        elif kind == "video":
-            # 情報とサムネは GUI スレッドで取る(QMediaPlayer の都合。filer_video.VideoProbe)
+        elif kind in ("video", "audio"):
             result.update(lines=core.info_lines(entry.name, entry))
+            if kind == "video":
+                # サムネと長さ・解像度は OpenCV で、この読み取りスレッドの中で取る(速い)。
+                # 取れない・cv2 が無いときは thumb を付けず、GUI スレッドの VideoProbe
+                # (QMediaPlayer。従来方式)に任せる。音声のタグは従来どおり VideoProbe。
+                try:
+                    import filer_video
+
+                    got = filer_video.cv_thumb(path)
+                    if got is not None:
+                        result.update(thumb=got[0], video_meta=got[1])
+                except Exception as e:  # noqa: BLE001  従来方式へ落とす
+                    _log_failure("videoCv", e)
+        elif kind == "xlsx":
+            import filer_formats
+
+            text, note = filer_formats.read_xlsx(path)
+            result.update(rich=("table", text), note=note)
+        elif kind == "model3d":
+            import filer_formats
+
+            if entry.size > filer_formats.MODEL_MAX_BYTES:
+                raise OSError(f"ファイルが大きすぎるため3Dの絵は作りません（"
+                              f"{entry.size // (1024 * 1024)}MB。"
+                              f"上限 {filer_formats.MODEL_MAX_BYTES // (1024 * 1024)}MB）")
+            image, note = filer_formats.model_preview(path, box)
+            result.update(image=image, note=note)
         elif kind == "info":
-            result.update(lines=core.info_lines(entry.name, entry))
+            lines = core.info_lines(entry.name, entry)
+            if os.path.splitext(entry.name)[1].lower() == ".shd":
+                import filer_formats
+
+                try:
+                    header, version = filer_formats.shd_header(path)
+                    lines += ["", f"Shade 3D  ver.{version}" if version else header,
+                              "（Shade 3D の独自形式のため、中身のプレビューは作れません）"]
+                except Exception as e:  # noqa: BLE001
+                    _log_failure("shdHeader", e)
+                    lines += ["", f"（Shade 3D のヘッダを読めません: {e}）"]
+            result.update(lines=lines)
     except Exception as e:  # noqa: BLE001  見本が作れないだけ。窓は止めない
-        result.update(kind="info", image=None,
+        _log_failure(f"preview:{kind}", e)
+        result.update(kind="info", image=None, rich=None,
                       lines=(core.info_lines(entry.name, entry) if entry else [])
                       + ["", f"（読めません: {e}）"])
     return result
@@ -256,6 +311,7 @@ class PreviewWidget(QWidget):
         self.probe = None           # いま動画の情報・サムネを取っている VideoProbe
         self._video_path = None
         self._video_lines = []
+        self._video_audio = False
         self.web = None             # ブラウザ表示(WebEngine)。HTML で Tab/Enter したときだけ作る
         self._html_path = None      # いま整形表示している HTML のパス(ブラウザ表示で開く)
         layout = QVBoxLayout(self)
@@ -436,7 +492,7 @@ class PreviewWidget(QWidget):
 
     def show_result(self, result: dict) -> None:
         self.last = result
-        if result.get("kind") != "video":
+        if result.get("kind") not in ("video", "audio"):
             self._stop_probe()
         if self.web is not None and self.web.url().toString() not in ("", "about:blank"):
             self.web.setUrl(QUrl("about:blank"))    # 別のファイルへ移ったら前のページは手放す
@@ -470,7 +526,7 @@ class PreviewWidget(QWidget):
             self.orig_btn.setEnabled(self._orig_pixmap is not None)
             self.image.setPixmap(pixmap)
             self.stack.setCurrentWidget(self.image)
-        elif result.get("kind") == "video":
+        elif result.get("kind") in ("video", "audio"):
             self._disp_pixmap = None
             self._orig_pixmap = None
             self.orig_btn.setEnabled(False)
@@ -484,7 +540,9 @@ class PreviewWidget(QWidget):
             self._html_path = base if kind == "html" and base else None
             self.rich.document().setBaseUrl(
                 QUrl.fromLocalFile(os.path.dirname(base) + os.sep) if base else QUrl())
-            if kind == "html":
+            if kind == "html" and self._show_html_in_web(base):
+                return      # HTML は一覧で選んだ時点からブラウザ表示(Enter 前後で見た目を揃える)
+            if kind in ("html", "table"):
                 self.rich.setHtml(text)
             else:
                 self.rich.setMarkdown(text)
@@ -555,6 +613,7 @@ class PreviewWidget(QWidget):
         self._stop_probe()
         path = result.get("path")
         self._video_path = path
+        self._video_audio = result.get("kind") == "audio"
         self._video_lines = list(result.get("lines") or [])
         self.video_thumb.clear()
         self.video_thumb.setText("読み込み中…" if path else "")
@@ -563,10 +622,15 @@ class PreviewWidget(QWidget):
         self.stack.setCurrentWidget(self.video_page)
         if not path or not os.path.isfile(path):
             return
+        thumb = result.get("thumb")
+        if thumb is not None and not thumb.isNull():
+            # 読み取りスレッドが OpenCV で取ってきたもの。プローブは要らない
+            self._on_probe(path, thumb, result.get("video_meta") or {})
+            return
         try:
             import filer_video  # 使うときに読む(QtMultimedia は重い)
 
-            self.probe = filer_video.VideoProbe(path, self)
+            self.probe = filer_video.VideoProbe(path, self, audio=self._video_audio)
             self.probe.done.connect(lambda image, meta, p=path: self._on_probe(p, image, meta))
             self.probe.start()
         except Exception:  # noqa: BLE001  QtMultimedia が無い環境は、情報だけ出す
@@ -578,7 +642,8 @@ class PreviewWidget(QWidget):
 
         lines = list(self._video_lines)
         lines += filer_video.describe_meta(meta)
-        lines += ["", "Ctrl+Enter → 内蔵プレーヤで再生（↑↓ で前後の動画）"]
+        lines += ["", "Ctrl+Enter → 内蔵プレーヤで再生（↑↓ で前後の"
+                  + ("曲" if self._video_audio else "動画") + "）"]
         self.video_info.setText(chr(10).join(lines))
 
     def _on_probe(self, path: str, image, meta: dict) -> None:
@@ -586,10 +651,14 @@ class PreviewWidget(QWidget):
             return
         self._set_video_info(meta)
         if image is None or image.isNull():
-            self.video_thumb.setText("サムネイルを作れませんでした")
+            audio = self._video_audio
+            self.video_thumb.setStyleSheet("background-color: #000000; color: #666666;"
+                                           + (" font-size: 64px;" if audio else ""))
+            self.video_thumb.setText("♪" if audio else "サムネイルを作れませんでした")
             return
         import filer_video
 
+        self.video_page.layout().activate()     # 出したばかりでも、箱の大きさを確定させてから収める
         size = self.video_thumb.size()
         scaled = filer_video.thumbnail_image(image, max(size.width() - 8, 16),
                                              max(size.height() - 8, 16))
@@ -659,6 +728,23 @@ class PreviewWidget(QWidget):
         self.web.setFocus()
         return True
 
+    def _show_html_in_web(self, path: str) -> bool:
+        """HTML をブラウザ(WebEngine)で出す。フォーカスは渡さない(一覧のまま動ける)。
+
+        出せたら True。WebEngine が使えないときは False で、呼び出し側が簡易表示にする。"""
+        if not path:
+            return False
+        try:
+            if self.web is None:
+                self.web = self._make_web()
+                self.stack.addWidget(self.web)
+            self.web.setUrl(QUrl.fromLocalFile(path))
+        except Exception:  # noqa: BLE001
+            self.web = None
+            return False
+        self.stack.setCurrentWidget(self.web)
+        return True
+
     def _make_web(self):
         from PySide6.QtGui import QKeySequence, QShortcut
         from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
@@ -695,10 +781,7 @@ class PreviewWidget(QWidget):
 
     def _leave_web(self, signal) -> None:
         """ブラウザ表示から出る。読み込んだページは手放す(ファイルを掴まない)。"""
-        if self.web is not None:
-            self.web.setUrl(QUrl("about:blank"))
-            if self.web_shown() and self.stack.indexOf(self.rich) >= 0:
-                self.stack.setCurrentWidget(self.rich)
+        # ページは出したまま(一覧の移動で別のファイルへ移るときに手放す)。閉じるときは shutdown。
         signal.emit()
 
     def shutdown(self) -> None:

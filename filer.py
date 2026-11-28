@@ -6469,6 +6469,12 @@ class FilerWindow(QWidget):
         self.preview_side = other.side
         if self.preview_widget is None:
             self.preview_widget = filer_preview.PreviewWidget(self, self.colors, self.log_font)
+            try:
+                import filer_video
+
+                filer_video.warm_cv()   # 動画のサムネ用の cv2 を裏で読んでおく
+            except Exception:  # noqa: BLE001  速くなるだけの先読み
+                pass
             # 埋め込みのテキストビュアから Esc / Tab / Enter で一覧へ戻る
             self.preview_widget.leave.connect(self._leave_preview_viewer)
             self.preview_widget.edit.connect(self._edit_from_preview)
@@ -6558,8 +6564,8 @@ class FilerWindow(QWidget):
     def _start_player(self) -> None:
         """Ctrl+Enter のメニューの「内蔵プレーヤ」: カーソルの動画を、反対窓いっぱいで再生する。"""
         entry = self.active.cursor_entry()
-        if core.preview_kind(entry, self.viewer_extensions) != "video":
-            self.log("内蔵プレーヤ: 動画ファイルではありません")
+        if core.preview_kind(entry, self.viewer_extensions) not in ("video", "audio"):
+            self.log("内蔵プレーヤ: 動画・音声ファイルではありません")
             return
         if not self.preview_on:
             self.preview_show()
@@ -6570,11 +6576,17 @@ class FilerWindow(QWidget):
             self.preview_widget.set_viewer_mode(True)
         self.schedule_preview(immediate=True)       # 読めたら _on_preview_ready で再生を始める
 
+    def _media_kind(self) -> str:
+        """カーソルが音声なら "audio"、それ以外は "video"(↑↓ で飛ぶ先・何本目かの数え方)。"""
+        kind = core.preview_kind(self.active.cursor_entry(), self.viewer_extensions)
+        return "audio" if kind == "audio" else "video"
+
     def _video_counter(self) -> str:
         """「3 / 12」: いまの窓の動画のうち、カーソルが何本目か。"""
         pane = self.active
+        want = self._media_kind()
         videos = [i for i, e in enumerate(pane.entries)
-                  if core.preview_kind(e, self.viewer_extensions) == "video"]
+                  if core.preview_kind(e, self.viewer_extensions) == want]
         row = pane.cursor_row()
         return f"{videos.index(row) + 1} / {len(videos)}" if row in videos else ""
 
@@ -6582,9 +6594,10 @@ class FilerWindow(QWidget):
         """プレーヤで ↑↓: 前・次の動画へ(動画でないファイルは飛ばす)。端では動かない。"""
         try:
             pane = self.active
+            want = self._media_kind()
             row = pane.cursor_row() + step
             while 0 <= row < len(pane.entries):
-                if core.preview_kind(pane.entries[row], self.viewer_extensions) == "video":
+                if core.preview_kind(pane.entries[row], self.viewer_extensions) == want:
                     pane.set_cursor(row)
                     return
                 row += step
@@ -6767,11 +6780,11 @@ class FilerWindow(QWidget):
             if generation != self._preview_generation or self.preview_widget is None:
                 return     # プレビューを閉じた(開き直した)あとに届いた結果
             if self.player_mode:
-                if (result.get("kind") == "video" and result.get("path")
+                if (result.get("kind") in ("video", "audio") and result.get("path")
                         and self.preview_widget.play_video(
                             result["path"], result.get("title", ""), self._video_counter())):
                     return      # 内蔵プレーヤで再生(情報の表示は作らない)
-                self.player_mode = False    # 動画でない・再生できない: 通常の表示へ
+                self.player_mode = False    # 動画・音声でない・再生できない: 通常の表示へ
                 self.preview_widget.stop_player()
             self.preview_widget.show_result(result)
             # ページが替わってビュアが隠れると、Qt がフォーカスを近くの部品(読み取り専用の
@@ -6813,7 +6826,7 @@ class FilerWindow(QWidget):
             allowed = []
             if widget.viewer_shown():
                 allowed.append(widget.viewer)
-            if widget.web_shown():
+            if widget.web_shown() and self.viewer_mode:     # 一覧で選んだだけのときは持たせない
                 allowed.append(widget.web)
             if widget.player_shown():
                 allowed.append(widget.player_view)

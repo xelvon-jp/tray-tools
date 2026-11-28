@@ -2309,7 +2309,11 @@ def range_mark_names(entries, marks, cursor: int, direction: int) -> set:
 # ---------------------------------------------------------------
 DEFAULT_VIEWER_EXTENSIONS = (
     "log txt csv tsv md json xml ini cfg conf yaml yml py ps1 bat cmd sql html htm css js "
-    "ts c h cpp java sh"
+    "ts c h cpp java sh "
+    "ino pm pl pod hpp hh cc cxx hxx inl cs go rs rb php lua kt swift vb vbs mjs cjs jsx "
+    "tsx vue scss less toml jsonl ndjson properties gradle cmake mk make rst tex bib diff "
+    "patch inf reg url srt vtt ass ssa lrc d map md5 sha1 sha256 lst gcode scad asm s ld "
+    "env gitignore"
 ).split()
 
 
